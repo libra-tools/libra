@@ -127,6 +127,20 @@ libra branch --show-current
 libra branch --json --show-current
 ```
 
+## `branch diff` (Libra extension)
+
+`libra branch diff [<BASE>] [<BRANCH>]` shows what `<BRANCH>` changes
+relative to `<BASE>` — tip-to-tip (the working tree is never involved),
+byte-identical to `libra diff <BASE>..<BRANCH>`. Defaults: `<BRANCH>` = the
+current branch; `<BASE>` = its configured upstream (no upstream → an error
+with setup hints). `--merge-base` switches to three-dot semantics. Curated
+passthrough: `--stat`, `--name-only`, `--name-status`, `--exit-code` and
+`-- <path>...`; the full diff surface lives on `libra diff`. `--json` emits
+the diff schema. Exit 0 even with differences (use `--exit-code` for 1),
+129 usage/unknown side, 128 fatal. Note: `diff` is a reserved verb —
+`libra branch -v diff` is refused rather than creating a branch named
+`diff` (use `libra switch -c diff` if you really want one).
+
 ## Common Commands
 
 ```bash

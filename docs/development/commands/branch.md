@@ -34,6 +34,10 @@ flowchart TD
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 
+### branch diff（lore.md 1.12）
+
+- 纯糖层：`execute_diff_safe` 解析默认值（subject=当前分支，base=`branch.<n>.remote/.merge` 上游）→ 未知侧转 `branch_not_found_error`（建议）→ 组装 argv（两点走 `--old/--new` 免歧义步行；`--merge-base` 三点粘连复用引擎 merge-base）→ `diff_plumbing::delegate_to_diff`（共享抽取；plumbing 保留其 128 解析覆盖，branch 走默认 129）。与 `diff A..B` 字节一致由测试钉住。保留字防护：clap `args_conflicts_with_subcommands` 在有 flags 时**不报错而是回落位置参数**（审阅 spike 实证），故 execute 处 `new_branch=="diff"` 一律拒绝（129 + 逃生口提示），绝不静默创建。
+
 ## 实现历史
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。

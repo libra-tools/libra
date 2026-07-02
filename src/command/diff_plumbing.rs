@@ -78,16 +78,32 @@ pub struct DiffFilesArgs {
 /// the porcelain `diff`, which exits 0 unless `--exit-code` is requested).
 async fn run_via_diff(mut argv: Vec<String>, output: &OutputConfig) -> CliResult<()> {
     argv.insert(1, "--exit-code".to_string());
+    // Plumbing keeps its historical 128 override on argv parse failures.
+    delegate_to_diff(argv, output, Some(128)).await
+}
+
+/// Parse a synthetic diff argv and dispatch into the diff engine — the shared
+/// delegation tail for the diff-tree plumbing wrappers and `branch diff`
+/// (lore.md 1.12). `parse_error_exit_override` preserves the plumbing
+/// convention (128); `None` keeps the usage default (129).
+pub(crate) async fn delegate_to_diff(
+    argv: Vec<String>,
+    output: &OutputConfig,
+    parse_error_exit_override: Option<i32>,
+) -> CliResult<()> {
     let args = DiffArgs::try_parse_from(argv).map_err(|error| {
-        CliError::command_usage(format!("invalid diff request: {error}"))
-            .with_stable_code(StableErrorCode::CliInvalidArguments)
-            .with_exit_code(128)
+        let mapped = CliError::command_usage(format!("invalid diff request: {error}"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments);
+        match parse_error_exit_override {
+            Some(code) => mapped.with_exit_code(code),
+            None => mapped,
+        }
     })?;
     crate::command::diff::execute_safe(args, output).await
 }
 
 /// Append `-- <paths...>` to a diff argv when path limiters are present.
-fn push_paths(argv: &mut Vec<String>, paths: &[String]) {
+pub(crate) fn push_paths(argv: &mut Vec<String>, paths: &[String]) {
     if !paths.is_empty() {
         argv.push("--".to_string());
         argv.extend(paths.iter().cloned());

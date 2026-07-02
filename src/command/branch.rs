@@ -59,6 +59,9 @@ pub enum BranchListMode {
 
 const BRANCH_AFTER_HELP: &str = "\
 NOTES:
+    `libra branch diff [<base>] [<branch>]` is a Libra verb — tip-to-tip diff
+    (see `libra branch diff --help`); `diff` is reserved as a branch name here.
+
     Libra's global --quiet suppresses the branch listing itself.
     This differs from `git branch --quiet`, which still prints the primary list.
 
@@ -177,8 +180,68 @@ pub struct BranchListEntry {
 
 // action options are mutually exclusive with query options
 // query options can be combined
+pub const BRANCH_DIFF_EXAMPLES: &str = "\
+EXAMPLES:
+    libra branch diff                     Current branch vs its upstream
+    libra branch diff main                What the current branch changes vs main
+    libra branch diff main feature       What feature changes vs main (diff main..feature)
+    libra branch diff --merge-base main feature   Three-dot: merge-base(main,feature)..feature
+    libra branch diff main -- src/       Limit to a path
+    libra branch diff main --stat        Diffstat only
+
+NOTES:
+    Tip-to-tip only — the working tree is never involved. Full diff options
+    live on `libra diff <base>..<branch>`. Exit 0 even with differences
+    (use --exit-code for 1-on-diff).";
+
+/// Branch verbs (Libra extensions to the flat Git-style flag surface).
+#[derive(clap::Subcommand, Debug)]
+pub enum BranchSubcommand {
+    /// Show what a branch changes relative to a base (tip-to-tip diff;
+    /// reuses the diff engine — Lore's `branch diff`).
+    #[command(after_help = BRANCH_DIFF_EXAMPLES)]
+    Diff(BranchDiffArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct BranchDiffArgs {
+    /// The base (old side). Defaults to the current branch's upstream.
+    #[clap(value_name = "BASE")]
+    pub base: Option<String>,
+
+    /// The branch (new side). Defaults to the current branch.
+    #[clap(value_name = "BRANCH")]
+    pub branch: Option<String>,
+
+    /// Three-dot semantics: diff from merge-base(BASE, BRANCH) to BRANCH
+    /// (mirrors `git diff --merge-base`).
+    #[clap(long = "merge-base")]
+    pub merge_base: bool,
+
+    /// Exit 1 when differences exist (0 when clean), like `diff --exit-code`.
+    #[clap(long = "exit-code")]
+    pub exit_code: bool,
+
+    /// Show a diffstat instead of the patch.
+    #[clap(long)]
+    pub stat: bool,
+
+    /// Show only names of changed files.
+    #[clap(long = "name-only", conflicts_with = "name_status")]
+    pub name_only: bool,
+
+    /// Show names and status letters of changed files.
+    #[clap(long = "name-status")]
+    pub name_status: bool,
+
+    /// Limit the diff to the given paths (always after `--`).
+    #[clap(last = true, value_name = "PATH")]
+    pub paths: Vec<String>,
+}
+
 #[derive(Parser, Debug)]
 #[command(after_help = BRANCH_AFTER_HELP)]
+#[command(args_conflicts_with_subcommands = true)]
 #[command(group(
     ArgGroup::new("action")
         .multiple(false)
@@ -191,6 +254,12 @@ pub struct BranchListEntry {
         .conflicts_with("action")
 ))]
 pub struct BranchArgs {
+    /// Branch verbs (Libra extensions). NOTE: when flags make clap fall back
+    /// to the positional parse, a literal `diff` in `new_branch` is refused
+    /// at execute time (never silently creates a branch named `diff`).
+    #[command(subcommand)]
+    pub subcommand: Option<BranchSubcommand>,
+
     /// new branch name
     #[clap(group = "action")]
     pub new_branch: Option<String>,
@@ -312,6 +381,112 @@ pub struct BranchArgs {
 }
 /// Fire-and-forget entry: prints the rendered error to stderr but does not
 /// signal exit code.
+/// `branch diff` (lore.md §1.12): thin sugar over the diff engine — resolve
+/// branch-flavored defaults, then delegate. Tip-to-tip only (the working
+/// tree is never involved), byte-identical output to `libra diff BASE..BRANCH`.
+async fn execute_diff_safe(args: BranchDiffArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::utils::util::require_repo().map_err(|_| CliError::repo_not_found())?;
+
+    // Subject (new side): explicit or the current branch.
+    let subject = match &args.branch {
+        Some(explicit) => explicit.clone(),
+        None => match Head::current().await {
+            Head::Branch(name) => name,
+            Head::Detached(_) => {
+                if args.base.is_some() && args.branch.is_some() {
+                    unreachable!("both sides explicit");
+                }
+                return Err(CliError::from(BranchError::DetachedHead));
+            }
+        },
+    };
+    // Base (old side): explicit or the current branch's upstream.
+    let base = match &args.base {
+        Some(explicit) => explicit.clone(),
+        None => {
+            let current = match Head::current().await {
+                Head::Branch(name) => name,
+                Head::Detached(_) => return Err(CliError::from(BranchError::DetachedHead)),
+            };
+            // Propagate real config-store failures — only a genuine ABSENCE
+            // of tracking config gets the setup hint.
+            let remote = ConfigKv::get(&format!("branch.{current}.remote"))
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read branch.{current}.remote: {error}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .map(|entry| entry.value);
+            let merge = ConfigKv::get(&format!("branch.{current}.merge"))
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read branch.{current}.merge: {error}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .map(|entry| entry.value);
+            match (remote, merge) {
+                (Some(remote), Some(merge)) => {
+                    let merge_short = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+                    if remote == "." {
+                        // Git's local-upstream form (branch.<n>.remote = "."):
+                        // the upstream is the LOCAL branch named by merge.
+                        merge_short.to_string()
+                    } else {
+                        format!("{remote}/{merge_short}")
+                    }
+                }
+                _ => {
+                    return Err(CliError::failure(format!(
+                        "there is no tracking information for branch '{current}'"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+                    .with_hint("set one with 'libra branch --set-upstream-to=<remote>/<branch>'")
+                    .with_hint(
+                        "or name the base explicitly: 'libra branch diff <base> [<branch>]'",
+                    ));
+                }
+            }
+        }
+    };
+    // Branch-flavored preflight: convert unknown sides into the branch UX
+    // (with the levenshtein suggestion) BEFORE delegating. On success the
+    // ORIGINAL strings are forwarded (the engine re-resolves identically).
+    for side in [&base, &subject] {
+        if get_target_commit(side).await.is_err() {
+            return Err(CliError::from(branch_not_found_error(side).await));
+        }
+    }
+
+    let mut argv: Vec<String> = vec!["diff".to_string()];
+    if args.merge_base {
+        // Three-dot: reuse the engine's own merge-base computation and
+        // NoMergeBase error. Refnames cannot contain '..', so the glued
+        // form cannot mis-split.
+        argv.push(format!("{base}...{subject}"));
+    } else {
+        // --old/--new route: skips the revision/path ambiguity walk entirely
+        // (a file named like the branch cannot shadow it).
+        argv.push("--old".to_string());
+        argv.push(base);
+        argv.push("--new".to_string());
+        argv.push(subject);
+    }
+    if args.exit_code {
+        argv.push("--exit-code".to_string());
+    }
+    if args.stat {
+        argv.push("--stat".to_string());
+    }
+    if args.name_only {
+        argv.push("--name-only".to_string());
+    }
+    if args.name_status {
+        argv.push("--name-status".to_string());
+    }
+    crate::command::diff_plumbing::push_paths(&mut argv, &args.paths);
+    crate::command::diff_plumbing::delegate_to_diff(argv, output, None).await
+}
+
 pub async fn execute(args: BranchArgs) {
     if let Err(err) = execute_safe(args, &OutputConfig::default()).await {
         err.print_stderr();
@@ -327,6 +502,22 @@ pub async fn execute(args: BranchArgs) {
 /// - All [`BranchError`] variants are mapped to [`CliError`] via the
 ///   `From` impl which sets stable codes and hints.
 pub async fn execute_safe(args: BranchArgs, output: &OutputConfig) -> CliResult<()> {
+    if let Some(BranchSubcommand::Diff(diff_args)) = args.subcommand {
+        return execute_diff_safe(diff_args, output).await;
+    }
+    // Reserved verb guard: when flags force clap into the positional parse
+    // (`branch -v diff`, `branch --no-column diff main`, …), the `diff` token
+    // lands in `new_branch` — refuse rather than silently create a branch
+    // literally named `diff` (documented; escape hatch: `libra switch -c diff`).
+    if args.new_branch.as_deref() == Some("diff") {
+        return Err(CliError::command_usage(
+            "`diff` is a reserved branch verb here (`libra branch diff …`) and branch flags \
+             cannot be combined with it",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint("to diff branches: `libra branch diff [<base>] [<branch>]`")
+        .with_hint("to create a branch literally named `diff`: `libra switch -c diff`"));
+    }
     // Validate the `--column` mode up front so an invalid mode is rejected
     // regardless of output path; the enable decision is recomputed at render.
     if let Some(mode) = args.column.as_deref() {
@@ -1808,6 +1999,7 @@ pub async fn list_branches(
     commits_no_contains: &[String],
 ) -> CliResult<()> {
     let args = BranchArgs {
+        subcommand: None,
         no_column: false,
         new_branch: None,
         commit_hash: None,

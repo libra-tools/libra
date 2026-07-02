@@ -536,6 +536,7 @@ async fn test_branch() {
         // create branch with first commit
         let first_branch_name = "first_branch".to_string();
         let args = BranchArgs {
+            subcommand: None,
             format: None,
             no_column: false,
             new_branch: Some(first_branch_name.clone()),
@@ -584,6 +585,7 @@ async fn test_branch() {
         // create second branch with current branch
         let second_branch_name = "second_branch".to_string();
         let args = BranchArgs {
+            subcommand: None,
             format: None,
             no_column: false,
             new_branch: Some(second_branch_name.clone()),
@@ -622,6 +624,7 @@ async fn test_branch() {
     // show current branch
     println!("show current branch");
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: None,
@@ -688,6 +691,7 @@ async fn test_create_branch_from_remote() {
     assert!(get_target_commit("origin/main").await.is_ok());
 
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: Some("test_new".to_string()),
@@ -755,6 +759,7 @@ async fn test_create_branch_from_remote_tracking_ref() {
     assert!(get_target_commit("origin/main").await.is_ok());
 
     execute(BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: Some("tracking-copy".to_string()),
@@ -978,6 +983,7 @@ async fn test_branch_rename() {
 
     // Create a test branch
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: Some("old_name".to_string()),
@@ -1015,6 +1021,7 @@ async fn test_branch_rename() {
 
     // Rename branch from old_name to new_name
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: None,
@@ -1121,6 +1128,7 @@ async fn test_rename_current_branch() {
     // Rename current branch (feature) to feature_new using single argument
     let feature_new = "feature_new".to_string();
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: None,
@@ -1202,6 +1210,7 @@ async fn test_rename_to_existing_branch() {
 
     // Create two branches
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: Some("branch1".to_string()),
@@ -1231,6 +1240,7 @@ async fn test_rename_to_existing_branch() {
     execute(args).await;
 
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: Some("branch2".to_string()),
@@ -1261,6 +1271,7 @@ async fn test_rename_to_existing_branch() {
 
     // Try to rename branch1 to branch2 (should fail)
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: None,
@@ -1335,6 +1346,7 @@ async fn test_list_all_branches() {
 
     // Create local branch
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: Some("feature_branch".to_string()),
@@ -1375,6 +1387,7 @@ async fn test_list_all_branches() {
 
     // Test -a parameter - just call execute, don't try to capture output
     let args = BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: None,
@@ -1454,6 +1467,7 @@ async fn test_branch_delete_safe() {
 
     // Create a feature branch
     execute(BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: Some("feature".to_string()),
@@ -1530,6 +1544,7 @@ async fn test_branch_delete_safe() {
 
     // Try to delete feature branch with -d (should fail - not merged)
     execute(BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: None,
@@ -1607,6 +1622,7 @@ async fn test_branch_delete_safe() {
 
     // Now try -d again (should succeed - fully merged)
     execute(BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: None,
@@ -1705,6 +1721,7 @@ async fn test_branch_contains_commit_filter() {
 
     // Create dev branch and add two commits
     execute(BranchArgs {
+        subcommand: None,
         format: None,
         no_column: false,
         new_branch: Some("dev".to_string()),
