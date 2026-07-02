@@ -59,6 +59,25 @@ repository.
 | `0` | Configuration was reported. |
 | non-zero | A storage config value could not be resolved (e.g. an unreadable global config DB); the failure is surfaced rather than silently reporting a default. |
 
+## `cache evict` (lore.md 2.9)
+
+Evicts **verified-durable** large loose objects (>= the tiered threshold)
+from the local cache, oldest-first by materialization time, until under the
+configured budget (`LIBRA_STORAGE_CACHE_SIZE`, overridable with
+`--max-size`; `--max-size 0` evicts every verified candidate). Safety: each
+unlink is gated on an error-aware durability probe run immediately before
+it — an object the durable tier *confirms absent* is skipped (push/backup to
+make it durable), a probe *error* is never treated as absence, and three
+leading probe failures abort the run with nothing deleted. `--dry-run`
+reports the outcome (probes still run); `--min-age` (default 600s) skips
+freshly materialized objects. Reads of evicted objects self-heal
+transparently from the durable tier (re-verified, re-cached) — but are
+unavailable offline. Local-only repositories have nothing evictable; the
+offline read policy refuses (probes impossible). Background use:
+`libra maintenance run --task cache-evict` (not in the default task set).
+Residual risk (documented): presence is not integrity — a corrupt remote
+copy would leave no good copy; v1 relies on S3/R2 server-side integrity.
+
 ## Examples
 
 ```bash

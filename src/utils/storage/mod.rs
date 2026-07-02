@@ -75,4 +75,61 @@ pub trait Storage: Send + Sync {
     async fn heal(&self, _hash: &ObjectHash) -> Result<bool, GitError> {
         Ok(false)
     }
+
+    /// Error-aware existence probe (lore.md 2.9): distinguishes a confirmed
+    /// ABSENCE (`Ok(false)`) from a probe FAILURE (`Err` — outage, bad
+    /// credentials). The plain `exist` collapses both into `false`, which is
+    /// fine for read fallbacks but must never gate a deletion.
+    async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        Ok(self.exist(hash).await)
+    }
+
+    /// Evict verified-durable large objects from the LOCAL tier until under
+    /// budget (lore.md 2.9). `Ok(None)` = not a tiered store (nothing
+    /// evictable). Deletion is gated on a per-object error-aware durability
+    /// probe run immediately before each unlink — an object is never deleted
+    /// on a probe ERROR, and a wholly unreachable tier aborts the run.
+    async fn evict_local(&self, _request: EvictRequest) -> Result<Option<EvictReport>, GitError> {
+        Ok(None)
+    }
+}
+
+/// Parameters for [`Storage::evict_local`].
+#[derive(Debug, Clone)]
+pub struct EvictRequest {
+    /// Target budget for the local large-object cache (uncompressed bytes —
+    /// the same conservative accounting as the in-process LRU).
+    pub budget_bytes: u64,
+    /// Skip objects materialized within this many seconds (mtime floor).
+    pub min_age_secs: u64,
+    /// Report what WOULD be evicted (probes still run); delete nothing.
+    pub dry_run: bool,
+}
+
+/// Outcome of [`Storage::evict_local`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct EvictReport {
+    /// Loose objects scanned.
+    pub scanned: usize,
+    /// Objects at/over the large threshold (eviction candidates before
+    /// age/budget filters).
+    pub candidate_count: usize,
+    /// Their summed uncompressed bytes.
+    pub candidate_bytes: u64,
+    /// Candidates whose durability probe confirmed presence.
+    pub verified: usize,
+    /// Objects actually evicted (0 under dry-run).
+    pub evicted: usize,
+    /// Uncompressed bytes reclaimed (would-be reclaimed under dry-run).
+    pub reclaimed_bytes: u64,
+    /// Skipped: the durable tier CONFIRMED the object absent (push/backup to
+    /// make it durable).
+    pub skipped_absent: usize,
+    /// Skipped: the durability probe ERRORED (outage ≠ absence; never
+    /// deleted on error).
+    pub skipped_probe_error: usize,
+    /// Skipped: younger than the min-age floor.
+    pub skipped_recent: usize,
+    /// Evicted (or would-be) objects, capped: (oid, uncompressed bytes).
+    pub evicted_objects: Vec<(String, u64)>,
 }

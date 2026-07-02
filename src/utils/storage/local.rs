@@ -120,6 +120,70 @@ impl LocalStorage {
     /// that previously panicked: missing `\0` terminator, non-UTF-8 header bytes,
     /// missing type prefix, missing size, non-numeric size, or size mismatch
     /// against the decompressed payload.
+    /// Enumerate loose objects with metadata for the evictor (lore.md 2.9):
+    /// `(hash, path, mtime, uncompressed_size)`. The size comes from a
+    /// PARTIAL zlib decode (header only, bounded) — full decompression of
+    /// every large object per scan would be a real I/O cost. Non-OID files
+    /// and unparseable objects are skipped (healing is fsck's job).
+    pub fn list_loose_with_meta(&self) -> Vec<(ObjectHash, PathBuf, std::time::SystemTime, u64)> {
+        let mut rows = Vec::new();
+        let Ok(shards) = fs::read_dir(&self.base_path) else {
+            return rows;
+        };
+        for shard in shards.flatten() {
+            let shard_name = shard.file_name().to_string_lossy().into_owned();
+            if shard_name.len() != 2 || !shard_name.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue; // pack/, info/, temp files
+            }
+            let Ok(entries) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let rest = entry.file_name().to_string_lossy().into_owned();
+                let oid_hex = format!("{shard_name}{rest}");
+                let Ok(hash) = ObjectHash::from_str(&oid_hex) else {
+                    continue;
+                };
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                let Some(size) = Self::peek_uncompressed_size(&entry.path()) else {
+                    continue;
+                };
+                rows.push((hash, entry.path(), mtime, size));
+            }
+        }
+        rows
+    }
+
+    /// Partially decode a loose object's zlib stream — just enough to read
+    /// the `"<type> <len>\0"` header — and return `<len>`. `None` on any
+    /// parse failure (the object is then not an eviction candidate).
+    pub fn peek_uncompressed_size(path: &Path) -> Option<u64> {
+        use std::io::Read;
+        let file = fs::File::open(path).ok()?;
+        let mut decoder = flate2::read::ZlibDecoder::new(file);
+        let mut header = [0u8; 64];
+        let mut filled = 0usize;
+        while filled < header.len() {
+            match decoder.read(&mut header[filled..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    filled += n;
+                    if header[..filled].contains(&0) {
+                        break;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+        let nul = header[..filled].iter().position(|b| *b == 0)?;
+        let text = std::str::from_utf8(&header[..nul]).ok()?;
+        let (_, len) = text.split_once(' ')?;
+        len.parse().ok()
+    }
+
     fn parse_header(data: &[u8]) -> Result<(String, usize, usize), GitError> {
         let end_of_header = data
             .iter()

@@ -169,6 +169,20 @@ impl Storage for RemoteStorage {
         self.inner.head(&path).await.is_ok()
     }
 
+    async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        let path = self.hash_to_path(hash);
+        match self.inner.head(&path).await {
+            Ok(_) => Ok(true),
+            // A confirmed miss — the only case that may gate an eviction.
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            // Everything else (outage, credentials, throttling) is an ERROR,
+            // never conflated with absence.
+            Err(error) => Err(GitError::IOError(std::io::Error::other(format!(
+                "durable-tier probe failed for {hash}: {error}"
+            )))),
+        }
+    }
+
     async fn search(&self, prefix: &str) -> Vec<ObjectHash> {
         let list_prefix = if prefix.len() >= 2 {
             // Optimization: Git objects are stored in xx/yyyy...

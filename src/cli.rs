@@ -1224,9 +1224,15 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         // `auth` manages host-global tokens in the GLOBAL store; it works
         // outside a repository and touches no objects.
         | Commands::Auth(_)
-        // `cache info` only inspects env/config-derived storage tunables.
-        | Commands::Cache(_)
         | Commands::Sandbox(_) => Ok(CommandPreflight::none()),
+        // `cache info` only inspects env/config-derived storage tunables and
+        // works outside a repository; `cache evict` deletes local objects, so
+        // it takes the standard repo + hash-kind preflight.
+        Commands::Cache(cache_args)
+            if matches!(cache_args.command, command::cache::CacheCommand::Info) =>
+        {
+            Ok(CommandPreflight::none())
+        }
         Commands::HashObject(args) if !args.write => {
             match utils::util::try_get_storage_path(None) {
                 Ok(storage) => Ok(CommandPreflight::repo_hash_kind_without_schema_guard(

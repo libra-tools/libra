@@ -13,7 +13,7 @@ use git_internal::{
 };
 use lru_mem::{HeapSize, LruCache};
 
-use super::{Storage, local::LocalStorage, remote::RemoteStorage};
+use super::{EvictReport, EvictRequest, Storage, local::LocalStorage, remote::RemoteStorage};
 use crate::utils::read_policy::{ReadPolicy, read_policy};
 
 /// Verify that a fetched object's bytes hash back to their claimed OID, before
@@ -148,29 +148,50 @@ impl TieredStorage {
     ) -> Result<(), GitError> {
         self.local.put(hash, data, obj_type).await?;
         if data.len() >= self.threshold {
-            // Recover from a poisoned lock rather than panicking during
-            // get/put/heal: the LRU only guards cache bookkeeping (never the
-            // object bytes, which are already written), so its contents stay
-            // valid even if another thread panicked while holding the lock.
-            let mut lru = self
-                .lru
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // If this object is already tracked (e.g. a `--remote` refresh or a
-            // heal of a corrupt cached object), the file was just rewritten in
-            // place at the same content-addressed path. Only touch recency —
-            // re-inserting a new `CachedFile` would evict the old entry, whose
-            // `Drop` deletes that very path, removing the object we just wrote.
-            if lru.get(hash).is_none() {
-                let path = self.local.get_obj_path(hash);
-                let _ = lru.insert(
-                    *hash,
-                    CachedFile {
-                        path,
-                        disk_size: data.len(),
-                    },
-                );
-            }
+            // Pre-trim victims INSIDE the lock, delete their files OUTSIDE
+            // it (lore.md:698 — the put/get/heal hot path must not perform
+            // unlink I/O while holding the LRU mutex). Deletion stays
+            // synchronous on this call (a fire-and-forget task could die at
+            // process exit and silently leak past the budget).
+            let victims: Vec<CachedFile> = {
+                // Recover from a poisoned lock rather than panicking during
+                // get/put/heal: the LRU only guards cache bookkeeping (never
+                // the object bytes, which are already written), so its
+                // contents stay valid even if another thread panicked while
+                // holding the lock.
+                let mut lru = self
+                    .lru
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // If this object is already tracked (e.g. a `--remote` refresh
+                // or a heal of a corrupt cached object), the file was just
+                // rewritten in place at the same content-addressed path. Only
+                // touch recency — re-inserting a new `CachedFile` would evict
+                // the old entry, whose `Drop` deletes that very path, removing
+                // the object we just wrote.
+                if lru.get(hash).is_some() {
+                    Vec::new()
+                } else {
+                    let mut victims = Vec::new();
+                    let incoming = data.len();
+                    while lru.current_size() + incoming > lru.max_size()
+                        && let Some((_, victim)) = lru.remove_lru()
+                    {
+                        victims.push(victim);
+                    }
+                    let path = self.local.get_obj_path(hash);
+                    let _ = lru.insert(
+                        *hash,
+                        CachedFile {
+                            path,
+                            disk_size: incoming,
+                        },
+                    );
+                    victims
+                }
+            };
+            // Dropping the victims unlinks their files — lock released.
+            drop(victims);
         }
         Ok(())
     }
@@ -207,7 +228,16 @@ impl Storage for TieredStorage {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let _ = lru.get(hash);
             }
-            return self.local.get(hash).await;
+            match self.local.get(hash).await {
+                Ok(hit) => return Ok(hit),
+                // SELF-HEALING READ (lore.md 2.9): the file can vanish
+                // between exist() and get() — an evictor, an external
+                // cleaner, or a crash artifact. Under any policy that may
+                // reach the durable tier, fall through to the remote fetch
+                // (which re-verifies and re-caches) instead of failing.
+                Err(_) if policy != ReadPolicy::LocalOnly => {}
+                Err(error) => return Err(error),
+            }
         }
 
         // Not local. Under `--offline`/`--local`, never reach for the durable
@@ -302,6 +332,106 @@ impl Storage for TieredStorage {
     /// persisted (no fabrication). `remote.get` inherits object_store's bounded
     /// 429/`SlowDown`/5xx backoff (lore.md §0.2); `verify_fetched_object` is the
     /// same integrity check as verify-on-cache (lore.md §0.3).
+    async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        if self.local.exist(hash).await {
+            return Ok(true);
+        }
+        self.remote.exist_checked(hash).await
+    }
+
+    /// Evict verified-durable large loose objects until under budget
+    /// (lore.md 2.9). Safety: every victim gets an error-aware durability
+    /// probe IMMEDIATELY before its unlink — confirmed-absent and
+    /// probe-error objects are skipped (and counted separately: absence is
+    /// actionable by push/backup, an error is an outage); three consecutive
+    /// leading probe errors abort the whole run (unreachable tier, nothing
+    /// deleted). RESIDUAL RISK (documented): presence ≠ integrity — a
+    /// corrupt remote copy would make the local one the only good copy;
+    /// v1 accepts this citing S3/R2 server-side integrity (a --verify deep
+    /// probe is a recorded follow-up).
+    async fn evict_local(&self, request: EvictRequest) -> Result<Option<EvictReport>, GitError> {
+        let mut report = EvictReport::default();
+        let now = std::time::SystemTime::now();
+        let mut rows = self.local.list_loose_with_meta();
+        report.scanned = rows.len();
+        rows.retain(|(_, _, _, size)| *size as usize >= self.threshold);
+        report.candidate_count = rows.len();
+        report.candidate_bytes = rows.iter().map(|(_, _, _, size)| *size).sum();
+
+        // Victim order: oldest mtime first (materialization recency), then
+        // larger-first, then OID — deterministic from filesystem state.
+        rows.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then(b.3.cmp(&a.3))
+                .then(a.0.to_string().cmp(&b.0.to_string()))
+        });
+
+        let mut remaining = report.candidate_bytes;
+        let mut consecutive_leading_errors = 0usize;
+        let mut probed_any_success = false;
+        for (hash, path, mtime, size) in rows {
+            if remaining <= request.budget_bytes {
+                break;
+            }
+            if let Ok(age) = now.duration_since(mtime)
+                && age.as_secs() < request.min_age_secs
+            {
+                report.skipped_recent += 1;
+                continue;
+            }
+            // Error-aware probe immediately before the unlink.
+            match self.remote.exist_checked(&hash).await {
+                Ok(true) => {
+                    probed_any_success = true;
+                    consecutive_leading_errors = 0;
+                    report.verified += 1;
+                    if !request.dry_run {
+                        if let Err(error) = std::fs::remove_file(&path)
+                            && error.kind() != std::io::ErrorKind::NotFound
+                        {
+                            return Err(GitError::IOError(error));
+                        }
+                        // Keep any in-process LRU accounting coherent.
+                        let mut lru = self
+                            .lru
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(entry) = lru.remove(&hash) {
+                            // The file is already gone; don't let Drop
+                            // unlink a path another process may recreate.
+                            std::mem::forget(entry);
+                        }
+                    }
+                    report.evicted += 1;
+                    report.reclaimed_bytes += size;
+                    remaining -= size;
+                    if report.evicted_objects.len() < 100 {
+                        report.evicted_objects.push((hash.to_string(), size));
+                    }
+                }
+                Ok(false) => {
+                    probed_any_success = true;
+                    consecutive_leading_errors = 0;
+                    report.skipped_absent += 1;
+                }
+                Err(_) => {
+                    report.skipped_probe_error += 1;
+                    if !probed_any_success {
+                        consecutive_leading_errors += 1;
+                        if consecutive_leading_errors >= 3 {
+                            return Err(GitError::IOError(std::io::Error::other(
+                                "the durable tier is unreachable (3 consecutive probe \
+                                 failures); nothing was evicted — retry when the tier is \
+                                 reachable",
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(report))
+    }
+
     async fn heal(&self, hash: &ObjectHash) -> Result<bool, GitError> {
         let (data, obj_type) = match self.remote.get(hash).await {
             Ok(pair) => pair,
@@ -921,5 +1051,225 @@ mod tests {
         assert!(path_b.exists(), "retained entry B's file must survive");
         assert!(lru.get(&key_b).is_some(), "B must remain cached");
         assert!(lru.get(&key_a).is_none(), "A must have been evicted");
+    }
+
+    /// The 2.9 evictor: verified-durable objects are evicted oldest-first to
+    /// budget; absent objects are skipped (never delete the only copy);
+    /// dry-run deletes nothing; the min-age floor holds; and a local read
+    /// after eviction self-heals from the durable tier.
+    #[tokio::test]
+    #[serial]
+    async fn evict_local_verifies_budget_and_self_heals() {
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+
+        use crate::utils::storage::EvictRequest;
+
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let obj_type = ObjectType::Blob;
+        let threshold = 8usize; // tiny threshold: everything below is permanent
+
+        let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
+        let local_dir = tempdir().expect("tempdir");
+        let tiered = TieredStorage::new(
+            LocalStorage::new(local_dir.path().to_path_buf()),
+            remote,
+            threshold,
+            1 << 20,
+        );
+
+        // Two large durable objects + one large LOCAL-ONLY object.
+        let durable_a = b"durable object AAAAAAAA".to_vec();
+        let durable_b = b"durable object BBBBBBBB".to_vec();
+        let local_only = b"local only CCCCCCCCCCCC".to_vec();
+        let hash_a = ObjectHash::from_type_and_data(obj_type, &durable_a);
+        let hash_b = ObjectHash::from_type_and_data(obj_type, &durable_b);
+        let hash_c = ObjectHash::from_type_and_data(obj_type, &local_only);
+        tiered
+            .put(&hash_a, &durable_a, obj_type)
+            .await
+            .expect("put a");
+        tiered
+            .put(&hash_b, &durable_b, obj_type)
+            .await
+            .expect("put b");
+        // c bypasses the remote (local materialization only).
+        tiered
+            .local
+            .put(&hash_c, &local_only, obj_type)
+            .await
+            .expect("local put c");
+
+        // Dry run with budget 0: would evict both durable objects, skips the
+        // local-only one, deletes nothing.
+        let report = tiered
+            .evict_local(EvictRequest {
+                budget_bytes: 0,
+                min_age_secs: 0,
+                dry_run: true,
+            })
+            .await
+            .expect("dry run")
+            .expect("tiered");
+        assert_eq!(report.evicted, 2, "{report:?}");
+        assert_eq!(report.skipped_absent, 1, "{report:?}");
+        assert!(tiered.local.exist(&hash_a).await, "dry run deletes nothing");
+
+        // Min-age floor skips everything (all freshly materialized).
+        let report = tiered
+            .evict_local(EvictRequest {
+                budget_bytes: 0,
+                min_age_secs: 3600,
+                dry_run: false,
+            })
+            .await
+            .expect("aged run")
+            .expect("tiered");
+        assert_eq!(report.evicted, 0, "{report:?}");
+        assert_eq!(report.skipped_recent, 3, "{report:?}");
+
+        // Real eviction to zero budget: both durable objects go, the
+        // local-only object stays (its durability is not confirmed).
+        let report = tiered
+            .evict_local(EvictRequest {
+                budget_bytes: 0,
+                min_age_secs: 0,
+                dry_run: false,
+            })
+            .await
+            .expect("evict")
+            .expect("tiered");
+        assert_eq!(report.evicted, 2, "{report:?}");
+        assert!(!tiered.local.exist(&hash_a).await, "evicted from local");
+        assert!(tiered.local.exist(&hash_c).await, "only copy never deleted");
+
+        // Self-healing read: the evicted object comes back from the durable
+        // tier transparently.
+        let (got, _) = tiered.get(&hash_a).await.expect("self-heal fetch");
+        assert_eq!(got, durable_a);
+        assert!(tiered.local.exist(&hash_a).await, "re-cached after heal");
+    }
+
+    /// A wholly unreachable durable tier aborts the run with nothing deleted
+    /// (probe error is never conflated with absence).
+    #[tokio::test]
+    #[serial]
+    async fn evict_local_aborts_on_unreachable_tier() {
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+
+        use crate::utils::storage::EvictRequest;
+
+        #[derive(Debug)]
+        struct FailingStore;
+        impl std::fmt::Display for FailingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "FailingStore")
+            }
+        }
+        #[async_trait::async_trait]
+        impl object_store::ObjectStore for FailingStore {
+            async fn put_opts(
+                &self,
+                _location: &object_store::path::Path,
+                _payload: object_store::PutPayload,
+                _opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                Err(object_store::Error::Generic {
+                    store: "failing",
+                    source: "down".into(),
+                })
+            }
+            async fn put_multipart_opts(
+                &self,
+                _location: &object_store::path::Path,
+                _opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                Err(object_store::Error::Generic {
+                    store: "failing",
+                    source: "down".into(),
+                })
+            }
+            async fn get_opts(
+                &self,
+                _location: &object_store::path::Path,
+                _options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                Err(object_store::Error::Generic {
+                    store: "failing",
+                    source: "down".into(),
+                })
+            }
+            fn list(
+                &self,
+                _prefix: Option<&object_store::path::Path>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                Box::pin(futures::stream::empty())
+            }
+            async fn list_with_delimiter(
+                &self,
+                _prefix: Option<&object_store::path::Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                Err(object_store::Error::Generic {
+                    store: "failing",
+                    source: "down".into(),
+                })
+            }
+            async fn copy_opts(
+                &self,
+                _from: &object_store::path::Path,
+                _to: &object_store::path::Path,
+                _options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                Err(object_store::Error::Generic {
+                    store: "failing",
+                    source: "down".into(),
+                })
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<
+                    'static,
+                    object_store::Result<object_store::path::Path>,
+                >,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+            {
+                locations
+            }
+        }
+
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let obj_type = ObjectType::Blob;
+        let local_dir = tempdir().expect("tempdir");
+        let tiered = TieredStorage::new(
+            LocalStorage::new(local_dir.path().to_path_buf()),
+            RemoteStorage::new(Arc::new(FailingStore)),
+            8,
+            1 << 20,
+        );
+        // Materialize large local objects directly.
+        let mut hashes = Vec::new();
+        for i in 0..3 {
+            let data = format!("large local object number {i} XXXXXXXX").into_bytes();
+            let hash = ObjectHash::from_type_and_data(obj_type, &data);
+            tiered.local.put(&hash, &data, obj_type).await.expect("put");
+            hashes.push(hash);
+        }
+        let error = tiered
+            .evict_local(crate::utils::storage::EvictRequest {
+                budget_bytes: 0,
+                min_age_secs: 0,
+                dry_run: false,
+            })
+            .await
+            .expect_err("unreachable tier aborts");
+        assert!(error.to_string().contains("unreachable"), "{error}");
+        for hash in &hashes {
+            assert!(tiered.local.exist(hash).await, "nothing deleted");
+        }
+        let _ = EvictRequest {
+            budget_bytes: 0,
+            min_age_secs: 0,
+            dry_run: false,
+        };
     }
 }

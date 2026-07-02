@@ -252,6 +252,15 @@ pub fn resolve_cache_config() -> Result<CacheConfig, String> {
 }
 
 impl ClientStorage {
+    /// Evict verified-durable large objects until under budget (lore.md
+    /// 2.9). `Ok(None)` when the backing store is not tiered.
+    pub async fn evict_local(
+        &self,
+        request: crate::utils::storage::EvictRequest,
+    ) -> Result<Option<crate::utils::storage::EvictReport>, git_internal::errors::GitError> {
+        self.storage.evict_local(request).await
+    }
+
     pub fn base_path(&self) -> &PathBuf {
         &self.base_path
     }

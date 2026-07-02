@@ -134,6 +134,10 @@ pub enum MaintenanceTask {
     CommitGraph,
     /// Prefetch remote refs without updating local branches.
     Prefetch,
+    /// Evict verified-durable large objects from the local cache (lore.md
+    /// 2.9). NOT in the default task set — select it explicitly (or schedule
+    /// it) so `maintenance run` never surprise-deletes cache entries.
+    CacheEvict,
 }
 
 impl std::fmt::Display for MaintenanceTask {
@@ -145,6 +149,7 @@ impl std::fmt::Display for MaintenanceTask {
             MaintenanceTask::IncrementalRepack => write!(f, "incremental-repack"),
             MaintenanceTask::CommitGraph => write!(f, "commit-graph"),
             MaintenanceTask::Prefetch => write!(f, "prefetch"),
+            MaintenanceTask::CacheEvict => write!(f, "cache-evict"),
         }
     }
 }
@@ -239,6 +244,7 @@ async fn run_tasks(
                 run_commit_graph(&repo_path, dry_run, quiet, output).await
             }
             MaintenanceTask::Prefetch => run_prefetch(&repo_path, dry_run, quiet, output).await,
+            MaintenanceTask::CacheEvict => run_cache_evict(dry_run).await,
         };
         match result {
             Ok(r) => {
@@ -300,6 +306,50 @@ async fn run_tasks(
 // GC task
 // ---------------------------------------------------------------------------
 
+/// `cache-evict` task (lore.md 2.9): delegate to the same engine as
+/// `libra cache evict`, with the resolved budget and the default age floor.
+async fn run_cache_evict(dry_run: bool) -> CliResult<TaskResult> {
+    use crate::utils::storage::EvictRequest;
+    let budget = crate::utils::client_storage::resolve_cache_config()
+        .map_err(|error| CliError::fatal(format!("cannot resolve the cache budget: {error}")))?
+        .cache_size_bytes as u64;
+    let storage = crate::utils::client_storage::ClientStorage::init(crate::utils::path::objects());
+    let report = storage
+        .evict_local(EvictRequest {
+            budget_bytes: budget,
+            min_age_secs: 600,
+            dry_run,
+        })
+        .await
+        .map_err(|error| CliError::fatal(format!("cache eviction failed: {error}")))?;
+    let (removed, message) = match report {
+        None => (
+            0,
+            "no durable tier configured — nothing evictable".to_string(),
+        ),
+        Some(report) => (
+            report.evicted,
+            format!(
+                "evicted {} object(s), {} bytes (skipped: {} absent, {} probe errors, {} recent)",
+                report.evicted,
+                report.reclaimed_bytes,
+                report.skipped_absent,
+                report.skipped_probe_error,
+                report.skipped_recent
+            ),
+        ),
+    };
+    Ok(TaskResult {
+        task: "cache-evict".to_string(),
+        success: true,
+        objects_removed: removed,
+        objects_packed: 0,
+        refs_packed: 0,
+        packs_repacked: 0,
+        message,
+    })
+}
+
 async fn run_gc(
     repo_path: &Path,
     dry_run: bool,
@@ -325,10 +375,14 @@ async fn run_gc(
                 }
             } else {
                 if let Err(e) = fs::remove_file(obj_path) {
-                    return Err(CliError::fatal(format!(
-                        "failed to remove unreachable object {}: {e}",
-                        hash_str
-                    )));
+                    // A concurrent cache eviction may have removed it first —
+                    // the goal state (file gone) is reached either way.
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(CliError::fatal(format!(
+                            "failed to remove unreachable object {}: {e}",
+                            hash_str
+                        )));
+                    }
                 }
                 removed += 1;
             }
@@ -386,6 +440,15 @@ async fn run_loose_objects(
         });
     }
 
+    // Under a configured durable tier, large (>= threshold) loose objects are
+    // CACHE residents managed by the 2.9 evictor — packing them would move
+    // them into local packs where the evictor never reaches, permanently
+    // defeating the cache budget. Exclude them from packing.
+    let cache_config = crate::utils::client_storage::resolve_cache_config().ok();
+    let large_cache_floor = cache_config
+        .as_ref()
+        .filter(|config| config.tiered)
+        .map(|config| config.threshold_bytes as u64);
     let old_loose: Vec<_> = loose
         .into_iter()
         .filter(|(_, p)| {
@@ -398,6 +461,16 @@ async fn run_loose_objects(
                         .unwrap_or(false)
                 })
                 .unwrap_or(false)
+        })
+        .filter(|(_, p)| match large_cache_floor {
+            // Classify by UNCOMPRESSED size (partial header decode) — the
+            // same signal the evictor and the LRU use; compressed on-disk
+            // size would let highly-compressible large residents slip into
+            // packs (Codex improvement note).
+            Some(floor) => crate::utils::storage::local::LocalStorage::peek_uncompressed_size(p)
+                .map(|size| size < floor)
+                .unwrap_or(true),
+            None => true,
         })
         .collect();
 
@@ -457,10 +530,13 @@ async fn run_loose_objects(
     // Remove the loose objects now that they live in the pack.
     for (hash_str, obj_path) in &old_loose {
         if let Err(e) = fs::remove_file(obj_path) {
-            return Err(CliError::fatal(format!(
-                "failed to remove packed loose object {}: {e}",
-                hash_str
-            )));
+            // Tolerate a concurrent eviction (the object is already packed).
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(CliError::fatal(format!(
+                    "failed to remove packed loose object {}: {e}",
+                    hash_str
+                )));
+            }
         }
     }
     let _ = cleanup_empty_dirs(&path::objects());
