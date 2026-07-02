@@ -303,6 +303,7 @@ mod commit_editor_test;
 mod commit_error_test;
 mod commit_json_test;
 mod commit_test;
+mod commit_tree_test;
 mod completions_test;
 mod config_test;
 mod credential_test;

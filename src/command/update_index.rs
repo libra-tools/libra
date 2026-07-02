@@ -41,6 +41,12 @@ EXAMPLES:
 #[derive(Parser, Debug)]
 #[command(after_help = UPDATE_INDEX_EXAMPLES)]
 pub struct UpdateIndexArgs {
+    /// Use this index file instead of `.libra/index` (a Libra flag standing
+    /// in for Git's GIT_INDEX_FILE env). A missing file starts as an empty
+    /// index — scratch revision composition never touches real staging state.
+    #[clap(long = "index-file", value_name = "PATH")]
+    pub index_file: Option<String>,
+
     /// Allow the positional paths to add files that are not yet in the index
     /// (read from the working tree). Without it, positional paths must already
     /// be tracked.
@@ -88,10 +94,21 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
             .with_exit_code(128)
     };
 
-    let mut index = Index::load(path::index()).map_err(|error| {
-        CliError::fatal(format!("failed to load index: {error}"))
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
+    let index_path = args
+        .index_file
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(path::index);
+    // GIT_INDEX_FILE parity: an explicit --index-file that doesn't exist yet
+    // starts as an EMPTY index (scratch composition).
+    let mut index = if args.index_file.is_some() && !index_path.exists() {
+        Index::new()
+    } else {
+        Index::load(&index_path).map_err(|error| {
+            CliError::fatal(format!("failed to load index: {error}"))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?
+    };
 
     let mut updated = 0usize;
     let mut removed = 0usize;
@@ -126,7 +143,7 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
         updated += 1;
     }
 
-    index.save(path::index()).map_err(|error| {
+    index.save(&index_path).map_err(|error| {
         CliError::fatal(format!("failed to save index: {error}"))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;

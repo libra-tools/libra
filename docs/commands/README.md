@@ -41,6 +41,7 @@ Every Libra command accepts the following global flags:
 | `libra status` | `st` | Show the state of the working tree, staging area, and upstream tracking | [status.md](status.md) |
 | `libra dirty` | | Advisory dirty-set marks for the status cache (Libra extension) | [dirty.md](dirty.md) |
 | `libra revision` | | Revision ordinal index over first-parent chains (Libra extension) | [revision.md](revision.md) |
+| `libra commit-tree` | `git commit-tree` | Create a commit object from a tree (plumbing) | [commit-tree.md](commit-tree.md) |
 | `libra auth` | | Host-scoped HTTP token auth (Libra extension) | [auth.md](auth.md) |
 | `libra service` | | Headless local service: notification bus + dirty-mark ingestion (Libra extension) | [service.md](service.md) |
 

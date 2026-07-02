@@ -36,7 +36,7 @@ Command Groups:
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, service
-  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref
+  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree
 
 Help Topics:
   error-codes  Print the stable CLI error code table (`libra help error-codes`)
@@ -476,6 +476,12 @@ enum Commands {
         after_help = command::write_tree::WRITE_TREE_EXAMPLES
     )]
     WriteTree(command::write_tree::WriteTreeArgs),
+    #[command(
+        about = "Create a commit object from an existing tree (plumbing; no ref updates)",
+        after_help = command::commit_tree::COMMIT_TREE_EXAMPLES,
+        name = "commit-tree"
+    )]
+    CommitTree(command::commit_tree::CommitTreeArgs),
     #[command(
         about = "Read a tree object into the index",
         after_help = command::read_tree::READ_TREE_EXAMPLES
@@ -1592,6 +1598,9 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         }
         Commands::WriteTree(cmd_args) => {
             command::write_tree::execute_safe(cmd_args, &output).await?
+        }
+        Commands::CommitTree(cmd_args) => {
+            command::commit_tree::execute_safe(cmd_args, &output).await?
         }
         Commands::ReadTree(cmd_args) => command::read_tree::execute_safe(cmd_args, &output).await?,
         Commands::UpdateIndex(cmd_args) => {

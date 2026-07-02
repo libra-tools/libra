@@ -37,6 +37,11 @@ EXAMPLES:
 #[derive(Parser, Debug)]
 #[command(after_help = READ_TREE_EXAMPLES)]
 pub struct ReadTreeArgs {
+    /// Use this index file instead of `.libra/index` (a Libra flag standing
+    /// in for Git's GIT_INDEX_FILE env; the file is created if missing).
+    #[clap(long = "index-file", value_name = "PATH")]
+    pub index_file: Option<String>,
+
     /// The tree-ish to read: a tree object id, a commit id/ref/tag (peeled to
     /// its tree), or a branch name / `HEAD`.
     #[clap(value_name = "TREE-ISH")]
@@ -68,7 +73,12 @@ pub async fn execute_safe(args: ReadTreeArgs, output: &OutputConfig) -> CliResul
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;
     let entries = index.tracked_entries(0).len();
-    index.save(path::index()).map_err(|error| {
+    let index_path = args
+        .index_file
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(path::index);
+    index.save(&index_path).map_err(|error| {
         CliError::fatal(format!("failed to save index: {error}"))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;
@@ -90,13 +100,13 @@ pub async fn execute_safe(args: ReadTreeArgs, output: &OutputConfig) -> CliResul
 /// Resolve a tree-ish to a concrete tree object id. Accepts a raw tree id, a
 /// commit id (peeled to its tree), or any revision name `util::get_commit_base`
 /// understands (branch, tag, `HEAD`, …, peeled to its tree).
-async fn resolve_tree_ish(tree_ish: &str) -> CliResult<ObjectHash> {
+pub(crate) async fn resolve_tree_ish(tree_ish: &str) -> CliResult<ObjectHash> {
     if let Ok(hash) = ObjectHash::from_str(tree_ish) {
         if let Ok(tree) = load_object::<Tree>(&hash) {
             return Ok(tree.id);
         }
         if let Ok(commit) = load_object::<Commit>(&hash) {
-            return Ok(commit.tree_id);
+            return validate_peeled_tree(commit.tree_id, tree_ish);
         }
     }
 
@@ -109,5 +119,18 @@ async fn resolve_tree_ish(tree_ish: &str) -> CliResult<ObjectHash> {
         CliError::fatal(format!("failed to load commit for '{tree_ish}': {error}"))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;
-    Ok(commit.tree_id)
+    validate_peeled_tree(commit.tree_id, tree_ish)
+}
+
+/// A peeled commit's `tree` header could point at a missing or non-tree
+/// object in a malformed repository — validate before anyone builds on it
+/// (commit-tree would otherwise mint a commit with a broken tree pointer).
+fn validate_peeled_tree(tree_id: ObjectHash, tree_ish: &str) -> CliResult<ObjectHash> {
+    load_object::<Tree>(&tree_id).map_err(|error| {
+        CliError::fatal(format!(
+            "'{tree_ish}' peels to {tree_id}, which is not a loadable tree: {error}"
+        ))
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+    })?;
+    Ok(tree_id)
 }

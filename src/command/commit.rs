@@ -507,7 +507,7 @@ pub(crate) async fn resolve_committer_identity() -> Result<UserIdentity, CommitE
 }
 
 /// Create author and committer signatures based on the provided arguments
-async fn create_commit_signatures(
+pub(crate) async fn create_commit_signatures(
     author_override: Option<&str>,
 ) -> Result<(Signature, Signature, UserIdentity), CommitError> {
     let committer_identity = resolve_committer_identity().await?;
