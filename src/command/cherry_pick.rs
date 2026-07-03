@@ -16,7 +16,7 @@ use git_internal::{
         object::{ObjectTrait, commit::Commit, tree::Tree, types::ObjectType},
     },
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use sea_orm::ConnectionTrait;
 use serde::Serialize;
 
 use crate::{
@@ -28,9 +28,9 @@ use crate::{
     internal::{
         branch::Branch,
         config::ConfigKv,
-        db::get_db_conn_instance,
         head::Head,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        sequencer::{self, SequenceKind, SequenceState},
         tree_plumbing,
     },
     utils::{
@@ -253,7 +253,7 @@ enum CherryPickSingleError {
 }
 
 /// Serializable snapshot of the commit-modifier options for a cherry-pick
-/// sequence, persisted in `cherry_pick_state.opts_json` so `--continue`/`--skip`
+/// sequence, persisted in the sequencer payload so `--continue`/`--skip`
 /// rebuild the same commit shape after a conflict.
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 struct CherryPickOpts {
@@ -578,6 +578,13 @@ pub async fn execute(args: CherryPickArgs) {
 /// errors and exiting. Replays one or more commit changes onto the current
 /// branch, optionally creating new commits or leaving them staged.
 pub async fn execute_safe(args: CherryPickArgs, output: &OutputConfig) -> CliResult<()> {
+    // Symmetric sequencer mutex (lore.md 2.6): a NEW cherry-pick is refused
+    // while ANY other sequence (merge/revert/rebase) is unresolved. Control
+    // verbs are exempt (they conclude the in-progress cherry-pick). Same-op
+    // in-progress falls through to run_cherry_pick's typed InProgress check.
+    if !(args.continue_pick || args.skip || args.abort || args.quit) {
+        sequencer::ensure_none_in_progress(SequenceKind::CherryPick).await?;
+    }
     let result = run_cherry_pick(args, output)
         .await
         .map_err(CliError::from)?;
@@ -685,24 +692,6 @@ fn silent_child_output(output: &OutputConfig) -> OutputConfig {
     let mut child = output.child_output_config();
     child.quiet = true;
     child
-}
-
-/// Refuse to start a sibling write operation (e.g. `merge`, `rebase`) while a
-/// cherry-pick sequence is in progress. Maps to `ConflictOperationBlocked`
-/// (`LBR-CONFLICT-002`), matching the plan's cross-command mutex contract.
-pub(crate) async fn ensure_no_cherry_pick_in_progress() -> CliResult<()> {
-    let in_progress = CherryPickState::is_in_progress().await.map_err(|e| {
-        CliError::fatal(format!("failed to query cherry-pick state: {e}"))
-            .with_stable_code(StableErrorCode::IoReadFailed)
-    })?;
-    if in_progress {
-        return Err(CliError::failure(
-            "a cherry-pick is in progress; finish it with 'libra cherry-pick --continue'/--skip \
-             or cancel with 'libra cherry-pick --abort'/--quit",
-        )
-        .with_stable_code(StableErrorCode::ConflictOperationBlocked));
-    }
-    Ok(())
 }
 
 /// `reset --hard <target>` via the reset command, silenced so cherry-pick owns
@@ -1720,7 +1709,7 @@ async fn update_head<C: ConnectionTrait>(db: &C, commit_id: &str) -> Result<(), 
     Ok(())
 }
 
-// ── Cherry-pick sequencer state (SQLite `cherry_pick_state`) ──────────────
+// ── Cherry-pick sequencer state (unified `sequence_state`, lore.md 2.6) ──
 
 /// Upper bound on `todo` OIDs read back from a persisted state row. Guards
 /// against an externally-corrupted `todo` column ballooning memory on load.
@@ -1729,7 +1718,7 @@ const CHERRY_PICK_TODO_CAP: usize = 10_000;
 /// In-progress cherry-pick sequence persisted in the repo database.
 ///
 /// Mirrors [`crate::command::rebase::RebaseState`]: the sequence lives ONLY in
-/// the SQLite `cherry_pick_state` table (there is no `.libra/CHERRY_PICK_HEAD`
+/// the unified `sequence_state` table (there is no `.libra/CHERRY_PICK_HEAD`
 /// file), matching the repository's metadata-in-SQLite convention. The
 /// `_with_conn` variants accept any [`ConnectionTrait`] so a caller can wrap the
 /// `DELETE`+`INSERT` save in one transaction; [`CherryPickState::save`] does
@@ -1749,173 +1738,62 @@ pub struct CherryPickState {
 }
 
 impl CherryPickState {
-    pub async fn ensure_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        let create = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                CREATE TABLE IF NOT EXISTS `cherry_pick_state` (
-                    `id`          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    `head_name`   TEXT NOT NULL,
-                    `head_orig`   TEXT NOT NULL,
-                    `current_oid` TEXT NOT NULL,
-                    `todo`        TEXT NOT NULL,
-                    `opts_json`   TEXT NOT NULL,
-                    `updated_at`  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-            "#
-            .to_string(),
-        );
-        db.execute(create)
-            .await
-            .map_err(|e| format!("failed to create cherry_pick_state table: {e}"))?;
-        Ok(())
+    /// Convert to the unified sequencer row (lore.md 2.6).
+    fn to_sequence(&self) -> SequenceState {
+        SequenceState {
+            kind: SequenceKind::CherryPick,
+            head_name: self.head_name.clone(),
+            head_orig: self.head_orig.to_string(),
+            current_oid: self.current_oid.to_string(),
+            todo: self.todo.iter().map(|oid| oid.to_string()).collect(),
+            payload: self.opts_json.clone(),
+        }
     }
 
-    pub async fn has_state_in_db<C: ConnectionTrait>(db: &C) -> Result<bool, String> {
-        Self::ensure_table_exists(db).await?;
-        let stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT 1 FROM cherry_pick_state LIMIT 1".to_string(),
-        );
-        let row = db
-            .query_one(stmt)
-            .await
-            .map_err(|e| format!("failed to query cherry_pick_state: {e}"))?;
-        Ok(row.is_some())
-    }
-
-    pub async fn load_with_conn<C: ConnectionTrait>(db: &C) -> Result<Option<Self>, String> {
-        Self::ensure_table_exists(db).await?;
-        let stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                SELECT head_name, head_orig, current_oid, todo, opts_json
-                FROM cherry_pick_state
-                LIMIT 1
-            "#
-            .to_string(),
-        );
-        let Some(row) = db
-            .query_one(stmt)
-            .await
-            .map_err(|e| format!("failed to load cherry_pick_state: {e}"))?
-        else {
-            return Ok(None);
-        };
-
-        let head_name: String = row
-            .try_get_by_index(0)
-            .map_err(|e| format!("invalid head_name: {e}"))?;
-        let head_orig_str: String = row
-            .try_get_by_index(1)
-            .map_err(|e| format!("invalid head_orig: {e}"))?;
-        let current_oid_str: String = row
-            .try_get_by_index(2)
-            .map_err(|e| format!("invalid current_oid: {e}"))?;
-        let todo_str: String = row
-            .try_get_by_index(3)
-            .map_err(|e| format!("invalid todo: {e}"))?;
-        let opts_json: String = row
-            .try_get_by_index(4)
-            .map_err(|e| format!("invalid opts_json: {e}"))?;
-
-        let head_orig = ObjectHash::from_str(head_orig_str.trim())
+    /// Rebuild from a unified sequencer row, re-validating the OIDs and the
+    /// todo cap through the existing parser.
+    fn from_sequence(state: SequenceState) -> Result<Self, String> {
+        let head_orig = ObjectHash::from_str(state.head_orig.trim())
             .map_err(|e| format!("invalid head_orig hash: {e}"))?;
-        let current_oid = ObjectHash::from_str(current_oid_str.trim())
+        let current_oid = ObjectHash::from_str(state.current_oid.trim())
             .map_err(|e| format!("invalid current_oid hash: {e}"))?;
-        let todo = VecDeque::from(Self::parse_todo(&todo_str)?);
-
-        Ok(Some(CherryPickState {
-            head_name,
+        let todo = VecDeque::from(Self::parse_todo(&state.todo.join("\n"))?);
+        Ok(CherryPickState {
+            head_name: state.head_name,
             head_orig,
             current_oid,
             todo,
-            opts_json,
-        }))
+            opts_json: state.payload,
+        })
     }
 
-    pub async fn save_with_conn<C: ConnectionTrait>(
-        db: &C,
-        state: &CherryPickState,
-    ) -> Result<(), String> {
-        let delete = Statement::from_string(
-            DbBackend::Sqlite,
-            "DELETE FROM cherry_pick_state".to_string(),
-        );
-        db.execute(delete)
-            .await
-            .map_err(|e| format!("failed to clear cherry_pick_state: {e}"))?;
-
-        let todo = Self::format_todo(state.todo.iter().cloned());
-        let insert = Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            r#"
-                INSERT INTO cherry_pick_state
-                (head_name, head_orig, current_oid, todo, opts_json)
-                VALUES (?, ?, ?, ?, ?);
-            "#,
-            [
-                state.head_name.clone().into(),
-                state.head_orig.to_string().into(),
-                state.current_oid.to_string().into(),
-                todo.into(),
-                state.opts_json.clone().into(),
-            ],
-        );
-        db.execute(insert)
-            .await
-            .map_err(|e| format!("failed to save cherry_pick_state: {e}"))?;
-        Ok(())
-    }
-
-    pub async fn clear_with_conn<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        let stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            "DELETE FROM cherry_pick_state".to_string(),
-        );
-        db.execute(stmt)
-            .await
-            .map_err(|e| format!("failed to clear cherry_pick_state: {e}"))?;
-        Ok(())
-    }
-
-    /// Pool-acquiring save that wraps `DELETE`+`INSERT` in one transaction so a
-    /// single sequencer write is atomic (no half-written row on crash).
+    /// Persist via the unified sequencer (atomic DELETE+INSERT txn).
     pub async fn save(&self) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_table_exists(&db).await?;
-        let txn = db
-            .begin()
-            .await
-            .map_err(|e| format!("failed to begin cherry_pick_state transaction: {e}"))?;
-        Self::save_with_conn(&txn, self).await?;
-        txn.commit()
-            .await
-            .map_err(|e| format!("failed to commit cherry_pick_state transaction: {e}"))?;
-        Ok(())
+        sequencer::save(&self.to_sequence()).await
     }
 
+    /// Load the active cherry-pick sequence, if the active sequence is a
+    /// cherry-pick (the unified table holds at most one active op).
     pub async fn load() -> Result<Option<Self>, String> {
-        let db = get_db_conn_instance().await;
-        Self::load_with_conn(&db).await
+        match sequencer::load().await? {
+            Some(state) if state.kind == SequenceKind::CherryPick => {
+                Ok(Some(Self::from_sequence(state)?))
+            }
+            _ => Ok(None),
+        }
     }
 
+    /// Clear the active sequence (idempotent; scoped to the cherry-pick kind).
     pub async fn clear() -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_table_exists(&db).await?;
-        Self::clear_with_conn(&db).await
+        sequencer::clear(SequenceKind::CherryPick).await
     }
 
+    /// Whether a cherry-pick specifically is in progress.
     pub async fn is_in_progress() -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
-        Self::has_state_in_db(&db).await
-    }
-
-    fn format_todo(items: impl Iterator<Item = ObjectHash>) -> String {
-        items
-            .map(|oid| oid.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
+        Ok(matches!(
+            sequencer::load().await?,
+            Some(state) if state.kind == SequenceKind::CherryPick
+        ))
     }
 
     fn parse_todo(raw: &str) -> Result<Vec<ObjectHash>, String> {

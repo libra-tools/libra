@@ -345,7 +345,29 @@ struct StatusData {
     stash_count: Option<usize>,
     upstream: Option<UpstreamInfo>,
     merge_state: Option<MergeStatusInfo>,
+    /// A non-merge sequence in progress (cherry-pick/revert/rebase), surfaced
+    /// as a one-line human advisory (lore.md 2.6). Merge has its own richer
+    /// rendering; porcelain/JSON are unchanged.
+    sequence_notice: Option<String>,
     porcelain_v2: Option<PorcelainV2Data>,
+}
+
+/// Human advisory for a non-merge sequence in progress (read-only detection).
+async fn sequence_notice() -> Option<String> {
+    use crate::internal::sequencer::{self, SequenceKind};
+    match sequencer::detect_active().await.ok().flatten() {
+        Some(SequenceKind::CherryPick) => Some(
+            "cherry-pick in progress; run 'libra cherry-pick --continue' or '--abort'".to_string(),
+        ),
+        Some(SequenceKind::Revert) => {
+            Some("revert in progress; run 'libra revert --continue' or '--abort'".to_string())
+        }
+        Some(SequenceKind::Rebase) => {
+            Some("rebase in progress; run 'libra rebase --continue' or '--abort'".to_string())
+        }
+        // Merge has its own dedicated rendering below.
+        Some(SequenceKind::Merge) | None => None,
+    }
 }
 
 impl StatusData {
@@ -475,6 +497,7 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         stash_count,
         upstream,
         merge_state,
+        sequence_notice: sequence_notice().await,
         porcelain_v2,
     })
 }
@@ -1095,6 +1118,7 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         stash_count: None,
         upstream,
         merge_state,
+        sequence_notice: sequence_notice().await,
         porcelain_v2: None,
     };
 
@@ -1278,6 +1302,9 @@ fn render_human_status(
         render_upstream_human(upstream, buffer)?;
     }
 
+    if let Some(notice) = &data.sequence_notice {
+        writeln!(buffer, "{notice}").map_err(write_error)?;
+    }
     if let Some(merge_state) = &data.merge_state {
         render_merge_state_human(merge_state, buffer)?;
     }

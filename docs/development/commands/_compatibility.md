@@ -123,7 +123,7 @@ flowchart TD
 
 - 状态：拒绝。`rebase -i` 与 `rebase --edit-todo` 暂不支持。
 - 原因：交互式 rebase 需要 sequencer/todo 文件、编辑器生命周期、冲突恢复和历史重写保护；当前 rebase 兼容面优先覆盖可脚本化路径。
-- 重启条件：sequencer 状态模型、错误恢复和非 TTY/Agent 驱动协议完成后重新评估。
+- 重启条件：sequencer 状态模型、错误恢复和非 TTY/Agent 驱动协议完成后重新评估。（lore.md 2.6 已落地统一 `sequence_state` 状态模型的 v1——cherry-pick 迁移 + 对称跨序列互斥；交互式 rebase 的 todo 文件/编辑器生命周期仍待后续，此状态模型为其前置。）
 
 ### D-clean-pathspec：`clean <pathspec>`
 

@@ -687,6 +687,15 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070301_revision_ordinal.sql"),
             include_str!("../../../sql/migrations/2026070301_revision_ordinal_down.sql"),
         ),
+        // lore.md 2.6: unified sequencer state (`sequence_state`). Folds the
+        // in-progress cherry-pick forward, retires cherry-pick's lazy DDL and
+        // the `revert_sequence` orphan. Owner: `internal::sequencer`.
+        sql_migration(
+            2026070401,
+            "sequence_state",
+            include_str!("../../../sql/migrations/2026070401_sequence_state.sql"),
+            include_str!("../../../sql/migrations/2026070401_sequence_state_down.sql"),
+        ),
     ]
 }
 
@@ -815,9 +824,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 16);
+        assert_eq!(runner.len(), 17);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070301));
+        assert_eq!(runner.max_registered_version(), Some(2026070401));
     }
 
     #[test]

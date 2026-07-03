@@ -123,7 +123,16 @@ pub async fn establish_connection_with_busy_timeout(
     let normalized_path = normalize_path_for_sqlite(db_path);
     let mut option = ConnectOptions::new(format!("sqlite://{normalized_path}"));
     option.sqlx_logging(false); // TODO use better option
-    option.map_sqlx_sqlite_opts(move |sqlx_opts| sqlx_opts.busy_timeout(busy_timeout));
+    // Recovery-critical durability (lore.md 2.6 / _general.md §12): the
+    // sequencer, refs, reflog, and config all live here, so every commit MUST
+    // reach disk — pin `synchronous = FULL` explicitly rather than relying on
+    // SQLite's journal-mode-dependent default (a future WAL adoption would
+    // silently drop it to NORMAL). The `--sync-data` switch never weakens it.
+    option.map_sqlx_sqlite_opts(move |sqlx_opts| {
+        sqlx_opts
+            .busy_timeout(busy_timeout)
+            .synchronous(sea_orm::sqlx::sqlite::SqliteSynchronous::Full)
+    });
     let conn = Database::connect(option)
         .await
         .map_err(|err| IOError::other(format!("Database connection error: {err:?}")))?;

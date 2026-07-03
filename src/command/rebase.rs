@@ -1046,7 +1046,10 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
     // (rebase's own --continue/--abort/--skip operate on rebase state, not
     // cherry-pick, so they are exempt from this guard).
     if !(args.continue_rebase || args.abort || args.skip) {
-        crate::command::cherry_pick::ensure_no_cherry_pick_in_progress().await?;
+        crate::internal::sequencer::ensure_none_in_progress(
+            crate::internal::sequencer::SequenceKind::Rebase,
+        )
+        .await?;
     }
 
     // For --continue, --abort, --skip: verify that a rebase is actually in

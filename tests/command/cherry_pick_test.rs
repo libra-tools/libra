@@ -1858,9 +1858,11 @@ async fn cherry_pick_malformed_todo_oid_errors_not_panics() {
     // Corrupt the persisted todo OID directly in the repo database.
     let db_url = format!("sqlite://{}?mode=rwc", p.join(".libra/libra.db").display());
     let conn = Database::connect(db_url).await.expect("connect repo db");
+    // lore.md 2.6: cherry-pick state now lives in the unified `sequence_state`
+    // table (kind='cherry_pick'), not the retired `cherry_pick_state` table.
     conn.execute(Statement::from_string(
         DatabaseBackend::Sqlite,
-        "UPDATE cherry_pick_state SET todo = 'not-a-valid-oid'".to_string(),
+        "UPDATE sequence_state SET todo = 'not-a-valid-oid' WHERE kind = 'cherry_pick'".to_string(),
     ))
     .await
     .expect("corrupt todo");
@@ -2404,4 +2406,47 @@ fn cherry_pick_conflict_is_line_level() {
         !ours.contains("top") && !ours.contains("bottom"),
         "shared lines must not be inside the conflict region: {body:?}"
     );
+}
+
+/// lore.md 2.6 symmetric mutex: an in-progress cherry-pick conflict blocks a
+/// NEW merge / revert / rebase with LBR-CONFLICT-002, while the cherry-pick's
+/// own --continue/--abort stay available.
+#[test]
+fn cherry_pick_in_progress_blocks_other_sequences() {
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path().to_path_buf();
+    // Pause on a conflict.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], &p)
+            .status
+            .code(),
+        Some(128),
+        "cherry-pick conflicts and pauses"
+    );
+    // A NEW sequence of a DIFFERENT kind is refused, naming the blocking op.
+    for argv in [
+        vec!["merge", "feature"],
+        vec!["revert", "HEAD"],
+        vec!["rebase", "feature"],
+    ] {
+        let out = run_libra_command(&argv, &p);
+        assert_eq!(
+            out.status.code(),
+            Some(128),
+            "{argv:?} must be blocked by the in-progress cherry-pick"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cherry-pick") && stderr.contains("LBR-CONFLICT-002"),
+            "{argv:?} names the blocking op + typed code: {stderr}"
+        );
+    }
+    // The cherry-pick's own --abort is NOT blocked.
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], &p),
+        "own --abort stays available",
+    );
+    // After abort, a fresh sequence starts cleanly.
+    let after = run_libra_command(&["revert", "HEAD", "--no-edit"], &p);
+    assert_eq!(after.status.code(), Some(0), "sequence clear after abort");
 }
