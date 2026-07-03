@@ -1,0 +1,1499 @@
+# Tracing 实施计划：先 `libra agent`，后 `libra code`
+
+## 0. 执行原则
+
+本计划把 [`agent.md`](agent.md) 与 [`code.md`](code.md) 当作实现目标文档；执行顺序固定为：
+
+1. 先完成 `docs/development/tracing/agent.md` 的外部 Agent 捕获计划（AG-16~AG-24a），再由 AG-24 做 docs/tests/compat/release closeout。
+2. `agent` 计划通过 AG-24 closeout（且 AG-24a 合规实现已完成）后，再进入 `docs/development/tracing/code.md` 的 `libra code` 实现核对、补强与收敛；若 AG-24a 任一实现子项明确 deferred，AG-24 只能标记 preview/blocked release，不得把 Agent 阶段声明为完整闭环。
+
+`libra agent` 和 `libra code` 的边界不得混同：
+
+- `libra agent` 负责 observed external agent 的注册、hook、lifecycle、session/checkpoint、transcript、review/investigate evidence。
+- `libra code` 负责内部 AgentRuntime、TUI/Web/headless/MCP、approval/sandbox/tool gate、workspace mutation。
+- review/investigate 的 mutating fix/action 只能桥接回 `libra code` 内部 AgentRuntime；没有源码锚点和测试证据前，必须稳定返回 unsupported。
+
+内部 AgentRuntime / Web-only 迁移的当前事实源是 `docs/development/internal/code-agent-runtime.md`。本计划中的 Code 阶段只消费该文档的内部 runtime/fix-bridge 证据；不得重新链接或恢复旧 `docs/development/code-agent-runtime.md`、`docs/development/agent.md`、`docs/development/web-only.md`。
+
+同目录范围外文档（out-of-scope 声明）：
+
+- `docs/development/tracing/` 下的 `memory.md`、`sandbox.md`、`web-api.md` 为独立 draft 提案，**不属于本计划范围**。任务卡的"关联设计文档"字段（只列 `agent.md` / `code.md`）是唯一执行依据；执行者不得从这三份文档引入验收标准或实现项。
+- 已知冲突处一律以本计划 + `agent.md` / `code.md` 为事实源：
+  - `memory.md` 断言 LifecycleEventKind 共 11 个变体、"无需新增任何 hook 事件"，与 A4 新增 `SubagentStart`/`SubagentEnd`（13 变体）冲突；A4 落地后该枚举描述需由文档 owner 更新。
+  - `memory.md` 以 `libra mcp --stdio`（其链接的 docs/development/mcp.md 当前不存在）为前提，与 C6 固定的 `libra code --stdio` 现实冲突；C6 落地后需对齐。
+  - `web-api.md` 的 `/api/v1` 变更型契约与 C4 的 `/api/code/*` observe-only 契约冲突；本计划执行期间 web 契约唯一事实源是 C4（与现行 `src/internal/ai/web/code_ui.rs` 一致），`/api/v1` 提案留待独立仲裁。
+  - `sandbox.md` 的 VM/AppleContainer 后端是净新增功能，不并入 C7（违反 §6 "不发明额外功能"口径），作为独立后续工作另行排期。
+- A9/C8 closeout 时在三份文档头部补 "out-of-scope of tracing/plan.md" banner 并注明上述冲突条目；修订其设计断言由各文档 owner 负责，不在本计划内。
+
+测试凭证使用规则：
+
+- 仓库根目录存在本地 `.env.test`，用于 live/provider 测试的真实 Key。计划和 PR 只允许引用文件名与所需 env key 名，不得复制、打印、提交或写入 `.env.test` 的内容。
+- 默认 L1/L2、compat、fake-provider 测试仍必须在不读取真实 Key 的情况下通过；`.env.test` 只用于明确标记为 live、provider-backed、model-generation 或需要真实 API 的验证。
+- CLI 级 live 验证优先通过 `libra code --env-file .env.test ...` 加载凭证，覆盖陈旧 shell env。
+- Cargo live 测试若直接读取进程环境，运行前使用 `set +x; set -a; source .env.test; set +a` 导出 Key，再执行对应 `cargo test`。执行日志不得回显 env 值。
+
+Agent 第一期本地采集验收规则：
+
+- 第一期完成口径必须覆盖本地三种真实 agent：`codex`、`claude`（Claude Code，对应 Libra slug `claude-code`）和 `opencode`。fake fixtures 只用于 CI/确定性回归，不能替代这三条本地采集验收。
+- 本地验收必须先记录 `command -v codex`、`command -v claude`、`command -v opencode` 和各自版本/路径；`opencode` 要特别记录实际命中的 PATH，避免 Homebrew 与 `~/.opencode/bin/opencode` 影子路径导致误判。
+- 三个 agent 都必须在临时 Libra 仓库中完成 hook 安装、一次最小会话运行、lifecycle ingest、session/checkpoint catalog 写入、`refs/libra/traces` checkpoint 写入、metadata-first show/list 和 redaction 验证。
+- 缺少任一二进制、登录态、hook provider 或 transcript 读取能力时，Agent 第一期不得标记完成；只能标记为 blocked，并写明缺失项与恢复步骤。
+- 本地三 agent 验收不得打印 prompt、token、provider credential、raw transcript 或 `.env.test` 内容；默认输出只能使用 redacted summary / metadata。
+
+每个实现 PR 都必须说明：变更边界、未触碰项、稳定错误码、migration/backfill 状态、用户可见行为、回滚方式、测试命令。
+
+每任务的版本发布、提交与部署流程见 §0.4（强制）；Claude 执行者的逐任务操作规程见 §0.5；执行进度以 §10 进度表 + `libra log` 为唯一事实源。**完成判定以代码为准**：不以文档修改或任务卡打勾确定功能是否完成，必须分析代码与测试证据；更新代码时必须同步更新文档。
+
+### 0.1 多维评审结论与强制改进项
+
+本节是对本计划的执行前复核结果。后续实现不得只按任务标题推进，必须把下表中对应门禁落实到任务卡、PR 描述、测试和文档同步中。
+
+| 维度 | 当前结论 | 改进后的执行门禁 |
+|---|---|---|
+| 合理性 | 总顺序合理：先外部 observed agent 捕获，再内部 `libra code` runtime；但不能把 `review/investigate fix` 提前混入 Agent 阶段。 | A7/A8 只交付 read-only；任何 mutation/fix 必须等 C7 找到内部 AgentRuntime、approval、sandbox、tool gate 源码锚点和测试证据。 |
+| 可行性 | 可分阶段落地，但本地三 agent smoke 依赖本机 `codex`、`claude`、`opencode` 的真实安装、登录态和稳定 transcript/hook 能力。 | A6.5 是第一期硬门禁；任一 agent 缺少 binary、登录态、HookProvider 或 transcript 读取能力时，只能标记 blocked，并记录恢复步骤，不得降级为 fake fixture 通过。 |
+| 完整性 | AG-16~AG-24a 与 C1~C8 已覆盖主要功能面；主要缺口是把横切非功能需求显式落到每张相关卡。 | 每个触达 public JSON、DB row、object layout、RPC、hook envelope、run state 的 PR 都必须声明 schema/protocol version、compat 窗口、migration/backfill、docs/tests 同步状态。 |
+| 安全性 | 已识别 secrets、stderr、raw transcript、external binary 仿冒和 `.env.test` 泄露风险。 | `.env.test` 只能由测试进程读取，不得打印；外部二进制必须 `env_clear` + allowlist；stderr/stdout/raw hook input 先 cap + redaction，再进入任何用户输出、JSON、DB 或对象存储。外部 agent 的一切输出（findings/stances/transcript）均视为不可信输入，进入后续 prompt、用户终端或持久化前必须 provenance 标注 + redaction + 控制序列剥离；`env_clear` + allowlist 原则同样适用于 §0.3 直启的真实 agent CLI（登录态所需基础变量除外）。 |
+| 功能正确性与接口兼容性 | alias、capability matrix、RPC v1/v2、Code mode/provider 参数互斥是最容易漂移的接口面。 | 所有 alias 必须同语义、同退出码、同 JSON shape；RPC v2 `info` 不破坏 v1 `capabilities` 一个 release window；`libra code` 参数互斥先由 C1 源码复核后再改。 |
+| 数据流与控制流正确性 | 正确边界是 `hook/RPC -> LifecycleEvent -> validation -> redaction -> checkpoint writer`；`review/investigate -> evidence -> optional internal fix bridge`。 | Provider hook 和 external binary parser 不得直接写 checkpoint；read-only workflow 不得直接修改工作树；mutating path 只能进入内部 AgentRuntime serialized queue。 |
+| 性能与效率 | transcript、review output、checkpoint catalog 和 session list 都可能放大到高成本路径。 | 默认 list/show 只读 metadata；transcript/detail 必须显式开启并 streaming/chunked；分页默认 `--limit 50`、cap 500；review sink 和 RPC stderr 设定 bounded buffer。 |
+| 可靠性与容错性 | checkpoint 写序、prune 并发、review/investigate cancel/timeout 是主要可靠性风险。 | A5 必测 ref/DB/object_index crash matrix、UPSERT/重试、doctor repair、prune A/B；A7/A8 必测 terminal state 和 process/reader/lock/lease cleanup。 |
+| 兼容性与互操作性 | `libra agent` 是 Libra extension，不是 Git 命令；外部 agent 配置文件和 MCP/code-control 边界必须可互操作但不混同。 | `status/enable/disable` 保持 canonical；`list/add/remove` 只是 alias；MCP stdio 不得成为 turn control plane；首批外 agent 配置只写 Libra-managed hook entry 并保留用户配置。 |
+| 可扩展性与可维护性 | first-batch roster 限制合理，但后续扩展必须避免散点状态字段和测试缺口。 | 新增 agent 必须更新 `agent.md` first-batch/roster 规则、E9、registry matrix、docs/commands、compat schema pin、tests/INDEX；新增 test target 必须同时注册 `Cargo.toml`。 |
+| 合规性与标准符合性 | retention、GC、raw export、audit、redaction report 已在 `agent.md` 中定义，但计划需要把它们作为发布门禁。 | A9/C8 closeout 必须同步 retention/GC/raw export/audit 文档；raw export 需要显式授权和 append-only audit；release notes 必须区分 enabled、preview/opt-in、deferred。合规实现面（audit 表、`--allow-raw`、retention/GC、erasure）由 A8.5 落实，不得降级为纯文档验收。 |
+
+#### 0.1.1 第二轮复核补充（2026-07-03）
+
+第二轮按同一维度清单对照当前源码、测试注册状态与本机外部 CLI 实测复核了本计划；经对抗验证确认的问题已直接改进到对应章节/任务卡，此处仅记录索引，防止后续修订回退：
+
+1. 检查点顺序矛盾（A-F3 要求 A6.5，但其前置 A6 被排在 A-F4 才验收）→ 已修正 §4。
+2. §2 依赖图缺 AG-20→AG-21、AG-17→A6.5 两条边 → 已修正 §2 与 A6/A6.5 依赖字段。
+3. review/investigate 新顶层命令缺三守卫/COMPATIBILITY/README/zh-CN 接线，单独合并必挂 compat-offline-core → 已补 A7/A8 验收、触达文件与验证命令，§0.2 增加"可见命令 compat 接线不得延后"规则。
+4. `LBR-AGENT-009/010` 无归属任务卡，且 agent.md E10 种子编号与已发布 `LBR-AGENT-001`（AgentBudgetExceeded）硬冲突 → 已补 A3 编号核对门禁与 A7/A8 触达文件。
+5. `claude -p --output-format stream-json` 必须搭配 `--verbose`（2.1.x 实测，缺失即退出码 1），原 smoke 命令必失败 → 已修正 §0.3.2/§0.3.4。
+6. Codex hooks 受用户级 trust/enable 双重门控、OpenCode 上游无 hooks.json（只有 plugin 机制），§0.3.3 原断言不成立 → 已改为"上游实测为准"口径并补 A4 验收。
+7. Preflight 缺登录态只读检查，blocked 硬判据不可机械执行、会在真实付费会话中途才暴露 → 已补 §0.3.2/§0.3.6/A6.5。
+8. §0.3.4 把 raw stdout 直落 evidence，与 §0.3.1/§0.3.5 redacted-only 规则自相矛盾；目录/文件权限未定义 → 已按 raw/ 与 summary 分区重写并规定 0700/0600。
+9. 对真实 agent 子进程整文件 `source .env.test` 会注入全部 provider/D1/R2/GitHub key → 已改为按需具名 key 注入。
+10. 已存在的 `libra agent push` 与 prune 重写后 refs/libra/traces 非快进发散在计划中零覆盖 → 已补 A5 验收与触达文件。
+11. Libra 自身存量 v1 checkpoint 布局（无 manifest/redaction_report/content_hash）的兼容读取与 doctor 误报防护缺失 → 已补 A5 验收与改造前 writer fixture 要求。
+12. agent.md 强制的合规实现面（`agent_audit_log`、`--allow-raw`、`agent.retention.*`、GC/erasure）被降级为 A9 纯文档验收 → 新增 Task A8.5。
+13. reviewer/investigator 缺最小权限 spawn 与强制 workspace 隔离（in-place 可直读仓库根 `.env.test`）；findings/stances 反哺后续 prompt 的注入链无 untrusted 门禁 → 已补 A7/A8 验收。
+14. gemini 从 supported 降级后的卸载通道、存量数据可读性、隐藏 hook 运行时入口去留无任务承接 → 已补 A2/A4/A5 验收。
+15. remove/disable 卸载侧配置清理、用户条目保留与二次卸载幂等零验收，smoke 无卸载环节 → 已补 A2/A6.5/§0.3.5。
+16. migration 规范门禁（YYYYMMDDNN/幂等/`_down.sql`/round-trip）、fixture 版本溯源、A6.5 二进制 pin（sha256）缺失 → 已补 A5/A6/§0.3.2/§0.3.6。
+17. 同目录 memory.md/sandbox.md/web-api.md 与 A4/C4/C6/C7 存在互斥断言且零引用 → 已在 §0 增加 out-of-scope 声明，并调整 C6 验证的 rg 扫描范围。
+18. §5 Code 进入条件第 4 条与 C1 自指循环 → 已改写 §5，并允许 C1 在 A-F4 后并行只读启动（差距清单须按最终 HEAD 复核）。
+
+#### 0.1.2 第三轮复核补充（2026-07-03）
+
+本轮重新 review 了 `plan.md`、`agent.md` 与 `code.md`，确认以下漂移必须在三份文档中统一：
+
+1. `agent.md` 的 Codex/OpenCode hook 契约仍把 `.codex/hooks.json`、`.opencode/hooks.json`、`[features] hooks = true` 写成目标形态；这与 §0.3.3 已确认的“Codex hooks 受用户级 `[hooks.state]` trust/enable 门控、OpenCode 上游无 hooks.json、实现必须以上游实测 plugin/config 形态为准”冲突。A4 和 A6.5 必须以 §0.3.3 的实测口径为事实源，`agent.md` 同步改为“候选形态/禁止未证实完成态”。
+2. `agent.md` E10 仍把 `LBR-AGENT-001`~`010` 当作未来错误码种子，但 `LBR-AGENT-001` 已发布为 `AgentBudgetExceeded`。三份文档统一改用语义错误键（如 `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`）作为计划内引用；真实 `LBR-*` 编号只能由 A3 在 `docs/error-codes.md` 中分配未占用编号后写回。
+3. runtime source-of-truth 已迁到 `docs/development/internal/code-agent-runtime.md`；旧 `docs/development/code-agent-runtime.md` 链接在当前工作区已失效。A9/C8 的跨文档同步、Agent fix-bridge 前置和 drift guard 均改指新路径。
+4. `code.md` 只有命令现状，未承接 C1~C8 的 mode/provider/Web/MCP/session/sandbox/fix-bridge 契约，无法作为 Code 阶段目标文档。C8 前必须保持 `code.md` 与 §6 一致，并把 C1 source-grounded audit 的分类结果写回 `code.md`。
+5. `agent.md` 只有 AG-24 closeout，缺少计划中 A8.5 的合规实现面分工，容易再次把 `agent_audit_log`、`--allow-raw`、retention GC、erasure 降级为文档同步。`agent.md` 必须显式拆出 `AG-24a / A8.5` 实现卡，AG-24 closeout 只做文档/compat/release 收敛。
+6. `agent.md` 与 `code.md` 里的 `_general.md` 相对链接从 tracing 目录解析错误；统一改为 `../commands/_general.md`，避免执行者点进不存在路径。
+7. `src/command/code.rs` 的 help/banner 示例暗示 `libra code --web-only --provider ollama`、`libra code --web-only --provider codex --browser-control loopback` 等组合可用，但 `validate_mode_args` 当前在 web-only/stdio 中通过 `reject_non_tui_flags` 拒绝一切非 Gemini provider（无 codex 豁免；`BrowserControlMode` 注释与 banner 示例亦受影响，Codex web-only 的 loopback/app-server 分支当前为 CLI 不可达代码）。C1 必须把该项分类为 code behavior、docs/help drift 或 deliberate difference；C2/C4 不得在未分类前按示例推进实现——两卡中 mode/provider 相关验收均已改写为以 C1 分类结果为前置的条件式验收。
+
+#### 0.1.3 第四轮复核补充（2026-07-03）
+
+本轮按 11 维度 + 跨文档一致性 + 源码锚点真实性重新 review 了三份文档（多视角评审 + 逐条对抗验证）；确认的问题已直接改进到三份文档对应章节，此处仅记录索引：
+
+1. 文档搬迁断链（blocker）：`docs/development/commands/{agent,code}.md` 已迁至本目录，但 `tests/compat/agent_docs_contract.rs` 的 `include_str!`、`tests/INDEX.md`、`COMPATIBILITY.md`、`docs/development/commands/README.md` 仍指旧路径——当前树上 `cargo test --all` 直接编译失败 → 新增 Task 0.3 承接接线；`agent.md` 验收命令中两条 rg 的旧路径已同步改指 tracing/。
+2. C2 与 C4 验收互斥且预设 C1 未做的分类结论（blocker）：`reject_non_tui_flags` 实际拒绝一切非 Gemini provider（含 codex，Codex web-only 分支为 CLI 不可达代码）→ C2/C4 相关验收改为以 C1 分类清单为前置的条件式验收；`code.md` 示例范围从 ollama 扩为所有非 Gemini provider。
+3. `STABLE_AGENT_SLUGS` 收敛归属矛盾（plan A1 排除 vs agent.md AG-16 改动清单包含）→ 统一为 A1/AG-16 只冻结 `observed_agents/{capability,registry}.rs` 事实源，CLI roster 常量收敛移入 AG-17（A2）。
+4. 第二/三轮新增验收未回写 agent.md：E4-libra-v1 存量布局契约、push 非快进语义、gemini uninstall-only 通道与测试、A7/A8 最小权限 spawn/ANSI 剥离/provenance 注入门禁、A6.5 硬门禁 target → 已补入 agent.md 对应节（E4 区、承诺矩阵、AG-17/AG-20/AG-22/AG-23、任务卡表、测试矩阵、验收命令）。
+5. agent.md 把 hook entry 写成裸 `libra` 且允许 "fallback 为 `libra`"，与 §0.3.3 pinned 绝对路径强制断言及源码（`resolve_hook_binary_path` 无裸名 fallback）冲突 → agent.md 安装契约改为 canonicalize 绝对路径必须形态；A4 补安装断言。
+6. `list --json` wire key 在 agent.md 内部冻结成两套（`hooks_installed` vs `installed`）→ 统一为 `installed`（以「第一批支持项目」capability matrix 为唯一事实源）。
+7. agent.md 强制补强项 #9（可观测性 span/metric）与 #10（hook 崩溃行为回归）在 plan 零承接 → A3/A4/A5/A7/A8 验收各补对应 span/metric 断言；A4 补 hook handler 崩溃回归。
+8. Code 阶段验证命令缺 `--features test-provider -- --test-threads=1`：`code_ui_remote_*` matrices、`code_mcp_dual_entry_test`、`code_resume_test` 整文件被 feature 门控，裸跑编译为 0 个测试空跑假通过 → C4/C5/C6/C7/C8 与 §9 已补 feature 与空跑警示。
+9. 保留期不闭合：agent.md 承诺 findings 90 天 "settings 可覆盖" 但无 settings 键、无任务承接 → agent.md 补 `agent.retention.findings_days`，A8.5 补 findings/run-state GC 验收；audit 1 年到期处理交叉引用 Audit log 规格的合规审批流程。
+10. `--allow-raw` 覆盖面矛盾：A8.5 把 redacted 的 detail/transcript 也锁进授权门，与 agent.md 读取 pipeline 及 A5/A6.5 metadata-first 断言自相矛盾 → 统一为 "detail/transcript：显式 flag + cap/streaming/redaction；raw（未脱敏）：`--allow-raw` + audit"；agent.md 三处混写句同步拆开。
+11. 分页契约挂在不存在的 `review/investigate run list` 子命令上，且 run_id 无枚举入口 → A7/A8 与 agent.md 补充规格 §5 统一新增 `review list` / `investigate list`（沿用 `--limit 50`/cap 500/keyset cursor）。
+12. §0.3.3 `prepare_agent_repo` 的命令替换会捕获 `libra init` 多行 banner 导致 repo 路径错位；preflight `cargo build` 未跳过 web 构建 → init 改 `-q`、§0.3.6 补静默 stdout 硬性要求、build 前缀 `LIBRA_SKIP_WEB_BUILD=1`。
+13. review 取消入口未定义（investigate 有 cancel，review 只有 show/clean）→ A7 与 agent.md §5 统一新增 `review cancel <run_id>`，前台 run 的 SIGINT/SIGTERM 等价 cancel。
+14. A3 缺 agent.md 威胁 T9 的 TOCTOU spawn revalidation 承接 → A3 补 fd-exec 优先/受信目录降级验收（可按 AG-18 DoD 显式延期）。
+15. agent.md E5 chunk 路径示例用 CLI slug（`claude-code.jsonl.001`）与 E4-libra `<agent_kind>`（`as_db_str()` snake_case）字段级冲突 → 示例改 `claude_code.jsonl.001` 并写明取值规则。
+16. agent.md 补充规格 §4 给三个运行期语义键预设退出码 129，与仓库 category 派生约定（cli→129、其余→128）冲突 → 改 128 并注明退出码由 category 派生。
+17. A9/C6 的 rg 验证命令不可机械判定（未转义正则、无否定断言/判定口径）→ A9 改用转义否定式，C6 补人工复核口径。
+18. agent.md 术语表指引用户运行已删除的 `libra db upgrade` → 改为 DB open 时自动迁移口径。
+19. A5 push 方案 (b) 需要稳定错误码但 E10 无对应语义键 → 命名 `ERR_AGENT_TRACES_PUSH_DIVERGED`，agent.md E10 表补条件行。
+
+### 0.2 执行粒度与 PR 切分规则
+
+任务卡是验收单元，不一定是单 PR。任何卡若实际触达超过 5 个文件、跨两个以上子系统，或需要新增测试 target + docs + schema/migration，必须拆成多个可独立验证的 PR slice：
+
+1. Contract slice：先落 trait/schema/CLI/RPC/JSON contract、snapshot test 和文档锚点，不引入大规模副作用。
+2. Implementation slice：再接入 provider/runtime/writer/workflow 主路径，保持默认路径可回滚或 fail-closed。
+3. Safety slice：补 redaction、env isolation、timeout、bounded buffer、migration/backfill（含 `_down.sql` 回滚演练）、crash recovery 和 doctor/cleanup。
+4. Compatibility slice：最后同步 `docs/commands/*`、`COMPATIBILITY.md`、`docs/error-codes.md`、`tests/INDEX.md`、release notes 和 compat guard。**例外**：新增可见顶层命令时，`COMPATIBILITY.md` 矩阵行、`docs/development/commands/README.md` 表行、`src/cli.rs` ROOT_AFTER_HELP 组行、`<CMD>_EXAMPLES`/help_examples_banner 接线不得延后——`compat_matrix_alignment`、`root_after_help_lists_every_visible_command`、`compat_help_examples_banner` 在默认 `cargo test --all` 必跑，命令在 `cli.rs` 可见的那个 PR 必须同步这些项，否则违反"每个 PR 可构建、可测试"。
+5. Live/local slice：只有 deterministic 测试通过后，才运行 `.env.test` live/provider tests 或 A6.5 本地三 agent smoke；live 证据不得替代 deterministic regression。
+
+拆分后每个 PR 必须让仓库保持可构建、可测试、public behavior 不自相矛盾。若某个 slice 只能引入计划中的测试 target，PR 必须同时说明 target 当前是否已注册、为何暂不能纳入默认必跑，以及下一 slice 的重启条件。
+
+### 0.3 本机真实 Agent 调用验证方案
+
+本节规定开发过程中如何调用本机真实安装的 `codex`、`claude`、`opencode` 做 A6.5 smoke。它是 deterministic fixture 之外的本地验收方案，不能替代单元/compat 测试，也不能在 CI 默认启用。
+
+#### 0.3.1 调用原则
+
+- 默认使用本机真实登录态和真实 CLI binary，不设置临时 `HOME`，否则会绕开用户已登录的 Codex/Claude/OpenCode 凭证；隔离范围放在临时 Libra 仓库和项目级 hook 配置中。
+- 每个 agent 使用独立临时仓库串行执行，避免 hook attribution、session owner filtering、checkpoint writer 互相污染；后续如需测试 owner filtering，可另加 combined-repo 专项用例。
+- 最终 capture smoke 不使用会关闭 session/hook/transcript 持久化的选项：Codex 不用 `--ephemeral`；Claude 不用 `--bare`、`--safe-mode`、`--no-session-persistence`；OpenCode 不用会绕过项目配置或权限边界的危险模式。
+- prompt 必须是非破坏性、低成本、可识别的固定文本，要求 agent 不读 secret、不改文件、不执行命令，只返回固定短语。
+- 本地 smoke 默认不读取 `.env.test`，优先使用各 CLI 的本地登录态。**禁止对 agent 子进程整文件 `source .env.test`**——那会把全部 provider/D1/R2/GitHub key 注入不受 `env_clear` 保护的外部 agent 环境。当某个 CLI 的 provider 确实需要环境变量时，由 harness 解析 `.env.test` 并只提取该 agent 所需的具名 key（例如仅 `MOONSHOT_API_KEY`），经子进程环境注入（Rust 端 `Command::env`，shell 端在关闭 xtrace 的子 shell 内注入），其余 key 一律不注入；严禁把 key 名=值写入命令行、日志或证据。`env_clear` + allowlist 原则同样适用于 shell 直启的真实 agent CLI（HOME 等登录态所需基础变量除外）。
+- 证据目录根目录即 summary 区：只保存 redacted stdout/stderr 摘要、命令退出码、binary path/version（做 `$HOME`→`~` 归一化）、Libra JSON 查询结果和对象/hash 标识，可留存/可入 PR。child process 的原始 stdout/stderr 一律落在 `raw/` 子目录：仅存在于本机 0700 临时目录、文件权限 0600、默认测试结束即删、永不提交、不作为 §0.3.5 断言对象。"redacted-only" 禁令适用于 summary 区及任何随 PR 提交的证据：不得包含 raw transcript、prompt 原文以外的模型上下文、provider token、`.env.test` 内容。
+
+#### 0.3.2 Preflight
+
+开发者先构建当前工作树的 `libra`，并固定本轮 smoke 使用的绝对路径：
+
+```bash
+set +x
+export LIBRA_SRC=/Volumes/Data/GitMono/libra
+cd "$LIBRA_SRC"
+LIBRA_SKIP_WEB_BUILD=1 cargo build --bin libra   # smoke 不需要 web 前端；不跳过则在无 pnpm 的机器上必失败
+export SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/libra-agent-smoke.XXXXXX")"   # mktemp -d 默认 0700
+mkdir -p "$SMOKE_ROOT/bin"
+cp "$LIBRA_SRC/target/debug/libra" "$SMOKE_ROOT/bin/libra"
+export LIBRA_BIN="$SMOKE_ROOT/bin/libra"
+shasum -a 256 "$LIBRA_BIN"   # sha256 记入 evidence summary；路径做 $HOME→~ 归一化
+"$LIBRA_BIN" --version
+export SMOKE_PROMPT="Libra local agent capture smoke. Do not read secrets, do not edit files, do not run shell commands. Reply exactly: libra-agent-smoke-ok."
+```
+
+`LIBRA_BIN` 必须指向复制进 `$SMOKE_ROOT/bin/` 的**不可变 pinned 副本**，而不是 `target/debug/libra` 原路径：hook entry 会把二进制的 canonicalize 绝对路径写进外部 agent 配置（`resolve_hook_binary_path` 基于 `current_exe`），pin 副本保证并发/后续 `cargo build` 重建 `target/` 不影响已安装 hook 的完整性，并使 sha256 provenance 与 A3 对外部 binary 的口径对齐。§0.3.6 的 Rust harness 同理，必须先把 `env!("CARGO_BIN_EXE_libra")` 指向的二进制复制进 smoke tempdir，再以副本安装 hooks。
+
+记录三类本机 agent 的路径和版本；输出可以进入证据 summary，但不得包含账号、token 或 provider key：
+
+```bash
+command -v codex
+codex --version
+command -v claude
+claude --version
+command -v opencode
+opencode --version
+```
+
+登录态是 blocked 硬判据（见 §0 采集验收规则），必须在发起任何真实付费会话前用只读命令机械判定：
+
+```bash
+codex login status
+claude auth status
+opencode providers list
+```
+
+- 证据只保留 redacted 摘要：是否已登录的布尔判定 + 退出码。`claude auth status` 默认输出包含 email/orgId/orgName，必须先 redact 再入 evidence；`opencode providers list` 只记录默认 provider 是否存在至少一条凭证。
+- 未登录时的确切退出码/输出以当时 CLI 版本实测为准并更新本节；任一 agent 登录检查未通过即按 §0 规则标记 blocked，不得进入 §0.3.4 真实会话。
+
+当前开发机已验证的非交互入口形态如下；后续版本变化时以 `--help` 重新核对并更新本节（重新核对范围不止 CLI 入口形态，还包括 transcript/hook 输出格式，对应的 fixture 刷新策略见 A6/A6.5）：
+
+| Agent | 已验证入口 | 关键安全参数 | 禁用参数 |
+|---|---|---|---|
+| `codex` | `codex exec [PROMPT]` | `-C <repo>`、`--skip-git-repo-check`、`--sandbox read-only`、`--json`、`-o <last-message-file>` | `--ephemeral` |
+| `claude` | `claude -p [PROMPT]` | `--permission-mode plan`、`--output-format stream-json`、`--verbose`（`claude -p` 下 `stream-json` 强制要求 `--verbose`，2.1.x 实测缺失时直接以退出码 1 失败）、`--include-hook-events`、`--max-budget-usd <small>` | `--bare`、`--safe-mode`、`--no-session-persistence` |
+| `opencode` | `opencode run [message..]` | `--dir <repo>`、`--format json`、`--title <name>` | `--dangerously-skip-permissions` |
+
+#### 0.3.3 每个 Agent 的临时仓库与 hook 安装
+
+每个 agent 单独创建临时 Libra 仓库。AG-17 alias 落地前，开发期可以用 canonical `enable/status`；AG-17 落地后，A6.5 必须同时验证 `add/list` alias 和 canonical 入口同语义。
+
+```bash
+# $SMOKE_ROOT 已在 §0.3.2 preflight 创建（0700），并已放入 pinned 的 $LIBRA_BIN
+mkdir -p "$SMOKE_ROOT/evidence"
+
+prepare_agent_repo() {
+  slug="$1"
+  repo="$SMOKE_ROOT/$slug/repo"
+  evidence="$SMOKE_ROOT/$slug/evidence"
+  mkdir -p "$repo" "$evidence/raw"
+  "$LIBRA_BIN" init -q "$repo"   # 必须 -q：函数 stdout 被命令替换捕获，init banner 混入会使 $repo 变成多行文本
+  printf '%s\n' "$repo"
+}
+```
+
+安装 hooks 时使用 §0.3.2 pinned 的 `LIBRA_BIN`，并把安装结果保存为 redacted JSON；`agent add` 之前先把 provider 配置文件现状（可为空）快照进 `$evidence/preinstall.snapshot`，供 §0.3.5 卸载对比：
+
+```bash
+repo="$(prepare_agent_repo claude-code)"
+cd "$repo"
+"$LIBRA_BIN" agent add claude-code --json > "$SMOKE_ROOT/claude-code/evidence/add.json"
+"$LIBRA_BIN" agent list --json > "$SMOKE_ROOT/claude-code/evidence/list.after-add.json"
+
+repo="$(prepare_agent_repo codex)"
+cd "$repo"
+"$LIBRA_BIN" agent add codex --json > "$SMOKE_ROOT/codex/evidence/add.json"
+"$LIBRA_BIN" agent list --json > "$SMOKE_ROOT/codex/evidence/list.after-add.json"
+
+repo="$(prepare_agent_repo opencode)"
+cd "$repo"
+"$LIBRA_BIN" agent add opencode --json > "$SMOKE_ROOT/opencode/evidence/add.json"
+"$LIBRA_BIN" agent list --json > "$SMOKE_ROOT/opencode/evidence/list.after-add.json"
+```
+
+若当前 slice 尚未落地 AG-17 alias，则等价使用：
+
+```bash
+"$LIBRA_BIN" agent enable --agent <slug> --json
+"$LIBRA_BIN" agent status --json
+```
+
+安装验收必须断言：
+
+- `list/status --json` 中目标 agent `supported=true`、`support_wave="first_batch"`。
+- HookProvider 已落地时目标 agent `hook_installable=true`、`installed=true`、`capabilities.hooks=true`。
+- provider 配置写入以**上游实测为准**：
+  - `claude-code`：`.claude/settings.json` 只增加 Libra-managed hook entry，保留用户已有项目配置。
+  - `codex`：上游**没有**已证实的 `.codex/hooks.json` 加载路径；以实测 codex CLI（记录版本，如 0.142.5）验证的加载形态为准（本地 plugin 的 hooks 定义或 config-layer hooks 键，含 project `.codex/config.toml`）。Codex hooks 还受**用户级 trust/enable 双重门控**（`~/.codex/config.toml` `[hooks.state]`）：installer 必须写入自有 entry（trusted_hash + enabled=true，只增不删，卸载时清理自有条目），或 smoke 命令显式携带 bypass 参数并在 §0.3.2 参数表登记豁免理由；无论哪种方案，实现 PR 必须用真实 `codex exec` 冒烟证明 hook 真正被读取并触发（而非静默不执行），并同步修订 `agent.md` 对应节（含未经 0.142.x 证实的 `[features] hooks = true` 键）。"保留用户已有项目配置"对 codex 放宽为：允许触碰用户级 config.toml 的 `[hooks.state]` 段，但仅限 Libra 自有 entry。
+  - `opencode`：上游**没有** hooks.json 机制；hook 能力预期为 `.opencode/plugins/` 下的 Libra 插件文件或 `opencode.json` plugin 项，实际文件名/形态由实现 PR 依上游实测固定并加 compat test，同 PR 回写 `agent.md` 对应节。单数 `.opencode/plugin/` 只可作为上游兼容读取/迁移输入，不作为 Libra 新写入目标。验收口径为"只增删 Libra-managed 文件/条目，不触碰用户其余 `.opencode/` 配置"。
+- 每个 Libra-managed hook entry 的 command 必须以 §0.3.2 pinned 的 `$LIBRA_BIN` 绝对路径开头（不允许裸 `libra` PATH 查找），安装后断言之。
+- 非目标 agent 不因本轮安装被标记为 installed 或 launchable。
+
+#### 0.3.4 真实 CLI 非交互调用矩阵
+
+每个命令都在对应临时仓库中执行。child process 的原始 stdout/stderr 只写入 `$evidence/raw/`（0700 目录内的 0600 文件，默认测试结束即删，分区规则见 §0.3.1）；harness 消费 raw 流后经 redaction + 截断，产出 evidence 根目录（summary 区）下的 redacted 摘要，只有 summary 区可留存。注意 shell `>` 重定向默认按 umask 产生 0644 文件——手工执行时需先 `umask 077`，Rust harness 用 `OpenOptions` mode(0o600)。测试 harness 必须对每个 child process 设置超时（建议 180 秒），超时后按**进程组** kill（覆盖 agent 自行 spawn 的子进程）、写 terminal state、保留 redacted summary。
+
+Codex：
+
+```bash
+repo="$SMOKE_ROOT/codex/repo"
+evidence="$SMOKE_ROOT/codex/evidence"
+codex exec \
+  -C "$repo" \
+  --skip-git-repo-check \
+  --sandbox read-only \
+  --json \
+  -o "$evidence/raw/codex.last-message.txt" \
+  "$SMOKE_PROMPT" \
+  > "$evidence/raw/codex.stdout.jsonl" \
+  2> "$evidence/raw/codex.stderr.log"
+```
+
+Claude Code：
+
+```bash
+repo="$SMOKE_ROOT/claude-code/repo"
+evidence="$SMOKE_ROOT/claude-code/evidence"
+cd "$repo"
+claude -p \
+  --permission-mode plan \
+  --output-format stream-json \
+  --verbose \
+  --include-hook-events \
+  --max-budget-usd 0.05 \
+  "$SMOKE_PROMPT" \
+  > "$evidence/raw/claude.stdout.jsonl" \
+  2> "$evidence/raw/claude.stderr.log"
+```
+
+OpenCode：
+
+```bash
+repo="$SMOKE_ROOT/opencode/repo"
+evidence="$SMOKE_ROOT/opencode/evidence"
+opencode run \
+  --dir "$repo" \
+  --format json \
+  --title libra-agent-smoke-opencode \
+  "$SMOKE_PROMPT" \
+  > "$evidence/raw/opencode.stdout.jsonl" \
+  2> "$evidence/raw/opencode.stderr.log"
+```
+
+这些命令只验证真实 agent 能触发 Libra-managed capture path，不验证模型回答质量。只要 agent 成功完成一次非交互 turn，并且 Libra 侧捕获到 lifecycle/session/checkpoint，即视为该 agent 的本地调用路径满足 smoke 要求。claude 的 stream-json stdout（含 `--include-hook-events` 的 hook 事件）可经 redaction 后作为 SessionStart/SessionEnd 触发的辅助证据摘要进入 summary 区，但验收口径仍以 Libra 侧 `agent session list` / `checkpoint list` 捕获结果为准。
+
+#### 0.3.5 Libra 侧断言
+
+每个 agent 命令完成后，在对应临时仓库执行以下查询并保存证据：
+
+```bash
+"$LIBRA_BIN" agent list --json > "$evidence/list.after-run.json"
+"$LIBRA_BIN" agent session list --json > "$evidence/session-list.json"
+"$LIBRA_BIN" agent checkpoint list --json > "$evidence/checkpoint-list.json"
+"$LIBRA_BIN" agent doctor --json > "$evidence/doctor.json"
+```
+
+必须断言：
+
+- `agent_session.agent_kind` 分别出现 `claude_code`、`codex`、`opencode`。
+- 每个 agent 至少有一次 session start、一次 user turn / prompt boundary、一次 stop/session end 或等价 terminal lifecycle event。
+- 每个 agent 至少写出一个 checkpoint，且 checkpoint 能关联到 `refs/libra/traces`、manifest、redaction report 和 content hash。
+- 默认 `session list` / `checkpoint list` / `checkpoint show` 不读取 raw transcript body；只有显式 detail/transcript 路径才允许读取 body。
+- `doctor --json` 不报告 ref/DB/object_index 不一致；若报告 warning，必须分类为已知非阻断项并写入 evidence summary。
+- summary 区证据与任何随 PR 提交的内容中不得出现 `.env.test` 值、API key、provider token 或 raw transcript 大段内容；hook 捕获的 transcript 与 checkpoint 内容中也不得出现 `.env.test` 内任何未注入 key 的值（违反按 §0.3.6 归类为安全阻断）。路径脱敏规则具体化：`$HOME` 前缀替换为 `~`、用户名替换为固定占位符；§0.3.2 要求记录的 binary path/version 属允许白名单（记录时同样做 `$HOME`→`~` 归一化）。
+
+三条采集断言完成后，每个 agent 追加一轮卸载 smoke：
+
+```bash
+"$LIBRA_BIN" agent remove <slug> --json > "$evidence/remove.json"
+"$LIBRA_BIN" agent list --json > "$evidence/list.after-remove.json"
+```
+
+（AG-17 alias 落地前等价使用 `disable --agent <slug>` + `status --json`，与 §0.3.3 安装侧口径一致。）
+
+- 与 §0.3.3 保存的 `preinstall.snapshot` 对比：provider 配置文件中仅 Libra-managed entry 被移除、用户条目语义等价保留（codex 另按 §0.3.3 处理 Libra 写入的 `[hooks.state]`/features 项）；已捕获的 agent_session/agent_checkpoint/refs/libra/traces 数据不删除。
+- `list --json` 显示该 agent `installed=false` 且 `hook_installable=true`；对未安装状态重复 remove 幂等（exit 0 或明确提示，不报错误栈）。
+- "卸载后 hook 不再写入"以"配置文件中 Libra hook 调用 entry 已不存在"作等价断言，不再跑一轮真实 agent 会话。
+- 可选：向本地 file remote 执行一次 `"$LIBRA_BIN" agent push --remote <local-file-remote>` 并断言 refs/libra/traces 推送成功，为 A5 的 push 语义提供本地证据。
+
+#### 0.3.6 自动化测试入口
+
+A6.5 的 `agent_local_capture_smoke_test` 必须把上面的 shell 流程固化为 Rust harness，而不是依赖人工复制命令。建议约定：
+
+```bash
+LIBRA_RUN_LOCAL_AGENTS=1 \
+LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode \
+LIBRA_KEEP_LOCAL_AGENT_SMOKE=1 \
+cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1
+```
+
+环境变量语义：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `LIBRA_RUN_LOCAL_AGENTS` | unset | 未设置时 ignored test 必须 skip，防止 CI 或普通本地测试误调用真实付费 agent。 |
+| `LIBRA_LOCAL_AGENT_SET` | `codex,claude-code,opencode` | 允许开发者临时只跑一个 agent；A6.5 完成前必须跑全量三项。 |
+| `LIBRA_KEEP_LOCAL_AGENT_SMOKE` | unset | 设置为 `1` 时保留临时 repo/evidence，便于排查；默认测试结束后删除。 |
+| `LIBRA_LOCAL_AGENT_TIMEOUT_SECS` | `180` | 每个真实 agent child process 的超时上限。 |
+| `LIBRA_LOCAL_AGENT_EVIDENCE_DIR` | tempdir | 指定 evidence 输出目录；目录内容视为敏感，不提交。 |
+
+harness 硬性要求：
+
+- evidence 目录（含自定义 `LIBRA_LOCAL_AGENT_EVIDENCE_DIR`）由 harness 创建或校验为 0700，写出的文件为 0600（shell 重定向默认 0644，harness 需显式 chmod 或 `OpenOptions` mode）；目录非空或权限过宽时拒绝执行。默认 mktemp 路径本已 0700，规则重点覆盖自定义目录。
+- harness 启动时先把 `env!("CARGO_BIN_EXE_libra")` 指向的二进制复制进 smoke tempdir，以副本安装 hooks 并记录副本 sha256（cargo test 自身会重建 `target/`，不能直接引用原路径；见 §0.3.2 pin 规则）。
+- `LIBRA_KEEP_LOCAL_AGENT_SMOKE=1` 保留 evidence（含 raw/）时必须打印敏感内容警告。
+- shell 样例中所有被命令替换（`$(...)`）包裹的 libra 调用必须静默 stdout（如 `init -q` 或重定向到 stderr），防止命令 banner 混入被捕获的路径/值；Rust harness 中等价要求是不从 child stdout 解析路径。
+
+失败分层：
+
+- preflight 失败：缺 binary、版本命令失败或 PATH shadowing，归类为环境阻断，不算实现通过。
+- 登录态缺失/凭证过期：§0.3.2 登录检查未通过，归类为环境阻断并按 §0 规则标记 blocked；恢复步骤分别为 `codex login`、`claude` 登录流程、`opencode` provider 凭证配置（以当时 CLI 版本实测为准），不得进入 §0.3.4 真实会话。
+- hook 安装失败：归类到 A4 HookProvider / AG-19；需区分"hook 配置未被真实 CLI 读取"与"hook 已读取但被 trust/enabled 门控拦截"（codex 双重门控，见 §0.3.3）两类。
+- agent 命令成功但没有 session：归类到 hook 配置未被真实 CLI 读取、lifecycle ingest 或 owner filtering。
+- 有 session 但无 checkpoint：归类到 A5 writer、manifest、`refs/libra/traces` 或 object_index。
+- 有 checkpoint 但 evidence 泄露 secret/raw transcript：归类为安全阻断，不能以 smoke 通过。
+
+### 0.4 每任务发布、提交与部署流程（强制）
+
+每完成一个任务卡（或 §0.2 拆分后的一个可独立验证 slice），必须按以下顺序完成发布闭环；未走完本节流程的任务不得在 §10 进度表标记完成。
+
+1. **完成判定（代码优先）**：不以文档修改或任务卡打勾作为功能完成依据，必须分析代码确认实现存在且行为正确（读实现源码 + 运行该卡「验证」清单全部命令）。反向同样成立：更新代码时必须同步更新对应文档（`docs/commands/*`、zh-CN 页、`COMPATIBILITY.md`、`tests/INDEX.md`、本目录 tracing 文档相关章节）。
+2. **质量门禁**（与 CLAUDE.md 质量验收标准一致，三项全部通过才可进入发布）：
+
+   ```bash
+   cargo +nightly fmt --all --check
+   cargo clippy --all-targets --all-features -- -D warnings
+   source .env.test && cargo test --all   # macOS 上加 RUST_MIN_STACK=33554432 前缀，避免 tag 测试栈溢出误报
+   ```
+
+   两条既定豁免（均须记入 §10，其余失败一律阻断发布）：
+   - **非本改动导致的既有失败**（如 main HEAD 已存在的失败测试）：空闲时单目标复跑确认与本改动无关后可继续发布——与 A-F5/C-F4 检查点"记录明确、非本改动导致的既有失败"同口径。
+   - **L2/L3 gated 测试**：本任务不触达网络/云/AI 面时，可不 `source .env.test` 直接 `cargo test --all`（未设 env 的 L2/L3 打印 skipped，不算失败）；触达对应面时才必须 source 实跑。
+
+3. **版本递增（patch +1）**：读取 `Cargo.toml` 当前 `version`（并发节点可能已递增，**bump 前必须重读**），patch 加 1。例：当前 `version = "0.17.500"` → 改为 `version = "0.17.501"`。同一提交内把 `web/package.json` 与 `worker/package.json` 的 `"version"` 字段同步为同一新值（两文件当前滞后于 `Cargo.toml` 属已知状态，首次执行本流程时一并同步到新版本）。
+4. **Cargo.lock 不手改**：不得手工编辑 `Cargo.lock`；执行 `cargo build --release`，由工具链更新 `Cargo.lock` 并产出 release 二进制。（release 构建默认包含 web 前端构建，需要 `pnpm`；若 web 构建故障且本任务不触达 web 资产，可临时 `LIBRA_SKIP_WEB_BUILD=1 cargo build --release` 并在 §10 记录。）
+5. **提交与推送**（本仓库由 Libra 管理，用 `libra` 命令，推送到 GitHub main）：
+
+   ```bash
+   libra status --short          # 先核对工作树变更是否全部属于本任务 + 版本文件
+   libra add <本任务触达文件与版本文件>
+   libra commit -a -s -m "<type>(<scope>): <summary> (v0.17.NNN)"
+   libra push origin main
+   ```
+
+   并发工作区 fallback：`libra status --short` 显示存在**非本任务**的变更（并发节点 in-flight 产物等）时，不得使用 `-a`（它会收编 status 检查与 commit 之间出现的一切工作树变更），改用显式 `libra add <本任务文件>` + `libra commit -s -m`（不带 `-a`，仅提交 staged），且不得 revert/restore 并发节点的变更；`-a` 只在确认工作树仅含本任务变更时使用。commit message 遵循 CLAUDE.md 类型化规范（`feat(agent): ...` / `fix(code): ...` 等）；单个 `-m`，内容不含反引号。
+6. **部署本机二进制**：
+
+   ```bash
+   cp target/release/libra "$HOME/.libra/bin/libra"
+   "$HOME/.libra/bin/libra" --version   # 若 macOS 上被 SIGKILL(137)，执行 codesign --force --sign - "$HOME/.libra/bin/libra" 后重试
+   ```
+
+7. **记录**：在 §10 执行进度表追加一行：日期、任务/slice、结果、版本号、commit id、验证摘要（或 blocked 原因与恢复步骤）。
+
+直推 main 模式说明：当前按"每任务直推 main"执行，§0.2 中"每个实现 PR 必须说明…"的要求由 commit message + §10 进度表行承载；每个 slice 对应一次本节发布循环，任何一次提交后仓库必须保持可构建、可测试、public behavior 不自相矛盾。
+
+只读任务豁免：无代码变更的只读任务（如 Task 0.1 基线记录、C1 初轮 audit）免第 3/4/6 步（版本递增、release 构建、部署）；其产出（基线记录、差距清单写回 `code.md` 等）若形成文档变更仍走第 5 步提交推送，并完成第 7 步 §10 记录；完全无文件变更时仅做第 7 步。
+
+### 0.5 Claude 执行者操作规程（执行入口）
+
+本计划可由 Claude（或其他 agent 执行者）自主逐任务执行。每个任务的执行循环：
+
+1. **定位状态**：读 §10 执行进度表 + `libra log`（用 `--oneline` 类简洁输出确认已发布版本与已完成任务）；重读 `Cargo.toml` 当前 version。
+2. **选任务**：按 §1/§2/§5 依赖关系选下一个所有依赖已完成的任务。顺序基线：Task 0.1 → **0.3**（先修守卫断链，否则一切验证命令不可用）→ 0.2 → A1 → A2/A3（可并行）→ A4 → A5 → A6 → A6.5 → A7/A8 → A8.5 → A9 →（§5 进入条件）→ C1 → C2 → C3/C4 → C5/C6 → C7 → C8。同一时间只推进一个任务到发布。
+3. **开工前 source-audit**：逐条核对该卡验收标准当前代码是否已满足（不以任何文档断言为准，含本计划自身——以 `rg`/Read 源码与测试为准）；已满足项记录证据（文件+行号/测试名）后视为完成，不重复实现。
+4. **实施**：按 §0.2 切分 slice；遵循 CLAUDE.md 编码规范（错误处理不 `unwrap()`、`_with_conn` 事务变体、测试隔离、hash-kind preflight 等）。
+5. **验证**：运行该卡「验证」清单全部命令，注意 feature 门控（`--features test-provider -- --test-threads=1`）与 env-gate（`LIBRA_RUN_LOCAL_AGENTS=1` 等）标注。测试 target 注册规则：`tests/compat/*` 文件必须注册 `Cargo.toml [[test]]`（Cargo 默认不发现子目录）并加 `tests/compat/README.md` 行；顶层 `tests/*.rs` 自动发现、无需注册 `[[test]]`；两类都必须同步 `tests/INDEX.md`。
+6. **发布**：执行 §0.4 全流程。
+7. **收尾**：在本文档勾选该卡已满足的验收 checkbox，更新 §10；验收项 deferred 时写明原因与重启条件。
+8. **阻塞处理**：任务 blocked（如 A6.5 缺登录态、上游 CLI 行为与 §0.3 记录不符）时，在 §10 记录 blocked + 缺失项 + 恢复步骤，转向下一个依赖已就绪的任务；不得静默跳过验收项，不得用 fake 证据顶替。特别地，**A6.5 blocked 时可推进的任务集合仅 A8.5**（其 findings GC 子项因前置 A7/A8 未动工而按验收条款显式 deferred）；A7/A8/A9 及 Code 阶段全部保持 blocked，此时按 §0 规则将 Agent 第一期整体标记 blocked 并等待环境恢复，不要反复空转选任务。
+
+执行环境前提（开工前一次性检查，缺失项按 blocked 处理并记录）：
+
+- Rust stable 工具链 + nightly rustfmt（`cargo +nightly fmt` 可用）。
+- `pnpm` 可用（release 构建嵌入 web 前端所需）；`LIBRA_SKIP_WEB_BUILD=1` 仅用于快速 check 或 web 构建故障降级（记录到 §10）。
+- macOS 跑 `cargo test --all` 需 `RUST_MIN_STACK=33554432`；少量进程/RPC 类测试在高并发下有超时抖动，空闲时单目标复跑确认后不作为回归处理。
+- 仓库根 `.env.test` 存在（live 验证用，凭证使用规则见 §0）。
+- A6.5 前置：本机 `codex`/`claude`/`opencode` CLI 与登录态（§0.3.2 preflight）。
+- 并发工作区注意：同一工作树可能存在并发节点提交（`Cargo.toml` version 被并发递增属正常现象）；每次 bump 前重读版本，`libra status --short` 发现非本任务变更时不得随 `commit -a` 带入。
+
+## 1. 全局准备与守卫
+
+### Task 0.1：建立当前事实基线
+
+**描述**：在任何实现前记录源码、文档、测试和现有命令面的真实状态，避免按过时文档实施。
+
+**关联设计文档**：[`agent.md`](agent.md)、[`code.md`](code.md)。执行时只核对当前实现与这两份目标文档的差距，不重新定义 Agent 或 Code 的设计方向。
+
+**验收标准**：
+
+- [ ] 读取 `docs/development/tracing/agent.md`、`docs/development/tracing/code.md`、`docs/development/commands/_general.md`。
+- [ ] 核对 `src/cli.rs`、`src/command/mod.rs`、`src/command/agent/*`、`src/command/code.rs` 的公开入口。
+- [ ] 核对 `tests/INDEX.md`、`Cargo.toml [[test]]`、相关 compat tests 的当前注册状态。
+- [ ] 用 `libra status --short` 记录工作树，后续只提交本轮任务涉及路径。
+
+**验证**：
+
+- [ ] `rg -n "AgentSubcommand|CodeArgs|CodeProvider|compat_agent|code_cli" src tests Cargo.toml tests/INDEX.md`
+- [ ] `libra diff --stat -- docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`
+
+**依赖**：无。
+
+**预计触达文件**：无代码变更；只读。
+
+**规模**：XS。
+
+### Task 0.2：固定公共命令开发规则
+
+**描述**：把 `_general.md` 的跨命令规则变成后续 PR checklist，尤其是 JSON/machine 输出、错误码、docs/commands、COMPATIBILITY 和 tests/INDEX 同步。
+
+**关联设计文档**：[`agent.md`](agent.md)、[`code.md`](code.md)。跨命令规则只作为执行约束；具体功能目标仍以这两份 tracing 设计文档为准。
+
+**验收标准**：
+
+- [ ] 每个新增/修改命令都有用户文档、开发文档、测试和 compat 证据。
+- [ ] 所有用户可见错误走 `CliError` / `StableErrorCode`，消息可操作。
+- [ ] 新增测试 target 同步 `Cargo.toml`、`tests/INDEX.md`，compat 文件同步 `tests/compat/README.md`。
+
+本卡交付物说明：规则本身已固化在 §0.2/§0.4/§0.5 checklist 中，本卡无独立代码变更；验收即下列两个守卫跑绿（依赖 Task 0.3 先修复断链）+ §10 记录一行。
+
+**验证**：
+
+- [ ] `cargo test --test compat_matrix_alignment`（Task 0.3 完成前预期失败，不得据此标记本卡完成）
+- [ ] `cargo test --test compat_error_codes_doc_sync`
+
+**依赖**：Task 0.1、0.3（0.3 未完成时本卡验证命令必失败）。
+
+**预计触达文件**：按后续任务决定。
+
+**规模**：XS。
+
+### Task 0.3：文档搬迁接线（tracing/ 新路径守卫与索引重指）
+
+**描述**：`docs/development/commands/{agent,code}.md` 已迁移为 `docs/development/tracing/{agent,code}.md`，但守卫与索引仍指旧路径，导致 `cargo test --all` 在当前树上直接编译失败（`include_str!` 指向不存在的文件）。本卡必须在任何 Agent/Code 实现任务开工前完成，否则 §9 与各任务卡引用的 `compat_agent_docs_contract`、`cargo test --all` 均不可执行。
+
+**关联设计文档**：[`agent.md`](agent.md)、[`code.md`](code.md)。只做路径重指与索引同步，不改变守卫断言语义。
+
+**验收标准**：
+
+- [ ] `tests/compat/agent_docs_contract.rs` 的 `include_str!("../../docs/development/commands/agent.md")` 重指 `../../docs/development/tracing/agent.md`；守卫内其它路径引用同步核对。
+- [ ] `tests/compat/matrix_alignment.rs` 的**运行时**旧路径读取同步重指：`read_repo_file("docs/development/commands/agent.md")`（约 :104）与相关 context 字符串（约 :171）——该守卫对缺失文件直接 panic，是 `include_str!` 之外的第二处断链，`cargo check` 抓不到。
+- [ ] `tests/INDEX.md` 与 `tests/compat/README.md` 中上述守卫的 source mapping 更新为 tracing/ 新路径。
+- [ ] `COMPATIBILITY.md` 中指向 `docs/development/commands/agent.md` / `code.md` 的链接改指 tracing/ 新路径。
+- [ ] `docs/development/commands/README.md` 的 agent/code 表行改指 tracing/ 新路径或注明已迁移（不留断链）。
+- [ ] 全库 `rg -n "docs/development/commands/(agent|code)\.md"` 余量**一律改指 tracing/ 新路径**（含 `Cargo.toml`、`AGENTS.md`、源码注释等处的引用；统一改指以便 rg 可断言零残留，不采用"注明历史引用"的模糊出口）。
+
+**验证**：
+
+- [ ] `cargo test --test compat_agent_docs_contract`
+- [ ] `cargo test --test compat_matrix_alignment`
+- [ ] `LIBRA_SKIP_WEB_BUILD=1 cargo check --all-targets`（确认无 `include_str!` 断链）
+- [ ] `! rg -n "docs/development/commands/(agent|code)\.md" src tests docs Cargo.toml COMPATIBILITY.md AGENTS.md`（否定断言，期望零命中）
+
+**依赖**：Task 0.1。本卡必须先于 Task 0.2 验证与一切 A/C 任务完成（0.3 未完成时 `compat_matrix_alignment`、`compat_agent_docs_contract` 乃至 `cargo test --all` 必失败）。
+
+**预计触达文件**：
+
+- `tests/compat/agent_docs_contract.rs`
+- `tests/compat/matrix_alignment.rs`
+- `tests/compat/README.md`
+- `tests/INDEX.md`
+- `COMPATIBILITY.md`
+- `docs/development/commands/README.md`
+- 其余 rg 命中的零散引用（`Cargo.toml` 注释、`AGENTS.md`、`docs/commands/package.md`、`src/internal/db.rs` 注释等）
+
+**规模**：XS/S。
+
+## 2. Agent 阶段总依赖图
+
+```text
+AG-16 capability/registry
+  ├─ AG-17 CLI alias/list/add/remove
+  ├─ AG-18 external RPC v2/security
+  └─ AG-19 lifecycle dispatcher/hooks/redaction
+       └─ AG-20 checkpoint/export/lazy IO/doctor/prune
+
+AG-18 + AG-20 -> AG-21 transcript intelligence
+AG-17 + AG-19 + AG-20 + AG-21 -> A6.5 local codex/claude/opencode capture smoke
+A6.5 -> AG-22 read-only review workflow
+A6.5 -> AG-23 read-only investigate workflow
+AG-20 + AG-21 -> A8.5 合规实现（audit/--allow-raw/retention GC/erasure）
+AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout -> Code 阶段
+```
+
+## 3. Agent 实施任务
+
+### Task A1：AG-16 Observed Agent capability contract
+
+**描述**：先冻结 capability、registry 和第一批 roster，使后续 CLI、RPC、hook、transcript、workflow 都从同一事实源派生。
+
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循 AG-16、E1、E9 和第一批 supported roster 约束，不重新分析或扩大 Agent 支持范围。
+
+**验收标准**：
+
+- [ ] 新增 `DeclaredAgentCaps` 8-bool wire contract：`hooks`、`transcript_analyzer`、`transcript_preparer`、`token_calculator`、`compact_transcript`、`text_generator`、`hook_response_writer`、`subagent_aware_extractor`。
+- [ ] `ObservedAgent` 增加 `as_*` capability accessors 与 `declared_capabilities()` 默认自省。
+- [ ] 删除或迁移 dead duplicate `ObservedAgentHooks`，hook 能力统一为 `as_hooks() -> Option<&dyn HookProvider>`。
+- [ ] 新增 `AgentRegistration` / registry matrix，字段覆盖 `slug`、`agent_kind`、`db_value`、`supported`、`support_wave`、`registered`、`transcript_readable`、`hook_installable`、`installed`、`launchable_review`、`launchable_investigate`、`external_binary`、`config_paths`、`capabilities`。
+- [ ] 第一批 supported roster 恰好是 `claude-code`、`codex`、`opencode`；`gemini`、`cursor`、`copilot`、`factory-ai` 等只能是 unsupported/quarantined/background。
+- [ ] `claude-code`、`codex`、`opencode` 三行都具备第一期本地采集所需字段：`supported=true`、`support_wave="first_batch"`、`transcript_readable=true`；HookProvider 落地后 `hook_installable=true` 且可进入本地采集 smoke。
+- [ ] 任务归属澄清（与 `agent.md` AG-16/AG-17 改动清单同口径）：A1/AG-16 只在 `src/internal/ai/observed_agents/{capability,registry}.rs` 冻结 registry/capability 事实源，静态 capability matrix 落 `registry.rs`；CLI 侧 roster 常量（`STABLE_AGENT_SLUGS`，`src/command/agent/mod.rs`）与 hook 安装面的收敛不在本卡，由 A2（AG-17）/A4（AG-19）承接。
+
+**验证**：
+
+- [ ] `cargo test --test compat_agent_capability_matrix_pin`
+- [ ] `cargo test --test compat_agent_architecture_guard`
+- [ ] `cargo test --lib observed_agents`
+
+**依赖**：Task 0.1、0.2、0.3（0.3 未完成时 `cargo test --all` 编译失败，任何任务的验收命令均不可执行）。
+
+**预计触达文件**：
+
+- `src/internal/ai/observed_agents/adapter.rs`
+- `src/internal/ai/observed_agents/capability.rs`
+- `src/internal/ai/observed_agents/registry.rs`
+- `src/internal/ai/observed_agents/mod.rs`
+- `tests/compat/agent_capability_matrix_pin.rs`
+- `tests/compat/agent_architecture_guard.rs`
+- `Cargo.toml`
+- `tests/INDEX.md`
+
+**规模**：M。
+
+### Task A2：AG-17 CLI alias parity
+
+**描述**：把 `list/add/remove` 落成 `status/enable/disable` 的严格 alias，同时保持旧入口 canonical，不扩大到内部 AgentRuntime 管理。
+
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循 AG-17 的 CLI alias parity、capability matrix 和 unsupported/quarantine 约束。
+
+**验收标准**：
+
+- [ ] `libra agent list` 输出 focused capability matrix，`--json` 带 schema/version 字段。
+- [ ] `libra agent add <name>` 与 `enable --agent <name>` 同语义、同退出码、同 JSON shape。
+- [ ] `libra agent remove <name>` 与 `disable --agent <name>` 同语义、同退出码、同 JSON shape。
+- [ ] 无参 `add/remove` 的行为与无参 `enable/disable` 一致，并只作用于 supported/installable roster。
+- [ ] 非首批 agent 返回 actionable unsupported，不写 hook、不创建 session/checkpoint、不把 `installed` 标为 true。
+- [ ] 曾 supported 的非首批 agent（如 `gemini`，现为 `STABLE_AGENT_SLUGS` 成员且 hooks 可安装）保留 **uninstall-only 通道**：`remove <name>` / `disable --agent <name>` 可卸载已安装的 Libra-managed hooks、幂等、卸载后不允许再 add/enable；仅 add/enable 返回 actionable unsupported。
+- [ ] remove/disable 卸载语义按 `agent.md` 既有锚点验收：provider 配置文件中仅 Libra-managed entry 被移除（codex 另按 `agent.md` 处理 Libra 写入的 features/`[hooks.state]` 项）、用户条目语义等价保留、已捕获的 agent_session/agent_checkpoint/refs/libra/traces 数据不删除；卸载后 `agent list --json` 显示 `installed=false` 且 `hook_installable=true`；对未安装状态重复 remove 幂等（exit 0 或明确提示，不报错误栈）。
+
+**验证**：
+
+- [ ] `cargo test --test command_test agent_list_add_remove_aliases_parse`
+- [ ] `cargo test --test command_test agent_list_json_contains_capability_fields`
+- [ ] `cargo test --test command_test agent_add_non_hook_installable_returns_actionable_unsupported`
+- [ ] `cargo test --test command_test agent_remove_gemini_uninstalls_legacy_hooks_idempotent`
+- [ ] `cargo test --test command_test agent_remove_preserves_user_hook_entries`
+
+**依赖**：Task A1。
+
+**预计触达文件**：
+
+- `src/command/agent/mod.rs`
+- `src/command/agent/status.rs`
+- `src/command/agent/doctor.rs`
+- `docs/commands/agent.md`
+- `docs/commands/zh-CN/agent.md`（若存在）
+- `COMPATIBILITY.md`
+- `tests/command/*`
+
+**规模**：M。
+
+### Task A3：AG-18 External `libra-agent-<name>` protocol v2 and security
+
+**描述**：在现有 JSON-RPC v1 之上增加 v2 `info`、protocol version、capability gate、trust/quarantine/provenance 与 spawn 安全。
+
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循 AG-18、E2、E10、settings gate、provenance、env/stderr redaction 和内置 slug 仿冒防护约束。
+
+**验收标准**：
+
+- [ ] v2 `info` 响应包含 `protocol_version`、`name`、`type`、`description`、`is_preview`、`protected_dirs`、`protected_files`、`hook_names`、E1 8-bool `capabilities`。
+- [ ] v1 `capabilities` method 至少保留一个 release window；client 协商顺序为 `info` -> v1 `capabilities` -> skip-and-log。
+- [ ] external discovery 默认 disabled；未知 binary quarantine，不注册为 callable agent。
+- [ ] `rpc trust/untrust` 记录 path、sha256、device、inode、mtime；hash/inode 变化重新 quarantine。
+- [ ] 内置 slug 仿冒（如 `libra-agent-claude-code`）skip-and-log，不能覆盖 built-in agent。
+- [ ] `RpcAgent::spawn` 使用 `env_clear()` + allowlist，只注入 `LIBRA_AGENT_PROTOCOL_VERSION`、`LIBRA_CLI_VERSION`、`LIBRA_REPO_ROOT` 等安全变量。
+- [ ] spawn 前按 `agent.md` 强制补强项 #2 / 威胁 T9 做 provenance revalidation（支持平台优先 fd 派生 exec，如 `fexecve`/`execveat`；不支持时受信目录 + canonical path + 父目录非 world-writable 校验 + sha256/device/inode/mtime 复验 + absolute-path spawn），PR 中记录所选平台策略为 best-effort TOCTOU mitigation、不声称完全消除竞态；若按 AG-18 DoD 延期，须在本卡显式写明延期原因与重启条件。
+- [ ] 按 `agent.md` 落地执行补充规格 §6 落地 `agent.rpc.discover` / `agent.rpc.invoke` span/metric（必带字段存在、禁止字段缺席），用 tracing fake sink 断言。
+- [ ] stderr 捕获、64 KiB cap、redaction；默认输出和 JSON 错误不得泄露 raw stderr、token、prompt、路径片段。
+- [ ] timeout、stdout/stderr IO cap、protocol mismatch、undeclared method 都映射到 E10 稳定错误码。
+- [ ] E10 错误码先使用语义键而非预占 `LBR-*` 字面量：`LBR-AGENT-001` 已被 `AgentBudgetExceeded` 占用（`src/utils/error.rs` + `docs/error-codes.md` 已发布并有 pin 测试）。contract slice 必须先在 `docs/error-codes.md` 为 E10 各语义分配未占用的真实编号，并同 PR 修正 `agent.md` E10 表；注意 `compat_error_codes_doc_sync` 只校验码在文档出现、不校验唯一性，需人工核对（或为该守卫补"同码不得映射多个 variant"断言）。计划内其它任务卡只允许引用 `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`、`ERR_AGENT_UNTRUSTED_SEED_FOR_MUTATION` 等语义键，真实编号以本项核对后的实际分配为准。
+
+**验证**：
+
+- [ ] `cargo test --test agent_rpc_external_test`
+- [ ] `cargo test --test compat_error_codes_doc_sync`
+- [ ] fake binary fixture 覆盖 protocol mismatch、timeout、oversize、stderr flood、env echo、PATH conflict。
+
+**依赖**：Task A1；可与 A2 并行，但合并前需 rebase 到同一 registry。
+
+**预计触达文件**：
+
+- `src/internal/ai/observed_agents/rpc.rs`
+- `src/command/agent/rpc.rs`
+- `src/utils/error.rs`
+- `docs/error-codes.md`
+- `tests/fixtures/agent_rpc/*`
+- `tests/agent_rpc_external_test.rs`
+- `Cargo.toml`
+- `tests/INDEX.md`
+
+**规模**：M。
+
+### Task A4：AG-19 normalized lifecycle dispatcher and hook providers
+
+**描述**：把 provider hook/parser 输出统一为 provider-neutral `LifecycleEvent`，由 central dispatcher 做校验、owner filtering、redaction 和写入。
+
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循 AG-19、E3、HookProvider、owner filtering、first-batch hook install 和 redaction-before-persist 约束。
+
+**验收标准**：
+
+- [ ] `LifecycleEventKind` 增加 `SubagentStart` / `SubagentEnd`，并用 `#[non_exhaustive]` 或兜底 match 防新增变体 panic。
+- [ ] 删除 runtime 中 provider-name 字符串桥，改为 `AgentKind` -> registry -> `as_hooks()`。
+- [ ] Claude Code 保持 installable；Codex/OpenCode HookProvider 落地后才允许 `hook_installable=true`。
+- [ ] Agent 第一期必须让 Claude Code、Codex、OpenCode 三个 HookProvider 全部可安装；Codex/OpenCode 不得停留在 transcript-readable-only 状态后仍宣称第一期完成。
+- [ ] Codex HookProvider 显式处理上游 trust/enable 双重门控（用户级 `[hooks.state]`，见 §0.3.3）：installer 写入自有 trusted_hash + enabled entry（只增不删，卸载时清理），或运行侧显式 bypass 并登记豁免理由；实测确认 enabled 语义与临时仓库 repo-trust 状态不阻断项目层配置加载，所选策略写入 evidence 与 `agent.md`。
+- [ ] OpenCode HookProvider 有事件映射规格：opencode 插件事件 → provider-neutral `LifecycleEvent` 的映射表（如 session.created→SessionStart、message 更新→turn boundary、session.idle/session.deleted→SessionEnd 或等价 terminal event、tool.execute.before/after→ToolUse）随实现 PR 依上游实测固定；如需由 OpenCode 进程退出推导 terminal event，必须标为 Libra 侧推断规则而非 OpenCode 官方 plugin event。实现 PR 同步回写 `agent.md`「OpenCode 安装流程契约」（替换现有 hooks.json 假想示例）；uninstall 仅删除 Libra 生成的 plugin 文件/条目。
+- [ ] Gemini 等非首批 agent 不再作为 supported/installable 暴露。
+- [ ] 明确隐藏 hook 运行时入口（`src/command/hooks.rs` 的 gemini 分组，存量已安装 hooks 会持续调用）的去留：保留为 ingest-reject-with-hint 或移除，与 A2 的 gemini uninstall-only 降级语义一致。
+- [ ] provider parser 只返回 `LifecycleEvent`，不得直接写 checkpoint。
+- [ ] central validation 覆盖 session id、provider session id、tool/subagent id、cwd 可信、path traversal、unknown agent kind quarantine。
+- [ ] owner filtering 防止多 adapter 重复 checkpoint；重复或 owner 不匹配的事件 skip/fail closed。
+- [ ] redaction-before-persist 类型级接入，raw hook input 不进入 session log、checkpoint tree、stdout/JSON。
+- [ ] 安装器写入的每个 Libra-managed hook entry command 必须是 `resolve_hook_binary_path` 产出的 canonicalize 绝对路径（`--binary-path` 或 `current_exe`，解析失败硬错误，禁止回退裸 `libra`），安装后有断言（覆盖非 smoke 常规安装路径，与 §0.3.3/A6.5 口径一致）。
+- [ ] 按 `agent.md` 补充规格 §6 落地 `agent.hook.ingest`、`agent.redaction.apply` span/metric，tracing fake sink 断言必带/禁止字段。
+- [ ] 按 `agent.md` 强制补强项 #10 落地 `libra hooks <provider> <verb>` 崩溃行为回归（panic 与被 kill 两路径）：断言无半截 checkpoint/DB 写入、退出码非零、stderr 不回显 raw stdin。
+
+**验证**：
+
+- [ ] `cargo test --test agent_lifecycle_event_test`
+- [ ] `cargo test --test agent_lifecycle_event_test hook_handler_crash_leaves_no_partial_write`（fn 名按实现落点调整）
+- [ ] `cargo test --test agent_checkpoint_redaction_test`
+- [ ] `cargo test --test command_test agent`
+- [ ] `rg -n "provider_name_for|find_provider\\(|ObservedAgentHooks" src/internal/ai src/command/agent` 不再出现独立字符串事实源。
+
+**依赖**：Task A1；A3 可并行，涉及 external parser 时需合并。
+
+**预计触达文件**：
+
+- `src/internal/ai/hooks/lifecycle.rs`
+- `src/internal/ai/hooks/runtime.rs`
+- `src/internal/ai/hooks/provider.rs`
+- `src/internal/ai/hooks/providers/mod.rs`
+- `src/internal/ai/hooks/providers/codex/*`
+- `src/internal/ai/hooks/providers/opencode/*`
+- `src/internal/ai/observed_agents/redaction.rs`
+- `src/command/hooks.rs`
+- `tests/fixtures/agent_hooks/*`
+- `tests/agent_lifecycle_event_test.rs`
+- `tests/agent_checkpoint_redaction_test.rs`
+- `tests/INDEX.md`
+
+**规模**：M。
+
+### Task A5：AG-20 E4-libra checkpoint export, lazy transcript IO, doctor and prune safety
+
+**描述**：把 external-agent checkpoint/export writer 固定到 E4-libra layout，同时补默认 metadata-first 读取、E4-entire legacy import、crash recovery、doctor repair 和 prune 并发保护。
+
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循 AG-20、E4-libra、E4-entire reader、E5、doctor repair、object_index 和 prune A/B 窗口约束。
+
+**验收标准**：
+
+- [ ] Writer 输出 E4-libra tree：`metadata.json`、`manifest.json`、`events/lifecycle.jsonl`、`transcript/<agent_kind>.jsonl`、`redaction_report.json`、`content_hash.txt`。
+- [ ] `content_hash.txt` writer 使用 `sha256:<64-hex>`；reader 兼容 legacy bare hex。
+- [ ] E4-entire fixture 只作为 import/legacy reader，不作为 writer 默认。
+- [ ] 大 transcript 走 E5 line-safe chunking，manifest-relative 路径；默认 `list/show` 不读取 transcript body。
+- [ ] `session list`、`checkpoint list` 默认 `--limit 50`，cap 500，使用 keyset cursor 和索引。
+- [ ] `agent_checkpoint` INSERT 改为幂等 UPSERT 或先探测 `traces_commit`，崩溃重试不主键冲突。
+- [ ] doctor 检测并修复三类不一致：DB 指向缺失对象、ref 可达但无 catalog 行、`object_index` 缺失。
+- [ ] prune 窗口 A/B 关闭：writer lease、临时保护 ref 或 ref-vs-catalog fail-closed 必须覆盖到 DB INSERT/UPSERT 完成。
+- [ ] `CheckpointCommit.commit_hash` 与 DB 列 `traces_commit` 命名不混用。
+- [ ] reader（metadata-first list/show/detail/transcript）与 doctor 兼容识别**升级前 Libra v1 布局的存量 checkpoint**（无 manifest.json/redaction_report.json/content_hash.txt，事件文件为 `events/<provider>.jsonl`、transcript 为 `transcript/<provider>`）：doctor 将其归类为 legacy-v1 而非三类不一致，不得误报缺 manifest 或触发 repair 改写；v1 checkpoint 的 show/transcript 走无 manifest 的 fallback 解析。`tests/fixtures/agent_checkpoints/` 必须包含一个由当前（改造前）writer 生成的 v1 布局 fixture 供回归。`agent_kind=gemini` 的存量 session/checkpoint 行继续可读（read-only），doctor 对残留 gemini hooks 配置给出指向卸载通道的 actionable 提示。
+- [ ] 提供 v1→E4-libra 的 migration notes 与 schema pin test；reader fallback 为主路径，是否对 `refs/libra/traces` 做一次性 backfill/重写为可选项，不做则在 release notes 说明 v1 checkpoint 长期以 legacy 形态可读。
+- [ ] 定义并测试 prune/rewrite 之后 `libra agent push` 的行为：`refs/libra/traces` 是 Libra 托管、prune 即整链重写的 ref，二选一——(a) agent push 对该 ref 采用 force-with-lease 等价语义（lease 基于 tracking ref，复用 push 既有机制，无需新错误码）；或 (b) 非快进时报 `ERR_AGENT_TRACES_PUSH_DIVERGED` 对应的稳定错误码（语义键须同 PR 补入/对齐 `agent.md` E10 表已预留的条件行；真实 `LBR-*` 编号沿用 A3 建立的分配规则，在本卡自己的 slice 内于 `docs/error-codes.md` 分配，无需回到 A3）+ actionable 指引，并提供重推出口（当前 `PushArgs` 仅有 `--remote`，需新增 force 类参数）；配套回归测试覆盖 clean/prune 重写后 push 到本地 file remote 的场景。
+- [ ] 新增迁移遵循 `sql/migrations/README.md` 规范：`YYYYMMDDNN` 命名（版本号严格递增）、forward DDL 幂等（`IF NOT EXISTS`）、配套 `_down.sql`（仓库现存迁移全部成对）、在 `builtin_migrations()` 注册，并补 run_pending 幂等 + 升级→回滚→再升级 round-trip 测试。
+- [ ] 按 `agent.md` 补充规格 §6 落地 `agent.checkpoint.write`、`agent.clean.prune`、`agent.doctor.repair` span/metric，tracing fake sink 断言必带/禁止字段。
+
+**验证**：
+
+- [ ] `cargo test --test agent_checkpoint_export_test`
+- [ ] `cargo test --test command_test agent_checkpoint_rewind`
+- [ ] `cargo test --test command_test agent_checkpoint_rewind -- --list` 列出接入后的 rewind guard。
+- [ ] `EXPLAIN QUERY PLAN` 或测试断言命中 `agent_session` / `agent_checkpoint` 分页索引。
+- [ ] `cargo test --test db_migration_test`（round-trip 用例落点按现有 target 组织）
+
+**依赖**：Task A1、A4。
+
+**预计触达文件**：
+
+- `src/internal/ai/history.rs`
+- `src/internal/ai/hooks/runtime.rs`
+- `src/command/agent/checkpoint.rs`
+- `src/command/agent/session.rs`
+- `src/command/agent/doctor.rs`
+- `src/command/agent/clean.rs`
+- `src/command/agent/push.rs`
+- `sql/migrations/*`
+- `tests/fixtures/agent_checkpoints/*`
+- `tests/agent_checkpoint_export_test.rs`
+- `tests/command/agent_checkpoint_test.rs`
+- `tests/command/mod.rs`
+
+**规模**：M。
+
+### Task A6：AG-21 transcript intelligence and skill-event extraction
+
+**描述**：在首批 provider 上实现 transcript/prompt/token/model/subagent/skill 提取，缺可选字段时 fail-open 标 partial，但安全/写入路径继续 fail-closed。
+
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循 AG-21、E5、E6、E7、partial extractor 和安全路径 fail-closed 约束。
+
+**验收标准**：
+
+- [ ] Claude Code、Codex、OpenCode adapter 按能力实现 `TranscriptAnalyzer`、`PromptExtractor`、`TranscriptPreparer`、`TokenCalculator`、`ModelExtractor`、`SubagentAwareExtractor`、`SkillEventExtractor` 中适用项。
+- [ ] E6 token usage key 显式映射到 Libra `CompletionUsageSummary`。
+- [ ] E7 `SkillEvent` 投影有 curated registry；上游无能力时写 empty/partial 并解释。
+- [ ] extractor 失败不阻断 checkpoint 保存，但 metadata 必须标 `partial` 并记录 redacted warning。
+- [ ] path validation、redaction、rewind apply、hook install/uninstall、external launch/fix 仍 fail-closed。
+- [ ] `tests/fixtures/agent_transcripts/*`（并同步 A4 的 `tests/fixtures/agent_hooks/*`）每组 fixture 附带溯源 manifest：来源 agent slug、CLI 版本、采集日期、采集/构造方式（真实采集后 redact 或手工构造）；harness 在 fixture 解析断言失败时的消息引用该 manifest 条目，便于区分实现回归与上游格式漂移。
+
+**验证**：
+
+- [ ] `cargo test --test agent_transcript_intelligence_test`
+- [ ] `cargo test --test agent_checkpoint_redaction_test extractor_warning_does_not_include_secret_owner_or_prompt`
+
+**依赖**：Task A1、A3、A5（A4 经 A5 传递依赖，与 §2 依赖图一致）。
+
+**预计触达文件**：
+
+- `src/internal/ai/observed_agents/capability.rs`
+- `src/internal/ai/observed_agents/builtin/claude_code.rs`
+- `src/internal/ai/observed_agents/builtin/stable_promoted.rs`
+- `src/internal/ai/hooks/providers/codex/*`
+- `src/internal/ai/hooks/providers/opencode/*`
+- `tests/fixtures/agent_transcripts/*`
+- `tests/agent_transcript_intelligence_test.rs`
+
+**规模**：M。
+
+### Task A6.5：Agent 第一期本地三 Agent 采集 smoke
+
+**描述**：用本机真实 `codex`、`claude`、`opencode` 验证 Agent 第一期采集闭环。该任务是第一期完成门禁：deterministic fixtures 必须继续存在，但不能替代真实本地 agent 的端到端采集证据。
+
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循第一批 supported roster、hook install、session/checkpoint/traces、metadata-first 与 redaction 约束。
+
+**验收标准**：
+
+- [ ] Preflight 记录 `command -v codex`、`codex --version`、`command -v claude`、`claude --version`、`command -v opencode`、`opencode --version`；若某命令不支持 `--version`，记录等价只读版本/状态命令。输出不得包含 token 或账户 secret。
+- [ ] `agent_local_capture_smoke_test` 按 §0.3 固化真实 CLI 调用矩阵：Codex 用 `codex exec`，Claude Code 用 `claude -p`，OpenCode 用 `opencode run`；每个 agent 使用独立临时 repo、独立 evidence 目录、串行执行和 child-process timeout。
+- [ ] 在临时 Libra 仓库中分别执行 `libra agent add claude-code`、`libra agent add codex`、`libra agent add opencode`；三者都必须安装 Libra-managed hooks，且保留用户已有 provider 配置。
+- [ ] 分别启动本地 `claude`、`codex`、`opencode` 的最小非破坏性会话，触发至少一个 `SessionStart`、一个 turn boundary、一个 `SessionEnd` 或等价 stop event；如果某 agent 的 CLI 无稳定非交互模式，测试 harness 必须明确记录手动/PTY 驱动步骤，并把该 agent 标为需要本地 smoke 而非 CI-only。
+- [ ] `libra agent list --json` 对三者均显示 `supported=true`、`support_wave="first_batch"`、`registered=true`、`transcript_readable=true`、`hook_installable=true`、`installed=true`。
+- [ ] `libra agent session list --json` 能看到 `agent_kind` 分别为 `claude_code`、`codex`、`opencode` 的 session；`libra agent checkpoint list --json` 至少各有一个对应 checkpoint。
+- [ ] `libra agent checkpoint show <id> --json` 默认只展示 metadata/redaction/content hash/token summary，不读取或打印完整 transcript；显式 detail/transcript 路径另测。
+- [ ] `libra agent doctor --json` 对三条本地采集链路不报告 missing hook、missing object、missing catalog row 或 redaction failure。
+- [ ] 三条 smoke 的产物都进入 `refs/libra/traces`，并能由 `checkpoint show` / `session show` 通过 OID 指针读取 metadata。
+- [ ] Preflight 完成 §0.3.2 登录态只读检查（`codex login status` / `claude auth status` / `opencode providers list`），evidence 只保留 redacted 布尔判定与退出码；任一未登录即按 §0 规则标记 blocked，不发起真实付费会话。
+- [ ] Preflight 记录 §0.3.2 pinned `$LIBRA_BIN` 副本的 sha256，安装断言确认各 hook entry command 以该 pinned 绝对路径开头（与 A3 的 provenance 口径对齐）。
+- [ ] 采集断言完成后执行 §0.3.5 卸载 smoke：`agent remove <slug>` 后 provider 配置回到安装前语义状态（与 `preinstall.snapshot` 对比）、`installed=false`、二次 remove 幂等；已捕获数据不删除。
+- [ ] 本机 agent CLI 版本高于 fixtures manifest 记录版本且 smoke 观察到 transcript/hook 格式差异时，在 evidence summary 写明差异并决定是否刷新 fixture；刷新按 §0.3.4 重新采集，提交前完成 redaction/最小化。
+- [ ] 缺少任一本地 agent、登录态或 HookProvider 时，该任务为 blocked；不得用 fake fixture 或单 agent 通过替代。
+
+**验证**：
+
+- [ ] `LIBRA_RUN_LOCAL_AGENTS=1 LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1`
+- [ ] 排障时可加 `LIBRA_KEEP_LOCAL_AGENT_SMOKE=1 LIBRA_LOCAL_AGENT_TIMEOUT_SECS=180` 保留 evidence；保留目录视为敏感，不提交。
+- [ ] `libra agent list --json`
+- [ ] `libra agent session list --json`
+- [ ] `libra agent checkpoint list --json`
+- [ ] `libra agent doctor --json`
+
+**依赖**：Task A1、A2（add/list alias 验收所需）、A4、A5、A6。
+
+**预计触达文件**：
+
+- `tests/agent_local_capture_smoke_test.rs`
+- `tests/harness/agent_local_capture.rs`
+- `tests/fixtures/agent_hooks/*`
+- `Cargo.toml`
+- `tests/INDEX.md`
+- `docs/commands/agent.md`
+- `docs/development/tracing/agent.md`
+
+**规模**：M。
+
+### Task A7：AG-22 read-only agent review workflow
+
+**描述**：先交付 read-only review：外部 reviewer 进程 fan-in、bounded sink、findings manifest、manual attach/provenance。`--fix` 在内部 fix bridge 未就绪时稳定 unsupported。
+
+**关联设计文档**：[`agent.md`](agent.md)、[`code.md`](code.md)。执行时遵循 AG-22/E8 read-only review 约束；任何 `--fix`/mutation 只按 `code.md` 中内部 AgentRuntime、approval、sandbox、tool gate 约束桥接。
+
+**验收标准**：
+
+- [ ] 新增 `libra review --agent <slug>... [--since <rev>] [--checkpoint <id>] [--json]`。
+- [ ] 新增 `libra review list [--json]`、`libra review show <run_id>`、`libra review cancel <run_id>`、`libra review clean`。
+- [ ] `review list` 作为 run 枚举入口，走统一分页契约：默认 `--limit 50`、cap 500、keyset cursor page envelope，`--json` 带 schema/version 字段（与 `agent.md` 强制补强项 #5 一致），有分页测试。
+- [ ] `review cancel <run_id>` 触发 `cancelled` terminal state 并执行完整资源释放；前台阻塞 run 的 SIGINT/SIGTERM 等价于 cancel，两条路径共用同一 cleanup。
+- [ ] run state 写入 `.libra/sessions/agent-runs/<run_id>/`，包含 `state.json`、`findings.md`、`manifest.json`、redacted reviewer logs。
+- [ ] reviewer 并发 fan-in 到串行 sink；单 reviewer 高频输出不阻塞其它 reviewer，per-sink 缓冲有上限。
+- [ ] 所有 run 都有 terminal state：`success`、`error`、`cancelled`、`timeout`、`partial`。
+- [ ] cancel/timeout 释放 external process、reader task、locks、workspace lease。
+- [ ] 非首批 agent 不能进入 launchable path；只能 unsupported 或 manual attach fallback。第一期 manual attach 仅为 E8-libra manifest 的 `manual_attach` 占位字段（默认空/false），**不提供命令面**；若要实现 attach 命令入口，必须先在 `agent.md` 补充规格 §5 补规格再动工。
+- [ ] reviewer 一律在**隔离 workspace** 中运行：将 `materialize_isolated_workspace`（`sub_agent_dispatcher.rs`）抽取为 public seam 并作为必选路径；隔离物化遵循 ignore 规则排除（`.env.test` 在 `.gitignore`，copy 后端已有此语义），若使用 FUSE overlay 后端须补测试证明 ignored 文件同样不暴露；in-place 运行只允许显式危险 flag 且默认拒绝。
+- [ ] 首批三 agent 的 reviewer spawn 固定为最小权限只读形态（当前具体形态见 §0.3.2 表：codex `--sandbox read-only`、claude `--permission-mode plan`、opencode 非危险模式；CLI 版本变化时按 §0.3.2 约定复核），测试断言实际 spawn 参数与工作目录指向隔离 workspace 而非仓库根。残余风险声明：read-only sandbox 不阻断 reviewer 自身网络能力，secret 不外泄的第一道防线是隔离 workspace 不含 secret 文件 + env 只注入 allowlist，redaction 仅是落盘兜底。
+- [ ] reviewer findings 与被引用的 transcript/checkpoint 摘要在注入任何后续 agent prompt 或汇总前，与 seed 同等对待：标注 provenance=untrusted、走与 seed 相同的 redaction 管线、prompt 中以明确定界（spotlighting）区分于指令；`review show` 渲染 findings.md 前剥离 ANSI/终端控制序列（reviewer stdout 自由文本可注入转义序列伪造终端输出）。
+- [ ] 新顶层命令与 `cli.rs` 注册**同 PR 原子**满足 compat 接线：`COMPATIBILITY.md` 顶层矩阵行（intentionally-different / Libra-only extension，`compat_matrix_alignment` 双向严格比对）、`src/cli.rs` ROOT_AFTER_HELP "AI And Automation" 组行、`docs/development/commands/review.md` + README 表行、`pub const REVIEW_EXAMPLES` + `after_help` 接线并把命令名补入 `tests/compat/help_examples_banner.rs` VISIBLE_COMMANDS、`docs/commands/review.md` 含 Examples 节并同步 zh-CN 页。无论实现文件放 `src/command/` 还是 `src/command/agent/`，CLI 面均为顶层命令，上述契约一律适用。
+- [ ] `review --fix`：若没有内部 serialized fix bridge 源码锚点和 approval/sandbox/tool gate 测试，返回 `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE` 对应的稳定错误码（真实 `LBR-*` 编号由 A3 在 `docs/error-codes.md` 分配），不得假成功。该错误语义由本卡首先落地，A8 复用。
+- [ ] 按 `agent.md` 补充规格 §6 落地 `agent.review.run` span/metric，tracing fake sink 断言必带/禁止字段。
+
+**验证**：
+
+- [ ] `cargo test --test agent_review_workflow_test`
+- [ ] `cargo test --test compat_error_codes_doc_sync`
+- [ ] `cargo test --test compat_matrix_alignment`
+- [ ] `cargo test --test compat_help_examples_banner`
+- [ ] `cargo test --test compat_command_docs_examples_section`
+- [ ] `cargo test --lib cli::tests::root_after_help_lists_every_visible_command`
+- [ ] stress test 覆盖 slow reviewer、stderr flood、cancel during pending output。
+
+**依赖**：read-only 依赖 A1、A3、A6、A6.5；fix path 另依赖 Code 阶段的内部 bridge 证据。
+
+**预计触达文件**：
+
+- `src/cli.rs`
+- `src/command/mod.rs`
+- `src/command/review.rs` 或 `src/command/agent/review.rs`（实现时择一并同步文档；CLI 面固定为顶层命令，不影响 compat 契约适用）
+- `src/internal/ai/observed_agents/rpc.rs`
+- `src/internal/ai/agent/runtime/sub_agent_dispatcher.rs`（抽取 `materialize_isolated_workspace` 为 public seam，必选）
+- `src/utils/error.rs`
+- `docs/error-codes.md`
+- `COMPATIBILITY.md`
+- `docs/commands/review.md`
+- `docs/commands/zh-CN/review.md`
+- `docs/development/commands/review.md`（及 README.md 表行）
+- `tests/compat/help_examples_banner.rs`
+- `tests/INDEX.md`
+- `tests/agent_review_workflow_test.rs`
+
+**规模**：M。
+
+### Task A8：AG-23 read-only agent investigate workflow
+
+**描述**：交付 read-only investigate：strict round-robin、run state、pending turn、quorum/max-turns、continue/show/clean。fix path 与 AG-22 同一门禁。
+
+**关联设计文档**：[`agent.md`](agent.md)、[`code.md`](code.md)。执行时遵循 AG-23/E8 read-only investigate 约束；任何 fix/action 只按 `code.md` 的内部受控执行边界处理。
+
+**验收标准**：
+
+- [ ] 新增 `libra investigate start --topic <text> --agent <slug>... [--max-turns N] [--quorum N]`。
+- [ ] 新增 `list`、`show`、`continue`、`cancel`、`clean`。
+- [ ] `investigate list [--json]` 作为 run 枚举入口，与 A7 `review list` 同一分页契约（默认 `--limit 50`、cap 500、keyset cursor page envelope、schema/version 字段），有分页测试。
+- [ ] `state.json` 包含 `run_id`、`topic`、`agents`、`quorum`、`max_turns`、`next_agent_idx`、`pending_turn`、`stances`、`findings_doc`、`starting_sha`。
+- [ ] strict round-robin，不把 review 并发模型套到 investigate。
+- [ ] run-id 并发 lock；同 run 并发继续必须 fail-closed。
+- [ ] issue link / seed prompt 默认 untrusted，进入 mutating workflow 必须显式 approval/flag。
+- [ ] stances、findings_doc 与被引用的 transcript/checkpoint 摘要在注入下一轮 agent turn 或汇总前，与 seed 同等对待：标注 provenance=untrusted、走相同 redaction 管线、prompt 中以明确定界（spotlighting）区分于指令；`investigate show` 渲染前剥离 ANSI/终端控制序列。
+- [ ] investigator 复用 A7 的隔离 workspace public seam 与最小权限只读 spawn 形态（含测试断言 spawn 参数与工作目录）；in-place 运行默认拒绝。
+- [ ] 新顶层命令与 `cli.rs` 注册**同 PR 原子**满足 compat 接线（同 A7 对应项）：`COMPATIBILITY.md` 矩阵行、ROOT_AFTER_HELP 组行、`docs/development/commands/investigate.md` + README 表行、`pub const INVESTIGATE_EXAMPLES` + `after_help` + VISIBLE_COMMANDS 行、`docs/commands/investigate.md` 含 Examples 节并同步 zh-CN 页。
+- [ ] fix 未就绪时 `investigate fix <run_id>` 返回 `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`；untrusted seed 试图进入 mutating workflow 时返回 `ERR_AGENT_UNTRUSTED_SEED_FOR_MUTATION`。两者的真实 `LBR-*` 编号由 A3 在 `docs/error-codes.md` 分配；错误消息必须说明 read-only 可用和启用 fix 的前置条件。
+- [ ] 按 `agent.md` 补充规格 §6 落地 `agent.investigate.run` span/metric，tracing fake sink 断言必带/禁止字段。
+
+**验证**：
+
+- [ ] `cargo test --test agent_investigate_workflow_test`
+- [ ] `cargo test --test compat_error_codes_doc_sync`
+- [ ] `cargo test --test compat_matrix_alignment`
+- [ ] `cargo test --test compat_help_examples_banner`
+- [ ] `cargo test --test compat_command_docs_examples_section`
+- [ ] `cargo test --lib cli::tests::root_after_help_lists_every_visible_command`
+- [ ] 测试覆盖 max-turns、quorum reached、no-new-findings stalled、agent failure pause、continue resume、cancel cleanup。
+
+**依赖**：read-only 依赖 A1、A3、A6、A6.5；fix path 另依赖 Code 阶段的内部 bridge 证据。
+
+**预计触达文件**：
+
+- `src/cli.rs`
+- `src/command/mod.rs`
+- `src/command/investigate.rs` 或 `src/command/agent/investigate.rs`（CLI 面固定为顶层命令，不影响 compat 契约适用）
+- `src/utils/error.rs`
+- `docs/error-codes.md`
+- `COMPATIBILITY.md`
+- `docs/commands/investigate.md`
+- `docs/commands/zh-CN/investigate.md`
+- `docs/development/commands/investigate.md`（及 README.md 表行）
+- `tests/compat/help_examples_banner.rs`
+- `tests/INDEX.md`
+- `tests/agent_investigate_workflow_test.rs`
+
+**规模**：M。
+
+### Task A8.5：AG-24a 合规实现面（audit、raw 授权、retention/GC、erasure）
+
+**描述**：把 `agent.md` 强制的合规要求从"文档验收"升格为实现任务：append-only audit、raw 访问显式授权、retention 窗口清理与本地 erasure 三面一致。A9 只承担其文档同步，不得以文档验收替代本卡实现。
+
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循 AG-24a 合规强制项（append-only audit、`--allow-raw`、`agent.retention.*`、GC/erasure）约束。
+
+**验收标准**：
+
+- [ ] sql/migrations 新增 `agent_audit_log` append-only 表：仅 INSERT/SELECT，触发器或代码层拒绝 UPDATE/DELETE；按 `agent.md` 约束，`_down.sql` 不得删除审计数据，只能停止新写入（不得简单 DROP TABLE）。
+- [ ] checkpoint show/export 的 **raw（未脱敏）访问/导出**要求显式 `--allow-raw`（或等价 approval），每次访问写一条 audit 记录（who/when/checkpoint/scope/justification，字段对齐 `agent.md`）；未经授权的 raw 访问 fail-closed 拒绝并写 audit。redacted 的显式 `--detail`/`--transcript` 路径**不**要求 `--allow-raw`，只受 size cap、streaming/chunk 与 redaction 约束（与 `agent.md`「读取 pipeline」及 A5/A6.5 metadata-first 断言同口径）。
+- [ ] `libra agent clean --gc` 实现 `agent.retention.transcript_days`（默认 90）/`agent.retention.stderr_days`（默认 30）窗口清理；`clean --all`/GC 不触碰 `agent_audit_log`，有测试。
+- [ ] review/investigate run state 与 findings（`.libra/sessions/agent-runs/<run_id>/`、findings blob/manifest/DB 行）按 `agent.retention.findings_days`（默认 90）窗口清理（并入 `libra agent clean --gc` 或 review/investigate clean，落点实现时定），有测试；若该窗口明确 deferred，必须由 A9 release notes 说明。
+- [ ] 本地 erasure 三面一致：重写 `refs/libra/traces` + 删除 agent_session/agent_checkpoint 行 + 清理 `object_index`，配一致性测试；D1/R2 deletion propagation 维持 explicitly deferred（由 A9 release notes 说明）。
+- [ ] `agent.retention.transcript_days`、`agent.retention.stderr_days`、`agent.retention.findings_days`、`agent.max_transcript_read_bytes` 等 settings 键有默认值、校验和文档（`max_transcript_read_bytes` 作用于 A5/A6 的 detail 读取路径）。
+
+**验证**：
+
+- [ ] `cargo test --test agent_audit_log_test`（新增 target，注册 `Cargo.toml` + `tests/INDEX.md`）
+- [ ] `cargo test --test agent_checkpoint_export_test allow_raw_gate`
+- [ ] `cargo test --test db_migration_test`
+- [ ] `cargo test --test compat_error_codes_doc_sync`
+
+**依赖**：Task A5、A6。findings GC 子项另前置 A7/A8（run-state/findings 结构由其创建）；A7/A8 未动工时该子项按验收条款显式 deferred（由 A9 release notes 说明），不阻塞本卡其余项。
+
+**预计触达文件**：
+
+- `sql/migrations/*`
+- `src/internal/ai/history.rs`
+- `src/command/agent/checkpoint.rs`
+- `src/command/agent/clean.rs`
+- `src/utils/error.rs`
+- `docs/error-codes.md`
+- `tests/agent_audit_log_test.rs`
+- `Cargo.toml`
+- `tests/INDEX.md`
+
+**规模**：M。
+
+### Task A9：AG-24 agent docs, tests, compatibility and release closeout
+
+**描述**：收敛 Gate 8 的 public behavior、schema、fixtures、retention/raw export/audit 和跨文档边界，避免 `agent.md`、runtime 文档、用户文档、compat matrix 漂移。
+
+**关联设计文档**：[`agent.md`](agent.md)、[`code.md`](code.md)。执行时以 `agent.md` 收敛外部捕获 public surface，并只同步 `code.md` 中与内部 AgentRuntime/fix bridge 边界有关的约束。
+
+**验收标准**：
+
+- [ ] `docs/development/tracing/agent.md` 与当前实现状态一致，规划 target 和已注册 target 不混写。
+- [ ] 同步 `docs/commands/agent.md`、zh-CN 文档、`COMPATIBILITY.md`、`docs/error-codes.md`、release notes/migration notes。
+- [ ] `tests/INDEX.md` 覆盖所有新增/重命名 target 的 wave、purpose、source mapping。
+- [ ] A8.5 落地的 retention、GC、raw export（`--allow-raw` + audit）、append-only audit、redaction report 完成**文档同步**（用户/运维文档）；本卡不承担其实现（见 A8.5）。
+- [ ] 按 §0 范围声明，为 `memory.md`、`sandbox.md`、`web-api.md` 头部补 "out-of-scope of tracing/plan.md" banner 并注明已知冲突条目。
+- [ ] 核对 fixtures 溯源 manifest（A4/A6）记录的 agent CLI 版本与 release 时点主流版本的差距，过期项记录为已知偏差或完成刷新。
+- [ ] `docs/development/internal/code-agent-runtime.md` / 当前 runtime source-of-truth 边界说明同步；不得重新引入旧 `../agent.md` / `../web-only.md` / `../code-agent-runtime.md` 链接。
+- [ ] 旧 claudecode provider 不被复活；`diagnostics_redaction_test` 事实保留。
+- [ ] 发布说明区分 enabled、preview/opt-in、explicitly deferred，尤其是 external discovery、review/investigate fix、D1/R2 deletion propagation。
+
+**验证**：
+
+- [ ] `cargo test --test compat_agent_docs_contract`
+- [ ] `cargo test --test compat_agent_run_non_exhaustive_guard`
+- [ ] `cargo test --test compat_matrix_alignment`
+- [ ] `cargo test --test compat_error_codes_doc_sync`
+- [ ] `! rg -n "\]\(\.\./agent\.md\)|\]\(\.\./web-only\.md\)|\]\(\.\./code-agent-runtime\.md\)" docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/internal/code-agent-runtime.md`（否定断言，期望零命中；与 `agent.md` 验收命令同式）
+- [ ] `! rg -n "src/internal/ai/claudecode" src docs tests`（否定断言，期望零命中；`claudecode` 一词在移除性表述中允许出现，不作为守卫模式）
+- [ ] `cargo +nightly fmt --all --check`
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
+- [ ] `cargo test --all`
+
+**依赖**：Task A1~A8.5（含 A6.5）的已落地范围。
+
+**预计触达文件**：
+
+- `docs/development/tracing/agent.md`
+- `docs/commands/agent.md`
+- `docs/commands/zh-CN/agent.md`（若存在）
+- `COMPATIBILITY.md`
+- `docs/error-codes.md`
+- `tests/INDEX.md`
+- `tests/compat/*`
+- release notes / migration notes 位置按仓库现有规范确认
+
+**规模**：M。
+
+## 4. Agent 阶段检查点
+
+### Checkpoint A-F1：AG-16 基础契约可合并
+
+- [ ] A1 完成，capability matrix schema pin 通过。
+- [ ] 非首批 agent 不再被误报 supported/installable/launchable。
+- [ ] 没有 checkpoint writer 或 storage 行为变更混入 A1。
+
+### Checkpoint A-F2：CLI/RPC 安全边界可合并
+
+- [ ] A2、A3 完成。
+- [ ] alias 同语义、external RPC v2/v1 兼容、安全默认值和 E10 错误码均有测试。
+- [ ] fake binary 不能读取父进程 secret env，stderr 不泄露。
+
+### Checkpoint A-F3：Hook/lifecycle/checkpoint 可合并
+
+- [ ] A4、A5、A6、A6.5 完成（A6 是 A6.5 的前置，必须在本检查点一并验收）。
+- [ ] Provider parser 不直接写 checkpoint。
+- [ ] 默认 list/show 不读取 transcript body。
+- [ ] crash recovery、doctor repair、prune A/B 窗口有确定性测试。
+- [ ] 本地 `codex`、`claude`、`opencode` 三条 smoke 均完成 session/checkpoint/traces 采集；任一缺失即阻塞第一期。
+
+### Checkpoint A-F4：Workflow read-only 可合并
+
+- [ ] A7、A8 完成 read-only 范围（前置 A6、A6.5 已在 A-F3 验收）。
+- [ ] review/investigate 有 terminal state、cancel cleanup、bounded sink。
+- [ ] `--fix` 未就绪时稳定 unsupported；不得让 observed external agent 执行 workspace mutation。
+
+### Checkpoint A-F5：Agent 总闭环
+
+- [ ] A8.5、A9 完成。
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all` 通过或记录明确、非本改动导致的既有失败。
+- [ ] `docs/development/tracing/code.md` 阶段尚未开始任何实现变更。
+
+## 5. Code 阶段进入条件
+
+只有满足以下条件才进入 `libra code` 阶段：
+
+- [ ] Agent Checkpoint A-F5 已通过。
+- [ ] Agent 第一期本地三 agent smoke 已通过：`codex`、`claude`、`opencode` 都完成采集闭环。
+- [ ] `review --fix` / `investigate fix` 的状态已明确：要么有内部 fix bridge 源码锚点和测试，要么仍保持 unsupported。
+- [ ] `docs/development/tracing/code.md` 的源码复核由 Task C1 承担：进入 Code 实现变更（C2 及之后任务）前 C1 必须完成，且差距清单以 Agent 阶段（含 A9）合并后的最终 HEAD 为基线，不得沿用 Agent 阶段前的旧结论。
+
+## 6. Code 实施任务
+
+`code.md` 当前描述的是已公开的 Libra AI extension，未列出大块净新建功能。Code 阶段的目标是：按当前源码核对并补齐 `libra code` 的公开模式、参数、provider、session、Web/headless/MCP、approval/sandbox、文档和测试闭环；若核对发现行为已满足，只做文档/测试/compat 收敛，不发明额外功能。
+
+### Task C1：`libra code` source-grounded audit
+
+**描述**：重新核对 `code.md` 与实际 `src/command/code.rs`、Code UI、MCP、docs/commands/code.md、tests/INDEX.md 是否一致，生成具体差距清单后再改代码。
+
+**关联设计文档**：[`code.md`](code.md)。执行时只核对实现与该文档的差距，不重新定义 `libra code` 的目标、模式或 provider 边界。
+
+**验收标准**：
+
+- [ ] 核对 `CodeArgs`、`CodeProvider`、`validate_mode_args`、`reject_non_tui_flags`、provider-specific flags、plan-mode、resume、web-only、stdio。
+- [ ] 核对 Web/headless/Code UI routes 与 `docs/commands/code.md` / zh-CN 文档。
+- [ ] 核对 MCP stdio 与 `code-control --stdio` 分工。
+- [ ] 核对 session resume、projection、graph handoff、audit sink、control token 文件。
+- [ ] 输出差距清单，标注每项为 code behavior、docs drift、test gap 或 deliberate difference。
+
+**验证**：
+
+- [ ] `rg -n "validate_mode_args|reject_non_tui_flags|CodeUi|HeadlessCodeRuntime|LibraMcpServer|TracingAuditSink|SessionStore" src/command/code.rs src/internal/ai`
+- [ ] `cargo test --test code_cli_dispatch_test -- --list`
+- [ ] `cargo test --test compat_matrix_alignment -- --list`
+
+**依赖**：Agent A-F5（只读核对可在 A-F4 通过后并行启动；但因 A9 会改动 docs/commands、tests/INDEX.md、COMPATIBILITY.md 等审计面，差距清单必须在 C2 开工前按 Agent 阶段最终 HEAD 复核一次）。
+
+**预计触达文件**：初始只读；后续按差距任务触达。
+
+**规模**：S。
+
+### Task C2：Mode and argument contract hardening
+
+**描述**：补齐 `libra code` 三模式（TUI、web-only、stdio）的参数互斥、provider-specific flags、错误消息和 JSON/quiet 行为。
+
+**关联设计文档**：[`code.md`](code.md)。执行时遵循 `code.md` 的 mode、argument、provider-specific flag 和输出/错误契约。
+
+**验收标准**：
+
+前置：本卡与 C4 中 mode/provider 相关验收以 **C1 输出的分类清单**为准（§0.1.2 第 7 条；`reject_non_tui_flags` 当前在 web-only/stdio 下拒绝一切非 Gemini provider，与 help/banner 示例冲突）。
+
+- [ ] `--web-only` 与 `--stdio` 冲突稳定报错。
+- [ ] web-only/stdio 下拒绝 TUI-only 参数：`--resume`、provider-specific flags 等。
+- [ ] web-only/stdio 的 provider 校验按 C1 分类结果二选一落地：若判定 docs/help drift（维持仅默认 provider），保持拒绝 `--provider` 非默认，并同 PR 修正 help/banner 示例（`CODE_EXAMPLES` 中 `--web-only --provider ollama|codex`）、`BrowserControlMode` 注释与用户文档；若判定 code behavior（放宽 web-only provider），实现放宽 + CLI regression，并与 C4 的可达性验收联动。
+- [ ] Codex-only flags（`--codex-bin`、`--codex-port`、`--plan-mode=true`）只允许 `--provider=codex`；`--api-base` 在 Codex 下拒绝。
+- [ ] DeepSeek/Kimi/Ollama provider-specific flags 非对应 provider 时拒绝。
+- [ ] 所有失败消息可操作，并有 Display/CLI regression test。
+
+**验证**：
+
+- [ ] `cargo test --test code_cli_dispatch_test`
+- [ ] `cargo test --lib code::tests::rejects_web_flags_in_stdio_mode`（按实际 test path 调整）
+- [ ] `cargo test --lib code::tests::rejects_explicit_plan_mode_true_for_non_codex_provider`（按实际 test path 调整）
+
+**依赖**：C1。
+
+**预计触达文件**：
+
+- `src/command/code.rs`
+- `tests/code_cli_dispatch_test.rs`
+- `docs/commands/code.md`
+- `docs/commands/zh-CN/code.md`
+
+**规模**：S。
+
+### Task C3：Provider/runtime bootstrap and env handling
+
+**描述**：确保 generic providers、Codex runtime、agent profile override、dotenv/Vault/env lookup 和 missing-key errors 在 TUI/headless 路径中一致、可测试、可恢复。
+
+**关联设计文档**：[`code.md`](code.md)。执行时遵循 `code.md` 的 provider/runtime、Codex、env-file、Vault/env lookup 和 live-test 约束。
+
+**验收标准**：
+
+- [ ] Provider factory 对 Gemini/OpenAI/Anthropic/DeepSeek/Kimi/Zhipu/Ollama/Codex 的默认模型、API key env、api-base 规则有测试。
+- [ ] `--env-file` 值优先于 Vault 和进程环境，错误消息指出缺哪个 env 和如何配置。
+- [ ] 本地 live/provider 验证统一使用仓库根目录 `.env.test`；CLI 场景传 `--env-file .env.test`，Cargo live 场景先 `set +x; source .env.test` 导出 Key。
+- [ ] Agent profile override 不允许 silent fallback 到 CLI provider。
+- [ ] Codex preflight 拒绝 file cwd，WebSocket startup timeout 有用户可读诊断。
+- [ ] live provider tests 保持 feature-gated，不进入默认 L1。
+
+**验证**：
+
+- [ ] `cargo test --test code_provider_boot_test`
+- [ ] `cargo test --test code_codex_runtime_test`
+- [ ] `cargo test --test code_codex_default_tui_test --features test-provider -- --test-threads=1`
+- [ ] `set +x; set -a; source .env.test; set +a; cargo test --features test-live-ai --test ai_agent_test`
+- [ ] `LIBRA_RUN_LIVE=1 cargo test --features test-provider --test code_ui_remote_model_generation_matrix -- --ignored --test-threads=1`
+
+**依赖**：C1、C2。
+
+**预计触达文件**：
+
+- `src/command/code.rs`
+- `src/internal/ai/providers/*`
+- `src/internal/ai/agent/profile/*`
+- `tests/code_provider_boot_test.rs`
+- `tests/code_codex_runtime_test.rs`
+
+**规模**：M。
+
+### Task C4：Web-only, Code UI, control and SSE contract
+
+**描述**：核对并补齐 Web/headless Code UI 的 session snapshot、SSE、browser control、local automation token、diagnostics redaction 和 remote state tests。
+
+**关联设计文档**：[`code.md`](code.md)。执行时遵循 `code.md` 的 Web-only、headless、Code UI API、browser control、diagnostics 和 SSE wire 约束。
+
+**验收标准**：
+
+前置：与 C2 相同，web-only provider 可达性相关验收以 C1 分类清单为准（当前 `--web-only --provider codex` 被 `reject_non_tui_flags` 拒绝，Codex web-only 分支为 CLI 不可达代码）。
+
+- [ ] 按 C1 分类二选一：若放宽 web-only provider——`--web-only` 非 Codex provider 走 `HeadlessCodeRuntime`、Codex provider 走 managed app-server path，并补可达性回归；若维持仅默认 provider——清理或显式标注当前 CLI 不可达的 Codex web-only 分支（app-server 分派、`web_only+Codex→Loopback` 默认值），并修正 banner/注释/docs 中的 `--web-only --provider codex` 示例。
+- [ ] `/api/code/session`、`/api/code/events`、`/api/code/diagnostics`、`/api/code/threads`、`/api/code/goal/status` observe-only 行为与文档一致。
+- [ ] Browser controller `loopback` 只允许 loopback host；browser-control 默认值矩阵按 C1 分类后的 provider 可达性固定（"Codex web-only 默认 loopback" 仅在放宽后成立），其它 provider 默认 off。
+- [ ] `--control write` 创建 0600 token 文件和非 secret control info，冲突快速失败。
+- [ ] diagnostics、control info、SSE 不泄露 token、headers、provider credentials 或 provider request/response body。
+- [ ] Wire shape 与 TypeScript mirror 一致。
+
+**验证**：
+
+- [ ] `cargo test --features test-provider --test code_ui_remote_sse_matrix -- --test-threads=1`
+- [ ] `cargo test --features test-provider --test code_ui_remote_state_matrix -- --test-threads=1`
+- [ ] `cargo test --features test-provider --test code_ui_remote_security_matrix -- --test-threads=1`
+- [ ] `cargo test --features test-provider --test code_ui_remote_lease_matrix -- --test-threads=1`
+- [ ] `cargo test --test ai_code_ui_wire_test`
+- [ ] `cargo test --test ai_code_ui_projection_test`
+
+（`code_ui_remote_*` matrices 整文件被 `#[cfg(feature = "test-provider")]` 门控：不带 feature 会编译为 0 个测试空跑"通过"，不得计为验收证据；与 CI compat-offline-core 第二遍口径一致。）
+
+**依赖**：C1、C2。
+
+**预计触达文件**：
+
+- `src/command/code.rs`
+- `src/command/code_control*.rs`
+- `src/internal/ai/web/*`
+- `src/internal/tui/*`
+- `web/src/lib/code-ui/types.ts`
+- `docs/commands/code.md`
+- `docs/commands/zh-CN/code.md`
+
+**规模**：M。
+
+### Task C5：Session resume, graph handoff and persistence
+
+**描述**：确保 `libra code` 的 canonical thread id、resume、SessionStore JSONL、projection bundle、graph handoff 和 history persistence 可恢复、可审计。
+
+**关联设计文档**：[`code.md`](code.md)。执行时遵循 `code.md` 的 session resume、projection、graph handoff、audit sink 和 persistence 约束。
+
+**验收标准**：
+
+- [ ] `--resume <THREAD_UUID>` 只在 TUI 允许，错误路径有测试。
+- [ ] TUI exit 时能打印/记录后续 `libra graph <thread_id>` 的入口，远程 repo 场景说明 `--repo <path>`。
+- [ ] Session JSONL reader 可跳过未知 event、恢复 truncated tail。
+- [ ] Projection bundle identity 优先于临时 session id。
+- [ ] Runtime audit sink 记录 local-tui-control 事件，不把 audit 当作 user-facing transcript。
+
+**验证**：
+
+- [ ] `cargo test --features test-provider --test code_resume_test -- --test-threads=1`（整文件 feature 门控，裸跑为 0 个测试空跑）
+- [ ] `cargo test --test ai_session_jsonl_test`
+- [ ] `cargo test --test ai_code_ui_projection_test`
+- [ ] `cargo test --test ai_goal_resume_test`
+
+**依赖**：C1、C4。
+
+**预计触达文件**：
+
+- `src/command/code.rs`
+- `src/internal/ai/session/*`
+- `src/internal/ai/history.rs`
+- `src/internal/ai/projection/*`
+- `src/internal/ai/runtime/*`
+- `docs/commands/code.md`
+
+**规模**：S/M，按 C1 差距决定。
+
+### Task C6：MCP stdio and code-control boundary
+
+**描述**：把 `libra code --stdio` 的 MCP server 与 `libra code-control --stdio` 的 live TUI automation 明确分离，并补足双入口测试。
+
+**关联设计文档**：[`code.md`](code.md)。执行时遵循 `code.md` 的 MCP stdio 与 `code-control --stdio` 分工；不得把 MCP 重新解释为 turn control plane。
+
+**验收标准**：
+
+- [ ] `libra code --stdio` 只运行 MCP stdio server，不控制 live TUI。
+- [ ] `libra code-control --stdio` 是 automation client 入口，受 control token/lease gate 保护。
+- [ ] docs 中不把 MCP stdio 描述成 AgentRuntime turn control plane。
+- [ ] MCP HTTP/stdio dual entry 的 tool set、错误和 shutdown 行为有回归测试。
+
+**验证**：
+
+- [ ] `cargo test --features test-provider --test code_mcp_dual_entry_test -- --test-threads=1`（整文件 feature 门控，裸跑为 0 个测试空跑）
+- [ ] `cargo test --features test-provider --test code_ui_remote_security_matrix -- --test-threads=1`
+- [ ] `rg -n "code-control --stdio|libra code --stdio|MCP" docs/commands docs/development/tracing/code.md docs/development/tracing/agent.md docs/development/tracing/plan.md src/command`（§0 范围外的 memory.md/sandbox.md/web-api.md 不在扫描范围；其 `libra mcp --stdio` 等表述按 §0 out-of-scope 声明处理，不作为本卡验收对象。判定口径：输出经人工复核，不得存在把 MCP stdio 描述为 live TUI turn control plane 的表述；复核结论附入 PR 描述）
+
+**依赖**：C1、C4。
+
+**预计触达文件**：
+
+- `src/command/code.rs`
+- `src/command/code_control.rs`
+- `src/internal/ai/mcp/*`
+- `docs/commands/code.md`
+- `docs/commands/code-control.md`
+- `docs/development/tracing/code.md`
+
+**规模**：S。
+
+### Task C7：Sandbox, approval and tool gate consistency
+
+**描述**：核对 `libra code` 内部 AgentRuntime 的 mutating path，确保 review/investigate fix bridge 只能走 serialized queue、approval、sandbox、tool ACL。
+
+**关联设计文档**：[`code.md`](code.md)、[`agent.md`](agent.md)。执行时遵循 `code.md` 的 internal AgentRuntime / approval / sandbox / tool gate 约束，并保持 `agent.md` 对 observed external agent 只提供 evidence/provenance 的边界。
+
+**验收标准**：
+
+- [ ] `CodeContext::Review` / `Research` 默认 read-only，`Dev` workspace-write。
+- [ ] `--approval-policy`、`--approval-ttl`、`--network-access` 映射到 `ToolRuntimeContext`，并在 tool invocation 中可见。
+- [ ] Tool ACL 区分 read-only、workspace-write、network、broad/mutating tools。
+- [ ] `review --fix` / `investigate fix` 若在 Agent 阶段启用，必须在这里有源码锚点和 tests；否则继续 unsupported。
+- [ ] 错误路径不得 `unwrap()` / `expect()`；生产路径用 `?` + context。
+
+**验证**：
+
+- [ ] `cargo test --test code_tool_acl_test`
+- [ ] `cargo test --features test-provider --test code_ui_remote_approval_matrix -- --test-threads=1`（整文件 feature 门控，裸跑为 0 个测试空跑）
+- [ ] `cargo test --test ai_subagent_worktree_readonly_test`
+- [ ] `cargo test --test compat_all_production_unwrap_guard`
+
+**依赖**：C1；若解锁 Agent fix path，还依赖 A7/A8。
+
+**预计触达文件**：
+
+- `src/command/code.rs`
+- `src/internal/ai/sandbox/*`
+- `src/internal/ai/tools/*`
+- `src/internal/ai/agent/runtime/*`
+- `tests/code_tool_acl_test.rs`
+- `tests/code_ui_remote_approval_matrix.rs`
+
+**规模**：M。
+
+### Task C8：Code docs, compatibility and final closeout
+
+**描述**：把 `libra code` 的实际状态同步回 tracing 目标文档、用户文档、compat matrix 和测试索引。
+
+**关联设计文档**：[`code.md`](code.md)、[`agent.md`](agent.md)。执行时以 `code.md` 收敛 `libra code` public behavior，并同步 `agent.md` 中与 fix bridge、review/investigate 边界相关的交叉说明。
+
+**验收标准**：
+
+- [ ] `docs/development/tracing/code.md` 与当前源码和测试证据一致。
+- [ ] `docs/commands/code.md` 与 `docs/commands/zh-CN/code.md` 同步参数、provider、mode、Code UI API、tracing/logging、examples。
+- [ ] `COMPATIBILITY.md` 明确 `libra code` 是 Libra-only extension / intentionally different。
+- [ ] `tests/INDEX.md` 中 Code UI、MCP、provider、resume、sandbox tests 的 wave 和 source mapping 准确。
+- [ ] 若 Agent 阶段启用了 mutating fix bridge，release notes 同时说明 `libra agent` 与 `libra code` 的协作边界。
+
+**验证**：
+
+- [ ] `cargo test --test compat_matrix_alignment`
+- [ ] `cargo test --test code_cli_dispatch_test`
+- [ ] `cargo test --test code_provider_boot_test`
+- [ ] `cargo test --features test-provider --test code_mcp_dual_entry_test -- --test-threads=1`
+- [ ] `cargo test --features test-provider --test code_resume_test -- --test-threads=1`
+- [ ] `cargo test --test code_tool_acl_test`
+- [ ] `cargo +nightly fmt --all --check`
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
+- [ ] `cargo test --all`
+
+**依赖**：C1~C7。
+
+**预计触达文件**：
+
+- `docs/development/tracing/code.md`
+- `docs/commands/code.md`
+- `docs/commands/zh-CN/code.md`
+- `COMPATIBILITY.md`
+- `tests/INDEX.md`
+- release notes / migration notes 位置按仓库现有规范确认
+
+**规模**：S/M。
+
+## 7. Code 阶段检查点
+
+### Checkpoint C-F1：Code audit 决策完成
+
+- [ ] C1 完成，差距清单按 code behavior / docs drift / test gap / deliberate difference 分类。
+- [ ] C1 差距清单已按 Agent 阶段最终 HEAD（含 A9 的 docs/compat/tests 改动）复核。
+- [ ] 没有在未确认差距前修改 `src/command/code.rs`。
+
+### Checkpoint C-F2：Mode/provider/Web/session 核心路径完成
+
+- [ ] C2、C3、C4、C5 完成或明确无代码差距。
+- [ ] 默认测试和 feature-gated 测试边界清楚。
+
+### Checkpoint C-F3：Control/MCP/sandbox/fix bridge 完成
+
+- [ ] C6、C7 完成。
+- [ ] `libra code --stdio` 与 `code-control --stdio` 边界清晰。
+- [ ] Mutating fix bridge 只有在 approval/sandbox/tool ACL 证据齐全时启用。
+
+### Checkpoint C-F4：总闭环
+
+- [ ] C8 完成。
+- [ ] Agent 与 Code 两条文档边界没有互相重写事实源。
+- [ ] 全量 fmt、clippy、默认测试通过或记录已知外部失败。
+
+## 8. 风险与缓解
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| 把 observed external agent 当作内部 AgentRuntime executor | 绕过 approval/sandbox/tool gate，产生不可审计 mutation | A7/A8 默认 read-only；fix path 必须等 C7 源码锚点和测试 |
+| 非首批 agent 被误报 supported/installable | 用户安装失败或捕获错误 agent kind | A1 registry + capability matrix pin；A2 unsupported tests |
+| external binary 继承 secrets 或冒用内置 slug | API key 泄露、供应链风险 | A3 `env_clear`、trust/quarantine/provenance、built-in slug skip |
+| redaction 只靠散点调用 | raw prompt/stderr/transcript 落盘 | A4/A5 类型级 `RedactedBytes` sink，redaction failure fail-closed |
+| checkpoint ref/DB/object_index 不一致 | restore/doctor/show 找不到对象，cloud sync 缺数据 | A5 crash matrix、doctor repair、UPSERT、prune A/B tests |
+| 大 transcript 默认读取 | 内存暴涨、TUI/Web 卡死 | A5 metadata-first + chunked streaming + cap |
+| A6.5 本地 smoke 被 fake fixture 替代 | 第一期声称支持 `codex`/`claude`/`opencode`，但真实用户环境无法采集 | A6.5 必须使用本机真实 binary 与临时 repo；fake fixture 只作为 deterministic regression |
+| `.env.test` 或外部 binary 输出泄露 secret | API key、provider token、D1/R2 key 或 prompt 泄露到日志/JSON/对象 | `.env.test` 不得回显；live 命令前关闭 shell xtrace；external RPC `env_clear`，stderr/stdout cap + redaction |
+| public JSON / RPC / DB schema 无版本 | 外部脚本、Web UI、legacy reader 或 external binary 升级后不兼容 | 所有 public wire 增加 `schema_version`/`protocol_version`，新增 snapshot/compat test，release notes 写兼容窗口 |
+| provider hook 直接写 checkpoint | validation/redaction/owner filtering 被绕过，产生重复或污染 checkpoint | A4 只允许 hook/parser 产 `LifecycleEvent`；A5 统一 writer 消费 validated/redacted event |
+| review/investigate cancel 或 timeout 未收敛 | 残留进程、reader task、lock、lease 或 pending turn，导致后续 run 卡死 | A7/A8 必测 terminal state、cancel cleanup、timeout cleanup 和 run-id lock |
+| MCP stdio、code-control 与 Agent turn control 混同 | 错把传输/control 面当内部执行面，破坏 approval/sandbox 边界 | C6 固定 MCP stdio 与 `code-control --stdio` 分工；C7 才决定 mutating fix bridge |
+| 大卡作为单 PR 推进 | diff 过大、测试目标漂移、review 不可控，难以回滚 | 0.2 要求 contract/implementation/safety/compat/live slice 拆分；每个 slice 保持可构建可测试 |
+| retention、raw export、audit 只落文档不落实现 | 难以满足本地删除、隐私和审计要求 | A8.5 落实 `agent_audit_log`/`--allow-raw`/retention GC/erasure 实现；A9/C8 只承担文档与 release notes 同步 |
+| codex/opencode 上游 hook 机制与计划假设不符（trust 门控、无 hooks.json） | hook 安装"成功"但静默不执行，采集闭环误判 | §0.3.3 改为上游实测为准；A4 增加 trust/enable 门控与 opencode plugin 事件映射验收 |
+| reviewer/investigator in-place 运行读到仓库 secrets | `.env.test` 等真实 key 经 findings/网络外泄 | A7/A8 强制隔离 workspace（ignore 规则排除 secrets）+ 最小权限只读 spawn + env 只注入 allowlist |
+| reviewer findings/stances 反哺后续 prompt 造成注入 | 外部输出诱导后续 agent 或伪造终端输出 | A7/A8 provenance=untrusted、redaction、spotlighting 定界、show 前剥离 ANSI 控制序列 |
+| prune/clean 重写 `refs/libra/traces` 后 `agent push` 非快进发散 | traces 远端同步失败且无恢复出口 | A5 定义 push 语义（force-with-lease 等价或稳定错误码 + 重推出口）并配回归测试 |
+| 升级后存量 v1 checkpoint 被 doctor 误判或不可读 | doctor 误修复、用户历史数据丢失可读性 | A5 legacy-v1 reader/doctor 分类验收 + 改造前 writer fixture 回归 |
+| E10 种子错误码与已发布编号冲突 | 同码双语义破坏稳定错误码契约 | A3 编号核对门禁：以 `docs/error-codes.md` 实际分配为准，同 PR 修正 `agent.md` 种子表 |
+| 同目录范围外文档（memory/sandbox/web-api）被当作事实源 | 执行者引入互斥断言，A4/C4/C6/C7 边界被污染 | §0 out-of-scope 声明；A9/C8 补 banner；C6 验证扫描范围排除 |
+| Code 阶段按旧文档实现 | 重复或回退已有功能 | C1 强制 source-grounded audit，差距分类后再改 |
+| 测试 target 写了但未注册 | CI 不运行，计划误判完成 | 每个新增 target 必改 `Cargo.toml` + `tests/INDEX.md`，A9/C8 closeout 复核 |
+
+## 9. 总体验收命令
+
+Agent 阶段完成后至少运行：
+
+```bash
+cargo test --test compat_agent_docs_contract
+cargo test --test compat_agent_run_non_exhaustive_guard
+cargo test --test compat_agent_capability_matrix_pin
+cargo test --test compat_agent_architecture_guard
+cargo test --test agent_rpc_external_test
+cargo test --test agent_lifecycle_event_test
+cargo test --test agent_checkpoint_redaction_test
+cargo test --test agent_checkpoint_export_test
+cargo test --test agent_transcript_intelligence_test
+LIBRA_RUN_LOCAL_AGENTS=1 LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1
+cargo test --test agent_review_workflow_test
+cargo test --test agent_investigate_workflow_test
+cargo test --test agent_audit_log_test
+cargo test --test command_test agent
+```
+
+声明 Agent 第一期完成前，还必须在本机运行真实 agent 采集 smoke：
+
+```bash
+LIBRA_RUN_LOCAL_AGENTS=1 LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1
+libra agent list --json
+libra agent session list --json
+libra agent checkpoint list --json
+libra agent doctor --json
+```
+
+排障时可临时保留本地 evidence：
+
+```bash
+LIBRA_RUN_LOCAL_AGENTS=1 LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode LIBRA_KEEP_LOCAL_AGENT_SMOKE=1 LIBRA_LOCAL_AGENT_TIMEOUT_SECS=180 cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1
+```
+
+Code 阶段完成后至少运行：
+
+```bash
+cargo test --test code_cli_dispatch_test
+cargo test --test code_provider_boot_test
+cargo test --features test-provider --test code_mcp_dual_entry_test -- --test-threads=1
+cargo test --features test-provider --test code_resume_test -- --test-threads=1
+cargo test --test code_tool_acl_test
+cargo test --features test-provider --test code_ui_remote_lease_matrix -- --test-threads=1
+cargo test --features test-provider --test code_ui_remote_sse_matrix -- --test-threads=1
+cargo test --features test-provider --test code_ui_remote_state_matrix -- --test-threads=1
+cargo test --features test-provider --test code_ui_remote_security_matrix -- --test-threads=1
+cargo test --features test-provider --test code_ui_remote_generation_matrix -- --test-threads=1
+cargo test --features test-provider --test code_ui_remote_approval_matrix -- --test-threads=1
+cargo test --test ai_code_ui_wire_test
+cargo test --test ai_code_ui_projection_test
+cargo test --test ai_code_ui_headless_test
+```
+
+注意：`code_ui_remote_*` matrices、`code_mcp_dual_entry_test`、`code_resume_test` 整文件被 `#[cfg(feature = "test-provider")]` 门控——不带 `--features test-provider` 时编译为 0 个测试、空跑显示"通过"，不得计为验收证据（与 CI compat-offline-core 第二遍 `--features test-provider ... --test-threads=1` 口径一致）。
+
+Code 阶段的 live/provider-backed 验证使用仓库根目录 `.env.test`。其中 CLI 场景传 `--env-file .env.test`；直接读取进程环境的 Cargo live tests 先导出该文件中的 Key：
+
+```bash
+set +x
+set -a; source .env.test; set +a
+cargo test --features test-live-ai --test ai_agent_test
+cargo test --features test-live-ai --test ai_chat_agent_test
+LIBRA_RUN_LIVE=1 cargo test --features test-provider --test code_ui_remote_model_generation_matrix -- --ignored --test-threads=1
+```
+
+最终 closeout 至少运行：
+
+```bash
+cargo +nightly fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+cargo test --test compat_matrix_alignment
+cargo test --test compat_error_codes_doc_sync
+cargo test --test compat_all_production_unwrap_guard
+cargo test --test compat_help_examples_banner
+cargo test --test compat_command_docs_examples_section
+cargo test --lib cli::tests::root_after_help_lists_every_visible_command
+```
+
+若某个 target 仍是计划目标、尚未注册，不能把它列入“当前已通过”；必须在 PR 中说明 target 未注册原因、重启条件和替代验证。
+
+## 10. 执行进度记录
+
+执行者每完成（或阻塞）一个任务/slice，按 §0.4 第 7 步在此表追加一行。本表 + `libra log` 是任务完成状态的唯一事实源；任务卡内的验收 checkbox 仅表示验收项覆盖情况，不单独构成完成证据。
+
+| 日期 | 任务/slice | 结果 | 版本 | commit | 验证摘要 / blocked 原因与恢复步骤 |
+|---|---|---|---|---|---|
+| 2026-07-03 | （基线）计划四轮复核完成（§0.1.3），尚未开始执行 | 基线 | Cargo.toml `0.17.1808`；web/worker package.json `0.17.1758`（滞后，首次发布时同步） | — | 三份 tracing 文档已统一；两处守卫断链（`agent_docs_contract.rs` 编译期 include_str! + `matrix_alignment.rs:104` 运行时 read_repo_file 均指旧路径）导致 `cargo test --all` 当前失败——执行顺序为 0.1 → 0.3（修断链）→ 0.2 |
