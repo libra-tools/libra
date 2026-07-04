@@ -1,0 +1,4 @@
+{"type":"user","text":"Please rotate the leaked key REDACT-ME-<REDACTED:aws-access-key-id> and audit where it was used."}
+{"type":"assistant","text":"I'll scan the repo for usages of that access key and prepare a rotation plan."}
+{"type":"tool_use","name":"Bash","input":{"command":"grep -rn access_key src/"},"id":"toolu_fixture_01"}
+{"type":"assistant","text":"Done: found 2 usages, both in tests. Rotation checklist written to docs/rotation.md."}
