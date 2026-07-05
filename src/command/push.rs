@@ -2603,17 +2603,22 @@ fn collect_history_commits(commit_id: &ObjectHash) -> HashSet<ObjectHash> {
 
     let mut commits = HashSet::new();
     let mut queue = VecDeque::new();
+    commits.insert(*commit_id);
     queue.push_back(*commit_id);
     while let Some(commit) = queue.pop_front() {
-        commits.insert(commit);
-
         let commit = match Commit::try_load(&commit) {
             Some(c) => c,
             None => continue,
         };
 
         for parent in commit.parent_commit_ids.iter() {
-            queue.push_back(*parent);
+            // Dedupe at enqueue time: without this, every merge commit
+            // re-enqueues its shared ancestry, and a merge-heavy history
+            // makes the walk exponential — pushing any merge tip then
+            // spins for hours (observed on this repo, 2026-07-05).
+            if commits.insert(*parent) {
+                queue.push_back(*parent);
+            }
         }
     }
     commits
@@ -3170,6 +3175,42 @@ mod test {
             "fast-forward push must not repack unchanged blobs inside changed subtrees"
         );
         assert_eq!(hashes.len(), 4);
+    }
+
+    /// Regression (2026-07-05): `collect_history_commits` enqueued parents
+    /// without a visited check, so every merge commit re-enqueued its
+    /// shared ancestry — a merge-heavy history made the walk exponential
+    /// and pushing any merge tip effectively hung forever. 40 stacked
+    /// merges are infeasible pre-fix (~2^40 queue operations) and
+    /// instantaneous post-fix.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn collect_history_commits_dedupes_merge_heavy_history() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("shared content");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "file.txt".to_string(),
+        )]);
+
+        let root = save_test_commit(tree.id, vec![], "root");
+        let mut tip = root.id;
+        let mut expected = 1usize;
+        for i in 0..40 {
+            let side = save_test_commit(tree.id, vec![tip], &format!("side {i}"));
+            let merge = save_test_commit(tree.id, vec![tip, side.id], &format!("merge {i}"));
+            tip = merge.id;
+            expected += 2;
+        }
+
+        let commits = collect_history_commits(&tip);
+        assert_eq!(commits.len(), expected, "every commit visited exactly once");
+        assert!(commits.contains(&root.id));
+        assert!(commits.contains(&tip));
     }
 
     #[tokio::test]
