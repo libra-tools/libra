@@ -83,6 +83,9 @@ fn fine_exit_codes_enabled() -> bool {
 pub enum CliErrorKind {
     /// `libra foo` where `foo` is not a known subcommand. Renders without prefix.
     UnknownCommand,
+    /// Runtime failure whose Git-compatible human output intentionally renders
+    /// without an `error:` / `fatal:` prefix.
+    UnprefixedFailure,
     /// Top-level argv parse failure (clap-detected). Renders with `error:` prefix.
     ParseUsage,
     /// Subcommand-specific usage failure (e.g. mutually exclusive flags).
@@ -639,6 +642,14 @@ impl CliError {
             .with_stable_code(StableErrorCode::CliUnknownCommand)
     }
 
+    /// Runtime failure rendered without a leading severity prefix.
+    ///
+    /// Use this only for Git-compatible command surfaces whose canonical human
+    /// output is an advisory block instead of an `error:` line.
+    pub fn unprefixed_failure(message: impl Into<String>) -> Self {
+        Self::new(CliErrorKind::UnprefixedFailure, message)
+    }
+
     /// Argv parse error detected by clap (root-level). Renders with the `error:`
     /// prefix. Use this for failures that occur before any subcommand handler runs.
     pub fn parse_usage(message: impl Into<String>) -> Self {
@@ -749,7 +760,7 @@ impl CliError {
             CliErrorKind::ParseUsage | CliErrorKind::CommandUsage | CliErrorKind::Failure => {
                 Some(ErrorLevel::Error)
             }
-            CliErrorKind::UnknownCommand => None,
+            CliErrorKind::UnknownCommand | CliErrorKind::UnprefixedFailure => None,
         }
     }
 
@@ -963,6 +974,7 @@ impl CliError {
         match self.kind {
             CliErrorKind::Fatal => "fatal",
             CliErrorKind::UnknownCommand
+            | CliErrorKind::UnprefixedFailure
             | CliErrorKind::ParseUsage
             | CliErrorKind::CommandUsage
             | CliErrorKind::Failure => "error",
@@ -987,7 +999,9 @@ impl CliError {
     fn render_human(&self, include_error_code: bool) -> String {
         let mut lines = Vec::new();
         match self.kind {
-            CliErrorKind::UnknownCommand => lines.push(self.message.clone()),
+            CliErrorKind::UnknownCommand | CliErrorKind::UnprefixedFailure => {
+                lines.push(self.message.clone());
+            }
             CliErrorKind::ParseUsage | CliErrorKind::CommandUsage | CliErrorKind::Failure => {
                 lines.push(format!("error: {}", self.message));
             }
@@ -1173,7 +1187,9 @@ fn infer_stable_error_code(kind: CliErrorKind, message: &str) -> StableErrorCode
                 StableErrorCode::CliInvalidArguments
             }
         }
-        CliErrorKind::Fatal | CliErrorKind::Failure => infer_runtime_error_code(&lower),
+        CliErrorKind::Fatal | CliErrorKind::Failure | CliErrorKind::UnprefixedFailure => {
+            infer_runtime_error_code(&lower)
+        }
     }
 }
 
@@ -1581,6 +1597,16 @@ mod tests {
             "libra: 'wat' is not a libra command. See 'libra --help'."
         );
         assert_eq!(err.exit_code(), 129);
+    }
+
+    #[test]
+    #[serial]
+    fn unprefixed_failure_has_no_error_prefix_but_keeps_runtime_exit_code() {
+        let err = CliError::unprefixed_failure("plain advisory block")
+            .with_stable_code(StableErrorCode::RepoStateInvalid);
+        assert_eq!(err.kind(), CliErrorKind::UnprefixedFailure);
+        assert_eq!(err.render(), "plain advisory block");
+        assert_eq!(err.exit_code(), 128);
     }
 
     #[test]

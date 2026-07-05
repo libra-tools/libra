@@ -183,7 +183,11 @@ pub(crate) enum PullError {
     NotOnBranch,
 
     #[error("there is no tracking information for the current branch")]
-    NoTrackingInfo { branch: String },
+    NoTrackingInfo {
+        branch: String,
+        advice_remote: Option<String>,
+        rebase: bool,
+    },
 
     #[error("remote '{0}' not found")]
     RemoteNotFound(String),
@@ -208,14 +212,16 @@ impl From<PullError> for CliError {
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("checkout a branch before pulling")
                 .with_hint("use 'libra switch <branch>' to switch"),
-            PullError::NoTrackingInfo { .. } => {
-                CliError::failure("there is no tracking information for the current branch")
-                    .with_stable_code(StableErrorCode::RepoStateInvalid)
-                    .with_hint("specify the remote and branch: 'libra pull <remote> <branch>'")
-                    .with_hint(
-                        "or set upstream with 'libra branch --set-upstream-to=<remote>/<branch>'",
-                    )
-            }
+            PullError::NoTrackingInfo {
+                branch,
+                advice_remote,
+                rebase,
+            } => CliError::unprefixed_failure(format_no_tracking_advice(
+                &branch,
+                advice_remote.as_deref(),
+                rebase,
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid),
             PullError::RemoteNotFound(remote) => {
                 CliError::command_usage(format!("remote '{remote}' not found"))
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
@@ -463,13 +469,9 @@ async fn resolve_pull_target(args: &PullArgs) -> Result<ResolvedPullTarget, Pull
             })
         }
         (None, None) => {
-            let branch_config = ConfigKv::branch_config(&branch)
-                .await
-                .ok()
-                .flatten()
-                .ok_or_else(|| PullError::NoTrackingInfo {
-                    branch: branch.clone(),
-                })?;
+            let Some(branch_config) = ConfigKv::branch_config(&branch).await.ok().flatten() else {
+                return Err(no_tracking_error(&branch, args.rebase).await);
+            };
             let remote_config = ConfigKv::remote_config(&branch_config.remote)
                 .await
                 .ok()
@@ -488,6 +490,48 @@ async fn resolve_pull_target(args: &PullArgs) -> Result<ResolvedPullTarget, Pull
         }
         (None, Some(_)) => unreachable!("clap requires repository when refspec is provided"),
     }
+}
+
+async fn no_tracking_error(branch: &str, rebase: bool) -> PullError {
+    PullError::NoTrackingInfo {
+        branch: branch.to_string(),
+        advice_remote: single_remote_for_tracking_advice().await,
+        rebase,
+    }
+}
+
+async fn single_remote_for_tracking_advice() -> Option<String> {
+    let remotes = ConfigKv::all_remote_configs().await.ok()?;
+    if remotes.len() == 1 {
+        remotes.into_iter().next().map(|remote| remote.name)
+    } else {
+        None
+    }
+}
+
+fn format_no_tracking_advice(branch: &str, advice_remote: Option<&str>, rebase: bool) -> String {
+    let action = if rebase {
+        "rebase against"
+    } else {
+        "merge with"
+    };
+    let upstream = advice_remote
+        .map(|remote| format!("{remote}/<branch>"))
+        .unwrap_or_else(|| "<remote>/<branch>".to_string());
+
+    format!(
+        concat!(
+            "There is no tracking information for the current branch.\n",
+            "Please specify which branch you want to {action}.\n",
+            "See git-pull(1) for details.\n\n",
+            "    libra pull <remote> <branch>\n\n",
+            "If you wish to set tracking information for this branch you can do so with:\n\n",
+            "    libra branch --set-upstream-to={upstream} {branch}"
+        ),
+        action = action,
+        upstream = upstream,
+        branch = branch,
+    )
 }
 
 fn child_output_for_pull(output: &OutputConfig) -> OutputConfig {
@@ -885,6 +929,8 @@ mod tests {
         assert_eq!(
             PullError::NoTrackingInfo {
                 branch: "main".to_string(),
+                advice_remote: None,
+                rebase: false,
             }
             .to_string(),
             "there is no tracking information for the current branch",

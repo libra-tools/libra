@@ -75,6 +75,20 @@ From git@github.com:user/repo.git
 Already up to date.
 ```
 
+没有 tracking 信息：
+
+```text
+There is no tracking information for the current branch.
+Please specify which branch you want to merge with.
+See git-pull(1) for details.
+
+    libra pull <remote> <branch>
+
+If you wish to set tracking information for this branch you can do so with:
+
+    libra branch --set-upstream-to=origin/<branch> main
+```
+
 Rebase：
 
 ```text
@@ -189,7 +203,7 @@ Rebase 输出省略 `merge` 并包含 `rebase`：
 | 场景 | 错误码 | 退出码 | 提示 |
 |----------|-----------|------|------|
 | HEAD detached | `LBR-REPO-003` | 128 | "checkout a branch before pulling" |
-| 分支没有 tracking 信息 | `LBR-REPO-003` | 128 | "specify the remote and branch" |
+| 分支没有 tracking 信息 | `LBR-REPO-003` | 128 | Git 风格 advisory block，包含 `libra pull <remote> <branch>` 和 `libra branch --set-upstream-to=...` |
 | 找不到远程 | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
 | Fetch：网络不可达 / 超时 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch：认证失败 | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |

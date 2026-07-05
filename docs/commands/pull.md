@@ -92,6 +92,20 @@ From git@github.com:user/repo.git
 Already up to date.
 ```
 
+No tracking information:
+
+```text
+There is no tracking information for the current branch.
+Please specify which branch you want to merge with.
+See git-pull(1) for details.
+
+    libra pull <remote> <branch>
+
+If you wish to set tracking information for this branch you can do so with:
+
+    libra branch --set-upstream-to=origin/<branch> main
+```
+
 Rebase:
 
 ```text
@@ -207,7 +221,7 @@ Every `PullError` variant maps to an explicit `StableErrorCode`. Fetch, merge, a
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
 | HEAD is detached | `LBR-REPO-003` | 128 | "checkout a branch before pulling" |
-| No tracking info for branch | `LBR-REPO-003` | 128 | "specify the remote and branch" |
+| No tracking info for branch | `LBR-REPO-003` | 128 | Git-style advisory block with `libra pull <remote> <branch>` and `libra branch --set-upstream-to=...` |
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
 | Fetch: network unreachable / timeout | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch: authentication failed | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |

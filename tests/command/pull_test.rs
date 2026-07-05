@@ -127,7 +127,44 @@ fn test_pull_cli_without_tracking_returns_repo_exit_code() {
 
     assert_eq!(output.status.code(), Some(128));
     assert_eq!(report.error_code, "LBR-REPO-003");
-    assert!(stderr.contains("there is no tracking information for the current branch"));
+    assert!(
+        stderr.starts_with(concat!(
+            "There is no tracking information for the current branch.\n",
+            "Please specify which branch you want to merge with.\n",
+            "See git-pull(1) for details.\n\n",
+            "    libra pull <remote> <branch>\n\n",
+            "If you wish to set tracking information for this branch you can do so with:\n\n",
+            "    libra branch --set-upstream-to=<remote>/<branch> main",
+        )),
+        "pull without tracking should match git-style advice: {stderr}"
+    );
+    assert!(
+        !stderr.starts_with("error:"),
+        "git-style pull advice is unprefixed: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_pull_cli_without_tracking_uses_single_remote_in_advice() {
+    let repo = create_committed_repo_via_cli();
+    let remote = tempdir().expect("failed to create remote root");
+
+    let remote_output = run_libra_command(
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        repo.path(),
+    );
+    assert_cli_success(&remote_output, "remote add");
+
+    let output = run_libra_command(&["pull"], repo.path());
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(128));
+    assert_eq!(report.error_code, "LBR-REPO-003");
+    assert!(
+        stderr.contains("    libra branch --set-upstream-to=origin/<branch> main"),
+        "single remote should appear in git-style set-upstream advice: {stderr}"
+    );
 }
 
 #[test]
