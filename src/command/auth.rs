@@ -20,6 +20,9 @@ pub const AUTH_EXAMPLES: &str = "\
 EXAMPLES:
     libra auth login --host git.example.com          Prompt for a token (hidden)
     printf '%s' \"$TOKEN\" | libra auth login --host git.example.com --with-token
+    libra auth login --host github.com --username x-access-token --expires-in 90d
+    printf '%s\\n' \"$GITHUB_PAT\" | libra auth login --host github.com --username x-access-token --with-token
+    libra config --global auth.backend keyring && libra auth migrate --to keyring
     libra auth login --host git.example.com:8443 --expires-in 30d
     libra auth status                                All stored tokens (never the secrets)
     libra auth status --host git.example.com         Scriptable: exit 0 iff valid
@@ -27,10 +30,12 @@ EXAMPLES:
     libra auth clear                                 Revoke everything
 
 NOTES:
-    There is no --token flag by design (shell history/proc leak). Tokens are
-    encrypted at rest with the 0600 vault key; `config get/list` cannot dump
-    them. Stored tokens attach only to matching https hosts (http only for
-    loopback, with the explicit port).";
+    GitHub HTTPS PATs are stored as the Basic-auth password for github.com.
+    There is no --token flag by design (shell history/proc leak). With the
+    default file backend, tokens are encrypted at rest with the 0600 global
+    vault key and `config get/list` cannot dump them. The keyring backend stores
+    secrets in the OS keychain. Stored tokens attach only to matching https
+    hosts (http only for loopback, with the explicit port).";
 
 /// Manage host-scoped HTTP tokens: login, status, logout (Libra extension).
 #[derive(Parser, Debug)]

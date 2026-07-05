@@ -20,6 +20,7 @@
 //! Modules here may depend on `git-internal` and on each other but should *not* depend
 //! on `src/command/*` — that direction is the CLI dispatch boundary.
 
+pub mod account;
 pub mod ai;
 pub mod alternates;
 pub mod auth;

@@ -138,7 +138,7 @@ fatal: cannot delete dirty worktree '../dirty-feature' (uncommitted changes)
        Hint: commit or stash changes, or remove without --delete-dir to keep the directory
 ```
 
-行为有意不同于 Git：Git 默认删除目录。Libra 默认保留目录以防意外数据丢失；`--delete-dir` 以显式 opt-in 恢复类 Git 语义。动机见 [`COMPATIBILITY.md`](../../COMPATIBILITY.md) 和 [`compatibility/worktree-surface.md`](../../development/commands/worktree.md)。
+行为有意不同于 Git：Git 默认删除目录。Libra 默认保留目录以防意外数据丢失；`--delete-dir` 以显式 opt-in 恢复类 Git 语义。动机见 [`COMPATIBILITY.md`](../../../COMPATIBILITY.md) 和 [`compatibility/worktree-surface.md`](../../development/commands/worktree.md)。
 
 ### 子命令：`umount`
 

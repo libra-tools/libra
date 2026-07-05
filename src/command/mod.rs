@@ -8,6 +8,7 @@
 //! command flows without missing repository, index, worktree, network, or
 //! rendering consequences.
 
+pub mod account;
 pub mod add;
 pub mod agent;
 pub mod alternates;

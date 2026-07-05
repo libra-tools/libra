@@ -25,7 +25,8 @@
 |------|------|------|------|
 | `libra init` | | 创建新的 Libra 仓库，带 SQLite 元数据、vault 签名和可选 Git 导入 | [init.md](init.md) |
 | `libra clone` | | 克隆远程仓库，支持 vault 引导、浅克隆和单分支 | [clone.md](clone.md) |
-| `libra config` | `cfg` | 管理仓库本地和用户全局配置，并用 vault 加密密钥 | [config.md](config.md) |
+| `libra config` | `cfg` | 管理仓库本地和用户全局配置，并用 vault 加密 secret | [config.md](config.md) |
+| `libra completions` | | 从实时 CLI 生成 shell completion 脚本（`bash`/`zsh`/`fish`/`powershell`/`elvish`） | [completions.md](completions.md) |
 
 ### 暂存与工作树
 
@@ -38,6 +39,11 @@
 | `libra clean` | | 从工作树移除未跟踪文件（要求 `-n` 或 `-f`） | [clean.md](clean.md) |
 | `libra stash` | | 用 push/pop/list/apply/drop 子命令保存和恢复临时更改 | [stash.md](stash.md) |
 | `libra status` | `st` | 显示工作树、暂存区和上游跟踪状态 | [status.md](status.md) |
+| `libra dirty` | | status 缓存的咨询式 dirty-set 标记（Libra 扩展） | [dirty.md](dirty.md) |
+| `libra revision` | | first-parent chains 上的 revision ordinal index（Libra 扩展） | [revision.md](revision.md) |
+| `libra commit-tree` | `git commit-tree` | 从 tree 创建 commit 对象（plumbing） | [commit-tree.md](commit-tree.md) |
+| `libra auth` | | 按 host 作用域管理 HTTP token auth（Libra 扩展） | [auth.md](auth.md) |
+| `libra service` | | 无头本地服务：notification bus + dirty-mark ingestion（Libra 扩展） | [service.md](service.md) |
 
 ### 提交与历史
 
@@ -45,26 +51,28 @@
 |------|------|------|------|
 | `libra commit` | `ci` | 将已暂存更改记录为新提交，支持可选 vault 签名和 conventional 格式 | [commit.md](commit.md) |
 | `libra log` | `hist`、`history` | 显示提交历史，支持图形、补丁、统计和自定义格式 | [log.md](log.md) |
+| `libra logfile` | | 检查 tracing log-file 配置（路径、rotation、filter、size） | [logfile.md](logfile.md) |
 | `libra shortlog` | `slog` | 按作者汇总可达提交 | [shortlog.md](shortlog.md) |
 | `libra show` | | 显示提交、标签、树、blob 或 `REV:path` 内容 | [show.md](show.md) |
-| `libra diff` | | 比较 HEAD、索引、工作树或两个修订之间的差异 | [diff.md](diff.md) |
-| `libra diff-tree` | | 比较两个 tree（git diff-tree） | [diff-tree.md](diff-tree.md) |
+| `libra diff` | | 比较 HEAD、索引、工作树或两个 revisions 之间的差异 | [diff.md](diff.md) |
+| `libra diff-tree` | | 比较两个 trees（git diff-tree） | [diff-tree.md](diff-tree.md) |
 | `libra diff-index` | | 比较一个 tree 与工作树（git diff-index） | [diff-index.md](diff-index.md) |
 | `libra diff-files` | | 比较 index 与工作树（git diff-files） | [diff-files.md](diff-files.md) |
 | `libra fast-export` | | 把历史导出为 git fast-import 流 | [fast-export.md](fast-export.md) |
 | `libra fast-import` | | 导入 git fast-import 流 | [fast-import.md](fast-import.md) |
 | `libra blame` | | 将文件每一行追溯到引入它的提交 | [blame.md](blame.md) |
 | `libra describe` | `desc` | 找到最近的可达标签，并格式化为 `tag-N-g<abbrev>` | [describe.md](describe.md) |
-| `libra grep` | | 在已跟踪文件中搜索模式，支持正则、修订和索引 | [grep.md](grep.md) |
+| `libra grep` | | 在已跟踪文件中搜索模式，支持正则、revision 和 index | [grep.md](grep.md) |
 | `libra reflog` | | 查看、删除或检查引用变更日志是否存在 | [reflog.md](reflog.md) |
-| `libra rev-list` | | 列出从修订可达的提交对象 | [rev-list.md](rev-list.md) |
-| `libra rev-parse` | | 解析修订名、缩写引用并打印仓库路径 | [rev-parse.md](rev-parse.md) |
+| `libra rev-list` | | 列出从 revision 可达的 commit objects | [rev-list.md](rev-list.md) |
+| `libra rev-parse` | | 解析 revision names、缩写 refs 并打印仓库路径 | [rev-parse.md](rev-parse.md) |
 
 ### 分支与导航
 
 | 命令 | 别名 | 说明 | 文档 |
 |------|------|------|------|
 | `libra branch` | `br` | 创建、删除、重命名、列出和检查分支 | [branch.md](branch.md) |
+| `libra metadata` | | Branch/repo metadata key-value store（protect/archive/lineage foundation） | [metadata.md](metadata.md) |
 | `libra tag` | | 创建、列出或删除轻量标签和附注标签 | [tag.md](tag.md) |
 | `libra switch` | `sw` | 切换分支、创建新分支或分离 HEAD，并提供模糊建议 | [switch.md](switch.md) |
 | `libra checkout` | | 分支兼容表面和显式 `--` 路径恢复别名；优先使用 `switch` / `restore` | [checkout.md](checkout.md) |
@@ -89,20 +97,21 @@
 
 | 命令 | 别名 | 说明 | 文档 |
 |------|------|------|------|
-| `libra remote` | | 管理远程仓库：添加、移除、重命名、检查 URL、清理陈旧引用 | [remote.md](remote.md) |
-| `libra fetch` | | 从一个或所有远程下载对象并更新远程跟踪引用 | [fetch.md](fetch.md) |
-| `libra ls-remote` | | 不获取对象，列出远程仓库公布的引用 | [ls-remote.md](ls-remote.md) |
-| `libra push` | | 将本地提交和对象发送到远程，集成 LFS | [push.md](push.md) |
-| `libra pull` | | 获取并快进合并到当前分支 | [pull.md](pull.md) |
-| `libra open` | | 在系统浏览器中打开仓库远程 URL | [open.md](open.md) |
+| `libra remote` | | 管理远程仓库：添加、移除、重命名、检查 URL、清理陈旧 refs | [remote.md](remote.md) |
+| `libra fetch` | | 从一个或所有 remotes 下载对象并更新 remote-tracking refs | [fetch.md](fetch.md) |
+| `libra ls-remote` | | 不获取对象，列出远程仓库公布的 refs | [ls-remote.md](ls-remote.md) |
+| `libra push` | | 将本地 commits 和对象发送到远端，集成 LFS | [push.md](push.md) |
+| `libra pull` | | Fetch 并快进 merge 到当前分支 | [pull.md](pull.md) |
+| `libra open` | | 在系统浏览器中打开仓库 remote URL | [open.md](open.md) |
 | `libra lfs` | | 管理 Large File Storage：track、lock、unlock、列出 LFS 文件 | [lfs.md](lfs.md) |
-| `libra credential` | | Vault 支撑的 Git 凭证助手（fill/store/erase） | [credential.md](credential.md) |
+| `libra credential` | | Vault-backed Git credential helper（fill/store/erase） | [credential.md](credential.md) |
 
 ### 云与存储
 
 | 命令 | 别名 | 说明 | 文档 |
 |------|------|------|------|
 | `libra cloud` | | 通过 Cloudflare D1/R2 执行云备份和恢复操作 | [cloud.md](cloud.md) |
+| `libra cache` | | 检查 tiered-storage / LRU cache 配置（type、threshold、budget） | [cache.md](cache.md) |
 | `libra publish` | | 管理只读 Cloudflare Worker 发布 | [publish.md](publish.md) |
 | `libra worktree` | `wt` | 管理附加到仓库的多个工作树 | [worktree.md](worktree.md) |
 
@@ -113,31 +122,31 @@
 | `libra code` | | 带 AI agent、Web 服务器和 MCP 集成的交互式 TUI | [code.md](code.md) |
 | `libra code-control` | | 驱动本地 Libra Code TUI 自动化控制会话 | [code-control.md](code-control.md) |
 | Codex data storage | | 将 `libra code --provider codex` 连接到 Codex app-server，并持久化 Codex 会话数据 | [codex-data-storage.md](codex-data-storage.md) |
-| `libra automation` | | 列出、运行和检查 AI 自动化规则 | [automation.md](automation.md) |
+| `libra automation` | | 列出、运行和检查 AI automation rules | [automation.md](automation.md) |
 | `libra usage` | | 报告并修剪 AI provider/model 使用聚合 | [usage.md](usage.md) |
-| `libra graph` | | 在专用 TUI 中检查 Libra Code 线程版本图 | [graph.md](graph.md) |
-| `libra sandbox` | | 检查 AI 沙箱诊断，包括 OS 后端可用性和降级警告 | [sandbox.md](sandbox.md) |
-| `libra agent` | | 管理外部 agent 捕获、检查点、hooks 和 RPC 适配器 | [agent.md](agent.md) |
+| `libra graph` | | 在专用 TUI 中检查 Libra Code thread version graph | [graph.md](graph.md) |
+| `libra sandbox` | | 检查 AI sandbox diagnostics，包括 OS backend 可用性和 downgrade warnings | [sandbox.md](sandbox.md) |
+| `libra agent` | | 管理外部 agent 捕获、checkpoints、hooks 和 RPC adapters | [agent.md](agent.md) |
 
 ### 底层与检查
 
 | 命令 | 别名 | 说明 | 文档 |
 |------|------|------|------|
-| `libra apply` | | 检查 unified-diff 补丁能否应用（`--check`） | [apply.md](apply.md) |
-| `libra cat-file` | | 按类型、大小或漂亮打印内容检查 Git 对象和 AI 对象 | [cat-file.md](cat-file.md) |
-| `libra check-attr` | | 报告路径的 `.libra_attributes` 属性（如 `filter`） | [check-attr.md](check-attr.md) |
-| `libra check-mailmap` | | 通过 `.mailmap` 解析 `Name <email>` 联系人 | [check-mailmap.md](check-mailmap.md) |
-| `libra check-ignore` | | 报告哪些路径被 `.libraignore` 规则忽略 | [check-ignore.md](check-ignore.md) |
-| `libra fsck` | | 校验 Libra 仓库中对象、refs 和索引的完整性 | [fsck.md](fsck.md) |
-| `libra hash-object` | | 从文件或标准输入计算 Git 兼容 blob 对象 ID | [hash-object.md](hash-object.md) |
-| `libra write-tree` | | 把当前 index 写成一个 tree 对象 | [write-tree.md](write-tree.md) |
-| `libra read-tree` | | 把一个 tree 对象读入 index（仅 index） | [read-tree.md](read-tree.md) |
+| `libra apply` | | 检查 unified-diff patch 能否应用（`--check`） | [apply.md](apply.md) |
+| `libra cat-file` | | 按类型、大小或漂亮打印内容检查 Git objects 和 AI objects | [cat-file.md](cat-file.md) |
+| `libra check-attr` | | 报告 pathnames 的 `.libra_attributes` 属性（例如 `filter`） | [check-attr.md](check-attr.md) |
+| `libra check-mailmap` | | 通过 `.mailmap` 解析 `Name <email>` contacts | [check-mailmap.md](check-mailmap.md) |
+| `libra check-ignore` | | 报告哪些 pathnames 被 `.libraignore` rules 排除 | [check-ignore.md](check-ignore.md) |
+| `libra fsck` | | 校验 Libra 仓库中 objects、refs 和 index 的完整性 | [fsck.md](fsck.md) |
+| `libra hash-object` | | 从文件或标准输入计算 Git-compatible blob object IDs | [hash-object.md](hash-object.md) |
+| `libra write-tree` | | 把当前 index 写成一个 tree object | [write-tree.md](write-tree.md) |
+| `libra read-tree` | | 把一个 tree object 读入 index（仅 index） | [read-tree.md](read-tree.md) |
 | `libra update-index` | | 直接修改 index（add/remove/cacheinfo） | [update-index.md](update-index.md) |
 | `libra update-ref` | | 安全地更新、创建或删除 refs/heads/<branch> ref | [update-ref.md](update-ref.md) |
-| `libra verify-pack` | | 对照 pack 归档验证 pack index 文件 | [verify-pack.md](verify-pack.md) |
-| `libra show-ref` | | 列出本地 refs（分支、标签、HEAD）及其对象 ID | [show-ref.md](show-ref.md) |
-| `libra symbolic-ref` | | 读取或更新符号 HEAD 引用 | [symbolic-ref.md](symbolic-ref.md) |
-| `libra index-pack` | | 为现有 `.pack` 归档构建 `.idx` pack index 文件（隐藏） | [index-pack.md](index-pack.md) |
+| `libra verify-pack` | | 对照 pack archives 验证 pack index files | [verify-pack.md](verify-pack.md) |
+| `libra show-ref` | | 列出本地 refs（branches、tags、HEAD）及其 object IDs | [show-ref.md](show-ref.md) |
+| `libra symbolic-ref` | | 读取或更新 symbolic HEAD ref | [symbolic-ref.md](symbolic-ref.md) |
+| `libra index-pack` | | 为现有 `.pack` archive 构建 `.idx` pack index 文件（隐藏） | [index-pack.md](index-pack.md) |
 | `libra hooks` | | 外部 AI agent（Claude Code / Gemini）hook 入口；由 `libra agent enable` 安装的配置调用（隐藏） | [hooks.md](hooks.md) |
 
 ## 结构化输出信封
@@ -184,9 +193,9 @@ Libra 的命令行接口基于以下原则设计：
 
 1. **在合理处保持 Git 兼容** — 大多数命令复用 Git 的标志名和行为，让既有肌肉记忆可以直接迁移。
 2. **结构化输出是一等能力** — `--json` 和 `--machine` 是全局标志，并且随着每个命令表面现代化逐步启用结构化输出。各命令页面会记录当前稳定的机器可读契约。
-3. **SQLite 优先于扁平文件** — Refs、config 和元数据存储在 SQLite 中，以获得事务一致性和原子更新。
-4. **默认安全** — 默认启用 vault 支撑的签名和密钥加密，而不是要求用户显式选择。
-5. **显式优先于隐式** — `clean` 等命令要求 `-f` 或 `-n`；`status --exit-code` 是显式选择，而不是 Git 中含糊的退出码行为。
+3. **SQLite 优先于扁平文件** — Refs、config 和 metadata 存储在 SQLite 中，以获得事务一致性和原子更新。
+4. **默认安全** — 默认启用 vault-backed signing 和 secret encryption，而不是要求用户显式选择。
+5. **显式优先于隐式** — `clean` 等命令要求 `-f` 或 `-n`；`status --exit-code` 是显式 opt-in，而不是 Git 中含糊的退出码行为。
 6. **可操作的错误** — 每个错误都包含稳定代码（`LBR-*`）、人类可读消息和解决提示。
-7. **AI 原生开发** — `libra code` 命令将 AI agent 直接集成到版本控制工作流，并支持多 provider 和 MCP 协议。
+7. **AI 原生开发** — `libra code` 命令将 AI agents 直接集成到版本控制工作流，并支持多 provider 和 MCP 协议。
 8. **云原生存储** — 内置分层存储（S3/R2）和云备份（D1/R2），服务分布式 monorepo 工作流。

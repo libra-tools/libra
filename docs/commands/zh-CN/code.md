@@ -112,7 +112,7 @@ Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 
 
 请求 `--browser-control loopback` 且浏览器持有 active lease 时，TUI 初始 controller 是 `LocalTui`（可见 owner，可 reclaim），而不是 `Fixed { Tui }`（永久阻塞）。如果 TUI 也想驱动写入，必须同时提供 `--control write` 和 `--browser-control loopback`；两个 writer 通过同一个 `TuiControlCommand` channel 串行化。
 
-对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 Phase 3 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../src/internal/ai/web/headless.rs)，直接运行 agent 的 tool loop，使浏览器可以驱动真实会话，无需终端。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`；`--resume <thread_id>` 会为相同工作目录恢复持久化 transcript/history。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。
+对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 Phase 3 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs)，直接运行 agent 的 tool loop，使浏览器可以驱动真实会话，无需终端。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`；`--resume <thread_id>` 会为相同工作目录恢复持久化 transcript/history。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。
 
 ### Code UI Wire Contract
 

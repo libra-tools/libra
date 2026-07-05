@@ -431,6 +431,12 @@ enum Commands {
         after_help = command::auth::AUTH_EXAMPLES
     )]
     Auth(command::auth::AuthArgs),
+    #[command(about = "Log in to Libra website account via browser")]
+    Login(command::account::LoginArgs),
+    #[command(about = "Show the current Libra website account session")]
+    Whoami(command::account::WhoamiArgs),
+    #[command(about = "Log out of the Libra website account session")]
+    Logout(command::account::LogoutArgs),
     #[command(
         about = "Look up revisions by ordinal on a branch's first-parent chain (Libra extension)",
         after_help = command::revision::REVISION_EXAMPLES
@@ -1326,6 +1332,9 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         // `auth` manages host-global tokens in the GLOBAL store; it works
         // outside a repository and touches no objects.
         | Commands::Auth(_)
+        | Commands::Login(_)
+        | Commands::Whoami(_)
+        | Commands::Logout(_)
         | Commands::Sandbox(_) => Ok(CommandPreflight::none()),
         // `cache info` only inspects env/config-derived storage tunables and
         // works outside a repository; `cache evict` deletes local objects, so
@@ -1654,6 +1663,9 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Metadata(cmd_args) => command::metadata::execute_safe(cmd_args, &output).await?,
         Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
         Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,
+        Commands::Login(cmd_args) => command::account::login(cmd_args, &output).await?,
+        Commands::Whoami(cmd_args) => command::account::whoami(cmd_args, &output).await?,
+        Commands::Logout(cmd_args) => command::account::logout(cmd_args, &output).await?,
         Commands::Revision(cmd_args) => command::revision::execute_safe(cmd_args, &output).await?,
         Commands::Service(cmd_args) => command::service::execute_safe(cmd_args, &output).await?,
         Commands::Shortlog(cmd_args) => command::shortlog::execute_safe(cmd_args, &output).await?,
