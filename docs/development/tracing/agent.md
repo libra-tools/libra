@@ -1565,8 +1565,8 @@ Rules：
 | `transcript_readable` | core `ObservedAgent::read_transcript` 可用且 adapter 不返回 preview-only `NotYetImplemented` | stable-promoted 可 true，但非首批仍 `supported=false` |
 | `hook_installable` | `agent.as_hooks().is_some() && supported` | capability + roster 双门控 |
 | `installed` | `as_hooks().hooks_are_installed()` | 只在 `hook_installable=true` 时调用；否则 false |
-| `launchable_review` | launch capability + supported + AG-22 ready | registered/readable 不等于 launchable |
-| `launchable_investigate` | launch capability + supported + AG-23 ready | 与 review 分开 |
+| `launchable_review` | registry row `launchable_review`（AG-22 已落地：首批 `claude-code`/`codex`/`opencode` 为 true；`libra review` launcher 以该 flag 为唯一门控事实源，supported ≠ launchable） | registered/readable 不等于 launchable |
+| `launchable_investigate` | registry row `launchable_investigate`（AG-23 未落地：当前所有行一律 false） | 与 review 分开 |
 | `external_binary` | RPC shim registration | built-in false；external true 且必须带 absolute path |
 | `capabilities` | `DeclaredAgentCaps` | 8-bool wire shape，字段名固定 |
 

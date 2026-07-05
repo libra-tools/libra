@@ -109,6 +109,9 @@ pub mod permission;
 pub mod prompt;
 // One submodule per LLM backend; each implements CompletionModel.
 pub mod providers;
+// AG-22 read-only agent review workflow engine (run store, reviewer
+// launcher, fan-in sink, terminal states).
+pub mod review;
 // Process-level runtime for long-running agents.
 pub mod runtime;
 // Filesystem/network sandbox shared by every tool handler.

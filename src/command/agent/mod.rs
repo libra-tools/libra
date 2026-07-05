@@ -25,6 +25,10 @@ mod doctor;
 mod hooks;
 mod list;
 mod push;
+// `libra review` is a TOP-LEVEL command (AG-22; `Commands::Review` in
+// `src/cli.rs`); its implementation lives here so it can reuse the
+// AG-20 `pub(super)` pagination helpers in `checkpoint.rs`.
+pub mod review;
 mod rpc;
 mod session;
 mod status;
@@ -159,6 +163,18 @@ pub struct CleanArgs {
     /// most recent.
     #[arg(long)]
     pub all: bool,
+
+    /// Retention GC (AG-24a): drop checkpoints from stopped sessions older
+    /// than `agent.retention.transcript_days` (default 90), regardless of
+    /// scope. Never touches the append-only `agent_audit_log`. Mutually
+    /// informative with `--all` (GC always spans every stopped session).
+    #[arg(long)]
+    pub gc: bool,
+
+    /// Override the transcript retention window (days) for this `--gc` run
+    /// instead of reading `agent.retention.transcript_days`.
+    #[arg(long, value_name = "DAYS", requires = "gc")]
+    pub retention_days: Option<u32>,
 }
 
 #[derive(Args, Debug)]

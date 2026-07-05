@@ -757,11 +757,17 @@ pub(crate) fn cleanup_task_worktree(worktree: TaskWorktree) -> io::Result<()> {
 /// ([`SubAgentWorkspace::cleanup`]) without touching the worktree
 /// internals.
 ///
+/// Nominal visibility is `pub` (the module itself stays `pub(crate)`)
+/// so the AG-22 `materialize_isolated_workspace` seam — a `pub fn` on a
+/// fully public path — can return it without a `private_interfaces`
+/// lint; outside the crate the type is reachable through that seam but
+/// not nameable.
+///
 // `allow(dead_code)`: the materialization abstraction lands ahead of the
 // flag-gated sub-agent dispatcher wiring that calls it (a later CEX-S2-11
 // slice), matching the doc's "abstraction before runtime" sequencing.
 #[allow(dead_code)]
-pub(crate) struct SubAgentWorkspace {
+pub struct SubAgentWorkspace {
     worktree: TaskWorktree,
     strategy: WorkspaceStrategy,
 }
@@ -769,12 +775,12 @@ pub(crate) struct SubAgentWorkspace {
 #[allow(dead_code)]
 impl SubAgentWorkspace {
     /// Filesystem root the sub-agent should run in.
-    pub(crate) fn root(&self) -> &Path {
+    pub fn root(&self) -> &Path {
         &self.worktree.root
     }
 
     /// The strategy recorded in the `workspace_materialized` event.
-    pub(crate) fn strategy(&self) -> WorkspaceStrategy {
+    pub fn strategy(&self) -> WorkspaceStrategy {
         self.strategy
     }
 
@@ -783,22 +789,25 @@ impl SubAgentWorkspace {
     /// object-store-sharing worktrees and sparse checkout land, every
     /// strategy is physically materialized through
     /// [`prepare_task_worktree`].
-    pub(crate) fn backend(&self) -> TaskWorkspaceBackend {
+    pub fn backend(&self) -> TaskWorkspaceBackend {
         self.worktree.backend()
     }
 
     /// Tear down the workspace (unmount FUSE / remove the copy). Per
     /// CEX-S2-11 (5) this must run on run completion so workspaces do not
     /// leak.
-    pub(crate) fn cleanup(self) -> io::Result<()> {
+    pub fn cleanup(self) -> io::Result<()> {
         cleanup_task_worktree(self.worktree)
     }
 }
 
 /// Error materializing a sub-agent's isolated workspace.
+///
+/// `pub` (not `pub(crate)`) for the same seam-signature reason as
+/// [`SubAgentWorkspace`].
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SubAgentWorkspaceError {
+pub enum SubAgentWorkspaceError {
     /// The preferred strategy could not be materialized and full-copy
     /// fallback was not permitted (`agent.allow_full_copy = false`).
     /// Surfaced WITHOUT touching the filesystem.

@@ -596,7 +596,8 @@ impl SubAgentDispatcher for DefaultSubAgentDispatcher {
                     TaskFailure,
                 > = match self.workspace_isolation.as_ref() {
                     Some(isolation) => {
-                        match materialize_isolated_workspace(&ctx, agent_run_id, isolation) {
+                        match materialize_isolated_dispatch_workspace(&ctx, agent_run_id, isolation)
+                        {
                             Ok((registry, runtime_context, workspace)) => {
                                 workspace_guard.workspace = Some(workspace);
                                 Ok((Some(registry), runtime_context))
@@ -725,17 +726,86 @@ impl SubAgentDispatcher for DefaultSubAgentDispatcher {
     }
 }
 
+/// Materialize a per-run isolated workspace and record the
+/// `workspace_materialized` audit event (CEX-S2-12 / S2-INV-03).
+///
+/// **AG-22 / plan.md Task A7 public seam — this is the mandatory
+/// reviewer isolation path.** External review agents (`libra review`)
+/// must run inside a workspace materialized through *this* function,
+/// never in the main worktree: the materialization walk honours ignore
+/// rules (`WalkBuilder::git_ignore(true)`), so gitignored secret files
+/// (e.g. `.env.test`) are excluded from what a reviewer process can
+/// read — the first line of defense against secret exfiltration
+/// (redaction of persisted reviewer output is only the on-disk
+/// fallback). Exposure choice: the fn is `pub` in place here, beside
+/// the sub-agent dispatcher that owns the isolation mechanics, and is
+/// re-exported at [`crate::internal::ai::review`] as the
+/// reviewer-facing path.
+///
+/// `main_working_dir` is the repo worktree to mirror; `thread_id` only
+/// names the audit transcript path
+/// `.libra/sessions/{thread_id}/agents/{run_id}.jsonl` the
+/// `workspace_materialized` event is appended to (rooted at
+/// `isolation.sessions_root`).
+///
+/// The returned [`SubAgentWorkspace`] must be held by the caller until
+/// the run completes and then torn down via
+/// [`SubAgentWorkspace::cleanup`] (no leaked workspaces,
+/// CEX-S2-11 (5)). When isolation is required, materialization failure
+/// is terminal for the caller: falling back to the main worktree would
+/// violate S2-INV-03 (and, for reviewers, plan.md:946).
+///
+/// [`SubAgentWorkspace`]: crate::internal::ai::orchestrator::workspace::SubAgentWorkspace
+/// [`SubAgentWorkspace::cleanup`]: crate::internal::ai::orchestrator::workspace::SubAgentWorkspace::cleanup
+pub fn materialize_isolated_workspace(
+    main_working_dir: &std::path::Path,
+    thread_id: uuid::Uuid,
+    agent_run_id: AgentRunId,
+    isolation: &super::sub_agent::WorkspaceIsolationConfig,
+) -> Result<
+    crate::internal::ai::orchestrator::workspace::SubAgentWorkspace,
+    crate::internal::ai::orchestrator::workspace::SubAgentWorkspaceError,
+> {
+    use crate::internal::ai::{
+        agent_run::{event_store::AgentRunEventStore, workspace_sizing::measure_workspace_sizing},
+        orchestrator::workspace::materialize_sub_agent_workspace,
+    };
+
+    let sizing = measure_workspace_sizing(
+        &main_working_dir.join(crate::utils::util::ROOT_DIR),
+        main_working_dir,
+    );
+    let store = AgentRunEventStore::new(isolation.sessions_root.clone());
+
+    materialize_sub_agent_workspace(
+        main_working_dir,
+        sizing,
+        thread_id,
+        agent_run_id,
+        isolation.allow_full_copy,
+        &isolation.fuse_state,
+        &store,
+    )
+}
+
 /// Materialize an isolated workspace for a sub-agent run and return the
 /// re-rooted child tool registry + the inherited runtime context with
 /// its sandbox `writable_roots` rebased onto the workspace
 /// (CEX-S2-12 / S2-INV-03).
+///
+/// Dispatcher-internal wrapper over the public
+/// [`materialize_isolated_workspace`] seam: the workspace mechanics are
+/// shared with the AG-22 reviewer path; only the registry re-root and
+/// sandbox rebase below are sub-agent-dispatch specific.
 ///
 /// The returned [`SubAgentWorkspace`] must be held by the caller until
 /// the child run completes and then cleaned up (no leaked workspaces,
 /// CEX-S2-11 (5)). When isolation is configured, materialization
 /// failure is terminal for the dispatch: running a mutating child
 /// against the main worktree would violate S2-INV-03.
-fn materialize_isolated_workspace(
+///
+/// [`SubAgentWorkspace`]: crate::internal::ai::orchestrator::workspace::SubAgentWorkspace
+fn materialize_isolated_dispatch_workspace(
     ctx: &DispatchContext<'_>,
     agent_run_id: AgentRunId,
     isolation: &super::sub_agent::WorkspaceIsolationConfig,
@@ -747,32 +817,15 @@ fn materialize_isolated_workspace(
     ),
     crate::internal::ai::orchestrator::workspace::SubAgentWorkspaceError,
 > {
-    use crate::internal::ai::{
-        agent_run::{event_store::AgentRunEventStore, workspace_sizing::measure_workspace_sizing},
-        orchestrator::workspace::materialize_sub_agent_workspace,
-    };
-
     let main_working_dir = ctx.tool_registry.working_dir().to_path_buf();
-    let sizing = measure_workspace_sizing(
-        &main_working_dir.join(crate::utils::util::ROOT_DIR),
-        &main_working_dir,
-    );
     // `thread_id` only names the `WorkspaceMaterialized` transcript
     // path; `parent_thread_id` is a free-form `String` today, so parse
     // with a fresh-uuid fallback.
     let thread_id =
         uuid::Uuid::parse_str(ctx.parent_thread_id).unwrap_or_else(|_| uuid::Uuid::new_v4());
-    let store = AgentRunEventStore::new(isolation.sessions_root.clone());
 
-    let workspace = materialize_sub_agent_workspace(
-        &main_working_dir,
-        sizing,
-        thread_id,
-        agent_run_id,
-        isolation.allow_full_copy,
-        &isolation.fuse_state,
-        &store,
-    )?;
+    let workspace =
+        materialize_isolated_workspace(&main_working_dir, thread_id, agent_run_id, isolation)?;
 
     let workspace_root = workspace.root().to_path_buf();
     // Re-root the child registry onto the workspace, aliasing the
@@ -2670,7 +2723,7 @@ mod tests {
         };
 
         let (registry, rebased_ctx, workspace) =
-            materialize_isolated_workspace(&context, AgentRunId::new(), &isolation)
+            materialize_isolated_dispatch_workspace(&context, AgentRunId::new(), &isolation)
                 .expect("materialization must succeed on a plain temp worktree");
 
         let workspace_root = workspace.root().to_path_buf();

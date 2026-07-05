@@ -8,8 +8,8 @@
 use std::collections::BTreeSet;
 
 use libra::internal::ai::observed_agents::{
-    AgentKind, DeclaredAgentCaps, FIRST_BATCH_WAVE, SlugLookup, agent_for, lookup_cli_slug,
-    registration_for, registry, supported_slugs,
+    AgentKind, DeclaredAgentCaps, FIRST_BATCH_WAVE, SlugLookup, agent_for, launchable_review_slugs,
+    lookup_cli_slug, registration_for, registry, supported_slugs,
 };
 
 /// E1: `DeclaredAgentCaps` serializes to exactly the 8 frozen snake_case
@@ -102,6 +102,37 @@ fn known_agent_capability_matrix_matches_current_roster() {
     );
     assert!(opencode.capabilities.hooks);
     assert_eq!(opencode.config_paths, [".opencode/plugin/libra-hooks.js"]);
+
+    // AG-22: the first batch is review-launchable — `libra review`
+    // gates on this exact flag, so the matrix row and the launcher can
+    // never disagree. `launchable_investigate` stays false until AG-23.
+    assert_eq!(
+        launchable_review_slugs(),
+        ["claude-code", "codex", "opencode"],
+        "the review-launchable roster is exactly the first-batch trio"
+    );
+    for kind in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode] {
+        let row = registration_for(kind);
+        assert!(
+            row.launchable_review,
+            "{}: first-batch rows are review-launchable since AG-22",
+            row.slug
+        );
+        assert!(
+            !row.launchable_investigate,
+            "{}: investigate launchability is AG-23 (not landed)",
+            row.slug
+        );
+    }
+    for row in registry() {
+        if row.launchable_review {
+            assert!(
+                row.supported,
+                "{}: launchable_review implies supported, never the reverse",
+                row.slug
+            );
+        }
+    }
 
     // Non-first-batch agents must never be exposed as installable or
     // launchable (E9 quarantine/unsupported rule).

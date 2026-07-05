@@ -62,8 +62,8 @@ pub use redaction::{
     RedactedBytes, RedactedSink, RedactionMatch, RedactionReport, RedactionRule, Redactor,
 };
 pub use registry::{
-    AgentRegistration, FIRST_BATCH_WAVE, SlugLookup, lookup_cli_slug, registration_for, registry,
-    supported_slugs,
+    AgentRegistration, FIRST_BATCH_WAVE, SlugLookup, launchable_review_slugs, lookup_cli_slug,
+    registration_for, registry, supported_slugs,
 };
 pub use rpc::{
     AgentInfo, RPC_BINARY_PREFIX, RPC_DEFAULT_TIMEOUT, RPC_MAX_STDERR_BYTES, RPC_PROTOCOL_VERSION,

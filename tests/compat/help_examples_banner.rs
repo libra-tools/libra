@@ -106,6 +106,7 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "graph",
     "sandbox",
     "agent",
+    "review",
     "maintenance",
     "completions",
     "logfile",
