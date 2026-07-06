@@ -740,6 +740,42 @@ impl McpServerHandle {
 // Mode: Web-only — headless web + MCP servers (no TUI)
 // ---------------------------------------------------------------------------
 
+/// Which Code UI runtime a `--web-only` invocation dispatches to, decided
+/// purely from the selected provider.
+///
+/// This is the single source of truth for the provider branch in
+/// [`execute_web_only`]. The exhaustive match in [`web_only_runtime_kind`]
+/// means a newly added [`CodeProvider`] variant forces a compile-time routing
+/// decision here instead of silently falling through to a default. Per-provider
+/// reachability is pinned by the `web_only_runtime_kind_routes_*` unit tests so
+/// the Task C2 validation relaxation — which now lets every provider reach this
+/// dispatch — cannot regress into a misrouted or unreachable runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebOnlyRuntimeKind {
+    /// Codex → managed app-server child process + `start_codex_code_ui_runtime`.
+    ManagedCodexAppServer,
+    /// Every other accepted provider → `HeadlessCodeRuntime` via
+    /// `build_non_codex_headless_runtime` (falling back to the read-only
+    /// placeholder only if that dispatcher declines the provider).
+    Headless,
+}
+
+/// Classify the web-only runtime for `provider`. See [`WebOnlyRuntimeKind`].
+fn web_only_runtime_kind(provider: CodeProvider) -> WebOnlyRuntimeKind {
+    match provider {
+        CodeProvider::Codex => WebOnlyRuntimeKind::ManagedCodexAppServer,
+        CodeProvider::Gemini
+        | CodeProvider::Openai
+        | CodeProvider::Anthropic
+        | CodeProvider::Deepseek
+        | CodeProvider::Kimi
+        | CodeProvider::Zhipu
+        | CodeProvider::Ollama => WebOnlyRuntimeKind::Headless,
+        #[cfg(feature = "test-provider")]
+        CodeProvider::Fake => WebOnlyRuntimeKind::Headless,
+    }
+}
+
 /// Runs the web server and MCP server without a terminal UI.
 ///
 /// Blocks on `Ctrl-C`, then performs graceful shutdown of both servers.
@@ -763,56 +799,57 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     let mcp_server = init_mcp_server(&working_dir).await;
 
     let mut managed_codex_server = None;
-    let code_ui_runtime = if args.provider == CodeProvider::Codex {
-        let server =
-            start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
-        println!("Starting Libra Code Web UI with Codex provider");
-        println!("Working directory: {}", working_dir.display());
-        println!("Codex WebSocket: {}", server.ws_url);
-        println!("Codex app-server: auto-started");
-        println!("Browser control: {}", browser_control.as_str());
-        managed_codex_server = Some(server);
+    let code_ui_runtime =
+        if web_only_runtime_kind(args.provider) == WebOnlyRuntimeKind::ManagedCodexAppServer {
+            let server =
+                start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
+            println!("Starting Libra Code Web UI with Codex provider");
+            println!("Working directory: {}", working_dir.display());
+            println!("Codex WebSocket: {}", server.ws_url);
+            println!("Codex app-server: auto-started");
+            println!("Browser control: {}", browser_control.as_str());
+            managed_codex_server = Some(server);
 
-        let ws_url = managed_codex_server
-            .as_ref()
-            .map(|server| server.ws_url.as_str())
-            .unwrap_or_default();
-        start_codex_code_ui_runtime(
-            args,
-            &working_dir,
-            ws_url,
-            mcp_server.clone(),
-            browser_control == BrowserControlMode::Loopback,
-            CodeUiInitialController::Unclaimed,
-        )
-        .await?
-    } else {
-        let storage_root = resolve_storage_root(&working_dir);
-        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
-        let session_state =
-            load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
-        // Phase 3 v0 routes the supported providers through the new
-        // headless runtime. Anything not yet hooked up keeps the read-only
-        // placeholder so we fail closed rather than panicking on attach.
-        match build_non_codex_headless_runtime(
-            args,
-            &working_dir,
-            session_store,
-            session_state,
-            browser_control == BrowserControlMode::Loopback,
-        )
-        .await?
-        {
-            Some(runtime) => {
-                println!("Starting Libra Code Web UI in headless mode");
-                println!("Working directory: {}", working_dir.display());
-                println!("Provider: {:?}", args.provider);
-                println!("Browser control: {}", browser_control.as_str());
-                runtime
+            let ws_url = managed_codex_server
+                .as_ref()
+                .map(|server| server.ws_url.as_str())
+                .unwrap_or_default();
+            start_codex_code_ui_runtime(
+                args,
+                &working_dir,
+                ws_url,
+                mcp_server.clone(),
+                browser_control == BrowserControlMode::Loopback,
+                CodeUiInitialController::Unclaimed,
+            )
+            .await?
+        } else {
+            let storage_root = resolve_storage_root(&working_dir);
+            let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+            let session_state =
+                load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
+            // Phase 3 v0 routes the supported providers through the new
+            // headless runtime. Anything not yet hooked up keeps the read-only
+            // placeholder so we fail closed rather than panicking on attach.
+            match build_non_codex_headless_runtime(
+                args,
+                &working_dir,
+                session_store,
+                session_state,
+                browser_control == BrowserControlMode::Loopback,
+            )
+            .await?
+            {
+                Some(runtime) => {
+                    println!("Starting Libra Code Web UI in headless mode");
+                    println!("Working directory: {}", working_dir.display());
+                    println!("Provider: {:?}", args.provider);
+                    println!("Browser control: {}", browser_control.as_str());
+                    runtime
+                }
+                None => build_placeholder_web_code_ui_runtime(args, &working_dir).await,
             }
-            None => build_placeholder_web_code_ui_runtime(args, &working_dir).await,
-        }
-    };
+        };
     mcp_server.set_code_ui_session(code_ui_runtime.adapter().session());
 
     let web_handle = match start_web_server(
@@ -5865,6 +5902,71 @@ no_cache_unknown_network = true
         assert_eq!(snapshot.provider.provider, "fake");
         assert_eq!(snapshot.provider.mode.as_deref(), Some("web-headless"));
         assert_eq!(snapshot.provider.model.as_deref(), Some("fake-local"));
+    }
+
+    /// C4 reachability regression (first dispatch layer): the web-only
+    /// provider branch in `execute_web_only` decides purely through
+    /// `web_only_runtime_kind`. Pin every accepted provider to its intended
+    /// runtime so the Task C2 validation relaxation — which now lets the
+    /// non-Gemini providers reach this dispatch — cannot silently misroute a
+    /// provider or strand one on the read-only placeholder.
+    #[test]
+    fn web_only_runtime_kind_routes_each_provider_to_its_runtime() {
+        // Codex is the only provider that drives the managed app-server child.
+        assert_eq!(
+            web_only_runtime_kind(CodeProvider::Codex),
+            WebOnlyRuntimeKind::ManagedCodexAppServer,
+        );
+        // Every other accepted provider reaches the headless runtime via
+        // `build_non_codex_headless_runtime`.
+        for provider in [
+            CodeProvider::Gemini,
+            CodeProvider::Openai,
+            CodeProvider::Anthropic,
+            CodeProvider::Deepseek,
+            CodeProvider::Kimi,
+            CodeProvider::Zhipu,
+            CodeProvider::Ollama,
+        ] {
+            assert_eq!(
+                web_only_runtime_kind(provider),
+                WebOnlyRuntimeKind::Headless,
+                "provider {provider:?} must reach the headless web runtime",
+            );
+        }
+        #[cfg(feature = "test-provider")]
+        assert_eq!(
+            web_only_runtime_kind(CodeProvider::Fake),
+            WebOnlyRuntimeKind::Headless,
+        );
+    }
+
+    /// C4 reachability regression (second dispatch layer): Codex must never
+    /// enter `build_non_codex_headless_runtime`. `execute_web_only` already
+    /// routes it to the managed app-server path via `web_only_runtime_kind`,
+    /// but the dispatcher itself also fails closed with `Ok(None)` so a future
+    /// refactor cannot silently build a headless completion model for Codex.
+    #[tokio::test]
+    async fn build_non_codex_headless_runtime_excludes_codex_provider() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut args = base_args();
+        args.provider = CodeProvider::Codex;
+        let session_store = Arc::new(SessionStore::from_storage_path(&tmp.path().join(".libra")));
+        let session_state = SessionState::new(&tmp.path().to_string_lossy());
+
+        let runtime = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            session_store,
+            session_state,
+            false,
+        )
+        .await
+        .expect("Codex arm must return Ok(None), not an error");
+        assert!(
+            runtime.is_none(),
+            "Codex must be excluded from the non-Codex headless dispatcher",
+        );
     }
 
     /// Scenario: `--provider gemini --model gpt-foo --agent planner`
