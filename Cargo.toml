@@ -25,7 +25,7 @@ keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release build
 
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
-git-internal = "0.8.1"
+git-internal = "0.8.2"
 anyhow = "1.0.102"
 byte-unit = "5.2.0"
 byteorder = "1.5.0"
