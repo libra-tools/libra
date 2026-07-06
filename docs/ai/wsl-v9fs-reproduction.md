@@ -4,6 +4,39 @@ This document shows how to reproduce the original `creation time is not availabl
 
 The bug only appears when the Libra worktree is on a filesystem where Rust `std::fs::Metadata::created()` returns `Unsupported`. In WSL this is most likely on a Windows-mounted or 9p/v9fs-backed path, not on the normal Linux ext4 home directory.
 
+## 0. Repositories and Fixed Commits
+
+Use these repository URLs and commit ids for the commands below:
+
+```bash
+LIBRA_URL="https://github.com/Ivanbeethoven/libra.git"
+GIT_INTERNAL_URL="https://github.com/Ivanbeethoven/git-internal.git"
+
+# Pre-fix Libra commit used to reproduce the panic.
+LIBRA_VULNERABLE_COMMIT="1b4665f0"
+
+# Fixed git-internal commit.
+GIT_INTERNAL_FIX_COMMIT="20d2810"
+
+# Libra commit that adds the local git-internal override.
+LIBRA_OVERRIDE_COMMIT="4d3e11d7"
+```
+
+The fixed local validation layout must keep both repositories as siblings:
+
+```text
+libra-v9fs-repro/
+├── git-internal/
+└── libra-fixed/
+```
+
+That sibling layout matters because `libra/Cargo.toml` contains:
+
+```toml
+[patch.crates-io]
+git-internal = { path = "../git-internal" }
+```
+
 ## 1. Pick a Reproduction Directory
 
 Run these commands inside WSL:
@@ -63,9 +96,9 @@ If `created = Ok(...)`, this exact WSL path may not reproduce the original issue
 Use the pre-fix `libra` commit, before the local `git-internal` override was added:
 
 ```bash
-git clone https://github.com/Ivanbeethoven/libra.git libra-vulnerable
+git clone "$LIBRA_URL" libra-vulnerable
 cd libra-vulnerable
-git checkout 1b4665f0
+git checkout "$LIBRA_VULNERABLE_COMMIT"
 ```
 
 Build only the Rust binary. `LIBRA_SKIP_WEB_BUILD=1` avoids requiring `pnpm` for this reproduction:
@@ -110,18 +143,18 @@ Clone both repositories as siblings on the same WSL filesystem:
 
 ```bash
 cd ..
-git clone https://github.com/Ivanbeethoven/git-internal.git git-internal
-git clone https://github.com/Ivanbeethoven/libra.git libra-fixed
+git clone "$GIT_INTERNAL_URL" git-internal
+git clone "$LIBRA_URL" libra-fixed
 ```
 
 The fixed commits are:
 
 ```bash
 cd git-internal
-git merge-base --is-ancestor 20d2810 HEAD && echo "git-internal fix is present"
+git merge-base --is-ancestor "$GIT_INTERNAL_FIX_COMMIT" HEAD && echo "git-internal fix is present"
 
 cd ../libra-fixed
-git merge-base --is-ancestor 4d3e11d7 HEAD && echo "libra local override is present"
+git merge-base --is-ancestor "$LIBRA_OVERRIDE_COMMIT" HEAD && echo "libra local override is present"
 ```
 
 Confirm `libra` is patched to use the sibling `git-internal` checkout:
