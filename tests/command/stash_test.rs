@@ -10,7 +10,7 @@ use libra::{
         commit::{self, CommitArgs},
     },
     internal::branch::Branch,
-    utils::test::ChangeDirGuard,
+    utils::{error::StableErrorCode, test::ChangeDirGuard},
 };
 use serial_test::serial;
 use tempfile::tempdir;
@@ -24,6 +24,12 @@ fn latest_stash_commit(repo: &Path) -> Commit {
     let stash_hash =
         ObjectHash::from_str(stash_ref.trim()).expect("refs/stash must contain a valid object id");
     load_object::<Commit>(&stash_hash).expect("failed to load latest stash commit")
+}
+
+fn status_short(repo: &Path) -> String {
+    let output = run_libra_command(&["status", "--short"], repo);
+    assert_cli_success(&output, "status --short");
+    String::from_utf8(output.stdout).expect("status --short output should be UTF-8")
 }
 
 #[test]
@@ -302,6 +308,108 @@ async fn test_stash_push_and_pop_preserves_dotfiles() {
         fs::read_to_string(".config/tool.toml").unwrap(),
         "mode = \"stashed\"\n",
         "dot-directory change should round-trip through stash"
+    );
+}
+
+#[test]
+fn test_stash_pop_restores_unstaged_change_without_staging() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a tracked file has only a working-tree edit.
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: the edit is back in the working tree but remains unstaged, matching
+    // Git's default `stash pop` behavior.
+    assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_restores_staged_only_change_as_unstaged_by_default() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a tracked file has only a staged edit.
+    fs::write(p.join("tracked.txt"), "staged version\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage tracked file",
+    );
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: default pop restores the content as an unstaged working-tree edit.
+    assert_eq!(
+        fs::read_to_string(p.join("tracked.txt")).unwrap(),
+        "staged version\n"
+    );
+    assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_restores_mixed_file_as_unstaged_worktree_content() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a file has both staged content and a newer working-tree edit.
+    fs::write(p.join("tracked.txt"), "staged version\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage tracked file",
+    );
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: the working-tree content wins, but the index remains at HEAD.
+    assert_eq!(
+        fs::read_to_string(p.join("tracked.txt")).unwrap(),
+        "worktree version\n"
+    );
+    assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_reports_index_load_failure_without_dropping_stash() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a valid stash exists, then the on-disk index becomes unreadable.
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+    fs::write(p.join(".libra").join("index"), b"garb").unwrap();
+
+    // When: default pop tries to build the current-worktree side of the merge.
+    let output = run_libra_command(&["stash", "pop"], p);
+
+    // Then: the index load failure is reported instead of treating the index as
+    // empty, and pop leaves the stash entry in place.
+    assert_eq!(output.status.code(), Some(128));
+    let (human, report) = parse_cli_error_stderr(&output.stderr);
+    assert!(
+        human.contains("failed to load index"),
+        "unexpected human stderr: {human}"
+    );
+    assert_eq!(report.error_code, StableErrorCode::IoReadFailed.as_str());
+    assert!(
+        report.message.contains("failed to load index"),
+        "unexpected JSON message: {}",
+        report.message
+    );
+
+    let list = run_libra_command(&["stash", "list"], p);
+    assert_cli_success(&list, "stash list after failed pop");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("stash@{0}:"),
+        "failed pop must keep the stash entry"
     );
 }
 
