@@ -278,6 +278,10 @@ name = "compat_format_patch_flag_surface"
 path = "tests/compat/format_patch_flag_surface.rs"
 
 [[test]]
+name = "compat_installer_https_examples_guard"
+path = "tests/compat/installer_https_examples_guard.rs"
+
+[[test]]
 name = "compat_otlp_feature_gate_guard"
 path = "tests/compat/otlp_feature_gate_guard.rs"
 
