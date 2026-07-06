@@ -77,7 +77,7 @@
 | `restore --overlay` | `cli.restore-reset-diff` | 已实现：overlay 模式仅创建/更新 source 中的路径、不移除 source 中缺失的已跟踪路径，runner 正向断言成功 |
 | `restore --no-overlay` | `cli.restore-reset-diff` | 已实现：与 `--overlay` 构成 last-wins 切换，默认行为（移除 source 中缺失路径），runner 正向断言成功 |
 | `restore --pathspec-from-file` | `cli.restore-reset-diff` | 已实现；负向步骤因 pathspec 文件缺失而失败（非「未实现」），runner 负向断言 |
-| `reset HEAD -- <path>` | `cli.restore-reset-diff` | 路径级 reset 只取消暂存 |
+| `reset <path>` / `reset HEAD -- <path>` | `cli.restore-reset-diff` | 路径级 reset 只取消暂存；revision/path 同名时用 `--` 消歧 |
 | `reset --soft` | `cli.restore-reset-diff` | 只移动 HEAD，保留 index/工作区 |
 | `reset --mixed` | `cli.restore-reset-diff` | 移动 HEAD 并重置 index |
 | `reset --hard` | `cli.restore-reset-diff` | HEAD、index、工作区全部回到目标 revision |

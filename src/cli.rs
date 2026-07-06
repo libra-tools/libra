@@ -1024,6 +1024,80 @@ fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
     out
 }
 
+fn rewrite_reset_pathspec_separator_args(args: Vec<String>) -> Vec<String> {
+    let subcommand = find_subcommand_index(&args);
+    let Some((reset_index, from_double_dash)) = subcommand else {
+        return args;
+    };
+    if !matches!(args.get(reset_index), Some(name) if name == "reset") {
+        return args;
+    }
+
+    let separator_index = args
+        .iter()
+        .enumerate()
+        .skip(reset_index + 1)
+        .find_map(|(index, arg)| (arg == "--").then_some(index));
+    let Some(separator_index) = separator_index else {
+        return args;
+    };
+
+    let has_target_before_separator =
+        reset_has_positional_target_before_separator(&args, reset_index + 1, separator_index);
+    let mut out = Vec::with_capacity(args.len() + usize::from(!has_target_before_separator));
+    if from_double_dash {
+        for (idx, arg) in args.iter().enumerate().take(reset_index + 1) {
+            if idx + 1 == reset_index && arg == "--" {
+                continue;
+            }
+            out.push(arg.clone());
+        }
+    } else {
+        out.extend(args.iter().take(reset_index + 1).cloned());
+    }
+
+    for arg in args.iter().take(separator_index).skip(reset_index + 1) {
+        out.push(arg.clone());
+    }
+    out.push(format!(
+        "--{}",
+        command::reset::RESET_PATHSPEC_SEPARATOR_FLAG
+    ));
+    if !has_target_before_separator && args.get(separator_index + 1).is_some() {
+        out.push("HEAD".to_string());
+    }
+    out.extend(args.iter().skip(separator_index + 1).cloned());
+    out
+}
+
+fn reset_has_positional_target_before_separator(
+    args: &[String],
+    start: usize,
+    separator_index: usize,
+) -> bool {
+    let mut index = start;
+    while index < separator_index {
+        let arg = &args[index];
+        if reset_flag_takes_separate_value(arg) {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn reset_flag_takes_separate_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--pathspec-from-file" | "--color" | "--progress" | "--max-connections"
+    )
+}
+
 /// Locate the first non-flag token in `args` and return its index plus whether it was
 /// produced by an explicit `--` separator.
 ///
@@ -1547,6 +1621,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     };
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
+    let argv = rewrite_reset_pathspec_separator_args(argv);
     prepare_cli_invocation_state();
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
