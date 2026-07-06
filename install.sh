@@ -1,8 +1,8 @@
 #!/bin/sh
 # libra installer · TUI
 #
-#   curl -fsSL https://libra.tools/install.sh | sh
-#   curl -fsSL https://libra.tools/install.sh | sh -s -- -v v0.17.874
+#   curl -fsSL https://download.libra.tools/install.sh | sh
+#   curl -fsSL https://download.libra.tools/install.sh | sh -s -- -v v0.17.874
 #
 # Visual design ports the Libra TUI Installer mock — banner, conversational
 # agent voice, animated per-step spinner, themed colors, success box.
@@ -178,12 +178,12 @@ error_exit() {
     # shellcheck disable=SC2016  # $HOME is shown to the user verbatim
     printf '       %s▸%s pick a writable directory        %sexport LIBRA_HOME="$HOME/.libra"%s\n' \
         "$C_ACCENT" "$C_RESET" "$C_ACCENT2" "$C_RESET"
-    printf '       %s▸%s pin a known-good version         %scurl -fsSL libra.tools/install.sh | sh -s -- -v v0.1.0%s\n' \
+    printf '       %s▸%s pin a known-good version         %scurl -fsSL https://download.libra.tools/install.sh | sh -s -- -v v0.1.0%s\n' \
         "$C_ACCENT" "$C_RESET" "$C_ACCENT2" "$C_RESET"
     printf '       %s▸%s open a bug report                %sgithub.com/libra-tools/libra/issues%s\n' \
         "$C_ACCENT" "$C_RESET" "$C_ACCENT2" "$C_RESET"
     printf '\n  %sneed the full log? re-run with:%s\n' "$C_DIM" "$C_RESET"
-    printf '  %scurl -fsSL libra.tools/install.sh | sh 2>&1 | tee install.log%s\n\n' "$C_TEXT" "$C_RESET"
+    printf '  %scurl -fsSL https://download.libra.tools/install.sh | sh 2>&1 | tee install.log%s\n\n' "$C_TEXT" "$C_RESET"
     exit 1
 }
 
@@ -203,16 +203,16 @@ OPTIONS:
 
 EXAMPLES:
     # Install latest version (no sudo, lives entirely under \$HOME/.libra)
-    curl -fsSL https://libra.tools/install.sh | sh
+    curl -fsSL https://download.libra.tools/install.sh | sh
 
     # Install specific version
-    curl -fsSL https://libra.tools/install.sh | sh -s -- -v v0.1.0
+    curl -fsSL https://download.libra.tools/install.sh | sh -s -- -v v0.1.0
 
     # Install to custom directory (must be user-writable; we never sudo)
-    curl -fsSL https://libra.tools/install.sh | sh -s -- -d ~/bin
+    curl -fsSL https://download.libra.tools/install.sh | sh -s -- -d ~/bin
 
     # Skip shell-rc modification (source \$HOME/.libra/env yourself)
-    curl -fsSL https://libra.tools/install.sh | sh -s -- --no-modify-path
+    curl -fsSL https://download.libra.tools/install.sh | sh -s -- --no-modify-path
 
 ENVIRONMENT VARIABLES:
     LIBRA_VERSION              Override version detection
@@ -425,7 +425,7 @@ screen_welcome() {
     banner
     agent_say "Hi — I'm the libra installer. I'll set up the AI-agent-native VCS for you in about 30 seconds. I'll show you what I'm doing at every step."
     printf '  %sgithub.com/libra-tools/libra%s\n'   "$C_DIM" "$C_RESET"
-    printf '  %scurl -fsSL libra.tools/install.sh | sh%s\n\n' "$C_DIM" "$C_RESET"
+    printf '  %scurl -fsSL https://download.libra.tools/install.sh | sh%s\n\n' "$C_DIM" "$C_RESET"
     [ "$TTY" = "1" ] && sleep 0.5 2>/dev/null || true
 }
 
@@ -509,7 +509,7 @@ screen_already_installed() {
         "$C_SUCCESS" "$C_RESET" "$C_TEXT" "$VERSION" "$EXISTING_PATH" "$C_RESET"
 
     printf '  %sneed a different version?%s\n' "$C_DIM" "$C_RESET"
-    printf '  %scurl -fsSL libra.tools/install.sh | sh -s -- -v <version>%s\n\n' "$C_TEXT" "$C_RESET"
+    printf '  %scurl -fsSL https://download.libra.tools/install.sh | sh -s -- -v <version>%s\n\n' "$C_TEXT" "$C_RESET"
 }
 
 screen_install() {
