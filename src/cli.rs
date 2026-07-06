@@ -1066,6 +1066,7 @@ fn rewrite_reset_pathspec_separator_args(args: Vec<String>) -> Vec<String> {
     if !has_target_before_separator && args.get(separator_index + 1).is_some() {
         out.push("HEAD".to_string());
     }
+    out.push("--".to_string());
     out.extend(args.iter().skip(separator_index + 1).cloned());
     out
 }

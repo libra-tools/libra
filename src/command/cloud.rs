@@ -2504,6 +2504,22 @@ mod tests {
         }
     }
 
+    async fn enter_isolated_libra_repo() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ScopedEnvVar,
+        ScopedEnvVar,
+        ChangeDirGuard,
+    ) {
+        let repo = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let home_env = ScopedEnvVar::set("HOME", home.path());
+        let test_home_env = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
+        setup_with_new_libra_in(repo.path()).await;
+        let cwd = ChangeDirGuard::new(repo.path());
+        (repo, home, home_env, test_home_env, cwd)
+    }
+
     struct ClearedEnvVarGuard {
         key: String,
         previous: Option<OsString>,
@@ -2882,7 +2898,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn cloud_restore_indexed_objects_downloads_skips_and_verifies_hash() {
+        let _repo = enter_isolated_libra_repo().await;
         let remote = RemoteStorage::new(Arc::new(InMemory::new()));
         let local_dir = tempdir().unwrap();
         let local = LocalStorage::new(local_dir.path().to_path_buf());
@@ -2917,7 +2935,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn cloud_restore_indexed_objects_reports_hash_mismatch() {
+        let _repo = enter_isolated_libra_repo().await;
         let remote = RemoteStorage::new(Arc::new(InMemory::new()));
         let local_dir = tempdir().unwrap();
         let local = LocalStorage::new(local_dir.path().to_path_buf());

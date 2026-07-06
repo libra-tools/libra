@@ -6,7 +6,13 @@
 //!
 //! Layer: L1 (deterministic; tempdir + isolated HOME, no network).
 
-use std::fs;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 
 use super::{
     assert_cli_success, create_committed_repo_via_cli, parse_cli_error_stderr, run_libra_command,
@@ -36,8 +42,40 @@ fn repo_with_secret() -> (tempfile::TempDir, String) {
     (repo, oid)
 }
 
-fn loose_path(repo: &std::path::Path, oid: &str) -> std::path::PathBuf {
+fn loose_path(repo: &Path, oid: &str) -> PathBuf {
     repo.join(".libra/objects").join(&oid[..2]).join(&oid[2..])
+}
+
+async fn connect_raw_repo_db(repo: &Path) -> DatabaseConnection {
+    let db_path = repo.join(".libra").join("libra.db");
+    let mut opts = ConnectOptions::new(format!("sqlite://{}", db_path.display()));
+    opts.sqlx_logging(false)
+        .connect_timeout(Duration::from_secs(5));
+    Database::connect(opts)
+        .await
+        .expect("connect raw repository database")
+}
+
+fn mark_obliteration_as_interrupted(repo: &Path) {
+    let runtime = tokio::runtime::Runtime::new().expect("create runtime for crash-recovery setup");
+    runtime.block_on(async {
+        let conn = connect_raw_repo_db(repo).await;
+        let result = conn
+            .execute(Statement::from_string(
+                conn.get_database_backend(),
+                "UPDATE object_obliteration SET state='obliterating', payload_deleted_at=NULL",
+            ))
+            .await
+            .expect("reset obliteration state to 'obliterating'");
+        assert_eq!(
+            result.rows_affected(),
+            1,
+            "reset exactly one obliteration row to 'obliterating'"
+        );
+        conn.close()
+            .await
+            .expect("close crash-recovery setup database");
+    });
 }
 
 #[test]
@@ -148,17 +186,9 @@ fn obliterate_recover_finishes_interrupted() {
         "payload restored on disk for the test"
     );
 
-    // Force the mid-state via sqlite3 — REQUIRED (fail, don't skip, if absent).
-    let db = p.join(".libra/libra.db");
-    let status = std::process::Command::new("sqlite3")
-        .arg(&db)
-        .arg("UPDATE object_obliteration SET state='obliterating', payload_deleted_at=NULL;")
-        .status()
-        .expect("sqlite3 is required for the crash-recovery test");
-    assert!(
-        status.success(),
-        "reset the obliteration state to 'obliterating'"
-    );
+    // Force the mid-state in the repository database without relying on host
+    // sqlite3 binaries, which are not guaranteed on self-hosted runners.
+    mark_obliteration_as_interrupted(p);
 
     // Recovery must re-delete the payload and finalize.
     let recover = run_libra_command(&["file", "obliterate", "--recover"], p);

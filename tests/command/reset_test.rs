@@ -373,6 +373,41 @@ fn reset_double_dash_pathspec_unstages_file_named_like_revision() {
 }
 
 #[test]
+fn reset_double_dash_preserves_dash_prefixed_pathspecs() {
+    // Given: tracked files have names that would otherwise parse as flags.
+    let repo = create_committed_repo_via_cli();
+    for name in ["-h", "--help"] {
+        fs::write(repo.path().join(name), format!("{name}\n")).unwrap();
+        let add = run_libra_command(&["add", "--", name], repo.path());
+        assert_cli_success(&add, "add dash-prefixed file");
+    }
+    let commit = run_libra_command(
+        &["commit", "-m", "add dash-prefixed files", "--no-verify"],
+        repo.path(),
+    );
+    assert_cli_success(&commit, "commit dash-prefixed files");
+
+    for name in ["-h", "--help"] {
+        fs::write(repo.path().join(name), format!("{name}\nupdated\n")).unwrap();
+        let add = run_libra_command(&["add", "--", name], repo.path());
+        assert_cli_success(&add, "stage dash-prefixed file update");
+
+        // When: `--` marks the dash-prefixed token as a pathspec.
+        let output = run_libra_command(&["reset", "--", name], repo.path());
+
+        // Then: reset treats the token as a filename instead of a reset/help flag.
+        assert_cli_success(&output, "reset dash-prefixed pathspec");
+        let status = run_libra_command(&["status", "--short"], repo.path());
+        assert_cli_success(&status, "status --short");
+        let stdout = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            stdout.contains(&format!(" M {name}\n")),
+            "expected {name} to be unstaged, got: {stdout}",
+        );
+    }
+}
+
+#[test]
 fn reset_bare_revision_path_ambiguity_errors_like_git() {
     // Given: a token names both a branch and a tracked path.
     let repo = create_committed_repo_via_cli();
