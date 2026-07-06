@@ -6,7 +6,7 @@
 > 兼容级别：`intentionally-different`（Libra AI 安全运行扩展，非 Git 命令）
 > 适用范围：`libra code`（TUI / headless / web-only 会话）执行 AI agent shell 命令时的进程隔离后端
 > 关联文档：[`docs/development/commands/sandbox.md`](commands/sandbox.md)（`libra sandbox status` 命令设计）、[`COMPATIBILITY.md`](../../COMPATIBILITY.md)
-> 调研基线：apple/container `1.0.0`、apple/containerization（pre-1.0），均为 Apple Silicon + macOS 26 (Tahoe) 目标；ricccrd/dd `9b950a2`（2026-07-04，`https://github.com/ricccrd/dd`）
+> 调研基线：apple/container `1.0.0`、apple/containerization（pre-1.0），均为 Apple Silicon + macOS 26 (Tahoe) 目标
 
 ---
 
@@ -23,8 +23,6 @@
 - **落地目标**：达到“可以在隔离 VM 里安全地跑 AI coding agent（`libra code` 本身，或在 VM 内整跑 Claude Code）做真实开发”的程度（见 §13 运行手册）。
 
 整个改动**复用现有 spawn/stdio/timeout/evidence 管线**：新后端本质上只是把 `seatbelt-exec … -- <cmd>` 这层 argv 包装换成 `container exec … -- <cmd>`，加上一套会话级 VM 生命周期与网络协调逻辑。
-
-本次补充的 `ricccrd/dd` 对照分析不改变上述主路线：`dd` 证明了“无 VM、userspace Linux kernel + Docker Engine API”的轻量方向在 macOS 上有性能与开发体验价值，但它默认仍是同宿主内核的 JIT 进程，`DDJIT_UNTRUSTED` sentry split 也处于早期能力阶段。结论是：**短期继续以 Apple `container` VM 作为不可信 agent 的强隔离后端；中期先吸收 `dd` 的 typed launch contract、path-jail/overlay/network/resource/test-oracle 方法；长期再评估 `MacosDdJit` 作为 trusted/fast 或 VM 内加速后端**（详见 §15.1）。
 
 ---
 
@@ -739,100 +737,6 @@ container stop dev-box && container rm dev-box
 - **macOS 15 兜底**：若有强需求，针对 0.x 预览的受限网络做降级模式（默认不做）。
 - **快照/检查点**：利用 VM 快照做会话级 undo（远期）。
 
-### 15.1 `ricccrd/dd` 对照改进方案（无 VM userspace-kernel 后端）
-
-#### 15.1.1 `dd` 功能拆解
-
-`dd` 的定位是：在 Apple Silicon macOS 上**不启动 Linux VM**，通过 JIT 翻译 guest 指令并在 userspace 服务 Linux syscall，让普通 Docker CLI 通过 Docker Engine API 驱动容器。仓库按职责拆成：
-
-| 模块 | 功能 | 对 Libra 的启发 |
-|---|---|---|
-| `dd-jit/` | C runtime + Rust binding；构建 `linux/aarch64`、`linux/x86_64`、`darwin/aarch64` 三类 engine；`Guest` + `SpawnConfig` 是前端唯一 launch contract。 | Libra 不应让每个后端散落解析 env/argv；先抽一个 typed `SandboxLaunchSpec`，再由 seatbelt/bwrap/apple-container/dd-jit 各自降低到 argv。 |
-| `dd-daemon/` | 实现 Docker Engine API v1.43：image/container/exec/logs/archive/volume/network/build/events/system 等路径；Unix socket + Docker CLI 兼容。 | `libra code` 不需要实现 Docker API，但 `libra sandbox` 可以借鉴“状态/生命周期/API 与执行引擎分层”，把 status/evidence 做成后端无关的诊断面。 |
-| `SpawnConfig` | 类型化描述 rootfs、lower layers、volumes、publish、netns、hostname、memory/pids/cpus、uid/gid、guest env、argv，然后生成 engine 命令。 | Libra 当前 `CommandSpec` 偏“运行一条命令”；VM/未来 userspace-kernel 后端需要补一层“会话容器/沙箱 launch spec”。 |
-| VFS / overlay | userspace path-jail、copy-up、`.wh.` whiteout、merged `getdents`、read-only bind mount、rootfs read-only；daemon 侧 `archive_host_path` / `overlay_host_path` 与 JIT 路由保持一致。 | Libra 的 worktree 挂载、`apply_patch` 与 shell 互见、deny_read/writable roots 都应有统一的 host↔guest 路径映射与一致性测试，而不是只在 Apple `container` 分支临时处理。 |
-| network | `DD_NETNS` 私有 loopback、`DD_NET_ISOLATE` null network、user-defined network 的 IPAM/embedded DNS/host port forwarder。 | Libra 的 `Denied/Allowlist/Full` 要变成后端能力矩阵：是否能硬阻断出网、是否只能 env 提示、代理能否被绕过，必须在 status/evidence 中直出。 |
-| resource | `DD_MEM_MAX`、`DD_PIDS_MAX`、`DD_CPUS`、`DD_ROOTFS_RO`、`DD_ULIMITS` 映射 Docker 资源语义。 | `libra code` 的 shell 工具需要资源上限：内存、进程数、CPU、日志缓冲、超时统一进入 `SandboxPolicy`/runtime config。 |
-| sentry split | `DDJIT_UNTRUSTED` / `DDJIT_SANDBOX`：worker 只跑 JIT/guest compute，deny-default Seatbelt；sentry 持有 host fs/net/proc 权限，通过共享内存 ring 转发 syscall。README 与源码都标注核心 fs syscall 已通、socket/exec/fork 等仍在 landing。 | 这是未来轻量后端的安全形态，但**不能作为当前不可信 agent 的主隔离边界**；只有 sentry syscall 覆盖、Seatbelt profile、escape 测试和 oracle 矩阵成熟后才能进入 `Required`。 |
-| tests | engine × case 矩阵、native oracle diff、real Docker oracle、PTY 字节级 diff、overlay differential、LTP compliance。 | Libra sandbox 测试不能只断言 argv；需要后端行为 oracle：文件、PTY、env、network、resource、timeout、cleanup 与跨后端 parity。 |
-
-#### 15.1.2 对当前 Apple `container` 主路线的修正
-
-1. **不把 `dd` 直接替代 Apple `container` VM**。`dd` 的默认 trusted 路径仍在宿主进程内服务 syscall，安全边界弱于独立 Linux 内核 + VMM；`DDJIT_UNTRUSTED` 的 sentry split 还不是完整 syscall 面。`libra code` 跑不可信依赖/自动批准命令时，默认仍应选择 VM。
-2. **提前抽 `SandboxLaunchSpec`，不要等 Phase 8 才抽 trait**。§6.4 原计划把 `trait SandboxBackend` 放到未来工作；`dd` 的 `SpawnConfig` 说明 launch contract 本身比 backend trait 更重要。Phase 1 应至少新增内部结构：
-
-   ```rust
-   pub struct SandboxLaunchSpec {
-       pub session_id: String,
-       pub host_worktree: PathBuf,
-       pub guest_worktree: PathBuf,
-       pub cwd: PathBuf,
-       pub argv: Vec<String>,
-       pub env: BTreeMap<String, String>,
-       pub writable_roots: Vec<PathBuf>,
-       pub deny_read_paths: Vec<PathBuf>,
-       pub network: NetworkAccess,
-       pub resources: SandboxResourceLimits,
-       pub isolation: IsolationStrength,
-   }
-   ```
-
-   `CommandSpec -> SandboxLaunchSpec -> backend argv` 成为新链路；seatbelt/bwrap 路径也走同一 spec，避免 VM 分支单独维护路径/env 规则。
-3. **把资源限制纳入一等配置**。参考 `dd` 的 memory/pids/cpus/ulimit/rootfs-ro，给 `.libra/sandbox.toml [sandbox.resources]` 增：
-   - `memory_mb`
-   - `pids_max`
-   - `cpu_count`
-   - `stdout_stderr_bytes`
-   - `rootfs_read_only`
-
-   v1 可只在 Apple `container` 与 Linux bwrap/seccomp 上强制，seatbelt 无法强制的字段在 `libra sandbox status --json` 中标 `enforced=false`。
-4. **把“文件一致性”从 VM 专项提升为全局 invariant**。`dd` 用 `DD_FSGEN_FILE` 解决 daemon-side 写入与 JIT VFS cache 的一致性；Libra 目前没有 JIT VFS cache，但同样存在 `apply_patch` 宿主写、shell 后端读写、future dd-jit 读写三方一致性。新增 `SandboxFsCoherence` 测试族：
-   - 宿主 `apply_patch` 后，后端 shell 立即读到。
-   - 后端 shell 写文件后，宿主 `libra diff/status` 立即看到。
-   - rename、symlink、chmod、nested writable root、deny_read 路径都覆盖。
-   - 若未来 `MacosDdJit` 引入路径缓存，必须有类似 `fsgen` 的 external-writer epoch。
-5. **把 backend capability 暴露给用户**。`libra sandbox status --json` 追加：
-   - `isolation_boundary`: `profile|namespace|vm|userspace-kernel|none`
-   - `host_kernel_shared`: bool
-   - `network_enforcement`: `kernel|namespace|vm-network|proxy-only|env-only|none`
-   - `fs_model`: `host-path-jail|bind-mount|virtiofs|overlay|none`
-   - `resource_controls`: 每项 `{requested,enforced,reason}`
-   - `trusted_for_required`: bool
-
-   这样 `dd`、seatbelt、bwrap、Apple VM 的强弱不会被同一个 `sandbox_type` 字符串掩盖。
-
-#### 15.1.3 可落地任务卡
-
-| 任务 | 改动 | 验收 |
-|---|---|---|
-| **DD-0 源码事实锁定** | 在本节引用的 `dd` 基线固定为 commit `9b950a2`；记录功能边界：Docker Engine API、JIT/userspace syscall、path-jail、overlay、netns、resource、sentry early state。 | 文档不再把 `dd` 描述成 VM，也不把 sentry 描述成完整 untrusted 方案。 |
-| **DD-1 `SandboxLaunchSpec`** | 新增 typed launch contract；`SandboxManager::transform` 先构造 spec，再由 seatbelt/bwrap/apple-container lowering。 | 现有 seatbelt/Linux 单测逐字节回归；VM path/env 过滤测试复用同一 spec。 |
-| **DD-2 capability/status** | 为每个后端填 `SandboxBackendCapabilities` 并进入 `libra sandbox status --json`。 | 非 macOS、seatbelt、Linux bwrap、Apple VM fake runner 均能输出完整 capability；Required 决策只看 capability，不靠字符串。 |
-| **DD-3 资源限制** | `.libra/sandbox.toml [sandbox.resources]` + env/flag 覆盖；贯穿到 Apple `container run --memory/--cpus`、Linux bwrap/rlimit、shell stdout/stderr cap。 | L1 fake runner 断言 lowering；L3 真机跑 memory/pids/CPU/log cap；未强制字段报告 `enforced=false`。 |
-| **DD-4 sandbox oracle 测试矩阵** | 新增 `tests/sandbox_backend_parity_test.rs` 与 fixtures：fs, env, pty, network, resource, timeout, cleanup。参考 `dd-tests` 的 oracle 思路，使用 host/native 行为或 Docker/Apple VM 作为 ground truth。 | 每个后端至少跑 L1 fake + 本机可用后端；PTY 用真实 pseudo-terminal；Denied/Allowlist/Full 有绕过尝试。 |
-| **DD-5 `MacosDdJit` spike（非产品）** | 只做实验后端，二选一：A. shell out 到 `dd-daemon`/Docker API；B. 直接依赖 `ddjit::SpawnConfig`（需评估 vendoring、MIT license、codesign/MAP_JIT entitlement、C toolchain）。 | 产出 spike findings：启动延迟、Rust/Cargo 构建可用性、path jail 逃逸测试、resource enforcement、network deny、sentry 覆盖缺口。未通过前不得进入 `auto` 或 `Required`。 |
-| **DD-6 sentry 安全闸门** | 若 DD-5 继续，定义 sentry 必过项：fs/net/proc/exec/fork/thread/mmap/socket/fd-passing 覆盖、Seatbelt deny-default profile、no host fd in worker、ring bounds、fuzz/differential/LTP。 | 只有全部通过且有 escape regression tests，`MacosDdJit` 才能标 `trusted_for_required=true`；否则仅允许 `BestEffort` / trusted workload。 |
-
-#### 15.1.4 与现有里程碑的关系
-
-- **M0-M6 仍以 Apple `container` VM 交付为主**；`dd` 不阻塞 VM 后端落地。
-- **DD-1/DD-2 应前置到 M1/M2**：它们降低 Apple VM 实现风险，并为未来后端留干净接口。
-- **DD-3/DD-4 可并行进入 M3/M4**：资源限制与 oracle 测试会直接提升 Apple VM 方案质量。
-- **DD-5/DD-6 是远期探索**：只有当用户明确需要“无 VM、更快、更省 RAM”的 trusted 后端，且 `dd` sentry 成熟后，再考虑产品化。
-
-#### 15.1.5 最小产品决策
-
-短期产品形态保持：
-
-```text
-default macOS backend: seatbelt
-explicit strong backend: apple-container
-future fast/trusted backend: macos-dd-jit (spike only)
-untrusted automatic backend: apple-container only
-```
-
-也就是说，`dd` 给 Libra 的第一批改进不是“马上跑一个 JIT Linux kernel”，而是把沙箱接口、资源、文件一致性、网络强制力、诊断和测试 oracle 做到足够严谨。等这些基础变成稳定 contract 后，才有条件接入 `dd` 这样的 userspace-kernel 后端。
-
 ---
 
 ## 16. 里程碑、测试矩阵与验收
@@ -872,7 +776,6 @@ untrusted automatic backend: apple-container only
 - apple/containerization README、`vminitd/`、DeepWiki（VM management）
 - WWDC 2025 session 346（Meet Containerization）
 - 第三方技术解读（the New Stack、4sysops、addozhang、anil.recoil.org、kubeace）——延迟/网络/限制的非官方实测，仅作旁证
-- ricccrd/dd README、`dd-jit/src/lib.rs`、`dd-daemon/src/{main.rs,runtime.rs,model.rs,archive.rs,networks.rs,util.rs}`、`dd-jit/src/runtime/os/linux/{sentry.c,container/vfs/resolve.c}`、`dd-tests/` oracle/scenario/PTY/overlay suites（基线 commit `9b950a2`）
 
 > 带 *UNVERIFIED* 的条目（绑挂传输方式、headless launchd、虚拟化授权细节、macOS 15 兜底价值、`container machine` 适用性）必须在 Phase 0 spike 用真机落实，再据实更新本文档。
 

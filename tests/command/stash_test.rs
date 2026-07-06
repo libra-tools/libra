@@ -10,7 +10,7 @@ use libra::{
         commit::{self, CommitArgs},
     },
     internal::branch::Branch,
-    utils::test::ChangeDirGuard,
+    utils::{error::StableErrorCode, test::ChangeDirGuard},
 };
 use serial_test::serial;
 use tempfile::tempdir;
@@ -375,6 +375,42 @@ fn test_stash_pop_restores_mixed_file_as_unstaged_worktree_content() {
         "worktree version\n"
     );
     assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_reports_index_load_failure_without_dropping_stash() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a valid stash exists, then the on-disk index becomes unreadable.
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+    fs::write(p.join(".libra").join("index"), b"garb").unwrap();
+
+    // When: default pop tries to build the current-worktree side of the merge.
+    let output = run_libra_command(&["stash", "pop"], p);
+
+    // Then: the index load failure is reported instead of treating the index as
+    // empty, and pop leaves the stash entry in place.
+    assert_eq!(output.status.code(), Some(128));
+    let (human, report) = parse_cli_error_stderr(&output.stderr);
+    assert!(
+        human.contains("failed to load index"),
+        "unexpected human stderr: {human}"
+    );
+    assert_eq!(report.error_code, StableErrorCode::IoReadFailed.as_str());
+    assert!(
+        report.message.contains("failed to load index"),
+        "unexpected JSON message: {}",
+        report.message
+    );
+
+    let list = run_libra_command(&["stash", "list"], p);
+    assert_cli_success(&list, "stash list after failed pop");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("stash@{0}:"),
+        "failed pop must keep the stash entry"
+    );
 }
 
 #[tokio::test]

@@ -93,6 +93,9 @@ pub(crate) enum StashError {
     #[error("failed to write object: {0}")]
     WriteObject(String),
 
+    #[error("failed to load index: {0}")]
+    IndexLoad(String),
+
     #[error("failed to save index: {0}")]
     IndexSave(String),
 
@@ -123,6 +126,7 @@ impl StashError {
             Self::ClearRequiresForce => StableErrorCode::CliInvalidArguments,
             Self::ReadObject(_) => StableErrorCode::IoReadFailed,
             Self::WriteObject(_) => StableErrorCode::IoWriteFailed,
+            Self::IndexLoad(_) => StableErrorCode::IoReadFailed,
             Self::IndexSave(_) => StableErrorCode::IoWriteFailed,
             Self::ResetFailed(_) => StableErrorCode::IoWriteFailed,
             Self::PathspecNoMatch(_) => StableErrorCode::CliInvalidTarget,
@@ -168,6 +172,9 @@ impl From<StashError> for CliError {
             StashError::PathspecWithOption(_) => CliError::command_usage(message)
                 .with_stable_code(stable_code)
                 .with_hint("run the option without a pathspec, or the pathspec without the option"),
+            StashError::IndexLoad(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("repair or refresh the index, then retry the stash operation."),
             StashError::Other(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint(format!("this is a bug; please report it at {ISSUE_URL}")),
@@ -1353,7 +1360,8 @@ pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashErr
     // base = the commit the stash was created on; theirs = the stashed tree.
     // `create_tree_from_workdir` writes every blob/subtree it visits, so the
     // resulting tree is fully materialised for `merge_trees`.
-    let current_index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
+    let current_index = Index::load(&index_path)
+        .map_err(|e| StashError::IndexLoad(format!("{}: {e}", index_path.display())))?;
     let worktree_tree = create_tree_from_workdir(workdir, &git_dir, &current_index)
         .map_err(StashError::ReadObject)?;
 
@@ -2280,7 +2288,7 @@ mod tests {
     /// in both human and `--json` envelopes for `stash`.
     ///
     /// Source-chained variants whose body is solely a wrapped string
-    /// (ReadObject, WriteObject, IndexSave, ResetFailed, Other) are
+    /// (ReadObject, WriteObject, IndexLoad, IndexSave, ResetFailed, Other) are
     /// covered indirectly by pinning the inner `{0}` echo form here for
     /// representative cases (Other does that explicitly).
     #[test]
@@ -2328,6 +2336,10 @@ mod tests {
             "failed to write object: disk full",
         );
         assert_eq!(
+            StashError::IndexLoad("corrupt".to_string()).to_string(),
+            "failed to load index: corrupt",
+        );
+        assert_eq!(
             StashError::IndexSave("io error".to_string()).to_string(),
             "failed to save index: io error",
         );
@@ -2346,8 +2358,8 @@ mod tests {
     /// [`StashError`]. JSON consumers branch on the
     /// [`StableErrorCode`] in the error envelope; three variants
     /// share `IoWriteFailed` (WriteObject / IndexSave / ResetFailed)
-    /// and two share both `IoReadFailed` (BranchLookupFailed /
-    /// ReadObject) and `CliInvalidArguments` (InvalidStashRef /
+    /// and three share `IoReadFailed` (BranchLookupFailed /
+    /// ReadObject / IndexLoad), while two share `CliInvalidArguments` (InvalidStashRef /
     /// ClearRequiresForce). A future refactor that reroutes any
     /// variant — for example flipping `BranchExists` from
     /// `ConflictOperationBlocked` to `CliInvalidTarget` — silently
@@ -2404,6 +2416,10 @@ mod tests {
         assert_eq!(
             StashError::WriteObject("ignored".to_string()).stable_code(),
             StableErrorCode::IoWriteFailed,
+        );
+        assert_eq!(
+            StashError::IndexLoad("ignored".to_string()).stable_code(),
+            StableErrorCode::IoReadFailed,
         );
         assert_eq!(
             StashError::IndexSave("ignored".to_string()).stable_code(),
