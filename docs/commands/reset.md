@@ -6,6 +6,7 @@ Move `HEAD` and reset the index or working tree depending on the selected mode.
 
 ```
 libra reset [<target>] [--soft | --mixed | --hard]
+libra reset <pathspec>...
 libra reset [<target>] [--] <pathspec>...
 libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 ```
@@ -18,7 +19,7 @@ libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 - **`--mixed`** (default): moves HEAD and resets the index. The working tree is untouched, so changes appear as unstaged modifications. Useful for un-staging files.
 - **`--hard`**: moves HEAD, resets the index, and restores the working tree. All uncommitted changes are discarded. Useful for fully reverting to a known state.
 
-When pathspecs are provided, the command performs a targeted mixed reset: only the named files are reset in the index to match the target commit, without moving HEAD. This is the primary way to un-stage specific files. Pathspecs are incompatible with `--soft` and `--hard`.
+When pathspecs are provided, the command performs a targeted mixed reset: only the named files are reset in the index to match the target commit, without moving HEAD. This is the primary way to un-stage specific files. Like Git, a bare first positional that is a known path and not a revision is treated as a pathspec with target `HEAD`, so `libra reset src/lib.rs` is equivalent to `libra reset HEAD -- src/lib.rs`. If a token is both a revision and a filename, reset refuses it as ambiguous; use `libra reset <revision> -- <file>` for a target revision or `libra reset -- <file>` for a path. Pathspecs are incompatible with `--soft` and `--hard`.
 
 The default target is `HEAD`, making `libra reset` (with no arguments) equivalent to un-staging everything.
 
@@ -30,7 +31,7 @@ The default target is `HEAD`, making `libra reset` (with no arguments) equivalen
 | | `--soft` | | Move HEAD only; keep index and working tree |
 | | `--mixed` | | Move HEAD and reset index; keep working tree (default) |
 | | `--hard` | | Move HEAD, reset index, and restore working tree |
-| | `<pathspec>...` | positional (after `--`) | Specific files to reset in the index |
+| | `<pathspec>...` | positional, optionally after `--` | Specific files to reset in the index |
 | | `--pathspec-from-file` | `<file>` | Read pathspecs from a file (`-` for stdin) instead of the command line. Mutually exclusive with command-line pathspecs |
 | | `--pathspec-file-nul` | | Treat `--pathspec-from-file` input as NUL-separated rather than line-separated. No-op without `--pathspec-from-file` |
 | | `--no-refresh` | | Accepted for Git compatibility; a no-op in Libra (see below) |
@@ -63,10 +64,16 @@ libra reset HEAD~2
 libra reset --hard main
 
 # Un-stage a specific file
+libra reset src/lib.rs
+
+# Un-stage a revision-like filename
+libra reset -- HEAD
+
+# Un-stage a specific file from an explicit target
 libra reset HEAD -- src/lib.rs
 
 # Un-stage multiple files
-libra reset HEAD -- src/main.rs src/cli.rs
+libra reset src/main.rs src/cli.rs
 
 # Reset specific files to a prior commit
 libra reset abc1234 -- path/to/file.rs
@@ -87,6 +94,7 @@ libra reset --json --hard HEAD~1
 libra reset HEAD~1                    # Move HEAD and reset index to the previous commit
 libra reset --soft HEAD~2             # Move HEAD only, keep index and worktree
 libra reset --hard main               # Reset HEAD, index, and worktree to branch 'main'
+libra reset src/lib.rs                 # Unstage a path back to HEAD
 libra reset HEAD -- src/lib.rs        # Unstage a path back to HEAD
 libra reset --pathspec-from-file=paths.txt   # Unstage paths read from a file ('-' for stdin)
 libra reset --json --hard HEAD~1      # Structured JSON output for agents
@@ -159,7 +167,7 @@ Pathspec reset:
 
 ### Why reject pathspecs with --soft/--hard?
 
-- **`--soft` + pathspecs**: `--soft` by definition only moves HEAD and touches nothing else. Resetting individual file index entries contradicts the "HEAD only" contract. If you want to un-stage specific files, use the default mixed mode: `libra reset HEAD -- file`.
+- **`--soft` + pathspecs**: `--soft` by definition only moves HEAD and touches nothing else. Resetting individual file index entries contradicts the "HEAD only" contract. If you want to un-stage specific files, use the default mixed mode: `libra reset file` or `libra reset HEAD -- file`.
 - **`--hard` + pathspecs**: `--hard` restores the entire working tree to match the target commit. Selectively restoring only some files while leaving others in a different state would create a confusing hybrid that is neither "fully reset" nor "index-only reset." For selective file restoration, use `libra restore --source <commit> -- file`.
 
 This restriction makes the three modes unambiguous: soft touches HEAD, mixed touches HEAD + index, hard touches HEAD + index + worktree. Pathspecs operate orthogonally at the index level only.
@@ -185,7 +193,7 @@ Libra favors explicit, composable commands over implicit multi-step operations h
 | Mixed reset (default) | `git reset <target>` | `libra reset <target>` | N/A (jj has no staging area) |
 | Soft reset | `git reset --soft <target>` | `libra reset --soft <target>` | N/A |
 | Hard reset | `git reset --hard <target>` | `libra reset --hard <target>` | `jj restore --from <rev>` |
-| Un-stage files | `git reset HEAD -- <file>` | `libra reset HEAD -- <file>` | N/A (no staging area) |
+| Un-stage files | `git reset <file>` / `git reset HEAD -- <file>` | `libra reset <file>` / `libra reset HEAD -- <file>` | N/A (no staging area) |
 | Merge reset | `git reset --merge <target>` | Not supported | N/A |
 | Keep reset | `git reset --keep <target>` | Not supported | N/A |
 | Pathspec from file | `git reset --pathspec-from-file=<f>` | `libra reset --pathspec-from-file=<f>` (literal paths; no C-style quote decoding) | N/A |
@@ -193,7 +201,7 @@ Libra favors explicit, composable commands over implicit multi-step operations h
 | Index refresh control | `git reset --[no-]refresh` | `--no-refresh` accepted as a no-op; no `--refresh` | N/A |
 | Default target | HEAD | HEAD | N/A |
 | Structured output | No | `--json` / `--machine` | `--template` |
-| Pathspec + soft | Allowed (un-stages) | Rejected (`LBR-CLI-002`) | N/A |
+| Pathspec + soft | Rejected | Rejected (`LBR-CLI-002`) | N/A |
 | Pathspec + hard | Rejected | Rejected (`LBR-CLI-002`) | N/A |
 | Pathspec from file + CLI pathspec | Rejected | Rejected (`LBR-CLI-002`) | N/A |
 | Rollback on failure | No | Attempts index rollback | N/A (operation log undo) |
@@ -204,6 +212,7 @@ Libra favors explicit, composable commands over implicit multi-step operations h
 |----------|-----------|------|
 | Not a libra repository | `LBR-REPO-001` | "run 'libra init' to create a repository in the current directory." |
 | Invalid revision | `LBR-CLI-003` | "check the revision name and try again." |
+| Ambiguous revision/path token | `LBR-CLI-002` | "use '--' to separate paths from revisions, like 'libra reset <revision> -- <file>' or 'libra reset -- <file>'." |
 | HEAD is unborn | `LBR-REPO-003` | "create a commit first before resetting HEAD." |
 | Failed to resolve HEAD | `LBR-IO-001` | "check whether the repository database is readable." |
 | HEAD reference corrupt | `LBR-REPO-002` | "the HEAD reference or branch metadata may be corrupted." |

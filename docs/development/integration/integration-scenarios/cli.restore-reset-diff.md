@@ -32,7 +32,7 @@ libra restore --worktree tracked.txt
 
 printf 'second\n' > tracked.txt
 libra add tracked.txt
-libra reset HEAD -- tracked.txt
+libra reset tracked.txt
 libra add tracked.txt
 libra commit -m "second" --no-verify
 libra diff --old HEAD~1 --new HEAD --numstat
@@ -70,6 +70,6 @@ libra fsck --connectivity-only
 
 - `diff` 在 unstaged、staged、revision-to-revision、文件输出和 JSON 输出路径中返回可观察差异。
 - `restore --staged` 取消暂存，`restore --worktree` 和 `restore --source` 恢复工作区内容。
-- `reset HEAD -- <path>` 只取消暂存，`--soft`、`--mixed`、`--hard` 覆盖当前支持的 HEAD/index/worktree 行为。
+- `reset <path>` / `reset HEAD -- <path>` 只取消暂存；revision/path 同名时必须用 `--` 消歧；`--soft`、`--mixed`、`--hard` 覆盖当前支持的 HEAD/index/worktree 行为。
 - 未实现参数必须返回稳定错误，且错误路径不能移动 HEAD 或改写目标文件。
 - 场景结束时运行 `fsck --connectivity-only`。

@@ -701,11 +701,12 @@ async fn reset_hard(target: &str, output: &OutputConfig) -> Result<(), CherryPic
     let child = silent_child_output(output);
     crate::command::reset::execute_safe(
         crate::command::reset::ResetArgs {
-            target: target.to_string(),
+            target: Some(target.to_string()),
             soft: false,
             mixed: false,
             hard: true,
             pathspecs: Vec::new(),
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,

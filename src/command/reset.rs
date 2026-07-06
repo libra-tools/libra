@@ -44,16 +44,19 @@ EXAMPLES:
     libra reset HEAD~1                    Move HEAD and reset index to the previous commit
     libra reset --soft HEAD~2             Move HEAD only, keep index and worktree
     libra reset --hard main               Reset HEAD, index, and worktree to branch 'main'
+    libra reset src/lib.rs                 Unstage a path back to HEAD
     libra reset HEAD -- src/lib.rs        Unstage a path back to HEAD
     libra reset --pathspec-from-file=paths.txt   Unstage paths read from a file ('-' for stdin)
     libra reset --json --hard HEAD~1      Structured JSON output for agents";
+
+pub(crate) const RESET_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-reset-pathspec-separator";
+const DEFAULT_RESET_TARGET: &str = "HEAD";
 
 #[derive(Parser, Debug)]
 #[command(after_help = RESET_EXAMPLES)]
 pub struct ResetArgs {
     /// The commit to reset to (default: HEAD)
-    #[clap(default_value = "HEAD")]
-    pub target: String,
+    pub target: Option<String>,
 
     /// Soft reset: only move HEAD pointer
     #[clap(long, group = "mode")]
@@ -70,6 +73,12 @@ pub struct ResetArgs {
     /// Pathspecs to reset specific files
     #[clap(value_name = "PATH")]
     pub pathspecs: Vec<String>,
+
+    /// Internal flag injected by the top-level CLI when the user typed `--`
+    /// inside `reset` arguments. Clap does not preserve the separator itself,
+    /// but reset needs to distinguish `reset HEAD` from `reset -- HEAD`.
+    #[clap(long = RESET_PATHSPEC_SEPARATOR_FLAG, hide = true)]
+    pub pathspec_separator: bool,
 
     /// Read pathspecs from the given file (`-` for stdin), one per line (or
     /// NUL-separated with --pathspec-file-nul). Mutually exclusive with
@@ -170,6 +179,9 @@ enum ResetError {
     #[error("{0}")]
     InvalidRevision(String),
 
+    #[error("ambiguous argument '{0}': both revision and filename")]
+    AmbiguousRevisionPath(String),
+
     #[error("Cannot reset: HEAD is unborn and points to no commit.")]
     HeadUnborn,
 
@@ -255,6 +267,7 @@ impl ResetError {
         match self {
             Self::NotInRepo => StableErrorCode::RepoNotFound,
             Self::InvalidRevision(_) => StableErrorCode::CliInvalidTarget,
+            Self::AmbiguousRevisionPath(_) => StableErrorCode::CliInvalidArguments,
             Self::HeadUnborn => StableErrorCode::RepoStateInvalid,
             Self::HeadRead(_) => StableErrorCode::IoReadFailed,
             Self::HeadCorrupt(_) => StableErrorCode::RepoCorrupt,
@@ -285,6 +298,9 @@ impl ResetError {
                 Some("run 'libra init' to create a repository in the current directory.")
             }
             Self::InvalidRevision(_) => Some("check the revision name and try again."),
+            Self::AmbiguousRevisionPath(_) => Some(
+                "use '--' to separate paths from revisions, like 'libra reset <revision> -- <file>' or 'libra reset -- <file>'.",
+            ),
             Self::HeadUnborn => Some("create a commit first before resetting HEAD."),
             Self::HeadRead(_) => Some("check whether the repository database is readable."),
             Self::HeadCorrupt(_) => Some("the HEAD reference or branch metadata may be corrupted."),
@@ -329,7 +345,8 @@ impl ResetError {
 
     fn is_command_usage(&self) -> bool {
         match self {
-            Self::PathspecWithSoft(_)
+            Self::AmbiguousRevisionPath(_)
+            | Self::PathspecWithSoft(_)
             | Self::PathspecWithHard
             | Self::PathspecSourceConflict
             | Self::PathspecOutsideWorkdir(_) => true,
@@ -394,14 +411,20 @@ async fn reject_reset_on_ai_managed_current_branch() -> Result<(), ResetError> {
     }
 }
 
+struct ResetRequest {
+    target: String,
+    pathspecs: Vec<String>,
+}
+
 async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
     util::require_repo().map_err(|_| ResetError::NotInRepo)?;
+    let request = normalize_reset_request(&args).await?;
 
     // Refuse to reset onto a Libra-managed locked branch. `is_locked_revision`
     // strips `~` / `^` / `@` suffixes so attempts like `traces~1` or
     // `intent^` are still rejected.
-    if branch::is_locked_revision(&args.target) {
-        return Err(ResetError::LockedTarget(args.target.clone()));
+    if branch::is_locked_revision(&request.target) {
+        return Err(ResetError::LockedTarget(request.target.clone()));
     }
 
     let mode = if args.soft {
@@ -413,22 +436,16 @@ async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
     };
     let previous_commit = Head::current_commit().await.map(|hash| hash.to_string());
 
-    // Effective pathspecs may come from the command line or from
-    // `--pathspec-from-file` (mutually exclusive; `-` reads stdin). Both
-    // sources flow through the same `reset_pathspecs` execution and
-    // containment checks below.
-    let effective_pathspecs = resolve_effective_pathspecs(&args)?;
-
-    if !effective_pathspecs.is_empty() {
+    if !request.pathspecs.is_empty() {
         if matches!(mode, ResetMode::Soft) {
-            return Err(ResetError::PathspecWithSoft(effective_pathspecs.join(" ")));
+            return Err(ResetError::PathspecWithSoft(request.pathspecs.join(" ")));
         }
         if matches!(mode, ResetMode::Hard) {
             return Err(ResetError::PathspecWithHard);
         }
 
-        let target_commit_id = resolve_commit(&args.target).await?;
-        let changed_paths = reset_pathspecs(&effective_pathspecs, &target_commit_id).await?;
+        let target_commit_id = resolve_commit(&request.target).await?;
+        let changed_paths = reset_pathspecs(&request.pathspecs, &target_commit_id).await?;
         let subject = load_commit_summary_or_warn(&target_commit_id);
         let commit = target_commit_id.to_string();
 
@@ -454,8 +471,8 @@ async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
 
     reject_reset_on_ai_managed_current_branch().await?;
 
-    let target_commit_id = resolve_commit(&args.target).await?;
-    let reset_stats = perform_reset(target_commit_id, mode, &args.target).await?;
+    let target_commit_id = resolve_commit(&request.target).await?;
+    let reset_stats = perform_reset(target_commit_id, mode, &request.target).await?;
 
     let subject = load_commit_summary_or_warn(&target_commit_id);
     let commit = target_commit_id.to_string();
@@ -472,6 +489,82 @@ async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
         },
         warnings: reset_stats.warnings,
     })
+}
+
+async fn normalize_reset_request(args: &ResetArgs) -> Result<ResetRequest, ResetError> {
+    // Effective pathspecs may come from the command line or from
+    // `--pathspec-from-file` (mutually exclusive; `-` reads stdin). Both
+    // sources flow through the same `reset_pathspecs` execution and
+    // containment checks below.
+    let mut pathspecs = resolve_effective_pathspecs(args)?;
+    let target = args
+        .target
+        .as_deref()
+        .unwrap_or(DEFAULT_RESET_TARGET)
+        .to_string();
+
+    if args.pathspec_separator || args.target.is_none() || args.pathspec_from_file.is_some() {
+        return Ok(ResetRequest { target, pathspecs });
+    }
+
+    let Some(target_arg) = args.target.as_deref() else {
+        return Ok(ResetRequest { target, pathspecs });
+    };
+    let resolves_as_revision = target_resolves_as_revision(target_arg).await?;
+    let matches_path = pathspec_matches_known_path(target_arg).await?;
+
+    match (resolves_as_revision, matches_path) {
+        (true, true) => Err(ResetError::AmbiguousRevisionPath(target_arg.to_string())),
+        (true, false) => Ok(ResetRequest { target, pathspecs }),
+        (false, true) => {
+            pathspecs.insert(0, target_arg.to_string());
+            Ok(ResetRequest {
+                target: DEFAULT_RESET_TARGET.to_string(),
+                pathspecs,
+            })
+        }
+        (false, false) => Ok(ResetRequest { target, pathspecs }),
+    }
+}
+
+async fn target_resolves_as_revision(target: &str) -> Result<bool, ResetError> {
+    match resolve_commit(target).await {
+        Ok(_) => Ok(true),
+        Err(ResetError::InvalidRevision(_)) | Err(ResetError::HeadUnborn) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn pathspec_matches_known_path(pathspec: &str) -> Result<bool, ResetError> {
+    let absolute = util::workdir_to_absolute(PathBuf::from(pathspec));
+    if absolute.exists() {
+        return Ok(true);
+    }
+    if !util::is_sub_path(&absolute, util::working_dir()) {
+        return Ok(false);
+    }
+
+    let relative_path = util::workdir_to_current(PathBuf::from(pathspec));
+    let path_str = relative_path
+        .to_str()
+        .ok_or_else(|| ResetError::InvalidPathspecEncoding(relative_path.display().to_string()))?;
+
+    let index = Index::load(path::index()).map_err(|e| ResetError::IndexLoad(e.to_string()))?;
+    if index.get(path_str, 0).is_some() {
+        return Ok(true);
+    }
+
+    let Some(head_commit_id) = Head::current_commit_result()
+        .await
+        .map_err(map_reset_head_commit_error)?
+    else {
+        return Ok(false);
+    };
+    let commit: Commit = load_object(&head_commit_id)
+        .map_err(|e| object_load_error("commit", head_commit_id.to_string(), e.to_string()))?;
+    let tree: Tree = load_object(&commit.tree_id)
+        .map_err(|e| object_load_error("tree", commit.tree_id.to_string(), e.to_string()))?;
+    find_tree_item(&tree, path_str).map(|item| item.is_some())
 }
 
 /// Reset specific files in the index to their state in the target commit.
@@ -1275,7 +1368,7 @@ mod tests {
     fn test_reset_args_parse() {
         let args = ResetArgs::try_parse_from(["reset", "--hard", "HEAD~1"]).unwrap();
         assert!(args.hard);
-        assert_eq!(args.target, "HEAD~1");
+        assert_eq!(args.target.as_deref(), Some("HEAD~1"));
     }
 
     /// Pin the `Display` format contract for static-message and
@@ -1304,6 +1397,10 @@ mod tests {
         assert_eq!(
             ResetError::InvalidRevision("ambiguous revision 'a'".to_string()).to_string(),
             "ambiguous revision 'a'",
+        );
+        assert_eq!(
+            ResetError::AmbiguousRevisionPath("HEAD".to_string()).to_string(),
+            "ambiguous argument 'HEAD': both revision and filename",
         );
         assert_eq!(
             ResetError::RevisionRead("io error".to_string()).to_string(),
@@ -1348,7 +1445,7 @@ mod tests {
 
     /// Pin the `stable_code()` mapping for every variant of
     /// [`ResetError`]. The [`StableErrorCode`] is what `--json`
-    /// consumers branch on; ResetError has 20 variants spread across
+    /// consumers branch on; ResetError has 21 variants spread across
     /// repo-state (RepoNotFound / RepoStateInvalid / RepoCorrupt),
     /// I/O (IoReadFailed / IoWriteFailed), and CLI input
     /// (CliInvalidArguments / CliInvalidTarget) buckets. A future
@@ -1370,6 +1467,10 @@ mod tests {
         assert_eq!(
             ResetError::InvalidRevision("ignored".to_string()).stable_code(),
             StableErrorCode::CliInvalidTarget,
+        );
+        assert_eq!(
+            ResetError::AmbiguousRevisionPath("ignored".to_string()).stable_code(),
+            StableErrorCode::CliInvalidArguments,
         );
         assert_eq!(
             ResetError::HeadUnborn.stable_code(),
