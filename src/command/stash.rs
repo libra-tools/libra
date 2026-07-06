@@ -34,8 +34,7 @@ use crate::{
         load_object, log,
         merge::{MergeTreeEntry, create_tree_from_items_map},
         reset::{
-            rebuild_index_from_tree, remove_empty_directories, reset_index_to_commit,
-            restore_working_directory_from_tree,
+            remove_empty_directories, reset_index_to_commit, restore_working_directory_from_tree,
         },
         status,
     },
@@ -1307,8 +1306,9 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
 /// Apply a stash COMMIT by OID — the three-way apply shared by
 /// `stash apply/pop` and the merge autostash finalizer (which holds a stash
 /// commit reachable only from its sidecar, never from refs/stash). All-or-
-/// nothing: any conflict or collision fails BEFORE the worktree or index is
-/// touched, leaving the current state intact.
+/// nothing for the working tree: any conflict or collision fails BEFORE files
+/// are rewritten, leaving the current state intact. The current index is
+/// intentionally preserved by default.
 pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashError> {
     let stash_commit_hash = *hash;
     let git_dir =
@@ -1360,8 +1360,6 @@ pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashErr
     let merged_tree = merge_trees(&base_tree, &worktree_tree, &stash_tree, &git_dir)
         .map_err(StashError::MergeConflict)?;
 
-    let mut new_index = Index::new();
-
     let worktree_files = tree::get_tree_files_recursive(&worktree_tree, &git_dir, &PathBuf::new())
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
     let merged_files = tree::get_tree_files_recursive(&merged_tree, &git_dir, &PathBuf::new())
@@ -1403,15 +1401,14 @@ pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashErr
 
     restore_working_directory_from_tree(&merged_tree, workdir, "")
         .map_err(StashError::WriteObject)?;
-    rebuild_index_from_tree(&merged_tree, &mut new_index, "").map_err(StashError::IndexSave)?;
     if let Some(untracked_tree) = untracked_tree.as_ref() {
         restore_working_directory_from_tree(untracked_tree, workdir, "")
             .map_err(StashError::WriteObject)?;
     }
 
-    new_index
-        .save(&index_path)
-        .map_err(|e| StashError::IndexSave(e.to_string()))?;
+    // Git's default `stash apply/pop` restores changes to the working tree only.
+    // Keep the existing index intact; a future `--index` mode should restore the
+    // stash's second parent explicitly instead of rebuilding from `merged_tree`.
 
     Ok(())
 }

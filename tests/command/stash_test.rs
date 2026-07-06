@@ -26,6 +26,12 @@ fn latest_stash_commit(repo: &Path) -> Commit {
     load_object::<Commit>(&stash_hash).expect("failed to load latest stash commit")
 }
 
+fn status_short(repo: &Path) -> String {
+    let output = run_libra_command(&["status", "--short"], repo);
+    assert_cli_success(&output, "status --short");
+    String::from_utf8(output.stdout).expect("status --short output should be UTF-8")
+}
+
 #[test]
 #[serial]
 fn test_stash_cli_outside_repository_returns_fatal_128() {
@@ -303,6 +309,72 @@ async fn test_stash_push_and_pop_preserves_dotfiles() {
         "mode = \"stashed\"\n",
         "dot-directory change should round-trip through stash"
     );
+}
+
+#[test]
+fn test_stash_pop_restores_unstaged_change_without_staging() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a tracked file has only a working-tree edit.
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: the edit is back in the working tree but remains unstaged, matching
+    // Git's default `stash pop` behavior.
+    assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_restores_staged_only_change_as_unstaged_by_default() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a tracked file has only a staged edit.
+    fs::write(p.join("tracked.txt"), "staged version\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage tracked file",
+    );
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: default pop restores the content as an unstaged working-tree edit.
+    assert_eq!(
+        fs::read_to_string(p.join("tracked.txt")).unwrap(),
+        "staged version\n"
+    );
+    assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_restores_mixed_file_as_unstaged_worktree_content() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a file has both staged content and a newer working-tree edit.
+    fs::write(p.join("tracked.txt"), "staged version\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage tracked file",
+    );
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: the working-tree content wins, but the index remains at HEAD.
+    assert_eq!(
+        fs::read_to_string(p.join("tracked.txt")).unwrap(),
+        "worktree version\n"
+    );
+    assert_eq!(status_short(p), " M tracked.txt\n");
 }
 
 #[tokio::test]
