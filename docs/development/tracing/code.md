@@ -45,7 +45,7 @@ flowchart TD
 
 | 面向 | 当前结论 | 必须保持 / 补强 |
 |---|---|---|
-| Mode 与参数 | TUI、web-only、stdio 已共用 `CodeArgs` 和 `validate_mode_args`，但 help/banner 与实际 web-only provider 校验存在漂移风险。 | C1 先做 source-grounded audit；C2 再决定是修 help/docs 还是放宽实现。任何 mode 变更必须有 CLI regression。 |
+| Mode 与参数 | TUI、web-only、stdio 已共用 `CodeArgs` 和 `validate_mode_args`；C1 审计出的 help/banner 与 web-only provider 校验漂移已由 C2 放宽 web-only provider/model/api-base/temperature + provider-specific flags 消除（`--stdio` 保持锁定）。 | C2 已落地放宽并有 CLI regression（`code_cli_dispatch_test` + `src/command/code.rs::tests` web-only accept/reject 矩阵）；后续任何 mode 变更仍必须带 CLI regression。 |
 | Provider / env | provider-specific flags 和 `--api-base` 规则已有校验；live/provider tests 依赖 `.env.test` 时不得泄露 key。 | C3 固定 provider factory、env-file 优先级、Vault/env lookup、missing-key 错误和 feature-gated live tests。 |
 | Web-only / Code UI | Code UI API、SSE、browser control、control token、diagnostics redaction 是用户可见接口。 | C4 固定 `/api/code/*` observe-only contract；control token 0600；diagnostics/SSE/control info 不泄露 secrets。 |
 | Session / graph | `--resume` 只应在 TUI path 允许；projection、graph handoff、audit sink 不能与 user transcript 混用。 | C5 固定 SessionStore JSONL unknown-event-safe、truncated-tail recovery、graph handoff 和 resume audit。 |

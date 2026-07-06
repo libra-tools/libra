@@ -1554,12 +1554,9 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
     let registry = Arc::new(builder.build());
     let allowed_tools = registry.filter_by_intent(task_intent);
 
-    let approval_config = approval_config_from_project_config(registry.working_dir());
-    let approval_ttl = args
-        .approval_ttl
-        .map(Duration::from_secs)
-        .or(approval_config.ttl)
-        .unwrap_or(DEFAULT_APPROVAL_TTL);
+    // Single source of truth for the args -> approval-context mapping
+    // (criterion 2), shared with the headless launch path.
+    let approval_cfg = tui_approval_config_from_args(&args, registry.working_dir());
     let provider_name = format!("{:?}", args.provider).to_lowercase();
     let launch_config = TuiLaunchConfig {
         host,
@@ -1576,10 +1573,10 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
         auto_classify_first_user_message: args.context.is_none(),
         context: args.context,
         resume_thread_id,
-        approval_policy: args.approval_policy.into(),
-        allow_all_commands: args.approval_policy.allows_all_commands(),
-        approval_ttl,
-        approval_cache_policy: approval_config.cache_policy,
+        approval_policy: approval_cfg.policy,
+        allow_all_commands: approval_cfg.allow_all_commands,
+        approval_ttl: approval_cfg.ttl,
+        approval_cache_policy: approval_cfg.cache_policy,
         network_access: args.network_access.is_allowed(),
         user_input_rx,
         exec_approval_rx,
@@ -2088,22 +2085,11 @@ where
     let session = CodeUiSession::new(snapshot);
     let persistence = HeadlessSessionPersistence::new(session_store, session_state);
 
-    let approval_config = approval_config_from_project_config(working_dir);
-    let approval_ttl = args
-        .approval_ttl
-        .map(Duration::from_secs)
-        .or(approval_config.ttl)
-        .unwrap_or(DEFAULT_APPROVAL_TTL);
     let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
     let runtime_context = Some(default_tui_runtime_context(
         working_dir,
         args.context,
-        DefaultTuiApprovalConfig {
-            policy: args.approval_policy.into(),
-            allow_all_commands: args.approval_policy.allows_all_commands(),
-            ttl: approval_ttl,
-            cache_policy: approval_config.cache_policy,
-        },
+        tui_approval_config_from_args(args, working_dir),
         args.network_access.is_allowed(),
         exec_approval_tx,
     ));
@@ -3661,6 +3647,27 @@ fn approval_config_from_project_config(working_dir: &Path) -> ApprovalRuntimeCon
             // config-derived policy starts with no projection attached.
             approved_ruleset: None,
         },
+    }
+}
+
+/// Single source of truth for the approval-related CLI-args -> runtime
+/// [`DefaultTuiApprovalConfig`] mapping (C7 criterion 2): `--approval-policy`
+/// maps through `.into()`, `--approval-ttl` through `Duration::from_secs`
+/// (CLI flag wins over the project `approval.ttl`, else `DEFAULT_APPROVAL_TTL`),
+/// and `--approval-policy` also drives `allow_all_commands`. Both the TUI and
+/// headless launch paths derive their approval config from here, so a dropped
+/// or hardcoded flag is a single-point regression the unit test guards.
+fn tui_approval_config_from_args(args: &CodeArgs, working_dir: &Path) -> DefaultTuiApprovalConfig {
+    let approval_config = approval_config_from_project_config(working_dir);
+    DefaultTuiApprovalConfig {
+        policy: args.approval_policy.into(),
+        allow_all_commands: args.approval_policy.allows_all_commands(),
+        ttl: args
+            .approval_ttl
+            .map(Duration::from_secs)
+            .or(approval_config.ttl)
+            .unwrap_or(DEFAULT_APPROVAL_TTL),
+        cache_policy: approval_config.cache_policy,
     }
 }
 
@@ -5704,6 +5711,61 @@ no_cache_unknown_network = true
             let sandbox = runtime.sandbox.expect("sandbox context should be present");
             assert!(matches!(sandbox.policy, SandboxPolicy::ReadOnly));
         }
+    }
+
+    /// C7 (plan.md:1376): the three runtime-shaping flags must be visible at
+    /// tool invocation through the `ToolRuntimeContext` the tool loop reads.
+    /// The `--network-access` and allow-all axes are pinned by the tests
+    /// above; this pins that a non-default `--approval-policy` and
+    /// `--approval-ttl` both land on the `ToolApprovalContext` (`policy` +
+    /// `approval_ttl`) rather than being silently dropped between the CLI
+    /// mapping and the runtime context. `shell`/`apply_patch` read exactly
+    /// these fields to gate execution, so observing them here is the
+    /// "visible at invocation" contract.
+    #[test]
+    fn default_tui_runtime_context_exposes_approval_policy_and_ttl() {
+        // Exercise the PRODUCTION mapping (codex C7 review): the args ->
+        // DefaultTuiApprovalConfig mapping is now the shared helper
+        // `tui_approval_config_from_args`, which both the TUI and headless
+        // launch paths call. Feeding it parsed CLI args and running the result
+        // through `default_tui_runtime_context` catches a regression where a
+        // flag is dropped or hardcoded on the real production path — not just
+        // inside the runtime-context builder.
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let args = CodeArgs::try_parse_from([
+            "libra",
+            "--approval-policy",
+            "untrusted",
+            "--approval-ttl",
+            "4242",
+        ])
+        .expect("parse code args");
+
+        let (tx, _rx) = unbounded_channel();
+        let runtime = default_tui_runtime_context(
+            workspace.path(),
+            Some(CodeContext::Dev),
+            tui_approval_config_from_args(&args, workspace.path()),
+            args.network_access.is_allowed(),
+            tx,
+        );
+
+        let approval = runtime
+            .approval
+            .expect("approval context should be present");
+        // `--approval-policy untrusted` must map through the helper's `.into()`
+        // to AskForApproval::UnlessTrusted.
+        assert_eq!(approval.policy, AskForApproval::UnlessTrusted);
+        // `--approval-ttl 4242` must map through the helper's Duration::from_secs.
+        assert_eq!(approval.approval_ttl, Duration::from_secs(4242));
+
+        // Control: with no --approval-ttl and no project config, the helper
+        // falls back to the 300s default — proving the 4242s above came from
+        // the flag, not a hardcode.
+        let default_args = CodeArgs::try_parse_from(["libra"]).expect("parse defaults");
+        let default_cfg = tui_approval_config_from_args(&default_args, workspace.path());
+        assert_eq!(default_cfg.ttl, DEFAULT_APPROVAL_TTL);
+        assert_ne!(default_cfg.ttl, Duration::from_secs(4242));
     }
 
     // ─── OC-Phase 2 P2.4: --agent override ────────────────────────────────
