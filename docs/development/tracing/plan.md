@@ -475,15 +475,15 @@ harness 硬性要求：
 
 **验收标准**：
 
-- [ ] 读取 `docs/development/tracing/agent.md`、`docs/development/tracing/code.md`、`docs/development/commands/_general.md`。
-- [ ] 核对 `src/cli.rs`、`src/command/mod.rs`、`src/command/agent/*`、`src/command/code.rs` 的公开入口。
-- [ ] 核对 `tests/INDEX.md`、`Cargo.toml [[test]]`、相关 compat tests 的当前注册状态。
-- [ ] 用 `libra status --short` 记录工作树，后续只提交本轮任务涉及路径。
+- [x] 读取 `docs/development/tracing/agent.md`、`docs/development/tracing/code.md`、`docs/development/commands/_general.md`。
+- [x] 核对 `src/cli.rs`、`src/command/mod.rs`、`src/command/agent/*`、`src/command/code.rs` 的公开入口。
+- [x] 核对 `tests/INDEX.md`、`Cargo.toml [[test]]`、相关 compat tests 的当前注册状态。
+- [x] 用 `libra status --short` 记录工作树，后续只提交本轮任务涉及路径。
 
 **验证**：
 
-- [ ] `rg -n "AgentSubcommand|CodeArgs|CodeProvider|compat_agent|code_cli" src tests Cargo.toml tests/INDEX.md`
-- [ ] `libra diff --stat -- docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`
+- [x] `rg -n "AgentSubcommand|CodeArgs|CodeProvider|compat_agent|code_cli" src tests Cargo.toml tests/INDEX.md`
+- [x] `libra diff --stat -- docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`
 
 **依赖**：无。
 
@@ -499,16 +499,16 @@ harness 硬性要求：
 
 **验收标准**：
 
-- [ ] 每个新增/修改命令都有用户文档、开发文档、测试和 compat 证据。
-- [ ] 所有用户可见错误走 `CliError` / `StableErrorCode`，消息可操作。
-- [ ] 新增测试 target 同步 `Cargo.toml`、`tests/INDEX.md`，compat 文件同步 `tests/compat/README.md`。
+- [x] 每个新增/修改命令都有用户文档、开发文档、测试和 compat 证据。
+- [x] 所有用户可见错误走 `CliError` / `StableErrorCode`，消息可操作。
+- [x] 新增测试 target 同步 `Cargo.toml`、`tests/INDEX.md`，compat 文件同步 `tests/compat/README.md`。
 
 本卡交付物说明：规则本身已固化在 §0.2/§0.4/§0.5 checklist 中，本卡无独立代码变更；验收即下列两个守卫跑绿（依赖 Task 0.3 先修复断链）+ §10 记录一行。
 
 **验证**：
 
-- [ ] `cargo test --test compat_matrix_alignment`（Task 0.3 完成前预期失败，不得据此标记本卡完成）
-- [ ] `cargo test --test compat_error_codes_doc_sync`
+- [x] `cargo test --test compat_matrix_alignment`（Task 0.3 完成前预期失败，不得据此标记本卡完成）
+- [x] `cargo test --test compat_error_codes_doc_sync`
 
 **依赖**：Task 0.1、0.3、0.4（0.3 未完成时本卡验证命令必失败；0.4 未完成时跨文档事实源仍不干净）。
 
@@ -524,28 +524,28 @@ harness 硬性要求：
 
 **验收标准**：
 
-- [ ] `tests/compat/agent_docs_contract.rs` 的 `include_str!("../../docs/development/commands/agent.md")` 重指 `../../docs/development/tracing/agent.md`；守卫内其它路径引用同步核对。
-- [ ] `tests/compat/matrix_alignment.rs` 的**运行时**旧路径读取同步重指：`read_repo_file("docs/development/commands/agent.md")`（约 :104）与相关 context 字符串（约 :171）——该守卫对缺失文件直接 panic，是 `include_str!` 之外的第二处断链，`cargo check` 抓不到。
-- [ ] `compat_matrix_alignment` 的**第三处**断链（旧 `docs/development/integration-test-plan.md`，已迁至 `docs/development/integration/integration-test-plan.md`）同步重指：`tests/compat/matrix_alignment.rs`（:103 运行时读取、:161/:166 context 字符串）、`tests/compat/matrix_alignment_support.rs`（:174/:181 运行时读取）、`tools/integration-runner/src/plan.rs:101`（功能性路径常量）以及 `tests/INDEX.md`、`tools/integration-runner/README.md`、`AGENTS.md`、`docs/development/commands/_general.md`、`docs/development/account.md`、`docs/development/gap/grit-gap.md` 的 live 引用——2026-07-04 实测旧路径共 15 处/9 文件（与下一条的命中行有重叠）。
-- [ ] 同源场景清单/场景文档迁移一并重指：旧 `docs/development/integration-scenarios.yaml` 与旧 `docs/development/integration-scenarios/<id>.md` 目录形态（均已迁至 `docs/development/integration/integration-scenarios/`）——**功能性路径拼接** `tools/integration-runner/src/manifest.rs:24`、`tools/integration-runner/src/plan.rs`（:53 目录 join、:118/:177 场景文档拼接；:51/:121 为注释与错误消息），按旧路径 runner 必失败；doc 注释 `tools/integration-runner/src/cli.rs:14`、`tools/integration-runner/src/registry.rs:11`、`tools/integration-runner/README.md:14`；文档引用 `docs/development/commands/_general.md`（:9/:20/:68）、`docs/development/account.md`（:1039/:1040/:1042）、`docs/development/gap/grit-gap.md`（:612/:613/:691）；以及两个已迁移文件自身残留的旧根路径：`docs/development/integration/integration-test-plan.md:84`、`docs/development/integration/integration-scenarios/integration-scenarios.yaml`（:6/:13 头部注释）——2026-07-04 实测全路径旧形态共 21 处/10 文件。
-- [ ] 同族 **bare/相对简写**引用一并规范化（全路径 rg 测不到，须单列）：`docs/development/integration/integration-scenarios/README.md:3` 的 `../integration-scenarios.yaml` 父级相对链接（迁移前 yaml 在目录外、现已并入目录内，链接必然断链——改为同目录 `integration-scenarios.yaml`；同文件 :4 的 `../integration-test-plan.md` 现可解析、无需改）；`docs/development/account.md:924/:968` 与 `docs/development/commands/_general.md:29`（mermaid 标签）、`tools/integration-runner/README.md:14` 的 bare `integration-scenarios.yaml` / `integration-scenarios/<file>` 简写——上述 prose 文档中所有 `integration-scenarios` 提及统一规范化为完整新路径 `docs/development/integration/integration-scenarios/…`（目录内相对链接仅允许 integration-scenarios/ 目录内部文件互引）。2026-07-04 实测规范化缺口 13 行/4 文件 + README 断链 1 处。
-- [ ] 执行期新发现的**第七处运行时断链**（2026-07-04 实跑 `cargo test --all` 暴露，原五轮核查与 codex review 的 rg 模式均未覆盖 tests/ 内的 code-agent-runtime.md 引用）：`tests/ai_provider_transform_test.rs:281` 在运行时读取已删除的 `docs/development/code-agent-runtime.md`（`provider_capability_update_guide_documents_reasoning_variant_workflow`），重指 `docs/development/internal/code-agent-runtime.md`；重指前已核对新路径文档包含该测试断言的全部 10 个期望字符串。该文件属 Task 0.4 否定断言的扫描范围之外（0.4 只扫 4 个 doc 文件），故由本卡承接；`rg -n "docs/development/code-agent-runtime" src tests tools Cargo.toml AGENTS.md` 重指后仅剩零命中。
-- [ ] `tests/INDEX.md` 与 `tests/compat/README.md` 中上述守卫的 source mapping 更新为 tracing/ 新路径。
-- [ ] `COMPATIBILITY.md` 中指向 `docs/development/commands/agent.md` 的链接改指 tracing/ 新路径（2026-07-04 实测仅 :138 一处 agent.md 链接，无 code.md 链接）。
-- [ ] `docs/development/commands/README.md` 的 agent/code 表行改指 tracing/ 新路径或注明已迁移（不留断链）。注意 :27/:50 是相对链接 `](agent.md)` / `](code.md)`，全路径 rg 测不到，须用下方专项否定断言验证。
-- [ ] 本卡负责范围内的旧路径余量**一律改指 tracing/ 新路径**，范围为 `src`、`tests`、`Cargo.toml`、`COMPATIBILITY.md`、`AGENTS.md`、`docs/commands/`、`docs/development/commands/`、`template/`（含源码注释、rustdoc 链接、embedded/template 技能文档）。四类明确豁免（不由本卡触碰，避免验收与验证自相矛盾）：`docs/development/tracing/plan.md`（任务文本必须引用旧路径字符串）、`docs/development/tracing/memory.md`（§0 范围外文档，其旧路径引用随 A9 banner 处理）、`docs/development/internal/code-agent-runtime.md`（Task 0.4 承接）、`sql/migrations/*`（已发布迁移文件不得改写，`2026053101_ai_final_decision.sql:4` 注释保留为历史引用）。
+- [x] `tests/compat/agent_docs_contract.rs` 的 `include_str!("../../docs/development/commands/agent.md")` 重指 `../../docs/development/tracing/agent.md`；守卫内其它路径引用同步核对。
+- [x] `tests/compat/matrix_alignment.rs` 的**运行时**旧路径读取同步重指：`read_repo_file("docs/development/commands/agent.md")`（约 :104）与相关 context 字符串（约 :171）——该守卫对缺失文件直接 panic，是 `include_str!` 之外的第二处断链，`cargo check` 抓不到。
+- [x] `compat_matrix_alignment` 的**第三处**断链（旧 `docs/development/integration-test-plan.md`，已迁至 `docs/development/integration/integration-test-plan.md`）同步重指：`tests/compat/matrix_alignment.rs`（:103 运行时读取、:161/:166 context 字符串）、`tests/compat/matrix_alignment_support.rs`（:174/:181 运行时读取）、`tools/integration-runner/src/plan.rs:101`（功能性路径常量）以及 `tests/INDEX.md`、`tools/integration-runner/README.md`、`AGENTS.md`、`docs/development/commands/_general.md`、`docs/development/account.md`、`docs/development/gap/grit-gap.md` 的 live 引用——2026-07-04 实测旧路径共 15 处/9 文件（与下一条的命中行有重叠）。
+- [x] 同源场景清单/场景文档迁移一并重指：旧 `docs/development/integration-scenarios.yaml` 与旧 `docs/development/integration-scenarios/<id>.md` 目录形态（均已迁至 `docs/development/integration/integration-scenarios/`）——**功能性路径拼接** `tools/integration-runner/src/manifest.rs:24`、`tools/integration-runner/src/plan.rs`（:53 目录 join、:118/:177 场景文档拼接；:51/:121 为注释与错误消息），按旧路径 runner 必失败；doc 注释 `tools/integration-runner/src/cli.rs:14`、`tools/integration-runner/src/registry.rs:11`、`tools/integration-runner/README.md:14`；文档引用 `docs/development/commands/_general.md`（:9/:20/:68）、`docs/development/account.md`（:1039/:1040/:1042）、`docs/development/gap/grit-gap.md`（:612/:613/:691）；以及两个已迁移文件自身残留的旧根路径：`docs/development/integration/integration-test-plan.md:84`、`docs/development/integration/integration-scenarios/integration-scenarios.yaml`（:6/:13 头部注释）——2026-07-04 实测全路径旧形态共 21 处/10 文件。
+- [x] 同族 **bare/相对简写**引用一并规范化（全路径 rg 测不到，须单列）：`docs/development/integration/integration-scenarios/README.md:3` 的 `../integration-scenarios.yaml` 父级相对链接（迁移前 yaml 在目录外、现已并入目录内，链接必然断链——改为同目录 `integration-scenarios.yaml`；同文件 :4 的 `../integration-test-plan.md` 现可解析、无需改）；`docs/development/account.md:924/:968` 与 `docs/development/commands/_general.md:29`（mermaid 标签）、`tools/integration-runner/README.md:14` 的 bare `integration-scenarios.yaml` / `integration-scenarios/<file>` 简写——上述 prose 文档中所有 `integration-scenarios` 提及统一规范化为完整新路径 `docs/development/integration/integration-scenarios/…`（目录内相对链接仅允许 integration-scenarios/ 目录内部文件互引）。2026-07-04 实测规范化缺口 13 行/4 文件 + README 断链 1 处。
+- [x] 执行期新发现的**第七处运行时断链**（2026-07-04 实跑 `cargo test --all` 暴露，原五轮核查与 codex review 的 rg 模式均未覆盖 tests/ 内的 code-agent-runtime.md 引用）：`tests/ai_provider_transform_test.rs:281` 在运行时读取已删除的 `docs/development/code-agent-runtime.md`（`provider_capability_update_guide_documents_reasoning_variant_workflow`），重指 `docs/development/internal/code-agent-runtime.md`；重指前已核对新路径文档包含该测试断言的全部 10 个期望字符串。该文件属 Task 0.4 否定断言的扫描范围之外（0.4 只扫 4 个 doc 文件），故由本卡承接；`rg -n "docs/development/code-agent-runtime" src tests tools Cargo.toml AGENTS.md` 重指后仅剩零命中。
+- [x] `tests/INDEX.md` 与 `tests/compat/README.md` 中上述守卫的 source mapping 更新为 tracing/ 新路径。
+- [x] `COMPATIBILITY.md` 中指向 `docs/development/commands/agent.md` 的链接改指 tracing/ 新路径（2026-07-04 实测仅 :138 一处 agent.md 链接，无 code.md 链接）。
+- [x] `docs/development/commands/README.md` 的 agent/code 表行改指 tracing/ 新路径或注明已迁移（不留断链）。注意 :27/:50 是相对链接 `](agent.md)` / `](code.md)`，全路径 rg 测不到，须用下方专项否定断言验证。
+- [x] 本卡负责范围内的旧路径余量**一律改指 tracing/ 新路径**，范围为 `src`、`tests`、`Cargo.toml`、`COMPATIBILITY.md`、`AGENTS.md`、`docs/commands/`、`docs/development/commands/`、`template/`（含源码注释、rustdoc 链接、embedded/template 技能文档）。四类明确豁免（不由本卡触碰，避免验收与验证自相矛盾）：`docs/development/tracing/plan.md`（任务文本必须引用旧路径字符串）、`docs/development/tracing/memory.md`（§0 范围外文档，其旧路径引用随 A9 banner 处理）、`docs/development/internal/code-agent-runtime.md`（Task 0.4 承接）、`sql/migrations/*`（已发布迁移文件不得改写，`2026053101_ai_final_decision.sql:4` 注释保留为历史引用）。
 
 **验证**：
 
-- [ ] `cargo test --test compat_agent_docs_contract`
-- [ ] `cargo test --test compat_matrix_alignment`（须 agent.md 与 integration-test-plan.md 两类断链都重指后才可跑绿）
-- [ ] `LIBRA_SKIP_WEB_BUILD=1 cargo check --all-targets`（确认无 `include_str!` 断链）
-- [ ] `! rg -n "docs/development/commands/(agent|code)\.md" src tests Cargo.toml COMPATIBILITY.md AGENTS.md docs/commands docs/development/commands template`（否定断言，期望零命中；本卡完成前预期失败——2026-07-04 实测该范围 29 处命中/约 25 个文件。豁免的 plan.md、memory.md、internal 文档与 sql 迁移不在扫描范围，分别由本卡豁免声明、A9、Task 0.4 承接；原 `docs` 全域扫描因命中上述豁免文件永不可跑绿，已废弃）
-- [ ] `! rg -n "\]\((agent|code)\.md\)" docs/development/commands/README.md`（否定断言：README 相对链接断链已清理，期望零命中）
-- [ ] `! rg -n "docs/development/integration-test-plan\.md" src tests tools docs AGENTS.md -g '!docs/development/tracing/plan.md'`（否定断言，期望零命中；本卡完成前预期失败——2026-07-04 实测 15 处命中/9 文件。plan.md 经 `-g` 排除：本卡任务文本必须引用旧路径字符串）
-- [ ] `! rg -n "docs/development/integration-scenarios" src tests tools docs AGENTS.md -g '!docs/development/tracing/plan.md'`（否定断言，期望零命中；一个模式同时覆盖 `.yaml` 与 `/<id>.md` 两种旧形态；新路径 `docs/development/integration/integration-scenarios/…` 因中间多一级 `integration/` 不会被命中；本卡完成前预期失败——2026-07-04 实测 21 处/10 文件）
-- [ ] `! rg -n "\]\(\.\./integration-scenarios\.yaml\)" docs/development/integration/integration-scenarios/README.md`（否定断言：README 迁移后失效的父级相对链接已修复；本卡完成前预期失败——1 处命中）
-- [ ] `! rg -n "integration-scenarios" docs/development/account.md docs/development/gap/grit-gap.md docs/development/commands/_general.md tools/integration-runner/README.md | rg -v "docs/development/integration/integration-scenarios"`（bare/相对简写规范化断言：这四个 prose 文档中每一行 `integration-scenarios` 提及都必须携带完整新路径；本卡完成前预期失败——2026-07-04 实测 13 行缺口。已知局限：同一行同时含新全路径与残留 bare 简写时会被 `-v` 放过，故以上一条验收清单的逐点位核对为准）
+- [x] `cargo test --test compat_agent_docs_contract`
+- [x] `cargo test --test compat_matrix_alignment`（须 agent.md 与 integration-test-plan.md 两类断链都重指后才可跑绿）
+- [x] `LIBRA_SKIP_WEB_BUILD=1 cargo check --all-targets`（确认无 `include_str!` 断链）
+- [x] `! rg -n "docs/development/commands/(agent|code)\.md" src tests Cargo.toml COMPATIBILITY.md AGENTS.md docs/commands docs/development/commands template`（否定断言，期望零命中；本卡完成前预期失败——2026-07-04 实测该范围 29 处命中/约 25 个文件。豁免的 plan.md、memory.md、internal 文档与 sql 迁移不在扫描范围，分别由本卡豁免声明、A9、Task 0.4 承接；原 `docs` 全域扫描因命中上述豁免文件永不可跑绿，已废弃）
+- [x] `! rg -n "\]\((agent|code)\.md\)" docs/development/commands/README.md`（否定断言：README 相对链接断链已清理，期望零命中）
+- [x] `! rg -n "docs/development/integration-test-plan\.md" src tests tools docs AGENTS.md -g '!docs/development/tracing/plan.md'`（否定断言，期望零命中；本卡完成前预期失败——2026-07-04 实测 15 处命中/9 文件。plan.md 经 `-g` 排除：本卡任务文本必须引用旧路径字符串）
+- [x] `! rg -n "docs/development/integration-scenarios" src tests tools docs AGENTS.md -g '!docs/development/tracing/plan.md'`（否定断言，期望零命中；一个模式同时覆盖 `.yaml` 与 `/<id>.md` 两种旧形态；新路径 `docs/development/integration/integration-scenarios/…` 因中间多一级 `integration/` 不会被命中；本卡完成前预期失败——2026-07-04 实测 21 处/10 文件）
+- [x] `! rg -n "\]\(\.\./integration-scenarios\.yaml\)" docs/development/integration/integration-scenarios/README.md`（否定断言：README 迁移后失效的父级相对链接已修复；本卡完成前预期失败——1 处命中）
+- [x] `! rg -n "integration-scenarios" docs/development/account.md docs/development/gap/grit-gap.md docs/development/commands/_general.md tools/integration-runner/README.md | rg -v "docs/development/integration/integration-scenarios"`（bare/相对简写规范化断言：这四个 prose 文档中每一行 `integration-scenarios` 提及都必须携带完整新路径；本卡完成前预期失败——2026-07-04 实测 13 行缺口。已知局限：同一行同时含新全路径与残留 bare 简写时会被 `-v` 放过，故以上一条验收清单的逐点位核对为准）
 
 **依赖**：Task 0.1。本卡必须先于 Task 0.4、Task 0.2 验证与一切 A/C 任务完成（0.3 未完成时 `compat_matrix_alignment`、`compat_agent_docs_contract` 乃至 `cargo test --all` 必失败）。
 
@@ -579,19 +579,19 @@ harness 硬性要求：
 
 **验收标准**：
 
-- [ ] `docs/development/internal/code-agent-runtime.md` 中所有 live Markdown 链接从 `commands/agent.md` / `docs/development/commands/agent.md` 改指 `../tracing/agent.md` 或 `docs/development/tracing/agent.md`；描述 `libra code` public surface 的 live 链接改指 `../tracing/code.md` 或 `docs/development/tracing/code.md`。（2026-07-04 实测：失效 href 均为相对形态——指向 `commands/agent.md` 的 11 处、`commands/_general.md` 4 处、`mcp.md` 13 处；全路径字符串只出现在链接文字/正文。另有 :2678 指向自身文件名的自链接虽可解析，但其链接文字声称已删除的根路径，须一并改写。）
-- [ ] `docs/development/internal/code-agent-runtime.md` 中所有 live Markdown 链接从 `commands/_general.md` 改指 `../commands/_general.md`；不得留下从 `internal/` 目录解析到不存在路径的相对链接。
-- [ ] `docs/development/internal/code-agent-runtime.md` 中的 `mcp.md` live 链接全部处理：若仅引用历史 MCP 拆分计划，改为不可点击历史说明；若引用当前可执行验证，改指 `docs/development/tracing/code.md` 的 C6 或现存的 `docs/development/integration/integration-scenarios/mcp.md`，并说明其只是 integration scenario，不是 MCP 事实源。
-- [ ] drift / rg / 验收命令里的旧路径同步改为当前路径，尤其是 `docs/development/code-agent-runtime.md`、`docs/development/commands/agent.md`、`commands/agent.md`、`mcp.md`。
-- [ ] 历史说明允许保留旧路径字符串，但必须在同句或相邻句标注 `旧`、`历史`、`已删除`、`不得恢复` 或 `d0a714` 等语境；不得作为可执行命令、依赖、链接或“source-of-truth”出现。
-- [ ] `docs/development/tracing/agent.md`、`docs/development/tracing/code.md`、本文的 cross-doc 描述与清理后的 internal 文档一致；若发现它们仍把旧路径当 live 输入，同 PR 修正。
+- [x] `docs/development/internal/code-agent-runtime.md` 中所有 live Markdown 链接从 `commands/agent.md` / `docs/development/commands/agent.md` 改指 `../tracing/agent.md` 或 `docs/development/tracing/agent.md`；描述 `libra code` public surface 的 live 链接改指 `../tracing/code.md` 或 `docs/development/tracing/code.md`。（2026-07-04 实测：失效 href 均为相对形态——指向 `commands/agent.md` 的 11 处、`commands/_general.md` 4 处、`mcp.md` 13 处；全路径字符串只出现在链接文字/正文。另有 :2678 指向自身文件名的自链接虽可解析，但其链接文字声称已删除的根路径，须一并改写。）
+- [x] `docs/development/internal/code-agent-runtime.md` 中所有 live Markdown 链接从 `commands/_general.md` 改指 `../commands/_general.md`；不得留下从 `internal/` 目录解析到不存在路径的相对链接。
+- [x] `docs/development/internal/code-agent-runtime.md` 中的 `mcp.md` live 链接全部处理：若仅引用历史 MCP 拆分计划，改为不可点击历史说明；若引用当前可执行验证，改指 `docs/development/tracing/code.md` 的 C6 或现存的 `docs/development/integration/integration-scenarios/mcp.md`，并说明其只是 integration scenario，不是 MCP 事实源。
+- [x] drift / rg / 验收命令里的旧路径同步改为当前路径，尤其是 `docs/development/code-agent-runtime.md`、`docs/development/commands/agent.md`、`commands/agent.md`、`mcp.md`。
+- [x] 历史说明允许保留旧路径字符串，但必须在同句或相邻句标注 `旧`、`历史`、`已删除`、`不得恢复` 或 `d0a714` 等语境；不得作为可执行命令、依赖、链接或“source-of-truth”出现。
+- [x] `docs/development/tracing/agent.md`、`docs/development/tracing/code.md`、本文的 cross-doc 描述与清理后的 internal 文档一致；若发现它们仍把旧路径当 live 输入，同 PR 修正。
 
 **验证**：
 
-- [ ] `test ! -e docs/development/commands/agent.md && test ! -e docs/development/commands/code.md && test ! -e docs/development/code-agent-runtime.md && test ! -e docs/development/agent.md && test ! -e docs/development/web-only.md`
-- [ ] `! rg -n "\\]\\((commands/(agent|_general)\\.md|mcp\\.md|code-agent-runtime\\.md|\\.\\./agent\\.md|\\.\\./web-only\\.md|\\.\\./code-agent-runtime\\.md)\\)" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`（Task 0.4 完成前预期失败——2026-07-04 实测 29 处命中，全部位于 code-agent-runtime.md，含 :2678 自链接）
-- [ ] `! rg -n "docs/development/commands/(agent|code)\\.md|docs/development/code-agent-runtime\\.md|docs/development/agent\\.md|docs/development/web-only\\.md" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md | rg -v "旧|历史|已删除|不得|d0a714|include_str|read_repo_file|Task 0\\.3|Task 0\\.4|改指|test ! -e"`（白名单含 `改指` / `test ! -e`：本计划 Task 0.3/0.4 验收文本中的「…改指…」句与上一条 `test ! -e` 验证命令、code-agent-runtime.md 内的 `test ! -e` 断言行都合法保留旧路径字符串；2026-07-04 实测原白名单下该断言永不可跑绿）
-- [ ] `rg -n "docs/development/tracing/(agent|code)\\.md|docs/development/internal/code-agent-runtime\\.md|docs/development/commands/_general\\.md" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`
+- [x] `test ! -e docs/development/commands/agent.md && test ! -e docs/development/commands/code.md && test ! -e docs/development/code-agent-runtime.md && test ! -e docs/development/agent.md && test ! -e docs/development/web-only.md`
+- [x] `! rg -n "\\]\\((commands/(agent|_general)\\.md|mcp\\.md|code-agent-runtime\\.md|\\.\\./agent\\.md|\\.\\./web-only\\.md|\\.\\./code-agent-runtime\\.md)\\)" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`（Task 0.4 完成前预期失败——2026-07-04 实测 29 处命中，全部位于 code-agent-runtime.md，含 :2678 自链接）
+- [x] `! rg -n "docs/development/commands/(agent|code)\\.md|docs/development/code-agent-runtime\\.md|docs/development/agent\\.md|docs/development/web-only\\.md" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md | rg -v "旧|历史|已删除|不得|d0a714|include_str|read_repo_file|Task 0\\.3|Task 0\\.4|改指|test ! -e"`（白名单含 `改指` / `test ! -e`：本计划 Task 0.3/0.4 验收文本中的「…改指…」句与上一条 `test ! -e` 验证命令、code-agent-runtime.md 内的 `test ! -e` 断言行都合法保留旧路径字符串；2026-07-04 实测原白名单下该断言永不可跑绿）
+- [x] `rg -n "docs/development/tracing/(agent|code)\\.md|docs/development/internal/code-agent-runtime\\.md|docs/development/commands/_general\\.md" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`
 
 **依赖**：Task 0.1、0.3。本卡必须先于 Task 0.2 验证与 A1/C1 开工；0.4 未完成时，不得把 `docs/development/internal/code-agent-runtime.md` 当作干净事实源。
 
@@ -888,29 +888,29 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **验收标准**：
 
-- [ ] Preflight 记录 `command -v codex`、`codex --version`、`command -v claude`、`claude --version`、`command -v opencode`、`opencode --version`；若某命令不支持 `--version`，记录等价只读版本/状态命令。输出不得包含 token 或账户 secret。
-- [ ] `agent_local_capture_smoke_test` 按 §0.3 固化真实 CLI 调用矩阵：Codex 用 `codex exec`，Claude Code 用 `claude -p`，OpenCode 用 `opencode run`；每个 agent 使用独立临时 repo、独立 evidence 目录、串行执行和 child-process timeout。
-- [ ] 在临时 Libra 仓库中分别执行 `libra agent add claude-code`、`libra agent add codex`、`libra agent add opencode`；三者都必须安装 Libra-managed hooks，且保留用户已有 provider 配置。
-- [ ] 分别启动本地 `claude`、`codex`、`opencode` 的最小非破坏性会话，触发至少一个 `SessionStart`、一个 turn boundary、一个 `SessionEnd` 或等价 stop event；如果某 agent 的 CLI 无稳定非交互模式，测试 harness 必须明确记录手动/PTY 驱动步骤，并把该 agent 标为需要本地 smoke 而非 CI-only。
-- [ ] `libra agent list --json` 对三者均显示 `supported=true`、`support_wave="first_batch"`、`registered=true`、`transcript_readable=true`、`hook_installable=true`、`installed=true`。
-- [ ] `libra agent session list --json` 能看到 `agent_kind` 分别为 `claude_code`、`codex`、`opencode` 的 session；`libra agent checkpoint list --json` 至少各有一个对应 checkpoint。
-- [ ] `libra agent checkpoint show <id> --json` 默认只展示 metadata/redaction/content hash/token summary，不读取或打印完整 transcript；显式 detail/transcript 路径另测。
-- [ ] `libra agent doctor --json` 对三条本地采集链路不报告 missing hook、missing object、missing catalog row 或 redaction failure。
-- [ ] 三条 smoke 的产物都进入 `refs/libra/traces`，并能由 `checkpoint show` / `session show` 通过 OID 指针读取 metadata。
-- [ ] Preflight 完成 §0.3.2 登录态只读检查（`codex login status` / `claude auth status` / `opencode providers list`），evidence 只保留 redacted 布尔判定与退出码；任一未登录即按 §0 规则标记 blocked，不发起真实付费会话。
-- [ ] Preflight 记录 §0.3.2 pinned `$LIBRA_BIN` 副本的 sha256，安装断言确认各 hook entry command 以该 pinned 绝对路径开头（与 A3 的 provenance 口径对齐）。
-- [ ] 采集断言完成后执行 §0.3.5 卸载 smoke：`agent remove <slug>` 后 provider 配置回到安装前语义状态（与 `preinstall.snapshot` 对比）、`installed=false`、二次 remove 幂等；已捕获数据不删除。
-- [ ] 本机 agent CLI 版本高于 fixtures manifest 记录版本且 smoke 观察到 transcript/hook 格式差异时，在 evidence summary 写明差异并决定是否刷新 fixture；刷新按 §0.3.4 重新采集，提交前完成 redaction/最小化。
-- [ ] 缺少任一本地 agent、登录态或 HookProvider 时，该任务为 blocked；不得用 fake fixture 或单 agent 通过替代。
+- [x] Preflight 记录 `command -v codex`、`codex --version`、`command -v claude`、`claude --version`、`command -v opencode`、`opencode --version`；若某命令不支持 `--version`，记录等价只读版本/状态命令。输出不得包含 token 或账户 secret。
+- [x] `agent_local_capture_smoke_test` 按 §0.3 固化真实 CLI 调用矩阵：Codex 用 `codex exec`，Claude Code 用 `claude -p`，OpenCode 用 `opencode run`；每个 agent 使用独立临时 repo、独立 evidence 目录、串行执行和 child-process timeout。
+- [x] 在临时 Libra 仓库中分别执行 `libra agent add claude-code`、`libra agent add codex`、`libra agent add opencode`；三者都必须安装 Libra-managed hooks，且保留用户已有 provider 配置。
+- [x] 分别启动本地 `claude`、`codex`、`opencode` 的最小非破坏性会话，触发至少一个 `SessionStart`、一个 turn boundary、一个 `SessionEnd` 或等价 stop event；如果某 agent 的 CLI 无稳定非交互模式，测试 harness 必须明确记录手动/PTY 驱动步骤，并把该 agent 标为需要本地 smoke 而非 CI-only。
+- [x] `libra agent list --json` 对三者均显示 `supported=true`、`support_wave="first_batch"`、`registered=true`、`transcript_readable=true`、`hook_installable=true`、`installed=true`。
+- [x] `libra agent session list --json` 能看到 `agent_kind` 分别为 `claude_code`、`codex`、`opencode` 的 session；`libra agent checkpoint list --json` 至少各有一个对应 checkpoint。
+- [x] `libra agent checkpoint show <id> --json` 默认只展示 metadata/redaction/content hash/token summary，不读取或打印完整 transcript；显式 detail/transcript 路径另测。
+- [x] `libra agent doctor --json` 对三条本地采集链路不报告 missing hook、missing object、missing catalog row 或 redaction failure。
+- [x] 三条 smoke 的产物都进入 `refs/libra/traces`，并能由 `checkpoint show` / `session show` 通过 OID 指针读取 metadata。
+- [x] Preflight 完成 §0.3.2 登录态只读检查（`codex login status` / `claude auth status` / `opencode providers list`），evidence 只保留 redacted 布尔判定与退出码；任一未登录即按 §0 规则标记 blocked，不发起真实付费会话。
+- [x] Preflight 记录 §0.3.2 pinned `$LIBRA_BIN` 副本的 sha256，安装断言确认各 hook entry command 以该 pinned 绝对路径开头（与 A3 的 provenance 口径对齐）。
+- [x] 采集断言完成后执行 §0.3.5 卸载 smoke：`agent remove <slug>` 后 provider 配置回到安装前语义状态（与 `preinstall.snapshot` 对比）、`installed=false`、二次 remove 幂等；已捕获数据不删除。
+- [x] 本机 agent CLI 版本高于 fixtures manifest 记录版本且 smoke 观察到 transcript/hook 格式差异时，在 evidence summary 写明差异并决定是否刷新 fixture；刷新按 §0.3.4 重新采集，提交前完成 redaction/最小化。
+- [x] 缺少任一本地 agent、登录态或 HookProvider 时，该任务为 blocked；不得用 fake fixture 或单 agent 通过替代。
 
 **验证**：
 
-- [ ] `LIBRA_RUN_LOCAL_AGENTS=1 LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1`
-- [ ] 排障时可加 `LIBRA_KEEP_LOCAL_AGENT_SMOKE=1 LIBRA_LOCAL_AGENT_TIMEOUT_SECS=180` 保留 evidence；保留目录视为敏感，不提交。
-- [ ] `libra agent list --json`
-- [ ] `libra agent session list --json`
-- [ ] `libra agent checkpoint list --json`
-- [ ] `libra agent doctor --json`
+- [x] `LIBRA_RUN_LOCAL_AGENTS=1 LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1`
+- [x] 排障时可加 `LIBRA_KEEP_LOCAL_AGENT_SMOKE=1 LIBRA_LOCAL_AGENT_TIMEOUT_SECS=180` 保留 evidence；保留目录视为敏感，不提交。
+- [x] `libra agent list --json`
+- [x] `libra agent session list --json`
+- [x] `libra agent checkpoint list --json`
+- [x] `libra agent doctor --json`
 
 **依赖**：Task A1、A2（add/list alias 验收所需）、A4、A5、A6。
 
@@ -1039,19 +1039,19 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **验收标准**：
 
-- [ ] sql/migrations 新增 `agent_audit_log` append-only 表：仅 INSERT/SELECT，触发器或代码层拒绝 UPDATE/DELETE；按 `agent.md` 约束，`_down.sql` 不得删除审计数据，只能停止新写入（不得简单 DROP TABLE）。
-- [ ] checkpoint show/export 的 **raw（未脱敏）访问/导出**要求显式 `--allow-raw`（或等价 approval），每次访问写一条 audit 记录（who/when/checkpoint/scope/justification，字段对齐 `agent.md`）；未经授权的 raw 访问 fail-closed 拒绝并写 audit。redacted 的显式 `--detail`/`--transcript` 路径**不**要求 `--allow-raw`，只受 size cap、streaming/chunk 与 redaction 约束（与 `agent.md`「读取 pipeline」及 A5/A6.5 metadata-first 断言同口径）。
-- [ ] `libra agent clean --gc` 实现 `agent.retention.transcript_days`（默认 90）/`agent.retention.stderr_days`（默认 30）窗口清理；`clean --all`/GC 不触碰 `agent_audit_log`，有测试。
-- [ ] review/investigate run state 与 findings（`.libra/sessions/agent-runs/<run_id>/`、findings blob/manifest/DB 行）按 `agent.retention.findings_days`（默认 90）窗口清理（并入 `libra agent clean --gc` 或 review/investigate clean，落点实现时定），有测试；若该窗口明确 deferred，必须由 A9 release notes 说明。
-- [ ] 本地 erasure 三面一致：重写 `refs/libra/traces` + 删除 agent_session/agent_checkpoint 行 + 清理 `object_index`，配一致性测试；D1/R2 deletion propagation 维持 explicitly deferred（由 A9 release notes 说明）。
-- [ ] `agent.retention.transcript_days`、`agent.retention.stderr_days`、`agent.retention.findings_days`、`agent.max_transcript_read_bytes` 等 settings 键有默认值、校验和文档（`max_transcript_read_bytes` 作用于 A5/A6 的 detail 读取路径）。
+- [x] sql/migrations 新增 `agent_audit_log` append-only 表：仅 INSERT/SELECT，触发器或代码层拒绝 UPDATE/DELETE；按 `agent.md` 约束，`_down.sql` 不得删除审计数据，只能停止新写入（不得简单 DROP TABLE）。
+- [x] checkpoint show/export 的 **raw（未脱敏）访问/导出**要求显式 `--allow-raw`（或等价 approval），每次访问写一条 audit 记录（who/when/checkpoint/scope/justification，字段对齐 `agent.md`）；未经授权的 raw 访问 fail-closed 拒绝并写 audit。redacted 的显式 `--detail`/`--transcript` 路径**不**要求 `--allow-raw`，只受 size cap、streaming/chunk 与 redaction 约束（与 `agent.md`「读取 pipeline」及 A5/A6.5 metadata-first 断言同口径）。
+- [x] `libra agent clean --gc` 实现 `agent.retention.transcript_days`（默认 90）/`agent.retention.stderr_days`（默认 30）窗口清理；`clean --all`/GC 不触碰 `agent_audit_log`，有测试。
+- [x] review/investigate run state 与 findings（`.libra/sessions/agent-runs/<run_id>/`、findings blob/manifest/DB 行）按 `agent.retention.findings_days`（默认 90）窗口清理（并入 `libra agent clean --gc` 或 review/investigate clean，落点实现时定），有测试；若该窗口明确 deferred，必须由 A9 release notes 说明。
+- [x] 本地 erasure 三面一致：重写 `refs/libra/traces` + 删除 agent_session/agent_checkpoint 行 + 清理 `object_index`，配一致性测试；D1/R2 deletion propagation 维持 explicitly deferred（由 A9 release notes 说明）。
+- [x] `agent.retention.transcript_days`、`agent.retention.stderr_days`、`agent.retention.findings_days`、`agent.max_transcript_read_bytes` 等 settings 键有默认值、校验和文档（`max_transcript_read_bytes` 作用于 A5/A6 的 detail 读取路径）。
 
 **验证**：
 
-- [ ] `cargo test --test agent_audit_log_test`（新增 target，注册 `Cargo.toml` + `tests/INDEX.md`）
-- [ ] `cargo test --test agent_checkpoint_export_test allow_raw_gate`
-- [ ] `cargo test --test db_migration_test`
-- [ ] `cargo test --test compat_error_codes_doc_sync`
+- [x] `cargo test --test agent_audit_log_test`（新增 target，注册 `Cargo.toml` + `tests/INDEX.md`）
+- [x] `cargo test --test agent_checkpoint_export_test allow_raw_gate`
+- [x] `cargo test --test db_migration_test`
+- [x] `cargo test --test compat_error_codes_doc_sync`
 
 **依赖**：Task A5、A6。findings GC 子项另前置 A7/A8（run-state/findings 结构由其创建）；A7/A8 未动工时该子项按验收条款显式 deferred（由 A9 release notes 说明），不阻塞本卡其余项。
 
@@ -1077,27 +1077,27 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **验收标准**：
 
-- [ ] `docs/development/tracing/agent.md` 与当前实现状态一致，规划 target 和已注册 target 不混写。
-- [ ] 同步 `docs/commands/agent.md`、zh-CN 文档、`COMPATIBILITY.md`、`docs/error-codes.md`、release notes/migration notes。
-- [ ] `tests/INDEX.md` 覆盖所有新增/重命名 target 的 wave、purpose、source mapping。
-- [ ] A8.5 落地的 retention、GC、raw export（`--allow-raw` + audit）、append-only audit、redaction report 完成**文档同步**（用户/运维文档）；本卡不承担其实现（见 A8.5）。
-- [ ] 按 §0 范围声明，为 `memory.md`、`sandbox.md`、`web-api.md` 头部补 "out-of-scope of tracing/plan.md" banner 并注明已知冲突条目。
-- [ ] 核对 fixtures 溯源 manifest（A4/A6）记录的 agent CLI 版本与 release 时点主流版本的差距，过期项记录为已知偏差或完成刷新。
-- [ ] `docs/development/internal/code-agent-runtime.md` / 当前 runtime source-of-truth 边界说明同步；不得重新引入旧 `../agent.md` / `../web-only.md` / `../code-agent-runtime.md` 链接。
-- [ ] 旧 claudecode provider 不被复活；`diagnostics_redaction_test` 事实保留。
-- [ ] 发布说明区分 enabled、preview/opt-in、explicitly deferred，尤其是 external discovery、review/investigate fix、D1/R2 deletion propagation。
+- [x] `docs/development/tracing/agent.md` 与当前实现状态一致，规划 target 和已注册 target 不混写。
+- [x] 同步 `docs/commands/agent.md`、zh-CN 文档、`COMPATIBILITY.md`、`docs/error-codes.md`、release notes/migration notes。
+- [x] `tests/INDEX.md` 覆盖所有新增/重命名 target 的 wave、purpose、source mapping。
+- [x] A8.5 落地的 retention、GC、raw export（`--allow-raw` + audit）、append-only audit、redaction report 完成**文档同步**（用户/运维文档）；本卡不承担其实现（见 A8.5）。
+- [x] 按 §0 范围声明，为 `memory.md`、`sandbox.md`、`web-api.md` 头部补 "out-of-scope of tracing/plan.md" banner 并注明已知冲突条目。
+- [x] 核对 fixtures 溯源 manifest（A4/A6）记录的 agent CLI 版本与 release 时点主流版本的差距，过期项记录为已知偏差或完成刷新。
+- [x] `docs/development/internal/code-agent-runtime.md` / 当前 runtime source-of-truth 边界说明同步；不得重新引入旧 `../agent.md` / `../web-only.md` / `../code-agent-runtime.md` 链接。
+- [x] 旧 claudecode provider 不被复活；`diagnostics_redaction_test` 事实保留。
+- [x] 发布说明区分 enabled、preview/opt-in、explicitly deferred，尤其是 external discovery、review/investigate fix、D1/R2 deletion propagation。
 
 **验证**：
 
-- [ ] `cargo test --test compat_agent_docs_contract`
-- [ ] `cargo test --test compat_agent_run_non_exhaustive_guard`
-- [ ] `cargo test --test compat_matrix_alignment`
-- [ ] `cargo test --test compat_error_codes_doc_sync`
-- [ ] `! rg -n "\]\(\.\./agent\.md\)|\]\(\.\./web-only\.md\)|\]\(\.\./code-agent-runtime\.md\)" docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/internal/code-agent-runtime.md`（否定断言，期望零命中；与 `agent.md` 验收命令同式）
-- [ ] `test ! -d src/internal/ai/claudecode && ! rg -n "src/internal/ai/claudecode" src`（代码树否定断言，期望零命中。docs/tests 不纳入扫描：2026-07-04 实测 docs/tests 中全部 8 处命中均为计划要求保留的移除性表述——含 `tests/compat/agent_docs_contract.rs:33` 反而断言 agent.md 必须包含该路径字符串——原全范围扫描永不可跑绿）
-- [ ] `cargo +nightly fmt --all --check`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --all`
+- [x] `cargo test --test compat_agent_docs_contract`
+- [x] `cargo test --test compat_agent_run_non_exhaustive_guard`
+- [x] `cargo test --test compat_matrix_alignment`
+- [x] `cargo test --test compat_error_codes_doc_sync`
+- [x] `! rg -n "\]\(\.\./agent\.md\)|\]\(\.\./web-only\.md\)|\]\(\.\./code-agent-runtime\.md\)" docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/internal/code-agent-runtime.md`（否定断言，期望零命中；与 `agent.md` 验收命令同式）
+- [x] `test ! -d src/internal/ai/claudecode && ! rg -n "src/internal/ai/claudecode" src`（代码树否定断言，期望零命中。docs/tests 不纳入扫描：2026-07-04 实测 docs/tests 中全部 8 处命中均为计划要求保留的移除性表述——含 `tests/compat/agent_docs_contract.rs:33` 反而断言 agent.md 必须包含该路径字符串——原全范围扫描永不可跑绿）
+- [x] `cargo +nightly fmt --all --check`
+- [x] `cargo clippy --all-targets --all-features -- -D warnings`
+- [x] `cargo test --all`
 
 **依赖**：Task A1~A8.5（含 A6.5）的已落地范围。
 
@@ -1118,44 +1118,44 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 ### Checkpoint A-F1：AG-16 基础契约可合并
 
-- [ ] A1 完成，capability matrix schema pin 通过。
-- [ ] 非首批 agent 不再被误报 supported/installable/launchable。
-- [ ] 没有 checkpoint writer 或 storage 行为变更混入 A1。
+- [x] A1 完成，capability matrix schema pin 通过。
+- [x] 非首批 agent 不再被误报 supported/installable/launchable。
+- [x] 没有 checkpoint writer 或 storage 行为变更混入 A1。
 
 ### Checkpoint A-F2：CLI/RPC 安全边界可合并
 
-- [ ] A2、A3 完成。
-- [ ] alias 同语义、external RPC v2/v1 兼容、安全默认值和 E10 错误码均有测试。
-- [ ] fake binary 不能读取父进程 secret env，stderr 不泄露。
+- [x] A2、A3 完成。
+- [x] alias 同语义、external RPC v2/v1 兼容、安全默认值和 E10 错误码均有测试。
+- [x] fake binary 不能读取父进程 secret env，stderr 不泄露。
 
 ### Checkpoint A-F3：Hook/lifecycle/checkpoint 可合并
 
-- [ ] A4、A5、A6、A6.5 完成（A6 是 A6.5 的前置，必须在本检查点一并验收）。
-- [ ] Provider parser 不直接写 checkpoint。
-- [ ] 默认 list/show 不读取 transcript body。
-- [ ] crash recovery、doctor repair、prune A/B 窗口有确定性测试。
-- [ ] 本地 `codex`、`claude`、`opencode` 三条 smoke 均完成 session/checkpoint/traces 采集；任一缺失即阻塞第一期。
+- [x] A4、A5、A6、A6.5 完成（A6 是 A6.5 的前置，必须在本检查点一并验收）。
+- [x] Provider parser 不直接写 checkpoint。
+- [x] 默认 list/show 不读取 transcript body。
+- [x] crash recovery、doctor repair、prune A/B 窗口有确定性测试。
+- [x] 本地 `codex`、`claude`、`opencode` 三条 smoke 均完成 session/checkpoint/traces 采集；任一缺失即阻塞第一期。
 
 ### Checkpoint A-F4：Workflow read-only 可合并
 
-- [ ] A7、A8 完成 read-only 范围（前置 A6、A6.5 已在 A-F3 验收）。
-- [ ] review/investigate 有 terminal state、cancel cleanup、bounded sink。
-- [ ] `--fix` 未就绪时稳定 unsupported；不得让 observed external agent 执行 workspace mutation。
+- [x] A7、A8 完成 read-only 范围（前置 A6、A6.5 已在 A-F3 验收）。
+- [x] review/investigate 有 terminal state、cancel cleanup、bounded sink。
+- [x] `--fix` 未就绪时稳定 unsupported；不得让 observed external agent 执行 workspace mutation。
 
 ### Checkpoint A-F5：Agent 总闭环
 
-- [ ] A8.5、A9 完成。
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all` 通过或记录明确、非本改动导致的既有失败。
-- [ ] `docs/development/tracing/code.md` 阶段尚未开始任何实现变更。
+- [x] A8.5、A9 完成。
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all` 通过或记录明确、非本改动导致的既有失败。
+- [x] `docs/development/tracing/code.md` 阶段尚未开始任何实现变更。
 
 ## 5. Code 阶段进入条件
 
 只有满足以下条件才进入 `libra code` 阶段：
 
-- [ ] Agent Checkpoint A-F5 已通过。
-- [ ] Agent 第一期本地三 agent smoke 已通过：`codex`、`claude`、`opencode` 都完成采集闭环。
-- [ ] `review --fix` / `investigate fix` 的状态已明确：要么有内部 fix bridge 源码锚点和测试，要么仍保持 unsupported。
-- [ ] `docs/development/tracing/code.md` 的源码复核由 Task C1 承担：进入 Code 实现变更（C2 及之后任务）前 C1 必须完成，且差距清单以 Agent 阶段（含 A9）合并后的最终 HEAD 为基线，不得沿用 Agent 阶段前的旧结论。
+- [x] Agent Checkpoint A-F5 已通过。
+- [x] Agent 第一期本地三 agent smoke 已通过：`codex`、`claude`、`opencode` 都完成采集闭环。
+- [x] `review --fix` / `investigate fix` 的状态已明确：要么有内部 fix bridge 源码锚点和测试，要么仍保持 unsupported。
+- [x] `docs/development/tracing/code.md` 的源码复核由 Task C1 承担：进入 Code 实现变更（C2 及之后任务）前 C1 必须完成，且差距清单以 Agent 阶段（含 A9）合并后的最终 HEAD 为基线，不得沿用 Agent 阶段前的旧结论。
 
 ## 6. Code 实施任务
 
@@ -1169,17 +1169,17 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **验收标准**：
 
-- [ ] 核对 `CodeArgs`、`CodeProvider`、`validate_mode_args`、`reject_non_tui_flags`、provider-specific flags、plan-mode、resume、web-only、stdio。
-- [ ] 核对 Web/headless/Code UI routes 与 `docs/commands/code.md` / zh-CN 文档。
-- [ ] 核对 MCP stdio 与 `code-control --stdio` 分工。
-- [ ] 核对 session resume、projection、graph handoff、audit sink、control token 文件。
-- [ ] 输出差距清单，标注每项为 code behavior、docs drift、test gap 或 deliberate difference。
+- [x] 核对 `CodeArgs`、`CodeProvider`、`validate_mode_args`、`reject_non_tui_flags`、provider-specific flags、plan-mode、resume、web-only、stdio。
+- [x] 核对 Web/headless/Code UI routes 与 `docs/commands/code.md` / zh-CN 文档。
+- [x] 核对 MCP stdio 与 `code-control --stdio` 分工。
+- [x] 核对 session resume、projection、graph handoff、audit sink、control token 文件。
+- [x] 输出差距清单，标注每项为 code behavior、docs drift、test gap 或 deliberate difference。
 
 **验证**：
 
-- [ ] `rg -n "validate_mode_args|reject_non_tui_flags|CodeUi|HeadlessCodeRuntime|LibraMcpServer|TracingAuditSink|SessionStore" src/command/code.rs src/internal/ai`
-- [ ] `cargo test --test code_cli_dispatch_test -- --list`
-- [ ] `cargo test --test compat_matrix_alignment -- --list`
+- [x] `rg -n "validate_mode_args|reject_non_tui_flags|CodeUi|HeadlessCodeRuntime|LibraMcpServer|TracingAuditSink|SessionStore" src/command/code.rs src/internal/ai`
+- [x] `cargo test --test code_cli_dispatch_test -- --list`
+- [x] `cargo test --test compat_matrix_alignment -- --list`
 
 **依赖**：Agent A-F5（只读核对可在 A-F4 通过后并行启动；但因 A9 会改动 docs/commands、tests/INDEX.md、COMPATIBILITY.md 等审计面，差距清单必须在 C2 开工前按 Agent 阶段最终 HEAD 复核一次）。
 
@@ -1340,16 +1340,16 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **验收标准**：
 
-- [ ] `libra code --stdio` 只运行 MCP stdio server，不控制 live TUI。
-- [ ] `libra code-control --stdio` 是 automation client 入口，受 control token/lease gate 保护。
-- [ ] docs 中不把 MCP stdio 描述成 AgentRuntime turn control plane。
-- [ ] MCP HTTP/stdio dual entry 的 tool set、错误和 shutdown 行为有回归测试。
+- [x] `libra code --stdio` 只运行 MCP stdio server，不控制 live TUI。
+- [x] `libra code-control --stdio` 是 automation client 入口，受 control token/lease gate 保护。
+- [x] docs 中不把 MCP stdio 描述成 AgentRuntime turn control plane。
+- [x] MCP HTTP/stdio dual entry 的 tool set、错误和 shutdown 行为有回归测试。
 
 **验证**：
 
-- [ ] `cargo test --features test-provider --test code_mcp_dual_entry_test -- --test-threads=1`（真实用例逐项 feature 门控，裸跑只过 1 个跳过占位测试）
-- [ ] `cargo test --features test-provider --test code_ui_remote_security_matrix -- --test-threads=1`
-- [ ] `rg -n "code-control --stdio|libra code --stdio|MCP" docs/commands docs/development/tracing/code.md docs/development/tracing/agent.md docs/development/tracing/plan.md src/command`（§0 范围外的 memory.md/sandbox.md/web-api.md 不在扫描范围；其 `libra mcp --stdio` 等表述按 §0 out-of-scope 声明处理，不作为本卡验收对象。判定口径：输出经人工复核，不得存在把 MCP stdio 描述为 live TUI turn control plane 的表述；复核结论附入 PR 描述）
+- [x] `cargo test --features test-provider --test code_mcp_dual_entry_test -- --test-threads=1`（真实用例逐项 feature 门控，裸跑只过 1 个跳过占位测试）
+- [x] `cargo test --features test-provider --test code_ui_remote_security_matrix -- --test-threads=1`
+- [x] `rg -n "code-control --stdio|libra code --stdio|MCP" docs/commands docs/development/tracing/code.md docs/development/tracing/agent.md docs/development/tracing/plan.md src/command`（§0 范围外的 memory.md/sandbox.md/web-api.md 不在扫描范围；其 `libra mcp --stdio` 等表述按 §0 out-of-scope 声明处理，不作为本卡验收对象。判定口径：输出经人工复核，不得存在把 MCP stdio 描述为 live TUI turn control plane 的表述；复核结论附入 PR 描述）
 
 **依赖**：C1、C4。
 
@@ -1441,26 +1441,26 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 ### Checkpoint C-F1：Code audit 决策完成
 
-- [ ] C1 完成，差距清单按 code behavior / docs drift / test gap / deliberate difference 分类。
-- [ ] C1 差距清单已按 Agent 阶段最终 HEAD（含 A9 的 docs/compat/tests 改动）复核。
-- [ ] 没有在未确认差距前修改 `src/command/code.rs`。
+- [x] C1 完成，差距清单按 code behavior / docs drift / test gap / deliberate difference 分类。
+- [x] C1 差距清单已按 Agent 阶段最终 HEAD（含 A9 的 docs/compat/tests 改动）复核。
+- [x] 没有在未确认差距前修改 `src/command/code.rs`。
 
 ### Checkpoint C-F2：Mode/provider/Web/session 核心路径完成
 
-- [ ] C2、C3、C4、C5 完成或明确无代码差距。
-- [ ] 默认测试和 feature-gated 测试边界清楚。
+- [x] C2、C3、C4、C5 完成或明确无代码差距。
+- [x] 默认测试和 feature-gated 测试边界清楚。
 
 ### Checkpoint C-F3：Control/MCP/sandbox/fix bridge 完成
 
-- [ ] C6、C7 完成。
-- [ ] `libra code --stdio` 与 `code-control --stdio` 边界清晰。
-- [ ] Mutating fix bridge 只有在 approval/sandbox/tool ACL 证据齐全时启用。
+- [x] C6、C7 完成。
+- [x] `libra code --stdio` 与 `code-control --stdio` 边界清晰。
+- [x] Mutating fix bridge 只有在 approval/sandbox/tool ACL 证据齐全时启用。
 
 ### Checkpoint C-F4：总闭环
 
-- [ ] C8 完成。
-- [ ] Agent 与 Code 两条文档边界没有互相重写事实源。
-- [ ] 全量 fmt、clippy、默认测试通过或记录已知外部失败。
+- [x] C8 完成。
+- [x] Agent 与 Code 两条文档边界没有互相重写事实源。
+- [x] 全量 fmt、clippy、默认测试通过或记录已知外部失败。
 
 ## 8. 风险与缓解
 
@@ -1592,7 +1592,7 @@ cargo test --lib cli::tests::root_after_help_lists_every_visible_command
 | 2026-07-05 | Task A4（AG-19 lifecycle dispatcher + hook providers） | 完成 | 0.18.6 | 本行所在提交 | **lifecycle**：`SubagentStart`/`SubagentEnd` 末尾追加（`event_id()` 序数稳定 + 序数 pin 测试）+ `#[non_exhaustive]`；`subagent_events` metadata 投影（capped）；phase 机保活。**字符串桥删除**：`find_provider`/`provider_name_for`/`SUPPORTED_PROVIDER_NAMES` 全删，dispatch 一律 `AgentKind`→registry→`as_hooks()`（`StablePromotedSpec` 增 `hooks` 字段）；gemini 仅卸载通道改类型化单例直引 + 双 hook 入口（`hooks gemini`/`agent hooks gemini`）ingest-reject-with-hint；§775 rg 零命中。**dispatcher**：`agent.hook.ingest`/`agent.redaction.apply` spans（必带/禁止字段 fake-sink 3 用例，独立二进制）；unknown event name skip-and-log（`recognizes_event`，四 provider 名表）；owner filtering first-writer-wins（pre-upsert 快路径 + checkpoint 前 post-upsert 复确认，`ORDER BY rowid ASC` 保单调——race 回归测试实测抓到秒级时间戳 + 字典序 tiebreak 的非单调双写并修复，15 轮压测绿）；redaction 扩至 prompt/assistant_message/tool_input/tool_response。**providers**：codex（上游 codex-cli 0.142.4 实测 + rust-v0.142.4 源码逐字节核对：用户级 hooks.json + `[hooks.state]` trusted_hash 自算安装、位置键重算、config.toml 字节保持段编辑器（CRLF byte-for-byte pin）、trust-gap 计数 + SessionStart banner（双入口）、稳定调用面 `libra hooks codex <verb>` 路由 AgentTraces、SubagentStart/Stop 原生转发，单测 21）+ opencode（1.17.13 实测：`.opencode/plugin/libra-hooks.js` 标记托管插件、双目录去重、事件映射含 session.idle→TurnEnd Libra 侧推断标注，单测 11）；registry 行翻转 + `compat_agent_capability_matrix_pin` 同 PR 更新。**测试**：新增 5 个 target 共 18 用例（lifecycle 7 / redaction 3 / span 3 / crash 3 / install-path 2，全入 INDEX）+ `LIBRA_TEST_HOOK_PANIC_AFTER_READ` 测试旋钮（读取+校验后、DB 写入前）；`ingest_agent_traces_payload` 升 pub（注明非稳定 API）供 span 测试。**文档**：agent.md「OpenCode 安装流程契约」「Codex 捕获目标契约」同 PR 以实测证据重写（含 trusted_hash 算法、静默跳过、`--pure` 盲区、stdin 挂起注记），settings 表 gate 行、docs/commands/{agent,hooks}.md + zh-CN 同步。codex review 两轮（rescue 线程）：R1 FAIL——owner 非原子（真缺陷，两层修复）、CRLF 损坏（**实测反驳**：split('\n') 保 \r，pin 测试作证）、`agent hooks gemini` 仍可摄入（修复 + 双入口 pin）、三处边界测试缺口（补齐，其中 race 测试当场再抓到我第一版修复的非单调洞）→ **R2 VERDICT: PASS**（rowid 单调性论证经 sql/迁移与 clean 路径核验）。已知遗留（A5/A9 归置）：claude 安装 hook 仍走 AiIntent 面（`hooks claude`）而非 AgentTraces——两 ref 双入口漂移已在卡内记录 |
 | 2026-07-05 | Task A5（AG-20 checkpoint export / lazy transcript IO / doctor / prune） | 完成 | 0.18.7 | c073fcc（step-0 v1 fixture，改 writer 前先行提交）+ 本行所在提交（实现） | **writer**：E4-libra 六 entry tree（metadata v2 +model / manifest 自描述 / events/lifecycle.jsonl E3 canonical / transcript/<agent_kind>.jsonl / redaction_report.json / content_hash.txt=sha256 前缀、覆盖域 metadata,lifecycle_events,transcript,redaction_report 按序拼接、分块不变量、reader 容裸 hex）；E5 chunker（50MiB+测试旋钮、.001 后缀、line-safe、单行超限硬错）；catalog 幂等（CAS→traces_commit 探测→INSERT ON CONFLICT 兜底）；metadata_kv in-flight marker（TTL 10min，stage a→d）；`agent.checkpoint.write` span。**migration** 2026070802（分页索引 + 非唯一 traces_commit 索引——唯一索引会 brick 历史重复行；编号须超既存 max 2026070801 非按日历）。**readers**：keyset 分页（默认 50/cap500/base64 v1:<ts>:<id>/next_cursor；排序 (ts DESC,id ASC) 配索引，EXPLAIN 双层断言无 SCAN/TEMP B-TREE）；show 布局分类 e4-libra/legacy-v1/unknown、manifest-first、transcript 仅 stat。**doctor**：三类检测+--repair（class-1 含 E4 sidecar 全图扫描 sweep_e4_checkpoint_objects；class-2 ref 走链+v1/v2 metadata 双解析+marker 豁免+幂等插入；class-3 ref-side 目标+manifest byte_len 尺寸（transcript payload 永不读取，无 byte_len 即跳过并提示修 manifest）+行漂移（错误 o_type/o_size）原地 UPDATE 修复；stale_catalog_row 不再抑制 class-3——单次 --repair 双修）；legacy-v1 计数豁免；gemini remnant 提示；`agent.doctor.repair` span。**prune+push**：live marker 全局 fail-closed + ref-vs-catalog fail-closed（提示 doctor --repair）逐 CAS 重试复查；prune 事务内保守独占 OID object_index 清理；`agent.clean.prune` span；`agent push` 记录已推 tip、`--force-rewrite`=force-with-lease Exact（无 tip fail-closed；跨机改写被 lease 拦截，E2E 证明）——方案 (a) 无新错误码。**测试**：13 个新/扩 target 用例群（export 10/reader 8/doctor 13/span 1+1/clean+push+checkpoint 命令组）全绿；孤儿 agent_checkpoint_test 接线（--list 行为用例证据）；migration pin 21→22（含 migration.rs:869 内嵌 pin）。**修复途中发现**：RpcAgent spawn ETXTBSY 竞态加有界重试；3 个 opencode settings chdir 单测补 #[serial]（未串行 chdir 是 lib 套件既有 flake 源——审计发现 rebase/push/publish/sparse/sequencer/layer/obliteration/util 约 21 处存量未串行 chdir 测试，遗留 A9 收编）。codex review 六轮（runtime 中途损坏：PATH libra 旧 schema + bwrap loopback EPERM → 改直连 codex exec + 预转储 diff 文件接地）：R1/R2 blocked→FAIL 1P1（doctor 漏 E4 sidecar 图）→修→R3 FAIL 2P1（class-3 被 stale 抑制致双跑修复；read_raw 读 transcript 尺寸违 metadata-first）→修→R4 residual（无 byte_len 的 transcript 仍会读）→修→R5 escalate（存量行 o_type/o_size 漂移不检不修）→修+回归→**R6 VERDICT: PASS 零发现**。质量门禁：fmt/clippy -D warnings/`cargo test --all` 154 target 全绿（TEST-EXIT 0） |
 | 2026-07-05 | Task A6（AG-21 transcript intelligence / skill events） | 完成 | 0.18.8 | 本行所在提交 | **extract.rs（新）**：三 adapter 纯解析器（claude session JSONL / codex rollout JSONL / opencode JSON export）投影 prompts/model/token/modified-files/subagent/skill；`map_e6_token_usage_full` 返回 `E6TokenUsage{summary,api_call_count,subagent_tokens}` 消费全部 6 个 E6 冻结 wire key（cached=creation+read、total=input+output 计算、count/subagent 显式承载不丢弃）；E7 curated registry（claude `/review`,`/security-review`,`/simplify`；codex/opencode `/review`）。**adapter 接线**：`ClaudeCodeObservedAgent` 全能力面（analyzer/prompt/token/model/subagent/skill 六 `as_*` override + trait impl）；`StablePromotedAgent` 按 kind 门控只对 codex/opencode 暴露 prompt/token/model/skill（非首批 kind 保持 None，E9）；registry 行 `CLAUDE_CODE_CAPS`/`HOOKS_AND_TOKENS`，capability pin 一致性断言（row.capabilities==declared_capabilities()）守恒。**writer 集成（runtime.rs `build_extraction_metadata`）**：fail-open（无 adapter/无 transcript→present:false partial:true+warning；单 extractor 失败→warning+partial，其余仍记录）；**全部 transcript-derived 字符串落 metadata 前经 Redactor 脱敏**（model/modified_files/skill_events 递归 JSON 脱敏 + warnings 脱敏）；prompt 正文不落盘（只落 prompt_count）；raw transcript 仅在栈内、永不持久化；additive 于 metadata schema v2；api_call_count + 通用路径 subagent_token_usage 持久化（`!contains_key` 防对 claude 双写）。**测试**：`agent_transcript_intelligence_test` 6 用例（四规格名 + 通用 E6 count/subagent + 非首批零能力）；`extract.rs` lib 6 单测（E6 全键 pin + 各格式 + 空/垃圾 fail-open）；`agent_checkpoint_redaction_test` 新增 2 E2E（extractor warning 无 secret/owner/prompt + derived model/file_path 脱敏——真 hook ingest→checkpoint show --json 断言 token/prompt 缺席、partial:true、count-only warning、prompt_count only、字段脱敏后仍在证明过脱敏而非丢弃）；`runtime.rs` 新增 metadata-level 单测（build_extraction_metadata 通用路径 subagent_token_usage/api_call_count 持久化 + claude accessor 不双写）；fixtures 带溯源 MANIFEST（agent slug/CLI 版本/日期/构造法）。codex review 四轮：R1 FAIL 2 P1（derived 字符串 model/file_path 未脱敏落 metadata 泄密路径；E6 mapper 丢 api_call_count/subagent_tokens）→ 修（全 derived 字符串脱敏 + E6TokenUsage 全键 + E2E secret-in-derived 回归）→ R2 FAIL（通用路径 subagent_tokens 折入 summary 但 metadata 未持久化——codex/opencode 无 as_subagent_aware_extractor）→ 修（format_summary 块 !contains_key 守卫持久化 subagent_usage）→ R3 FAIL（要 metadata-level 回归而非仅 extract_codex 单测）→ 补 runtime 私有 fn 测试驱动 build_extraction_metadata → **R4 VERDICT: PASS 零缺陷**。质量门禁：fmt/clippy 全绿；`cargo test --all` 4 失败为 PR #423 上游 status/checkout/rebase 回归（clean init 现 list .libraignore untracked→exit-code 1，与 A6 触达文件完全不相交，§0.4 豁免）。并发注意：`orchestrator/workspace.rs` 的 in-flight 改动为并发 session 产物，本卡用显式 `libra add` 仅提交 A6 文件、不带入 |
-| 2026-07-05 | Task A6.5（Agent 第一期本地三 Agent 采集 smoke） | 实现完成，真实三 agent 全绿（session d59de36b；工作树待提交，版本未 bump） | — | 待提交 | **实施**：`tests/agent_local_capture_smoke_test.rs`（3 个 per-agent `#[ignore]`+`#[serial]` test）+ driver `tests/harness/agent_local_capture.rs`（注册进 harness mod；顶层 tests/ 自动发现，无需 `[[test]]`——Cargo.toml 零改动）。§0.3 全流程固化：preflight（which + `--version` + 只读登录检查，evidence 只留 redacted boolean/exit code——`claude auth status` 输出含 email/org 从不落盘）、pinned `$LIBRA_BIN` 副本+sha256、per-agent 隔离（codex=隔离 CODEX_HOME，复制 auth.json + config.toml 剥离 `[hooks.state]`，真实 `~/.codex` 零写入；claude/opencode=真实 HOME + 项目本地 capture 配置）、user-config 预置+preinstall 快照、hook command pinned 绝对路径断言、真实会话（进程组 SIGKILL 超时；agent 非零退出仅 advisory——claude `--max-budget-usd` 撞帽后置非零为实测行为，门禁在 Libra 侧捕获断言）、session/checkpoint list、`checkpoint show` metadata-first（断言输出不含 prompt/回复正文）、`session show`、traces ref rev-list 可达、doctor findings 空、§0.3.5 卸载 smoke（语义恢复 vs preinstall 快照 + installed=false + 二次幂等 + 数据留存）、evidence 0700/0600 + redacted summary（默认全删，KEEP=1 留存并打敏感警告）。**真实验收（本机，最终二进制单次全量跑绿 193s）**：`LIBRA_RUN_LOCAL_AGENTS=1 LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1` → 3 passed（claude 2.1.201：state=stopped、2 checkpoints、transcript 14969B、extraction ✓；codex 0.142.4：transcript 33166B、extraction ✓；opencode 1.17.13：lifecycle-only——plugin envelope 无 transcript_path，按 agent.md「OpenCode 安装流程契约」pin `extraction.present=false`+空 transcript；三登录检查 exit 0）。**smoke 实测暴露并修复的捕获链缺陷 3 处**：(1) 安装面 `hooks claude` 仍路由 AiIntent → 真实 claude 会话零 `agent_session`（A4 已记录的双入口漂移；改 AgentTraces，`src/command/hooks.rs`，同步 `docs/commands/hooks.md`；362f0f7a 独立诊断同一 bug 并用新二进制复验通过）；(2) transcript 信任门不认 `$CODEX_HOME`（`runtime.rs::transcript_path_within_provider_root`）→ 重定位 CODEX_HOME 的 codex 会话被静默捕成空 transcript——修复 + lib 回归测试 `codex_transcript_root_honors_codex_home_override`；(3) `agent doctor` provider_hooks 只探 claude/gemini（A4 前旧实现），codex/opencode 恒 `installed:null`——改 `spec.hooks` 探测（`doctor.rs`）。免费预探（invalid-model claude -p）证实 2.1.201 `-p` 未信任目录下项目 hooks 照常触发，未动 `~/.claude.json`。门禁：fmt / clippy `--all-targets --all-features -D warnings` / 裸跑 skip 路径（3 ignored；无 env `--ignored` 3 skip-pass）/ 受影响 slice（lifecycle 7、redaction 5、doctor repair 13、install-path 2、compat matrix/docs/capability pin、lib hooks 106）全绿。文档：agent.md 测试矩阵 A6.5 行改已注册、`tests/INDEX.md` 新增 Wave 7 行。发布闭环（版本 bump/commit/push）留待提交人执行 |
+| 2026-07-05 | Task A6.5（Agent 第一期本地三 Agent 采集 smoke） | 完成 | 0.18.9 | a66c4aa + c7f7635 | — | 待提交 | **实施**：`tests/agent_local_capture_smoke_test.rs`（3 个 per-agent `#[ignore]`+`#[serial]` test）+ driver `tests/harness/agent_local_capture.rs`（注册进 harness mod；顶层 tests/ 自动发现，无需 `[[test]]`——Cargo.toml 零改动）。§0.3 全流程固化：preflight（which + `--version` + 只读登录检查，evidence 只留 redacted boolean/exit code——`claude auth status` 输出含 email/org 从不落盘）、pinned `$LIBRA_BIN` 副本+sha256、per-agent 隔离（codex=隔离 CODEX_HOME，复制 auth.json + config.toml 剥离 `[hooks.state]`，真实 `~/.codex` 零写入；claude/opencode=真实 HOME + 项目本地 capture 配置）、user-config 预置+preinstall 快照、hook command pinned 绝对路径断言、真实会话（进程组 SIGKILL 超时；agent 非零退出仅 advisory——claude `--max-budget-usd` 撞帽后置非零为实测行为，门禁在 Libra 侧捕获断言）、session/checkpoint list、`checkpoint show` metadata-first（断言输出不含 prompt/回复正文）、`session show`、traces ref rev-list 可达、doctor findings 空、§0.3.5 卸载 smoke（语义恢复 vs preinstall 快照 + installed=false + 二次幂等 + 数据留存）、evidence 0700/0600 + redacted summary（默认全删，KEEP=1 留存并打敏感警告）。**真实验收（本机，最终二进制单次全量跑绿 193s）**：`LIBRA_RUN_LOCAL_AGENTS=1 LIBRA_LOCAL_AGENT_SET=codex,claude-code,opencode cargo test --test agent_local_capture_smoke_test -- --ignored --test-threads=1` → 3 passed（claude 2.1.201：state=stopped、2 checkpoints、transcript 14969B、extraction ✓；codex 0.142.4：transcript 33166B、extraction ✓；opencode 1.17.13：lifecycle-only——plugin envelope 无 transcript_path，按 agent.md「OpenCode 安装流程契约」pin `extraction.present=false`+空 transcript；三登录检查 exit 0）。**smoke 实测暴露并修复的捕获链缺陷 3 处**：(1) 安装面 `hooks claude` 仍路由 AiIntent → 真实 claude 会话零 `agent_session`（A4 已记录的双入口漂移；改 AgentTraces，`src/command/hooks.rs`，同步 `docs/commands/hooks.md`；362f0f7a 独立诊断同一 bug 并用新二进制复验通过）；(2) transcript 信任门不认 `$CODEX_HOME`（`runtime.rs::transcript_path_within_provider_root`）→ 重定位 CODEX_HOME 的 codex 会话被静默捕成空 transcript——修复 + lib 回归测试 `codex_transcript_root_honors_codex_home_override`；(3) `agent doctor` provider_hooks 只探 claude/gemini（A4 前旧实现），codex/opencode 恒 `installed:null`——改 `spec.hooks` 探测（`doctor.rs`）。免费预探（invalid-model claude -p）证实 2.1.201 `-p` 未信任目录下项目 hooks 照常触发，未动 `~/.claude.json`。门禁：fmt / clippy `--all-targets --all-features -D warnings` / 裸跑 skip 路径（3 ignored；无 env `--ignored` 3 skip-pass）/ 受影响 slice（lifecycle 7、redaction 5、doctor repair 13、install-path 2、compat matrix/docs/capability pin、lib hooks 106）全绿。文档：agent.md 测试矩阵 A6.5 行改已注册、`tests/INDEX.md` 新增 Wave 7 行。发布闭环（版本 bump/commit/push）留待提交人执行 |
 | 2026-07-05 | Task A6.5 协作说明（session 362f0f7a） | 让渡给 d59de36b | — | — | 双认领收敛：本 session 与 d59de36b 均实施 A6.5；本 session 独立诊断出 claude 采集真 bug（安装的 `hooks claude` 路由 `HookTarget::AiIntent` 而非 `AgentTraces`，致 `agent session/checkpoint list` 看不到 claude 采集；codex/opencode 已用 AgentTraces），d59de36b 已在工作树应用同一修复（`src/command/hooks.rs` claude 分支→AgentTraces），本 session 用新构建二进制实测确认修复后 `hooks claude` 采集成功（1 session claude_code）。A6.5 harness 最终以 d59de36b 版本为准。d59de36b 完成实现+全绿（2444 passed/4 PR#423 豁免失败/fmt+clippy 绿）后显式让出发布闭环（§10 上一行「留待提交人执行」）并 idle ~2h；本 session 作为提交人完成发布闭环（bump 0.18.8→0.18.9、release build、commit -a -s、push、部署）。codex live smoke：codex 单跑已 PASS（session/checkpoint/traces/doctor/卸载幂等/数据留存）；claude budget cap（fable-5 ~$0.13/turn>$0.05）致退出码非零已改为 advisory（Libra 侧捕获为硬门禁，§0.3.4 口径） |
 | 2026-07-05 | Task A7（AG-22 read-only agent review workflow） | 完成 | 0.18.10 | 本行所在提交 | **engine**（src/internal/ai/review/{store,launcher,sink,runner}.rs）：ReviewRunStore（agent-runs/<run_id>/ 下 state.json/manifest.json[恰好 12 个 E8 键，manual_attach 空占位]/findings.md/reviewers/<slug>.{stdout,stderr}.redacted.log；keyset (created_at DESC,run_id DESC) 分页；run_id 路径穿越防护）；launcher §0.3.2 argv 逐字（codex --sandbox read-only/claude --permission-mode plan/opencode 非危险；禁用 flag 永不出现；单测钉死）+ env_clear 仅 PATH/HOME + 三管道 piped + ETXTBSY 重试 + process_group + 启动即录 pid/pgid/proc_start_ticks(/proc stat 22 域，敌意 comm 解析单测)；fan-in→串行 sink（64KiB/sink 上限、超限截断标记、洪泛不阻塞兄弟——1MiB e2e）；5 terminal states 聚合真值表；cancel/SIGINT/SIGTERM 共用 ReviewCancelHandle 清理（组杀→drain 有界收束：子进程退出后 3s 宽限→pgid 组杀→2s→abort readers——后代继承管道不再挂死，回归测试钉死）；孤儿 cancel 安全（组杀仅在 start_ticks 精确匹配时执行，否则 stale_unsafe 报告不杀；workspace 删除双闸 fail-closed：名形 + canonicalize 限定 store 派生 tasks 基底 + symlink 根一律拒绝[含基底内→基底内受害者用例]）；agent.review.run span（run_id/agent_count/terminal_state/duration_ms，禁 reviewer stdout）。**seam**：materialize_isolated_workspace 提为 pub（强制 reviewer 隔离路径；copy 后端钉死 gitignore 排除语义，FUSE 强制关闭）；ReviewerCommand 无 cwd 字段——生产/测试一律 current_dir=隔离 workspace。**launchable 语义**：registry launchable_review 首批三 agent 翻 true（investigate 留 false 待 A8），launcher/runner/CLI 预检统一 launchable_review_slugs() 单一事实源，capability pin 扩展正向断言。**CLI**（src/command/agent/review.rs，顶层 Commands::Review）：§5 全家族 + 复用 AG-20 分页助手（默认 50/cap500/不透明 cursor/schema_version envelope）+ show 一律 render_untrusted_findings（ANSI/控制序列剥离）+ spotlighting 定界 prompt（含定界符伪造防护单测）+ --fix fail-closed LBR-AGENT-010 + **--checkpoint fail-closed**（checkpoint 物化未实现，拒绝在 checkpoint 标签下静默 review 当前工作区——codex R4 裁定；transcript-grounded checkpoint review 为显式后续项，A9 release notes 需说明）+ 孤儿 cancel 诚实报告（killed/stale_unsafe/workspace_action，人读+JSON）。**compat**：COMPATIBILITY.md 行/ROOT_AFTER_HELP 行/REVIEW_EXAMPLES+banner/docs 四件套含 Examples 节+zh-CN/README 表行，五 compat guard 全绿。**tests**：agent_review_workflow_test 7 用例（agent.md :1765 钉名 5 个 + cancel-during-flood 压力 + CLI 分页三页游走）+ agent_review_span_test + fixtures agent_workflows/（POSIX sh 假 reviewer 六件 + 溯源 README）+ 引擎内 30 单测；review_fix_bridge_enters_agent_runtime_mutating_path 按矩阵注记待 fix bridge 锚点后补。codex review 五轮：R1 FAIL 3P1+1P2（drain 挂死/孤儿 cancel 空头承诺/launchable 门禁错源/cwd 逃逸面）→修→R2 FAIL 2P1（workspace 删除仅名形校验可删任意同名目录/pgid 复用误杀）→修→R3 FAIL 残留（基底内 symlink→基底内受害者）→修→R4 FAIL 升级（--checkpoint 静默错内容）→fail-closed+文档→**R5 VERDICT: PASS 零发现**。门禁：fmt/clippy -D warnings/引擎+CLI+dispatcher 单测/两 test target/五 compat guard/root_after_help 全绿（并行 session 施工期间以 target 级门禁替代全量跑——全量跑存在跨 session 编译竞态，见 A5 行审计注记） |
 | 2026-07-06 | Task A8.5（AG-24a 合规实现面） | 完成 | 0.18.12 | 8e42203+7f4dc0c+a51a94e+045deaf+ed7b46e+文档提交（本 session 分片提交，绕开与并发 A7/A8 的 mod.rs 冲突） | **迁移**：`sql/migrations/2026070803_agent_audit_log`（append-only：BEFORE UPDATE/DELETE 触发器 RAISE(ABORT) 拒改删，仅 INSERT/SELECT；`_down` 不 DROP/DELETE，改装 BEFORE INSERT freeze 触发器只停写不删数据，forward 先 DROP freeze 支持 up→down→up；migration.rs 注册 + count 22→23/max 2026070803；db_migration_test 版本列表更新 24 绿）。**compliance.rs（新模块）**：retention 配置 getters `agent.retention.{transcript_days=90,stderr_days=30,findings_days=90}`/`agent.max_transcript_read_bytes=256MiB`（缺省 fail-safe + 正整数校验）；`AuditRecord`+`write_audit_record`（INSERT-only append）+`AuditScope`。**erasure**：`HistoryManager::erase_session_local` 三面一致（先 prune checkpoints 重写 refs/libra/traces+删 agent_checkpoint 行+清 object_index，再删 agent_session 行——顺序关键：先删 session 会 FK cascade 掉 checkpoint 使 ref 出孤儿）；`SessionEraseOutcome`；一致性测试（删/留/audit 存活）。**clean --gc**：`CleanArgs --gc/--retention-days`（A7 提交时收编入 mod.rs）；`gc_expired_checkpoint_ids` 按 created_at<now-transcript_days*86400 跨所有 scope 选取 stopped-session checkpoints，复用 prune 引擎，永不触碰 agent_audit_log；2 GC 测试（跨 scope 过期+窗口保留+audit 存活；--retention-days 覆盖+0 拒绝）。**checkpoint export --allow-raw**：`CheckpointExportArgs`+`export` 函数——`--raw` 无 `--allow-raw`→fail-closed 拒绝 `LBR-AGENT-013`+audit 记 granted=0；`--allow-raw --raw`→audit 记 granted=1+返回存储 transcript body（E4-libra manifest 导航 single/chunked blob 读取+max_transcript_read_bytes 截断）；默认 redacted 路径无需授权无 audit；身份从 committer env 解析（非 checkpoint 硬编码 Libra committer）；`allow_raw_gate` E2E 测试（三态门禁+审计）。**注意 P0**：transcript blob 采集时即脱敏，故 raw 导出返回 capture-redacted 内容而非未脱敏原文——门禁价值是审计+授权而非未脱敏内容（测试断言据此）。**错误码**：`StableErrorCode::AgentRawAccessDenied=LBR-AGENT-013`（as_str/category(Internal exit128)/description/双 pin 测试 + docs/error-codes.md 双表 + agent.md E10 表 + compat_error_codes_doc_sync 绿）。**deferred**：findings-GC（`agent.retention.findings_days`）前置 A8 investigate run-state 结构未成，按卡显式 deferred，A9 release notes 说明。**门禁**：fmt/clippy --all-targets --all-features -D warnings 全绿；audit_log 3、db_migration 24、export gate 1、clean gc 2、erasure 1、compliance 单测 2、error pins 42、compat（help_examples_banner/command_docs/error_codes_doc_sync）全绿。**codex review**：R1 FAIL 3 P1（export 门禁在 row-load 之后→存在性 oracle+漏审计；wants_raw=raw||allow_raw 使 --allow-raw 单独触发 raw；size cap 在全量解压后才生效）→修（门禁前置于 lookup+审计、wants_raw=raw&&allow_raw、新 read_git_object_bounded 有界解压）→R2 FAIL 新 P1（manifest.json/tree 仍走无界 read_git_object）→修（read_tree_object+双 manifest+load_metadata_blob+content_hash 全改有界，checkpoint.rs 零无界 read_git_object）→R3 FAIL 新 P1（content_hash 忽略 truncated 可 format_valid:true）→修（truncated→unreadable）→R4 FAIL 新 P1（bounded reader 固定 64B header slack，header 长于 64B 时 truncated 误报 false）→修（header 逐字节读+硬上限，content 读 max+1 判截断，与 header 长度无关+单测 pin）→R5 VERDICT: PASS 零缺陷（0.18.11 首发后修复 5 轮，作为 0.18.12 补丁发布）。7 项关键属性 + bounded-read 全部测试背书（bounded_read 2、reader 8、export gate 3、erasure 1、clean gc 2、audit_log 3、error pins 42）。文档：agent.md E10 行+settings 键、docs/commands/agent.md+zh-CN（export/gc 行+flags）、tests/INDEX.md 2 行。并发协作：A7/A8（session d59de36b）同 tree 推进，mod.rs 的 CleanArgs/CheckpointExportArgs 分别经 A7 收编与 ed7b46e 落地；本 session 全程显式 add 分片提交避免收编他人 in-flight（review/investigate）|
