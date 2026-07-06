@@ -79,8 +79,8 @@
 | `code_tool_acl_test` | 2 | Tool registry ACL & safety classification | `src/internal/ai/tools/` |
 | `code_mcp_dual_entry_test` | 2 | MCP stdio + http dual entry parity | `src/internal/ai/mcp/`, `src/command/code.rs` |
 | `code_resume_test` | 2 | Session resume across restarts | `src/internal/ai/session/`, `src/command/code.rs` |
-| `code_codex_default_tui_test` | 2 | Codex runtime default TUI wiring | `src/internal/ai/agent/codex*` |
-| `code_codex_runtime_test` | 2 | Codex runtime tool loop regression | `src/internal/ai/agent/codex*`, `src/internal/ai/tools/` |
+| `code_codex_default_tui_test` | 2 | `--provider codex` routes through the default managed-runtime TUI (legacy stdin loop unreachable) | `src/command/code.rs`, `src/internal/ai/codex/`, `src/internal/tui/` |
+| `code_codex_runtime_test` | 2 | `--provider codex` WS runtime boot: `--codex-port` validation, managed app-server initialize/thread-start, approval-interaction regression | `src/command/code.rs`, `src/internal/ai/codex/` |
 | `ai_code_ui_headless_test` | 2 | Headless Code UI runtime and projection coverage | `src/internal/ai/web/headless.rs` |
 | `ai_code_ui_projection_test` | 2 | Projection snapshot replication | `src/internal/ai/history.rs`, `src/internal/tui/` |
 | `ai_code_ui_wire_test` | 2 | Wire-format contract for UI events | `src/internal/tui/`, `src/internal/ai/agent/` |
