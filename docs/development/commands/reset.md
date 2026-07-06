@@ -45,8 +45,8 @@ flowchart TD
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/reset.md`。
-- Synopsis：`libra reset [--soft | --mixed | --hard] [<target>] [-- <pathspec>...]`；`libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]`。
-- 公开参数/子命令包括：`[<target>]`、`--soft`、`--mixed`、`--hard`、`[<pathspec>...]`、`--pathspec-from-file=<file>`、`--pathspec-file-nul`、`--no-refresh`。
+- Synopsis：`libra reset [--soft | --mixed | --hard] [<target>]`；`libra reset <pathspec>...`；`libra reset [<target>] [--] <pathspec>...`；`libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]`。
+- 公开参数/子命令包括：`[<target>]`、`--soft`、`--mixed`、`--hard`、`[<pathspec>...]`、`--pathspec-from-file=<file>`、`--pathspec-file-nul`、`--no-refresh`。裸路径兼容 Git：`libra reset <path>` 以 `HEAD` 为目标取消暂存；`libra reset -- <path>` 强制按路径解释 revision-like 文件名；同一 token 同时是 revision 和文件名时返回歧义错误 `LBR-CLI-002`。
 
 
 ## 还未实现的功能

@@ -35,7 +35,7 @@ flowchart TD
 
 ### --autostash（lore.md 1.8）
 
-- 合并属主状态机（非 pull 的 push/pop 包裹）：`stash::push_held_stash`（tracked-only，写 stash 提交对象但**不入 refs/stash**）→ sidecar `merge-autostash.json`（原子+fsync，MERGE_AUTOSTASH 模拟；held 提交仅由此文件可达——**未来 GC/prune 必须视其为根**）→ 硬重置 → 合并。统一 finalize（每个动作后运行）：无 merge-state → 回贴（干净→删 sidecar；冲突→`store_stash_commit` 提升入 stash list + 通知，回贴 all-or-nothing——`apply_stash_commit` 在写任何工作树/索引前失败，并新增纯添加 vs 未跟踪文件碰撞守卫；其它错误→警告+保留 sidecar，合并结果不变）；有 merge-state → held。`--restart` 以 `preserve_held_autostash` 跳过陈旧回收（否则 held stash 会被误降级）。陈旧 sidecar（崩溃残留）在下次合并启动时提升入 stash list（警告注明可能与已回贴内容重复）。配置 `merge.autostash` git-bool，非法值硬错误；`--dry-run` 下配置启用被静默抑制（dry-run 零写入契约）。已知限制（文档化）：与 stash pop 同源的 index/worktree 分离不保真（staged-only 且工作树回退的内容会丢——继承 stash 行为）；`libra commit` 不终结合并（Libra 需 `merge --continue`，故 sidecar 不会被普通 commit 触发回贴）；并发合并进程间 sidecar 无锁（与 merge-state.json 同级暴露）。
+- 合并属主状态机（非 pull 的 push/pop 包裹）：`stash::push_held_stash`（tracked-only，写 stash 提交对象但**不入 refs/stash**）→ sidecar `merge-autostash.json`（原子+fsync，MERGE_AUTOSTASH 模拟；held 提交仅由此文件可达——**未来 GC/prune 必须视其为根**）→ 硬重置 → 合并。统一 finalize（每个动作后运行）：无 merge-state → 回贴（干净→删 sidecar；冲突→`store_stash_commit` 提升入 stash list + 通知，回贴 all-or-nothing——`apply_stash_commit` 在写工作树前完成冲突/碰撞预检，且默认不重建 index，并新增纯添加 vs 未跟踪文件碰撞守卫；其它错误→警告+保留 sidecar，合并结果不变）；有 merge-state → held。`--restart` 以 `preserve_held_autostash` 跳过陈旧回收（否则 held stash 会被误降级）。陈旧 sidecar（崩溃残留）在下次合并启动时提升入 stash list（警告注明可能与已回贴内容重复）。配置 `merge.autostash` git-bool，非法值硬错误；`--dry-run` 下配置启用被静默抑制（dry-run 零写入契约）。已知限制（文档化）：与 stash pop 同源的 index/worktree 分离不保真（staged-only 或混合修改回贴后内容会回到工作树，但原 staged 状态不会保留，会表现为未暂存修改）；`libra commit` 不终结合并（Libra 需 `merge --continue`，故 sidecar 不会被普通 commit 触发回贴）；并发合并进程间 sidecar 无锁（与 merge-state.json 同级暴露）。
 
 ## 实现历史
 

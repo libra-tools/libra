@@ -329,6 +329,88 @@ fn test_reset_json_pathspec_omits_previous_commit() {
 }
 
 #[test]
+fn reset_bare_pathspec_unstages_file_like_git() {
+    // Given: a tracked file is modified and staged.
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("tracked.txt"), "tracked\nupdated\n").unwrap();
+    let add_output = run_libra_command(&["add", "tracked.txt"], repo.path());
+    assert_cli_success(&add_output, "stage tracked.txt");
+
+    // When: reset receives the file as a bare positional, matching `git reset <path>`.
+    let output = run_libra_command(&["reset", "tracked.txt"], repo.path());
+
+    // Then: the file is unstaged but the worktree modification remains.
+    assert_cli_success(&output, "reset tracked.txt");
+    let status = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&status, "status --short");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), " M tracked.txt\n");
+}
+
+#[test]
+fn reset_double_dash_pathspec_unstages_file_named_like_revision() {
+    // Given: a tracked file is literally named HEAD and has staged content.
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("HEAD"), "head file\n").unwrap();
+    let add = run_libra_command(&["add", "HEAD"], repo.path());
+    assert_cli_success(&add, "add HEAD file");
+    let commit = run_libra_command(
+        &["commit", "-m", "add head file", "--no-verify"],
+        repo.path(),
+    );
+    assert_cli_success(&commit, "commit HEAD file");
+    fs::write(repo.path().join("HEAD"), "head file\nupdated\n").unwrap();
+    let add = run_libra_command(&["add", "HEAD"], repo.path());
+    assert_cli_success(&add, "stage HEAD file update");
+
+    // When: `--` explicitly marks the following token as a pathspec.
+    let output = run_libra_command(&["reset", "--", "HEAD"], repo.path());
+
+    // Then: the revision-like filename is treated as a path and unstaged.
+    assert_cli_success(&output, "reset -- HEAD");
+    let status = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&status, "status --short");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), " M HEAD\n");
+}
+
+#[test]
+fn reset_bare_revision_path_ambiguity_errors_like_git() {
+    // Given: a token names both a branch and a tracked path.
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("feature"), "branch/path collision\n").unwrap();
+    let add = run_libra_command(&["add", "feature"], repo.path());
+    assert_cli_success(&add, "add feature file");
+    let commit = run_libra_command(
+        &["commit", "-m", "add feature file", "--no-verify"],
+        repo.path(),
+    );
+    assert_cli_success(&commit, "commit feature file");
+    let branch = run_libra_command(&["branch", "feature"], repo.path());
+    assert_cli_success(&branch, "create feature branch");
+    fs::write(
+        repo.path().join("feature"),
+        "branch/path collision\nupdated\n",
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "feature"], repo.path());
+    assert_cli_success(&add, "stage feature file update");
+
+    // When: reset receives the ambiguous token without `--`.
+    let output = run_libra_command(&["reset", "feature"], repo.path());
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    // Then: it refuses to guess between revision and pathspec.
+    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert!(
+        stderr.contains("ambiguous argument 'feature': both revision and filename"),
+        "unexpected stderr: {stderr}"
+    );
+    let status = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&status, "status --short");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "M  feature\n");
+}
+
+#[test]
 fn test_reset_json_hard_with_pathspec_returns_usage_error() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("tracked.txt"), "tracked\nupdated\n").unwrap();
@@ -573,11 +655,12 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
 
     let result = reset::execute_safe(
         ResetArgs {
-            target: "HEAD~1".to_string(),
+            target: Some("HEAD~1".to_string()),
             soft: false,
             mixed: false,
             hard: true,
             pathspecs: vec![],
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
@@ -911,11 +994,12 @@ async fn test_reset_soft() {
 
     // Perform soft reset to commit 1
     reset::execute(ResetArgs {
-        target: "1".to_string(), // Reset to branch 1
+        target: Some("1".to_string()), // Reset to branch 1
         soft: true,
         mixed: false,
         hard: false,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
@@ -958,11 +1042,12 @@ async fn test_reset_mixed() {
 
     // Perform mixed reset (default) to commit 1
     reset::execute(ResetArgs {
-        target: "1".to_string(), // Reset to branch 1
+        target: Some("1".to_string()), // Reset to branch 1
         soft: false,
         mixed: false, // false means default (mixed)
         hard: false,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
@@ -1009,11 +1094,12 @@ async fn test_reset_hard() {
 
     // Perform hard reset to commit 1
     reset::execute(ResetArgs {
-        target: "1".to_string(), // Reset to branch 1
+        target: Some("1".to_string()), // Reset to branch 1
         soft: false,
         mixed: false,
         hard: true,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
@@ -1130,11 +1216,12 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
 
     reset::execute_safe(
         ResetArgs {
-            target: "HEAD".to_string(),
+            target: Some("HEAD".to_string()),
             soft: false,
             mixed: true,
             hard: false,
             pathspecs: vec![],
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
@@ -1223,11 +1310,12 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
 
     reset::execute_safe(
         ResetArgs {
-            target: "HEAD".to_string(),
+            target: Some("HEAD".to_string()),
             soft: false,
             mixed: false,
             hard: true,
             pathspecs: vec![],
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
@@ -1349,11 +1437,12 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
 
     reset::execute_safe(
         ResetArgs {
-            target: "HEAD~1".to_string(),
+            target: Some("HEAD~1".to_string()),
             soft: false,
             mixed: false,
             hard: true,
             pathspecs: vec![],
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
@@ -1390,11 +1479,12 @@ async fn test_reset_with_head_reference() {
 
     // Reset using HEAD~ syntax
     reset::execute(ResetArgs {
-        target: "HEAD~1".to_string(),
+        target: Some("HEAD~1".to_string()),
         soft: false,
         mixed: true,
         hard: false,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
@@ -1436,11 +1526,12 @@ async fn test_reset_on_branch() {
 
             // Perform reset
             reset::execute(ResetArgs {
-                target: commit1.to_string(),
+                target: Some(commit1.to_string()),
                 soft: true,
                 mixed: false,
                 hard: false,
                 pathspecs: vec![],
+                pathspec_separator: false,
                 pathspec_from_file: None,
                 pathspec_file_nul: false,
                 no_refresh: false,
@@ -1525,11 +1616,12 @@ async fn test_reset_hard_skips_ignored_directories() {
 
     // Perform hard reset
     reset::execute(ResetArgs {
-        target: "HEAD".to_string(),
+        target: Some("HEAD".to_string()),
         soft: false,
         mixed: false,
         hard: true,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,

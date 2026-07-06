@@ -83,6 +83,26 @@
 - **Stale src/ file-count claim refreshed (v0.17.843)**: bumped
   410 → 427 in `docs/development/commands/_general.md`'s
   `compat_all_production_unwrap_guard` description.
+- **`libra code` Code-phase closeout (C1–C8)**: synced
+  `docs/development/tracing/code.md`, `docs/commands/code.md`,
+  `docs/commands/zh-CN/code.md`, `COMPATIBILITY.md`, and
+  `tests/INDEX.md` to the shipped mode/provider/Web/MCP/session/
+  approval behavior. The `run_libra_vcs` allowlist docs now list all
+  ten commands (`status`, `diff`, `branch`, `log`, `show`, `show-ref`,
+  `ls-files`, `add`, `commit`, `switch`) and recommend `ls-files
+  --others --exclude-standard` for untracked-path inspection, matching
+  the tool's own guidance.
+- **Mutating fix bridge deferred (no agent↔code write collaboration
+  yet)**: the internal AgentRuntime serialized fix bridge is not
+  enabled. `libra review --fix` and `libra investigate fix` stay
+  read-only and fail closed with `LBR-AGENT-010`
+  (`ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`, exit 128); `libra agent`
+  review/investigate produce findings only and never mutate the
+  working tree through `libra code`. Because the bridge is unbuilt,
+  there is no `libra agent` ↔ `libra code` mutating collaboration
+  boundary to describe — findings-to-fix hand-off remains a documented
+  deferral until the bridge lands with approval/sandbox/tool-ACL
+  coverage.
 
 ## [0.1.6]
 

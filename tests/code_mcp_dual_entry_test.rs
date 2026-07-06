@@ -34,8 +34,11 @@ mod harness;
 
 #[cfg(feature = "test-provider")]
 use std::{
-    path::PathBuf,
-    process::Command,
+    collections::BTreeSet,
+    io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -582,6 +585,417 @@ fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
     );
 
     let _payload = wait_for_sse_transcript(&mut events, marker, Duration::from_secs(10))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// C6 — MCP stdio transport regression coverage.
+//
+// The tests above drive only the MCP Streamable-HTTP transport (plus the
+// clap-level `--stdio`/`--web-only` mutex). C6's acceptance criterion
+// (`plan.md:1346`) requires the MCP HTTP/stdio *dual entry* to have regression
+// coverage for the shared **tool set**, **error behavior**, and **shutdown**
+// behavior. The helpers below drive the real `libra code --stdio` MCP server
+// over its newline-delimited JSON-RPC transport so those three facets are
+// pinned for the stdio side, and the parity test proves the stdio tool set is
+// identical to the HTTP one (both entries share `init_mcp_server` →
+// `build_tool_router`, so a divergence is a regression).
+// ---------------------------------------------------------------------------
+
+/// Collected result of one `libra code --stdio` MCP session driven to stdin EOF.
+#[cfg(feature = "test-provider")]
+struct StdioMcpRun {
+    exited_success: bool,
+    values: Vec<Value>,
+    stderr: String,
+}
+
+#[cfg(feature = "test-provider")]
+impl StdioMcpRun {
+    /// The JSON-RPC response value carrying `id == want`, if any.
+    fn response_with_id(&self, want: u64) -> Option<&Value> {
+        self.values
+            .iter()
+            .find(|value| value.get("id") == Some(&Value::from(want)))
+    }
+}
+
+/// Create an isolated, freshly-initialized Libra repo for a stdio MCP probe.
+/// Returns the `TempDir` (kept alive by the caller) — the MCP server only needs
+/// a repo root under which it can open `.libra/libra.db`; the stdio tool
+/// surface is repo-independent.
+#[cfg(feature = "test-provider")]
+fn init_stdio_repo() -> Result<tempfile::TempDir> {
+    let temp = tempfile::Builder::new()
+        .prefix("libra-code-stdio-mcp-")
+        .tempdir()
+        .context("failed to create stdio MCP repo tempdir")?;
+    let output = Command::new(libra_bin_path())
+        .args(["init", "--vault=false", "--quiet"])
+        .arg(temp.path())
+        .output()
+        .context("failed to run libra init for stdio MCP repo")?;
+    if !output.status.success() {
+        bail!(
+            "libra init failed for stdio MCP repo\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Ok(temp)
+}
+
+/// Drive a full `libra code --stdio` MCP session: write every `request_line` to
+/// the server's stdin (newline-delimited JSON-RPC), then close stdin so the
+/// server observes EOF and shuts down. Collects the JSON-RPC responses printed
+/// on stdout and the process exit status.
+///
+/// A watchdog fails the call (rather than hanging the test) if the server does
+/// not close stdout within 30s — which is exactly the shutdown-on-EOF
+/// regression this coverage exists to catch.
+#[cfg(feature = "test-provider")]
+fn run_stdio_mcp_session(repo_dir: &Path, request_lines: &[String]) -> Result<StdioMcpRun> {
+    let repo_str = repo_dir
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("stdio MCP repo path is not valid UTF-8"))?;
+    let mut child = Command::new(libra_bin_path())
+        .args(["code", "--stdio", "--cwd", repo_str])
+        .current_dir(repo_dir)
+        .env("LIBRA_ENABLE_TEST_PROVIDER", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn libra code --stdio")?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("libra code --stdio child had no stdin handle"))?;
+    for line in request_lines {
+        stdin
+            .write_all(line.as_bytes())
+            .context("failed to write JSON-RPC request to stdio MCP server")?;
+        stdin
+            .write_all(b"\n")
+            .context("failed to write newline to stdio MCP server")?;
+    }
+    stdin.flush().context("failed to flush stdio MCP stdin")?;
+    // Closing stdin is the shutdown signal: the rmcp transport hits EOF and the
+    // server exits. Dropping the handle here is what the shutdown assertion
+    // relies on.
+    drop(stdin);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("libra code --stdio child had no stdout handle"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("libra code --stdio child had no stderr handle"))?;
+
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => lines.push(line),
+                Err(_) => break,
+            }
+        }
+        let _ = stdout_tx.send(lines);
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut buf);
+        buf
+    });
+
+    let stdout_lines = match stdout_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(lines) => lines,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            bail!(
+                "libra code --stdio did not close stdout within 30s after stdin EOF \
+                 (possible MCP-stdio shutdown regression)\nstderr:\n{stderr}"
+            );
+        }
+    };
+    let _ = stdout_reader.join();
+
+    // stdout reached EOF, which means the child *should* be exiting — but a
+    // regression could close stdout while leaving the process alive, so bound
+    // the exit wait too (codex C6 review): poll try_wait to a deadline, then
+    // kill+fail rather than hang indefinitely on child.wait().
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().context("try_wait on libra code --stdio")? {
+            Some(status) => break status,
+            None if Instant::now() >= exit_deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                bail!(
+                    "libra code --stdio closed stdout but did not exit within 10s \
+                     after stdin EOF (possible MCP-stdio shutdown regression: the \
+                     process is stuck alive)\nstderr:\n{stderr}"
+                );
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    let values = stdout_lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+
+    Ok(StdioMcpRun {
+        exited_success: status.success(),
+        values,
+        stderr,
+    })
+}
+
+/// The three MCP handshake lines every stdio probe needs before it can call a
+/// tool-router method: initialize (id 1), the initialized notification, then
+/// the caller's request lines.
+#[cfg(feature = "test-provider")]
+fn stdio_handshake_lines() -> Vec<String> {
+    vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "libra-code-stdio-dual-entry", "version": "0.0.0" }
+            }
+        })
+        .to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        })
+        .to_string(),
+    ]
+}
+
+/// Extract the sorted set of MCP tool names from a `tools/list` JSON-RPC result.
+#[cfg(feature = "test-provider")]
+fn tool_names_from_list_result(value: &Value) -> BTreeSet<String> {
+    value
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Call `tools/list` over the MCP Streamable-HTTP transport and return the
+/// sorted tool-name set.
+#[cfg(feature = "test-provider")]
+fn http_tool_names(
+    client: &reqwest::blocking::Client,
+    mcp_url: &str,
+    session_id: &str,
+) -> Result<BTreeSet<String>> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    });
+    let (status, body) = mcp_post(client, mcp_url, Some(session_id), &request)
+        .context("MCP HTTP tools/list failed")?;
+    if !status.is_success() {
+        bail!("MCP HTTP tools/list returned non-success status {status}: {body}");
+    }
+    let value = first_json_rpc_sse_body("tools/list", &body)?;
+    let names = tool_names_from_list_result(&value);
+    if names.is_empty() {
+        bail!("MCP HTTP tools/list returned no tools: {value}");
+    }
+    Ok(names)
+}
+
+/// C6 §5.14 / `plan.md:1346` — the `libra code --stdio` MCP entry must (a)
+/// expose the shared tool surface via `tools/list`, (b) surface a JSON-RPC
+/// error for an unknown method AND an error-shaped result for an unknown tool,
+/// and (c) shut down cleanly when its stdin is closed (EOF). All three facets
+/// are driven over the real stdio transport in one session.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down() -> Result<()> {
+    let repo = init_stdio_repo()?;
+
+    let mut lines = stdio_handshake_lines();
+    // id 2 — tool set.
+    lines.push(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        })
+        .to_string(),
+    );
+    // id 3 — unknown method → canonical JSON-RPC "method not found" error.
+    lines.push(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "libra/definitely-not-a-method",
+            "params": {}
+        })
+        .to_string(),
+    );
+    // id 4 — unknown tool → error-shaped tools/call response.
+    lines.push(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "definitely_not_a_tool", "arguments": {} }
+        })
+        .to_string(),
+    );
+
+    let run = run_stdio_mcp_session(repo.path(), &lines)?;
+
+    // (c) Shutdown: closing stdin (EOF) must terminate the server cleanly.
+    assert!(
+        run.exited_success,
+        "libra code --stdio must exit 0 after stdin EOF; stderr:\n{}",
+        run.stderr,
+    );
+
+    // (a) Tool set: tools/list must expose the shared MCP tool surface.
+    let tools_list = run
+        .response_with_id(2)
+        .ok_or_else(|| anyhow::anyhow!("stdio MCP produced no tools/list response (id 2)"))?;
+    let names = tool_names_from_list_result(tools_list);
+    for expected in [
+        "run_libra_vcs",
+        "create_task",
+        "list_tasks",
+        "create_intent",
+    ] {
+        assert!(
+            names.contains(expected),
+            "stdio MCP tools/list must expose `{expected}`; got: {names:?}",
+        );
+    }
+    assert!(
+        names.len() >= 10,
+        "stdio MCP tools/list must expose the full workflow tool surface (>=10 tools); got {} : {names:?}",
+        names.len(),
+    );
+
+    // (b) Error behavior — unknown method → top-level JSON-RPC error with the
+    // exact "method not found" code (codex C6 review: pin the code, not just
+    // error.is_some(), so a wrong-code regression is caught).
+    let unknown_method = run.response_with_id(3).ok_or_else(|| {
+        anyhow::anyhow!("stdio MCP produced no response for the unknown method (id 3)")
+    })?;
+    assert_eq!(
+        unknown_method
+            .pointer("/error/code")
+            .and_then(Value::as_i64),
+        Some(-32601),
+        "unknown method must map to JSON-RPC -32601 (method not found) over stdio; got: {unknown_method}",
+    );
+
+    // (b) Error behavior — unknown tool → top-level JSON-RPC -32602
+    // (invalid params) per rmcp 1.5.0, not a result flagged isError.
+    let unknown_tool = run.response_with_id(4).ok_or_else(|| {
+        anyhow::anyhow!("stdio MCP produced no response for the unknown tool (id 4)")
+    })?;
+    assert_eq!(
+        unknown_tool.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32602),
+        "calling an unknown tool over stdio must map to JSON-RPC -32602 (invalid params); got: {unknown_tool}",
+    );
+
+    Ok(())
+}
+
+/// C6 §5.14 / `plan.md:1346` — dual-entry tool-set parity. The HTTP and stdio
+/// MCP entries are the same server (`init_mcp_server` → `build_tool_router`),
+/// so `tools/list` over each transport must return an identical tool set. A
+/// divergence would mean one entry point drifted from the other — exactly the
+/// dual-entry regression this test guards.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn mcp_http_and_stdio_expose_identical_tool_set() -> Result<()> {
+    // HTTP side — reuse the harness-spawned `libra code` MCP HTTP transport.
+    let session = CodeSession::spawn(CodeSessionOptions::new(
+        "code-mcp-tool-set-parity",
+        fixture_path(),
+    ))?;
+    let mcp_url = session
+        .mcp_url()
+        .ok_or_else(|| anyhow::anyhow!("control.json did not surface mcpUrl after spawn"))?
+        .to_string();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build MCP tool-set parity client")?;
+    let http_session_id = mcp_initialize(&client, &mcp_url)?;
+    let http_names = http_tool_names(&client, &mcp_url, &http_session_id)?;
+
+    // stdio side — an independent, isolated repo (the tool surface is
+    // repo-independent, so a separate repo avoids DB contention with the HTTP
+    // session while still exercising the real stdio transport).
+    let repo = init_stdio_repo()?;
+    let mut lines = stdio_handshake_lines();
+    lines.push(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        })
+        .to_string(),
+    );
+    let run = run_stdio_mcp_session(repo.path(), &lines)?;
+    assert!(
+        run.exited_success,
+        "stdio MCP parity probe must exit cleanly; stderr:\n{}",
+        run.stderr,
+    );
+    let tools_list = run
+        .response_with_id(2)
+        .ok_or_else(|| anyhow::anyhow!("stdio MCP parity probe produced no tools/list response"))?;
+    let stdio_names = tool_names_from_list_result(tools_list);
+
+    assert!(
+        !stdio_names.is_empty(),
+        "stdio MCP tools/list returned no tools",
+    );
+    assert_eq!(
+        http_names,
+        stdio_names,
+        "MCP HTTP and stdio entries must expose an identical tool set\n  http-only:  {:?}\n  stdio-only: {:?}",
+        http_names.difference(&stdio_names).collect::<Vec<_>>(),
+        stdio_names.difference(&http_names).collect::<Vec<_>>(),
+    );
+
     Ok(())
 }
 

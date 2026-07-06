@@ -1554,12 +1554,9 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
     let registry = Arc::new(builder.build());
     let allowed_tools = registry.filter_by_intent(task_intent);
 
-    let approval_config = approval_config_from_project_config(registry.working_dir());
-    let approval_ttl = args
-        .approval_ttl
-        .map(Duration::from_secs)
-        .or(approval_config.ttl)
-        .unwrap_or(DEFAULT_APPROVAL_TTL);
+    // Single source of truth for the args -> approval-context mapping
+    // (criterion 2), shared with the headless launch path.
+    let approval_cfg = tui_approval_config_from_args(&args, registry.working_dir());
     let provider_name = format!("{:?}", args.provider).to_lowercase();
     let launch_config = TuiLaunchConfig {
         host,
@@ -1576,10 +1573,10 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
         auto_classify_first_user_message: args.context.is_none(),
         context: args.context,
         resume_thread_id,
-        approval_policy: args.approval_policy.into(),
-        allow_all_commands: args.approval_policy.allows_all_commands(),
-        approval_ttl,
-        approval_cache_policy: approval_config.cache_policy,
+        approval_policy: approval_cfg.policy,
+        allow_all_commands: approval_cfg.allow_all_commands,
+        approval_ttl: approval_cfg.ttl,
+        approval_cache_policy: approval_cfg.cache_policy,
         network_access: args.network_access.is_allowed(),
         user_input_rx,
         exec_approval_rx,
@@ -1929,12 +1926,30 @@ struct HeadlessApprovalChannels {
     exec_approval_rx: mpsc::UnboundedReceiver<ExecApprovalRequest>,
 }
 
+/// Bootstraps the `SessionState` for a `--web-only` non-Codex headless run.
+///
+/// The `create` path (`SessionState::new`) is the only one reachable through
+/// the CLI: `validate_mode_args`/`reject_non_tui_flags` reject `--resume` in
+/// every non-TUI mode, so `args.resume` is always `None` here. `--resume` is
+/// TUI-only by design (see `docs/development/tracing/code.md` §"Session /
+/// graph" and `docs/commands/code.md`), not deferred work — persisted headless
+/// resume is reachable only through the TUI path.
+///
+/// The session-layer `load_for_thread_id` branch below is therefore retained
+/// only as defense-in-depth so this helper keeps a single, correct
+/// load-or-create shape (identical to the TUI resume bootstrap): if a future
+/// caller ever supplies a resume id, it loads the right session instead of
+/// silently discarding it. It is intentionally not reachable via `libra code
+/// --web-only --resume`.
 fn load_or_create_headless_web_session_state(
     args: &CodeArgs,
     working_dir: &Path,
     session_store: &Arc<SessionStore>,
 ) -> CliResult<SessionState> {
     let working_dir_str = working_dir.to_string_lossy().to_string();
+    // NOTE: unreachable via the CLI today — `--resume` is rejected before we
+    // get here in web-only mode (TUI-only by design). Kept for a uniform
+    // load-or-create shape; see this function's doc comment.
     let mut session = if let Some(thread_id) = args.resume.as_deref() {
         if thread_id.trim().is_empty() {
             return Err(CliError::command_usage(
@@ -2070,22 +2085,11 @@ where
     let session = CodeUiSession::new(snapshot);
     let persistence = HeadlessSessionPersistence::new(session_store, session_state);
 
-    let approval_config = approval_config_from_project_config(working_dir);
-    let approval_ttl = args
-        .approval_ttl
-        .map(Duration::from_secs)
-        .or(approval_config.ttl)
-        .unwrap_or(DEFAULT_APPROVAL_TTL);
     let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
     let runtime_context = Some(default_tui_runtime_context(
         working_dir,
         args.context,
-        DefaultTuiApprovalConfig {
-            policy: args.approval_policy.into(),
-            allow_all_commands: args.approval_policy.allows_all_commands(),
-            ttl: approval_ttl,
-            cache_policy: approval_config.cache_policy,
-        },
+        tui_approval_config_from_args(args, working_dir),
         args.network_access.is_allowed(),
         exec_approval_tx,
     ));
@@ -2822,6 +2826,57 @@ async fn run_tui_with_managed_code_runtime(
     .await
 }
 
+/// Formats the post-exit "inspect this thread graph" handoff line printed
+/// when the TUI leaves and Libra could derive a canonical thread id.
+///
+/// The bare `libra graph <thread_id>` form discovers the repository from the
+/// current directory. When the code session ran against a different repository
+/// (`--repo`/`--cwd`, or simply launched from elsewhere), that discovery would
+/// resolve the wrong repo, so the hint appends `--repo <path>` pointing at the
+/// session's working directory — matching the remote-repo guidance in
+/// `docs/commands/code.md`.
+///
+/// `current_dir` is the process working directory (`None` when it cannot be
+/// resolved). Paths are canonicalized before comparison so `.`/relative/symlink
+/// forms of the same directory do not produce a spurious `--repo` suffix; if
+/// the current directory is unknown we fail safe by including the explicit
+/// `--repo` path.
+/// Quote a path for a copy-pasteable shell command when it contains
+/// whitespace or shell-special characters; otherwise return it bare so the
+/// common case stays readable. POSIX single-quote escaping (`'` -> `'\''`).
+fn shell_quote_for_display(value: &str) -> String {
+    let needs_quoting = value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || "'\"\\$`&|;<>()*?[]{}#~!".contains(c));
+    if needs_quoting {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_graph_handoff_hint(
+    thread_id: &str,
+    session_working_dir: &Path,
+    current_dir: Option<&Path>,
+) -> String {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let needs_repo_hint = match current_dir {
+        Some(cwd) => canonical(cwd) != canonical(session_working_dir),
+        None => true,
+    };
+    if needs_repo_hint {
+        format!(
+            "Inspect this thread graph with: libra graph {thread_id} --repo {}",
+            shell_quote_for_display(&session_working_dir.display().to_string())
+        )
+    } else {
+        format!("Inspect this thread graph with: libra graph {thread_id}")
+    }
+}
+
 async fn run_tui_with_model_inner<M>(
     model: M,
     params: TuiLaunchConfig,
@@ -2887,6 +2942,10 @@ where
 
     // Set up session persistence
     let working_dir_str = registry.working_dir().to_string_lossy().to_string();
+    // Capture the resolved session working directory before `registry` is
+    // moved into `App::new`; the post-exit graph handoff hint needs it to
+    // decide whether to surface a `--repo <path>` suffix for a non-cwd repo.
+    let session_working_dir = registry.working_dir().to_path_buf();
     let storage_root = resolve_storage_root(registry.working_dir());
     let session_store = SessionStore::from_storage_path(&storage_root);
     let session = if let Some(thread_id) = params.resume_thread_id.as_deref() {
@@ -3304,7 +3363,11 @@ where
         let _ = runtime.shutdown().await;
     }
     if let Some(thread_id) = graph_thread_hint {
-        println!("Inspect this thread graph with: libra graph {thread_id}");
+        let current_dir = std::env::current_dir().ok();
+        println!(
+            "{}",
+            format_graph_handoff_hint(&thread_id, &session_working_dir, current_dir.as_deref())
+        );
     }
 
     Ok(())
@@ -3584,6 +3647,27 @@ fn approval_config_from_project_config(working_dir: &Path) -> ApprovalRuntimeCon
             // config-derived policy starts with no projection attached.
             approved_ruleset: None,
         },
+    }
+}
+
+/// Single source of truth for the approval-related CLI-args -> runtime
+/// [`DefaultTuiApprovalConfig`] mapping (C7 criterion 2): `--approval-policy`
+/// maps through `.into()`, `--approval-ttl` through `Duration::from_secs`
+/// (CLI flag wins over the project `approval.ttl`, else `DEFAULT_APPROVAL_TTL`),
+/// and `--approval-policy` also drives `allow_all_commands`. Both the TUI and
+/// headless launch paths derive their approval config from here, so a dropped
+/// or hardcoded flag is a single-point regression the unit test guards.
+fn tui_approval_config_from_args(args: &CodeArgs, working_dir: &Path) -> DefaultTuiApprovalConfig {
+    let approval_config = approval_config_from_project_config(working_dir);
+    DefaultTuiApprovalConfig {
+        policy: args.approval_policy.into(),
+        allow_all_commands: args.approval_policy.allows_all_commands(),
+        ttl: args
+            .approval_ttl
+            .map(Duration::from_secs)
+            .or(approval_config.ttl)
+            .unwrap_or(DEFAULT_APPROVAL_TTL),
+        cache_policy: approval_config.cache_policy,
     }
 }
 
@@ -4244,10 +4328,12 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 ///   which still rejects a provider-specific flag that does not match the
 ///   selected provider and still rejects `--api-base` under `--provider=codex`.
 ///
-/// Flags that stay rejected in BOTH non-TUI modes (safety / deferred work):
-/// `--resume` (web-only resume relaxation is deferred to Task C5), `--env-file`
-/// (the headless runtime still boots with `CodeEnvFile::default()`, so honoring
-/// a user `--env-file` web-only needs additional plumbing — deferred),
+/// Flags that stay rejected in BOTH non-TUI modes (design / safety / deferred
+/// work): `--resume` (TUI-only by design — resume is accepted only on the TUI
+/// path per `docs/development/tracing/code.md`; the session-layer headless
+/// resume implementation is never wired to the CLI), `--env-file` (the
+/// headless runtime still boots with `CodeEnvFile::default()`, so honoring a
+/// user `--env-file` web-only needs additional plumbing — deferred),
 /// `--network-access allow` (safety gate), plus `--context`,
 /// `--approval-policy`, and `--approval-ttl`.
 fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(), String> {
@@ -4287,9 +4373,12 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
     // that lands.
     reject_mode_flag(args.env_file.is_some(), "--env-file", mode)?;
     reject_mode_flag(args.context.is_some(), "--context", mode)?;
-    // NOTE (C2): web-only `--resume` is implemented at the session layer
-    // (`load_or_create_headless_web_session_state`) but its CLI relaxation is
-    // deferred to Task C5; keep it rejected in both non-TUI modes for now.
+    // `--resume` is TUI-only by design (C5): although the session layer
+    // (`load_or_create_headless_web_session_state`) carries a headless resume
+    // implementation, resume is accepted only on the TUI path
+    // (`docs/development/tracing/code.md` §"Session / graph"). This is a
+    // deliberate contract, not deferred work — keep it rejected in every
+    // non-TUI mode.
     reject_mode_flag(args.resume.is_some(), "--resume", mode)?;
     reject_mode_flag(
         args.approval_policy != CodeApprovalPolicy::OnRequest,
@@ -4471,9 +4560,10 @@ mod tests {
         assert!(err.contains("exceeds the"));
     }
 
-    /// C2: `--resume` is a TUI-only flag that stays rejected under `--web-only`
-    /// (its web-only relaxation is deferred to Task C5). `--model` used to be
-    /// rejected here too, but C2 relaxed it web-only — see
+    /// C5: `--resume` is TUI-only by design and stays rejected under
+    /// `--web-only`. This is a deliberate contract (resume is accepted only on
+    /// the TUI path, `docs/development/tracing/code.md`), not deferred work.
+    /// `--model` used to be rejected here too, but C2 relaxed it web-only — see
     /// `accepts_model_api_base_and_temperature_in_web_only_mode`.
     #[test]
     fn rejects_tui_flags_in_web_mode() {
@@ -4484,6 +4574,120 @@ mod tests {
         assert!(
             err.contains("--resume") && err.contains("--web") && err.contains("remove"),
             "web-only --resume rejection must name the flag, the mode, and an action; got: {err}"
+        );
+    }
+
+    /// C5: `--resume` is also rejected under `--stdio` (the MCP transport has
+    /// no session/resume surface). Pin the actionable message shape — name the
+    /// flag, the mode, and a corrective action — so the TUI-only contract has a
+    /// regression guard on both non-TUI modes.
+    #[test]
+    fn rejects_resume_in_stdio_mode() {
+        let mut args = base_args();
+        args.stdio = true;
+        args.resume = Some("11111111-1111-4111-8111-111111111111".to_string());
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--resume") && err.contains("--stdio") && err.contains("remove"),
+            "stdio --resume rejection must name the flag, the mode, and an action; got: {err}"
+        );
+    }
+
+    /// C5: the post-exit graph handoff prints a bare `libra graph <thread_id>`
+    /// when the session ran against the current directory (graph discovers the
+    /// repo from cwd), so no `--repo` suffix is needed.
+    #[test]
+    fn graph_handoff_hint_omits_repo_for_current_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let thread_id = "11111111-1111-4111-8111-111111111111";
+        let hint = format_graph_handoff_hint(thread_id, dir.path(), Some(dir.path()));
+        assert_eq!(
+            hint,
+            format!("Inspect this thread graph with: libra graph {thread_id}")
+        );
+        assert!(
+            !hint.contains("--repo"),
+            "same-dir hint must not add --repo"
+        );
+    }
+
+    /// C5: when the code session ran against a repository other than the
+    /// current directory (`--repo`/`--cwd`), the handoff appends
+    /// `--repo <path>` so `libra graph` resolves the same repository — matching
+    /// the remote-repo guidance in `docs/commands/code.md`.
+    #[test]
+    fn graph_handoff_hint_appends_repo_for_remote_repository() {
+        let session_dir = tempfile::tempdir().expect("session tempdir");
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let thread_id = "11111111-1111-4111-8111-111111111111";
+        let hint = format_graph_handoff_hint(thread_id, session_dir.path(), Some(cwd.path()));
+        assert_eq!(
+            hint,
+            format!(
+                "Inspect this thread graph with: libra graph {thread_id} --repo {}",
+                session_dir.path().display()
+            )
+        );
+    }
+
+    /// C5 (codex review): the copy-pasteable `--repo` hint must survive paths
+    /// with whitespace/shell-special characters — clean paths stay bare, dirty
+    /// ones are POSIX single-quoted so the emitted command word-splits correctly.
+    #[test]
+    fn shell_quote_for_display_quotes_only_when_needed() {
+        assert_eq!(
+            shell_quote_for_display("/home/user/repo"),
+            "/home/user/repo"
+        );
+        assert_eq!(
+            shell_quote_for_display("/Volumes/Data/My Repo"),
+            "'/Volumes/Data/My Repo'"
+        );
+        // Embedded single quote is escaped via the '\'' idiom.
+        assert_eq!(
+            shell_quote_for_display("/tmp/o'brien"),
+            "'/tmp/o'\\''brien'"
+        );
+        // Shell metacharacters force quoting even without whitespace.
+        assert_eq!(shell_quote_for_display("/tmp/a$b"), "'/tmp/a$b'");
+        assert_eq!(shell_quote_for_display(""), "''");
+    }
+
+    /// C5 (codex review): a session dir with a space produces a quoted
+    /// `--repo` argument in the handoff hint.
+    #[test]
+    fn graph_handoff_hint_quotes_repo_path_with_spaces() {
+        let base = tempfile::tempdir().expect("base tempdir");
+        let session_dir = base.path().join("My Repo");
+        std::fs::create_dir_all(&session_dir).expect("create spaced dir");
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let thread_id = "22222222-2222-4222-8222-222222222222";
+        let hint = format_graph_handoff_hint(thread_id, &session_dir, Some(cwd.path()));
+        let canonical = std::fs::canonicalize(&session_dir).unwrap_or(session_dir);
+        assert!(
+            hint.ends_with(&format!(
+                "--repo {}",
+                shell_quote_for_display(&canonical.display().to_string())
+            )),
+            "spaced repo path must be quoted in the hint: {hint}"
+        );
+        assert!(
+            hint.contains('\''),
+            "quoted path must contain a quote: {hint}"
+        );
+    }
+
+    /// C5: if the process working directory can't be resolved, fail safe by
+    /// emitting the explicit `--repo <path>` form rather than a bare hint that
+    /// might discover the wrong repository.
+    #[test]
+    fn graph_handoff_hint_appends_repo_when_current_dir_unknown() {
+        let session_dir = tempfile::tempdir().expect("session tempdir");
+        let thread_id = "11111111-1111-4111-8111-111111111111";
+        let hint = format_graph_handoff_hint(thread_id, session_dir.path(), None);
+        assert!(
+            hint.contains("--repo") && hint.contains(&session_dir.path().display().to_string()),
+            "unknown cwd must fall back to explicit --repo; got: {hint}"
         );
     }
 
@@ -5507,6 +5711,61 @@ no_cache_unknown_network = true
             let sandbox = runtime.sandbox.expect("sandbox context should be present");
             assert!(matches!(sandbox.policy, SandboxPolicy::ReadOnly));
         }
+    }
+
+    /// C7 (plan.md:1376): the three runtime-shaping flags must be visible at
+    /// tool invocation through the `ToolRuntimeContext` the tool loop reads.
+    /// The `--network-access` and allow-all axes are pinned by the tests
+    /// above; this pins that a non-default `--approval-policy` and
+    /// `--approval-ttl` both land on the `ToolApprovalContext` (`policy` +
+    /// `approval_ttl`) rather than being silently dropped between the CLI
+    /// mapping and the runtime context. `shell`/`apply_patch` read exactly
+    /// these fields to gate execution, so observing them here is the
+    /// "visible at invocation" contract.
+    #[test]
+    fn default_tui_runtime_context_exposes_approval_policy_and_ttl() {
+        // Exercise the PRODUCTION mapping (codex C7 review): the args ->
+        // DefaultTuiApprovalConfig mapping is now the shared helper
+        // `tui_approval_config_from_args`, which both the TUI and headless
+        // launch paths call. Feeding it parsed CLI args and running the result
+        // through `default_tui_runtime_context` catches a regression where a
+        // flag is dropped or hardcoded on the real production path — not just
+        // inside the runtime-context builder.
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let args = CodeArgs::try_parse_from([
+            "libra",
+            "--approval-policy",
+            "untrusted",
+            "--approval-ttl",
+            "4242",
+        ])
+        .expect("parse code args");
+
+        let (tx, _rx) = unbounded_channel();
+        let runtime = default_tui_runtime_context(
+            workspace.path(),
+            Some(CodeContext::Dev),
+            tui_approval_config_from_args(&args, workspace.path()),
+            args.network_access.is_allowed(),
+            tx,
+        );
+
+        let approval = runtime
+            .approval
+            .expect("approval context should be present");
+        // `--approval-policy untrusted` must map through the helper's `.into()`
+        // to AskForApproval::UnlessTrusted.
+        assert_eq!(approval.policy, AskForApproval::UnlessTrusted);
+        // `--approval-ttl 4242` must map through the helper's Duration::from_secs.
+        assert_eq!(approval.approval_ttl, Duration::from_secs(4242));
+
+        // Control: with no --approval-ttl and no project config, the helper
+        // falls back to the 300s default — proving the 4242s above came from
+        // the flag, not a hardcode.
+        let default_args = CodeArgs::try_parse_from(["libra"]).expect("parse defaults");
+        let default_cfg = tui_approval_config_from_args(&default_args, workspace.path());
+        assert_eq!(default_cfg.ttl, DEFAULT_APPROVAL_TTL);
+        assert_ne!(default_cfg.ttl, Duration::from_secs(4242));
     }
 
     // ─── OC-Phase 2 P2.4: --agent override ────────────────────────────────

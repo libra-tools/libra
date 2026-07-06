@@ -353,6 +353,7 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
 /// safe anchor is the LAST `)` — everything after it is the
 /// space-separated tail starting at field 3 (`state`). Field 22 is
 /// therefore index 19 of that tail.
+#[cfg(any(target_os = "linux", test))]
 fn parse_stat_start_ticks(stat: &str) -> Option<u64> {
     let tail = &stat[stat.rfind(')')? + 1..];
     tail.split_whitespace().nth(19)?.parse().ok()

@@ -17,7 +17,7 @@ libra stash clear [--force]
 
 ## Description
 
-`libra stash` saves your local modifications to a new stash entry and reverts the working directory to match HEAD. By default, `stash push` records tracked index/worktree changes and leaves untracked files alone. Use `-u` / `--include-untracked` to include visible untracked files, or `-a` / `--all` to include ignored files too. Pass `-- <pathspec>...` (file or directory paths; `.` selects the whole tree) to stash only the changes to those paths, leaving every other change in the working tree. A pathspec cannot be combined with `-u`/`-a`/`-k`. The modifications can be restored later with `libra stash pop` or `libra stash apply`, which replay the stash onto the CURRENT working tree (not HEAD) — so any unrelated uncommitted change you made in the meantime, including the paths a pathspec push left behind, is preserved. If `stash push` is run on a clean working tree and no requested untracked files exist, it exits successfully as a no-op and reports that there are no local changes to save.
+`libra stash` saves your local modifications to a new stash entry and reverts the working directory to match HEAD. By default, `stash push` records tracked index/worktree changes and leaves untracked files alone. Use `-u` / `--include-untracked` to include visible untracked files, or `-a` / `--all` to include ignored files too. Pass `-- <pathspec>...` (file or directory paths; `.` selects the whole tree) to stash only the changes to those paths, leaving every other change in the working tree. A pathspec cannot be combined with `-u`/`-a`/`-k`. The modifications can be restored later with `libra stash pop` or `libra stash apply`, which replay the stash onto the CURRENT working tree (not HEAD) — so any unrelated uncommitted change you made in the meantime, including the paths a pathspec push left behind, is preserved. Default `apply` / `pop` leave the current index intact, so restored tracked changes appear as unstaged working-tree changes; Git's `--index` restore mode is not exposed yet. If `stash push` is run on a clean working tree and no requested untracked files exist, it exits successfully as a no-op and reports that there are no local changes to save.
 
 Stash entries are stored as specially-structured commit objects under `.libra/refs/stash`, with a flat-file list tracking the stash stack. Each stash captures both the index state and worktree state at the time of creation.
 
@@ -60,7 +60,7 @@ libra stash push -- src/main.rs docs/
 
 #### `pop`
 
-Apply the top stash entry and remove it from the stash list. Equivalent to `apply` followed by `drop`.
+Apply the top stash entry and remove it from the stash list. Equivalent to `apply` followed by `drop`. By default, restored tracked changes are written to the working tree only and are not staged.
 
 | Argument | Description |
 |----------|-------------|
@@ -84,7 +84,7 @@ libra stash list
 
 #### `apply`
 
-Apply a stash entry without removing it from the stash list. Useful when you want to apply the same stash to multiple branches.
+Apply a stash entry without removing it from the stash list. Useful when you want to apply the same stash to multiple branches. By default, restored tracked changes are written to the working tree only and are not staged.
 
 | Argument | Description |
 |----------|-------------|
@@ -379,6 +379,10 @@ The structured envelope always emits the full `files` list. The `--name-only` / 
 ### How untracked and ignored files are stored
 
 `stash push -u` and `stash push -a` use a third stash parent for the untracked/all snapshot, matching Git's object topology. `stash apply` and `stash pop` restore those files as untracked worktree files. If a local file would be overwritten during restore, the apply/pop operation fails and keeps the stash entry intact.
+
+### How `pop` / `apply` treat the index
+
+Default `stash pop` and `stash apply` restore tracked content to the working tree while leaving the current index unchanged. A change that was staged when stashed comes back as an unstaged working-tree edit unless a future `--index` mode is added. This matches Git's default `stash pop` / `stash apply` behavior and prevents a later `libra commit` from committing restored stash content before the user runs `libra add`.
 
 ### How `--keep-index` works
 
