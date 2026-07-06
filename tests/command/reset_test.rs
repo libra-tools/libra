@@ -446,6 +446,23 @@ fn reset_bare_revision_path_ambiguity_errors_like_git() {
 }
 
 #[test]
+fn reset_soft_revision_does_not_probe_index_for_pathspec_disambiguation() {
+    // Given: a normal repository whose index is unreadable.
+    let repo = create_committed_repo_via_cli();
+    fs::write(
+        repo.path().join(".libra").join("index"),
+        b"corrupted-index-data",
+    )
+    .unwrap();
+
+    // When: reset receives an unambiguous revision target.
+    let output = run_libra_command(&["reset", "--soft", "HEAD"], repo.path());
+
+    // Then: soft reset resolves the revision without probing pathspec state.
+    assert_cli_success(&output, "reset --soft HEAD with corrupt index");
+}
+
+#[test]
 fn test_reset_json_hard_with_pathspec_returns_usage_error() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("tracked.txt"), "tracked\nupdated\n").unwrap();

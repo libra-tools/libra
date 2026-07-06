@@ -50,7 +50,7 @@ EXAMPLES:
     libra reset --json --hard HEAD~1      Structured JSON output for agents";
 
 pub(crate) const RESET_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-reset-pathspec-separator";
-const DEFAULT_RESET_TARGET: &str = "HEAD";
+pub(crate) const DEFAULT_RESET_TARGET: &str = "HEAD";
 
 #[derive(Parser, Debug)]
 #[command(after_help = RESET_EXAMPLES)]
@@ -511,20 +511,22 @@ async fn normalize_reset_request(args: &ResetArgs) -> Result<ResetRequest, Reset
         return Ok(ResetRequest { target, pathspecs });
     };
     let resolves_as_revision = target_resolves_as_revision(target_arg).await?;
-    let matches_path = pathspec_matches_known_path(target_arg).await?;
-
-    match (resolves_as_revision, matches_path) {
-        (true, true) => Err(ResetError::AmbiguousRevisionPath(target_arg.to_string())),
-        (true, false) => Ok(ResetRequest { target, pathspecs }),
-        (false, true) => {
-            pathspecs.insert(0, target_arg.to_string());
-            Ok(ResetRequest {
-                target: DEFAULT_RESET_TARGET.to_string(),
-                pathspecs,
-            })
+    if resolves_as_revision {
+        if pathspec_exists_in_worktree(target_arg) {
+            return Err(ResetError::AmbiguousRevisionPath(target_arg.to_string()));
         }
-        (false, false) => Ok(ResetRequest { target, pathspecs }),
+        return Ok(ResetRequest { target, pathspecs });
     }
+
+    if pathspec_matches_known_path(target_arg).await? {
+        pathspecs.insert(0, target_arg.to_string());
+        return Ok(ResetRequest {
+            target: DEFAULT_RESET_TARGET.to_string(),
+            pathspecs,
+        });
+    }
+
+    Ok(ResetRequest { target, pathspecs })
 }
 
 async fn target_resolves_as_revision(target: &str) -> Result<bool, ResetError> {
@@ -565,6 +567,11 @@ async fn pathspec_matches_known_path(pathspec: &str) -> Result<bool, ResetError>
     let tree: Tree = load_object(&commit.tree_id)
         .map_err(|e| object_load_error("tree", commit.tree_id.to_string(), e.to_string()))?;
     find_tree_item(&tree, path_str).map(|item| item.is_some())
+}
+
+fn pathspec_exists_in_worktree(pathspec: &str) -> bool {
+    let absolute = util::workdir_to_absolute(PathBuf::from(pathspec));
+    absolute.exists() && util::is_sub_path(&absolute, util::working_dir())
 }
 
 /// Reset specific files in the index to their state in the target commit.
