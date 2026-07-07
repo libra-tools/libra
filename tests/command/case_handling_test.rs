@@ -129,6 +129,60 @@ fn add_refuses_case_fold_twins_under_error_default() {
 }
 
 #[test]
+fn add_accepts_case_renamed_tracked_directory_alias() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    if !libra::utils::path_case::probe_dir_ignore_case(p) {
+        eprintln!("skipping case-renamed directory add: host filesystem is case-sensitive");
+        return;
+    }
+
+    fs::create_dir(p.join("slides")).unwrap();
+    fs::write(p.join("slides/a.txt"), "one\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "slides/a.txt"], p),
+        "add slides",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "slides", "--no-verify"], p),
+        "commit slides",
+    );
+
+    fs::rename(p.join("slides"), p.join("slides-tmp")).unwrap();
+    fs::rename(p.join("slides-tmp"), p.join("Slides")).unwrap();
+    fs::write(p.join("Slides/a.txt"), "two\n").unwrap();
+
+    let added = run_libra_command(&["add", "Slides"], p);
+    assert_cli_success(&added, "add through case-renamed directory");
+
+    let ls = run_libra_command(&["ls-files"], p);
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(listing.contains("slides/a.txt"), "{listing}");
+    assert!(!listing.contains("Slides/a.txt"), "{listing}");
+
+    let status = run_libra_command(&["--json", "status"], p);
+    let json = parse_json_stdout(&status);
+    let staged_modified: Vec<String> = json["data"]["staged"]["modified"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(staged_modified, vec!["slides/a.txt".to_string()]);
+    let unstaged_new: Vec<String> = json["data"]["unstaged"]["new"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(!unstaged_new.contains(&"Slides/".to_string()), "{json}");
+}
+
+#[test]
 fn checkout_switch_refuse_colliding_trees_on_insensitive_view() {
     let repo = case_repo();
     let p = repo.path();

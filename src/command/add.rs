@@ -345,6 +345,13 @@ struct ValidatedPathspecs {
     missing: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+struct PathspecMatchContext<'a> {
+    workdir: &'a Path,
+    current_dir: &'a Path,
+    ignore_case: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -508,6 +515,16 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         source,
     })?;
     let current_dir = env::current_dir().map_err(|source| AddError::Workdir { source })?;
+    let ignore_case = crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|error| {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    let pathspec_ctx = PathspecMatchContext {
+        workdir: &workdir,
+        current_dir: &current_dir,
+        ignore_case,
+    };
 
     let (mut visible_changes, mut ignored_changes) = if args.force {
         status::changes_to_be_staged_split_force().map_err(|source| AddError::Status { source })?
@@ -522,8 +539,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     let validated = validate_pathspecs(
         &args.pathspec,
         &requested_paths,
-        &workdir,
-        &current_dir,
+        pathspec_ctx,
         &visible_changes,
         &ignored_changes,
         &index,
@@ -544,12 +560,8 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
 
     // --- Refresh mode ---
     if args.refresh {
-        let tracked_modified = filter_refresh_candidates(
-            &visible_changes.modified,
-            &validated.files,
-            &workdir,
-            &current_dir,
-        );
+        let tracked_modified =
+            filter_refresh_candidates(&visible_changes.modified, &validated.files, pathspec_ctx);
         if args.dry_run {
             add_output.refreshed = tracked_modified
                 .iter()
@@ -573,19 +585,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // `--renormalize` operates on the tracked set (implies `-u`) and force-rewrites
     // each matched blob; the regular path collects working-tree changes.
     let mut files = if args.renormalize {
-        filter_candidates(
-            &index.tracked_files(),
-            &validated.files,
-            &workdir,
-            &current_dir,
-        )
+        filter_candidates(&index.tracked_files(), &validated.files, pathspec_ctx)
     } else {
         let mut f = visible_changes.modified;
         f.extend(visible_changes.deleted);
         if !args.update {
             f.extend(visible_changes.new);
         }
-        filter_candidates(&f, &validated.files, &workdir, &current_dir)
+        filter_candidates(&f, &validated.files, pathspec_ctx)
     };
     filter_out_current_executable(&mut files);
     files.sort();
@@ -669,8 +676,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                 &mut index,
                 target_mode,
                 &validated.files,
-                &workdir,
-                &current_dir,
+                pathspec_ctx,
                 true,
                 &mut add_output,
             )?;
@@ -684,11 +690,6 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // (`core.casehandling=error`) the whole add refuses BEFORE mutating the
     // index; `warn`/`allow` skip the colliding candidates (staging under the
     // existing casing is the engine's job — v1 skips, documented).
-    let ignore_case = crate::utils::path_case::effective_ignore_case()
-        .await
-        .map_err(|error| {
-            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
     let files = if ignore_case {
         let policy = crate::utils::path_case::case_handling_from_config()
             .await
@@ -710,6 +711,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             let text = crate::utils::util::path_to_string(&file);
             match tracked_fold.get(&crate::utils::path_case::fold_path_key(&text)) {
                 Some(existing) if existing != &text => {
+                    let existing_path = PathBuf::from(existing);
+                    if crate::utils::path_case::is_same_file_case_alias(
+                        &workdir,
+                        &file,
+                        &existing_path,
+                    ) {
+                        continue;
+                    }
                     collisions.push((text, existing.clone()));
                 }
                 _ => kept.push(file),
@@ -786,8 +795,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             &mut index,
             target_mode,
             &validated.files,
-            &workdir,
-            &current_dir,
+            pathspec_ctx,
             false,
             &mut add_output,
         )?;
@@ -825,17 +833,11 @@ fn apply_chmod(
     index: &mut Index,
     target_mode: u32,
     validated_files: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
+    pathspec_ctx: PathspecMatchContext<'_>,
     dry_run: bool,
     out: &mut AddOutput,
 ) -> Result<(), AddError> {
-    let matched = filter_candidates(
-        &index.tracked_files(),
-        validated_files,
-        workdir,
-        current_dir,
-    );
+    let matched = filter_candidates(&index.tracked_files(), validated_files, pathspec_ctx);
     for file in &matched {
         let file_str = file
             .to_str()
@@ -850,7 +852,7 @@ fn apply_chmod(
         if current_mode & 0o170000 != 0o100000 || current_mode == target_mode {
             continue;
         }
-        let file_abs = workdir.join(file);
+        let file_abs = pathspec_ctx.workdir.join(file);
         if !file_abs.is_file() {
             // The tracked path is gone (or is a directory): nothing to chmod.
             continue;
@@ -858,12 +860,13 @@ fn apply_chmod(
         if !dry_run {
             // Rebuild the entry from the working-tree stat, keeping the existing
             // blob (no content change) and forcing the requested mode.
-            let mut updated = IndexEntry::new_from_file(file, hash, workdir).map_err(|source| {
-                AddError::CreateIndexEntry {
-                    path: file.to_path_buf(),
-                    source,
-                }
-            })?;
+            let mut updated =
+                IndexEntry::new_from_file(file, hash, pathspec_ctx.workdir).map_err(|source| {
+                    AddError::CreateIndexEntry {
+                        path: file.to_path_buf(),
+                        source,
+                    }
+                })?;
             updated.mode = target_mode;
             index.update(updated);
         }
@@ -1155,8 +1158,7 @@ fn write_err(e: io::Error) -> CliError {
 fn validate_pathspecs(
     raw_pathspecs: &[String],
     requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
+    pathspec_ctx: PathspecMatchContext<'_>,
     visible_changes: &Changes,
     ignored_changes: &Changes,
     index: &Index,
@@ -1178,17 +1180,19 @@ fn validate_pathspecs(
     let mut files = Vec::new();
     let mut missing = Vec::new();
     for (raw, requested_path) in raw_pathspecs.iter().zip(requested_paths.iter()) {
-        let requested_abs = resolve_pathspec(requested_path, current_dir);
-        if !util::is_sub_path(&requested_abs, workdir) {
+        let requested_abs = resolve_pathspec(requested_path, pathspec_ctx.current_dir);
+        if !util::is_sub_path(&requested_abs, pathspec_ctx.workdir) {
             return Err(AddError::PathOutsideRepo {
                 path: raw.clone(),
-                repo_root: workdir.to_path_buf(),
+                repo_root: pathspec_ctx.workdir.to_path_buf(),
             });
         }
 
-        let matches_changes = pathspec_matches_any(&requested_abs, &change_candidates, workdir);
-        let matches_tracked = pathspec_matches_any(&requested_abs, &tracked_files, workdir);
-        let matches_ignored = pathspec_matches_any(&requested_abs, &ignored_candidates, workdir);
+        let matches_changes =
+            pathspec_matches_any(&requested_abs, &change_candidates, pathspec_ctx);
+        let matches_tracked = pathspec_matches_any(&requested_abs, &tracked_files, pathspec_ctx);
+        let matches_ignored =
+            pathspec_matches_any(&requested_abs, &ignored_candidates, pathspec_ctx);
 
         if matches_changes || matches_tracked {
             files.push(requested_path.clone());
@@ -1240,13 +1244,43 @@ fn resolve_pathspec(pathspec: &Path, current_dir: &Path) -> PathBuf {
     }
 }
 
+fn pathspec_contains(candidate_abs: &Path, requested_abs: &Path, ignore_case: bool) -> bool {
+    if util::is_sub_path(candidate_abs, requested_abs) {
+        return true;
+    }
+    ignore_case && path_starts_with_casefold(candidate_abs, requested_abs)
+}
+
+fn path_starts_with_casefold(path: &Path, parent: &Path) -> bool {
+    let mut path_components = path.components();
+    for parent_component in parent.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        let path_key = crate::utils::path_case::fold_path_key(
+            path_component.as_os_str().to_string_lossy().as_ref(),
+        );
+        let parent_key = crate::utils::path_case::fold_path_key(
+            parent_component.as_os_str().to_string_lossy().as_ref(),
+        );
+        if path_key != parent_key {
+            return false;
+        }
+    }
+    true
+}
+
 /// True iff any path in `candidates` (interpreted relative to `workdir`) is a
 /// subpath of `requested_abs`. Used both for tracked-file matching and for
 /// status-change matching.
-fn pathspec_matches_any(requested_abs: &Path, candidates: &[PathBuf], workdir: &Path) -> bool {
+fn pathspec_matches_any(
+    requested_abs: &Path,
+    candidates: &[PathBuf],
+    pathspec_ctx: PathspecMatchContext<'_>,
+) -> bool {
     candidates.iter().any(|candidate| {
-        let candidate_abs = workdir.join(candidate);
-        util::is_sub_path(&candidate_abs, requested_abs)
+        let candidate_abs = pathspec_ctx.workdir.join(candidate);
+        pathspec_contains(&candidate_abs, requested_abs, pathspec_ctx.ignore_case)
     })
 }
 
@@ -1256,16 +1290,15 @@ fn pathspec_matches_any(requested_abs: &Path, candidates: &[PathBuf], workdir: &
 fn filter_candidates(
     files: &[PathBuf],
     requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
+    pathspec_ctx: PathspecMatchContext<'_>,
 ) -> Vec<PathBuf> {
     files
         .iter()
         .filter(|file| {
-            let file_abs = workdir.join(file.as_path());
+            let file_abs = pathspec_ctx.workdir.join(file.as_path());
             requested_paths.iter().any(|pathspec| {
-                let requested_abs = resolve_pathspec(pathspec, current_dir);
-                util::is_sub_path(&file_abs, &requested_abs)
+                let requested_abs = resolve_pathspec(pathspec, pathspec_ctx.current_dir);
+                pathspec_contains(&file_abs, &requested_abs, pathspec_ctx.ignore_case)
             })
         })
         .cloned()
@@ -1278,10 +1311,9 @@ fn filter_candidates(
 fn filter_refresh_candidates(
     files: &[PathBuf],
     requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
+    pathspec_ctx: PathspecMatchContext<'_>,
 ) -> Vec<PathBuf> {
-    filter_candidates(files, requested_paths, workdir, current_dir)
+    filter_candidates(files, requested_paths, pathspec_ctx)
 }
 
 /// Remove the running `libra` binary from the candidate list.

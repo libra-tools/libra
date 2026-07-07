@@ -7,19 +7,45 @@ use git_internal::internal::index::Index;
 
 pub(crate) struct TrackedPaths {
     files: Vec<PathBuf>,
+    case_aliases_enabled: bool,
+    files_by_fold: HashMap<String, PathBuf>,
     top_level_dirs: HashSet<PathBuf>,
+    top_level_dirs_by_fold: HashMap<String, PathBuf>,
 }
 
 impl TrackedPaths {
     pub(crate) fn from_index(index: &Index) -> Self {
         let files = index.tracked_files();
+        let case_aliases_enabled = crate::utils::path_case::probe_workdir_ignore_case();
         let top_level_dirs = files
             .iter()
             .filter_map(|path| top_level_dir(path))
             .collect();
+        let files_by_fold = files
+            .iter()
+            .map(|path| {
+                (
+                    crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref()),
+                    path.clone(),
+                )
+            })
+            .collect();
+        let top_level_dirs_by_fold = files
+            .iter()
+            .filter_map(|path| {
+                let dir = top_level_dir(path)?;
+                Some((
+                    crate::utils::path_case::fold_path_key(dir.to_string_lossy().as_ref()),
+                    dir,
+                ))
+            })
+            .collect();
         Self {
             files,
+            case_aliases_enabled,
+            files_by_fold,
             top_level_dirs,
+            top_level_dirs_by_fold,
         }
     }
 
@@ -29,10 +55,46 @@ impl TrackedPaths {
 
     pub(crate) fn has_descendant(&self, dir: &Path) -> bool {
         if is_top_level_path(dir) {
-            return self.top_level_dirs.contains(dir);
+            return self.top_level_dirs.contains(dir)
+                || (self.case_aliases_enabled
+                    && self.top_level_dirs_by_fold.contains_key(
+                        &crate::utils::path_case::fold_path_key(dir.to_string_lossy().as_ref()),
+                    ));
         }
-        self.files.iter().any(|file| file.starts_with(dir))
+        self.files.iter().any(|file| {
+            file.starts_with(dir)
+                || (self.case_aliases_enabled && path_starts_with_casefold(file, dir))
+        })
     }
+
+    pub(crate) fn same_file_case_alias(&self, workdir: &Path, path: &Path) -> bool {
+        if !self.case_aliases_enabled {
+            return false;
+        }
+        let key = crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref());
+        self.files_by_fold.get(&key).is_some_and(|tracked| {
+            crate::utils::path_case::is_same_file_case_alias(workdir, path, tracked)
+        })
+    }
+}
+
+fn path_starts_with_casefold(path: &Path, parent: &Path) -> bool {
+    let mut path_components = path.components();
+    for parent_component in parent.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        let path_key = crate::utils::path_case::fold_path_key(
+            path_component.as_os_str().to_string_lossy().as_ref(),
+        );
+        let parent_key = crate::utils::path_case::fold_path_key(
+            parent_component.as_os_str().to_string_lossy().as_ref(),
+        );
+        if path_key != parent_key {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn collapse_untracked_directories(

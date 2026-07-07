@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     io::{IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use clap::{Parser, ValueEnum};
@@ -2606,6 +2606,7 @@ fn changes_to_be_staged_split_force_with_index(
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
     let tracked_files = index.tracked_files();
+    let tracked_fold = tracked_files_by_fold(workdir, &tracked_files);
     for file in tracked_files.iter() {
         let file_str = file
             .to_str()
@@ -2634,7 +2635,8 @@ fn changes_to_be_staged_split_force_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             visible.new.push(file);
         }
     }
@@ -2642,7 +2644,8 @@ fn changes_to_be_staged_split_force_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             ignored.new.push(file);
         }
     }
@@ -2656,6 +2659,7 @@ fn changes_to_be_staged_split_with_index(
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
     let tracked_files = index.tracked_files();
+    let tracked_fold = tracked_files_by_fold(workdir, &tracked_files);
     for file in tracked_files.iter() {
         let file_str = file
             .to_str()
@@ -2683,7 +2687,8 @@ fn changes_to_be_staged_split_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             visible.new.push(file);
         }
     }
@@ -2691,11 +2696,38 @@ fn changes_to_be_staged_split_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             ignored.new.push(file);
         }
     }
     Ok((visible, ignored))
+}
+
+fn tracked_files_by_fold(workdir: &Path, tracked_files: &[PathBuf]) -> HashMap<String, PathBuf> {
+    if !crate::utils::path_case::probe_dir_ignore_case(workdir) {
+        return HashMap::new();
+    }
+    tracked_files
+        .iter()
+        .map(|path| {
+            (
+                crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref()),
+                path.clone(),
+            )
+        })
+        .collect()
+}
+
+fn is_same_file_tracked_alias(
+    workdir: &Path,
+    file: &Path,
+    tracked_fold: &HashMap<String, PathBuf>,
+) -> bool {
+    let key = crate::utils::path_case::fold_path_key(file.to_string_lossy().as_ref());
+    tracked_fold.get(&key).is_some_and(|tracked| {
+        crate::utils::path_case::is_same_file_case_alias(workdir, file, tracked)
+    })
 }
 
 fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {

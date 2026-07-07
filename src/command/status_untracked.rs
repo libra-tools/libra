@@ -179,7 +179,15 @@ fn scan_workdir(
                 }
                 pending_dirs.push(path);
             } else if file_type.is_file() {
-                scan_file(&mut scan, workdir, index, &path, &relative, include_ignored)?;
+                scan_file(
+                    &mut scan,
+                    workdir,
+                    index,
+                    tracked,
+                    &path,
+                    &relative,
+                    include_ignored,
+                )?;
             }
         }
     }
@@ -191,6 +199,7 @@ fn scan_file(
     scan: &mut WorkdirScan,
     workdir: &Path,
     index: &Index,
+    tracked_paths: &TrackedPaths,
     path: &Path,
     relative: &Path,
     include_ignored: bool,
@@ -200,7 +209,8 @@ fn scan_file(
         .ok_or_else(|| StatusError::InvalidPathEncoding {
             path: relative.to_path_buf(),
         })?;
-    let tracked = index.tracked(file_str, 0);
+    let tracked =
+        index.tracked(file_str, 0) || tracked_paths.same_file_case_alias(workdir, relative);
     if util::check_gitignore(&workdir.to_path_buf(), &path.to_path_buf()) {
         if include_ignored && !tracked {
             scan.ignored.push(relative.to_path_buf());
