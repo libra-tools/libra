@@ -4663,11 +4663,10 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd tempdir");
         let thread_id = "22222222-2222-4222-8222-222222222222";
         let hint = format_graph_handoff_hint(thread_id, &session_dir, Some(cwd.path()));
-        let canonical = std::fs::canonicalize(&session_dir).unwrap_or(session_dir);
         assert!(
             hint.ends_with(&format!(
                 "--repo {}",
-                shell_quote_for_display(&canonical.display().to_string())
+                shell_quote_for_display(&session_dir.display().to_string())
             )),
             "spaced repo path must be quoted in the hint: {hint}"
         );

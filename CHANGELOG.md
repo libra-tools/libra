@@ -92,6 +92,14 @@
   `ls-files`, `add`, `commit`, `switch`) and recommend `ls-files
   --others --exclude-standard` for untracked-path inspection, matching
   the tool's own guidance.
+- **Agent Gate 8 closeout docs (v0.18.21)**: re-audited the Agent
+  tracing plan against the shipped code and updated
+  `docs/development/tracing/agent.md` / `plan.md` to reflect the
+  implemented first-batch roster, hook providers, lifecycle events,
+  checkpoint/export/doctor/retention/audit behavior, and intentionally
+  deferred parity items. `compat_agent_docs_contract` now also pins the
+  schema/retention/raw-export wording and the current internal runtime
+  source-of-truth link.
 - **Mutating fix bridge deferred (no agent↔code write collaboration
   yet)**: the internal AgentRuntime serialized fix bridge is not
   enabled. `libra review --fix` and `libra investigate fix` stay

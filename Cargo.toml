@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.20"
+version = "0.18.21"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -25,7 +25,7 @@ keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release build
 
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
-git-internal = "0.8.2"
+git-internal = "0.8.3"
 anyhow = "1.0.102"
 byte-unit = "5.2.0"
 byteorder = "1.5.0"

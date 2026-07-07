@@ -489,10 +489,19 @@ impl LocalStorage {
         let full_obj = match obj.object_type() {
             ObjectType::OffsetDelta => {
                 // INVARIANT: obj.object_type() == OffsetDelta implies offset_delta() is Some.
-                let delta = obj
+                //
+                // NOTE: git-internal's `offset_delta()` returns the ABSOLUTE base
+                // offset (it stores `init_offset - delta_distance` internally),
+                // NOT the raw OFS_DELTA distance. Use it directly as the base
+                // offset — do not subtract it from `offset` again. Subtracting
+                // reads from the wrong location and fails with a "corrupt deflate
+                // stream" error on OFS_DELTA packs (e.g. packs fetched from
+                // GitHub); libra-produced packs use REF_DELTA (the HashDelta arm
+                // below) so this path was previously never exercised.
+                let base_offset = obj
                     .offset_delta()
-                    .expect("OffsetDelta object must have offset_delta");
-                let base_offset = offset - delta as u64;
+                    .expect("OffsetDelta object must have offset_delta")
+                    as u64;
                 let base_obj = Self::read_pack_obj(pack_file, base_offset)?;
                 let base_obj = Arc::new(base_obj);
                 Pack::rebuild_delta(obj, base_obj)
@@ -921,6 +930,47 @@ mod tests {
             entries.len(),
             1,
             "shard should hold only the final object (no stray temp), got: {entries:?}"
+        );
+    }
+
+    /// Regression test for OFS_DELTA base-offset resolution in `read_pack_obj`.
+    ///
+    /// git-internal's `offset_delta()` returns the ABSOLUTE base offset, so
+    /// `read_pack_obj` must use it directly — it must NOT subtract it from the
+    /// delta object's own offset. The buggy double-subtraction read from the
+    /// wrong location and failed with "corrupt deflate stream" when reading
+    /// OFS_DELTA packs (e.g. packs fetched from GitHub; libra's own packs use
+    /// REF_DELTA, which is why this path was previously never exercised).
+    ///
+    /// Fixture `ofs-delta-sha1.pack` stores blob `1b59abc0…` as an OFS_DELTA
+    /// (offset 420) against base blob `b1a36d77…` (offset 241); the buggy code
+    /// would read at 420-241=179 (garbage) instead of 241.
+    #[test]
+    fn read_pack_obj_resolves_ofs_delta_base() {
+        use std::str::FromStr;
+
+        set_hash_kind(HashKind::Sha1);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("ofs-delta-sha1.pack");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+        std::fs::copy(&fixture, &pack).expect("copy fixture pack");
+
+        let idx = dir.path().join("ofs-delta-sha1.idx");
+        command::index_pack::build_index_v1(pack.to_str().unwrap(), idx.to_str().unwrap())
+            .expect("build v1 index for fixture");
+
+        let ofs_delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72").unwrap();
+        let obj = LocalStorage::read_pack_by_idx(&idx, &ofs_delta)
+            .expect("reading the OFS_DELTA object must resolve its base offset correctly")
+            .expect("object must be present in the pack");
+
+        assert_eq!(obj.object_type(), ObjectType::Blob);
+        let expected = "libra ofs-delta base line\n".repeat(400).into_bytes();
+        assert_eq!(
+            obj.data_decompressed, expected,
+            "OFS_DELTA object must reconstruct to the correct blob contents"
         );
     }
 }

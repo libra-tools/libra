@@ -2485,9 +2485,9 @@ dependencies = [
 
 [[package]]
 name = "git-internal"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "feefd9da5da7a91e89427dfb728cd676ad2facd4a388003691aa538a5641b785"
+checksum = "4fa539369d3cb64828c397475332b274f4561a2c21cba8efa01e57654e3d5ee2"
 dependencies = [
  "ahash 0.8.12",
  "async-trait",
@@ -3423,7 +3423,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libra"
-version = "0.18.20"
+version = "0.18.21"
 dependencies = [
  "anyhow",
  "assert_cmd",

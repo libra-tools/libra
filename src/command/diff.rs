@@ -9,6 +9,7 @@ use std::{
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     rc::Rc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::Parser;
@@ -1681,12 +1682,8 @@ fn index_entry_matches_worktree_stat(entry: &IndexEntry, metadata: &std::fs::Met
     let Ok(size) = u32::try_from(metadata.len()) else {
         return false;
     };
-    let Ok(ctime) = metadata.created().map(Time::from_system_time) else {
-        return false;
-    };
-    let Ok(mtime) = metadata.modified().map(Time::from_system_time) else {
-        return false;
-    };
+    let ctime = Time::from_system_time(index_ctime(metadata));
+    let mtime = Time::from_system_time(index_mtime(metadata));
 
     entry.ctime == ctime
         && entry.mtime == mtime
@@ -1696,6 +1693,46 @@ fn index_entry_matches_worktree_stat(entry: &IndexEntry, metadata: &std::fs::Met
         && entry.uid == index_uid_from_metadata(metadata)
         && entry.gid == index_gid_from_metadata(metadata)
         && entry.mode == index_mode_from_metadata(metadata)
+}
+
+#[cfg(unix)]
+fn index_ctime(metadata: &std::fs::Metadata) -> SystemTime {
+    unix_metadata_time(metadata.ctime(), metadata.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn index_ctime(metadata: &std::fs::Metadata) -> SystemTime {
+    metadata
+        .created()
+        .or_else(|_| metadata.modified())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(unix)]
+fn index_mtime(metadata: &std::fs::Metadata) -> SystemTime {
+    unix_metadata_time(metadata.mtime(), metadata.mtime_nsec())
+}
+
+#[cfg(not(unix))]
+fn index_mtime(metadata: &std::fs::Metadata) -> SystemTime {
+    metadata
+        .modified()
+        .or_else(|_| metadata.created())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(unix)]
+fn unix_metadata_time(seconds: i64, nanos: i64) -> SystemTime {
+    if seconds < 0 {
+        return UNIX_EPOCH;
+    }
+
+    let nanos = u32::try_from(nanos)
+        .ok()
+        .filter(|nanos| *nanos < 1_000_000_000)
+        .unwrap_or(0);
+
+    UNIX_EPOCH + Duration::new(seconds as u64, nanos)
 }
 
 fn index_dev_from_metadata(metadata: &std::fs::Metadata) -> u32 {

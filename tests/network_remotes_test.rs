@@ -13,10 +13,12 @@ use libra::{
 };
 use url::Url;
 
+const PUBLIC_FIXTURE_REPO: &str = "https://github.com/libra-tools/libra.git";
+const PUBLIC_FIXTURE_REPO_WEB_URL: &str = "https://github.com/libra-tools/libra/";
+
 #[tokio::test]
 async fn https_discovery_upload_pack_lists_refs() {
-    let client =
-        HttpsClient::from_url(&Url::parse("https://github.com/libra-tools/mega.git/").unwrap());
+    let client = HttpsClient::from_url(&Url::parse(PUBLIC_FIXTURE_REPO).unwrap());
     let discovery = client
         .discovery_reference(UploadPack)
         .await
@@ -34,8 +36,7 @@ async fn https_discovery_upload_pack_lists_refs() {
 
 #[tokio::test]
 async fn https_upload_pack_returns_pack_data() {
-    let client =
-        HttpsClient::from_url(&Url::parse("https://github.com/libra-tools/mega/").unwrap());
+    let client = HttpsClient::from_url(&Url::parse(PUBLIC_FIXTURE_REPO_WEB_URL).unwrap());
     let discovery = client
         .discovery_reference(UploadPack)
         .await
@@ -77,8 +78,7 @@ async fn github_lfs_batch_download_returns_response() {
         }],
         hash_algo: lfs::LFS_HASH_ALGO.to_string(),
     };
-    let lfs_client =
-        LFSClient::from_url(&Url::parse("https://github.com/libra-tools/mega.git").unwrap());
+    let lfs_client = LFSClient::from_url(&Url::parse(PUBLIC_FIXTURE_REPO).unwrap());
     let response = lfs_client
         .client
         .post(lfs_client.batch_url.clone())

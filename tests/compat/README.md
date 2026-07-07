@@ -43,7 +43,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `extra_production_unwrap_guard.rs` | unwrap audit (v0.17.266) | extra audited files (`lfs.rs`, `object.rs`, `storage/local.rs`, `storage/tiered.rs`, `path_ext.rs`, `git_protocol.rs`, `lfs_structs.rs`, `command/reflog.rs`) must not regress |
 | `all_production_unwrap_guard.rs` | unwrap audit (v0.17.268) | catch-all guard walking the entire `src/` tree; new modules are automatically in scope |
 | `agent_run_non_exhaustive_guard.rs` | agent_run | every `pub enum` exposed under `src/internal/ai/agent_run/` must carry `#[non_exhaustive]` so additive evolution is non-breaking |
-| `agent_docs_contract.rs` | agent plan docs | `docs/development/tracing/agent.md` must not claim removed provider surfaces still exist after source/tests close them |
+| `agent_docs_contract.rs` | agent plan docs | `docs/development/tracing/agent.md` must not claim removed provider surfaces still exist, drop public schema/retention/raw-export constraints, or link stale internal-plan files |
 | `agent_capability_matrix_pin.rs` | AG-16 capability contract | E1 `DeclaredAgentCaps` serializes exactly 8 snake_case keys; first-batch roster frozen to `claude-code`/`codex`/`opencode`; unsupported/unknown agents never installable or launchable |
 | `agent_architecture_guard.rs` | AG-16 architecture boundary | observed_agents must not import AgentRuntime/checkpoint layers; `agent_for` total over `AgentKind`; static roster is built-in-only; SQL CHECK constraint and doc roster stay in sync with the enum |
 | `help_examples_banner.rs` | cross-cutting item B (v0.17.841) | every visible command in `src/cli.rs::Commands` renders `EXAMPLES:` / `Examples:` in `<cmd> --help` |
