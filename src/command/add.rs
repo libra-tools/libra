@@ -527,9 +527,11 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     };
 
     let (mut visible_changes, mut ignored_changes) = if args.force {
-        status::changes_to_be_staged_split_force().map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+            .map_err(|source| AddError::Status { source })?
     } else {
-        status::changes_to_be_staged_split_safe().map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
+            .map_err(|source| AddError::Status { source })?
     };
     if args.force {
         visible_changes.extend(ignored_changes.clone());

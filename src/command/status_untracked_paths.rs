@@ -14,32 +14,37 @@ pub(crate) struct TrackedPaths {
 }
 
 impl TrackedPaths {
-    pub(crate) fn from_index(index: &Index) -> Self {
+    pub(crate) fn from_index(index: &Index, case_aliases_enabled: bool) -> Self {
         let files = index.tracked_files();
-        let case_aliases_enabled = crate::utils::path_case::probe_workdir_ignore_case();
         let top_level_dirs = files
             .iter()
             .filter_map(|path| top_level_dir(path))
             .collect();
-        let files_by_fold = files
-            .iter()
-            .map(|path| {
-                (
-                    crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref()),
-                    path.clone(),
-                )
-            })
-            .collect();
-        let top_level_dirs_by_fold = files
-            .iter()
-            .filter_map(|path| {
-                let dir = top_level_dir(path)?;
-                Some((
-                    crate::utils::path_case::fold_path_key(dir.to_string_lossy().as_ref()),
-                    dir,
-                ))
-            })
-            .collect();
+        let (files_by_fold, top_level_dirs_by_fold) = if case_aliases_enabled {
+            (
+                files
+                    .iter()
+                    .map(|path| {
+                        (
+                            crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref()),
+                            path.clone(),
+                        )
+                    })
+                    .collect(),
+                files
+                    .iter()
+                    .filter_map(|path| {
+                        let dir = top_level_dir(path)?;
+                        Some((
+                            crate::utils::path_case::fold_path_key(dir.to_string_lossy().as_ref()),
+                            dir,
+                        ))
+                    })
+                    .collect(),
+            )
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
         Self {
             files,
             case_aliases_enabled,
@@ -152,4 +157,42 @@ fn top_level_dir(path: &Path) -> Option<PathBuf> {
     let mut components = path.components();
     let first = PathBuf::from(components.next()?.as_os_str());
     components.next().map(|_| first)
+}
+
+#[cfg(test)]
+mod tests {
+    use git_internal::{
+        hash::ObjectHash,
+        internal::index::{Index, IndexEntry},
+    };
+
+    use super::*;
+
+    fn index_with_paths(paths: &[&str]) -> Index {
+        let mut index = Index::new();
+        for path in paths {
+            index.add(IndexEntry::new_from_blob(
+                (*path).to_string(),
+                ObjectHash::new(&[1; 20]),
+                0,
+            ));
+        }
+        index
+    }
+
+    #[test]
+    fn tracked_paths_do_not_fold_when_case_aliases_are_disabled() {
+        let index = index_with_paths(&["slides/a.txt"]);
+        let tracked = TrackedPaths::from_index(&index, false);
+
+        assert!(!tracked.has_descendant(Path::new("Slides")));
+    }
+
+    #[test]
+    fn tracked_paths_fold_descendants_when_case_aliases_are_enabled() {
+        let index = index_with_paths(&["slides/a.txt"]);
+        let tracked = TrackedPaths::from_index(&index, true);
+
+        assert!(tracked.has_descendant(Path::new("Slides")));
+    }
 }
