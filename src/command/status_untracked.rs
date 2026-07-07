@@ -30,6 +30,7 @@ struct WorkdirScan {
 pub(crate) fn collect_status_worktree_changes(
     untracked_mode: UntrackedFiles,
     include_ignored: bool,
+    ignore_case: bool,
 ) -> Result<StatusWorktreeChanges, StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
@@ -37,7 +38,7 @@ pub(crate) fn collect_status_worktree_changes(
         path: index_path.clone(),
         source,
     })?;
-    let tracked = TrackedPaths::from_index(&index);
+    let tracked = TrackedPaths::from_index(&index, ignore_case);
     let mut unstaged = collect_tracked_worktree_changes(&workdir, &index, tracked.files())?;
     let mut ignored_files = Vec::new();
 
