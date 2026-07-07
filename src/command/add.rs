@@ -1250,26 +1250,7 @@ fn pathspec_contains(candidate_abs: &Path, requested_abs: &Path, ignore_case: bo
     if util::is_sub_path(candidate_abs, requested_abs) {
         return true;
     }
-    ignore_case && path_starts_with_casefold(candidate_abs, requested_abs)
-}
-
-fn path_starts_with_casefold(path: &Path, parent: &Path) -> bool {
-    let mut path_components = path.components();
-    for parent_component in parent.components() {
-        let Some(path_component) = path_components.next() else {
-            return false;
-        };
-        let path_key = crate::utils::path_case::fold_path_key(
-            path_component.as_os_str().to_string_lossy().as_ref(),
-        );
-        let parent_key = crate::utils::path_case::fold_path_key(
-            parent_component.as_os_str().to_string_lossy().as_ref(),
-        );
-        if path_key != parent_key {
-            return false;
-        }
-    }
-    true
+    ignore_case && crate::utils::path_case::path_starts_with_casefold(candidate_abs, requested_abs)
 }
 
 /// True iff any path in `candidates` (interpreted relative to `workdir`) is a
