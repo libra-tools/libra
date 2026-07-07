@@ -123,6 +123,17 @@ pub fn same_file_entry(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Whether `candidate` and `tracked` differ only by case and resolve to the
+/// same worktree entry. This is the case-only alias path on case-insensitive
+/// filesystems; it is not an index twin.
+pub fn is_same_file_case_alias(workdir: &Path, candidate: &Path, tracked: &Path) -> bool {
+    let candidate_text = candidate.to_string_lossy();
+    let tracked_text = tracked.to_string_lossy();
+    candidate_text != tracked_text
+        && fold_path_key(candidate_text.as_ref()) == fold_path_key(tracked_text.as_ref())
+        && same_file_entry(&workdir.join(candidate), &workdir.join(tracked))
+}
+
 /// The repo's EFFECTIVE case-insensitivity: explicit `core.ignorecase`
 /// (git-bool, invalid = hard error) wins; otherwise a per-process runtime
 /// probe of the workdir; missing workdir → false (guards no-op).
@@ -268,6 +279,41 @@ mod tests {
                 !probe_dir_ignore_case(dir.path()),
                 "a genuine .LIBRA sibling is not case-insensitivity"
             );
+        }
+    }
+
+    #[test]
+    fn same_file_case_alias_requires_same_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".libra")).unwrap();
+        let lower = dir.path().join("slides.txt");
+        std::fs::write(&lower, "content").unwrap();
+
+        if probe_dir_ignore_case(dir.path()) {
+            assert!(is_same_file_case_alias(
+                dir.path(),
+                Path::new("Slides.txt"),
+                Path::new("slides.txt")
+            ));
+            return;
+        }
+
+        std::fs::write(dir.path().join("Slides.txt"), "other").unwrap();
+        assert!(!is_same_file_case_alias(
+            dir.path(),
+            Path::new("Slides.txt"),
+            Path::new("slides.txt")
+        ));
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(dir.path().join("Slides.txt")).unwrap();
+            std::fs::hard_link(&lower, dir.path().join("Slides.txt")).unwrap();
+            assert!(is_same_file_case_alias(
+                dir.path(),
+                Path::new("Slides.txt"),
+                Path::new("slides.txt")
+            ));
         }
     }
 }
