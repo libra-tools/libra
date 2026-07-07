@@ -134,6 +134,16 @@ pub fn is_same_file_case_alias(workdir: &Path, candidate: &Path, tracked: &Path)
         && same_file_entry(&workdir.join(candidate), &workdir.join(tracked))
 }
 
+fn parse_ignore_case_value(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" | "" => Ok(false),
+        other => Err(anyhow!(
+            "unsupported core.ignorecase '{other}' (expected a boolean)"
+        )),
+    }
+}
+
 /// The repo's EFFECTIVE case-insensitivity: explicit `core.ignorecase`
 /// (git-bool, invalid = hard error) wins; otherwise a per-process runtime
 /// probe of the workdir; missing workdir → false (guards no-op).
@@ -142,15 +152,41 @@ pub async fn effective_ignore_case() -> Result<bool> {
         .await
         .map_err(|error| anyhow!("failed to read core.ignorecase: {error}"))?;
     if let Some(entry) = entry {
-        return match entry.value.trim().to_ascii_lowercase().as_str() {
-            "true" | "yes" | "on" | "1" => Ok(true),
-            "false" | "no" | "off" | "0" | "" => Ok(false),
-            other => Err(anyhow!(
-                "unsupported core.ignorecase '{other}' (expected a boolean)"
-            )),
-        };
+        return parse_ignore_case_value(&entry.value);
     }
     Ok(probe_workdir_ignore_case())
+}
+
+/// Synchronous counterpart for status helpers that are intentionally sync.
+///
+/// It honors the explicit `core.ignorecase` override first and falls back to an
+/// uncached probe of the supplied workdir, so callers do not accidentally reuse
+/// the process-wide probe for a different repository.
+pub fn effective_ignore_case_for_dir_sync(dir: &Path) -> Result<bool> {
+    let value = core_ignorecase_value_sync()?;
+    match value {
+        Some(value) => parse_ignore_case_value(&value),
+        None => Ok(probe_dir_ignore_case(dir)),
+    }
+}
+
+fn core_ignorecase_value_sync() -> Result<Option<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<Option<String>> {
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|err| anyhow!("failed to create tokio runtime: {err}"))?;
+            runtime.block_on(async {
+                ConfigKv::get_var_case_insensitive("core.", "ignorecase")
+                    .await
+                    .map(|entry| entry.map(|entry| entry.value))
+            })
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv()
+        .map_err(|_| anyhow!("core.ignorecase sync worker exited unexpectedly"))?
+        .map_err(|error| anyhow!("failed to read core.ignorecase: {error}"))
 }
 
 /// Runtime probe (cached per process): does the working directory's

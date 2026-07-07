@@ -281,6 +281,8 @@ pub enum StatusError {
     ListWorkdirFiles { path: PathBuf, source: io::Error },
     #[error("failed to determine working directory: {source}")]
     Workdir { source: io::Error },
+    #[error("{source}")]
+    ConfigRead { source: anyhow::Error },
 }
 
 impl From<StatusError> for CliError {
@@ -301,6 +303,9 @@ impl From<StatusError> for CliError {
             }
             StatusError::Workdir { .. } => {
                 CliError::fatal(msg).with_stable_code(StableErrorCode::RepoNotFound)
+            }
+            StatusError::ConfigRead { .. } => {
+                CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed)
             }
         }
     }
@@ -2575,7 +2580,7 @@ pub fn changes_to_be_staged() -> Result<Changes, StatusError> {
 /// Commands such as `add --force` or `status --ignored` can switch policies as needed.
 pub fn changes_to_be_staged_with_policy(policy: IgnorePolicy) -> Result<Changes, StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
-    let ignore_case = crate::utils::path_case::probe_dir_ignore_case(&workdir);
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
     changes_to_be_staged_with_policy_and_ignore_case(policy, ignore_case)
 }
 
@@ -2609,7 +2614,7 @@ fn changes_to_be_staged_with_policy_and_ignore_case(
 
 pub fn changes_to_be_staged_split_safe() -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
-    let ignore_case = crate::utils::path_case::probe_dir_ignore_case(&workdir);
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
     changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
 }
 
@@ -2628,8 +2633,13 @@ pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
 /// List changes to be staged with --force semantics (recurse into ignored directories)
 pub fn changes_to_be_staged_split_force() -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
-    let ignore_case = crate::utils::path_case::probe_dir_ignore_case(&workdir);
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
     changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+}
+
+fn effective_ignore_case_for_workdir(workdir: &Path) -> Result<bool, StatusError> {
+    crate::utils::path_case::effective_ignore_case_for_dir_sync(workdir)
+        .map_err(|source| StatusError::ConfigRead { source })
 }
 
 pub(crate) fn changes_to_be_staged_split_force_with_ignore_case(
