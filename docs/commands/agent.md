@@ -80,7 +80,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `--dry-run` | `checkpoint rewind` | Show the impact without modifying files; this is the default |
 | `--allow-raw` / `--raw` | `checkpoint export` | Authorize + request a raw (un-redacted) export; without `--allow-raw` a `--raw` request is refused (`LBR-AGENT-013`) and audited |
 | `--justification <text>` / `-o <path>` | `checkpoint export` | Audit justification and output file for a raw export |
-| `--gc` / `--retention-days <n>` | `clean` | Retention GC: drop checkpoints from stopped sessions older than `agent.retention.transcript_days` (default 90; override with `--retention-days`); never touches `agent_audit_log` |
+| `--gc` / `--retention-days <n>` | `clean` | Retention GC: drop checkpoints from stopped sessions older than `agent.retention.transcript_days` (default 90; override with `--retention-days`), and prune reviewer stderr diagnostic logs of terminal review/investigate runs older than `agent.retention.stderr_days` (default 30) while keeping each run's aggregate record (`state.json`/`manifest.json`/`findings.md` + stdout logs); never touches `agent_audit_log` |
 | `--apply` | `checkpoint rewind` | Restore the working tree for the selected checkpoint |
 
 ## JSON Output

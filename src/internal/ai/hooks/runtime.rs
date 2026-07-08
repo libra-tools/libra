@@ -73,10 +73,10 @@ pub const AI_SESSION_SCHEMA: &str = "libra.ai_session.v2";
 ///
 /// - [`HookTarget::AiIntent`] — the canonical `refs/libra/intent` writer used
 ///   by `libra code` and the existing Claude/Gemini hook configs.
-/// - [`HookTarget::AgentTraces`] — the new external-Agent capture writer
-///   that lives on `refs/libra/traces`. **Phase 1 stub**: the variant
-///   exists for API surface stability, but the runtime currently rejects it
-///   with a clear "not yet wired" message; Phase 2 lands the actual writer.
+/// - [`HookTarget::AgentTraces`] — the external-Agent capture writer that
+///   lives on `refs/libra/traces`. Fully wired: the runtime ingests the
+///   lifecycle event into `agent_session` and writes an E4-libra checkpoint
+///   commit on `SessionEnd` (see [`ingest_agent_traces_payload`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookTarget {
     AiIntent,
@@ -165,13 +165,11 @@ pub async fn process_hook_event_from_stdin(
 /// Parametric form of [`process_hook_event_from_stdin`] that selects the
 /// writer destination via [`HookTarget`].
 ///
-/// CEX-EntireIO Phase 1.5: this is the seam Phase 2 grows into. For
-/// [`HookTarget::AiIntent`] the function is exactly the historical behaviour
-/// (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the function
-/// runs a Phase 1 minimal ingest — stdin parse, validate, redact, and
-/// upsert into `agent_session` — and returns. Phase 2 will extend the
-/// AgentTraces branch to additionally generate checkpoint commits on
-/// `refs/libra/traces`.
+/// For [`HookTarget::AiIntent`] the function is exactly the historical
+/// behaviour (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the
+/// function runs the external-Agent capture ingest — stdin parse, validate,
+/// redact, upsert into `agent_session`, and (on `SessionEnd`) write an
+/// E4-libra checkpoint commit on `refs/libra/traces`.
 pub async fn process_hook_event_with_target(
     command: super::provider::ProviderHookCommand,
     expected_kind: LifecycleEventKind,
@@ -405,13 +403,13 @@ pub async fn process_hook_event_with_target(
     Ok(())
 }
 
-/// Load `core.objectformat` from the local repository and pin the global hash kind.
-/// CEX-EntireIO Phase 1: minimal AgentTraces ingest.
+/// External-Agent capture ingest (`refs/libra/traces`).
 ///
 /// Reads the hook envelope from stdin, validates, parses to a
 /// [`LifecycleEvent`], redacts free-form fields, and upserts into
-/// `agent_session`. Does NOT yet generate checkpoint commits on
-/// `refs/libra/traces` — that is Phase 2 work.
+/// `agent_session`. On `SessionEnd` it also writes an E4-libra checkpoint
+/// commit on `refs/libra/traces` (it resolves the storage path and calls
+/// [`ingest_agent_traces_payload`] with `Some(repo_path)`).
 ///
 /// Boundary conditions:
 /// - Idempotent on repeated `SessionStart` for the same provider session

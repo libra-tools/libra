@@ -1,10 +1,10 @@
 //! Top-level `libra agent` command surface.
 //!
-//! The Phase 1 cut implements parsing, the read-only `status` subcommand, and
-//! stub handlers for the rest of the CLI surface so users can discover the
-//! shape via `libra agent --help`. Subsequent phases fill in checkpoint /
-//! session / hook routing on top of this scaffold; see
-//! `docs/development/commands/_general.md` section 9.
+//! Every subcommand dispatches to a real handler: `status`/`list` (capability
+//! matrix), `enable`/`add` and `disable`/`remove` (hook install/uninstall
+//! aliases), `session`, `checkpoint`, `clean`, `doctor`, `push`, `hooks`, and
+//! `rpc`. See `docs/development/commands/_general.md` section 9 and
+//! `docs/development/tracing/agent.md` for the external-agent capture surface.
 
 use clap::{Args, Subcommand};
 
@@ -295,12 +295,9 @@ pub struct CheckpointRewindArgs {
     pub apply: bool,
 }
 
-/// Run an `agent` subcommand.
-///
-/// V1 ships a stable status path and stub handlers that emit a clear
-/// "not yet implemented in this phase" message rather than panicking — this
-/// keeps the CLI discoverable while later phases land checkpoint / session
-/// machinery.
+/// Run an `agent` subcommand. Every variant routes to its implemented
+/// handler; unsupported *inputs* (e.g. a non-first-batch agent slug) still
+/// return an actionable error rather than panicking.
 pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<()> {
     match args.command {
         AgentSubcommand::Status(args) => status::execute_safe(args, output).await,
@@ -489,9 +486,9 @@ fn resolve_agent_kinds(agents: &[String]) -> CliResult<Vec<AgentKind>> {
     Ok(out)
 }
 
-/// Helper used by stubs that should still surface as a non-zero exit when
-/// called outside an interactive shell. Reserved for future expansions of
-/// the agent CLI that need an explicit refuse path.
+/// Reserved refuse helper for future agent subcommands that need an explicit
+/// non-zero-exit refuse path. Currently unused (all subcommands are
+/// implemented); kept as a small seam rather than re-added ad hoc later.
 #[allow(dead_code)]
 fn refuse(message: &str) -> CliResult<()> {
     Err(CliError::fatal(message.to_string()))

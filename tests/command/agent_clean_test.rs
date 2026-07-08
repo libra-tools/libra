@@ -744,3 +744,83 @@ async fn agent_clean_gc_retention_days_override_and_zero_rejected() {
         "--retention-days 0 must be rejected"
     );
 }
+
+/// Materialize an `agent-runs/<run_id>/` directory with a shared E8-style
+/// `manifest.json`, aggregate files and reviewer stdout/stderr logs — enough
+/// for the stderr-window GC to classify it.
+fn write_agent_run(runs_root: &Path, run_id: &str, terminal_state: Option<&str>, updated_at: &str) {
+    let run_dir = runs_root.join(run_id);
+    std::fs::create_dir_all(run_dir.join("reviewers")).expect("create run dir");
+    let terminal = match terminal_state {
+        Some(state) => format!("\"{state}\""),
+        None => "null".to_string(),
+    };
+    let manifest = format!(
+        "{{\"schema_version\":1,\"run_id\":\"{run_id}\",\"kind\":\"review\",\
+         \"terminal_state\":{terminal},\"created_at\":\"{updated_at}\",\
+         \"updated_at\":\"{updated_at}\"}}"
+    );
+    std::fs::write(run_dir.join("manifest.json"), manifest).expect("write manifest");
+    std::fs::write(run_dir.join("state.json"), "{}").expect("write state");
+    std::fs::write(run_dir.join("findings.md"), "# findings").expect("write findings");
+    std::fs::write(
+        run_dir.join("reviewers/codex.stderr.redacted.log"),
+        "reviewer stderr diagnostic",
+    )
+    .expect("write stderr log");
+    std::fs::write(
+        run_dir.join("reviewers/codex.stdout.redacted.log"),
+        "reviewer stdout findings",
+    )
+    .expect("write stdout log");
+}
+
+/// AG-24a stderr window (`agent clean --gc`, Task A8.6): prunes reviewer stderr
+/// diagnostic logs of aged **terminal** review/investigate runs while preserving
+/// the aggregate record (manifest/state/findings + stdout logs), and leaves
+/// recent or in-flight runs untouched.
+#[tokio::test]
+async fn agent_clean_gc_prunes_aged_reviewer_stderr_logs_and_keeps_aggregate() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+
+    let runs_root = repo.path().join(".libra/sessions/agent-runs");
+    let ancient = "2000-01-01T00:00:00.000000Z"; // far past the 30-day stderr window
+    let recent = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+    write_agent_run(&runs_root, "aged-terminal-run", Some("success"), ancient);
+    write_agent_run(&runs_root, "recent-terminal-run", Some("success"), &recent);
+    write_agent_run(&runs_root, "aged-inflight-run", None, ancient);
+
+    let output = run_libra_command(&["--quiet", "agent", "clean", "--gc"], repo.path());
+    assert_cli_success(&output, "libra agent clean --gc");
+
+    // Aged terminal run: stderr diagnostic pruned; aggregate + stdout preserved.
+    assert!(
+        !runs_root
+            .join("aged-terminal-run/reviewers/codex.stderr.redacted.log")
+            .exists(),
+        "aged terminal run's reviewer stderr log must be pruned"
+    );
+    assert!(
+        runs_root
+            .join("aged-terminal-run/reviewers/codex.stdout.redacted.log")
+            .exists(),
+        "stdout log (findings provenance) is preserved"
+    );
+    assert!(runs_root.join("aged-terminal-run/manifest.json").exists());
+    assert!(runs_root.join("aged-terminal-run/findings.md").exists());
+    // Recent terminal + aged in-flight runs: stderr preserved.
+    assert!(
+        runs_root
+            .join("recent-terminal-run/reviewers/codex.stderr.redacted.log")
+            .exists(),
+        "a run inside the stderr window is untouched"
+    );
+    assert!(
+        runs_root
+            .join("aged-inflight-run/reviewers/codex.stderr.redacted.log")
+            .exists(),
+        "an in-flight (non-terminal) run's diagnostics are never pruned"
+    );
+}

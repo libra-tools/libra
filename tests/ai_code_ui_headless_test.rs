@@ -360,6 +360,33 @@ async fn submit_plan_draft_tool_call_projects_draft_plan_into_snapshot() {
                 "Expose planning draft projection in the browser",
             );
             assert_eq!(plan.steps[1].status, "pending");
+            // C11 regression: the same `on_tool_call_end` writes the tool_call
+            // row and the tool-call transcript entry terminal BEFORE the plan,
+            // so once the plan is "completed" they must be too. The ordering
+            // barrier (`on_tool_call_end` awaits `on_tool_call_begin`) guarantees
+            // a late "start" task cannot regress any of these id-keyed rows back
+            // to "running" (previously ~40% flaky "plan stuck at running").
+            // (Session status is a separate multi-writer race — see the C11
+            // card — and is intentionally not asserted here.)
+            let tool_call = snapshot
+                .tool_calls
+                .iter()
+                .find(|call| call.id == "call_submit_plan_draft_1")
+                .expect("submit_plan_draft tool call must be projected");
+            assert_eq!(
+                tool_call.status, "completed",
+                "tool_call status must not regress to running"
+            );
+            let entry = snapshot
+                .transcript
+                .iter()
+                .find(|entry| entry.id == "call_submit_plan_draft_1")
+                .expect("submit_plan_draft transcript entry must be projected");
+            assert_eq!(
+                entry.status.as_deref(),
+                Some("completed"),
+                "tool-call transcript entry status must not regress to running"
+            );
             return;
         }
         tokio::time::sleep(Duration::from_millis(40)).await;

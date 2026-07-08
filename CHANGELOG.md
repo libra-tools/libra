@@ -111,6 +111,23 @@
   boundary to describe — findings-to-fix hand-off remains a documented
   deferral until the bridge lands with approval/sandbox/tool-ACL
   coverage.
+- **External agent discovery is preview / opt-in (default off)**:
+  `libra agent rpc list/trust/invoke` over external `libra-agent-*`
+  binaries is disabled by default behind the `agent.external_agents.enabled`
+  setting; unknown binaries are quarantined (never registered as
+  callable) and built-in slug impersonation is skip-and-logged. This is
+  a preview surface — enable it deliberately per repo, it is not on by
+  default.
+- **D1/R2 deletion propagation for agent-capture data is deferred**: a
+  best-effort cloud mirror already exists via `libra cloud sync` — agent
+  checkpoint blobs/trees/commits reach R2 through `object_index`, and
+  `agent_session` / `agent_checkpoint` rows are mirrored to D1. Local
+  erasure (`libra agent clean --gc` and session erasure) rewrites
+  `refs/libra/traces` and drops the local DB / `object_index` rows, but
+  it does NOT push a tombstone/delete to D1/R2, so a later
+  `cloud sync` / restore from another machine could resurrect erased
+  agent-capture data. Tombstone/deletion propagation to D1/R2 is
+  explicitly deferred until it lands.
 
 ## [0.1.6]
 

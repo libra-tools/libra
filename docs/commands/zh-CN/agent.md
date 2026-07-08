@@ -62,6 +62,7 @@ libra agent rpc <subcommand>
 | `--cursor <cursor>` | `session list`, `checkpoint list` | 上一页 `next_cursor` 返回的不透明 keyset 游标；不要手工构造 |
 | `--extract-transcript <path>` | `session show` | 将会话元数据中的已捕获 transcript 路径复制到本地文件 |
 | `--all` | `clean` | 清理所有已停止会话的 checkpoint，而不只是最近一个 |
+| `--gc` / `--retention-days <n>` | `clean` | 保留期 GC：删除已停止会话中早于 `agent.retention.transcript_days`（默认 90；用 `--retention-days` 覆盖）的 checkpoint，并清理早于 `agent.retention.stderr_days`（默认 30）的**终态** review/investigate run 的 reviewer stderr 诊断日志，同时保留该 run 的聚合记录（`state.json`/`manifest.json`/`findings.md` 与 stdout 日志）；永不触碰 `agent_audit_log` |
 | `--repair` | `doctor` | 修复检测到的 checkpoint 存储不一致（从 `refs/libra/traces` 重建过期/缺失的 catalog 行，补插缺失的 `object_index` 行）；省略时仅检测 |
 | `--remote <name>` | `push` | 选择用于推送代理 trace 引用的远程 |
 | `--force-rewrite` | `push` | 允许本地 `clean` prune 之后的非快进推送（traces 引用由 Libra 托管，prune 即整链重写）；采用针对本仓库最近一次推送记录的 force-with-lease 语义——绝非无条件 force——远程被别处重写时仍 fail-closed 拒绝 |

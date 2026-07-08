@@ -84,6 +84,13 @@ jobs:
           # Make binary executable
           chmod +x build/$BINARY_NAME
 
+          # Generate sha256 for Homebrew tap updates and CDN verification
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "build/$BINARY_NAME" | awk '{print $1}' > "build/$BINARY_NAME.sha256"
+          else
+            shasum -a 256 "build/$BINARY_NAME" | awk '{print $1}' > "build/$BINARY_NAME.sha256"
+          fi
+
           echo "Built binary: $BINARY_NAME"
 
       - name: Build Binary (Windows)
@@ -127,6 +134,15 @@ jobs:
 
           echo "Upload completed for ${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
 
+      - name: Upload Homebrew sha256 artifact
+        if: matrix.target.os != 'windows'
+        continue-on-error: true
+        uses: actions/upload-artifact@v5
+        with:
+          name: homebrew-sha256-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: build/${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.sha256
+          if-no-files-found: error
+
       - name: Upload to Cloudflare R2 (Windows)
         if: matrix.target.os == 'windows'
         shell: pwsh
@@ -145,3 +161,133 @@ jobs:
           rclone copy ./build/ r2:${{ secrets.R2_BUCKET_NAME }}/libra/releases/${{ github.ref_name }}/ -v
 
           Write-Output "Upload completed for ${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+
+  update-homebrew-tap:
+    needs: build-and-upload
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download darwin arm64 sha256 artifact
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: homebrew-sha256-darwin-arm64
+          path: homebrew-sha256/darwin-arm64
+
+      - name: Download linux amd64 sha256 artifact
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: homebrew-sha256-linux-amd64
+          path: homebrew-sha256/linux-amd64
+
+      - name: Download linux arm64 sha256 artifact
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: homebrew-sha256-linux-arm64
+          path: homebrew-sha256/linux-arm64
+
+      - name: Update Homebrew tap
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set +e
+
+          warn() {
+            local message="$1"
+            echo "::warning::$message"
+            {
+              echo "### Homebrew tap update warning"
+              echo
+              echo "$message"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          run_step() {
+            local description="$1"
+            shift
+            "$@"
+            local status=$?
+            if [[ $status -ne 0 ]]; then
+              warn "$description failed with exit code $status."
+              exit 0
+            fi
+          }
+
+          if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
+            warn "HOMEBREW_TAP_TOKEN is not configured; skipping Homebrew tap update."
+            exit 0
+          fi
+
+          run_step "Install GitHub CLI" bash -c 'type gh >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y gh)'
+
+          read_sha() {
+            local path="$1"
+            local value
+            value="$(tr -d '[:space:]' < "$path")" || return 1
+            [[ "$value" =~ ^[0-9a-f]{64}$ ]] || return 1
+            printf '%s' "$value"
+          }
+
+          darwin_arm64_sha="$(read_sha homebrew-sha256/darwin-arm64/libra-darwin-arm64.sha256)"
+          if [[ $? -ne 0 ]]; then
+            warn "darwin arm64 sha256 artifact is missing or invalid."
+            exit 0
+          fi
+
+          linux_amd64_sha="$(read_sha homebrew-sha256/linux-amd64/libra-linux-amd64.sha256)"
+          if [[ $? -ne 0 ]]; then
+            warn "linux amd64 sha256 artifact is missing or invalid."
+            exit 0
+          fi
+
+          linux_arm64_sha="$(read_sha homebrew-sha256/linux-arm64/libra-linux-arm64.sha256)"
+          if [[ $? -ne 0 ]]; then
+            warn "linux arm64 sha256 artifact is missing or invalid."
+            exit 0
+          fi
+
+          export GH_TOKEN="$HOMEBREW_TAP_TOKEN"
+          run_step "Configure GitHub CLI git authentication" gh auth setup-git
+          run_step "Checkout homebrew-libra tap" gh repo clone libra-tools/homebrew-libra homebrew-libra
+
+          cd homebrew-libra || {
+            warn "homebrew-libra checkout directory was not created."
+            exit 0
+          }
+
+          run_step "Update Homebrew formula" scripts/update-formula.sh "$GITHUB_REF_NAME" "$darwin_arm64_sha" "$linux_amd64_sha" "$linux_arm64_sha"
+
+          grep -q "version \"${GITHUB_REF_NAME#v}\"" Formula/libra.rb &&
+            grep -q "https://download.libra.tools/libra/releases/${GITHUB_REF_NAME}/libra-darwin-arm64" Formula/libra.rb &&
+            grep -q "https://download.libra.tools/libra/releases/${GITHUB_REF_NAME}/libra-linux-amd64" Formula/libra.rb &&
+            grep -q "https://download.libra.tools/libra/releases/${GITHUB_REF_NAME}/libra-linux-arm64" Formula/libra.rb
+          if [[ $? -ne 0 ]]; then
+            warn "Formula/libra.rb did not contain the expected version and CDN URLs after update."
+            exit 0
+          fi
+
+          if git diff --quiet -- Formula/libra.rb; then
+            {
+              echo "### Homebrew tap update"
+              echo
+              echo "Formula/libra.rb already matches ${GITHUB_REF_NAME}."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          run_step "Commit Homebrew formula update" git commit -am "Update libra formula to ${GITHUB_REF_NAME}"
+          run_step "Push Homebrew formula update" git push origin HEAD
+
+          {
+            echo "### Homebrew tap update"
+            echo
+            echo "Updated Formula/libra.rb for ${GITHUB_REF_NAME}."
+          } >> "$GITHUB_STEP_SUMMARY"
