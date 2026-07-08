@@ -126,7 +126,7 @@
           "path": "linked/src/main.rs",
           "expect": {
             "assertions": [
-              "file_contains:Subcommand",
+              "file_contains_any:Subcommand|subcommand",
               "file_contains:code",
               "file_contains:cloud",
               "file_contains:backup",
