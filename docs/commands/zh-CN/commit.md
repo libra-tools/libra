@@ -21,6 +21,8 @@ libra commit --amend [--no-edit]
 
 该命令读取索引以确定哪些文件已暂存，构造与暂存内容匹配的 tree 对象层级，使用提供的消息和 author/committer 元数据创建 commit 对象，并推进当前分支 ref。启用 vault signing 时，提交会自动进行 GPG 签名。除非用 `--no-verify` 绕过，pre-commit 和 commit-msg hooks 会被执行。
 
+在计算暂存变更或写入 tree/commit 对象之前，`commit` 会校验 stage-0 index 条目是否指向缺失或类型不匹配的 blob/tree 对象。损坏的 index 条目会 fail-closed，返回 `LBR-REPO-002`，并保持 `HEAD` 不变。
+
 作者身份来自 `--author`，其次是 `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`，再回退到配置的 `user.name`/`user.email`；提交者身份来自 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`，再回退到配置。除非设置了 `user.useConfigOnly=true`，Git 环境变量优先于配置。既有 `LIBRA_COMMITTER_NAME`/`LIBRA_COMMITTER_EMAIL` 仍作为更低优先级后备，兼容旧自动化。
 
 ## 选项
@@ -367,6 +369,7 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 | 场景 | 错误码 | 退出码 | 提示 |
 |----------|-----------|------|------|
 | 索引损坏 | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
+| index 对象缺失或类型不匹配 | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | 无法保存索引 | `LBR-IO-002` | 128 | -- |
 | 无内容可提交（干净） | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |
 | 无内容可提交（无已跟踪文件） | `LBR-REPO-003` | 128 | "create/copy files and use 'libra add' to track" |

@@ -65,6 +65,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `commit_amend_no_edit_test.rs` | P0-07 (plan-20260708) | clean `commit --amend --no-edit` 必须真正重写 HEAD，保留 tree/parents/message，并刷新 committer date；不得打印成功但保持 HEAD 不变 |
 | `commit_identity_date_test.rs` | P0-08 (plan-20260708) | `commit` 必须支持 Git author/committer 身份与日期环境变量、`--date`、`--reset-author`，并让 `-C/-c` 复用来源提交的 message 与 author metadata |
 | `sequencer_message_author_test.rs` | P0-08 (plan-20260708) | `cherry-pick` 必须保留原提交 author metadata，`revert` 必须使用当前身份创建提交，且二者生成消息不得从签名块派生错误 subject |
+| `write_tree_missing_object_test.rs` | P0-09 (plan-20260708) | `write-tree` / `commit` 在写 tree 或 commit 前必须拒绝 index 中缺失或类型不匹配的对象（`LBR-REPO-002`），且失败不得移动 `HEAD` |
 
 ## Authoring guidelines
 

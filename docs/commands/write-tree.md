@@ -7,7 +7,7 @@ plumbing companion to [`read-tree`](read-tree.md), equivalent to
 ## Synopsis
 
 ```
-libra write-tree
+libra write-tree [--index-file <path>]
 ```
 
 ## Description
@@ -24,10 +24,18 @@ An empty index produces the canonical empty tree
 This is a read-only plumbing command: it writes tree objects but does not move
 any ref or change the index or working tree.
 
+Before writing any tree object, `write-tree` validates each stage-0 index entry
+whose mode points at an object in this repository. Regular files, executable
+files, and symlinks must point at loadable blob objects; any tree-mode entry
+must point at a loadable tree object. Missing or mistyped objects fail closed
+with `LBR-REPO-002`. Gitlinks (`160000`) are not validated because they refer to
+submodule commits that may live outside this object database.
+
 ## Options
 
 | Option | Description | Example |
 |--------|-------------|---------|
+| `--index-file <path>` | Read a scratch index instead of `.libra/index`; a missing scratch index is treated as empty. | `libra write-tree --index-file scratch.idx` |
 | `--json` / `--machine` | Structured output: `{ tree: "<id>" }`. | `libra --json write-tree` |
 
 Git's `--prefix=<prefix>` and `--missing-ok` are not exposed (deferred).
@@ -37,7 +45,7 @@ Git's `--prefix=<prefix>` and `--missing-ok` are not exposed (deferred).
 | Code | Meaning |
 |------|---------|
 | `0` | The tree was written; its id is printed. |
-| `128` | Not inside a repository, or the index/tree could not be processed. |
+| `128` | Not inside a repository, the index/tree could not be processed, or an index object is missing/wrong-type (`LBR-REPO-002`). |
 
 ## Examples
 
@@ -47,6 +55,10 @@ TREE=$(libra write-tree)
 
 # Structured output for agents
 libra --json write-tree
+
+# Build from a scratch index
+libra update-index --index-file scratch.idx --cacheinfo 100644,$OID,path/file
+libra write-tree --index-file scratch.idx
 ```
 
 ## Comparison with Git

@@ -5,7 +5,7 @@
 ## 用法
 
 ```
-libra write-tree
+libra write-tree [--index-file <path>]
 ```
 
 ## 说明
@@ -16,10 +16,17 @@ libra write-tree
 
 这是只读底层命令：它写入 tree 对象，但不移动任何 ref，也不修改 index 或工作树。
 
+写入任何 tree 对象前，`write-tree` 会校验每个 stage-0 index 条目中指向本仓库对象的
+mode。普通文件、可执行文件和符号链接必须指向可加载的 blob 对象；异常 tree-mode
+条目必须指向可加载的 tree 对象。对象缺失或类型不匹配会 fail-closed，并返回
+`LBR-REPO-002`。Gitlink（`160000`）不会被校验，因为它指向的子模块 commit 可能位于
+另一个对象库。
+
 ## 选项
 
 | 选项 | 说明 | 示例 |
 |------|------|------|
+| `--index-file <path>` | 读取 scratch index 而不是 `.libra/index`；缺失的 scratch index 视为空。 | `libra write-tree --index-file scratch.idx` |
 | `--json` / `--machine` | 结构化输出：`{ tree: "<id>" }`。 | `libra --json write-tree` |
 
 Git 的 `--prefix=<prefix>` 与 `--missing-ok` 未公开（延后）。
@@ -29,7 +36,7 @@ Git 的 `--prefix=<prefix>` 与 `--missing-ok` 未公开（延后）。
 | 退出码 | 含义 |
 |--------|------|
 | `0` | tree 已写入，打印其 id。 |
-| `128` | 不在仓库内，或无法处理 index/tree。 |
+| `128` | 不在仓库内、无法处理 index/tree，或 index 对象缺失/类型不匹配（`LBR-REPO-002`）。 |
 
 ## 示例
 
@@ -39,6 +46,10 @@ TREE=$(libra write-tree)
 
 # 面向 agent 的结构化输出
 libra --json write-tree
+
+# 从 scratch index 构造 tree
+libra update-index --index-file scratch.idx --cacheinfo 100644,$OID,path/file
+libra write-tree --index-file scratch.idx
 ```
 
 ## 与 Git 对比

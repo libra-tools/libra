@@ -34,6 +34,7 @@ flowchart TD
 - stdout pipeline 契约（plan-20260708 P0-06）：会向 stdout 输出的命令在下游提前关闭管道时必须把 `BrokenPipe` 视为正常终止，不打印 panic/backtrace/`Broken pipe` 噪声；全局入口、`OutputConfig` 输出层和大输出命令由 `compat_broken_pipe_output` 守卫。
 - clean amend 契约（plan-20260708 P0-07）：`commit --amend --no-edit` 即使没有 tree/message 变化，也必须重写 `HEAD` 并刷新 committer date；不得打印成功摘要但保持引用不变，由 `compat_commit_amend_no_edit` 守卫。
 - identity/date 契约（plan-20260708 P0-08）：`commit` 支持 `--date`、`GIT_AUTHOR_*`/`GIT_COMMITTER_*` 身份与日期覆盖、`-C/-c` 复用来源 author metadata、`--reset-author` amend 重置 author；`cherry-pick` 保留源提交 author metadata；`revert` 使用当前身份并从去签名消息取 subject。由 `compat_commit_identity_date` 与 `compat_sequencer_message_author` 守卫。
+- index object integrity 契约（plan-20260708 P0-09）：`write-tree` 与 `commit` 在写 tree/commit 前必须校验 stage-0 index 条目的 blob/tree 对象存在且类型匹配；缺失或错类型以 `LBR-REPO-002` fail-closed，且 `commit` 失败不得移动 `HEAD`。`update-index --cacheinfo` 仍允许暂时登记不存在对象，后续写入路径负责拦截。由 `compat_write_tree_missing_object` 守卫。
 - 副作用边界：本文件解释“为什么这样兼容”，不替代 `COMPATIBILITY.md` 的用户承诺；新增命令或参数时必须同时给出 tier、测试证据和未完成项处理方式。
 
 ## 当前状态

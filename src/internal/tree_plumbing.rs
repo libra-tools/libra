@@ -35,6 +35,26 @@ pub enum TreePlumbingError {
     /// An index entry carried a file-type mode the tree format cannot represent.
     #[error("unsupported file mode {mode:#o} for index entry '{path}'")]
     UnsupportedMode { path: String, mode: u32 },
+    /// An index entry points at an object that cannot be read.
+    #[error(
+        "index entry '{path}' points to missing or unreadable {expected} object {object}: {detail}"
+    )]
+    MissingOrUnreadableObject {
+        path: String,
+        object: ObjectHash,
+        expected: ObjectType,
+        detail: String,
+    },
+    /// An index entry points at an object whose type does not match the mode.
+    #[error(
+        "index entry '{path}' points to {object}, expected {expected} object but found {actual}"
+    )]
+    WrongObjectType {
+        path: String,
+        object: ObjectHash,
+        expected: ObjectType,
+        actual: ObjectType,
+    },
     /// A path could not be represented as UTF-8.
     #[error("non-UTF-8 path in index: {0}")]
     NonUtf8Path(String),
@@ -59,6 +79,8 @@ impl From<GitError> for TreePlumbingError {
 /// (SHA-1 / SHA-256) follows the process hash kind, since the tree id is derived
 /// from the serialized tree bytes.
 pub fn write_tree_from_index(index: &Index) -> Result<ObjectHash, TreePlumbingError> {
+    validate_index_objects(index)?;
+
     let mut leaves = Vec::new();
     for path in index.tracked_files() {
         let key = path
@@ -71,6 +93,49 @@ pub fn write_tree_from_index(index: &Index) -> Result<ObjectHash, TreePlumbingEr
         leaves.push((path, mode, entry.hash));
     }
     write_tree_from_leaves(leaves)
+}
+
+/// Validate the object ids referenced by every stage-0 index entry before any
+/// tree or commit object is written. Gitlinks (`160000`) intentionally are not
+/// checked: their ids belong to the submodule repository, not necessarily this
+/// object database.
+pub fn validate_index_objects(index: &Index) -> Result<(), TreePlumbingError> {
+    let storage = util::objects_storage();
+
+    for entry in index.tracked_entries(0) {
+        let mode = index_mode_to_tree_mode(entry.mode, &entry.name)?;
+        let Some(expected) = expected_object_type(mode) else {
+            continue;
+        };
+        let actual = storage.get_object_type(&entry.hash).map_err(|error| {
+            TreePlumbingError::MissingOrUnreadableObject {
+                path: entry.name.clone(),
+                object: entry.hash,
+                expected,
+                detail: error.to_string(),
+            }
+        })?;
+        if actual != expected {
+            return Err(TreePlumbingError::WrongObjectType {
+                path: entry.name.clone(),
+                object: entry.hash,
+                expected,
+                actual,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn expected_object_type(mode: TreeItemMode) -> Option<ObjectType> {
+    match mode {
+        TreeItemMode::Blob | TreeItemMode::BlobExecutable | TreeItemMode::Link => {
+            Some(ObjectType::Blob)
+        }
+        TreeItemMode::Tree => Some(ObjectType::Tree),
+        TreeItemMode::Commit => None,
+    }
 }
 
 /// Build a nested Git tree from a flat list of leaf entries `(full path, mode,
@@ -253,6 +318,7 @@ mod tests {
     #[test]
     fn public_api_signatures_are_frozen() {
         let _write: fn(&Index) -> Result<ObjectHash, TreePlumbingError> = write_tree_from_index;
+        let _validate: fn(&Index) -> Result<(), TreePlumbingError> = validate_index_objects;
         let _read: fn(&ObjectHash) -> Result<Index, TreePlumbingError> = read_tree_into_index;
     }
 

@@ -30,6 +30,10 @@ author/committer metadata, and advances the current branch ref. When vault signi
 the commit is automatically GPG-signed. Pre-commit and commit-msg hooks are executed unless
 bypassed with `--no-verify`.
 
+Before computing staged changes or writing tree/commit objects, `commit` validates stage-0
+index entries for missing or mistyped blob/tree objects. A corrupt index entry fails closed
+with `LBR-REPO-002` and leaves `HEAD` unchanged.
+
 Author identity comes from `--author`, then `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`, then
 configured `user.name`/`user.email`; committer identity comes from
 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`, then config. Git environment variables
@@ -550,6 +554,7 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
 | Index corrupted | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
+| Index object missing or wrong type | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | Failed to save index | `LBR-IO-002` | 128 | -- |
 | Nothing to commit (clean) | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |
 | Nothing to commit (no tracked) | `LBR-REPO-003` | 128 | "create/copy files and use 'libra add' to track" |

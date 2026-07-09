@@ -33,7 +33,7 @@ flowchart TD
 ```
 
 - 底层操作对象：`IndexEntry`（索引条目，承载路径、mode、object id 和 stat 元数据）；`Index` / `.libra/index`（暂存区状态、路径条目和刷新/保存边界）；`Blob`（文件内容或 LFS pointer 写入对象库后的 blob 对象）；`Commit`（提交对象、父提交关系和提交消息载荷）；`TreeItem` / `TreeItemMode`（tree 中的路径项和 mode）；`Tree`（由索引或对象遍历生成的目录树对象）；`Branch` / branch store（SQLite refs 上的分支读写、过滤和上游关系）；`Head`（SQLite 中的 HEAD 指向、当前分支和 detached 状态）；`ReflogContext` / `with_reflog`（SQLite reflog 写入和动作记录）；`ClientStorage`（本地/分层对象存储读写入口）；SeaORM / `.libra/libra.db`（配置、refs、reflog、AI/发布元数据等 SQLite 表）；`ObjectHash`（SHA-1/SHA-256 对象 ID 和 revision 解析结果）
-- 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。
+- 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。P0-09 起，commit 在计算 staged changes 和写 tree/commit 前调用 `tree_plumbing::validate_index_objects`，缺失或类型不匹配的 blob/tree index 对象返回 `LBR-REPO-002`，且不得移动 `HEAD`。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 
 ## 实现历史
@@ -64,6 +64,7 @@ flowchart TD
 | ✅ 已实现 | `commit.cleanup`/`commit.verbose` 配置默认（CLI flag 未给时回退到 local→global 配置，flag 优先；`parse_cleanup_mode` + `parse_git_config_bool`）。带集成测试 `test_commit_honors_cleanup_and_verbose_config`（verbatim 保留 `#` 注释、verbose=true 在 `-m` 提交时把 staged diff 打到 stderr）。 | 与 git 一致；经真实 git 对照。 |
 | ✅ 已实现 | `-t/--template <FILE>` 初始模板 | `CommitArgs.template`（短 `-t`）。仅当无显式消息源（`-m`/`-F`/`-C`/`-c`/`--fixup`/`--squash`，即 `base.is_none()`）时经 `resolve_commit_template` 读取：`-t` 文件优先，否则回落 `commit.template` 配置（文件路径，`~/` 展开为 `$HOME`）；读失败→`CommitError::TemplateRead`（`IoReadFailed`）。模板作为 `initial` 缓冲，优先于 amend 父消息。`--no-edit` 时直接用作消息；否则 seed 编辑器，**若编辑后（cleanup 归一）等于 cleanup(template) 则中止**（`CommitError::TemplateUnedited`，与 git "you did not edit the message" 一致；`--no-edit` 不触发）。有显式消息源时 `-t` 不读取也不报错（`-m` 胜，与 git 一致）。带集成测试（`template_t_flag_loads_initial_content`/`template_seeds_editor_and_edited_message_is_committed`/`template_left_unedited_aborts`）。 |
 | ✅ 已实现 | P0-08 身份/日期保真 | `create_commit_signatures` 分离 author/committer 身份；非 `user.useConfigOnly` 下 Git env 覆盖 config，`LIBRA_COMMITTER_*` 为后备；`--date` 与 `GIT_AUTHOR_DATE` 设置 author date，`GIT_COMMITTER_DATE` 设置 committer date，raw `<unix> <tz>` 保留时区；`-C/-c` 复用来源提交 message 与 author metadata；`--reset-author` amend 时重置到当前 author 身份/日期。带 compat 测试 `compat_commit_identity_date`。 |
+| ✅ 已实现 | P0-09 index 对象完整性预检 | `commit` 在加载/刷新 index 后立即调用 `tree_plumbing::validate_index_objects`，确保普通/可执行/symlink 条目指向 blob、tree-mode 条目指向 tree；缺失或错类型返回 `LBR-REPO-002` 并保持 `HEAD` 不变。带 compat 测试 `compat_write_tree_missing_object`。 |
 
 ## 维护要求
 

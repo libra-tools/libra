@@ -40,6 +40,7 @@ use crate::{
         head::Head,
         log::date_parser::parse_date,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        tree_plumbing,
     },
     utils::{
         client_storage::ClientStorage,
@@ -285,6 +286,9 @@ pub enum CommitError {
     #[error("failed to create tree: {0}")]
     TreeCreation(String),
 
+    #[error("index object validation failed: {0}")]
+    IndexObjectInvalid(String),
+
     #[error("failed to store commit object: {0}")]
     ObjectStorage(String),
 
@@ -372,6 +376,10 @@ impl From<CommitError> for CliError {
             CommitError::TreeCreation(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::InternalInvariant)
                 .with_hint(format!("this is a bug; please report it at {ISSUE_URL}")),
+            CommitError::IndexObjectInvalid(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint("run 'libra fsck' to inspect missing or mistyped objects")
+                .with_hint("restore the object or remove the bad index entry before committing"),
             CommitError::ObjectStorage(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
@@ -783,6 +791,9 @@ pub async fn run_commit(
     let index = Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
     let storage = ClientStorage::init(path::objects());
     let tracked_entries = index.tracked_entries(0);
+
+    tree_plumbing::validate_index_objects(&index)
+        .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
 
     // Skip empty commit check for --amend operations
     if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
