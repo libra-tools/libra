@@ -19,6 +19,14 @@ describe whether a command has been modernized for CLIG (`--json` / `--machine`
 [`docs/development/commands/_general.md`](docs/development/commands/_general.md) and in each command
 batch document.
 
+## Cross-command stdout pipeline behavior
+
+Stdout-producing commands treat a downstream closed pipe as normal Unix
+pipeline termination: they exit quietly without printing panic/backtrace or
+`Broken pipe` diagnostics. This is enforced for the global output layer and the
+large-output commands covered by `compat_broken_pipe_output` (`log`, `diff`,
+`grep`, `ls-files`, `show`, `for-each-ref`, `cat-file`, and JSON emit paths).
+
 ## Top-level commands (from `src/cli.rs`)
 
 | Command | Tier | Notes |

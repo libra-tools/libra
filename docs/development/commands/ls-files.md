@@ -22,6 +22,7 @@
 
 - 2026-06-13 `8d4fb969`：引入基础索引列举实现轮廓。
 - 2026-06-20 PR #415：公开 `ls-files` 顶层命令，补齐 pathspec、`--error-unmatch`、`-z`、AI/MCP 只读安全覆盖、用户文档和兼容矩阵。
+- 2026-07-09（plan-20260708 P0-06）：直接 stdout 写入改走全局 `stdout_write_error` 映射，下游提前关闭管道时静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 
 ## 当前状态
 

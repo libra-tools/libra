@@ -30,6 +30,9 @@ supported; pathspecs that resolve outside the repository are rejected. The
 resolve-undo and
 sparse-checkout integration remain deferred.
 
+When stdout is piped and the downstream command exits early, `libra ls-files` exits quietly
+without printing panic/backtrace or `Broken pipe` diagnostics.
+
 ## Options
 
 | Option | Description |

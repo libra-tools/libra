@@ -16,6 +16,8 @@ libra log [OPTIONS] [<revision-range>] [[--] <path>...]
 
 人类模式保留当前 `--oneline`、`--graph`、`--pretty`、`--stat`、`--patch` 和相关输出样式。`--quiet` 抑制人类输出，但仍验证请求的历史范围。
 
+当 stdout 被管道连接且下游命令提前退出时，`libra log` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
+
 ## 选项
 
 ### `-n, --number <N>`

@@ -10,9 +10,14 @@
 //!    so that `--json` and friends keep behaving consistently when parsing itself fails.
 
 use std::{
+    any::Any,
     fs::OpenOptions,
+    panic,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use libra::{
@@ -25,6 +30,8 @@ use libra::{
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
+
+static STDOUT_BROKEN_PIPE_PANIC: AtomicBool = AtomicBool::new(false);
 
 /// Process entry point.
 ///
@@ -42,6 +49,7 @@ use tracing_subscriber::EnvFilter;
 /// - On a clean `Err(CliError)`, the exit code is sourced from
 ///   [`CliError::exit_code`] so each error class has a stable code.
 fn main() {
+    install_broken_pipe_panic_hook();
     init_tracing();
 
     const CLI_STACK_SIZE: usize = 32 * 1024 * 1024;
@@ -53,6 +61,14 @@ fn main() {
     let result = match handle {
         Ok(handle) => match handle.join() {
             Ok(result) => result,
+            Err(payload) if panic_payload_is_stdout_broken_pipe(&*payload) => {
+                flush_telemetry();
+                return;
+            }
+            Err(_) if STDOUT_BROKEN_PIPE_PANIC.swap(false, Ordering::SeqCst) => {
+                flush_telemetry();
+                return;
+            }
             Err(_) => {
                 eprintln!("fatal: CLI thread panicked\n\nHint: {INTERNAL_ERROR_REPORT_HINT}");
                 flush_telemetry();
@@ -69,6 +85,10 @@ fn main() {
     };
 
     if let Err(err) = result {
+        if err.is_stdout_broken_pipe() {
+            flush_telemetry();
+            return;
+        }
         // Best-effort JSON rendering: resolve the output flags directly from argv so
         // parse-time failures follow the same precedence rules as successful dispatch.
         // We must read from `std::env::args()` (not the dispatcher's parsed `args`)
@@ -80,6 +100,36 @@ fn main() {
         std::process::exit(err.exit_code());
     }
     flush_telemetry();
+}
+
+/// Suppress Rust's default panic report for the specific panic emitted by
+/// `println!`/`print!` when stdout is a closed pipe. The CLI thread still unwinds;
+/// `main` classifies the join payload and exits quietly.
+fn install_broken_pipe_panic_hook() {
+    let previous = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if panic_payload_is_stdout_broken_pipe(info.payload()) {
+            STDOUT_BROKEN_PIPE_PANIC.store(true, Ordering::SeqCst);
+            return;
+        }
+        previous(info);
+    }));
+}
+
+fn panic_payload_is_stdout_broken_pipe(payload: &(dyn Any + Send)) -> bool {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return message_is_stdout_broken_pipe(message);
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message_is_stdout_broken_pipe(message);
+    }
+    false
+}
+
+fn message_is_stdout_broken_pipe(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("failed printing to stdout")
+        && (lower.contains("broken pipe") || lower.contains("os error 32"))
 }
 
 /// Flush OTLP telemetry (feature-gated). MUST be called explicitly before

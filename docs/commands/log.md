@@ -21,6 +21,9 @@ Human mode preserves the current `--oneline`, `--graph`, `--pretty`, `--stat`, `
 related output styles. `--quiet` suppresses human output but still validates the requested
 history range.
 
+When stdout is piped and the downstream command exits early, `libra log` exits quietly without
+printing panic/backtrace or `Broken pipe` diagnostics.
+
 ## Options
 
 ### `-n, --number <N>`

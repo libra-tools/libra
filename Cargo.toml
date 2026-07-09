@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.39"
+version = "0.18.40"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -320,6 +320,10 @@ path = "tests/compat/checkout_branch_startpoint_test.rs"
 [[test]]
 name = "compat_switch_orphan_root"
 path = "tests/compat/switch_orphan_root_test.rs"
+
+[[test]]
+name = "compat_broken_pipe_output"
+path = "tests/compat/broken_pipe_output_test.rs"
 
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).

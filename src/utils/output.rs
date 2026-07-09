@@ -16,7 +16,7 @@ use std::{
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 
-use crate::utils::error::{CliError, CliResult};
+use crate::utils::error::{CliError, CliResult, StableErrorCode};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -112,6 +112,23 @@ fn write_json_command_envelope<W: Write, T: Serialize>(
         JsonFormat::Compact | JsonFormat::Ndjson => serde_json::to_writer(&mut *writer, &envelope)?,
     }
     writeln!(writer)
+}
+
+/// Convert stdout write failures into CLI errors. BrokenPipe is not an error for
+/// Unix pipelines: it means the downstream consumer intentionally stopped early.
+pub fn stdout_write_error(action: &str, error: io::Error) -> CliError {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        return CliError::silent_exit(0);
+    }
+    CliError::fatal(format!("failed to {action}: {error}"))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+}
+
+fn stdout_json_error(action: &str, error: serde_json::Error) -> CliError {
+    if error.io_error_kind() == Some(io::ErrorKind::BrokenPipe) {
+        return CliError::silent_exit(0);
+    }
+    CliError::internal(format!("failed to {action}: {error}"))
 }
 
 impl Default for OutputConfig {
@@ -367,24 +384,24 @@ pub fn emit<T: CommandOutput>(value: &T, config: &OutputConfig) -> CliResult<()>
         Some(JsonFormat::Pretty) => {
             let envelope = serde_json::json!({"ok": true, "data": value});
             serde_json::to_writer_pretty(&mut w, &envelope)
-                .map_err(|e| CliError::internal(format!("JSON serialization failed: {e}")))?;
-            writeln!(w).map_err(|e| CliError::io(format!("failed to write JSON output: {e}")))?;
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
         }
         Some(JsonFormat::Compact) => {
             let envelope = serde_json::json!({"ok": true, "data": value});
             serde_json::to_writer(&mut w, &envelope)
-                .map_err(|e| CliError::internal(format!("JSON serialization failed: {e}")))?;
-            writeln!(w).map_err(|e| CliError::io(format!("failed to write JSON output: {e}")))?;
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
         }
         Some(JsonFormat::Ndjson) => {
             serde_json::to_writer(&mut w, value)
-                .map_err(|e| CliError::internal(format!("JSON serialization failed: {e}")))?;
-            writeln!(w).map_err(|e| CliError::io(format!("failed to write JSON output: {e}")))?;
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
         }
         None => {
             value
                 .render_human(&mut w, config)
-                .map_err(|e| CliError::io(format!("failed to write output: {e}")))?;
+                .map_err(|e| stdout_write_error("write output", e))?;
         }
     }
     Ok(())
@@ -403,7 +420,7 @@ pub fn emit_json_data<T: Serialize>(
     let stdout = io::stdout();
     let mut writer = stdout.lock();
     write_json_command_envelope(&mut writer, command, data, format)
-        .map_err(|e| CliError::io(format!("failed to write JSON output: {e}")))
+        .map_err(|e| stdout_write_error("write JSON output", e))
 }
 
 /// Emit each item in an iterator as a separate NDJSON line, or collect into a
@@ -415,27 +432,26 @@ pub fn emit_list<T: CommandOutput>(items: &[T], config: &OutputConfig) -> CliRes
         Some(JsonFormat::Pretty) => {
             let envelope = serde_json::json!({"ok": true, "data": items});
             serde_json::to_writer_pretty(&mut w, &envelope)
-                .map_err(|e| CliError::internal(format!("JSON serialization failed: {e}")))?;
-            writeln!(w).map_err(|e| CliError::io(format!("failed to write JSON output: {e}")))?;
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
         }
         Some(JsonFormat::Compact) => {
             let envelope = serde_json::json!({"ok": true, "data": items});
             serde_json::to_writer(&mut w, &envelope)
-                .map_err(|e| CliError::internal(format!("JSON serialization failed: {e}")))?;
-            writeln!(w).map_err(|e| CliError::io(format!("failed to write JSON output: {e}")))?;
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
         }
         Some(JsonFormat::Ndjson) => {
             for item in items {
                 serde_json::to_writer(&mut w, item)
-                    .map_err(|e| CliError::internal(format!("JSON serialization failed: {e}")))?;
-                writeln!(w)
-                    .map_err(|e| CliError::io(format!("failed to write JSON output: {e}")))?;
+                    .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+                writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
             }
         }
         None => {
             for item in items {
                 item.render_human(&mut w, config)
-                    .map_err(|e| CliError::io(format!("failed to write output: {e}")))?;
+                    .map_err(|e| stdout_write_error("write output", e))?;
             }
         }
     }

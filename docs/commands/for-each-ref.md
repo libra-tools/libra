@@ -18,6 +18,9 @@ Positional `<pattern>` arguments act as substring filters on the fully-qualified
 
 Use `--points-at <object>` to keep refs that point at the resolved object. Annotated tags match both their tag object and their peeled target commit, matching Git's common `for-each-ref --points-at HEAD` behavior.
 
+When stdout is piped and the downstream command exits early, `libra for-each-ref` exits quietly
+without printing panic/backtrace or `Broken pipe` diagnostics.
+
 The `--format` option accepts a simple atom language. Supported atoms:
 
 | Atom | Value |

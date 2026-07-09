@@ -37,6 +37,7 @@ flowchart TD
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-06-13 `8d4fb969`（`Implement ref and index listing commands`）：基础实现节点：Implement ref and index listing commands；当前实现的主要轮廓可追溯到该提交。
+- 2026-07-09（plan-20260708 P0-06）：仍使用 `println!` 的行输出路径由 `main.rs` stdout broken-pipe panic hook 统一收口；下游提前关闭管道时静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 - 历史结论：`src/command/for_each_ref.rs` 已通过 `src/cli.rs::Commands::ForEachRef` 公开；早期“未公开 CLI”的记录已经过期，当前状态以源码和本页“当前状态”为准。
 
 ## 当前状态

@@ -25,6 +25,8 @@ Diff 引擎支持多种算法（默认 histogram，myers 和 myersMinimal 作为
 
 Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改。
 
+当 stdout 被管道连接且下游命令提前退出时，stdout `BrokenPipe` 会被视为正常管道终止；不会打印 panic/backtrace 或 `Broken pipe` 诊断。
+
 ## 选项
 
 | 选项 | 短选项 | 长选项 | 说明 |

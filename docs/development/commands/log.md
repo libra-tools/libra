@@ -41,6 +41,7 @@ flowchart TD
 - 2026-06-06 `89045f35`（`feat(log): support revision ranges (A..B, A...B, ^A B)`）：通过 `--range <SPEC>` 引入 revision range 入口。**后续已补齐 Git 位置性 `git log A..B`/`A...B`/`^A` 语法**（`split_log_positionals` 把前导 positional 按解析结果分流到 revision 或 pathspec，rev/path 同名歧义报错并提示 `--range`）；`--range` 作为显式入口保留。
 - 2026-06-07 `155a430a`（`fix(log): close compatibility plan gaps`）：实现修正：close compatibility plan gaps；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 2026-07-09（plan-20260708 P0-05）：orphan root 语义验收要求 `log --pretty=%P -1` 能稳定显示父提交列表；当前 `CommitFormatter` 补齐 `%P`（完整 parent OID 列表）与 `%p`（缩写 parent OID 列表），root commit 输出空字符串。回归覆盖：`compat_switch_orphan_root` 与 formatter 单测。
+- 2026-07-09（plan-20260708 P0-06）：stdout 下游提前关闭时经全局入口与 `Pager`/输出层静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态

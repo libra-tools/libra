@@ -19,7 +19,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         ignore,
-        output::{OutputConfig, emit_json_data},
+        output::{OutputConfig, emit_json_data, stdout_write_error},
         path, util,
     },
 };
@@ -546,16 +546,12 @@ fn render_output(
             record = format!("{} {}", status_tag(&entry.status), record);
         }
 
-        stdout.write_all(record.as_bytes()).map_err(|source| {
-            CliError::fatal(format!("failed to write ls-files output: {source}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
+        stdout
+            .write_all(record.as_bytes())
+            .map_err(|source| stdout_write_error("write ls-files output", source))?;
         stdout
             .write_all(if args.nul_terminate { b"\0" } else { b"\n" })
-            .map_err(|source| {
-                CliError::fatal(format!("failed to write ls-files output: {source}"))
-                    .with_stable_code(StableErrorCode::IoWriteFailed)
-            })?;
+            .map_err(|source| stdout_write_error("write ls-files output", source))?;
     }
 
     Ok(())

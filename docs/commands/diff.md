@@ -25,6 +25,9 @@ When the working tree contains unmerged conflict entries, the default working-tr
 
 Pathspec arguments filter the diff to only show changes in matching files or directories.
 
+When stdout is piped and the downstream command exits early, stdout `BrokenPipe` is treated as
+normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is printed.
+
 ## Options
 
 | Option | Short | Long | Description |

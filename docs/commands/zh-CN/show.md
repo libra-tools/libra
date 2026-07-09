@@ -14,6 +14,8 @@ libra show [OPTIONS] [OBJECT] [-- <PATHS>...]
 
 对于提交，输出包含头部（作者、提交者、日期、消息），随后是 unified diff（“patch”）。`--no-patch`、`--stat` 和 `--name-only` 等标志控制显示多少 diff 上下文。对于附注标签，会先打印 tagger 元数据和消息，然后打印目标对象。树会列出其条目，blob 会打印文本内容（或二进制摘要）。
 
+当 stdout 被管道连接且下游命令提前退出时，`libra show` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
+
 ## 选项
 
 | 标志 | 短选项 | 说明 |

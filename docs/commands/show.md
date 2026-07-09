@@ -21,6 +21,9 @@ and `--name-only` control how much diff context is shown. For annotated tags the
 tagger metadata and message are printed, followed by the target object. Trees
 list their entries and blobs print their text content (or a binary summary).
 
+When stdout is piped and the downstream command exits early, `libra show` exits quietly without
+printing panic/backtrace or `Broken pipe` diagnostics.
+
 ## Options
 
 | Flag | Short | Description |

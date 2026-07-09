@@ -991,6 +991,24 @@ impl CliError {
         }
     }
 
+    /// True when this error is the normal Unix "downstream closed stdout"
+    /// condition rather than a user-visible failure.
+    pub fn is_stdout_broken_pipe(&self) -> bool {
+        if self.silent {
+            return false;
+        }
+        let lower = self.message.to_ascii_lowercase();
+        let broken_pipe = lower.contains("broken pipe") || lower.contains("os error 32");
+        let stdout_write = lower.contains("failed printing to stdout")
+            || lower.contains("failed to write output")
+            || lower.contains("failed to write json output")
+            || lower.contains("failed to write clap output")
+            || lower.contains("failed to write completion script")
+            || lower.contains("failed to write ls-files output")
+            || lower.contains("stdout");
+        broken_pipe && stdout_write
+    }
+
     /// Rendered severity string used by JSON envelopes. Stable across releases.
     fn severity(&self) -> &'static str {
         match self.kind {

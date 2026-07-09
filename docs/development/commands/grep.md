@@ -46,6 +46,7 @@ flowchart TD
 - 2026-06-05 `e8151a5`（`feat(grep): add -a/--text and -I binary-file handling`）：曾添加 `-a`/`--text` 与 `-I` 二进制文件处理；但该批改动同样被 `900c062`（`Update integration`）回退，当前 HEAD 的 `GrepArgs` 已无这些参数（参见缺口表「强制文本搜索」「忽略二进制文件」两行）。
 - 2026-06-05 `3e17784`（`feat(grep): accept -E/-G as regex aliases and decline -P/--perl-regexp (129)`）：曾添加 `-E`/`-G` 正则别名并以 129 退出拒绝 `-P`/`--perl-regexp`；但该批改动同样被 `900c062`（`Update integration`）回退，当前 HEAD 的 `GrepArgs` 已无这些参数（参见缺口表「扩展正则」「Perl 正则」两行）。
 - 2026-06-07 `6d60ee03`（`fix(grep): close compatibility plan gaps`）：实现修正：close compatibility plan gaps；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
+- 2026-07-09（plan-20260708 P0-06）：stdout 下游提前关闭时经全局入口与 `Pager` 输出层静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态

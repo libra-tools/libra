@@ -31,6 +31,7 @@ flowchart TD
 
 - 底层操作对象：治理对象包括公开命令 enum、`COMPATIBILITY.md` 顶层矩阵、D 编号决策、用户文档、命令开发文档、Cargo compat 测试和 shell 校验脚本；它们共同决定“代码是否真的支持某项 Git surface”。
 - 输出与错误契约：`COMPATIBILITY.md` 必须记录命令级 tier；各命令开发文档必须记录参数级缺口和测试处理方式；任何新增拒绝/延后项都要落到稳定 D 编号，避免未实现项失去解释来源。
+- stdout pipeline 契约（plan-20260708 P0-06）：会向 stdout 输出的命令在下游提前关闭管道时必须把 `BrokenPipe` 视为正常终止，不打印 panic/backtrace/`Broken pipe` 噪声；全局入口、`OutputConfig` 输出层和大输出命令由 `compat_broken_pipe_output` 守卫。
 - 副作用边界：本文件解释“为什么这样兼容”，不替代 `COMPATIBILITY.md` 的用户承诺；新增命令或参数时必须同时给出 tier、测试证据和未完成项处理方式。
 
 ## 当前状态

@@ -20,6 +20,9 @@ Output can be tuned with flags to show only filenames (`-l`, `-L`), match counts
 
 When stdout is a terminal, output is sent through a pager. In JSON mode, structured output is emitted for programmatic consumption.
 
+When stdout is piped and the downstream command exits early, `libra grep` exits quietly without
+printing panic/backtrace or `Broken pipe` diagnostics.
+
 ## Options
 
 | Flag | Short | Long | Description |

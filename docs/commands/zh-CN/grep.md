@@ -20,6 +20,8 @@ libra grep -f <file> [-- <pathspec>...]
 
 当 stdout 是终端时，输出会通过分页器发送。在 JSON 模式下，会输出适合程序消费的结构化结果。
 
+当 stdout 被管道连接且下游命令提前退出时，`libra grep` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
+
 ## 选项
 
 | 标志 | 短选项 | 长选项 | 说明 |

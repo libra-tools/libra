@@ -40,6 +40,7 @@ flowchart TD
 - 2026-06-05 `a9e6093e`（`feat(diff): add -W/--function-context hunk expansion`）：历史节点；`-W`/`--function-context` 当前并未在 `DiffArgs` 中公开，该行为已不在当前实现内。
 - 2026-06-05 `45de394f`（`feat(diff): add --word-diff with plain/color and configurable regex`）：历史节点。`--word-diff[=plain|color|porcelain|none]` 现已在 `DiffArgs` 中公开并实现（见下方专门行）；`--color-words` 与 `--word-diff-regex` 仍未实现。
 - 2026-06-07 `6ef353a3`（`fix(diff): close compatibility plan gaps`）：实现修正：close compatibility plan gaps；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
+- 2026-07-09（plan-20260708 P0-06）：stdout 下游提前关闭时经全局入口与 `Pager` 输出层静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
