@@ -2,6 +2,12 @@
 
 本目录包含所有 Libra CLI 命令的详细文档。每份文档都包含概要、选项参考、人工输出和结构化（JSON）输出示例、设计动机，以及与 Git 和 jj 的参数对比。
 
+兼容性按两层维护：各命令页面描述该命令的用户可见行为，而
+[`COMPATIBILITY.md`](../../../COMPATIBILITY.md#sub-face-compatibility-grading-p0p1-touched-commands)
+按子面（`common-user-flow`、`porcelain-machine`、`conflict-aware`、
+`config-aware`、`plumbing-compatible`）细分 P0/P1 命令表面的兼容等级。脚本依赖
+porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表面时，应以该子面表为准。
+
 ## 全局标志
 
 每个 Libra 命令都接受以下全局标志：

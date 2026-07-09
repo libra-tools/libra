@@ -152,3 +152,85 @@ batch document.
 - Repository asset storage policy: current committed binaries remain inline.
   Optional future Git LFS rules in `.gitattributes` are tracked as a repository
   governance decision, **not** as the `libra lfs` command status.
+
+## Sub-face compatibility grading (P0/P1-touched commands)
+
+The single `Tier` column above is deliberately coarse: a command marked
+`partial` or `supported` can still hide a broken conflict view, an unparseable
+`--porcelain` stream, an ignored config default, or a non-Git plumbing output.
+This section splits the compatibility promise of every command reached by the
+[plan-20260708](docs/development/plan/plan-20260708.md) P0/P1 work into a fixed
+enumeration of **sub-faces**, each graded into one of the four tiers so
+`supported` can no longer mask a defect. This is the machine-checked surface
+(guard `compat_subface_labels`).
+
+**Fixed sub-face enumeration** (a guard rejects any label outside this set):
+
+| Sub-face | What it promises |
+|----------|------------------|
+| `common-user-flow` | The normal, interactive human path works like Git. |
+| `porcelain-machine` | `--porcelain` / `-z` / exit code / stdout-vs-stderr are script-parseable like Git. |
+| `conflict-aware` | Unmerged index, sequencer state, and conflict-aware `status`/`diff`/`restore` are correct. |
+| `config-aware` | Common Git config defaults (e.g. `status.*`, `diff.renames`, `pull.rebase`) are honored. |
+| `plumbing-compatible` | Object / ref / rev-syntax / raw output is byte-close to Git. |
+
+**Bucket meaning** (same four tiers as the top-level matrix): *supported* = solid
+today; *partial* = works for common cases but a P0/P1 task is closing gaps;
+*unsupported* = the Git-compatible behavior is absent today (a P0/P1 task will
+introduce it) and MUST carry a governing plan/`D` number; *intentionally-different*
+= Libra deliberately diverges (documented). A face not listed for a command in
+any bucket is not separately graded (`—`). Every `unsupported` face is also
+recorded, with its governing number, in
+[`docs/development/commands/_compatibility.md`](docs/development/commands/_compatibility.md#子面兼容分级cg-01).
+
+| Command | Supported faces | Partial faces | Unsupported faces | Intentionally-different faces |
+|---------|-----------------|---------------|-------------------|-------------------------------|
+| add | — | common-user-flow, config-aware, plumbing-compatible | — | — |
+| archive | common-user-flow | config-aware | — | — |
+| branch | common-user-flow | config-aware, plumbing-compatible | — | — |
+| bundle | common-user-flow | porcelain-machine, plumbing-compatible | — | — |
+| cat-file | common-user-flow | porcelain-machine, plumbing-compatible | — | — |
+| check-attr | common-user-flow | — | config-aware (P1-02) | — |
+| check-ignore | common-user-flow | plumbing-compatible | config-aware (P1-02) | — |
+| checkout | — | common-user-flow, plumbing-compatible | — | — |
+| cherry-pick | — | common-user-flow, conflict-aware | — | — |
+| clean | — | common-user-flow, config-aware | — | — |
+| clone | — | common-user-flow, config-aware, plumbing-compatible | — | — |
+| cloud | — | config-aware, porcelain-machine | — | common-user-flow |
+| commit | — | common-user-flow, config-aware, plumbing-compatible | — | — |
+| commit-tree | common-user-flow | plumbing-compatible | — | — |
+| diff | — | common-user-flow, porcelain-machine, config-aware, plumbing-compatible | conflict-aware (P0-01) | — |
+| fast-export | common-user-flow | porcelain-machine, plumbing-compatible | — | — |
+| fast-import | — | common-user-flow, plumbing-compatible | — | — |
+| fetch | — | common-user-flow, porcelain-machine, config-aware, plumbing-compatible | — | — |
+| for-each-ref | common-user-flow | porcelain-machine, plumbing-compatible | — | — |
+| grep | — | common-user-flow, porcelain-machine, plumbing-compatible | — | — |
+| hooks | — | common-user-flow | — | config-aware |
+| init | — | common-user-flow, config-aware | — | — |
+| lfs | common-user-flow | — | — | config-aware |
+| log | common-user-flow | porcelain-machine, config-aware, plumbing-compatible | — | — |
+| ls-files | — | common-user-flow, porcelain-machine, plumbing-compatible | conflict-aware (P0-01) | — |
+| ls-remote | common-user-flow | plumbing-compatible | — | — |
+| media | — | config-aware | — | common-user-flow |
+| merge | — | common-user-flow, conflict-aware, config-aware | — | — |
+| pull | common-user-flow | porcelain-machine, config-aware | — | — |
+| push | common-user-flow | porcelain-machine, config-aware | — | — |
+| rebase | — | common-user-flow, conflict-aware | — | — |
+| remote | — | common-user-flow, config-aware, plumbing-compatible | — | — |
+| reset | — | common-user-flow, conflict-aware | — | — |
+| restore | — | common-user-flow, conflict-aware | — | — |
+| rev-parse | common-user-flow | plumbing-compatible | — | — |
+| revert | — | common-user-flow, conflict-aware | — | — |
+| rm | — | common-user-flow, plumbing-compatible | — | — |
+| show | common-user-flow | porcelain-machine, plumbing-compatible | — | — |
+| show-ref | common-user-flow | plumbing-compatible | — | — |
+| shortlog | common-user-flow | porcelain-machine, plumbing-compatible | — | — |
+| status | — | common-user-flow, porcelain-machine, config-aware, plumbing-compatible | conflict-aware (P0-01) | — |
+| switch | — | common-user-flow | — | — |
+| tag | common-user-flow | config-aware, plumbing-compatible | — | — |
+| write-tree | common-user-flow | plumbing-compatible | — | — |
+
+The graded command set is pinned to the plan's P0/P1 surface; the
+`compat_subface_labels` guard fails if it drifts from that set or from
+`src/cli.rs::Commands`, or if any cell names a label outside the fixed
+enumeration.

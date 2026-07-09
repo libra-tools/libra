@@ -2,6 +2,15 @@
 
 This directory contains detailed documentation for all Libra CLI commands. Each document includes a synopsis, option reference, human and structured (JSON) output examples, design rationale, and a parameter comparison with Git and jj.
 
+Compatibility is tracked at two levels: each command page describes the
+user-facing behavior of that command, while
+[`COMPATIBILITY.md`](../../COMPATIBILITY.md#sub-face-compatibility-grading-p0p1-touched-commands)
+grades the P0/P1 command surface by sub-face (`common-user-flow`,
+`porcelain-machine`, `conflict-aware`, `config-aware`, and
+`plumbing-compatible`). Use the sub-face table when a script depends on a
+specific Git-compatible surface such as porcelain output, conflict handling, or
+plumbing syntax.
+
 ## Global Flags
 
 Every Libra command accepts the following global flags:

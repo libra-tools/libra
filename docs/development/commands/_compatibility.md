@@ -42,6 +42,39 @@ flowchart TD
 | push | partial | partial | branch/tag update, multi-refspec, delete, `--tags`, and `--mirror` supported; local file remote rejected intentionally |
 | checkout | partial | partial | visible branch compatibility surface plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
 
+## 子面兼容分级（CG-01）
+
+CG-01 把粗粒度的命令级 tier 细化为**子面分级**，避免单个 `supported`/`partial`
+掩盖冲突、porcelain、config、plumbing 缺陷。规范表（每个被 plan-20260708 的
+P0/P1 触达的命令 × 四栏「已支持面 / 部分支持面 / 明确不支持面 / 有意差异面」）
+是 [`COMPATIBILITY.md`](../../../COMPATIBILITY.md#sub-face-compatibility-grading-p0p1-touched-commands)
+的「Sub-face compatibility grading」小节，并由 `compat_subface_labels` 守卫机器
+校验。固定子面枚举（守卫拒绝任何枚举外标签）：`common-user-flow`、
+`porcelain-machine`、`conflict-aware`、`config-aware`、`plumbing-compatible`。
+
+**明确不支持面（unsupported）登记**：按验收要求，每个保留/新增的 unsupported
+子面必须挂在一个 `D` 编号或本计划编号下（守卫会核对治理编号确实是计划里的任务
+或本文的 `D` 决策）。当前 CG-01 枚举的 unsupported 子面由 **P0-01**（修复
+unmerged/conflict 状态与 diff 展示）与 **P1-02**（兼容 Git ignore/attributes 来源）
+治理，实现后即上调为 partial/supported：
+
+| 命令 | unsupported 子面 | 治理编号 | 说明 |
+|---|---|---|---|
+| status | conflict-aware | P0-01 | `status` 当前不输出 `UU`/unmerged XY（v1）或 `u` 记录（v2），冲突被报成 `??`。 |
+| diff | conflict-aware | P0-01 | `diff` 把 unmerged path 当作 `/dev/null` 新增，未走 stage/combined 冲突视图。 |
+| ls-files | conflict-aware | P0-01 | `ls-files -u`/`-t` 不输出 unmerged stage 行。 |
+| check-ignore | config-aware | P1-02 | 当前只读 `.libraignore`，不读 `.gitignore`/`.git/info/exclude`/`core.excludesFile`（§30）。 |
+| check-attr | config-aware | P1-02 | 当前只读 `.libra_attributes`，不读 `.gitattributes`/`core.attributesFile`（§31）。 |
+
+`check-ignore`/`check-attr` 的 `config-aware` **不是**刻意分歧：P1-02 的目标就是让
+Git 标准 ignore/attributes 来源与 `.libraignore`/`.libra_attributes` **并存**（Git 源
+今天完全缺失，属真实缺口），故登记为 `unsupported (P1-02)` 而非 intentionally-different。
+
+**有意差异面（intentionally-different）**：`lfs` 的 `config-aware`（内建
+`.libra_attributes`、不依赖 stock `git-lfs` filter，见 **D5**）、`media`/`cloud` 的
+`common-user-flow`（Libra 扩展命令）、`hooks` 的 `config-aware`（`.libra/hooks`
+而非 `.git/hooks`，见 **D3**）——均为已文档化的刻意分歧，不作为缺口。
+
 ## 还未实现的功能
 
 本节是对 `docs/development` 下所有 Markdown 文档中“还未实现的功能”、`BASELINE_GAP-*`、Account/Agent/Web-only 任务卡和 LFS quota 设计的全集整理，并按当前代码做最后核对。这里只保留代码仍未落地、用户面未公开、测试证据未闭合，或文档与代码存在收口风险的项；已经由代码确认落地的旧文档条目不再作为全局未实现项列入。
