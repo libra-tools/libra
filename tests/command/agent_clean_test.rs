@@ -788,10 +788,20 @@ async fn agent_clean_gc_prunes_aged_reviewer_stderr_logs_and_keeps_aggregate() {
     init_repo_via_cli(repo.path());
 
     let runs_root = repo.path().join(".libra/sessions/agent-runs");
-    let ancient = "2000-01-01T00:00:00.000000Z"; // far past the 30-day stderr window
+    // Past the 30-day stderr window but INSIDE the 90-day findings window, so
+    // the stderr blob is pruned while the aggregate record (and the whole run)
+    // is preserved — the A0-09 findings GC only removes runs older than 90d.
+    let stderr_expired = (chrono::Utc::now() - chrono::Duration::days(60))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let ancient = "2000-01-01T00:00:00.000000Z"; // used only for a non-terminal run
     let recent = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
-    write_agent_run(&runs_root, "aged-terminal-run", Some("success"), ancient);
+    write_agent_run(
+        &runs_root,
+        "aged-terminal-run",
+        Some("success"),
+        &stderr_expired,
+    );
     write_agent_run(&runs_root, "recent-terminal-run", Some("success"), &recent);
     write_agent_run(&runs_root, "aged-inflight-run", None, ancient);
 
@@ -825,5 +835,178 @@ async fn agent_clean_gc_prunes_aged_reviewer_stderr_logs_and_keeps_aggregate() {
             .join("aged-inflight-run/reviewers/codex.stderr.redacted.log")
             .exists(),
         "an in-flight (non-terminal) run's diagnostics are never pruned"
+    );
+}
+
+/// Write a terminal review run with an objectized findings blob (A0-06 shape):
+/// manifest carries `findings_oid`, and the loose blob object exists under
+/// `.libra/objects/`. Returns the findings OID.
+fn write_agent_run_with_findings(
+    repo: &Path,
+    run_id: &str,
+    terminal_state: Option<&str>,
+    updated_at: &str,
+) -> String {
+    let run_dir = repo.join(".libra/sessions/agent-runs").join(run_id);
+    std::fs::create_dir_all(run_dir.join("reviewers")).expect("create run dir");
+    let content = format!("# findings for {run_id}\n");
+    let oid =
+        libra::utils::object::write_git_object(&repo.join(".libra"), "blob", content.as_bytes())
+            .expect("write findings blob")
+            .to_string();
+    let terminal = match terminal_state {
+        Some(state) => format!("\"{state}\""),
+        None => "null".to_string(),
+    };
+    let manifest = format!(
+        "{{\"schema_version\":1,\"run_id\":\"{run_id}\",\"kind\":\"review\",\
+         \"terminal_state\":{terminal},\"created_at\":\"{updated_at}\",\
+         \"updated_at\":\"{updated_at}\",\"findings_oid\":\"{oid}\",\"manual_attach\":[]}}"
+    );
+    std::fs::write(run_dir.join("manifest.json"), manifest).expect("write manifest");
+    std::fs::write(run_dir.join("state.json"), "{}").expect("write state");
+    std::fs::write(run_dir.join("findings.md"), &content).expect("write findings");
+    oid
+}
+
+/// A0-09: `agent clean --gc` removes aged terminal review/investigate run
+/// directories (the objectized findings blob is content-addressed and left for
+/// a future repo-wide object GC), keeps recent/in-flight runs, previews under
+/// `--dry-run`, and is idempotent.
+#[tokio::test]
+async fn agent_clean_findings_retention_gc() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let runs_root = repo.path().join(".libra/sessions/agent-runs");
+    let objects_root = repo.path().join(".libra/objects");
+    let ancient = "2000-01-01T00:00:00.000000Z"; // far past the 90-day window
+    let recent = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+    let aged_oid = write_agent_run_with_findings(repo.path(), "aged-run", Some("success"), ancient);
+    let recent_oid =
+        write_agent_run_with_findings(repo.path(), "recent-run", Some("success"), &recent);
+    let inflight_oid = write_agent_run_with_findings(repo.path(), "inflight-run", None, ancient);
+
+    let loose = |oid: &str| objects_root.join(&oid[..2]).join(&oid[2..]);
+    assert!(loose(&aged_oid).exists(), "findings blob written");
+
+    // Dry-run: previews the aged run without deleting anything.
+    let dry = run_libra_command(
+        &["agent", "clean", "--gc", "--dry-run", "--json"],
+        repo.path(),
+    );
+    assert_cli_success(&dry, "clean --gc --dry-run");
+    let json = parse_json_stdout(&dry);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert_eq!(
+        json["data"]["findings_runs_pruned"], 1,
+        "dry-run previews the aged run: {json}"
+    );
+    assert!(
+        runs_root.join("aged-run").exists(),
+        "dry-run deletes nothing"
+    );
+    assert!(loose(&aged_oid).exists(), "dry-run keeps the blob");
+
+    // Real GC.
+    let out = run_libra_command(&["agent", "clean", "--gc", "--json"], repo.path());
+    assert_cli_success(&out, "clean --gc");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["findings_runs_pruned"], 1,
+        "one aged run pruned: {json}"
+    );
+    assert_eq!(json["data"]["dry_run"], false);
+
+    // Aged terminal run DIR: gone. The objectized blob is deliberately KEPT
+    // (content-addressed; reclaimed by a future repo-wide object GC, never by
+    // per-run retention, so a shared/reachable object can't be corrupted).
+    assert!(!runs_root.join("aged-run").exists(), "aged run dir removed");
+    assert!(
+        loose(&aged_oid).exists(),
+        "the objectized blob is left for a repo-wide GC, not deleted here"
+    );
+    // Recent terminal + aged in-flight runs: KEPT.
+    assert!(runs_root.join("recent-run").exists(), "recent run kept");
+    assert!(loose(&recent_oid).exists(), "recent blob kept");
+    assert!(
+        runs_root.join("inflight-run").exists(),
+        "an in-flight (non-terminal) run is never GC'd"
+    );
+    assert!(loose(&inflight_oid).exists());
+
+    // Idempotent: a second sweep finds nothing more to prune (missing-object safe).
+    let again = run_libra_command(&["agent", "clean", "--gc", "--json"], repo.path());
+    assert_cli_success(&again, "clean --gc idempotent");
+    assert_eq!(parse_json_stdout(&again)["data"]["findings_runs_pruned"], 0);
+}
+
+/// A0-09 (codex P1): a findings/attachment blob shared (content-addressed) by
+/// an expired run AND a retained run must NOT be deleted when the expired run
+/// is GC'd — the retained run still references it.
+#[tokio::test]
+async fn agent_clean_findings_gc_keeps_shared_object_of_retained_run() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let runs_root = repo.path().join(".libra/sessions/agent-runs");
+    let objects_root = repo.path().join(".libra/objects");
+    let ancient = "2000-01-01T00:00:00.000000Z";
+    let recent = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+    // Identical findings + attachment content in both runs → shared OIDs.
+    let shared = "# identical shared findings\n";
+    let oid = libra::utils::object::write_git_object(
+        &repo.path().join(".libra"),
+        "blob",
+        shared.as_bytes(),
+    )
+    .expect("write shared findings blob")
+    .to_string();
+    let attach = "shared attachment body\n";
+    let attach_oid = libra::utils::object::write_git_object(
+        &repo.path().join(".libra"),
+        "blob",
+        attach.as_bytes(),
+    )
+    .expect("write shared attach blob")
+    .to_string();
+
+    let write_shared = |run_id: &str, updated: &str| {
+        let run_dir = runs_root.join(run_id);
+        std::fs::create_dir_all(run_dir.join("reviewers")).unwrap();
+        let manifest = format!(
+            "{{\"schema_version\":1,\"run_id\":\"{run_id}\",\"kind\":\"review\",\
+             \"terminal_state\":\"success\",\"created_at\":\"{updated}\",\"updated_at\":\"{updated}\",\
+             \"findings_oid\":\"{oid}\",\"manual_attach\":[{{\"oid\":\"{attach_oid}\",\
+             \"name\":\"a\",\"provenance\":\"manual\",\"size\":1,\"attached_at\":\"{updated}\"}}]}}"
+        );
+        std::fs::write(run_dir.join("manifest.json"), manifest).unwrap();
+        std::fs::write(run_dir.join("state.json"), "{}").unwrap();
+        std::fs::write(run_dir.join("findings.md"), shared).unwrap();
+    };
+    write_shared("aged-run", ancient);
+    write_shared("recent-run", &recent);
+
+    let loose = |o: &str| objects_root.join(&o[..2]).join(&o[2..]);
+    assert!(loose(&oid).exists() && loose(&attach_oid).exists());
+
+    let out = run_libra_command(&["agent", "clean", "--gc", "--json"], repo.path());
+    assert_cli_success(&out, "clean --gc");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["findings_runs_pruned"], 1,
+        "only the aged run is pruned: {json}"
+    );
+    // Aged run gone; recent run kept.
+    assert!(!runs_root.join("aged-run").exists());
+    assert!(runs_root.join("recent-run").exists());
+    // Shared objects SURVIVE — the retained run still references them.
+    assert!(
+        loose(&oid).exists(),
+        "shared findings blob must be kept for the retained run"
+    );
+    assert!(
+        loose(&attach_oid).exists(),
+        "shared attach blob must be kept for the retained run"
     );
 }

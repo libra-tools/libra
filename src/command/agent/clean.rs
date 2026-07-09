@@ -70,6 +70,14 @@ struct CleanReport {
     /// Terminal review/investigate runs whose stderr logs the stderr-window GC
     /// touched.
     stderr_runs_pruned: u64,
+    /// A0-09: aged terminal review/investigate run directories removed by the
+    /// `agent.retention.findings_days` window (only under `--gc`). The
+    /// objectized findings blob is left for a future repo-wide object GC (it is
+    /// content-addressed and may be shared with a reachable object).
+    findings_runs_pruned: u64,
+    /// A0-09: whether this was a `--dry-run` preview (nothing was deleted; all
+    /// counts are what *would* be removed).
+    dry_run: bool,
     note: &'static str,
 }
 
@@ -88,6 +96,8 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
                 object_index_rows_dropped: 0,
                 stderr_logs_pruned: 0,
                 stderr_runs_pruned: 0,
+                findings_runs_pruned: 0,
+                dry_run: args.dry_run,
                 note: "agent_checkpoint table not present (run `libra init`?)",
             },
             output,
@@ -138,7 +148,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
         .map_err(|e| CliError::fatal(format!("failed to locate .libra directory: {e}")))?;
     let storage = Arc::new(ClientStorage::init(repo_path.join("objects")));
     // Resolve the run-state root before `repo_path` is moved into the history
-    // manager; the stderr-window GC below prunes reviewer diagnostics here.
+    // manager; the stderr- and findings-window GCs below prune under it.
     let sessions_root = repo_path.join("sessions");
 
     // AG-24a stderr window (Task A8.6): resolve + validate the stderr cutoff
@@ -157,29 +167,68 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
         None
     };
 
+    // A0-09 findings window: resolve + validate BEFORE any mutation too, so a
+    // bad `agent.retention.findings_days` fails closed rather than aborting
+    // mid-sweep. Its own knob (independent of `--retention-days`).
+    let findings_cutoff: Option<Option<DateTime<Utc>>> = if args.gc {
+        let findings_days =
+            crate::internal::ai::observed_agents::compliance::retention_findings_days()
+                .await
+                .map_err(|e| CliError::fatal(format!("read findings retention config: {e:#}")))?;
+        Some(stderr_cutoff_for_days(findings_days))
+    } else {
+        None
+    };
+
     let history =
         HistoryManager::new_with_ref(storage, repo_path, Arc::new(conn.clone()), TRACES_BRANCH);
-    let prune = history
-        .prune_checkpoint_commits(&checkpoint_ids)
-        .await
-        .map_err(map_prune_error)?;
+    // Under `--dry-run` nothing is mutated: the checkpoint prune is skipped and
+    // its primary count is the number of checkpoints that WOULD be dropped.
+    let prune = if args.dry_run {
+        None
+    } else {
+        Some(
+            history
+                .prune_checkpoint_commits(&checkpoint_ids)
+                .await
+                .map_err(map_prune_error)?,
+        )
+    };
 
     let (stderr_logs_pruned, stderr_runs_pruned) = match stderr_cutoff {
-        Some(Some(cutoff)) => gc_expired_stderr_logs(&sessions_root, cutoff)?,
+        Some(Some(cutoff)) => gc_expired_stderr_logs(&sessions_root, cutoff, args.dry_run)?,
         // Not a `--gc` run, or a retention window so large nothing is expired.
         _ => (0, 0),
+    };
+
+    let findings_runs_pruned = match findings_cutoff {
+        Some(Some(cutoff)) => {
+            gc_expired_findings_runs(&sessions_root, cutoff, args.dry_run).await?
+        }
+        _ => 0,
     };
 
     emit_report(
         &CleanReport {
             sessions_inspected,
-            temporary_checkpoints_dropped: prune.removed_checkpoints,
-            retained_checkpoints_rewritten: prune.rewritten_checkpoints,
-            traces_ref_rewritten: prune.ref_rewritten,
-            window_guard: prune.window_guard,
-            object_index_rows_dropped: prune.deleted_object_index_rows,
+            temporary_checkpoints_dropped: prune
+                .as_ref()
+                .map(|p| p.removed_checkpoints)
+                .unwrap_or(checkpoint_ids.len() as u64),
+            retained_checkpoints_rewritten: prune
+                .as_ref()
+                .map(|p| p.rewritten_checkpoints)
+                .unwrap_or(0),
+            traces_ref_rewritten: prune.as_ref().map(|p| p.ref_rewritten).unwrap_or(false),
+            window_guard: prune.as_ref().map(|p| p.window_guard).unwrap_or("noop"),
+            object_index_rows_dropped: prune
+                .as_ref()
+                .map(|p| p.deleted_object_index_rows)
+                .unwrap_or(0),
             stderr_logs_pruned,
             stderr_runs_pruned,
+            findings_runs_pruned,
+            dry_run: args.dry_run,
             note,
         },
         output,
@@ -241,6 +290,13 @@ fn emit_report(report: &CleanReport, output: &OutputConfig) -> CliResult<()> {
         "Reviewer stderr logs pruned   : {} (across {} run(s))",
         report.stderr_logs_pruned, report.stderr_runs_pruned
     );
+    println!(
+        "Findings runs pruned          : {}",
+        report.findings_runs_pruned
+    );
+    if report.dry_run {
+        println!("Mode                          : dry-run (nothing was deleted)");
+    }
     println!("Note                          : {}", report.note);
     Ok(())
 }
@@ -358,7 +414,7 @@ fn read_run_retention_meta(run_dir: &Path) -> Option<RunRetentionMeta> {
 /// stay. Symlinks are never followed: a symlinked `reviewers` directory is
 /// refused outright (so a hostile run dir cannot redirect deletion outside the
 /// store), and within the dir only regular files are removed.
-fn prune_stderr_logs_in(reviewers_dir: &Path) -> CliResult<u64> {
+fn prune_stderr_logs_in(reviewers_dir: &Path, dry_run: bool) -> CliResult<u64> {
     // Refuse to descend a symlinked `reviewers` directory — `read_dir` would
     // otherwise follow it and delete matching files at the symlink target.
     match fs::symlink_metadata(reviewers_dir) {
@@ -394,6 +450,11 @@ fn prune_stderr_logs_in(reviewers_dir: &Path) -> CliResult<u64> {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if name.ends_with(".stderr.redacted.log") {
+            if dry_run {
+                // Preview: count what would be pruned without removing it.
+                removed += 1;
+                continue;
+            }
             match fs::remove_file(entry.path()) {
                 Ok(()) => removed += 1,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -415,7 +476,11 @@ fn prune_stderr_logs_in(reviewers_dir: &Path) -> CliResult<u64> {
 /// have an unreadable/undated manifest, or have an unparseable timestamp are
 /// skipped fail-safe — a stderr blob is never deleted when the run's age is
 /// unknown. The run's aggregate record is always preserved.
-fn gc_expired_stderr_logs(sessions_root: &Path, cutoff: DateTime<Utc>) -> CliResult<(u64, u64)> {
+fn gc_expired_stderr_logs(
+    sessions_root: &Path,
+    cutoff: DateTime<Utc>,
+    dry_run: bool,
+) -> CliResult<(u64, u64)> {
     let runs_root = sessions_root.join("agent-runs");
     let entries = match fs::read_dir(&runs_root) {
         Ok(read_dir) => read_dir,
@@ -459,13 +524,94 @@ fn gc_expired_stderr_logs(sessions_root: &Path, cutoff: DateTime<Utc>) -> CliRes
         if updated >= cutoff {
             continue; // within the retention window
         }
-        let pruned_here = prune_stderr_logs_in(&run_dir.join("reviewers"))?;
+        let pruned_here = prune_stderr_logs_in(&run_dir.join("reviewers"), dry_run)?;
         if pruned_here > 0 {
             files_pruned += pruned_here;
             runs_pruned += 1;
         }
     }
     Ok((files_pruned, runs_pruned))
+}
+
+/// A0-09: findings retention GC. Remove whole terminal review/investigate run
+/// DIRECTORIES (`findings.md`, `manifest.json`, `state.json`, reviewer logs)
+/// older than the `agent.retention.findings_days` cutoff. Returns the number of
+/// run directories pruned. Runs still in flight (non-terminal), with an
+/// unreadable/undated manifest, or an unparseable timestamp are skipped
+/// fail-safe — a run is never removed when its age is unknown. The append-only
+/// `agent_audit_log` is a separate table and is never touched. Idempotent (a
+/// missing dir is a no-op).
+///
+/// This deliberately does NOT delete the objectized findings blob or drop its
+/// `object_index` row: those are ordinary content-addressed git objects that
+/// may be byte-identical to a blob reachable from a branch, index, reflog, or
+/// another run. Reclaiming a content-addressed object safely requires repo-wide
+/// reachability analysis (a future `libra gc`), so per-run findings retention
+/// only removes the run directory and leaves the shared object store intact.
+async fn gc_expired_findings_runs(
+    sessions_root: &Path,
+    cutoff: DateTime<Utc>,
+    dry_run: bool,
+) -> CliResult<u64> {
+    let runs_root = sessions_root.join("agent-runs");
+    let entries = match fs::read_dir(&runs_root) {
+        Ok(read_dir) => read_dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(CliError::fatal(format!(
+                "failed to read agent-runs dir {}: {err}",
+                runs_root.display()
+            )));
+        }
+    };
+
+    let mut runs_pruned = 0u64;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(run_id) = entry.file_name().into_string() else {
+            continue;
+        };
+        // The same path-traversal-safe validator the stderr window uses: a
+        // stray/hostile dir name can never widen the delete scope.
+        if !crate::internal::ai::review::store::is_valid_run_id(&run_id) {
+            continue;
+        }
+        let run_dir = entry.path();
+        let Some(meta) = read_run_retention_meta(&run_dir) else {
+            continue; // missing/corrupt manifest → skip fail-safe (dir kept)
+        };
+        if !meta.is_terminal {
+            continue; // never delete an in-flight / paused run
+        }
+        let Some(updated) = meta.updated_at else {
+            continue; // undatable → skip fail-safe
+        };
+        if updated >= cutoff {
+            continue; // within the retention window
+        }
+
+        runs_pruned += 1;
+        if dry_run {
+            continue; // preview: count without removing
+        }
+        match fs::remove_dir_all(&run_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CliError::fatal(format!(
+                    "failed to remove expired run dir {}: {err}",
+                    run_dir.display()
+                )));
+            }
+        }
+    }
+    Ok(runs_pruned)
 }
 
 async fn temporary_checkpoint_ids(
@@ -535,7 +681,7 @@ mod stderr_gc_tests {
         );
 
         let cutoff = Utc::now() - chrono::Duration::days(30);
-        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff).unwrap();
+        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff, false).unwrap();
 
         assert_eq!(
             (files, runs),
@@ -576,7 +722,7 @@ mod stderr_gc_tests {
         write_run(&sessions, "bad-ts", true, "not-a-timestamp");
 
         let cutoff = Utc::now() - chrono::Duration::days(30);
-        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff).unwrap();
+        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff, false).unwrap();
 
         assert_eq!((files, runs), (0, 0), "nothing pruned when age is unknown");
         assert!(no_manifest.join("a.stderr.redacted.log").exists());
@@ -587,7 +733,7 @@ mod stderr_gc_tests {
     fn missing_agent_runs_dir_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let (files, runs) =
-            gc_expired_stderr_logs(&tmp.path().join("sessions"), Utc::now()).unwrap();
+            gc_expired_stderr_logs(&tmp.path().join("sessions"), Utc::now(), false).unwrap();
         assert_eq!((files, runs), (0, 0));
     }
 
@@ -632,7 +778,7 @@ mod stderr_gc_tests {
         );
 
         let cutoff = Utc::now() - chrono::Duration::days(30);
-        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff).unwrap();
+        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff, false).unwrap();
         assert_eq!((files, runs), (0, 0));
         assert!(stderr_exists(&sessions, "foreign-kind"));
         assert!(stderr_exists(&sessions, "corrupt-terminal"));
@@ -653,7 +799,7 @@ mod stderr_gc_tests {
             ),
         );
         let cutoff = Utc::now() - chrono::Duration::days(30);
-        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff).unwrap();
+        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff, false).unwrap();
         assert_eq!((files, runs), (1, 1));
         assert!(!stderr_exists(&sessions, "aged-investigate"));
     }
@@ -695,7 +841,7 @@ mod stderr_gc_tests {
         symlink(&victim, run_dir.join("reviewers")).unwrap();
 
         let cutoff = Utc::now() - chrono::Duration::days(30);
-        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff).unwrap();
+        let (files, runs) = gc_expired_stderr_logs(&sessions, cutoff, false).unwrap();
         assert_eq!(
             (files, runs),
             (0, 0),

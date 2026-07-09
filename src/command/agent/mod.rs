@@ -205,6 +205,11 @@ pub struct CleanArgs {
     /// instead of reading `agent.retention.transcript_days`.
     #[arg(long, value_name = "DAYS", requires = "gc")]
     pub retention_days: Option<u32>,
+
+    /// Preview only: report what a `--gc` sweep *would* remove (checkpoints,
+    /// stderr logs, findings runs) without deleting anything.
+    #[arg(long, requires = "gc")]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]

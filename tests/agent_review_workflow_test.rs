@@ -1180,3 +1180,70 @@ fn review_artifacts_objectized() {
         "the read-error must not leak the secret from the path: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A0-09: findings retention GC removes an expired terminal run
+// ---------------------------------------------------------------------------
+
+/// A real finalized review run's manifest carries the retention fields
+/// (`terminal_state`, `updated_at`, `findings_oid`); once backdated past the
+/// `agent.retention.findings_days` window, `libra agent clean --gc` removes the
+/// whole run directory (the objectized blob is content-addressed and kept for a
+/// future repo-wide object GC).
+#[test]
+fn findings_retention_manifest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    let store = store_for(&repo);
+    store
+        .create_run("gc-run", &["codex".to_string()], "sha", "HEAD~1..HEAD")
+        .expect("create run");
+    store
+        .write_findings("gc-run", "review finding body\n")
+        .expect("write findings");
+    store
+        .finalize_run(
+            "gc-run",
+            ReviewTerminalState::Success,
+            &[],
+            libra::internal::ai::review::store::RedactionReportSummary::default(),
+        )
+        .expect("finalize objectizes findings");
+
+    let run_dir = repo.join(".libra/sessions/agent-runs/gc-run");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["terminal_state"], "success");
+    let findings_oid = manifest["findings_oid"]
+        .as_str()
+        .expect("A0-06 findings_oid")
+        .to_string();
+    let blob = repo
+        .join(".libra/objects")
+        .join(&findings_oid[..2])
+        .join(&findings_oid[2..]);
+    assert!(blob.exists(), "findings blob objectized");
+
+    // Backdate updated_at past the retention window, then GC via the binary.
+    let mut backdated = manifest.clone();
+    backdated["updated_at"] = serde_json::json!("2000-01-01T00:00:00.000000Z");
+    std::fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_vec(&backdated).unwrap(),
+    )
+    .unwrap();
+
+    let out = run_libra(&["agent", "clean", "--gc"], &repo, &[]);
+    assert!(
+        out.status.success(),
+        "clean --gc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!run_dir.exists(), "the expired terminal run dir is GC'd");
+    // The objectized blob is content-addressed and left for a future repo-wide
+    // object GC — per-run retention never deletes it.
+    assert!(
+        blob.exists(),
+        "the objectized findings blob is not deleted here"
+    );
+}

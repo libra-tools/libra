@@ -1234,7 +1234,7 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 | `agent.external_agents.env_allowlist_extra` | `[]` | string[] | 额外透传 env（默认不建议） | 仅显式配置 | 禁止通配；不得匹配 `*_API_KEY`、`*_TOKEN`、`*_SECRET`、`*_PASSWORD`、`LIBRA_STORAGE_*`、`LIBRA_D1_*` |
 | `agent.retention.transcript_days` | `90` | integer | stopped-session transcript/prompt/context 保留期 | settings | active session 不受 GC |
 | `agent.retention.stderr_days` | `30` | integer | stderr/debug blob 保留期 | settings | GC 后保留聚合计数 |
-| `agent.retention.findings_days` | `90` | integer | review/investigate run state 与 findings（`.libra/sessions/agent-runs/<run_id>/`、findings blob/manifest/DB 行）保留期 | settings | 到期由 `clean --gc` 或 review/investigate clean 清理；不触碰 `agent_audit_log` |
+| `agent.retention.findings_days` | `90` | integer | review/investigate run 目录状态（`.libra/sessions/agent-runs/<run_id>/`：findings.md/manifest/state/reviewer 日志）保留期 | settings | 到期由 `clean --gc` 清理 run 目录；对象化 findings blob 与 `object_index` 行是内容寻址、可能被共享，per-run retention 不删除（交由未来仓库级 object GC 可达性回收）；不触碰 `agent_audit_log` |
 | `agent.max_transcript_read_bytes` | `268435456` | integer | detail/transcript 路径单次读取上限（256 MiB） | settings | 超限必须截断 + redaction + `truncated:true` |
 | `agent.max_concurrent_runs` | `2` | integer | review/investigate run 并发上限 | settings | **A0-04 已强制**（`internal::ai::run_admission`）：超限进队列（cap 10）阻塞，队满返回 `LBR-AGENT-014` fail-closed；`0` 视为非法（clamp 到 1，config 解析拒绝 0） |
 | `agent.max_reviewers_per_run` | `4` | integer | 单次 review reviewer 并发 | settings | 超限排队，不静默丢弃 |
@@ -1856,7 +1856,7 @@ rg -n "claudecode|claude-code|libra-agent-|agent list|agent add|agent remove|Lif
 | 数据模型 | cloud mirror tombstone propagation for agent capture data | 本地 erasure 已重写 `refs/libra/traces` 并删除 DB/object_index；当前未启用 D1/R2 agent capture mirror，不声明 cloud tombstone 已覆盖。 | AG-24a / future cloud mirror |
 | 多 Agent | `review/investigate --checkpoint <id>` scoped review（review 目标物化） | **A0-06 已实现** findings 对象化 + manual attach：`findings_oid` 在 finalize 写入内容寻址 blob（`agent_findings` object_index tag，doctor 可修复），`review/investigate attach <run_id> <file>` 命令面把外部文件脱敏后对象化并记入 `manual_attach`。**仍 deferred**：`--checkpoint <id>` scoped review 保持 fail-closed（`checkpoint_scope_unimplemented_error`）——checkpoint 捕获的是 transcript 而非代码 worktree，把它物化为 review 目标需要独立设计，fail-closed 拒绝是正确行为（避免静默 review 错误内容）。 | E8-libra / A0-06 + future scoped-review materialization |
 | 外部插件安全 | （已实现）未来可选：per-agent env 透传粒度 | **A0-08 已实现**：`agent.external_agents.trusted_dirs`（默认 `["~/.libra/agents"]`，JSON 数组存 config_kv）+ `libra agent rpc trust --dir <path>`（canonicalize + 目录本身非 world-writable + 追加 allowlist）；`record_trust`/`revalidate_trust` 强制二进制 canonical path 必须在受信目录下（否则 `LBR-AGENT-005`）。`agent.external_agents.env_allowlist_extra`：额外 exact-name env 透传，`env_name_is_forbidden` 硬拒绝 wildcard 及 `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`/`LIBRA_STORAGE_*`/`LIBRA_D1_*`（spawn 处二次校验）。 | 落地执行补充规格 §2 |
-| 合规实现 | review/investigate findings-GC（`agent.retention.findings_days`） | `retention_findings_days()` 已定义但当前无 GC 消费者（`clean --gc` 仅处理 transcript/stderr 保留期）；findings run-state GC 待 run-state retention 策略新增删除命令后落地。 | AG-24a / future GC |
+| 合规实现 | 仓库级 object GC（可达性分析后回收对象化 findings blob） | **A0-09 已实现** findings-GC run-state 部分：`clean --gc` 现同时处理 transcript / stderr / findings 三窗口。`gc_expired_findings_runs`（clean.rs）按 `agent.retention.findings_days`（默认 90）删除**过期 terminal** review/investigate run 目录（`.libra/sessions/agent-runs/<run_id>/`，含 findings.md/manifest/state/reviewer 日志）；non-terminal / 未到期 / 时间戳不可解析 fail-safe 跳过；`agent_audit_log` 绝不纳入。新增 `--dry-run` 预览。**有意 deferred**：对象化 findings blob 与其 `object_index` 行是内容寻址、可能与 branch/index/reflog 可达对象共享，per-run retention 不删除；安全回收须仓库级可达性分析（future `libra gc`）。 | AG-24a / A0-09 |
 
 ## 合规、保留期、删除权与审计策略详细规格
 
@@ -1868,7 +1868,7 @@ rg -n "claudecode|claude-code|libra-agent-|agent list|agent add|agent remove|Lif
 |---|---|---|---|---|
 | stopped-session checkpoint transcript/prompt/context | 90 天 | settings 可覆盖（`agent.retention.transcript_days`） | 每日 GC 或 `libra agent clean --gc` | 删除对象 + `object_index` + DB 行 + 重写 `refs/libra/traces` |
 | active-session 事件 JSONL | 至 session end + 90 天 | — | session 显式 stop/timeout | 同上 |
-| review/investigate findings 与 run state | 90 天 | settings 可覆盖（`agent.retention.findings_days`） | GC（`clean --gc` 或 review/investigate clean） | 删除 `.libra/sessions/agent-runs/<run_id>/` + findings blob + manifest + DB 行 |
+| review/investigate findings 与 run state | 90 天 | settings 可覆盖（`agent.retention.findings_days`） | GC（`clean --gc` 或 review/investigate clean） | 删除 run 目录 `.libra/sessions/agent-runs/<run_id>/`（含 findings.md/manifest/state/reviewer 日志）。对象化 findings blob 与 `object_index` 行是**内容寻址**、可能与 branch/index/reflog 可达对象共享，per-run retention **不删除**；安全回收须仓库级可达性分析（future `libra gc`） |
 | stderr / redaction report | 30 天 | settings 可覆盖（`agent.retention.stderr_days`） | GC | 删除诊断 blob，保留聚合计数 |
 | audit log（raw 读取/export） | 1 年 | 运维设置 | 到期归档/删除（走「Audit log 规格」的合规审批整表流转，**非** AG-24a 常规 GC 交付项） | 按合规策略处理；与 append-only 约束不冲突——常规 GC/`clean --all` 永不触碰 |
 
