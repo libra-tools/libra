@@ -1,12 +1,14 @@
 # `libra check-ignore`
 
-Report which pathnames are excluded by `.libraignore` rules — the equivalent of
-`git check-ignore`, adapted to Libra's ignore file.
+Report which pathnames are excluded by Git/Libra ignore rules — the equivalent
+of `git check-ignore`, with Libra extension files preserved.
 
-> Intentional difference: Libra's ignore rules live in `.libraignore`, not
-> `.gitignore` (see [`docs/development/commands/_compatibility.md`](../development/commands/_compatibility.md)).
-> The matching engine, precedence, and pattern syntax are otherwise the same as
-> Git's.
+Libra reads standard Git ignore sources (`.gitignore`, `.git/info/exclude`, and
+`core.excludesFile`) as well as Libra extension files (`.libraignore`). Within
+the same directory, `.libraignore` has higher precedence than `.gitignore`; a
+nearer directory source overrides an ancestor; `.git/info/exclude` and
+`core.excludesFile` are lower-precedence fallbacks. Pattern syntax is Git
+ignore syntax.
 
 ## Synopsis
 
@@ -18,9 +20,9 @@ libra check-ignore [-v] [-n] [-z] [--no-index] --stdin
 ## Description
 
 For each `<pathname>` (given on the command line, or read from `--stdin`),
-`check-ignore` consults the active `.libraignore` rules and prints the paths
-that are **ignored** (excluded). It is a read-only query: it never changes the
-index or the working tree.
+`check-ignore` consults the active ignore sources and prints the paths that are
+**ignored** (excluded). It is a read-only query: it never changes the index or
+the working tree.
 
 By default a path that is already tracked in the index is reported as *not*
 ignored (an explicit `add` overrides the rules). Pass `--no-index` to report a

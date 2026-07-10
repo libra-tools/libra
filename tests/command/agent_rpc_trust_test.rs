@@ -41,6 +41,8 @@ fn run_with_path_and_env(
 }
 
 /// Init a repo with a fixture-bin dir and the external-agents gate open.
+/// A0-08: the fixture dir is registered as a trusted directory so
+/// `rpc trust <slug>` binaries planted there pass the allowlist enforcement.
 fn setup_enabled(temp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let repo = temp.join("repo");
     init_repo_via_cli(&repo);
@@ -52,6 +54,16 @@ fn setup_enabled(temp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         &fixtures,
     );
     assert!(set.status.success(), "config set must succeed");
+    let trust_dir = run_with_path(
+        &["agent", "rpc", "trust", "--dir", fixtures.to_str().unwrap()],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        trust_dir.status.success(),
+        "trust --dir must succeed: {}",
+        String::from_utf8_lossy(&trust_dir.stderr)
+    );
     (repo, fixtures)
 }
 
@@ -109,6 +121,18 @@ fn external_agents_gate_trust_and_invoke_flow() {
         &fixtures,
     );
     assert!(set.status.success(), "config set must succeed");
+    // A0-08: register the fixture dir as trusted so `trust ext` (below) passes
+    // the trusted-directory allowlist.
+    let trust_dir = run_with_path(
+        &["agent", "rpc", "trust", "--dir", fixtures.to_str().unwrap()],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        trust_dir.status.success(),
+        "trust --dir must succeed: {}",
+        String::from_utf8_lossy(&trust_dir.stderr)
+    );
 
     // list now works and shows the binary as quarantined.
     let list = run_with_path(&["agent", "rpc", "list"], &repo, &fixtures);
@@ -343,4 +367,99 @@ fn builtin_slug_impersonation_is_rejected() {
             "{args:?} rejects impersonation with the stable code"
         );
     }
+}
+
+/// A0-08: `rpc trust --dir` registers a trusted directory; a binary under a
+/// trusted dir is trustable, one outside every trusted dir is rejected
+/// (`LBR-AGENT-005`), and a world-writable directory can never be registered.
+#[test]
+fn agent_rpc_trust_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("tempdir");
+    // setup_enabled opens the gate AND registers `fixtures` as a trusted dir.
+    let (repo, fixtures) = setup_enabled(temp.path());
+
+    // (a) `trust --dir` emits the canonical trusted directory (JSON).
+    let other = temp.path().join("other-bin");
+    std::fs::create_dir_all(&other).unwrap();
+    let reg = run_with_path(
+        &[
+            "--json",
+            "agent",
+            "rpc",
+            "trust",
+            "--dir",
+            other.to_str().unwrap(),
+        ],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        reg.status.success(),
+        "trust --dir must succeed: {}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&reg.stdout).unwrap_or_default();
+    assert!(
+        json["data"]["trusted_dir"]
+            .as_str()
+            .unwrap_or("")
+            .contains("other-bin"),
+        "trust --dir emits the canonical dir: {}",
+        String::from_utf8_lossy(&reg.stdout)
+    );
+
+    // (b) a binary under a trusted dir is trustable.
+    plant_script(&fixtures, "inn", ANSWERER);
+    let ok = run_with_path(&["agent", "rpc", "trust", "inn"], &repo, &fixtures);
+    assert!(
+        ok.status.success(),
+        "binary under a trusted dir must be trustable: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // (c) a binary NOT under any trusted directory is rejected (LBR-AGENT-005).
+    let untrusted_dir = temp.path().join("untrusted-bin");
+    std::fs::create_dir_all(&untrusted_dir).unwrap();
+    plant_script(&untrusted_dir, "out", ANSWERER);
+    let path_var = format!(
+        "{}:{}:{}",
+        untrusted_dir.display(),
+        fixtures.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let rej = run_libra_command_with_stdin_and_env(
+        &["agent", "rpc", "trust", "out"],
+        &repo,
+        "",
+        &[("PATH", &path_var)],
+    );
+    assert!(
+        !rej.status.success(),
+        "a binary outside every trusted dir must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&rej.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-005") && stderr.contains("trusted director"),
+        "rejection is a provenance refusal naming the cause: {stderr}"
+    );
+
+    // (d) a world-writable directory can never be registered.
+    let ww = temp.path().join("ww-bin");
+    std::fs::create_dir_all(&ww).unwrap();
+    std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let ww_reg = run_with_path(
+        &["agent", "rpc", "trust", "--dir", ww.to_str().unwrap()],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        !ww_reg.status.success(),
+        "a world-writable directory must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&ww_reg.stderr).contains("world-writable"),
+        "refusal names the cause: {}",
+        String::from_utf8_lossy(&ww_reg.stderr)
+    );
 }

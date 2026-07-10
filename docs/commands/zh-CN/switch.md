@@ -13,13 +13,14 @@ libra switch -C <name> [<start-point>]
 libra switch --orphan <name>
 libra switch -d <commit|tag|branch>
 libra switch --track <remote/branch>
+libra switch [--guess | --no-guess] <branch>
 ```
 
 ## 说明
 
 `libra switch` 是更改分支的主要命令。它会在切换前验证工作树干净，更新 HEAD 和索引，并恢复工作树以匹配目标提交。与作为 Git 兼容表面存在的 `libra checkout` 不同，`switch` 是分支操作的推荐命令。
 
-该命令支持多种模式：切换到已有本地分支（默认）、用 `-c` 创建新分支、用 `-C` 强制创建或重置分支、用 `--orphan` 创建无父提交分支、用 `-d` detach HEAD，以及用 `--track` 跟踪远程分支。当目标分支已经是当前分支时，该命令是 no-op，并完全跳过干净性检查。
+该命令支持多种模式：切换到已有本地分支（默认）、用 `-c` 创建新分支、用 `-C` 强制创建或重置分支、用 `--orphan` 创建 unborn 无父提交分支、用 `-d` detach HEAD，以及用 `--track` 跟踪远程分支。当目标分支已经是当前分支时，该命令是 no-op，并完全跳过干净性检查。
 
 当找不到分支时，会通过 Levenshtein 距离提供模糊分支名建议，帮助捕获拼写错误，而无需精确匹配。
 
@@ -30,9 +31,11 @@ libra switch --track <remote/branch>
 | | `<branch>` | 位置参数（可选） | 要切换到的本地分支；与 `--detach` 搭配时也可为提交、标签或分支 |
 | `-c` | `--create` | `<name>` | 创建新分支并切换到它 |
 | `-C` | `--force-create` | `<name>` | 创建新分支或重置已有分支并切换到它 |
-| | `--orphan` | `<name>` | 创建无父提交的新分支并切换到它 |
+| | `--orphan` | `<name>` | 创建 unborn 无父提交分支并切换到它 |
 | `-d` | `--detach` | | 在给定提交、标签或分支上 detach HEAD |
 | | `--track` | | 创建跟踪给定远程分支的本地分支，并切换到它 |
+| | `--guess` | | 当 `<branch>` 唯一匹配某个远程跟踪分支时自动创建 tracking 分支（默认；DWIM） |
+| | `--no-guess` | | 禁用远程跟踪猜测；要求本地分支或显式 `--track` |
 | | `--no-progress` | | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 switch 从不渲染进度条。 |
 
 ### 标志细节
@@ -52,10 +55,12 @@ libra switch -C feature-x              # 将 feature-x 重置到 HEAD 并切换
 libra switch -C fix-123 abc1234        # 从特定提交重置分支
 ```
 
-**`--orphan <name>`**：创建没有父提交历史的新分支，并把工作树恢复到空树状态。如果分支已存在，会先删除重建（当前分支除外）。
+`-c` 或 `-C` 成功后，`HEAD` 会保持为指向创建/重置分支的 symbolic ref（`refs/heads/<name>`），即使提供了 start-point 也是如此。
+
+**`--orphan <name>`**：创建没有父提交历史的 unborn 分支，并把 `HEAD` 切到 `refs/heads/<name>`，但此时尚不创建分支 ref。索引和工作树会保留上一分支的状态，所以 orphan 分支上的首个用户提交会把保留的索引写成无 parent 的 root commit。切换前工作树必须干净；如果同名分支已存在，命令会 fail-closed 拒绝，而不是删除重建。
 
 ```bash
-libra switch --orphan fresh-start      # 创建无历史的新分支
+libra switch --orphan fresh-start      # 创建 unborn 分支；首个提交无 parent
 ```
 
 **`-d / --detach`**：让 HEAD 直接指向某个提交，而不是分支。适合检查历史状态或从标签构建。
@@ -72,6 +77,13 @@ libra switch --track origin/main       # 跟踪并切换到远程分支
 libra switch --track feature            # 假设 origin/feature
 ```
 
+**`--guess` / `--no-guess`**：当 `<branch>` 不是已有本地分支，但恰好只有一个远程有同名 tracking 分支时，`--guess`（默认）会创建同名本地分支、设置 upstream，并切换到它；这与 `--track <remote>/<branch>` 的单步行为一致。猜测默认开启，生效优先级为 `--no-guess` > `--guess` > `checkout.guess`（默认 `true`）。多个远程同名时会以歧义错误失败（退出码 128），除非 `checkout.defaultRemote` 指定一个远程。显式 `remote/branch` 形式（例如 `libra switch origin/main`）不受 guess 影响，仍会提示使用 `--track`。
+
+```bash
+libra switch feature                   # 如果只有 origin 有 feature，则自动 tracking
+libra switch --no-guess feature        # 禁止远程分支猜测
+```
+
 ## 常用命令
 
 ```bash
@@ -79,9 +91,11 @@ libra switch main                      # 切换到已有分支
 libra switch -c feature-x              # 创建并切换到新分支
 libra switch -c fix-123 abc1234        # 从特定提交创建分支
 libra switch -C feature-x              # 重置分支到 HEAD 并切换
-libra switch --orphan fresh-start      # 创建无历史的新分支
+libra switch --orphan fresh-start      # 创建 unborn 分支；首个提交无 parent
 libra switch --detach v1.0             # 在标签上 detach HEAD
 libra switch --track origin/main       # 跟踪并切换到远程分支
+libra switch feature                   # 从唯一远程自动创建 tracking 分支（guess）
+libra switch --no-guess feature        # 禁用远程分支猜测
 libra switch --json main               # 面向代理的结构化 JSON 输出
 ```
 
@@ -136,6 +150,7 @@ Already on 'main'
     "commit": "def5678abc1234901234567890abcdef12345678",
     "created": false,
     "detached": false,
+    "unborn": false,
     "already_on": false,
     "tracking": null
   }
@@ -155,6 +170,27 @@ Already on 'main'
     "commit": "abc1234def5678901234567890abcdef12345678",
     "created": true,
     "detached": false,
+    "unborn": false,
+    "already_on": false,
+    "tracking": null
+  }
+}
+```
+
+创建 unborn orphan 分支：
+
+```json
+{
+  "ok": true,
+  "command": "switch",
+  "data": {
+    "previous_branch": "main",
+    "previous_commit": "abc1234def5678901234567890abcdef12345678",
+    "branch": "fresh-start",
+    "commit": "0000000000000000000000000000000000000000",
+    "created": true,
+    "detached": false,
+    "unborn": true,
     "already_on": false,
     "tracking": null
   }
@@ -174,6 +210,7 @@ Already on 'main'
     "commit": "def5678abc1234901234567890abcdef12345678",
     "created": false,
     "detached": true,
+    "unborn": false,
     "already_on": false,
     "tracking": null
   }
@@ -193,6 +230,7 @@ Already on 'main'
     "commit": "def5678abc1234901234567890abcdef12345678",
     "created": true,
     "detached": false,
+    "unborn": false,
     "already_on": false,
     "tracking": {
       "remote": "origin",
@@ -206,9 +244,10 @@ Already on 'main'
 
 - `previous_branch` 在切换前 HEAD detached 时为 `null`
 - `branch` 在 HEAD 当前 detached（`--detach`）时为 `null`
+- `unborn` 仅在 `--orphan` 后为 `true`；首个用户提交创建分支 ref 前，`commit` 为全零 OID
 - `already_on` 在目标分支等于当前分支（no-op）时为 `true`
-- `tracking` 仅在 `--track` 时存在，包含 `remote` 和 `remote_branch`
-- `created` 在 `--create` 或 `--track` 创建新本地分支时为 `true`
+- `tracking` 在 `--track` 或成功 guess 时存在，包含 `remote` 和 `remote_branch`
+- `created` 在 `--create`、`--force-create`、`--track` 或 guess 创建/重置本地分支时为 `true`
 
 ## 设计理由
 

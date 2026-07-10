@@ -154,18 +154,33 @@ fn test_switch_force_create_refuses_current_branch() {
 }
 
 #[test]
-fn test_switch_orphan_creates_branch_with_no_history() {
+fn test_switch_orphan_keeps_head_unborn_until_first_commit() {
     let repo = create_committed_repo_via_cli();
 
     let output = run_libra_command(&["switch", "--orphan", "fresh"], repo.path());
     assert_cli_success(&output, "create orphan branch should succeed");
 
-    let output = run_libra_command(&["log", "--oneline"], repo.path());
-    assert_cli_success(&output, "log should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let output = run_libra_command(&["rev-parse", "--symbolic-full-name", "HEAD"], repo.path());
+    assert_cli_success(&output, "orphan branch should become symbolic HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "refs/heads/fresh"
+    );
+
+    let output = run_libra_command(&["rev-parse", "HEAD"], repo.path());
     assert!(
-        stdout.contains("orphan branch root commit"),
-        "expected orphan root commit in log, got: {stdout}"
+        !output.status.success(),
+        "orphan HEAD should be unborn before the first user commit"
+    );
+
+    let output = run_libra_command(&["commit", "-m", "fresh root", "--no-verify"], repo.path());
+    assert_cli_success(&output, "first orphan commit should succeed");
+
+    let output = run_libra_command(&["log", "--pretty=%P", "-1"], repo.path());
+    assert_cli_success(&output, "parent list should be printable");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "first orphan commit should have no parents"
     );
 }
 

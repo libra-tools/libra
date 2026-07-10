@@ -1,11 +1,6 @@
 //! Implements `ls-files` to list files in the index with basic filters.
 
-use std::{
-    collections::HashSet,
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, fs, io::Write, path::Path};
 
 use clap::Parser;
 use git_internal::{
@@ -15,12 +10,14 @@ use git_internal::{
 use serde::Serialize;
 
 use crate::{
-    command::load_object,
+    command::{load_object, read_worktree_blob_bytes},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         ignore,
-        output::{OutputConfig, emit_json_data},
-        path, util,
+        output::{OutputConfig, emit_json_data, stdout_write_error},
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -33,7 +30,7 @@ EXAMPLES:
     libra ls-files -m                   Show only modified files (-m = --modified)
     libra ls-files --stage              Include stage information (for conflicts)
     libra ls-files --others             Show untracked files
-    libra ls-files --exclude-standard   Exclude files matching .libraignore
+    libra ls-files --exclude-standard   Exclude files matching standard ignore sources
     libra ls-files -o -x '*.log'        Show untracked files except ones matching a pattern
     libra ls-files -o -X .gitignore-extra  Read extra exclude patterns from a file
     libra ls-files -i -o --exclude-standard  List only the ignored untracked files
@@ -76,7 +73,7 @@ pub struct LsFilesArgs {
     #[clap(long = "ignored", short = 'i')]
     pub ignored: bool,
 
-    /// Exclude files matching .libraignore patterns
+    /// Exclude files matching standard Git/Libra ignore sources
     #[clap(long)]
     pub exclude_standard: bool,
 
@@ -125,8 +122,8 @@ pub struct LsFilesArgs {
 
     /// Show line-ending info for each cached file: `i/<eol> w/<eol> attr/<attr>`
     /// before the path, where `<eol>` is `lf`/`crlf`/`mixed`/`none`/`-text` for
-    /// the index blob (`i/`) and the worktree file (`w/`). Libra has no
-    /// `.gitattributes` support, so `attr/` is always empty.
+    /// the index blob (`i/`) and the worktree file (`w/`). Line-ending
+    /// attribute reporting is not implemented, so `attr/` is always empty.
     #[clap(long)]
     pub eol: bool,
 
@@ -142,12 +139,6 @@ pub struct FileEntry {
     mode: Option<String>,
     stage: Option<u32>,
     status: String,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedPathspec {
-    raw: String,
-    absolute: PathBuf,
 }
 
 pub async fn execute(args: LsFilesArgs) -> CliResult<()> {
@@ -172,7 +163,8 @@ fn run_ls_files(
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
     let workdir = util::working_dir();
     let current_dir = util::cur_dir();
-    let pathspecs = resolve_ls_files_pathspecs(_args, &workdir, &current_dir)?;
+    let pathspecs = PathspecSet::from_workdir(&_args.pathspec, &current_dir, &workdir)
+        .map_err(pathspec_error_to_cli)?;
 
     let index = Index::load(path::index()).map_err(|source| {
         CliError::fatal(format!("failed to load index: {source}"))
@@ -189,8 +181,8 @@ fn run_ls_files(
         })?;
     // Whether a path is excluded, with Git source precedence: the explicit
     // `-x`/`-X` matcher (higher precedence) decides first — an explicit negation
-    // (`Some(false)`) re-includes the path even if `.libraignore` would exclude
-    // it; only when no custom pattern matches (`None`) do the standard
+    // (`Some(false)`) re-includes the path even if a standard ignore source
+    // would exclude it; only when no custom pattern matches (`None`) do the standard
     // `--exclude-standard` rules apply.
     let is_excluded = |abs: &Path| {
         let custom = custom_excludes
@@ -243,7 +235,7 @@ fn run_ls_files(
         // `-u`/`--unmerged` restricts the listing to conflict stages 1/2/3.
         let stages: &[u8] = if _args.unmerged {
             &[1, 2, 3]
-        } else if _args.stage || _args.short {
+        } else if _args.stage || _args.short || _args.tag {
             &[0, 1, 2, 3]
         } else {
             &[0]
@@ -252,12 +244,12 @@ fn run_ls_files(
             for entry in index.tracked_entries(*stage) {
                 let worktree_path = workdir.join(&entry.name);
                 // `-i`: among cached entries, list only those matching an exclude
-                // pattern — `.libraignore` (under `--exclude-standard`) or an
+                // pattern — standard sources under `--exclude-standard` or an
                 // explicit `-x`/`-X` pattern (a tracked file that would be ignored).
                 if _args.ignored && !is_excluded(&worktree_path) {
                     continue;
                 }
-                let exists = worktree_path.exists();
+                let exists = fs::symlink_metadata(&worktree_path).is_ok();
                 let is_deleted = !exists;
                 let is_modified =
                     exists && entry_modified(&worktree_path, &entry.name, &entry.hash.to_string())?;
@@ -318,7 +310,7 @@ fn run_ls_files(
             }
             let abs = workdir.join(&file);
             // An untracked file is "excluded" per Git source precedence: explicit
-            // `-x`/`-X` first, then `.libraignore` under `--exclude-standard`.
+            // `-x`/`-X` first, then the standard sources under `--exclude-standard`.
             let excluded = is_excluded(&abs);
             if _args.ignored {
                 // `-i -o`: list ONLY the excluded (ignored) untracked files.
@@ -347,9 +339,9 @@ fn run_ls_files(
         entries.retain(|entry| entry.stage.unwrap_or(0) > 0 || view.contains_str(&entry.path));
     }
 
-    entries = filter_entries_by_pathspec(entries, &pathspecs, &workdir);
+    entries = filter_entries_by_pathspec(entries, &pathspecs);
     if _args.error_unmatch {
-        ensure_error_unmatch(&pathspecs, &entries, &workdir)?;
+        ensure_error_unmatch(&pathspecs, &entries)?;
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path).then(a.stage.cmp(&b.stage)));
@@ -383,87 +375,48 @@ fn collect_ls_files_exclude_patterns(args: &LsFilesArgs) -> CliResult<Vec<String
     Ok(patterns)
 }
 
-fn resolve_ls_files_pathspecs(
-    args: &LsFilesArgs,
-    workdir: &Path,
-    current_dir: &Path,
-) -> CliResult<Vec<ResolvedPathspec>> {
-    args.pathspec
-        .iter()
-        .map(|raw| {
-            let absolute = resolve_pathspec(Path::new(raw), current_dir);
-            if !util::is_sub_path(&absolute, workdir) {
-                return Err(CliError::fatal(format!(
-                    "'{raw}' is outside repository at '{}'",
-                    workdir.display()
-                ))
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-                .with_hint("all paths must be within the repository working tree"));
-            }
-            Ok(ResolvedPathspec {
-                raw: raw.clone(),
-                absolute,
-            })
-        })
-        .collect()
-}
-
-fn resolve_pathspec(pathspec: &Path, current_dir: &Path) -> PathBuf {
-    if pathspec.is_absolute() {
-        pathspec.to_path_buf()
-    } else {
-        current_dir.join(pathspec)
-    }
-}
-
-fn filter_entries_by_pathspec(
-    entries: Vec<FileEntry>,
-    pathspecs: &[ResolvedPathspec],
-    workdir: &Path,
-) -> Vec<FileEntry> {
+fn filter_entries_by_pathspec(entries: Vec<FileEntry>, pathspecs: &PathspecSet) -> Vec<FileEntry> {
     if pathspecs.is_empty() {
         return entries;
     }
 
     entries
         .into_iter()
-        .filter(|entry| {
-            pathspecs
-                .iter()
-                .any(|pathspec| entry_matches_pathspec(entry, pathspec, workdir))
-        })
+        .filter(|entry| pathspecs.matches_path(&entry.path))
         .collect()
 }
 
-fn ensure_error_unmatch(
-    pathspecs: &[ResolvedPathspec],
-    entries: &[FileEntry],
-    workdir: &Path,
-) -> CliResult<()> {
-    if let Some(unmatched) = pathspecs.iter().find(|pathspec| {
-        !entries
-            .iter()
-            .any(|entry| entry_matches_pathspec(entry, pathspec, workdir))
-    }) {
-        return Err(CliError::fatal(format!(
-            "pathspec '{}' did not match any files",
-            unmatched.raw
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidTarget)
-        .with_hint("check the path and try again.")
-        .with_hint("use 'libra ls-files' to inspect visible paths."));
+fn ensure_error_unmatch(pathspecs: &PathspecSet, entries: &[FileEntry]) -> CliResult<()> {
+    if let Some(unmatched) =
+        pathspecs.unmatched_positive(entries.iter().map(|entry| Path::new(&entry.path)))
+    {
+        return Err(
+            CliError::fatal(format!("pathspec '{unmatched}' did not match any files"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_exit_code(1)
+                .with_hint("check the path and try again.")
+                .with_hint("use 'libra ls-files' to inspect visible paths."),
+        );
     }
 
     Ok(())
 }
 
-fn entry_matches_pathspec(entry: &FileEntry, pathspec: &ResolvedPathspec, workdir: &Path) -> bool {
-    let entry_abs = workdir.join(Path::new(&entry.path));
-    util::is_sub_path(&entry_abs, &pathspec.absolute)
+fn pathspec_error_to_cli(error: PathspecError) -> CliError {
+    match error {
+        PathspecError::OutsideRepository { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("all pathspecs must stay within the repository working tree"),
+        PathspecError::UnsupportedMagic { .. } | PathspecError::InvalidPattern { .. } => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use supported magic: top, exclude, icase, literal, glob")
+        }
+    }
 }
 
 fn entry_modified(worktree_path: &Path, display_path: &str, indexed_hash: &str) -> CliResult<bool> {
-    let data = match fs::read(worktree_path) {
+    let data = match read_worktree_blob_bytes(worktree_path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(source) => {
@@ -546,16 +499,12 @@ fn render_output(
             record = format!("{} {}", status_tag(&entry.status), record);
         }
 
-        stdout.write_all(record.as_bytes()).map_err(|source| {
-            CliError::fatal(format!("failed to write ls-files output: {source}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
+        stdout
+            .write_all(record.as_bytes())
+            .map_err(|source| stdout_write_error("write ls-files output", source))?;
         stdout
             .write_all(if args.nul_terminate { b"\0" } else { b"\n" })
-            .map_err(|source| {
-                CliError::fatal(format!("failed to write ls-files output: {source}"))
-                    .with_stable_code(StableErrorCode::IoWriteFailed)
-            })?;
+            .map_err(|source| stdout_write_error("write ls-files output", source))?;
     }
 
     Ok(())
@@ -609,7 +558,8 @@ fn classify_eol(data: &[u8]) -> &'static str {
 /// Build the `git ls-files --eol` column (`i/<eol> w/<eol> attr/<attr>\t`) for
 /// one entry: the index-blob eol (loaded by object id) and the worktree-file eol
 /// (read from disk). A missing blob/file leaves that field empty (Git's
-/// `lstat`-failed case). `attr/` is always empty (Libra has no `.gitattributes`).
+/// `lstat`-failed case). `attr/` is always empty because line-ending attribute
+/// reporting is not implemented.
 /// The format (`i/%-5s w/%-5s attr/%-17s\t`) is byte-compatible with Git, and
 /// the caller inserts it immediately before the path (composing with `-t`/`-s`).
 fn eol_column(entry: &FileEntry, workdir: &Path) -> String {

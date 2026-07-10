@@ -23,6 +23,20 @@ copied to matching `.libraignore` files so Libra ignore rules work immediately.
 For bare clones, no working tree checkout is performed and the repository directory itself
 becomes the object store. Bare clones do not create `.libraignore`.
 
+## Global Config Schema Guard
+
+`libra clone` reads the global storage configuration (`~/.libra/config.db`, or
+`LIBRA_CONFIG_GLOBAL_DB`) before trusting remote/tiered object storage settings. If that
+database has a schema version newer than this binary supports, clone fails closed with
+`LBR-CONFIG-001` instead of silently ignoring global storage config and falling back to
+local objects. The diagnostic includes the binary path and version, config DB path,
+schema versions, and the update command:
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+
+Use `libra --offline clone ...` or `LIBRA_READ_POLICY=offline|local libra clone ...` only when
+you intentionally want local-only object access. Libra will warn once and ignore the
+global storage config for that run.
+
 ## Options
 
 ### `<REMOTE_REPO>` (required)
@@ -186,7 +200,10 @@ libra clone -l /path/to/source /path/to/dest
 Create a shallow clone with history truncated to the specified number of commits.
 `N` must be a positive integer.
 Only Git remotes support shallow transfer. Cloudflare restore rejects `--depth`
-because it must download the complete published object set.
+because it must download the complete published object set. A local Libra source
+also rejects `--depth` with `LBR-REPO-002`: that transport cannot advertise
+shallow boundaries yet, so accepting the option would leave a clone with missing
+parents.
 
 ```bash
 libra clone --depth 1 git@github.com:user/repo.git
@@ -197,16 +214,17 @@ libra clone --depth 50 git@github.com:user/repo.git
 
 Fail if the clone would be a shallow repository that you did not request — i.e.
 the source repository is shallow — matching `git clone --reject-shallow`
-(exit 128). Combining it with `--depth` is allowed: the depth-induced
-shallowness is expected and not rejected. On rejection the partially-created
-destination is removed.
+(exit 128). Combining it with `--depth` is allowed only for transports that can
+negotiate shallow boundaries. A local Libra source rejects `--depth` before
+object transfer, and no initialized target is left behind.
 
 Two narrowings vs Git: (1) Libra's clone of a local-path source re-fetches the
 full history rather than inheriting the source's shallow marker, so this check
 is most meaningful when cloning a shallow *remote*; (2) because Libra cannot
 distinguish a shallow source from `--depth`-induced shallowness, passing
-`--depth` suppresses the check entirely (Git would still reject a shallow source
-with `--depth`).
+`--depth` suppresses the post-fetch `--reject-shallow` check for remotes that
+do support shallow negotiation (Git would still reject a shallow source with
+`--depth`).
 
 ```bash
 libra clone --reject-shallow git@github.com:user/repo.git
@@ -461,9 +479,11 @@ are preserved and surfaced as warnings; the original `.gitignore` files remain u
 ### `--depth` for shallow clones
 
 Shallow clones are essential for CI/CD pipelines and large monorepos where full history is
-unnecessary. Libra supports `--depth N` with the same semantics as Git: the history is
-truncated to the specified number of commits. The depth value is validated at parse time
-(must be a positive integer) and propagated to the fetch protocol layer. Libra bounds
+unnecessary. Libra supports `--depth N` for Git remotes that negotiate shallow
+boundaries: the history is truncated to the specified number of commits. The
+depth value is validated at parse time (must be a positive integer) and
+propagated to the fetch protocol layer. Local Libra sources fail closed with
+`LBR-REPO-002` until they can produce shallow boundary metadata. Libra bounds
 shallow history **only** by `--depth`: the date/ref-based `--shallow-since` and
 `--shallow-exclude` flags are accepted but ignored with a warning (see their Options entry
 above) rather than rejected, so scripts that pass them still clone successfully.
@@ -504,7 +524,7 @@ not, because its operation-log model fetches all refs by design.
 | Single branch | `--single-branch` | N/A | `--single-branch` |
 | No single branch | `--no-single-branch` | N/A | `--no-single-branch` (countermands `--single-branch`; all branches is the default) |
 | Bare clone | `--bare` | N/A | `--bare` |
-| Shallow clone (depth) | `--depth <n>` | N/A | `--depth <n>` |
+| Shallow clone (depth) | `--depth <n>` | N/A | supported for Git remotes; local Libra sources fail closed (`LBR-REPO-002`); cloud rejects |
 | Shallow since date | `--shallow-since=<date>` | N/A | accepted no-op for Git remotes (ignored + warning; not applied, history bounded only by `--depth`); rejected for cloud |
 | Shallow exclude | `--shallow-exclude=<rev>` | N/A | accepted no-op for Git remotes (ignored + warning; not applied, history bounded only by `--depth`); rejected for cloud |
 | Mirror clone | `--mirror` | N/A | `--mirror` (implies `--bare`; mirrors fetched branches into `refs/heads/*`, keeps tags, no tracking refs, sets `remote.<name>.mirror` marker; narrowed — only fetched branches/tags, refresh not mirror-aware) |

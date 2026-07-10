@@ -22,7 +22,9 @@ use crate::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data, record_warning},
         pager::Pager,
-        path, util,
+        path,
+        pathspec::{PathspecDepthRoot, PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -307,15 +309,16 @@ pub async fn execute_safe(args: GrepArgs, output: &OutputConfig) -> CliResult<()
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
     }
 
-    let result = run_grep(&args).await?;
+    let result = run_grep(&args)
+        .await
+        .map_err(|error| error.with_exit_code(2))?;
     let has_selected_results = has_selected_results(&args, &result);
     render_grep_output(&args, &result, output)?;
 
     if has_selected_results {
         Ok(())
     } else {
-        Err(CliError::failure("no matches found")
-            .with_stable_code(StableErrorCode::CliInvalidTarget))
+        Err(CliError::silent_exit(1))
     }
 }
 
@@ -653,26 +656,26 @@ async fn get_search_files(args: &GrepArgs) -> CliResult<Vec<SearchFile>> {
         get_working_tree_files(&args.pathspec)?
     };
 
-    Ok(apply_max_depth(files, args))
+    apply_max_depth(files, args)
 }
 
 /// Drop files deeper than `--max-depth` levels below their matching pathspec
 /// (or below the search root when no pathspec is given). A negative depth, or
 /// no `--max-depth`, leaves the list unchanged. Depth is measured the same way
 /// as Git: a file directly inside a pathspec directory is depth 0.
-fn apply_max_depth(files: Vec<SearchFile>, args: &GrepArgs) -> Vec<SearchFile> {
+fn apply_max_depth(files: Vec<SearchFile>, args: &GrepArgs) -> CliResult<Vec<SearchFile>> {
     let Some(max_depth) = args.max_depth else {
-        return files;
+        return Ok(files);
     };
     if max_depth < 0 {
-        return files;
+        return Ok(files);
     }
     let max_depth = max_depth as usize;
     // Normalise the pathspecs into the SAME path form as the collected file
     // paths so the component math lines up: working-tree/index/tree paths are
     // workdir-relative (`to_workdir_path`), while `--no-index` display paths are
     // relative to the current directory.
-    let specs: Vec<PathBuf> = if args.no_index {
+    let specs: Vec<PathspecDepthRoot> = if args.no_index {
         let cwd = util::cur_dir();
         args.pathspec
             .iter()
@@ -683,16 +686,18 @@ fn apply_max_depth(files: Vec<SearchFile>, args: &GrepArgs) -> Vec<SearchFile> {
                 } else {
                     cwd.join(&path)
                 };
-                pathdiff::diff_paths(&absolute, &cwd).unwrap_or(path)
+                PathspecDepthRoot::case_sensitive(
+                    pathdiff::diff_paths(&absolute, &cwd).unwrap_or(path),
+                )
             })
             .collect()
     } else {
-        args.pathspec.iter().map(util::to_workdir_path).collect()
+        compile_repo_pathspecs(&args.pathspec)?.positive_depth_roots()
     };
-    files
+    Ok(files
         .into_iter()
         .filter(|file| within_max_depth(&file.path, &specs, max_depth))
-        .collect()
+        .collect())
 }
 
 /// Whether `file` is within `max_depth` directory levels of at least one of
@@ -700,7 +705,7 @@ fn apply_max_depth(files: Vec<SearchFile>, args: &GrepArgs) -> Vec<SearchFile> {
 /// is `components(file) - components(spec) - 1`, clamped at 0, so a file
 /// directly inside the pathspec (or a pathspec naming the file itself) is
 /// depth 0 — matching Git's `--max-depth`.
-fn within_max_depth(file: &Path, specs: &[PathBuf], max_depth: usize) -> bool {
+fn within_max_depth(file: &Path, specs: &[PathspecDepthRoot], max_depth: usize) -> bool {
     let file_comps = path_depth_components(file);
     if specs.is_empty() {
         // No pathspec: depth is measured from the WORKTREE ROOT. Unlike Git
@@ -712,14 +717,40 @@ fn within_max_depth(file: &Path, specs: &[PathBuf], max_depth: usize) -> bool {
         return file_comps.saturating_sub(1) <= max_depth;
     }
     specs.iter().any(|spec| {
-        if file == spec || util::is_sub_path(file, spec) {
-            let spec_comps = path_depth_components(spec);
+        if depth_root_matches(file, spec) {
+            let spec_comps = path_depth_components(spec.path());
             let depth = file_comps.saturating_sub(spec_comps + 1);
             depth <= max_depth
         } else {
             false
         }
     })
+}
+
+fn depth_root_matches(file: &Path, spec: &PathspecDepthRoot) -> bool {
+    if !spec.icase() {
+        return file == spec.path() || util::is_sub_path(file, spec.path());
+    }
+
+    let file = slash_path(file).to_lowercase();
+    let spec = slash_path(spec.path()).to_lowercase();
+    spec.is_empty()
+        || file == spec
+        || file
+            .strip_prefix(spec.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().replace('\\', "/")),
+            std::path::Component::CurDir => None,
+            std::path::Component::ParentDir => Some("..".to_string()),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Count the path components that contribute to directory depth, ignoring
@@ -794,9 +825,9 @@ fn get_no_index_files(pathspec: &[String]) -> CliResult<Vec<SearchFile>> {
 /// combined list is sorted by path for deterministic, Git-like output.
 fn get_working_tree_files_with_untracked(pathspec: &[String]) -> CliResult<Vec<SearchFile>> {
     let index = load_index()?;
-    let path_filters: Vec<PathBuf> = pathspec.iter().map(util::to_workdir_path).collect();
+    let pathspecs = compile_repo_pathspecs(pathspec)?;
 
-    let mut files = tracked_files_from_index(&index, &path_filters, false);
+    let mut files = tracked_files_from_index(&index, &pathspecs, false);
     let tracked: std::collections::HashSet<PathBuf> =
         files.iter().map(|file| file.path.clone()).collect();
 
@@ -810,7 +841,7 @@ fn get_working_tree_files_with_untracked(pathspec: &[String]) -> CliResult<Vec<S
         if tracked.contains(&path) {
             continue;
         }
-        if path_filters.is_empty() || path_filters.iter().any(|f| util::is_sub_path(&path, f)) {
+        if pathspecs.matches_path(&path) {
             files.push(SearchFile {
                 path,
                 blob_hash: None,
@@ -848,9 +879,9 @@ async fn get_tree_files(tree_ref: &str, pathspec: &[String]) -> CliResult<Vec<Se
     // Get all files from the tree with their blob hashes.
     let all_files: Vec<(PathBuf, git_internal::hash::ObjectHash)> = tree.get_plain_items();
 
-    let path_filters: Vec<PathBuf> = pathspec.iter().map(util::to_workdir_path).collect();
+    let pathspecs = compile_repo_pathspecs(pathspec)?;
 
-    let files: Vec<SearchFile> = if path_filters.is_empty() {
+    let files: Vec<SearchFile> = if pathspecs.is_empty() {
         all_files
             .into_iter()
             .map(|(path, blob_hash)| SearchFile {
@@ -862,7 +893,7 @@ async fn get_tree_files(tree_ref: &str, pathspec: &[String]) -> CliResult<Vec<Se
     } else {
         all_files
             .into_iter()
-            .filter(|(p, _)| path_filters.iter().any(|f| util::is_sub_path(p, f)))
+            .filter(|(p, _)| pathspecs.matches_path(p))
             .map(|(path, blob_hash)| SearchFile {
                 path,
                 blob_hash: Some(blob_hash),
@@ -877,17 +908,17 @@ async fn get_tree_files(tree_ref: &str, pathspec: &[String]) -> CliResult<Vec<Se
 /// Get files from the index (staged files).
 fn get_index_files(pathspec: &[String]) -> CliResult<Vec<SearchFile>> {
     let index = load_index()?;
-    let path_filters: Vec<PathBuf> = pathspec.iter().map(util::to_workdir_path).collect();
+    let pathspecs = compile_repo_pathspecs(pathspec)?;
 
-    Ok(tracked_files_from_index(&index, &path_filters, true))
+    Ok(tracked_files_from_index(&index, &pathspecs, true))
 }
 
 /// Get tracked files from the working tree while reading their current on-disk contents.
 fn get_working_tree_files(pathspec: &[String]) -> CliResult<Vec<SearchFile>> {
     let index = load_index()?;
-    let path_filters: Vec<PathBuf> = pathspec.iter().map(util::to_workdir_path).collect();
+    let pathspecs = compile_repo_pathspecs(pathspec)?;
 
-    Ok(tracked_files_from_index(&index, &path_filters, false))
+    Ok(tracked_files_from_index(&index, &pathspecs, false))
 }
 
 fn load_index() -> CliResult<Index> {
@@ -899,28 +930,37 @@ fn load_index() -> CliResult<Index> {
 
 fn tracked_files_from_index(
     index: &Index,
-    path_filters: &[PathBuf],
+    pathspecs: &PathspecSet,
     include_blob_hash: bool,
 ) -> Vec<SearchFile> {
     index
         .tracked_entries(0)
         .into_iter()
-        .filter(|entry| {
-            if path_filters.is_empty() {
-                true
-            } else {
-                let entry_path = PathBuf::from(&entry.name);
-                path_filters
-                    .iter()
-                    .any(|f| util::is_sub_path(&entry_path, f))
-            }
-        })
+        .filter(|entry| pathspecs.matches_path(&entry.name))
         .map(|entry| SearchFile {
             path: PathBuf::from(&entry.name),
             blob_hash: include_blob_hash.then_some(entry.hash),
             read_override: None,
         })
         .collect()
+}
+
+fn compile_repo_pathspecs(pathspec: &[String]) -> CliResult<PathspecSet> {
+    PathspecSet::from_workdir(pathspec, &util::cur_dir(), &util::working_dir())
+        .map_err(pathspec_error_to_cli)
+}
+
+fn pathspec_error_to_cli(error: PathspecError) -> CliError {
+    match error {
+        PathspecError::OutsideRepository { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("all pathspecs must stay within the repository working tree"),
+        PathspecError::UnsupportedMagic { .. } | PathspecError::InvalidPattern { .. } => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use supported magic: top, exclude, icase, literal, glob")
+        }
+    }
 }
 
 /// Read file content from working tree or from a blob object.

@@ -24,8 +24,8 @@ use git_internal::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    command::{editor, load_object, save_object},
-    common_utils::format_commit_msg,
+    command::{commit::create_commit_signatures, editor, load_object, save_object},
+    common_utils::{format_commit_msg, parse_commit_msg},
     internal::{branch::Branch, head::Head},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -108,6 +108,9 @@ enum RevertError {
     #[error("failed to resolve committer identity for --signoff: {0}")]
     Signoff(String),
 
+    #[error("failed to resolve commit identity: {0}")]
+    Identity(String),
+
     #[error("{0}")]
     MultiCommitUnsupported(String),
 
@@ -175,6 +178,7 @@ impl RevertError {
             Self::IndexSave(_) => StableErrorCode::IoWriteFailed,
             Self::UpdateHead(_) => StableErrorCode::IoWriteFailed,
             Self::Signoff(_) => StableErrorCode::CliInvalidArguments,
+            Self::Identity(_) => StableErrorCode::AuthMissingCredentials,
             Self::MultiCommitUnsupported(_) => StableErrorCode::CliInvalidArguments,
             Self::Conflicts { .. } | Self::UnresolvedConflicts(_) => {
                 StableErrorCode::ConflictUnresolved
@@ -1111,9 +1115,11 @@ async fn build_revert_message(
 ) -> Result<String, RevertError> {
     let reverted_commit: Commit =
         load_object(reverted_commit_id).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+    let (message, _) = parse_commit_msg(&reverted_commit.message);
+    let subject = message.lines().next().unwrap_or("").trim();
     Ok(format!(
         "Revert \"{}\"\n\nThis reverts commit {}.{}",
-        reverted_commit.message.lines().next().unwrap_or(""),
+        subject,
         reverted_commit_id,
         signoff_trailer(signoff).await?
     ))
@@ -1141,7 +1147,12 @@ async fn create_revert_commit(
     tree_id: &ObjectHash,
     message: &str,
 ) -> Result<ObjectHash, RevertError> {
-    let commit = Commit::from_tree_id(
+    let (author, committer, _identity) = create_commit_signatures(None, None)
+        .await
+        .map_err(|e| RevertError::Identity(e.to_string()))?;
+    let commit = Commit::new(
+        author,
+        committer,
         *tree_id,
         vec![*parent_id],
         &format_commit_msg(message, None),
@@ -1179,7 +1190,12 @@ async fn create_empty_revert_commit(
     let empty_tree = empty_tree().map_err(RevertError::SaveObject)?;
     save_object(&empty_tree, &empty_tree.id).map_err(|e| RevertError::SaveObject(e.to_string()))?;
 
-    let commit = Commit::from_tree_id(
+    let (author, committer, _identity) = create_commit_signatures(None, None)
+        .await
+        .map_err(|e| RevertError::Identity(e.to_string()))?;
+    let commit = Commit::new(
+        author,
+        committer,
         empty_tree.id,
         vec![*parent_id],
         &format_commit_msg(message, None),

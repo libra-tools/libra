@@ -240,6 +240,112 @@ fn skill_events_project_for_claude_and_codex() {
     assert_eq!(events[0].source.agent, "codex");
 }
 
+/// A0-07: the searchable [`SkillEventProjection`] ingests extracted events
+/// from all three fixtures and answers queries by skill name, provider, and
+/// session, dedupes by `(session, id)`, and stays empty (never panics) on a
+/// garbage transcript. Its wire schema version is frozen.
+#[test]
+fn skill_event_projection() {
+    use libra::internal::ai::observed_agents::{
+        SKILL_PROJECTION_SCHEMA_VERSION, SkillEventProjection, SkillQuery,
+    };
+
+    assert_eq!(
+        SKILL_PROJECTION_SCHEMA_VERSION, 1,
+        "skill projection schema version is additive-only"
+    );
+
+    let mut proj = SkillEventProjection::new();
+    for (kind, file, provider, session) in [
+        (
+            AgentKind::ClaudeCode,
+            "claude_code.jsonl",
+            "claude-code",
+            "sess-claude",
+        ),
+        (AgentKind::Codex, "codex.jsonl", "codex", "sess-codex"),
+        (
+            AgentKind::OpenCode,
+            "opencode.json",
+            "opencode",
+            "sess-opencode",
+        ),
+    ] {
+        let events = agent_for(kind)
+            .as_skill_event_extractor()
+            .expect("skill extractor")
+            .extract_skill_events(&fixture(file), 0)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{file}: one /review event");
+        proj.ingest(session, Some("cp-1"), provider, events);
+    }
+    assert_eq!(proj.len(), 3);
+
+    // Search by skill name returns all three /review events across providers.
+    assert_eq!(
+        proj.search(&SkillQuery {
+            skill: Some("/review".to_string()),
+            ..Default::default()
+        })
+        .len(),
+        3
+    );
+    // Filter by provider / session each narrows to one.
+    assert_eq!(
+        proj.search(&SkillQuery {
+            provider: Some("codex".to_string()),
+            ..Default::default()
+        })
+        .len(),
+        1
+    );
+    assert_eq!(
+        proj.search(&SkillQuery {
+            session: Some("sess-claude".to_string()),
+            ..Default::default()
+        })
+        .len(),
+        1
+    );
+    // An unknown skill name matches nothing.
+    assert!(
+        proj.search(&SkillQuery {
+            skill: Some("/nope".to_string()),
+            ..Default::default()
+        })
+        .is_empty()
+    );
+
+    // Empty/garbage transcript → zero events, never a panic.
+    let empty = agent_for(AgentKind::Codex)
+        .as_skill_event_extractor()
+        .unwrap()
+        .extract_skill_events(b"not json at all\n", 0)
+        .unwrap();
+    assert!(empty.is_empty());
+    let mut empty_proj = SkillEventProjection::new();
+    assert_eq!(empty_proj.ingest("s", None, "codex", empty), 0);
+    assert!(empty_proj.is_empty());
+
+    // Duplicate: re-ingesting one session's events is deduped by (session, id).
+    let claude = agent_for(AgentKind::ClaudeCode)
+        .as_skill_event_extractor()
+        .unwrap()
+        .extract_skill_events(&fixture("claude_code.jsonl"), 0)
+        .unwrap();
+    let mut dup = SkillEventProjection::new();
+    assert_eq!(
+        dup.ingest("s1", Some("cp"), "claude-code", claude.clone()),
+        1
+    );
+    assert_eq!(
+        dup.ingest("s1", Some("cp"), "claude-code", claude),
+        0,
+        "the same session's identical event is deduped by (session, id)"
+    );
+    assert_eq!(dup.len(), 1);
+}
+
 /// E6 generic path (codex/opencode): a wire `subagent_tokens` value is
 /// folded into `subagent_usage` and an explicit `api_call_count` from the
 /// wire is honoured (not just +1 per usage object). Codex review P1

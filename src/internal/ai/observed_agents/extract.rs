@@ -33,6 +33,20 @@ pub const CLAUDE_CODE_SKILL_REGISTRY: &[&str] = &["/review", "/security-review",
 pub const CODEX_SKILL_REGISTRY: &[&str] = &["/review"];
 pub const OPENCODE_SKILL_REGISTRY: &[&str] = &["/review"];
 
+/// A0-07: exhaustive [`AgentKind`] → curated skill registry lookup. The single
+/// fact source both transcript extraction and `libra agent skill` discovery
+/// read through: a new `AgentKind` fails to compile here until it registers.
+/// Non-first-batch agents expose no discoverable skills (`&[]`).
+pub fn skill_registry_for(kind: super::adapter::AgentKind) -> &'static [&'static str] {
+    use super::adapter::AgentKind;
+    match kind {
+        AgentKind::ClaudeCode => CLAUDE_CODE_SKILL_REGISTRY,
+        AgentKind::Codex => CODEX_SKILL_REGISTRY,
+        AgentKind::OpenCode => OPENCODE_SKILL_REGISTRY,
+        AgentKind::Gemini | AgentKind::Cursor | AgentKind::Copilot | AgentKind::FactoryAi => &[],
+    }
+}
+
 /// The full E6 token-usage projection: all SIX frozen wire keys, none
 /// dropped. `summary` folds the token counts into the shared
 /// [`CompletionUsageSummary`]; `api_call_count` and `subagent_tokens`

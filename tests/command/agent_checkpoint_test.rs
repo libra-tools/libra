@@ -132,3 +132,64 @@ async fn agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only() {
         head_before_rewind
     );
 }
+
+/// A0-02: `checkpoint list` distinguishes a `scope='subagent'` checkpoint
+/// from the session's `committed` checkpoints, and the subagent row carries
+/// its parent-checkpoint linkage.
+#[tokio::test]
+#[serial]
+async fn agent_checkpoint_subagent_scope_listed_and_linked() {
+    let repo = create_committed_repo_via_cli();
+    let _guard = ChangeDirGuard::new(repo.path());
+    let conn = connect_repo_db(repo.path()).await;
+
+    // A committed parent + a subagent child linked back to it.
+    seed_checkpoint_for_parent(&conn, "cp-committed", "deadbeef").await;
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (
+            checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
+            tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
+            subagent_session_id, description, created_at
+         ) VALUES ('cp-subagent', 'session-rewind', 'cp-committed', 'subagent', 'deadbeef',
+                   '4444444444444444444444444444444444444444',
+                   '5555555555555555555555555555555555555555',
+                   '6666666666666666666666666666666666666666',
+                   'Task', 'sub-run-9', 'subagent end via Task', 41)",
+        [],
+    ))
+    .await
+    .expect("insert subagent checkpoint");
+
+    let output = run_libra_command(&["--json", "agent", "checkpoint", "list"], repo.path());
+    assert_cli_success(&output, "agent checkpoint list");
+    let json = parse_json_stdout(&output);
+    let rows = json["data"]["checkpoints"]
+        .as_array()
+        .expect("checkpoints array");
+    let scope_of = |id: &str| -> String {
+        rows.iter()
+            .find(|r| r["checkpoint_id"] == id)
+            .and_then(|r| r["scope"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(scope_of("cp-committed"), "committed", "rows: {rows:?}");
+    assert_eq!(scope_of("cp-subagent"), "subagent", "rows: {rows:?}");
+
+    // Parent linkage persisted on the subagent row.
+    let link = conn
+        .query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT parent_checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = 'cp-subagent'",
+            [],
+        ))
+        .await
+        .expect("query linkage")
+        .expect("subagent row present");
+    assert_eq!(
+        link.try_get_by::<String, _>("parent_checkpoint_id")
+            .unwrap(),
+        "cp-committed"
+    );
+}

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use colored::Colorize;
-use git_internal::{errors::GitError, internal::index::Index};
+use git_internal::internal::index::Index;
 use serde::Serialize;
 use tokio::fs;
 
@@ -14,8 +14,8 @@ use crate::{
         error::{CliError, CliResult},
         output::{OutputConfig, emit_json_data},
         path,
-        path_ext::PathExt,
-        util,
+        pathspec::PathspecSet,
+        util::{self, path_to_string},
     },
 };
 
@@ -147,8 +147,6 @@ pub async fn execute_safe(args: RemoveArgs, output: &OutputConfig) -> CliResult<
 
 async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
     let idx_file = path::index();
-    let mut remove_list = Vec::new();
-    let mut remove_dir_list = Vec::new();
     let mut index = match Index::load(&idx_file) {
         Ok(index) => index,
         Err(err) => {
@@ -195,57 +193,61 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
         args.pathspec.clone()
     };
 
-    let dirs = get_dirs(&pathspecs);
-    match validate_pathspec(&pathspecs, &index, args.ignore_unmatch) {
-        Ok(_) => (),
-        Err(err) => {
-            return Err(CliError::fatal(err.to_string()));
-        }
+    if pathspecs.is_empty() {
+        return Err(CliError::fatal(
+            "No pathspec was given. Which files should I remove?",
+        ));
     }
 
-    if !dirs.is_empty() && !args.recursive {
-        let error_msg = format!("not removing '{}' recursively without -r", dirs[0]);
+    let current_dir = std::env::current_dir()
+        .map_err(|error| CliError::fatal(format!("failed to read current directory: {error}")))?;
+    let workdir = util::try_working_dir()
+        .map_err(|error| CliError::fatal(format!("failed to determine worktree root: {error}")))?;
+    let ignore_case = crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|error| CliError::fatal(error.to_string()))?;
+    let compiled = PathspecSet::from_workdir_with_default_icase(
+        &pathspecs,
+        &current_dir,
+        &workdir,
+        ignore_case,
+    )
+    .map_err(|error| {
+        CliError::fatal(error.to_string())
+            .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob")
+    })?;
+
+    let tracked_files = index.tracked_files();
+    if let Some(unmatched) = compiled.unmatched_positive(&tracked_files)
+        && !args.ignore_unmatch
+    {
+        return Err(
+            CliError::fatal(format!("pathspec '{unmatched}' did not match any files"))
+                .with_hint("run 'libra status' to inspect tracked paths.")
+                .with_hint("use '--ignore-unmatch' to ignore missing paths."),
+        );
+    }
+
+    let mut remove_list = tracked_files
+        .iter()
+        .filter(|path| compiled.matches_path(path))
+        .map(|path| path_to_string(path))
+        .collect::<Vec<_>>();
+    remove_list.sort();
+    remove_list.dedup();
+    let matched_dirs = matched_directory_prefixes(&compiled, &workdir);
+
+    if let Some(dir) = matched_dirs.first()
+        && !args.recursive
+    {
+        let error_msg = format!("not removing '{}' recursively without -r", dir.display());
         return Err(CliError::fatal(error_msg));
     }
-
-    // Build the remove list from input paths, handling tracked files and optionally ignoring untracked paths based on the `ignore_unmatch` flag.
-    for path_str in pathspecs.iter() {
-        let path = PathBuf::from(path_str);
-        let relative_path = path.to_workdir().to_string_or_panic();
-        if dirs.contains(path_str) {
-            // dir - find all files in this directory that are tracked
-            let entries = index.tracked_entries(0);
-            // Create directory prefix with proper path separator for cross-platform compatibility
-            let dir_prefix = if relative_path.is_empty() {
-                String::new()
-            } else if relative_path.ends_with(std::path::MAIN_SEPARATOR) {
-                relative_path.clone()
-            } else {
-                format!("{}{}", relative_path, std::path::MAIN_SEPARATOR)
-            };
-            for entry in entries.iter() {
-                if entry.name.starts_with(&dir_prefix) {
-                    remove_list.push(entry.name.clone());
-                }
-            }
-            // For recursive removal, add the directory itself to be removed from filesystem
-            if args.recursive && !args.cached {
-                remove_dir_list.push(path_str.clone());
-            }
-        } else {
-            // file
-            // - If tracked, would be removed from index
-            if index.tracked(&relative_path, 0) {
-                remove_list.push(path_str.clone());
-            } else if !args.ignore_unmatch {
-                // If ignore_unmatch is false, error if the pathspec does not match any tracked files (consistent with Git behavior).
-                let error_msg = format!("pathspec '{path_str}' did not match any files");
-                return Err(CliError::fatal(error_msg)
-                    .with_hint("run 'libra status' to inspect tracked paths.")
-                    .with_hint("use '--ignore-unmatch' to ignore missing paths."));
-            }
-        }
-    }
+    let remove_dir_list = if args.recursive && !args.cached {
+        plain_directory_prefixes_for_removal(&compiled, &workdir)
+    } else {
+        Vec::new()
+    };
 
     // Check all input paths for any uncommitted changes.
     let mut diff_status = DiffStatus::default();
@@ -358,50 +360,31 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
             removed_from_disk: !args.cached && !args.dry_run,
         })
         .collect();
-    let directories = remove_dir_list
-        .iter()
-        .map(|path| RemoveDirectoryOutput {
-            path: path.clone(),
-            removed_from_disk: args.recursive && !args.cached && !args.dry_run,
-        })
-        .collect();
 
     for path_str in remove_list.iter() {
         if !args.dry_run {
-            let relative_path = PathBuf::from(&path_str).to_workdir().to_string_or_panic();
-            index.remove(&relative_path, 0);
+            index.remove(path_str, 0);
         }
     }
     if !args.cached && !args.dry_run {
-        for path_str in remove_list {
-            let path = PathBuf::from(&path_str);
+        for path_str in &remove_list {
+            let path = workdir.join(path_str);
             if let Err(e) = fs::remove_file(&path).await {
                 return Err(CliError::failure(format!(
                     "failed to remove file '{}': {}",
-                    path.display(),
-                    e
+                    path_str, e
                 )));
             }
-        }
-        for path_str in remove_dir_list {
-            let path = PathBuf::from(&path_str);
-            if args.recursive {
-                if let Err(e) = fs::remove_dir_all(&path).await {
-                    return Err(CliError::failure(format!(
-                        "failed to remove directory '{}': {}",
-                        path.display(),
-                        e
-                    )));
-                }
-            } else if let Err(e) = fs::remove_dir(&path).await {
-                return Err(CliError::failure(format!(
-                    "failed to remove directory '{}': {}",
-                    path.display(),
-                    e
-                )));
-            }
+            util::clear_empty_dir(&path);
         }
     }
+    let directories = remove_dir_list
+        .iter()
+        .map(|path| RemoveDirectoryOutput {
+            path: path_to_string(path),
+            removed_from_disk: !args.cached && !args.dry_run && !workdir.join(path).exists(),
+        })
+        .collect();
 
     if index.save(&idx_file).is_err() {
         return Err(CliError::fatal("failed to save index"));
@@ -431,40 +414,23 @@ fn render_remove_output(result: &RemoveOutput, output: &OutputConfig) -> CliResu
     Ok(())
 }
 
-/// check if pathspec is all valid(in index)
-/// - if path is a dir, check if any file in the dir is in index
-fn validate_pathspec(
-    pathspec: &[String],
-    index: &Index,
-    ignore_unmatch: bool,
-) -> Result<(), GitError> {
-    if pathspec.is_empty() {
-        let error_msg = "No pathspec was given. Which files should I remove?".to_string();
-        return Err(GitError::CustomError(error_msg));
-    }
-    for path_str in pathspec.iter() {
-        let path = PathBuf::from(path_str);
-        let relative_path = path.to_workdir().to_string_or_panic();
-        if !index.tracked(&relative_path, 0) {
-            // not tracked, but path may be a directory
-            // check if any tracked file in the directory
-            if !index.contains_dir_file(&relative_path) && !ignore_unmatch {
-                let error_msg = format!("pathspec '{path_str}' did not match any files");
-                return Err(GitError::CustomError(error_msg));
-            }
-        }
-    }
-    Ok(())
+fn matched_directory_prefixes(pathspecs: &PathspecSet, workdir: &std::path::Path) -> Vec<PathBuf> {
+    pathspecs
+        .positive_prefixes()
+        .into_iter()
+        .filter(|path| workdir.join(path).is_dir())
+        .collect()
 }
 
-/// run after `validate_pathspec`
-fn get_dirs(pathspec: &[String]) -> Vec<String> {
-    let mut dirs = Vec::new();
-    for path_str in pathspec.iter() {
-        let path = PathBuf::from(path_str);
-        if path.exists() && path.is_dir() {
-            dirs.push(path_str.clone());
-        }
-    }
-    dirs
+fn plain_directory_prefixes_for_removal(
+    pathspecs: &PathspecSet,
+    workdir: &std::path::Path,
+) -> Vec<PathBuf> {
+    pathspecs
+        .plain_positive_prefixes()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| path != std::path::Path::new(".") && !path.as_os_str().is_empty())
+        .filter(|path| workdir.join(path).is_dir())
+        .collect()
 }

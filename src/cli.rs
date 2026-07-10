@@ -74,6 +74,11 @@ For per-command flags, see `libra <cmd> --help`.
 );
 
 const ERROR_CODES_HELP: &str = include_str!("../docs/error-codes.md");
+const CLOUD_GLOBAL_CONFIG_KEYS: &[&str] = &[
+    "LIBRA_D1_ACCOUNT_ID",
+    "LIBRA_D1_API_TOKEN",
+    "LIBRA_D1_DATABASE_ID",
+];
 
 /// Read the repository's `core.objectformat` and pin the global hash algorithm.
 ///
@@ -495,12 +500,12 @@ enum Commands {
     #[command(about = "Provide content, type or size info for repository objects")]
     CatFile(command::cat_file::CatFileArgs),
     #[command(
-        about = "Report pathnames excluded by .libraignore rules",
+        about = "Report pathnames excluded by Git/Libra ignore rules",
         after_help = command::check_ignore::CHECK_IGNORE_EXAMPLES
     )]
     CheckIgnore(command::check_ignore::CheckIgnoreArgs),
     #[command(
-        about = "Report .libra_attributes attributes for pathnames",
+        about = "Report Git/Libra attributes for pathnames",
         after_help = command::check_attr::CHECK_ATTR_EXAMPLES
     )]
     CheckAttr(command::check_attr::CheckAttrArgs),
@@ -1532,8 +1537,105 @@ fn apply_global_runtime_flags(args: &Cli) -> CliResult<()> {
     Ok(())
 }
 
+async fn enforce_global_config_schema_policy(command: &Commands) -> CliResult<()> {
+    let Some(future) = utils::client_storage::inspect_global_config_schema_future().await else {
+        return Ok(());
+    };
+
+    if utils::read_policy::read_policy() == utils::read_policy::ReadPolicy::LocalOnly {
+        utils::client_storage::emit_global_config_schema_future_warning(
+            &future,
+            "--offline or LIBRA_READ_POLICY=offline/local requested; ignoring global storage config and continuing with local storage",
+        );
+        return Ok(());
+    }
+
+    if command_requires_global_storage_config(command)
+        && command_may_read_global_config(command).await
+    {
+        return Err(global_config_schema_future_error(command, &future));
+    }
+
+    let action = if command_requires_global_storage_config(command) {
+        "process or repo-local configuration makes global storage config unnecessary; ignoring global config and continuing"
+    } else {
+        "command does not require global storage config; ignoring global config and continuing"
+    };
+    utils::client_storage::emit_global_config_schema_future_warning(&future, action);
+    Ok(())
+}
+
+async fn command_may_read_global_config(command: &Commands) -> bool {
+    let storage_may_read_global =
+        utils::client_storage::storage_config_resolution_may_read_global_config().await;
+    if matches!(command, Commands::Cloud(_)) {
+        storage_may_read_global
+            || utils::client_storage::env_resolution_may_read_global_config(
+                CLOUD_GLOBAL_CONFIG_KEYS,
+            )
+            .await
+    } else {
+        storage_may_read_global
+    }
+}
+
+fn command_requires_global_storage_config(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Pull(_)
+            | Commands::Push(_)
+            | Commands::Fetch(_)
+            | Commands::Clone(_)
+            | Commands::Cloud(_)
+    )
+}
+
+fn command_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Pull(_) => "pull",
+        Commands::Push(_) => "push",
+        Commands::Fetch(_) => "fetch",
+        Commands::Clone(_) => "clone",
+        Commands::Cloud(_) => "cloud",
+        _ => "command",
+    }
+}
+
+fn global_config_schema_future_error(
+    command: &Commands,
+    future: &utils::client_storage::GlobalConfigSchemaFuture,
+) -> CliError {
+    let command_name = command_name(command);
+    CliError::fatal(future.diagnostic_message(&format!(
+        "`libra {command_name}` requires global storage config to be trusted and was stopped before using local fallback"
+    )))
+    .with_stable_code(utils::error::StableErrorCode::ConfigSchemaFuture)
+    .with_hint(format!(
+        "install a newer Libra binary with: {}",
+        utils::client_storage::INSTALL_NEWER_LIBRA_COMMAND
+    ))
+    .with_hint("use --offline or LIBRA_READ_POLICY=offline/local only when local-only object access is intended")
+    .with_detail("command", command_name)
+    .with_detail(
+        "binary_path",
+        utils::client_storage::GlobalConfigSchemaFuture::binary_path_display(),
+    )
+    .with_detail("binary_version", env!("CARGO_PKG_VERSION"))
+    .with_detail("config_database", future.db_path.display().to_string())
+    .with_detail("config_schema_version", future.current_version)
+    .with_detail(
+        "latest_supported_schema_version",
+        future.latest_supported_display(),
+    )
+    .with_detail(
+        "install_command",
+        utils::client_storage::INSTALL_NEWER_LIBRA_COMMAND,
+    )
+}
+
 fn prepare_cli_invocation_state() {
     utils::output::reset_warning_tracker();
+    utils::client_storage::reset_global_config_schema_future_warning_for_invocation();
     // Pick up `LIBRA_SYNC_DATA` so atomic object writes fsync when requested
     // (lore.md §7.7; the `--sync-data` flag of §0.5 layers on top).
     utils::atomic_write::init_sync_data_from_env();
@@ -1642,6 +1744,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         },
     };
     apply_global_runtime_flags(&args)?;
+    enforce_global_config_schema_policy(&args.command).await?;
     if let Commands::Tag(tag_args) = &args.command {
         command::tag::validate_cli_args(tag_args)?;
     }

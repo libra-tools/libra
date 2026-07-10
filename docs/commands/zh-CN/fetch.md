@@ -16,6 +16,13 @@ libra fetch [OPTIONS] [<repository> [<refspec>]]
 
 Fetch 支持 SSH、HTTPS、本地文件和 `git://` 传输。配置了 `vault.ssh.<remote>.privkey` 时，会自动加载 vault-backed SSH 密钥。
 
+## 全局配置 Schema 保护
+
+`libra fetch` 在信任远端 / tiered 对象存储设置前，会读取全局存储配置（`~/.libra/config.db`，或 `LIBRA_CONFIG_GLOBAL_DB` 指定的路径）。如果该数据库的 schema 版本比当前二进制支持的版本更新，fetch 会以 `LBR-CONFIG-001` fail-closed，而不是静默忽略全局存储配置并回退到本地对象。诊断会包含二进制路径和版本、配置 DB 路径、schema 版本，以及升级命令：
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`。
+
+只有在明确希望本地对象访问时，才使用 `libra --offline fetch ...` 或 `LIBRA_READ_POLICY=offline|local libra fetch ...`。Libra 会告警一次，并在本次运行中忽略全局存储配置。
+
 ## 选项
 
 | 标志 / 参数 | 说明 | 示例 |
@@ -23,7 +30,7 @@ Fetch 支持 SSH、HTTPS、本地文件和 `git://` 传输。配置了 `vault.ss
 | `<repository>` | 要从中 fetch 的远程名称或 URL。省略时使用当前分支的 upstream 远程。 | `libra fetch origin` |
 | `<refspec>` | 要获取的分支名。需要 `<repository>`。省略时获取远程的所有分支。 | `libra fetch origin main` |
 | `-a`, `--all` | 从每个已配置远程获取。与 `<repository>` 冲突。 | `libra fetch --all` |
-| `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。公共稳定标志。 | `libra fetch origin --depth 1` |
+| `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。仅支持能声明 shallow boundary 的 Git 远程；本地 Libra 远程在补齐 shallow 元数据前会以 `LBR-REPO-002` fail-closed。 | `libra fetch origin --depth 1` |
 | `--json` | 向 stdout 输出结构化 JSON 信封（全局标志）。 | `libra --json fetch origin` |
 | `--machine` | 紧凑单行 JSON；抑制进度（全局标志）。 | `libra --machine fetch origin` |
 | `--progress none` | 在 JSON 模式下抑制 stderr 上的 NDJSON 进度事件。 | `libra --json fetch origin --progress none` |
@@ -44,6 +51,10 @@ libra fetch --all --depth 3                # 对所有远程进行 shallow fetch
 libra --json fetch origin
 libra --json fetch origin --progress none
 ```
+
+## 浅 fetch 完整性
+
+`--depth <N>` 只有在所选传输能返回 shallow boundary 元数据时才会执行。本地 Git 仓库和网络 Git 远程可以走该路径；本地 Libra 仓库当前不能声明 shallow boundary，因此 `libra fetch <本地 Libra 远程> --depth <N>` 会在下载对象或写入 `.libra/shallow` 前失败，并返回 `LBR-REPO-002`。该 fail-closed 行为避免 remote-tracking ref 指向缺父提交且没有 shallow 标记的对象闭包。
 
 ## 人类可读输出
 

@@ -149,6 +149,69 @@ fn agent_list_json_contains_capability_fields() {
     assert_eq!(gemini["installed"], false);
 }
 
+/// The `list --json` roster surface pins the A0-11 deferred-parity decision:
+/// exactly the first-batch trio is supported/launchable, and every
+/// non-first-batch agent (`gemini`/`cursor`/`copilot`/`factory-ai`) stays a
+/// fully-closed row — `supported`/`hook_installable`/`launchable_review`/
+/// `launchable_investigate`/`capabilities.hooks` all `false`. Keeps the docs'
+/// "deferred parity" roster claim honest against the registry.
+#[test]
+fn agent_roster_surface() {
+    let temp = tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    init_repo_via_cli(&repo);
+
+    let output = run_libra_command(&["agent", "list", "--json"], &repo);
+    assert!(output.status.success(), "agent list --json must succeed");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("list --json emits valid JSON");
+    let agents = envelope["data"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .clone();
+
+    // Supported roster is exactly the first batch — nothing more, nothing less.
+    let supported: Vec<&str> = agents
+        .iter()
+        .filter(|row| row["supported"] == true)
+        .map(|row| row["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        supported,
+        ["claude-code", "codex", "opencode"],
+        "supported roster must be the first-batch trio"
+    );
+
+    // Every deferred-parity agent is a fully-closed row.
+    for slug in ["gemini", "cursor", "copilot", "factory-ai"] {
+        let row = agents
+            .iter()
+            .find(|row| row["slug"] == slug)
+            .unwrap_or_else(|| panic!("registry must list {slug}"));
+        assert_eq!(row["supported"], false, "{slug} must stay unsupported");
+        assert_eq!(
+            row["hook_installable"], false,
+            "{slug} must not be hook-installable"
+        );
+        assert_eq!(
+            row["launchable_review"], false,
+            "{slug} must not be launchable for review"
+        );
+        assert_eq!(
+            row["launchable_investigate"], false,
+            "{slug} must not be launchable for investigate"
+        );
+        assert_eq!(
+            row["capabilities"]["hooks"], false,
+            "{slug} must not advertise the hooks capability"
+        );
+        assert!(
+            row["support_wave"].is_null(),
+            "{slug} carries no support wave"
+        );
+    }
+}
+
 /// Enabling anything outside the supported roster is an actionable error
 /// (nothing installed, non-zero exit); a supported agent without a landed
 /// HookProvider is an informational skip, not an error.

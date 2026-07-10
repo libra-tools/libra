@@ -14,14 +14,20 @@ libra add --refresh [PATHSPEC...]
 ## Description
 
 `libra add` stages file changes from the working tree into the index, preparing them
-for the next `libra commit`. It supports pathspecs, glob patterns, `--dry-run` preview,
-and `--refresh` to re-stat already tracked entries without staging new content.
+for the next `libra commit`. It supports shared Git-style pathspec matching,
+`--dry-run` preview, and `--refresh` to re-stat already tracked entries without
+staging new content.
 
 The command resolves pathspecs relative to the current working directory, validates them
-against the repository root, and respects `.libraignore` rules. Files tracked by LFS are
+against the repository root, and respects Git/Libra ignore sources. Files tracked by LFS are
 automatically staged as pointer files. The `-A` flag stages all changes (adds, modifies,
 removes) across the entire working tree, while `-u` updates only tracked files without
 adding new ones.
+
+Symbolic links are staged as Git-compatible symlink blobs: the index mode is
+`120000` and the blob content is the link target bytes. The link is never
+followed while staging, so a symlink pointing outside the worktree is recorded
+as the link itself rather than as the target file's contents.
 
 ## Options
 
@@ -30,10 +36,21 @@ adding new ones.
 One or more files or directories to stage. Paths are resolved relative to the current
 directory. Required unless `-A`, `-u`, or `--refresh` is specified.
 
+Pathspecs use Libra's shared Git-style matcher: plain pathspecs match a file or
+directory prefix, wildcard pathspecs are supported, and the high-value magic
+forms `:(top)`, `:/`, `:(glob)`, `:(literal)`, `:(icase)`,
+`:(exclude)`, `:!`, and `:^` are honored. Exclude pathspecs subtract from the
+positive selection, and pathspec matching follows `core.ignorecase` when enabled.
+Wildcard-looking pathspecs also match an exact path or directory prefix with
+the same literal text, matching Git's bracket-file and bracket-directory
+behavior.
+
 ```bash
 libra add file.txt
 libra add src/ tests/
 libra add .
+libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
+libra add ':(literal)literal/[abc].txt'
 ```
 
 ### `-A, --all`
@@ -69,7 +86,7 @@ libra add --refresh
 
 ### `-f, --force`
 
-Allow adding files that are otherwise ignored by `.libraignore`.
+Allow adding files that are otherwise ignored by Git/Libra ignore rules.
 
 ```bash
 libra add -f ignored_file.log
@@ -106,7 +123,8 @@ libra add --ignore-errors src/
 ### `--pathspec-from-file <file>`
 
 Read pathspecs from `<file>` (one per line) and merge them with any pathspecs given on
-the command line. Use `-` is not supported; pass a real path. Pair with
+the command line. Entries use the same shared pathspec matcher and magic forms as
+positional pathspecs. Use `-` is not supported; pass a real path. Pair with
 `--pathspec-file-nul` when the list is NUL-separated (e.g. produced by another tool's
 `-z` output). Empty lines are ignored.
 
@@ -146,9 +164,10 @@ libra add --renormalize src/
 
 ### `--ignore-missing`
 
-Under `--dry-run`, silently skip pathspecs that do not exist instead of failing (a
-warning is printed to stderr). Mirrors Git: `--ignore-missing` requires `--dry-run`,
-and a pathspec that exists but matches nothing is still an error.
+Under `--dry-run`, skip pathspecs that match no add candidate instead of failing
+(a warning is printed to stderr). Mirrors Git: `--ignore-missing` requires
+`--dry-run`. Pathspecs that only match ignored files are still reported as
+ignored-path warnings.
 
 ```bash
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt
@@ -164,6 +183,7 @@ libra add -n file.txt
 libra add --refresh
 libra add --ignore-errors src/
 libra add --pathspec-from-file paths.txt
+libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 libra add --chmod=+x scripts/build.sh
 libra add --renormalize
 ```
@@ -197,7 +217,8 @@ add 'src/lib.rs' (modified)
 Ignored files produce a warning on `stderr`:
 
 ```text
-warning: all specified paths are ignored by .libraignore
+warning: the following paths are ignored by configured ignore rules:
+ignored.log
 Hint: use '-f' to force staging of ignored files
 ```
 
@@ -271,7 +292,7 @@ Partial failure with `--ignore-errors`:
 
 - `added` / `modified` / `removed` correspond to new, changed, and deleted files staged
 - `refreshed` is populated only when `--refresh` is used
-- `ignored` lists paths skipped by `.libraignore`
+- `ignored` lists paths skipped by Git/Libra ignore rules
 - `failed` lists paths that failed to stage, each with `path` and `message`
 - `dry_run` is `true` when `-n` / `--dry-run` is passed; no files are actually staged
 
@@ -305,14 +326,19 @@ by clap argument groups). This makes the intent explicit: `--refresh` never stag
 content, only updates metadata. The mutual exclusivity prevents confusing combinations like
 `-A --refresh` where the user's intent would be ambiguous.
 
-### `.libraignore` instead of `.gitignore`
+### Ignore Source Precedence
 
-Libra uses `.libraignore` files for its ignore policy rather than `.gitignore`. This avoids
-conflicts when a Libra repository coexists with or is converted from a Git repository, and
-makes it clear which VCS owns the ignore rules. The ignore file format is compatible with
-Git's pattern syntax (globs, negation with `!`, directory-only patterns with trailing `/`).
-`libra init` creates a root `.libraignore` in non-bare repositories, and Git imports or
-non-bare clones copy existing `.gitignore` files to matching `.libraignore` files.
+Libra reads Git standard ignore files (`.gitignore`, `.git/info/exclude`, and
+`core.excludesFile`) plus Libra extension files (`.libraignore`). In the same
+directory, `.libraignore` has higher precedence than `.gitignore`; nearer
+directory sources override ancestors; `.git/info/exclude` and
+`core.excludesFile` are lower-precedence fallbacks. All sources use Git ignore
+pattern syntax.
+
+`libra init` still creates a root `.libraignore` in non-bare repositories for
+Libra-specific rules, and Git imports or non-bare clones may copy existing
+`.gitignore` files to matching `.libraignore` files for explicit Libra
+overrides.
 
 ## Parameter Comparison: Libra vs Git vs jj
 
@@ -332,7 +358,7 @@ non-bare clones copy existing `.gitignore` files to matching `.libraignore` file
 | Edit diff before staging | `git add -e` / `--edit` | N/A | N/A |
 | Chmod only | `git add --chmod=+x` | N/A | N/A |
 | Sparse checkout paths | `git add --sparse` | N/A | N/A |
-| Ignore file | `.gitignore` | N/A (jj uses `.gitignore`) | `.libraignore` |
+| Ignore file | `.gitignore` | N/A (jj uses `.gitignore`) | `.gitignore` + `.libraignore` |
 | Structured JSON output | N/A | N/A | `--json` / `--machine` |
 | Error hints | Minimal | N/A | Every error type has an actionable hint |
 
@@ -359,6 +385,6 @@ Every `AddError` variant maps to an explicit `StableErrorCode`.
 
 - jj does not have an `add` command; it automatically tracks all working tree changes
 - Libra's `add` is required before `commit`, matching Git's explicit staging model
-- `.libraignore` uses the same pattern syntax as `.gitignore` but is a separate file; imports
-  and non-bare clones copy `.gitignore` rules instead of deleting or renaming the originals
+- `.gitignore` and `.libraignore` both use Git ignore syntax; `.libraignore`
+  remains the Libra-specific override file when both exist in the same directory
 - LFS-tracked files are automatically converted to pointer files during staging

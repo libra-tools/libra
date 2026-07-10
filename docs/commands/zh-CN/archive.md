@@ -15,6 +15,10 @@ libra archive --list
 
 省略 `TREEISH` 时，命令归档 `HEAD`。默认格式是写到 stdout 的未压缩 tar 流。从交互式 shell 运行时，请使用 `--output <FILE>`，这样二进制归档字节会写入文件，而不是写到终端。若在 `TREEISH` 后提供 `PATH` 参数，则只归档该提交 tree 内匹配的文件或目录。
 
+如果某个路径被被归档 tree 内 `.gitattributes` 或 `.libra_attributes`
+文件中的 `export-ignore` 属性命中，该条目会从归档中省略。未提交的工作树
+attributes 修改不会影响对既有 `TREEISH` 的归档。`export-subst` 尚未实现。
+
 ## 选项
 
 | 标志 | 短参数 | 说明 | 默认值 |

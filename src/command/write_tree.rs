@@ -65,10 +65,7 @@ pub async fn execute_safe(args: WriteTreeArgs, output: &OutputConfig) -> CliResu
         })?
     };
 
-    let tree = tree_plumbing::write_tree_from_index(&index).map_err(|error| {
-        CliError::fatal(format!("failed to write tree from index: {error}"))
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
+    let tree = tree_plumbing::write_tree_from_index(&index).map_err(map_tree_plumbing_error)?;
 
     if output.is_json() {
         emit_json_data(
@@ -83,5 +80,24 @@ pub async fn execute_safe(args: WriteTreeArgs, output: &OutputConfig) -> CliResu
             println!("{tree}");
         }
         Ok(())
+    }
+}
+
+fn map_tree_plumbing_error(error: tree_plumbing::TreePlumbingError) -> CliError {
+    let message = format!("failed to write tree from index: {error}");
+    match error {
+        tree_plumbing::TreePlumbingError::MissingOrUnreadableObject { .. }
+        | tree_plumbing::TreePlumbingError::WrongObjectType { .. }
+        | tree_plumbing::TreePlumbingError::UnsupportedMode { .. }
+        | tree_plumbing::TreePlumbingError::NonUtf8Path(_) => CliError::fatal(message)
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint("run 'libra fsck' to inspect missing or mistyped index objects")
+            .with_hint("restore the object or remove the bad index entry before writing the tree"),
+        tree_plumbing::TreePlumbingError::Tree(_) => {
+            CliError::fatal(message).with_stable_code(StableErrorCode::RepoCorrupt)
+        }
+        tree_plumbing::TreePlumbingError::Storage(_) => CliError::fatal(message)
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+            .with_hint("check filesystem permissions and repository object storage writability"),
     }
 }

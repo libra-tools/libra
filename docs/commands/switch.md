@@ -20,7 +20,7 @@ libra switch [--guess | --no-guess] <branch>
 
 `libra switch` is the primary command for changing branches. It validates that the working tree is clean before switching, updates HEAD and the index, and restores the working tree to match the target commit. Unlike `libra checkout`, which exists as a Git-compatibility surface, `switch` is the recommended command for branch operations.
 
-The command supports multiple modes: switching to an existing local branch (default), creating a new branch with `-c`, force-creating or resetting a branch with `-C`, creating an orphan branch with `--orphan`, detaching HEAD with `-d`, and tracking a remote branch with `--track`. When the target branch is already the current branch, the command is a no-op and skips the cleanliness check entirely.
+The command supports multiple modes: switching to an existing local branch (default), creating a new branch with `-c`, force-creating or resetting a branch with `-C`, creating an unborn orphan branch with `--orphan`, detaching HEAD with `-d`, and tracking a remote branch with `--track`. When the target branch is already the current branch, the command is a no-op and skips the cleanliness check entirely.
 
 Fuzzy branch name suggestions are provided via Levenshtein distance when a branch is not found, helping catch typos without requiring exact matches.
 
@@ -31,7 +31,7 @@ Fuzzy branch name suggestions are provided via Levenshtein distance when a branc
 | | `<branch>` | positional (optional) | Target local branch to switch to, or a commit/tag/branch when used with `--detach` |
 | `-c` | `--create` | `<name>` | Create a new branch and switch to it |
 | `-C` | `--force-create` | `<name>` | Create a new branch or reset an existing one and switch to it |
-| | `--orphan` | `<name>` | Create a new orphan branch with no parents and switch to it |
+| | `--orphan` | `<name>` | Create a new unborn orphan branch with no parents and switch to it |
 | `-d` | `--detach` | | Detach HEAD at the given commit, tag, or branch |
 | | `--track` | | Create a local branch tracking the given remote branch and switch to it |
 | | `--guess` | | Auto-create a tracking branch when `<branch>` uniquely matches one remote (default; DWIM) |
@@ -55,10 +55,12 @@ libra switch -C feature-x              # Reset feature-x to HEAD and switch
 libra switch -C fix-123 abc1234        # Reset fix-123 to specific commit
 ```
 
-**`--orphan <name>`**: Creates a new branch with no parent history and an empty root tree, then switches to it. The working tree is restored to the empty tree state. If the branch already exists it is deleted first (except when it is the current branch).
+After `-c` or `-C` succeeds, `HEAD` remains a symbolic reference to the created/reset branch (`refs/heads/<name>`), including when a start-point was provided.
+
+**`--orphan <name>`**: Creates an unborn branch with no parent history, then switches `HEAD` to `refs/heads/<name>` without creating a branch ref yet. The index and working tree are preserved from the previous branch, so the first user commit on the orphan branch records the retained index as a root commit with no parents. The working tree must be clean before the switch, and an existing branch name is rejected fail-closed.
 
 ```bash
-libra switch --orphan fresh-start      # New branch with no history
+libra switch --orphan fresh-start      # Unborn branch; first commit has no parents
 ```
 
 **`-d / --detach`**: Moves HEAD to point directly at a commit rather than a branch. Useful for inspecting historical states or building from tags.
@@ -89,7 +91,7 @@ libra switch main                      # Switch to an existing branch
 libra switch -c feature-x              # Create and switch to a new branch
 libra switch -c fix-123 abc1234        # Create branch from specific commit
 libra switch -C feature-x              # Reset branch to HEAD and switch
-libra switch --orphan fresh-start      # Create branch with no history
+libra switch --orphan fresh-start      # Create unborn branch; first commit has no parents
 libra switch --detach v1.0             # Detach HEAD at a tag
 libra switch --track origin/main       # Track and switch to remote branch
 libra switch feature                   # Auto-create a tracking branch from a unique remote (guess)
@@ -148,6 +150,7 @@ Switch to an existing branch:
     "commit": "def5678abc1234901234567890abcdef12345678",
     "created": false,
     "detached": false,
+    "unborn": false,
     "already_on": false,
     "tracking": null
   }
@@ -167,6 +170,27 @@ Create and switch to a new branch:
     "commit": "abc1234def5678901234567890abcdef12345678",
     "created": true,
     "detached": false,
+    "unborn": false,
+    "already_on": false,
+    "tracking": null
+  }
+}
+```
+
+Create an unborn orphan branch:
+
+```json
+{
+  "ok": true,
+  "command": "switch",
+  "data": {
+    "previous_branch": "main",
+    "previous_commit": "abc1234def5678901234567890abcdef12345678",
+    "branch": "fresh-start",
+    "commit": "0000000000000000000000000000000000000000",
+    "created": true,
+    "detached": false,
+    "unborn": true,
     "already_on": false,
     "tracking": null
   }
@@ -186,6 +210,7 @@ Detach HEAD at a tag or commit:
     "commit": "def5678abc1234901234567890abcdef12345678",
     "created": false,
     "detached": true,
+    "unborn": false,
     "already_on": false,
     "tracking": null
   }
@@ -205,6 +230,7 @@ Track and switch to a remote branch:
     "commit": "def5678abc1234901234567890abcdef12345678",
     "created": true,
     "detached": false,
+    "unborn": false,
     "already_on": false,
     "tracking": {
       "remote": "origin",
@@ -218,9 +244,10 @@ Track and switch to a remote branch:
 
 - `previous_branch` is `null` when HEAD was detached before the switch
 - `branch` is `null` when HEAD is now detached (`--detach`)
+- `unborn` is `true` only after `--orphan`; `commit` is the all-zero OID until the first user commit creates the branch ref
 - `already_on` is `true` when the target branch equals the current branch (no-op)
 - `tracking` is present with `--track` or a successful guess, containing `remote` and `remote_branch`
-- `created` is `true` when `--create`, `--track`, or a guess created a new local branch
+- `created` is `true` when `--create`, `--force-create`, `--track`, or a guess created or reset a local branch
 
 ## Design Rationale
 

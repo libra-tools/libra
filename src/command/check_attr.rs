@@ -1,12 +1,10 @@
 //! `libra check-attr` — report Libra attributes for pathnames, the analogue of
 //! `git check-attr` adapted to Libra's attribute model.
 //!
-//! Libra's attributes live in `.libra_attributes` and currently express a single
-//! meaningful attribute: `filter` (value `lfs` for an LFS-tracked path). This is
-//! an **intentional difference** from Git (see `_compatibility.md` D5): Libra
-//! does not implement the Git `.gitattributes` smudge/clean filter bridge, so
-//! `check-attr` is a read-only query over `.libra_attributes`, not a filter
-//! driver.
+//! Libra reads Git attributes sources plus `.libra_attributes` extension files
+//! and reports them without running filters. This preserves the D5 intentional
+//! difference: Libra does not implement the Git `.gitattributes` smudge/clean
+//! filter bridge, so `check-attr` is a read-only query, not a filter driver.
 //!
 //! Exit codes: `0` on success (even when every queried attribute is
 //! `unspecified`), `128` on a usage/repository error.
@@ -20,16 +18,12 @@ use clap::Parser;
 use serde::Serialize;
 
 use crate::utils::{
+    attributes::{self, AttributeState},
     error::{CliError, CliResult, StableErrorCode},
-    lfs,
     output::{OutputConfig, emit_json_data},
     util,
 };
 
-/// The one attribute Libra's `.libra_attributes` expresses today.
-const FILTER_ATTR: &str = "filter";
-/// The value reported for an LFS-tracked path's `filter` attribute.
-const FILTER_LFS_VALUE: &str = "lfs";
 /// Git's value for an attribute that is not set on a path.
 const UNSPECIFIED: &str = "unspecified";
 
@@ -49,7 +43,7 @@ EXAMPLES:
     libra check-attr -z filter --stdin    NUL-delimited stdin input and output
     libra check-attr --json filter a.bin  Structured JSON output for agents";
 
-/// Report `.libra_attributes` attributes for the given pathnames.
+/// Report Git/Libra attributes for the given pathnames.
 #[derive(Parser, Debug)]
 #[command(after_help = CHECK_ATTR_EXAMPLES)]
 pub struct CheckAttrArgs {
@@ -150,22 +144,24 @@ pub async fn execute_safe(args: CheckAttrArgs, output: &OutputConfig) -> CliResu
     let workdir = util::working_dir();
     let mut results = Vec::new();
     for path_str in &paths {
-        let tracked = is_lfs_tracked_for(path_str, &workdir);
+        let absolute = resolve_workdir_path(path_str, &workdir);
         if args.all {
             // Report only the attributes that are actually set.
-            if tracked {
-                results.push(CheckAttrEntry {
-                    path: path_str.clone(),
-                    attr: FILTER_ATTR.to_string(),
-                    value: FILTER_LFS_VALUE.to_string(),
-                });
+            for (attr, state) in attributes::all_attribute_states_for_path(&absolute) {
+                if let Some(value) = state.check_attr_value() {
+                    results.push(CheckAttrEntry {
+                        path: path_str.clone(),
+                        attr,
+                        value,
+                    });
+                }
             }
         } else {
             for attr in &attr_names {
                 results.push(CheckAttrEntry {
                     path: path_str.clone(),
                     attr: attr.clone(),
-                    value: attribute_value(attr, tracked),
+                    value: attribute_value(attr, &absolute),
                 });
             }
         }
@@ -174,34 +170,24 @@ pub async fn execute_safe(args: CheckAttrArgs, output: &OutputConfig) -> CliResu
     render(&args, &results, output)
 }
 
-/// The value of `attr` for a path whose LFS-tracked status is `tracked`. Only
-/// `filter` is expressed by `.libra_attributes`; every other name is
-/// `unspecified`.
-fn attribute_value(attr: &str, tracked: bool) -> String {
-    if attr == FILTER_ATTR && tracked {
-        FILTER_LFS_VALUE.to_string()
-    } else {
-        UNSPECIFIED.to_string()
-    }
+/// The value of `attr` for a path. `None` / `!attr` reports Git's
+/// `unspecified`; bare attrs report `set`; `-attr` reports `unset`; valued attrs
+/// report their value.
+fn attribute_value(attr: &str, absolute: &Path) -> String {
+    attributes::attribute_state_for_path(attr, absolute)
+        .and_then(|state| match state {
+            AttributeState::Unspecified => None,
+            other => other.check_attr_value(),
+        })
+        .unwrap_or_else(|| UNSPECIFIED.to_string())
 }
 
-/// Whether `path_str` is LFS-tracked. The path is resolved against the worktree
-/// root and then guarded with the panic-safe [`util::is_sub_path`]: a path that
-/// does not lie inside the worktree cannot match a repository attribute and is
-/// reported as not-tracked (so the attribute is `unspecified`). The guard is
-/// also necessary for safety — `is_lfs_tracked` relativises via
-/// `util::to_workdir_path`, whose `pathdiff` relativization panics when given a
-/// path it cannot express relative to the worktree.
-fn is_lfs_tracked_for(path_str: &str, workdir: &Path) -> bool {
-    let absolute = if Path::new(path_str).is_absolute() {
+fn resolve_workdir_path(path_str: &str, workdir: &Path) -> PathBuf {
+    if Path::new(path_str).is_absolute() {
         PathBuf::from(path_str)
     } else {
         workdir.join(path_str)
-    };
-    if !util::is_sub_path(&absolute, workdir) {
-        return false;
     }
-    lfs::is_lfs_tracked(&absolute)
 }
 
 /// Read pathnames from stdin, split on NUL when `null` is set, else newlines.

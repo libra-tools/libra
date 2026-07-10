@@ -275,7 +275,7 @@ scenarios:
   - id: cli.grep-blame-describe-shortlog
     wave: 1
     group: inspection
-    purpose: "Cover inspection commands: grep (-F/-i/-n/-c/-l/-L/-e/-f/pathspec/--tree/--cached), blame (-L and explicit commit), describe (--tags/--always/--abbrev/--exact-match/--long/--dirty), shortlog (-s/-n/-e/revision), plus negative checks for unsupported grep -z/--untracked, blame --porcelain, describe --exact-match after HEAD moves past a tag, and shortlog extended flags."
+    purpose: "Cover inspection commands: grep (-F/-i/-n/-c/-l/-L/-e/-f/pathspec/--tree/--cached/-z/--untracked plus 0/1/2 exit behavior), blame (-L and explicit commit), describe (--tags/--always/--abbrev/--exact-match/--long/--dirty), shortlog (-s/-n/-e/revision), plus negative checks for grep no-match/command errors, blame failures, describe --exact-match after HEAD moves past a tag, and shortlog extended flags."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, negative_exit]

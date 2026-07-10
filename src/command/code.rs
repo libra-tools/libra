@@ -828,9 +828,13 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
             let session_state =
                 load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
-            // Phase 3 v0 routes the supported providers through the new
-            // headless runtime. Anything not yet hooked up keeps the read-only
-            // placeholder so we fail closed rather than panicking on attach.
+            // All accepted non-Codex web-only providers now route through the
+            // headless runtime (C2 relaxed the web-only provider gate).
+            // Construction errors propagate via `?`; the read-only placeholder
+            // below is only the `Ok(None)` (not-wired) fallback — reached when
+            // the builder declines a provider (today only `Codex`, which is
+            // routed away before this branch), so it is defensive fail-closed
+            // code rather than a live path.
             match build_non_codex_headless_runtime(
                 args,
                 &working_dir,
@@ -2278,7 +2282,7 @@ async fn build_placeholder_web_code_ui_runtime(
         kind: CodeUiTranscriptEntryKind::InfoNote,
         title: Some("Web Control Unavailable".to_string()),
         content: Some(
-            "Interactive browser control is fully implemented for `--provider codex`. For other providers, launch `libra code` without `--web-only` to observe the live terminal session in the browser."
+            "The interactive web runtime for this provider could not be started; showing a read-only view. Retry, or launch `libra code` without `--web-only` to drive the live terminal session directly."
                 .to_string(),
         ),
         status: Some("completed".to_string()),

@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra revert` 的目标是生成抵消已有提交的反向变更，并保留冲突处理和提交控制的清晰边界。当前实现支持单父提交的反向变更、merge commit mainline revert（`-m/--mainline`）、no-commit 流程、`--continue`/`--abort` 冲突恢复和稳定错误输出，`--skip` 与多提交冲突的自动续作（剩余提交队列）也已实现，仅自定义策略（strategy）列为未完成。
+`libra revert` 的目标是生成抵消已有提交的反向变更，并保留冲突处理和提交控制的清晰边界。当前实现支持单父提交的反向变更、merge commit mainline revert（`-m/--mainline`）、no-commit 流程、`--continue`/`--abort` 冲突恢复和稳定错误输出，`--skip` 与多提交冲突的自动续作（剩余提交队列）也已实现。自动创建的 revert commit 使用当前 author/committer 身份（含 `GIT_AUTHOR_*`/`GIT_COMMITTER_*` 日期覆盖），默认消息从被 revert 提交的去签名正文中取 subject，避免从 `gpgsig` 块派生错误标题。仅自定义策略（strategy）列为未完成。
 
 ## 对比 Git 与兼容性
 
@@ -59,6 +59,7 @@ flowchart TD
 | ✅ 已实现 | 编辑消息 `-e`/`--edit` | 见上方 `-e`/`--edit` 与 `--no-edit` 行：在生成消息上打开编辑器（opt-in，与 git 默认不同）。 |
 | ✅ 已实现 | Skip 当前 commit | `--skip`：`run_revert_skip` 经 `restore_to_orig_head` 丢弃当前冲突提交后用 `revert_sequence` 续作 `RevertState.remaining`；剩余为空时清理 state 不建提交。与 `--continue`/`--abort` 互斥。带回归测试 `test_revert_skip_continues_with_remaining` / `test_revert_skip_with_nothing_remaining`。 |
 | ✅ 已实现 | 多提交冲突自动续作 | 冲突时把剩余提交队列存入 `RevertState.remaining`；`--continue`/`--skip` 经共享 `revert_sequence` 自动续作其余提交（此前剩余提交会被静默丢弃）。带回归测试 `test_revert_continue_drains_remaining_commits`。 |
+| ✅ 已实现 | P0-08 identity/subject 保真 | `create_revert_commit` / `create_empty_revert_commit` 不再使用 `Commit::from_tree_id` 的固定 `mega <admin@mega.org>` 身份，而是走 `commit::create_commit_signatures(None, None)`；`build_revert_message` 使用 `parse_commit_msg` 后的首行作为 `Revert "<subject>"`。带 compat 测试 `compat_sequencer_message_author::revert_uses_current_identity_and_strips_signed_subject`。 |
 | 兼容差异项 | 策略 | 原始对照：--strategy <s>；相关参数/替代：不适用；当前说明：不支持。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
 
 ## 维护要求

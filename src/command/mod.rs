@@ -111,6 +111,7 @@ mod show_ref_render;
 pub mod sparse_view;
 pub mod symbolic_ref;
 pub mod tag;
+pub(crate) mod unmerged;
 pub mod update_index;
 pub mod update_ref;
 pub mod usage;
@@ -137,7 +138,7 @@ pub mod web_assets;
 pub mod write_tree;
 
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, Read, Write},
     path::Path,
 };
@@ -261,12 +262,49 @@ pub fn ask_basic_auth() -> BasicAuth {
 /// Calculate the hash of a file blob
 /// - for `lfs` file: calculate hash of the pointer data
 pub fn calc_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {
-    if utils::lfs::is_lfs_tracked(&path) {
-        let (pointer, _) = utils::lfs::generate_pointer_file(&path);
+    let path = path.as_ref();
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Ok(Blob::from_content_bytes(read_symlink_blob_bytes(path)?).id);
+    }
+    if utils::lfs::is_lfs_tracked(path) {
+        let (pointer, _) = utils::lfs::generate_pointer_file(path);
         return Ok(Blob::from_content(&pointer).id);
     }
 
     stream_file_blob_hash(path)
+}
+
+/// Read the bytes Git would store for a worktree path's blob.
+///
+/// Regular files use their file content (or the generated LFS pointer when the
+/// path is LFS-tracked). Symlinks use the link target bytes and are never
+/// followed.
+pub fn read_worktree_blob_bytes(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    let path = path.as_ref();
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return read_symlink_blob_bytes(path);
+    }
+    if utils::lfs::is_lfs_tracked(path) {
+        let (pointer, _) = utils::lfs::generate_pointer_file(path);
+        return Ok(pointer.into_bytes());
+    }
+    fs::read(path)
+}
+
+fn read_symlink_blob_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    Ok(symlink_target_blob_bytes(&fs::read_link(path)?))
+}
+
+#[cfg(unix)]
+pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    target.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
+    target.to_string_lossy().as_bytes().to_vec()
 }
 
 fn stream_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {

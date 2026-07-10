@@ -32,6 +32,7 @@ libra rev-parse [OPTIONS] [SPEC]...
 | `--revs-only` | 输出过滤模式：仅打印解析为 revision 的参数（以对象名输出），丢弃 flag 与非 revision 的 path。 |
 | `--no-revs` | 输出过滤模式：丢弃 revision 参数，保留 flag 与非 revision 的 path。 |
 | `--show-toplevel` | 打印顶层工作树的绝对路径。 |
+| `--is-shallow-repository` | 当 `.libra/shallow` 至少包含一个 shallow boundary 时打印 `true`，否则打印 `false`。 |
 | `--git-dir` | 打印 `.libra` 目录路径（Libra 的 `$GIT_DIR`）；在 Libra 中始终为绝对路径。 |
 | `--absolute-git-dir` | 同 `--git-dir`，但始终为规范化后的绝对路径。（Libra 中 `--git-dir` 已是绝对路径，故两者一致。） |
 | `<SPEC>...` | 要解析的修订（可多个）。省略时默认为 `HEAD`；多个时各自解析。 |
@@ -44,6 +45,7 @@ libra rev-parse HEAD~1
 libra rev-parse --short HEAD
 libra rev-parse --abbrev-ref HEAD
 libra rev-parse --show-toplevel
+libra rev-parse --is-shallow-repository
 libra rev-parse --absolute-git-dir
 libra --json rev-parse --short HEAD
 ```

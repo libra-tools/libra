@@ -39,6 +39,8 @@ flowchart TD
 - 2026-06-06 `1593a844`（`feat(show): add --name-status diff display mode`）：新增 `--name-status`（字段 `name_status`），按 `A`/`M`/`D` 状态字母 + tab + 文件名输出。该提交曾在一次 reconcile 中从工作树丢失，已于 2026-06-18 依据原提交 diff 恢复（含两条端到端测试与文档）。
 - 2026-05-15 `aaf16f28`（`feat(show): route human output through pager`）：功能演进：route human output through pager；该节点扩展了当前命令可用的参数或行为。
 - 2026-06-07 `5a5e5fcb`（`fix(show): summarize large and binary blobs`）：实现修正：summarize large and binary blobs；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
+- 2026-07-09（plan-20260708 P0-06）：stdout 下游提前关闭时经全局入口与 `Pager` 输出层静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
+- 2026-07-09（plan-20260708 P1-04）：`show --pretty/--format` 复用扩展后的 `CommitFormatter`，获得 `%b`/`%B`/`%n`/ASCII/control `%xNN`/`%%`/`%aI`/`%cI`/`%at`/`%ct`/`%D`/`%m`/color placeholders；`show -s --format=<tmpl>` 与 Git 逐字节对齐的用例纳入 `compat_pretty_format_placeholders`，`%C...` 颜色占位符按全局 `--color` 策略输出。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
@@ -46,7 +48,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/show.md`。
 - Synopsis：`libra show [OPTIONS] [OBJECT] [PATHS]...`。
-- 公开参数/子命令包括：`[OBJECT]`、`-s, --no-patch`、`--oneline`、`--pretty <FORMAT>`、`--format <FORMAT>`、`--abbrev-commit`、`--no-abbrev-commit`、`--name-only`、`--name-status`、`--stat`、`--patch-with-stat`（先发 `show_diffstat` 的 diffstat 块、空行、再发默认 patch；置于输出分支链首位，受 `-s`/`--no-patch` 抑制；复用既有 `--stat` 与默认 patch 渲染，与 `show --stat` 的 diffstat 逐字一致）、`--summary`（创建/删除文件的 mode 摘要，复用 `generate_diff` 输出解析，等同 `diff --summary` 子集）、`--no-expand-tabs`/`--no-notes`/`--no-mailmap`/`--no-show-signature`（接受式 no-op：Libra 的 show 从不展开 tab、从不内联显示 notes、从不应用 mailmap、从不内联显示提交签名；四个字段解析后不被读取。Git 的反向 `--expand-tabs`/`--notes`/`--mailmap`/`--show-signature` 未实现）、`[PATHS]...`。`--pretty=<fmt>`/`--format=<fmt>` 经 `parse_pretty_format` + `CommitFormatter` 渲染 commit header（abbrev=7），随后照常输出 diff（`-s` 时仅输出 header）；`--abbrev-commit` 把默认 header 的 `commit <hash>` 缩写为 7 位，`--no-abbrev-commit`（经 clap `overrides_with` 与 `--abbrev-commit` 互为最后一个生效；读 `abbrev_commit` 字段，`no_abbrev_commit` 不直接读取）显示完整（未缩写）哈希，完整哈希为默认故单独为 no-op。
+- 公开参数/子命令包括：`[OBJECT]`、`-s, --no-patch`、`--oneline`、`--pretty <FORMAT>`、`--format <FORMAT>`、`--abbrev-commit`、`--no-abbrev-commit`、`--name-only`、`--name-status`、`--stat`、`--patch-with-stat`（先发 `show_diffstat` 的 diffstat 块、空行、再发默认 patch；置于输出分支链首位，受 `-s`/`--no-patch` 抑制；复用既有 `--stat` 与默认 patch 渲染，与 `show --stat` 的 diffstat 逐字一致）、`--summary`（创建/删除文件的 mode 摘要，复用 `generate_diff` 输出解析，等同 `diff --summary` 子集）、`--no-expand-tabs`/`--no-notes`/`--no-mailmap`/`--no-show-signature`（接受式 no-op：Libra 的 show 从不展开 tab、从不内联显示 notes、从不应用 mailmap、从不内联显示提交签名；四个字段解析后不被读取。Git 的反向 `--expand-tabs`/`--notes`/`--mailmap`/`--show-signature` 未实现）、`[PATHS]...`。`--pretty=<fmt>`/`--format=<fmt>` 经 `parse_pretty_format` + `CommitFormatter` 渲染 commit header（abbrev=7），支持与 `libra log --format` 同源的自定义占位符（含 `%b`/`%B`/`%n`/ASCII/control `%xNN`/`%%`/`%aI`/`%cI`/`%at`/`%ct`/`%D`/`%m`/color）；随后照常输出 diff（`-s` 时仅输出 header）。`--abbrev-commit` 把默认 header 的 `commit <hash>` 缩写为 7 位，`--no-abbrev-commit`（经 clap `overrides_with` 与 `--abbrev-commit` 互为最后一个生效；读 `abbrev_commit` 字段，`no_abbrev_commit` 不直接读取）显示完整（未缩写）哈希，完整哈希为默认故单独为 no-op。
 
 
 ## 还未实现的功能

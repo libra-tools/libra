@@ -411,7 +411,7 @@ fn ls_files_error_unmatch_fails_for_missing_pathspec() {
     let repo = setup_ls_files_repo();
 
     let output = run_libra_command(&["ls-files", "--error-unmatch", "missing.txt"], repo.path());
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(1));
 
     let (_, report) = parse_cli_error_stderr(&output.stderr);
     assert_eq!(report.error_code, "LBR-CLI-003");
@@ -433,7 +433,7 @@ fn ls_files_error_unmatch_fails_when_any_pathspec_is_missing() {
         &["ls-files", "--error-unmatch", "tracked.txt", "missing.txt"],
         repo.path(),
     );
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(1));
 
     let (_, report) = parse_cli_error_stderr(&output.stderr);
     assert_eq!(report.error_code, "LBR-CLI-003");

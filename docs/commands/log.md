@@ -21,6 +21,9 @@ Human mode preserves the current `--oneline`, `--graph`, `--pretty`, `--stat`, `
 related output styles. `--quiet` suppresses human output but still validates the requested
 history range.
 
+When stdout is piped and the downstream command exits early, `libra log` exits quietly without
+printing panic/backtrace or `Broken pipe` diagnostics.
+
 ## Options
 
 ### `-n, --number <N>`
@@ -87,6 +90,18 @@ subject/body blank line is collapsed), so they match Git's preset *structure*
 rather than being byte-identical. `libra show --pretty=<preset>` uses the same
 formats.
 
+Custom templates support `%H` / `%h` (full / abbreviated commit hash), `%P` /
+`%p` (full / abbreviated parent hashes), `%s` / `%f` (subject / sanitized
+subject), `%b` / `%B` (body / raw subject+body), `%n`, ASCII/control `%xNN`, `%%`, `%an` / `%ae` /
+`%ad` / `%aI` / `%at` (author), `%cn` / `%ce` / `%cd` / `%cI` / `%ct`
+(committer), `%d` / `%D` (decorations), `%m`, and common color placeholders
+such as `%Cred`, `%C(red)`, `%C(always,red)`, and `%Creset`. Unknown
+placeholders stay literal, matching Git's pretty-format behavior.
+Color reset follows Git's color policy: `%C(always,...)` can force an ANSI
+escape even when ordinary colors are disabled, while `%Creset` resets only when
+color output is enabled; use `%C(always,reset)` when a forced-color template
+also needs a forced reset.
+
 ```bash
 libra log --pretty=short
 libra log --pretty=fuller
@@ -118,6 +133,16 @@ Show names and status (added/modified/deleted) of changed files for each commit.
 ```bash
 libra log --name-status
 libra log --name-status -- src/
+```
+
+### `-z, --null`
+
+Use NUL separators for log records and changed-path output. With `--name-only`
+or `--name-status`, the formatted commit text is terminated by `NUL`, the path
+section is separated like Git, and each path/status field is NUL-terminated.
+
+```bash
+libra log -z --name-status --format=%s
 ```
 
 ### `--stat`
@@ -217,12 +242,14 @@ libra log --until 2026-03-01
 
 ### `--pretty <FORMAT>`
 
-Custom pretty-print format string. Supports placeholders like `%h` (short hash), `%s`
-(subject), `%an` (author name), `%ae` (author email), `%ad` (author date), etc.
+Custom pretty-print format string. Supports the same placeholder set described
+above, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, strict ISO dates `%aI` / `%cI`, raw
+timestamps `%at` / `%ct`, raw decorations `%D`, `%m`, and color placeholders.
 
 ```bash
 libra log --pretty="%h - %s (%an)"
 libra log --pretty="format:%H %s"
+libra log --pretty=%P -1
 ```
 
 ### `--format <FORMAT>`
@@ -580,6 +607,7 @@ flag only affects the human rendering layer.
 | Show patch | `git log -p` | `jj diff -r <rev>` (separate cmd) | `libra log -p` / `--patch` |
 | Name only | `git log --name-only` | N/A | `libra log --name-only` |
 | Name and status | `git log --name-status` | N/A | `libra log --name-status` |
+| NUL path output | `git log -z --name-status` | N/A | `libra log -z --name-status` |
 | Diffstat | `git log --stat` | `jj diff --stat -r <rev>` | `libra log --stat` |
 | Short diffstat | `git log --shortstat` | N/A | `libra log --shortstat` |
 | Filter by author | `git log --author=<pat>` | `jj log --author <pat>` (revset) | `libra log --author <pat>` |

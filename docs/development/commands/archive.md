@@ -13,7 +13,7 @@
 
 - 入口与分发：`src/cli.rs::Commands::Archive` 公开顶层 CLI，`src/command/mod.rs` 导出 `archive` 模块；CLI 层在 `src/cli.rs` 把解析后的参数交给 `command::archive::execute_safe`，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/archive.rs`。参数/子命令类型包括：`ArchiveArgs`；输出、错误或状态类型包括：源码未暴露独立输出/错误类型，错误通过 `CliResult` 或上层命令错误统一传播；主要执行函数包括：`execute_safe`。
-- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；核心流程解析 `TREEISH`、读取 commit/tree/blob 对象、遍历 tree 条目，并把归档内容写到 stdout 或 `--output` 指定文件。
+- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；核心流程解析 `TREEISH`、读取 commit/tree/blob 对象、遍历 tree 条目，从被归档 tree 内的 `.gitattributes` / `.libra_attributes` blob 构造 `export-ignore` 匹配器，并把归档内容写到 stdout 或 `--output` 指定文件。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
@@ -27,7 +27,7 @@ flowchart TD
     E --> G["副作用边界<br/>只写归档输出流/文件"]
 ```
 
-- 底层操作对象：`Blob`（`load_blob_content` 读取 `blob.data` 并原样写入归档，不识别或解引用 LFS pointer，LFS pointer blob 按原始字节写入）；`Commit`（提交对象，仅读取 `commit.tree_id`，不读取父提交关系或提交消息载荷）；`TreeItem` / `TreeItemMode`（tree 中的路径项和 mode）；`Tree`（`resolve_entries` 仅通过 `load_object::<Tree>(&commit.tree_id)` 从对象库加载，不访问索引）；`ObjectHash`（SHA-1/SHA-256 对象 ID 和 revision 解析结果）
+- 底层操作对象：`Blob`（`load_blob_content` 读取 `blob.data` 并原样写入归档，不识别或解引用 LFS pointer，LFS pointer blob 按原始字节写入）；`Commit`（提交对象，仅读取 `commit.tree_id`，不读取父提交关系或提交消息载荷）；`TreeItem` / `TreeItemMode`（tree 中的路径项和 mode）；`Tree`（`resolve_entries` 仅通过 `load_object::<Tree>(&commit.tree_id)` 从对象库加载，不访问索引）；tree 内 attributes blob（仅用于 `export-ignore` 过滤，默认不读取未提交工作树 attributes）；`ObjectHash`（SHA-1/SHA-256 对象 ID 和 revision 解析结果）
 - 输出与错误契约：`execute_safe` 把二进制归档写入 `-o`/stdout；签名中接收 `_output: &OutputConfig`（前导下划线表示有意未使用），不读取该参数，也没有 `--json` / `--machine` 分支或 `emit_json_data` 调用。`-v`/`--verbose` 是唯一的进度分支：把每个归档路径打印到 stderr（不影响 stdout 的归档字节）。失败通过 `CliError` / `CliResult` 传播，并已经携带多种稳定错误码：`CliInvalidArguments`（`LBR-CLI-002`，格式或前缀非法）、`CliInvalidTarget`（`LBR-CLI-003`，treeish 无法解析或空树）、`RepoCorrupt`（`LBR-REPO-002`，commit/tree 对象或不安全条目名不可读）、`IoReadFailed`（`LBR-IO-001`，blob 读取失败）、`IoWriteFailed`（`LBR-IO-002`，归档写出/落盘失败）；新增失败模式要补稳定错误码、用户提示和回归测试。
 - 副作用边界：该命令不应修改索引、对象库、refs/HEAD 或 reflog；唯一写入面是归档输出流/文件，发布前需要继续验证二进制输出不会误写终端或覆盖非预期路径。
 
@@ -54,7 +54,8 @@ flowchart TD
 | ✅ 已实现 | `-v` / `--verbose`（向 stderr 报告进度） | 已实现：在 `execute_safe` 写归档前，按归档条目顺序把每个（应用 `--prefix` 后的）路径打印到 stderr，对齐 `git archive -v`；归档字节仍走 `-o`/stdout，verbose 不污染 stdout。带集成测试（`test_archive_verbose_lists_paths_on_stderr`）。 |
 | ✅ 已实现 | `--mtime <time>` + 缺省 mtime=committer 时间 | 此前所有条目 mtime 硬编码为 `0`（epoch，归档显示 1970/zip 1980）——**与 Git 不符的 bug**。现 `resolve_entries` 返回归档 commit 的 `committer.timestamp`，`execute_safe` 解析有效 mtime：`--mtime` 给定时经 `log::date_parser::parse_date`（与 `--since`/`--until` 同格式：`YYYY-MM-DD`/RFC3339/相对/Unix 时间戳；解析失败→`CliInvalidArguments`/129），否则用 committer 时间。该 i64 经 `create_archive` 透传到 tar（`header.set_mtime(mtime.max(0) as u64)`，负值即 pre-1970 钳到 0）与 zip（`zip_datetime` 用 chrono 把 Unix 秒转 `zip::DateTime`，MS-DOS 1980-2107 之外回落 zip epoch）写入器；gz/bz2 复用 tar 写入器。带集成测试（`archive_default_mtime_uses_commit_committer_time`、`archive_mtime_flag_overrides_entry_time`、`archive_mtime_rejects_invalid_value`）。 |
 | Git flag | `--remote=<repo>` / `--exec=<cmd>`（从远端取归档） | 未公开；依赖 `upload-archive` 协议，需打通 `src/internal/protocol`，协议层改造。 |
-| 行为差异 | `.gitattributes` 的 `export-ignore` / `export-subst` 属性过滤 | 未实现；与 D5（`.gitattributes` filter/hooks bridge 有意差异）相关，按对象内容属性处理设计后再评估。 |
+| ✅ 已实现 | `.gitattributes` / `.libra_attributes` 的 `export-ignore` 属性过滤 | `resolve_entries` 后先读取被归档 tree 内的 attributes blob，经 `utils::tree_attributes::ExportIgnoreMatcher` 过滤归档条目；未提交工作树 attributes 不影响既有 `TREEISH` 的归档；`export-subst` 仍未实现。带 compat 测试 `compat_ignore_attributes_sources::attributes_sources_feed_check_attr_lfs_diff_and_archive`。 |
+| 行为差异 | `.gitattributes` 的 `export-subst` 属性展开 | 未实现；按对象内容属性处理设计后再评估。 |
 | 兼容矩阵 | `COMPATIBILITY.md` 已登记该命令。 | 已纳入用户可见兼容矩阵和矩阵守卫。 |
 | CLI 接入 | `src/cli.rs::Commands::Archive` 已公开。 | 已接入 CLI；后续扩展参数时同步文档、矩阵和测试。 |
 

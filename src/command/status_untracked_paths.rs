@@ -7,19 +7,50 @@ use git_internal::internal::index::Index;
 
 pub(crate) struct TrackedPaths {
     files: Vec<PathBuf>,
+    case_aliases_enabled: bool,
+    files_by_fold: HashMap<String, PathBuf>,
     top_level_dirs: HashSet<PathBuf>,
+    top_level_dirs_by_fold: HashMap<String, PathBuf>,
 }
 
 impl TrackedPaths {
-    pub(crate) fn from_index(index: &Index) -> Self {
+    pub(crate) fn from_index(index: &Index, case_aliases_enabled: bool) -> Self {
         let files = index.tracked_files();
         let top_level_dirs = files
             .iter()
             .filter_map(|path| top_level_dir(path))
             .collect();
+        let (files_by_fold, top_level_dirs_by_fold) = if case_aliases_enabled {
+            (
+                files
+                    .iter()
+                    .map(|path| {
+                        (
+                            crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref()),
+                            path.clone(),
+                        )
+                    })
+                    .collect(),
+                files
+                    .iter()
+                    .filter_map(|path| {
+                        let dir = top_level_dir(path)?;
+                        Some((
+                            crate::utils::path_case::fold_path_key(dir.to_string_lossy().as_ref()),
+                            dir,
+                        ))
+                    })
+                    .collect(),
+            )
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
         Self {
             files,
+            case_aliases_enabled,
+            files_by_fold,
             top_level_dirs,
+            top_level_dirs_by_fold,
         }
     }
 
@@ -29,9 +60,27 @@ impl TrackedPaths {
 
     pub(crate) fn has_descendant(&self, dir: &Path) -> bool {
         if is_top_level_path(dir) {
-            return self.top_level_dirs.contains(dir);
+            return self.top_level_dirs.contains(dir)
+                || (self.case_aliases_enabled
+                    && self.top_level_dirs_by_fold.contains_key(
+                        &crate::utils::path_case::fold_path_key(dir.to_string_lossy().as_ref()),
+                    ));
         }
-        self.files.iter().any(|file| file.starts_with(dir))
+        self.files.iter().any(|file| {
+            file.starts_with(dir)
+                || (self.case_aliases_enabled
+                    && crate::utils::path_case::path_starts_with_casefold(file, dir))
+        })
+    }
+
+    pub(crate) fn same_file_case_alias(&self, workdir: &Path, path: &Path) -> bool {
+        if !self.case_aliases_enabled {
+            return false;
+        }
+        let key = crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref());
+        self.files_by_fold.get(&key).is_some_and(|tracked| {
+            crate::utils::path_case::is_same_file_case_alias(workdir, path, tracked)
+        })
     }
 }
 
@@ -90,4 +139,45 @@ fn top_level_dir(path: &Path) -> Option<PathBuf> {
     let mut components = path.components();
     let first = PathBuf::from(components.next()?.as_os_str());
     components.next().map(|_| first)
+}
+
+#[cfg(test)]
+mod tests {
+    use git_internal::{
+        hash::{ObjectHash, get_hash_kind},
+        internal::index::{Index, IndexEntry},
+    };
+
+    use super::*;
+
+    fn index_with_paths(paths: &[&str]) -> Index {
+        let mut index = Index::new();
+        let hash_bytes = vec![1; get_hash_kind().size()];
+        let object_hash = ObjectHash::from_bytes(&hash_bytes)
+            .expect("test hash length matches the active hash kind");
+        for path in paths {
+            index.add(IndexEntry::new_from_blob(
+                (*path).to_string(),
+                object_hash,
+                0,
+            ));
+        }
+        index
+    }
+
+    #[test]
+    fn tracked_paths_do_not_fold_when_case_aliases_are_disabled() {
+        let index = index_with_paths(&["slides/a.txt"]);
+        let tracked = TrackedPaths::from_index(&index, false);
+
+        assert!(!tracked.has_descendant(Path::new("Slides")));
+    }
+
+    #[test]
+    fn tracked_paths_fold_descendants_when_case_aliases_are_enabled() {
+        let index = index_with_paths(&["slides/a.txt"]);
+        let tracked = TrackedPaths::from_index(&index, true);
+
+        assert!(tracked.has_descendant(Path::new("Slides")));
+    }
 }

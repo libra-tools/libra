@@ -24,6 +24,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::internal::ai::observed_agents::RedactionReport;
 
+/// `object_index` o_type tag for objectized review/investigate findings +
+/// manual attachments (A0-06). A distinguished tag (parallel to
+/// `agent_transcript`) so `libra agent doctor` and retention can enumerate
+/// findings artifacts; cloud sync does not filter by o_type either way.
+pub const AGENT_FINDINGS_OTYPE: &str = "agent_findings";
+
 /// `manifest.json` schema version (E8-libra manifest contract).
 pub const REVIEW_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
@@ -185,13 +191,16 @@ pub struct ReviewManifest {
     /// pagination contract relies on this).
     pub created_at: String,
     pub updated_at: String,
-    /// OID of `findings.md` once written to the object store — always
-    /// `null` in AG-22 (no object write yet).
+    /// OID of `findings.md` in the object store. `null` at create time and
+    /// for an empty findings set; populated at `finalize_run` (A0-06) with a
+    /// content-addressed, `object_index`-visible, doctor-repairable blob.
     pub findings_oid: Option<String>,
     pub redaction_report: RedactionReportSummary,
-    /// Manual-attach placeholder (plan.md:945): **no command surface in
-    /// AG-22**, always empty. Extending it requires an `agent.md` §5
-    /// spec amendment first.
+    /// Manual attachments (A0-06): each entry is
+    /// `{oid, path, provenance:"manual", size, attached_at}` for an external
+    /// transcript/findings/context file attached via `libra review attach`.
+    /// Empty until the first attach; the attached bytes are redacted and
+    /// object_index-tagged like findings.
     pub manual_attach: Vec<serde_json::Value>,
 }
 
@@ -514,9 +523,51 @@ impl ReviewRunStore {
         file.write_all(content.as_bytes())
     }
 
+    /// A0-06: the `.libra` dir (git object-store root) derived from the
+    /// store's `<.libra>/sessions` root.
+    fn libra_dir(&self) -> io::Result<PathBuf> {
+        self.sessions_root
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "review sessions root has no parent .libra directory",
+                )
+            })
+    }
+
+    /// A0-06: write `bytes` as a content-addressed git blob and enqueue it
+    /// into `object_index` (tag [`AGENT_FINDINGS_OTYPE`]), returning the OID.
+    /// Content-addressed, so re-objectizing identical bytes is idempotent.
+    pub fn objectize_bytes(&self, bytes: &[u8]) -> io::Result<String> {
+        let libra_dir = self.libra_dir()?;
+        let oid = crate::utils::object::write_git_object(&libra_dir, "blob", bytes)
+            .map_err(|e| io::Error::other(format!("failed to write findings object: {e}")))?;
+        crate::utils::client_storage::enqueue_agent_blob_object_index_update(
+            &libra_dir,
+            &oid.to_string(),
+            AGENT_FINDINGS_OTYPE,
+            bytes.len() as i64,
+        );
+        Ok(oid.to_string())
+    }
+
+    /// A0-06: objectize the run's current `findings.md` into the object store
+    /// and `object_index`. Returns the blob OID, or `None` when findings are
+    /// empty (nothing to objectize). The bytes are already redacted before
+    /// they reach `findings.md`, so objectizing them introduces no new leak.
+    pub fn objectize_findings(&self, run_id: &str) -> io::Result<Option<String>> {
+        let content = self.read_findings(run_id)?.unwrap_or_default();
+        if content.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.objectize_bytes(content.as_bytes())?))
+    }
+
     /// Stamp the run terminal: updates `state.json` (outcome rows +
     /// terminal state) and `manifest.json` (terminal state + redaction
-    /// summary), bumping `updated_at` on both.
+    /// summary + A0-06 `findings_oid`), bumping `updated_at` on both.
     pub fn finalize_run(
         &self,
         run_id: &str,
@@ -545,6 +596,12 @@ impl ReviewRunStore {
         manifest.terminal_state = Some(terminal);
         manifest.redaction_report = redaction;
         manifest.updated_at = now;
+        // A0-06: objectize the final findings.md into the object store so the
+        // manifest's `findings_oid` points at a real, object_index-visible,
+        // doctor-repairable blob instead of a placeholder null.
+        if let Some(oid) = self.objectize_findings(run_id)? {
+            manifest.findings_oid = Some(oid);
+        }
         self.write_manifest(&manifest)
     }
 
@@ -810,7 +867,10 @@ mod tests {
             keys, expected,
             "manifest.json must carry exactly the E8 keys"
         );
-        // The AG-22 placeholder contract: no manual attach surface yet.
+        // A create-time / attachment-free manifest serializes findings_oid as
+        // null and manual_attach as []; A0-06 populates them at finalize /
+        // attach without changing the 12-key set (proven in the workflow
+        // tests). This case pins the empty-state serialization only.
         assert_eq!(value["manual_attach"], serde_json::json!([]));
         assert_eq!(value["findings_oid"], serde_json::Value::Null);
     }

@@ -170,7 +170,7 @@ pub async fn execute_safe(args: CommitTreeArgs, output: &OutputConfig) -> CliRes
 
     let message = assemble_message(&args)?;
     let (author, committer, _identity) =
-        crate::command::commit::create_commit_signatures(None).await?;
+        crate::command::commit::create_commit_signatures(None, None).await?;
 
     // The blank-line header/body separator is the LEADING newline inside the
     // message field (git-internal's Commit::to_data appends the message

@@ -24,9 +24,14 @@ saves the index.
   hashes computed with `hash-object`. `<mode>` is an octal file mode:
   `100644` (file), `100755` (executable), `120000` (symlink), `160000`
   (gitlink). The object id length must match the repository hash format. The
-  path is an index key — absolute paths and `..` traversal are rejected.
+  path is an index key — absolute paths and `..` traversal are rejected. A later
+  `write-tree` or `commit` validates object existence/type and fails with
+  `LBR-REPO-002` if a blob/tree entry still points at a missing or wrong-type
+  object.
 - `--add <path>...` (re)stages files from the working tree, allowing paths not
-  yet tracked. Without `--add`, a positional path must already be tracked.
+  yet tracked. Working-tree symlinks are staged as mode `120000` blobs whose
+  content is the link target bytes; the target is not followed. Without
+  `--add`, a positional path must already be tracked.
 - `--remove <path>...` drops the named paths from the index.
 
 ## Options
@@ -53,9 +58,16 @@ OID=$(libra hash-object -w data.bin)
 libra update-index --cacheinfo 100644,"$OID",assets/data.bin
 libra write-tree
 
+# A missing cacheinfo object may be registered, but write-tree will reject it
+libra update-index --cacheinfo 100644,1111111111111111111111111111111111111111,missing.bin
+libra write-tree   # fails with LBR-REPO-002
+
 # Stage and unstage working-tree files
 libra update-index --add src/new.rs
 libra update-index --remove src/old.rs
+
+# Stage a working-tree symlink as a 120000 link-target blob
+libra update-index --add link-to-target
 ```
 
 ## Comparison with Git

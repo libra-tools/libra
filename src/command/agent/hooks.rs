@@ -11,12 +11,12 @@ use clap::Subcommand;
 
 use crate::{
     internal::ai::hooks::{
-        HookTarget, process_hook_event_with_target,
+        HookEnvelopeInvalid, HookTarget, process_hook_event_with_target,
         provider::ProviderHookCommand,
         providers::{claude_provider, codex, codex_provider, opencode_provider},
     },
     utils::{
-        error::{CliError, CliResult},
+        error::{CliError, CliResult, StableErrorCode},
         output::OutputConfig,
     },
 };
@@ -126,5 +126,20 @@ async fn run(
     let expected_kind = cmd.lifecycle_event_kind();
     process_hook_event_with_target(cmd, expected_kind, provider, HookTarget::AgentTraces)
         .await
-        .map_err(|err| CliError::fatal(format!("agent hook ingestion failed: {err}")))
+        .map_err(map_ingest_error)
+}
+
+/// A0-03: map an ingest failure to a `CliError`, attaching the stable
+/// `LBR-AGENT-008` code when the error chain carries a
+/// [`HookEnvelopeInvalid`] (envelope size / UTF-8 / JSON / schema / path
+/// reject). All other ingest failures stay generic fatals so a genuine
+/// runtime error never masquerades as an envelope reject and vice-versa.
+fn map_ingest_error(err: anyhow::Error) -> CliError {
+    let envelope_invalid = err.chain().any(|cause| cause.is::<HookEnvelopeInvalid>());
+    let cli = CliError::fatal(format!("agent hook ingestion failed: {err}"));
+    if envelope_invalid {
+        cli.with_stable_code(StableErrorCode::AgentHookEnvelopeInvalid)
+    } else {
+        cli
+    }
 }

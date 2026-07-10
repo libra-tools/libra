@@ -112,6 +112,8 @@ pub mod providers;
 // AG-22 read-only agent review workflow engine (run store, reviewer
 // launcher, fan-in sink, terminal states).
 pub mod review;
+
+pub mod run_admission;
 // AG-23 read-only agent investigate workflow engine (strict round-robin
 // run store, turn loop, quorum/max-turns/pause states) — reuses review's
 // launcher/sink/isolation machinery.

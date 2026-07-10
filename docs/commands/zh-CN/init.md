@@ -82,7 +82,21 @@ libra init --template /path/to/template
 
 ### `--shared <MODE>`
 
-指定仓库将在多个用户之间共享（镜像 Git 的 `--shared` 标志，用于组权限）。
+指定仓库将在多个用户之间共享（镜像 Git 的 `--shared` 标志，用于组权限）。支持
+`false`、`umask`、`true`、`group`、`all`、`world`、`everybody`，或 `0770`
+这类 4 位八进制模式。
+
+`true` 会规范化为 `group`；`world` 与 `everybody` 会规范化为 `all`。只要显式
+传入 `--shared`，Libra 就会把规范化后的值写入 `core.sharedRepository`，因此
+fresh init 与 reinit 之后都可以用 `libra config get core.sharedRepository` 观察当前
+shared 模式。
+
+Numeric mode 会在任何仓库布局写入前预校验。当前 Libra 会把 numeric mode 直接应用到仓库目录和文件，因此 owner 必须保留 `rwx`，且 group/other 任一类只要获得 read 或 write 权限，就必须同时具备对应的 execute bit 以保证目录可遍历。`0660` 这类不可遍历模式会以 `LBR-CLI-002` 拒绝，并且不会留下半初始化的 `.libra` 目录。
+
+```bash
+libra init --shared group shared-repo
+libra init --shared 0770 shared-repo
+```
 
 ### `--ref-format <FORMAT>`
 
@@ -106,6 +120,7 @@ libra init -b develop
 libra init --object-format sha256
 libra init --from-git-repository ../old-project
 libra init --vault false
+libra init --shared group shared-repo
 ```
 
 ## 人类可读输出

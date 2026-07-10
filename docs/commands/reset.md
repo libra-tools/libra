@@ -19,7 +19,14 @@ libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 - **`--mixed`** (default): moves HEAD and resets the index. The working tree is untouched, so changes appear as unstaged modifications. Useful for un-staging files.
 - **`--hard`**: moves HEAD, resets the index, and restores the working tree. All uncommitted changes are discarded. Useful for fully reverting to a known state.
 
-When pathspecs are provided, the command performs a targeted mixed reset: only the named files are reset in the index to match the target commit, without moving HEAD. This is the primary way to un-stage specific files. Like Git, a bare first positional that is a known path and not a revision is treated as a pathspec with target `HEAD`, so `libra reset src/lib.rs` is equivalent to `libra reset HEAD -- src/lib.rs`. If a token is both a revision and a filename, reset refuses it as ambiguous; use `libra reset <revision> -- <file>` for a target revision or `libra reset -- <file>` for a path. Pathspecs are incompatible with `--soft` and `--hard`.
+When `--hard` restores a tree entry whose mode is `120000`, Libra creates a
+real symlink on Unix from the stored link target bytes. If a regular file
+currently occupies that path, it is replaced by the symlink; if a symlink
+currently occupies a path that should become a regular file, the link itself is
+removed before writing. Platforms without symlink support report an explicit
+unsupported diagnostic.
+
+When pathspecs are provided, the command performs a targeted mixed reset: only the named files are reset in the index to match the target commit, without moving HEAD. This is the primary way to un-stage specific files. Like Git, a bare first positional that is a known path and not a revision is treated as a pathspec with target `HEAD`, so `libra reset src/lib.rs` is equivalent to `libra reset HEAD -- src/lib.rs`. If a token is both a revision and a filename, reset refuses it as ambiguous; use `libra reset <revision> -- <file>` for a target revision or `libra reset -- <file>` for a path. Pathspecs are incompatible with `--soft` and `--hard`. When a pathspec reset restores a symlink from the target commit, the index entry keeps mode `120000` and the blob remains the link target bytes.
 
 The default target is `HEAD`, making `libra reset` (with no arguments) equivalent to un-staging everything.
 

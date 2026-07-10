@@ -6,7 +6,7 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。`--force` / `--dry-run` / `--cached` / `--recursive` / `--ignore-unmatch` / `--pathspec-from-file` / `--pathspec-file-nul` supported; `--sparse` accepted as a no-op (Libra has no sparse-checkout cone); per-command `--quiet` not exposed (use global `--quiet`)
+- 兼容级别：`partial`。`--force` / `--dry-run` / `--cached` / `--recursive` / `--ignore-unmatch` / `--pathspec-from-file` / `--pathspec-file-nul` supported; shared pathspec magic supported for remove selection; `--sparse` accepted as a no-op (Libra has no sparse-checkout cone); per-command `--quiet` not exposed (use global `--quiet`)
 
 - 当前矩阵明确仍是部分兼容；未覆盖的 Git surface 必须显式列在“还未实现的功能”。
 
@@ -39,6 +39,7 @@ flowchart TD
 - 2026-01-13 `9d37fd8d`（`feat(rm): support --pathspec-from-file and --pathspec-file-nul (#117)`）：基础实现节点：support --pathspec-from-file and --pathspec-file-nul (#117)；当前实现的主要轮廓可追溯到该提交。
 - 2026-05-15 `8d9a89c9`（`feat(commands): structure mv and rm output`）：功能演进：structure mv and rm output；该节点扩展了当前命令可用的参数或行为。
 - 2026-06-06 `17e563bb`（`fix(rm): plain piped output, 4-space conflict indent, save index before deleting files`）：实现修正：plain piped output, 4-space conflict indent, save index before deleting files；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
+- 2026-07-09（plan-20260708 P1-01）：`rm`/`remove`/`delete` 的位置 pathspec 与 `--pathspec-from-file` 统一接入 `src/utils/pathspec/`。当前按 tracked index entries 作为删除候选，支持 plain prefix、wildcard、`:(top)`/`:/`、`:(glob)`、`:(literal)`、`:(icase)`、`:(exclude)`、`:!`、`:^`，并按 `core.ignorecase` 作为默认大小写策略；wildcard-looking pattern 仍匹配同名字面路径或目录前缀（Git bracket-file / bracket-directory 行为）；目录递归保护只用正向前缀判定，实际磁盘只删除匹配到的已跟踪文件，并通过 `clear_empty_dir` 清理变空父目录，避免 `:(exclude)` 或未跟踪文件被目录级删除绕过。回归守卫：`compat_pathspec_magic::rm_honors_shared_pathspec_magic`、`compat_pathspec_magic::rm_recursive_preserves_untracked_files_in_matched_directory`。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
@@ -47,13 +48,15 @@ flowchart TD
 - 用户文档：`docs/commands/rm.md`。
 - Synopsis：`libra rm [-r] [-f] [--cached] [--dry-run] [--ignore-unmatch] [--sparse] [--pathspec-from-file <file> [--pathspec-file-nul]] <pathspec>...`。
 - 公开参数/子命令包括：`<pathspec>...`、`--cached`、`-r, --recursive`、`-f, --force`、`--dry-run`、`--ignore-unmatch`、`--sparse`（no-op，Libra 无 sparse-checkout cone）、`--pathspec-from-file <PATHSPEC_FROM_FILE>`、`--pathspec-file-nul`。
+- plan-20260708 P1-01 后，删除候选统一由 `PathspecSet::from_workdir_with_default_icase` 编译并过滤 tracked index entries；排除 magic 会从正向集合扣除，`--ignore-unmatch` 只放宽未命中正向规格，不放宽无 pathspec 的用法错误；`-r` 只允许目录 pathspec 展开到已跟踪文件，磁盘清理仍限于删除匹配文件后自然变空的目录。
 
 
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容矩阵说明 | `--force` / `--dry-run` / `--cached` / `--recursive` / `--ignore-unmatch` / `--pathspec-from-file` / `--pathspec-file-nul` 支持; `--sparse` 按 no-op 接受 (Libra 无 sparse-checkout cone); per-command `--quiet` 未公开暴露 (use global `--quiet`) | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
+| 兼容矩阵说明 | `--force` / `--dry-run` / `--cached` / `--recursive` / `--ignore-unmatch` / `--pathspec-from-file` / `--pathspec-file-nul` 支持; shared pathspec magic 已支持; `--sparse` 按 no-op 接受 (Libra 无 sparse-checkout cone); per-command `--quiet` 未公开暴露 (use global `--quiet`) | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
+| ✅ 已实现 | Shared pathspec magic | 原始对照：git pathspec magic；当前说明：`rm` 位置参数与 `--pathspec-from-file` 条目统一走 `src/utils/pathspec/`，支持 plain prefix、wildcard、`top`/`glob`/`literal`/`icase`/`exclude` 等高价值 magic，并继承 `core.ignorecase`。带 compat 测试 `compat_pathspec_magic::rm_honors_shared_pathspec_magic`。 |
 
 ## 维护要求
 

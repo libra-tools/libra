@@ -55,6 +55,24 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `otlp_feature_gate_guard.rs` | `compat_otlp_feature_gate_guard` | lore.md 1.7 硬约束：`otlp` feature 不得进入 default、四个 opentelemetry 依赖保持 optional、模块声明与 main.rs 使用点保持 `#[cfg(feature = "otlp")]` 门控 |
 | `keyring_feature_gate_guard.rs` | `compat_keyring_feature_gate_guard` | lore.md 2.7 门控：`keyring` feature 不入 default、依赖 optional + VENDORED libdbus（静态——终端用户无运行时 dylib 依赖）、后端模块 cfg 门控（发布构建显式 --features keyring 启用） |
 | `fastcdc_feature_gate_guard.rs` | `compat_fastcdc_feature_gate_guard` | lore.md §6 硬约束：`fastcdc` FastCDC media chunking feature 不入 default、保持纯 in-tree（`fastcdc = []` 无捆绑依赖）、`utils::media`/`command::media` 模块声明与 cli.rs `Media` 变体+dispatch 保持 `#[cfg(feature = "fastcdc")]` 门控 |
+| `subface_labels.rs` | CG-01 (plan-20260708) | `COMPATIBILITY.md` 的「Sub-face compatibility grading」矩阵机器校验：子面标签限于固定五枚举、被分级命令集钉死在 P0/P1 触达面且不脱离 `src/cli.rs::Commands`、同一命令不得把一个子面分进两档、每个 `unsupported` 子面带治理编号并与 `_compatibility.md` 登记表双向一致 |
+| `conflict_status_diff_test.rs` | P0-01 (plan-20260708) | merge / rebase / cherry-pick 内容冲突后，`status --porcelain` 输出 `UU`、porcelain v2 输出 `u UU ...`、`ls-files -u/-t` 暴露 stage 1/2/3，`diff` 使用 `diff --cc` 而不是把冲突文件误报为 `/dev/null` 新增 |
+| `diff_check_safety_test.rs` | P0-02 (plan-20260708) | `diff --check` 覆盖 Git 的三类安全检查：尾随空白、leftover conflict marker、new blank line at EOF，且任一命中退出码为 2 |
+| `clone_shallow_integrity_test.rs` | P0-03 (plan-20260708) | 本地 Libra 源的 `clone --depth` / `fetch --depth` 必须 fail-closed（`LBR-REPO-002`）且不留下 broken target / shallow metadata；`rev-parse --is-shallow-repository` 正确报告 shallow 布尔 |
+| `checkout_branch_startpoint_test.rs` | P0-04 (plan-20260708) | `checkout -b/-B <branch> <start-point>` 与 `switch -C <branch> <start-point>` 必须把 `HEAD` 保持为目标分支的 symbolic ref；无效 start-point 必须 fail-closed 且不移动 `HEAD` / 既有分支引用 |
+| `switch_orphan_root_test.rs` | P0-05 (plan-20260708) | `switch --orphan` / `checkout --orphan` 必须把 `HEAD` 指向 unborn 分支、保留 index/worktree、JSON 标记 `unborn=true`，并让首个用户提交成为无 parent 的 root commit；已有分支和不支持的 start-point 必须 fail-closed |
+| `broken_pipe_output_test.rs` | P0-06 (plan-20260708) | `log`、`diff`、`grep`、`ls-files`、`show`、`for-each-ref` 等 stdout 命令在下游提前关闭管道时必须静默正常结束，不打印 panic/backtrace/BrokenPipe 噪声 |
+| `commit_amend_no_edit_test.rs` | P0-07 (plan-20260708) | clean `commit --amend --no-edit` 必须真正重写 HEAD，保留 tree/parents/message，并刷新 committer date；不得打印成功但保持 HEAD 不变 |
+| `commit_identity_date_test.rs` | P0-08 (plan-20260708) | `commit` 必须支持 Git author/committer 身份与日期环境变量、`--date`、`--reset-author`，并让 `-C/-c` 复用来源提交的 message 与 author metadata |
+| `sequencer_message_author_test.rs` | P0-08 (plan-20260708) | `cherry-pick` 必须保留原提交 author metadata，`revert` 必须使用当前身份创建提交，且二者生成消息不得从签名块派生错误 subject |
+| `write_tree_missing_object_test.rs` | P0-09 (plan-20260708) | `write-tree` / `commit` 在写 tree 或 commit 前必须拒绝 index 中缺失或类型不匹配的对象（`LBR-REPO-002`），且失败不得移动 `HEAD` |
+| `init_shared_mode_test.rs` | P0-10 (plan-20260708) | `init --shared=<numeric>` 必须预拒绝不可遍历目录权限且不留下半仓库；`group`/`all`/可用 numeric 模式必须持久化 `core.sharedRepository`，reinit 同步更新该配置 |
+| `symlink_basic_test.rs` | P0-11 (plan-20260708) | symlink 必须以 index mode `120000` 和 link target blob 入库；pathspec reset 必须保留 symlink index mode；checkout/restore/reset 必须恢复真实 symlink；status/diff/ls-files 必须识别 symlink target 变更且 dangling symlink 不误报删除；非 Unix 平台必须显式诊断而非写普通文件 |
+| `global_config_schema_future_test.rs` | P0-12 (plan-20260708) | 全局 config DB schema 比当前二进制新时，`pull` 等远端/云命令默认 fail-closed 并输出 `LBR-CONFIG-001`；`--offline` / `LIBRA_READ_POLICY=offline|local` 明确降级；完整进程环境或 repo-local `LIBRA_STORAGE_*` 配置不误报；本地命令只 warning；JSON/人类诊断包含升级命令且不泄露 vault secret |
+| `pathspec_magic_test.rs` | P1-01 (plan-20260708) | 共享 pathspec parser/matcher 必须支持 `top` / `exclude` / `icase` / `literal` / `glob` magic、子目录相对解析，并被 `ls-files` / `grep` / `diff` / `status` 只读消费者复用 |
+| `ignore_attributes_sources_test.rs` | P1-02 (plan-20260708) | Git 标准 ignore/attributes 来源（`.gitignore`、`.git/info/*`、`core.*File`）与 Libra 扩展来源并存；覆盖 `status` / `add` / `clean` / `check-ignore` / `check-attr` / `lfs` / `diff --textconv` / `archive export-ignore` |
+| `machine_porcelain_contract_test.rs` | P1-03 (plan-20260708) | 机器可读 porcelain 契约：`status --porcelain=v1/v2 -z` 使用 NUL 记录、默认 `diff` 不含 untracked 且 `--quiet`/`--exit-code` 退出码正确、`ls-files --error-unmatch` 退出 1、`grep` 命中/无命中/错误分别退出 0/1/2 |
+| `pretty_format_placeholders_test.rs` | P1-04 (plan-20260708) | `log` / `show` / `shortlog` 共享 Git-like pretty-format placeholders（含 ASCII/control `%xNN`、`%%` 与 forced color）；`log --name-only --format` 分隔与 `log -z --name-status` NUL 记录对齐 Git |
 
 ## Authoring guidelines
 

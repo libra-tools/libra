@@ -633,6 +633,20 @@ impl CodeUiSession {
 
     pub async fn upsert_plan(&self, plan: CodeUiPlanSnapshot) {
         self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
+            // Monotonic plan status: a plan that has already reached a terminal
+            // status ("completed"/"failed") must not be regressed to a
+            // non-terminal one ("running"/"pending") by a late-arriving event.
+            // `on_tool_call_start` (running) and `on_tool_call_end` (completed)
+            // each `tokio::spawn` an independent task with no ordering
+            // guarantee; without this guard a late "running" upsert clobbers an
+            // already-"completed" plan and strands it (the source of a flaky
+            // "plan stuck at running" projection).
+            if let Some(existing) = snapshot.plans.iter().find(|item| item.id == plan.id)
+                && is_terminal_plan_status(&existing.status)
+                && !is_terminal_plan_status(&plan.status)
+            {
+                return;
+            }
             upsert_by_id(&mut snapshot.plans, plan, |item| item.id.as_str());
         })
         .await;
@@ -686,6 +700,13 @@ where
     } else {
         items.push(incoming);
     }
+}
+
+/// A plan status is terminal once the tool call that produced it has ended.
+/// Used to keep [`CodeUiSession::upsert_plan`] monotonic so a late-arriving
+/// non-terminal upsert cannot regress a finished plan.
+fn is_terminal_plan_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed")
 }
 
 #[async_trait]
@@ -1679,6 +1700,59 @@ mod tests {
                 ..CodeUiCapabilities::default()
             },
         ))
+    }
+
+    #[test]
+    fn terminal_plan_status_classification() {
+        assert!(is_terminal_plan_status("completed"));
+        assert!(is_terminal_plan_status("failed"));
+        assert!(!is_terminal_plan_status("running"));
+        assert!(!is_terminal_plan_status("pending"));
+    }
+
+    #[tokio::test]
+    async fn upsert_plan_does_not_regress_terminal_status_to_running() {
+        let session = test_session();
+        let plan = |status: &str| CodeUiPlanSnapshot {
+            id: "call_1".to_string(),
+            title: Some("t".to_string()),
+            summary: None,
+            status: status.to_string(),
+            steps: Vec::new(),
+            updated_at: Utc::now(),
+        };
+        let stored_status = |snap: &CodeUiSessionSnapshot| {
+            snap.plans
+                .iter()
+                .find(|p| p.id == "call_1")
+                .map(|p| p.status.clone())
+        };
+
+        // Normal order (running → completed) still lands on completed.
+        session.upsert_plan(plan("running")).await;
+        session.upsert_plan(plan("completed")).await;
+        assert_eq!(
+            stored_status(&session.snapshot().await).as_deref(),
+            Some("completed")
+        );
+
+        // The race: a late "running" upsert (from on_tool_call_start losing the
+        // spawn race with on_tool_call_end) must NOT clobber the completed plan.
+        session.upsert_plan(plan("running")).await;
+        assert_eq!(
+            stored_status(&session.snapshot().await).as_deref(),
+            Some("completed"),
+            "a late non-terminal upsert must not regress a completed plan"
+        );
+
+        // Terminal→terminal is still allowed (completed → failed), and a
+        // subsequent late "running" is likewise ignored.
+        session.upsert_plan(plan("failed")).await;
+        session.upsert_plan(plan("running")).await;
+        assert_eq!(
+            stored_status(&session.snapshot().await).as_deref(),
+            Some("failed")
+        );
     }
 
     #[test]

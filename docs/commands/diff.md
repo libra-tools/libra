@@ -17,11 +17,21 @@ libra diff [--algorithm <name>] [--output <file>]
 
 ## Description
 
-`libra diff` shows changes between different states of the repository. By default it compares the index against the working tree (unstaged changes). With `--staged`, it compares HEAD against the index (staged changes). With `--old` and `--new`, it compares two arbitrary commits.
+`libra diff` shows changes between different states of the repository. By default it compares the index against tracked working-tree paths (unstaged changes). Untracked files are not part of the default diff and therefore do not affect `--quiet`, `--exit-code`, `--name-status`, `--numstat`, or `--shortstat`; use `libra status`, `libra ls-files --others`, or `libra add` to inspect or promote untracked files. With `--staged`, it compares HEAD against the index (staged changes). With `--old` and `--new`, it compares two arbitrary commits.
 
 The diff engine supports multiple algorithms (histogram by default, with myers and myersMinimal as alternatives). Output can be directed to a file with `--output`, and several summary formats are available (`--name-only`, `--name-status`, `--numstat`, `--stat`, `--shortstat`, `--summary`). A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes the name/numstat outputs NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity (matching Git's structure; like all Libra diffs, the exact word grouping can differ from Git on ambiguous changes, and hunk headers keep Libra's unified-diff format).
 
+When the working tree contains unmerged conflict entries, the default working-tree diff renders a conflict-aware `diff --cc <path>` record instead of treating the conflict file as a `/dev/null` addition.
+
+Tracked symlink changes are diffed by the symlink target bytes. The worktree
+reader uses `symlink_metadata`/`read_link`, so dangling symlinks are still
+diffed as symlinks and are not treated as deleted merely because their targets
+do not exist.
+
 Pathspec arguments filter the diff to only show changes in matching files or directories.
+
+When stdout is piped and the downstream command exits early, stdout `BrokenPipe` is treated as
+normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is printed.
 
 ## Options
 
@@ -31,7 +41,7 @@ Pathspec arguments filter the diff to only show changes in matching files or dir
 | New commit | | `--new <COMMIT>` | Specifies the "new" side. Requires `--old`. Conflicts with `--staged`. |
 | Staged | | `--staged` | Compare HEAD against the index (staged changes). Conflicts with `--new`. |
 | Revisions | | positional | Up to two leading revisions, Git-style: `diff A` (A vs worktree), `diff A B` (≡ `A..B`), `diff A..B`, `diff A...B` (merge-base(A,B) vs B), `diff --staged A` (A vs index). Not interpreted when `--old`/`--new` is given. |
-| Pathspec | | positional | One or more files or directories to restrict the diff (after any revisions; use `--` to force the path reading). Pre-`--` paths must exist (or carry glob magic); post-`--` paths are taken verbatim. |
+| Pathspec | | positional | One or more files or directories to restrict the diff (after any revisions; use `--` to force the path reading). Supports exact files, directory prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic. Pre-`--` paths must exist or carry wildcard syntax / supported pathspec magic; post-`--` paths are taken verbatim. |
 | Algorithm | | `--algorithm <name>` | Diff algorithm: `histogram` (default), `myers`, or `myersMinimal`. |
 | Output file | | `--output <FILENAME>` | Write human-readable output to a file instead of stdout. Ignored in `--json` mode. |
 | Name only | | `--name-only` | Show only the names of changed files. |
@@ -50,7 +60,7 @@ Pathspec arguments filter the diff to only show changes in matching files or dir
 | No patch | `-s` | `--no-patch` | Suppress the patch (diff body). Combine with `--exit-code` for a status-only check. |
 | Exit code | | `--exit-code` | Still print the diff, but exit with code 1 when there are differences (0 otherwise). Unlike `--quiet`, the diff is not suppressed. |
 | NUL output | `-z` | `--null` | NUL-terminate `--name-only`/`--name-status`/`--numstat` records (and split the `--name-status` status and path into separate NUL fields); other modes are unaffected. |
-| Whitespace check | | `--check` | Instead of the diff, warn about whitespace errors on added lines (trailing whitespace and space-before-tab in the indent), printing `<path>:<line>: <message>` and exiting 2 when any are found. Git's blank-at-eof check is not performed; takes precedence over other output modes. |
+| Whitespace check | | `--check` | Instead of the diff, warn about safety problems on added lines: trailing whitespace, space-before-tab in the indent, leftover conflict markers, and new blank lines at EOF. Prints `<path>:<line>: <message>` and exits 2 when any are found; takes precedence over other output modes. |
 | Reverse | `-R` | `--reverse` | Swap the two sides so additions become deletions and vice-versa (the patch that would undo the change). |
 | Text | `-a` | `--text` | Treat all files as text: diff the content even of files detected as binary (a NUL byte in either side, or non-UTF-8 content), suppressing the "Binary files … differ" line. Libra's diff is text-based, so a non-UTF-8 change that is identical after lossy-UTF-8 conversion still shows "Binary files … differ". |
 | Binary patch | | `--binary` | Emit a `GIT binary patch` (base85 `literal` chunks for both directions) for binary files instead of "Binary files … differ". The patch is valid and appliable, but its compressed bytes are not byte-identical to Git's (Libra deflates with a different zlib and always emits `literal`, not Git's smaller-of-literal/delta). |
@@ -63,7 +73,7 @@ Pathspec arguments filter the diff to only show changes in matching files or dir
 | Relative | | `--relative[=<path>]` | Restrict the diff to a directory and show paths relative to it: with a value, `<path>` is resolved from the current directory; bare `--relative` uses the current directory. Files outside the directory are excluded and the prefix is stripped from displayed paths (also in `--stat` and JSON). With an external `diff.external` driver, the file-set restriction still applies but the prefix is NOT stripped from the driver's verbatim output. |
 | No relative | | `--no-relative` | Show full repo-root-relative paths. This is Libra's default; accepted for Git parity and takes precedence over `--relative`. |
 | No indent heuristic | | `--no-indent-heuristic` | Disable the indent heuristic for hunk boundaries. Accepted no-op: Libra's diff does not apply Git's indent heuristic. (Git's `--indent-heuristic` is not supported.) |
-| Textconv | | `--textconv` | Run textconv filters to make content human-diffable: a file whose `diff=<driver>` attribute (in the root `.libra_attributes`) names a driver with a configured `diff.<driver>.textconv` command has each side converted by that command before diffing. On by default for `diff` (like Git); this flag is the explicit opposite of `--no-textconv`. The resulting patch is for reading, not applying. A failing textconv command is a fatal error; textconv is not applied under `--check` or when `diff.external` is active; only the root `.libra_attributes` is consulted. |
+| Textconv | | `--textconv` | Run textconv filters to make content human-diffable: a file whose `diff=<driver>` attribute from Git/Libra attribute sources names a driver with a configured `diff.<driver>.textconv` command has each side converted by that command before diffing. On by default for `diff` (like Git); this flag is the explicit opposite of `--no-textconv`. The resulting patch is for reading, not applying. A failing textconv command is a fatal error; textconv is not applied under `--check` or when `diff.external` is active. |
 | No textconv | | `--no-textconv` | Diff the raw content, skipping any textconv filter (countermands an earlier `--textconv`). |
 | JSON | | `--json` | Emit structured JSON output. |
 | Quiet | | `--quiet` | Suppress stdout; exit code 1 if differences exist, 0 otherwise. When combined with `--output`, the file is still written. |
@@ -178,7 +188,12 @@ Supported output modes:
 - `-s` / `--no-patch` suppresses the patch body (for status-only checks)
 - `--exit-code` still prints the diff but exits `1` when there are differences
 - `-z` / `--null` NUL-terminates `--name-only`/`--name-status`/`--numstat` records (status and path become separate NUL fields under `--name-status`)
+- `--check` scans added lines for trailing whitespace, space-before-tab, leftover conflict markers, and new blank lines at EOF; any hit exits `2`
 - `--quiet` suppresses stdout and uses exit `1` to signal that differences exist
+
+By default these machine-oriented diff modes report only tracked/index-vs-worktree changes. Untracked files, including an untracked `.libraignore`, do not appear and do not make `--quiet` or `--exit-code` fail.
+
+Unmerged conflict paths are shown with `diff --cc <path>` headers in the default working-tree diff.
 
 `--output <file>` writes human-readable output to a file. In `--quiet` mode the file is still written, but differences still return exit `1`. In `--json` mode this flag is ignored and output always goes to stdout.
 
@@ -281,7 +296,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Suppress patch | `-s` / `--no-patch` | `-s` / `--no-patch` | N/A |
 | Exit code | `--exit-code` | `--exit-code` | N/A |
 | NUL-terminated output | `-z` / `--null` | `-z` | N/A |
-| Whitespace check | `--check` (trailing-ws / space-before-tab) | `--check` | N/A |
+| Whitespace check | `--check` (trailing-ws / space-before-tab / conflict markers / blank-at-eof) | `--check` | N/A |
 | Reverse diff | `-R` / `--reverse` | `-R` | N/A |
 | Treat as text | `-a` / `--text` (force content diff of binary files) | `-a` / `--text` | N/A |
 | Word diff | `--word-diff[=<mode>]` (no `--color-words`/`--word-diff-regex`) | `--word-diff` / `--color-words` | N/A |
@@ -298,7 +313,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | JSON output | `--json` | Not supported | N/A |
 | Rename detection | `-M[<n>]` / `--find-renames[=<n>]` (similarity matches Git for typical content; opt-in, not auto-enabled via `diff.renames`) | `-M` / `--find-renames` | Automatic |
 | Moved-line color | `--color-moved[=<mode>]` / `--no-color-moved` (`plain` semantics; block modes approximated) | `--color-moved[=<mode>]` | N/A |
-| Textconv | `--textconv` / `--no-textconv` (on by default; `.libra_attributes` `diff=<driver>` + `diff.<driver>.textconv`) | `--textconv` / `--no-textconv` | N/A |
+| Textconv | `--textconv` / `--no-textconv` (on by default; Git/Libra attributes `diff=<driver>` + `diff.<driver>.textconv`) | `--textconv` / `--no-textconv` | N/A |
 | Copy detection | Not supported | `-C` / `--find-copies` | N/A |
 | Three-dot diff | `<A>...<B>` (from merge base) | `<A>...<B>` (merge base) | N/A |
 

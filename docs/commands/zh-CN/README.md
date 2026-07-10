@@ -2,6 +2,12 @@
 
 本目录包含所有 Libra CLI 命令的详细文档。每份文档都包含概要、选项参考、人工输出和结构化（JSON）输出示例、设计动机，以及与 Git 和 jj 的参数对比。
 
+兼容性按两层维护：各命令页面描述该命令的用户可见行为，而
+[`COMPATIBILITY.md`](../../../COMPATIBILITY.md#sub-face-compatibility-grading-p0p1-touched-commands)
+按子面（`common-user-flow`、`porcelain-machine`、`conflict-aware`、
+`config-aware`、`plumbing-compatible`）细分 P0/P1 命令表面的兼容等级。脚本依赖
+porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表面时，应以该子面表为准。
+
 ## 全局标志
 
 每个 Libra 命令都接受以下全局标志：
@@ -134,9 +140,9 @@
 |------|------|------|------|
 | `libra apply` | | 检查 unified-diff patch 能否应用（`--check`） | [apply.md](apply.md) |
 | `libra cat-file` | | 按类型、大小或漂亮打印内容检查 Git objects 和 AI objects | [cat-file.md](cat-file.md) |
-| `libra check-attr` | | 报告 pathnames 的 `.libra_attributes` 属性（例如 `filter`） | [check-attr.md](check-attr.md) |
+| `libra check-attr` | | 报告 pathnames 的 Git/Libra 属性（例如 `filter`、`diff`、`export-ignore`） | [check-attr.md](check-attr.md) |
 | `libra check-mailmap` | | 通过 `.mailmap` 解析 `Name <email>` contacts | [check-mailmap.md](check-mailmap.md) |
-| `libra check-ignore` | | 报告哪些 pathnames 被 `.libraignore` rules 排除 | [check-ignore.md](check-ignore.md) |
+| `libra check-ignore` | | 报告哪些 pathnames 被 Git/Libra ignore 规则排除 | [check-ignore.md](check-ignore.md) |
 | `libra fsck` | | 校验 Libra 仓库中 objects、refs 和 index 的完整性 | [fsck.md](fsck.md) |
 | `libra hash-object` | | 从文件或标准输入计算 Git-compatible blob object IDs | [hash-object.md](hash-object.md) |
 | `libra write-tree` | | 把当前 index 写成一个 tree object | [write-tree.md](write-tree.md) |

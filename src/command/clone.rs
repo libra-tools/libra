@@ -166,12 +166,12 @@ pub struct CloneArgs {
 
     /// Fail if the clone would be a shallow repository that was not explicitly
     /// requested — i.e. the source repository is shallow (matching
-    /// `git clone --reject-shallow`). Two narrowings vs Git: (1) Libra cannot
-    /// distinguish a shallow source from `--depth`-induced shallowness, so
-    /// passing `--depth` suppresses this check entirely (Git would still reject);
-    /// (2) cloning a local-path source re-fetches full history and does not
-    /// inherit the source's shallow marker, so the check is most meaningful for
-    /// shallow remotes.
+    /// `git clone --reject-shallow`). Two narrowings vs Git: (1) for remotes
+    /// that can negotiate shallow boundaries, Libra cannot distinguish a shallow
+    /// source from `--depth`-induced shallowness, so passing `--depth`
+    /// suppresses the post-fetch check (Git would still reject); (2) local Libra
+    /// sources do not advertise shallow boundaries yet, so `--depth` fails
+    /// closed before this check.
     #[clap(long = "reject-shallow")]
     pub reject_shallow: bool,
 
@@ -281,8 +281,10 @@ pub struct CloneArgs {
 /// NARROWING vs Git: Git rejects a shallow SOURCE regardless of `--depth`, but
 /// Libra has no protocol signal distinguishing a shallow source from
 /// `--depth`-induced shallowness (both only leave a `.libra/shallow` marker), so
-/// when `--depth` is given Libra does NOT reject. The common cases still match
-/// Git: `--reject-shallow` alone rejects a shallow result, and a full clone of a
+/// when `--depth` is given Libra does NOT reject after fetch. Local Libra
+/// sources are rejected earlier by fetch when `--depth` is present because they
+/// cannot advertise shallow boundaries yet. The common cases still match Git:
+/// `--reject-shallow` alone rejects a shallow result, and a full clone of a
 /// non-shallow source is allowed.
 /// Warn when `--reference`/`--shared` were given: those flags ask Git to share
 /// or borrow objects from another local store via alternates, but Libra always
@@ -1055,6 +1057,14 @@ fn map_fetch_error(source: fetch::FetchError) -> CliError {
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("the remote transfer failed or returned corrupted data; retry the clone")
         }
+        fetch::FetchError::UnsupportedShallowLocalLibra | fetch::FetchError::LocalState { .. } => {
+            CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint(
+                    "omit --depth for local Libra sources, or use a Git remote that negotiates \
+                     shallow boundaries",
+                )
+        }
         fetch::FetchError::RemoteBranchNotFound { .. } => CliError::fatal(source.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("the specified branch does not exist on the remote"),
@@ -1097,6 +1107,11 @@ fn map_checkout_error(source: RestoreError) -> CliError {
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
                 .with_hint("checkout required downloading LFS content, but the transfer failed")
         }
+        RestoreError::SymlinkUnsupported(path) => CliError::fatal(format!(
+            "working tree checkout requires a symlink at '{path}', but this platform does not support it"
+        ))
+        .with_stable_code(StableErrorCode::Unsupported)
+        .with_hint("retry on a platform with symlink support or disable checkout and inspect the tree"),
         // `clone` never resolves user revisions, so the locked-source guard
         // in `restore::run_restore` is unreachable here. Surface a fatal
         // diagnostic rather than panicking on the unreachable branch — keeps
@@ -1130,6 +1145,10 @@ fn map_checkout_error(source: RestoreError) -> CliError {
         // surface rather than panic.
         RestoreError::UnsupportedConflictStyle(style) => CliError::fatal(format!(
             "internal error: clone checkout reported an unsupported conflict style '{style}'"
+        ))
+        .with_stable_code(StableErrorCode::RepoStateInvalid),
+        RestoreError::InvalidPathspec(detail) => CliError::fatal(format!(
+            "internal error: clone checkout reported an invalid pathspec: {detail}"
         ))
         .with_stable_code(StableErrorCode::RepoStateInvalid),
     }
@@ -3447,8 +3466,10 @@ async fn clone_into_destination(
 
     // `--reject-shallow`: if the fetch left a shallow boundary that the user did
     // not request via `--depth`, the source repository was shallow — refuse it
-    // (matching `git clone --reject-shallow`). The cwd is still the new repo
-    // here, so the shallow marker lives at the current `.libra/shallow`.
+    // (matching `git clone --reject-shallow`). Local Libra sources with
+    // `--depth` fail earlier in fetch because they cannot produce this shallow
+    // metadata. The cwd is still the new repo here, so the shallow marker lives
+    // at the current `.libra/shallow`.
     let is_shallow = std::fs::read_to_string(util::storage_path().join("shallow"))
         .map(|contents| !contents.trim().is_empty())
         .unwrap_or(false);
@@ -4078,10 +4099,12 @@ mod tests {
     fn clone_should_reject_shallow_only_for_unrequested_shallowness() {
         // Reject only when shallow AND the user did not ask for --depth.
         assert!(clone_should_reject_shallow(true, true, None));
-        // --depth makes the shallowness expected, so it is allowed. NOTE: this
-        // also (intentionally) suppresses rejection for a shallow SOURCE cloned
-        // with --depth — a documented narrowing vs Git, since Libra cannot tell
-        // the two apart.
+        // In the post-fetch check, --depth makes the shallowness expected, so it
+        // is allowed. NOTE: this also (intentionally) suppresses rejection for a
+        // shallow SOURCE cloned with --depth on transports that can negotiate
+        // shallow boundaries — a documented narrowing vs Git, since Libra cannot
+        // tell the two apart at this point. Local Libra --depth is rejected
+        // earlier by fetch.
         assert!(!clone_should_reject_shallow(true, true, Some(1)));
         // A non-shallow result never triggers a rejection.
         assert!(!clone_should_reject_shallow(true, false, None));

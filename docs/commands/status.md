@@ -7,7 +7,7 @@ Show the working tree status.
 ## Synopsis
 
 ```
-libra status [OPTIONS]
+libra status [OPTIONS] [pathspec]...
 ```
 
 ## Description
@@ -22,8 +22,31 @@ human-readable long format (default, also selectable explicitly with `--long`), 
 format, structured JSON for agent consumption, and `-z` NUL-terminated machine output. It can
 also detect renames (`--find-renames`), align output into columns (`--column`), and control
 whether upstream ahead/behind counts are shown (`--ahead-behind` / `--no-ahead-behind`).
+Optional pathspecs limit the reported staged, unstaged, unmerged, ignored, and
+untracked paths. They use the shared pathspec engine, including `:(top)`,
+`:(exclude)`, `:(icase)`, `:(literal)`, and `:(glob)` magic.
+An in-progress merge is still reported as a global repository state even when
+the selected pathspec hides every conflicted path; `--exit-code` remains dirty
+until the merge is continued or aborted.
+
+During merge, rebase, and cherry-pick conflicts, unmerged index entries are reported as conflicts
+instead of untracked files. Porcelain v1/short output uses Git-style XY codes such as `UU
+conflict.txt`; porcelain v2 emits `u <XY> ...` records with stage modes and object IDs.
+
+Tracked symlinks participate in the same HEAD/index/worktree comparison as
+regular files. `status` treats the symlink itself as the worktree object,
+compares the stored link target bytes, and reports target changes as
+modifications instead of following the link or treating dangling symlinks as
+deleted.
 
 ## Options
+
+### `<pathspec>...`
+
+Limit status output to matching paths. Pathspecs resolve from the current
+working directory unless `:(top)` is used, and support exact files, directory
+prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` /
+`:(literal)` / `:(glob)` magic.
 
 ### `-s, --short`
 
@@ -232,6 +255,12 @@ M  src/lib.rs
 ?? notes.txt
 ```
 
+Unmerged conflict:
+
+```text
+UU conflict.txt
+```
+
 `--quiet` suppresses all `stdout` output. Combined with `--exit-code`, it acts as a
 silent dirty check (exit 1 if dirty, exit 0 if clean).
 
@@ -335,7 +364,8 @@ Detached HEAD:
 - `upstream` is `null` when no tracking branch is configured or HEAD is detached
 - `upstream.gone` is `true` when the remote tracking branch no longer exists
 - `upstream.ahead` / `upstream.behind` are `null` when `gone` is `true`
-- `is_clean` is `true` when all staged, unstaged, and untracked lists are empty
+- `is_clean` is `true` only when staged, unstaged, untracked, and unmerged
+  lists are empty and no global merge state is active
 - `has_commits` is `false` in a freshly initialized repository with no commits
 - `stash_entries` (optional, integer): present only when `--show-stash` is
   passed. Counts the entries on the stash stack (matching `libra stash list`)
@@ -361,6 +391,10 @@ matching Git's own v2 encoding. The implementation lives in
 `src/command/status.rs::output_porcelain_v2` and is fed by
 `build_porcelain_v2_data`, which pulls mode + hash metadata out of the
 index and HEAD tree before rendering.
+
+With `-z`, porcelain v1 and v2 records are NUL-terminated and contain no
+trailing newlines. Rename-capable porcelain output does not use the human
+`old -> new` arrow form under `-z`; scripts should split fields on NUL.
 
 Most consumers should still prefer `--json` (or `--machine` for compact
 single-line JSON): the JSON envelope carries the same staged/unstaged/

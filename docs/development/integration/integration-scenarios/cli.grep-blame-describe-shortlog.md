@@ -85,8 +85,17 @@ python3 -c "import json; d=json.load(open('shortlog.json')); assert d['ok'] is T
 
 ```bash
 cd "$RUN_DIR/inspect-repo"
-! libra grep no-such-pattern docs/guide.txt
-! libra grep --tree no-such-revision Alpha docs/guide.txt
+set +e
+libra grep no-such-pattern docs/guide.txt
+grep_no_match_status=$?
+libra grep --tree no-such-revision Alpha docs/guide.txt
+grep_bad_tree_status=$?
+libra grep -P Alpha docs/guide.txt
+grep_perl_status=$?
+set -e
+test "$grep_no_match_status" -eq 1
+test "$grep_bad_tree_status" -eq 2
+test "$grep_perl_status" -eq 2
 ! libra blame -L bad docs/guide.txt
 ! libra blame missing.txt
 ! libra describe no-such-revision
@@ -94,11 +103,11 @@ cd "$RUN_DIR/inspect-repo"
 ! libra describe --exact-match            # HEAD 已越过 tag，必须失败
 ```
 
-断言：`grep` 可在工作区、指定 pathspec、pattern file、暂存区（`--cached`）、未跟踪文件（`--untracked`）和历史 tree 中匹配内容，`-F` / `-i` / `-n` / `-c` / `-l` / `-L` 输出可用于脚本断言，`-z -l` 输出 NUL 结尾路径且无尾随换行；`blame` 输出每行作者和提交信息，`-L` 限制行范围，COMMIT 位置参数按历史版本归因，`--porcelain` 输出 `author ` / `author-mail <...>` 键值头部与 tab 前缀内容行；`describe --tags` 使用可达 tag，`--always --abbrev` 在需要时输出短 hash，`--long` 在精确匹配时输出 `tag-0-gHASH`，`--exact-match` 仅在 HEAD 恰好位于 tag 时成功，`--dirty` 仅在跟踪内容偏离 HEAD 时追加后缀，`--long --abbrev=0` 必须失败；`shortlog` 默认、summary、排序、`-e` 邮箱、`--format` 占位符、`--top` / `--min-count` / `--reverse` 过滤排序与位置 revision 限制都能按作者汇总；无匹配 grep、非法 revision、非法 blame 范围、缺失文件、越过 tag 的 `--exact-match` 必须失败且不改变仓库。
+断言：`grep` 可在工作区、指定 pathspec、pattern file、暂存区（`--cached`）、未跟踪文件（`--untracked`）和历史 tree 中匹配内容，`-F` / `-i` / `-n` / `-c` / `-l` / `-L` 输出可用于脚本断言，`-z -l` 输出 NUL 结尾路径且无尾随换行；`grep` 退出码遵循 Git grep 合同：命中 0、无命中 1 且 stderr 静默、命令错误（例如非法 revision 或 `-P`）2；`blame` 输出每行作者和提交信息，`-L` 限制行范围，COMMIT 位置参数按历史版本归因，`--porcelain` 输出 `author ` / `author-mail <...>` 键值头部与 tab 前缀内容行；`describe --tags` 使用可达 tag，`--always --abbrev` 在需要时输出短 hash，`--long` 在精确匹配时输出 `tag-0-gHASH`，`--exact-match` 仅在 HEAD 恰好位于 tag 时成功，`--dirty` 仅在跟踪内容偏离 HEAD 时追加后缀，`--long --abbrev=0` 必须失败；`shortlog` 默认、summary、排序、`-e` 邮箱、`--format` 占位符、`--top` / `--min-count` / `--reverse` 过滤排序与位置 revision 限制都能按作者汇总；无匹配 grep、非法 revision、非法 blame 范围、缺失文件、越过 tag 的 `--exact-match` 必须失败且不改变仓库。
 
 补充可执行断言：
 - `libra --json grep Alpha docs` 必须 `ok:true` 且 `data.matches[]` 可解析。
 - `libra --json blame -L 1,1 docs/guide.txt` 验证结构包含 author / commit 信息。
 - `libra --json describe --tags` 成功且包含 tag 信息。
 - `libra --json shortlog` 返回按作者汇总的结构。
-- 负向 `libra grep` 无匹配 或 `libra blame` 非法范围必须非 0，stderr 包含可识别错误（可选 LBR-）。
+- 负向 `libra grep` 无匹配必须退出 1 且 stderr 静默；grep 命令错误必须退出 2；`libra blame` 非法范围必须非 0，stderr 包含可识别错误（可选 LBR-）。

@@ -16,9 +16,14 @@ libra grep -f <file> [-- <pathspec>...]
 
 Multiple patterns can be supplied via `-e` flags or read from files via `-f`. When multiple patterns are active, a file matches if any pattern matches at least one line (OR semantics). With `--all-match`, a file is included only if every pattern matches at least one line in that file (AND semantics across patterns, not across lines).
 
-Output can be tuned with flags to show only filenames (`-l`, `-L`), match counts per file (`-c`), line numbers (`-n`), byte offsets (`-b`), or inverted matches (`-v`). The command supports pathspec filtering to restrict the search to specific files or directories.
+Output can be tuned with flags to show only filenames (`-l`, `-L`), match counts per file (`-c`), line numbers (`-n`), byte offsets (`-b`), or inverted matches (`-v`). The command supports pathspec filtering to restrict the search to specific files or directories. Repository searches use the shared pathspec engine, including `:(top)`, `:(exclude)`, `:(icase)`, `:(literal)`, and `:(glob)` magic.
 
 When stdout is a terminal, output is sent through a pager. In JSON mode, structured output is emitted for programmatic consumption.
+
+When stdout is piped and the downstream command exits early, `libra grep` exits quietly without
+printing panic/backtrace or `Broken pipe` diagnostics.
+
+Exit codes follow Git's grep contract: matches exit 0, no selected matches exit 1 without an error diagnostic, and grep command errors (for example invalid regexes, unsupported `-P`, missing pattern files, or invalid `--tree` revisions) exit 2. Repository preflight errors such as running repository mode outside a Libra repository keep the standard Libra fatal exit code.
 
 ## Options
 
@@ -382,7 +387,7 @@ jj does not have a built-in grep command. Users are expected to use external too
 | Index search | `--cached` | `--cached` | N/A |
 | Context lines | `-A` / `-B` / `-C` | `-C` / `-A` / `-B` | N/A |
 | Extended regexp | `-E` / `--extended-regexp` | `-E` / `--extended-regexp` | N/A |
-| Perl regexp | Rejected (exit 129) | `-P` / `--perl-regexp` | N/A |
+| Perl regexp | Rejected (exit 2) | `-P` / `--perl-regexp` | N/A |
 | Max count | `-m` / `--max-count` | `-m` / `--max-count` | N/A |
 | Only matching | `-o` / `--only-matching` | `-o` / `--only-matching` | N/A |
 | Show function | Not supported | `-p` / `--show-function` | N/A |
@@ -399,8 +404,8 @@ Note: jj does not have a built-in grep command. Users rely on external tools lik
 |----------|-----------------|------|
 | Not a libra repository | `LBR-REPO-001` | 128 |
 | No pattern provided (and no `-e` or `-f`) | Clap argument error | 2 |
-| Invalid regex pattern | `LBR-CLI-003` (CliInvalidTarget) | 129 |
-| Revision not found (`--tree`) | `LBR-CLI-003` (CliInvalidTarget) | 129 |
-| No matches found | `LBR-CLI-003` (CliInvalidTarget) | 129 |
+| Invalid regex pattern | `LBR-CLI-002` (CliInvalidArguments) | 2 |
+| Revision not found (`--tree`) | `LBR-CLI-003` (CliInvalidTarget) | 2 |
+| No matches found | Status-only signal | 1 |
 | Failed to read file (non-fatal) | Warning in output, file skipped | 0 |
-| Failed to read pattern file (`-f`) | Error with file path details | 128 |
+| Failed to read pattern file (`-f`) | Error with file path details | 2 |

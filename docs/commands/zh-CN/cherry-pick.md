@@ -22,6 +22,8 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 该命令要求处于活动分支（不是 detached HEAD）。非 merge commit 直接应用；cherry-pick merge commit 需用 `-m <n>`/`--mainline <n>` 指定沿哪个父提交做 diff。
 
+自动提交的 cherry-pick 会保留源提交的 author metadata（姓名、邮箱、author date 与时区）。committer 使用当前身份/日期，并遵循 `GIT_COMMITTER_*` 覆盖。带签名的源提交会先剥离 `gpgsig` 消息块，再执行消息清理与 trailer 追加，因此签名块不会成为重放后的 subject。
+
 当某提交无法干净应用时，Libra 执行三方 apply（base = 父提交树，ours = 当前索引，theirs = 被 pick 的树），并把任何发散路径写入索引（stage 1/2/3）与工作树（行级冲突标记，与 Git 一致）。进行中的序列持久化到 SQLite `cherry_pick_state` 表，因此你可以解决冲突后用 `--continue` 续作、用 `--skip` 丢弃冲突提交，或用 `--abort`/`--quit` 撤销整个序列。cherry-pick 序列进行期间，`merge` 与 `rebase` 被阻止（`LBR-CONFLICT-002`）。
 
 ## 选项

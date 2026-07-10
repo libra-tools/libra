@@ -22,6 +22,11 @@ This is useful for selectively applying commits from one branch to another witho
 
 The command requires an active branch (not detached HEAD). Non-merge commits are applied directly; merge commits require `-m <parent-number>` to choose which parent to diff against.
 
+Auto-committed picks preserve the source commit's author metadata (name, email,
+author date, and timezone). The committer is the current identity/date, honoring
+`GIT_COMMITTER_*` overrides. Signed source messages are de-signed before message
+cleanup/trailer handling, so `gpgsig` blocks never become the replayed subject.
+
 When a commit cannot be applied cleanly, Libra performs a three-way apply (base = parent tree, ours = current index, theirs = picked tree) and writes any divergent path to the index (stages 1/2/3) and the working tree (line-level conflict markers, matching Git). The in-progress sequence is persisted in the SQLite `cherry_pick_state` table, so you can resolve the conflict and continue with `--continue`, drop the conflicted commit with `--skip`, or undo the whole sequence with `--abort`/`--quit`. While a cherry-pick sequence is in progress, `merge` and `rebase` are blocked (`LBR-CONFLICT-002`).
 
 ## Options

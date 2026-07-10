@@ -1,16 +1,16 @@
-//! `libra check-ignore` — report which pathnames are excluded by `.libraignore`
-//! rules, mirroring `git check-ignore`.
+//! `libra check-ignore` — report which pathnames are excluded by Git/Libra
+//! ignore rules, mirroring `git check-ignore`.
 //!
 //! For each pathname (positional or read from `--stdin`), the command consults
-//! the same `.libraignore` engine `status` / `add` use (via
+//! the same ignore engine `status` / `add` use (via
 //! [`util::check_gitignore_match`]) and reports the paths that are ignored. With
 //! `-v` it also reports the deciding pattern's source file, line, and text.
 //!
 //! Exit codes follow Git: `0` when at least one path is ignored, `1` when none
 //! are (a clean signal, not an error), and `128` for a usage/repository error.
 //!
-//! Libra-specific note (intentional difference, see `_compatibility.md` D5):
-//! the rules come from `.libraignore`, not `.gitignore`.
+//! Libra-specific extension files are read alongside Git's standard ignore
+//! sources.
 
 use std::{
     io::{self, Read, Write},
@@ -43,7 +43,7 @@ EXAMPLES:
     libra check-ignore --no-index a.log   Match rules even for a tracked path (debugging)
     libra check-ignore --json target/     Structured JSON output for agents";
 
-/// Report which pathnames are excluded by `.libraignore` rules.
+/// Report which pathnames are excluded by Git/Libra ignore rules.
 #[derive(Parser, Debug)]
 #[command(after_help = CHECK_IGNORE_EXAMPLES)]
 pub struct CheckIgnoreArgs {
@@ -83,7 +83,7 @@ pub struct CheckIgnoreEntry {
     pub path: String,
     /// Whether the path is excluded by an ignore rule.
     pub ignored: bool,
-    /// The `.libraignore` file that supplied the deciding pattern, if any.
+    /// The ignore file that supplied the deciding pattern, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// 1-based line number of the deciding pattern within `source`, if known.
@@ -177,7 +177,7 @@ pub async fn execute_safe(args: CheckIgnoreArgs, output: &OutputConfig) -> CliRe
 /// Out-of-worktree paths are a fatal error (exit 128, matching Git), not a
 /// silent non-match: a lexically-normalised absolute path that does not stay
 /// under the worktree is rejected *before* the matcher runs (the matcher
-/// asserts containment and would otherwise read `.libraignore` files outside the
+/// asserts containment and would otherwise read ignore files outside the
 /// repository when a `..` sequence escapes it).
 fn classify_path(
     path_str: &str,
@@ -218,22 +218,20 @@ fn classify_path(
         return Ok(none(false));
     }
 
-    Ok(
-        match util::check_gitignore_match(&workdir.to_path_buf(), &normalized) {
-            Some(info) => CheckIgnoreEntry {
-                path: path_str.to_string(),
-                ignored: info.ignored,
-                source: info.source.map(|source| display_source(&source, workdir)),
-                line: info.line,
-                pattern: if info.pattern.is_empty() {
-                    None
-                } else {
-                    Some(info.pattern)
-                },
+    Ok(match util::check_gitignore_match(workdir, &normalized) {
+        Some(info) => CheckIgnoreEntry {
+            path: path_str.to_string(),
+            ignored: info.ignored,
+            source: info.source.map(|source| display_source(&source, workdir)),
+            line: info.line,
+            pattern: if info.pattern.is_empty() {
+                None
+            } else {
+                Some(info.pattern)
             },
-            None => none(false),
         },
-    )
+        None => none(false),
+    })
 }
 
 /// Lexically normalise a path by collapsing `.` and `..` components without
@@ -253,8 +251,8 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// Render the `.libraignore` source path relative to the worktree root when it
-/// lives inside it (so output reads `sub/.libraignore`, not an absolute path).
+/// Render the ignore source path relative to the worktree root when it lives
+/// inside it (so output reads `sub/.gitignore`, not an absolute path).
 fn display_source(source: &Path, workdir: &Path) -> String {
     source
         .strip_prefix(workdir)

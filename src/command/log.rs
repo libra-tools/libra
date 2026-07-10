@@ -4,6 +4,7 @@ use std::{
     cell::RefCell,
     cmp::min,
     collections::{HashMap, HashSet, VecDeque},
+    io::IsTerminal,
     path::PathBuf,
     rc::Rc,
     str::FromStr,
@@ -34,7 +35,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         object_ext::TreeExt,
-        output::{OutputConfig, emit_json_data},
+        output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
         util,
     },
@@ -153,6 +154,9 @@ pub struct LogArgs {
     /// Show names and status of changed files
     #[clap(long)]
     pub name_status: bool,
+    /// Use NUL separators for log records and changed-path output
+    #[clap(short = 'z', long = "null")]
+    pub null: bool,
     /// Filter commits by author name or email (case-insensitive substring match)
     #[clap(long, value_name = "PATTERN")]
     pub author: Option<String>,
@@ -1409,8 +1413,14 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
     } else {
         FormatType::Full
     };
-    let mut formatter =
-        CommitFormatter::new(format_type).with_date_mode(args.date.clone().unwrap_or_default());
+    let color_enabled = match output.color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => std::io::stdout().is_terminal(),
+    };
+    let mut formatter = CommitFormatter::new(format_type)
+        .with_date_mode(args.date.clone().unwrap_or_default())
+        .with_color_enabled(color_enabled);
     if args.only_trailers {
         // Key-filter the display to the `--trailer` keys when given.
         let selected_keys: Vec<String> = parse_trailer_filters(&args.trailers)?
@@ -1579,14 +1589,8 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         let mut message = formatter.format(&commit, &ctx);
 
         if name_only || name_status {
-            if let Some(changes) = cached_changes.take()
-                && !changes.is_empty()
-            {
-                if !message.ends_with('\n') {
-                    message.push('\n');
-                }
-                message.push_str(&format_changes(&changes, name_status));
-            }
+            let changes = cached_changes.take().unwrap_or_default();
+            append_changed_paths(&mut message, &changes, name_status, args.null);
         } else if patch {
             // Build the optional diffstat block first (stat, blank line, then the
             // patch), reusing the existing `--stat` and `-p` renderers in Git's
@@ -1628,7 +1632,14 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
             }
         }
 
-        pager.write_line(&message)?;
+        if args.null {
+            if !(name_only || name_status) {
+                message.push('\0');
+            }
+            pager.write_str(&message)?;
+        } else {
+            pager.write_line(&message)?;
+        }
     }
 
     pager.finish()?;
@@ -2147,7 +2158,28 @@ pub(crate) async fn get_changed_files_for_commit(
     Ok(changed_files)
 }
 
-fn format_changes(changes: &[FileChange], include_status: bool) -> String {
+fn append_changed_paths(
+    message: &mut String,
+    changes: &[FileChange],
+    include_status: bool,
+    null: bool,
+) {
+    if null {
+        message.push('\0');
+        if !changes.is_empty() {
+            message.push('\n');
+            message.push_str(&format_changes(changes, include_status, true));
+        }
+    } else if !changes.is_empty() {
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
+        message.push('\n');
+        message.push_str(&format_changes(changes, include_status, false));
+    }
+}
+
+fn format_changes(changes: &[FileChange], include_status: bool, null: bool) -> String {
     let mut out = String::new();
     for change in changes {
         if include_status {
@@ -2156,9 +2188,27 @@ fn format_changes(changes: &[FileChange], include_status: bool) -> String {
                 ChangeType::Modified => "M",
                 ChangeType::Deleted => "D",
             };
-            out.push_str(&format!("{}\t{}\n", status, change.path.display()));
+            if null {
+                out.push_str(status);
+                out.push('\0');
+                out.push_str(&change.path.display().to_string());
+                out.push('\0');
+            } else {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("{}\t{}", status, change.path.display()));
+            }
         } else {
-            out.push_str(&format!("{}\n", change.path.display()));
+            if null {
+                out.push_str(&change.path.display().to_string());
+                out.push('\0');
+            } else {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&change.path.display().to_string());
+            }
         }
     }
     out
@@ -2703,6 +2753,9 @@ mod tests {
         let args = LogArgs::parse_from(["libra", "--name-status"]);
         assert!(args.name_status);
         assert!(!args.name_only);
+
+        let args = LogArgs::parse_from(["libra", "-z", "--name-status"]);
+        assert!(args.null);
     }
 
     #[test]
@@ -2711,12 +2764,15 @@ mod tests {
             path: PathBuf::from("src/main.rs"),
             status: ChangeType::Added,
         }];
-        let with_status = format_changes(&changes, true);
-        assert!(with_status.contains("A\tsrc/main.rs"));
+        let with_status = format_changes(&changes, true, false);
+        assert_eq!(with_status, "A\tsrc/main.rs");
 
-        let names_only = format_changes(&changes, false);
-        assert!(names_only.contains("src/main.rs"));
+        let names_only = format_changes(&changes, false, false);
+        assert_eq!(names_only, "src/main.rs");
         assert!(!names_only.contains("A\t"));
+
+        let with_status_z = format_changes(&changes, true, true);
+        assert_eq!(with_status_z.as_bytes(), b"A\0src/main.rs\0");
     }
 
     #[tokio::test]

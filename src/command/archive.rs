@@ -24,6 +24,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::OutputConfig,
+        tree_attributes::{self, ExportIgnoreMatcher, TreeAttributeSource},
         util,
     },
 };
@@ -210,6 +211,32 @@ fn load_entry_content(entry: &ArchiveEntry) -> Result<Vec<u8>, CliError> {
         ArchiveSource::Blob(hash) => load_blob_content(hash),
         ArchiveSource::Inline(data) => Ok(data.clone()),
     }
+}
+
+fn collect_tree_attribute_sources(
+    entries: &[ArchiveEntry],
+) -> Result<Vec<TreeAttributeSource>, CliError> {
+    let mut sources = Vec::new();
+    for entry in entries {
+        if !tree_attributes::is_tree_attribute_file(&entry.path) {
+            continue;
+        }
+        sources.push(TreeAttributeSource {
+            path: entry.path.clone(),
+            contents: load_entry_content(entry)?,
+        });
+    }
+    Ok(sources)
+}
+
+fn filter_export_ignored_entries(
+    entries: Vec<ArchiveEntry>,
+    matcher: &ExportIgnoreMatcher,
+) -> Vec<ArchiveEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| !matcher.is_ignored(&entry.path))
+        .collect()
 }
 
 /// Map a working-tree file's metadata to the archive header mode: executable
@@ -719,7 +746,10 @@ pub async fn execute_safe(args: ArchiveArgs, _output: &OutputConfig) -> CliResul
     let prefix = validate_prefix(args.prefix.as_deref())?;
     let treeish = args.treeish.as_deref().unwrap_or("HEAD");
     let (resolved_entries, committer_time) = resolve_entries(treeish).await?;
-    let mut entries = filter_entries_by_pathspecs(resolved_entries, &args.paths)?;
+    let attribute_sources = collect_tree_attribute_sources(&resolved_entries)?;
+    let export_ignore = ExportIgnoreMatcher::from_sources(&attribute_sources);
+    let entries = filter_entries_by_pathspecs(resolved_entries, &args.paths)?;
+    let mut entries = filter_export_ignored_entries(entries, &export_ignore);
 
     // Archive-entry modification time: `--mtime` when given (same date formats as
     // `--since`/`--until`), otherwise the archived commit's committer time

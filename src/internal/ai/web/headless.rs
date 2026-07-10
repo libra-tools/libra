@@ -356,6 +356,7 @@ where
                 session: session.clone(),
                 assistant_entry_id: task_assistant_entry_id.clone(),
                 tool_arguments: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                start_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             };
 
             let prior_history = {
@@ -921,6 +922,13 @@ struct HeadlessTurnObserver {
     session: Arc<CodeUiSession>,
     assistant_entry_id: String,
     tool_arguments: Arc<std::sync::Mutex<HashMap<String, serde_json::Value>>>,
+    /// `JoinHandle`s of the per-tool-call "start" projection tasks, keyed by
+    /// call id. `on_tool_call_start` and `on_tool_call_end` each `tokio::spawn`
+    /// an independent task with no ordering guarantee; `on_tool_call_end`
+    /// awaits the matching start handle before writing terminal state so a late
+    /// "start" task can never clobber the "completed" tool_call / transcript /
+    /// plan rows or regress the session status back to `ExecutingTool`.
+    start_tasks: Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
 impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnObserver {
@@ -954,9 +962,10 @@ impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnO
 
         let session = self.session.clone();
         let call_id = call_id.to_string();
+        let start_key = call_id.clone();
         let tool_name = tool_name.to_string();
         let arguments = arguments.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let summary = headless_tool_call_summary(&tool_name, &arguments);
             session
                 .upsert_tool_call(CodeUiToolCallSnapshot {
@@ -995,6 +1004,11 @@ impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnO
             }
             session.set_status(CodeUiSessionStatus::ExecutingTool).await;
         });
+        // Record the start task so `on_tool_call_end` can await it before
+        // writing terminal state (the ordering barrier for this tool call).
+        if let Ok(mut tasks) = self.start_tasks.lock() {
+            tasks.insert(start_key, handle);
+        }
     }
 
     fn on_tool_call_end(
@@ -1008,11 +1022,23 @@ impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnO
             .lock()
             .ok()
             .and_then(|mut arguments_by_call| arguments_by_call.remove(call_id));
+        // Ordering barrier: take the matching `on_tool_call_begin` task so the
+        // end task can await it before writing terminal state. Without this, a
+        // late-scheduled start task would clobber "completed" back to "running"
+        // (tool_call / transcript / plan rows) and regress the session status.
+        let start_handle = self
+            .start_tasks
+            .lock()
+            .ok()
+            .and_then(|mut tasks| tasks.remove(call_id));
         let session = self.session.clone();
         let call_id = call_id.to_string();
         let tool_name = tool_name.to_string();
         let result = result.clone();
         tokio::spawn(async move {
+            if let Some(handle) = start_handle {
+                let _ = handle.await;
+            }
             let (status, details) = match &result {
                 Ok(output) if output.is_success() => (
                     "completed".to_string(),

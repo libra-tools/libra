@@ -803,6 +803,10 @@ pub enum FetchError {
     IndexPack { path: String, source: GitError },
     #[error("failed to update references after fetch: {message}")]
     UpdateRefs { message: String },
+    #[error(
+        "local Libra remotes do not support --depth yet because they cannot advertise shallow boundaries"
+    )]
+    UnsupportedShallowLocalLibra,
     #[error("failed to inspect local repository state: {message}")]
     LocalState { message: String },
 }
@@ -860,6 +864,12 @@ impl From<FetchError> for CliError {
             | FetchError::UpdateRefs { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            FetchError::UnsupportedShallowLocalLibra => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint(
+                    "omit --depth for local Libra remotes, or fetch from a Git remote that \
+                     negotiates shallow boundaries",
+                ),
             FetchError::LocalState { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
             }
@@ -1395,6 +1405,11 @@ pub(crate) async fn fetch_repository_with_result(
     // prevent secret leakage in both human and JSON output.
     let normalized_url =
         redact_url_credentials(&normalize_remote_url(&remote_config.url, &remote_client));
+    if depth.is_some()
+        && matches!(&remote_client, RemoteClient::Local(client) if client.is_libra_source())
+    {
+        return Err(FetchError::UnsupportedShallowLocalLibra);
+    }
     let local_kind = get_hash_kind();
     if discovery.hash_kind != local_kind {
         return Err(FetchError::ObjectFormatMismatch {

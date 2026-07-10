@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use libra::internal::ai::observed_agents::{
-    AgentKind, DeclaredAgentCaps, FIRST_BATCH_WAVE, SlugLookup, agent_for,
+    AgentKind, DeclaredAgentCaps, FIRST_BATCH_WAVE, SlugLookup, agent_for, discover_skills,
     launchable_investigate_slugs, launchable_review_slugs, lookup_cli_slug, registration_for,
     registry, supported_slugs,
 };
@@ -185,6 +185,65 @@ fn known_agent_capability_matrix_matches_current_roster() {
             "{}: hook_installable must equal supported && as_hooks().is_some()",
             row.slug
         );
+    }
+}
+
+/// A0-07: the curated per-agent skill-discovery registry
+/// (`discover_skills`, the public SkillDiscoverer surface) matches the frozen
+/// first-batch roster — Claude Code exposes the three E7 skills, Codex and
+/// OpenCode the single `/review`, and every non-first-batch agent exposes
+/// none. Skill discovery is an OPTIONAL capability (unlocked via the v1
+/// `methods[]` `skill_events` negotiation), deliberately NOT a 9th
+/// `DeclaredAgentCaps` bool, so the frozen 8-key wire contract above is
+/// untouched.
+#[test]
+fn skill_discovery_registry_matches_roster() {
+    let claude = discover_skills(AgentKind::ClaudeCode);
+    assert_eq!(
+        claude.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        ["/review", "/security-review", "/simplify"],
+        "claude-code curated skills drifted from E7"
+    );
+    assert!(
+        claude.iter().all(|s| s.provider == "claude-code"),
+        "discovered skills carry the agent's CLI slug as provider"
+    );
+    assert_eq!(
+        discover_skills(AgentKind::Codex)
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["/review"]
+    );
+    assert_eq!(
+        discover_skills(AgentKind::OpenCode)
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["/review"]
+    );
+    // Non-first-batch agents expose no discoverable skills.
+    for kind in [
+        AgentKind::Gemini,
+        AgentKind::Cursor,
+        AgentKind::Copilot,
+        AgentKind::FactoryAi,
+    ] {
+        assert!(
+            discover_skills(kind).is_empty(),
+            "{}: unsupported agents expose no discoverable skills",
+            kind.as_cli_slug()
+        );
+    }
+    // Every supported agent's discovery set is non-empty and provider-tagged.
+    for kind in AgentKind::all() {
+        for skill in discover_skills(*kind) {
+            assert_eq!(skill.provider, kind.as_cli_slug());
+            assert!(
+                skill.name.starts_with('/'),
+                "skill names are slash commands"
+            );
+        }
     }
 }
 

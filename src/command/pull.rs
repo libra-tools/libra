@@ -733,6 +733,12 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         | fetch::FetchError::UpdateRefs { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
         }
+        fetch::FetchError::UnsupportedShallowLocalLibra => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint(
+                "omit --depth for local Libra upstreams, or pull from a Git remote that \
+                 negotiates shallow boundaries",
+            ),
         fetch::FetchError::LocalState { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
         }

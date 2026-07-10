@@ -1,10 +1,8 @@
 # `libra check-ignore`
 
-报告哪些路径被 `.libraignore` 规则忽略（排除）——等价于 `git check-ignore`，但适配 Libra 的忽略文件。
+报告哪些路径被 Git/Libra ignore 规则忽略（排除）——等价于 `git check-ignore`，同时保留 Libra 扩展文件。
 
-> 有意差异：Libra 的忽略规则位于 `.libraignore`，而非 `.gitignore`（见
-> [`docs/development/commands/_compatibility.md`](../../development/commands/_compatibility.md)）。
-> 匹配引擎、优先级与模式语法与 Git 一致。
+Libra 会读取 Git 标准来源（`.gitignore`、`.git/info/exclude`、`core.excludesFile`）以及 Libra 扩展来源（`.libraignore`）。同一目录内 `.libraignore` 优先于 `.gitignore`；更近目录的来源优先于祖先目录；`.git/info/exclude` 和 `core.excludesFile` 是较低优先级 fallback。模式语法使用 Git ignore 语法。
 
 ## 用法
 
@@ -15,7 +13,7 @@ libra check-ignore [-v] [-n] [-z] [--no-index] --stdin
 
 ## 说明
 
-对每个 `<pathname>`（命令行给出，或经 `--stdin` 读取），`check-ignore` 按当前 `.libraignore` 规则判定，并打印**被忽略**（排除）的路径。它是只读查询，不修改 index 或工作树。
+对每个 `<pathname>`（命令行给出，或经 `--stdin` 读取），`check-ignore` 按当前 ignore 来源判定，并打印**被忽略**（排除）的路径。它是只读查询，不修改 index 或工作树。
 
 默认情况下，已被 index 跟踪的路径会被报告为**未忽略**（显式 `add` 覆盖规则）。使用 `--no-index` 可对已跟踪路径也按纯模式匹配上报——用于调试为何某路径未如预期被忽略。
 

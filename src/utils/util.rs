@@ -6,7 +6,7 @@ use std::{
     ffi::OsStr,
     fs, io,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::SystemTime,
 };
@@ -16,7 +16,7 @@ use git_internal::{
     internal::object::{commit::Commit, types::ObjectType},
 };
 use ignore::{
-    Match, WalkBuilder,
+    Match,
     gitignore::{Gitignore, GitignoreBuilder},
 };
 use indicatif::{ProgressBar, ProgressStyle};
@@ -27,7 +27,7 @@ use crate::{
     command::load_object,
     internal::{
         branch::{Branch, BranchStoreError},
-        config::ConfigKv,
+        config::{ConfigKv, LocalIdentityTarget, read_cascaded_config_value},
         head::Head,
         tag,
     },
@@ -44,18 +44,34 @@ pub const ROOT_DIR: &str = ".libra";
 /// untracked or staged, and it cannot be un-ignored via `.libraignore`.
 pub const GIT_DIR: &str = ".git";
 const LIBRAIGNORE_FILE: &str = ".libraignore";
+const GITIGNORE_FILE: &str = ".gitignore";
+const CORE_EXCLUDES_FILE_KEY: &str = "core.excludesFile";
 pub const DATABASE: &str = "libra.db";
 pub const ATTRIBUTES: &str = ".libra_attributes";
 
 static OBJECTS_STORAGE_CACHE: Lazy<Mutex<HashMap<PathBuf, ClientStorage>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static LIBRAIGNORE_CACHE: Lazy<Mutex<HashMap<PathBuf, CachedGitignore>>> =
+static LIBRAIGNORE_CACHE: Lazy<Mutex<HashMap<IgnoreCacheKey, CachedGitignore>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static CONFIG_PATH_CACHE: Lazy<Mutex<HashMap<ConfigPathCacheKey, Option<PathBuf>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IgnoreCacheKey {
+    source: PathBuf,
+    base: PathBuf,
+}
 
 struct CachedGitignore {
     len: u64,
     modified: SystemTime,
     matcher: Arc<Gitignore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConfigPathCacheKey {
+    workdir: PathBuf,
+    key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +165,15 @@ fn resolve_dot_git_dir(worktree: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Resolve a Git-standard `.git/info/<name>` file for a worktree, including
+/// linked-worktree `.git` files. Returns `None` when the worktree has no Git
+/// metadata directory.
+pub fn git_info_file_path(worktree: &Path, name: &str) -> Option<PathBuf> {
+    let git_dir = resolve_dot_git_dir(worktree)?;
+    let common_dir = git_common_dir(&git_dir).unwrap_or(git_dir);
+    Some(common_dir.join("info").join(name))
+}
+
 fn git_common_dir(git_dir: &Path) -> Option<PathBuf> {
     let contents = fs::read_to_string(git_dir.join("commondir")).ok()?;
     let raw = contents.lines().next()?.trim();
@@ -157,11 +182,35 @@ fn git_common_dir(git_dir: &Path) -> Option<PathBuf> {
     }
 
     let common_dir = Path::new(raw);
-    Some(if common_dir.is_absolute() {
+    let path = if common_dir.is_absolute() {
         common_dir.to_path_buf()
     } else {
         git_dir.join(common_dir)
-    })
+    };
+    Some(normalize_lexical_path(&path))
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Path::new(component.as_os_str())),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    out.push("..");
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
 }
 
 fn git_dir_marker_exists(git_dir: &Path, common_dir: Option<&Path>, marker: &str) -> bool {
@@ -438,6 +487,67 @@ pub fn try_working_dir() -> io::Result<PathBuf> {
     Ok(workdir)
 }
 
+/// Read a path-valued config key from local-then-global config and expand it
+/// relative to `workdir`. This is best-effort for optional Git compatibility
+/// sources such as `core.excludesFile`: unreadable or absent config is treated
+/// as no configured path so hot-path commands do not fail because an optional
+/// global config DB is unavailable.
+pub fn optional_cascaded_config_path(key: &str, workdir: &Path) -> Option<PathBuf> {
+    let cache_key = ConfigPathCacheKey {
+        workdir: workdir.to_path_buf(),
+        key: key.to_string(),
+    };
+    if let Ok(cache) = CONFIG_PATH_CACHE.lock()
+        && let Some(cached) = cache.get(&cache_key)
+    {
+        return cached.clone();
+    }
+
+    let value = read_cascaded_config_value_sync(key).map(|raw| expand_config_path(&raw, workdir));
+    if let Ok(mut cache) = CONFIG_PATH_CACHE.lock() {
+        cache.insert(cache_key, value.clone());
+    }
+    value
+}
+
+fn read_cascaded_config_value_sync(key: &str) -> Option<String> {
+    let key = key.to_string();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        runtime
+            .block_on(read_cascaded_config_value(
+                LocalIdentityTarget::CurrentRepo,
+                &key,
+            ))
+            .ok()
+            .flatten()
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+fn expand_config_path(raw: &str, workdir: &Path) -> PathBuf {
+    let expanded = if raw == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw))
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(raw))
+    } else {
+        PathBuf::from(raw)
+    };
+
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        workdir.join(expanded)
+    }
+}
+
 /// Get the working directory of the repository as a string, panics if the path is not valid utf-8
 pub fn working_dir_string() -> String {
     // INVARIANT: this function is documented to panic on non-UTF-8 paths.
@@ -669,31 +779,30 @@ fn list_files_respecting_libraignore(path: &Path) -> io::Result<Vec<PathBuf>> {
         return Ok(files);
     }
 
-    let mut builder = WalkBuilder::new(path);
-    builder
-        .hidden(false)
-        .parents(true)
-        .ignore(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .add_custom_ignore_filename(LIBRAIGNORE_FILE)
-        // Always skip `.libra` (Libra metadata) and `.git` (like Git).
-        .filter_entry(|entry| {
-            let name = entry.file_name();
-            name != OsStr::new(ROOT_DIR) && name != OsStr::new(GIT_DIR)
-        });
+    fn visit(workdir: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let file_name = entry.file_name();
+            if file_name == OsStr::new(ROOT_DIR) || file_name == OsStr::new(GIT_DIR) {
+                continue;
+            }
 
-    for entry in builder.build() {
-        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        let entry_path = entry.path();
-        if entry_path == path {
-            continue;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                if !check_gitignore(workdir, &entry_path) {
+                    visit(workdir, &entry_path, files)?;
+                }
+            } else if (file_type.is_file() || file_type.is_symlink())
+                && !check_gitignore(workdir, &entry_path)
+            {
+                files.push(to_workdir_path(&entry_path));
+            }
         }
-        if entry_path.is_file() {
-            files.push(to_workdir_path(entry_path));
-        }
+        Ok(())
     }
+
+    visit(path, path, &mut files)?;
 
     Ok(files)
 }
@@ -1168,18 +1277,19 @@ fn path_has_git_dir_component(work_dir: &Path, target_file: &Path) -> bool {
         .any(|component| component.as_os_str() == OsStr::new(GIT_DIR))
 }
 
-/// Check each directory level from `work_dir` to `target_file` to see if there is a `.libraignore`
-/// file that matches `target_file`.
+/// Check each directory level from `work_dir` to `target_file` to see if an
+/// ignore source matches `target_file`.
 ///
-/// `.git` is always treated as ignored (like Git) regardless of any `.libraignore` rule.
+/// `.git` is always treated as ignored (like Git) regardless of any ignore
+/// rule.
 ///
 /// Low-level helper historically used by status/add flows. Prefer the higher-level wrappers in
 /// `crate::utils::ignore::{should_ignore, filter_workdir_paths}` so that ignore policies and index
-/// awareness stay consistent. Call this directly only when you explicitly need raw `.libraignore`
+/// awareness stay consistent. Call this directly only when you explicitly need raw ignore-source
 /// parsing.
 ///
 /// Assume `target_file` is in `work_dir`.
-pub fn check_gitignore(work_dir: &PathBuf, target_file: &PathBuf) -> bool {
+pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {
     assert!(target_file.starts_with(work_dir));
 
     // Git hardcodes ignoring `.git`. Mirror that here, before consulting any
@@ -1202,57 +1312,20 @@ pub fn check_gitignore(work_dir: &PathBuf, target_file: &PathBuf) -> bool {
         return true;
     }
 
-    let mut dir = target_file.clone();
-    dir.pop();
-
-    while dir.starts_with(work_dir) {
-        let gitignore_path = dir.join(".libraignore");
-        if !gitignore_path.exists() {
-            dir.pop();
-            continue;
+    for source in ignore_sources_for_target(work_dir, target_file) {
+        let ignore = cached_ignore_file(&source.path, &source.base);
+        if let Some(verdict) = ignore_verdict(&ignore, work_dir, target_file) {
+            return verdict;
         }
-
-        let ignore = cached_libraignore(&gitignore_path);
-
-        match ignore.matched(target_file, target_file.is_dir()) {
-            Match::Ignore(_) => return true,
-            Match::Whitelist(_) => return false,
-            Match::None => (),
-        }
-
-        let mut parent_dir = if target_file.is_dir() {
-            target_file.clone()
-        } else {
-            // INVARIANT: this branch only fires when `target_file` is a file
-            // (not a directory). Files always have a parent directory, even
-            // for relative paths like "foo" whose parent is "". The function
-            // asserts `target_file.starts_with(work_dir)` above, so the
-            // parent walk always reaches the workdir.
-            target_file
-                .parent()
-                .expect("non-directory path always has a parent")
-                .to_path_buf()
-        };
-
-        while parent_dir.starts_with(work_dir) {
-            match ignore.matched(&parent_dir, true) {
-                Match::Ignore(_) => return true,
-                Match::Whitelist(_) => return false,
-                Match::None => (),
-            };
-            parent_dir.pop();
-        }
-
-        dir.pop();
     }
 
     false
 }
 
-/// The deciding `.libraignore` pattern for a path, produced by
+/// The deciding ignore pattern for a path, produced by
 /// [`check_gitignore_match`] for `check-ignore -v` output.
 pub struct IgnoreMatchInfo {
-    /// The `.libraignore` file that supplied the deciding pattern. `None` for
+    /// The ignore file that supplied the deciding pattern. `None` for
     /// the built-in `.git` rule.
     pub source: Option<PathBuf>,
     /// 1-based line number of the pattern within `source`, recovered by scanning
@@ -1269,12 +1342,12 @@ pub struct IgnoreMatchInfo {
 
 /// Like [`check_gitignore`] but returns the deciding pattern's source file,
 /// line, and text — the detail `check-ignore -v` reports. Returns `Some(info)`
-/// when a `.libraignore` pattern (or the built-in `.git` rule) decides the
+/// when an ignore pattern (or the built-in `.git` rule) decides the
 /// path's status (`info.ignored` distinguishes an ignore match from a whitelist
 /// override) and `None` when no pattern applies. The walk order matches
-/// [`check_gitignore`] exactly (nearest `.libraignore` first, last matching
-/// pattern within a file wins), so the two never disagree on the verdict.
-pub fn check_gitignore_match(work_dir: &PathBuf, target_file: &PathBuf) -> Option<IgnoreMatchInfo> {
+/// [`check_gitignore`] exactly (nearest per-directory ignore source first, last
+/// matching pattern within a file wins), so the two never disagree on the verdict.
+pub fn check_gitignore_match(work_dir: &Path, target_file: &Path) -> Option<IgnoreMatchInfo> {
     assert!(target_file.starts_with(work_dir));
 
     if path_has_git_dir_component(work_dir, target_file) {
@@ -1286,37 +1359,73 @@ pub fn check_gitignore_match(work_dir: &PathBuf, target_file: &PathBuf) -> Optio
         });
     }
 
-    let mut dir = target_file.clone();
+    for source in ignore_sources_for_target(work_dir, target_file) {
+        let ignore = cached_ignore_file(&source.path, &source.base);
+        if let Some(info) = ignore_match_info(&ignore, work_dir, target_file) {
+            return Some(info);
+        }
+    }
+
+    None
+}
+
+struct IgnoreSource {
+    path: PathBuf,
+    base: PathBuf,
+}
+
+fn ignore_sources_for_target(work_dir: &Path, target_file: &Path) -> Vec<IgnoreSource> {
+    let mut sources = Vec::new();
+    let mut dir = target_file.to_path_buf();
     dir.pop();
 
     while dir.starts_with(work_dir) {
-        let gitignore_path = dir.join(".libraignore");
-        if !gitignore_path.exists() {
-            dir.pop();
-            continue;
-        }
-        let ignore = cached_libraignore(&gitignore_path);
+        push_ignore_source(&mut sources, dir.join(LIBRAIGNORE_FILE), dir.clone());
+        push_ignore_source(&mut sources, dir.join(GITIGNORE_FILE), dir.clone());
+        dir.pop();
+    }
 
-        if let Some(info) = glob_match_info(ignore.matched(target_file, target_file.is_dir())) {
+    if let Some(info_exclude) = git_info_file_path(work_dir, "exclude") {
+        push_ignore_source(&mut sources, info_exclude, work_dir.to_path_buf());
+    }
+    if let Some(configured) = optional_cascaded_config_path(CORE_EXCLUDES_FILE_KEY, work_dir) {
+        push_ignore_source(&mut sources, configured, work_dir.to_path_buf());
+    }
+    sources
+}
+
+fn push_ignore_source(sources: &mut Vec<IgnoreSource>, path: PathBuf, base: PathBuf) {
+    if path.exists() {
+        sources.push(IgnoreSource { path, base });
+    }
+}
+
+fn ignore_verdict(ignore: &Gitignore, work_dir: &Path, target_file: &Path) -> Option<bool> {
+    ignore_match_info(ignore, work_dir, target_file).map(|info| info.ignored)
+}
+
+fn ignore_match_info(
+    ignore: &Gitignore,
+    work_dir: &Path,
+    target_file: &Path,
+) -> Option<IgnoreMatchInfo> {
+    if let Some(info) = glob_match_info(ignore.matched(target_file, target_file.is_dir())) {
+        return Some(info);
+    }
+
+    let mut parent_dir = if target_file.is_dir() {
+        target_file.to_path_buf()
+    } else {
+        target_file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| work_dir.to_path_buf())
+    };
+    while parent_dir.starts_with(work_dir) {
+        if let Some(info) = glob_match_info(ignore.matched(&parent_dir, true)) {
             return Some(info);
         }
-
-        let mut parent_dir = if target_file.is_dir() {
-            target_file.clone()
-        } else {
-            target_file
-                .parent()
-                .expect("non-directory path always has a parent")
-                .to_path_buf()
-        };
-        while parent_dir.starts_with(work_dir) {
-            if let Some(info) = glob_match_info(ignore.matched(&parent_dir, true)) {
-                return Some(info);
-            }
-            parent_dir.pop();
-        }
-
-        dir.pop();
+        parent_dir.pop();
     }
 
     None
@@ -1343,7 +1452,7 @@ fn glob_match_info(m: Match<&ignore::gitignore::Glob>) -> Option<IgnoreMatchInfo
     })
 }
 
-/// Best-effort recovery of a pattern's 1-based line number in a `.libraignore`
+/// Best-effort recovery of a pattern's 1-based line number in an ignore
 /// file: the first non-blank, non-comment line whose trimmed content equals
 /// `pattern`. The matcher engine does not expose line numbers, so `check-ignore
 /// -v` reconstructs them here. Returns `None` if the file cannot be read or the
@@ -1364,29 +1473,33 @@ fn find_pattern_line(source: &Path, pattern: &str) -> Option<usize> {
         .map(|(idx, _)| idx + 1)
 }
 
-fn cached_libraignore(gitignore_path: &Path) -> Arc<Gitignore> {
-    let Ok(metadata) = fs::metadata(gitignore_path) else {
-        return load_libraignore(gitignore_path);
+fn cached_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
+    let Ok(metadata) = fs::metadata(ignore_path) else {
+        return load_ignore_file(ignore_path, base);
     };
     let Ok(modified) = metadata.modified() else {
-        return load_libraignore(gitignore_path);
+        return load_ignore_file(ignore_path, base);
     };
     let len = metadata.len();
+    let key = IgnoreCacheKey {
+        source: ignore_path.to_path_buf(),
+        base: base.to_path_buf(),
+    };
 
     let mut cache = match LIBRAIGNORE_CACHE.lock() {
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(cached) = cache.get(gitignore_path)
+    if let Some(cached) = cache.get(&key)
         && cached.len == len
         && cached.modified == modified
     {
         return Arc::clone(&cached.matcher);
     }
 
-    let matcher = load_libraignore(gitignore_path);
+    let matcher = load_ignore_file(ignore_path, base);
     cache.insert(
-        gitignore_path.to_path_buf(),
+        key,
         CachedGitignore {
             len,
             modified,
@@ -1399,7 +1512,7 @@ fn cached_libraignore(gitignore_path: &Path) -> Arc<Gitignore> {
 /// Build an in-memory gitignore matcher from explicit exclude patterns supplied
 /// on the command line (e.g. `ls-files -x <pattern>` / `-X <file>`), rooted at
 /// `work_dir`. Returns `None` when there are no patterns, so callers can skip the
-/// match entirely. Pattern syntax matches `.libraignore` (the same engine).
+/// match entirely. Pattern syntax matches Git ignore files (the same engine).
 pub fn build_exclude_matcher(
     work_dir: &Path,
     patterns: &[String],
@@ -1423,7 +1536,7 @@ pub fn build_exclude_matcher(
 /// [`build_exclude_matcher`] for `abs_path` (under `work_dir`). `Some(true)`
 /// means excluded; `Some(false)` means explicitly re-included by a negation (a
 /// higher-precedence source — the caller should let this override lower-priority
-/// excludes such as `.libraignore`); `None` means no explicit pattern matched
+/// standard excludes); `None` means no explicit pattern matched
 /// (defer to the standard excludes).
 ///
 /// Honors Git's parent-directory dominance: once an ancestor directory is
@@ -1454,14 +1567,37 @@ pub fn exclude_matcher_verdict(
     }
 }
 
-fn load_libraignore(gitignore_path: &Path) -> Arc<Gitignore> {
-    let (ignore, err) = Gitignore::new(gitignore_path);
-    if let Some(e) = err {
-        eprintln!(
-            "warning: There are some invalid globs in libraignore file {gitignore_path:#?}:\n{e}\n"
-        );
+fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
+    let mut builder = GitignoreBuilder::new(base);
+    match fs::read_to_string(ignore_path) {
+        Ok(contents) => {
+            for line in contents.lines() {
+                if let Err(error) = builder.add_line(Some(ignore_path.to_path_buf()), line) {
+                    eprintln!(
+                        "warning: invalid ignore pattern in {}: {error}",
+                        ignore_path.display()
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: failed to read ignore file {}: {error}",
+                ignore_path.display()
+            );
+        }
     }
-    Arc::new(ignore)
+    match builder.build() {
+        Ok(ignore) => Arc::new(ignore),
+        Err(error) => {
+            eprintln!(
+                "warning: failed to compile ignore file {}: {error}",
+                ignore_path.display()
+            );
+            let (empty, _) = Gitignore::new(base.join(".libra-empty-ignore-fallback"));
+            Arc::new(empty)
+        }
+    }
 }
 
 use git_internal::internal::object::signature::{Signature, SignatureType};
@@ -2331,6 +2467,27 @@ mod test {
 
         assert_eq!(location.root, repo.canonicalize().unwrap());
         assert!(!location.is_bare);
+    }
+
+    #[test]
+    fn test_git_info_file_path_uses_common_dir_for_linked_worktree() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("linked-worktree");
+        let common = temp.path().join("main.git");
+        let worktree_git = common.join("worktrees").join("linked-worktree");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(common.join("info")).unwrap();
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(
+            repo.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        fs::write(worktree_git.join("commondir"), b"../..\n").unwrap();
+
+        let info_path = git_info_file_path(&repo, "exclude").expect("resolve info path");
+
+        assert_eq!(info_path, common.join("info").join("exclude"));
     }
 
     #[test]

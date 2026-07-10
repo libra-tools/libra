@@ -57,7 +57,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.0 --activate
+          corepack prepare pnpm@11.10.0 --activate
 
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -83,7 +83,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.0 --activate
+          corepack prepare pnpm@11.10.0 --activate
 
       # The Rust crate's `build.rs` skips the web build whenever
       # `LIBRA_SKIP_WEB_BUILD=1` (set on every other job for speed). This
@@ -166,7 +166,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.0 --activate
+          corepack prepare pnpm@11.10.0 --activate
 
       - name: Ensure ripgrep is available
         shell: bash
@@ -292,7 +292,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.0 --activate
+          corepack prepare pnpm@11.10.0 --activate
 
       # Network-only test layer (`test-network` feature gate). Tests requiring outbound
       # network but no secrets are surfaced through this job; tests requiring real

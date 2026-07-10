@@ -66,6 +66,14 @@ async fn read_setting(key: &str) -> Result<Option<String>> {
         .map(|entry| entry.value))
 }
 
+/// Narrow a validated positive day-count to `u32`, rejecting values that would
+/// silently wrap on an `as u32` cast (a huge config must fail loudly rather
+/// than becoming a tiny — and dangerously destructive — retention window).
+fn u32_days(value: u64, key: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| anyhow::anyhow!("config '{key}' exceeds the maximum of {} days", u32::MAX))
+}
+
 /// Resolve `agent.retention.transcript_days` (default 90, must be > 0).
 pub async fn retention_transcript_days() -> Result<u32> {
     let v = positive_u64_setting(
@@ -73,7 +81,7 @@ pub async fn retention_transcript_days() -> Result<u32> {
         RETENTION_TRANSCRIPT_DAYS_KEY,
         DEFAULT_RETENTION_TRANSCRIPT_DAYS as u64,
     )?;
-    Ok(v as u32)
+    u32_days(v, RETENTION_TRANSCRIPT_DAYS_KEY)
 }
 
 /// Resolve `agent.retention.stderr_days` (default 30, must be > 0).
@@ -83,7 +91,7 @@ pub async fn retention_stderr_days() -> Result<u32> {
         RETENTION_STDERR_DAYS_KEY,
         DEFAULT_RETENTION_STDERR_DAYS as u64,
     )?;
-    Ok(v as u32)
+    u32_days(v, RETENTION_STDERR_DAYS_KEY)
 }
 
 /// Resolve `agent.retention.findings_days` (default 90, must be > 0).
@@ -93,7 +101,7 @@ pub async fn retention_findings_days() -> Result<u32> {
         RETENTION_FINDINGS_DAYS_KEY,
         DEFAULT_RETENTION_FINDINGS_DAYS as u64,
     )?;
-    Ok(v as u32)
+    u32_days(v, RETENTION_FINDINGS_DAYS_KEY)
 }
 
 /// Resolve `agent.max_transcript_read_bytes` (default 256 MiB, must be > 0).
@@ -231,5 +239,16 @@ mod tests {
     fn audit_scope_strings_are_stable() {
         assert_eq!(AuditScope::Transcript.as_str(), "transcript");
         assert_eq!(AuditScope::Full.as_str(), "full");
+    }
+
+    #[test]
+    fn u32_days_rejects_values_that_would_wrap() {
+        // In range: passes through unchanged.
+        assert_eq!(u32_days(90, "k").unwrap(), 90);
+        assert_eq!(u32_days(u64::from(u32::MAX), "k").unwrap(), u32::MAX);
+        // Just over u32::MAX would wrap on `as u32` (2^32 + 1 -> 1); it must
+        // fail loudly instead of becoming a tiny, over-destructive window.
+        assert!(u32_days(u64::from(u32::MAX) + 1, "k").is_err());
+        assert!(u32_days(u64::MAX, "k").is_err());
     }
 }

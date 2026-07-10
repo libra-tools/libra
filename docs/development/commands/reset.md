@@ -39,6 +39,7 @@ flowchart TD
 - 2026-06-06 `0e7b5a8f`（`feat(reset): support --pathspec-from-file, --pathspec-file-nul, --no-refresh`）：引入 `--pathspec-from-file`（`-` 读 stdin）/ `--pathspec-file-nul` / `--no-refresh` 三个标志。注：该提交的代码内容曾被一次纠缠的 reconcile 从工作树中丢弃（提交信息保留、实现消失），已于 2026-06-18 按原 diff 重新落地到当前 `ResetArgs`，故这些标志现已公开并有回归测试覆盖。
 - 2026-05-24 `2827b6e3`（`fix(reset): skip traversing ignored directories in reset --hard and bump version to 0.17.946`）：实现修正：skip traversing ignored directories in reset --hard and bump version to 0.17.946；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 2026-05-21 `1fa9973e`（`test(reset): pin ResetError stable_code 19-variant mapping (v0.17.706)`）：测试契约：pin ResetError stable_code 19-variant mapping (v0.17.706)；相关行为已有回归守卫，后续变更需要继续满足。
+- 2026-07-09（plan-20260708 P0-11）：源码核对确认 `reset --hard` 旧工作树恢复只写普通文件，tree 中 mode `120000` 的 symlink 会变成普通文件；pathspec reset 也曾用默认 blob mode 写回 index，可能丢失 `120000`。当前 hard reset 按 `TreeItemMode` 写工作树：symlink 用 blob 字节创建真实 symlink，普通文件写入前移除同名 symlink；pathspec reset 写 index 时保留 tree item mode；不支持平台明确报错。回归守卫：`compat_symlink_basic`。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
@@ -47,6 +48,7 @@ flowchart TD
 - 用户文档：`docs/commands/reset.md`。
 - Synopsis：`libra reset [--soft | --mixed | --hard] [<target>]`；`libra reset <pathspec>...`；`libra reset [<target>] [--] <pathspec>...`；`libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]`。
 - 公开参数/子命令包括：`[<target>]`、`--soft`、`--mixed`、`--hard`、`[<pathspec>...]`、`--pathspec-from-file=<file>`、`--pathspec-file-nul`、`--no-refresh`。裸路径兼容 Git：`libra reset <path>` 以 `HEAD` 为目标取消暂存；`libra reset -- <path>` 强制按路径解释 revision-like 文件名；同一 token 同时是 revision 和文件名时返回歧义错误 `LBR-CLI-002`。
+- `--hard` 工作树恢复保留 tree item mode：普通文件、可执行文件和 symlink 分别按 mode 写入；mode `120000` 的 symlink 不跟随目标、不解析目标路径，只把 blob 字节作为链接目标。Pathspec reset 只改 index，但同样保留目标 tree 的 mode，因此 symlink reset 回 index 后仍是 `120000`。
 
 
 ## 还未实现的功能

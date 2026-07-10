@@ -20,6 +20,13 @@ libra cloud status [--verbose]
 
 恢复可以用 UUID（`--repo-id`）或项目名（`--name`）定位仓库。它会从 D1 下载对象索引，可选地从 R2 下载对象，恢复元数据（references），并从 HEAD 填充工作目录。
 
+## 全局配置 Schema 保护
+
+`libra cloud` 在信任远端 / tiered 对象存储设置前，会读取全局存储配置（`~/.libra/config.db`，或 `LIBRA_CONFIG_GLOBAL_DB` 指定的路径）。如果该数据库的 schema 版本比当前二进制支持的版本更新，cloud 命令会以 `LBR-CONFIG-001` fail-closed，而不是静默忽略全局存储配置并回退到本地对象。诊断会包含二进制路径和版本、配置 DB 路径、schema 版本，以及升级命令：
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`。
+
+只有在明确希望本地对象访问时，才使用 `libra --offline cloud ...` 或 `LIBRA_READ_POLICY=offline|local libra cloud ...`。Libra 会告警一次，并在本次运行中忽略全局存储配置。
+
 ## 选项
 
 ### 子命令：`sync`

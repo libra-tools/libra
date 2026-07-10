@@ -17,7 +17,20 @@ libra rm [--json|--machine] --dry-run <pathspec>...
 
 `libra rm` removes files from the working tree and the index. By default it deletes the file from disk and unstages it so the removal is recorded in the next commit. With `--cached`, only the index entry is removed and the file remains on disk -- useful for untracking a file that was added by mistake without losing local changes.
 
-Removing a directory requires the `-r` (recursive) flag. Without it, specifying a directory path produces an error. This mirrors Git's behavior and prevents accidental recursive deletion.
+Removing a directory requires the `-r` (recursive) flag. Without it,
+specifying a directory path produces an error. With `-r`, Libra removes only
+the tracked files matched by the pathspec and prunes directories only after
+they become empty; untracked files and excluded tracked files keep their
+directories on disk.
+
+Pathspecs use Libra's shared Git-style matcher: plain pathspecs match a file or
+directory prefix, wildcard pathspecs are supported, and the high-value magic
+forms `:(top)`, `:/`, `:(glob)`, `:(literal)`, `:(icase)`,
+`:(exclude)`, `:!`, and `:^` are honored. Exclude pathspecs subtract from the
+positive selection, and pathspec matching follows `core.ignorecase` when enabled.
+Wildcard-looking pathspecs also match an exact path or directory prefix with
+the same literal text, matching Git's bracket-file and bracket-directory
+behavior.
 
 Before removing a file, Libra checks for uncommitted changes (both staged and unstaged). If the file has local modifications relative to the index, or the index differs from HEAD, the command refuses to proceed unless `--force` is passed or `--cached` is used. This safety check prevents silent data loss when a file has unsaved work.
 
@@ -27,13 +40,13 @@ Aliases: `remove`, `delete`. All three names invoke the same command.
 
 | Flag | Short | Long | Description |
 |------|-------|------|-------------|
-| Pathspec | | positional | One or more files or directories to remove. Required unless `--pathspec-from-file` is used. |
+| Pathspec | | positional | One or more files or directories to remove. Supports shared pathspec magic; required unless `--pathspec-from-file` is used. |
 | Cached | | `--cached` | Only remove from the index; keep the working tree file intact. |
 | Recursive | `-r` | `--recursive` | Allow recursive removal when a directory is specified. |
 | Force | `-f` | `--force` | Force removal, bypassing the uncommitted-changes safety check. |
 | Dry run | | `--dry-run` | Show what would be removed without actually deleting anything. |
 | Ignore unmatch | | `--ignore-unmatch` | Exit with zero status even if no pathspec matched any file. |
-| Pathspec from file | | `--pathspec-from-file <FILE>` | Read pathspecs from a file, one per line. |
+| Pathspec from file | | `--pathspec-from-file <FILE>` | Read shared-matcher pathspecs from a file, one per line. |
 | NUL separator | | `--pathspec-file-nul` | Pathspec file entries are separated by NUL bytes instead of newlines. |
 | Sparse | | `--sparse` | Accepted for Git compatibility as a no-op. Git uses it to allow removing index entries outside the sparse-checkout cone; Libra has no sparse-checkout state, so it changes nothing. |
 
@@ -69,7 +82,9 @@ rm 'tests/old_test.rs'
 
 **`--pathspec-from-file`**
 
-Reads pathspecs from a file instead of command-line arguments. Combined with `--pathspec-file-nul`, this supports filenames containing newlines or other special characters:
+Reads shared-matcher pathspecs from a file instead of command-line arguments.
+Combined with `--pathspec-file-nul`, this supports filenames containing
+newlines or other special characters:
 
 ```bash
 $ libra rm --pathspec-from-file files-to-remove.txt
@@ -98,6 +113,9 @@ libra rm -f src/experimental.rs
 # Remove files listed in a manifest
 libra rm --pathspec-from-file cleanup-list.txt
 
+# Remove tracked Rust files from the index except generated output
+libra rm --cached ':(glob)src/*.rs' ':(exclude)src/generated.rs'
+
 # Remove from index, ignore if file is not tracked
 libra rm --cached --ignore-unmatch generated.rs
 ```
@@ -120,10 +138,11 @@ and errors on stderr.
 ## JSON Output
 
 `--json` and `--machine` use the `rm` command envelope. `paths` contains every
-tracked file matched for index removal. `directories` contains recursive
-directory pathspecs that were removed from disk. In `--dry-run`, the same
-candidate paths are reported, but `removed_from_index` and `removed_from_disk`
-are `false`.
+tracked file matched for index removal. `directories` contains recursive plain
+directory pathspecs and reports whether the directory actually disappeared from
+disk after tracked files were deleted and empty parents were pruned. In
+`--dry-run`, the same candidate paths are reported, but `removed_from_index`
+and `removed_from_disk` are `false`.
 
 ```json
 {

@@ -1,6 +1,10 @@
 //! Implements `rev-parse` to resolve revision names and print basic repository paths.
 
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    fs,
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use clap::Parser;
 use git_internal::hash::ObjectHash;
@@ -45,6 +49,7 @@ EXAMPLES:
     libra rev-parse --verify HEAD       Assert HEAD resolves to one object (exit 128 if not)
     libra rev-parse --is-inside-work-tree  Print true/false for working-tree context
     libra rev-parse --is-inside-git-dir    Print true/false for .libra-directory context
+    libra rev-parse --is-shallow-repository  Print true/false for shallow repository state
     libra rev-parse --absolute-git-dir  Print the canonicalized absolute .libra path
     libra rev-parse --json HEAD         Structured JSON output for agents";
 
@@ -103,6 +108,10 @@ pub struct RevParseArgs {
     /// Print "true" when the repository is bare, "false" otherwise.
     #[clap(long = "is-bare-repository", conflicts_with_all = ["short", "abbrev_ref", "show_toplevel", "spec", "git_dir", "absolute_git_dir"])]
     pub is_bare_repository: bool,
+
+    /// Print "true" when `.libra/shallow` contains at least one shallow boundary.
+    #[clap(long = "is-shallow-repository", conflicts_with_all = ["short", "abbrev_ref", "show_toplevel", "spec", "symbolic_full_name", "symbolic", "verify", "default", "is_inside_work_tree", "is_inside_git_dir", "is_bare_repository", "git_dir", "absolute_git_dir", "show_prefix", "show_cdup"])]
+    pub is_shallow_repository: bool,
 
     /// Print the path to the `.libra` directory.
     #[clap(long = "git-dir", conflicts_with_all = ["short", "abbrev_ref", "show_toplevel", "spec"])]
@@ -259,6 +268,7 @@ pub async fn execute_safe(args: RevParseArgs, output: &OutputConfig) -> CliResul
         || args.is_inside_work_tree
         || args.is_inside_git_dir
         || args.is_bare_repository
+        || args.is_shallow_repository
         || args.show_prefix
         || args.show_cdup;
     let single_revision = (args.verify || args.short.is_some()) && !is_query_mode;
@@ -516,6 +526,14 @@ async fn resolve_rev_parse(spec: &str, args: &RevParseArgs) -> CliResult<RevPars
             mode: "is_bare_repository",
             input: None,
             value: is_bare_repository().await?.to_string(),
+        });
+    }
+
+    if args.is_shallow_repository {
+        return Ok(RevParseOutput {
+            mode: "is_shallow_repository",
+            input: None,
+            value: is_shallow_repository()?.to_string(),
         });
     }
 
@@ -915,6 +933,21 @@ async fn is_bare_repository() -> CliResult<bool> {
             CliError::fatal(format!("Failed to read core.bare config: {error}"))
                 .with_stable_code(StableErrorCode::IoReadFailed),
         ),
+    }
+}
+
+fn is_shallow_repository() -> CliResult<bool> {
+    let storage = util::try_get_storage_path(None).map_err(map_repo_path_error)?;
+    let shallow = storage.join("shallow");
+    match fs::read_to_string(&shallow) {
+        Ok(contents) => Ok(contents.lines().any(|line| !line.trim().is_empty())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliError::fatal(format!(
+            "failed to read shallow metadata '{}': {error}",
+            shallow.display()
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+        .with_hint("check repository metadata permissions and retry")),
     }
 }
 

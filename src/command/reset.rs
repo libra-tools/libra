@@ -21,7 +21,7 @@ use git_internal::{
 use serde::Serialize;
 
 use crate::{
-    command::load_object,
+    command::{load_object, symlink_target_blob_bytes},
     common_utils::parse_commit_msg,
     internal::{
         branch::{self, Branch},
@@ -539,7 +539,7 @@ async fn target_resolves_as_revision(target: &str) -> Result<bool, ResetError> {
 
 async fn pathspec_matches_known_path(pathspec: &str) -> Result<bool, ResetError> {
     let absolute = util::workdir_to_absolute(PathBuf::from(pathspec));
-    if absolute.exists() {
+    if absolute.symlink_metadata().is_ok() {
         return Ok(true);
     }
     if !util::is_sub_path(&absolute, util::working_dir()) {
@@ -571,7 +571,7 @@ async fn pathspec_matches_known_path(pathspec: &str) -> Result<bool, ResetError>
 
 fn pathspec_exists_in_worktree(pathspec: &str) -> bool {
     let absolute = util::workdir_to_absolute(PathBuf::from(pathspec));
-    absolute.exists() && util::is_sub_path(&absolute, util::working_dir())
+    absolute.symlink_metadata().is_ok() && util::is_sub_path(&absolute, util::working_dir())
 }
 
 /// Reset specific files in the index to their state in the target commit.
@@ -611,11 +611,12 @@ async fn reset_pathspecs(
             Some(item) => {
                 let blob: git_internal::internal::object::blob::Blob = load_object(&item.id)
                     .map_err(|e| object_load_error("blob", item.id.to_string(), e.to_string()))?;
-                let entry = IndexEntry::new_from_blob(
+                let mut entry = IndexEntry::new_from_blob(
                     path_str.to_string(),
                     item.id,
                     blob.data.len() as u32,
                 );
+                entry.mode = tree_item_mode_to_index_mode(item.mode)?;
                 index.add(entry);
                 changed = true;
                 changed_paths.push(pathspec.clone());
@@ -1082,7 +1083,6 @@ fn restore_working_directory_from_tree_counted_typed(
                 )?;
             }
             _ => {
-                // Restore file
                 let blob = load_object::<git_internal::internal::object::blob::Blob>(&item.id)
                     .map_err(|e| object_load_error("blob", item.id.to_string(), e.to_string()))?;
 
@@ -1097,26 +1097,10 @@ fn restore_working_directory_from_tree_counted_typed(
                     })?;
                 }
 
-                let needs_write = match fs::read(&file_path) {
-                    Ok(existing) => existing != blob.data,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => true,
-                    Err(err) => {
-                        return Err(ResetError::WorktreeRead(format!(
-                            "failed to read file {}: {}",
-                            file_path.display(),
-                            err
-                        )));
-                    }
-                };
+                let needs_write = !worktree_entry_matches(&file_path, item.mode, &blob.data)?;
 
                 if needs_write {
-                    fs::write(&file_path, blob.data).map_err(|e| {
-                        ResetError::WorktreeRestore(format!(
-                            "failed to write file {}: {}",
-                            file_path.display(),
-                            e
-                        ))
-                    })?;
+                    write_worktree_entry(&file_path, item.mode, &blob.data)?;
                     files_restored += 1;
                 }
                 apply_worktree_blob_mode(&file_path, item.mode)?;
@@ -1124,6 +1108,137 @@ fn restore_working_directory_from_tree_counted_typed(
         }
     }
     Ok(files_restored)
+}
+
+fn worktree_entry_matches(
+    path: &Path,
+    mode: TreeItemMode,
+    expected: &[u8],
+) -> Result<bool, ResetError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(ResetError::WorktreeRead(format!(
+                "failed to inspect file {}: {}",
+                path.display(),
+                error
+            )));
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        if mode != TreeItemMode::Link {
+            return Ok(false);
+        }
+        let target = fs::read_link(path).map_err(|error| {
+            ResetError::WorktreeRead(format!(
+                "failed to read symlink {}: {}",
+                path.display(),
+                error
+            ))
+        })?;
+        return Ok(symlink_target_blob_bytes(&target) == expected);
+    }
+
+    if mode == TreeItemMode::Link {
+        return Ok(false);
+    }
+
+    match fs::read(path) {
+        Ok(existing) => Ok(existing == expected),
+        Err(_) if metadata.is_dir() => Ok(false),
+        Err(error) => Err(ResetError::WorktreeRead(format!(
+            "failed to read file {}: {}",
+            path.display(),
+            error
+        ))),
+    }
+}
+
+fn write_worktree_entry(path: &Path, mode: TreeItemMode, content: &[u8]) -> Result<(), ResetError> {
+    if mode == TreeItemMode::Link {
+        return write_worktree_symlink(path, content);
+    }
+
+    remove_existing_symlink(path)?;
+    fs::write(path, content).map_err(|error| {
+        ResetError::WorktreeRestore(format!(
+            "failed to write file {}: {}",
+            path.display(),
+            error
+        ))
+    })
+}
+
+fn remove_existing_symlink(path: &Path) -> Result<(), ResetError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(path).map_err(|error| {
+                ResetError::WorktreeRestore(format!(
+                    "failed to replace symlink {}: {}",
+                    path.display(),
+                    error
+                ))
+            })
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ResetError::WorktreeRead(format!(
+            "failed to inspect file {}: {}",
+            path.display(),
+            error
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn write_worktree_symlink(path: &Path, target: &[u8]) -> Result<(), ResetError> {
+    use std::{
+        ffi::OsStr,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+    };
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            return Err(ResetError::WorktreeRestore(format!(
+                "cannot replace directory {} with symlink",
+                path.display()
+            )));
+        }
+        Ok(_) => fs::remove_file(path).map_err(|error| {
+            ResetError::WorktreeRestore(format!(
+                "failed to replace path {} with symlink: {}",
+                path.display(),
+                error
+            ))
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ResetError::WorktreeRead(format!(
+                "failed to inspect file {}: {}",
+                path.display(),
+                error
+            )));
+        }
+    }
+
+    let target = Path::new(OsStr::from_bytes(target));
+    symlink(target, path).map_err(|error| {
+        ResetError::WorktreeRestore(format!(
+            "failed to create symlink {}: {}",
+            path.display(),
+            error
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn write_worktree_symlink(path: &Path, _target: &[u8]) -> Result<(), ResetError> {
+    Err(ResetError::WorktreeRestore(format!(
+        "symlink checkout is not supported on this platform: {}",
+        path.display()
+    )))
 }
 
 #[cfg(unix)]

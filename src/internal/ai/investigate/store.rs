@@ -26,13 +26,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::internal::ai::review::store::{AGENT_FINDINGS_OTYPE, read_json_opt, utc_timestamp};
 // The run-id / reviewer-name validators and the redaction summary are
 // shared verbatim with the review store (same path-traversal guard, same
 // filesystem-safe log naming, same redaction accounting).
 pub use crate::internal::ai::review::store::{
     RedactionReportSummary, is_valid_run_id, sanitize_reviewer_name,
 };
-use crate::internal::ai::review::store::{read_json_opt, utc_timestamp};
 
 /// `manifest.json` schema version (E8-libra manifest contract).
 pub const INVESTIGATE_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -227,12 +227,15 @@ pub struct InvestigateManifest {
     /// chronological order — the keyset pagination contract relies on it).
     pub created_at: String,
     pub updated_at: String,
-    /// OID of `findings.md` once written to the object store — always
-    /// `null` in AG-23 (no object write yet).
+    /// OID of `findings.md` in the object store. `null` at create time / for
+    /// empty findings; populated at terminal manifest write (A0-06) with a
+    /// content-addressed, `object_index`-visible, doctor-repairable blob.
     pub findings_oid: Option<String>,
     pub redaction_report: RedactionReportSummary,
-    /// Manual-attach placeholder (plan.md:945): no command surface in
-    /// AG-23, always empty.
+    /// Manual attachments (A0-06): `{oid, path, provenance:"manual", size,
+    /// attached_at}` per external file attached via `libra investigate
+    /// attach`. Empty until the first attach; attached bytes are redacted and
+    /// object_index-tagged like findings.
     pub manual_attach: Vec<serde_json::Value>,
 }
 
@@ -612,6 +615,45 @@ impl InvestigateRunStore {
     /// Update the manifest's terminal state + redaction summary, bumping
     /// `updated_at`. `terminal` is `None` for a paused run (stays in
     /// flight).
+    /// A0-06: the `.libra` dir (git object-store root) derived from the
+    /// store's `<.libra>/sessions` root.
+    fn libra_dir(&self) -> io::Result<PathBuf> {
+        self.sessions_root()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "investigate sessions root has no parent .libra directory",
+                )
+            })
+    }
+
+    /// A0-06: write `bytes` as a content-addressed git blob and enqueue it
+    /// into `object_index` (tag [`AGENT_FINDINGS_OTYPE`]), returning the OID.
+    /// Idempotent by content-addressing.
+    pub fn objectize_bytes(&self, bytes: &[u8]) -> io::Result<String> {
+        let libra_dir = self.libra_dir()?;
+        let oid = crate::utils::object::write_git_object(&libra_dir, "blob", bytes)
+            .map_err(|e| io::Error::other(format!("failed to write findings object: {e}")))?;
+        crate::utils::client_storage::enqueue_agent_blob_object_index_update(
+            &libra_dir,
+            &oid.to_string(),
+            AGENT_FINDINGS_OTYPE,
+            bytes.len() as i64,
+        );
+        Ok(oid.to_string())
+    }
+
+    /// A0-06: objectize the run's current `findings.md`. `None` when empty.
+    pub fn objectize_findings(&self, run_id: &str) -> io::Result<Option<String>> {
+        let content = self.read_findings(run_id)?.unwrap_or_default();
+        if content.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.objectize_bytes(content.as_bytes())?))
+    }
+
     pub fn write_manifest_terminal(
         &self,
         run_id: &str,
@@ -627,6 +669,11 @@ impl InvestigateRunStore {
         manifest.terminal_state = terminal;
         manifest.redaction_report = redaction;
         manifest.updated_at = utc_timestamp();
+        // A0-06: objectize the final findings.md so `findings_oid` points at a
+        // real, object_index-visible, doctor-repairable blob.
+        if let Some(oid) = self.objectize_findings(run_id)? {
+            manifest.findings_oid = Some(oid);
+        }
         self.write_manifest(&manifest)
     }
 

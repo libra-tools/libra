@@ -23,9 +23,13 @@ CREATE TABLE IF NOT EXISTS agent_audit_log (
     audit_id       TEXT    NOT NULL PRIMARY KEY,
     -- UTC ISO-8601 timestamp of the access.
     timestamp      TEXT    NOT NULL,
-    -- Resolved end-user identity (config user.name/email or the
-    -- GIT_/LIBRA_COMMITTER_* env fallbacks); never the checkpoint's
-    -- hardcoded `Libra <ai@libra>` committer.
+    -- Resolved end-user identity from the GIT_COMMITTER_* / GIT_AUTHOR_* /
+    -- EMAIL / LIBRA_COMMITTER_* environment variables only (see
+    -- src/command/agent/checkpoint.rs); NULL when none are set. NOTE: does
+    -- NOT currently fall back to the repo config user.name/user.email — a
+    -- repo whose identity lives only in `libra config` (no committer env
+    -- exported) records a NULL actor. Never the checkpoint's hardcoded
+    -- `Libra <ai@libra>` committer.
     user_id        TEXT,
     user_name      TEXT,
     -- Audited action; `raw_export` today (kept as free text for additive

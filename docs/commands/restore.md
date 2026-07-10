@@ -18,17 +18,26 @@ libra restore --ignore-unmerged [--source <tree-ish>] <pathspec>...
 
 For new workflows, use `libra restore` directly. `libra checkout -- <path>` and `libra checkout <tree-ish> -- <path>` are accepted only as Git-compatible aliases for this path-restore behavior.
 
-The `<pathspec>` argument is required and accepts one or more file paths or directory paths. The special path `.` restores all files.
+The `<pathspec>` argument is required and accepts one or more file paths or directory paths. The special path `.` restores all files. Pathspecs use Libra's shared Git-style matcher: plain pathspecs match a file or directory prefix, wildcard pathspecs are supported, and the high-value magic forms `:(top)`, `:/`, `:(glob)`, `:(literal)`, `:(icase)`, `:(exclude)`, `:!`, and `:^` are honored. Exclude pathspecs subtract from the positive selection, pathspec matching follows `core.ignorecase` when enabled, and wildcard-looking pathspecs also match an exact path or directory prefix with the same literal text.
 
 When a source commit contains files that do not exist in the current worktree, those files are created. In the default (`--no-overlay`) mode, when the current worktree contains tracked files that do not exist in the source, those files are deleted so the target matches the source exactly; with `--overlay` those source-absent tracked paths are left in place instead. The output reports both `restored_files` and `deleted_files` separately.
 
 LFS-managed files are automatically downloaded from the LFS server when restoring from a commit that references LFS pointers.
 
+Tracked symlinks are restored as symlinks on Unix for source tree, index, and
+conflict-stage restores. The stored blob bytes are used directly as the link
+target and are not interpreted as a path to open during restore, which avoids
+writing through a link that points outside the worktree. `--merge` conflict
+marker rebuilds also replace an existing worktree symlink before writing the
+regular marker file. Platforms that cannot create symlinks return an explicit
+unsupported diagnostic instead of materializing a regular file containing the
+target text.
+
 ## Options
 
 | Option | Short | Long | Description |
 |--------|-------|------|-------------|
-| Pathspec | | positional (required) | One or more files or directories to restore. Use `.` for all files. |
+| Pathspec | | positional (required) | One or more files or directories to restore. Supports shared pathspec magic. Use `.` for all files. |
 | Source | `-s` | `--source <tree-ish>` | Restore from the specified commit or tree-ish instead of the default source. When omitted, the default source depends on the mode: index for worktree restore, HEAD for staged restore. |
 | Staged | `-S` | `--staged` | Restore the index (unstage files). Defaults the source to HEAD if `--source` is not given. |
 | Worktree | `-W` | `--worktree` | Restore the working tree. This is the default when `--staged` is not given. |
@@ -37,7 +46,7 @@ LFS-managed files are automatically downloaded from the LFS server when restorin
 | Merge | | `--merge` | For an unmerged path, rewrite the working tree with the conflict markers rebuilt from the index stages (`ours` from stage 2, `theirs` from stage 3), leaving the index unmerged. Libra writes whole-file `ours`/`theirs` markers (with generic `ours`/`theirs` labels) — not Git's line-level 3-way. (Note: `libra merge`/`cherry-pick` now write line-level markers via the three-way merge engine; restore's index-stage rebuild remains whole-file.) Same exclusions as `--ours`. |
 | Conflict style | | `--conflict <style>` | Implies `--merge`. `merge` (default) writes `ours`/`theirs` blocks; `diff3` also includes the `base` block (stage 1). `zdiff3` is not supported. |
 | Ignore unmerged | | `--ignore-unmerged` | Skip unmerged paths instead of erroring; the remaining paths still restore. |
-| Pathspec from file | | `--pathspec-from-file <FILE>` | Read pathspecs from `<FILE>` (one per line; `-` reads stdin). When given, the file contents replace any positional pathspecs (which then need not be supplied). |
+| Pathspec from file | | `--pathspec-from-file <FILE>` | Read shared-matcher pathspecs from `<FILE>` (one per line; `-` reads stdin). When given, the file contents replace any positional pathspecs (which then need not be supplied). |
 | Pathspec file NUL | | `--pathspec-file-nul` | Pathspecs read via `--pathspec-from-file` are separated by NUL, not newlines (requires `--pathspec-from-file`). |
 | No progress | | `--no-progress` | Do not show a progress meter. Accepted no-op for Git parity: Libra's restore never renders a progress meter. |
 | Overlay | | `--overlay` | Restore in overlay mode: only create/update paths present in the source; tracked paths absent from the source are left alone instead of removed. Toggle pair with `--no-overlay` (last one wins). |
@@ -121,11 +130,17 @@ libra restore --staged file.txt
 # Restore from a specific commit
 libra restore --source HEAD~1 src/main.rs
 
+# Restore Rust files except generated output
+libra restore ':(glob)src/*.rs' ':(exclude)src/generated.rs'
+
 # Restore both working tree and index
 libra restore -S -W file.txt
 
 # Restore everything from HEAD
 libra restore --source HEAD .
+
+# Restore a tracked symlink as a symlink
+libra restore --source HEAD link-to-target
 
 # Take our / their side of a merge conflict
 libra restore --ours file.txt

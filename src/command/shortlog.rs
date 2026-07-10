@@ -66,7 +66,7 @@ use crate::{
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
-        output::{OutputConfig, emit_json_data},
+        output::{ColorChoice, OutputConfig, emit_json_data},
         util::{self, CommitBaseError, require_repo},
     },
 };
@@ -152,8 +152,9 @@ pub struct ShortlogArgs {
     pub group: Option<String>,
 
     /// Render each commit under its author header with a custom format string
-    /// (the same `%`-placeholders as `libra log --format`: `%H`/`%h`/`%s`/`%f`/
-    /// `%an`/`%ae`/`%ad`/`%cn`/`%ce`/`%cd`/`%d`) instead of the commit subject.
+    /// (the same `%`-placeholders as `libra log --format`, including `%b`,
+    /// `%B`, `%n`, ASCII/control `%xNN`, strict ISO dates, raw timestamps,
+    /// decorations, marks, and color placeholders) instead of the commit subject.
     #[clap(long = "format", value_name = "FORMAT")]
     pub format: Option<String>,
 
@@ -289,7 +290,7 @@ struct ShortlogOutput {
 /// quiet modes, use [`execute_safe`].
 pub async fn execute_to(args: ShortlogArgs, writer: &mut impl Write) -> CliResult<()> {
     require_repo().map_err(|_| CliError::repo_not_found())?;
-    let shortlog_output = run_shortlog(&args).await?;
+    let shortlog_output = run_shortlog(&args, false).await?;
     render_shortlog_output(&shortlog_output, writer)
 }
 
@@ -385,7 +386,7 @@ pub async fn execute(args: ShortlogArgs) {
 /// [`execute_to`] for formatted output.
 pub async fn execute_safe(args: ShortlogArgs, output: &OutputConfig) -> CliResult<()> {
     require_repo().map_err(|_| CliError::repo_not_found())?;
-    let shortlog_output = run_shortlog(&args).await?;
+    let shortlog_output = run_shortlog(&args, color_enabled_for_output(output)).await?;
 
     if output.is_json() {
         emit_json_data("shortlog", &shortlog_output, output)?;
@@ -397,7 +398,15 @@ pub async fn execute_safe(args: ShortlogArgs, output: &OutputConfig) -> CliResul
     Ok(())
 }
 
-async fn run_shortlog(args: &ShortlogArgs) -> CliResult<ShortlogOutput> {
+fn color_enabled_for_output(output: &OutputConfig) -> bool {
+    match output.color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => std::io::stdout().is_terminal(),
+    }
+}
+
+async fn run_shortlog(args: &ShortlogArgs, color_enabled: bool) -> CliResult<ShortlogOutput> {
     // Pipe-input mode (matching `git log | git shortlog`): with no explicit
     // revision and a non-interactive stdin that carries data, summarise the
     // piped `git log` output instead of walking the repository. An empty /
@@ -452,6 +461,7 @@ async fn run_shortlog(args: &ShortlogArgs) -> CliResult<ShortlogOutput> {
         &revision,
         commits,
         wrap,
+        color_enabled,
     ))
 }
 
@@ -461,6 +471,7 @@ fn aggregate_shortlog(
     revision: &str,
     commits: Vec<Commit>,
     wrap: Option<(usize, usize, usize)>,
+    color_enabled: bool,
 ) -> ShortlogOutput {
     let total_commits = commits.len();
     let mut author_map: HashMap<String, AuthorStats> = HashMap::new();
@@ -468,10 +479,9 @@ fn aggregate_shortlog(
     // `--format`: render each commit with a custom template (the same renderer as
     // `libra log --format`) instead of its subject. The short-hash width matches
     // what `libra log` uses so `%h` is consistent across the two commands.
-    let formatter = args
-        .format
-        .as_ref()
-        .map(|fmt| CommitFormatter::new(FormatType::Custom(fmt.clone())));
+    let formatter = args.format.as_ref().map(|fmt| {
+        CommitFormatter::new(FormatType::Custom(fmt.clone())).with_color_enabled(color_enabled)
+    });
     let abbrev_len = util::get_min_unique_hash_length(&commits).max(7);
 
     for commit in commits {

@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::IsTerminal,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -35,7 +36,7 @@ use crate::{
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         object_ext::TreeExt,
-        output::{OutputConfig, emit_json_data},
+        output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
         path, util,
     },
@@ -282,7 +283,7 @@ pub async fn execute_safe(args: ShowArgs, output: &OutputConfig) -> CliResult<()
         return validate_show_quiet(&args).await;
     }
 
-    let rendered = render_show_human(&args).await?;
+    let rendered = render_show_human(&args, color_enabled_for_output(output)).await?;
     if rendered.is_empty() {
         return Ok(());
     }
@@ -292,7 +293,15 @@ pub async fn execute_safe(args: ShowArgs, output: &OutputConfig) -> CliResult<()
     pager.finish()
 }
 
-async fn render_show_human(args: &ShowArgs) -> CliResult<String> {
+fn color_enabled_for_output(output: &OutputConfig) -> bool {
+    match output.color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => std::io::stdout().is_terminal(),
+    }
+}
+
+async fn render_show_human(args: &ShowArgs, color_enabled: bool) -> CliResult<String> {
     let object_ref = args.object.as_deref().unwrap_or("HEAD");
 
     // Handle `<revision>:<path>` lookups before generic revision resolution.
@@ -303,7 +312,7 @@ async fn render_show_human(args: &ShowArgs) -> CliResult<String> {
     // Raw object IDs should keep their native schema, including annotated tag
     // objects, but hash-like ref names must still fall back to ref resolution.
     if let Some(hash) = resolve_existing_object_hash(object_ref) {
-        return show_object_by_hash(&hash, args).await;
+        return show_object_by_hash(&hash, args, color_enabled).await;
     }
 
     // Resolve refs first so tags keep their custom rendering.
@@ -317,11 +326,11 @@ async fn render_show_human(args: &ShowArgs) -> CliResult<String> {
                 } else {
                     commit_hash
                 };
-                return show_tag_by_hash(&tag_hash, args).await;
+                return show_tag_by_hash(&tag_hash, args, color_enabled).await;
             }
             _ => {
                 // Not a tag, lightweight tag, or tag doesn't exist: show as commit.
-                return show_commit(&commit_hash, args).await;
+                return show_commit(&commit_hash, args, color_enabled).await;
             }
         }
     }
@@ -363,6 +372,7 @@ async fn validate_show_quiet(args: &ShowArgs) -> CliResult<()> {
 fn show_object_by_hash<'a>(
     hash: &'a ObjectHash,
     args: &'a ShowArgs,
+    color_enabled: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CliResult<String>> + 'a>> {
     Box::pin(async move {
         let storage = ClientStorage::init(path::objects());
@@ -372,8 +382,8 @@ fn show_object_by_hash<'a>(
             .map_err(|e| show_object_load_error(hash, e))?;
 
         match obj_type {
-            ObjectType::Commit => show_commit(hash, args).await,
-            ObjectType::Tag => show_tag_by_hash(hash, args).await,
+            ObjectType::Commit => show_commit(hash, args, color_enabled).await,
+            ObjectType::Tag => show_tag_by_hash(hash, args, color_enabled).await,
             ObjectType::Tree => show_tree(hash).await,
             ObjectType::Blob => show_blob(hash).await,
             _ => Err(show_unsupported_object_type_error(format!("{obj_type:?}"))),
@@ -403,13 +413,17 @@ fn validate_object_by_hash<'a>(
 }
 
 /// Shows a commit together with optional diff output.
-async fn show_commit(commit_hash: &ObjectHash, args: &ShowArgs) -> CliResult<String> {
+async fn show_commit(
+    commit_hash: &ObjectHash,
+    args: &ShowArgs,
+    color_enabled: bool,
+) -> CliResult<String> {
     // Load the commit before rendering any metadata or diff output.
     let commit =
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
 
     let mut output = String::new();
-    display_commit_info(&mut output, &commit, args);
+    display_commit_info(&mut output, &commit, args, color_enabled);
 
     // Render patch-style details when requested.
     if !args.no_patch {
@@ -644,7 +658,11 @@ async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> Cl
 }
 
 /// Shows an annotated or lightweight tag.
-async fn show_tag_by_hash(hash: &ObjectHash, args: &ShowArgs) -> CliResult<String> {
+async fn show_tag_by_hash(
+    hash: &ObjectHash,
+    args: &ShowArgs,
+    color_enabled: bool,
+) -> CliResult<String> {
     match tag::load_object_trait(hash).await {
         Ok(tag::TagObject::Tag(tag_obj)) => {
             let mut output = String::new();
@@ -664,12 +682,12 @@ async fn show_tag_by_hash(hash: &ObjectHash, args: &ShowArgs) -> CliResult<Strin
             output.push_str("\n\n");
 
             // Continue with the tagged object.
-            output.push_str(&show_object_by_hash(&tag_obj.object_hash, args).await?);
+            output.push_str(&show_object_by_hash(&tag_obj.object_hash, args, color_enabled).await?);
             Ok(output)
         }
         Ok(tag::TagObject::Commit(commit)) => {
             // Lightweight tags point directly to commits.
-            show_commit(&commit.id, args).await
+            show_commit(&commit.id, args, color_enabled).await
         }
         Ok(_) => Err(show_unsupported_object_type_error("tag target")),
         Err(e) => Err(show_object_load_error(hash, e)),
@@ -773,12 +791,13 @@ async fn validate_commit_file(rev: &str, file_path: &str) -> CliResult<()> {
 }
 
 /// Renders the commit header using the selected format.
-fn display_commit_info(output: &mut String, commit: &Commit, args: &ShowArgs) {
+fn display_commit_info(output: &mut String, commit: &Commit, args: &ShowArgs, color_enabled: bool) {
     // `--format` is Git's alias for `--pretty` (mutually exclusive in clap).
     if let Some(pretty) = args.pretty.as_ref().or(args.format.as_ref()) {
         // `--pretty=<fmt>` renders the commit header through the shared log
         // formatter (oneline / format:<tmpl> / tformat:<tmpl> / custom template).
-        let formatter = CommitFormatter::new(parse_pretty_format(pretty.clone()));
+        let formatter = CommitFormatter::new(parse_pretty_format(pretty.clone()))
+            .with_color_enabled(color_enabled);
         let ctx = FormatContext {
             graph_prefix: "",
             decoration: "",

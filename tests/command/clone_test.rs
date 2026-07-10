@@ -949,13 +949,13 @@ fn test_clone_local_flag_accepted_for_local_source() {
     );
 }
 
-/// `--reject-shallow` allows a normal clone and a `--depth` clone (the
-/// depth-induced shallowness is expected); it only rejects an *unrequested*
-/// shallow result (a shallow source), which the unit test
-/// `clone_should_reject_shallow_only_for_unrequested_shallowness` covers.
+/// `--reject-shallow` allows a normal clone. Local Libra `--depth` is rejected
+/// before fetch because that source cannot advertise shallow boundaries yet; the
+/// pure post-fetch `clone_should_reject_shallow_only_for_unrequested_shallowness`
+/// unit test covers the remaining remote-shallow decision.
 #[test]
 #[serial]
-fn test_clone_reject_shallow_allows_normal_and_depth() {
+fn test_clone_reject_shallow_rejects_local_libra_depth() {
     use super::run_libra_command;
 
     let source = tempdir().expect("source dir");
@@ -1000,7 +1000,8 @@ fn test_clone_reject_shallow_allows_normal_and_depth() {
     );
     assert!(full.join(".libra").exists(), "full clone created");
 
-    // `--reject-shallow --depth` is allowed: the shallowness was requested.
+    // Local Libra sources cannot produce shallow boundary metadata yet, so
+    // `--depth` must fail closed rather than leaving a missing-parent clone.
     let shallow = dest_root.path().join("shallow");
     let out = run_libra_command(
         &[
@@ -1013,12 +1014,22 @@ fn test_clone_reject_shallow_allows_normal_and_depth() {
         ],
         dest_root.path(),
     );
-    assert!(
-        out.status.success(),
-        "--reject-shallow with --depth is allowed: {}",
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "--reject-shallow with local Libra --depth should fail closed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(shallow.join(".libra").exists(), "depth clone created");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Error-Code: LBR-REPO-002"), "{stderr}");
+    assert!(
+        stderr.contains("local Libra remotes do not support --depth"),
+        "{stderr}"
+    );
+    assert!(
+        !shallow.join(".libra").exists(),
+        "failed depth clone must not initialize target"
+    );
 }
 
 /// `--reference`/`--shared`/`--reference-if-able`/`--dissociate` are accepted as

@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     io::{IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use clap::{Parser, ValueEnum};
@@ -22,7 +22,10 @@ use git_internal::{
 };
 use serde::Serialize;
 
-use super::{merge, stash, status_untracked};
+use super::{
+    merge, stash, status_untracked,
+    unmerged::{self, UnmergedEntry},
+};
 use crate::{
     command::calc_file_blob_hash,
     internal::{
@@ -35,7 +38,9 @@ use crate::{
         ignore::IgnorePolicy,
         object_ext::{CommitExt, TreeExt},
         output::{ColorChoice, OutputConfig, emit_json_data},
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -179,6 +184,10 @@ pub struct StatusArgs {
     /// Can be combined with --quiet for silent dirty checking.
     #[clap(long = "exit-code")]
     pub exit_code: bool,
+
+    /// Limit status output to files matching the given pathspec(s).
+    #[clap(value_name = "pathspec")]
+    pub pathspec: Vec<String>,
 }
 
 impl StatusArgs {
@@ -281,6 +290,8 @@ pub enum StatusError {
     ListWorkdirFiles { path: PathBuf, source: io::Error },
     #[error("failed to determine working directory: {source}")]
     Workdir { source: io::Error },
+    #[error("{source}")]
+    ConfigRead { source: anyhow::Error },
 }
 
 impl From<StatusError> for CliError {
@@ -301,6 +312,9 @@ impl From<StatusError> for CliError {
             }
             StatusError::Workdir { .. } => {
                 CliError::fatal(msg).with_stable_code(StableErrorCode::RepoNotFound)
+            }
+            StatusError::ConfigRead { .. } => {
+                CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed)
             }
         }
     }
@@ -328,6 +342,7 @@ pub struct UpstreamInfo {
 pub struct MergeStatusInfo {
     pub target_ref: String,
     pub conflicted_paths: Vec<String>,
+    pub unresolved_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +356,7 @@ struct StatusData {
     has_commits: bool,
     staged: Changes,
     unstaged: Changes,
+    unmerged: Vec<UnmergedEntry>,
     ignored_files: Vec<PathBuf>,
     stash_count: Option<usize>,
     upstream: Option<UpstreamInfo>,
@@ -378,7 +394,10 @@ async fn sequence_notice() -> Option<String> {
 
 impl StatusData {
     fn is_dirty(&self) -> bool {
-        !self.staged.is_empty() || !self.unstaged.is_empty() || self.merge_state.is_some()
+        !self.staged.is_empty()
+            || !self.unstaged.is_empty()
+            || self.merge_state.is_some()
+            || !self.unmerged.is_empty()
     }
 }
 
@@ -393,6 +412,7 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("this command requires a working tree; bare repositories do not have one"));
     }
+    let ignore_case = effective_ignore_case_for_status().await?;
 
     let head = Head::current_result()
         .await
@@ -406,10 +426,25 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         .await
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
-    let worktree =
-        status_untracked::collect_status_worktree_changes(args.untracked_files, args.ignored)
-            .map_err(CliError::from)?;
+    let worktree = status_untracked::collect_status_worktree_changes(
+        args.untracked_files,
+        args.ignored,
+        ignore_case,
+    )
+    .map_err(CliError::from)?;
     let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
+    let unmerged = unmerged::collect(&worktree.index)
+        .into_iter()
+        .map(|entry| {
+            let current_path = util::workdir_to_current(&entry.path);
+            entry.with_path(current_path)
+        })
+        .collect::<Vec<_>>();
+    let unmerged_paths = unmerged
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    unstaged.new.retain(|path| !unmerged_paths.contains(path));
     let ignored_files = worktree
         .ignored_files
         .into_iter()
@@ -454,12 +489,12 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             let index = maybe_index
                 .as_ref()
                 .ok_or_else(|| CliError::internal("status index should be loaded"))?;
+            let conflicted_paths =
+                merge::unresolved_conflicted_paths(index, &state.conflicted_paths);
             Some(MergeStatusInfo {
                 target_ref: state.target_ref,
-                conflicted_paths: merge::unresolved_conflicted_paths(
-                    index,
-                    &state.conflicted_paths,
-                ),
+                unresolved_count: conflicted_paths.len(),
+                conflicted_paths,
             })
         }
         None => None,
@@ -473,12 +508,13 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         None
     };
 
-    Ok(StatusData {
+    let mut data = StatusData {
         head,
         head_oid,
         has_commits,
         staged,
         unstaged,
+        unmerged,
         ignored_files,
         stash_count,
         upstream,
@@ -488,7 +524,64 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             .await
             .is_active(),
         porcelain_v2,
-    })
+    };
+    filter_status_data_by_pathspec(&mut data, args)?;
+    Ok(data)
+}
+
+fn filter_status_data_by_pathspec(data: &mut StatusData, args: &StatusArgs) -> CliResult<()> {
+    if args.pathspec.is_empty() {
+        return Ok(());
+    }
+    let pathspecs =
+        PathspecSet::from_workdir(&args.pathspec, &util::cur_dir(), &util::working_dir())
+            .map_err(pathspec_error_to_cli)?;
+
+    filter_changes_by_pathspec(&mut data.staged, &pathspecs);
+    filter_changes_by_pathspec(&mut data.unstaged, &pathspecs);
+    data.unmerged
+        .retain(|entry| current_relative_matches(&entry.path, &pathspecs));
+    data.ignored_files
+        .retain(|path| current_relative_matches(path, &pathspecs));
+    if let Some(merge_state) = data.merge_state.as_mut() {
+        merge_state
+            .conflicted_paths
+            .retain(|path| pathspecs.matches_path(Path::new(path)));
+    }
+
+    Ok(())
+}
+
+fn filter_changes_by_pathspec(changes: &mut Changes, pathspecs: &PathspecSet) {
+    changes
+        .new
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes
+        .modified
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes
+        .deleted
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes.renamed.retain(|(old, new)| {
+        current_relative_matches(old, pathspecs) || current_relative_matches(new, pathspecs)
+    });
+}
+
+fn current_relative_matches(path: &Path, pathspecs: &PathspecSet) -> bool {
+    pathspecs.matches_path(util::to_workdir_path(path))
+}
+
+fn pathspec_error_to_cli(error: PathspecError) -> CliError {
+    match error {
+        PathspecError::OutsideRepository { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("all pathspecs must stay within the repository working tree"),
+        PathspecError::UnsupportedMagic { .. } | PathspecError::InvalidPattern { .. } => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use supported magic: top, exclude, icase, literal, glob")
+        }
+    }
 }
 
 /// Detect renames between deleted and new files in `changes`.
@@ -717,8 +810,17 @@ async fn compute_raw_sets() -> CliResult<(Changes, Changes)> {
     let staged = changes_to_be_committed_safe()
         .await
         .map_err(CliError::from)?;
-    let unstaged = changes_to_be_staged().map_err(CliError::from)?;
+    let ignore_case = effective_ignore_case_for_status().await?;
+    let unstaged = changes_to_be_staged_with_ignore_case(ignore_case).map_err(CliError::from)?;
     Ok((staged, unstaged))
+}
+
+async fn effective_ignore_case_for_status() -> CliResult<bool> {
+    crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|error| {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        })
 }
 
 fn dirty_cache_error(action: &str, error: anyhow::Error) -> CliError {
@@ -1092,18 +1194,24 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         CliError::fatal(format!("failed to inspect merge state: {detail}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
     })? {
-        Some(state) => Some(MergeStatusInfo {
-            target_ref: state.target_ref.clone(),
-            conflicted_paths: state.conflicted_paths.clone(),
-        }),
+        Some(state) => {
+            let conflicted_paths =
+                merge::unresolved_conflicted_paths(&index, &state.conflicted_paths);
+            Some(MergeStatusInfo {
+                target_ref: state.target_ref.clone(),
+                unresolved_count: conflicted_paths.len(),
+                conflicted_paths,
+            })
+        }
         None => None,
     };
-    let data = StatusData {
+    let mut data = StatusData {
         head,
         has_commits: head_oid_hash.is_some(),
         head_oid: head_oid_hash,
         staged,
         unstaged,
+        unmerged: vec![],
         ignored_files: vec![],
         stash_count: None,
         upstream,
@@ -1114,6 +1222,7 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
             .is_active(),
         porcelain_v2: None,
     };
+    filter_status_data_by_pathspec(&mut data, args)?;
 
     if output.is_json() {
         let mut json_data = build_status_json(&data, args);
@@ -1188,6 +1297,7 @@ async fn render_status_to_writer(
             output_porcelain_v2(
                 &data.staged,
                 &data.unstaged,
+                &data.unmerged,
                 &data.ignored_files,
                 data.porcelain_v2.as_ref(),
                 args.null_terminated,
@@ -1206,9 +1316,10 @@ async fn render_status_to_writer(
                     &mut buffer,
                 )?;
             }
-            output_porcelain(
+            output_porcelain_with_unmerged(
                 &data.staged,
                 &data.unstaged,
+                &data.unmerged,
                 args.null_terminated,
                 &mut buffer,
             )?;
@@ -1242,6 +1353,7 @@ async fn render_status_to_writer(
         output_short_format_with_config(
             &data.staged,
             &data.unstaged,
+            &data.unmerged,
             output,
             args.null_terminated,
             &mut buffer,
@@ -1326,7 +1438,11 @@ fn render_human_status(
     }
 
     // Clean tree
-    if data.staged.is_empty() && data.unstaged.is_empty() {
+    if data.merge_state.is_none()
+        && data.staged.is_empty()
+        && data.unstaged.is_empty()
+        && data.unmerged.is_empty()
+    {
         writeln!(buffer, "nothing to commit, working tree clean").map_err(write_error)?;
         return Ok(());
     }
@@ -1392,6 +1508,35 @@ fn render_human_status(
         }
     }
 
+    if !data.unmerged.is_empty() {
+        writeln!(buffer, "Unmerged paths:").map_err(write_error)?;
+        writeln!(buffer, "  use \"libra add <file>...\" to mark resolution")
+            .map_err(write_error)?;
+        writeln!(
+            buffer,
+            "  use \"libra merge --abort\" or the active sequencer abort command to abort"
+        )
+        .map_err(write_error)?;
+        let entries = data
+            .unmerged
+            .iter()
+            .map(|entry| {
+                (
+                    unmerged_human_label(entry),
+                    entry.path.display().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if args.column {
+            render_columnated_labeled_entries(buffer, &entries, colored::Color::BrightRed)?;
+        } else {
+            for (label, path) in entries {
+                let line = format!("\t{label} {path}");
+                writeln!(buffer, "{}", line.bright_red()).map_err(write_error)?;
+            }
+        }
+    }
+
     // Untracked
     if !data.unstaged.new.is_empty() {
         writeln!(buffer, "Untracked files:").map_err(write_error)?;
@@ -1429,6 +1574,18 @@ fn render_human_status(
     }
 
     Ok(())
+}
+
+fn unmerged_human_label(entry: &UnmergedEntry) -> &'static str {
+    match entry.xy() {
+        ('D', 'D') => "both deleted:",
+        ('A', 'U') => "added by us:",
+        ('U', 'D') => "deleted by them:",
+        ('U', 'A') => "added by them:",
+        ('D', 'U') => "deleted by us:",
+        ('A', 'A') => "both added:",
+        _ => "both modified:",
+    }
 }
 
 /// Build a flat list of (label, path) for human output.
@@ -1548,10 +1705,16 @@ fn render_merge_state_human(merge_state: &MergeStatusInfo, buffer: &mut Vec<u8>)
         merge_state.target_ref
     )
     .map_err(write_error)?;
-    if merge_state.conflicted_paths.is_empty() {
+    if merge_state.unresolved_count == 0 {
         writeln!(
             buffer,
             "  (all conflicts fixed: run \"libra merge --continue\")"
+        )
+        .map_err(write_error)?;
+    } else if merge_state.conflicted_paths.is_empty() {
+        writeln!(
+            buffer,
+            "  (conflicts remain outside the selected pathspec; run \"libra status\" to see them)"
         )
         .map_err(write_error)?;
     } else {
@@ -1698,6 +1861,13 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
             "deleted": paths_to_json(&data.unstaged.deleted),
             "renamed": renamed_to_json(&data.unstaged.renamed),
         },
+        "unmerged": paths_to_json(
+            &data
+                .unmerged
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>()
+        ),
         "untracked": paths_to_json(&data.unstaged.new),
         "ignored": paths_to_json(&data.ignored_files),
         "is_clean": !data.is_dirty(),
@@ -1734,7 +1904,17 @@ pub fn output_porcelain(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let status_list = generate_short_format_status(staged, unstaged);
+    output_porcelain_with_unmerged(staged, unstaged, &[], null_terminated, writer)
+}
+
+fn output_porcelain_with_unmerged(
+    staged: &Changes,
+    unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
+    null_terminated: bool,
+    writer: &mut impl Write,
+) -> CliResult<()> {
+    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
     for (file, staged_status, unstaged_status) in status_list {
         write!(
@@ -1862,6 +2042,7 @@ fn build_porcelain_v2_data(index: Index, head_oid: Option<&ObjectHash>) -> Porce
 fn output_porcelain_v2(
     staged: &Changes,
     unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
     ignored: &[PathBuf],
     metadata: Option<&PorcelainV2Data>,
     null_terminated: bool,
@@ -1871,6 +2052,10 @@ fn output_porcelain_v2(
         metadata.ok_or_else(|| CliError::internal("missing porcelain v2 metadata for status"))?;
     let zero_hash = zero_hash_str();
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+
+    for entry in unmerged {
+        write_unmerged_porcelain_v2(entry, &zero_hash, null_terminated, writer)?;
+    }
 
     let status_list = generate_short_format_status(staged, unstaged);
     for (file, staged_status, unstaged_status) in status_list {
@@ -1949,6 +2134,59 @@ fn zero_hash_str() -> String {
     ObjectHash::zero_str(get_hash_kind())
 }
 
+fn write_unmerged_porcelain_v2(
+    entry: &UnmergedEntry,
+    zero_hash: &str,
+    null_terminated: bool,
+    writer: &mut impl Write,
+) -> CliResult<()> {
+    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let (staged_status, unstaged_status) = entry.xy();
+    let mode = |stage| {
+        entry
+            .stage(stage)
+            .map(|stage| format_mode(stage.mode))
+            .unwrap_or_else(|| "000000".to_string())
+    };
+    let hash = |stage| {
+        entry
+            .stage(stage)
+            .map(|stage| stage.hash.to_string())
+            .unwrap_or_else(|| zero_hash.to_string())
+    };
+    write!(
+        writer,
+        "u {}{} N... {} {} {} {} {} {} {} {}",
+        staged_status,
+        unstaged_status,
+        mode(1),
+        mode(2),
+        mode(3),
+        format_mode(get_unmerged_worktree_mode(&entry.path)),
+        hash(1),
+        hash(2),
+        hash(3),
+        entry.path.display()
+    )
+    .map_err(write_err)?;
+    if null_terminated {
+        writer.write_all(b"\0").map_err(write_err)?;
+    } else {
+        writer.write_all(b"\n").map_err(write_err)?;
+    }
+    Ok(())
+}
+
+fn get_unmerged_worktree_mode(file_path: &std::path::Path) -> u32 {
+    let workdir_path = current_to_workdir(file_path);
+    let abs_path = util::workdir_to_absolute(&workdir_path);
+    if std::fs::symlink_metadata(&abs_path).is_ok() {
+        get_worktree_mode(file_path)
+    } else {
+        0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Short format
 // ---------------------------------------------------------------------------
@@ -1957,6 +2195,14 @@ fn zero_hash_str() -> String {
 pub fn generate_short_format_status(
     staged: &Changes,
     unstaged: &Changes,
+) -> Vec<(std::path::PathBuf, char, char)> {
+    generate_short_format_status_with_unmerged(staged, unstaged, &[])
+}
+
+fn generate_short_format_status_with_unmerged(
+    staged: &Changes,
+    unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
 ) -> Vec<(std::path::PathBuf, char, char)> {
     let mut file_status: HashMap<PathBuf, (char, char)> = HashMap::new();
 
@@ -1999,6 +2245,9 @@ pub fn generate_short_format_status(
     for file in &unstaged.new {
         file_status.insert(file.clone(), ('?', '?'));
     }
+    for entry in unmerged {
+        file_status.insert(entry.path.clone(), entry.xy());
+    }
 
     let mut sorted_files: Vec<_> = file_status.iter().collect();
     sorted_files.sort_by(|a, b| a.0.cmp(b.0));
@@ -2017,13 +2266,22 @@ pub async fn output_short_format(
     unstaged: &Changes,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    output_short_format_with_config(staged, unstaged, &OutputConfig::default(), false, writer).await
+    output_short_format_with_config(
+        staged,
+        unstaged,
+        &[],
+        &OutputConfig::default(),
+        false,
+        writer,
+    )
+    .await
 }
 
 /// Short format output with color controlled by OutputConfig.
 async fn output_short_format_with_config(
     staged: &Changes,
     unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
     output: &OutputConfig,
     null_terminated: bool,
     writer: &mut impl Write,
@@ -2031,7 +2289,7 @@ async fn output_short_format_with_config(
     let use_colors = should_use_colors(output).await;
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
 
-    let status_list = generate_short_format_status(staged, unstaged);
+    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
 
     for (file, staged_status, unstaged_status) in status_list {
         if use_colors {
@@ -2562,12 +2820,28 @@ pub fn changes_to_be_staged() -> Result<Changes, StatusError> {
 /// Commands such as `add --force` or `status --ignored` can switch policies as needed.
 pub fn changes_to_be_staged_with_policy(policy: IgnorePolicy) -> Result<Changes, StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    changes_to_be_staged_with_policy_and_ignore_case(policy, ignore_case)
+}
+
+pub(crate) fn changes_to_be_staged_with_ignore_case(
+    ignore_case: bool,
+) -> Result<Changes, StatusError> {
+    changes_to_be_staged_with_policy_and_ignore_case(IgnorePolicy::Respect, ignore_case)
+}
+
+fn changes_to_be_staged_with_policy_and_ignore_case(
+    policy: IgnorePolicy,
+    ignore_case: bool,
+) -> Result<Changes, StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    let (mut visible, ignored) = changes_to_be_staged_split_with_index(&workdir, &index)?;
+    let (mut visible, ignored) =
+        changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)?;
     match policy {
         IgnorePolicy::Respect => Ok(visible),
         IgnorePolicy::OnlyIgnored => Ok(ignored),
@@ -2580,38 +2854,61 @@ pub fn changes_to_be_staged_with_policy(policy: IgnorePolicy) -> Result<Changes,
 
 pub fn changes_to_be_staged_split_safe() -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
-    let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
-    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
-        path: index_path.clone(),
-        source,
-    })?;
-    changes_to_be_staged_split_with_index(&workdir, &index)
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
 }
 
-/// List changes to be staged with --force semantics (recurse into ignored directories)
-pub fn changes_to_be_staged_split_force() -> Result<(Changes, Changes), StatusError> {
+pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
+    ignore_case: bool,
+) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    changes_to_be_staged_split_force_with_index(&workdir, &index)
+    changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)
+}
+
+/// List changes to be staged with --force semantics (recurse into ignored directories)
+pub fn changes_to_be_staged_split_force() -> Result<(Changes, Changes), StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+}
+
+fn effective_ignore_case_for_workdir(workdir: &Path) -> Result<bool, StatusError> {
+    crate::utils::path_case::effective_ignore_case_for_dir_sync(workdir)
+        .map_err(|source| StatusError::ConfigRead { source })
+}
+
+pub(crate) fn changes_to_be_staged_split_force_with_ignore_case(
+    ignore_case: bool,
+) -> Result<(Changes, Changes), StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
+    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
+        path: index_path.clone(),
+        source,
+    })?;
+    changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case)
 }
 
 fn changes_to_be_staged_split_force_with_index(
     workdir: &PathBuf,
     index: &Index,
+    ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
     let tracked_files = index.tracked_files();
+    let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
     for file in tracked_files.iter() {
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
         let file_abs = workdir.join(file);
-        if !file_abs.exists() {
+        if file_abs.symlink_metadata().is_err() {
             visible.deleted.push(file.clone());
         } else if index.is_modified(file_str, 0, workdir) {
             let file_hash =
@@ -2634,7 +2931,8 @@ fn changes_to_be_staged_split_force_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             visible.new.push(file);
         }
     }
@@ -2642,7 +2940,8 @@ fn changes_to_be_staged_split_force_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             ignored.new.push(file);
         }
     }
@@ -2652,16 +2951,18 @@ fn changes_to_be_staged_split_force_with_index(
 fn changes_to_be_staged_split_with_index(
     workdir: &PathBuf,
     index: &Index,
+    ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
     let tracked_files = index.tracked_files();
+    let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
     for file in tracked_files.iter() {
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
         let file_abs = workdir.join(file);
-        if !file_abs.exists() {
+        if file_abs.symlink_metadata().is_err() {
             visible.deleted.push(file.clone());
         } else if index.is_modified(file_str, 0, workdir) {
             let file_hash =
@@ -2683,7 +2984,8 @@ fn changes_to_be_staged_split_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             visible.new.push(file);
         }
     }
@@ -2691,11 +2993,38 @@ fn changes_to_be_staged_split_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             ignored.new.push(file);
         }
     }
     Ok((visible, ignored))
+}
+
+fn tracked_files_by_fold(tracked_files: &[PathBuf], ignore_case: bool) -> HashMap<String, PathBuf> {
+    if !ignore_case {
+        return HashMap::new();
+    }
+    tracked_files
+        .iter()
+        .map(|path| {
+            (
+                crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref()),
+                path.clone(),
+            )
+        })
+        .collect()
+}
+
+fn is_same_file_tracked_alias(
+    workdir: &Path,
+    file: &Path,
+    tracked_fold: &HashMap<String, PathBuf>,
+) -> bool {
+    let key = crate::utils::path_case::fold_path_key(file.to_string_lossy().as_ref());
+    tracked_fold.get(&key).is_some_and(|tracked| {
+        crate::utils::path_case::is_same_file_case_alias(workdir, file, tracked)
+    })
 }
 
 fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
@@ -2726,7 +3055,7 @@ fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>,
                 } else {
                     pending_dirs.push(path);
                 }
-            } else if file_type.is_file() {
+            } else if file_type.is_file() || file_type.is_symlink() {
                 if util::check_gitignore(workdir, &path) {
                     ignored.push(relative);
                 } else {
@@ -2769,7 +3098,7 @@ fn list_workdir_files_split_force(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>
                 // — so `add --force` sees concrete blobs, not a path that
                 // would panic when `Blob::from_file` tries to read it.
                 pending_dirs.push(path.clone());
-            } else if file_type.is_file() {
+            } else if file_type.is_file() || file_type.is_symlink() {
                 if util::check_gitignore(workdir, &path) {
                     ignored.push(relative);
                 } else {
@@ -2782,7 +3111,7 @@ fn list_workdir_files_split_force(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>
     Ok((files, ignored))
 }
 
-/// List ignored files (not tracked by index, but ignored by .libraignore) under workdir
+/// List ignored files (not tracked by index, but ignored by configured rules) under workdir
 pub fn list_ignored_files() -> Result<Changes, StatusError> {
     changes_to_be_staged_with_policy(IgnorePolicy::OnlyIgnored)
 }

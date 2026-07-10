@@ -210,15 +210,18 @@ impl Default for Redactor {
     }
 }
 
-/// Marker trait for sinks that may persist redacted bytes.
+/// Marker trait reserved for a future sink abstraction that persists redacted
+/// bytes (e.g. a cloud-sync uploader).
 ///
-/// Phase 2 wiring (checkpoint commit writer, cloud-sync uploader) implements
-/// this trait so that the only entry point that accepts bytes is
-/// `accept(&RedactedBytes)`. Together with the `pub(crate)` constructor on
-/// [`RedactedBytes`], no `&[u8]` can flow into a sink without first passing
-/// through [`Redactor::redact`]. The trait exists as a placeholder in Phase 1
-/// so test scaffolding (`tests/redaction_contract_test.rs`) can pin the
-/// contract before the real sinks land.
+/// NOTE (G4): the checkpoint commit writer does NOT route through this trait —
+/// it enforces the same invariant directly by typing every blob parameter of
+/// `history::CheckpointCommitParams` (metadata / transcript / lifecycle events
+/// / redaction report) as [`RedactedBytes`], so no `&[u8]` can reach the
+/// `refs/libra/traces` sink. Together with the `pub(crate)` constructor on
+/// [`RedactedBytes`], nothing flows into a persistence path without first
+/// passing through [`Redactor::redact`]. This trait remains an (unused)
+/// placeholder so `tests/redaction_contract_test.rs` can pin the contract for
+/// the day a distinct uploader sink lands.
 pub trait RedactedSink {
     fn accept(&mut self, redacted: &RedactedBytes);
 }

@@ -1,10 +1,10 @@
 //! Top-level `libra agent` command surface.
 //!
-//! The Phase 1 cut implements parsing, the read-only `status` subcommand, and
-//! stub handlers for the rest of the CLI surface so users can discover the
-//! shape via `libra agent --help`. Subsequent phases fill in checkpoint /
-//! session / hook routing on top of this scaffold; see
-//! `docs/development/commands/_general.md` section 9.
+//! Every subcommand dispatches to a real handler: `status`/`list` (capability
+//! matrix), `enable`/`add` and `disable`/`remove` (hook install/uninstall
+//! aliases), `session`, `checkpoint`, `clean`, `doctor`, `push`, `hooks`, and
+//! `rpc`. See `docs/development/commands/_general.md` section 9 and
+//! `docs/development/tracing/agent.md` for the external-agent capture surface.
 
 use clap::{Args, Subcommand};
 
@@ -35,7 +35,24 @@ pub mod review;
 pub mod investigate;
 mod rpc;
 mod session;
+mod skill;
 mod status;
+
+/// A0-06: derive a safe display/record name from a `review/investigate attach`
+/// path. Only the basename is kept (never the full path — no directory-tree
+/// leak); the basename is then redacted (a filename can embed a secret) and
+/// every control character is stripped (Unix filenames can carry
+/// newlines/tabs/ANSI). Used for BOTH the manifest `manual_attach` entry AND
+/// any user-facing read error, so a hostile path never reaches output
+/// unsanitized.
+pub(crate) fn sanitize_attachment_name(path: &std::path::Path) -> String {
+    let raw = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+    let (redacted, _) = crate::internal::ai::review::redact_untrusted(raw.as_bytes());
+    redacted.chars().filter(|c| !c.is_control()).collect()
+}
 
 /// `--help` examples shown in `libra agent --help` output.
 ///
@@ -64,6 +81,8 @@ EXAMPLES:
     libra agent checkpoint rewind <id>              Preview/apply checkpoint rewind
     libra agent checkpoint export <id>              Export the redacted transcript (no authorization needed)
     libra agent checkpoint export <id> --allow-raw --raw  Export the raw transcript (audited; requires --allow-raw)
+    libra agent skill search --skill /review        Search captured skill events (by skill/provider/session/time)
+    libra agent skill registry                      Show the curated per-agent discoverable-skill registry
     libra agent clean                               Drop temporary checkpoints from the most recent stopped session
     libra agent clean --all                         Drop temporary checkpoints from every stopped session
     libra agent doctor                              Diagnose hook installation and capture state
@@ -71,6 +90,7 @@ EXAMPLES:
     libra agent push --remote origin                Push refs/libra/traces to a named remote
     libra agent rpc list                            Discover libra-agent-<name> RPC binaries on PATH
     libra agent rpc trust <slug>                    Trust a discovered binary (records sha256/inode provenance)
+    libra agent rpc trust --dir <path>              Register a trusted directory (binaries must live under one)
     libra agent rpc untrust <slug>                  Revoke trust (binary returns to quarantine)
     libra agent rpc invoke <slug> <method>          Invoke a single JSON-RPC method (use --params '<json>' for arguments)
     libra agent --json status                       Structured JSON output for agents";
@@ -117,6 +137,10 @@ pub enum AgentSubcommand {
     /// Inspect captured checkpoints.
     #[command(subcommand, about = "Inspect captured checkpoints")]
     Checkpoint(CheckpointSubcommand),
+
+    /// Discover and search captured skill events.
+    #[command(subcommand, about = "Discover and search captured skill events")]
+    Skill(skill::SkillSubcommand),
 
     /// Remove temporary checkpoints from stopped sessions.
     #[command(about = "Clean up temporary checkpoints from stopped sessions")]
@@ -181,6 +205,11 @@ pub struct CleanArgs {
     /// instead of reading `agent.retention.transcript_days`.
     #[arg(long, value_name = "DAYS", requires = "gc")]
     pub retention_days: Option<u32>,
+
+    /// Preview only: report what a `--gc` sweep *would* remove (checkpoints,
+    /// stderr logs, findings runs) without deleting anything.
+    #[arg(long, requires = "gc")]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -295,12 +324,9 @@ pub struct CheckpointRewindArgs {
     pub apply: bool,
 }
 
-/// Run an `agent` subcommand.
-///
-/// V1 ships a stable status path and stub handlers that emit a clear
-/// "not yet implemented in this phase" message rather than panicking — this
-/// keeps the CLI discoverable while later phases land checkpoint / session
-/// machinery.
+/// Run an `agent` subcommand. Every variant routes to its implemented
+/// handler; unsupported *inputs* (e.g. a non-first-batch agent slug) still
+/// return an actionable error rather than panicking.
 pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<()> {
     match args.command {
         AgentSubcommand::Status(args) => status::execute_safe(args, output).await,
@@ -311,6 +337,7 @@ pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<(
         AgentSubcommand::Remove(args) => disable_agents(&args.agents, output),
         AgentSubcommand::Session(cmd) => session::execute_safe(cmd, output).await,
         AgentSubcommand::Checkpoint(cmd) => checkpoint::execute_safe(cmd, output).await,
+        AgentSubcommand::Skill(cmd) => skill::execute_safe(cmd, output).await,
         AgentSubcommand::Clean(cmd) => clean::execute_safe(cmd, output).await,
         AgentSubcommand::Doctor(cmd) => doctor::execute_safe(cmd, output).await,
         AgentSubcommand::Push(cmd) => push::execute_safe(cmd, output).await,
@@ -489,9 +516,9 @@ fn resolve_agent_kinds(agents: &[String]) -> CliResult<Vec<AgentKind>> {
     Ok(out)
 }
 
-/// Helper used by stubs that should still surface as a non-zero exit when
-/// called outside an interactive shell. Reserved for future expansions of
-/// the agent CLI that need an explicit refuse path.
+/// Reserved refuse helper for future agent subcommands that need an explicit
+/// non-zero-exit refuse path. Currently unused (all subcommands are
+/// implemented); kept as a small seam rather than re-added ad hoc later.
 #[allow(dead_code)]
 fn refuse(message: &str) -> CliResult<()> {
     Err(CliError::fatal(message.to_string()))

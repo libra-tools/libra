@@ -17,7 +17,9 @@ libra rm [--json|--machine] --dry-run <pathspec>...
 
 `libra rm` 从工作树和索引中移除文件。默认情况下，它会从磁盘删除文件并取消暂存，从而在下一次提交中记录删除。使用 `--cached` 时，只移除索引条目，文件仍保留在磁盘上，这适合停止跟踪误添加的文件，同时不丢失本地更改。
 
-移除目录需要 `-r`（recursive）标志。没有该标志时，指定目录路径会产生错误。这与 Git 行为一致，并防止意外递归删除。
+移除目录需要 `-r`（recursive）标志。没有该标志时，指定目录路径会产生错误。传入 `-r` 后，Libra 只删除 pathspec 匹配到的已跟踪文件，并仅在目录变空后清理空父目录；未跟踪文件和被 exclude 的已跟踪文件会让目录继续保留在磁盘上。
+
+Pathspec 使用 Libra 共享的 Git 风格匹配器：普通 pathspec 匹配文件或目录前缀，支持通配符，并支持高价值 magic 形式 `:(top)`、`:/`、`:(glob)`、`:(literal)`、`:(icase)`、`:(exclude)`、`:!`、`:^`。排除 pathspec 会从正向选择中扣除；启用 `core.ignorecase` 时，匹配会按忽略大小写处理。看起来像通配符的 pathspec 也会匹配同名的字面路径或目录前缀，以保留 Git 对 bracket 文件名和目录名的行为。
 
 移除文件前，Libra 会检查未提交更改（包括已暂存和未暂存）。如果文件相对索引有本地修改，或索引与 HEAD 不同，除非传递 `--force` 或使用 `--cached`，否则命令会拒绝继续。此安全检查可防止文件有未保存工作时发生静默数据丢失。
 
@@ -27,13 +29,13 @@ libra rm [--json|--machine] --dry-run <pathspec>...
 
 | 标志 | 短选项 | 长选项 | 说明 |
 |------|-------|------|-------------|
-| Pathspec | | 位置参数 | 要移除的一个或多个文件或目录。除非使用 `--pathspec-from-file`，否则必需。 |
+| Pathspec | | 位置参数 | 要移除的一个或多个文件或目录。支持共享 pathspec magic；除非使用 `--pathspec-from-file`，否则必需。 |
 | Cached | | `--cached` | 只从索引中移除；保留工作树文件。 |
 | Recursive | `-r` | `--recursive` | 指定目录时允许递归移除。 |
 | Force | `-f` | `--force` | 强制移除，绕过未提交更改安全检查。 |
 | Dry run | | `--dry-run` | 显示会被移除的内容，但不实际删除任何东西。 |
 | Ignore unmatch | | `--ignore-unmatch` | 即使没有 pathspec 匹配任何文件，也以零状态退出。 |
-| Pathspec from file | | `--pathspec-from-file <FILE>` | 从文件读取 pathspec，每行一个。 |
+| Pathspec from file | | `--pathspec-from-file <FILE>` | 从文件读取共享匹配器 pathspec，每行一个。 |
 | NUL separator | | `--pathspec-file-nul` | Pathspec 文件条目使用 NUL 字节而不是换行分隔。 |
 | Sparse | | `--sparse` | 为 Git 兼容按 no-op 接受。Git 用它允许移除 sparse-checkout cone 之外的索引条目；Libra 没有 sparse-checkout 状态，故不改变任何行为。 |
 
@@ -69,7 +71,7 @@ rm 'tests/old_test.rs'
 
 **`--pathspec-from-file`**
 
-从文件而不是命令行参数读取 pathspec。与 `--pathspec-file-nul` 结合时，支持包含换行或其他特殊字符的文件名：
+从文件而不是命令行参数读取共享匹配器 pathspec。与 `--pathspec-file-nul` 结合时，支持包含换行或其他特殊字符的文件名：
 
 ```bash
 $ libra rm --pathspec-from-file files-to-remove.txt
@@ -98,6 +100,9 @@ libra rm -f src/experimental.rs
 # 移除清单中列出的文件
 libra rm --pathspec-from-file cleanup-list.txt
 
+# 从索引中移除 Rust 文件，但保留生成文件
+libra rm --cached ':(glob)src/*.rs' ':(exclude)src/generated.rs'
+
 # 从索引移除，如果文件未被跟踪则忽略
 libra rm --cached --ignore-unmatch generated.rs
 ```
@@ -118,7 +123,7 @@ rm 'old_module/bar.rs'
 
 ## JSON 输出
 
-`--json` 和 `--machine` 使用 `rm` 命令信封。`paths` 包含所有匹配到、将从索引移除的已跟踪文件。`directories` 包含从磁盘移除的递归目录 pathspec。在 `--dry-run` 中，会报告相同候选路径，但 `removed_from_index` 和 `removed_from_disk` 为 `false`。
+`--json` 和 `--machine` 使用 `rm` 命令信封。`paths` 包含所有匹配到、将从索引移除的已跟踪文件。`directories` 包含递归 plain 目录 pathspec，并报告已跟踪文件删除、空父目录清理后该目录是否实际从磁盘消失。在 `--dry-run` 中，会报告相同候选路径，但 `removed_from_index` 和 `removed_from_disk` 为 `false`。
 
 ```json
 {

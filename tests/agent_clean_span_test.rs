@@ -93,6 +93,9 @@ async fn seed_temporary_checkpoint(
     );
     let redactor = Redactor::new_default();
     let (redacted, _) = redactor.redact(b"transcript for the prune span test");
+    let (meta_redacted, _) = redactor.redact(br#"{"checkpoint_id":"span"}"#);
+    let (events_redacted, _) = redactor.redact(b"{}\n");
+    let (report_redacted, _) = redactor.redact(b"{}");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id,
@@ -101,10 +104,10 @@ async fn seed_temporary_checkpoint(
             parent_commit: None,
             scope: CheckpointScope::Temporary,
             tool_use_id: None,
-            metadata_json: br#"{"checkpoint_id":"span"}"#,
+            metadata_json: &meta_redacted,
             transcript_redacted: &redacted,
-            lifecycle_events_jsonl: b"{}\n",
-            redaction_report_json: b"{}",
+            lifecycle_events_jsonl: &events_redacted,
+            redaction_report_json: &report_redacted,
         })
         .await
         .expect("append temporary checkpoint commit");

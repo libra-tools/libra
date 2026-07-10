@@ -36,6 +36,7 @@ pub mod preview;
 pub mod redaction;
 pub mod registry;
 pub mod rpc;
+pub mod skill_projection;
 pub mod trust;
 
 pub use adapter::{
@@ -69,10 +70,16 @@ pub use rpc::{
     AgentInfo, RPC_BINARY_PREFIX, RPC_DEFAULT_TIMEOUT, RPC_MAX_STDERR_BYTES, RPC_PROTOCOL_VERSION,
     RpcAgent, RpcAgentBinary, RpcError, RpcRequest, RpcResponse, discover_rpc_agents,
 };
+pub use skill_projection::{
+    DiscoveredSkill, IndexedSkillEvent, SKILL_PROJECTION_SCHEMA_VERSION, SkillEventProjection,
+    SkillQuery, discover_skills,
+};
 pub use trust::{
-    EXTERNAL_AGENTS_ENABLED_KEY, Provenance, TrustRecord, compute_provenance,
-    ensure_parent_not_world_writable, external_agents_enabled, read_trust, record_trust,
-    revalidate_trust, revoke_trust,
+    DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY, Provenance,
+    TRUSTED_DIRS_KEY, TrustRecord, add_trusted_dir, compute_provenance,
+    ensure_dir_not_world_writable, ensure_parent_not_world_writable, env_allowlist_extra,
+    env_name_is_forbidden, external_agents_enabled, path_within_trusted_dirs, read_trust,
+    read_trusted_dirs, record_trust, revalidate_trust, revoke_trust,
 };
 
 /// Borrow the static [`ObservedAgent`] for the supplied [`AgentKind`].

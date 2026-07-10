@@ -205,6 +205,9 @@ async fn seed_checkpoint_commit(
     let redactor = Redactor::new_default();
     let (redacted, _) = redactor.redact(format!("transcript for {checkpoint_id}").as_bytes());
     let metadata = format!(r#"{{"checkpoint_id":"{checkpoint_id}"}}"#);
+    let (meta_redacted, _) = redactor.redact(metadata.as_bytes());
+    let (events_redacted, _) = redactor.redact(b"{}\n");
+    let (report_redacted, _) = redactor.redact(b"{}");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id,
@@ -213,10 +216,10 @@ async fn seed_checkpoint_commit(
             parent_commit: None,
             scope,
             tool_use_id: None,
-            metadata_json: metadata.as_bytes(),
+            metadata_json: &meta_redacted,
             transcript_redacted: &redacted,
-            lifecycle_events_jsonl: b"{}\n",
-            redaction_report_json: b"{}",
+            lifecycle_events_jsonl: &events_redacted,
+            redaction_report_json: &report_redacted,
         })
         .await
         .expect("append checkpoint commit");

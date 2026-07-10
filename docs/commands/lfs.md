@@ -17,7 +17,13 @@ libra lfs ls-files [--long] [--size] [--name-only]
 
 `libra lfs` provides built-in Large File Storage for managing binary files, media assets, and other large objects that do not diff or merge well. Instead of storing the full file content in the repository, LFS replaces large files with lightweight pointer files and stores the actual content on a dedicated LFS server.
 
-LFS tracking is configured through Libra Attributes (`.libra_attributes`), which maps glob patterns to the LFS filter. The `track` and `untrack` subcommands manage these patterns. File locking prevents concurrent edits to binary files that cannot be merged, with server-side enforcement via the LFS lock API.
+LFS tracking is read from Git/Libra attribute sources (`core.attributesFile`,
+per-directory `.gitattributes`, `.libra_attributes`, and
+`.git/info/attributes`) when `add` and `lfs ls-files` decide whether a path has
+`filter=lfs`. The `track` and `untrack` subcommands still manage the root
+`.libra_attributes` file as Libra's writable convenience layer. File locking prevents concurrent edits to
+binary files that cannot be merged, with server-side enforcement via the LFS
+lock API.
 
 Unlike Git, which requires a separate `git-lfs` extension installed as a smudge/clean filter, Libra integrates LFS natively. The LFS client, pointer file parsing, and attribute management are built into the `libra` binary. No additional installation or filter configuration is needed.
 
@@ -291,7 +297,7 @@ Unlocking a file while the working tree is dirty could indicate that the develop
 | File size | `--size` | `--size` | Not available |
 | Name only | `--name-only` | `--name-only` | Not available |
 | Installation required | Built-in | Separate `git-lfs` install + `git lfs install` | Not available |
-| Attributes file | `.libra_attributes` | `.gitattributes` | Not available |
+| Attributes file | Reads `.gitattributes` + `.libra_attributes`; `track` writes `.libra_attributes` | `.gitattributes` | Not available |
 | Filter configuration | Automatic | Manual (smudge/clean filters) | Not available |
 
 Note: jj does not currently have LFS support. Large file management in jj repositories requires using Git's LFS infrastructure via jj's Git backend.
@@ -307,6 +313,6 @@ Note: jj does not currently have LFS support. Large file management in jj reposi
 | `unlock` with dirty working tree (no `--force`) | `ConflictOperationBlocked` | The working tree has uncommitted changes. |
 | `unlock` on file with no lock | `RepoStateInvalid` | No lock was found for the specified path. |
 | `unlock` without push access | `AuthPermissionDenied` | The user lacks push permissions. |
-| Failed to read/write `.libra_attributes` | IO error | The attributes file could not be read or written. |
+| Failed to read/write `.libra_attributes` | IO error | The writable Libra attributes file could not be read or written. |
 | Failed to load index | IO error | The repository index is corrupted or missing. |
 | LFS server communication failure | Network error | The LFS server returned an unexpected status code. |

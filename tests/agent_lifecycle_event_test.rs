@@ -585,3 +585,96 @@ fn kind_mismatch_still_fails_closed() {
         "kind mismatch must not create a checkpoint"
     );
 }
+
+/// A0-02: a `SubagentStop` (→ `SubagentEnd`) boundary materialises an
+/// independent `scope='subagent'` checkpoint, and it stays distinguishable
+/// from the session's `committed` checkpoints in `checkpoint list`.
+#[test]
+fn subagent_end_materializes_distinct_subagent_scope_checkpoint() {
+    let repo = HookRepo::init();
+    let session = "sess-subagent";
+
+    // Establish a codex-owned session (codex exposes native subagent hooks).
+    let out = repo.hook(
+        "codex",
+        "session-start",
+        &repo.envelope("SessionStart", session, None, json!({})),
+    );
+    assert!(
+        out.status.success(),
+        "codex session-start: {}",
+        describe(&out)
+    );
+
+    // A turn Stop writes a `committed` checkpoint the subagent links back to.
+    let out = repo.hook(
+        "codex",
+        "stop",
+        &repo.envelope("Stop", session, None, json!({})),
+    );
+    assert!(out.status.success(), "codex stop: {}", describe(&out));
+
+    // A SubagentStop boundary materialises a distinct subagent checkpoint.
+    let out = repo.hook(
+        "codex",
+        "subagent-end",
+        &repo.envelope("SubagentStop", session, None, json!({})),
+    );
+    assert!(
+        out.status.success(),
+        "codex subagent-end must materialise a subagent checkpoint: {}",
+        describe(&out)
+    );
+
+    let checkpoints = repo.checkpoints();
+    let scopes: Vec<String> = checkpoints
+        .iter()
+        .map(|c| c["scope"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        scopes.iter().any(|s| s == "subagent"),
+        "SubagentStop must produce a scope='subagent' checkpoint, got {scopes:?}"
+    );
+    assert!(
+        scopes.iter().any(|s| s == "committed"),
+        "the committed turn checkpoint must remain distinguishable, got {scopes:?}"
+    );
+}
+
+/// A0-03: a malformed (non-JSON) or schema-invalid hook envelope is rejected
+/// with the stable `LBR-AGENT-008` (`AgentHookEnvelopeInvalid`) code and a
+/// non-zero exit — not a bare fatal — so automation can distinguish an
+/// envelope reject from a genuine runtime failure.
+#[test]
+fn hook_envelope_invalid_emits_lbr_agent_008() {
+    let repo = HookRepo::init();
+
+    // Malformed JSON: fails at the JSON parse gate.
+    let out = repo.hook("codex", "session-start", "{ this is not valid json");
+    assert!(
+        !out.status.success(),
+        "a malformed envelope must fail: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "an envelope reject exits 128: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-008"),
+        "malformed envelope must carry LBR-AGENT-008: {stderr}"
+    );
+
+    // Well-formed JSON but schema-invalid (missing required fields) also maps
+    // to LBR-AGENT-008.
+    let out = repo.hook("codex", "session-start", "{}");
+    assert!(!out.status.success(), "schema-invalid envelope must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-008"),
+        "schema-invalid envelope must carry LBR-AGENT-008: {stderr}"
+    );
+}

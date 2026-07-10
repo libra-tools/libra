@@ -34,6 +34,21 @@ const TRUST_KEY_PREFIX: &str = "agent.trust.";
 /// `docs/development/tracing/agent.md`.
 pub const EXTERNAL_AGENTS_ENABLED_KEY: &str = "agent.external_agents.enabled";
 
+/// A0-08: trusted-directory allowlist (E2). A binary is only trustable when
+/// its canonical path lives under one of these directories — rejecting
+/// arbitrary user-writable `$PATH` entries. Stored as a JSON string array in a
+/// single `config_kv` cell; `libra agent rpc trust --dir <path>` appends to it.
+pub const TRUSTED_DIRS_KEY: &str = "agent.external_agents.trusted_dirs";
+
+/// A0-08: extra environment variables (exact names) to pass through to spawned
+/// external agents on top of [`super::rpc::RPC_ENV_PASSTHROUGH_ALLOWLIST`].
+/// Credential/endpoint names are always rejected (see [`env_name_is_forbidden`]).
+pub const ENV_ALLOWLIST_EXTRA_KEY: &str = "agent.external_agents.env_allowlist_extra";
+
+/// A0-08: the default trusted directory when the operator has registered none.
+/// `~` is expanded against `$HOME` at read time.
+pub const DEFAULT_TRUSTED_DIRS: &[&str] = &["~/.libra/agents"];
+
 /// One recorded trust decision for an external binary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustRecord {
@@ -127,6 +142,132 @@ pub fn ensure_parent_not_world_writable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A0-08: the directory itself (not just its parent) must not be
+/// world-writable — a world-writable trusted dir lets any local user drop a
+/// binary that would then be trustable.
+pub fn ensure_dir_not_world_writable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("stat directory {}", path.display()))?;
+        if !meta.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        if meta.permissions().mode() & 0o002 != 0 {
+            bail!(
+                "directory {} is world-writable; refusing to trust it (use a protected directory)",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Expand a single leading `~` against `$HOME` (best-effort; returns the path
+/// unchanged when there is no HOME or no leading `~`).
+fn expand_tilde(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Path::new(&home).join(rest);
+    }
+    if raw == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home);
+    }
+    PathBuf::from(raw)
+}
+
+/// A0-08: the operator-configured trusted directory allowlist, tilde-expanded.
+/// Absent config yields [`DEFAULT_TRUSTED_DIRS`]; a corrupt value fails closed
+/// to the default rather than trusting everything.
+pub async fn read_trusted_dirs() -> Result<Vec<PathBuf>> {
+    let entry = ConfigKv::get(TRUSTED_DIRS_KEY)
+        .await
+        .context("read agent.external_agents.trusted_dirs")?;
+    let raw: Vec<String> = match entry {
+        Some(entry) => serde_json::from_str(&entry.value)
+            .unwrap_or_else(|_| DEFAULT_TRUSTED_DIRS.iter().map(|s| s.to_string()).collect()),
+        None => DEFAULT_TRUSTED_DIRS.iter().map(|s| s.to_string()).collect(),
+    };
+    Ok(raw.iter().map(|s| expand_tilde(s)).collect())
+}
+
+/// A0-08: append `path` to the trusted-directory allowlist. The path is
+/// canonicalized and must be an existing, non-world-writable directory.
+/// Idempotent — a directory already present is not duplicated. Returns the
+/// canonical path recorded.
+pub async fn add_trusted_dir(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize trusted directory {}", path.display()))?;
+    ensure_dir_not_world_writable(&canonical)?;
+
+    // Read the raw (un-expanded) list so re-runs stay stable, then append the
+    // canonical string form if absent.
+    let entry = ConfigKv::get(TRUSTED_DIRS_KEY)
+        .await
+        .context("read agent.external_agents.trusted_dirs")?;
+    let mut raw: Vec<String> = match entry {
+        Some(entry) => serde_json::from_str(&entry.value).unwrap_or_default(),
+        None => DEFAULT_TRUSTED_DIRS.iter().map(|s| s.to_string()).collect(),
+    };
+    let canonical_str = canonical.to_string_lossy().to_string();
+    if !raw.iter().any(|d| expand_tilde(d) == canonical) {
+        raw.push(canonical_str);
+        let value = serde_json::to_string(&raw).context("serialize trusted_dirs")?;
+        ConfigKv::set(TRUSTED_DIRS_KEY, &value, false)
+            .await
+            .context("persist agent.external_agents.trusted_dirs")?;
+    }
+    Ok(canonical)
+}
+
+/// A0-08: whether `canonical_binary` lives under one of the trusted `dirs`.
+/// Both sides are assumed already canonicalized.
+pub fn path_within_trusted_dirs(canonical_binary: &Path, dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| {
+        dir.canonicalize()
+            .map(|d| canonical_binary.starts_with(&d))
+            .unwrap_or_else(|_| canonical_binary.starts_with(dir))
+    })
+}
+
+/// A0-08: env-var names that must NEVER be passed through to a spawned
+/// external agent, regardless of `env_allowlist_extra`. Rejects wildcards and
+/// any credential/endpoint name (matched case-insensitively, ASCII).
+pub fn env_name_is_forbidden(name: &str) -> bool {
+    // A real env name is `[A-Za-z_][A-Za-z0-9_]*`; anything else (notably a
+    // literal `*` wildcard) is refused outright.
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return true;
+    }
+    let upper = name.to_ascii_uppercase();
+    const FORBIDDEN_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"];
+    const FORBIDDEN_PREFIXES: &[&str] = &["LIBRA_STORAGE_", "LIBRA_D1_"];
+    FORBIDDEN_SUFFIXES.iter().any(|s| upper.ends_with(s))
+        || FORBIDDEN_PREFIXES.iter().any(|p| upper.starts_with(p))
+}
+
+/// A0-08: the operator-configured extra env-passthrough names, with any
+/// forbidden name silently dropped (defense-in-depth — the spawn path also
+/// re-checks). Absent/corrupt config yields an empty list.
+pub async fn env_allowlist_extra() -> Result<Vec<String>> {
+    let entry = ConfigKv::get(ENV_ALLOWLIST_EXTRA_KEY)
+        .await
+        .context("read agent.external_agents.env_allowlist_extra")?;
+    let raw: Vec<String> = match entry {
+        Some(entry) => serde_json::from_str(&entry.value).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    Ok(raw
+        .into_iter()
+        .filter(|name| !env_name_is_forbidden(name))
+        .collect())
+}
+
 fn trust_key(slug: &str) -> String {
     format!("{TRUST_KEY_PREFIX}{slug}")
 }
@@ -139,6 +280,22 @@ fn trust_key(slug: &str) -> String {
 pub async fn record_trust(slug: &str, path: &Path) -> Result<TrustRecord> {
     let provenance = compute_provenance(path)?;
     ensure_parent_not_world_writable(&provenance.canonical_path)?;
+    // A0-08: the binary must live under a trusted directory — an arbitrary
+    // user-writable $PATH entry is not trustable even if its parent happens
+    // not to be world-writable.
+    let dirs = read_trusted_dirs().await?;
+    if !path_within_trusted_dirs(&provenance.canonical_path, &dirs) {
+        bail!(
+            "external agent binary {} is not under a trusted directory; \
+             register its directory first with `libra agent rpc trust --dir <path>` \
+             (trusted dirs: {})",
+            provenance.canonical_path.display(),
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let record = TrustRecord {
         path: provenance.canonical_path.clone(),
         sha256: provenance.sha256,
@@ -205,6 +362,17 @@ pub async fn revalidate_trust(slug: &str, record: &TrustRecord) -> Result<Proven
             "external agent binary for '{slug}' changed since it was trusted \
              (sha256/device/inode/mtime drift); trust revoked — re-run \
              'libra agent rpc trust {slug}' after verifying the binary"
+        );
+    }
+    // A0-08 defense-in-depth: if the binary's directory was removed from the
+    // trusted allowlist since it was trusted, drop it back to quarantine.
+    let dirs = read_trusted_dirs().await?;
+    if !path_within_trusted_dirs(&provenance.canonical_path, &dirs) {
+        let _ = revoke_trust(slug).await;
+        bail!(
+            "external agent binary for '{slug}' is no longer under a trusted directory; \
+             trust revoked — re-register its directory with \
+             'libra agent rpc trust --dir <path>' then re-trust it"
         );
     }
     Ok(provenance)

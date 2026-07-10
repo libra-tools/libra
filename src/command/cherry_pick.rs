@@ -21,10 +21,12 @@ use serde::Serialize;
 
 use crate::{
     command::{
-        commit::{CleanupMode, cleanup_commit_message, parse_cleanup_mode},
+        commit::{
+            CleanupMode, cleanup_commit_message, create_committer_signature, parse_cleanup_mode,
+        },
         load_object, merge, save_object,
     },
-    common_utils::format_commit_msg,
+    common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
         config::ConfigKv,
@@ -1353,7 +1355,8 @@ async fn build_cherry_pick_message(
             }
         });
 
-    let body = original_commit.message.trim();
+    let (body, _) = parse_commit_msg(&original_commit.message);
+    let body = body.trim();
 
     if let Some(mode) = effective_cleanup {
         // `--cleanup` path: clean the BODY (and, after `-e`, the edited buffer),
@@ -1436,10 +1439,13 @@ async fn create_cherry_pick_commit(
     }
 
     let parents = vec![*parent_id];
+    let author = original_commit.author.clone();
+    let (committer, _identity) = create_committer_signature()
+        .await
+        .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))?;
     let commit = if args.gpg_sign {
         // Sign via the libra vault (force=true so it signs regardless of the
         // `vault.signing` default).
-        let (author, committer) = util::create_signatures().await;
         let gpgsig = crate::command::commit::vault_sign_commit(
             &tree_id, &parents, &author, &committer, &message, true,
         )
@@ -1461,7 +1467,13 @@ async fn create_cherry_pick_commit(
             }
         }
     } else {
-        Commit::from_tree_id(tree_id, parents, &format_commit_msg(&message, None))
+        Commit::new(
+            author,
+            committer,
+            tree_id,
+            parents,
+            &format_commit_msg(&message, None),
+        )
     };
 
     save_object(&commit, &commit.id)

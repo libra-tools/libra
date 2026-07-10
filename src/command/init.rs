@@ -257,7 +257,7 @@ pub struct InitArgs {
     #[clap(long, short = 'q', required = false)]
     pub quiet: bool,
 
-    /// Filesystem sharing mode for the repository (placeholder — see `git init --shared`)
+    /// Filesystem sharing mode: false, umask, group/true, all/world/everybody, or traversable octal like 0770
     #[clap(long, required = false, value_name = "MODE")]
     pub shared: Option<String>,
 
@@ -492,7 +492,7 @@ async fn run_init_internal(
         .as_ref()
         .map(|path| resolve_template_path(&current_dir, path))
         .transpose()?;
-    validate_shared_mode(args.shared.as_deref())?;
+    let shared_mode = parse_shared_mode(args.shared.as_deref())?;
 
     if is_reinit(&target_dir, args.bare) {
         // Git-style safe re-initialization: top-up the standard layout and re-apply
@@ -500,7 +500,14 @@ async fn run_init_internal(
         // vault, repo id). Never recreate config/refs here. Reached BEFORE resolving
         // `--from-git-repository` so that flag is rejected by its raw presence rather
         // than failing first on a missing source path.
-        return reinitialize_existing(&args, &root_dir, template_dir.as_deref(), progress).await;
+        return reinitialize_existing(
+            &args,
+            &root_dir,
+            template_dir.as_deref(),
+            shared_mode.as_ref(),
+            progress,
+        )
+        .await;
     }
 
     let from_git = args
@@ -542,7 +549,15 @@ async fn run_init_internal(
             .map(crate::utils::path_case::probe_dir_ignore_case)
             .unwrap_or(false)
     };
-    let repo_id = init_config(&conn, args.bare, &object_format, &ref_format, ignore_case).await?;
+    let repo_id = init_config(
+        &conn,
+        args.bare,
+        &object_format,
+        &ref_format,
+        ignore_case,
+        shared_mode.as_ref(),
+    )
+    .await?;
 
     progress.emit("Setting up refs ...");
     // INVARIANT: refs are initialized after core config so HEAD/branch rows are
@@ -551,7 +566,7 @@ async fn run_init_internal(
     initialize_refs(&conn, &initial_branch_name).await?;
 
     set_dir_hidden(&root_dir)?;
-    if let Some(shared_mode) = args.shared.as_deref() {
+    if let Some(shared_mode) = shared_mode.as_ref() {
         apply_shared(&root_dir, shared_mode)?;
     }
 
@@ -627,6 +642,7 @@ async fn reinitialize_existing(
     args: &InitArgs,
     root_dir: &Path,
     template_dir: Option<&Path>,
+    shared_mode: Option<&SharedMode>,
     progress: &InitProgress,
 ) -> Result<InitOutput, InitError> {
     // Validate all flags BEFORE any filesystem side effects, so an invalid invocation
@@ -660,7 +676,7 @@ async fn reinitialize_existing(
     fs::create_dir_all(root_dir)?;
     prepare_repository_layout(root_dir, template_dir)?;
     set_dir_hidden(root_dir)?;
-    if let Some(shared_mode) = args.shared.as_deref() {
+    if let Some(shared_mode) = shared_mode {
         // `apply_shared` skips the vault database/sidecars, so private signing
         // material keeps its owner-only mode through the chmod sweep.
         apply_shared(root_dir, shared_mode)?;
@@ -672,6 +688,9 @@ async fn reinitialize_existing(
     let conn = get_db_conn_instance_for_path(&database_path)
         .await
         .map_err(InitError::Io)?;
+    if let Some(shared_mode) = shared_mode {
+        persist_shared_repository(&conn, shared_mode).await?;
+    }
 
     let object_format = read_config_string(&conn, "core.objectformat")
         .await?
@@ -754,6 +773,20 @@ async fn read_config_string(conn: &DbConn, key: &str) -> Result<Option<String>, 
         .await
         .map(|entry| entry.map(|entry| entry.value))
         .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))
+}
+
+async fn persist_shared_repository(
+    conn: &DbConn,
+    shared_mode: &SharedMode,
+) -> Result<(), InitError> {
+    ConfigKv::set_with_conn(
+        conn,
+        "core.sharedRepository",
+        shared_mode.config_value(),
+        false,
+    )
+    .await
+    .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))
 }
 
 fn resolve_cli_path(base: &Path, raw: &str) -> PathBuf {
@@ -936,30 +969,102 @@ fn copy_template(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_shared_mode(shared_mode: Option<&str>) -> Result<(), InitError> {
-    let Some(shared_mode) = shared_mode else {
-        return Ok(());
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SharedMode {
+    False,
+    Umask,
+    Group,
+    All,
+    Numeric { raw: String, bits: u32 },
+}
 
-    match shared_mode {
-        "false" | "true" | "umask" | "group" | "all" | "world" | "everybody" => Ok(()),
-        mode if mode.starts_with('0') && mode.len() == 4 => {
-            u32::from_str_radix(&mode[1..], 8)
-                .map_err(|_| invalid_argument(format!("invalid shared mode '{mode}'"), None))?;
-            Ok(())
+impl SharedMode {
+    fn parse(raw: &str) -> Result<Self, InitError> {
+        match raw {
+            "false" => Ok(Self::False),
+            "umask" => Ok(Self::Umask),
+            "true" | "group" => Ok(Self::Group),
+            "all" | "world" | "everybody" => Ok(Self::All),
+            mode if mode.starts_with('0') && mode.len() == 4 => {
+                let bits = u32::from_str_radix(&mode[1..], 8).map_err(|_| {
+                    invalid_argument(
+                        format!("invalid shared mode '{mode}'"),
+                        Some(
+                            "supported numeric shared modes must be 4-digit octal values like 0770"
+                                .to_string(),
+                        ),
+                    )
+                })?;
+                validate_numeric_shared_mode(mode, bits)?;
+                Ok(Self::Numeric {
+                    raw: mode.to_string(),
+                    bits,
+                })
+            }
+            other => Err(invalid_argument(
+                format!("invalid shared mode '{other}'"),
+                Some(
+                    "supported values: umask, group, all, true, false, or a 4-digit octal mode."
+                        .to_string(),
+                ),
+            )),
         }
-        other => Err(invalid_argument(
-            format!("invalid shared mode '{other}'"),
-            Some(
-                "supported values: umask, group, all, true, false, or a 4-digit octal mode."
-                    .to_string(),
-            ),
-        )),
+    }
+
+    fn config_value(&self) -> &str {
+        match self {
+            Self::False => "false",
+            Self::Umask => "umask",
+            Self::Group => "group",
+            Self::All => "all",
+            Self::Numeric { raw, .. } => raw,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn permission_bits(&self) -> Option<u32> {
+        match self {
+            Self::False | Self::Umask => None,
+            Self::Group => Some(0o2775),
+            Self::All => Some(0o2777),
+            Self::Numeric { bits, .. } => Some(*bits),
+        }
     }
 }
 
+fn parse_shared_mode(shared_mode: Option<&str>) -> Result<Option<SharedMode>, InitError> {
+    shared_mode.map(SharedMode::parse).transpose()
+}
+
+fn validate_numeric_shared_mode(raw: &str, bits: u32) -> Result<(), InitError> {
+    let mut invalid_classes = Vec::new();
+    if bits & 0o700 != 0o700 {
+        invalid_classes.push("owner rwx");
+    }
+    if bits & 0o060 != 0 && bits & 0o010 == 0 {
+        invalid_classes.push("group execute");
+    }
+    if bits & 0o006 != 0 && bits & 0o001 == 0 {
+        invalid_classes.push("other execute");
+    }
+
+    if invalid_classes.is_empty() {
+        return Ok(());
+    }
+
+    Err(invalid_argument(
+        format!(
+            "invalid shared mode '{raw}': numeric modes must keep repository directories traversable"
+        ),
+        Some(format!(
+            "missing {}; use a directory-safe mode such as 0770 or 0755",
+            invalid_classes.join(", ")
+        )),
+    ))
+}
+
 #[cfg(not(target_os = "windows"))]
-fn apply_shared(root_dir: &Path, shared_mode: &str) -> io::Result<()> {
+fn apply_shared(root_dir: &Path, shared_mode: &SharedMode) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fn set_recursive(dir: &Path, mode: u32) -> io::Result<()> {
@@ -987,22 +1092,14 @@ fn apply_shared(root_dir: &Path, shared_mode: &str) -> io::Result<()> {
         Ok(())
     }
 
-    match shared_mode {
-        "false" | "umask" => {}
-        "true" | "group" => set_recursive(root_dir, 0o2775)?,
-        "all" | "world" | "everybody" => set_recursive(root_dir, 0o2777)?,
-        mode if mode.starts_with('0') && mode.len() == 4 => {
-            if let Ok(bits) = u32::from_str_radix(&mode[1..], 8) {
-                set_recursive(root_dir, bits)?;
-            }
-        }
-        _ => {}
+    if let Some(bits) = shared_mode.permission_bits() {
+        set_recursive(root_dir, bits)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn apply_shared(_root_dir: &Path, _shared_mode: &str) -> io::Result<()> {
+fn apply_shared(_root_dir: &Path, _shared_mode: &SharedMode) -> io::Result<()> {
     Ok(())
 }
 
@@ -1184,6 +1281,7 @@ async fn init_config(
     object_format: &str,
     ref_format: &RefFormat,
     ignore_case: bool,
+    shared_mode: Option<&SharedMode>,
 ) -> Result<String, DbErr> {
     let txn = conn.begin().await?;
 
@@ -1226,6 +1324,16 @@ async fn init_config(
     ConfigKv::set_with_conn(&txn, "libra.repoid", &repo_id, false)
         .await
         .map_err(|error| DbErr::Custom(error.to_string()))?;
+    if let Some(shared_mode) = shared_mode {
+        ConfigKv::set_with_conn(
+            &txn,
+            "core.sharedRepository",
+            shared_mode.config_value(),
+            false,
+        )
+        .await
+        .map_err(|error| DbErr::Custom(error.to_string()))?;
+    }
 
     txn.commit().await?;
     Ok(repo_id)

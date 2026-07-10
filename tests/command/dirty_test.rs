@@ -60,6 +60,64 @@ fn dirty_cache_scan_cached_roundtrip() {
 }
 
 #[test]
+fn dirty_cache_status_modes_honor_pathspec_filters() {
+    let repo = dirty_repo();
+    let p = repo.path();
+    fs::create_dir_all(p.join("docs")).unwrap();
+    fs::write(p.join("f.txt"), "two\n").unwrap();
+    fs::write(p.join("docs/readme.md"), "docs\n").unwrap();
+    assert_cli_success(&run_libra_command(&["status", "--scan"], p), "scan");
+
+    let cached = run_libra_command(&["--json", "status", "--cached", "docs"], p);
+    assert_cli_success(&cached, "cached docs");
+    let json = parse_json_stdout(&cached);
+    assert!(
+        json["data"]["untracked"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("docs/readme.md"))),
+        "cached pathspec should keep docs/readme.md: {json}"
+    );
+    assert!(
+        !json["data"]["unstaged"]["modified"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("f.txt"))),
+        "cached pathspec should filter unrelated f.txt: {json}"
+    );
+
+    let clean_path = run_libra_command(
+        &[
+            "status",
+            "--cached",
+            "--quiet",
+            "--exit-code",
+            ".libraignore",
+        ],
+        p,
+    );
+    assert_eq!(
+        clean_path.status.code(),
+        Some(0),
+        "filtered cached dirty state should not trip --exit-code"
+    );
+
+    let check_dirty = run_libra_command(&["--json", "status", "--check-dirty", "docs"], p);
+    assert_cli_success(&check_dirty, "check-dirty docs");
+    let json = parse_json_stdout(&check_dirty);
+    assert!(
+        json["data"]["untracked"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("docs/readme.md"))),
+        "check-dirty pathspec should keep docs/readme.md: {json}"
+    );
+    assert!(
+        !json["data"]["unstaged"]["modified"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("f.txt"))),
+        "check-dirty pathspec should filter unrelated f.txt: {json}"
+    );
+}
+
+#[test]
 fn dirty_cache_invalidated_by_index_write() {
     let repo = dirty_repo();
     let p = repo.path();

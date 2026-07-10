@@ -41,6 +41,7 @@ use crate::{
                 ReviewRunSummary, ReviewTerminalState, ReviewerOutcome, ReviewerSource,
                 cancel_orphaned_run, is_launchable_reviewer, render_untrusted_findings, run_review,
             },
+            run_admission::{self, RejectedAdmission},
         },
         head::Head,
     },
@@ -67,6 +68,7 @@ EXAMPLES:
     libra review cancel <run_id>                     Cancel a run (same cleanup path as Ctrl-C)
     libra review clean --run <run_id>                Remove one finished run directory
     libra review clean --all                         Remove every finished run directory
+    libra review attach <run_id> <file>              Attach an external file to a run (provenance=manual)
 
     `libra review --fix` is not supported yet: it requires the internal
     AgentRuntime fix bridge and fails with LBR-AGENT-010 until that lands.";
@@ -129,6 +131,23 @@ pub enum ReviewSubcommand {
     /// Remove review run directories.
     #[command(about = "Remove finished review run directories")]
     Clean(ReviewCleanArgs),
+    /// Attach an external file to a run's audit chain (provenance=manual).
+    #[command(
+        about = "Attach an external transcript/findings/context file to a run (provenance=manual)"
+    )]
+    Attach(ReviewAttachArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ReviewAttachArgs {
+    /// Run identifier from `libra review list`.
+    #[arg(value_name = "RUN_ID")]
+    pub run_id: String,
+    /// Path to the external file to attach. Its bytes are redacted, written
+    /// to the object store (object_index-tagged), and recorded in the run
+    /// manifest's `manual_attach` list with `provenance=manual`.
+    #[arg(value_name = "FILE")]
+    pub file: std::path::PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -173,6 +192,7 @@ pub async fn execute_safe(args: ReviewArgs, output: &OutputConfig) -> CliResult<
         Some(ReviewSubcommand::Show(show_args)) => show(show_args, output).await,
         Some(ReviewSubcommand::Cancel(cancel_args)) => cancel(cancel_args, output).await,
         Some(ReviewSubcommand::Clean(clean_args)) => clean(clean_args, output).await,
+        Some(ReviewSubcommand::Attach(attach_args)) => attach(attach_args, output).await,
         None => run(args.run, output).await,
     }
 }
@@ -378,6 +398,20 @@ struct ReviewerReportRow {
     launch_error: Option<String>,
 }
 
+/// A0-04: fail-closed error when the shared run queue is full — more than
+/// `agent.max_concurrent_runs` runs are active and the wait queue is at its
+/// cap. Carries `LBR-AGENT-014` so automation can detect the back-pressure.
+fn run_queue_full_error(rejected: RejectedAdmission) -> CliError {
+    CliError::fatal(format!(
+        "too many concurrent review/investigate runs: {} active, {} queued (queue cap {}); \
+         refusing to start another",
+        rejected.active, rejected.queued, rejected.cap
+    ))
+    .with_stable_code(StableErrorCode::AgentRunQueueFull)
+    .with_hint("wait for a running review/investigate run to finish, or cancel one with `libra review cancel <run_id>` / `libra investigate cancel <run_id>`")
+    .with_hint("raise the limit with `libra config set agent.max_concurrent_runs <N>` (default 2)")
+}
+
 async fn run(args: ReviewRunCliArgs, output: &OutputConfig) -> CliResult<()> {
     if args.fix {
         return Err(fix_bridge_unavailable_error());
@@ -450,6 +484,31 @@ async fn run(args: ReviewRunCliArgs, output: &OutputConfig) -> CliResult<()> {
         starting_sha.clone(),
         reviewers,
     );
+
+    // A0-04: acquire a shared run-level admission slot before doing any
+    // expensive setup. Over `agent.max_concurrent_runs` this blocks in the
+    // queue until a slot frees; a full queue fails closed with
+    // `LBR-AGENT-014`. The slot is held for the whole run and released on
+    // completion / cancel / failure (RAII) so the concurrency budget is never
+    // overrun or permanently occupied.
+    let max_runs = run_admission::max_concurrent_runs().await.map_err(|e| {
+        CliError::fatal(format!(
+            "failed to resolve {}: {e}",
+            run_admission::MAX_CONCURRENT_RUNS_KEY
+        ))
+    })?;
+    let _run_slot = match run_admission::admit_blocking(
+        &store.runs_root(),
+        max_runs,
+        run_admission::RUN_QUEUE_CAP,
+        None,
+    )
+    .await
+    .map_err(|e| CliError::fatal(format!("run admission failed: {e}")))?
+    {
+        Ok(slot) => slot,
+        Err(rejected) => return Err(run_queue_full_error(rejected)),
+    };
 
     if !output.quiet && !output.is_json() {
         println!(
@@ -971,6 +1030,69 @@ async fn clean(args: ReviewCleanArgs, output: &OutputConfig) -> CliResult<()> {
             "pass --run <run_id> to remove one run or --all to remove every finished run",
         )),
     }
+}
+
+/// A0-06: `libra review attach <run_id> <file>` — attach an external file to a
+/// run's audit chain with `provenance=manual`. The file bytes are redacted,
+/// objectized into the object store + `object_index`, and recorded as a
+/// `manual_attach` manifest entry `{oid, name, provenance, size, attached_at}`.
+/// It never mutates findings or run state — it only appends to the audit chain.
+async fn attach(args: ReviewAttachArgs, output: &OutputConfig) -> CliResult<()> {
+    let store = open_store()?;
+    // Attaching to an unknown run is a usage error, not a silent no-op.
+    store
+        .load_state(&args.run_id)
+        .map_err(|e| map_store_error("failed to read review run state", e))?
+        .ok_or_else(|| run_not_found(&args.run_id))?;
+
+    // Sanitize the record/display name FIRST, so a hostile path (token or
+    // control char in the filename) never reaches the read-error either.
+    let name = super::sanitize_attachment_name(&args.file);
+    let raw = std::fs::read(&args.file)
+        .map_err(|e| CliError::fatal(format!("failed to read attach file '{name}': {e}")))?;
+    // provenance=manual, untrusted external content → redact before persist.
+    let (redacted, _report) = crate::internal::ai::review::redact_untrusted(&raw);
+    let oid = store
+        .objectize_bytes(redacted.as_bytes())
+        .map_err(|e| map_store_error("failed to objectize the attachment", e))?;
+
+    let attached_at = crate::internal::ai::review::store::utc_timestamp();
+    let entry = serde_json::json!({
+        "oid": oid,
+        "name": name,
+        "provenance": "manual",
+        "size": redacted.len(),
+        "attached_at": attached_at,
+    });
+
+    let mut manifest = store
+        .load_manifest(&args.run_id)
+        .map_err(|e| map_store_error("failed to read review run manifest", e))?
+        .ok_or_else(|| run_not_found(&args.run_id))?;
+    manifest.manual_attach.push(entry);
+    manifest.updated_at = attached_at;
+    let attachments = manifest.manual_attach.len();
+    store
+        .write_manifest(&manifest)
+        .map_err(|e| map_store_error("failed to record the attachment in the manifest", e))?;
+
+    if output.is_json() {
+        let payload = serde_json::json!({
+            "schema_version": PAGE_SCHEMA_VERSION,
+            "run_id": args.run_id,
+            "oid": oid,
+            "name": name,
+            "attachments": attachments,
+        });
+        return emit_json_data("review_attach", &payload, output);
+    }
+    if !output.quiet {
+        println!(
+            "attached {name} to review run {} ({attachments} attachment(s) total)",
+            args.run_id
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.21"
+version = "0.18.51"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -296,6 +296,78 @@ path = "tests/compat/agent_capability_matrix_pin.rs"
 [[test]]
 name = "compat_agent_architecture_guard"
 path = "tests/compat/agent_architecture_guard.rs"
+
+[[test]]
+name = "compat_subface_labels"
+path = "tests/compat/subface_labels.rs"
+
+[[test]]
+name = "compat_conflict_status_diff"
+path = "tests/compat/conflict_status_diff_test.rs"
+
+[[test]]
+name = "compat_diff_check_safety"
+path = "tests/compat/diff_check_safety_test.rs"
+
+[[test]]
+name = "compat_clone_shallow_integrity"
+path = "tests/compat/clone_shallow_integrity_test.rs"
+
+[[test]]
+name = "compat_checkout_branch_startpoint"
+path = "tests/compat/checkout_branch_startpoint_test.rs"
+
+[[test]]
+name = "compat_switch_orphan_root"
+path = "tests/compat/switch_orphan_root_test.rs"
+
+[[test]]
+name = "compat_broken_pipe_output"
+path = "tests/compat/broken_pipe_output_test.rs"
+
+[[test]]
+name = "compat_commit_amend_no_edit"
+path = "tests/compat/commit_amend_no_edit_test.rs"
+
+[[test]]
+name = "compat_commit_identity_date"
+path = "tests/compat/commit_identity_date_test.rs"
+
+[[test]]
+name = "compat_sequencer_message_author"
+path = "tests/compat/sequencer_message_author_test.rs"
+
+[[test]]
+name = "compat_write_tree_missing_object"
+path = "tests/compat/write_tree_missing_object_test.rs"
+
+[[test]]
+name = "compat_init_shared_mode"
+path = "tests/compat/init_shared_mode_test.rs"
+
+[[test]]
+name = "compat_symlink_basic"
+path = "tests/compat/symlink_basic_test.rs"
+
+[[test]]
+name = "compat_global_config_schema_future"
+path = "tests/compat/global_config_schema_future_test.rs"
+
+[[test]]
+name = "compat_pathspec_magic"
+path = "tests/compat/pathspec_magic_test.rs"
+
+[[test]]
+name = "compat_ignore_attributes_sources"
+path = "tests/compat/ignore_attributes_sources_test.rs"
+
+[[test]]
+name = "compat_machine_porcelain_contract"
+path = "tests/compat/machine_porcelain_contract_test.rs"
+
+[[test]]
+name = "compat_pretty_format_placeholders"
+path = "tests/compat/pretty_format_placeholders_test.rs"
 
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).

@@ -8,6 +8,9 @@
 //!
 //! **Layer:** L1 — deterministic.
 
+use libra::utils::ignore::IgnorePolicy;
+use serial_test::serial;
+
 use super::*;
 
 fn case_repo() -> tempfile::TempDir {
@@ -28,6 +31,58 @@ fn skip_case_twin_fixture_on_case_insensitive_host(p: &std::path::Path, scenario
         return true;
     }
     false
+}
+
+#[tokio::test]
+#[serial]
+async fn status_sync_wrappers_honor_core_ignorecase_override() {
+    let repo = case_repo();
+    let p = repo.path();
+    let host_ignore_case = libra::utils::path_case::probe_dir_ignore_case(p);
+    let expected_alias_is_new = host_ignore_case;
+    let configured_ignorecase = if host_ignore_case { "false" } else { "true" };
+    assert_cli_success(
+        &run_libra_command(&["config", "core.ignorecase", configured_ignorecase], p),
+        "force ignorecase",
+    );
+    if host_ignore_case {
+        fs::rename(p.join("Foo.txt"), p.join("case-tmp.txt")).unwrap();
+        fs::rename(p.join("case-tmp.txt"), p.join("foo.txt")).unwrap();
+    } else if let Err(error) = fs::hard_link(p.join("Foo.txt"), p.join("foo.txt")) {
+        eprintln!("skipping ignorecase override status wrapper test: hard link failed: {error}");
+        return;
+    }
+    let _guard = ChangeDirGuard::new(p);
+
+    let unstaged = libra::command::status::changes_to_be_staged_with_policy(IgnorePolicy::Respect)
+        .expect("status policy wrapper should read worktree");
+    assert_eq!(
+        unstaged.new.iter().any(|path| path == Path::new("foo.txt")),
+        expected_alias_is_new,
+        "core.ignorecase={configured_ignorecase} should control same-file case aliases in policy wrapper: {unstaged:?}"
+    );
+
+    let (safe_visible, _) = libra::command::status::changes_to_be_staged_split_safe()
+        .expect("safe split wrapper should read worktree");
+    assert_eq!(
+        safe_visible
+            .new
+            .iter()
+            .any(|path| path == Path::new("foo.txt")),
+        expected_alias_is_new,
+        "core.ignorecase={configured_ignorecase} should control same-file case aliases in safe split wrapper: {safe_visible:?}"
+    );
+
+    let (force_visible, _) = libra::command::status::changes_to_be_staged_split_force()
+        .expect("force split wrapper should read worktree");
+    assert_eq!(
+        force_visible
+            .new
+            .iter()
+            .any(|path| path == Path::new("foo.txt")),
+        expected_alias_is_new,
+        "core.ignorecase={configured_ignorecase} should control same-file case aliases in force split wrapper: {force_visible:?}"
+    );
 }
 
 #[test]
@@ -126,6 +181,60 @@ fn add_refuses_case_fold_twins_under_error_default() {
     );
     fs::write(p.join("other.txt"), "x\n").unwrap();
     assert_cli_success(&run_libra_command(&["add", "other.txt"], p), "clean add");
+}
+
+#[test]
+fn add_accepts_case_renamed_tracked_directory_alias() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    if !libra::utils::path_case::probe_dir_ignore_case(p) {
+        eprintln!("skipping case-renamed directory add: host filesystem is case-sensitive");
+        return;
+    }
+
+    fs::create_dir(p.join("slides")).unwrap();
+    fs::write(p.join("slides/a.txt"), "one\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "slides/a.txt"], p),
+        "add slides",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "slides", "--no-verify"], p),
+        "commit slides",
+    );
+
+    fs::rename(p.join("slides"), p.join("slides-tmp")).unwrap();
+    fs::rename(p.join("slides-tmp"), p.join("Slides")).unwrap();
+    fs::write(p.join("Slides/a.txt"), "two\n").unwrap();
+
+    let added = run_libra_command(&["add", "Slides"], p);
+    assert_cli_success(&added, "add through case-renamed directory");
+
+    let ls = run_libra_command(&["ls-files"], p);
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(listing.contains("slides/a.txt"), "{listing}");
+    assert!(!listing.contains("Slides/a.txt"), "{listing}");
+
+    let status = run_libra_command(&["--json", "status"], p);
+    let json = parse_json_stdout(&status);
+    let staged_modified: Vec<String> = json["data"]["staged"]["modified"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(staged_modified, vec!["slides/a.txt".to_string()]);
+    let unstaged_new: Vec<String> = json["data"]["unstaged"]["new"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(!unstaged_new.contains(&"Slides/".to_string()), "{json}");
 }
 
 #[test]

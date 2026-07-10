@@ -157,3 +157,89 @@ async fn erase_session_local_removes_rows_and_preserves_audit_log() {
         "erasure must never delete audit rows"
     );
 }
+
+/// A0-10 local tombstone contract: `erase_session_local` is a self-contained
+/// LOCAL tombstone. It succeeds with no D1/R2 cloud mirror configured (cloud
+/// tombstone propagation is an explicit, documented deferral — see
+/// `docs/development/tracing/agent.md` "还未实现的功能" row), and re-erasing a
+/// session that is already gone is idempotent (the tombstone is stable — a
+/// deleted session is never revived by a second erase).
+#[tokio::test]
+async fn agent_erasure_local_tombstone() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let conn = connect_repo_db(repo.path()).await;
+
+    seed_session(&conn, "sess-tomb").await;
+    seed_checkpoint(&conn, "cp-t1", "sess-tomb", 200).await;
+    seed_checkpoint(&conn, "cp-t2", "sess-tomb", 201).await;
+
+    // Audit row that must outlive the tombstone.
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_audit_log (audit_id, timestamp, action, checkpoint_id, scope, granted) \
+         VALUES ('aud-tomb', '2026-07-09T00:00:00Z', 'raw_export', 'cp-t1', 'transcript', 1)",
+        Vec::<Value>::new(),
+    ))
+    .await
+    .expect("seed audit");
+
+    let repo_path = repo.path().join(".libra");
+    let storage = Arc::new(ClientStorage::init(repo_path.join("objects")));
+    let history =
+        HistoryManager::new_with_ref(storage, repo_path, Arc::new(conn.clone()), TRACES_BRANCH);
+
+    // First erase: the session is tombstoned locally with NO cloud mirror in
+    // scope — proving the local tombstone does not depend on D1/R2.
+    let first = history
+        .erase_session_local("sess-tomb")
+        .await
+        .expect("first erase (local-only, no cloud mirror)");
+    assert!(first.session_deleted, "session tombstoned on first erase");
+    assert_eq!(first.removed_checkpoints, 2, "both checkpoints removed");
+
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_session WHERE session_id = 'sess-tomb'"
+        )
+        .await,
+        0,
+        "tombstoned session row gone"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE session_id = 'sess-tomb'"
+        )
+        .await,
+        0,
+        "tombstoned session's checkpoints gone"
+    );
+
+    // Idempotency: re-erasing a session that is already gone is a no-op —
+    // the tombstone is stable and never revives the deleted rows.
+    let second = history
+        .erase_session_local("sess-tomb")
+        .await
+        .expect("re-erase is idempotent");
+    assert!(
+        !second.session_deleted,
+        "re-erase must not report a fresh deletion"
+    );
+    assert_eq!(
+        second.removed_checkpoints, 0,
+        "re-erase removes nothing (tombstone is stable)"
+    );
+
+    // The append-only audit log survives every erase.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_audit_log WHERE audit_id = 'aud-tomb'"
+        )
+        .await,
+        1,
+        "audit row survives the local tombstone and its idempotent re-run"
+    );
+}

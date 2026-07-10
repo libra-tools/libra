@@ -28,15 +28,21 @@ use similar::{Algorithm, ChangeTag, TextDiff};
 use tempfile::NamedTempFile;
 
 use crate::{
-    command::{get_target_commit, load_object},
+    command::{
+        get_target_commit, load_object, read_worktree_blob_bytes,
+        unmerged::{self, UnmergedEntry},
+    },
     internal::{config::ConfigKv, head::Head},
     utils::{
+        attributes,
         error::{CliError, CliResult, StableErrorCode},
         ignore::{self, IgnorePolicy},
         object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, ProgressMode, emit_json_data},
         pager::Pager,
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -57,7 +63,7 @@ EXAMPLES:
     libra diff --ignore-blank-lines         Ignore changes that are only blank lines
     libra diff -s --exit-code               Status-only check: no output, exit 1 if changes
     libra diff --name-only -z               NUL-terminated changed-file list for scripts
-    libra diff --cached --check             Warn about whitespace errors on added lines
+    libra diff --cached --check             Warn about whitespace/conflict-marker errors
     libra diff -R                           Reverse diff (swap additions and deletions)
     libra --json diff --staged              Structured JSON output for agents";
 
@@ -201,9 +207,9 @@ pub struct DiffArgs {
     #[clap(short = 'z', long = "null")]
     pub null: bool,
 
-    /// Warn about whitespace errors on added lines instead of printing the diff.
-    /// Detects trailing whitespace and space-before-tab in the indent; exits 2
-    /// when any problem is found. (Git's blank-at-eof check is not performed.)
+    /// Warn about safety problems on added lines instead of printing the diff.
+    /// Detects trailing whitespace, space-before-tab in the indent, leftover
+    /// conflict markers, and new blank lines at EOF; exits 2 when any problem is found.
     /// Unaffected by `-w`/`-b`/`--ignore-space-at-eol` — like Git, the scan runs
     /// on the full diff, so added trailing whitespace is still reported.
     #[clap(long = "check")]
@@ -310,11 +316,11 @@ pub struct DiffArgs {
     pub no_indent_heuristic: bool,
 
     /// Run textconv filters to make content human-diffable: a file whose
-    /// `diff=<driver>` attribute (in `.libra_attributes`) names a driver with a
-    /// `diff.<driver>.textconv` command has each side converted by that command
-    /// before diffing. Like Git, textconv is ON by default for `diff`; this flag
-    /// is the explicit opposite of `--no-textconv`. The resulting patch is for
-    /// reading, not applying.
+    /// `diff=<driver>` attribute from Git/Libra attribute sources names a driver
+    /// with a `diff.<driver>.textconv` command has each side converted by that
+    /// command before diffing. Like Git, textconv is ON by default for `diff`;
+    /// this flag is the explicit opposite of `--no-textconv`. The resulting
+    /// patch is for reading, not applying.
     #[clap(long = "textconv", overrides_with = "no_textconv")]
     pub textconv: bool,
 
@@ -363,6 +369,9 @@ pub struct DiffFileStat {
     /// `None` for text files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<(u64, u64)>,
+    /// First new-side line in a trailing blank run, used only by `diff --check`.
+    #[serde(skip)]
+    check_trailing_blank_start: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -401,9 +410,6 @@ pub(crate) enum DiffError {
 
     #[error("failed to load index: {0}")]
     IndexLoad(String),
-
-    #[error("failed to list working directory files: {0}")]
-    WorkdirList(String),
 
     #[error("failed to read file '{path}': {detail}")]
     FileRead { path: String, detail: String },
@@ -449,6 +455,9 @@ pub(crate) enum DiffError {
     /// `A...B` where both sides resolve but share no merge base.
     #[error("no merge base found for '{left}' and '{right}'")]
     NoMergeBase { left: String, right: String },
+
+    #[error("{0}")]
+    Pathspec(String),
 }
 
 impl From<DiffError> for CliError {
@@ -465,9 +474,6 @@ impl From<DiffError> for CliError {
             DiffError::IndexLoad(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("the index file may be corrupted"),
-            DiffError::WorkdirList(_) => {
-                CliError::fatal(message).with_stable_code(StableErrorCode::IoReadFailed)
-            }
             DiffError::FileRead { .. } => {
                 CliError::fatal(message).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -511,6 +517,9 @@ impl From<DiffError> for CliError {
             DiffError::NoMergeBase { .. } => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("the two revisions share no common ancestor"),
+            DiffError::Pathspec(_) => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob"),
         }
     }
 }
@@ -592,7 +601,8 @@ async fn apply_sparse_view_filter(result: &mut DiffOutput) {
     }
     result.files.retain(|file| {
         // A rename's old path counts as in-view too (either side visible).
-        view.contains_str(&file.path)
+        file.raw_diff.starts_with("diff --cc ")
+            || view.contains_str(&file.path)
             || file
                 .rename_from
                 .as_deref()
@@ -1030,11 +1040,16 @@ fn exists_as_path(tok: &str) -> bool {
     std::path::Path::new(tok).symlink_metadata().is_ok()
 }
 
-/// Whether `tok` carries pathspec glob magic. Git's `check_filename` exempts
-/// wildcard pathspecs from the unknown-revision-or-path error (`git diff '*.c'`
-/// works with no literal `*.c` file); mirror that so globs stay pathspecs.
-fn has_glob_magic(tok: &str) -> bool {
+/// Whether `tok` carries pathspec syntax that should bypass the
+/// unknown-revision-or-path precheck. Git accepts wildcard pathspecs and magic
+/// pathspecs without a literal matching file; let the shared pathspec parser
+/// validate magic support and pattern details after revision disambiguation.
+fn has_pathspec_syntax(tok: &str) -> bool {
     tok.contains(['*', '?', '['])
+        || tok.starts_with(":(")
+        || tok.starts_with(":/")
+        || tok.starts_with(":!")
+        || tok.starts_with(":^")
 }
 
 /// Resolve leading positional revisions and the `--` pathspec separator,
@@ -1169,7 +1184,7 @@ async fn resolve_positional_revisions(args: &mut DiffArgs) -> Result<(), DiffErr
         if dashdash {
             return Err(DiffError::UnknownRevisionOrPath(tok));
         }
-        if !is_path && !has_glob_magic(&tok) {
+        if !is_path && !has_pathspec_syntax(&tok) {
             return Err(DiffError::UnknownRevisionOrPath(tok));
         }
         paths_started = true;
@@ -1222,7 +1237,11 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     let old_side = resolve_diff_side(&args.old, args.staged, false, &index).await?;
     let new_side = resolve_diff_side(&args.new, args.staged, true, &index).await?;
 
-    let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
+    let pathspecs =
+        PathspecSet::from_workdir(&args.pathspec, &util::cur_dir(), &util::working_dir())
+            .map_err(pathspec_error_to_diff)?;
+    let paths: Vec<PathBuf> = pathspecs.plain_positive_prefixes().unwrap_or_default();
+    let diff_pathspecs = paths.clone();
     let worktree_entries = new_side.worktree_entries.clone();
     // Separate copy for the external-diff pass (the one above is moved into the
     // diff closure below). Lets the GIT_EXTERNAL_DIFF protocol report a zero hash
@@ -1299,6 +1318,10 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     }
 
     let mut files: Vec<DiffFileStat> = diff_output.iter().map(parse_diff_item).collect();
+    if args.old.is_none() && args.new.is_none() && !args.staged {
+        apply_unmerged_worktree_diff(&mut files, &index, &diff_pathspecs)?;
+    }
+    filter_diff_files_by_pathspec(&mut files, &pathspecs);
 
     // Resolve the external diff driver (`diff.external`) when it should drive this
     // run: a patch-body output mode (not `--stat`/name/numstat/summary/`-s`/
@@ -1388,51 +1411,46 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     // leaves textconv'd files alone.
     let textconv_paths: std::collections::HashSet<String> =
         if !args.no_textconv && !args.check && external_command.is_none() {
-            let drivers = extract_diff_drivers(&path::attributes());
-            if drivers.is_empty() {
+            let mut command_cache: HashMap<String, Option<String>> = HashMap::new();
+            // Per file: the (old-side, new-side) textconv command. A rename's
+            // old side is at `rename_from` and may resolve a different driver
+            // than the new side (Git resolves textconv per blob/path), so each
+            // side is looked up independently.
+            let mut path_commands: HashMap<String, (Option<String>, Option<String>)> =
+                HashMap::new();
+            for file in &files {
+                let new_path = PathBuf::from(&file.path);
+                let old_path = file
+                    .rename_from
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| new_path.clone());
+                let new_driver = attributes::diff_driver_for_path(&new_path);
+                let new_command =
+                    resolve_textconv_command(new_driver.as_deref(), &mut command_cache).await;
+                let old_command = if old_path == new_path {
+                    new_command.clone()
+                } else {
+                    let old_driver = attributes::diff_driver_for_path(&old_path);
+                    resolve_textconv_command(old_driver.as_deref(), &mut command_cache).await
+                };
+                if old_command.is_some() || new_command.is_some() {
+                    path_commands.insert(file.path.clone(), (old_command, new_command));
+                }
+            }
+            if path_commands.is_empty() {
                 std::collections::HashSet::new()
             } else {
-                let mut command_cache: HashMap<String, Option<String>> = HashMap::new();
-                // Per file: the (old-side, new-side) textconv command. A rename's
-                // old side is at `rename_from` and may resolve a different driver
-                // than the new side (Git resolves textconv per blob/path), so each
-                // side is looked up independently.
-                let mut path_commands: HashMap<String, (Option<String>, Option<String>)> =
-                    HashMap::new();
-                for file in &files {
-                    let new_path = PathBuf::from(&file.path);
-                    let old_path = file
-                        .rename_from
-                        .as_deref()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| new_path.clone());
-                    let new_driver = diff_driver_for_path(&drivers, &new_path);
-                    let new_command =
-                        resolve_textconv_command(new_driver.as_deref(), &mut command_cache).await;
-                    let old_command = if old_path == new_path {
-                        new_command.clone()
-                    } else {
-                        let old_driver = diff_driver_for_path(&drivers, &old_path);
-                        resolve_textconv_command(old_driver.as_deref(), &mut command_cache).await
-                    };
-                    if old_command.is_some() || new_command.is_some() {
-                        path_commands.insert(file.path.clone(), (old_command, new_command));
-                    }
-                }
-                if path_commands.is_empty() {
-                    std::collections::HashSet::new()
-                } else {
-                    apply_textconv(
-                        &mut files,
-                        &path_commands,
-                        &first_map,
-                        &second_map,
-                        &ext_worktree_entries,
-                        regen_context,
-                        ws_normalize,
-                        args.ignore_blank_lines,
-                    )?
-                }
+                apply_textconv(
+                    &mut files,
+                    &path_commands,
+                    &first_map,
+                    &second_map,
+                    &ext_worktree_entries,
+                    regen_context,
+                    ws_normalize,
+                    args.ignore_blank_lines,
+                )?
             }
         } else {
             std::collections::HashSet::new()
@@ -1624,6 +1642,16 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
         false
     };
 
+    if args.check {
+        annotate_diff_check_trailing_blanks(
+            &mut files,
+            &second_map,
+            &ext_worktree_entries,
+            &worktree_cache,
+            &repo_cache,
+        )?;
+    }
+
     let total_insertions = files.iter().map(|file| file.insertions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
     let files_changed = files.len();
@@ -1638,6 +1666,27 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
         external_diff_applied,
         binary_patch,
     })
+}
+
+fn pathspec_error_to_diff(error: PathspecError) -> DiffError {
+    match error {
+        PathspecError::OutsideRepository { .. }
+        | PathspecError::UnsupportedMagic { .. }
+        | PathspecError::InvalidPattern { .. } => DiffError::Pathspec(error.to_string()),
+    }
+}
+
+fn filter_diff_files_by_pathspec(files: &mut Vec<DiffFileStat>, pathspecs: &PathspecSet) {
+    if pathspecs.is_empty() {
+        return;
+    }
+    files.retain(|file| {
+        pathspecs.matches_path(&file.path)
+            || file
+                .rename_from
+                .as_ref()
+                .is_some_and(|old_path| pathspecs.matches_path(old_path))
+    });
 }
 
 #[derive(Debug)]
@@ -1662,7 +1711,7 @@ fn get_files_blobs(
                 return Ok((p.to_owned(), hash));
             }
             let path = util::workdir_to_absolute(p);
-            let data = std::fs::read(&path).map_err(|e| DiffError::FileRead {
+            let data = read_worktree_blob_bytes(&path).map_err(|e| DiffError::FileRead {
                 path: path.display().to_string(),
                 detail: e.to_string(),
             })?;
@@ -1816,18 +1865,11 @@ fn index_mode_from_metadata(metadata: &std::fs::Metadata) -> u32 {
 }
 
 fn get_worktree_diff_files(index: &Index) -> Result<Vec<PathBuf>, DiffError> {
-    let mut seen = HashSet::new();
     let mut files = Vec::new();
-
-    for file in util::list_workdir_files().map_err(|e| DiffError::WorkdirList(e.to_string()))? {
-        if seen.insert(file.clone()) {
-            files.push(file);
-        }
-    }
 
     for file in index.tracked_files() {
         let absolute = util::workdir_to_absolute(&file);
-        if absolute.is_file() && seen.insert(file.clone()) {
+        if std::fs::symlink_metadata(&absolute).is_ok() {
             files.push(file);
         }
     }
@@ -1980,10 +2022,149 @@ fn load_repo_blob_content(hash: &ObjectHash) -> Result<Vec<u8>, DiffError> {
 
 fn read_worktree_blob_content(path_buf: &PathBuf) -> Result<Vec<u8>, DiffError> {
     let absolute = util::workdir_to_absolute(path_buf);
-    std::fs::read(&absolute).map_err(|e| DiffError::FileRead {
+    read_worktree_blob_bytes(&absolute).map_err(|e| DiffError::FileRead {
         path: absolute.display().to_string(),
         detail: e.to_string(),
     })
+}
+
+fn apply_unmerged_worktree_diff(
+    files: &mut Vec<DiffFileStat>,
+    index: &Index,
+    pathspecs: &[PathBuf],
+) -> Result<(), DiffError> {
+    let entries = unmerged::collect(index)
+        .into_iter()
+        .filter(|entry| unmerged::path_matches(&entry.path, pathspecs))
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let unmerged_paths = entries
+        .iter()
+        .map(|entry| entry.path.to_string_lossy().into_owned())
+        .collect::<HashSet<_>>();
+    files.retain(|file| !unmerged_paths.contains(&file.path));
+    for entry in entries {
+        files.push(build_unmerged_diff_file(&entry)?);
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(())
+}
+
+fn build_unmerged_diff_file(entry: &UnmergedEntry) -> Result<DiffFileStat, DiffError> {
+    let path = entry.path.to_string_lossy().into_owned();
+    let raw_diff = render_unmerged_combined_diff(entry)?;
+    Ok(DiffFileStat {
+        path,
+        status: "modified".to_string(),
+        insertions: 0,
+        deletions: 0,
+        hunks: Vec::new(),
+        raw_diff,
+        rename_from: None,
+        similarity: None,
+        binary: None,
+        check_trailing_blank_start: None,
+    })
+}
+
+fn render_unmerged_combined_diff(entry: &UnmergedEntry) -> Result<String, DiffError> {
+    let path = entry.path.to_string_lossy();
+    let ours = entry.stage(2);
+    let theirs = entry.stage(3);
+    let ours_text = stage_text(ours.as_ref())?;
+    let theirs_text = stage_text(theirs.as_ref())?;
+    let worktree_text = read_optional_worktree_text(&entry.path)?;
+    let ours_lines = line_count(&ours_text);
+    let theirs_lines = line_count(&theirs_text);
+    let worktree_lines = line_count(&worktree_text);
+    let ours_hash = abbreviated_stage_hash(ours.as_ref());
+    let theirs_hash = abbreviated_stage_hash(theirs.as_ref());
+
+    let mut rendered = format!(
+        "diff --cc {path}\nindex {ours_hash},{theirs_hash}..0000000\n--- a/{path}\n+++ b/{path}\n@@@ -1,{ours_lines} -1,{theirs_lines} +1,{worktree_lines} @@@\n"
+    );
+    for (prefix, line) in combined_worktree_lines(&worktree_text, &ours_text, &theirs_text) {
+        rendered.push_str(prefix);
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    Ok(rendered)
+}
+
+fn combined_worktree_lines<'a>(
+    worktree: &'a str,
+    ours: &'a str,
+    theirs: &'a str,
+) -> Vec<(&'static str, &'a str)> {
+    let ours_lines = ours.lines().collect::<Vec<_>>();
+    let theirs_lines = theirs.lines().collect::<Vec<_>>();
+    let mut ours_pos = 0;
+    let mut theirs_pos = 0;
+
+    worktree
+        .lines()
+        .map(|line| {
+            let matches_ours = ours_lines.get(ours_pos).is_some_and(|ours| *ours == line);
+            let matches_theirs = theirs_lines
+                .get(theirs_pos)
+                .is_some_and(|theirs| *theirs == line);
+            match (matches_ours, matches_theirs) {
+                (true, true) => {
+                    ours_pos += 1;
+                    theirs_pos += 1;
+                    ("  ", line)
+                }
+                (true, false) => {
+                    ours_pos += 1;
+                    (" +", line)
+                }
+                (false, true) => {
+                    theirs_pos += 1;
+                    ("+ ", line)
+                }
+                (false, false) => ("++", line),
+            }
+        })
+        .collect()
+}
+
+fn stage_text(
+    stage: Option<&crate::command::unmerged::UnmergedStage>,
+) -> Result<String, DiffError> {
+    match stage {
+        Some(stage) => {
+            Ok(String::from_utf8_lossy(&load_repo_blob_content(&stage.hash)?).into_owned())
+        }
+        None => Ok(String::new()),
+    }
+}
+
+fn read_optional_worktree_text(path: &PathBuf) -> Result<String, DiffError> {
+    let absolute = util::workdir_to_absolute(path);
+    match read_worktree_blob_bytes(&absolute) {
+        Ok(data) => Ok(String::from_utf8_lossy(&data).into_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(DiffError::FileRead {
+            path: absolute.display().to_string(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
+fn abbreviated_stage_hash(stage: Option<&crate::command::unmerged::UnmergedStage>) -> String {
+    stage
+        .map(|stage| {
+            let full = stage.hash.to_string();
+            full.get(..7).unwrap_or(&full).to_string()
+        })
+        .unwrap_or_else(|| "0000000".to_string())
+}
+
+fn line_count(text: &str) -> usize {
+    text.lines().count().max(1)
 }
 
 /// Whether the textual patch body is shown for this invocation. The
@@ -2409,60 +2590,8 @@ fn build_rename_entry(
         rename_from: Some(old_path.to_string()),
         similarity: Some(percent),
         binary: None,
+        check_trailing_blank_start: None,
     }
-}
-
-/// Parse `.libra_attributes` for `diff` attributes, returning `(pattern, value)`
-/// pairs in file order. `value` is `Some(driver)` for `diff=<driver>` and `None`
-/// for `-diff` / `!diff` / a bare `diff` (which unset or reset the driver, so a
-/// later such entry clears an earlier `diff=<driver>` under last-match-wins).
-fn extract_diff_drivers(attr_path: &Path) -> Vec<(String, Option<String>)> {
-    let Ok(content) = std::fs::read_to_string(attr_path) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut tokens = line.split_whitespace();
-        let Some(pattern) = tokens.next() else {
-            continue;
-        };
-        for token in tokens {
-            if let Some(driver) = token.strip_prefix("diff=") {
-                if !driver.is_empty() {
-                    out.push((pattern.to_string(), Some(driver.to_string())));
-                }
-            } else if token == "diff" || token == "-diff" || token == "!diff" {
-                // Set/unset/unspecified: no named driver → clears any earlier one.
-                out.push((pattern.to_string(), None));
-            }
-        }
-    }
-    out
-}
-
-/// The diff driver assigned to `path` by `.libra_attributes` — the LAST matching
-/// `diff` attribute wins (Git's attribute semantics); a matching unset/reset
-/// (`-diff`/`!diff`/bare `diff`) clears any earlier `diff=<driver>`, so this
-/// returns `None` for it.
-fn diff_driver_for_path(drivers: &[(String, Option<String>)], path: &Path) -> Option<String> {
-    let workdir = util::working_dir();
-    let mut result = None;
-    for (pattern, value) in drivers {
-        let mut builder = ::ignore::gitignore::GitignoreBuilder::new(&workdir);
-        if builder.add_line(None, pattern).is_err() {
-            continue;
-        }
-        if let Ok(gi) = builder.build()
-            && matches!(gi.matched(path, false), ::ignore::Match::Ignore(_))
-        {
-            result = value.clone();
-        }
-    }
-    result
 }
 
 /// Run a `diff.<driver>.textconv` command on `content`: Git writes the blob to a
@@ -3110,9 +3239,8 @@ fn record_diff_content_error(slot: &Rc<RefCell<Option<DiffError>>>, error: DiffE
 }
 
 /// Identify the first whitespace problem on an added line's content (the text
-/// after the leading `+`). Returns `None` for a clean line. Checks Git's two
-/// most common defaults: trailing whitespace (`blank-at-eol`) and a space
-/// immediately before a tab in the leading indent (`space-before-tab`).
+/// after the leading `+`). Returns `None` for a clean line. Checks Git's
+/// blank-at-eol and space-before-tab defaults.
 fn whitespace_problem(content: &str) -> Option<&'static str> {
     if content.ends_with(' ') || content.ends_with('\t') {
         return Some("trailing whitespace");
@@ -3127,10 +3255,67 @@ fn whitespace_problem(content: &str) -> Option<&'static str> {
     None
 }
 
-/// Scan one file's unified diff for whitespace errors on added (`+`) lines,
+fn is_leftover_conflict_marker(content: &str) -> bool {
+    content.starts_with("<<<<<<<")
+        || content.starts_with("|||||||")
+        || content.starts_with("=======")
+        || content.starts_with(">>>>>>>")
+}
+
+fn first_trailing_blank_line(text: &str) -> Option<usize> {
+    let mut first_blank = None;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            if first_blank.is_none() {
+                first_blank = Some(index + 1);
+            }
+        } else {
+            first_blank = None;
+        }
+    }
+    first_blank
+}
+
+fn annotate_diff_check_trailing_blanks(
+    files: &mut [DiffFileStat],
+    second_map: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_cache: &Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>>,
+    repo_cache: &Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>>,
+) -> Result<(), DiffError> {
+    for file in files {
+        let path = PathBuf::from(&file.path);
+        let Some(hash) = second_map.get(&path) else {
+            file.check_trailing_blank_start = None;
+            continue;
+        };
+        let bytes = worktree_cache
+            .borrow()
+            .get(hash)
+            .cloned()
+            .or_else(|| repo_cache.borrow().get(hash).cloned())
+            .map(Ok)
+            .unwrap_or_else(|| {
+                if worktree_entries.get(&path) == Some(hash) {
+                    read_worktree_blob_content(&path)
+                } else {
+                    load_repo_blob_content(hash)
+                }
+            })?;
+        file.check_trailing_blank_start =
+            first_trailing_blank_line(&String::from_utf8_lossy(&bytes));
+    }
+    Ok(())
+}
+
+/// Scan one file's unified diff for `--check` problems on added (`+`) lines,
 /// tracking new-file line numbers from each hunk header. Returns one
 /// `path:line: message` string per problem.
-fn check_whitespace_in_file(path: &str, raw_diff: &str) -> Vec<String> {
+fn check_whitespace_in_file(
+    path: &str,
+    raw_diff: &str,
+    trailing_blank_start: Option<usize>,
+) -> Vec<String> {
     let mut problems = Vec::new();
     let mut new_lineno = 0usize;
     for line in raw_diff.lines() {
@@ -3151,6 +3336,14 @@ fn check_whitespace_in_file(path: &str, raw_diff: &str) -> Vec<String> {
             if let Some(msg) = whitespace_problem(content) {
                 problems.push(format!("{path}:{new_lineno}: {msg}"));
             }
+            if is_leftover_conflict_marker(content) {
+                problems.push(format!("{path}:{new_lineno}: leftover conflict marker"));
+            }
+            if trailing_blank_start.is_some_and(|start| new_lineno >= start)
+                && content.trim().is_empty()
+            {
+                problems.push(format!("{path}:{new_lineno}: new blank line at EOF."));
+            }
             new_lineno += 1;
         } else if line.starts_with(' ') {
             // Context line: advances the new-file counter.
@@ -3168,7 +3361,9 @@ fn render_diff_check(result: &DiffOutput) -> CliResult<()> {
     let problems: Vec<String> = result
         .files
         .iter()
-        .flat_map(|file| check_whitespace_in_file(&file.path, &file.raw_diff))
+        .flat_map(|file| {
+            check_whitespace_in_file(&file.path, &file.raw_diff, file.check_trailing_blank_start)
+        })
         .collect();
     if problems.is_empty() {
         return Ok(());
@@ -4304,6 +4499,7 @@ fn parse_diff_item(item: &git_internal::diff::DiffItem) -> DiffFileStat {
         rename_from: None,
         similarity: None,
         binary: None,
+        check_trailing_blank_start: None,
     }
 }
 

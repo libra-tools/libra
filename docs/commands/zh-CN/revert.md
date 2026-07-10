@@ -17,6 +17,8 @@ libra revert --abort
 
 该命令通过计算目标提交与其父提交之间的 diff，然后将该 diff 的逆应用到当前工作树和索引来工作。如果结果状态干净，会记录一个新提交，消息格式为 `Revert "<original subject>"`。
 
+revert 提交使用当前 author 与 committer 身份/日期，并在创建提交时遵循与 `libra commit` 相同的 `GIT_AUTHOR_*` 与 `GIT_COMMITTER_*` 环境变量规则。生成的 subject 来自目标提交剥离签名后的消息正文，因此嵌入的 `gpgsig` 块不会被当作原始 subject。
+
 回滚 root 提交（没有父提交的提交）会产生空树，实际效果是撤销初始提交的更改。
 
 该命令要求处于活动分支（不是 detached HEAD）。它接受一个或多个提交引用，按给定顺序依次回滚（每个各自生成一个 revert commit）；冲突会停止该序列，用 `libra revert --continue` 收尾、`libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。当冲突中断多提交回滚时，其后仍待处理的提交会被记住，并在 `--continue`/`--skip` 续作序列时自动回滚。`-n/--no-commit` 与 `-m/--mainline` 仅适用于单个提交。

@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -159,6 +159,129 @@ pub struct ClientStorage {
 pub const DEFAULT_STORAGE_THRESHOLD_BYTES: usize = 1024 * 1024;
 /// Default local LRU disk budget for large cached objects (200 MiB).
 pub const DEFAULT_CACHE_SIZE_BYTES: usize = 200 * 1024 * 1024;
+/// Operator command shown when an old binary sees a newer global config schema.
+pub const INSTALL_NEWER_LIBRA_COMMAND: &str =
+    "curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh";
+
+static GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+const REMOTE_STORAGE_ENV_KEYS_AFTER_TYPE: &[&str] = &[
+    "LIBRA_STORAGE_BUCKET",
+    "LIBRA_STORAGE_ENDPOINT",
+    "LIBRA_STORAGE_REGION",
+    "LIBRA_STORAGE_ACCESS_KEY",
+    "LIBRA_STORAGE_SECRET_KEY",
+    "LIBRA_STORAGE_ALLOW_HTTP",
+    "LIBRA_STORAGE_THRESHOLD",
+    "LIBRA_STORAGE_CACHE_SIZE",
+];
+
+/// Typed description of a global config DB that this binary cannot safely read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalConfigSchemaFuture {
+    pub db_path: PathBuf,
+    pub current_version: i64,
+    pub latest_version: Option<i64>,
+}
+
+impl GlobalConfigSchemaFuture {
+    pub fn latest_supported_display(&self) -> String {
+        self.latest_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    pub fn binary_path_display() -> String {
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|err| format!("unknown ({err})"))
+    }
+
+    pub fn diagnostic_message(&self, action: &str) -> String {
+        format!(
+            "global config database schema is newer than this Libra binary supports; binary: {}; version: {}; config database: {}; config schema version: {}; latest supported schema version: {}; {action}; update with: {INSTALL_NEWER_LIBRA_COMMAND}",
+            Self::binary_path_display(),
+            env!("CARGO_PKG_VERSION"),
+            self.db_path.display(),
+            self.current_version,
+            self.latest_supported_display(),
+        )
+    }
+}
+
+impl std::fmt::Display for GlobalConfigSchemaFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "global config database '{}' schema version {} is newer than this Libra binary supports (latest supported: {})",
+            self.db_path.display(),
+            self.current_version,
+            self.latest_supported_display()
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StorageConfigResolutionError {
+    GlobalSchemaFuture(GlobalConfigSchemaFuture),
+    Other(String),
+}
+
+impl std::fmt::Display for StorageConfigResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GlobalSchemaFuture(future) => future.fmt(f),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Warn once when the global config DB is too new but the current command may
+/// continue in an explicit local/offline or config-irrelevant mode.
+pub fn emit_global_config_schema_future_warning(future: &GlobalConfigSchemaFuture, action: &str) {
+    if GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        crate::utils::error::emit_warning(future.diagnostic_message(action));
+    }
+}
+
+pub(crate) fn reset_global_config_schema_future_warning_for_invocation() {
+    GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED.store(false, Ordering::Relaxed);
+}
+
+pub async fn storage_config_resolution_may_read_global_config() -> bool {
+    let storage_type = match resolve_env_for_storage_init_without_global("LIBRA_STORAGE_TYPE").await
+    {
+        Ok(Some(storage_type)) => storage_type,
+        Ok(None) => return true,
+        Err(_) => return false,
+    };
+    match storage_type.as_str() {
+        "s3" | "r2" => {
+            for name in REMOTE_STORAGE_ENV_KEYS_AFTER_TYPE {
+                match resolve_env_for_storage_init_without_global(name).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return true,
+                    Err(_) => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+pub async fn env_resolution_may_read_global_config(names: &[&str]) -> bool {
+    for name in names {
+        match resolve_env_for_storage_init_without_global(name).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+    false
+}
 
 /// The resolved tiered-storage / LRU-cache tunables (lore.md §0.10). Exposes the
 /// existing `LIBRA_STORAGE_*` knobs for inspection via `libra cache info`.
@@ -325,8 +448,9 @@ impl ClientStorage {
     ///   should be impossible given the explicit checks above.
     fn create_storage_backend(base_path: PathBuf) -> Arc<dyn Storage> {
         // Check for object storage configuration.
-        // Uses resolve_env_sync() so vault-stored secrets are picked up.
-        let storage_type = match resolve_env_sync("LIBRA_STORAGE_TYPE") {
+        // Uses the typed resolver so vault-stored secrets are picked up without
+        // turning a too-new global config schema into a silent local fallback.
+        let storage_type = match resolve_env_sync_typed("LIBRA_STORAGE_TYPE") {
             Ok(Some(storage_type)) => storage_type,
             Ok(None) => {
                 return Arc::new(LocalStorage::new_with_alternates(base_path));
@@ -340,7 +464,7 @@ impl ClientStorage {
             }
         };
 
-        let bucket = match resolve_env_sync("LIBRA_STORAGE_BUCKET") {
+        let bucket = match resolve_env_sync_typed("LIBRA_STORAGE_BUCKET") {
             Ok(Some(bucket)) => bucket,
             Ok(None) => "libra".to_string(),
             Err(err) => {
@@ -379,7 +503,7 @@ impl ClientStorage {
                     retry_timeout: Duration::from_secs(60),
                 });
 
-                let endpoint = match resolve_env_sync("LIBRA_STORAGE_ENDPOINT") {
+                let endpoint = match resolve_env_sync_typed("LIBRA_STORAGE_ENDPOINT") {
                     Ok(endpoint) => endpoint,
                     Err(err) => {
                         return Self::storage_config_resolution_fallback(
@@ -399,7 +523,7 @@ impl ClientStorage {
                     }
                     builder = builder.with_endpoint(endpoint);
                 }
-                let region = match resolve_env_sync("LIBRA_STORAGE_REGION") {
+                let region = match resolve_env_sync_typed("LIBRA_STORAGE_REGION") {
                     Ok(region) => region,
                     Err(err) => {
                         return Self::storage_config_resolution_fallback(
@@ -412,7 +536,7 @@ impl ClientStorage {
                 if let Some(region) = region {
                     builder = builder.with_region(region);
                 }
-                let key = match resolve_env_sync("LIBRA_STORAGE_ACCESS_KEY") {
+                let key = match resolve_env_sync_typed("LIBRA_STORAGE_ACCESS_KEY") {
                     Ok(key) => key,
                     Err(err) => {
                         return Self::storage_config_resolution_fallback(
@@ -431,7 +555,7 @@ impl ClientStorage {
                     }
                     builder = builder.with_access_key_id(key);
                 }
-                let secret = match resolve_env_sync("LIBRA_STORAGE_SECRET_KEY") {
+                let secret = match resolve_env_sync_typed("LIBRA_STORAGE_SECRET_KEY") {
                     Ok(secret) => secret,
                     Err(err) => {
                         return Self::storage_config_resolution_fallback(
@@ -451,7 +575,7 @@ impl ClientStorage {
                     builder = builder.with_secret_access_key(secret);
                 }
 
-                let allow_http = match resolve_env_sync("LIBRA_STORAGE_ALLOW_HTTP") {
+                let allow_http = match resolve_env_sync_typed("LIBRA_STORAGE_ALLOW_HTTP") {
                     Ok(allow_http) => allow_http,
                     Err(err) => {
                         return Self::storage_config_resolution_fallback(
@@ -487,7 +611,7 @@ impl ClientStorage {
         };
         let local = LocalStorage::new_with_alternates(base_path.clone());
 
-        let threshold = match resolve_env_sync("LIBRA_STORAGE_THRESHOLD") {
+        let threshold = match resolve_env_sync_typed("LIBRA_STORAGE_THRESHOLD") {
             Ok(Some(raw_threshold)) => raw_threshold
                 .parse()
                 .unwrap_or(DEFAULT_STORAGE_THRESHOLD_BYTES),
@@ -502,7 +626,7 @@ impl ClientStorage {
         };
 
         // Parse cache size (previously hardcoded/magic number)
-        let disk_cache_limit_bytes = match resolve_env_sync("LIBRA_STORAGE_CACHE_SIZE") {
+        let disk_cache_limit_bytes = match resolve_env_sync_typed("LIBRA_STORAGE_CACHE_SIZE") {
             Ok(Some(raw_size)) => raw_size.parse().unwrap_or(DEFAULT_CACHE_SIZE_BYTES),
             Ok(None) => DEFAULT_CACHE_SIZE_BYTES,
             Err(err) => {
@@ -534,8 +658,15 @@ impl ClientStorage {
     fn storage_config_resolution_fallback(
         base_path: &Path,
         name: &str,
-        error: &str,
+        error: &StorageConfigResolutionError,
     ) -> Arc<dyn Storage> {
+        if let StorageConfigResolutionError::GlobalSchemaFuture(future) = error {
+            emit_global_config_schema_future_warning(
+                future,
+                "ignoring global storage config and falling back to local storage",
+            );
+            return Arc::new(LocalStorage::new_with_alternates(base_path.to_path_buf()));
+        }
         eprintln!(
             "Warning: failed to resolve {}: {}. Falling back to local storage.",
             name, error
@@ -1172,6 +1303,10 @@ impl Storage for ClientStorage {
 ///   permissions). Callers convert this into a hard storage configuration failure
 ///   rather than silently degrading.
 fn resolve_env_sync(name: &str) -> Result<Option<String>, String> {
+    resolve_env_sync_typed(name).map_err(|err| err.to_string())
+}
+
+fn resolve_env_sync_typed(name: &str) -> Result<Option<String>, StorageConfigResolutionError> {
     // Always check system environment first.
     if let Ok(val) = std::env::var(name) {
         return Ok(Some(val));
@@ -1185,20 +1320,22 @@ fn resolve_env_sync(name: &str) -> Result<Option<String>, String> {
     });
     match rx.recv() {
         Ok(result) => result,
-        Err(_) => Err(format!(
+        Err(_) => Err(StorageConfigResolutionError::Other(format!(
             "env resolution worker for '{name}' exited before returning a result"
-        )),
+        ))),
     }
 }
 
 /// Worker side of [`resolve_env_sync`]: builds a single-purpose tokio runtime in a
 /// dedicated thread so we can drive the async config lookup without colliding with
 /// any runtime the caller already owns.
-fn resolve_env_sync_worker(name: &str) -> Result<Option<String>, String> {
+fn resolve_env_sync_worker(name: &str) -> Result<Option<String>, StorageConfigResolutionError> {
     let runtime = tokio::runtime::Runtime::new().map_err(|err| {
-        format!("failed to create tokio runtime for env resolution of '{name}': {err}")
+        StorageConfigResolutionError::Other(format!(
+            "failed to create tokio runtime for env resolution of '{name}': {err}"
+        ))
     })?;
-    runtime.block_on(resolve_env_for_storage_init(name))
+    runtime.block_on(resolve_env_for_storage_init_typed(name))
 }
 
 /// Look up `name` in the local repo's config first, then in the global config.
@@ -1212,26 +1349,27 @@ fn resolve_env_sync_worker(name: &str) -> Result<Option<String>, String> {
 /// - Returns `Err` when a database file exists but cannot be opened or queried — the
 ///   caller surfaces this so the user sees actionable errors rather than silently
 ///   degrading to local-only storage on a typo'd schema.
-async fn resolve_env_for_storage_init(name: &str) -> Result<Option<String>, String> {
-    let vault_key = format!("vault.env.{name}");
-
-    if let Ok(storage_path) = try_get_storage_path(None) {
-        let local_db_path = storage_path.join(DATABASE);
-        if local_db_path.exists()
-            && let Some(value) =
-                read_config_env_value(name, &vault_key, &local_db_path, "local").await?
-        {
-            return Ok(Some(value));
-        }
+async fn resolve_env_for_storage_init_typed(
+    name: &str,
+) -> Result<Option<String>, StorageConfigResolutionError> {
+    if let Some(value) = resolve_env_for_storage_init_without_global(name).await? {
+        return Ok(Some(value));
     }
+
+    let vault_key = format!("vault.env.{name}");
 
     if let Some(global_db_path) = storage_global_config_path()
         && global_db_path.exists()
     {
-        match read_config_env_value(name, &vault_key, &global_db_path, "global").await {
+        if let Some(future) = inspect_global_config_schema_future_at_path(&global_db_path).await {
+            return Err(StorageConfigResolutionError::GlobalSchemaFuture(future));
+        }
+        match read_config_env_value(name, &vault_key, &global_db_path, "global")
+            .await
+            .map_err(StorageConfigResolutionError::Other)
+        {
             Ok(Some(value)) => return Ok(Some(value)),
             Ok(None) => {}
-            Err(err) if is_schema_incompatible_error(&err) => {}
             Err(err) => return Err(err),
         }
     }
@@ -1239,13 +1377,54 @@ async fn resolve_env_for_storage_init(name: &str) -> Result<Option<String>, Stri
     Ok(None)
 }
 
-/// A schema-compatibility failure on the global config database. Pending
-/// migrations are now applied automatically when the connection is opened, so
-/// the only surviving incompatibility is a schema *newer* than this binary
-/// supports — degrade gracefully (skip the global layer) instead of failing
-/// storage/config init.
-fn is_schema_incompatible_error(error: &str) -> bool {
-    error.contains("is newer than this Libra binary supports")
+async fn resolve_env_for_storage_init_without_global(
+    name: &str,
+) -> Result<Option<String>, StorageConfigResolutionError> {
+    if let Ok(val) = std::env::var(name) {
+        return Ok(Some(val));
+    }
+
+    let vault_key = format!("vault.env.{name}");
+
+    if let Ok(storage_path) = try_get_storage_path(None) {
+        let local_db_path = storage_path.join(DATABASE);
+        if local_db_path.exists()
+            && let Some(value) = read_config_env_value(name, &vault_key, &local_db_path, "local")
+                .await
+                .map_err(StorageConfigResolutionError::Other)?
+        {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Inspect the configured global config DB and return only the too-new-schema
+/// case. Other config errors are left to the normal resolver path so commands
+/// that never touch global storage config keep their historical behavior.
+pub async fn inspect_global_config_schema_future() -> Option<GlobalConfigSchemaFuture> {
+    let global_db_path = storage_global_config_path()?;
+    if !global_db_path.exists() {
+        return None;
+    }
+    inspect_global_config_schema_future_at_path(&global_db_path).await
+}
+
+async fn inspect_global_config_schema_future_at_path(
+    global_db_path: &Path,
+) -> Option<GlobalConfigSchemaFuture> {
+    match db::inspect_database_schema(global_db_path).await {
+        Ok(db::SchemaCompatibility::UnsupportedFuture {
+            current_version,
+            latest_version,
+        }) => Some(GlobalConfigSchemaFuture {
+            db_path: global_db_path.to_path_buf(),
+            current_version,
+            latest_version,
+        }),
+        Ok(_) | Err(_) => None,
+    }
 }
 
 /// Read a single `vault.env.*` entry from a config database, decrypting if needed.

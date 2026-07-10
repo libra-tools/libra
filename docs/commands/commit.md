@@ -12,6 +12,7 @@ libra commit [OPTIONS] -F <FILE>
 libra commit [OPTIONS] -C <COMMIT>
 libra commit [OPTIONS] -c <COMMIT>
 libra commit [OPTIONS] -t <FILE>
+libra commit [OPTIONS] --date <DATE> -m <MESSAGE>
 libra commit [OPTIONS] --fixup <COMMIT>
 libra commit [OPTIONS] --squash <COMMIT>
 libra commit --amend [--no-edit]
@@ -28,6 +29,17 @@ hierarchy matching the staged content, creates a commit object with the provided
 author/committer metadata, and advances the current branch ref. When vault signing is enabled,
 the commit is automatically GPG-signed. Pre-commit and commit-msg hooks are executed unless
 bypassed with `--no-verify`.
+
+Before computing staged changes or writing tree/commit objects, `commit` validates stage-0
+index entries for missing or mistyped blob/tree objects. A corrupt index entry fails closed
+with `LBR-REPO-002` and leaves `HEAD` unchanged.
+
+Author identity comes from `--author`, then `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`, then
+configured `user.name`/`user.email`; committer identity comes from
+`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`, then config. Git environment variables
+take priority over config unless `user.useConfigOnly=true`, in which case environment
+identity is ignored. `LIBRA_COMMITTER_NAME`/`LIBRA_COMMITTER_EMAIL` remain as
+lower-priority fallbacks for older automation.
 
 ## Options
 
@@ -101,6 +113,9 @@ libra commit -F message.txt
 
 Replace the tip of the current branch by creating a new commit. The new commit has the same
 parent(s) as the replaced commit. Cannot amend merge commits (commits with multiple parents).
+When the index tree and message are unchanged, `--amend --no-edit` still rewrites the commit
+and refreshes committer metadata; it never reports a successful amend while leaving `HEAD`
+unchanged.
 
 ```bash
 libra commit --amend
@@ -110,7 +125,8 @@ libra commit --amend -m "Updated message"
 ### `--no-edit`
 
 When used with `--amend`, reuse the message from the original commit without prompting for
-changes. Conflicts with `-m` and `-F`.
+changes. A clean amend still creates a replacement commit with a refreshed committer date.
+Conflicts with `-m` and `-F`.
 
 ```bash
 libra commit --amend --no-edit
@@ -178,6 +194,28 @@ Override the commit author. Must use the standard `A U Thor <author@example.com>
 ```bash
 libra commit --author "Jane Doe <jane@example.com>" -m "Patch"
 ```
+
+### `--date <DATE>`
+
+Set the author date for the new commit. The committer date still uses the
+current time unless `GIT_COMMITTER_DATE` is set. Accepted formats include Git
+raw dates (`<unix> <+HHMM|-HHMM>`), RFC 3339, `YYYY-MM-DD HH:MM:SS +HHMM`,
+`YYYY-MM-DD`, relative dates such as `2 days ago`, and Unix timestamps.
+`--date` takes precedence over `GIT_AUTHOR_DATE`.
+
+```bash
+libra commit --date "1700000000 +0000" -m "Backdated author timestamp"
+```
+
+### Identity And Date Environment
+
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, and `GIT_AUTHOR_DATE` set the author
+identity/date. `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`, and
+`GIT_COMMITTER_DATE` set the committer identity/date. If a Git committer
+identity field is absent, Libra falls back through the matching author field,
+`EMAIL` for the email, then `LIBRA_COMMITTER_*`; config is used after those
+environment fallbacks. `user.useConfigOnly=true` disables all identity
+environment fallbacks, but explicit `--author` still applies.
 
 ### `--cleanup <MODE>`
 
@@ -269,7 +307,9 @@ libra commit --squash abc1234
 
 ### `-C <COMMIT>`, `--reuse-message <COMMIT>`
 
-Reuse the commit message from the specified commit.
+Reuse the commit message and author metadata (name, email, author date, and
+timezone) from the specified commit. The new commit still receives the current
+committer identity/date, or `GIT_COMMITTER_*` overrides when set.
 
 ```bash
 libra commit -C HEAD~1
@@ -277,8 +317,9 @@ libra commit -C HEAD~1
 
 ### `-c <COMMIT>`, `--reedit-message <COMMIT>`
 
-Reuse the commit message from the specified commit. In Git this opens an editor; Libra
-reuses the message directly when no editor is available.
+Reuse the commit message and author metadata from the specified commit, then
+open the editor to edit the message. If no editor is configured, the command
+uses the reused message unchanged.
 
 ```bash
 libra commit -c HEAD~1
@@ -294,8 +335,10 @@ libra commit -m "Add feature" --trailer "Reviewed-by: Jane Doe"
 
 ### `--reset-author`
 
-Reset the author of the commit to the current user identity. This is the default for new
-commits; the flag is accepted for Git compatibility.
+When amending, reset the author to the current author identity and date instead
+of preserving the amended commit's original author. Current author identity/date
+honors `GIT_AUTHOR_*` and `--date` as described above. For new non-amend commits
+this is already the default.
 
 ```bash
 libra commit --amend --reset-author --no-edit
@@ -310,6 +353,7 @@ libra commit --amend
 libra commit --amend --no-edit
 libra commit -a -m "Fix typo"
 libra commit -F message.txt
+libra commit --date "2026-07-09 10:00:00 +0800" -m "Backdated author date"
 libra commit -s -m "Add feature"
 libra commit --allow-empty -m "Trigger CI"
 libra commit --dry-run -m "Draft commit"
@@ -488,11 +532,13 @@ switching from Git do not need to learn a new flag name.
 | Signoff trailer | `git commit -s` / `--signoff` | N/A | `libra commit -s` / `--signoff` |
 | GPG sign commit | `git commit -S` (manual GPG) | N/A (no signing) | Automatic (vault-backed) |
 | Override author | `git commit --author="..."` | N/A | `libra commit --author="..."` |
+| Author date | `git commit --date=<date>` | N/A | `libra commit --date <date>` |
 | Conventional check | External tool (commitlint) | N/A | `libra commit --conventional` |
 | Skip pre-commit only | N/A | N/A | `libra commit --disable-pre` |
 | Skip all hooks | `git commit --no-verify` | N/A | `libra commit --no-verify` |
 | Fixup commit | `git commit --fixup=<commit>` | N/A | `libra commit --fixup=<commit>` |
 | Squash commit | `git commit --squash=<commit>` | `jj squash` | `libra commit --squash=<commit>` |
+| Reuse message + author | `git commit -C/-c <commit>` | N/A | `libra commit -C/-c <commit>` |
 | Interactive message | `git commit` (opens editor) | `jj commit` (opens editor) | `libra commit` / `libra commit -e` (opens editor) |
 | Verbose diff in editor | `git commit -v` | N/A | `libra commit -v` |
 | Reset author date | `git commit --reset-author` | N/A | `libra commit --reset-author` |
@@ -508,6 +554,7 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
 | Index corrupted | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
+| Index object missing or wrong type | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | Failed to save index | `LBR-IO-002` | 128 | -- |
 | Nothing to commit (clean) | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |
 | Nothing to commit (no tracked) | `LBR-REPO-003` | 128 | "create/copy files and use 'libra add' to track" |
@@ -515,6 +562,7 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | No commit to amend | `LBR-REPO-003` | 128 | "create a commit before using --amend" |
 | Amend merge commit | `LBR-REPO-003` | 128 | "create a new commit instead of amending a merge commit" |
 | Invalid author format | `LBR-CLI-002` | 129 | "expected format: 'Name <email>'" |
+| Invalid author/committer date | `LBR-CLI-002` | 129 | Supported date formats |
 | Message file unreadable | `LBR-IO-001` | 128 | -- |
 | Empty commit message | `LBR-REPO-003` | 128 | "use -m to provide a commit message" |
 | Tree creation failed | `LBR-INTERNAL-001` | 128 | Issues URL |

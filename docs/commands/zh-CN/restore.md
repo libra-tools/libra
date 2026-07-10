@@ -18,17 +18,19 @@ libra restore --ignore-unmerged [--source <tree-ish>] <pathspec>...
 
 对于新工作流，请直接使用 `libra restore`。`libra checkout -- <path>` 和 `libra checkout <tree-ish> -- <path>` 仅作为此路径恢复行为的 Git 兼容别名被接受。
 
-`<pathspec>` 参数是必需的，并接受一个或多个文件路径或目录路径。特殊路径 `.` 会恢复所有文件。
+`<pathspec>` 参数是必需的，并接受一个或多个文件路径或目录路径。特殊路径 `.` 会恢复所有文件。Pathspec 使用 Libra 共享的 Git 风格匹配器：普通 pathspec 匹配文件或目录前缀，支持通配符，并支持高价值 magic 形式 `:(top)`、`:/`、`:(glob)`、`:(literal)`、`:(icase)`、`:(exclude)`、`:!`、`:^`。排除 pathspec 会从正向选择中扣除；启用 `core.ignorecase` 时，匹配会按忽略大小写处理；看起来像通配符的 pathspec 也会匹配同名的字面路径或目录前缀。
 
 当来源提交包含当前工作树中不存在的文件时，这些文件会被创建。在默认（`--no-overlay`）模式下，当当前工作树包含来源中不存在的已跟踪文件时，这些文件会被删除以使目标与来源完全一致；使用 `--overlay` 时则保留这些来源中缺失的已跟踪路径。输出会分别报告 `restored_files` 和 `deleted_files`。
 
 从引用 LFS 指针的提交恢复时，LFS 管理的文件会自动从 LFS 服务器下载。
 
+从来源 tree、索引或冲突 stage 恢复符号链接时，Libra 会在支持 symlink 的平台上创建真正的 symlink，并把链接 blob 字节作为目标路径。恢复过程不会跟随或打开目标路径，因此指向仓库外部的 symlink 也只会被恢复为链接本身。`--merge` 重建冲突标记时也会先替换工作树中的既有 symlink，再写入普通冲突标记文件。不支持 symlink 的平台会返回明确诊断，而不是把链接目标写成普通文件内容。
+
 ## 选项
 
 | 选项 | 短选项 | 长选项 | 说明 |
 |--------|-------|------|-------------|
-| Pathspec | | 位置参数（必需） | 要恢复的一个或多个文件或目录。使用 `.` 表示所有文件。 |
+| Pathspec | | 位置参数（必需） | 要恢复的一个或多个文件或目录。支持共享 pathspec magic；使用 `.` 表示所有文件。 |
 | Source | `-s` | `--source <tree-ish>` | 从指定提交或 tree-ish 恢复，而不是从默认来源恢复。省略时，默认来源取决于模式：工作树恢复使用索引，暂存恢复使用 HEAD。 |
 | Staged | `-S` | `--staged` | 恢复索引（取消暂存文件）。如果未给出 `--source`，默认来源为 HEAD。 |
 | Worktree | `-W` | `--worktree` | 恢复工作树。当未给出 `--staged` 时这是默认值。 |
@@ -37,7 +39,7 @@ libra restore --ignore-unmerged [--source <tree-ish>] <pathspec>...
 | Merge | | `--merge` | 对未合并路径，从索引 stage 重建冲突标记写回工作树（ours=stage 2、theirs=stage 3），索引保持未合并。Libra 写整文件 `ours`/`theirs` 标记（标签为通用 `ours`/`theirs`），非 Git 行级 3-way。（注：`libra merge`/`cherry-pick` 现经三方合并引擎写行级标记；restore 的索引-stage 重建仍为整文件。）互斥关系同 `--ours`。 |
 | 冲突风格 | | `--conflict <style>` | 隐含 `--merge`。`merge`（默认）写 `ours`/`theirs` 块；`diff3` 额外含 base 块（stage 1）。`zdiff3` 不支持。 |
 | 忽略未合并 | | `--ignore-unmerged` | 跳过未合并路径而非报错；其余路径仍正常恢复。 |
-| 从文件读取 pathspec | | `--pathspec-from-file <FILE>` | 从 `<FILE>` 读取 pathspec（每行一个，`-` 读 stdin）。给出此选项时，文件内容会替换位置 pathspec（此时无需再提供位置参数）。 |
+| 从文件读取 pathspec | | `--pathspec-from-file <FILE>` | 从 `<FILE>` 读取共享匹配器 pathspec（每行一个，`-` 读 stdin）。给出此选项时，文件内容会替换位置 pathspec（此时无需再提供位置参数）。 |
 | pathspec 文件 NUL 分隔 | | `--pathspec-file-nul` | 经 `--pathspec-from-file` 读取的 pathspec 以 NUL 而非换行分隔（要求同时给出 `--pathspec-from-file`）。 |
 | 不显示进度条 | | `--no-progress` | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 restore 从不渲染进度条。 |
 | Overlay | | `--overlay` | 以 overlay 模式恢复：仅创建/更新 source 中存在的路径；source 中缺失的已跟踪路径保持不动而非被移除。与 `--no-overlay` 构成切换对（后者优先=最后给出的生效）。 |
@@ -114,6 +116,12 @@ libra restore --staged file.txt
 
 # 从特定提交恢复
 libra restore --source HEAD~1 src/main.rs
+
+# 恢复 Rust 文件，但排除生成文件
+libra restore ':(glob)src/*.rs' ':(exclude)src/generated.rs'
+
+# 从 HEAD 恢复已跟踪符号链接
+libra restore --source HEAD link-to-target
 
 # 同时恢复工作树和索引
 libra restore -S -W file.txt

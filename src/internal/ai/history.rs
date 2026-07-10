@@ -919,14 +919,15 @@ impl HistoryManager {
                 Ok(oid)
             };
 
-        let metadata_blob_oid = write_indexed_blob(params.metadata_json, "blob", "metadata.json")?;
+        let metadata_blob_oid =
+            write_indexed_blob(params.metadata_json.bytes(), "blob", "metadata.json")?;
         let events_blob_oid = write_indexed_blob(
-            params.lifecycle_events_jsonl,
+            params.lifecycle_events_jsonl.bytes(),
             "blob",
             "events/lifecycle.jsonl",
         )?;
         let report_blob_oid = write_indexed_blob(
-            params.redaction_report_json,
+            params.redaction_report_json.bytes(),
             "blob",
             "redaction_report.json",
         )?;
@@ -966,10 +967,10 @@ impl HistoryManager {
         // is invariant under re-chunking. See the E4-libra section of
         // `docs/development/tracing/agent.md`.
         let content_hash = checkpoint_content_hash(&[
-            params.metadata_json,
-            params.lifecycle_events_jsonl,
+            params.metadata_json.bytes(),
+            params.lifecycle_events_jsonl.bytes(),
             transcript_bytes,
-            params.redaction_report_json,
+            params.redaction_report_json.bytes(),
         ]);
         let content_hash_blob_oid =
             write_indexed_blob(content_hash.as_bytes(), "blob", "content_hash.txt")?;
@@ -1828,8 +1829,10 @@ pub struct CheckpointCommitParams<'a> {
     pub scope: CheckpointScope,
     /// Optional tool-use id when the checkpoint was triggered by a tool call.
     pub tool_use_id: Option<&'a str>,
-    /// Pre-serialised metadata JSON to land at `metadata.json`.
-    pub metadata_json: &'a [u8],
+    /// Pre-serialised metadata JSON to land at `metadata.json`. Typed as
+    /// [`RedactedBytes`] (AG-19 / G4) so the traces write path can only ever
+    /// receive bytes that passed through the redaction type.
+    pub metadata_json: &'a RedactedBytes,
     /// Already-redacted transcript bytes. Typed as [`RedactedBytes`]
     /// (not `&[u8]`) so the traces write path can only ever receive
     /// bytes that passed through the redaction type — entire.md §8.1 /
@@ -1840,12 +1843,15 @@ pub struct CheckpointCommitParams<'a> {
     /// `events/lifecycle.jsonl` — one already-redacted canonical event per
     /// line (see `hooks::lifecycle::lifecycle_events_to_canonical_jsonl`).
     /// Today the runtime passes the single triggering event; multi-event
-    /// batches are just additional lines.
-    pub lifecycle_events_jsonl: &'a [u8],
+    /// batches are just additional lines. Typed as [`RedactedBytes`]
+    /// (AG-19 / G4) so no `&[u8]` can reach the checkpoint sink.
+    pub lifecycle_events_jsonl: &'a RedactedBytes,
     /// The aggregated redaction-report JSON (same document that lands in
     /// `agent_session.redaction_report` / metadata.json) to land at
     /// `redaction_report.json`. Rule-hit statistics only — never raw text.
-    pub redaction_report_json: &'a [u8],
+    /// Typed as [`RedactedBytes`] (AG-19 / G4) to keep the whole checkpoint
+    /// tree behind the redaction type.
+    pub redaction_report_json: &'a RedactedBytes,
 }
 
 /// Scope tag stamped on each checkpoint, mirroring the

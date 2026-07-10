@@ -139,12 +139,12 @@ async fn test_grep_untracked_searches_untracked_non_ignored_files() {
     let conflict = run_libra_command(&["grep", "--untracked", "--cached", "needle"], repo.path());
     assert_eq!(conflict.status.code(), Some(129));
 
-    // --untracked with a --tree revision is a usage error.
+    // --untracked with a --tree revision is a command-level grep error.
     let with_tree = run_libra_command(
         &["grep", "--untracked", "--tree", "HEAD", "needle"],
         repo.path(),
     );
-    assert_eq!(with_tree.status.code(), Some(129));
+    assert_eq!(with_tree.status.code(), Some(2));
     let (_stderr, report) = parse_cli_error_stderr(&with_tree.stderr);
     assert_eq!(report.error_code, "LBR-CLI-002");
 }
@@ -276,7 +276,7 @@ async fn test_grep_perl_regexp_is_rejected() {
     add_and_commit("add f", vec!["f.txt".to_string()]).await;
 
     let output = run_libra_command(&["grep", "-P", "needle"], repo.path());
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("perl-regexp is not supported"),
@@ -476,7 +476,7 @@ async fn test_grep_tree_skips_large_blob_files() {
         &["--json=compact", "grep", "--tree", "HEAD", "needle"],
         repo.path(),
     );
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(1));
     let json = parse_json_stdout(&output);
     assert_eq!(json["data"]["total_matches"], Value::from(0));
     assert_eq!(json["data"]["total_files"], Value::from(0));
@@ -658,7 +658,7 @@ async fn test_grep_tree_large_blob_emits_warning_in_json() {
         &["--json=compact", "grep", "--tree", "HEAD", "needle"],
         repo.path(),
     );
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(1));
 
     let json = parse_json_stdout(&output);
     let warnings = json["data"]["warnings"]
@@ -709,9 +709,12 @@ async fn test_grep_returns_nonzero_when_no_matches_found() {
     add_and_commit("add no-match file", vec!["nomatch.txt".to_string()]).await;
 
     let output = run_libra_command(&["grep", "needle"], repo.path());
-    assert_eq!(output.status.code(), Some(129));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("error: no matches found"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stderr.is_empty(),
+        "no-match grep should be a silent status signal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]

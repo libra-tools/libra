@@ -51,6 +51,9 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
         HistoryManager::new_with_ref(storage, repo_path, Arc::new(conn.clone()), TRACES_BRANCH);
     let redactor = Redactor::new_default();
     let (redacted, _) = redactor.redact(format!("transcript with key {SECRET} inside").as_bytes());
+    let (meta_redacted, _) = redactor.redact(br#"{"checkpoint_id":"x"}"#);
+    let (events_redacted, _) = redactor.redact(b"{}\n");
+    let (report_redacted, _) = redactor.redact(b"{}");
     let checkpoint_id = "aabbccddeeff00112233445566778899".to_string();
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
@@ -60,10 +63,10 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
             parent_commit: None,
             scope: CheckpointScope::Committed,
             tool_use_id: None,
-            metadata_json: br#"{"checkpoint_id":"x"}"#,
+            metadata_json: &meta_redacted,
             transcript_redacted: &redacted,
-            lifecycle_events_jsonl: b"{}\n",
-            redaction_report_json: b"{}",
+            lifecycle_events_jsonl: &events_redacted,
+            redaction_report_json: &report_redacted,
         })
         .await
         .expect("append checkpoint");

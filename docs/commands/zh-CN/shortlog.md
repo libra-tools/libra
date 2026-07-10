@@ -40,7 +40,7 @@ git log | libra shortlog [-n] [-s] [-e] [--group <TYPE>] [--author <pattern>] [-
 | Since | | `--since <date>` | 只包含比指定日期更新的提交。 |
 | Until | | `--until <date>` | 只包含比指定日期更旧的提交。 |
 | Wrap | `-w` | `--wrap [<W>[,<I1>[,<I2>]]]` | 在宽度 `W`（默认 76）处换行主题，首行缩进 `I1`（6），续行缩进 `I2`（9）。`-w0` 仅缩进不换行。 |
-| Format | | `--format <FORMAT>` | 在作者标题下用自定义模板渲染每条提交行（取代默认 subject）。支持与 `libra log --format` 相同的 `%` 占位符：`%H`、`%h`、`%s`、`%f`、`%an`、`%ae`、`%ad`、`%cn`、`%ce`、`%cd`、`%d`。 |
+| Format | | `--format <FORMAT>` | 在作者标题下用自定义模板渲染每条提交行（取代默认 subject）。支持与 `libra log --format` 相同的 `%` 占位符，包括 `%H`、`%h`、`%P`、`%p`、`%s`、`%f`、`%b`、`%B`、`%n`、ASCII/control `%xNN`、`%%`、`%an`、`%ae`、`%ad`、`%aI`、`%at`、`%cn`、`%ce`、`%cd`、`%cI`、`%ct`、`%d`、`%D`、`%m` 和颜色占位符。 |
 | Revision | | 位置参数（可选） | 要从中汇总的修订。默认为 `HEAD`。 |
 | JSON | | `--json` | 输出结构化 JSON。 |
 | Quiet | | `--quiet` | 抑制人类可读输出。 |

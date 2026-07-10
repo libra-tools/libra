@@ -8,6 +8,7 @@ use std::{
     str::FromStr,
 };
 
+use chrono::DateTime;
 use clap::Parser;
 use git_internal::{
     hash::{ObjectHash, get_hash_kind},
@@ -32,9 +33,14 @@ use crate::{
     internal::{
         ai::automation::{VCS_EVENT_POST_COMMIT, dispatch_current_repo_vcs_event_to_history},
         branch::Branch,
-        config::{LocalIdentityTarget, read_cascaded_config_value, resolve_user_identity_sources},
+        config::{
+            LocalIdentityTarget, env_first_non_empty, read_cascaded_config_value,
+            resolve_user_identity_sources,
+        },
         head::Head,
+        log::date_parser::parse_date,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        tree_plumbing,
     },
     utils::{
         client_storage::ClientStorage,
@@ -130,6 +136,10 @@ pub struct CommitArgs {
     /// Override the commit author. Specify an explicit author using the standard A U Thor <author@example.com> format.
     #[arg(long)]
     pub author: Option<String>,
+
+    /// Override the author date. Accepts Git raw dates (`<timestamp> <tz>`), RFC 3339, `YYYY-MM-DD`, or a Unix timestamp.
+    #[arg(long, value_name = "DATE")]
+    pub date: Option<String>,
 
     /// Create a fixup commit targeting the specified commit. The message becomes "fixup! <subject>".
     #[arg(long, value_name = "COMMIT", conflicts_with_all = ["message", "file", "squash", "reuse_message", "reedit_message"])]
@@ -254,6 +264,13 @@ pub enum CommitError {
     #[error("invalid author format: {0}")]
     InvalidAuthor(String),
 
+    #[error("invalid {date_source} date '{value}': {detail}")]
+    InvalidDate {
+        date_source: &'static str,
+        value: String,
+        detail: String,
+    },
+
     #[error("failed to read message file '{path}': {detail}")]
     MessageFileRead { path: String, detail: String },
 
@@ -268,6 +285,9 @@ pub enum CommitError {
 
     #[error("failed to create tree: {0}")]
     TreeCreation(String),
+
+    #[error("index object validation failed: {0}")]
+    IndexObjectInvalid(String),
 
     #[error("failed to store commit object: {0}")]
     ObjectStorage(String),
@@ -330,6 +350,11 @@ impl From<CommitError> for CliError {
             CommitError::InvalidAuthor(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("expected format: 'Name <email>'"),
+            CommitError::InvalidDate { .. } => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint(
+                    "supported formats: '<unix> <+HHMM|-HHMM>', RFC 3339, 'YYYY-MM-DD HH:MM:SS +HHMM', 'YYYY-MM-DD', relative dates, or a Unix timestamp",
+                ),
             CommitError::InvalidConfig(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("fix the offending value with 'libra config <key> <value>'"),
@@ -351,6 +376,10 @@ impl From<CommitError> for CliError {
             CommitError::TreeCreation(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::InternalInvariant)
                 .with_hint(format!("this is a bug; please report it at {ISSUE_URL}")),
+            CommitError::IndexObjectInvalid(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint("run 'libra fsck' to inspect missing or mistyped objects")
+                .with_hint("restore the object or remove the bad index entry before committing"),
             CommitError::ObjectStorage(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
@@ -471,22 +500,55 @@ fn missing_identity_error(name_missing: bool, email_missing: bool) -> CommitErro
     CommitError::IdentityMissing(detail.to_string())
 }
 
+async fn identity_config_only() -> bool {
+    get_user_config_value("useConfigOnly")
+        .await
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+fn author_env_identity() -> (Option<String>, Option<String>) {
+    (
+        env_first_non_empty(&[
+            "GIT_AUTHOR_NAME",
+            "GIT_COMMITTER_NAME",
+            "LIBRA_COMMITTER_NAME",
+        ]),
+        env_first_non_empty(&[
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_EMAIL",
+            "EMAIL",
+            "LIBRA_COMMITTER_EMAIL",
+        ]),
+    )
+}
+
+fn committer_env_identity() -> (Option<String>, Option<String>) {
+    (
+        env_first_non_empty(&[
+            "GIT_COMMITTER_NAME",
+            "GIT_AUTHOR_NAME",
+            "LIBRA_COMMITTER_NAME",
+        ]),
+        env_first_non_empty(&[
+            "GIT_COMMITTER_EMAIL",
+            "GIT_AUTHOR_EMAIL",
+            "EMAIL",
+            "LIBRA_COMMITTER_EMAIL",
+        ]),
+    )
+}
+
 pub(crate) async fn resolve_committer_identity() -> Result<UserIdentity, CommitError> {
     let identity_sources = resolve_user_identity_sources(LocalIdentityTarget::CurrentRepo)
         .await
         .map_err(|error| CommitError::IdentityMissing(error.to_string()))?;
 
-    // Step 2: check user.useConfigOnly BEFORE falling back to env vars.
+    // Step 2: check user.useConfigOnly BEFORE reading env vars.
     // When useConfigOnly is true, only config values are acceptable — env vars are
     // skipped so the user is forced to configure identity
-    // explicitly.  This is stricter than Git (which still honours GIT_AUTHOR_*
-    // env vars) and prevents silent identity leakage from server environments.
-    let use_config_only = get_user_config_value("useConfigOnly")
-        .await
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-
-    if use_config_only {
+    // explicitly.
+    if identity_config_only().await {
         if let (Some(name), Some(email)) = (
             identity_sources.config_name.clone(),
             identity_sources.config_email.clone(),
@@ -500,9 +562,11 @@ pub(crate) async fn resolve_committer_identity() -> Result<UserIdentity, CommitE
         return Err(missing_identity_error(name_missing, email_missing));
     }
 
-    // Step 3: env-var fallback (GIT_COMMITTER_*, GIT_AUTHOR_*, EMAIL, LIBRA_COMMITTER_*)
-    let name = identity_sources.config_name.or(identity_sources.env_name);
-    let email = identity_sources.config_email.or(identity_sources.env_email);
+    // Step 3: Git env vars override config; Libra-specific env vars remain a
+    // lower-priority fallback for older automation.
+    let (env_name, env_email) = committer_env_identity();
+    let name = env_name.or(identity_sources.config_name);
+    let email = env_email.or(identity_sources.config_email);
 
     if let (Some(name), Some(email)) = (name.clone(), email.clone()) {
         return Ok(UserIdentity { name, email });
@@ -511,32 +575,183 @@ pub(crate) async fn resolve_committer_identity() -> Result<UserIdentity, CommitE
     Err(missing_identity_error(name.is_none(), email.is_none()))
 }
 
+async fn resolve_author_identity(
+    author_override: Option<&str>,
+) -> Result<UserIdentity, CommitError> {
+    if let Some(author_str) = author_override {
+        let (name, email) = parse_author(author_str)?;
+        return Ok(UserIdentity { name, email });
+    }
+
+    let identity_sources = resolve_user_identity_sources(LocalIdentityTarget::CurrentRepo)
+        .await
+        .map_err(|error| CommitError::IdentityMissing(error.to_string()))?;
+
+    if identity_config_only().await {
+        if let (Some(name), Some(email)) = (
+            identity_sources.config_name.clone(),
+            identity_sources.config_email.clone(),
+        ) {
+            return Ok(UserIdentity { name, email });
+        }
+        return Err(missing_identity_error(
+            identity_sources.config_name.is_none(),
+            identity_sources.config_email.is_none(),
+        ));
+    }
+
+    let (env_name, env_email) = author_env_identity();
+    let name = env_name.or(identity_sources.config_name);
+    let email = env_email.or(identity_sources.config_email);
+
+    if let (Some(name), Some(email)) = (name.clone(), email.clone()) {
+        return Ok(UserIdentity { name, email });
+    }
+
+    Err(missing_identity_error(name.is_none(), email.is_none()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignatureDate {
+    timestamp: usize,
+    timezone: Option<String>,
+}
+
+fn env_date(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_timezone(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() == 5
+        && matches!(bytes[0], b'+' | b'-')
+        && bytes[1..].iter().all(u8::is_ascii_digit)
+    {
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn timezone_from_offset_seconds(offset_seconds: i32) -> String {
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let abs = offset_seconds.unsigned_abs();
+    let hours = abs / 3600;
+    let minutes = (abs % 3600) / 60;
+    format!("{sign}{hours:02}{minutes:02}")
+}
+
+fn timestamp_from_i64(
+    source: &'static str,
+    value: &str,
+    timestamp: i64,
+) -> Result<usize, CommitError> {
+    usize::try_from(timestamp).map_err(|_| CommitError::InvalidDate {
+        date_source: source,
+        value: value.to_string(),
+        detail: "date is before the Unix epoch or too large for this platform".to_string(),
+    })
+}
+
+fn parse_signature_date(source: &'static str, value: &str) -> Result<SignatureDate, CommitError> {
+    let trimmed = value.trim();
+
+    if let Some((timestamp, timezone)) = trimmed.rsplit_once(' ')
+        && let Some(timezone) = parse_timezone(timezone)
+        && let Ok(timestamp) = timestamp.parse::<i64>()
+    {
+        return Ok(SignatureDate {
+            timestamp: timestamp_from_i64(source, value, timestamp)?,
+            timezone: Some(timezone),
+        });
+    }
+
+    if let Ok(datetime) = DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S %z") {
+        return Ok(SignatureDate {
+            timestamp: timestamp_from_i64(source, value, datetime.timestamp())?,
+            timezone: Some(timezone_from_offset_seconds(
+                datetime.offset().local_minus_utc(),
+            )),
+        });
+    }
+
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(SignatureDate {
+            timestamp: timestamp_from_i64(source, value, datetime.timestamp())?,
+            timezone: Some(timezone_from_offset_seconds(
+                datetime.offset().local_minus_utc(),
+            )),
+        });
+    }
+
+    let timestamp = parse_date(trimmed).map_err(|error| CommitError::InvalidDate {
+        date_source: source,
+        value: value.to_string(),
+        detail: error.to_string(),
+    })?;
+    Ok(SignatureDate {
+        timestamp: timestamp_from_i64(source, value, timestamp)?,
+        timezone: None,
+    })
+}
+
+pub(crate) fn apply_signature_date(
+    signature: &mut Signature,
+    source: &'static str,
+    value: &str,
+) -> Result<(), CommitError> {
+    let date = parse_signature_date(source, value)?;
+    signature.timestamp = date.timestamp;
+    if let Some(timezone) = date.timezone {
+        signature.timezone = timezone;
+    }
+    Ok(())
+}
+
 /// Create author and committer signatures based on the provided arguments
 pub(crate) async fn create_commit_signatures(
     author_override: Option<&str>,
+    author_date_override: Option<&str>,
 ) -> Result<(Signature, Signature, UserIdentity), CommitError> {
+    let author_identity = resolve_author_identity(author_override).await?;
     let committer_identity = resolve_committer_identity().await?;
 
-    // Create author signature (use override if provided)
-    let author = if let Some(author_str) = author_override {
-        let (name, email) = parse_author(author_str)?;
-        Signature::new(SignatureType::Author, name, email)
-    } else {
-        Signature::new(
-            SignatureType::Author,
-            committer_identity.name.clone(),
-            committer_identity.email.clone(),
-        )
-    };
+    let mut author = Signature::new(
+        SignatureType::Author,
+        author_identity.name,
+        author_identity.email,
+    );
+    if let Some(value) = author_date_override {
+        apply_signature_date(&mut author, "--date", value)?;
+    } else if let Some(value) = env_date("GIT_AUTHOR_DATE") {
+        apply_signature_date(&mut author, "GIT_AUTHOR_DATE", &value)?;
+    }
 
-    // Committer always uses default user info
-    let committer = Signature::new(
+    let mut committer = Signature::new(
         SignatureType::Committer,
         committer_identity.name.clone(),
         committer_identity.email.clone(),
     );
+    if let Some(value) = env_date("GIT_COMMITTER_DATE") {
+        apply_signature_date(&mut committer, "GIT_COMMITTER_DATE", &value)?;
+    }
 
     Ok((author, committer, committer_identity))
+}
+
+pub(crate) async fn create_committer_signature() -> Result<(Signature, UserIdentity), CommitError> {
+    let committer_identity = resolve_committer_identity().await?;
+    let mut committer = Signature::new(
+        SignatureType::Committer,
+        committer_identity.name.clone(),
+        committer_identity.email.clone(),
+    );
+    if let Some(value) = env_date("GIT_COMMITTER_DATE") {
+        apply_signature_date(&mut committer, "GIT_COMMITTER_DATE", &value)?;
+    }
+    Ok((committer, committer_identity))
 }
 
 fn first_message_line(message: &str) -> String {
@@ -576,6 +791,9 @@ pub async fn run_commit(
     let index = Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
     let storage = ClientStorage::init(path::objects());
     let tracked_entries = index.tracked_entries(0);
+
+    tree_plumbing::validate_index_objects(&index)
+        .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
 
     // Skip empty commit check for --amend operations
     if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
@@ -646,8 +864,21 @@ pub async fn run_commit(
     let tree = create_tree(&index, &storage, "".into()).await?;
 
     // Create author and committer signatures
-    let (author, committer, committer_identity) =
-        create_commit_signatures(args.author.as_deref()).await?;
+    let reuse_author = load_reused_commit_author(&args).await?;
+    let (mut author, committer, committer_identity) =
+        create_commit_signatures(args.author.as_deref(), args.date.as_deref()).await?;
+    let reused_author_applied = if let Some(mut reused_author) = reuse_author
+        && args.author.is_none()
+        && !args.reset_author
+    {
+        if let Some(date) = args.date.as_deref() {
+            apply_signature_date(&mut reused_author, "--date", date)?;
+        }
+        author = reused_author;
+        true
+    } else {
+        false
+    };
 
     // Build the signoff trailer
     let signoff_line = if is_signoff {
@@ -673,17 +904,21 @@ pub async fn run_commit(
                 detail: e.to_string(),
             }
         })?;
-        let grandpa_commit_id = parent_commit.parent_commit_ids;
+        let grandpa_commit_id = parent_commit.parent_commit_ids.clone();
 
         // Git-compatible amend authorship: preserve the original commit's author
         // (name, email, and authored date) unless the user explicitly resets it
         // with `--reset-author` or supplies a new one with `--author`. Without this
         // the amended commit would silently adopt the current committer identity,
         // which makes `--reset-author` a no-op and diverges from Git.
-        let author = if args.reset_author || args.author.is_some() {
+        let author = if args.reset_author || args.author.is_some() || reused_author_applied {
             author
         } else {
-            parent_commit.author.clone()
+            let mut parent_author = parent_commit.author.clone();
+            if let Some(date) = args.date.as_deref() {
+                apply_signature_date(&mut parent_author, "--date", date)?;
+            }
+            parent_author
         };
 
         // `--amend --no-edit` reuses the parent message verbatim (no re-cleanup),
@@ -710,6 +945,15 @@ pub async fn run_commit(
             Some(line) => append_trailers(&final_message, std::slice::from_ref(line)),
             None => final_message.clone(),
         };
+        let mut committer = committer;
+        refresh_noop_amend_committer_timestamp(
+            &parent_commit,
+            &author,
+            &mut committer,
+            &tree.id,
+            &grandpa_commit_id,
+            &commit_message,
+        );
 
         // Conventional commit validation
         if is_conventional
@@ -876,6 +1120,32 @@ pub async fn run_commit(
         porcelain_text.take(),
     )
     .await)
+}
+
+fn refresh_noop_amend_committer_timestamp(
+    parent_commit: &Commit,
+    author: &Signature,
+    committer: &mut Signature,
+    tree_id: &ObjectHash,
+    parent_ids: &[ObjectHash],
+    commit_message: &str,
+) {
+    let parent_message = parse_commit_msg(&parent_commit.message).0;
+    let same_committer_identity = parent_commit.committer.signature_type
+        == committer.signature_type
+        && parent_commit.committer.name == committer.name
+        && parent_commit.committer.email == committer.email
+        && parent_commit.committer.timezone == committer.timezone;
+
+    if parent_commit.tree_id == *tree_id
+        && parent_commit.parent_commit_ids == parent_ids
+        && parent_commit.author == *author
+        && same_committer_identity
+        && parent_message == commit_message
+        && committer.timestamp <= parent_commit.committer.timestamp
+    {
+        committer.timestamp = parent_commit.committer.timestamp.saturating_add(1);
+    }
 }
 
 /// Resolve the final commit message from CLI arguments.
@@ -1215,6 +1485,21 @@ async fn build_status_section() -> Option<String> {
 
 /// Load the commit message of the given commit-ish.
 async fn load_commit_message(spec: &str) -> Result<String, CommitError> {
+    let commit = load_commit_for_message_source(spec).await?;
+    // Strip any embedded `gpgsig` header so that reusing a signed commit's
+    // message (via `-C`/`-c`/`--reuse-message`/`--fixup`/`--squash`) yields the
+    // real log message rather than the leading PGP/SSH signature block.
+    Ok(parse_commit_msg(&commit.message).0.to_string())
+}
+
+async fn load_reused_commit_author(args: &CommitArgs) -> Result<Option<Signature>, CommitError> {
+    let Some(spec) = args.reuse_message.as_ref().or(args.reedit_message.as_ref()) else {
+        return Ok(None);
+    };
+    Ok(Some(load_commit_for_message_source(spec).await?.author))
+}
+
+async fn load_commit_for_message_source(spec: &str) -> Result<Commit, CommitError> {
     let hash =
         util::get_commit_base_typed(spec)
             .await
@@ -1226,10 +1511,7 @@ async fn load_commit_message(spec: &str) -> Result<String, CommitError> {
         commit_id: spec.to_string(),
         detail: e.to_string(),
     })?;
-    // Strip any embedded `gpgsig` header so that reusing a signed commit's
-    // message (via `-C`/`-c`/`--reuse-message`/`--fixup`/`--squash`) yields the
-    // real log message rather than the leading PGP/SSH signature block.
-    Ok(parse_commit_msg(&commit.message).0.to_string())
+    Ok(commit)
 }
 
 /// Extract the subject (first line) of a commit message.

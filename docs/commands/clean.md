@@ -5,8 +5,8 @@ Remove untracked files (and optionally directories) from the working tree.
 ## Synopsis
 
 ```
-libra clean -n [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [--quiet]
-libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [--quiet]
+libra clean -n [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [--quiet] [pathspec]...
+libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [--quiet] [pathspec]...
 ```
 
 ## Description
@@ -17,13 +17,18 @@ for actual deletion. Running `libra clean` without either flag is an
 error. This prevents accidental data loss by forcing the user to state
 intent explicitly.
 
-By default, only files are removed and `.libraignore` rules are honored
+By default, only files are removed and Git/Libra ignore sources are honored
 (ignored files are skipped). The `-d` flag opts into removing untracked
 directories as well; `-x` opts into removing files the ignore rules would
 otherwise protect; `-X` flips the rules so that *only* ignored files are
 removed. Every candidate path is canonicalized and verified to reside
 inside the worktree root before deletion, preventing symlink-escape
 attacks.
+
+Optional pathspecs limit cleaning to matching untracked files or directory
+prefixes. This is the current literal prefix matcher used by `clean`; shared
+pathspec magic such as `:(exclude)` / `:(glob)` is not enabled for deletion
+paths yet.
 
 ## Options
 
@@ -32,9 +37,10 @@ attacks.
 | Dry run | `-n` | `--dry-run` | Show what would be removed without deleting anything. |
 | Force | `-f` | `--force` | Actually remove untracked files. |
 | Directories | `-d` | `--dir` | Also remove untracked directories (otherwise only files). |
-| Include ignored | `-x` | | Remove untracked files **including** those matched by `.libraignore`. |
-| Only ignored | `-X` | | Remove **only** untracked files that are matched by `.libraignore`. |
+| Include ignored | `-x` | | Remove untracked files **including** those matched by ignore rules. |
+| Only ignored | `-X` | | Remove **only** untracked files that are matched by ignore rules. |
 | Exclude | `-e` | `--exclude <pattern>` | Add an extra exclusion pattern; may be repeated. |
+| Pathspec | | positional | Limit candidates to matching files or directory prefixes. Shared pathspec magic is not enabled for `clean` yet. |
 | JSON | | `--json` | Emit structured JSON output (see below). |
 | Quiet | | `--quiet` | Suppress all human-readable stdout. |
 
@@ -74,19 +80,19 @@ empty directory is removed after its files are.
 
 **`-x`**
 
-Override `.libraignore`. Without this flag, ignored files (build
+Override configured ignore sources. Without this flag, ignored files (build
 artifacts, caches, etc.) are skipped. With `-x`, they are treated like
 any other untracked file and removed.
 
 **`-X`**
 
-Inverse of `-x`. Removes only the files that `.libraignore` would
+Inverse of `-x`. Removes only the files that ignore sources would
 normally protect. Useful for "clean my build artifacts but leave
 hand-edited files alone."
 
 **`-e` / `--exclude <pattern>`**
 
-Add an additional exclusion pattern (in `.libraignore` syntax) for this
+Add an additional exclusion pattern (in Git ignore syntax) for this
 invocation only. Can be passed multiple times to layer patterns:
 
 ```bash
@@ -114,7 +120,7 @@ libra clean -fx
 # Remove only ignored files (keep hand-edited files intact)
 libra clean -fX
 
-# Layer an additional exclusion pattern on top of .libraignore
+# Layer an additional exclusion pattern on top of configured ignore sources
 libra clean -f --exclude '*.log'
 
 # Preview in JSON format (useful for scripting)
@@ -197,7 +203,7 @@ safety guarantees while restoring parity with `git clean`.
 | Interactive mode | Not supported | `-i` | N/A |
 | Quiet mode | `--quiet` | `-q` / `--quiet` | N/A |
 | JSON output | `--json` | Not supported | N/A |
-| Pathspec filter | Not supported | `<pathspec>...` | N/A |
+| Pathspec filter | Literal file/directory prefix pathspecs | `<pathspec>...` | N/A |
 | Require force config | Always required | `clean.requireForce` (default true) | N/A |
 
 Note: jj does not have a `clean` command because its working-copy model

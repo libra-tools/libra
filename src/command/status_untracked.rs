@@ -30,6 +30,7 @@ struct WorkdirScan {
 pub(crate) fn collect_status_worktree_changes(
     untracked_mode: UntrackedFiles,
     include_ignored: bool,
+    ignore_case: bool,
 ) -> Result<StatusWorktreeChanges, StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
@@ -37,7 +38,7 @@ pub(crate) fn collect_status_worktree_changes(
         path: index_path.clone(),
         source,
     })?;
-    let tracked = TrackedPaths::from_index(&index);
+    let tracked = TrackedPaths::from_index(&index, ignore_case);
     let mut unstaged = collect_tracked_worktree_changes(&workdir, &index, tracked.files())?;
     let mut ignored_files = Vec::new();
 
@@ -106,7 +107,7 @@ fn collect_tracked_worktree_changes(
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
         let file_abs = workdir.join(file);
-        if !file_abs.exists() {
+        if file_abs.symlink_metadata().is_err() {
             changes.deleted.push(file.clone());
         } else if index.is_modified(file_str, 0, workdir) {
             let file_hash =
@@ -152,7 +153,7 @@ fn scan_workdir(
                 .map_err(|err| list_error(&dir, io::Error::other(err.to_string())))?
                 .to_path_buf();
             if file_type.is_dir() {
-                if util::check_gitignore(&workdir.to_path_buf(), &path) {
+                if util::check_gitignore(workdir, &path) {
                     if include_ignored {
                         scan.ignored.push(relative);
                     }
@@ -178,8 +179,16 @@ fn scan_workdir(
                     continue;
                 }
                 pending_dirs.push(path);
-            } else if file_type.is_file() {
-                scan_file(&mut scan, workdir, index, &path, &relative, include_ignored)?;
+            } else if file_type.is_file() || file_type.is_symlink() {
+                scan_file(
+                    &mut scan,
+                    workdir,
+                    index,
+                    tracked,
+                    &path,
+                    &relative,
+                    include_ignored,
+                )?;
             }
         }
     }
@@ -191,6 +200,7 @@ fn scan_file(
     scan: &mut WorkdirScan,
     workdir: &Path,
     index: &Index,
+    tracked_paths: &TrackedPaths,
     path: &Path,
     relative: &Path,
     include_ignored: bool,
@@ -200,8 +210,9 @@ fn scan_file(
         .ok_or_else(|| StatusError::InvalidPathEncoding {
             path: relative.to_path_buf(),
         })?;
-    let tracked = index.tracked(file_str, 0);
-    if util::check_gitignore(&workdir.to_path_buf(), &path.to_path_buf()) {
+    let tracked =
+        index.tracked(file_str, 0) || tracked_paths.same_file_case_alias(workdir, relative);
+    if util::check_gitignore(workdir, path) {
         if include_ignored && !tracked {
             scan.ignored.push(relative.to_path_buf());
         }
@@ -233,10 +244,10 @@ fn untracked_dir_has_visible_file(workdir: &Path, dir: &Path) -> bool {
                 return true;
             };
             let path = entry.path();
-            if util::check_gitignore(&workdir.to_path_buf(), &path) {
+            if util::check_gitignore(workdir, &path) {
                 continue;
             }
-            if file_type.is_file() {
+            if file_type.is_file() || file_type.is_symlink() {
                 return true;
             }
             if file_type.is_dir() {

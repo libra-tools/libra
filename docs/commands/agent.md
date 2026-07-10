@@ -13,6 +13,7 @@ libra agent disable [--agent <name>]...
 libra agent remove [<name>...]
 libra agent session <subcommand>
 libra agent checkpoint <subcommand>
+libra agent skill <subcommand>
 libra agent clean [--all]
 libra agent doctor [--repair]
 libra agent push [--remote <name>] [--force-rewrite]
@@ -57,11 +58,15 @@ for any other non-roster agent — return an actionable unsupported error.
 | `checkpoint show <id>` | Show checkpoint metadata |
 | `checkpoint rewind <id>` | Inspect or apply a working-tree rewind for one checkpoint |
 | `checkpoint export <id>` | Export a checkpoint's transcript. Redacted by default (no authorization); raw (un-redacted) export requires `--allow-raw --raw` and is recorded in the append-only `agent_audit_log` (`LBR-AGENT-013` when refused without it) |
+| `skill search` | Search captured skill events by `--skill`, `--provider`, `--session`, and RFC3339 `--since`/`--until` (keyset-paginated with `--limit`/`--cursor`, `--json`). A read-time projection over checkpoint metadata — no dedicated table |
+| `skill list` | Alias of `skill search` (same filters) |
+| `skill registry` | Show the curated per-agent discoverable-skill registry (`--provider <slug>` to scope; the public SkillDiscoverer surface) |
 | `clean` | Clean up temporary checkpoints from stopped sessions (prune fails closed while a checkpoint write is in flight or the traces ref reaches uncataloged commits; also drops `object_index` rows made unreachable) |
 | `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies |
 | `push` | Push `refs/libra/traces` to a remote (`--force-rewrite` for the non-fast-forward push after a `clean` prune, using force-with-lease) |
 | `rpc list` | List discovered `libra-agent-*` binaries on `PATH` (with trusted/quarantined state); requires the external-agents opt-in |
-| `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable) |
+| `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable, or when the binary is not under a trusted directory — `LBR-AGENT-005`) |
+| `rpc trust --dir <path>` | Register a trusted directory (`agent.external_agents.trusted_dirs`, default `~/.libra/agents`): external binaries are only trustable when their canonical path lives under one. The path is canonicalized and must be an existing, non-world-writable directory |
 | `rpc untrust <slug>` | Revoke trust; the binary returns to quarantine (always available, even while external agents are disabled) |
 | `rpc invoke` | Invoke one JSON-RPC method on a trusted `libra-agent-*` binary |
 
@@ -80,7 +85,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `--dry-run` | `checkpoint rewind` | Show the impact without modifying files; this is the default |
 | `--allow-raw` / `--raw` | `checkpoint export` | Authorize + request a raw (un-redacted) export; without `--allow-raw` a `--raw` request is refused (`LBR-AGENT-013`) and audited |
 | `--justification <text>` / `-o <path>` | `checkpoint export` | Audit justification and output file for a raw export |
-| `--gc` / `--retention-days <n>` | `clean` | Retention GC: drop checkpoints from stopped sessions older than `agent.retention.transcript_days` (default 90; override with `--retention-days`); never touches `agent_audit_log` |
+| `--gc` / `--retention-days <n>` / `--dry-run` | `clean` | Retention GC across three windows: (1) drop checkpoints from stopped sessions older than `agent.retention.transcript_days` (default 90; override with `--retention-days`); (2) prune reviewer stderr diagnostic logs of terminal review/investigate runs older than `agent.retention.stderr_days` (default 30) while keeping each run's aggregate record; (3) **A0-09** remove whole terminal review/investigate run directories (`findings.md`, `manifest.json`, `state.json`, reviewer logs) older than `agent.retention.findings_days` (default 90). The objectized findings blob is content-addressed and left for a future repo-wide object GC (per-run retention never deletes a shared object). Non-terminal/undated runs are skipped fail-safe; `agent_audit_log` is never touched. `--dry-run` reports what each window *would* remove (JSON `dry_run`/`findings_runs_pruned`) without deleting anything |
 | `--apply` | `checkpoint rewind` | Restore the working tree for the selected checkpoint |
 
 ## JSON Output
@@ -108,6 +113,15 @@ page per call: `data` carries a `schema_version`, the rows under `sessions`
 token to pass back via `--cursor`, `null` once the listing is exhausted.
 Pages are ordered newest-first (`started_at` / `created_at` descending,
 with the row id as tiebreaker).
+
+Each checkpoint row carries a `scope`. `committed` checkpoints are written at
+turn/session boundaries (`Stop` / `SessionEnd`) and carry the redacted
+transcript snapshot. `subagent` checkpoints are materialized at an observed
+agent's sub-agent boundary (`SubagentStart` / `SubagentEnd`): they are
+independent checkpoints — listable, showable, exportable, prunable, and
+doctor-visible — that link back to the enclosing turn via
+`parent_checkpoint_id`, so nested runs are first-class rather than buried as
+metadata on the main checkpoint.
 
 `agent checkpoint show --json` additionally reports a `layout` summary
 (`e4-libra`, `legacy-v1` for pre-AG-20 checkpoints, or `unknown` when the
@@ -200,6 +214,34 @@ The same banner is rendered by `libra agent --help` so the doc and the
 CLI surface stay in sync (cross-cutting `--help` EXAMPLES rollout, see
 `docs/development/commands/_general.md` item B).
 
+## Deferred parity (non-goals)
+
+The following external-agent parity surfaces are intentionally **not** exposed
+in this wave. They are recorded — with their handling and restart condition —
+in the Agent tracing contract
+([`../development/tracing/agent.md`](../development/tracing/agent.md), section
+「还未实现的功能」), and are called out here so scripts and users do not depend
+on them:
+
+- **`agent add`/`remove` `--local-dev` / `--force` flags** are unpublished — use
+  the canonical `enable` / `disable` (and their `add` / `remove` aliases) only.
+  If they ever ship, each will be wired onto both the canonical verb and its
+  alias.
+- **Provider-specific transcript compaction / reassemble traits** are a future
+  parity item. The writer already stores large transcripts as manifest-relative
+  chunks, but there is no provider-specific compactor/reassembler yet.
+- **Optional capability traits** (`ProtectedFilesProvider`, `TranscriptCompactor`,
+  `HookResponseWriter`, `RestoredSessionPathResolver`, …) beyond the landed
+  `DeclaredAgentCaps` matrix have no public behavior yet.
+- **External-RPC method families beyond the v2 `info` / capability gate** are not
+  implemented; an agent that does not declare a capability continues to fail
+  closed.
+- **The non-first-batch roster is unsupported.** Only `claude-code`, `codex` and
+  `opencode` are supported, hook-installable and launchable for
+  review/investigate. `gemini` (uninstall-only, see the Description above),
+  `cursor`, `copilot` and `factory-ai` are `supported=false`: `add`/`enable`
+  returns an actionable unsupported error and they are not launchable.
+
 ## Notes
 
 - External `libra-agent-*` agents are **disabled by default**. Opt in with
@@ -217,6 +259,12 @@ CLI surface stay in sync (cross-cutting `--help` EXAMPLES rollout, see
 
 - The top-level `agent hooks` entry is hidden and intended for hook configs
   installed by `libra agent enable`; users normally do not call it directly.
+  A hook envelope that fails size / UTF-8 / JSON / schema / transcript-path
+  validation is rejected fail-closed with `LBR-AGENT-008` (exit 128) — raw
+  stdin is never echoed. A checkpoint operation (e.g. `checkpoint rewind`) on
+  an inconsistent store — a catalog row whose `parent_commit` is malformed or
+  points at a missing traces object — fails with `LBR-AGENT-009` (exit 128);
+  run `libra agent doctor` to inspect the store.
 - `checkpoint rewind --apply` restores working-tree files only; the agent's own
   transcript file is not rewritten.
 - Hook and capture diagnostics are best-effort and are designed to report

@@ -58,8 +58,15 @@ pub struct AgentRpcListArgs {}
 
 #[derive(Args, Debug)]
 pub struct AgentRpcTrustArgs {
-    /// Slug after `libra-agent-`. The binary must be on `$PATH`.
-    pub slug: String,
+    /// Slug after `libra-agent-`. The binary must be on `$PATH` and live under
+    /// a trusted directory (register one with `--dir` first).
+    #[arg(required_unless_present = "dir", conflicts_with = "dir")]
+    pub slug: Option<String>,
+    /// Register a trusted directory: external agent binaries are only
+    /// trustable when their canonical path lives under one of these. The path
+    /// is canonicalized and must be an existing, non-world-writable directory.
+    #[arg(long, value_name = "PATH", required_unless_present = "slug")]
+    pub dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -202,13 +209,37 @@ async fn list(_args: AgentRpcListArgs, output: &OutputConfig) -> CliResult<()> {
 
 async fn trust(args: AgentRpcTrustArgs, output: &OutputConfig) -> CliResult<()> {
     require_external_agents_enabled().await?;
-    reject_builtin_impersonation(&args.slug)?;
+
+    // A0-08: `--dir <path>` registers a trusted directory (canonicalized +
+    // must be an existing, non-world-writable directory).
+    if let Some(dir) = &args.dir {
+        let canonical = crate::internal::ai::observed_agents::add_trusted_dir(dir)
+            .await
+            .map_err(|e| {
+                CliError::fatal(format!("cannot trust directory {}: {e}", dir.display()))
+                    .with_stable_code(StableErrorCode::AgentProvenanceRejected)
+            })?;
+        if output.is_json() {
+            let payload = serde_json::json!({ "trusted_dir": canonical.display().to_string() });
+            return emit_json_data("agent_rpc_trust_dir", &payload, output);
+        }
+        if !output.quiet {
+            println!("registered trusted directory {}", canonical.display());
+        }
+        return Ok(());
+    }
+
+    // Slug branch — clap guarantees `slug` is present when `--dir` is absent.
+    let slug = args.slug.as_deref().ok_or_else(|| {
+        CliError::command_usage(
+            "pass a slug to trust a binary, or --dir <path> to trust a directory",
+        )
+    })?;
+    reject_builtin_impersonation(slug)?;
     let binary = discover_rpc_agents()
         .into_iter()
-        .find(|b| b.slug == args.slug)
-        .ok_or_else(|| {
-            CliError::fatal(format!("no libra-agent-{} binary found on PATH", args.slug))
-        })?;
+        .find(|b| b.slug == slug)
+        .ok_or_else(|| CliError::fatal(format!("no libra-agent-{slug} binary found on PATH")))?;
     // Provenance is only meaningful for a binary nobody else can swap:
     // refuse to trust one whose (canonical) parent directory is
     // world-writable (`LBR-AGENT-005`). `record_trust` re-enforces this
@@ -216,24 +247,26 @@ async fn trust(args: AgentRpcTrustArgs, output: &OutputConfig) -> CliResult<()> 
     // boundary.
     let canonical = binary.binary_path.canonicalize().map_err(|e| {
         CliError::fatal(format!(
-            "cannot trust '{}': canonicalize {}: {e}",
-            args.slug,
+            "cannot trust '{slug}': canonicalize {}: {e}",
             binary.binary_path.display()
         ))
         .with_stable_code(StableErrorCode::AgentProvenanceRejected)
     })?;
     crate::internal::ai::observed_agents::ensure_parent_not_world_writable(&canonical).map_err(
         |e| {
-            CliError::fatal(format!("cannot trust '{}': {e}", args.slug))
+            CliError::fatal(format!("cannot trust '{slug}': {e}"))
                 .with_stable_code(StableErrorCode::AgentProvenanceRejected)
         },
     )?;
-    let record = record_trust(&args.slug, &binary.binary_path)
-        .await
-        .map_err(|e| CliError::fatal(format!("record trust for '{}': {e}", args.slug)))?;
+    // record_trust also enforces the A0-08 trusted-directory allowlist; a
+    // rejection there is a provenance refusal too (`LBR-AGENT-005`).
+    let record = record_trust(slug, &binary.binary_path).await.map_err(|e| {
+        CliError::fatal(format!("record trust for '{slug}': {e}"))
+            .with_stable_code(StableErrorCode::AgentProvenanceRejected)
+    })?;
     if output.is_json() {
         let payload = serde_json::json!({
-            "slug": args.slug,
+            "slug": slug,
             "path": record.path.display().to_string(),
             "sha256": record.sha256,
         });
@@ -241,8 +274,7 @@ async fn trust(args: AgentRpcTrustArgs, output: &OutputConfig) -> CliResult<()> 
     }
     if !output.quiet {
         println!(
-            "trusted libra-agent-{} at {} (sha256 {})",
-            args.slug,
+            "trusted libra-agent-{slug} at {} (sha256 {})",
             record.path.display(),
             record.sha256
         );
@@ -317,7 +349,12 @@ async fn invoke(args: AgentRpcInvokeArgs, output: &OutputConfig) -> CliResult<()
         slug: args.slug.clone(),
         binary_path: provenance.canonical_path.clone(),
     };
-    let mut agent = RpcAgent::spawn_in_repo(binary, repo_root.as_deref())
+    // A0-08: thread the operator-approved extra env passthrough (forbidden
+    // credential/endpoint names already filtered out) into the cleared child.
+    let extra_env = crate::internal::ai::observed_agents::env_allowlist_extra()
+        .await
+        .map_err(|e| CliError::fatal(format!("read env_allowlist_extra: {e}")))?;
+    let mut agent = RpcAgent::spawn_in_repo_with_env(binary, repo_root.as_deref(), &extra_env)
         .map_err(|e| CliError::fatal(format!("spawn libra-agent-{}: {e}", args.slug)))?;
 
     // v2 negotiation order (E2): `info` first (optional), then the

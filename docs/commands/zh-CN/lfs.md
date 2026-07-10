@@ -17,7 +17,7 @@ libra lfs ls-files [--long] [--size] [--name-only]
 
 `libra lfs` 提供内置 Large File Storage，用于管理二进制文件、媒体资产和其他不适合 diff 或 merge 的大型对象。LFS 不在仓库中存储完整文件内容，而是用轻量指针文件替换大文件，并将实际内容存储在专用 LFS 服务器上。
 
-LFS 跟踪通过 Libra Attributes（`.libra_attributes`）配置，将 glob 模式映射到 LFS 过滤器。`track` 和 `untrack` 子命令管理这些模式。文件锁定可防止无法合并的二进制文件被并发编辑，并通过 LFS lock API 在服务端强制执行。
+`add` 和 `lfs ls-files` 判断路径是否带有 `filter=lfs` 时，会读取 Git/Libra attributes 来源（`core.attributesFile`、逐目录 `.gitattributes`、`.libra_attributes` 和 `.git/info/attributes`）。`track` 和 `untrack` 子命令仍管理根 `.libra_attributes` 文件，作为 Libra 的可写便捷层。文件锁定可防止无法合并的二进制文件被并发编辑，并通过 LFS lock API 在服务端强制执行。
 
 与需要单独安装 `git-lfs` 扩展作为 smudge/clean 过滤器的 Git 不同，Libra 原生集成 LFS。LFS 客户端、指针文件解析和 attributes 管理都内置于 `libra` 二进制文件中。不需要额外安装或过滤器配置。
 
@@ -271,7 +271,7 @@ Libra 在二进制层面集成 LFS：指针格式、attribute 解析、batch API
 | 文件大小 | `--size` | `--size` | 不可用 |
 | 仅名称 | `--name-only` | `--name-only` | 不可用 |
 | 需要安装 | 内置 | 单独安装 `git-lfs` + `git lfs install` | 不可用 |
-| Attributes 文件 | `.libra_attributes` | `.gitattributes` | 不可用 |
+| Attributes 文件 | 读取 `.gitattributes` + `.libra_attributes`；`track` 写 `.libra_attributes` | `.gitattributes` | 不可用 |
 | Filter 配置 | 自动 | 手动（smudge/clean filters） | 不可用 |
 
 注意：jj 当前没有 LFS 支持。jj 仓库中的大文件管理需要通过 jj 的 Git 后端使用 Git 的 LFS 基础设施。
@@ -287,6 +287,6 @@ Libra 在二进制层面集成 LFS：指针格式、attribute 解析、batch API
 | 脏工作树中执行 `unlock`（无 `--force`） | `ConflictOperationBlocked` | 工作树有未提交更改。 |
 | 对无 lock 文件执行 `unlock` | `RepoStateInvalid` | 未找到指定路径的 lock。 |
 | 无 push 权限执行 `unlock` | `AuthPermissionDenied` | 用户缺少 push 权限。 |
-| 无法读取/写入 `.libra_attributes` | IO error | attributes 文件无法读取或写入。 |
+| 无法读取/写入 `.libra_attributes` | IO error | Libra 可写 attributes 文件无法读取或写入。 |
 | 无法加载索引 | IO error | 仓库索引损坏或缺失。 |
 | LFS 服务器通信失败 | Network error | LFS 服务器返回了非预期状态码。 |

@@ -4,6 +4,7 @@
 //! walking and filtering live elsewhere. Command log tests cover empty history,
 //! decorate modes, date formats, and machine-readable output.
 
+use chrono::{DateTime, FixedOffset, Utc};
 use colored::Colorize;
 use git_internal::internal::object::commit::Commit;
 
@@ -51,6 +52,8 @@ pub struct CommitFormatter {
     format: FormatType,
     /// `--date=<mode>` rendering mode for author/committer dates ("" = default).
     date_mode: String,
+    /// Whether color placeholders such as `%Cred` / `%C(red)` should emit ANSI.
+    color_enabled: bool,
     /// `--only-trailers`: show only the trailer block (selected keys; empty = all).
     only_trailers: Option<Vec<String>>,
 }
@@ -60,6 +63,7 @@ impl CommitFormatter {
         Self {
             format,
             date_mode: String::new(),
+            color_enabled: false,
             only_trailers: None,
         }
     }
@@ -67,6 +71,12 @@ impl CommitFormatter {
     /// Set the `--date=<mode>` rendering mode applied to author/committer dates.
     pub fn with_date_mode(mut self, date_mode: String) -> Self {
         self.date_mode = date_mode;
+        self
+    }
+
+    /// Enable color-sensitive placeholders (`%Cred`, `%C(<spec>)`, `%Creset`).
+    pub fn with_color_enabled(mut self, color_enabled: bool) -> Self {
+        self.color_enabled = color_enabled;
         self
     }
 
@@ -324,37 +334,276 @@ impl CommitFormatter {
     }
 
     fn format_custom(&self, commit: &Commit, ctx: &FormatContext<'_>, template: &str) -> String {
-        let mut result = template.to_string();
         let commit_id = commit.id.to_string();
         let short_hash = commit_id.chars().take(ctx.abbrev_len).collect::<String>();
-        let (subject, _) = parse_commit_msg(&commit.message);
-        let subject_line = subject.lines().next().unwrap_or("");
+        let parent_ids = commit
+            .parent_commit_ids
+            .iter()
+            .map(|parent| parent.to_string())
+            .collect::<Vec<_>>();
+        let parents = parent_ids.join(" ");
+        let short_parents = parent_ids
+            .iter()
+            .map(|parent| parent.chars().take(ctx.abbrev_len).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (message, _) = parse_commit_msg(&commit.message);
+        let subject_line = message.lines().next().unwrap_or("");
+        let body = pretty_message_body(message);
+        let raw_body = pretty_raw_body(message);
         let decoration = if ctx.decoration.is_empty() {
             String::new()
         } else {
             format!(" ({})", ctx.decoration)
         };
+        let raw_decoration = ctx.decoration.to_string();
+        let author_iso = format_strict_iso_with_timezone(
+            commit.author.timestamp as i64,
+            &commit.author.timezone,
+        );
+        let committer_iso = format_strict_iso_with_timezone(
+            commit.committer.timestamp as i64,
+            &commit.committer.timezone,
+        );
+        let author_date = format_timestamp_with(commit.author.timestamp as i64, &self.date_mode);
+        let committer_date =
+            format_timestamp_with(commit.committer.timestamp as i64, &self.date_mode);
+        let author_ts = commit.author.timestamp.to_string();
+        let committer_ts = commit.committer.timestamp.to_string();
+        let filename_subject = subject_line.replace(' ', "-");
 
-        result = result.replace("%H", &commit_id);
-        result = result.replace("%h", &short_hash);
-        result = result.replace("%s", subject_line);
-        result = result.replace("%f", &subject_line.replace(' ', "-"));
-        result = result.replace("%an", commit.author.name.trim());
-        result = result.replace("%ae", commit.author.email.trim());
-        result = result.replace(
-            "%ad",
-            &format_timestamp_with(commit.author.timestamp as i64, &self.date_mode),
-        );
-        result = result.replace("%cn", commit.committer.name.trim());
-        result = result.replace("%ce", commit.committer.email.trim());
-        result = result.replace(
-            "%cd",
-            &format_timestamp_with(commit.committer.timestamp as i64, &self.date_mode),
-        );
-        result = result.replace("%d", &decoration);
+        let mut result = String::new();
+        let mut idx = 0;
+        while idx < template.len() {
+            let Some(next) = template[idx..].chars().next() else {
+                break;
+            };
+            if next != '%' {
+                result.push(next);
+                idx += next.len_utf8();
+                continue;
+            }
+
+            let rest = &template[idx + 1..];
+            if let Some((consumed, rendered)) = self.render_color_placeholder(rest) {
+                result.push_str(&rendered);
+                idx += 1 + consumed;
+                continue;
+            }
+            if let Some((consumed, rendered)) = render_hex_placeholder(rest) {
+                result.push_str(&rendered);
+                idx += 1 + consumed;
+                continue;
+            }
+
+            let replacement = if rest.starts_with("H") {
+                Some((1, commit_id.as_str()))
+            } else if rest.starts_with("h") {
+                Some((1, short_hash.as_str()))
+            } else if rest.starts_with("P") {
+                Some((1, parents.as_str()))
+            } else if rest.starts_with("p") {
+                Some((1, short_parents.as_str()))
+            } else if rest.starts_with("s") {
+                Some((1, subject_line))
+            } else if rest.starts_with("f") {
+                Some((1, filename_subject.as_str()))
+            } else if rest.starts_with("b") {
+                Some((1, body.as_str()))
+            } else if rest.starts_with("B") {
+                Some((1, raw_body.as_str()))
+            } else if rest.starts_with("n") {
+                Some((1, "\n"))
+            } else if rest.starts_with('%') {
+                Some((1, "%"))
+            } else if rest.starts_with("aI") {
+                Some((2, author_iso.as_str()))
+            } else if rest.starts_with("cI") {
+                Some((2, committer_iso.as_str()))
+            } else if rest.starts_with("at") {
+                Some((2, author_ts.as_str()))
+            } else if rest.starts_with("ct") {
+                Some((2, committer_ts.as_str()))
+            } else if rest.starts_with("an") {
+                Some((2, commit.author.name.trim()))
+            } else if rest.starts_with("ae") {
+                Some((2, commit.author.email.trim()))
+            } else if rest.starts_with("ad") {
+                Some((2, author_date.as_str()))
+            } else if rest.starts_with("cn") {
+                Some((2, commit.committer.name.trim()))
+            } else if rest.starts_with("ce") {
+                Some((2, commit.committer.email.trim()))
+            } else if rest.starts_with("cd") {
+                Some((2, committer_date.as_str()))
+            } else if rest.starts_with("D") {
+                Some((1, raw_decoration.as_str()))
+            } else if rest.starts_with("d") {
+                Some((1, decoration.as_str()))
+            } else if rest.starts_with("m") {
+                Some((1, ">"))
+            } else {
+                None
+            };
+
+            if let Some((consumed, rendered)) = replacement {
+                result.push_str(rendered);
+                idx += 1 + consumed;
+            } else {
+                // Git leaves unknown pretty placeholders literal, e.g. `%q`.
+                result.push('%');
+                idx += 1;
+            }
+        }
 
         format!("{}{}", ctx.graph_prefix, result)
     }
+
+    fn render_color_placeholder(&self, rest: &str) -> Option<(usize, String)> {
+        if rest.starts_with("Creset") {
+            return Some((
+                "Creset".len(),
+                if self.color_enabled {
+                    "\x1b[m".to_string()
+                } else {
+                    String::new()
+                },
+            ));
+        }
+
+        for (name, code) in COLOR_SPECS {
+            let token = format!("C{name}");
+            if rest.starts_with(&token) {
+                return Some((
+                    token.len(),
+                    if self.color_enabled {
+                        ansi_code(code)
+                    } else {
+                        String::new()
+                    },
+                ));
+            }
+        }
+
+        let after_open = rest.strip_prefix("C(")?;
+        let close = after_open.find(')')?;
+        let spec = &after_open[..close];
+        let consumed = "C(".len() + close + 1;
+        let (always, color_spec) = if let Some(color) = spec.strip_prefix("always,") {
+            (true, color)
+        } else if let Some(color) = spec.strip_prefix("auto,") {
+            (false, color)
+        } else {
+            (false, spec)
+        };
+        let enabled = always || self.color_enabled;
+        let rendered = if enabled {
+            color_spec_to_ansi(color_spec.trim()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Some((consumed, rendered))
+    }
+}
+
+const COLOR_SPECS: &[(&str, &str)] = &[
+    ("black", "30"),
+    ("red", "31"),
+    ("green", "32"),
+    ("yellow", "33"),
+    ("blue", "34"),
+    ("magenta", "35"),
+    ("cyan", "36"),
+    ("white", "37"),
+];
+
+fn ansi_code(code: &str) -> String {
+    format!("\x1b[{code}m")
+}
+
+fn color_spec_to_ansi(spec: &str) -> Option<String> {
+    if spec == "reset" {
+        return Some("\x1b[m".to_string());
+    }
+    COLOR_SPECS
+        .iter()
+        .find_map(|(name, code)| (*name == spec).then(|| ansi_code(code)))
+}
+
+fn render_hex_placeholder(rest: &str) -> Option<(usize, String)> {
+    let bytes = rest.as_bytes();
+    if bytes.len() < 3 || bytes[0] != b'x' {
+        return None;
+    }
+    let high = hex_value(bytes[1])?;
+    let low = hex_value(bytes[2])?;
+    let byte = (high << 4) | low;
+    let mut rendered = String::new();
+    rendered.push(char::from(byte));
+    Some((3, rendered))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn pretty_message_body(message: &str) -> String {
+    message
+        .split_once("\n\n")
+        .map(|(_, body)| ensure_trailing_newline(body))
+        .unwrap_or_default()
+}
+
+fn pretty_raw_body(message: &str) -> String {
+    ensure_trailing_newline(message)
+}
+
+fn ensure_trailing_newline(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut output = text.to_string();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn format_strict_iso_with_timezone(timestamp: i64, timezone: &str) -> String {
+    let Some(utc) = DateTime::<Utc>::from_timestamp(timestamp, 0) else {
+        return timestamp.to_string();
+    };
+    let Some(offset_seconds) = parse_timezone_offset(timezone) else {
+        return utc.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+    };
+    let Some(offset) = FixedOffset::east_opt(offset_seconds) else {
+        return utc.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+    };
+    utc.with_timezone(&offset)
+        .format("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string()
+}
+
+fn parse_timezone_offset(timezone: &str) -> Option<i32> {
+    let bytes = timezone.as_bytes();
+    if bytes.len() != 5 || !matches!(bytes[0], b'+' | b'-') {
+        return None;
+    }
+    if !bytes[1..].iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let hours = i32::from(bytes[1] - b'0') * 10 + i32::from(bytes[2] - b'0');
+    let minutes = i32::from(bytes[3] - b'0') * 10 + i32::from(bytes[4] - b'0');
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let seconds = hours * 3600 + minutes * 60;
+    Some(if bytes[0] == b'-' { -seconds } else { seconds })
 }
 
 pub fn format_timestamp(timestamp: i64) -> String {
@@ -368,7 +617,6 @@ pub fn format_timestamp(timestamp: i64) -> String {
 /// zone is always `+0000` (Libra stores a per-signature tz that this i64-only
 /// entry point does not receive).
 pub fn format_timestamp_with(timestamp: i64, mode: &str) -> String {
-    use chrono::{DateTime, Utc};
     let dt = DateTime::<Utc>::from_timestamp(timestamp, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
     match mode {
         "short" => dt.format("%Y-%m-%d").to_string(),
@@ -411,6 +659,38 @@ mod tests {
         let out = formatter.format(&commit, &ctx);
         assert!(out.contains(" - Test subject"));
         assert!(out.split_whitespace().next().unwrap().len() <= 8);
+    }
+
+    #[test]
+    fn format_custom_parent_placeholders() {
+        let mut commit = build_commit("Child subject");
+        let parent_a = ObjectHash::new(&[2; 20]);
+        let parent_b = ObjectHash::new(&[3; 20]);
+        commit.parent_commit_ids = vec![parent_a, parent_b];
+
+        let formatter = CommitFormatter::new(FormatType::Custom("%P|%p".into()));
+        let ctx = FormatContext {
+            graph_prefix: "",
+            decoration: "",
+            abbrev_len: 8,
+            extra_hashes: "",
+        };
+
+        let out = formatter.format(&commit, &ctx);
+        assert_eq!(
+            out,
+            format!(
+                "{} {}|{} {}",
+                parent_a,
+                parent_b,
+                parent_a.to_string().chars().take(8).collect::<String>(),
+                parent_b.to_string().chars().take(8).collect::<String>()
+            )
+        );
+
+        let root = build_commit("Root subject");
+        let out = formatter.format(&root, &ctx);
+        assert_eq!(out, "|");
     }
 
     #[test]

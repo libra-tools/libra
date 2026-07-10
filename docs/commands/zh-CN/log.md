@@ -16,6 +16,8 @@ libra log [OPTIONS] [<revision-range>] [[--] <path>...]
 
 人类模式保留当前 `--oneline`、`--graph`、`--pretty`、`--stat`、`--patch` 和相关输出样式。`--quiet` 抑制人类输出，但仍验证请求的历史范围。
 
+当 stdout 被管道连接且下游命令提前退出时，`libra log` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
+
 ## 选项
 
 ### `-n, --number <N>`
@@ -75,6 +77,8 @@ libra log --no-abbrev-commit
 
 预设继承 `libra log` 既有惯例（时间戳渲染为 UTC `+0000`；`--pretty` 缩写哈希；存储消息中 subject/body 间空行已折叠），故与 Git 预设**结构**一致而非逐字节相同。`libra show --pretty=<preset>` 使用相同格式。
 
+自定义模板支持 `%H` / `%h`（完整 / 缩写提交哈希）、`%P` / `%p`（完整 / 缩写父提交哈希列表）、`%s` / `%f`（主题 / 清理后的主题）、`%b` / `%B`（正文 / 原始 subject+body）、`%n`、ASCII/control `%xNN`、`%%`、`%an` / `%ae` / `%ad` / `%aI` / `%at`（作者）、`%cn` / `%ce` / `%cd` / `%cI` / `%ct`（提交者）、`%d` / `%D`（装饰）、`%m`，以及 `%Cred`、`%C(red)`、`%C(always,red)`、`%Creset` 等常见颜色占位符。未知占位符会按 Git pretty-format 规则原样保留。颜色复位遵循 Git 策略：`%C(always,...)` 即使普通颜色关闭也会强制输出 ANSI，而 `%Creset` 只在颜色输出启用时复位；强制颜色模板若也要强制复位，请使用 `%C(always,reset)`。
+
 ```bash
 libra log --pretty=short
 libra log --pretty=fuller
@@ -105,6 +109,16 @@ libra log --name-only
 ```bash
 libra log --name-status
 libra log --name-status -- src/
+```
+
+### `-z, --null`
+
+使用 NUL 分隔 log 记录和变更路径输出。与 `--name-only` 或
+`--name-status` 组合时，格式化后的提交文本以 `NUL` 结束，路径区块按
+Git 规则分隔，每个路径/状态字段均以 NUL 终止。
+
+```bash
+libra log -z --name-status --format=%s
 ```
 
 ### `--stat`
@@ -173,11 +187,12 @@ libra log --until 2026-03-01
 
 ### `--pretty <FORMAT>`
 
-自定义 pretty-print 格式字符串。支持 `%h`（短哈希）、`%s`（主题）、`%an`（作者名）、`%ae`（作者 email）、`%ad`（作者日期）等占位符。
+自定义 pretty-print 格式字符串。支持上文列出的同一组占位符，包括 `%b`、`%B`、`%n`、ASCII/control `%xNN`、`%%`、严格 ISO 日期 `%aI` / `%cI`、原始时间戳 `%at` / `%ct`、原始装饰 `%D`、`%m` 和颜色占位符。
 
 ```bash
 libra log --pretty="%h - %s (%an)"
 libra log --pretty="format:%H %s"
+libra log --pretty=%P -1
 ```
 
 ### `--format <FORMAT>`
@@ -469,6 +484,7 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | 显示 patch | `git log -p` | `jj diff -r <rev>`（单独命令） | `libra log -p` / `--patch` |
 | 仅名称 | `git log --name-only` | N/A | `libra log --name-only` |
 | 名称和状态 | `git log --name-status` | N/A | `libra log --name-status` |
+| NUL 路径输出 | `git log -z --name-status` | N/A | `libra log -z --name-status` |
 | Diffstat | `git log --stat` | `jj diff --stat -r <rev>` | `libra log --stat` |
 | 简短 diffstat | `git log --shortstat` | 无 | `libra log --shortstat` |
 | 按作者过滤 | `git log --author=<pat>` | `jj log --author <pat>`（revset） | `libra log --author <pat>` |

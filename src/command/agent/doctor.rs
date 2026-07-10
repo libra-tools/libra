@@ -100,7 +100,11 @@ use crate::{
             history::{self, HistoryManager},
             hooks::{
                 providers::{claude_provider, gemini_provider},
-                runtime::{AgentCheckpointRow, insert_agent_checkpoint_row_idempotent},
+                runtime::{
+                    AgentCheckpointRow, SubagentCheckpointRow,
+                    insert_agent_checkpoint_row_idempotent,
+                    insert_subagent_checkpoint_row_idempotent,
+                },
             },
             observed_agents::{AgentStability, PREVIEW_SPECS, STABLE_PROMOTED_SPECS},
         },
@@ -126,6 +130,12 @@ const CLASS_MISSING_OBJECTS: &str = "missing_objects";
 const CLASS_STALE_CATALOG_ROW: &str = "stale_catalog_row";
 const CLASS_MISSING_CATALOG_ROW: &str = "missing_catalog_row";
 const CLASS_MISSING_OBJECT_INDEX: &str = "missing_object_index";
+/// A0-06: a run manifest's `findings_oid` points at a blob missing from the
+/// object store.
+const CLASS_MISSING_FINDINGS_OBJECT: &str = "missing_findings_object";
+/// A0-06: a run's findings blob exists but has no (or a drifted)
+/// `object_index` row (invisible to cloud sync / retention).
+const CLASS_MISSING_FINDINGS_OBJECT_INDEX: &str = "missing_findings_object_index";
 
 #[derive(Debug, Serialize)]
 struct ProviderHookStatus {
@@ -151,6 +161,32 @@ struct DoctorReport {
     gemini_hooks_remnant: bool,
     /// AG-20 checkpoint-store scan (three-class detection + repair).
     checkpoint_store: CheckpointStoreReport,
+    /// A0-06 review/investigate findings-object scan (detection + repair).
+    findings_store: FindingsStoreReport,
+}
+
+#[derive(Debug, Serialize)]
+struct FindingsStoreReport {
+    scanned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    /// Runs whose manifest carries a non-null `findings_oid`.
+    runs_with_findings: usize,
+    repair_applied: bool,
+    repaired: usize,
+    manual_required: usize,
+    findings: Vec<FindingsObjectFinding>,
+}
+
+#[derive(Debug, Serialize)]
+struct FindingsObjectFinding {
+    /// `missing_findings_object` or `missing_findings_object_index`.
+    inconsistency_type: String,
+    run_id: String,
+    /// Diagnosis — OIDs/reasons only, never findings content.
+    detail: String,
+    repaired: bool,
+    manual_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +235,21 @@ enum RepairPlan {
         checkpoint_id: String,
         session_id: String,
         parent_commit: Option<String>,
+        tree_oid: String,
+        metadata_blob_oid: String,
+        traces_commit: String,
+        created_at: i64,
+    },
+    /// Class 2, subagent scope (A0-02): probe-first idempotent catalog
+    /// INSERT rebuilding a `scope='subagent'` row with its linkage columns.
+    InsertSubagentCatalogRow {
+        checkpoint_id: String,
+        session_id: String,
+        parent_commit: Option<String>,
+        parent_checkpoint_id: Option<String>,
+        subagent_session_id: Option<String>,
+        tool_use_id: Option<String>,
+        description: Option<String>,
         tree_oid: String,
         metadata_blob_oid: String,
         traces_commit: String,
@@ -300,6 +351,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
         .any(|ph| ph.name == "gemini" && ph.installed == Some(true));
 
     let checkpoint_store = scan_checkpoint_store(&conn, schema_present, args.repair).await?;
+    let findings_store = scan_agent_findings(&conn, schema_present, args.repair).await?;
 
     emit_report(
         &DoctorReport {
@@ -310,6 +362,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
             provider_hooks,
             gemini_hooks_remnant,
             checkpoint_store,
+            findings_store,
         },
         output,
     )
@@ -372,6 +425,17 @@ struct CheckpointMetadataProbe {
     created_at: i64,
     #[serde(default)]
     scope: Option<String>,
+    // A0-02: subagent-scope checkpoints carry these linkage fields flat in
+    // `metadata.json` so a class-2 (crash-window-B) repair can rebuild a
+    // first-class `scope='subagent'` catalog row instead of leaving it manual.
+    #[serde(default)]
+    parent_checkpoint_id: Option<String>,
+    #[serde(default)]
+    subagent_session_id: Option<String>,
+    #[serde(default)]
+    tool_use_id: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// `Libra-*` trailers from a traces checkpoint commit message.
@@ -1194,6 +1258,41 @@ async fn execute_repair(
                 }
             }
         }
+        RepairPlan::InsertSubagentCatalogRow {
+            checkpoint_id,
+            session_id,
+            parent_commit,
+            parent_checkpoint_id,
+            subagent_session_id,
+            tool_use_id,
+            description,
+            tree_oid,
+            metadata_blob_oid,
+            traces_commit,
+            created_at,
+        } => {
+            let row = SubagentCheckpointRow {
+                checkpoint_id,
+                session_id,
+                parent_commit: parent_commit.as_deref(),
+                parent_checkpoint_id: parent_checkpoint_id.as_deref(),
+                subagent_session_id: subagent_session_id.as_deref(),
+                tool_use_id: tool_use_id.as_deref(),
+                description: description.as_deref(),
+                tree_oid,
+                metadata_blob_oid,
+                traces_commit,
+                created_at: *created_at,
+            };
+            match insert_subagent_checkpoint_row_idempotent(conn, &row).await {
+                Ok(_) => finding.repaired = true,
+                Err(err) => {
+                    finding
+                        .detail
+                        .push_str(&format!("; repair failed: {err:#}"));
+                }
+            }
+        }
         RepairPlan::UpdateCatalogRow {
             checkpoint_id,
             tree_oid,
@@ -1289,16 +1388,16 @@ async fn build_class2_plan(
             ));
         }
     };
-    // The committed-checkpoint writer is the only source of window-B rows;
-    // its rows are always scope='committed' (which is also what the shared
-    // idempotent INSERT stamps). Anything else is unexpected enough that a
-    // human should look.
+    // Class-2 rows come from either the committed writer (scope='committed')
+    // or, since A0-02, the subagent writer (scope='subagent'); both stamp
+    // `metadata.json` with the fields needed to rebuild their catalog row.
+    // Any other scope is unexpected enough that a human should look.
     let scope = metadata
         .scope
         .clone()
         .or_else(|| rc.scope_trailer.clone())
         .unwrap_or_else(|| "committed".to_string());
-    if scope != "committed" {
+    if scope != "committed" && scope != "subagent" {
         return Ok((
             format!("{base}; scope '{scope}' is not auto-repairable — manual review"),
             RepairPlan::Manual,
@@ -1311,6 +1410,24 @@ async fn build_class2_plan(
                 metadata.session_id
             ),
             RepairPlan::Manual,
+        ));
+    }
+    if scope == "subagent" {
+        return Ok((
+            format!("{base}; scope='subagent' row can be rebuilt from the commit's metadata.json"),
+            RepairPlan::InsertSubagentCatalogRow {
+                checkpoint_id: checkpoint_id.to_string(),
+                session_id: metadata.session_id,
+                parent_commit: rc.parent_commit_trailer.clone(),
+                parent_checkpoint_id: metadata.parent_checkpoint_id,
+                subagent_session_id: metadata.subagent_session_id,
+                tool_use_id: metadata.tool_use_id,
+                description: metadata.description,
+                tree_oid: rc.root_tree.clone(),
+                metadata_blob_oid: metadata_blob.to_string(),
+                traces_commit: rc.commit.clone(),
+                created_at: metadata.created_at,
+            },
         ));
     }
     Ok((
@@ -1535,6 +1652,234 @@ async fn session_exists(conn: &DatabaseConnection, session_id: &str) -> CliResul
 /// Same repo-id resolution as the background indexer
 /// (`client_storage::resolve_repo_id_for_index`): the `libra.repoid`
 /// config key, falling back to `unknown-repo`.
+/// Blob OID (hex) of `bytes` WITHOUT writing — content addressing lets us
+/// test whether an on-disk `findings.md` would restore the exact missing
+/// object before touching the store.
+fn blob_oid_hex(bytes: &[u8]) -> String {
+    let header = format!("blob {}\0", bytes.len());
+    let mut content = header.into_bytes();
+    content.extend_from_slice(bytes);
+    ObjectHash::new(&content).to_string()
+}
+
+/// Minimal parse of a run manifest's non-null `findings_oid` (avoids pulling
+/// the review/investigate manifest structs into doctor).
+fn manifest_findings_oid(manifest_path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(manifest_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("findings_oid")?.as_str().map(str::to_string)
+}
+
+/// A0-06: scan review/investigate run manifests for findings-object
+/// inconsistencies, mirroring the checkpoint-store scan scoped to the
+/// `findings_oid` blob:
+/// - `missing_findings_object`: the blob is absent — AUTO-repairable when an
+///   on-disk `findings.md` re-hashes to the same OID (content-addressed, so
+///   the rewrite is exact + idempotent); MANUAL when `findings.md` is gone or
+///   changed.
+/// - `missing_findings_object_index`: the blob is present but has no/drifted
+///   `object_index` row — re-inserted so cloud sync / retention see it.
+///
+/// Doctor is foreground: repairs write the blob + insert the `object_index`
+/// row directly (idempotent), never the background enqueue.
+async fn scan_agent_findings(
+    conn: &DatabaseConnection,
+    schema_present: bool,
+    repair: bool,
+) -> CliResult<FindingsStoreReport> {
+    use crate::internal::ai::review::store::{AGENT_FINDINGS_OTYPE, is_valid_run_id};
+
+    let mut report = FindingsStoreReport {
+        scanned: false,
+        note: None,
+        runs_with_findings: 0,
+        repair_applied: repair,
+        repaired: 0,
+        manual_required: 0,
+        findings: Vec::new(),
+    };
+    if !schema_present {
+        report.note = Some("agent schema not present (run `libra init`?)".to_string());
+        return Ok(report);
+    }
+    let repo_path = match util::try_get_storage_path(None) {
+        Ok(path) => path,
+        Err(err) => {
+            report.note = Some(format!("failed to locate .libra directory: {err}"));
+            return Ok(report);
+        }
+    };
+    report.scanned = true;
+    let reader = ObjectReader {
+        storage: Arc::new(ClientStorage::init(repo_path.join("objects"))),
+    };
+    let repo_id = resolve_repo_id(conn).await;
+    let runs_root = repo_path.join("sessions").join("agent-runs");
+    let entries = match std::fs::read_dir(&runs_root) {
+        Ok(read_dir) => read_dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(err) => {
+            report.note = Some(format!("failed to read agent-runs directory: {err}"));
+            return Ok(report);
+        }
+    };
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir() {
+            continue;
+        }
+        let Some(run_id) = run_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        // Skip `.admission` and any foreign directory — same validity gate the
+        // run stores use.
+        if !is_valid_run_id(&run_id) {
+            continue;
+        }
+        let Some(findings_oid) = manifest_findings_oid(&run_dir.join("manifest.json")) else {
+            continue;
+        };
+        report.runs_with_findings += 1;
+
+        let on_disk = std::fs::read(run_dir.join("findings.md"))
+            .ok()
+            .filter(|bytes| !bytes.is_empty());
+
+        if !reader.exists_str(&findings_oid) {
+            // Auto-repairable only when findings.md is present AND re-hashes to
+            // the missing OID (content-addressed → the rewrite is exact and
+            // idempotent). `filter` binds the bytes without any fallible unwrap.
+            let recoverable = on_disk
+                .as_ref()
+                .filter(|bytes| blob_oid_hex(bytes) == findings_oid);
+            if let Some(bytes) = recoverable {
+                let (repaired, detail) = if repair {
+                    crate::utils::object::write_git_object(&repo_path, "blob", bytes).map_err(
+                        |e| {
+                            CliError::fatal(format!(
+                                "failed to rewrite findings blob for run '{run_id}': {e}"
+                            ))
+                        },
+                    )?;
+                    insert_object_index_row(
+                        conn,
+                        &findings_oid,
+                        AGENT_FINDINGS_OTYPE,
+                        bytes.len() as i64,
+                        &repo_id,
+                    )
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!(
+                            "failed to reinsert findings object_index for run '{run_id}': {e}"
+                        ))
+                    })?;
+                    report.repaired += 1;
+                    (
+                        true,
+                        format!(
+                            "findings object {findings_oid} was missing; rewrote it from findings.md"
+                        ),
+                    )
+                } else {
+                    (
+                        false,
+                        format!(
+                            "findings object {findings_oid} is missing but findings.md matches — repairable"
+                        ),
+                    )
+                };
+                report.findings.push(FindingsObjectFinding {
+                    inconsistency_type: CLASS_MISSING_FINDINGS_OBJECT.to_string(),
+                    run_id,
+                    detail,
+                    repaired,
+                    manual_required: false,
+                });
+            } else {
+                report.manual_required += 1;
+                report.findings.push(FindingsObjectFinding {
+                    inconsistency_type: CLASS_MISSING_FINDINGS_OBJECT.to_string(),
+                    run_id,
+                    detail: format!(
+                        "findings object {findings_oid} is missing and findings.md is absent or changed — manual review"
+                    ),
+                    repaired: false,
+                    manual_required: true,
+                });
+            }
+            continue;
+        }
+
+        // Blob present — ensure a correctly-shaped object_index row.
+        let Ok(hash) = ObjectHash::from_str(&findings_oid) else {
+            continue;
+        };
+        let o_size = reader.read_raw(&hash).map(|b| b.len() as i64).unwrap_or(0);
+        let shape = object_index_row_shape(conn, &findings_oid, &repo_id).await?;
+        // The o_type is cosmetic here: doctor enumerates findings from the
+        // MANIFEST (`findings_oid`), not from `object_index`, and cloud sync
+        // does not filter by o_type. The shared index consumer also refuses to
+        // retag an already-`agent_*` row, so a findings blob whose bytes were
+        // first indexed as `agent_transcript` legitimately keeps that tag.
+        // Flag only a genuinely-untracked (absent) or wrong-SIZE row; never a
+        // benign tag difference — that would start a doctor↔writer tag-war.
+        let needs_repair = match &shape {
+            None => true,
+            Some((_o_type, size)) => *size != o_size,
+        };
+        if needs_repair {
+            let repaired = if repair {
+                if shape.is_some() {
+                    update_object_index_row_shape(
+                        conn,
+                        &findings_oid,
+                        AGENT_FINDINGS_OTYPE,
+                        o_size,
+                        &repo_id,
+                    )
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!(
+                            "failed to update findings object_index for run '{run_id}': {e}"
+                        ))
+                    })?;
+                } else {
+                    insert_object_index_row(
+                        conn,
+                        &findings_oid,
+                        AGENT_FINDINGS_OTYPE,
+                        o_size,
+                        &repo_id,
+                    )
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!(
+                            "failed to insert findings object_index for run '{run_id}': {e}"
+                        ))
+                    })?;
+                }
+                report.repaired += 1;
+                true
+            } else {
+                false
+            };
+            report.findings.push(FindingsObjectFinding {
+                inconsistency_type: CLASS_MISSING_FINDINGS_OBJECT_INDEX.to_string(),
+                run_id,
+                detail: format!("findings object {findings_oid} has no/drifted object_index row"),
+                repaired,
+                manual_required: false,
+            });
+        }
+    }
+    Ok(report)
+}
+
 async fn resolve_repo_id(conn: &DatabaseConnection) -> String {
     match ConfigKv::get_with_conn(conn, "libra.repoid").await {
         Ok(Some(entry)) if !entry.value.trim().is_empty() => entry.value,
@@ -1719,6 +2064,36 @@ fn emit_report(report: &DoctorReport, output: &OutputConfig) -> CliResult<()> {
             );
         }
         if let Some(note) = &store.note {
+            println!("  Note: {note}");
+        }
+    }
+
+    let findings = &report.findings_store;
+    println!("Findings store:");
+    if !findings.scanned {
+        println!(
+            "  not scanned ({})",
+            findings.note.as_deref().unwrap_or("unavailable")
+        );
+    } else {
+        println!("  Runs with findings    : {}", findings.runs_with_findings);
+        println!("  Inconsistencies       : {}", findings.findings.len());
+        for finding in &findings.findings {
+            let status = if finding.repaired {
+                "repaired"
+            } else if finding.manual_required {
+                "manual action required"
+            } else if findings.repair_applied {
+                "NOT repaired"
+            } else {
+                "detected (run --repair)"
+            };
+            println!(
+                "    [{}] {}: {} — {status}",
+                finding.inconsistency_type, finding.run_id, finding.detail
+            );
+        }
+        if let Some(note) = &findings.note {
             println!("  Note: {note}");
         }
     }

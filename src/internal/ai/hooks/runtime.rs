@@ -73,10 +73,10 @@ pub const AI_SESSION_SCHEMA: &str = "libra.ai_session.v2";
 ///
 /// - [`HookTarget::AiIntent`] — the canonical `refs/libra/intent` writer used
 ///   by `libra code` and the existing Claude/Gemini hook configs.
-/// - [`HookTarget::AgentTraces`] — the new external-Agent capture writer
-///   that lives on `refs/libra/traces`. **Phase 1 stub**: the variant
-///   exists for API surface stability, but the runtime currently rejects it
-///   with a clear "not yet wired" message; Phase 2 lands the actual writer.
+/// - [`HookTarget::AgentTraces`] — the external-Agent capture writer that
+///   lives on `refs/libra/traces`. Fully wired: the runtime ingests the
+///   lifecycle event into `agent_session` and writes an E4-libra checkpoint
+///   commit on `SessionEnd` (see [`ingest_agent_traces_payload`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookTarget {
     AiIntent,
@@ -162,16 +162,24 @@ pub async fn process_hook_event_from_stdin(
     process_hook_event_with_target(command, expected_kind, provider, HookTarget::AiIntent).await
 }
 
+/// Marker error for hook-envelope validation failures (size / UTF-8 / empty
+/// / JSON / schema / transcript-path). A0-03: the command layer
+/// (`command/agent/hooks.rs`) maps any ingest error whose chain carries this
+/// to the stable `LBR-AGENT-008` (`AgentHookEnvelopeInvalid`) code; genuine
+/// runtime failures (DB open, storage resolution, redaction) stay generic
+/// fatals so an envelope reject never masquerades as an internal error.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct HookEnvelopeInvalid(pub String);
+
 /// Parametric form of [`process_hook_event_from_stdin`] that selects the
 /// writer destination via [`HookTarget`].
 ///
-/// CEX-EntireIO Phase 1.5: this is the seam Phase 2 grows into. For
-/// [`HookTarget::AiIntent`] the function is exactly the historical behaviour
-/// (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the function
-/// runs a Phase 1 minimal ingest — stdin parse, validate, redact, and
-/// upsert into `agent_session` — and returns. Phase 2 will extend the
-/// AgentTraces branch to additionally generate checkpoint commits on
-/// `refs/libra/traces`.
+/// For [`HookTarget::AiIntent`] the function is exactly the historical
+/// behaviour (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the
+/// function runs the external-Agent capture ingest — stdin parse, validate,
+/// redact, upsert into `agent_session`, and (on `SessionEnd`) write an
+/// E4-libra checkpoint commit on `refs/libra/traces`.
 pub async fn process_hook_event_with_target(
     command: super::provider::ProviderHookCommand,
     expected_kind: LifecycleEventKind,
@@ -405,13 +413,13 @@ pub async fn process_hook_event_with_target(
     Ok(())
 }
 
-/// Load `core.objectformat` from the local repository and pin the global hash kind.
-/// CEX-EntireIO Phase 1: minimal AgentTraces ingest.
+/// External-Agent capture ingest (`refs/libra/traces`).
 ///
 /// Reads the hook envelope from stdin, validates, parses to a
 /// [`LifecycleEvent`], redacts free-form fields, and upserts into
-/// `agent_session`. Does NOT yet generate checkpoint commits on
-/// `refs/libra/traces` — that is Phase 2 work.
+/// `agent_session`. On `SessionEnd` it also writes an E4-libra checkpoint
+/// commit on `refs/libra/traces` (it resolves the storage path and calls
+/// [`ingest_agent_traces_payload`] with `Some(repo_path)`).
 ///
 /// Boundary conditions:
 /// - Idempotent on repeated `SessionStart` for the same provider session
@@ -430,7 +438,10 @@ async fn ingest_agent_traces(
         .read_to_end(&mut stdin_bytes)
         .context("failed to read stdin")?;
     if stdin_bytes.len() > MAX_STDIN_BYTES {
-        bail!("hook input exceeds {MAX_STDIN_BYTES} bytes");
+        // A0-03: envelope-size reject → LBR-AGENT-008 at the command layer.
+        return Err(
+            HookEnvelopeInvalid(format!("hook input exceeds {MAX_STDIN_BYTES} bytes")).into(),
+        );
     }
 
     // Resolve storage and pin hash kind, exactly as the AiIntent flow does,
@@ -497,21 +508,27 @@ pub async fn ingest_agent_traces_payload(
         partial = tracing::field::Empty,
     );
 
+    // A0-03: every envelope-content validation failure carries
+    // [`HookEnvelopeInvalid`] so the command layer maps it to
+    // `LBR-AGENT-008`, distinct from downstream store/runtime failures.
     if payload.len() > MAX_STDIN_BYTES {
         ingest_span.record("validated", false);
-        bail!("hook input exceeds {MAX_STDIN_BYTES} bytes");
+        return Err(
+            HookEnvelopeInvalid(format!("hook input exceeds {MAX_STDIN_BYTES} bytes")).into(),
+        );
     }
-    let stdin = std::str::from_utf8(payload).context("hook input is not valid UTF-8")?;
+    let stdin = std::str::from_utf8(payload)
+        .map_err(|err| HookEnvelopeInvalid(format!("hook input is not valid UTF-8: {err}")))?;
     if stdin.trim().is_empty() {
         ingest_span.record("validated", false);
-        bail!("hook input is empty");
+        return Err(HookEnvelopeInvalid("hook input is empty".to_string()).into());
     }
 
-    let envelope: SessionHookEnvelope =
-        serde_json::from_str(stdin).map_err(|err| anyhow!("invalid hook JSON payload: {err}"))?;
+    let envelope: SessionHookEnvelope = serde_json::from_str(stdin)
+        .map_err(|err| HookEnvelopeInvalid(format!("invalid hook JSON payload: {err}")))?;
     if let Err(err) = validate_session_hook_envelope(&envelope, MAX_TRANSCRIPT_PATH_BYTES) {
         ingest_span.record("validated", false);
-        return Err(err);
+        return Err(HookEnvelopeInvalid(format!("{err}")).into());
     }
     ingest_span.record("validated", true);
 
@@ -750,7 +767,10 @@ pub async fn ingest_agent_traces_payload(
     // checkpoints give `libra agent checkpoint rewind` turn-level granularity.
     if matches!(
         event.kind,
-        LifecycleEventKind::SessionEnd | LifecycleEventKind::TurnEnd
+        LifecycleEventKind::SessionEnd
+            | LifecycleEventKind::TurnEnd
+            | LifecycleEventKind::SubagentStart
+            | LifecycleEventKind::SubagentEnd
     ) && let Some(repo) = repo_path
     {
         // AG-19 owner-race closure: the pre-upsert owner check above is a
@@ -789,18 +809,42 @@ pub async fn ingest_agent_traces_payload(
             );
             return Ok(());
         }
-        write_committed_checkpoint(
-            conn,
-            repo,
-            &session_id,
-            &envelope,
-            agent_kind,
-            &event,
-            &redaction_report_json,
-            &all_matches,
-            now,
-        )
-        .await?;
+        // A0-02: `SubagentStart` / `SubagentEnd` boundaries materialise an
+        // independent `scope='subagent'` checkpoint (its own `traces`
+        // commit + `agent_checkpoint` row) that carries parent session /
+        // checkpoint linkage, so `checkpoint list/show/export/prune` and
+        // `doctor` surface nested runs as first-class checkpoints instead of
+        // leaving them as bounded `subagent_events` metadata on the main
+        // checkpoint. `SessionEnd` / `TurnEnd` keep the `committed` path.
+        if matches!(
+            event.kind,
+            LifecycleEventKind::SubagentStart | LifecycleEventKind::SubagentEnd
+        ) {
+            write_subagent_checkpoint(
+                conn,
+                repo,
+                &session_id,
+                &envelope,
+                agent_kind,
+                &event,
+                &redaction_report_json,
+                now,
+            )
+            .await?;
+        } else {
+            write_committed_checkpoint(
+                conn,
+                repo,
+                &session_id,
+                &envelope,
+                agent_kind,
+                &event,
+                &redaction_report_json,
+                &all_matches,
+                now,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -1022,6 +1066,12 @@ async fn write_committed_checkpoint(
     }
     let metadata_bytes =
         serde_json::to_vec_pretty(&metadata).context("serialize checkpoint metadata")?;
+    // AG-19 / G4 redaction-before-persist: every blob entering the traces
+    // writer is a `RedactedBytes`, so no `&[u8]` can reach the checkpoint
+    // sink. The pass is idempotent defense-in-depth — these buffers are
+    // already built from redacted extraction outputs / rule-hit statistics,
+    // and the redactor skips existing `<REDACTED:…>` spans.
+    let (metadata_redacted, _) = Redactor::new_default().redact(&metadata_bytes);
 
     // Canonical E3-JSONL evidence line(s) for events/lifecycle.jsonl —
     // exactly the redacted triggering event today; the slice API keeps
@@ -1037,8 +1087,10 @@ async fn write_committed_checkpoint(
     };
     let lifecycle_events_jsonl =
         super::lifecycle::lifecycle_events_to_canonical_jsonl(&[event], &canonical_ctx);
+    let (lifecycle_events_redacted, _) = Redactor::new_default().redact(&lifecycle_events_jsonl);
     let redaction_report_bytes = serde_json::to_vec_pretty(&redaction_report_value)
         .context("serialize checkpoint redaction_report.json")?;
+    let (redaction_report_redacted, _) = Redactor::new_default().redact(&redaction_report_bytes);
 
     // AG-20 observability (`agent.md` §6): one span per checkpoint write.
     // Required fields: checkpoint_id, session_id, stage (progression),
@@ -1123,10 +1175,10 @@ async fn write_committed_checkpoint(
             parent_commit: parent_commit.as_deref(),
             scope: CheckpointScope::Committed,
             tool_use_id: None,
-            metadata_json: &metadata_bytes,
+            metadata_json: &metadata_redacted,
             transcript_redacted: &transcript_redacted,
-            lifecycle_events_jsonl: &lifecycle_events_jsonl,
-            redaction_report_json: &redaction_report_bytes,
+            lifecycle_events_jsonl: &lifecycle_events_redacted,
+            redaction_report_json: &redaction_report_redacted,
         })
         .await
         .context("failed to append checkpoint commit on traces")?;
@@ -1186,6 +1238,341 @@ async fn write_committed_checkpoint(
     // Phase 3 enhancement that adds per-rule counters to metadata.
     let _ = redaction_matches;
     Ok(())
+}
+
+/// A0-02: materialise an independent `scope='subagent'` checkpoint at a
+/// `SubagentStart` / `SubagentEnd` boundary.
+///
+/// Unlike [`write_committed_checkpoint`], this path deliberately does NOT
+/// re-read the parent agent's on-disk transcript — a subagent boundary event
+/// carries no separate transcript, and the parent session's `committed`
+/// checkpoints already capture the full transcript. The subagent checkpoint's
+/// tree carries a compact `metadata.json` describing the boundary (kind,
+/// tool, source, timestamp, parent linkage) with an empty transcript blob, so
+/// it is fully `list/show/export/prune/doctor`-able while staying cheap to
+/// write. Parent linkage (`parent_checkpoint_id`) points at the session's
+/// most recent `committed` checkpoint so `checkpoint show` can walk from a
+/// nested run back to the enclosing turn/session checkpoint.
+///
+/// Crash-safety mirrors the committed path: an in-flight marker is persisted
+/// before the traces commit and cleared after the catalog INSERT, so a
+/// concurrent prune in the ref-CAS→catalog window cannot drop the commit.
+#[allow(clippy::too_many_arguments)]
+async fn write_subagent_checkpoint(
+    conn: &sea_orm::DatabaseConnection,
+    repo_path: &std::path::Path,
+    libra_session_id: &str,
+    envelope: &SessionHookEnvelope,
+    agent_kind: &str,
+    event: &LifecycleEvent,
+    redaction_report_json: &str,
+    now: i64,
+) -> Result<()> {
+    use crate::internal::ai::{
+        history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
+        observed_agents::{RedactedBytes, Redactor},
+    };
+
+    // Resolve the parent `committed` checkpoint (if any) for linkage.
+    let parent_checkpoint_id = latest_committed_checkpoint_id(conn, libra_session_id).await?;
+
+    let boundary = match event.kind {
+        LifecycleEventKind::SubagentStart => "start",
+        _ => "end",
+    };
+    // The subagent boundary hook envelope carries only `session_id` + `cwd`
+    // (see the Codex `SubagentStop` row in agent.md) — no distinct subagent
+    // id and no tool-use id. We therefore leave `subagent_session_id` /
+    // `tool_use_id` NULL rather than inventing them: in particular
+    // `event.session_ref` is filled from the transcript PATH by
+    // `build_lifecycle_event`, so persisting it as a subagent id would both
+    // mislabel the column and leak a filesystem path. The tool NAME (if the
+    // provider ever surfaces one) is recorded in the metadata / description
+    // for context only; the id columns stay reserved for a future provider
+    // that emits a real subagent/tool-use id.
+    let tool_name = event.tool_name.clone();
+    let subagent_session_id: Option<String> = None;
+    let tool_use_id: Option<String> = None;
+    // Redact the description before it lands in either the catalog row or
+    // metadata.json — `tool_name` is event-derived and could carry a path.
+    // Redacting once keeps the row's `description` column and the
+    // metadata.json `description` (which doctor rebuilds the row from) byte
+    // -identical.
+    let description = redact_extracted_string(&match tool_name.as_deref() {
+        Some(t) => format!("subagent {boundary} via {t}"),
+        None => format!("subagent {boundary}"),
+    });
+
+    let checkpoint_id = uuid::Uuid::new_v4().to_string();
+
+    // Compact metadata.json. Boundary/source/tool are event-derived and may
+    // reference file paths, so the whole object passes the default redactor
+    // before persist (same discipline as the committed writer's metadata).
+    let source_redacted = event.source.clone().map(redact_extracted_json);
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "checkpoint_id": checkpoint_id,
+        "session_id": libra_session_id,
+        "agent_kind": agent_kind,
+        "scope": "subagent",
+        "provider_session_id": envelope.session_id,
+        "working_dir": envelope.cwd,
+        "created_at": now,
+        // Flat linkage fields (A0-02): the subagent-scope class-2 doctor
+        // repair rebuilds the catalog row straight from these, mirroring the
+        // committed path's metadata-driven repair.
+        "parent_checkpoint_id": parent_checkpoint_id,
+        "subagent_session_id": subagent_session_id,
+        "tool_use_id": tool_use_id,
+        "description": description,
+        "subagent": {
+            "boundary": boundary,
+            "kind": event.kind.to_string(),
+            "tool": tool_name,
+            "source": source_redacted,
+            "timestamp": event.timestamp.to_rfc3339(),
+        },
+    });
+    let metadata_bytes =
+        serde_json::to_vec_pretty(&metadata).context("serialize subagent checkpoint metadata")?;
+    let (metadata_redacted, _) = Redactor::new_default().redact(&metadata_bytes);
+
+    // Empty transcript — the boundary carries no separate transcript body.
+    let transcript_redacted = RedactedBytes::new_unchecked(Vec::new());
+
+    // One canonical lifecycle evidence line for the boundary event.
+    let canonical_ctx = super::lifecycle::CanonicalEventContext {
+        agent_kind,
+        session_id: libra_session_id,
+        provider_session_id: &envelope.session_id,
+        provenance: serde_json::json!({
+            "channel": "hook",
+            "hook_event_name": envelope.hook_event_name,
+        }),
+    };
+    // Defense-in-depth (Codex A0-02 re-review): `build_lifecycle_event`
+    // fills `session_ref` from the transcript PATH, and the default redactor
+    // does not reliably scrub arbitrary absolute paths — so a `SubagentStop`
+    // serialized verbatim would persist that local path in the syncable
+    // `events/lifecycle.jsonl` blob. Clear `session_ref` (and the unused
+    // prompt body) on a sanitized copy before serialization; a subagent
+    // boundary marker needs neither field.
+    let mut sidecar_event = event.clone();
+    sidecar_event.session_ref = None;
+    sidecar_event.prompt = None;
+    let lifecycle_events_jsonl =
+        super::lifecycle::lifecycle_events_to_canonical_jsonl(&[&sidecar_event], &canonical_ctx);
+    let (lifecycle_events_redacted, _) = Redactor::new_default().redact(&lifecycle_events_jsonl);
+
+    let report_value = serde_json::from_str::<serde_json::Value>(redaction_report_json)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let redaction_report_bytes = serde_json::to_vec_pretty(&report_value)
+        .context("serialize subagent checkpoint redaction_report.json")?;
+    let (redaction_report_redacted, _) = Redactor::new_default().redact(&redaction_report_bytes);
+
+    // Parent user-branch HEAD (same semantics/tolerance as committed path).
+    let parent_commit: Option<String> =
+        match crate::internal::head::Head::current_commit_result_with_conn(conn).await {
+            Ok(commit) => commit.map(|h| h.to_string()),
+            Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
+                if detail.contains("HEAD reference is missing") =>
+            {
+                None
+            }
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to resolve HEAD while writing subagent checkpoint: {err}"
+                ));
+            }
+        };
+
+    let marker = history::TracesInflightMarker::new(
+        libra_session_id,
+        &checkpoint_id,
+        Utc::now().timestamp_millis(),
+    );
+    if let Err(err) = history::write_traces_inflight_marker(conn, &marker).await {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to persist subagent traces in-flight marker; continuing"
+        );
+    }
+
+    let objects_dir = repo_path.join("objects");
+    std::fs::create_dir_all(&objects_dir)
+        .context("create objects dir for subagent checkpoint commit")?;
+    let storage = std::sync::Arc::new(crate::utils::client_storage::ClientStorage::init(
+        objects_dir,
+    ));
+    let manager = HistoryManager::new_with_ref(
+        storage,
+        repo_path.to_path_buf(),
+        std::sync::Arc::new(conn.clone()),
+        crate::internal::branch::TRACES_BRANCH,
+    );
+
+    let written = manager
+        .append_checkpoint_commit(CheckpointCommitParams {
+            checkpoint_id: &checkpoint_id,
+            session_id: libra_session_id,
+            agent_kind,
+            parent_commit: parent_commit.as_deref(),
+            scope: CheckpointScope::Subagent,
+            tool_use_id: tool_use_id.as_deref(),
+            metadata_json: &metadata_redacted,
+            transcript_redacted: &transcript_redacted,
+            lifecycle_events_jsonl: &lifecycle_events_redacted,
+            redaction_report_json: &redaction_report_redacted,
+        })
+        .await
+        .context("failed to append subagent checkpoint commit on traces")?;
+
+    let mut committed_marker = marker.clone();
+    committed_marker.commit = Some(written.commit_hash.to_string());
+    committed_marker.oids = vec![
+        written.tree_oid.to_string(),
+        written.metadata_blob_oid.to_string(),
+    ];
+    if let Err(err) = history::write_traces_inflight_marker(conn, &committed_marker).await {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to refresh subagent traces in-flight marker after ref CAS"
+        );
+    }
+
+    insert_subagent_checkpoint_row_idempotent(
+        conn,
+        &SubagentCheckpointRow {
+            checkpoint_id: &checkpoint_id,
+            session_id: libra_session_id,
+            parent_commit: parent_commit.as_deref(),
+            parent_checkpoint_id: parent_checkpoint_id.as_deref(),
+            subagent_session_id: subagent_session_id.as_deref(),
+            tool_use_id: tool_use_id.as_deref(),
+            description: Some(&description),
+            tree_oid: &written.tree_oid.to_string(),
+            metadata_blob_oid: &written.metadata_blob_oid.to_string(),
+            traces_commit: &written.commit_hash.to_string(),
+            created_at: now,
+        },
+    )
+    .await?;
+
+    if let Err(err) =
+        history::clear_traces_inflight_marker(conn, libra_session_id, &checkpoint_id).await
+    {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to clear subagent traces in-flight marker after catalog insert"
+        );
+    }
+
+    Ok(())
+}
+
+/// Most-recent `committed` checkpoint id for a session, used as the
+/// `parent_checkpoint_id` linkage of a freshly-materialised subagent
+/// checkpoint. Returns `None` when the session has no committed checkpoint
+/// yet (the subagent ran before the first turn/session checkpoint landed).
+async fn latest_committed_checkpoint_id(
+    conn: &sea_orm::DatabaseConnection,
+    session_id: &str,
+) -> Result<Option<String>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT checkpoint_id FROM agent_checkpoint \
+             WHERE session_id = ? AND scope = 'committed' \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [session_id.into()],
+        ))
+        .await
+        .context("failed to resolve latest committed checkpoint for subagent linkage")?;
+    row.map(|r| r.try_get::<String>("", "checkpoint_id"))
+        .transpose()
+        .context("failed to read parent committed checkpoint id")
+}
+
+/// Column values for one `scope='subagent'` `agent_checkpoint` row (A0-02).
+/// Carries the subagent-specific linkage columns the committed path leaves
+/// NULL: `parent_checkpoint_id`, `subagent_session_id`, `tool_use_id`,
+/// `description`.
+#[derive(Debug)]
+pub struct SubagentCheckpointRow<'a> {
+    pub checkpoint_id: &'a str,
+    pub session_id: &'a str,
+    pub parent_commit: Option<&'a str>,
+    pub parent_checkpoint_id: Option<&'a str>,
+    pub subagent_session_id: Option<&'a str>,
+    pub tool_use_id: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub tree_oid: &'a str,
+    pub metadata_blob_oid: &'a str,
+    /// `CheckpointCommit.commit_hash` — lands in the `traces_commit` column.
+    pub traces_commit: &'a str,
+    pub created_at: i64,
+}
+
+/// Idempotent INSERT of a `scope='subagent'` catalog row, mirroring
+/// [`insert_agent_checkpoint_row_idempotent`]: probe by `traces_commit`
+/// first (a crash-retry or doctor backfill must not double-insert), then
+/// INSERT with an `ON CONFLICT(checkpoint_id) DO NOTHING` backstop. Returns
+/// `true` when this call inserted the row.
+pub async fn insert_subagent_checkpoint_row_idempotent(
+    conn: &sea_orm::DatabaseConnection,
+    row: &SubagentCheckpointRow<'_>,
+) -> Result<bool> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    use crate::internal::ai::history;
+
+    if let Some(existing_id) =
+        history::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
+    {
+        tracing::info!(
+            checkpoint_id = %row.checkpoint_id,
+            existing_checkpoint_id = %existing_id,
+            "agent_checkpoint subagent row already present for traces commit; skipping INSERT"
+        );
+        return Ok(false);
+    }
+    let parent_commit_value: sea_orm::Value = row.parent_commit.map(str::to_string).into();
+    let parent_checkpoint_value: sea_orm::Value =
+        row.parent_checkpoint_id.map(str::to_string).into();
+    let subagent_session_value: sea_orm::Value = row.subagent_session_id.map(str::to_string).into();
+    let tool_use_value: sea_orm::Value = row.tool_use_id.map(str::to_string).into();
+    let description_value: sea_orm::Value = row.description.map(str::to_string).into();
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_checkpoint (
+                checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
+                tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
+                subagent_session_id, description, created_at
+             ) VALUES (?, ?, ?, 'subagent', ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(checkpoint_id) DO NOTHING",
+            [
+                row.checkpoint_id.into(),
+                row.session_id.into(),
+                parent_checkpoint_value,
+                parent_commit_value,
+                row.tree_oid.into(),
+                row.metadata_blob_oid.into(),
+                row.traces_commit.into(),
+                tool_use_value,
+                subagent_session_value,
+                description_value,
+                row.created_at.into(),
+            ],
+        ))
+        .await
+        .context("failed to insert subagent agent_checkpoint row")?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Column values for one `agent_checkpoint` row (scope is always

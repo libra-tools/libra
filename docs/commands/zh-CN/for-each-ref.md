@@ -18,7 +18,10 @@ libra for-each-ref [--heads] [--tags] [--remotes] [--all] [--format=<format>] [-
 
 使用 `--points-at <object>` 可保留指向已解析对象的 refs。Annotated tags 同时匹配其 tag object 和 peeled target commit，匹配 Git 常见的 `for-each-ref --points-at HEAD` 行为。
 
-`--format` 选项接受一个简单 atom 语言。支持的 atoms：
+当 stdout 被管道连接且下游命令提前退出时，`libra for-each-ref` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
+
+`--format` 选项接受 Git 的 `%(atom)` ref 模板语言；它不同于
+`log`/`show`/`shortlog` 的 `%` pretty-format 占位符。支持的 atoms：
 
 | Atom | 值 |
 |---|---|

@@ -17,6 +17,12 @@ libra revert --abort
 
 The command works by computing the diff between the target commit and its parent, then applying the inverse of that diff to the current working tree and index. If the resulting state is clean, a new commit is recorded with a message of the form `Revert "<original subject>"`.
 
+The revert commit uses the current author and committer identity/date, honoring
+`GIT_AUTHOR_*` and `GIT_COMMITTER_*` through the same environment rules as
+`libra commit` when it creates the commit. The generated subject is derived from
+the target commit's de-signed message body, so an embedded `gpgsig` block is not
+used as the original subject.
+
 Reverting a root commit (one with no parent) produces an empty tree, effectively undoing the initial commit's changes.
 
 To revert a **merge commit** (one with more than one parent), pass `-m <parent-number>` to choose which parent is the mainline; the merge's changes are then computed relative to that parent. See [`-m`, `--mainline`](#-m---mainline-parent-number) below.

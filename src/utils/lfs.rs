@@ -9,92 +9,40 @@ use std::{
 };
 
 use git_internal::internal::index::Index;
-use ignore::{Match, gitignore::GitignoreBuilder};
 use lazy_static::lazy_static;
 use regex::Regex;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use ring::digest::{Context, SHA256};
 use url::Url;
-use wax::Program;
 
-use crate::utils::{path, path_ext::PathExt, util};
+use crate::utils::{attributes, path, util};
 
 lazy_static! {
-    static ref LFS_PATTERNS: Vec<String> = { // cache
-        let attr_path = path::attributes().to_string_or_panic();
-        match extract_lfs_patterns(&attr_path) {
-            Ok(patterns) => patterns,
-            Err(err) => {
-                tracing::warn!(
-                    attributes = %attr_path,
-                    error = %err,
-                    "failed to parse LFS patterns from attributes file; treating as no LFS patterns"
-                );
-                Vec::new()
-            }
-        }
-    };
-
     pub static ref LFS_HEADERS: HeaderMap = {
         let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.git-lfs+json"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/vnd.git-lfs+json"));
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.git-lfs+json"),
+        );
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.git-lfs+json"),
+        );
         headers
     };
 }
 
 /// Check if a file is LFS tracked
-/// - support Glob pattern matching
-/// - only check root attributes file now, should check all attributes files in sub-dirs
+/// - supports Git/Libra attributes sources
 /// - absolute path
 ///
-/// Returns `false` on any internal failure (malformed pattern, non-UTF-8 path,
-/// gitignore build error) so a corrupt `.libra_attributes` cannot crash `libra add`
-/// or other LFS-aware flows. Errors are logged via `tracing::warn!`.
+/// Returns `false` for paths outside the current worktree or attributes that do
+/// not assign `filter=lfs`.
 pub fn is_lfs_tracked<P>(path: P) -> bool
 where
     P: AsRef<Path>,
 {
-    if LFS_PATTERNS.is_empty() {
-        return false;
-    }
-
-    let patterns = LFS_PATTERNS.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-
-    let mut gitignore = GitignoreBuilder::new(util::working_dir());
-    patterns.iter().for_each(|&s| {
-        let _ = gitignore.add_line(None, s);
-    });
-    let gitignore_matched = match gitignore.build() {
-        Ok(gitignore) => matches!(gitignore.matched(&path, false), Match::Ignore(_)),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "failed to build gitignore from LFS patterns; treating path as not tracked"
-            );
-            false
-        }
-    };
-
-    let path = util::to_workdir_path(path);
-    let glob = match wax::any(patterns) {
-        Ok(glob) => glob,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "failed to compile LFS glob pattern; falling back to gitignore-only match"
-            );
-            return gitignore_matched;
-        }
-    };
-    let Some(path_str) = path.to_str() else {
-        tracing::warn!(
-            path = %path.display(),
-            "skipping LFS glob check for non-UTF-8 path; using gitignore-only result"
-        );
-        return gitignore_matched;
-    };
-    glob.is_match(path_str) || gitignore_matched
+    attributes::is_lfs_tracked(path.as_ref())
 }
 
 const LFS_VERSION: &str = "https://git-lfs.github.com/spec/v1";

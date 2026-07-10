@@ -34,7 +34,8 @@ use libra::internal::ai::{
     hooks::{
         LifecycleEventKind, ProviderHookCommand, claude_provider,
         runtime::{
-            AgentCheckpointRow, ingest_agent_traces_payload, insert_agent_checkpoint_row_idempotent,
+            AgentCheckpointRow, SubagentCheckpointRow, ingest_agent_traces_payload,
+            insert_agent_checkpoint_row_idempotent, insert_subagent_checkpoint_row_idempotent,
         },
     },
 };
@@ -738,6 +739,108 @@ async fn catalog_insert_is_idempotent_across_crash_retries() {
     .await
     .expect("fresh insert");
     assert!(inserted_fresh);
+}
+
+/// A0-02 subagent_scope: a `scope='subagent'` catalog row persists its
+/// subagent-specific linkage columns (`parent_checkpoint_id`,
+/// `subagent_session_id`, `tool_use_id`, `description`) that the committed
+/// path leaves NULL, dedupes idempotently by `traces_commit`, and coexists
+/// with the parent `committed` row so the two stay distinguishable by scope.
+#[tokio::test]
+#[serial]
+async fn subagent_scope_row_persists_linkage_and_is_idempotent() {
+    let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
+    // Parent committed checkpoint the subagent links back to.
+    let parent = repo.ingest_session("sess-subagent", json!({})).await;
+
+    let sub_commit = "a".repeat(40);
+    let sub_id = uuid::Uuid::new_v4().to_string();
+    let inserted = insert_subagent_checkpoint_row_idempotent(
+        &repo.conn,
+        &SubagentCheckpointRow {
+            checkpoint_id: &sub_id,
+            session_id: &parent.session_id,
+            parent_commit: Some(&parent.traces_commit),
+            parent_checkpoint_id: Some(&parent.checkpoint_id),
+            subagent_session_id: Some("sub-run-123"),
+            tool_use_id: Some("Task"),
+            description: Some("subagent end via Task"),
+            tree_oid: &parent.tree_oid,
+            metadata_blob_oid: &parent.metadata_blob_oid,
+            traces_commit: &sub_commit,
+            created_at: 7,
+        },
+    )
+    .await
+    .expect("insert subagent row");
+    assert!(inserted, "a fresh subagent row must insert");
+
+    // The row persisted with scope='subagent' and all four linkage columns.
+    let row = repo
+        .conn
+        .query_one(Statement::from_sql_and_values(
+            repo.conn.get_database_backend(),
+            "SELECT scope, parent_checkpoint_id, subagent_session_id, tool_use_id, description \
+             FROM agent_checkpoint WHERE checkpoint_id = ?",
+            [sub_id.clone().into()],
+        ))
+        .await
+        .expect("query subagent row")
+        .expect("subagent row present");
+    assert_eq!(row.try_get_by::<String, _>("scope").unwrap(), "subagent");
+    assert_eq!(
+        row.try_get_by::<String, _>("parent_checkpoint_id").unwrap(),
+        parent.checkpoint_id
+    );
+    assert_eq!(
+        row.try_get_by::<String, _>("subagent_session_id").unwrap(),
+        "sub-run-123"
+    );
+    assert_eq!(row.try_get_by::<String, _>("tool_use_id").unwrap(), "Task");
+    assert_eq!(
+        row.try_get_by::<String, _>("description").unwrap(),
+        "subagent end via Task"
+    );
+
+    // Crash-retry with a fresh id but the same traces_commit → deduped.
+    let retry_id = uuid::Uuid::new_v4().to_string();
+    let replayed = insert_subagent_checkpoint_row_idempotent(
+        &repo.conn,
+        &SubagentCheckpointRow {
+            checkpoint_id: &retry_id,
+            session_id: &parent.session_id,
+            parent_commit: Some(&parent.traces_commit),
+            parent_checkpoint_id: Some(&parent.checkpoint_id),
+            subagent_session_id: Some("sub-run-123"),
+            tool_use_id: Some("Task"),
+            description: Some("subagent end via Task"),
+            tree_oid: &parent.tree_oid,
+            metadata_blob_oid: &parent.metadata_blob_oid,
+            traces_commit: &sub_commit,
+            created_at: 8,
+        },
+    )
+    .await
+    .expect("replay subagent insert");
+    assert!(!replayed, "a subagent retry on the same commit must dedupe");
+
+    // Committed parent and subagent child coexist, distinguishable by scope.
+    let scopes = repo
+        .conn
+        .query_all(Statement::from_sql_and_values(
+            repo.conn.get_database_backend(),
+            "SELECT scope FROM agent_checkpoint WHERE session_id = ? ORDER BY scope",
+            [parent.session_id.clone().into()],
+        ))
+        .await
+        .expect("query scopes")
+        .into_iter()
+        .map(|r| r.try_get_by::<String, _>("scope").unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        scopes.contains(&"committed".to_string()) && scopes.contains(&"subagent".to_string()),
+        "both a committed and a subagent scope row must coexist, got {scopes:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

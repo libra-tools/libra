@@ -33,12 +33,15 @@ use super::checkpoint::{
 };
 use crate::{
     internal::{
-        ai::investigate::{
-            DEFAULT_CLAUDE_REVIEW_MAX_BUDGET_USD, DEFAULT_INVESTIGATOR_TIMEOUT,
-            InvestigateCancelHandle, InvestigateRunCursor, InvestigateRunError,
-            InvestigateRunOutcome, InvestigateRunRequest, InvestigateRunStore,
-            InvestigateRunSummary, InvestigateTerminalState, InvestigatorSource, PauseReason,
-            is_launchable_investigator, render_untrusted_findings, run_investigate,
+        ai::{
+            investigate::{
+                DEFAULT_CLAUDE_REVIEW_MAX_BUDGET_USD, DEFAULT_INVESTIGATOR_TIMEOUT,
+                InvestigateCancelHandle, InvestigateRunCursor, InvestigateRunError,
+                InvestigateRunOutcome, InvestigateRunRequest, InvestigateRunStore,
+                InvestigateRunSummary, InvestigateTerminalState, InvestigatorSource, PauseReason,
+                is_launchable_investigator, render_untrusted_findings, run_investigate,
+            },
+            run_admission::{self, RejectedAdmission},
         },
         head::Head,
     },
@@ -67,6 +70,7 @@ EXAMPLES:
     libra investigate cancel <run_id>                         Cancel a run (same cleanup path as Ctrl-C)
     libra investigate clean --run <run_id>                    Remove one finished run directory
     libra investigate clean --all                             Remove every finished run directory
+    libra investigate attach <run_id> <file>                  Attach an external file to a run (provenance=manual)
 
     `libra investigate fix` is not supported yet: it requires the internal
     AgentRuntime fix bridge and fails with LBR-AGENT-010 until that lands.";
@@ -106,6 +110,23 @@ pub enum InvestigateSubcommand {
     /// available yet — fails with LBR-AGENT-010).
     #[command(about = "Apply investigation findings via the fix bridge (unsupported yet)")]
     Fix(InvestigateFixArgs),
+    /// Attach an external file to a run's audit chain (provenance=manual).
+    #[command(
+        about = "Attach an external transcript/findings/context file to a run (provenance=manual)"
+    )]
+    Attach(InvestigateAttachArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct InvestigateAttachArgs {
+    /// Run identifier from `libra investigate list`.
+    #[arg(value_name = "RUN_ID")]
+    pub run_id: String,
+    /// Path to the external file to attach. Its bytes are redacted, written
+    /// to the object store (object_index-tagged), and recorded in the run
+    /// manifest's `manual_attach` list with `provenance=manual`.
+    #[arg(value_name = "FILE")]
+    pub file: std::path::PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -184,7 +205,68 @@ pub async fn execute_safe(args: InvestigateArgs, output: &OutputConfig) -> CliRe
         InvestigateSubcommand::Cancel(a) => cancel(a, output).await,
         InvestigateSubcommand::Clean(a) => clean(a, output).await,
         InvestigateSubcommand::Fix(a) => fix(a, output).await,
+        InvestigateSubcommand::Attach(a) => attach(a, output).await,
     }
+}
+
+/// A0-06: `libra investigate attach <run_id> <file>` — attach an external file
+/// to a run's audit chain (`provenance=manual`). The file bytes are redacted,
+/// objectized into the object store + `object_index`, and recorded as a
+/// `manual_attach` manifest entry. Never mutates findings or run state.
+async fn attach(args: InvestigateAttachArgs, output: &OutputConfig) -> CliResult<()> {
+    let store = open_store()?;
+    store
+        .load_state(&args.run_id)
+        .map_err(|e| map_store_error("failed to read investigate run state", e))?
+        .ok_or_else(|| run_not_found(&args.run_id))?;
+
+    // Sanitize the record/display name FIRST, so a hostile path never reaches
+    // the read-error either.
+    let name = super::sanitize_attachment_name(&args.file);
+    let raw = std::fs::read(&args.file)
+        .map_err(|e| CliError::fatal(format!("failed to read attach file '{name}': {e}")))?;
+    let (redacted, _report) = crate::internal::ai::review::redact_untrusted(&raw);
+    let oid = store
+        .objectize_bytes(redacted.as_bytes())
+        .map_err(|e| map_store_error("failed to objectize the attachment", e))?;
+
+    let attached_at = crate::internal::ai::review::store::utc_timestamp();
+    let entry = serde_json::json!({
+        "oid": oid,
+        "name": name,
+        "provenance": "manual",
+        "size": redacted.len(),
+        "attached_at": attached_at,
+    });
+
+    let mut manifest = store
+        .load_manifest(&args.run_id)
+        .map_err(|e| map_store_error("failed to read investigate run manifest", e))?
+        .ok_or_else(|| run_not_found(&args.run_id))?;
+    manifest.manual_attach.push(entry);
+    manifest.updated_at = attached_at;
+    let attachments = manifest.manual_attach.len();
+    store
+        .write_manifest(&manifest)
+        .map_err(|e| map_store_error("failed to record the attachment in the manifest", e))?;
+
+    if output.is_json() {
+        let payload = serde_json::json!({
+            "schema_version": PAGE_SCHEMA_VERSION,
+            "run_id": args.run_id,
+            "oid": oid,
+            "name": name,
+            "attachments": attachments,
+        });
+        return emit_json_data("investigate_attach", &payload, output);
+    }
+    if !output.quiet {
+        println!(
+            "attached {name} to investigate run {} ({attachments} attachment(s) total)",
+            args.run_id
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +319,19 @@ fn open_store() -> CliResult<InvestigateRunStore> {
         ))
     })?;
     Ok(InvestigateRunStore::new(storage.join("sessions")))
+}
+
+/// A0-04: fail-closed error when the shared review/investigate run queue is
+/// full. Carries `LBR-AGENT-014` (the same code `libra review` emits).
+fn run_queue_full_error(rejected: RejectedAdmission) -> CliError {
+    CliError::fatal(format!(
+        "too many concurrent review/investigate runs: {} active, {} queued (queue cap {}); \
+         refusing to start another",
+        rejected.active, rejected.queued, rejected.cap
+    ))
+    .with_stable_code(StableErrorCode::AgentRunQueueFull)
+    .with_hint("wait for a running review/investigate run to finish, or cancel one with `libra investigate cancel <run_id>` / `libra review cancel <run_id>`")
+    .with_hint("raise the limit with `libra config set agent.max_concurrent_runs <N>` (default 2)")
 }
 
 fn map_store_error(context: &str, error: std::io::Error) -> CliError {
@@ -387,6 +482,29 @@ async fn start(args: InvestigateStartArgs, output: &OutputConfig) -> CliResult<(
         max_turns,
         quorum,
     );
+
+    // A0-04: acquire a shared run-level admission slot (the same queue
+    // `libra review` uses). Over `agent.max_concurrent_runs` this blocks in
+    // the queue; a full queue fails closed with `LBR-AGENT-014`. Held for the
+    // run's lifetime (RAII), released on completion / cancel / failure.
+    let max_runs = run_admission::max_concurrent_runs().await.map_err(|e| {
+        CliError::fatal(format!(
+            "failed to resolve {}: {e}",
+            run_admission::MAX_CONCURRENT_RUNS_KEY
+        ))
+    })?;
+    let _run_slot = match run_admission::admit_blocking(
+        &store.runs_root(),
+        max_runs,
+        run_admission::RUN_QUEUE_CAP,
+        None,
+    )
+    .await
+    .map_err(|e| CliError::fatal(format!("run admission failed: {e}")))?
+    {
+        Ok(slot) => slot,
+        Err(rejected) => return Err(run_queue_full_error(rejected)),
+    };
 
     if !output.quiet && !output.is_json() {
         println!(

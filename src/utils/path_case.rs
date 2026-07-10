@@ -25,7 +25,10 @@ use std::{collections::HashMap, path::Path};
 
 use anyhow::{Result, anyhow};
 
-use crate::internal::config::ConfigKv;
+use crate::{
+    internal::{config::ConfigKv, db::establish_connection},
+    utils::util,
+};
 
 /// The case-handling policy (lore.md 1.14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,6 +73,25 @@ pub async fn case_handling_from_config() -> Result<CaseHandling> {
 /// the approximation caveats).
 pub fn fold_path_key(path: &str) -> String {
     path.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// Component-aware case-folded prefix check for paths.
+///
+/// This intentionally compares path components instead of folded path strings,
+/// so `FooBar` is not treated as a descendant of `foo`.
+pub fn path_starts_with_casefold(path: &Path, parent: &Path) -> bool {
+    let mut path_components = path.components();
+    for parent_component in parent.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        let path_key = fold_path_key(path_component.as_os_str().to_string_lossy().as_ref());
+        let parent_key = fold_path_key(parent_component.as_os_str().to_string_lossy().as_ref());
+        if path_key != parent_key {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether two paths differ ONLY by case (fold-equal but byte-different).
@@ -123,6 +145,27 @@ pub fn same_file_entry(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Whether `candidate` and `tracked` differ only by case and resolve to the
+/// same worktree entry. This is the case-only alias path on case-insensitive
+/// filesystems; it is not an index twin.
+pub fn is_same_file_case_alias(workdir: &Path, candidate: &Path, tracked: &Path) -> bool {
+    let candidate_text = candidate.to_string_lossy();
+    let tracked_text = tracked.to_string_lossy();
+    candidate_text != tracked_text
+        && fold_path_key(candidate_text.as_ref()) == fold_path_key(tracked_text.as_ref())
+        && same_file_entry(&workdir.join(candidate), &workdir.join(tracked))
+}
+
+fn parse_ignore_case_value(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" | "" => Ok(false),
+        other => Err(anyhow!(
+            "unsupported core.ignorecase '{other}' (expected a boolean)"
+        )),
+    }
+}
+
 /// The repo's EFFECTIVE case-insensitivity: explicit `core.ignorecase`
 /// (git-bool, invalid = hard error) wins; otherwise a per-process runtime
 /// probe of the workdir; missing workdir → false (guards no-op).
@@ -131,15 +174,68 @@ pub async fn effective_ignore_case() -> Result<bool> {
         .await
         .map_err(|error| anyhow!("failed to read core.ignorecase: {error}"))?;
     if let Some(entry) = entry {
-        return match entry.value.trim().to_ascii_lowercase().as_str() {
-            "true" | "yes" | "on" | "1" => Ok(true),
-            "false" | "no" | "off" | "0" | "" => Ok(false),
-            other => Err(anyhow!(
-                "unsupported core.ignorecase '{other}' (expected a boolean)"
-            )),
-        };
+        return parse_ignore_case_value(&entry.value);
     }
     Ok(probe_workdir_ignore_case())
+}
+
+/// Synchronous counterpart for status helpers that are intentionally sync.
+///
+/// It honors the explicit `core.ignorecase` override first and falls back to an
+/// uncached probe of the supplied workdir, so callers do not accidentally reuse
+/// the process-wide probe for a different repository.
+pub fn effective_ignore_case_for_dir_sync(dir: &Path) -> Result<bool> {
+    let value = core_ignorecase_value_sync(dir)?;
+    match value {
+        Some(value) => parse_ignore_case_value(&value),
+        None => Ok(probe_dir_ignore_case(dir)),
+    }
+}
+
+fn core_ignorecase_value_sync(dir: &Path) -> Result<Option<String>> {
+    let storage = util::try_get_storage_path(Some(dir.to_path_buf())).map_err(|error| {
+        anyhow!(
+            "failed to resolve repository storage for {}: {error}",
+            dir.display()
+        )
+    })?;
+    let db_path = storage.join(util::DATABASE);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<Option<String>> {
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|err| anyhow!("failed to create tokio runtime: {err}"))?;
+            runtime.block_on(async {
+                let db_path_text = db_path.to_str().ok_or_else(|| {
+                    anyhow!(
+                        "repository database path is not valid UTF-8: {}",
+                        db_path.display()
+                    )
+                })?;
+                let db = establish_connection(db_path_text).await.map_err(|error| {
+                    anyhow!(
+                        "failed to open repository database {}: {error}",
+                        db_path.display()
+                    )
+                })?;
+                let value =
+                    ConfigKv::get_var_case_insensitive_with_conn(&db, "core.", "ignorecase")
+                        .await
+                        .map(|entry| entry.map(|entry| entry.value));
+                db.close().await.map_err(|error| {
+                    anyhow!(
+                        "failed to close repository database {}: {error}",
+                        db_path.display()
+                    )
+                })?;
+                value
+            })
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv()
+        .map_err(|_| anyhow!("core.ignorecase sync worker exited unexpectedly"))?
+        .map_err(|error| anyhow!("failed to read core.ignorecase: {error}"))
 }
 
 /// Runtime probe (cached per process): does the working directory's
@@ -219,6 +315,8 @@ pub async fn guard_tree_case_collisions(
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     #[test]
@@ -230,6 +328,22 @@ mod tests {
             "byte-equal is not a pair"
         );
         assert!(!is_case_only_pair("foo.txt", "bar.txt"));
+    }
+
+    #[test]
+    fn casefold_prefix_check_is_component_aware() {
+        assert!(path_starts_with_casefold(
+            Path::new("Slides/Deck.md"),
+            Path::new("slides")
+        ));
+        assert!(path_starts_with_casefold(
+            Path::new("Slides"),
+            Path::new("slides")
+        ));
+        assert!(!path_starts_with_casefold(
+            Path::new("SlidesExtra/Deck.md"),
+            Path::new("slides")
+        ));
     }
 
     #[test]
@@ -269,5 +383,62 @@ mod tests {
                 "a genuine .LIBRA sibling is not case-insensitivity"
             );
         }
+    }
+
+    #[test]
+    fn same_file_case_alias_requires_same_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".libra")).unwrap();
+        let lower = dir.path().join("slides.txt");
+        std::fs::write(&lower, "content").unwrap();
+
+        if probe_dir_ignore_case(dir.path()) {
+            assert!(is_same_file_case_alias(
+                dir.path(),
+                Path::new("Slides.txt"),
+                Path::new("slides.txt")
+            ));
+            return;
+        }
+
+        std::fs::write(dir.path().join("Slides.txt"), "other").unwrap();
+        assert!(!is_same_file_case_alias(
+            dir.path(),
+            Path::new("Slides.txt"),
+            Path::new("slides.txt")
+        ));
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(dir.path().join("Slides.txt")).unwrap();
+            std::fs::hard_link(&lower, dir.path().join("Slides.txt")).unwrap();
+            assert!(is_same_file_case_alias(
+                dir.path(),
+                Path::new("Slides.txt"),
+                Path::new("slides.txt")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sync_ignore_case_uses_supplied_repo_dir_not_process_cwd() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        {
+            let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+            ConfigKv::set("core.ignorecase", "true", false)
+                .await
+                .unwrap();
+        }
+
+        let outside = tempfile::tempdir().unwrap();
+        let _outside_guard = crate::utils::test::ChangeDirGuard::new(outside.path());
+
+        assert!(
+            effective_ignore_case_for_dir_sync(repo.path()).unwrap(),
+            "sync lookup must use the explicit repo dir, not the process cwd"
+        );
     }
 }

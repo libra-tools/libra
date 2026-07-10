@@ -2,11 +2,11 @@
 
 ## 命令实现目标
 
-`libra init` 的目标是在目录中初始化 Libra 仓库，创建数据库、对象目录、默认 refs、索引和必要配置。在已存在仓库上再次 `init` 执行 Git 式安全重初始化（`is_reinit()` 检测后走 `reinitialize_existing()`：补齐标准布局、重应用 `--shared`、保留数据库 config/HEAD/refs/objects/vault/repoid，打印 `Reinitialized existing ...`），并支持 shared 模式、从 Git 布局迁移的边界、JSON 输出和错误码，且明确子模块递归初始化不在当前范围。
+`libra init` 的目标是在目录中初始化 Libra 仓库，创建数据库、对象目录、默认 refs、索引和必要配置。在已存在仓库上再次 `init` 执行 Git 式安全重初始化（`is_reinit()` 检测后走 `reinitialize_existing()`：补齐标准布局、重应用 `--shared`、更新 `core.sharedRepository`、保留数据库 config/HEAD/refs/objects/vault/repoid 的其余状态，打印 `Reinitialized existing ...`），并支持 shared 模式、从 Git 布局迁移的边界、JSON 输出和错误码，且明确子模块递归初始化不在当前范围。
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。新仓库初始化已支持；对已有 Libra 仓库执行安全 re-init/top-up 已实现（保留 DB，补齐布局，`InitOutput.reinitialized=true`，banner 改为 `Reinitialized existing ...`）。
+- 兼容级别：`partial`。新仓库初始化已支持；对已有 Libra 仓库执行安全 re-init/top-up 已实现（保留 DB，补齐布局，`InitOutput.reinitialized=true`，banner 改为 `Reinitialized existing ...`）。`--shared` 支持 `false`/`umask`/`true`/`group`/`all`/`world`/`everybody` 与 4 位八进制 numeric mode；numeric mode 在副作用前校验目录可遍历性，不满足时以 `LBR-CLI-002` fail-closed 且不创建 `.libra`。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -40,6 +40,7 @@ flowchart TD
 - 2026-06-05 `d29da9bf`（`feat(init): support safe re-initialization of existing repositories`）：该提交曾尝试支持安全重新初始化，但在后续 reconcile 中丢失（[[goal_loop_work_vanished]] 模式）。
 - 2026-06-25 (#156)：重新落地安全重初始化。`run_init_internal` 中 `is_reinit()` 命中后改走 `reinitialize_existing()`：`prepare_repository_layout` 补齐缺失模板、重应用 `--shared`、用 `get_db_conn_instance_for_path` 连接现有 DB（而非 `create_database_connection`，后者会拒绝已存在文件），从 config/HEAD 读回 objectformat/initrefformat/repoid/bare/vault.signing/分支填充 `InitOutput`（新增 `reinitialized: bool`），banner 改为 `Reinitialized existing{bare} Libra repository in ...`。`--from-git-repository` 在已存在仓库上拒绝（`InvalidArgument`）；`--initial-branch`/`--object-format` 若与现有不符则忽略并 warn。删除了不再可达的 `InitError::AlreadyInitialized` 变体。回归测试 `init_bare_reinit_tops_up_and_preserves_state` / `init_worktree_reinit_tops_up_and_preserves_state`。
 - 2026-06-05 `901b433b`（`feat(init): persist core.sharedRepository and isolate vault.db from --shared chmod`）：功能演进：persist core.sharedRepository and isolate vault.db from --shared chmod；该节点扩展了当前命令可用的参数或行为。
+- 2026-07-09（plan-20260708 P0-10）：当前 main 重新核对后修复 `--shared` 语义漂移：`parse_shared_mode()` 在任何仓库写入前解析并拒绝不可遍历 numeric mode（如 `0660`）；fresh init 的 `init_config()` 与 reinit 的 `persist_shared_repository()` 都持久化规范化后的 `core.sharedRepository`；Unix `apply_shared()` 复用解析结果，继续跳过 vault 数据库及 sidecar。回归测试 `compat_init_shared_mode`。
 - 2026-06-07 `99c39206`（`fix(init): close compatibility plan gaps`）：实现修正：close compatibility plan gaps；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
@@ -57,6 +58,7 @@ flowchart TD
 |---|---|---|
 | 兼容差异项 | Recurse submodules | 原始对照：git init + git submodule init；相关参数/替代：不适用；当前说明：不适用 (submodules not 支持)。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
 | ✅ 已实现 | 安全重新初始化（在已存在仓库上再次 `init`） | `git init` 风格：打印 `Reinitialized existing{bare} Libra repository in ...`、补齐缺失标准布局（模板/目录）、重应用 `--shared`，并完整保留现有数据库（config/HEAD/refs/objects/vault/repoid）。`reinitialize_existing()` 用 `get_db_conn_instance_for_path` 连接现有 DB，从 config/HEAD 读回身份/格式填充 `InitOutput`（`reinitialized=true`）。`--from-git-repository` 在已初始化仓库上拒绝；`--initial-branch`/`--object-format` 与现有不符则忽略并 warn。带回归测试。 |
+| ✅ 已实现 | `--shared` 配置持久化与 numeric fail-closed | `true`/`group` 规范化为 `group`，`all`/`world`/`everybody` 规范化为 `all`，numeric mode 保留原始八进制文本，均写入 `core.sharedRepository`。numeric mode 要求 owner `rwx`，且 group/other 若有 read/write 必须有 execute；否则在创建 `.libra` 前返回 `LBR-CLI-002`。带回归测试 `compat_init_shared_mode`。 |
 
 ## 维护要求
 

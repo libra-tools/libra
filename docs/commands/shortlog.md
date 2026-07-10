@@ -41,7 +41,7 @@ Date filtering via `--since` and `--until` restricts which commits are included 
 | Since | | `--since <date>` | Only include commits more recent than the specified date. |
 | Until | | `--until <date>` | Only include commits older than the specified date. |
 | Wrap | `-w` | `--wrap [<W>[,<I1>[,<I2>]]]` | Linewrap subjects at width `W` (default 76), first-line indent `I1` (6), continuation indent `I2` (9). `-w0` indents without wrapping. |
-| Format | | `--format <FORMAT>` | Render each commit line under its author header with a custom template instead of the subject. Supports the same `%`-placeholders as `libra log --format`: `%H`, `%h`, `%s`, `%f`, `%an`, `%ae`, `%ad`, `%cn`, `%ce`, `%cd`, `%d`. |
+| Format | | `--format <FORMAT>` | Render each commit line under its author header with a custom template instead of the subject. Supports the same `%`-placeholders as `libra log --format`, including `%H`, `%h`, `%P`, `%p`, `%s`, `%f`, `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, `%an`, `%ae`, `%ad`, `%aI`, `%at`, `%cn`, `%ce`, `%cd`, `%cI`, `%ct`, `%d`, `%D`, `%m`, and color placeholders. |
 | Revision | | positional (optional) | The revision to summarize from. Defaults to `HEAD`. |
 | JSON | | `--json` | Emit structured JSON output. |
 | Quiet | | `--quiet` | Suppress human-readable output. |

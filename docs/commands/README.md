@@ -2,6 +2,15 @@
 
 This directory contains detailed documentation for all Libra CLI commands. Each document includes a synopsis, option reference, human and structured (JSON) output examples, design rationale, and a parameter comparison with Git and jj.
 
+Compatibility is tracked at two levels: each command page describes the
+user-facing behavior of that command, while
+[`COMPATIBILITY.md`](../../COMPATIBILITY.md#sub-face-compatibility-grading-p0p1-touched-commands)
+grades the P0/P1 command surface by sub-face (`common-user-flow`,
+`porcelain-machine`, `conflict-aware`, `config-aware`, and
+`plumbing-compatible`). Use the sub-face table when a script depends on a
+specific Git-compatible surface such as porcelain output, conflict handling, or
+plumbing syntax.
+
 ## Global Flags
 
 Every Libra command accepts the following global flags:
@@ -137,9 +146,9 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra apply` | | Check whether a unified-diff patch applies (`--check`) | [apply.md](apply.md) |
 | `libra cat-file` | | Inspect Git objects and AI objects by type, size, or pretty-printed content | [cat-file.md](cat-file.md) |
-| `libra check-attr` | | Report `.libra_attributes` attributes (e.g. `filter`) for pathnames | [check-attr.md](check-attr.md) |
+| `libra check-attr` | | Report Git/Libra attributes (e.g. `filter`, `diff`, `export-ignore`) for pathnames | [check-attr.md](check-attr.md) |
 | `libra check-mailmap` | | Resolve `Name <email>` contacts through `.mailmap` | [check-mailmap.md](check-mailmap.md) |
-| `libra check-ignore` | | Report which pathnames are excluded by `.libraignore` rules | [check-ignore.md](check-ignore.md) |
+| `libra check-ignore` | | Report which pathnames are excluded by Git/Libra ignore rules | [check-ignore.md](check-ignore.md) |
 | `libra fsck` | | Verify the integrity of objects, refs, and index in a Libra repository | [fsck.md](fsck.md) |
 | `libra hash-object` | | Compute Git-compatible blob object IDs from files or standard input | [hash-object.md](hash-object.md) |
 | `libra write-tree` | | Write the current index out as a tree object | [write-tree.md](write-tree.md) |

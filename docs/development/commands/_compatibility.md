@@ -31,6 +31,11 @@ flowchart TD
 
 - 底层操作对象：治理对象包括公开命令 enum、`COMPATIBILITY.md` 顶层矩阵、D 编号决策、用户文档、命令开发文档、Cargo compat 测试和 shell 校验脚本；它们共同决定“代码是否真的支持某项 Git surface”。
 - 输出与错误契约：`COMPATIBILITY.md` 必须记录命令级 tier；各命令开发文档必须记录参数级缺口和测试处理方式；任何新增拒绝/延后项都要落到稳定 D 编号，避免未实现项失去解释来源。
+- stdout pipeline 契约（plan-20260708 P0-06）：会向 stdout 输出的命令在下游提前关闭管道时必须把 `BrokenPipe` 视为正常终止，不打印 panic/backtrace/`Broken pipe` 噪声；全局入口、`OutputConfig` 输出层和大输出命令由 `compat_broken_pipe_output` 守卫。
+- clean amend 契约（plan-20260708 P0-07）：`commit --amend --no-edit` 即使没有 tree/message 变化，也必须重写 `HEAD` 并刷新 committer date；不得打印成功摘要但保持引用不变，由 `compat_commit_amend_no_edit` 守卫。
+- identity/date 契约（plan-20260708 P0-08）：`commit` 支持 `--date`、`GIT_AUTHOR_*`/`GIT_COMMITTER_*` 身份与日期覆盖、`-C/-c` 复用来源 author metadata、`--reset-author` amend 重置 author；`cherry-pick` 保留源提交 author metadata；`revert` 使用当前身份并从去签名消息取 subject。由 `compat_commit_identity_date` 与 `compat_sequencer_message_author` 守卫。
+- index object integrity 契约（plan-20260708 P0-09）：`write-tree` 与 `commit` 在写 tree/commit 前必须校验 stage-0 index 条目的 blob/tree 对象存在且类型匹配；缺失或错类型以 `LBR-REPO-002` fail-closed，且 `commit` 失败不得移动 `HEAD`。`update-index --cacheinfo` 仍允许暂时登记不存在对象，后续写入路径负责拦截。由 `compat_write_tree_missing_object` 守卫。
+- symlink 基础兼容契约（plan-20260708 P0-11）：`add` / `update-index --add` 必须把 symlink 作为 mode `120000` 和 link target blob bytes 暂存；`checkout` / `restore` / `reset --hard` 必须在支持平台恢复真实 symlink，且不跟随目标路径；`status` / `diff` / `ls-files` 必须按 symlink 自身比较 target bytes，dangling symlink 不得误报为删除。不支持 symlink 的平台必须显式 fail-closed/skip 诊断，而不是写普通文件。由 `compat_symlink_basic` 守卫。
 - 副作用边界：本文件解释“为什么这样兼容”，不替代 `COMPATIBILITY.md` 的用户承诺；新增命令或参数时必须同时给出 tier、测试证据和未完成项处理方式。
 
 ## 当前状态
@@ -40,7 +45,37 @@ flowchart TD
 | merge | partial | partial | fast-forward and single-head three-way merge supported; `-m`/`--ff-only`/`--no-ff`/`--squash`/`--no-commit`/`--no-edit`/`--verify-signatures` (vault-key PGP only) supported; octopus/custom strategies deferred |
 | pull | partial | partial | fetch + fast-forward/three-way merge supported; advanced strategy flags still partial |
 | push | partial | partial | branch/tag update, multi-refspec, delete, `--tags`, and `--mirror` supported; local file remote rejected intentionally |
-| checkout | partial | partial | visible branch compatibility surface plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
+| checkout | partial | partial | visible branch compatibility surface including `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
+
+## 子面兼容分级（CG-01）
+
+CG-01 把粗粒度的命令级 tier 细化为**子面分级**，避免单个 `supported`/`partial`
+掩盖冲突、porcelain、config、plumbing 缺陷。规范表（每个被 plan-20260708 的
+P0/P1 触达的命令 × 四栏「已支持面 / 部分支持面 / 明确不支持面 / 有意差异面」）
+是 [`COMPATIBILITY.md`](../../../COMPATIBILITY.md#sub-face-compatibility-grading-p0p1-touched-commands)
+的「Sub-face compatibility grading」小节，并由 `compat_subface_labels` 守卫机器
+校验。固定子面枚举（守卫拒绝任何枚举外标签）：`common-user-flow`、
+`porcelain-machine`、`conflict-aware`、`config-aware`、`plumbing-compatible`。
+
+**明确不支持面（unsupported）登记**：按验收要求，每个保留/新增的 unsupported
+子面必须挂在一个 `D` 编号或本计划编号下（守卫会核对治理编号确实是计划里的任务
+或本文的 `D` 决策）。**P0-01 已在 v0.18.35 收口**：`status`/`diff`/`ls-files`
+的 `conflict-aware` 子面已从 unsupported 上调到 `COMPATIBILITY.md` 的 partial/supported
+列。**P1-02 已在 v0.18.49 收口**：`check-ignore`/`check-attr` 的 `config-aware`
+子面已从 unsupported 上调到 supported，Git 标准 ignore/attributes 来源与
+`.libraignore`/`.libra_attributes` 并存。当前 CG-01 表不保留 P0/P1 治理的
+unsupported 子面。
+
+| 命令 | unsupported 子面 | 治理编号 | 说明 |
+|---|---|---|---|
+
+当前无 P0/P1 治理的 unsupported 子面；上表保持空表以便
+`compat_subface_labels` 与 `COMPATIBILITY.md` 双向比对。
+
+**有意差异面（intentionally-different）**：`lfs` 的 stock Git-LFS filter/hook bridge
+仍不支持（`filter=lfs` attributes 会被读取，但不依赖外部 `git-lfs`，见 **D5**）、`media`/`cloud` 的
+`common-user-flow`（Libra 扩展命令）、`hooks` 的 `config-aware`（`.libra/hooks`
+而非 `.git/hooks`，见 **D3**）——均为已文档化的刻意分歧，不作为缺口。
 
 ## 还未实现的功能
 
@@ -52,7 +87,7 @@ flowchart TD
 | 兼容证据治理 | 参数级缺口不能只停留在文字说明；需要在命令开发文档、用户文档和 compat/integration 测试之间闭环。 | 删除独立参数 YAML 后，不再存在 `test_evidence`/`last_verified` 字段；证据必须落到具体测试、脚本或 D 编号说明中。 | 不允许把未验证参数当作完成承诺；新增兼容项时补测试证据，或把状态改为拒绝、延后、有意差异并给出 D 编号。 |
 | 拒绝/延后决策 | submodule family、本地 file remote push、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、clean pathspec、empty commit message、跨网/foreign-Git/push 侧 notes travel、依赖过滤克隆的工作树磁盘收窄。 | 对应 D1-D10、D15、D16、D17、D18、D-clean-pathspec、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
 | staging/worktree Git surface | `add --intent-to-add`、`clean -i`、`clean <pathspec>`、`reset --merge/--keep`、`checkout -p` 以及跨命令 patch mode。（`restore --overlay`/`--ours`/`--theirs`/`--merge`/`--conflict` 已实现；`restore --progress` 是全局 `--progress` 冲突，DEAD。） | `mv -k` / `--skip-errors` 已实现，`mv --sparse` 与 `rm --sparse` 均已作为 no-op 暴露；`add`、`clean`、`reset` 的参数结构仍未暴露这些剩余 flag；patch mode 由 D15 拒绝；`switch --detach` 已实现，不能再把 detached HEAD 作为全局缺口。 | 作为命令级 Git 兼容缺口保留；实现时同步命令文档、`COMPATIBILITY.md` 和 integration scenarios。 |
-| commit/rewrite/sequencer | `commit --allow-empty-message`、`rebase -i/--edit-todo/--exec/--rebase-merges/--empty=stop|ask` 类项、`rebase -i/--edit-todo/--exec/--rebase-merges/--empty=stop|ask`、`cherry-pick` 的 `--edit`、sequencer `--skip` / todo 自动续作与 strategy 扩展（`revert` 的 `--edit`/`--skip`/多提交续作均已实现，余为 cherry-pick/rebase 范畴）。 | `CommitArgs` 已公开并实现 `--fixup`、`--squash`、`--cleanup`，以及 `-e/--edit`、`-v/--verbose`（共享编辑器 helper + scissors 剥离）、`--porcelain`（提交状态 porcelain v1 机器输出）、`--status`/`--no-status`、`-t/--template`（含 `commit.template` 配置回落 + unedited-template 中止），这些不能再列为当前缺口；`--allow-empty-message` 仍由 D-empty-message 拒绝；`RebaseArgs` 已支持 `--onto`/`--autosquash`/`--reapply-cherry-picks`/`--keep-empty`/`--no-keep-empty`(丢弃 start-empty)/`--empty=<drop|keep>`(replay 后变空提交，缺省 keep)（仍缺 `-i/--exec/--rebase-merges`/`--empty=stop|ask` 等）；`cherry-pick` 已有较完整 sequencer，`revert` 已有 `--continue`/`--abort`/`--skip`、`--no-edit`（接受式 no-op）与 `-e/--edit`（编辑器，opt-in，经 `RevertState.edit` 串到 `--continue`/`--skip`），并已实现多提交冲突自动续作（冲突时把剩余提交 ID 存入 `RevertState.remaining`，`--continue`/`--skip` 续作其余）。注意 `pull --rebase` 已实现，不列入缺口。 | 保留为重写/序列器能力缺口；不能把已实现的 rebase `--onto`、commit `--fixup`/`--squash`/`--cleanup`/`-e`/`-v` 当作缺失。 |
+| commit/rewrite/sequencer | `commit --allow-empty-message`、`rebase -i/--edit-todo/--exec/--rebase-merges/--empty=stop|ask` 类项、`rebase -i/--edit-todo/--exec/--rebase-merges/--empty=stop|ask`、sequencer strategy 扩展。 | `CommitArgs` 已公开并实现 `--date`、`GIT_AUTHOR_*`/`GIT_COMMITTER_*` 身份/日期覆盖、`--fixup`、`--squash`、`--cleanup`，以及 `-e/--edit`、`-v/--verbose`（共享编辑器 helper + scissors 剥离）、`--porcelain`（提交状态 porcelain v1 机器输出）、`--status`/`--no-status`、`-t/--template`（含 `commit.template` 配置回落 + unedited-template 中止）、`-C/-c` 复用 message+author metadata、`--reset-author`；这些不能再列为当前缺口；`--allow-empty-message` 仍由 D-empty-message 拒绝；`RebaseArgs` 已支持 `--onto`/`--autosquash`/`--reapply-cherry-picks`/`--keep-empty`/`--no-keep-empty`(丢弃 start-empty)/`--empty=<drop|keep>`(replay 后变空提交，缺省 keep)（仍缺 `-i/--exec/--rebase-merges`/`--empty=stop|ask` 等）；`cherry-pick` 已保留源 author metadata、去签名消息、并有较完整 sequencer，`revert` 已用当前身份创建提交、去签名 subject，且已有 `--continue`/`--abort`/`--skip`、`--no-edit`（接受式 no-op）与 `-e/--edit`（编辑器，opt-in，经 `RevertState.edit` 串到 `--continue`/`--skip`），并已实现多提交冲突自动续作（冲突时把剩余提交 ID 存入 `RevertState.remaining`，`--continue`/`--skip` 续作其余）。注意 `pull --rebase` 已实现，不列入缺口。 | 保留为重写/序列器能力缺口；不能把已实现的 rebase `--onto`、commit identity/date/message-source、commit `--fixup`/`--squash`/`--cleanup`/`-e`/`-v` 当作缺失。 |
 | merge/pull strategy surface | octopus merge、自定义 strategy/`-X`。 | `MergeArgs` 已有 `-m`/`--ff-only`/`--no-ff`/`--squash`/`--no-commit`/`--no-edit`/`--verify-signatures`(vault-key PGP 验证，无外部 keyring)（octopus/自定义 strategy/`-X` 仍缺）；`PullArgs` 已有 `--rebase`、`--ff-only`、`--ff`、`--no-ff`、`--squash`、`--commit`、`--no-commit`、`--autostash` 与 fetch `--depth`。 | 仅 octopus/自定义 strategy/`-X` 仍为缺口；不要再把已实现的 merge/pull strategy flags（`--ff-only`/`--no-ff`/`--squash`/`--no-commit`/`-m`/`--no-edit`/`--verify-signatures`、pull `--squash`/`--commit`/`--no-commit`/`--autostash`）当作缺失。 |
 | object/plumbing surface | `cat-file --follow-symlinks` 等（`index-pack --fix-thin` 已作为接受式 no-op 实现——libra 要求自包含 pack、无外部 delta-base 解析器、从不产出 thin pack，故对其能建索引的 pack 无需补全；真正的 thin-pack 补全不支持，不再列为开放缺口）。 | `cat-file` 暴露 `-t/-s/-p/-e`、AI modes、`--batch-check`/`--batch`/`--batch-command`（info/contents，带可选 `=<format>`）、`--batch-all-objects`（loose+packed，按 id 排序）；`verify-pack` 接受一个或多个 idx file、`--pack`（仅单 idx）、`-v` 和 `-s/--stat-only`；`index-pack` 是隐藏 plumbing，接受 pack file、`--stdin`、`-o`、`--keep[=<MSG>]`、Git-style `--progress` / `--no-progress`、`--fix-thin`（接受式 no-op）兼容入口和 test-only index version；`ls-tree` 已公开基础 tree inspection surface、子目录路径语义、`--full-name`、`--full-tree`、部分 `--format` atom 和 `REV:path` 子树导航，仅缺少完整 Git pathspec magic。 | 保留为 plumbing 兼容缺口；扩展参数时同步用户文档、命令文档、兼容矩阵和测试证据。 |
 | inspection/reporting surface | `blame` reverse/incremental 与 copy/move detection、`describe --contains`、`diff --color-words`（`--binary`/`--ext-diff` 已实现）、`shortlog` stdin。 | `grep --untracked`（搜索未跟踪非忽略文件，#160）与 `grep --no-index`（无仓库递归遍历文件系统，#161）已实现；`shortlog --format`（自定义每条提交行模板，复用 `log --format` 占位符，#166）已实现；`describe --long` / `--dirty` / `--first-parent` / `--match` / `--exclude` / `--candidates`（n=0 等价 exact-match）/ `--all`（任意 ref，带 heads/remotes/tags 前缀）已有 CLI、JSON 和集成场景证据；`grep -A/-B/-C`、`-E/-G`、`-P` 拒绝、`-a/-I`、`--heading`/`--break`/`-z`、`grep -m`/`--max-count`、`grep -o`/`--only-matching`、`for-each-ref --merged`、`for-each-ref --exclude`、`blame -e`、`blame -l`/`-s`/`-t`/`--abbrev`/`-p`（显示标志）、`blame -w`/`--ignore-whitespace`（ignore-all-whitespace 行归属）、`diff --shortstat`/`--exit-code`/`-s`、`rev-parse --is-inside-git-dir`、`archive -v` 已实现；`shortlog --author`、`shortlog --group=author\|committer\|trailer:<key>` 与 `shortlog -w`（换行宽度，默认 76/6/9）已实现。 | 保留为低风险兼容增强池；新增时必须补命令级回归和测试证据。 |
@@ -129,9 +164,9 @@ flowchart TD
 
 ### D-clean-pathspec：`clean <pathspec>`
 
-- 状态：延后。`clean` 的 pathspec 位置参数未纳入当前可用面。
-- 原因：`clean` 会删除工作树文件，pathspec 过滤必须先有明确的 ignore、目录递归、dry-run 和安全提示一致性。
-- 重启条件：完成 pathspec 解析与删除保护测试，确保 dry-run 与实际删除结果一致。
+- 状态：部分可用、共享 magic 延后。当前 `clean` 已公开位置 pathspec，并按字面文件/目录前缀限制候选；但尚未接入 P1-01 的共享 pathspec magic（`:(exclude)` / `:(glob)` / `:(top)` 等）。
+- 原因：`clean` 会删除工作树文件，shared magic 接入必须同时验证 dry-run 与实际删除、ignore 叠加、目录递归和安全提示一致性，不能只复用只读命令的 matcher。
+- 重启条件：完成 `clean -n` 与 `clean -f` 的 shared pathspec 解析与删除保护测试，确保 dry-run 与实际删除结果一致。
 
 ### D-empty-message：`commit --allow-empty-message`
 

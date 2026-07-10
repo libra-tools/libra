@@ -144,6 +144,7 @@ pub type ExitCode = CliExitCode;
 pub enum CliErrorCategory {
     Cli,
     Repo,
+    Config,
     Conflict,
     Network,
     Auth,
@@ -161,6 +162,7 @@ impl CliErrorCategory {
         match self {
             Self::Cli => "cli",
             Self::Repo => "repo",
+            Self::Config => "config",
             Self::Conflict => "conflict",
             Self::Network => "network",
             Self::Auth => "auth",
@@ -192,6 +194,8 @@ pub enum StableErrorCode {
     RepoNotFound,
     RepoCorrupt,
     RepoStateInvalid,
+    /// Global config database schema is newer than this Libra binary supports.
+    ConfigSchemaFuture,
     ConflictUnresolved,
     ConflictOperationBlocked,
     /// Branch policy (protect/archive metadata) blocked a ref update — the
@@ -281,6 +285,12 @@ pub enum StableErrorCode {
     /// `ERR_AGENT_RAW_ACCESS_DENIED`). The refusal is itself audited in
     /// `agent_audit_log` (granted = 0).
     AgentRawAccessDenied,
+    /// A `review` / `investigate` run was refused because the shared
+    /// run-level admission queue is full (more than `agent.max_concurrent_runs`
+    /// runs are active and the wait queue already holds its cap). Fail-closed
+    /// so callers never silently overrun the concurrency budget (A0-04, E10
+    /// `ERR_AGENT_RUN_QUEUE_FULL`).
+    AgentRunQueueFull,
 }
 
 impl Serialize for StableErrorCode {
@@ -303,6 +313,7 @@ impl StableErrorCode {
             Self::RepoNotFound => "LBR-REPO-001",
             Self::RepoCorrupt => "LBR-REPO-002",
             Self::RepoStateInvalid => "LBR-REPO-003",
+            Self::ConfigSchemaFuture => "LBR-CONFIG-001",
             Self::ConflictUnresolved => "LBR-CONFLICT-001",
             Self::ConflictOperationBlocked => "LBR-CONFLICT-002",
             Self::PolicyRefUpdateBlocked => "LBR-POLICY-001",
@@ -337,6 +348,7 @@ impl StableErrorCode {
             Self::AgentUntrustedSeedForMutation => "LBR-AGENT-011",
             Self::AgentRpcTransportFailed => "LBR-AGENT-012",
             Self::AgentRawAccessDenied => "LBR-AGENT-013",
+            Self::AgentRunQueueFull => "LBR-AGENT-014",
         }
     }
 
@@ -350,6 +362,7 @@ impl StableErrorCode {
             Self::RepoNotFound | Self::RepoCorrupt | Self::RepoStateInvalid => {
                 CliErrorCategory::Repo
             }
+            Self::ConfigSchemaFuture => CliErrorCategory::Config,
             Self::ConflictUnresolved
             | Self::ConflictOperationBlocked
             // Policy refusals ride the Conflict category (no dedicated
@@ -387,7 +400,8 @@ impl StableErrorCode {
             | Self::AgentFixBridgeUnavailable
             | Self::AgentUntrustedSeedForMutation
             | Self::AgentRpcTransportFailed
-            | Self::AgentRawAccessDenied => CliErrorCategory::Internal,
+            | Self::AgentRawAccessDenied
+            | Self::AgentRunQueueFull => CliErrorCategory::Internal,
         }
     }
 
@@ -419,6 +433,7 @@ impl StableErrorCode {
         match self.category() {
             CliErrorCategory::Cli => 2,
             CliErrorCategory::Repo => 3,
+            CliErrorCategory::Config => 8,
             CliErrorCategory::Conflict => 4,
             CliErrorCategory::Network => 5,
             CliErrorCategory::Auth => 6,
@@ -439,6 +454,9 @@ impl StableErrorCode {
             Self::RepoCorrupt => "Repository metadata is missing, incompatible, or corrupt.",
             Self::RepoStateInvalid => {
                 "Repository state prevents the requested operation from proceeding."
+            }
+            Self::ConfigSchemaFuture => {
+                "Global config database schema is newer than this Libra binary supports."
             }
             Self::ConflictUnresolved => {
                 "Operation stopped because unresolved conflicts are present."
@@ -527,6 +545,9 @@ impl StableErrorCode {
             }
             Self::AgentRawAccessDenied => {
                 "Raw (un-redacted) checkpoint access/export denied without --allow-raw; redacted --detail/--transcript output stays available."
+            }
+            Self::AgentRunQueueFull => {
+                "Too many concurrent review/investigate runs are active and the wait queue is full; the run was refused fail-closed."
             }
         }
     }
@@ -978,6 +999,24 @@ impl CliError {
         } else {
             self.print_stderr();
         }
+    }
+
+    /// True when this error is the normal Unix "downstream closed stdout"
+    /// condition rather than a user-visible failure.
+    pub fn is_stdout_broken_pipe(&self) -> bool {
+        if self.silent {
+            return false;
+        }
+        let lower = self.message.to_ascii_lowercase();
+        let broken_pipe = lower.contains("broken pipe") || lower.contains("os error 32");
+        let stdout_write = lower.contains("failed printing to stdout")
+            || lower.contains("failed to write output")
+            || lower.contains("failed to write json output")
+            || lower.contains("failed to write clap output")
+            || lower.contains("failed to write completion script")
+            || lower.contains("failed to write ls-files output")
+            || lower.contains("stdout");
+        broken_pipe && stdout_write
     }
 
     /// Rendered severity string used by JSON envelopes. Stable across releases.
@@ -1831,7 +1870,7 @@ mod tests {
     /// would invalidate every downstream pin without tripping any
     /// test until end-to-end JSON harness assertions caught it.
     ///
-    /// Enumerate all 22 variants so a new addition trips both this
+    /// Enumerate all 23 non-agent variants so a new addition trips both this
     /// list and the `as_str` impl's exhaustive match.
     #[test]
     fn stable_error_code_as_str_pins_each_variant() {
@@ -1841,6 +1880,10 @@ mod tests {
         assert_eq!(StableErrorCode::RepoNotFound.as_str(), "LBR-REPO-001");
         assert_eq!(StableErrorCode::RepoCorrupt.as_str(), "LBR-REPO-002");
         assert_eq!(StableErrorCode::RepoStateInvalid.as_str(), "LBR-REPO-003");
+        assert_eq!(
+            StableErrorCode::ConfigSchemaFuture.as_str(),
+            "LBR-CONFIG-001",
+        );
         assert_eq!(
             StableErrorCode::ConflictUnresolved.as_str(),
             "LBR-CONFLICT-001",
@@ -1909,6 +1952,7 @@ mod tests {
             ),
             (StableErrorCode::AgentRpcTransportFailed, "LBR-AGENT-012"),
             (StableErrorCode::AgentRawAccessDenied, "LBR-AGENT-013"),
+            (StableErrorCode::AgentRunQueueFull, "LBR-AGENT-014"),
         ] {
             assert_eq!(variant.as_str(), code);
         }
@@ -1955,6 +1999,10 @@ mod tests {
         assert_eq!(
             StableErrorCode::RepoStateInvalid.category(),
             CliErrorCategory::Repo,
+        );
+        assert_eq!(
+            StableErrorCode::ConfigSchemaFuture.category(),
+            CliErrorCategory::Config,
         );
         assert_eq!(
             StableErrorCode::ConflictUnresolved.category(),

@@ -1418,3 +1418,493 @@ async fn class3_drifted_object_index_row_updated_in_place() {
     assert_store_clean(&repo.doctor_json(false));
     assert_store_clean(&repo.doctor_json(true));
 }
+
+// ---------------------------------------------------------------------------
+// A0-02 — subagent-scope crash-window-B repair parity
+// ---------------------------------------------------------------------------
+
+async fn subagent_parent_link(repo: &DoctorRepo, checkpoint_id: &str) -> Option<String> {
+    let conn = repo.db().await;
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            backend,
+            "SELECT parent_checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = ?",
+            vec![checkpoint_id.into()],
+        ))
+        .await
+        .expect("query parent_checkpoint_id")
+        .expect("subagent row present");
+    row.try_get_by::<Option<String>, _>("parent_checkpoint_id")
+        .unwrap()
+}
+
+/// A subagent-scope orphan (traces commit present, catalog row deleted) is
+/// auto-repaired by `doctor --repair`, which rebuilds a first-class
+/// `scope='subagent'` row — including its `parent_checkpoint_id` linkage —
+/// from the commit's metadata.json, at parity with the committed class-2 path.
+#[tokio::test]
+async fn class2_missing_subagent_catalog_row_repaired() {
+    let repo = DoctorRepo::init();
+
+    // User commit so the checkpoint's parent_commit is Some(head).
+    std::fs::write(repo.repo.join("seed.txt"), "seed\n").expect("write seed file");
+    assert!(repo.run(&["add", "seed.txt"], None).status.success());
+    assert!(repo.run(&["commit", "-m", "seed"], None).status.success());
+
+    let transcript = repo.write_claude_transcript(TRANSCRIPT);
+    let session = "sess-subagent-doctor";
+    // codex owns the session; Stop writes a committed parent…
+    assert!(
+        repo.hook(
+            "codex",
+            "session-start",
+            &repo.envelope("SessionStart", session, &transcript),
+        )
+        .status
+        .success(),
+        "codex session-start"
+    );
+    assert!(
+        repo.hook(
+            "codex",
+            "stop",
+            &repo.envelope("Stop", session, &transcript)
+        )
+        .status
+        .success(),
+        "codex stop"
+    );
+    // …and a SubagentStop boundary materialises the subagent checkpoint.
+    let out = repo.hook(
+        "codex",
+        "subagent-end",
+        &repo.envelope("SubagentStop", session, &transcript),
+    );
+    assert!(out.status.success(), "subagent-end: {}", describe(&out));
+
+    let rows = repo.checkpoint_rows().await;
+    let subagent = rows
+        .iter()
+        .find(|r| r.scope == "subagent")
+        .cloned()
+        .expect("a scope='subagent' checkpoint row");
+    let parent_link_before = subagent_parent_link(&repo, &subagent.checkpoint_id).await;
+    assert!(
+        parent_link_before.is_some(),
+        "subagent checkpoint must link back to the committed parent"
+    );
+
+    // Fabricate window B for the subagent row.
+    repo.exec_sql(
+        "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
+        vec![subagent.checkpoint_id.clone().into()],
+    )
+    .await;
+
+    // Detection-only: reported, not repaired.
+    let report = repo.doctor_json(false);
+    assert!(
+        findings(&report)
+            .iter()
+            .any(|f| f["checkpoint_id"] == json!(subagent.checkpoint_id)
+                && f["inconsistency_type"] == json!("missing_catalog_row")
+                && f["repaired"] == json!(false)),
+        "subagent window B must be detected without repair: {report}"
+    );
+
+    // Repair: a scope='subagent' row comes back with its linkage intact.
+    let report = repo.doctor_json(true);
+    assert!(
+        findings(&report)
+            .iter()
+            .any(|f| f["checkpoint_id"] == json!(subagent.checkpoint_id)
+                && f["repaired"] == json!(true)),
+        "subagent row must be auto-repaired: {report}"
+    );
+    let rows = repo.checkpoint_rows().await;
+    let repaired = rows
+        .iter()
+        .find(|r| r.checkpoint_id == subagent.checkpoint_id)
+        .expect("subagent row reinserted");
+    assert_eq!(
+        repaired.scope, "subagent",
+        "repaired row must keep scope='subagent'"
+    );
+    assert_eq!(
+        subagent_parent_link(&repo, &subagent.checkpoint_id).await,
+        parent_link_before,
+        "parent_checkpoint_id linkage must survive the repair"
+    );
+
+    // Idempotent.
+    assert_store_clean(&repo.doctor_json(true));
+}
+
+// ---------------------------------------------------------------------------
+// A0-02 — subagent checkpoint sidecar must not leak the transcript path
+// ---------------------------------------------------------------------------
+
+/// Resolve the OID of a named entry among parsed `(mode, name, oid)` tree rows.
+fn subagent_entry_oid(entries: &[(String, String, String)], name: &str) -> String {
+    entries
+        .iter()
+        .find(|(_, n, _)| n == name)
+        .map(|(_, _, oid)| oid.clone())
+        .unwrap_or_else(|| panic!("tree entry '{name}' missing"))
+}
+
+/// A0-02 (Codex re-review): a `SubagentStop` whose envelope carries a
+/// transcript path must NOT persist that local path in the subagent
+/// checkpoint's syncable `events/lifecycle.jsonl` blob — the writer clears
+/// `session_ref` on the sidecar event before serialization.
+#[tokio::test]
+async fn subagent_checkpoint_sidecar_omits_transcript_path() {
+    let repo = DoctorRepo::init();
+    let transcript = repo.write_claude_transcript(TRANSCRIPT);
+    let transcript_str = transcript.to_string_lossy().to_string();
+    let session = "sess-subagent-sidecar";
+
+    assert!(
+        repo.hook(
+            "codex",
+            "session-start",
+            &repo.envelope("SessionStart", session, &transcript),
+        )
+        .status
+        .success(),
+        "codex session-start"
+    );
+    let out = repo.hook(
+        "codex",
+        "subagent-end",
+        &repo.envelope("SubagentStop", session, &transcript),
+    );
+    assert!(out.status.success(), "subagent-end: {}", describe(&out));
+
+    let subagent = repo
+        .checkpoint_rows()
+        .await
+        .into_iter()
+        .find(|r| r.scope == "subagent")
+        .expect("a scope='subagent' checkpoint row");
+
+    // Walk root → checkpoint/<id[:2]>/<id[2:]> → events → lifecycle.jsonl.
+    let id = &subagent.checkpoint_id;
+    let root = tree_entries(&repo, &subagent.tree_oid);
+    let checkpoint = tree_entries(&repo, &subagent_entry_oid(&root, "checkpoint"));
+    let prefix = tree_entries(&repo, &subagent_entry_oid(&checkpoint, &id[..2]));
+    let inner = tree_entries(&repo, &subagent_entry_oid(&prefix, &id[2..]));
+    let events = tree_entries(&repo, &subagent_entry_oid(&inner, "events"));
+    let blob_oid = subagent_entry_oid(&events, "lifecycle.jsonl");
+    let (blob_type, blob) = read_loose(&repo, &blob_oid);
+    assert_eq!(blob_type, "blob");
+    let content = String::from_utf8_lossy(&blob);
+
+    assert!(
+        !content.contains(&transcript_str),
+        "events/lifecycle.jsonl must not leak the transcript path '{transcript_str}':\n{content}"
+    );
+    assert!(
+        !content.contains("session_ref"),
+        "the subagent sidecar event must not carry session_ref:\n{content}"
+    );
+}
+
+/// A0-03: a checkpoint operation on an inconsistent store (a catalog row whose
+/// `parent_commit` points at an object missing from the store) fails closed
+/// with the stable `LBR-AGENT-009` (`AgentCheckpointStoreInconsistent`) code,
+/// not a bare fatal.
+#[tokio::test]
+async fn checkpoint_store_inconsistent_emits_lbr_agent_009() {
+    let repo = DoctorRepo::init();
+
+    // A user commit so the checkpoint records a real parent_commit.
+    std::fs::write(repo.repo.join("seed.txt"), "seed\n").expect("write seed file");
+    assert!(repo.run(&["add", "seed.txt"], None).status.success());
+    assert!(repo.run(&["commit", "-m", "seed"], None).status.success());
+
+    repo.ingest_checkpoint("sess-inconsistent", TRANSCRIPT);
+    let cp = repo.checkpoint_rows().await.remove(0);
+
+    // Corrupt the catalog: point parent_commit at a non-existent object.
+    let bogus = "b".repeat(40);
+    repo.exec_sql(
+        "UPDATE agent_checkpoint SET parent_commit = ? WHERE checkpoint_id = ?",
+        vec![bogus.into(), cp.checkpoint_id.clone().into()],
+    )
+    .await;
+
+    let out = repo.run(
+        &[
+            "agent",
+            "checkpoint",
+            "rewind",
+            &cp.checkpoint_id,
+            "--dry-run",
+        ],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "rewind on a corrupted store must fail: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-009"),
+        "an inconsistent store must carry LBR-AGENT-009: {stderr}"
+    );
+}
+
+/// A0-03 (Codex re-review): a rewind whose parent tree's ROOT is present but a
+/// nested subtree object is missing must fail closed with `LBR-AGENT-009`, not
+/// panic through `Tree::load`. Regression for the recursive tree-walk path.
+#[tokio::test]
+async fn checkpoint_store_missing_nested_tree_emits_lbr_agent_009() {
+    let repo = DoctorRepo::init();
+
+    // A commit whose tree contains a subdirectory (a nested subtree object).
+    std::fs::create_dir_all(repo.repo.join("nested")).expect("mkdir nested");
+    std::fs::write(repo.repo.join("nested").join("f.txt"), "x\n").expect("write nested file");
+    assert!(repo.run(&["add", "nested/f.txt"], None).status.success());
+    assert!(repo.run(&["commit", "-m", "nested"], None).status.success());
+
+    repo.ingest_checkpoint("sess-nested", TRANSCRIPT);
+    let cp = repo.checkpoint_rows().await.remove(0);
+    let parent_commit = cp
+        .parent_commit
+        .clone()
+        .expect("checkpoint records a parent_commit");
+
+    // Resolve the root tree from the commit object, find the "nested" subtree,
+    // and delete that object — leaving the root tree readable.
+    let (_, commit_body) = read_loose(&repo, &parent_commit);
+    let commit_text = String::from_utf8_lossy(&commit_body);
+    let root_tree = commit_text
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("tree "))
+        .expect("commit starts with a tree line")
+        .trim()
+        .to_string();
+    let subtree_oid = subagent_entry_oid(&tree_entries(&repo, &root_tree), "nested");
+    let obj = repo
+        .repo
+        .join(".libra")
+        .join("objects")
+        .join(&subtree_oid[..2])
+        .join(&subtree_oid[2..]);
+    std::fs::remove_file(&obj).expect("delete nested subtree object");
+
+    let out = repo.run(
+        &[
+            "agent",
+            "checkpoint",
+            "rewind",
+            &cp.checkpoint_id,
+            "--dry-run",
+        ],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "rewind with a missing nested tree must fail: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-009"),
+        "a missing nested tree must carry LBR-AGENT-009: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "rewind must not panic on a missing subtree: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A0-06 — findings-object repair (review/investigate objectized findings)
+// ---------------------------------------------------------------------------
+
+/// A0-06: a review run's objectized findings blob that goes missing while
+/// `findings.md` remains is detected as `missing_findings_object` and
+/// auto-repaired by `doctor --repair` (content-addressed rewrite from
+/// findings.md), idempotently.
+#[tokio::test]
+async fn findings_object_repair() {
+    use libra::internal::ai::review::{
+        ReviewRunStore, ReviewTerminalState, store::RedactionReportSummary,
+    };
+
+    let repo = DoctorRepo::init();
+    let store = ReviewRunStore::new(repo.repo.join(".libra").join("sessions"));
+    store
+        .create_run(
+            "findings-run",
+            &["codex".to_string()],
+            "sha",
+            "HEAD~1..HEAD",
+        )
+        .expect("create run");
+    store
+        .write_findings("findings-run", "review finding body line\n")
+        .expect("write findings");
+    store
+        .finalize_run(
+            "findings-run",
+            ReviewTerminalState::Success,
+            &[],
+            RedactionReportSummary::default(),
+        )
+        .expect("finalize objectizes findings");
+
+    let manifest = store
+        .load_manifest("findings-run")
+        .expect("load manifest")
+        .expect("manifest");
+    let findings_oid = manifest
+        .findings_oid
+        .expect("A0-06 populated findings_oid at finalize");
+    let obj_path = repo
+        .repo
+        .join(".libra")
+        .join("objects")
+        .join(&findings_oid[..2])
+        .join(&findings_oid[2..]);
+    assert!(
+        obj_path.exists(),
+        "findings object must be written at finalize"
+    );
+
+    // Fabricate the missing-object case (findings.md stays on disk).
+    std::fs::remove_file(&obj_path).expect("delete findings object");
+
+    // Detection-only: reported, auto-repairable, not yet repaired.
+    let report = repo.doctor_json(false);
+    let found = report["findings_store"]["findings"]
+        .as_array()
+        .expect("findings_store.findings array");
+    assert!(
+        found
+            .iter()
+            .any(|f| f["inconsistency_type"] == "missing_findings_object"
+                && f["run_id"] == "findings-run"
+                && f["repaired"] == false
+                && f["manual_required"] == false),
+        "missing findings object must be detected auto-repairable: {report}"
+    );
+    assert!(
+        !obj_path.exists(),
+        "detection-only must not rewrite the object"
+    );
+
+    // Repair: object rewritten from findings.md.
+    let report = repo.doctor_json(true);
+    assert!(
+        report["findings_store"]["repaired"].as_u64().unwrap_or(0) >= 1,
+        "--repair must rewrite the findings object: {report}"
+    );
+    assert!(
+        obj_path.exists(),
+        "the findings object must be restored by --repair"
+    );
+
+    // Idempotent: a second run finds no missing_findings_object.
+    let report = repo.doctor_json(true);
+    assert!(
+        report["findings_store"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["inconsistency_type"] != "missing_findings_object"),
+        "second repair run must be clean: {report}"
+    );
+}
+
+/// A0-06 (codex P1-1): a findings blob already indexed under a different
+/// `agent_*` tag (e.g. `agent_transcript`, because identical bytes were first
+/// seen as a transcript) with the correct size must NOT be flagged as
+/// `missing_findings_object_index` drift — otherwise doctor and the index
+/// writer (which refuses to retag an `agent_*` row) fight a tag-war forever.
+#[tokio::test]
+async fn findings_object_index_tolerates_agent_transcript_tag() {
+    use libra::internal::ai::review::{
+        ReviewRunStore, ReviewTerminalState, store::RedactionReportSummary,
+    };
+
+    let repo = DoctorRepo::init();
+    let store = ReviewRunStore::new(repo.repo.join(".libra").join("sessions"));
+    let findings_body = "review finding body line\n";
+    store
+        .create_run("tag-run", &["codex".to_string()], "sha", "HEAD~1..HEAD")
+        .expect("create run");
+    store
+        .write_findings("tag-run", findings_body)
+        .expect("write findings");
+    store
+        .finalize_run(
+            "tag-run",
+            ReviewTerminalState::Success,
+            &[],
+            RedactionReportSummary::default(),
+        )
+        .expect("finalize objectizes findings");
+    let manifest = store
+        .load_manifest("tag-run")
+        .expect("load manifest")
+        .expect("manifest");
+    let findings_oid = manifest.findings_oid.expect("findings_oid populated");
+
+    // Resolve doctor's repo_id and pre-index the findings blob under the
+    // agent_transcript tag with the correct payload size.
+    let repo_id = {
+        let conn = repo.db().await;
+        let backend = conn.get_database_backend();
+        conn.query_one(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key='libra.repoid'",
+        ))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get_by::<String, _>("value").ok())
+        .unwrap_or_else(|| "unknown-repo".to_string())
+    };
+    repo.exec_sql(
+        "DELETE FROM object_index WHERE o_id = ?",
+        vec![findings_oid.clone().into()],
+    )
+    .await;
+    repo.exec_sql(
+        "INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced) \
+         VALUES (?, ?, ?, ?, ?, 0)",
+        vec![
+            findings_oid.clone().into(),
+            "agent_transcript".into(),
+            (findings_body.len() as i64).into(),
+            repo_id.into(),
+            0i64.into(),
+        ],
+    )
+    .await;
+
+    // A --repair run must NOT flag the size-matching agent_transcript row.
+    let report = repo.doctor_json(true);
+    let findings = report["findings_store"]["findings"]
+        .as_array()
+        .expect("findings_store.findings array");
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["inconsistency_type"] != "missing_findings_object_index"),
+        "a size-matching agent_* index row must not be flagged as findings drift: {report}"
+    );
+    // The tag is preserved — no tag-war rewrite.
+    let rows = repo.object_index_rows(&[&findings_oid]).await;
+    assert!(
+        rows.iter()
+            .any(|(_, o_type, _, _)| o_type == "agent_transcript"),
+        "the pre-existing agent_transcript tag must be left intact: {rows:?}"
+    );
+}

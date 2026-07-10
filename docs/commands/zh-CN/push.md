@@ -17,6 +17,13 @@ libra push [OPTIONS] [<repository> [<refspec>...]]
 
 LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lfs push`。
 
+## 全局配置 Schema 保护
+
+`libra push` 在信任远端 / tiered 对象存储设置前，会读取全局存储配置（`~/.libra/config.db`，或 `LIBRA_CONFIG_GLOBAL_DB` 指定的路径）。如果该数据库的 schema 版本比当前二进制支持的版本更新，push 会以 `LBR-CONFIG-001` fail-closed，而不是静默忽略全局存储配置并回退到本地对象。诊断会包含二进制路径和版本、配置 DB 路径、schema 版本，以及升级命令：
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`。
+
+只有在明确希望本地对象访问时，才使用 `libra --offline push ...` 或 `LIBRA_READ_POLICY=offline|local libra push ...`。Libra 会告警一次，并在本次运行中忽略全局存储配置。
+
 ## 选项
 
 | 标志 / 参数 | 说明 | 示例 |

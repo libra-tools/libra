@@ -19,12 +19,15 @@ use git_internal::{
 };
 use serde::Serialize;
 
-use crate::utils::{
-    error::{CliError, CliResult, StableErrorCode},
-    lfs,
-    object_ext::BlobExt,
-    output::{OutputConfig, emit_json_data},
-    path, util,
+use crate::{
+    command::symlink_target_blob_bytes,
+    utils::{
+        error::{CliError, CliResult, StableErrorCode},
+        lfs,
+        object_ext::BlobExt,
+        output::{OutputConfig, emit_json_data},
+        path, util,
+    },
 };
 
 /// `--help` examples (cross-cutting EXAMPLES contract, `_general.md`).
@@ -251,7 +254,7 @@ fn stage_working_tree_path(
     if file_type.is_symlink() {
         let target = fs::read_link(absolute)
             .map_err(|error| fatal(format!("cannot stage symlink '{path_str}': {error}")))?;
-        let blob = Blob::from_content_bytes(target.to_string_lossy().as_bytes().to_vec());
+        let blob = Blob::from_content_bytes(symlink_target_blob_bytes(&target));
         blob.save();
         let mut entry = IndexEntry::new_from_blob(path_str.to_string(), blob.id, 0);
         entry.mode = 0o120000;

@@ -13,8 +13,7 @@ use super::{
     status,
 };
 use crate::{
-    command::{load_object, save_object, status::StatusArgs},
-    common_utils::format_commit_msg,
+    command::{load_object, status::StatusArgs},
     internal::{
         ai::automation::{VCS_EVENT_POST_SWITCH, dispatch_current_repo_vcs_event_to_history},
         branch::{self as repo_branch, Branch},
@@ -63,7 +62,7 @@ pub struct SwitchArgs {
     #[clap(long, short = 'C', group = "sub")]
     pub force_create: Option<String>,
 
-    /// Create a new orphan branch with no parents and an empty tree, and switch to it
+    /// Create a new unborn orphan branch with no parents, preserving index/worktree state
     #[clap(long, group = "sub")]
     pub orphan: Option<String>,
 
@@ -117,6 +116,8 @@ pub struct SwitchOutput {
     pub commit: String,
     pub created: bool,
     pub detached: bool,
+    /// True when HEAD points at a branch whose ref does not exist yet.
+    pub unborn: bool,
     /// True when the target branch equals the current branch (no-op switch).
     pub already_on: bool,
     pub tracking: Option<SwitchTrackingInfo>,
@@ -167,9 +168,6 @@ pub enum SwitchError {
 
     #[error("failed to delete existing branch '{branch}': {detail}")]
     BranchDelete { branch: String, detail: String },
-
-    #[error("failed to create orphan root commit for branch '{0}'")]
-    OrphanCommitCreate(String),
 
     #[error("'{0}' is a reserved branch name")]
     InternalBranchBlocked(String),
@@ -260,9 +258,6 @@ impl From<SwitchError> for CliError {
             SwitchError::BranchDelete { ref branch, ref detail } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::IoWriteFailed)
                 .with_hint(format!("branch '{branch}' could not be deleted before force-create: {detail}")),
-            SwitchError::OrphanCommitCreate(ref name) => CliError::fatal(error.to_string())
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-                .with_hint(format!("failed to create orphan root commit for branch '{name}'")),
             SwitchError::InternalBranchBlocked(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
             SwitchError::DirtyUnstaged => CliError::fatal(error.to_string())
@@ -768,6 +763,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
             commit: tracked.commit.to_string(),
             created: true,
             detached: false,
+            unborn: false,
             already_on: false,
             tracking: Some(SwitchTrackingInfo {
                 remote: tracked.remote,
@@ -795,6 +791,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
             commit: commit.to_string(),
             created: true,
             detached: false,
+            unborn: false,
             already_on: false,
             tracking: None,
         });
@@ -838,60 +835,24 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
             commit: commit.to_string(),
             created: true,
             detached: false,
+            unborn: false,
             already_on: false,
             tracking: None,
         });
     }
 
     if let Some(new_branch_name) = orphan {
-        validate_new_branch_request(&new_branch_name, None, true).await?;
-        if let Some(existing) = Branch::find_branch_result(&new_branch_name, None)
-            .await
-            .map_err(map_branch_store_error)?
-        {
-            if Some(existing.name.as_str()) == previous_branch.as_deref() {
-                return Err(SwitchError::DelegatedCli(
-                    CliError::fatal(format!(
-                        "cannot create orphan from the currently checked-out branch '{}'",
-                        new_branch_name
-                    ))
-                    .with_stable_code(StableErrorCode::ConflictOperationBlocked),
-                ));
-            }
-            Branch::delete_branch_result(&new_branch_name, None)
-                .await
-                .map_err(|e| SwitchError::BranchDelete {
-                    branch: new_branch_name.clone(),
-                    detail: e.to_string(),
-                })?;
+        if let Some(start_point) = branch {
+            return Err(SwitchError::DelegatedCli(
+                CliError::command_usage("switch --orphan does not accept a start-point")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint(format!(
+                        "run 'libra switch --orphan {new_branch_name}' without '{start_point}'."
+                    )),
+            ));
         }
-        ensure_clean_status(output).await?;
-        let orphan_commit = create_orphan_root_commit().await.map_err(|e| {
-            SwitchError::DelegatedCli(
-                CliError::fatal(format!(
-                    "failed to create orphan root commit for branch '{new_branch_name}': {e}"
-                ))
-                .with_stable_code(StableErrorCode::IoWriteFailed),
-            )
-        })?;
-        Branch::update_branch(&new_branch_name, &orphan_commit.to_string(), None)
-            .await
-            .map_err(|e| SwitchError::BranchCreate {
-                branch: new_branch_name.clone(),
-                detail: e.to_string(),
-            })?;
-        let created_branch = resolve_created_branch(&new_branch_name).await?;
-        let commit = switch_to_resolved_branch(created_branch, output).await?;
-        return Ok(SwitchOutput {
-            previous_branch,
-            previous_commit,
-            branch: Some(new_branch_name),
-            commit: commit.to_string(),
-            created: true,
-            detached: false,
-            already_on: false,
-            tracking: None,
-        });
+        return switch_to_orphan_branch(new_branch_name, previous_branch, previous_commit, output)
+            .await;
     }
 
     if detach {
@@ -909,6 +870,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
             commit: commit.to_string(),
             created: false,
             detached: true,
+            unborn: false,
             already_on: false,
             tracking: None,
         });
@@ -925,6 +887,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
                     commit: target_branch.commit.to_string(),
                     created: false,
                     detached: false,
+                    unborn: false,
                     already_on: true,
                     tracking: None,
                 });
@@ -940,6 +903,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
                 commit: commit.to_string(),
                 created: false,
                 detached: false,
+                unborn: false,
                 already_on: false,
                 tracking: None,
             })
@@ -954,6 +918,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
                 commit: tracked.commit.to_string(),
                 created: true,
                 detached: false,
+                unborn: false,
                 already_on: false,
                 tracking: Some(SwitchTrackingInfo {
                     remote: tracked.remote,
@@ -1062,6 +1027,89 @@ async fn switch_to_tracked_remote_branch(
         local_branch,
         commit,
     })
+}
+
+pub(crate) async fn switch_to_orphan_branch(
+    new_branch_name: String,
+    previous_branch: Option<String>,
+    previous_commit: Option<String>,
+    output: &OutputConfig,
+) -> Result<SwitchOutput, SwitchError> {
+    validate_new_branch_request(&new_branch_name, None, false).await?;
+    if previous_branch.as_deref() == Some(new_branch_name.as_str()) {
+        return Err(SwitchError::DelegatedCli(
+            CliError::fatal(format!(
+                "cannot create orphan from the currently checked-out branch '{}'",
+                new_branch_name
+            ))
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked),
+        ));
+    }
+    if let Some(other) = Head::branch_checked_out_elsewhere(&new_branch_name).await {
+        return Err(SwitchError::WorktreeConflict(
+            CliError::fatal(format!(
+                "branch '{new_branch_name}' is already checked out at worktree '{other}'"
+            ))
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("choose a different orphan branch name"),
+        ));
+    }
+    ensure_clean_status(output).await?;
+    switch_head_to_unborn_branch(&new_branch_name).await?;
+
+    Ok(SwitchOutput {
+        previous_branch,
+        previous_commit,
+        branch: Some(new_branch_name),
+        commit: ObjectHash::zero_str(get_hash_kind()).to_string(),
+        created: true,
+        detached: false,
+        unborn: true,
+        already_on: false,
+        tracking: None,
+    })
+}
+
+async fn switch_head_to_unborn_branch(branch_name: &str) -> Result<(), SwitchError> {
+    let db = get_db_conn_instance().await;
+    let old_oid = Head::current_commit_result_with_conn(&db)
+        .await
+        .map_err(map_branch_store_error)?
+        .map(|oid| oid.to_string())
+        .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
+    let from_ref_name = match Head::current_result_with_conn(&db)
+        .await
+        .map_err(map_branch_store_error)?
+    {
+        Head::Branch(name) => name,
+        Head::Detached(hash) => hash.to_string()[..7].to_string(),
+    };
+
+    let action = ReflogAction::Switch {
+        from: from_ref_name,
+        to: branch_name.to_string(),
+    };
+    let context = ReflogContext {
+        old_oid,
+        new_oid: ObjectHash::zero_str(get_hash_kind()).to_string(),
+        action,
+    };
+    let branch_name = branch_name.to_string();
+
+    with_reflog(
+        context,
+        move |txn: &sea_orm::DatabaseTransaction| {
+            let branch_name = branch_name.clone();
+            Box::pin(async move {
+                Head::update_result_with_conn(txn, Head::Branch(branch_name), None)
+                    .await
+                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
+            })
+        },
+        false,
+    )
+    .await
+    .map_err(|error| SwitchError::HeadUpdate(error.to_string()))
 }
 
 /// change the working directory to the version of commit_hash
@@ -1276,71 +1324,6 @@ fn render_switch_output(result: &SwitchOutput, output: &OutputConfig) -> CliResu
     }
 
     Ok(())
-}
-
-async fn create_orphan_root_commit() -> Result<ObjectHash, CliError> {
-    use git_internal::internal::object::{
-        blob::Blob,
-        commit::Commit,
-        signature::{Signature, SignatureType},
-        tree::{Tree, TreeItem, TreeItemMode},
-    };
-
-    let name = ConfigKv::get("user.name")
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v.value)
-        .unwrap_or_else(|| "Libra Orphan".to_string());
-    let email = ConfigKv::get("user.email")
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v.value)
-        .unwrap_or_else(|| "orphan@libra".to_string());
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as usize)
-        .unwrap_or(0);
-    let author = Signature {
-        signature_type: SignatureType::Author,
-        name: name.clone(),
-        email: email.clone(),
-        timestamp,
-        timezone: "+0000".to_string(),
-    };
-    let committer = Signature {
-        signature_type: SignatureType::Committer,
-        name,
-        email,
-        timestamp,
-        timezone: "+0000".to_string(),
-    };
-    let blob = Blob::from_content("");
-    save_object(&blob, &blob.id).map_err(|e| {
-        CliError::fatal(format!("failed to save orphan blob object: {e}"))
-            .with_stable_code(StableErrorCode::IoWriteFailed)
-    })?;
-    let tree_item = TreeItem {
-        mode: TreeItemMode::Blob,
-        name: ".librakeep".to_string(),
-        id: blob.id,
-    };
-    let tree = Tree::from_tree_items(vec![tree_item]).map_err(|e| {
-        CliError::fatal(format!("failed to create orphan tree object: {e}"))
-            .with_stable_code(StableErrorCode::IoWriteFailed)
-    })?;
-    save_object(&tree, &tree.id).map_err(|e| {
-        CliError::fatal(format!("failed to save orphan tree object: {e}"))
-            .with_stable_code(StableErrorCode::IoWriteFailed)
-    })?;
-    let message = format_commit_msg("orphan branch root commit", None);
-    let commit = Commit::new(author, committer, tree.id, Vec::new(), &message);
-    save_object(&commit, &commit.id).map_err(|e| {
-        CliError::fatal(format!("failed to save orphan commit object: {e}"))
-            .with_stable_code(StableErrorCode::IoWriteFailed)
-    })?;
-    Ok(commit.id)
 }
 
 async fn current_switch_state() -> (Option<String>, Option<String>) {

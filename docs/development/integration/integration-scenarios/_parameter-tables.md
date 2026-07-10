@@ -128,8 +128,8 @@
 | `cherry-pick <commit>` / `cherry-pick -x <commit>` | `cli.merge-rebase-cherry-revert-smoke` | 指定提交修改被重放到当前分支；默认消息不追加来源行，`-x` 追加来源提交行 |
 | `revert <commit>` / `A..B`, `revert --continue` / `--abort` | `cli.merge-rebase-cherry-revert-smoke` | 单提交反向提交覆盖；范围回滚和空会话控制为负向断言 |
 | `grep` / `grep -F/-i/-n/-c/-l/-L/-e/-f/--tree/--cached` | `cli.grep-blame-describe-shortlog` | 工作区、index、pathspec、pattern file 和历史 tree 搜索可观察 |
-| `grep -z` / `grep --untracked` | `cli.grep-blame-describe-shortlog` | 当前未实现，runner 负向断言 |
-| `blame` / `blame -L` / `blame <file> <commit>` | `cli.grep-blame-describe-shortlog` | 行级作者、提交和范围限制可观察；`--porcelain` 为负向断言 |
+| `grep -z` / `grep --untracked` / grep 0/1/2 exit codes | `cli.grep-blame-describe-shortlog` | 已实现；runner 正向断言 NUL 路径输出、未跟踪文件搜索，并负向断言无匹配退出 1、命令错误退出 2 |
+| `blame` / `blame -L` / `blame <file> <commit>` / `blame --porcelain` | `cli.grep-blame-describe-shortlog` | 行级作者、提交、范围限制和 porcelain 头部可观察 |
 | `describe --tags/--always/--abbrev/--exact-match/--dirty[=<mark>]` | `cli.grep-blame-describe-shortlog` | tag 描述、hash fallback、exact match 和 tracked dirty 后缀可观察；HEAD 越过 tag 后的 `--exact-match` 为负向断言 |
 | `shortlog` / `shortlog -s` / `shortlog -n` / `shortlog -e` | `cli.grep-blame-describe-shortlog` | 作者汇总、排序、邮箱和 revision 限制可观察；扩展 flags 为负向断言 |
 | `rev-parse HEAD` / `--short` / `--show-toplevel` | `cli.object-readback` | 完整哈希、短哈希和工作树根路径可传递给后续 plumbing 命令 |

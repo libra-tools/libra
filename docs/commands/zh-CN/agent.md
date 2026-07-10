@@ -13,6 +13,7 @@ libra agent disable [--agent <name>]...
 libra agent remove [<name>...]
 libra agent session <subcommand>
 libra agent checkpoint <subcommand>
+libra agent skill <subcommand>
 libra agent clean [--all]
 libra agent doctor [--repair]
 libra agent push [--remote <name>] [--force-rewrite]
@@ -45,11 +46,15 @@ libra agent rpc <subcommand>
 | `checkpoint show <id>` | 显示 checkpoint 元数据 |
 | `checkpoint rewind <id>` | 检查或应用某个 checkpoint 的工作树回退 |
 | `checkpoint export <id>` | 导出 checkpoint transcript：默认脱敏（无需授权）；raw（未脱敏）导出须 `--allow-raw --raw` 并写入 append-only `agent_audit_log`（缺失授权时拒绝并返回 `LBR-AGENT-013`） |
+| `skill search` | 按 `--skill`、`--provider`、`--session`、RFC3339 `--since`/`--until` 搜索捕获的 skill events（`--limit`/`--cursor` keyset 分页、`--json`）。基于 checkpoint metadata 的读时投影，无独立表 |
+| `skill list` | `skill search` 的别名（同过滤项） |
+| `skill registry` | 展示各 agent 的 curated 可发现 skill 注册表（`--provider <slug>` 限定；公开 SkillDiscoverer 面） |
 | `clean` | 清理已停止会话的临时 checkpoint（prune 遇到进行中的 checkpoint 写入或 traces 引用可达但无 catalog 行的提交时 fail-closed 拒绝；同时删除因此不可达的 `object_index` 行） |
 | `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致 |
 | `push` | 将 `refs/libra/traces` 推送到远程（`clean` prune 重写后的非快进推送用 `--force-rewrite`，采用 force-with-lease 语义） |
 | `rpc list` | 列出 `PATH` 上发现的 `libra-agent-*` 二进制（含 trusted/quarantined 状态）；需先开启 external-agents 开关 |
-| `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable 时拒绝） |
+| `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable、或二进制不在受信目录下时拒绝——`LBR-AGENT-005`） |
+| `rpc trust --dir <path>` | 注册一个受信目录（`agent.external_agents.trusted_dirs`，默认 `~/.libra/agents`）：外部二进制的 canonical path 必须位于其中之一才可被信任。路径会被 canonicalize，且必须是存在且非 world-writable 的目录 |
 | `rpc untrust <slug>` | 撤销信任；二进制回到隔离状态（始终可用，不受开关限制） |
 | `rpc invoke` | 在**已信任**的 `libra-agent-*` 二进制上调用一个 JSON-RPC 方法 |
 
@@ -62,6 +67,7 @@ libra agent rpc <subcommand>
 | `--cursor <cursor>` | `session list`, `checkpoint list` | 上一页 `next_cursor` 返回的不透明 keyset 游标；不要手工构造 |
 | `--extract-transcript <path>` | `session show` | 将会话元数据中的已捕获 transcript 路径复制到本地文件 |
 | `--all` | `clean` | 清理所有已停止会话的 checkpoint，而不只是最近一个 |
+| `--gc` / `--retention-days <n>` / `--dry-run` | `clean` | 三窗口保留期 GC：(1) 删除已停止会话中早于 `agent.retention.transcript_days`（默认 90；用 `--retention-days` 覆盖）的 checkpoint；(2) 清理早于 `agent.retention.stderr_days`（默认 30）的**终态** run 的 reviewer stderr 诊断日志，保留聚合记录；(3) **A0-09** 删除早于 `agent.retention.findings_days`（默认 90）的**终态** review/investigate run 整个目录（`findings.md`/`manifest.json`/`state.json`/reviewer 日志）。对象化的 findings blob 是内容寻址对象，交由未来的仓库级 object GC 回收（per-run retention 绝不删除可能被共享的对象）。non-terminal/时间戳不可解析的 run 一律 fail-safe 跳过；永不触碰 `agent_audit_log`。`--dry-run` 仅预览各窗口 would-be 删除（JSON `dry_run`/`findings_runs_pruned`），不实际删除 |
 | `--repair` | `doctor` | 修复检测到的 checkpoint 存储不一致（从 `refs/libra/traces` 重建过期/缺失的 catalog 行，补插缺失的 `object_index` 行）；省略时仅检测 |
 | `--remote <name>` | `push` | 选择用于推送代理 trace 引用的远程 |
 | `--force-rewrite` | `push` | 允许本地 `clean` prune 之后的非快进推送（traces 引用由 Libra 托管，prune 即整链重写）；采用针对本仓库最近一次推送记录的 force-with-lease 语义——绝非无条件 force——远程被别处重写时仍 fail-closed 拒绝 |
@@ -82,6 +88,8 @@ libra --json agent rpc list
 `agent list --json` 携带稳定的 `schema_version` 与每个已知代理一行（`slug`、`agent_kind`、`stability`、`supported`、`support_wave`、`registered`、`transcript_readable`、`hook_installable`、`installed`、`launchable_review`、`launchable_investigate`、`external_binary`、`config_paths`、`protected_dirs`、`capabilities`）。行结构是面向自动化的冻结契约。
 
 `agent session list --json` 与 `agent checkpoint list --json` 每次返回一页：`data` 携带 `schema_version`、位于 `sessions` / `checkpoints` 下的行（单行结构不变），以及 `next_cursor`——传回 `--cursor` 的不透明游标，列表耗尽时为 `null`。页序为最新在前（`started_at` / `created_at` 降序，行 id 作为并列时的次序键）。
+
+每个 checkpoint 行携带 `scope`。`committed` checkpoint 在 turn/session 边界（`Stop` / `SessionEnd`）写入，携带脱敏的 transcript 快照。`subagent` checkpoint 在被观测 agent 的子代理边界（`SubagentStart` / `SubagentEnd`）物化：它们是**独立** checkpoint——可 list/show/export/prune，且 doctor 可见——通过 `parent_checkpoint_id` 链回所属 turn，使嵌套运行成为一等公民，而非只作为主 checkpoint 上的 metadata。
 
 `agent checkpoint show --json` 额外报告 `layout` 摘要（`e4-libra`、`legacy-v1` 表示 AG-20 之前的存量 checkpoint、`unknown` 表示 checkpoint tree 本地不可读），包含 manifest 角色、按 manifest 顺序列出的 transcript 分片、`content_hash` 格式校验，以及 transcript `availability` 标志（`present`/`missing`/`unknown`）——全程不读取 transcript blob 内容。
 
@@ -171,7 +179,7 @@ libra agent --json status
 
 - 外部 `libra-agent-*` 代理**默认禁用**。使用 `libra config set agent.external_agents.enabled true`（仓库级）显式开启；开启前 `rpc list`/`rpc trust`/`rpc invoke` 会以 `LBR-AGENT-002` 拒绝（`rpc untrust` 始终可用——撤销信任只会收紧安全面）。已发现的二进制在 `rpc trust <slug>` 记录来源前保持隔离（world-writable 目录中的二进制拒绝信任）；每次 invoke 都会复验来源（漂移即撤销信任，`LBR-AGENT-005`）；子进程环境被清空为白名单注入，stderr 被捕获/限长/脱敏——绝不继承。invoke 超时、broken pipe、malformed frame 映射 `LBR-AGENT-012`；IO 硬上限超限映射 `LBR-AGENT-007`。
 
-- 顶层 `agent hooks` 入口是隐藏的，面向由 `libra agent enable` 安装的 hook 配置；用户通常不会直接调用它。
+- 顶层 `agent hooks` 入口是隐藏的，面向由 `libra agent enable` 安装的 hook 配置；用户通常不会直接调用它。若 hook envelope 未通过大小 / UTF-8 / JSON / schema / transcript 路径校验，会以 `LBR-AGENT-008`（退出码 128）fail-closed 拒绝——绝不回显 raw stdin。对不一致 store 执行 checkpoint 操作（如 `checkpoint rewind`）——catalog 行的 `parent_commit` 非法或指向缺失的 traces 对象——会以 `LBR-AGENT-009`（退出码 128）失败；运行 `libra agent doctor` 检查 store。
 - `checkpoint rewind --apply` 只恢复工作树文件；代理自身的 transcript 文件不会被重写。
 - Hook 和捕获诊断采用 best-effort 方式，设计目标是报告可操作的安装状态，而不是静默忽略缺失的提供商。
 

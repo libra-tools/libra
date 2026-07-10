@@ -20,6 +20,20 @@ Each repository is identified by a UUID (`libra.repoid` config key) and optional
 
 Restore can target a repository by UUID (`--repo-id`) or project name (`--name`). It downloads the object index from D1, optionally downloads objects from R2, restores metadata (references), and populates the working directory from HEAD.
 
+## Global Config Schema Guard
+
+`libra cloud` reads the global storage configuration (`~/.libra/config.db`, or
+`LIBRA_CONFIG_GLOBAL_DB`) before trusting remote/tiered object storage settings. If that
+database has a schema version newer than this binary supports, cloud commands fail closed
+with `LBR-CONFIG-001` instead of silently ignoring global storage config and falling back
+to local objects. The diagnostic includes the binary path and version, config DB path,
+schema versions, and the update command:
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+
+Use `libra --offline cloud ...` or `LIBRA_READ_POLICY=offline|local libra cloud ...` only when
+you intentionally want local-only object access. Libra will warn once and ignore the
+global storage config for that run.
+
 ## Options
 
 ### Subcommand: `sync`

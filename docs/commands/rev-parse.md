@@ -34,6 +34,7 @@ It also supports `--show-toplevel` to print the absolute repository root for a w
 | `--no-revs` | Output-filter mode: drop revision args, keeping flags and non-revision paths. |
 | `--show-toplevel` | Print the absolute path to the top-level working tree. |
 | `--is-inside-git-dir` | Print `true` when the current directory is inside the `.libra` directory (Libra's `$GIT_DIR` equivalent), `false` otherwise. |
+| `--is-shallow-repository` | Print `true` when `.libra/shallow` contains at least one shallow boundary, `false` otherwise. |
 | `--git-dir` | Print the path to the `.libra` directory (Libra's `$GIT_DIR`). In Libra this is always absolute. |
 | `--absolute-git-dir` | Like `--git-dir`, but always the canonicalized absolute path. (In Libra `--git-dir` is already absolute, so the two coincide.) |
 | `<SPEC>` | Revision to resolve. Defaults to `HEAD` when omitted. |
@@ -47,6 +48,7 @@ libra rev-parse --short HEAD
 libra rev-parse --abbrev-ref HEAD
 libra rev-parse --show-toplevel
 libra rev-parse --is-inside-git-dir
+libra rev-parse --is-shallow-repository
 libra rev-parse --absolute-git-dir
 libra --json rev-parse --short HEAD
 ```

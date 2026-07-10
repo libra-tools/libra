@@ -90,6 +90,30 @@ pub const RPC_PROTOCOL_VERSION: u32 = 2;
 /// surfaced raw — only redacted excerpts.
 pub const RPC_MAX_STDERR_BYTES: usize = 64 * 1024;
 
+/// Non-secret parent-environment variables passed through to a spawned
+/// `libra-agent-*` binary after `env_clear()` (AG-18 / E2 allowlist,
+/// agent.md §强制补强项 #2). Real external CLIs need these to locate their
+/// interpreter, dependencies, config and dotfiles; a child with an empty
+/// `PATH`/`HOME` typically cannot run at all. Membership is an exact,
+/// case-sensitive name match — no wildcards — so credential/endpoint
+/// variables (`*_API_KEY`, `LIBRA_STORAGE_*`, `LIBRA_D1_*`, `*_TOKEN`,
+/// `*_SECRET`, `*_PASSWORD`, `*_BASE_URL`, …) are never on this list and
+/// stay cleared. `LIBRA_AGENT_PROTOCOL_DEBUG` is only forwarded when the
+/// parent has it set (default: cleared).
+pub const RPC_ENV_PASSTHROUGH_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TZ",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "LIBRA_AGENT_PROTOCOL_DEBUG",
+];
+
 /// Typed classification for RPC failures (AG-18). Attached to the
 /// `anyhow` chain via `.context(...)` so callers can `downcast_ref`
 /// instead of substring-matching over messages that may embed
@@ -247,9 +271,10 @@ pub struct RpcError {
 
 impl RpcAgent {
     /// Spawn `binary` as a child process and prepare a JSON-RPC
-    /// channel against it. The child's stderr inherits from the
-    /// runtime so operators see binary-side panics in their terminal;
-    /// stdout/stdin are piped for RPC traffic.
+    /// channel against it. The child's stderr is captured into a capped,
+    /// redacted in-memory buffer — never inherited to the operator's
+    /// terminal (see [`Self::redacted_stderr_excerpt`]); stdout/stdin are
+    /// piped for RPC traffic.
     ///
     /// A dedicated reader thread pumps complete lines from stdout
     /// into a bounded sync channel so the timeout in `invoke` can
@@ -262,15 +287,33 @@ impl RpcAgent {
     /// child as `LIBRA_REPO_ROOT`.
     ///
     /// Security contract (AG-18 / E2): the child environment is cleared
-    /// and ONLY the allowlisted `LIBRA_AGENT_PROTOCOL_VERSION`,
-    /// `LIBRA_CLI_VERSION` and (when given) `LIBRA_REPO_ROOT` variables
-    /// are injected — provider API keys, `LIBRA_STORAGE_*`, `LIBRA_D1_*`
-    /// and the rest of the parent environment never reach the binary.
-    /// Stderr is piped into a capped in-memory buffer (never inherited);
-    /// use [`Self::redacted_stderr_excerpt`] for diagnostics.
+    /// and only an explicit allowlist is re-injected — the derived
+    /// `LIBRA_AGENT_PROTOCOL_VERSION` / `LIBRA_CLI_VERSION` / (when given)
+    /// `LIBRA_REPO_ROOT`, plus the non-secret parent variables in
+    /// [`RPC_ENV_PASSTHROUGH_ALLOWLIST`] (`PATH`, `HOME`, locale, …) that
+    /// real external CLIs need to locate their interpreter, dependencies
+    /// and config. Provider API keys, `LIBRA_STORAGE_*`, `LIBRA_D1_*`,
+    /// `*_TOKEN`/`*_SECRET` and the rest of the parent environment never
+    /// reach the binary. Stderr is piped into a capped in-memory buffer
+    /// (never inherited); use [`Self::redacted_stderr_excerpt`] for
+    /// diagnostics.
     pub fn spawn_in_repo(
         binary: RpcAgentBinary,
         repo_root: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        Self::spawn_in_repo_with_env(binary, repo_root, &[])
+    }
+
+    /// [`Self::spawn_in_repo`] plus an operator-configured
+    /// `extra_env_allowlist` of additional exact env-var names to pass through
+    /// (A0-08 `agent.external_agents.env_allowlist_extra`). Each name is
+    /// re-checked against [`env_name_is_forbidden`] here as defense-in-depth,
+    /// so a credential/endpoint name can never reach the child even if it
+    /// slipped into config.
+    pub fn spawn_in_repo_with_env(
+        binary: RpcAgentBinary,
+        repo_root: Option<&std::path::Path>,
+        extra_env_allowlist: &[String],
     ) -> Result<Self> {
         let mut command = Command::new(&binary.binary_path);
         command
@@ -283,6 +326,25 @@ impl RpcAgent {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Re-inject the non-secret passthrough allowlist (only the vars the
+        // parent actually has set). `env_clear()` above guarantees anything
+        // not on this list — including every credential/endpoint variable —
+        // stays out of the child.
+        for name in RPC_ENV_PASSTHROUGH_ALLOWLIST {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        // A0-08 extra passthrough: operator-approved additional names, with a
+        // hard secret/wildcard denial re-applied here.
+        for name in extra_env_allowlist {
+            if super::trust::env_name_is_forbidden(name) {
+                continue;
+            }
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         if let Some(root) = repo_root {
             command.env("LIBRA_REPO_ROOT", root);
         }

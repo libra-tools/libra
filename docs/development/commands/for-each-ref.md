@@ -37,6 +37,7 @@ flowchart TD
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-06-13 `8d4fb969`（`Implement ref and index listing commands`）：基础实现节点：Implement ref and index listing commands；当前实现的主要轮廓可追溯到该提交。
+- 2026-07-09（plan-20260708 P0-06）：仍使用 `println!` 的行输出路径由 `main.rs` stdout broken-pipe panic hook 统一收口；下游提前关闭管道时静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 - 历史结论：`src/command/for_each_ref.rs` 已通过 `src/cli.rs::Commands::ForEachRef` 公开；早期“未公开 CLI”的记录已经过期，当前状态以源码和本页“当前状态”为准。
 
 ## 当前状态
@@ -44,6 +45,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已从 `src/command/mod.rs` 导出。
 - 用户文档：`docs/commands/for-each-ref.md`，记录公开 CLI 合约。
 - 公开参数/子命令包括：`--heads`、`--tags`、`--remotes`、`--all`、`--format`、`--sort`、`--count`、`--points-at <object>`、`--contains <commit>`、`--no-contains <commit>`、`--merged <commit>`、`--no-merged <commit>`、`--exclude <pattern>`、`<pattern>...`。`--exclude`（可重复）在位置 include 模式过滤之后，丢弃 refname 匹配任一 exclude 模式的 ref（复用 `matches_ref_pattern`）。
+- P1-04 核对结论：`for-each-ref --format` 是 Git 的 `%(atom)` ref 模板语言，已在本页 atom 表中单独维护；它不消费 `log`/`show`/`shortlog` 的 `%` pretty-format placeholder，因此本切片不把 `CommitFormatter` 接入 `for-each-ref`。
 - `--contains <commit>` / `--no-contains <commit>`：仅保留（或排除）其提交以 `<commit>` 为祖先的 ref（即 ref 的提交“包含”该 commit）。复用 `log::get_reachable_commits` 对每个 ref 的 peeled commit 做一次可达性遍历。
 - `--merged <commit>` / `--no-merged <commit>`：仅保留（或排除）其提交可从 `<commit>` 到达的 ref（即 ref 已合并入 `<commit>`），方向与 `--contains` 相反。复用 `log::get_reachable_commits` 对 `<commit>` 计算一次可达集合后逐 ref 判定，避免逐 ref 重复遍历。
 

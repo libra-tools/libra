@@ -242,7 +242,7 @@ fn should_ignore_with_workdir(
     path: &Path,
     policy: IgnorePolicy,
     index: &Index,
-    workdir: &PathBuf,
+    workdir: &Path,
 ) -> bool {
     let is_tracked = path_is_tracked_or_unknown_encoding(path, index);
 
@@ -294,10 +294,10 @@ fn path_is_tracked_or_unknown_encoding(path: &Path, index: &Index) -> bool {
 /// "ignored"), this reports the raw pattern match — used by `ls-files -i` so a
 /// tracked file that matches an exclude pattern (`-i -c`) is surfaced correctly.
 pub fn path_matches_ignore_pattern(path: &Path, workdir: &Path) -> bool {
-    is_path_ignored(path, &workdir.to_path_buf())
+    is_path_ignored(path, workdir)
 }
 
-fn is_path_ignored(path: &Path, workdir: &PathBuf) -> bool {
+fn is_path_ignored(path: &Path, workdir: &Path) -> bool {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

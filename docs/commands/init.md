@@ -28,7 +28,7 @@ Running `libra init` again inside an already-initialized repository is safe: lik
 `git init`, it re-initializes in place, printing `Reinitialized existing Libra
 repository in <path>` and re-creating any missing standard layout (templates,
 directories) and re-applying `--shared`, while preserving the existing database —
-configuration, `HEAD`, refs, objects, vault, and repository id are untouched.
+configuration, `HEAD`, refs, objects, vault, and repository id are otherwise untouched.
 `--initial-branch` and `--object-format` are ignored (with a warning) when they
 differ from the existing repository, and `--from-git-repository` is rejected on an
 already-initialized repository.
@@ -108,7 +108,26 @@ libra init --template /path/to/template
 ### `--shared <MODE>`
 
 Specify that the repository is to be shared amongst several users (mirrors the Git
-`--shared` flag for group permissions).
+`--shared` flag for group permissions). Supported values are `false`, `umask`,
+`true`, `group`, `all`, `world`, `everybody`, or a 4-digit octal mode such as
+`0770`.
+
+`true` is canonicalized to `group`; `world` and `everybody` are canonicalized to
+`all`. Any explicit `--shared` value is recorded in `core.sharedRepository`, so
+`libra config get core.sharedRepository` reflects the active shared mode after a
+fresh init or re-initialization.
+
+Numeric modes are validated before any repository layout is written. Libra applies
+numeric modes directly to repository directories and files, so the owner must keep
+`rwx` access and any group/other class that receives read or write permission must
+also receive the matching execute bit for directory traversal. Non-traversable
+modes such as `0660` are rejected with `LBR-CLI-002` and do not leave a partial
+`.libra` directory.
+
+```bash
+libra init --shared group shared-repo
+libra init --shared 0770 shared-repo
+```
 
 ### `--ref-format <FORMAT>`
 
@@ -132,6 +151,7 @@ libra init -b develop
 libra init --object-format sha256
 libra init --from-git-repository ../old-project
 libra init --vault false
+libra init --shared group shared-repo
 ```
 
 ## Human Output

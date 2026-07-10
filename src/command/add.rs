@@ -1,7 +1,7 @@
 //! Stages changes for the next commit (`libra add`).
 //!
 //! Implements the `add` subcommand: parses pathspecs and mode flags, applies
-//! ignore policy (`.libraignore`), classifies each path against the working
+//! ignore policy, classifies each path against the working
 //! tree and the on-disk index, writes new blob objects under the repository's
 //! object storage, and finally persists the updated index.
 //!
@@ -35,14 +35,18 @@ use git_internal::{
 use serde::Serialize;
 
 use crate::{
-    command::status::{self, Changes},
+    command::{
+        read_worktree_blob_bytes,
+        status::{self, Changes},
+    },
     internal::ai::automation::{VCS_EVENT_POST_ADD, dispatch_current_repo_vcs_event_to_history},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
-        lfs,
         object_ext::BlobExt,
         output::{self, OutputConfig},
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -188,6 +192,9 @@ pub enum AddError {
     /// [`status::StatusError`] is preserved as a source.
     #[error("failed to inspect repository status: {source}")]
     Status { source: status::StatusError },
+    /// The shared Git-style pathspec parser rejected the user input.
+    #[error("{source}")]
+    Pathspec { source: PathspecError },
 }
 
 impl From<AddError> for CliError {
@@ -234,6 +241,9 @@ impl From<AddError> for CliError {
             AddError::Status { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("failed to compute working tree status"),
+            AddError::Pathspec { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob"),
         }
     }
 }
@@ -265,7 +275,7 @@ pub struct AddOutput {
     pub removed: Vec<String>,
     /// Files whose metadata was refreshed (--refresh mode)
     pub refreshed: Vec<String>,
-    /// Paths ignored by .libraignore (only when pathspec matches ignored files)
+    /// Paths ignored by configured ignore sources (only when pathspec matches ignored files)
     pub ignored: Vec<String>,
     /// Paths that failed under --ignore-errors
     pub failed: Vec<AddFailure>,
@@ -334,15 +344,21 @@ enum StagedAction {
 
 /// Result of [`validate_pathspecs`]: the canonicalised set of pathspecs that
 /// should drive staging, plus any pathspecs that only matched
-/// `.libraignore`d entries (reported as warnings).
-#[derive(Default)]
+/// ignored entries (reported as warnings).
 struct ValidatedPathspecs {
-    files: Vec<PathBuf>,
+    pathspecs: PathspecSet,
     ignored: Vec<String>,
-    /// Pathspecs skipped under `--ignore-missing` because they do not exist in
-    /// the working tree (dry-run only). Reported as stderr warnings, never in
-    /// the JSON payload.
+    /// Pathspecs skipped under `--ignore-missing` because they matched no add
+    /// candidate (dry-run only). Reported as stderr warnings and the JSON
+    /// payload.
     missing: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct PathspecMatchContext<'a> {
+    workdir: &'a Path,
+    current_dir: &'a Path,
+    ignore_case: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -492,27 +508,34 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
 
     // Resolve pathspecs. `--renormalize` implies `-u` (tracked-only), so it also
     // permits an empty pathspec (operate on the whole tracked set).
-    let requested_paths: Vec<PathBuf> = if args.pathspec.is_empty() {
-        if !args.all && !args.update && !args.refresh && !args.renormalize {
-            return Err(CliError::command_usage("nothing specified, nothing added")
-                .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint("maybe you wanted to say 'libra add .'?"));
-        }
-        vec![workdir.clone()]
-    } else {
-        args.pathspec.iter().map(PathBuf::from).collect()
-    };
+    if args.pathspec.is_empty() && !args.all && !args.update && !args.refresh && !args.renormalize {
+        return Err(CliError::command_usage("nothing specified, nothing added")
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint("maybe you wanted to say 'libra add .'?"));
+    }
 
     let mut index = Index::load(&index_path).map_err(|source| AddError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
     let current_dir = env::current_dir().map_err(|source| AddError::Workdir { source })?;
+    let ignore_case = crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|error| {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    let pathspec_ctx = PathspecMatchContext {
+        workdir: &workdir,
+        current_dir: &current_dir,
+        ignore_case,
+    };
 
     let (mut visible_changes, mut ignored_changes) = if args.force {
-        status::changes_to_be_staged_split_force().map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+            .map_err(|source| AddError::Status { source })?
     } else {
-        status::changes_to_be_staged_split_safe().map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
+            .map_err(|source| AddError::Status { source })?
     };
     if args.force {
         visible_changes.extend(ignored_changes.clone());
@@ -521,9 +544,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
 
     let validated = validate_pathspecs(
         &args.pathspec,
-        &requested_paths,
-        &workdir,
-        &current_dir,
+        pathspec_ctx,
         &visible_changes,
         &ignored_changes,
         &index,
@@ -544,12 +565,8 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
 
     // --- Refresh mode ---
     if args.refresh {
-        let tracked_modified = filter_refresh_candidates(
-            &visible_changes.modified,
-            &validated.files,
-            &workdir,
-            &current_dir,
-        );
+        let tracked_modified =
+            filter_refresh_candidates(&visible_changes.modified, &validated.pathspecs);
         if args.dry_run {
             add_output.refreshed = tracked_modified
                 .iter()
@@ -573,19 +590,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // `--renormalize` operates on the tracked set (implies `-u`) and force-rewrites
     // each matched blob; the regular path collects working-tree changes.
     let mut files = if args.renormalize {
-        filter_candidates(
-            &index.tracked_files(),
-            &validated.files,
-            &workdir,
-            &current_dir,
-        )
+        filter_candidates(&index.tracked_files(), &validated.pathspecs)
     } else {
         let mut f = visible_changes.modified;
         f.extend(visible_changes.deleted);
         if !args.update {
             f.extend(visible_changes.new);
         }
-        filter_candidates(&f, &validated.files, &workdir, &current_dir)
+        filter_candidates(&f, &validated.pathspecs)
     };
     filter_out_current_executable(&mut files);
     files.sort();
@@ -647,11 +659,11 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             let path_str = file.display().to_string();
             if args.renormalize {
                 // Mirror `renormalize_entry` exactly (via `symlink_metadata`, which
-                // does not follow links): gone -> staged deletion, directory or
-                // symlink -> skipped, regular file -> force-rewritten (modified).
+                // does not follow links): gone -> staged deletion, directory ->
+                // skipped, regular file or symlink -> force-rewritten (modified).
                 match std::fs::symlink_metadata(workdir.join(file)) {
                     Err(_) => add_output.removed.push(path_str),
-                    Ok(meta) if meta.is_dir() || meta.file_type().is_symlink() => {}
+                    Ok(meta) if meta.is_dir() => {}
                     Ok(_) => add_output.modified.push(path_str),
                 }
                 continue;
@@ -668,9 +680,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             apply_chmod(
                 &mut index,
                 target_mode,
-                &validated.files,
-                &workdir,
-                &current_dir,
+                &validated.pathspecs,
                 true,
                 &mut add_output,
             )?;
@@ -684,11 +694,6 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // (`core.casehandling=error`) the whole add refuses BEFORE mutating the
     // index; `warn`/`allow` skip the colliding candidates (staging under the
     // existing casing is the engine's job — v1 skips, documented).
-    let ignore_case = crate::utils::path_case::effective_ignore_case()
-        .await
-        .map_err(|error| {
-            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
     let files = if ignore_case {
         let policy = crate::utils::path_case::case_handling_from_config()
             .await
@@ -710,6 +715,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             let text = crate::utils::util::path_to_string(&file);
             match tracked_fold.get(&crate::utils::path_case::fold_path_key(&text)) {
                 Some(existing) if existing != &text => {
+                    let existing_path = PathBuf::from(existing);
+                    if crate::utils::path_case::is_same_file_case_alias(
+                        &workdir,
+                        &file,
+                        &existing_path,
+                    ) {
+                        continue;
+                    }
                     collisions.push((text, existing.clone()));
                 }
                 _ => kept.push(file),
@@ -785,9 +798,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         apply_chmod(
             &mut index,
             target_mode,
-            &validated.files,
-            &workdir,
-            &current_dir,
+            &validated.pathspecs,
             false,
             &mut add_output,
         )?;
@@ -824,18 +835,12 @@ fn parse_chmod(value: &str) -> CliResult<u32> {
 fn apply_chmod(
     index: &mut Index,
     target_mode: u32,
-    validated_files: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
+    pathspecs: &PathspecSet,
     dry_run: bool,
     out: &mut AddOutput,
 ) -> Result<(), AddError> {
-    let matched = filter_candidates(
-        &index.tracked_files(),
-        validated_files,
-        workdir,
-        current_dir,
-    );
+    let workdir = util::working_dir();
+    let matched = filter_candidates(&index.tracked_files(), pathspecs);
     for file in &matched {
         let file_str = file
             .to_str()
@@ -851,19 +856,24 @@ fn apply_chmod(
             continue;
         }
         let file_abs = workdir.join(file);
-        if !file_abs.is_file() {
-            // The tracked path is gone (or is a directory): nothing to chmod.
+        let Ok(metadata) = std::fs::symlink_metadata(&file_abs) else {
+            // The tracked path is gone: nothing to chmod.
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            // Only real regular files carry an executable bit.
             continue;
         }
         if !dry_run {
             // Rebuild the entry from the working-tree stat, keeping the existing
             // blob (no content change) and forcing the requested mode.
-            let mut updated = IndexEntry::new_from_file(file, hash, workdir).map_err(|source| {
-                AddError::CreateIndexEntry {
-                    path: file.to_path_buf(),
-                    source,
-                }
-            })?;
+            let mut updated =
+                IndexEntry::new_from_file(file, hash, &workdir).map_err(|source| {
+                    AddError::CreateIndexEntry {
+                        path: file.to_path_buf(),
+                        source,
+                    }
+                })?;
             updated.mode = target_mode;
             index.update(updated);
         }
@@ -903,13 +913,10 @@ fn renormalize_entry(
     if meta.is_dir() {
         return Ok(StagedAction::Unchanged);
     }
-    if meta.file_type().is_symlink() {
-        // A symlink's content is its link target — there is nothing to
-        // renormalize, and re-reading it through `gen_blob_from_file` (which
-        // follows the link) would corrupt the entry. Leave it untouched.
-        return Ok(StagedAction::Unchanged);
-    }
-    let blob = gen_blob_from_file(&file_abs);
+    let blob = gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+        path: file.to_path_buf(),
+        source,
+    })?;
     blob.save();
     index.update(
         IndexEntry::new_from_file(file, blob.id, workdir).map_err(|source| {
@@ -937,7 +944,7 @@ fn renormalize_entry(
 fn check_ignored_only_error(output: AddOutput) -> CliResult<AddOutput> {
     if !output.ignored.is_empty() && output.is_empty() {
         let mut message =
-            String::from("the following paths are ignored by one of your .libraignore files:");
+            String::from("the following paths are ignored by configured ignore rules:");
         for path in &output.ignored {
             message.push('\n');
             message.push_str(path);
@@ -1100,7 +1107,7 @@ fn render_normal(w: &mut impl Write, result: &AddOutput, verbose: bool) -> CliRe
 /// stdout redirection.
 fn render_warnings_stderr(result: &AddOutput) {
     if !result.ignored.is_empty() {
-        eprintln!("warning: the following paths are ignored by one of your .libraignore files:");
+        eprintln!("warning: the following paths are ignored by configured ignore rules:");
         for path in &result.ignored {
             eprintln!("{path}");
         }
@@ -1154,69 +1161,59 @@ fn write_err(e: io::Error) -> CliError {
 #[allow(clippy::too_many_arguments)]
 fn validate_pathspecs(
     raw_pathspecs: &[String],
-    requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
+    pathspec_ctx: PathspecMatchContext<'_>,
     visible_changes: &Changes,
     ignored_changes: &Changes,
     index: &Index,
     ignore_missing: bool,
 ) -> Result<ValidatedPathspecs, AddError> {
-    if raw_pathspecs.is_empty() {
-        return Ok(ValidatedPathspecs {
-            files: requested_paths.to_vec(),
-            ignored: Vec::new(),
-            missing: Vec::new(),
-        });
-    }
+    let pathspecs = PathspecSet::from_workdir_with_default_icase(
+        raw_pathspecs,
+        pathspec_ctx.current_dir,
+        pathspec_ctx.workdir,
+        pathspec_ctx.ignore_case,
+    )
+    .map_err(|source| AddError::Pathspec { source })?;
 
     let tracked_files = index.tracked_files();
     let change_candidates = collect_change_candidates(visible_changes);
     let ignored_candidates = collect_change_candidates(ignored_changes);
+    let selectable_candidates = pathspec_candidates(&change_candidates, &tracked_files);
+    let all_candidates = pathspec_candidates(&selectable_candidates, &ignored_candidates);
 
     let mut ignored = Vec::new();
-    let mut files = Vec::new();
     let mut missing = Vec::new();
-    for (raw, requested_path) in raw_pathspecs.iter().zip(requested_paths.iter()) {
-        let requested_abs = resolve_pathspec(requested_path, current_dir);
-        if !util::is_sub_path(&requested_abs, workdir) {
-            return Err(AddError::PathOutsideRepo {
-                path: raw.clone(),
-                repo_root: workdir.to_path_buf(),
+
+    let unmatched_selectable = pathspecs.unmatched_positive_specs(&selectable_candidates);
+    if !unmatched_selectable.is_empty() {
+        let unmatched_all = pathspecs.unmatched_positive_specs(&all_candidates);
+        for raw in unmatched_selectable {
+            if !unmatched_all.contains(&raw) {
+                ignored.push(raw.to_string());
+                continue;
+            }
+            if ignore_missing {
+                missing.push(raw.to_string());
+                continue;
+            }
+            return Err(AddError::PathspecNotMatched {
+                pathspec: raw.to_string(),
             });
         }
-
-        let matches_changes = pathspec_matches_any(&requested_abs, &change_candidates, workdir);
-        let matches_tracked = pathspec_matches_any(&requested_abs, &tracked_files, workdir);
-        let matches_ignored = pathspec_matches_any(&requested_abs, &ignored_candidates, workdir);
-
-        if matches_changes || matches_tracked {
-            files.push(requested_path.clone());
-            continue;
-        }
-        if matches_ignored {
-            ignored.push(raw.clone());
-            continue;
-        }
-
-        // `--ignore-missing` (dry-run only) skips a pathspec that does not exist
-        // on disk instead of failing; a path that EXISTS but still matches
-        // nothing is a real error even under `--ignore-missing` (matching Git).
-        if ignore_missing && !requested_abs.exists() {
-            missing.push(raw.clone());
-            continue;
-        }
-
-        return Err(AddError::PathspecNotMatched {
-            pathspec: raw.clone(),
-        });
     }
 
     Ok(ValidatedPathspecs {
-        files,
+        pathspecs,
         ignored,
         missing,
     })
+}
+
+fn pathspec_candidates(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(left.len() + right.len());
+    candidates.extend(left.iter().cloned());
+    candidates.extend(right.iter().cloned());
+    candidates
 }
 
 /// Flatten the three change buckets (`new`, `modified`, `deleted`) into a
@@ -1232,42 +1229,13 @@ fn collect_change_candidates(changes: &Changes) -> Vec<PathBuf> {
 /// Make a user-supplied pathspec absolute by joining onto `current_dir` when
 /// it is relative. Mirrors how Git's pathspec parser anchors specs to the
 /// invoking shell's CWD rather than to the worktree root.
-fn resolve_pathspec(pathspec: &Path, current_dir: &Path) -> PathBuf {
-    if pathspec.is_absolute() {
-        pathspec.to_path_buf()
-    } else {
-        current_dir.join(pathspec)
-    }
-}
-
-/// True iff any path in `candidates` (interpreted relative to `workdir`) is a
-/// subpath of `requested_abs`. Used both for tracked-file matching and for
-/// status-change matching.
-fn pathspec_matches_any(requested_abs: &Path, candidates: &[PathBuf], workdir: &Path) -> bool {
-    candidates.iter().any(|candidate| {
-        let candidate_abs = workdir.join(candidate);
-        util::is_sub_path(&candidate_abs, requested_abs)
-    })
-}
-
 /// Restrict `files` (workdir-relative) to entries that fall under at least
 /// one of the user's pathspecs. Used to scope `-A`/`-u`-derived candidate
 /// sets to the explicit positional arguments.
-fn filter_candidates(
-    files: &[PathBuf],
-    requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
-) -> Vec<PathBuf> {
+fn filter_candidates(files: &[PathBuf], pathspecs: &PathspecSet) -> Vec<PathBuf> {
     files
         .iter()
-        .filter(|file| {
-            let file_abs = workdir.join(file.as_path());
-            requested_paths.iter().any(|pathspec| {
-                let requested_abs = resolve_pathspec(pathspec, current_dir);
-                util::is_sub_path(&file_abs, &requested_abs)
-            })
-        })
+        .filter(|file| pathspecs.matches_path(file.as_path()))
         .cloned()
         .collect()
 }
@@ -1275,13 +1243,8 @@ fn filter_candidates(
 /// Alias of [`filter_candidates`] used in `--refresh` mode. Kept separate so
 /// future divergence in semantics (e.g. submodule handling) only needs to
 /// touch one branch.
-fn filter_refresh_candidates(
-    files: &[PathBuf],
-    requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
-) -> Vec<PathBuf> {
-    filter_candidates(files, requested_paths, workdir, current_dir)
+fn filter_refresh_candidates(files: &[PathBuf], pathspecs: &PathspecSet) -> Vec<PathBuf> {
+    filter_candidates(files, pathspecs)
 }
 
 /// Remove the running `libra` binary from the candidate list.
@@ -1378,15 +1341,23 @@ async fn stage_a_file(
         path: file.to_path_buf(),
     })?;
 
-    // Skip directories - they cannot be staged as blobs
-    if file_abs.is_dir() {
+    // Skip real directories - symlinks to directories are staged as link blobs.
+    if file_abs
+        .symlink_metadata()
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
         return Ok(StagedAction::Unchanged);
     }
 
     let file_status = check_file_status(file, index, workdir)?;
     match file_status {
         FileStatus::New => {
-            let blob = gen_blob_from_file(&file_abs);
+            let blob =
+                gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+                    path: file.to_path_buf(),
+                    source,
+                })?;
             blob.save();
             index.add(
                 IndexEntry::new_from_file(file, blob.id, workdir).map_err(|source| {
@@ -1400,7 +1371,11 @@ async fn stage_a_file(
         }
         FileStatus::Modified => {
             if index.is_modified(file_str, 0, workdir) {
-                let blob = gen_blob_from_file(&file_abs);
+                let blob =
+                    gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+                        path: file.to_path_buf(),
+                        source,
+                    })?;
                 if !index.verify_hash(file_str, 0, &blob.id) {
                     blob.save();
                     index.update(IndexEntry::new_from_file(file, blob.id, workdir).map_err(
@@ -1455,7 +1430,7 @@ fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileS
         path: file.to_path_buf(),
     })?;
     let file_abs = workdir.join(file);
-    if !file_abs.exists() {
+    if file_abs.symlink_metadata().is_err() {
         if index.tracked(file_str, 0) {
             Ok(FileStatus::Deleted)
         } else {
@@ -1473,15 +1448,10 @@ fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileS
 /// Generate a `Blob` from a file.
 ///
 /// Functional scope:
-/// - When the file matches a `.libra_attributes` LFS filter, returns a pointer
-///   blob via [`Blob::from_lfs_file`]; otherwise reads the file content
-///   verbatim into a regular blob.
-fn gen_blob_from_file(path: impl AsRef<Path>) -> Blob {
-    if lfs::is_lfs_tracked(&path) {
-        Blob::from_lfs_file(&path)
-    } else {
-        Blob::from_file(&path)
-    }
+/// - Reads the exact bytes Git would store for a worktree blob: regular file
+///   content, generated LFS pointer content, or symlink target bytes.
+fn gen_blob_from_file(path: impl AsRef<Path>) -> io::Result<Blob> {
+    read_worktree_blob_bytes(path).map(Blob::from_content_bytes)
 }
 
 #[cfg(test)]

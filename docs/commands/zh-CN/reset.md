@@ -18,9 +18,11 @@ libra reset [<target>] [--] <pathspec>...
 - **`--mixed`**（默认）：移动 HEAD 并重置索引。工作树保持不变，因此更改表现为未暂存修改。适合取消暂存文件。
 - **`--hard`**：移动 HEAD、重置索引并恢复工作树。所有未提交更改都会被丢弃。适合完全回到已知状态。
 
-提供 pathspec 时，命令执行有针对性的 mixed reset：只将命名文件在索引中重置为匹配目标提交，不移动 HEAD。这是取消暂存特定文件的主要方式。与 Git 一样，如果第一个裸位置参数是已知路径且不是 revision，`libra reset src/lib.rs` 会按 `HEAD` 目标的 pathspec reset 处理，等价于 `libra reset HEAD -- src/lib.rs`。如果同一个 token 既是 revision 又是文件名，reset 会拒绝猜测并报歧义；要把它作为目标 revision，请使用 `libra reset <revision> -- <file>`，要把它作为路径，请使用 `libra reset -- <file>`。Pathspec 与 `--soft` 和 `--hard` 不兼容。
+提供 pathspec 时，命令执行有针对性的 mixed reset：只将命名文件在索引中重置为匹配目标提交，不移动 HEAD。这是取消暂存特定文件的主要方式。与 Git 一样，如果第一个裸位置参数是已知路径且不是 revision，`libra reset src/lib.rs` 会按 `HEAD` 目标的 pathspec reset 处理，等价于 `libra reset HEAD -- src/lib.rs`。如果同一个 token 既是 revision 又是文件名，reset 会拒绝猜测并报歧义；要把它作为目标 revision，请使用 `libra reset <revision> -- <file>`，要把它作为路径，请使用 `libra reset -- <file>`。Pathspec 与 `--soft` 和 `--hard` 不兼容。当 pathspec reset 从目标提交恢复符号链接时，索引条目会保留 mode `120000`，blob 仍是链接目标字节。
 
 默认目标是 `HEAD`，因此不带参数的 `libra reset` 等价于取消暂存所有内容。
+
+`reset --hard` 恢复工作树时会保留 tree 中的文件类型：符号链接会恢复为真正的 symlink，链接 blob 字节作为目标路径写入；若工作树当前位置已有普通文件或已有 symlink，必要时会被替换为目标 symlink。不支持 symlink 的平台会返回明确诊断，而不是把链接目标写入普通文件。
 
 ## 选项
 
@@ -72,6 +74,7 @@ libra reset --json --hard HEAD~1
 libra reset HEAD~1                    # 移动 HEAD 并将索引重置到上一个提交
 libra reset --soft HEAD~2             # 只移动 HEAD，保留索引和工作树
 libra reset --hard main               # 将 HEAD、索引和工作树重置到分支 'main'
+libra reset --hard HEAD               # 同时把已跟踪符号链接恢复为 symlink
 libra reset src/lib.rs                 # 将路径取消暂存回 HEAD
 libra reset HEAD -- src/lib.rs        # 将路径取消暂存回 HEAD
 libra reset --json --hard HEAD~1      # 面向代理的结构化 JSON 输出

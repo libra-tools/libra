@@ -72,6 +72,52 @@ fn agent_doc_tracks_schema_versioning_and_retention_policy() {
 }
 
 #[test]
+fn agent_doc_declares_cloud_tombstone_deferred() {
+    // A0-10 doc-guard. Ground truth (verified against src/command/cloud.rs):
+    // the D1/R2 agent-capture MIRROR is live — `libra cloud sync` upserts
+    // agent_session/agent_checkpoint to D1 on every sync and `libra cloud
+    // restore` reads them back. What is DEFERRED is delete/tombstone
+    // propagation: a local `erase_session_local` does not delete the D1/R2
+    // mirror rows, so `libra cloud restore` can REVIVE erased capture. The
+    // doc must keep declaring exactly this, and must never regress to the
+    // (false) "mirror not enabled" wording or overclaim that propagation is
+    // implemented.
+    for required in [
+        "cloud mirror tombstone propagation for agent capture data",
+        "delete/tombstone propagation",
+        "复活已本地擦除的 capture",
+        // Positive truth: the mirror IS live via cloud sync/restore.
+        "libra cloud sync",
+        "libra cloud restore",
+    ] {
+        assert!(
+            AGENT_DOC.contains(required),
+            "agent.md must keep declaring the mirror live + delete/tombstone propagation deferred: {required}",
+        );
+    }
+
+    for forbidden in [
+        // The old, factually wrong claims that the mirror does not exist /
+        // is not enabled / only lands after some future "introduction".
+        "当前未启用 D1/R2 agent capture mirror",
+        "未启用 D1/R2 mirror",
+        "未启用 cloud mirror",
+        "引入 cloud mirror 后",
+        "引入并启用 D1/R2 mirror",
+        "cloud mirror 启用后",
+        "尚无 D1 mirror",
+        "没有 D1 mirror",
+        // Overclaiming that the deferred propagation is done.
+        "delete/tombstone propagation 已实现",
+    ] {
+        assert!(
+            !AGENT_DOC.contains(forbidden),
+            "agent.md must not regress to a false/overclaimed cloud-mirror statement: {forbidden}",
+        );
+    }
+}
+
+#[test]
 fn agent_doc_tracks_code_agent_runtime_source_of_truth() {
     assert!(
         AGENT_DOC.contains("../internal/code-agent-runtime.md"),

@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -34,7 +34,9 @@ use crate::{
         lfs,
         object_ext::{BlobExt, CommitExt, TreeExt},
         output::{OutputConfig, emit_json_data},
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -102,6 +104,10 @@ pub enum RestoreError {
     /// `diff3` are accepted; `zdiff3` is not implemented).
     #[error("unsupported conflict style '{0}' (expected 'merge' or 'diff3')")]
     UnsupportedConflictStyle(String),
+    #[error("symlink checkout is not supported on this platform: {0}")]
+    SymlinkUnsupported(String),
+    #[error("{0}")]
+    InvalidPathspec(String),
 }
 
 /// Human label for a conflict stage used by [`RestoreError::MissingStageVersion`].
@@ -131,6 +137,8 @@ impl RestoreError {
             Self::PathUnmerged(_) => StableErrorCode::ConflictUnresolved,
             Self::MissingStageVersion { .. } => StableErrorCode::ConflictUnresolved,
             Self::UnsupportedConflictStyle(_) => StableErrorCode::CliInvalidArguments,
+            Self::SymlinkUnsupported(_) => StableErrorCode::Unsupported,
+            Self::InvalidPathspec(_) => StableErrorCode::CliInvalidTarget,
         }
     }
 }
@@ -178,6 +186,9 @@ impl From<RestoreError> for CliError {
             RestoreError::UnsupportedConflictStyle(_) => CliError::command_usage(message)
                 .with_stable_code(stable_code)
                 .with_hint("use --conflict=merge (default) or --conflict=diff3"),
+            RestoreError::InvalidPathspec(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob"),
             _ => CliError::fatal(message).with_stable_code(stable_code),
         }
     }
@@ -363,12 +374,32 @@ fn read_restore_pathspec_file(path: &str, nul: bool) -> Result<Vec<String>, Rest
         .collect())
 }
 
+async fn compile_restore_pathspecs(raw: &[String]) -> Result<PathspecSet, RestoreError> {
+    if raw.is_empty() {
+        return Err(RestoreError::InvalidPathspec(
+            "no pathspec was given".to_string(),
+        ));
+    }
+    let current_dir = env::current_dir().map_err(|_| RestoreError::ReadWorktree)?;
+    let workdir = util::try_working_dir().map_err(|_| RestoreError::ReadWorktree)?;
+    let ignore_case = crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|_| RestoreError::ReadWorktree)?;
+    PathspecSet::from_workdir_with_default_icase(raw, &current_dir, &workdir, ignore_case)
+        .map_err(invalid_pathspec)
+}
+
+fn invalid_pathspec(error: PathspecError) -> RestoreError {
+    RestoreError::InvalidPathspec(error.to_string())
+}
+
 async fn run_restore(mut args: RestoreArgs) -> Result<RestoreOutput, RestoreError> {
     // `--pathspec-from-file` populates the pathspec list from a file (or stdin
     // for `-`) before the normal restore logic runs.
     if let Some(file) = args.pathspec_from_file.take() {
         args.pathspec = read_restore_pathspec_file(&file, args.pathspec_file_nul)?;
     }
+    let pathspecs = compile_restore_pathspecs(&args.pathspec).await?;
     let staged = args.staged;
     let mut worktree = args.worktree;
     if !staged {
@@ -399,8 +430,7 @@ async fn run_restore(mut args: RestoreArgs) -> Result<RestoreOutput, RestoreErro
     // worktree operation.
     if args.ours || args.theirs {
         let stage = if args.ours { 2 } else { 3 };
-        let (restored, deleted) =
-            restore_conflict_stage(&args.pathspec, stage, args.overlay).await?;
+        let (restored, deleted) = restore_conflict_stage(&pathspecs, stage, args.overlay).await?;
         return Ok(RestoreOutput {
             source: None,
             worktree: true,
@@ -420,7 +450,7 @@ async fn run_restore(mut args: RestoreArgs) -> Result<RestoreOutput, RestoreErro
             Some("diff3") => true,
             Some(other) => return Err(RestoreError::UnsupportedConflictStyle(other.to_string())),
         };
-        let restored = restore_conflict_merge(&args.pathspec, diff3).await?;
+        let restored = restore_conflict_merge(&pathspecs, diff3).await?;
         return Ok(RestoreOutput {
             source: None,
             worktree: true,
@@ -433,40 +463,21 @@ async fn run_restore(mut args: RestoreArgs) -> Result<RestoreOutput, RestoreErro
     let storage = util::objects_storage();
     let mut target_blobs = resolve_target_blobs(source.as_deref(), staged, &storage).await?;
 
-    let mut paths = args
-        .pathspec
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<PathBuf>>();
-
     // Unmerged guard: a plain restore must not silently act on a matched
     // unmerged path. Without an exemption this is a fatal error (Git's
     // `path '<file>' is unmerged`, exit 128); `--ignore-unmerged` instead drops
     // the unmerged paths from the restore set so the rest still restore.
-    let unmerged_matches = collect_matched_unmerged_paths(&paths)?;
+    let mut skipped_unmerged_paths = Vec::new();
+    let unmerged_matches = collect_matched_unmerged_paths(&pathspecs)?;
     if !unmerged_matches.is_empty() {
         if args.ignore_unmerged {
             // `skip` holds the index-relative unmerged paths matched by the
             // pathspecs. Drop them from the restore inputs so they are never
             // rewritten...
-            let skip = unmerged_matches;
-            target_blobs.retain(|(p, _)| !skip.contains(p));
-            // ...and drop any pathspec whose only remaining matches are skipped
-            // unmerged paths, so an exact pathspec naming one (even a deleted
-            // one, in any spelling like `./file` or an absolute path) becomes a
-            // clean no-op instead of tripping the no-match precheck. The same
-            // `filter_to_fit_paths` matcher that classified the unmerged paths
-            // is reused here, so the decision is spelling-robust. A pathspec is
-            // KEPT when it still matches something (exists on disk or matches a
-            // surviving target) or when it never matched a skipped path at all
-            // (so a genuinely unmatched pathspec still errors as before).
-            let surviving: Vec<PathBuf> = target_blobs.iter().map(|(p, _)| p.clone()).collect();
-            paths.retain(|p| {
-                let one = vec![p.clone()];
-                p.exists()
-                    || !util::filter_to_fit_paths(&surviving, &one).is_empty()
-                    || util::filter_to_fit_paths(&skip, &one).is_empty()
-            });
+            skipped_unmerged_paths = unmerged_matches;
+            target_blobs.retain(|(p, _)| !skipped_unmerged_paths.contains(p));
+            // Paths matched only by skipped unmerged entries are treated as clean
+            // no-ops below by including `skip` in the no-match allowance.
         } else {
             let first = path_to_utf8_typed(&unmerged_matches[0])?;
             return Err(RestoreError::PathUnmerged(first.to_string()));
@@ -482,12 +493,15 @@ async fn run_restore(mut args: RestoreArgs) -> Result<RestoreOutput, RestoreErro
     let overlay = args.overlay;
 
     if worktree {
-        let (restored, deleted) = restore_worktree_tracked(&paths, &target_blobs, overlay).await?;
+        let (restored, deleted) =
+            restore_worktree_tracked(&pathspecs, &target_blobs, overlay, &skipped_unmerged_paths)
+                .await?;
         restored_files.extend(restored);
         deleted_files.extend(deleted);
     }
     if staged {
-        let (restored, deleted) = restore_index_tracked(&paths, &target_blobs, overlay)?;
+        let (restored, deleted) =
+            restore_index_tracked(&pathspecs, &target_blobs, overlay, &skipped_unmerged_paths)?;
         let mut restored_seen: HashSet<String> = restored_files.iter().cloned().collect();
         let mut deleted_seen: HashSet<String> = deleted_files.iter().cloned().collect();
 
@@ -587,13 +601,15 @@ async fn resolve_target_blobs(
 // ── Worktree restore (unified typed path) ────────────────────────────
 
 async fn restore_worktree_tracked(
-    filter: &[PathBuf],
+    pathspecs: &PathspecSet,
     target_blobs: &[(PathBuf, RestoreTarget)],
     overlay: bool,
+    allowed_unmatched: &[PathBuf],
 ) -> Result<(Vec<String>, Vec<String>), RestoreError> {
     let target_map = preprocess_blobs(target_blobs);
     let index = Index::load(path::index()).map_err(|_| RestoreError::ReadIndex)?;
-    let file_paths = collect_restore_worktree_paths(filter, &target_map, &index)?;
+    let file_paths =
+        collect_restore_worktree_paths(pathspecs, &target_map, &index, allowed_unmatched)?;
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
 
@@ -601,21 +617,21 @@ async fn restore_worktree_tracked(
         let path_abs = util::workdir_to_absolute(path_wd);
         let path_wd_str = path_to_utf8_typed(path_wd)?;
         let tracked = index.tracked(path_wd_str, 0);
-        if !path_abs.exists() {
+        if !worktree_path_exists(&path_abs) {
             if let Some(target) = target_map.get(path_wd) {
-                restore_to_file_typed(&target.hash, path_wd).await?;
-                apply_worktree_target_mode(&path_abs, target.mode)?;
+                restore_target_to_file_typed(*target, path_wd).await?;
                 restored.push(path_wd.display().to_string());
             } else if !tracked {
                 return Err(pathspec_not_matched(path_wd));
             }
         } else if let Some(target) = target_map.get(path_wd) {
             let hash = calc_file_blob_hash(&path_abs).map_err(|_| RestoreError::ReadObject)?;
-            if hash != target.hash {
-                restore_to_file_typed(&target.hash, path_wd).await?;
+            if hash != target.hash || !worktree_mode_matches(&path_abs, target.mode)? {
+                restore_target_to_file_typed(*target, path_wd).await?;
                 restored.push(path_wd.display().to_string());
+            } else {
+                apply_worktree_target_mode(&path_abs, target.mode)?;
             }
-            apply_worktree_target_mode(&path_abs, target.mode)?;
         } else if !overlay && tracked {
             fs::remove_file(&path_abs).map_err(|_| RestoreError::WriteWorktree)?;
             util::clear_empty_dir(&path_abs);
@@ -629,9 +645,10 @@ async fn restore_worktree_tracked(
 // ── Index restore (unified typed path) ───────────────────────────────
 
 fn restore_index_tracked(
-    filter: &[PathBuf],
+    pathspecs: &PathspecSet,
     target_blobs: &[(PathBuf, RestoreTarget)],
     overlay: bool,
+    allowed_unmatched: &[PathBuf],
 ) -> Result<(Vec<String>, Vec<String>), RestoreError> {
     let target_map = preprocess_blobs(target_blobs);
 
@@ -640,10 +657,13 @@ fn restore_index_tracked(
     // Source paths missing from the index — added in BOTH modes. Overlay only
     // suppresses *removal* of index entries absent from the source (gated below).
     let deleted_files_index =
-        get_index_deleted_files_in_filters_typed(&index, filter, &target_map)?;
+        get_index_deleted_files_in_filters_typed(&index, pathspecs, &target_map)?;
 
-    let filter_vec = filter.to_vec();
-    let mut file_paths = util::filter_to_fit_paths(&index.tracked_files(), &filter_vec);
+    ensure_positive_pathspecs_match(
+        pathspecs,
+        restore_match_candidates(&target_map, &index, allowed_unmatched),
+    )?;
+    let mut file_paths = filter_paths(&index.tracked_files(), pathspecs);
     file_paths.extend(deleted_files_index);
 
     let mut restored = Vec::new();
@@ -744,7 +764,7 @@ pub async fn execute_checked(args: RestoreArgs) -> io::Result<()> {
         }
     };
 
-    let target_blobs: Vec<(PathBuf, ObjectHash)> = {
+    let target_blobs: Vec<(PathBuf, RestoreTarget)> = {
         match (source.as_ref(), target_commit) {
             (None, _) => {
                 assert!(!staged);
@@ -753,13 +773,24 @@ pub async fn execute_checked(args: RestoreArgs) -> io::Result<()> {
                 index
                     .tracked_entries(0)
                     .into_iter()
-                    .map(|entry| (PathBuf::from(&entry.name), entry.hash))
+                    .map(|entry| {
+                        (
+                            PathBuf::from(&entry.name),
+                            RestoreTarget::new(
+                                entry.hash,
+                                index_mode_to_tree_item_mode(entry.mode),
+                            ),
+                        )
+                    })
                     .collect()
             }
             (Some(_), Some(commit)) => {
                 let tree_id = Commit::load(&commit).tree_id;
                 let tree = Tree::load(&tree_id);
-                tree.get_plain_items()
+                tree.get_plain_items_with_mode()
+                    .into_iter()
+                    .map(|(path, hash, mode)| (path, RestoreTarget::new(hash, Some(mode))))
+                    .collect()
             }
             (Some(src), None) => {
                 if storage
@@ -779,17 +810,18 @@ pub async fn execute_checked(args: RestoreArgs) -> io::Result<()> {
         }
     };
 
-    let paths = args
-        .pathspec
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<PathBuf>>();
+    let pathspecs = compile_restore_pathspecs(&args.pathspec)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
 
     if worktree {
-        restore_worktree(&paths, &target_blobs).await?;
+        restore_worktree_tracked(&pathspecs, &target_blobs, false, &[])
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
     }
     if staged {
-        restore_index(&paths, &target_blobs)?;
+        restore_index_tracked(&pathspecs, &target_blobs, false, &[])
+            .map_err(|error| io::Error::other(error.to_string()))?;
     }
     Ok(())
 }
@@ -811,7 +843,7 @@ pub async fn execute_checked_typed(args: RestoreArgs) -> Result<(), RestoreError
     }
 
     let storage = util::objects_storage();
-    let target_blobs: Vec<(PathBuf, ObjectHash)> = match source.as_ref() {
+    let target_blobs: Vec<(PathBuf, RestoreTarget)> = match source.as_ref() {
         None => {
             if staged {
                 return Err(RestoreError::ResolveSource);
@@ -820,7 +852,12 @@ pub async fn execute_checked_typed(args: RestoreArgs) -> Result<(), RestoreError
             index
                 .tracked_entries(0)
                 .into_iter()
-                .map(|entry| (PathBuf::from(&entry.name), entry.hash))
+                .map(|entry| {
+                    (
+                        PathBuf::from(&entry.name),
+                        RestoreTarget::new(entry.hash, index_mode_to_tree_item_mode(entry.mode)),
+                    )
+                })
                 .collect()
         }
         Some(src) => {
@@ -838,16 +875,19 @@ pub async fn execute_checked_typed(args: RestoreArgs) -> Result<(), RestoreError
                 .tree_id;
             load_object::<Tree>(&tree_id)
                 .map_err(|_| RestoreError::ReadObject)?
-                .get_plain_items()
+                .get_plain_items_with_mode()
+                .into_iter()
+                .map(|(path, hash, mode)| (path, RestoreTarget::new(hash, Some(mode))))
+                .collect()
         }
     };
 
-    let paths = args.pathspec.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let pathspecs = compile_restore_pathspecs(&args.pathspec).await?;
     if worktree {
-        restore_worktree_legacy_typed(&paths, &target_blobs).await?;
+        restore_worktree_tracked(&pathspecs, &target_blobs, false, &[]).await?;
     }
     if staged {
-        restore_index_legacy_typed(&paths, &target_blobs)?;
+        restore_index_tracked(&pathspecs, &target_blobs, false, &[])?;
     }
     Ok(())
 }
@@ -952,33 +992,64 @@ fn legacy_targets(blobs: &[(PathBuf, ObjectHash)]) -> Vec<(PathBuf, RestoreTarge
 }
 
 fn collect_restore_worktree_paths(
-    filter: &[PathBuf],
+    pathspecs: &PathspecSet,
     target_map: &HashMap<PathBuf, RestoreTarget>,
     index: &Index,
+    allowed_unmatched: &[PathBuf],
 ) -> Result<Vec<PathBuf>, RestoreError> {
     let tracked_paths = index.tracked_files();
-    for path in filter {
-        if path.exists() {
-            continue;
-        }
-
-        let matches_target = target_map
-            .keys()
-            .any(|p| util::is_sub_path(util::workdir_to_absolute(p), path));
-        let matches_index = tracked_paths
-            .iter()
-            .any(|p| util::is_sub_path(util::workdir_to_absolute(p), path));
-        if !matches_target && !matches_index {
-            return Err(pathspec_not_matched(path));
-        }
-    }
-
-    let filter_vec = filter.to_vec();
     let target_paths = target_map.keys().cloned().collect::<Vec<_>>();
+    let candidates = pathspec_candidates(&target_paths, &tracked_paths, allowed_unmatched);
+    ensure_positive_pathspecs_match(pathspecs, candidates)?;
     let mut paths = BTreeSet::new();
-    paths.extend(util::filter_to_fit_paths(&target_paths, &filter_vec));
-    paths.extend(util::filter_to_fit_paths(&tracked_paths, &filter_vec));
+    paths.extend(filter_paths(&target_paths, pathspecs));
+    paths.extend(filter_paths(&tracked_paths, pathspecs));
     Ok(paths.into_iter().collect())
+}
+
+fn filter_paths(paths: &[PathBuf], pathspecs: &PathspecSet) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| pathspecs.matches_path(path))
+        .cloned()
+        .collect()
+}
+
+fn pathspec_candidates(
+    target_paths: &[PathBuf],
+    tracked_paths: &[PathBuf],
+    allowed_unmatched: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut candidates =
+        Vec::with_capacity(target_paths.len() + tracked_paths.len() + allowed_unmatched.len());
+    candidates.extend(target_paths.iter().cloned());
+    candidates.extend(tracked_paths.iter().cloned());
+    candidates.extend(allowed_unmatched.iter().cloned());
+    candidates
+}
+
+fn restore_match_candidates(
+    target_map: &HashMap<PathBuf, RestoreTarget>,
+    index: &Index,
+    allowed_unmatched: &[PathBuf],
+) -> Vec<PathBuf> {
+    let target_paths = target_map.keys().cloned().collect::<Vec<_>>();
+    let tracked_paths = index.tracked_files();
+    pathspec_candidates(&target_paths, &tracked_paths, allowed_unmatched)
+}
+
+fn ensure_positive_pathspecs_match<I, P>(
+    pathspecs: &PathspecSet,
+    candidates: I,
+) -> Result<(), RestoreError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    if let Some(unmatched) = pathspecs.unmatched_positive(candidates) {
+        return Err(RestoreError::PathspecNotMatched(unmatched.to_string()));
+    }
+    Ok(())
 }
 
 fn tree_item_mode_to_index_mode(mode: TreeItemMode) -> Option<u32> {
@@ -1005,6 +1076,23 @@ fn index_entry_from_target(path: String, target: RestoreTarget, size: u32) -> In
     let mut entry = IndexEntry::new_from_blob(path, target.hash, size);
     entry.mode = target.index_mode();
     entry
+}
+
+fn worktree_path_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn worktree_mode_matches(path: &Path, mode: Option<TreeItemMode>) -> Result<bool, RestoreError> {
+    let Some(mode) = mode else {
+        return Ok(true);
+    };
+    let metadata = fs::symlink_metadata(path).map_err(|_| RestoreError::ReadWorktree)?;
+    let file_type = metadata.file_type();
+    Ok(match mode {
+        TreeItemMode::Link => file_type.is_symlink(),
+        TreeItemMode::Blob | TreeItemMode::BlobExecutable => !file_type.is_symlink(),
+        TreeItemMode::Commit | TreeItemMode::Tree => true,
+    })
 }
 
 #[cfg(unix)]
@@ -1067,20 +1155,28 @@ fn collect_unmerged_paths(index: &Index) -> Vec<PathBuf> {
 
 /// Unmerged paths (stages 1/2/3) that match the requested `filter` pathspecs.
 /// Empty when nothing is unmerged, so the common conflict-free path stays cheap.
-fn collect_matched_unmerged_paths(filter: &[PathBuf]) -> Result<Vec<PathBuf>, RestoreError> {
+fn collect_matched_unmerged_paths(pathspecs: &PathspecSet) -> Result<Vec<PathBuf>, RestoreError> {
     let index = Index::load(path::index()).map_err(|_| RestoreError::ReadIndex)?;
     let unmerged = collect_unmerged_paths(&index);
     if unmerged.is_empty() {
         return Ok(Vec::new());
     }
-    let filter_vec = filter.to_vec();
-    Ok(util::filter_to_fit_paths(&unmerged, &filter_vec))
+    Ok(filter_paths(&unmerged, pathspecs))
 }
 
-/// Blob OID for `path` at conflict `stage` (2 = ours, 3 = theirs). Thin wrapper
-/// over `Index::get_hash`; returns `None` when the path has no such stage.
+/// Restore target for `path` at conflict `stage` (2 = ours, 3 = theirs).
+/// Returns `None` when the path has no such stage.
+fn stage_target(index: &Index, path: &str, stage: u8) -> Option<RestoreTarget> {
+    index
+        .tracked_entries(stage)
+        .into_iter()
+        .find(|entry| entry.name == path)
+        .map(|entry| RestoreTarget::new(entry.hash, index_mode_to_tree_item_mode(entry.mode)))
+}
+
+/// Blob OID for `path` at conflict `stage` (2 = ours, 3 = theirs).
 fn stage_blob(index: &Index, path: &str, stage: u8) -> Option<ObjectHash> {
-    index.get_hash(path, stage)
+    stage_target(index, path, stage).map(|target| target.hash)
 }
 
 /// Restore the `stage` side (2 = ours, 3 = theirs) of each matched unmerged path
@@ -1098,26 +1194,27 @@ fn stage_blob(index: &Index, path: &str, stage: u8) -> Option<ObjectHash> {
 ///
 /// Returns `(restored, deleted)` working-tree paths.
 async fn restore_conflict_stage(
-    pathspec: &[String],
+    pathspecs: &PathspecSet,
     stage: u8,
     overlay: bool,
 ) -> Result<(Vec<String>, Vec<String>), RestoreError> {
     let index = Index::load(path::index()).map_err(|_| RestoreError::ReadIndex)?;
     let unmerged = collect_unmerged_paths(&index);
-    let filter: Vec<PathBuf> = pathspec.iter().map(PathBuf::from).collect();
-    let matched = util::filter_to_fit_paths(&unmerged, &filter);
+    let matched = filter_paths(&unmerged, pathspecs);
     if matched.is_empty() {
-        let first = filter.first().cloned().unwrap_or_default();
-        return Err(pathspec_not_matched(&first));
+        if let Some(unmatched) = pathspecs.unmatched_positive(&unmerged) {
+            return Err(RestoreError::PathspecNotMatched(unmatched.to_string()));
+        }
+        return Err(RestoreError::PathspecNotMatched(String::new()));
     }
 
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
     for path in &matched {
         let path_str = path_to_utf8_typed(path)?;
-        match stage_blob(&index, path_str, stage) {
-            Some(hash) => {
-                restore_to_file_typed(&hash, path).await?;
+        match stage_target(&index, path_str, stage) {
+            Some(target) => {
+                restore_target_to_file_typed(target, path).await?;
                 restored.push(path.display().to_string());
             }
             None if overlay => {
@@ -1132,7 +1229,7 @@ async fn restore_conflict_stage(
                 // restore it by removing it from the worktree. Idempotent — an
                 // already-absent file is fine (Git exits 0 either way).
                 let path_abs = util::workdir_to_absolute(path);
-                if path_abs.exists() {
+                if worktree_path_exists(&path_abs) {
                     fs::remove_file(&path_abs).map_err(|_| RestoreError::WriteWorktree)?;
                     util::clear_empty_dir(&path_abs);
                 }
@@ -1152,16 +1249,17 @@ async fn restore_conflict_stage(
 /// carry
 /// no commit names) — not Git's line-level 3-way merge.
 async fn restore_conflict_merge(
-    pathspec: &[String],
+    pathspecs: &PathspecSet,
     diff3: bool,
 ) -> Result<Vec<String>, RestoreError> {
     let index = Index::load(path::index()).map_err(|_| RestoreError::ReadIndex)?;
     let unmerged = collect_unmerged_paths(&index);
-    let filter: Vec<PathBuf> = pathspec.iter().map(PathBuf::from).collect();
-    let matched = util::filter_to_fit_paths(&unmerged, &filter);
+    let matched = filter_paths(&unmerged, pathspecs);
     if matched.is_empty() {
-        let first = filter.first().cloned().unwrap_or_default();
-        return Err(pathspec_not_matched(&first));
+        if let Some(unmatched) = pathspecs.unmatched_positive(&unmerged) {
+            return Err(RestoreError::PathspecNotMatched(unmatched.to_string()));
+        }
+        return Err(RestoreError::PathspecNotMatched(String::new()));
     }
 
     let eol = if cfg!(windows) { "\r\n" } else { "\n" };
@@ -1181,6 +1279,7 @@ async fn restore_conflict_merge(
         if let Some(parent) = path_abs.parent() {
             fs::create_dir_all(parent).map_err(|_| RestoreError::WriteWorktree)?;
         }
+        remove_existing_symlink(&path_abs)?;
         util::write_file(content.as_bytes(), &path_abs).map_err(|_| RestoreError::WriteWorktree)?;
         restored.push(path.display().to_string());
     }
@@ -1238,12 +1337,21 @@ fn build_conflict_markers(
     out
 }
 
-async fn restore_to_file_typed(hash: &ObjectHash, path: &PathBuf) -> Result<(), RestoreError> {
-    let blob = load_object::<Blob>(hash).map_err(|_| RestoreError::ReadObject)?;
+async fn restore_target_to_file_typed(
+    target: RestoreTarget,
+    path: &PathBuf,
+) -> Result<(), RestoreError> {
+    let blob = load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
     let path_abs = util::workdir_to_absolute(path);
     if let Some(parent) = path_abs.parent() {
         fs::create_dir_all(parent).map_err(|_| RestoreError::WriteWorktree)?;
     }
+
+    if matches!(target.mode, Some(TreeItemMode::Link)) {
+        return write_worktree_symlink(&path_abs, &blob.data);
+    }
+
+    remove_existing_symlink(&path_abs)?;
 
     match lfs::parse_pointer_data(&blob.data) {
         Some((oid, size)) => {
@@ -1267,6 +1375,42 @@ async fn restore_to_file_typed(hash: &ObjectHash, path: &PathBuf) -> Result<(), 
     Ok(())
 }
 
+fn remove_existing_symlink(path: &Path) -> Result<(), RestoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(path).map_err(|_| RestoreError::WriteWorktree)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(RestoreError::ReadWorktree),
+    }
+}
+
+#[cfg(unix)]
+fn write_worktree_symlink(path: &Path, target: &[u8]) -> Result<(), RestoreError> {
+    use std::{
+        ffi::OsStr,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+    };
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            return Err(RestoreError::WriteWorktree);
+        }
+        Ok(_) => fs::remove_file(path).map_err(|_| RestoreError::WriteWorktree)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(RestoreError::WriteWorktree),
+    }
+
+    let target = Path::new(OsStr::from_bytes(target));
+    symlink(target, path).map_err(|_| RestoreError::WriteWorktree)
+}
+
+#[cfg(not(unix))]
+fn write_worktree_symlink(path: &Path, _target: &[u8]) -> Result<(), RestoreError> {
+    Err(RestoreError::SymlinkUnsupported(path.display().to_string()))
+}
+
 /// Restore a blob to file.
 /// If blob is an LFS pointer, download the actual file from LFS server.
 /// - `path` : to workdir
@@ -1275,6 +1419,12 @@ pub async fn restore_to_file(hash: &ObjectHash, path: &PathBuf) -> io::Result<()
     let path_abs = util::workdir_to_absolute(path);
     if let Some(parent) = path_abs.parent() {
         fs::create_dir_all(parent)?;
+    }
+    if fs::symlink_metadata(&path_abs)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        fs::remove_file(&path_abs)?;
     }
     match lfs::parse_pointer_data(&blob.data) {
         Some((oid, size)) => {
@@ -1306,15 +1456,24 @@ pub async fn restore_worktree(
     let target_blobs = legacy_targets(target_blobs);
     let target_blobs = preprocess_blobs(&target_blobs);
     let index = Index::load(path::index()).map_err(|e| io::Error::other(e.to_string()))?;
-    let file_paths = collect_restore_worktree_paths(filter, &target_blobs, &index)
+    let raw_pathspecs = filter
+        .iter()
+        .map(|path| util::path_to_string(path))
+        .collect::<Vec<_>>();
+    let pathspecs = compile_restore_pathspecs(&raw_pathspecs)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let file_paths = collect_restore_worktree_paths(&pathspecs, &target_blobs, &index, &[])
         .map_err(|error| io::Error::other(error.to_string()))?;
     for path_wd in &file_paths {
         let path_abs = util::workdir_to_absolute(path_wd);
         let path_wd_str = path_to_utf8(path_wd)?;
         let tracked = index.tracked(path_wd_str, 0);
-        if !path_abs.exists() {
+        if !worktree_path_exists(&path_abs) {
             if let Some(target) = target_blobs.get(path_wd) {
-                restore_to_file(&target.hash, path_wd).await?;
+                restore_target_to_file_typed(*target, path_wd)
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
             } else if !tracked {
                 return Err(io::Error::other(format!(
                     "pathspec '{}' did not match any files",
@@ -1324,46 +1483,21 @@ pub async fn restore_worktree(
         } else if let Some(target) = target_blobs.get(path_wd) {
             let hash =
                 calc_file_blob_hash(&path_abs).map_err(|e| io::Error::other(e.to_string()))?;
-            if hash != target.hash {
-                restore_to_file(&target.hash, path_wd).await?;
+            let mode_matches = worktree_mode_matches(&path_abs, target.mode)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            if hash != target.hash || !mode_matches {
+                restore_target_to_file_typed(*target, path_wd)
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            } else {
+                apply_worktree_target_mode(&path_abs, target.mode)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
             }
         } else if tracked {
             fs::remove_file(&path_abs)?;
             util::clear_empty_dir(&path_abs);
         }
     }
-    Ok(())
-}
-
-async fn restore_worktree_legacy_typed(
-    filter: &[PathBuf],
-    target_blobs: &[(PathBuf, ObjectHash)],
-) -> Result<(), RestoreError> {
-    let target_blobs = legacy_targets(target_blobs);
-    let target_blobs = preprocess_blobs(&target_blobs);
-    let index = Index::load(path::index()).map_err(|_| RestoreError::ReadIndex)?;
-    let file_paths = collect_restore_worktree_paths(filter, &target_blobs, &index)?;
-    for path_wd in &file_paths {
-        let path_abs = util::workdir_to_absolute(path_wd);
-        let path_wd_str = path_to_utf8_typed(path_wd)?;
-        let tracked = index.tracked(path_wd_str, 0);
-        if !path_abs.exists() {
-            if let Some(target) = target_blobs.get(path_wd) {
-                restore_to_file_typed(&target.hash, path_wd).await?;
-            } else if !tracked {
-                return Err(pathspec_not_matched(path_wd));
-            }
-        } else if let Some(target) = target_blobs.get(path_wd) {
-            let hash = calc_file_blob_hash(&path_abs).map_err(|_| RestoreError::ReadObject)?;
-            if hash != target.hash {
-                restore_to_file_typed(&target.hash, path_wd).await?;
-            }
-        } else if tracked {
-            fs::remove_file(&path_abs).map_err(|_| RestoreError::WriteWorktree)?;
-            util::clear_empty_dir(&path_abs);
-        }
-    }
-
     Ok(())
 }
 
@@ -1414,57 +1548,6 @@ pub fn restore_index(filter: &[PathBuf], target_blobs: &[(PathBuf, ObjectHash)])
     Ok(())
 }
 
-fn restore_index_legacy_typed(
-    filter: &[PathBuf],
-    target_blobs: &[(PathBuf, ObjectHash)],
-) -> Result<(), RestoreError> {
-    let target_blobs = legacy_targets(target_blobs);
-    let target_blobs = preprocess_blobs(&target_blobs);
-
-    let idx_file = path::index();
-    let mut index = Index::load(&idx_file).map_err(|_| RestoreError::ReadIndex)?;
-    let deleted_files_index =
-        get_index_deleted_files_in_filters_typed(&index, filter, &target_blobs)?;
-
-    let filter_vec = filter.to_vec();
-    let mut file_paths = util::filter_to_fit_paths(&index.tracked_files(), &filter_vec);
-    file_paths.extend(deleted_files_index);
-
-    for path in &file_paths {
-        let path_str = path_to_utf8_typed(path)?;
-        if !index.tracked(path_str, 0) {
-            if let Some(target) = target_blobs.get(path) {
-                let blob =
-                    load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
-                index.add(index_entry_from_target(
-                    path_str.to_string(),
-                    *target,
-                    blob.data.len() as u32,
-                ));
-            } else {
-                return Err(pathspec_not_matched(path));
-            }
-        } else if let Some(target) = target_blobs.get(path) {
-            if !index.verify_hash(path_str, 0, &target.hash) {
-                let blob =
-                    load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
-                index.update(index_entry_from_target(
-                    path_str.to_string(),
-                    *target,
-                    blob.data.len() as u32,
-                ));
-            }
-        } else {
-            index.remove(path_str, 0);
-        }
-    }
-
-    index
-        .save(&idx_file)
-        .map_err(|_| RestoreError::WriteWorktree)?;
-    Ok(())
-}
-
 fn get_index_deleted_files_in_filters(
     index: &Index,
     filters: &[PathBuf],
@@ -1483,14 +1566,13 @@ fn get_index_deleted_files_in_filters(
 
 fn get_index_deleted_files_in_filters_typed(
     index: &Index,
-    filters: &[PathBuf],
+    pathspecs: &PathspecSet,
     target_blobs: &HashMap<PathBuf, RestoreTarget>,
 ) -> Result<HashSet<PathBuf>, RestoreError> {
     let mut deleted = HashSet::new();
     for path_wd in target_blobs.keys() {
         let path_wd_str = path_to_utf8_typed(path_wd)?;
-        let path_abs = util::workdir_to_absolute(path_wd);
-        if !index.tracked(path_wd_str, 0) && util::is_sub_of_paths(path_abs, filters) {
+        if !index.tracked(path_wd_str, 0) && pathspecs.matches_path(path_wd) {
             deleted.insert(path_wd.clone());
         }
     }
@@ -1577,6 +1659,14 @@ mod tests {
             RestoreError::UnsupportedConflictStyle("zdiff3".to_string()).to_string(),
             "unsupported conflict style 'zdiff3' (expected 'merge' or 'diff3')",
         );
+        assert_eq!(
+            RestoreError::SymlinkUnsupported("src/link".to_string()).to_string(),
+            "symlink checkout is not supported on this platform: src/link",
+        );
+        assert_eq!(
+            RestoreError::InvalidPathspec("unsupported pathspec magic".to_string()).to_string(),
+            "unsupported pathspec magic",
+        );
     }
 
     /// Pin the `stable_code()` mapping for every variant of
@@ -1588,7 +1678,7 @@ mod tests {
     /// reroutes any of them (for example flipping `LfsDownload` from
     /// `NetworkUnavailable` to `IoReadFailed`) silently changes
     /// client retry classification unless every variant has its own
-    /// guard. Enumerate all 11 variants so a new variant trips both
+    /// guard. Enumerate every variant so a new variant trips both
     /// this exhaustive list and the `stable_code()` impl's match.
     #[test]
     fn restore_error_stable_code_pins_each_variant() {
@@ -1651,6 +1741,14 @@ mod tests {
         assert_eq!(
             RestoreError::UnsupportedConflictStyle("zdiff3".to_string()).stable_code(),
             StableErrorCode::CliInvalidArguments,
+        );
+        assert_eq!(
+            RestoreError::SymlinkUnsupported("ignored".to_string()).stable_code(),
+            StableErrorCode::Unsupported,
+        );
+        assert_eq!(
+            RestoreError::InvalidPathspec("ignored".to_string()).stable_code(),
+            StableErrorCode::CliInvalidTarget,
         );
     }
 

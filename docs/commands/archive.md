@@ -21,6 +21,11 @@ from an interactive shell so binary archive bytes are written to a file instead
 of the terminal. When `PATH` arguments are provided after `TREEISH`, only
 matching files or directories inside that committed tree are archived.
 
+Entries whose path is matched by the `export-ignore` attribute in the archived
+tree's `.gitattributes` or `.libra_attributes` files are omitted from the
+archive. Uncommitted working-tree attribute changes do not affect an archive of
+an existing `TREEISH`. `export-subst` is not implemented.
+
 ## Options
 
 | Flag | Short | Description | Default |

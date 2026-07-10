@@ -9,6 +9,9 @@
 ```
 libra commit [OPTIONS] -m <MESSAGE>
 libra commit [OPTIONS] -F <FILE>
+libra commit [OPTIONS] -C <COMMIT>
+libra commit [OPTIONS] -c <COMMIT>
+libra commit [OPTIONS] --date <DATE> -m <MESSAGE>
 libra commit --amend [--no-edit]
 ```
 
@@ -17,6 +20,10 @@ libra commit --amend [--no-edit]
 `libra commit` 从已暂存更改创建新提交，构建 tree 和 commit 对象，验证消息（包括可选的 conventional commit 格式，以及通过 vault 进行 GPG 签名），并更新 HEAD 和 refs。
 
 该命令读取索引以确定哪些文件已暂存，构造与暂存内容匹配的 tree 对象层级，使用提供的消息和 author/committer 元数据创建 commit 对象，并推进当前分支 ref。启用 vault signing 时，提交会自动进行 GPG 签名。除非用 `--no-verify` 绕过，pre-commit 和 commit-msg hooks 会被执行。
+
+在计算暂存变更或写入 tree/commit 对象之前，`commit` 会校验 stage-0 index 条目是否指向缺失或类型不匹配的 blob/tree 对象。损坏的 index 条目会 fail-closed，返回 `LBR-REPO-002`，并保持 `HEAD` 不变。
+
+作者身份来自 `--author`，其次是 `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`，再回退到配置的 `user.name`/`user.email`；提交者身份来自 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`，再回退到配置。除非设置了 `user.useConfigOnly=true`，Git 环境变量优先于配置。既有 `LIBRA_COMMITTER_NAME`/`LIBRA_COMMITTER_EMAIL` 仍作为更低优先级后备，兼容旧自动化。
 
 ## 选项
 
@@ -47,6 +54,8 @@ libra commit -t .libra/commit-template.txt
 ### `--amend`
 
 通过创建新提交替换当前分支 tip。新提交拥有与被替换提交相同的父提交。不能 amend merge commits（有多个父提交的提交）。
+当 index tree 与提交消息都未变化时，`--amend --no-edit` 仍会重写提交并刷新 committer metadata；
+不会打印成功但让 `HEAD` 保持不变。
 
 ```bash
 libra commit --amend
@@ -55,7 +64,8 @@ libra commit --amend -m "Updated message"
 
 ### `--no-edit`
 
-与 `--amend` 一起使用时，复用原提交消息，不提示修改。与 `-m` 和 `-F` 冲突。
+与 `--amend` 一起使用时，复用原提交消息，不提示修改。clean amend 仍会生成替换提交并刷新
+committer date。与 `-m` 和 `-F` 冲突。
 
 ```bash
 libra commit --amend --no-edit
@@ -118,6 +128,42 @@ libra commit --no-verify -m "WIP: work in progress"
 libra commit --author "Jane Doe <jane@example.com>" -m "Patch"
 ```
 
+### `--date <DATE>`
+
+设置新提交的 author date。committer date 仍取当前时间，除非设置 `GIT_COMMITTER_DATE`。支持 Git raw 日期（`<unix> <+HHMM|-HHMM>`）、RFC 3339、`YYYY-MM-DD HH:MM:SS +HHMM`、`YYYY-MM-DD`、`2 days ago` 这类相对日期，以及 Unix timestamp。`--date` 优先于 `GIT_AUTHOR_DATE`。
+
+```bash
+libra commit --date "1700000000 +0000" -m "Backdated author timestamp"
+```
+
+### 身份与日期环境变量
+
+`GIT_AUTHOR_NAME`、`GIT_AUTHOR_EMAIL`、`GIT_AUTHOR_DATE` 设置 author 身份/日期。`GIT_COMMITTER_NAME`、`GIT_COMMITTER_EMAIL`、`GIT_COMMITTER_DATE` 设置 committer 身份/日期。缺少 Git committer 字段时，Libra 会依次回退到对应 author 字段、email 的 `EMAIL`、再到 `LIBRA_COMMITTER_*`，最后使用配置。`user.useConfigOnly=true` 会禁用环境变量身份回退，但显式 `--author` 仍生效。
+
+### `-C <COMMIT>`, `--reuse-message <COMMIT>`
+
+复用指定提交的提交消息和 author metadata（姓名、邮箱、author date 与时区）。新提交仍使用当前 committer 身份/日期，或使用 `GIT_COMMITTER_*` 覆盖。
+
+```bash
+libra commit -C HEAD~1
+```
+
+### `-c <COMMIT>`, `--reedit-message <COMMIT>`
+
+复用指定提交的提交消息和 author metadata，然后打开编辑器编辑消息。未配置编辑器时，直接使用复用的消息。
+
+```bash
+libra commit -c HEAD~1
+```
+
+### `--reset-author`
+
+amend 时把 author 重置为当前 author 身份与日期，而不是保留被 amend 提交的原 author。当前 author 身份/日期按上面的 `GIT_AUTHOR_*` 与 `--date` 规则解析。新建非 amend 提交本来就是当前 author。
+
+```bash
+libra commit --amend --reset-author --no-edit
+```
+
 ### `--status` / `--no-status`
 
 `--status` 把工作树状态以 `#` 注释行注入提交消息编辑器模板（Git 默认显示；Libra 默认省略，故用 `--status` 主动开启）。由于是注释行，消息 cleanup 会将其剥离——仅供参考，不进入最终提交消息。未打开编辑器时（例如带 `-m`）无效果。在保留注释行的 cleanup 模式下也会省略（`--cleanup=verbatim`、`--cleanup=whitespace` 与 `--cleanup=scissors`——显式 scissors 保留 marker 之上的 `#` 行），从而绝不泄漏进消息；仅当打开编辑器且生效的 cleanup 会剥离注释（`strip`/`default`）时才注入。`-v` 仅截断附加的 diff，不强制 strip，故上述模式下即便加 `-v` 也不注入 status。`--no-status`（默认）不含 status 段。两者构成 last-wins 切换。
@@ -144,6 +190,7 @@ libra commit --amend
 libra commit --amend --no-edit
 libra commit -a -m "Fix typo"
 libra commit -F message.txt
+libra commit --date "2026-07-09 10:00:00 +0800" -m "Backdated author date"
 libra commit -s -m "Add feature"
 libra commit --allow-empty -m "Trigger CI"
 libra commit --json -m "Add feature"
@@ -298,11 +345,13 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 | Signoff trailer | `git commit -s` / `--signoff` | N/A | `libra commit -s` / `--signoff` |
 | GPG 签名提交 | `git commit -S`（手动 GPG） | N/A（无签名） | 自动（vault-backed） |
 | 覆盖 author | `git commit --author="..."` | N/A | `libra commit --author="..."` |
+| Author date | `git commit --date=<date>` | N/A | `libra commit --date <date>` |
 | Conventional 检查 | 外部工具（commitlint） | N/A | `libra commit --conventional` |
 | 只跳过 pre-commit | N/A | N/A | `libra commit --disable-pre` |
 | 跳过所有 hooks | `git commit --no-verify` | N/A | `libra commit --no-verify` |
 | Fixup commit | `git commit --fixup=<commit>` | N/A | `libra commit --fixup=<commit>` |
 | Squash commit | `git commit --squash=<commit>` | `jj squash` | `libra commit --squash=<commit>` |
+| 复用消息和 author | `git commit -C/-c <commit>` | N/A | `libra commit -C/-c <commit>` |
 | 交互式消息 | `git commit`（打开编辑器） | `jj commit`（打开编辑器） | `libra commit`（无 -m/-F 时打开编辑器）/ `-e` |
 | 编辑器中 verbose diff | `git commit -v` | N/A | `libra commit -v` |
 | verbose 配置默认 | `commit.verbose`（未给 `-v` 时回退；CLI flag 优先） | N/A | `libra config commit.verbose true` |
@@ -320,6 +369,7 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 | 场景 | 错误码 | 退出码 | 提示 |
 |----------|-----------|------|------|
 | 索引损坏 | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
+| index 对象缺失或类型不匹配 | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | 无法保存索引 | `LBR-IO-002` | 128 | -- |
 | 无内容可提交（干净） | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |
 | 无内容可提交（无已跟踪文件） | `LBR-REPO-003` | 128 | "create/copy files and use 'libra add' to track" |
@@ -327,6 +377,7 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 | 没有可 amend 的提交 | `LBR-REPO-003` | 128 | "create a commit before using --amend" |
 | Amend merge commit | `LBR-REPO-003` | 128 | "create a new commit instead of amending a merge commit" |
 | 无效 author 格式 | `LBR-CLI-002` | 129 | "expected format: 'Name <email>'" |
+| 无效 author/committer 日期 | `LBR-CLI-002` | 129 | 支持的日期格式 |
 | 无法读取消息文件 | `LBR-IO-001` | 128 | -- |
 | 空提交消息 | `LBR-REPO-003` | 128 | "use -m to provide a commit message" |
 | Tree 创建失败 | `LBR-INTERNAL-001` | 128 | Issues URL |

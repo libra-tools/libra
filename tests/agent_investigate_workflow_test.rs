@@ -589,15 +589,16 @@ async fn investigate_read_only_persists_state_and_findings_doc() {
     assert_eq!(manifest["starting_sha"], "sha-e8-wire");
     assert_eq!(manifest["target_scope"], topic);
     assert_eq!(manifest["terminal_state"], "quorum");
+    // A0-06: findings.md is objectized at the terminal manifest write.
+    let findings_oid = manifest["findings_oid"]
+        .as_str()
+        .expect("A0-06 populates findings_oid with a real object id");
     assert!(
-        manifest["findings_oid"].is_null(),
-        "AG-23 writes no findings object yet"
+        findings_oid.len() == 40 || findings_oid.len() == 64,
+        "findings_oid must be a git object id: {findings_oid}"
     );
-    assert_eq!(
-        manifest["manual_attach"],
-        serde_json::json!([]),
-        "manual_attach is an EMPTY placeholder in AG-23 (no command surface)"
-    );
+    // No `investigate attach` was invoked → manual_attach stays empty.
+    assert_eq!(manifest["manual_attach"], serde_json::json!([]));
     assert!(
         manifest["redaction_report"]["matches"]
             .as_u64()
@@ -624,6 +625,22 @@ async fn investigate_read_only_persists_state_and_findings_doc() {
         .read_findings(&run_id)
         .expect("read findings")
         .expect("findings exist");
+    // A0-06: the objectized blob at findings_oid must decode to findings.md.
+    let obj_path = repo
+        .join(".libra")
+        .join("objects")
+        .join(&findings_oid[..2])
+        .join(&findings_oid[2..]);
+    let raw = std::fs::read(&obj_path).expect("findings object exists on disk");
+    let mut decoder = flate2::read::ZlibDecoder::new(&raw[..]);
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut decoded).expect("zlib decode findings object");
+    let header_end = decoded.iter().position(|&b| b == 0).expect("object header");
+    assert_eq!(
+        &decoded[header_end + 1..],
+        findings.as_bytes(),
+        "the findings object must match findings.md bytes"
+    );
     // The untrusted seed topic is persisted (control-scrubbed) in the header.
     assert!(
         findings.contains("TOPIC-SEED-MARKER-7z"),
@@ -1412,4 +1429,280 @@ async fn corrupt_started_at_terminates_closed() {
         "no turn ran with a corrupt anchor"
     );
     assert_no_leaked_workspace(&repo);
+}
+
+// ---------------------------------------------------------------------------
+// A0-04: run-level admission / queue enforcement (shared with review)
+// ---------------------------------------------------------------------------
+
+fn seed_admission(repo: &Path, slots: usize, queued: usize) {
+    let admission = repo
+        .join(".libra")
+        .join("sessions")
+        .join("agent-runs")
+        .join(".admission");
+    let pid = std::process::id().to_string();
+    for (dir, n) in [("slots", slots), ("queue", queued)] {
+        let d = admission.join(dir);
+        std::fs::create_dir_all(&d).expect("create admission subdir");
+        for i in 0..n {
+            std::fs::write(d.join(format!("seed-{dir}-{i:03}")), &pid).expect("write ticket");
+        }
+    }
+}
+
+/// A0-04: `libra investigate` honours the same shared run-level admission
+/// queue as `libra review` — a full queue (2 active + 10 queued) refuses a
+/// fresh run fail-closed with `LBR-AGENT-014` (exit 128) on both surfaces.
+#[test]
+fn run_level_concurrency_rejects_when_queue_full() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    seed_admission(&repo, 2, 10);
+
+    let output = run_libra(
+        &[
+            "investigate",
+            "start",
+            "--topic",
+            "why is X slow",
+            "--agent",
+            "codex",
+        ],
+        &repo,
+        &[],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "a full queue must refuse fatally (128): stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stderr.contains("LBR-AGENT-014"),
+        "stderr must carry the run-queue-full code: {stderr}"
+    );
+
+    let output = run_libra(
+        &[
+            "investigate",
+            "start",
+            "--topic",
+            "why is X slow",
+            "--agent",
+            "codex",
+        ],
+        &repo,
+        &[("LIBRA_ERROR_JSON", "1")],
+    );
+    assert_eq!(output.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let json_start = stderr
+        .rfind("\n{")
+        .map(|index| index + 1)
+        .or_else(|| stderr.find('{'))
+        .expect("structured stderr must carry a JSON error report");
+    let report: serde_json::Value =
+        serde_json::from_str(stderr[json_start..].trim()).expect("JSON error report parses");
+    assert_eq!(report["error_code"], "LBR-AGENT-014");
+    assert_eq!(report["exit_code"], 128);
+}
+
+// ---------------------------------------------------------------------------
+// A0-06: manual attach command surface objectizes external files
+// ---------------------------------------------------------------------------
+
+/// `libra investigate attach <run_id> <file>` redacts the external file,
+/// objectizes it, and records a `manual_attach` manifest entry.
+#[test]
+fn investigate_artifacts_objectized() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    let store = store_for(&repo);
+    let run = store
+        .create_run(
+            "attach-run",
+            "why is X slow",
+            &["codex".to_string()],
+            4,
+            1,
+            "sha-attach",
+        )
+        .expect("create run");
+
+    let attach_file = temp.path().join("external-context.md");
+    std::fs::write(
+        &attach_file,
+        format!("external context body\ncredential {FAKE_CREDENTIAL}\n"),
+    )
+    .expect("write attach file");
+
+    let out = run_libra(
+        &[
+            "investigate",
+            "attach",
+            &run.run_id,
+            attach_file.to_str().unwrap(),
+        ],
+        &repo,
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "investigate attach must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let manifest = store
+        .load_manifest(&run.run_id)
+        .expect("load manifest")
+        .expect("manifest exists");
+    assert_eq!(manifest.manual_attach.len(), 1, "one attachment recorded");
+    let entry = &manifest.manual_attach[0];
+    assert_eq!(entry["provenance"], "manual");
+    assert_eq!(entry["name"], "external-context.md");
+    let oid = entry["oid"].as_str().expect("attachment oid");
+
+    let obj_path = repo
+        .join(".libra")
+        .join("objects")
+        .join(&oid[..2])
+        .join(&oid[2..]);
+    let raw = std::fs::read(&obj_path).expect("attachment object on disk");
+    let mut decoder = flate2::read::ZlibDecoder::new(&raw[..]);
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut decoded).expect("zlib decode attachment");
+    let header_end = decoded.iter().position(|&b| b == 0).expect("object header");
+    let text = String::from_utf8_lossy(&decoded[header_end + 1..]).to_string();
+    assert!(
+        text.contains("external context body"),
+        "content preserved: {text}"
+    );
+    assert!(
+        !text.contains(FAKE_CREDENTIAL),
+        "the credential must be redacted out of the attachment: {text}"
+    );
+
+    // An untrusted basename (secret + newline/tab/ANSI) is redacted + fully
+    // control-stripped before it is recorded.
+    let leaky_name = format!("leak-{FAKE_CREDENTIAL}-\u{1b}\n\ty.md");
+    let leaky_file = temp.path().join(&leaky_name);
+    std::fs::write(&leaky_file, "second body\n").expect("write leaky-name file");
+    let out = run_libra(
+        &[
+            "investigate",
+            "attach",
+            &run.run_id,
+            leaky_file.to_str().unwrap(),
+        ],
+        &repo,
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "leaky-name attach: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manifest = store.load_manifest(&run.run_id).unwrap().unwrap();
+    let name2 = manifest.manual_attach[1]["name"]
+        .as_str()
+        .expect("attachment name");
+    assert!(
+        !name2.contains(FAKE_CREDENTIAL),
+        "the basename must be redacted: {name2}"
+    );
+    assert!(
+        !name2.chars().any(|c| c.is_control()),
+        "the basename must have every control char stripped: {name2:?}"
+    );
+
+    // A failed read of a hostile path must not leak the secret/path either.
+    let missing = temp.path().join(format!("missing-{FAKE_CREDENTIAL}.md"));
+    let out = run_libra(
+        &[
+            "investigate",
+            "attach",
+            &run.run_id,
+            missing.to_str().unwrap(),
+        ],
+        &repo,
+        &[],
+    );
+    assert!(!out.status.success(), "attaching a missing file must fail");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(FAKE_CREDENTIAL),
+        "the read-error must not leak the secret from the path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A0-09: findings retention GC removes an expired terminal run
+// ---------------------------------------------------------------------------
+
+/// A real finalized investigate run's manifest carries the retention fields;
+/// once backdated past the `agent.retention.findings_days` window,
+/// `libra agent clean --gc` removes the run dir (the objectized blob is
+/// content-addressed and kept for a future repo-wide object GC).
+#[test]
+fn findings_retention_manifest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    let store = store_for(&repo);
+    store
+        .create_run(
+            "gc-run",
+            "why is X slow",
+            &["codex".to_string()],
+            4,
+            1,
+            "sha",
+        )
+        .expect("create run");
+    store
+        .write_findings("gc-run", "investigate finding body\n")
+        .expect("write findings");
+    store
+        .write_manifest_terminal(
+            "gc-run",
+            Some(InvestigateTerminalState::Quorum),
+            libra::internal::ai::review::store::RedactionReportSummary::default(),
+        )
+        .expect("finalize objectizes findings");
+
+    let run_dir = repo.join(".libra/sessions/agent-runs/gc-run");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["terminal_state"], "quorum");
+    let findings_oid = manifest["findings_oid"]
+        .as_str()
+        .expect("A0-06 findings_oid")
+        .to_string();
+    let blob = repo
+        .join(".libra/objects")
+        .join(&findings_oid[..2])
+        .join(&findings_oid[2..]);
+    assert!(blob.exists(), "findings blob objectized");
+
+    let mut backdated = manifest.clone();
+    backdated["updated_at"] = serde_json::json!("2000-01-01T00:00:00.000000Z");
+    std::fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_vec(&backdated).unwrap(),
+    )
+    .unwrap();
+
+    let out = run_libra(&["agent", "clean", "--gc"], &repo, &[]);
+    assert!(
+        out.status.success(),
+        "clean --gc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!run_dir.exists(), "the expired terminal run dir is GC'd");
+    // The objectized blob is content-addressed and left for a future repo-wide
+    // object GC — per-run retention never deletes it.
+    assert!(
+        blob.exists(),
+        "the objectized findings blob is not deleted here"
+    );
 }

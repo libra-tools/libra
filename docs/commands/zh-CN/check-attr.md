@@ -1,11 +1,13 @@
 # `libra check-attr`
 
-报告一个或多个路径的 `.libra_attributes` 属性——Libra 版的 `git check-attr`。
+报告一个或多个路径的 Git/Libra attributes——Libra 版的 `git check-attr`。
 
 > 有意差异（见
 > [`docs/development/commands/_compatibility.md`](../../development/commands/_compatibility.md)
 > 决策 **D5**）：Libra **不**实现 Git `.gitattributes` 的 smudge/clean filter 桥接。
-> `check-attr` 是对 `.libra_attributes` 的只读查询，而非 filter 驱动。Libra 当前只表达一个有意义的属性：`filter`（LFS 跟踪路径取值 `lfs`）。
+> `check-attr` 是对 attributes 的只读查询，而非 filter 驱动。
+
+Attributes 来源按从低到高的优先级应用：`core.attributesFile`、从根到子目录的 `.gitattributes`、同目录 `.libra_attributes`、最后是 `.git/info/attributes`。Libra 扩展文件会覆盖同目录 `.gitattributes` 的匹配规则，而 `.git/info/attributes` 保持 Git 的最高优先级工作树本地层级。
 
 ## 用法
 
@@ -19,10 +21,11 @@ libra check-attr [-z] (<attr>... | --all) --stdin
 
 对每个 `(路径, 属性)` 组合，`check-attr` 打印属性值。取值之一：
 
-- `lfs` —— 当 `filter` 属性命中（`.libra_attributes` 有匹配该路径的 `filter=lfs` 模式）。
+- `lfs` —— 当 `filter` 属性命中（某个 attributes 来源有匹配该路径的 `filter=lfs` 模式）。
+- `set` / `unset` —— 裸属性或 `-attr` 规则。
 - `unspecified` —— 该属性未在路径上设置。
 
-`--all` 仅报告路径上**已设置**的属性（当前：LFS 跟踪路径为 `filter: lfs`，否则无）。
+`--all` 仅报告路径上**已设置**的属性（例如 `filter: lfs` 或 `diff: <driver>`）。
 
 命令成功时总是退出 `0`（即使所有属性都是 `unspecified`）；用法或仓库错误退出 `128`。
 
@@ -56,7 +59,7 @@ libra check-attr [-z] (<attr>... | --all) --stdin
 ```bash
 # a.bin 是否走 LFS filter？
 libra check-attr filter a.bin
-# -> a.bin: filter: lfs   （若 .libra_attributes 跟踪 *.bin）
+# -> a.bin: filter: lfs   （若某个 attributes 来源跟踪 *.bin）
 
 # 查询多个属性（用 -- 分隔）
 libra check-attr filter text -- a.bin notes.txt
@@ -79,4 +82,4 @@ libra check-attr --json filter a.bin
 | 全部属性 | `libra check-attr --all a.bin` | `git check-attr --all a.bin` |
 | 从 stdin | `libra check-attr filter --stdin` | `git check-attr filter --stdin` |
 
-Libra 只识别 `filter` 属性（映射到 LFS），不运行 smudge/clean filter。Git 的 `--cached`、`--source` 与任意 `.gitattributes` 宏不适用。
+Libra 读取 `filter`、`diff`、`export-ignore` 等属性，但不运行 smudge/clean filter。Git 的 `--cached`、`--source` 与 attributes 宏展开尚未公开。

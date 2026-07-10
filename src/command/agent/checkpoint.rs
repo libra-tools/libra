@@ -328,10 +328,13 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
     // restored. We use this both for dry-run output and for a "summary
     // before apply" line.
     let parent_oid = ObjectHash::from_str(&parent_commit).map_err(|e| {
+        // A0-03: a malformed parent_commit in the catalog is a checkpoint
+        // store inconsistency (the writer only records valid OIDs).
         CliError::fatal(format!(
             "checkpoint '{}' has invalid parent_commit '{parent_commit}': {e}",
             args.checkpoint_id
         ))
+        .with_stable_code(StableErrorCode::AgentCheckpointStoreInconsistent)
     })?;
     // Codex Phase-2-followups round-1 P1 #2: dry-run was previously
     // emitting only the additions/modifications side, leaving users
@@ -341,7 +344,11 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
     //   delete  = files tracked by the index but absent from the target
     //             tree (will be removed by the worktree-restore pass)
     let plan = build_rewind_plan(&parent_oid).map_err(|e| {
+        // A0-03: rewind cannot resolve the parent commit / tree — the
+        // referenced objects are missing from the store, a checkpoint-store
+        // inconsistency (recovery failure), not a user input error.
         CliError::fatal(format!("failed to enumerate files for rewind preview: {e}"))
+            .with_stable_code(StableErrorCode::AgentCheckpointStoreInconsistent)
     })?;
 
     // Codex round-2 follow-up: report `transcript_truncation_supported`
@@ -780,6 +787,42 @@ struct RewindPlan {
     delete: Vec<String>,
 }
 
+/// Fallible recursive expansion of a tree to `(path, oid)` leaves.
+///
+/// A0-03: `TreeExt::get_plain_items` recurses via `Tree::load`, which
+/// **panics** on a missing / corrupt subtree object. A checkpoint rewind must
+/// instead fail closed with `LBR-AGENT-009` when the store is inconsistent, so
+/// this variant loads every nested tree through the fallible `Tree::try_load`
+/// and returns an error (which `build_rewind_plan`'s caller maps to
+/// `AgentCheckpointStoreInconsistent`) rather than aborting the process.
+/// Gitlink (`160000`) entries are skipped, mirroring `get_plain_items`.
+fn try_expand_tree_plain_items(
+    tree: &Tree,
+) -> Result<Vec<(std::path::PathBuf, ObjectHash)>, anyhow::Error> {
+    use std::path::PathBuf;
+
+    let mut items = Vec::new();
+    for item in tree.tree_items.iter() {
+        match item.mode {
+            TreeItemMode::Commit => continue,
+            TreeItemMode::Tree => {
+                let sub_tree = Tree::try_load(&item.id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing or corrupt subtree object {} ('{}')",
+                        item.id,
+                        item.name
+                    )
+                })?;
+                for (path, hash) in try_expand_tree_plain_items(&sub_tree)? {
+                    items.push((PathBuf::from(item.name.clone()).join(path), hash));
+                }
+            }
+            _ => items.push((PathBuf::from(item.name.clone()), item.id)),
+        }
+    }
+    Ok(items)
+}
+
 fn build_rewind_plan(commit_oid: &ObjectHash) -> Result<RewindPlan, anyhow::Error> {
     use std::{collections::HashSet, path::PathBuf};
 
@@ -789,7 +832,7 @@ fn build_rewind_plan(commit_oid: &ObjectHash) -> Result<RewindPlan, anyhow::Erro
         .map_err(|e| anyhow::anyhow!("failed to load commit {commit_oid}: {e}"))?;
     let tree: Tree = load_object(&commit.tree_id)
         .map_err(|e| anyhow::anyhow!("failed to load tree {}: {e}", commit.tree_id))?;
-    let target: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items();
+    let target: Vec<(PathBuf, ObjectHash)> = try_expand_tree_plain_items(&tree)?;
     let target_set: HashSet<PathBuf> = target.iter().map(|(p, _)| p.clone()).collect();
 
     let mut restore: Vec<String> = target
@@ -1503,7 +1546,7 @@ async fn write_export_audit(
         .map_err(|e| CliError::fatal(format!("append audit record: {e:#}")))
 }
 
-fn load_metadata_blob(oid: &str) -> Result<String, CliError> {
+pub(super) fn load_metadata_blob(oid: &str) -> Result<String, CliError> {
     let hash = ObjectHash::from_str(oid)
         .map_err(|e| CliError::fatal(format!("invalid metadata_blob_oid '{oid}': {e}")))?;
     let storage = util::try_get_storage_path(None)
@@ -1644,7 +1687,10 @@ fn emit_one(
     Ok(())
 }
 
-async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> CliResult<bool> {
+pub(super) async fn table_exists(
+    conn: &(impl ConnectionTrait + ?Sized),
+    name: &str,
+) -> CliResult<bool> {
     let backend = conn.get_database_backend();
     let stmt = Statement::from_sql_and_values(
         backend,

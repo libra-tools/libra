@@ -10,7 +10,18 @@ libra review list [--json] [--limit <n>] [--cursor <token>]
 libra review show <run_id> [--json]
 libra review cancel <run_id>
 libra review clean [--run <run_id>] [--all]
+libra review attach <run_id> <file> [--json]
 ```
+
+## Artifacts
+
+A finished run objectizes its `findings.md` into the object store: the run
+manifest's `findings_oid` is a content-addressed blob, `object_index`-tagged
+so cloud sync and retention track it and `libra agent doctor` can repair it if
+it goes missing. `libra review attach <run_id> <file>` records an external
+file on the run's audit chain with `provenance=manual` — the bytes are
+redacted, objectized the same way, and appended to the manifest's
+`manual_attach` list. Attach never modifies findings or run state.
 
 ## Description
 
@@ -107,12 +118,24 @@ libra review clean --run <run_id>
 libra review clean --all
 ```
 
+## Concurrency
+
+`review` and `investigate` share one run-level concurrency budget across the
+repository. At most `agent.max_concurrent_runs` runs (default `2`) execute at
+once; a run started while the budget is saturated waits in a queue (blocking
+the foreground process — `Ctrl-C` cancels the wait and advances the queue for
+others). If the wait queue is already at its cap (10), the new run is refused
+fail-closed with the stable code `LBR-AGENT-014` (exit 128) rather than
+overrunning the budget. Raise the limit with
+`libra config set agent.max_concurrent_runs <N>`.
+
 ## Exit Status
 
 - `0` — the run reached `success`, `partial`, `timeout`, or `cancelled`
   (the terminal state is reported in the output); subcommands succeeded.
 - non-zero — usage errors, a run that ended in the `error` terminal
-  state, unknown run ids, or `--fix` (stable code `LBR-AGENT-010`).
+  state, unknown run ids, `--fix` (stable code `LBR-AGENT-010`), or a full
+  run queue (stable code `LBR-AGENT-014`).
 
 ## See Also
 
