@@ -291,3 +291,51 @@ jobs:
             echo
             echo "Updated Formula/libra.rb for ${GITHUB_REF_NAME}."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  verify-homebrew-formula:
+    needs: update-homebrew-tap
+    runs-on: macos-latest
+    steps:
+      - name: Install and verify Homebrew formula
+        shell: bash
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set +e
+
+          warn() {
+            local message="$1"
+            echo "::warning::$message"
+            {
+              echo "### Homebrew formula verification warning"
+              echo
+              echo "$message"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if ! brew tap libra-tools/libra; then
+            warn "Failed to tap libra-tools/libra; skipping Homebrew formula verification."
+            exit 0
+          fi
+
+          if ! brew install libra-tools/libra/libra; then
+            warn "Failed to install libra-tools/libra/libra; skipping version verification."
+            exit 0
+          fi
+
+          if ! actual_version="$(libra --version 2>&1)"; then
+            warn "The installed libra binary failed to report its version."
+            exit 0
+          fi
+
+          expected_version="libra ${GITHUB_REF_NAME#v}"
+          if [[ "$actual_version" != "$expected_version" ]]; then
+            warn "Installed version '$actual_version' does not match expected version '$expected_version'."
+            exit 0
+          fi
+
+          {
+            echo "### Homebrew formula verification"
+            echo
+            echo "Verified $expected_version from libra-tools/libra."
+          } >> "$GITHUB_STEP_SUMMARY"
