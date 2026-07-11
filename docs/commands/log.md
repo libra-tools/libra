@@ -108,6 +108,28 @@ libra log --pretty=fuller
 libra log --pretty=reference
 ```
 
+When no explicit `--oneline`, `--pretty`, or `--format` is present,
+`format.pretty` supplies the default for both `libra log` and `libra show`.
+The supported config values are the presets above or a non-empty custom
+template using `format:`, `tformat:`, or a `%` placeholder. Empty values and
+unknown bare preset names fail before output with `LBR-CLI-002`; an explicit
+CLI format bypasses the matching config key.
+
+### `--date=<format>`
+
+Select the human-readable author/committer date mode. Supported modes are
+`default`, `short`, `iso`/`iso8601`, `iso-strict`/`iso8601-strict`,
+`rfc`/`rfc2822`, `unix`, and `raw`. `log.date` supplies the default for human
+`log` and `show` output; an explicit `--date` wins. Valid Git modes that this
+renderer does not yet implement (`relative`, `human`, `local`, `format:*`, and
+`auto:*`) are rejected when configured instead of being silently ignored.
+Dates in structured JSON keep their schema-defined RFC3339 representation.
+
+```bash
+libra log --date=iso-strict
+libra log --pretty='format:%ad %s' --date=unix
+```
+
 ### `-p, --patch`
 
 Show the diff (patch) for each commit. Can be combined with path arguments to limit
@@ -193,6 +215,7 @@ Libra). `--invert-grep` keeps commits whose message does *not* match.
 libra log --grep "fix(" -n 20
 libra log --grep fix -i              # case-insensitive
 libra log --grep WIP --invert-grep   # hide WIP commits
+```
 
 ### `--trailer <KEY[=VALUE]>` / `--only-trailers` (Libra extensions)
 
@@ -211,6 +234,8 @@ value. Repeatable: every `--trailer` must match.
 It does not filter — trailer-less commits print with an empty message
 section. Combined with `--trailer`, the display shows only the selected keys.
 Mutually exclusive with `--oneline`/`--pretty`/`--format`.
+Because this is an explicit display mode, it also overrides the
+`format.pretty` and `log.date` defaults.
 
 ```bash
 libra log --trailer Reviewed-by                  # commits reviewed by anyone
@@ -221,7 +246,6 @@ libra log --only-trailers --trailer signed-off-by
 In `--json` output every commit carries an additive `trailers` array
 (`[{"key": …, "value": …}]`, empty when the commit has no qualifying block);
 `body` still contains the trailer lines inline, unchanged.
-```
 
 ### `--since <DATE>`
 
@@ -395,13 +419,20 @@ matches the default. (Git's opposite `--show-signature` is not implemented.)
 libra log --no-show-signature
 ```
 
-### `--follow <FILE>`
+### `--follow <FILE>` / `--no-follow`
 
-Best-effort continuation of a file's history across renames. The file is resolved
-relative to the current directory.
+Best-effort continuation of a file's history across renames. Paths are
+normalized from the current directory to the repository root. With
+`log.follow=true`, the same traversal is enabled automatically when exactly one
+positional path names an existing file; a single directory remains a normal
+directory filter. `--follow <FILE>` and `--no-follow` override the config. The
+config applies to human and JSON commit selection. Rename matching is exact-blob
+best effort, so content-changing and complex/non-linear renames remain outside
+the compatibility promise.
 
 ```bash
 libra log --follow src/main.rs
+libra log --no-follow src/main.rs
 ```
 
 ### `--parents` / `--children`
@@ -518,6 +549,8 @@ Graph format:
 - `-n` also applies in JSON mode
 - `total` reflects the filtered commit count only when `-n` is not supplied; with `-n`, it is always `null`
 - `--graph`, `--pretty`, and `--oneline` do not change the JSON schema
+- `format.pretty` and `log.date` do not change the JSON schema; `log.follow`
+  can change which commits are selected for a single positional path
 - `--decorate` only affects human rendering; JSON always returns a `refs` array, and auxiliary ref metadata is collected best-effort
 - `files` is always a structured change summary and never includes patch text
 
@@ -567,9 +600,10 @@ timestamp (no topological constraint).
 
 ### `--follow`
 
-`--follow` performs best-effort rename detection by walking history and matching
-removed/added blob hashes. It does not handle complex directory renames or
-content-similar renames.
+`--follow` performs best-effort rename detection by walking history backwards,
+switching to an exact-blob predecessor path at a rename. It does not handle
+complex directory renames, content-changing/content-similar renames, or every
+non-linear-history case.
 
 ### `-L`
 

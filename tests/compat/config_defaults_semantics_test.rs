@@ -19,6 +19,12 @@ mod diff_defaults;
 mod diff_prefix_defaults;
 #[path = "config_defaults_diff_prefix_edges.rs"]
 mod diff_prefix_edges;
+#[path = "config_defaults_log_errors.rs"]
+mod log_default_errors;
+#[path = "config_defaults_log.rs"]
+mod log_defaults;
+#[path = "config_defaults_log_follow.rs"]
+mod log_follow_defaults;
 
 const PATH_ENV: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 

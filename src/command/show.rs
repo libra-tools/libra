@@ -23,13 +23,17 @@ use serde::Serialize;
 use crate::{
     command::{
         load_object,
-        log::{ChangeType, generate_diff, get_changed_files_for_commit, parse_pretty_format},
+        log::{
+            ChangeType,
+            config::{configured_date, configured_pretty, resolve_cli_date},
+            generate_diff, get_changed_files_for_commit, parse_pretty_format,
+        },
     },
     common_utils::parse_commit_msg,
     internal::{
         branch::Branch,
         head::Head,
-        log::formatter::{CommitFormatter, FormatContext},
+        log::formatter::{CommitFormatter, FormatContext, format_timestamp_with},
         tag,
     },
     utils::{
@@ -81,6 +85,11 @@ pub struct ShowArgs {
     /// names and `%`-placeholder templates as `--pretty`.
     #[clap(long, value_name = "FORMAT", conflicts_with = "pretty")]
     pub format: Option<String>,
+
+    /// Date rendering mode for author/committer dates: default / short / iso /
+    /// iso-strict / rfc / unix / raw.
+    #[clap(long, value_name = "FORMAT")]
+    pub date: Option<String>,
 
     /// Abbreviate the commit object name in the default header instead of
     /// printing the full (unabbreviated) hash.
@@ -271,8 +280,12 @@ pub async fn execute(args: ShowArgs) {
 /// Safe entry point that returns structured [`CliResult`] instead of printing
 /// errors and exiting. Resolves a revision (commit, tag, tree, blob, or
 /// `<rev>:<path>`) and prints its contents with diff formatting.
-pub async fn execute_safe(args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute_safe(mut args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::from(ShowError::NotInRepo))?;
+
+    if let Some(date) = args.date.take() {
+        args.date = Some(resolve_cli_date(&date)?);
+    }
 
     if output.is_json() {
         let result = run_show(&args).await?;
@@ -281,6 +294,21 @@ pub async fn execute_safe(args: ShowArgs, output: &OutputConfig) -> CliResult<()
 
     if output.quiet {
         return validate_show_quiet(&args).await;
+    }
+
+    // These are commit-display defaults. Invalid values must not block
+    // tree/blob/REV:path output, which never renders either setting.
+    if show_target_uses_commit_display(&args).await? {
+        if !args.oneline && args.pretty.is_none() && args.format.is_none() {
+            let configured = configured_pretty().await?;
+            // `medium` is Git's default renderer, including the full commit id.
+            if configured.as_deref() != Some("medium") {
+                args.pretty = configured;
+            }
+        }
+        if args.date.is_none() {
+            args.date = configured_date().await?;
+        }
     }
 
     let rendered = render_show_human(&args, color_enabled_for_output(output)).await?;
@@ -299,6 +327,23 @@ fn color_enabled_for_output(output: &OutputConfig) -> bool {
         ColorChoice::Never => false,
         ColorChoice::Auto => std::io::stdout().is_terminal(),
     }
+}
+
+async fn show_target_uses_commit_display(args: &ShowArgs) -> CliResult<bool> {
+    let object_ref = args.object.as_deref().unwrap_or("HEAD");
+    if object_ref.contains(':') {
+        return Ok(false);
+    }
+
+    if let Some(hash) = resolve_existing_object_hash(object_ref) {
+        let storage = ClientStorage::init(path::objects());
+        let object_type = storage
+            .get_object_type(&hash)
+            .map_err(|error| show_object_load_error(hash, error))?;
+        return Ok(matches!(object_type, ObjectType::Commit | ObjectType::Tag));
+    }
+
+    Ok(util::get_commit_base(object_ref).await.is_ok())
 }
 
 async fn render_show_human(args: &ShowArgs, color_enabled: bool) -> CliResult<String> {
@@ -675,9 +720,13 @@ async fn show_tag_by_hash(
             ));
             output.push('\n');
 
-            let date = chrono::DateTime::from_timestamp(tag_obj.tagger.timestamp as i64, 0)
-                .unwrap_or(chrono::DateTime::UNIX_EPOCH);
-            output.push_str(&format!("Date:   {}\n\n", date.to_rfc2822()));
+            output.push_str(&format!(
+                "Date:   {}\n\n",
+                format_timestamp_with(
+                    tag_obj.tagger.timestamp as i64,
+                    args.date.as_deref().unwrap_or_default(),
+                )
+            ));
             output.push_str(tag_obj.message.trim());
             output.push_str("\n\n");
 
@@ -793,10 +842,16 @@ async fn validate_commit_file(rev: &str, file_path: &str) -> CliResult<()> {
 /// Renders the commit header using the selected format.
 fn display_commit_info(output: &mut String, commit: &Commit, args: &ShowArgs, color_enabled: bool) {
     // `--format` is Git's alias for `--pretty` (mutually exclusive in clap).
-    if let Some(pretty) = args.pretty.as_ref().or(args.format.as_ref()) {
+    if let Some(pretty) = args
+        .pretty
+        .as_ref()
+        .or(args.format.as_ref())
+        .filter(|pretty| pretty.as_str() != "medium")
+    {
         // `--pretty=<fmt>` renders the commit header through the shared log
         // formatter (oneline / format:<tmpl> / tformat:<tmpl> / custom template).
         let formatter = CommitFormatter::new(parse_pretty_format(pretty.clone()))
+            .with_date_mode(args.date.clone().unwrap_or_default())
             .with_color_enabled(color_enabled);
         let ctx = FormatContext {
             graph_prefix: "",
@@ -831,9 +886,13 @@ fn display_commit_info(output: &mut String, commit: &Commit, args: &ShowArgs, co
         ));
 
         // Format the commit timestamp for display.
-        let date = chrono::DateTime::from_timestamp(commit.committer.timestamp as i64, 0)
-            .unwrap_or(chrono::DateTime::UNIX_EPOCH);
-        output.push_str(&format!("Date:   {}\n", date.to_rfc2822()));
+        output.push_str(&format!(
+            "Date:   {}\n",
+            format_timestamp_with(
+                commit.committer.timestamp as i64,
+                args.date.as_deref().unwrap_or_default(),
+            )
+        ));
 
         // Print the commit message body.
         let (msg, _) = parse_commit_msg(&commit.message);

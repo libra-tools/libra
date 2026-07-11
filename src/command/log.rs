@@ -1,5 +1,7 @@
 //! Log command rendering commit history with optional decorations, filtering, and custom formatting utilities.
 
+pub(crate) mod config;
+
 use std::{
     cell::RefCell,
     cmp::min,
@@ -19,6 +21,7 @@ use git_internal::{
 };
 use serde::Serialize;
 
+use self::config::{ResolvedLogConfig, resolve_log_config};
 use crate::{
     command::load_object,
     common_utils::parse_commit_msg,
@@ -173,8 +176,8 @@ pub struct LogArgs {
     /// names and `%`-placeholder templates as `--pretty`.
     #[clap(long, value_name = "FORMAT", conflicts_with = "pretty")]
     pub format: Option<String>,
-    /// Date rendering mode for author/committer dates: short / iso / iso-strict /
-    /// rfc / unix / raw (others fall back to the default form).
+    /// Date rendering mode for author/committer dates: default / short / iso /
+    /// iso-strict / rfc / unix / raw.
     #[clap(long, value_name = "FORMAT")]
     pub date: Option<String>,
     /// Print out ref names of any commits that are shown
@@ -328,8 +331,12 @@ pub struct LogArgs {
     pub all: bool,
 
     /// Show history of a single file, following renames across commits.
-    #[clap(long, value_name = "FILE")]
+    #[clap(long, value_name = "FILE", conflicts_with = "no_follow")]
     pub follow: Option<String>,
+
+    /// Do not follow renames, overriding `log.follow=true`.
+    #[clap(long = "no-follow")]
+    pub no_follow: bool,
 
     /// Trace the evolution of the line range in the given file.
     /// Format: `<start>,<end>:<file>` or `:funcname:<file>`.
@@ -366,6 +373,13 @@ pub struct FileChange {
 struct SelectedLogCommit {
     commit: Commit,
     cached_changes: Option<Vec<FileChange>>,
+    path_filters: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct TraversedLogCommit {
+    commit: Commit,
+    follow_paths: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -981,6 +995,11 @@ async fn resolve_log_inputs(args: &LogArgs) -> CliResult<(Vec<String>, Vec<Strin
     Ok((ranges, paths))
 }
 
+fn configured_follow_path(paths: &[PathBuf], enabled: bool) -> Option<PathBuf> {
+    (enabled && paths.len() == 1 && util::workdir_to_absolute(&paths[0]).is_file())
+        .then(|| paths[0].clone())
+}
+
 /// Resolve the starting commit(s) and optional exclusion set from CLI arguments.
 /// `ranges` carries the effective revision specs (`--range` plus any positional
 /// revisions) computed by [`resolve_log_inputs`].
@@ -1178,77 +1197,80 @@ async fn commit_touches_path_follow(
     commit: &Commit,
     target: &PathBuf,
 ) -> Result<Option<PathBuf>, CliError> {
-    let changes = get_changed_files_for_commit(commit, &[]).await?;
-    for change in changes {
-        if &change.path == target {
-            return Ok(Some(target.clone()));
-        }
-    }
-
-    // Rename detection: if the target file does not exist in this commit's tree
-    // but a file with the same blob hash as the target existed in the parent,
-    // treat that parent path as the target for this commit.
     let tree = load_object::<Tree>(&commit.tree_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
     let current_items: HashMap<PathBuf, ObjectHash> = tree.get_plain_items().into_iter().collect();
-
-    if current_items.contains_key(target) {
-        return Ok(Some(target.clone()));
-    }
+    let current_blob = current_items.get(target).copied();
 
     if commit.parent_commit_ids.is_empty() {
-        return Ok(None);
+        return Ok(current_blob.map(|_| target.clone()));
     }
 
-    let target_blob = current_items.get(target).copied();
     let parent_commit = load_object::<Commit>(&commit.parent_commit_ids[0])
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
     let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
     let parent_items: HashMap<PathBuf, ObjectHash> =
         parent_tree.get_plain_items().into_iter().collect();
+    let parent_blob = parent_items.get(target).copied();
 
-    // If target was added here (not in parent), no rename predecessor.
-    if target_blob.is_none() && parent_items.contains_key(target) {
-        return Ok(Some(target.clone()));
-    }
-
-    // Look for a deleted parent file whose blob matches the target's current blob.
-    if let Some(target_blob) = target_blob {
-        for (path, hash) in parent_items {
-            if hash == target_blob {
-                return Ok(Some(path));
-            }
+    match (current_blob, parent_blob) {
+        (Some(current), Some(parent)) => {
+            return Ok((current != parent).then(|| target.clone()));
         }
+        (None, Some(_)) => return Ok(Some(target.clone())),
+        (None, None) => return Ok(None),
+        (Some(_), None) => {}
     }
 
-    Ok(None)
+    // The path was added in this commit. An exact blob match at a different
+    // parent path is the best-effort rename predecessor for the next step.
+    let Some(current_blob) = current_blob else {
+        return Ok(None);
+    };
+    let predecessor = parent_items
+        .iter()
+        .filter(|(path, hash)| {
+            **path != *target && **hash == current_blob && !current_items.contains_key(*path)
+        })
+        .map(|(path, _)| path)
+        .min()
+        .cloned();
+    if let Some(path) = predecessor {
+        return Ok(Some(path));
+    }
+    Ok(Some(target.clone()))
 }
 
 /// Filter reachable commits for `--follow` and `-L` paths.
 async fn apply_follow_and_line_filters(
     commits: Vec<Commit>,
-    follow: &Option<String>,
+    follow: &Option<PathBuf>,
     line_ranges: &[String],
-) -> Result<Vec<Commit>, CliError> {
+) -> Result<Vec<TraversedLogCommit>, CliError> {
     let mut result = Vec::new();
-    let mut current_path = follow.as_ref().map(PathBuf::from);
+    let mut current_path = follow.clone();
     let ranges: Vec<LineRange> = line_ranges
         .iter()
         .map(|s| parse_line_range(s))
         .collect::<Result<Vec<_>, _>>()?;
 
     for commit in commits {
-        let path_to_check = if let Some(path) = &current_path {
-            let touched = commit_touches_path_follow(&commit, path).await?;
+        let (path_to_check, follow_paths) = if let Some(path) = &current_path {
+            let commit_path = path.clone();
+            let touched = commit_touches_path_follow(&commit, &commit_path).await?;
             if let Some(new_path) = touched {
                 current_path = Some(new_path.clone());
-                Some(new_path)
+                let mut paths = vec![commit_path.clone()];
+                if new_path != commit_path {
+                    paths.push(new_path.clone());
+                }
+                (Some(new_path), Some(paths))
             } else {
                 continue;
             }
         } else {
-            None
+            (None, None)
         };
 
         if !ranges.is_empty() {
@@ -1260,7 +1282,10 @@ async fn apply_follow_and_line_filters(
             }
         }
 
-        result.push(commit);
+        result.push(TraversedLogCommit {
+            commit,
+            follow_paths,
+        });
     }
 
     Ok(result)
@@ -1307,10 +1332,11 @@ async fn commit_affects_line_range(
 /// errors and exiting. Walks commit history applying filters (date range,
 /// author, path) and renders formatted log output.
 pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()> {
+    let log_config = resolve_log_config(&args, !output.is_json()).await?;
     let decorate_option = resolve_decorate_option(&args).await?;
 
     if output.is_json() {
-        let result = run_log(&args).await?;
+        let result = run_log(&args, &log_config).await?;
         return emit_json_data("log", &result, output);
     }
 
@@ -1328,6 +1354,17 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
     let until = args.until.as_deref().map(parse_date_arg).transpose()?;
     let (ranges, paths) = resolve_log_inputs(&args).await?;
     let path_filters: Vec<PathBuf> = paths.iter().map(util::to_workdir_path).collect();
+    let configured_follow = configured_follow_path(&path_filters, log_config.follow);
+    let effective_follow = args
+        .follow
+        .as_deref()
+        .map(util::to_workdir_path)
+        .or_else(|| configured_follow.clone());
+    let selection_path_filters = if effective_follow.is_some() {
+        Vec::new()
+    } else {
+        path_filters.clone()
+    };
     let (min_parents, max_parents) = resolve_parent_bounds(
         args.merges,
         args.no_merges,
@@ -1340,7 +1377,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         args.committer.clone(),
         since,
         until,
-        path_filters.clone(),
+        selection_path_filters,
         args.grep.clone(),
         min_parents,
         max_parents,
@@ -1359,19 +1396,18 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         get_reachable_commits_excluding(start_commits, excludes, None, args.first_parent).await?;
     // newest first
     sort_commits_newest_first(&mut reachable_commits, args.author_date_order);
+    let default_abbrev = util::get_min_unique_hash_length(&reachable_commits).max(7);
+    let mut traversed_commits =
+        apply_follow_and_line_filters(reachable_commits, &effective_follow, &args.line_range)
+            .await?;
     if args.reverse {
-        reachable_commits.reverse();
+        traversed_commits.reverse();
     }
 
-    reachable_commits =
-        apply_follow_and_line_filters(reachable_commits, &args.follow, &args.line_range).await?;
-
-    let default_abbrev = util::get_min_unique_hash_length(&reachable_commits).max(7);
-
-    let max_output_number = min(args.number.unwrap_or(usize::MAX), reachable_commits.len());
+    let max_output_number = min(args.number.unwrap_or(usize::MAX), traversed_commits.len());
     let reuse_changed_files = name_only || name_status;
     let selected_commits = select_log_commits(
-        reachable_commits,
+        traversed_commits,
         &filter,
         &path_filters,
         max_output_number,
@@ -1383,7 +1419,6 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
     if output.quiet {
         return validate_selected_log_commits(
             &selected_commits,
-            &path_filters,
             name_only,
             name_status,
             patch,
@@ -1410,6 +1445,8 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
     } else if let Some(format) = args.format.clone() {
         // `--format` is Git's alias for `--pretty=<format>`.
         parse_pretty_format(format)
+    } else if let Some(pretty) = log_config.pretty.clone() {
+        parse_pretty_format(pretty)
     } else {
         FormatType::Full
     };
@@ -1419,7 +1456,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         ColorChoice::Auto => std::io::stdout().is_terminal(),
     };
     let mut formatter = CommitFormatter::new(format_type)
-        .with_date_mode(args.date.clone().unwrap_or_default())
+        .with_date_mode(log_config.date.clone().unwrap_or_default())
         .with_color_enabled(color_enabled);
     if args.only_trailers {
         // Key-filter the display to the `--trailer` keys when given.
@@ -1435,12 +1472,22 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
     } else {
         None
     };
+    // `medium` is the default full renderer and therefore retains the full
+    // commit id. Other explicit/configured pretty formats keep the existing
+    // abbreviated `%h` context.
+    let pretty_requests_abbreviation =
+        |pretty: Option<&String>| pretty.is_some_and(|value| value.as_str() != "medium");
     // Decide abbreviated hash length
     let abbrev_len = if args.no_abbrev_commit {
         full_hash_len
     } else if let Some(n) = args.abbrev {
         if n == 0 { default_abbrev } else { n }
-    } else if args.abbrev_commit || args.oneline || args.pretty.is_some() || args.format.is_some() {
+    } else if args.abbrev_commit
+        || args.oneline
+        || pretty_requests_abbreviation(args.pretty.as_ref())
+        || pretty_requests_abbreviation(args.format.as_ref())
+        || pretty_requests_abbreviation(log_config.pretty.as_ref())
+    {
         default_abbrev
     } else {
         full_hash_len
@@ -1472,6 +1519,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         let SelectedLogCommit {
             commit,
             mut cached_changes,
+            path_filters: commit_path_filters,
         } = selected;
         let ref_msg = if decorate_option != DecorateOptions::No {
             let mut ref_msgs: Vec<String> = vec![];
@@ -1597,14 +1645,14 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
             // `--patch-with-stat` order.
             let mut block = String::new();
             if stat_before_patch {
-                let stats = compute_commit_stat(&commit, path_filters.clone()).await?;
+                let stats = compute_commit_stat(&commit, commit_path_filters.clone()).await?;
                 let stat_output = format_stat_output(&stats);
                 if !stat_output.is_empty() {
                     block.push_str(stat_output.trim_end_matches('\n'));
                     block.push_str("\n\n");
                 }
             }
-            let patch_output = generate_diff(&commit, path_filters.clone()).await?;
+            let patch_output = generate_diff(&commit, commit_path_filters.clone()).await?;
             block.push_str(&patch_output);
             if !block.is_empty() {
                 if !message.ends_with('\n') {
@@ -1613,7 +1661,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
                 message.push_str(&block);
             }
         } else if args.stat {
-            let stats = compute_commit_stat(&commit, path_filters.clone()).await?;
+            let stats = compute_commit_stat(&commit, commit_path_filters.clone()).await?;
             let stat_output = format_stat_output(&stats);
             if !stat_output.is_empty() {
                 if !message.ends_with('\n') {
@@ -1622,7 +1670,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
                 message.push_str(&stat_output);
             }
         } else if args.shortstat {
-            let stats = compute_commit_stat(&commit, path_filters.clone()).await?;
+            let stats = compute_commit_stat(&commit, commit_path_filters).await?;
             let shortstat_output = format_shortstat_output(&stats);
             if !shortstat_output.is_empty() {
                 if !message.ends_with('\n') {
@@ -1646,11 +1694,22 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
     Ok(())
 }
 
-async fn run_log(args: &LogArgs) -> CliResult<LogOutput> {
+async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<LogOutput> {
     let since = args.since.as_deref().map(parse_date_arg).transpose()?;
     let until = args.until.as_deref().map(parse_date_arg).transpose()?;
     let (ranges, paths) = resolve_log_inputs(args).await?;
     let path_filters: Vec<PathBuf> = paths.iter().map(util::to_workdir_path).collect();
+    let configured_follow = configured_follow_path(&path_filters, log_config.follow);
+    let effective_follow = args
+        .follow
+        .as_deref()
+        .map(util::to_workdir_path)
+        .or_else(|| configured_follow.clone());
+    let selection_path_filters = if effective_follow.is_some() {
+        Vec::new()
+    } else {
+        path_filters.clone()
+    };
     let (min_parents, max_parents) = resolve_parent_bounds(
         args.merges,
         args.no_merges,
@@ -1663,7 +1722,7 @@ async fn run_log(args: &LogArgs) -> CliResult<LogOutput> {
         args.committer.clone(),
         since,
         until,
-        path_filters.clone(),
+        selection_path_filters,
         args.grep.clone(),
         min_parents,
         max_parents,
@@ -1682,18 +1741,23 @@ async fn run_log(args: &LogArgs) -> CliResult<LogOutput> {
         get_reachable_commits_excluding(start_commits, excludes, None, args.first_parent).await?;
     // newest first
     sort_commits_newest_first(&mut reachable_commits, args.author_date_order);
+    let mut traversed_commits =
+        apply_follow_and_line_filters(reachable_commits, &effective_follow, &args.line_range)
+            .await?;
     if args.reverse {
-        reachable_commits.reverse();
+        traversed_commits.reverse();
     }
 
-    let max_output_number = min(args.number.unwrap_or(usize::MAX), reachable_commits.len());
+    let max_output_number = min(args.number.unwrap_or(usize::MAX), traversed_commits.len());
     let include_total = args.number.is_none();
     let ref_commits = create_reference_commit_map().await;
     let mut commits = Vec::new();
     let mut total = 0usize;
     let skip = args.skip.unwrap_or(0);
 
-    for commit in reachable_commits {
+    for traversed in traversed_commits {
+        let commit = traversed.commit;
+        let effective_path_filters = traversed.follow_paths.as_deref().unwrap_or(&path_filters);
         if !include_total && commits.len() >= max_output_number {
             break;
         }
@@ -1701,7 +1765,7 @@ async fn run_log(args: &LogArgs) -> CliResult<LogOutput> {
             continue;
         }
 
-        let files = get_changed_files_for_commit(&commit, &path_filters).await?;
+        let files = get_changed_files_for_commit(&commit, effective_path_filters).await?;
         if !filter.matches(&commit, Some(&files)).await? {
             continue;
         }
@@ -1774,7 +1838,7 @@ async fn run_log(args: &LogArgs) -> CliResult<LogOutput> {
 }
 
 async fn select_log_commits(
-    reachable_commits: Vec<Commit>,
+    reachable_commits: Vec<TraversedLogCommit>,
     filter: &CommitFilter,
     path_filters: &[PathBuf],
     max_output_number: usize,
@@ -1784,7 +1848,11 @@ async fn select_log_commits(
     let mut selected = Vec::new();
     let mut skipped = 0usize;
 
-    for commit in reachable_commits {
+    for traversed in reachable_commits {
+        let commit = traversed.commit;
+        let effective_path_filters = traversed
+            .follow_paths
+            .unwrap_or_else(|| path_filters.to_vec());
         if selected.len() >= max_output_number {
             break;
         }
@@ -1795,7 +1863,7 @@ async fn select_log_commits(
         let cached_changes = if filter.paths.is_empty() && !keep_changed_files {
             None
         } else {
-            Some(get_changed_files_for_commit(&commit, path_filters).await?)
+            Some(get_changed_files_for_commit(&commit, &effective_path_filters).await?)
         };
 
         if !filter.matches(&commit, cached_changes.as_deref()).await? {
@@ -1811,6 +1879,7 @@ async fn select_log_commits(
         selected.push(SelectedLogCommit {
             commit,
             cached_changes,
+            path_filters: effective_path_filters,
         });
     }
 
@@ -1819,7 +1888,6 @@ async fn select_log_commits(
 
 async fn validate_selected_log_commits(
     selected_commits: &[SelectedLogCommit],
-    path_filters: &[PathBuf],
     name_only: bool,
     name_status: bool,
     patch: bool,
@@ -1828,12 +1896,13 @@ async fn validate_selected_log_commits(
     for selected in selected_commits {
         if name_only || name_status {
             if selected.cached_changes.is_none() {
-                let _ = get_changed_files_for_commit(&selected.commit, path_filters).await?;
+                let _ =
+                    get_changed_files_for_commit(&selected.commit, &selected.path_filters).await?;
             }
         } else if patch {
-            let _ = generate_diff(&selected.commit, path_filters.to_vec()).await?;
+            let _ = generate_diff(&selected.commit, selected.path_filters.clone()).await?;
         } else if stat {
-            let _ = compute_commit_stat(&selected.commit, path_filters.to_vec()).await?;
+            let _ = compute_commit_stat(&selected.commit, selected.path_filters.clone()).await?;
         }
     }
 

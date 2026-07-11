@@ -25,9 +25,11 @@ libra show [OPTIONS] [OBJECT] [-- <PATHS>...]
 | `--oneline` | | `--pretty=oneline` 的简写，在一行中打印哈希和主题。 |
 | `--pretty <FORMAT>` | | 以预设（`oneline`、`short`、`full`、`fuller`、`reference`、`raw`）或 `%` 占位符模板（`format:`/`tformat:`/裸模板）格式化 commit header。复用 `libra log --format` 的同一组自定义占位符，包括 `%b`、`%B`、`%n`、ASCII/control `%xNN`、`%%`、`%aI`、`%cI`、`%at`、`%ct`、`%D`、`%m` 和颜色占位符。 |
 | `--format <FORMAT>` | | `--pretty=<FORMAT>` 的别名（Git 的 `--format`）。与 `--pretty` 互斥。 |
+| `--date <FORMAT>` | | 选择人类日期格式（`default`、`short`、`iso`、`iso-strict`、`rfc`、`unix` 或 `raw`），覆盖 `log.date`。 |
 | `--abbrev-commit` | | 把默认 header 的 commit 对象名缩写为 7 位前缀。 |
 | `--no-abbrev-commit` | | 显示完整（未缩写）commit 对象名，撤销先前的 `--abbrev-commit`（最后出现者生效）。完整哈希是默认，故单独使用时为 no-op。 |
 | `--name-only` | | 只显示已更改文件名（没有 diff hunk）。 |
+| `--name-status` | | 显示已更改文件名，并以 `A`/`M`/`D` 状态字母为前缀。 |
 | `--raw` | | 以原始 diff 格式 `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>`（对象 id 缩写 7 位）显示而非 patch，类似 `git show --raw`。 |
 | `--stat` | | 显示 diff 统计（每个文件的插入 / 删除）。 |
 | `--patch-with-stat` | | 先显示 diffstat 块，再显示完整 patch（Git 对 `-p --stat` 的旧式同义词）。 |
@@ -68,6 +70,7 @@ libra show HEAD~3                   # 显示祖先提交
 libra show -s v2.0.0                # 只显示标签元数据
 libra show HEAD:Cargo.toml          # 打印 HEAD 中的文件
 libra show --name-only HEAD         # 列出已更改文件
+libra show --name-status HEAD       # 列出已更改文件及 A/M/D 状态
 libra show --stat HEAD              # diff 统计
 libra show --patch-with-stat HEAD   # 先 diffstat 再完整 patch
 libra show --summary HEAD           # 创建/删除文件 mode 摘要
@@ -181,7 +184,7 @@ libra --json show HEAD              # 结构化 JSON 输出
 
 ### `--pretty` / `--format` 与结构化 JSON
 
-`--pretty=<fmt>` 及其别名 `--format=<fmt>` 以 `oneline` 预设或 `%` 占位符模板（`format:`/`tformat:`/裸模板）渲染 commit header，复用 `libra log` 的 formatter。命名预设 `short` / `full` / `fuller` / `reference` / `raw` 已单独渲染（结构对齐 Git 预设），`medium` 映射默认格式（这与 `--raw` diff 格式不同——见 `--raw` 选项，它选择原始 `:<old-mode> <new-mode> …` diff 格式而非预设）。对程序消费者，仍推荐 `--json`：它在类型良好、按类型判别的 schema 中提供每个字段（类型化字段而非字符串解析），避免格式字符串的脆弱性。
+`--pretty=<fmt>` 及其别名 `--format=<fmt>` 以 `oneline` 预设或 `%` 占位符模板（`format:`/`tformat:`/裸模板）渲染 commit header，复用 `libra log` 的 formatter。命名预设 `short` / `full` / `fuller` / `reference` / `raw` 已单独渲染（结构对齐 Git 预设），`medium` 映射默认格式并保留完整 commit id（这与 `--raw` diff 格式不同——见 `--raw` 选项，它选择原始 `:<old-mode> <new-mode> …` diff 格式而非预设）。未显式提供 `--oneline`、`--pretty` 或 `--format` 时，`format.pretty` 为人类 commit header 提供默认值；`log.date` 同样提供日期默认值，显式 `--date` 优先。两键使用严格 local→global→system 级联；无效值/读取失败会在 commit/tag 输出前以 `LBR-CLI-002`/`LBR-IO-001` 失败。tree、blob、`REV:path`、quiet 验证与结构化 JSON 不读取这两项 commit 展示默认。对程序消费者，仍推荐 `--json`：它在类型良好、按类型判别的 schema 中提供每个字段（类型化字段而非字符串解析），避免格式字符串的脆弱性。
 
 ### 为什么使用类型感知 JSON schema？
 
@@ -196,8 +199,10 @@ libra --json show HEAD              # 结构化 JSON 输出
 | `--no-patch` / `-s` | 是 | 是 | N/A |
 | `--oneline` | 是 | 是 | N/A（使用 `jj log --template`） |
 | `--name-only` | 是 | 是 | N/A |
+| `--name-status` | 是 | 是 | N/A |
 | `--stat` | 是 | 是 | N/A（`jj diff --stat -r REV`） |
-| `--pretty` / `--format` | 是（`oneline` + `%` 模板；预设待补） | 是 | 否（使用模板） |
+| `--patch-with-stat` | 是 | 是 | N/A |
+| `--pretty` / `--format` | 是（命名预设 + `%` 模板） | 是 | 否（使用模板） |
 | `--abbrev-commit` | 是 | 是 | N/A |
 | `--quiet` | 是（仅验证） | 否 | N/A |
 | JSON 输出 | `--json`，带类型 schema | 无 | 无 |

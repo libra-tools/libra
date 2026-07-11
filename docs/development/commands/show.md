@@ -41,6 +41,7 @@ flowchart TD
 - 2026-06-07 `5a5e5fcb`（`fix(show): summarize large and binary blobs`）：实现修正：summarize large and binary blobs；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 2026-07-09（plan-20260708 P0-06）：stdout 下游提前关闭时经全局入口与 `Pager` 输出层静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 - 2026-07-09（plan-20260708 P1-04）：`show --pretty/--format` 复用扩展后的 `CommitFormatter`，获得 `%b`/`%B`/`%n`/ASCII/control `%xNN`/`%%`/`%aI`/`%cI`/`%at`/`%ct`/`%D`/`%m`/color placeholders；`show -s --format=<tmpl>` 与 Git 逐字节对齐的用例纳入 `compat_pretty_format_placeholders`，`%C...` 颜色占位符按全局 `--color` 策略输出。
+- 2026-07-11（plan-20260708 P1-05d）：`show` 与 Git 一样继承 `format.pretty` 和 `log.date`；新增显式 `--date` 覆盖配置。两键复用 `src/command/log/config.rs` 的严格 local→global→system 读取器，配置错误在 pager/对象输出前 fail-closed，JSON schema 与值保持配置免疫。默认 commit/tag 日期改走共享 `format_timestamp_with`，不再由 show 私有 RFC2822 分支绕开日期模式。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
@@ -50,6 +51,7 @@ flowchart TD
 - Synopsis：`libra show [OPTIONS] [OBJECT] [PATHS]...`。
 - 公开参数/子命令包括：`[OBJECT]`、`-s, --no-patch`、`--oneline`、`--pretty <FORMAT>`、`--format <FORMAT>`、`--abbrev-commit`、`--no-abbrev-commit`、`--name-only`、`--name-status`、`--stat`、`--patch-with-stat`（先发 `show_diffstat` 的 diffstat 块、空行、再发默认 patch；置于输出分支链首位，受 `-s`/`--no-patch` 抑制；复用既有 `--stat` 与默认 patch 渲染，与 `show --stat` 的 diffstat 逐字一致）、`--summary`（创建/删除文件的 mode 摘要，复用 `generate_diff` 输出解析，等同 `diff --summary` 子集）、`--no-expand-tabs`/`--no-notes`/`--no-mailmap`/`--no-show-signature`（接受式 no-op：Libra 的 show 从不展开 tab、从不内联显示 notes、从不应用 mailmap、从不内联显示提交签名；四个字段解析后不被读取。Git 的反向 `--expand-tabs`/`--notes`/`--mailmap`/`--show-signature` 未实现）、`[PATHS]...`。`--pretty=<fmt>`/`--format=<fmt>` 经 `parse_pretty_format` + `CommitFormatter` 渲染 commit header（abbrev=7），支持与 `libra log --format` 同源的自定义占位符（含 `%b`/`%B`/`%n`/ASCII/control `%xNN`/`%%`/`%aI`/`%cI`/`%at`/`%ct`/`%D`/`%m`/color）；随后照常输出 diff（`-s` 时仅输出 header）。`--abbrev-commit` 把默认 header 的 `commit <hash>` 缩写为 7 位，`--no-abbrev-commit`（经 clap `overrides_with` 与 `--abbrev-commit` 互为最后一个生效；读 `abbrev_commit` 字段，`no_abbrev_commit` 不直接读取）显示完整（未缩写）哈希，完整哈希为默认故单独为 no-op。
 
+- P1-05 展示默认：commit/tag 人类输出未显式指定格式时读取 `format.pretty`，未显式指定日期时读取 `log.date`；CLI `--oneline`/`--pretty`/`--format` 与新增的 `--date` 始终优先。`medium` 保持默认完整 commit id；tree/blob/`REV:path`、quiet 验证与 JSON 不读取这两项 commit 展示配置。
 
 ## 还未实现的功能
 

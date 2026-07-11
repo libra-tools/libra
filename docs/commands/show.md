@@ -33,6 +33,7 @@ printing panic/backtrace or `Broken pipe` diagnostics.
 | `--oneline` | | Shorthand for `--pretty=oneline` -- prints hash and subject on one line. |
 | `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`, `short`, `full`, `fuller`, `reference`, `raw`) or a `%`-placeholder template (`format:`/`tformat:`/bare). Uses the same custom placeholders as `libra log --format`, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, `%aI`, `%cI`, `%at`, `%ct`, `%D`, `%m`, and color placeholders. |
 | `--format <FORMAT>` | | Alias for `--pretty=<FORMAT>` (Git's `--format`). Mutually exclusive with `--pretty`. |
+| `--date <FORMAT>` | | Select the human date mode (`default`, `short`, `iso`, `iso-strict`, `rfc`, `unix`, or `raw`). Overrides `log.date`. |
 | `--abbrev-commit` | | Abbreviate the commit object name in the default header to a 7-character prefix. |
 | `--no-abbrev-commit` | | Show the full (unabbreviated) commit object name, countermanding an earlier `--abbrev-commit` (last one wins). The full hash is the default, so on its own this is a no-op. |
 | `--name-only` | | Show only changed file names (no diff hunks). |
@@ -202,9 +203,16 @@ naturally to the internal tree-walk operation that Libra already performs.
 `oneline` preset or a `%`-placeholder template (`format:`/`tformat:`/bare), sharing
 `libra log`'s formatter. The named presets `short`, `full`, `fuller`, `reference`,
 and `raw` are rendered distinctly (matching Git's preset structure); `medium`
-maps to the default format. (This is separate from the `--raw` diff format —
+maps to the default format and retains the full commit id. (This is separate
+from the `--raw` diff format —
 see the `--raw` option — which selects the raw `:<old-mode> <new-mode> …` diff
-format instead of a preset.) For programmatic consumers, `--json` remains the
+format instead of a preset.) Without an explicit `--oneline`, `--pretty`, or
+`--format`, `format.pretty` supplies the human commit-header default. Likewise,
+`log.date` supplies the human date mode unless `--date` is present. Both keys
+use the strict local→global→system cascade; invalid/read-failed values stop
+before commit/tag output with `LBR-CLI-002`/`LBR-IO-001`. Tree, blob,
+`REV:path`, quiet validation, and structured JSON do not read these
+commit-display defaults. For programmatic consumers, `--json` remains the
 recommended interface: it gives every field in a well-typed, type-discriminated
 schema (typed fields vs. string parsing), avoiding format-string fragility.
 
@@ -227,9 +235,10 @@ but I expected it" bugs in agent tooling.
 | `--no-patch` / `-s` | Yes | Yes | N/A |
 | `--oneline` | Yes | Yes | N/A (use `jj log --template`) |
 | `--name-only` | Yes | Yes | N/A |
+| `--name-status` | Yes | Yes | N/A |
 | `--stat` | Yes | Yes | N/A (`jj diff --stat -r REV`) |
 | `--patch-with-stat` | Yes | Yes | N/A |
-| `--pretty` / `--format` | Yes (`oneline` + `%`-templates; presets pending) | Yes | No (use templates) |
+| `--pretty` / `--format` | Yes (named presets + `%`-templates) | Yes | No (use templates) |
 | `--abbrev-commit` | Yes | Yes | N/A |
 | `--quiet` | Yes (validates only) | No | N/A |
 | JSON output | `--json` with typed schema | No | No |

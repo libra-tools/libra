@@ -75,7 +75,7 @@ libra log --no-abbrev-commit
 | `reference` | 单行 `<abbrev> (<subject>, <short-date>)` |
 | `raw` | 提交对象的 `tree`/`parent`/`author`/`committer` 头 + 缩进消息 |
 
-预设继承 `libra log` 既有惯例（时间戳渲染为 UTC `+0000`；`--pretty` 缩写哈希；存储消息中 subject/body 间空行已折叠），故与 Git 预设**结构**一致而非逐字节相同。`libra show --pretty=<preset>` 使用相同格式。
+预设继承 `libra log` 既有惯例（时间戳渲染为 UTC `+0000`；除默认 `medium` 外，显式 `--pretty` 使用缩写哈希；存储消息中 subject/body 间空行已折叠），故与 Git 预设**结构**一致而非逐字节相同。`libra show --pretty=<preset>` 使用相同格式。
 
 自定义模板支持 `%H` / `%h`（完整 / 缩写提交哈希）、`%P` / `%p`（完整 / 缩写父提交哈希列表）、`%s` / `%f`（主题 / 清理后的主题）、`%b` / `%B`（正文 / 原始 subject+body）、`%n`、ASCII/control `%xNN`、`%%`、`%an` / `%ae` / `%ad` / `%aI` / `%at`（作者）、`%cn` / `%ce` / `%cd` / `%cI` / `%ct`（提交者）、`%d` / `%D`（装饰）、`%m`，以及 `%Cred`、`%C(red)`、`%C(always,red)`、`%Creset` 等常见颜色占位符。未知占位符会按 Git pretty-format 规则原样保留。颜色复位遵循 Git 策略：`%C(always,...)` 即使普通颜色关闭也会强制输出 ANSI，而 `%Creset` 只在颜色输出启用时复位；强制颜色模板若也要强制复位，请使用 `%C(always,reset)`。
 
@@ -83,6 +83,25 @@ libra log --no-abbrev-commit
 libra log --pretty=short
 libra log --pretty=fuller
 libra log --pretty=reference
+```
+
+未显式提供 `--oneline`、`--pretty` 或 `--format` 时，`format.pretty` 为
+`libra log` 与 `libra show` 提供默认格式。配置值须为上表预设，或使用
+`format:`、`tformat:`、`%` 占位符的非空自定义模板。空值与未知的裸预设名
+会在输出前以 `LBR-CLI-002` 失败；显式 CLI 格式会绕过对应配置键。
+
+### `--date=<format>`
+
+选择人类输出中的作者/提交者日期格式。支持 `default`、`short`、
+`iso`/`iso8601`、`iso-strict`/`iso8601-strict`、`rfc`/`rfc2822`、`unix`
+与 `raw`。`log.date` 为人类 `log`/`show` 输出提供默认值，显式 `--date`
+优先。当前 renderer 尚未实现的合法 Git 模式（`relative`、`human`、
+`local`、`format:*`、`auto:*`）在配置中会明确报错，而不是静默忽略。
+结构化 JSON 日期继续使用 schema 规定的 RFC3339 表示。
+
+```bash
+libra log --date=iso-strict
+libra log --pretty='format:%ad %s' --date=unix
 ```
 
 ### `-p, --patch`
@@ -166,7 +185,7 @@ libra log --grep WIP --invert-grep   # 隐藏 WIP 提交
 
 ### `--trailer <KEY[=VALUE]>` / `--only-trailers`（Libra 扩展）
 
-Git 无此二 flag（最近等价：过滤用脆弱的 `--grep='^Key: '`，展示用 `--pretty='%(trailers)'`）。`--trailer KEY` 只保留其**合格 trailer 块**（按 Git 规则解析：末段、绝非标题段；key 仅 ASCII 字母数字/连字符；混合块需含 `Signed-off-by` 等可识别 trailer 且 trailer 行 ≥25%）携带该 key 的提交（ASCII 大小写不敏感）；`KEY=VALUE` 另要求展开后的值精确相等；可重复（全部须命中，AND）。`--only-trailers` 把每个提交的消息替换为其 trailer 块（展开的 `Key: value` 行；`(cherry picked from commit …)` 原样），本身不过滤；与 `--trailer` 组合时仅展示所选 key；与 `--oneline`/`--pretty`/`--format` 互斥。`--json` 下每个提交带增量 `trailers` 数组（`[{key,value}]`，无合格块时为空数组）；`body` 不变。
+Git 无此二 flag（最近等价：过滤用脆弱的 `--grep='^Key: '`，展示用 `--pretty='%(trailers)'`）。`--trailer KEY` 只保留其**合格 trailer 块**（按 Git 规则解析：末段、绝非标题段；key 仅 ASCII 字母数字/连字符；混合块需含 `Signed-off-by` 等可识别 trailer 且 trailer 行 ≥25%）携带该 key 的提交（ASCII 大小写不敏感）；`KEY=VALUE` 另要求展开后的值精确相等；可重复（全部须命中，AND）。`--only-trailers` 把每个提交的消息替换为其 trailer 块（展开的 `Key: value` 行；`(cherry picked from commit …)` 原样），本身不过滤；与 `--trailer` 组合时仅展示所选 key；与 `--oneline`/`--pretty`/`--format` 互斥，并优先于 `format.pretty`/`log.date` 默认。`--json` 下每个提交带增量 `trailers` 数组（`[{key,value}]`，无合格块时为空数组）；`body` 不变。
 
 ### `--since <DATE>`
 
@@ -315,12 +334,17 @@ libra log --no-mailmap
 libra log --no-show-signature
 ```
 
-### `--follow <FILE>`
+### `--follow <FILE>` / `--no-follow`
 
-Best-effort 跨重命名追踪单个文件历史。文件路径相对于当前目录解析。
+Best-effort 跨重命名追踪单个文件历史。路径会从当前目录规范化到仓库根。
+`log.follow=true` 时，恰好一个位置路径且它指向现存文件时会自动启用同一遍历；
+单一目录仍保持普通目录过滤。`--follow <FILE>` 与 `--no-follow` 均优先于配置。
+该配置同时影响人类输出与 JSON 的提交选择。重命名匹配采用 exact-blob best
+effort，修改内容的重命名、复杂/非线性重命名仍不在兼容承诺内。
 
 ```bash
 libra log --follow src/main.rs
+libra log --no-follow src/main.rs
 ```
 
 ### `--parents` / `--children`
@@ -430,6 +454,8 @@ Graph 格式：
 - `-n` 也适用于 JSON 模式
 - 仅在未提供 `-n` 时，`total` 反映过滤后的提交数量；使用 `-n` 时始终为 `null`
 - `--graph`、`--pretty` 和 `--oneline` 不改变 JSON schema
+- `format.pretty` 与 `log.date` 不改变 JSON schema；单个位置路径下的
+  `log.follow` 可改变被选中的提交集合
 - `--decorate` 只影响人类渲染；JSON 始终返回 `refs` 数组，辅助 ref 元数据以 best-effort 收集
 - `files` 始终是结构化变更摘要，永远不包含 patch 文本
 
@@ -457,7 +483,7 @@ Git 接受 `git log A..B` 这种位置修订表达式（其后可跟 pathspec）
 
 ### `--follow`
 
-`--follow` 通过遍历历史并匹配被移除/新增 blob 哈希来进行 best-effort 重命名检测。它不能处理复杂目录重命名或内容相似重命名。
+`--follow` 反向遍历历史，并在重命名处切换到 exact-blob 匹配的父路径。它不能处理复杂目录重命名、内容发生变化/仅相似的重命名或所有非线性历史场景。
 
 ### `-L`
 
