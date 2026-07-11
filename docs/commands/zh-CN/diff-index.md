@@ -10,7 +10,7 @@ libra diff-index <tree> [-- <path>...]
 
 ## 说明
 
-`diff-index <tree>` 等价于 `libra diff --old <tree>`：把给定 tree-ish 与当前工作树做 diff。路径限定写在 `--` 之后，所有 `diff` 全局标志均可用。
+`diff-index <tree>` 等价于 `libra diff --old <tree> --no-renames`：把给定 tree-ish 与当前工作树做 diff。路径限定写在 `--` 之后。作为 Git plumbing，它忽略 porcelain `diff.renames`；`libra --json diff-index ...` 等全局输出标志仍可用。
 
 `--cached`（把 tree 与 index 比较）**暂不支持**；HEAD 对 index 请用 `libra diff --staged`。
 

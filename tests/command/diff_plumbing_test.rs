@@ -36,6 +36,13 @@ fn repo_with_two_commits() -> (TempDir, String, String) {
     (repo, c1, c2)
 }
 
+fn configure_invalid_diff_renames(repo: &TempDir) {
+    assert_cli_success(
+        &run_libra_command(&["config", "diff.renames", "sideways"], repo.path()),
+        "set invalid porcelain-only diff.renames",
+    );
+}
+
 #[test]
 fn diff_plumbing_tree_diffs_two_trees() {
     let (repo, c1, c2) = repo_with_two_commits();
@@ -52,6 +59,20 @@ fn diff_plumbing_tree_diffs_two_trees() {
         "diff-tree should show the changed file: {}",
         out_str(&out)
     );
+}
+
+#[test]
+fn diff_plumbing_tree_ignores_porcelain_rename_config() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    configure_invalid_diff_renames(&repo);
+    let out = run_libra_command(&["diff-tree", &c1, &c2], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out_str(&out).contains("tracked.txt"));
 }
 
 #[test]
@@ -74,6 +95,21 @@ fn diff_plumbing_files_shows_unstaged_changes() {
 }
 
 #[test]
+fn diff_plumbing_files_ignores_porcelain_rename_config() {
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    configure_invalid_diff_renames(&repo);
+    fs::write(repo.path().join("tracked.txt"), "worktree-edit\n").unwrap();
+    let out = run_libra_command(&["diff-files"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out_str(&out).contains("tracked.txt"));
+}
+
+#[test]
 fn diff_plumbing_index_diffs_tree_against_worktree() {
     let (repo, _c1, _c2) = repo_with_two_commits();
     fs::write(repo.path().join("tracked.txt"), "worktree-edit\n").unwrap();
@@ -89,6 +125,21 @@ fn diff_plumbing_index_diffs_tree_against_worktree() {
         "diff-index should show the change vs the working tree: {}",
         out_str(&out)
     );
+}
+
+#[test]
+fn diff_plumbing_index_ignores_porcelain_rename_config() {
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    configure_invalid_diff_renames(&repo);
+    fs::write(repo.path().join("tracked.txt"), "worktree-edit\n").unwrap();
+    let out = run_libra_command(&["diff-index", "HEAD"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out_str(&out).contains("tracked.txt"));
 }
 
 #[test]

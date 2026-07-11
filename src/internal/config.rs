@@ -1158,7 +1158,7 @@ pub fn parse_git_config_bool(value: &str) -> Option<bool> {
 /// Parse a Git-compatible integer config value: an optional sign, digits, and
 /// an optional `k`/`m`/`g` unit suffix (×1024 steps). `None` on anything else
 /// or on overflow. Expects pre-trimmed, pre-lowercased input.
-fn parse_git_config_int(value: &str) -> Option<i64> {
+pub(crate) fn parse_git_config_int(value: &str) -> Option<i64> {
     let (digits, multiplier) = match value.as_bytes().last()? {
         b'k' => (&value[..value.len() - 1], 1024i64),
         b'm' => (&value[..value.len() - 1], 1024i64 * 1024),

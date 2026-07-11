@@ -321,6 +321,7 @@ mod deps_travel_test;
 mod describe_long_test;
 mod describe_test;
 mod diff_plumbing_test;
+mod diff_rename_limit_test;
 mod diff_test;
 mod dirty_test;
 mod fast_export_test;

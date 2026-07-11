@@ -11,9 +11,10 @@ libra diff-files [-- <path>...]
 
 ## Description
 
-`diff-files` is equivalent to a bare `libra diff`: it shows the unstaged changes
-(index vs working tree). Path limiters go after `--`, and all `diff` global
-flags (`--json`, `--stat`, `-M`, …) apply.
+`diff-files` is equivalent to `libra diff --no-renames`: it shows the unstaged
+changes (index vs working tree). Path limiters go after `--`; as Git plumbing it
+ignores porcelain `diff.renames`. Global output flags such as
+`libra --json diff-files` still apply.
 
 ## Options
 

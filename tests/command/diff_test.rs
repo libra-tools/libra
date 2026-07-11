@@ -387,17 +387,29 @@ fn test_diff_stats_count_hunk_lines_that_start_with_header_prefixes() {
 fn test_diff_added_and_deleted_files_use_dev_null_headers() {
     let repo = create_committed_repo_via_cli();
 
+    // Since P1-03 the default diff matches Git: untracked files are NOT part
+    // of it. A staged new file shows the /dev/null old header via --staged.
     fs::write(repo.path().join("added.txt"), "added\n").unwrap();
-    let added = run_libra_command(&["diff"], repo.path());
-    assert_cli_success(&added, "diff added file");
+    let untracked = run_libra_command(&["diff"], repo.path());
+    assert_cli_success(&untracked, "diff with untracked file");
+    let untracked_stdout = String::from_utf8_lossy(&untracked.stdout);
+    assert!(
+        !untracked_stdout.contains("added.txt"),
+        "untracked files must not appear in the default diff, got: {untracked_stdout}"
+    );
+
+    let add = run_libra_command(&["add", "added.txt"], repo.path());
+    assert_cli_success(&add, "stage added file");
+    let added = run_libra_command(&["diff", "--staged"], repo.path());
+    assert_cli_success(&added, "diff staged added file");
     let added_stdout = String::from_utf8_lossy(&added.stdout);
     assert!(
         added_stdout.contains("--- /dev/null"),
-        "expected added file diff to use /dev/null old header, got: {added_stdout}"
+        "expected staged added file diff to use /dev/null old header, got: {added_stdout}"
     );
     assert!(
         added_stdout.contains("+++ b/added.txt"),
-        "expected added file diff to use b/ path in new header, got: {added_stdout}"
+        "expected staged added file diff to use b/ path in new header, got: {added_stdout}"
     );
 
     fs::remove_file(repo.path().join("tracked.txt")).unwrap();
@@ -445,14 +457,44 @@ async fn test_diff_after_init() {
     let args = DiffArgs::parse_from(["diff", "--output", output_str]);
     diff::execute(args).await;
 
+    // Since P1-03 the default diff matches Git: the untracked .libraignore
+    // created by init is NOT part of it, and an empty repository diffs empty.
     let content = fs::read_to_string(&output_file).unwrap_or_default();
     assert!(
-        content.contains("diff --git a/.libraignore b/.libraignore"),
-        "Expected init-created .libraignore to be visible in diff, got: {content}"
+        content.trim().is_empty(),
+        "an empty repository's default diff must be empty (untracked files \
+         excluded since P1-03), got: {content}"
+    );
+
+    // Once staged, the file appears with the /dev/null old header via --staged.
+    add::execute(AddArgs {
+        pathspec: vec![String::from(".libraignore")],
+        all: false,
+        update: false,
+        refresh: false,
+        force: false,
+        verbose: false,
+        dry_run: false,
+        ignore_errors: false,
+        pathspec_from_file: None,
+        pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
+    })
+    .await;
+    let staged_file = output_dir.path().join("diff_staged_output.txt");
+    let staged_str = staged_file.to_str().unwrap();
+    let staged_args = DiffArgs::parse_from(["diff", "--staged", "--output", staged_str]);
+    diff::execute(staged_args).await;
+    let staged_content = fs::read_to_string(&staged_file).unwrap_or_default();
+    assert!(
+        staged_content.contains("diff --git a/.libraignore b/.libraignore"),
+        "staged .libraignore must be visible in diff --staged, got: {staged_content}"
     );
     assert!(
-        content.contains("# Libra ignore file"),
-        "Expected default .libraignore contents in diff, got: {content}"
+        staged_content.contains("# Libra ignore file"),
+        "default .libraignore contents expected in diff --staged, got: {staged_content}"
     );
 }
 
@@ -1294,11 +1336,10 @@ fn diff_rename_relative_indent_noop_flags_are_accepted() {
     let plain = run_libra_command(&["diff", "--cached"], p);
     assert_cli_success(&plain, "diff --cached");
     let plain_out = String::from_utf8_lossy(&plain.stdout);
-    // `--no-renames`/`--no-relative`/`--no-indent-heuristic` are accepted no-ops when
-    // given ALONE: Libra's diff never detects renames, defaults to repo-root-relative
-    // paths, and applies no indent heuristic, so output is unchanged. (`--no-relative`
-    // is only consequential when combined with `--relative`, which it overrides —
-    // covered by `test_diff_relative_filters_and_strips_prefix`.)
+    // These negating flags leave this single-add diff unchanged: there is no
+    // rename candidate, paths are already repo-root-relative, and Libra applies
+    // no indent heuristic. `--no-relative` overriding `--relative` is covered by
+    // `test_diff_relative_filters_and_strips_prefix`.
     for flag in ["--no-renames", "--no-relative", "--no-indent-heuristic"] {
         let out = run_libra_command(&["diff", "--cached", flag], p);
         assert_cli_success(&out, &format!("diff --cached {flag}"));

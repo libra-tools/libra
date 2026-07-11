@@ -1,5 +1,7 @@
 //! Provides diff command logic comparing commits, the index, and the working tree with algorithm selection, pathspec filtering, and optional file output.
 
+mod options;
+
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::{
@@ -27,6 +29,9 @@ use serde::Serialize;
 use similar::{Algorithm, ChangeTag, TextDiff};
 use tempfile::NamedTempFile;
 
+#[cfg(test)]
+use self::options::parse_rename_score;
+use self::options::{ResolvedDiffConfig, resolve_diff_config};
 use crate::{
     command::{
         get_target_commit, load_object, read_worktree_blob_bytes,
@@ -286,8 +291,8 @@ pub struct DiffArgs {
     )]
     pub find_renames: Option<String>,
 
-    /// Turn off rename detection (the default, and countermands an earlier
-    /// `-M`/`--find-renames`).
+    /// Turn off rename detection, overriding Git's default, `diff.renames`, and
+    /// an earlier `-M`/`--find-renames`.
     #[clap(long = "no-renames", overrides_with = "find_renames")]
     pub no_renames: bool,
 
@@ -425,6 +430,12 @@ pub(crate) enum DiffError {
     #[error("invalid argument to find-renames: '{0}'")]
     InvalidRenameScore(String),
 
+    #[error("bad config value '{value}' for '{key}'")]
+    InvalidDiffConfig { key: &'static str, value: String },
+
+    #[error("failed to read config '{key}': {detail}")]
+    DiffConfigRead { key: &'static str, detail: String },
+
     #[error("invalid argument to color-moved: '{0}'")]
     InvalidColorMoved(String),
 
@@ -490,6 +501,11 @@ impl From<DiffError> for CliError {
                 .with_hint(
                     "use -M, -M<n> (e.g. -M90%), or --find-renames=<n>; a pathspec after a bare -M must follow '--'",
                 ),
+            DiffError::InvalidDiffConfig { key, .. } => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint(format!("fix the offending value with 'libra config {key} <value>'")),
+            DiffError::DiffConfigRead { .. } => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::IoReadFailed),
             DiffError::InvalidColorMoved(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("expected no, default, plain, blocks, zebra, or dimmed-zebra"),
@@ -539,8 +555,11 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
         .await
         .map_err(CliError::from)?;
     validate_diff_algorithm(&args).map_err(CliError::from)?;
+    let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
-    let mut result = run_diff(&args, output).await.map_err(CliError::from)?;
+    let mut result = run_diff(&args, output, config)
+        .await
+        .map_err(CliError::from)?;
     // lore.md 2.2: read-only sparse view — scope ONLY the working-tree diff
     // (unstaged: new side is the worktree, not `--staged`, not rev-vs-rev), the
     // one that is pure browsing. `--staged` (index-vs-HEAD, commit-authoritative)
@@ -1229,7 +1248,11 @@ fn emit_worktree_scan_progress(args: &DiffArgs, output: &OutputConfig) {
     }
 }
 
-async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, DiffError> {
+async fn run_diff(
+    args: &DiffArgs,
+    output: &OutputConfig,
+    config: ResolvedDiffConfig,
+) -> Result<DiffOutput, DiffError> {
     util::require_repo().map_err(|_| DiffError::NotInRepo)?;
     tracing::debug!("diff args: {:?}", args);
     let index = Index::load(path::index()).map_err(|e| DiffError::IndexLoad(e.to_string()))?;
@@ -1356,7 +1379,7 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     // `--ignore-space-at-eol` if more than one is given (matching Git).
     // `--ignore-blank-lines` COMPOSES with a whitespace flag: the diff and the
     // blank classification both run through the normalizer (matching Git).
-    let regen_context = args.unified.unwrap_or(3);
+    let regen_context = config.context;
     let ws_normalize: Option<fn(&str) -> String> = if args.ignore_all_space {
         Some(normalize_ignore_all_space)
     } else if args.ignore_space_change {
@@ -1384,7 +1407,7 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     // entries. Done here (after the whitespace/context selection, before the
     // post-passes) so the rename's own content diff honors `-U<n>`/`-w`/blank
     // rules and the post-passes then leave rename entries alone.
-    if let Some(threshold) = resolve_rename_threshold(args)? {
+    if let Some(threshold) = config.rename_threshold {
         // `--check` scans added lines for whitespace errors and ignores the
         // whitespace-ignore flags, so the rename body must stay unfiltered.
         let (rn_ws, rn_blank) = if args.check {
@@ -1392,7 +1415,7 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
         } else {
             (ws_normalize, args.ignore_blank_lines)
         };
-        apply_rename_detection(
+        let inexact_rename_skipped = apply_rename_detection(
             &mut files,
             &first_map,
             &second_map,
@@ -1402,6 +1425,11 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
             rn_ws,
             rn_blank,
         );
+        if inexact_rename_skipped {
+            crate::utils::error::emit_legacy_stderr(
+                "warning: skipped inexact rename detection because more than 1000 sources or destinations changed; exact renames were still detected",
+            );
+        }
     }
 
     // Textconv (`--textconv`, on by default unless `--no-textconv`): re-diff the
@@ -1519,10 +1547,7 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     // `diff --check -w`/`-b`/`--ignore-space-at-eol` still reports trailing-
     // whitespace errors. It replaces the patch output, so the post-pass (which
     // only rewrites the patch/stat/counts) is skipped entirely when `--check`.
-    if external_command.is_none()
-        && !args.check
-        && (rediffs || (args.unified.is_some() && regen_context != 3))
-    {
+    if external_command.is_none() && !args.check && (rediffs || regen_context != 3) {
         let blob_text = |map: &HashMap<PathBuf, ObjectHash>, path: &Path| -> String {
             let Some(hash) = map.get(path) else {
                 return String::new();
@@ -2249,77 +2274,6 @@ fn color_moved_active(args: &DiffArgs) -> Result<bool, DiffError> {
     }
 }
 
-/// Resolve `-M`/`--find-renames[=<n>]` to a similarity score threshold on Git's
-/// 0..60000 scale, or `None` when rename detection is off (or `--no-renames`).
-fn resolve_rename_threshold(args: &DiffArgs) -> Result<Option<u32>, DiffError> {
-    if args.no_renames {
-        return Ok(None);
-    }
-    let Some(raw) = args.find_renames.as_ref() else {
-        return Ok(None);
-    };
-    let score = parse_rename_score(raw)?;
-    // Git's `diffcore_rename` treats a zero minimum score (`-M0`, `-M0%`, empty
-    // value, or a value that truncates to 0) as the 50% default before pairing,
-    // so it never folds unrelated pairs into `R000` renames.
-    Ok(Some(if score == 0 { 30000 } else { score }))
-}
-
-/// Parse a `-M`/`--find-renames` argument into a similarity threshold on Git's
-/// 0..60000 scale, matching Git's `parse_rename_score`: `<n>%` is a literal
-/// percent; `<n>` carrying a decimal point is a literal fraction (`0.9` = 90%);
-/// a bare integer is read as the fractional digits after an implied `0.` (so
-/// `-M5` = 50%, `-M90` = 90%, `-M100` = 10%). Invalid input is a usage error.
-fn parse_rename_score(raw: &str) -> Result<u32, DiffError> {
-    let invalid = || DiffError::InvalidRenameScore(raw.to_string());
-    // Parse a decimal string into (num, denom) so value == num/denom, using
-    // integer arithmetic (no float rounding — matches Git's integer scaling and
-    // its truncation at boundaries). At most one '.', digits only.
-    let parse_decimal = |s: &str| -> Option<(u128, u128)> {
-        let mut num: u128 = 0;
-        let mut denom: u128 = 1;
-        let mut seen_dot = false;
-        let mut any_digit = false;
-        // Cap BOTH num and denom: a huge integer part grows `num` (denom stays 1),
-        // while a long all-zero fractional part grows `denom` (num stays 0). Once
-        // either hits the cap, further digits are dropped — Git likewise stops
-        // scaling past a cap, and the threshold needs nothing finer. This keeps
-        // `num * 10` well within u128 so no malformed argument can overflow.
-        const CAP: u128 = 1_000_000_000_000;
-        for b in s.bytes() {
-            match b {
-                b'.' if !seen_dot => seen_dot = true,
-                b'0'..=b'9' => {
-                    any_digit = true;
-                    if num < CAP && denom < CAP {
-                        num = num * 10 + (b - b'0') as u128;
-                        if seen_dot {
-                            denom *= 10;
-                        }
-                    }
-                }
-                _ => return None,
-            }
-        }
-        any_digit.then_some((num, denom))
-    };
-    // `<n>%` is a literal percent (divide the fraction by 100); `<n>` carrying a
-    // decimal point is a literal fraction; a bare integer is read after an
-    // implied `0.` (so `-M5` = 0.5 = 50%, `-M100` = 0.100 = 10%).
-    let (num, denom) = if let Some(body) = raw.strip_suffix('%') {
-        let (n, d) = parse_decimal(body).ok_or_else(invalid)?;
-        (n, d * 100)
-    } else if raw.contains('.') {
-        parse_decimal(raw).ok_or_else(invalid)?
-    } else {
-        parse_decimal(&format!("0.{raw}")).ok_or_else(invalid)?
-    };
-    const MAX: u128 = 60000;
-    // Git: a fraction >= 1 clamps to MAX_SCORE; otherwise floor(MAX * num/denom).
-    let score = if num >= denom { MAX } else { MAX * num / denom };
-    Ok(score as u32)
-}
-
 /// Chunk `data` the way Git's rename spanhash does — a chunk ends at a newline or
 /// after 64 bytes; a `\r` in a `\r\n` is ignored for text — and accumulate the
 /// byte count per chunk-hash. We hash each chunk with FNV-1a rather than Git's
@@ -2392,7 +2346,7 @@ fn apply_rename_detection(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
-) {
+) -> bool {
     let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Option<Vec<u8>> {
         let pb = PathBuf::from(path);
         let hash = map.get(&pb)?;
@@ -2411,7 +2365,7 @@ fn apply_rename_detection(
         .filter(|&i| files[i].status == "added")
         .collect();
     if deleted.is_empty() || added.is_empty() {
-        return;
+        return false;
     }
 
     let mut used_del = vec![false; files.len()];
@@ -2419,20 +2373,53 @@ fn apply_rename_detection(
     // (old_idx, new_idx, score) for the chosen pairs.
     let mut pairs: Vec<(usize, usize, u32)> = Vec::new();
 
-    // Pass 1: exact renames (identical blob id).
+    // Pass 1: exact renames (identical blob id). Index destinations by object id
+    // so the default-on path remains linear rather than deleted×added.
+    let mut added_by_hash: HashMap<String, VecDeque<usize>> = HashMap::new();
+    for &ai in &added {
+        if let Some(hash) = second_map.get(&PathBuf::from(&files[ai].path)) {
+            added_by_hash
+                .entry(hash.to_string())
+                .or_default()
+                .push_back(ai);
+        }
+    }
     for &di in &deleted {
         let Some(dh) = first_map.get(&PathBuf::from(&files[di].path)) else {
             continue;
         };
-        for &ai in &added {
-            if used_add[ai] {
-                continue;
+        let Some(ai) = added_by_hash
+            .get_mut(&dh.to_string())
+            .and_then(VecDeque::pop_front)
+        else {
+            continue;
+        };
+        pairs.push((di, ai, 60000));
+        used_del[di] = true;
+        used_add[ai] = true;
+    }
+
+    let remaining_deleted = deleted.iter().filter(|&&di| !used_del[di]).count();
+    let remaining_added = added.iter().filter(|&&ai| !used_add[ai]).count();
+    const MAX_SCORE: u32 = 60000;
+    let inexact_skipped = threshold < MAX_SCORE
+        && inexact_rename_detection_exceeds_limit(remaining_deleted, remaining_added);
+
+    let mut old_contents: HashMap<usize, Vec<u8>> = HashMap::new();
+    let mut new_contents: HashMap<usize, Vec<u8>> = HashMap::new();
+    if threshold < MAX_SCORE && !inexact_skipped {
+        for &di in &deleted {
+            if !used_del[di]
+                && let Some(content) = load(&files[di].path, first_map)
+            {
+                old_contents.insert(di, content);
             }
-            if second_map.get(&PathBuf::from(&files[ai].path)) == Some(dh) {
-                pairs.push((di, ai, 60000));
-                used_del[di] = true;
-                used_add[ai] = true;
-                break;
+        }
+        for &ai in &added {
+            if !used_add[ai]
+                && let Some(content) = load(&files[ai].path, second_map)
+            {
+                new_contents.insert(ai, content);
             }
         }
     }
@@ -2443,26 +2430,25 @@ fn apply_rename_detection(
     // prefers same-name pairings. `-M100%` (threshold == MAX_SCORE) is exact-only:
     // Git skips inexact detection entirely, so a 100%-similar but non-identical
     // pair (e.g. reordered lines) must NOT be folded.
-    const MAX_SCORE: u32 = 60000;
     let basename = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
-    if threshold < MAX_SCORE {
+    if threshold < MAX_SCORE && !inexact_skipped {
         // (score, same_basename, di, ai)
         let mut candidates: Vec<(u32, bool, usize, usize)> = Vec::new();
         for &di in &deleted {
             if used_del[di] {
                 continue;
             }
-            let Some(old) = load(&files[di].path, first_map) else {
+            let Some(old) = old_contents.get(&di) else {
                 continue;
             };
             for &ai in &added {
                 if used_add[ai] {
                     continue;
                 }
-                let Some(new) = load(&files[ai].path, second_map) else {
+                let Some(new) = new_contents.get(&ai) else {
                     continue;
                 };
-                let score = similarity_score(&old, &new);
+                let score = similarity_score(old, new);
                 if score >= threshold {
                     let same_base = basename(&files[di].path) == basename(&files[ai].path);
                     candidates.push((score, same_base, di, ai));
@@ -2485,41 +2471,56 @@ fn apply_rename_detection(
     }
 
     if pairs.is_empty() {
-        return;
+        return inexact_skipped;
     }
 
     // Build the rename entries, then drop the consumed del/add entries.
-    let mut renames: Vec<(usize, DiffFileStat)> = Vec::new();
+    let mut renames: HashMap<usize, DiffFileStat> = HashMap::with_capacity(pairs.len());
     for (di, ai, score) in &pairs {
         let old_path = files[*di].path.clone();
         let new_path = files[*ai].path.clone();
         let percent = score / 600;
+        let old_content = old_contents
+            .remove(di)
+            .or_else(|| load(&old_path, first_map))
+            .unwrap_or_default();
+        let new_content = new_contents
+            .remove(ai)
+            .or_else(|| load(&new_path, second_map))
+            .unwrap_or_default();
         let entry = build_rename_entry(
             &old_path,
             &new_path,
             percent,
             first_map.get(&PathBuf::from(&old_path)),
             second_map.get(&PathBuf::from(&new_path)),
-            &load(&old_path, first_map).unwrap_or_default(),
-            &load(&new_path, second_map).unwrap_or_default(),
+            &old_content,
+            &new_content,
             context,
             ws_normalize,
             ignore_blank,
         );
         // Insert at the added entry's position so output order stays stable.
-        renames.push((*ai, entry));
+        renames.insert(*ai, entry);
     }
     let drop: std::collections::HashSet<usize> =
         pairs.iter().flat_map(|(d, a, _)| [*d, *a]).collect();
     let mut rebuilt: Vec<DiffFileStat> = Vec::with_capacity(files.len());
     for (idx, file) in files.drain(..).enumerate() {
-        if let Some(pos) = renames.iter().position(|(ai, _)| *ai == idx) {
-            rebuilt.push(renames.remove(pos).1);
+        if let Some(rename) = renames.remove(&idx) {
+            rebuilt.push(rename);
         } else if !drop.contains(&idx) {
             rebuilt.push(file);
         }
     }
     *files = rebuilt;
+    inexact_skipped
+}
+
+const DEFAULT_RENAME_LIMIT: usize = 1000;
+
+fn inexact_rename_detection_exceeds_limit(sources: usize, destinations: usize) -> bool {
+    sources > DEFAULT_RENAME_LIMIT || destinations > DEFAULT_RENAME_LIMIT
 }
 
 /// Render one rename entry (patch + metadata). A byte-identical rename emits only
@@ -3562,7 +3563,7 @@ fn diff_exit_result(args: &DiffArgs, result: &DiffOutput) -> CliResult<()> {
 }
 
 /// Render `--summary`: one line per created file, deleted file, or detected
-/// rename (`-M`); plain content modifications produce no line, matching
+/// rename; plain content modifications produce no line, matching
 /// `git diff --summary`. Mode-only changes are not surfaced.
 fn format_diff_summary(result: &DiffOutput) -> String {
     result
@@ -4355,7 +4356,8 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         no_textconv: false,
         ext_diff: false,
     };
-    let result = run_diff(&args, &OutputConfig::default()).await?;
+    let config = resolve_diff_config(&args).await?;
+    let result = run_diff(&args, &OutputConfig::default(), config).await?;
     Ok(format_unified_diff(&result))
 }
 
@@ -4694,6 +4696,13 @@ mod test {
         let _ = parse_rename_score(&"9".repeat(64)).unwrap();
         let _ = parse_rename_score(&format!("0.{}", "0".repeat(64))).unwrap();
         let _ = parse_rename_score(&format!("{}%", "9".repeat(64))).unwrap();
+    }
+
+    #[test]
+    fn inexact_rename_detection_obeys_git_default_limit() {
+        assert!(!inexact_rename_detection_exceeds_limit(1000, 1000));
+        assert!(inexact_rename_detection_exceeds_limit(1001, 1));
+        assert!(inexact_rename_detection_exceeds_limit(1, 1001));
     }
 
     struct ColorOverrideReset;

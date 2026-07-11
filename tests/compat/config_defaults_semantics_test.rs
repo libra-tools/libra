@@ -13,6 +13,9 @@ use libra::internal::{config::Config, db::get_db_conn_instance_for_path};
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
+#[path = "config_defaults_diff.rs"]
+mod diff_defaults;
+
 const PATH_ENV: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 struct Fixture {

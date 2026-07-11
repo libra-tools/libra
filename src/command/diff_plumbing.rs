@@ -3,8 +3,8 @@
 //!
 //! Each command translates its arguments into the equivalent `diff` invocation
 //! (built by re-parsing a synthetic argv into [`DiffArgs`]) and hands it to
-//! [`crate::command::diff::execute_safe`], so output, exit codes, and rename /
-//! whitespace handling are all identical to `diff`.
+//! [`crate::command::diff::execute_safe`]. Output and whitespace handling share
+//! the porcelain engine, while plumbing exit codes and rename defaults differ.
 
 use clap::Parser;
 
@@ -77,6 +77,9 @@ pub struct DiffFilesArgs {
 /// there are differences, 0 when clean — so `--exit-code` is always on (unlike
 /// the porcelain `diff`, which exits 0 unless `--exit-code` is requested).
 async fn run_via_diff(mut argv: Vec<String>, output: &OutputConfig) -> CliResult<()> {
+    // `diff.renames` is porcelain-only in Git. Keep the shared engine's default
+    // rename detection out of plumbing, and bypass invalid porcelain config.
+    argv.insert(1, "--no-renames".to_string());
     argv.insert(1, "--exit-code".to_string());
     // Plumbing keeps its historical 128 override on argv parse failures.
     delegate_to_diff(argv, output, Some(128)).await

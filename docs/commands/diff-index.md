@@ -11,9 +11,10 @@ libra diff-index <tree> [-- <path>...]
 
 ## Description
 
-`diff-index <tree>` is equivalent to `libra diff --old <tree>`: it diffs the
-given tree-ish against the current working tree. Path limiters go after `--`,
-and all `diff` global flags apply.
+`diff-index <tree>` is equivalent to `libra diff --old <tree> --no-renames`: it
+diffs the given tree-ish against the current working tree. Path limiters go
+after `--`; as Git plumbing it ignores porcelain `diff.renames`. Global output
+flags such as `libra --json diff-index ...` still apply.
 
 `--cached` (compare the tree against the index) is **not yet supported**; use
 `libra diff --staged` for HEAD vs the index.

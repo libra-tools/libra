@@ -1,6 +1,6 @@
 # `libra diff-tree`
 
-显示两个 tree 之间的差异 —— 复用唯一 `diff` 引擎的底层入口（输出、退出码、rename/空白处理均与 [`diff`](diff.md) 一致）。
+显示两个 tree 之间的差异 —— 复用 [`diff`](diff.md) 引擎、采用 plumbing 退出码与 rename 默认值的底层入口。
 
 ## 用法
 
@@ -10,7 +10,7 @@ libra diff-tree <tree-a> <tree-b> [-- <path>...]
 
 ## 说明
 
-`diff-tree` 等价于 `libra diff --old <tree-a> --new <tree-b>`：对两个 tree-ish（commit 或 tree id）做 diff。路径限定写在 `--` 之后。所有 `diff` 全局标志（`--json`、`--stat`、`-M` 等）均可用。
+`diff-tree` 等价于 `libra diff --old <tree-a> --new <tree-b> --no-renames`：对两个 tree-ish（commit 或 tree id）做 diff。路径限定写在 `--` 之后。作为 Git plumbing，它忽略 porcelain `diff.renames`；`libra --json diff-tree ...` 等全局输出标志仍可用。
 
 ## 选项
 

@@ -10,7 +10,7 @@ libra diff-files [-- <path>...]
 
 ## 说明
 
-`diff-files` 等价于裸 `libra diff`：显示未暂存改动（index 对工作树）。路径限定写在 `--` 之后，所有 `diff` 全局标志（`--json`、`--stat`、`-M` 等）均可用。
+`diff-files` 等价于 `libra diff --no-renames`：显示未暂存改动（index 对工作树）。路径限定写在 `--` 之后。作为 Git plumbing，它忽略 porcelain `diff.renames`；`libra --json diff-files` 等全局输出标志仍可用。
 
 ## 选项
 

@@ -1,8 +1,7 @@
 # `libra diff-tree`
 
 Show the differences between two trees — a plumbing entry point that reuses the
-one `diff` engine (so output, exit codes, rename and whitespace handling are
-identical to [`diff`](diff.md)).
+shared [`diff`](diff.md) engine with plumbing exit codes and rename defaults.
 
 ## Synopsis
 
@@ -12,9 +11,10 @@ libra diff-tree <tree-a> <tree-b> [-- <path>...]
 
 ## Description
 
-`diff-tree` is equivalent to `libra diff --old <tree-a> --new <tree-b>`: it
+`diff-tree` is equivalent to `libra diff --old <tree-a> --new <tree-b> --no-renames`: it
 diffs the two tree-ish arguments (commits or tree ids). Path limiters go after
-`--`. All `diff` global flags (`--json`, `--stat`, `-M`, …) apply.
+`--`. As Git plumbing, it ignores porcelain `diff.renames`; global output flags
+such as `libra --json diff-tree ...` still apply.
 
 ## Options
 
