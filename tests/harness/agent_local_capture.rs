@@ -168,8 +168,10 @@ pub fn requested_agents() -> Vec<String> {
 /// an explanatory notice), then runs the full smoke for `slug`, panicking
 /// on any genuine capture-chain failure. A missing binary or failed
 /// login-state probe is an **environment block** (§0.3.6 failure
-/// layering): the run is marked blocked and skipped without starting a
-/// paid session.
+/// layering): no paid session is started, the redacted blocked reason is
+/// flushed to summary.json, and the test FAILS with a `BLOCKED` panic —
+/// once the gate is explicitly opened, blocked must stay machine
+/// distinguishable (exit code / pass count) from a real green run.
 pub fn run_slug(slug: &str) {
     if !std::env::var(GATE_ENV).map(|v| v == "1").unwrap_or(false) {
         eprintln!(
@@ -187,15 +189,19 @@ pub fn run_slug(slug: &str) {
     match smoke.preflight() {
         Preflight::Ready => {}
         Preflight::Blocked(reason) => {
-            // §0 blocked rule: record + skip, never fake and never pay.
-            // The redacted reason lands in summary.json via the Drop
-            // flush so a blocked run leaves machine-readable evidence.
+            // §0 blocked rule: record, never fake and never pay — but once
+            // the gate is explicitly opened, blocked must be MACHINE
+            // distinguishable from a real green run: a plain `return` here
+            // would let `cargo test` report "3 passed" / exit 0 on a
+            // machine with zero installed agents, indistinguishable from
+            // real capture evidence. The redacted reason still lands in
+            // summary.json via the Drop flush during unwind.
             smoke.mark_blocked(&reason);
-            eprintln!(
-                "BLOCKED ({slug}): {reason} — marking this agent's local smoke blocked; \
-                 no paid session was started (plan.md §0.3.2/§0.3.6)"
+            panic!(
+                "BLOCKED ({slug}): {reason} — environment block, no paid session was \
+                 started; fix the environment (install/login the agent CLI) or drop \
+                 {slug} from {SET_ENV} to run a partial set (plan.md §0.3.2/§0.3.6)"
             );
-            return;
         }
     }
     smoke.run();
@@ -1190,14 +1196,24 @@ impl Drop for SmokeAgent {
 }
 
 /// Smoke root: per-agent subdir under `LIBRA_LOCAL_AGENT_EVIDENCE_DIR`
-/// when set (custom roots are validated 0700 and the per-agent subdir must
-/// not pre-exist non-empty — §0.3.6 refuses wide-open or dirty dirs), else
-/// a fresh 0700 dir under the system tempdir.
+/// when set (a root we create fresh is tightened to 0700; a pre-existing
+/// root is validated 0700 and the per-agent subdir must not pre-exist
+/// non-empty — §0.3.6 refuses wide-open or dirty dirs), else a fresh 0700
+/// dir under the system tempdir.
 fn smoke_root_for(slug: &str) -> PathBuf {
     match std::env::var_os(EVIDENCE_DIR_ENV) {
         Some(custom) => {
             let base = PathBuf::from(custom);
+            // A directory we create ourselves is safe to tighten to 0700
+            // (create_dir_all inherits the umask, typically 755); only a
+            // PRE-EXISTING wide-open directory is refused — its mode is a
+            // user decision we must not silently override.
+            let preexisting = base.exists();
             fs::create_dir_all(&base).expect("create custom evidence dir");
+            if !preexisting {
+                fs::set_permissions(&base, fs::Permissions::from_mode(0o700))
+                    .expect("chmod fresh custom evidence dir 0700");
+            }
             let mode = fs::metadata(&base)
                 .expect("stat custom evidence dir")
                 .permissions()

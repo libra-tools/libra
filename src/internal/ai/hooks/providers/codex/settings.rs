@@ -740,10 +740,18 @@ fn rewrite_codex_state_sections(
                 index += 1;
                 // Consume the section body: everything up to the next
                 // section header or the next Libra marker (which belongs to
-                // the following section).
+                // the following section). The final empty element of the
+                // `split('\n')` encodes the file's trailing newline, not a
+                // body line — consuming it would eat a trailing blank line
+                // the user's config carried before install and break the
+                // byte-restore contract (uninstall must reproduce the
+                // pre-install bytes exactly).
                 while index < lines.len() {
                     let body = lines[index];
                     if body.trim_start().starts_with('[') || body.trim() == CODEX_STATE_MARKER {
+                        break;
+                    }
+                    if body.is_empty() && index == lines.len() - 1 {
                         break;
                     }
                     index += 1;
@@ -1208,6 +1216,47 @@ mod tests {
             fs::read_to_string(&config_path).expect("read config"),
             user_config,
             "uninstall must restore the user's CRLF config byte-for-byte",
+        );
+    }
+
+    /// A user config.toml ending with a trailing blank line (here the
+    /// real-world shape that broke the A6.5 local smoke on 2026-07-12: a
+    /// bare user-owned `[hooks.state]` header followed by a blank line at
+    /// EOF) survives install → uninstall byte-for-byte. Regression: the
+    /// section-body consumer used to swallow the final empty `split('\n')`
+    /// element — the encoding of the file's trailing newline — so uninstall
+    /// returned the file one byte short (`…[hooks.state]\n` instead of
+    /// `…[hooks.state]\n\n`).
+    #[test]
+    fn trailing_blank_line_user_config_survives_install_and_uninstall() {
+        let tmp = TempDir::new().expect("tmp dir");
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        let config_path = config_path_of(&codex_home);
+        let user_config =
+            "# user config\nmodel = \"gpt-5.4\"\n\n[hooks]\nenabled = false\n\n[hooks.state]\n\n";
+        fs::write(&config_path, user_config).expect("seed config.toml");
+
+        install_codex_hooks_at(&codex_home, BINARY, 30).expect("install");
+        let after_install = fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            after_install.starts_with(user_config),
+            "user bytes (incl. the trailing blank line) must survive install as an exact \
+             prefix; got:\n{after_install:?}",
+        );
+
+        uninstall_codex_hooks_at(&codex_home).expect("uninstall");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            user_config,
+            "uninstall must restore the trailing blank line byte-for-byte",
+        );
+
+        // Idempotent second uninstall.
+        uninstall_codex_hooks_at(&codex_home).expect("second uninstall");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            user_config,
         );
     }
 

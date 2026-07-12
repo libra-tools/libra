@@ -29,8 +29,10 @@
 //! `LIBRA_LOCAL_AGENT_EVIDENCE_DIR` (custom 0700 evidence root).
 //!
 //! A missing binary or a failed read-only login probe marks that agent's
-//! run **BLOCKED** and skips it without starting a paid session (§0
-//! blocked rule); it must never be faked green. The shared driver — and
+//! run **BLOCKED** without starting a paid session (§0 blocked rule) and
+//! **fails the test with a `BLOCKED` panic**: with the gate explicitly
+//! open, blocked stays machine-distinguishable (exit code / pass count)
+//! from a real green run and can never be faked green. The shared driver — and
 //! the documented per-CLI isolation decisions (isolated `CODEX_HOME` for
 //! codex; real `HOME` + project-local capture configs for claude and
 //! opencode) — lives in `tests/harness/agent_local_capture.rs`.

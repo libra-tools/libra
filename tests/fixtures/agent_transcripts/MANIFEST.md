@@ -13,3 +13,13 @@ upstream format drift.
 
 刷新协议：A6.5 本地 smoke 观察到 transcript 格式差异时，按 §0.3.4 重新采集
 （提交前 redact + 最小化），并更新本表的版本与 method 字段。
+
+核对记录（无漂移确认，避免"静默满足"歧义）：
+
+- 2026-07-12（darwin arm64）：A6.5 真实三 agent smoke 重跑，CLI 版本
+  claude 2.1.207 / codex-cli 0.144.1 / opencode 1.17.18（均高于上表记录）。
+  claude/codex 采集断言全绿（extraction present、transcript 非空、
+  metadata-first 输出无正文泄露），opencode 保持 lifecycle-only pin
+  （`extraction.present=false`，见 agent.md「OpenCode 安装流程契约」§5）——
+  解析层未观察到 transcript/hook 格式漂移，判定无需刷新本组 fixture；
+  上表版本字段保留为 fixture 字节的采集/构造来源。
