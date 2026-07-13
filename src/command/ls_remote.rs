@@ -8,9 +8,12 @@ use serde::Serialize;
 use url::Url;
 
 use crate::{
-    command::fetch::RemoteClient,
+    command::fetch::{RemoteClient, resolve_remote_default_branch},
     git_protocol::ServiceType::UploadPack,
-    internal::{config::ConfigKv, protocol::ssh_client::is_ssh_spec},
+    internal::{
+        config::ConfigKv,
+        protocol::{DiscRef, ssh_client::is_ssh_spec},
+    },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -107,10 +110,9 @@ struct LsRemoteOutput {
     sort: Option<String>,
     patterns: Vec<String>,
     entries: Vec<LsRemoteEntry>,
-    /// Symbolic-ref targets, populated only with `--symref`. Empty for local
-    /// Libra repositories and any transport that does not advertise `symref=`
-    /// capabilities (local Git repositories, served via `git-upload-pack`, do
-    /// advertise them and are populated).
+    /// Symbolic-ref targets, populated only with `--symref`. Prefer advertised
+    /// `symref=` capabilities; when they are absent, a visible HEAD may be
+    /// derived from advertised branch tips (notably for local Libra sources).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     symrefs: Vec<LsRemoteSymref>,
 }
@@ -139,22 +141,42 @@ fn parse_symrefs(capabilities: &[String]) -> Vec<LsRemoteSymref> {
 /// Resolve the symbolic refs to surface for `--symref`: parse the remote's
 /// advertised `symref=` capabilities (e.g. `symref=HEAD:refs/heads/main`) and
 /// keep only those whose `name` survives the active ref filters. Returns empty
-/// when `--symref` was not requested, or for local Libra repositories /
-/// transports that advertise no `symref=` capability (local Git repositories
-/// served via `git-upload-pack` do advertise it). Libra reads symrefs from the
-/// wire only — it never synthesizes them from a local `HEAD`.
+/// when `--symref` was not requested. When a transport has no `symref=`
+/// capability (notably a local Libra source), derive HEAD from the advertised
+/// HEAD and branch tips with the same deterministic resolver used by fetch.
 fn resolve_output_symrefs(
     capabilities: &[String],
     entries: &[LsRemoteEntry],
+    discovered: &[DiscRef],
     want: bool,
 ) -> Vec<LsRemoteSymref> {
     if !want {
         return Vec::new();
     }
-    parse_symrefs(capabilities)
+    let parsed = parse_symrefs(capabilities)
         .into_iter()
         .filter(|symref| entries.iter().any(|entry| entry.refname == symref.name))
-        .collect()
+        .collect::<Vec<_>>();
+    if !parsed.is_empty() {
+        return parsed;
+    }
+    if !entries.iter().any(|entry| entry.refname == "HEAD") {
+        return Vec::new();
+    }
+    let remote_head = discovered.iter().find(|reference| reference._ref == "HEAD");
+    let heads = discovered
+        .iter()
+        .filter(|reference| reference._ref.starts_with("refs/heads/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    resolve_remote_default_branch(capabilities, &heads, remote_head)
+        .map(|branch| {
+            vec![LsRemoteSymref {
+                name: "HEAD".to_string(),
+                target: format!("refs/heads/{branch}"),
+            }]
+        })
+        .unwrap_or_default()
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -254,7 +276,12 @@ async fn run_ls_remote(args: LsRemoteArgs) -> Result<LsRemoteOutput, LsRemoteErr
         .collect();
     sort_entries(&mut entries, args.sort.as_deref())?;
 
-    let symrefs = resolve_output_symrefs(&discovery.capabilities, &entries, args.symref);
+    let symrefs = resolve_output_symrefs(
+        &discovery.capabilities,
+        &entries,
+        &discovery.refs,
+        args.symref,
+    );
 
     Ok(LsRemoteOutput {
         remote: visible_remote,

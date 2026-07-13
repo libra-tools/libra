@@ -15,7 +15,7 @@ libra ls-remote [OPTIONS] <repository> [patterns...]
 | `--heads` | 只显示 `refs/heads/*` 分支引用 | `libra ls-remote --heads origin` |
 | `-t`, `--tags` | 只显示 `refs/tags/*` 标签引用 | `libra ls-remote --tags origin` |
 | `--refs` | 省略 `HEAD` 和以 `^{}` 结尾的 peeled 标签引用 | `libra ls-remote --refs origin` |
-| `--symref` | 打印远端在 capabilities 中通告的 symbolic-ref 目标（如 `ref: refs/heads/main\tHEAD`），位于对应引用的 OID 行之上；Git 远端与本地 Git 仓库（`git-upload-pack`）会通告，本地 **Libra** 仓库不通告（有意与 Git 不同，从不基于本地 `HEAD` 合成） | `libra ls-remote --symref origin` |
+| `--symref` | 在对应 OID 行之前打印 symbolic-ref 目标（如 `ref: refs/heads/main\tHEAD`）。远端通告的 `symref=` capability 优先；缺失 capability 时（尤其本地 Libra 源），使用与 fetch 相同的 HEAD OID / 分支 tip 解析器合成 `HEAD`。 | `libra ls-remote --symref origin` |
 | `patterns...` | 匹配完整引用名或尾部路径组件；`*` 和 `?` 遵循 Git 风格 glob 行为，并且可以匹配 `/` | `libra ls-remote origin main 'refs/heads/*'` |
 
 ## 人类可读输出

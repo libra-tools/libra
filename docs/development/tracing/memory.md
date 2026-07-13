@@ -19,127 +19,153 @@ Libra 在 [`agent.md`](../ai/object-model.md) 与
 
 如果本文档与 `agent.md` 或 `agent-workflow.md`（见 [`agent-workflow.md`](../ai/workflow.md)）有冲突，以那两份文档为准。此外，外部 agent 捕获契约（见 [`docs/development/tracing/agent.md`](./commands/agent.md)）在其覆盖的存储与捕获面、MCP 边界（见 [`docs/development/mcp.md`](./mcp.md)）在其覆盖的 MCP 命令面，亦各自为准。
 
-### 0.0 外部记忆系统完整分析（设计参考）
+### 0.0 外部记忆系统完整分析（2026-07-13 收敛版，设计参考）
 
-本节对本文档所借鉴的六个外部记忆系统做完整分析，作为整篇设计的参考基线。每个系统按定位、核心机制、优势、局限与 Libra 的取舍展开；§2.4 的对照表是本节结论的浓缩，另有 agentmemory.md 与 Memoria 的补充借鉴（隔离、回滚、混合搜索）亦见 §2.4。
+本节综合当前 [`mainline.md`](../gap/mainline.md) §5.1 / §9 / §15 与用户提供的[开源 Agent Memory 调研](https://chatgpt.com/s/t_6a5460adb8608191abe538f582230f18)，并以各项目一手资料复核其承重机制。它只确定设计取舍与所有权边界，不把外部 README、benchmark、默认后端或路线图变成 Libra 的实现事实或验收标准；实现 PR 必须按当时版本重新核对。
 
-#### 0.0.1 memoir-ai —— "Git for AI Memory"
+#### 0.0.1 总结论：Libra 自有权威层，外部系统只提供机制与候选
 
-**定位。** [memoir-ai](https://github.com/zhangfengcdt/memoir)（Python 实现，附 TypeScript UI，Apache 2.0，Alpha 阶段）是本设计最直接的蓝本：一个把版本控制心智模型应用于 agent 记忆的语义记忆系统，明确以「取代向量数据库」为立场——用透明、带版本、具密码学完整性的分层语义路径存储替代 embedding 检索。
+任何现有 Agent Memory 框架都不应成为 Libra 的权威存储层。Libra 需要的不只是跨对话偏好与相似度检索，还包括 branch / commit 语义、Run / Decision / Evidence 来源链、可审查 promotion、跨 actor 授权、错误记忆撤销以及上下文选择的可解释重放。由此得到六条不可折中的约束：
 
-**核心机制。**
+1. **权威真源保持 Libra-native。** 既有 AgentRuntime typed AI objects、code commits、`MemoryNote` / `MemoryEvent` JSON blobs、Git refs 与可重建 SQLite 投影共同承载事实；不因外部调研再引入一个泛化 `MemoryObject` typed object 或第二套数据库真源。
+2. **先编译，再使用。** 原始 trace 只能成为 compiler 输入；长期 Fact / Episode / Skill 必须记录来源、编译器 / prompt / model / policy 版本、幂等键与审查状态后，才有资格进入召回候选集。
+3. **写入不等于可注入。** capture、Draft、Confirmed、可被当前 principal 读取、可进入 prompt 是不同门；网页、prompt、tool output、远端 publication 与 sidecar 结果都不能越过 promotion / authorization。
+4. **可重放的是选择，不是模型输出。** Context bundle 的对象集合、排序原因、token 预算与 policy/index 快照应可复核；不得把它扩张为外部 provider 回答逐字节确定性的承诺。
+5. **时间与 Git DAG 同时显式。** Fact 需要 recorded time、有效 commit / branch anchor 与 supersession；单一 wall-clock 区间不能替代 branch ancestry，也不能把分叉历史伪装成线性真值。
+6. **衰减与遗忘不破坏审计。** recency 只影响排名；expiration / tombstone 阻止未来读取与注入；物理删除另受不可变 Git 历史、远端副本与 durable tier 的合规约束。
 
-- 分层语义路径作键（`profile.professional.skills.python` 式的可读地址，而非 UUID 或向量），前缀查找 O(log n)；
-- 路径处的记忆聚合——相关记忆自动收拢到同一语义位置，而非散落为独立文档；
-- Git 式版本化：branch / commit / merge / rollback，存储后端为 Prolly tree（概率平衡 Merkle 树）；
-- branch 感知存储：尊重 `git checkout` 状态，防止跨分支上下文污染；
-- 价值过滤（worthiness）：显式分类「到底要不要记」；
-- LLM 自动分类（默认 Haiku 量级小模型）+ 迭代式分类树扩展（`LLMIterativeTaxonomy`），模式匹配快路径自报 1–5ms；
-- hook 驱动捕获：Claude Code 插件经 prompt-submit / Stop 等生命周期 hook 自动注入上下文并捕获记忆，另有 Codex 等多 agent 插件与任意 MCP host 接入；
-- 代码库 onboarding 快照与用户事实分离存放。
+建议的逻辑数据流为：
 
-**优势。** 人类可读、可审计、可回滚；无 embedding 基础设施依赖；branch 感知直接命中 §2.1 所述 CLAUDE.md 反模式的要害。
+```text
+M0 private trace / existing typed AI objects / code commits
+        ↓ deterministic rules + optional LLM compiler
+M1 Fact + M2 Episode + M3 Policy/Skill/Profile candidates
+        ↓ validation + authorization/review + append-only events
+confirmed MemoryNote/MemoryEvent history on Libra refs
+        ↓ scope/ACL/trust/sensitivity filter before ranking
+ContextBundle + private ContextReceipt
+        ↓ optional candidate-only adapters
+graph / vector / linker / reranker sidecars
+```
 
-**局限。** (1) Prolly tree 是自建存储层，与既有 VCS 工具链（log / blame / diff / merge 生态）不互通，版本化能力须自行重新实现一遍；(2) 集合语义单层，缺少 namespace 级的差异化保留 / 注入策略；(3) 没有 trust / sensitivity / 审查状态门禁——自动捕获的内容可直接进入注入面；(4) Alpha 成熟度。
+这里的 M0–M3 是**逻辑层级**，不是新增的 git-internal `ObjectType` 家族。规范存储仍使用本文 §4 的 `MemoryNote` / `MemoryEvent` / projection 模型；`ContextBundle` / `ContextReceipt` 是读取时的局部审计产物，不自动成为长期 Memory，也默认不得进入团队 ref。
 
-**Libra 取舍。** 原封采纳分层路径、路径聚合、worthiness、branch 感知、hook 捕获与迭代分类树（§2.3）；明确拒绝 Prolly tree——Libra 已实现 Git 磁盘格式，把历史真源放在 `git-internal` 的 refs 上即可免费获得 log / diff / blame / merge / cherry-pick（§5.1）；明确补强 namespace（§3.2）、审查状态 + trust / sensitivity 门禁（§7.5）与快照 / 事件 / 投影三层模型（§4）。
+#### 0.0.2 核心架构参考：Statewave 的 compile-then-use 与 receipt
 
-#### 0.0.2 Letta / MemGPT —— 分级可见性与自编辑记忆
+[Statewave](https://github.com/smaramwbc/statewave) 的承重价值是 `append-only episode → typed compiled memory → token-bounded context bundle → governance` 生命周期，以及从 bundle 回指 source episode、policy snapshot 和 assembly receipt 的 provenance。Libra 应吸收：
 
-**定位。** [MemGPT](https://docs.letta.com/guides/agents/memory)（2023 论文，后产品化为 Letta 平台）提出「LLM 即操作系统」的类比：上下文窗口是 RAM，外部存储是磁盘，agent 通过工具调用在两级之间自主「换页」。
+- compiler 输入对象哈希、算法 / prompt / model 版本与幂等键；
+- 选择对象、排名原因、token 预算、index manifest、policy snapshot 与 bundle hash；
+- 同一固定输入和选择策略可重建同一 bundle 的契约。
 
-**核心机制。**
+Libra 不采用其 Postgres / pgvector 真源，也不照搬「相同查询返回相同 bytes」为整个 agent 的确定性承诺。receipt 原语必须与 `mainline.md` ML-05 / ML-08 共用，Memory 不再创建第二种互不兼容的选择回执。
 
-- core memory：始终驻留上下文的小块结构化记忆（persona / human 等 block，各有大小预算），agent 可通过工具自编辑；
-- archival / recall memory：向量库与完整对话历史，仅按需检索进入上下文；
-- 后台整理：sleep-time agent 在会话间隙做记忆归并。
+#### 0.0.3 本地可读投影参考：ReMe 的 capture / consolidate 流水线
 
-**优势。** 「常驻小核心 + 按需大档案」的分级可见性是控制 token 成本的经典解法；agent 自主管理记忆的先驱。
+[ReMe](https://github.com/agentscope-ai/ReMe) 把原始 session / resource 渐进处理为 daily 与 digest 下的个人事实、procedure 和 wiki Markdown，并用 BM25、embedding、wikilink 与后台 consolidation 支撑召回。其 `capture → index → consolidate → recall` 分工适合 Libra，但文件角色必须反转为：
 
-**局限。** 记忆是数据库行 / 向量条目，没有版本历史——没有 diff、blame、回滚；core memory 的自编辑没有审查门禁，一次幻觉可以直接改写 persona block 并毒化后续所有推理；以单 agent / 单用户会话为中心，缺少 repo / branch 维度。
+- `.libra/memory/**` Markdown 只是人类可读、可审查的 projection；
+- `indexes/**` 只保存可重建索引或 manifest；
+- 用户或 agent 对 Markdown 的编辑必须转译为 proposal → validation → authorization/review → `MemoryEvent`，不能原地改变 Policy 或 branch truth；
+- consolidation 保留原始 M0 / source refs，不用摘要覆盖或删除证据。
 
-**Libra 取舍。** 采纳分级可见性——始终可见的记忆映射到 `ContextSegmentKind::ProjectMemory` / `MemoryAnchor` 常驻注入段，episodic 与大体量 semantic 保持按需召回（§8.5、§11.6）；拒绝无门禁自编辑——所有写入过 worthiness 与审查状态机，自动确认受四重条件约束（§11.5）。
+#### 0.0.4 时间事实参考：Graphiti 的 provenance、有效期与 supersession
 
-#### 0.0.3 LangGraph memory —— namespace 作用域与写入时机
+[Graphiti](https://github.com/getzep/graphiti) 把 episode 作为派生事实的来源，并为事实关系保留有效期，支持时间、关键词、语义与图遍历混合检索。Libra 应将这套思路落到既有 note/event 模型：
 
-**定位。** [LangGraph memory](https://docs.langchain.com/oss/python/langgraph/memory) 是 graph 工作流框架的记忆层：thread 内 short-term 记忆由 checkpointer 持久化对话状态；跨 thread long-term 记忆放入按 namespace 组织的 Store（KV + JSON 文档，可选向量检索），配套的 LangMem SDK 提供抽取 / 整理原语。
+- `MemoryNote.created_at` 与相应 `MemoryEvent.at` 表示 Libra 何时记录、接受或改变事实；
+- `valid_from` / `valid_until` 配合 `Branch` scope 与 commit `evidence_refs`，表示事实在哪段代码历史中成立；
+- `supersedes` / `contradicts` / `supports` 显式表达替代和冲突，旧事实不被就地覆盖；
+- 图、embedding 与实体消解只是 Phase E 可重建投影。
 
-**核心机制。**
+Libra 不引入 Neo4j / FalkorDB / Neptune 一类图后端作为权威层，也不假设外部图对节点属性、显著性、冲突和 Git 分支语义已给出完整答案。
 
-- namespace 层级（如 `(user_id, "memories")`）实现 user / agent / organization 作用域隔离；
-- 沿 CoALA 本体区分 semantic / episodic / procedural 记忆；
-- 把「何时写记忆」当作一等设计问题：hot path（对话中实时写，占用交互延迟与 agent 注意力）vs background（后台 / 定时归并，有滞后但不干扰主任务）。
+#### 0.0.5 Git UX 与自编辑边界：Letta Code / MemGPT
 
-**优势。** namespace 化的多作用域；对写入时机权衡的显式讨论在同类系统中最清晰。
+[Letta Code](https://github.com/letta-ai/letta-code) 证明 context、memory block 与 skill 可以具备 Git history、agent / project scope、查看与质量诊断 UX；[Letta / MemGPT](https://docs.letta.com/guides/agents/memory) 的「小型常驻 core + 大型按需 archival」也为 token 分级提供了直接参考。
 
-**局限。** Store 是 KV + 可选向量，没有路径式分类树与路径聚合；没有版本化与审计；记忆质量（去重、冲突、陈旧）完全依赖应用层自律。
+Libra 采纳 diff / history / review、常驻小核心、按需档案与 scope-aware skill，但拒绝 agent 无审查地重写 memory、prompt、Policy、Skill 或 Constraint。所有高影响自编辑都必须先形成显式 proposal，经过 evidence、权限、schema 和安全策略验证后才追加新事件；历史版本保持可 blame / revert。
 
-**Libra 取舍。** 保留 CoALA kind 轴并新增 namespace 轴（§3.2）；把 hot-path / background 权衡具体化为「生命周期钩子只起草、不自动确认」（§11.2、§11.5）+「归并是排期作业」（§10.5）的组合；版本化与审计由 Git 真源补齐。
+#### 0.0.6 运行状态与长期记忆分离：LangGraph / LangMem
 
-#### 0.0.4 OpenAI Agents SDK memory —— 渐进式披露与陈旧性纪律
+[LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence) 明确区分 thread-scoped checkpointer 与 cross-thread store；[LangMem](https://github.com/langchain-ai/langmem) 则区分 agent hot-path 写入与 background extraction / consolidation。Libra 的映射为：
 
-**定位。** [OpenAI Agents SDK 的 memory 方案](https://openai.github.io/openai-agents-python/sandbox/memory/) 更接近一套模式而非独立子系统：workspace 内以文件形态组织记忆——`memory_summary.md`（简明摘要）、`MEMORY.md`（可搜索主索引）、`raw_memories/`（对话抽取）、`rollout_summaries/`（详细的历史工作摘要）。
+| 外部概念 | Libra 归属 | 禁止的捷径 |
+|---|---|---|
+| Checkpoint / thread state | run / session checkpoint、Run 内 `ContextFrame`、恢复 / fork | 不因持久化就自动成为长期或团队 Memory |
+| Raw interaction / tool trajectory | M0 Trace、Run / ToolInvocation / Evidence | 不直接进入 prompt 常驻段 |
+| Cross-thread fact | M1 `MemoryNote` + 来源与有效性 | 不允许无来源的 LLM 摘要直接 Confirmed |
+| Background manager | §10.5 consolidation job | 不在 hook 热路径中静默改写真源 |
 
-**核心机制。**
+这项参考不授权 Libra 引入第二套 graph runtime，也不改变现有 AgentRuntime 的 checkpoint / history 边界。
 
-- 渐进式披露：run 开始只注入小摘要；判断相关时 agent 按关键词搜索主索引；确有需要才取详细 rollout 摘要——三层递进控制 token；
-- 两阶段归并：先从对话历史抽取摘要与原始记忆笔记，再归并进结构化的 `MEMORY.md` / `memory_summary.md`，超过阈值按新近度遗忘；
-- 陈旧性纪律：明确指示 agent「把记忆只当作指引，信任当前环境」，并支持执行中在线刷新过时索引。
+#### 0.0.7 Experience-to-Skill：PowerMem / MemOS
 
-**优势。** 渐进披露的 token 经济学；对「记忆会过时」这一事实的诚实处理。
+[PowerMem](https://github.com/oceanbase/powermem) 的 Experience + Skill 两层蒸馏与混合检索、[MemOS](https://github.com/MemTensor/MemOS) 的 memory cube / scheduler / 分层 skill 演化，适合补足 M2 → M3：
 
-**局限。** 真源是扁平 Markdown 文件——正是 §2.1 所述反模式的变体（有缓解但未根治）；无分类门禁与信任分级；按新近度遗忘会静默丢弃低频但重要的事实。
+```text
+多次 Run / Episode
+  → 聚类出候选 procedure
+  → 记录适用与不适用条件、权限和正反样本
+  → 在固定 code version 上以 Test / Evidence 试运行
+  → review / signature promotion 为 Skill
+  → 代码或依赖变化后 revalidate；失败时 rollback / revoke
+```
 
-**Libra 取舍。** `memory.summarize()` 成为面向 agent 的一等默认原语，caller-driven 召回即三层递进（§8.4）；召回结果强制附带 confidence / trust / staleness 元数据，prompt 中同样声明「当前源文件覆盖陈旧记忆」（§8.5）；遗忘改为投影级修剪 + 可复活（§10.4），不静默丢弃历史。
+时间衰减最多进入 ranking score，不能删除 Episode、失败样本、promotion 记录或审计事件。Memory cube / pack 可作为未来导入导出格式参考，但必须包含 source refs、ACL / policy、compiler versions、signatures 与 index hints；导入包仍先进入隔离候选区。
 
-#### 0.0.5 Mem0 —— 抽取 / 归并流水线与可度量性
+#### 0.0.8 补充参考、sidecar 与算法基线
 
-**定位。** [Mem0](https://arxiv.org/abs/2504.19413)（2025）是生产级记忆服务：两阶段流水线——抽取阶段从对话增量提取候选事实，更新阶段由 LLM 对照既有记忆决策 ADD / UPDATE / DELETE / NOOP；变体 Mem0^g 叠加图存储做关系增强召回。
+| 方案 | 可吸收机制 | Libra 定位与边界 |
+|---|---|---|
+| [memoir-ai](https://github.com/zhangfengcdt/memoir) | 语义路径、路径聚合、worthiness、branch-aware capture、迭代 taxonomy | 保留为 §6 / §7 的键控与分类参考；拒绝另建 Prolly-tree 真源，补上 namespace、审查、trust 与 sensitivity。 |
+| [OpenAI Agents SDK memory](https://openai.github.io/openai-agents-python/sandbox/memory/) | summary → searchable index → detailed rollout 的渐进披露与「当前环境优先」的陈旧性纪律 | `memory.summarize()` 与 caller-driven recall 的参考；Markdown 不是权威层，新近度不能静默删除低频高价值事实。 |
+| [Cognee](https://github.com/topoteretes/cognee) | 自托管 graph/vector knowledge、traceability、MCP 与 Rust client | 外部文档、代码知识和跨仓库关系的只读 candidate provider；不保存或决定 Run / Evidence / Decision 的权威状态。 |
+| [Mem0](https://github.com/mem0ai/mem0) | scope、filter、CRUD/Search API、延迟 / token / 质量测量 | API 与 benchmark baseline。其 OSS v3 ADD-only / entity-boost 行为是版本限定事实，不能替代 Libra 的 supersession、branch 或图遍历语义。 |
+| [A-MEM](https://github.com/agiresearch/a-mem) / [HippoRAG](https://github.com/OSU-NLP-Group/HippoRAG) | Zettelkasten-style 动态链接、graph / Personalized PageRank 多跳召回 | 可插拔 `MemoryLinker` / `ContextRetriever` 算法实验；MVP 不增加其存储依赖。 |
+| [agentmemory.md](https://agentmemory.md/) / [Memoria](https://arxiv.org/abs/2512.12686) | 人类可读记录、append-only history、混合搜索、矛盾隔离 | 强化 quarantine、回滚和可审计性；论文或站点描述不直接形成实现验收。 |
 
-**核心机制。** LLM 驱动的抽取与归并；向量检索为主；以延迟 / token / 质量三指标度量——论文自报在 LOCOMO 基准上相对全上下文基线有 90% 量级的 token 节省与 91% 的 p95 延迟下降。
+所有 sidecar 统一遵守 candidate-only 契约：可返回内容、score、reason 与 provenance；不可直接 append `AI_REF` / memory ref、生成 pin、改变 `review_state`、写入 Policy / Skill，或决定当前 branch truth。
 
-**优势。** 端到端可度量是同类系统中最强的工程纪律；抽取-归并流水线成熟。
+#### 0.0.9 M0–M3 在本文对象模型中的归属
 
-**局限。** LLM 决策的 UPDATE / DELETE 直接改写真源，无审计、无回滚——一次错误归并不可恢复，也无从 blame；托管服务与向量库中心的架构与「本地仓库产物」的定位相悖。
+| 层 | 内容 | 本文规范映射 | Promotion 门槛 |
+|---|---|---|---|
+| **M0 Trace** | 消息、hook / session、ToolInvocation、Run、PatchSet、Test、Evidence | 既有 typed AI objects 与私有原始捕获；只是 `evidence_refs` 来源 | 自动捕获可行，但默认 local / private，绝不自动注入或团队发布 |
+| **M1 Fact** | 项目事实、环境状态、约束、实体关系 | semantic `MemoryNote` + `MemoryEvent`；带 recorded / valid time、commit anchor、confidence、supersedes | 规则或 compiler 产生 Draft；冲突、来源、scope 与权限验证后 Confirmed |
+| **M2 Episode** | Task / Run 的目标、过程、结果、失败原因 | episodic `MemoryNote`，引用 Run / Outcome / Evidence / Decision | 必须有稳定 outcome 与 evidence；摘要不能覆盖原始 trace |
+| **M3 Profile** | user / actor 偏好 | semantic / procedural note，actor / user scope | 仅主体本人或明确授权 principal 可修改 |
+| **M3 Skill** | 可复用 procedure | procedural note + validation / promotion events | 正反样本、工具权限、适用代码版本、成功 evidence、review 与 revalidation |
+| **M3 Policy** | 组织规则、稳定约束 | 最高信任级 procedural note | 默认 human / signature approval；任何 imported / model-generated 内容不得自动生效 |
 
-**Libra 取舍。** 采纳抽取 / 归并流水线（§10.5）与延迟 / token 度量（`metrics.*` namespace，§3.3）；但归并产物默认停在 Draft、源 note 标记 `Consolidated` 而非删除（§10.5）；向量 / 图召回只能作可选二级索引，绝不作真源（§1.2、§17）。
+该映射修正了外部调研中把 `MemoryObject` 当作新权威对象的歧义：Libra 需要吸收其字段语义，而不是新增平行对象族。M1–M3 的每次变化都通过 append-only event 表达，SQLite、Markdown、Hub、graph 与 vector 仅是投影。
 
-#### 0.0.6 Zep / Graphiti —— 时序真值与关系召回
+#### 0.0.10 与 mainline.md 的五轴收敛
 
-**定位。** [Zep](https://arxiv.org/abs/2501.13956)（2025）的核心是 Graphiti——时序知识图谱引擎，把对话与业务数据摄入为实体-关系图。
+`mainline.md` 是 portable sealed code intent / pin / recall 的 committed schedule；本文是通用长期 Memory 的设计提案。二者按其 §9 与 ML-07 只允许以下关系：
 
-**核心机制。**
+| 重叠轴 | 单一归属 / 共用原语 | 禁止重复建设 |
+|---|---|---|
+| 存储与传输 | intent-team 与 memory 可有独立 ref / schema；共同复用 classification、lease、validation、tracking、watermark 与 safe-publication primitives | 不 mirror 原始 `AI_REF`；Memory 不复制 transport stack |
+| Decision / Evidence | mainline ML-03 扩展 live git-internal `Decision`；Memory `evidence_refs` 指向同一对象 | 不在 Memory 重新定义 Decision 真源 |
+| Recall / 注入 / receipt | 单一 scope-aware 检索与 prompt 注入管线；ContextReceipt 原语由 ML-05 / ML-08 与本文共用 | 不创建两套 `with_memory` / SessionStart 注入和两种 receipt |
+| Constraint / Skill | portable code constraint 的排期由 mainline ML-12 管；通用 M1 / M3 语义由本文定义，ML-07 先收敛 | 未定案前不让 `constraint` 与 `procedural.*` 双写 |
+| Hub / Markdown / API | 共用 `code.md` C4 `/api/code/*` 读面，所有编辑回到 proposal/event 流程 | 不建立平行 `/api/v1` 或可直写真源的 UI |
 
-- 双时间轴建模：事件发生时间与摄入时间分离；
-- 边携带有效期区间（valid_at / invalid_at）：事实失效是打标记而非删除——「何时为真」成为一等查询维度；
-- 实体抽取与消解、社区检测；
-- 混合检索：embedding + BM25 + 图遍历，改善多跳与「何时发生了什么变化」类召回。
+因此，mainline 只消费 seal / pin / provenance 完整且通过 policy 的高置信对象；它不负责通用 Fact compiler、Episode consolidation、Skill promotion 或独立 memory refs。反过来，本文也不重排 ML-01~ML-13，不把普通 Memory 自动升级为 team intent。
 
-**优势。** 时间性真值处理在同类系统中最完整；多跳关系召回能力强。
+#### 0.0.11 安全、可回放与验收纪律
 
-**局限。** 图数据库的运维与 schema 演进成本高；真源在图中，与文本 / VCS 审计工具链不互通；对代码 agent 的核心场景（规则、命令、事实）而言，图的表达力大部分时候用不上。
+[OWASP AI Agent Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/AI_Agent_Security_Cheat_Sheet.html) 将 memory poisoning 明确列为跨会话风险；[OWASP Agent Memory Guard](https://owasp.org/www-project-agent-memory-guard/) 的完整性检查思路可作为补充，但 hash 只能证明 bytes 未变，不能证明内容可信、可见或有权注入。Libra 至少必须做到：
 
-**Libra 取舍。** 现在就采纳 `valid_from` / `valid_until` 有效期区间与来源时间戳（§4.1），以及显式记忆链接 `supports` / `contradicts` / `supersedes`（§6.3）——用「note + 链接 + 事件」在不引入图数据库的前提下获得时序真值语义；实体图的物化推迟为 Phase E 的可选投影（§15），叠加在事件流之上，绝不取代 Git 历史真源。
+- principal / namespace / scope / visibility / ACL / trust / sensitivity / redaction 在 relevance、recency、graph expansion 与 rerank **之前**执行；
+- prompt、网页、tool output、远端 publication 与低信任 trace 默认进 Draft / Quarantined，不得直接 promotion 为 Policy / Skill / Constraint；
+- ContextReceipt 记录 selected IDs、reason codes、bundle hash、as-of commit/ref、selector/compiler/index/policy version；缺失快照时返回 stale / non-reproducible，不静默 fallback；
+- receipt、query hash 和 selected IDs 也可能泄露工作意图，默认 local-only；任何共享另做 visibility / retention / threat-model 审查；
+- append / confirm / supersede / revoke / forget / import / merge 均须 schema validation、CAS / lease、审计事件和稳定错误语义，mutating path fail-closed；
+- 安全 fixture 覆盖跨 actor / user 越权、poisoning、secret recall、malformed import、stale receipt、投影漂移、tombstone 与 rollback；外部自报 benchmark 只能提供场景，不能替代 Libra 测试结果。
 
-#### 0.0.7 综合对照与本设计的定位
-
-| 系统 | 历史真源 | 键控 / 检索 | 版本化与审计 | 写入门禁 | 时序建模 |
-|---|---|---|---|---|---|
-| memoir-ai | Prolly tree | 语义路径 + LLM 分类 | branch / commit / rollback（自建） | worthiness | 无 |
-| Letta / MemGPT | DB 行 + 向量库 | 常驻 block + 向量检索 | 无 | 无（自编辑） | 无 |
-| LangGraph | Store（KV + JSON） | namespace + key + 可选向量 | 无 | 应用层自理 | 无 |
-| OpenAI Agents SDK | Markdown 文件 | 摘要 → 索引 → 详情三层 | 无 | 新近度遗忘 | 陈旧性提示 |
-| Mem0 | 向量库（+ 图） | 向量（+ 图遍历） | 无（UPDATE / DELETE 就地改写） | LLM 归并决策 | 无 |
-| Zep / Graphiti | 知识图谱 | embedding + BM25 + 图遍历 | 失效标记（边级） | 实体消解 | 双时间轴 + 有效期 |
-| **Libra Memory（本设计）** | **Git refs（blob / tree / commit）** | **语义路径 + 四种召回模式** | **log / diff / blame / merge / cherry-pick 免费复用** | **worthiness + 审查状态机 + trust / sensitivity** | **valid_from / until + 事件全序** |
-
-六个系统合起来划出的设计空间可以归纳为三条轴：
-
-1. **键控方式**——路径（memoir-ai）、KV + namespace（LangGraph）、向量（Letta 档案层 / Mem0）、图（Zep）。本设计选路径为默认、namespace 为集合边界，向量与图降级为可选二级索引：代码 agent 的记忆以「规则 / 命令 / 事实」为主，可读寻址的价值高于模糊相似度。
-2. **写入纪律**——从 Letta 的无门禁自编辑，到 memoir-ai 的 worthiness，到 Mem0 的 LLM 归并决策，逐级收紧；但共同缺口是**没有一家把「写入」与「进入 prompt」分离成两道门**。本设计的审查状态机（Draft → Confirmed / Quarantined / …）+ trust / sensitivity 门禁正是补这一缺口。
-3. **版本化**——只有 memoir-ai 提供回滚概念，但须靠自建存储层实现；其余系统的错误记忆本质上不可审计、不可归因、不可恢复。这是 Libra 的差异化立足点：**记忆的版本化不必新造，复用 VCS 即可**——Libra 已实现 Git 磁盘格式，把真源放在 `refs/libra/memory*` 上，blame / diff / revert / merge 对记忆零成本可用（§5.1）。
-
-一句话概括：本设计 = memoir-ai 的键控与捕获 + Letta 的分级可见性 + LangGraph 的 kind / namespace 轴 + OpenAI 的渐进披露与陈旧性纪律 + Mem0 的流水线与度量 + Zep 的时序真值，全部落在 Libra 既有的 Git 对象库与快照 / 事件 / 投影三层模型上，并用审查门禁补齐所有外部系统共同缺失的「写入 ≠ 可注入」边界。
+最终定位：**Libra Memory = Libra-native 内容寻址与事件历史 + Statewave 式 compiler / receipt + ReMe 式可读投影 + Graphiti 式时间事实 + Letta 式 Git 审计 UX + LangGraph 式运行态分离 + PowerMem / MemOS 式受审查 Skill 晋升；图、向量与外部框架永远是可替换的候选层。**
 
 ### 0.1 方案审查结论
 

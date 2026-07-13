@@ -12,7 +12,7 @@ libra fetch [OPTIONS] [<repository> [<refspec>]]
 
 `libra fetch` 联系远程仓库，协商本地存储缺少哪些对象，将它们作为 pack 文件下载，索引该 pack，并更新对应的远程跟踪引用（例如 `refs/remotes/origin/main`）。它永远不会修改工作树或当前分支；要进行这些操作，请使用 `libra pull` 或 `libra merge`。
 
-不带参数调用时，它从当前分支配置的 upstream 获取。给出 `--all` 时，会依次获取每个已配置远程。指定某个 `<repository>` 时，只联系该远程。可选 `<refspec>` 会将 fetch 缩小到单个分支。
+不带参数调用时，它从当前分支配置的 upstream 获取。给出 `--all` 时，会依次获取每个已配置远程。指定某个 `<repository>` 时，只联系该远程。可选 `<refspec>` 可精确指定源和目标：短分支名 `main` 等价于 `refs/heads/main:refs/remotes/<repository>/main`，完整 `<src>:<dst>` 只写 `<dst>`。未给 CLI refspec 时，Libra 读取全部 `remote.<name>.fetch` 值（包括 `remote add -t` / `remote set-branches` 写入的精确或通配映射）；只有没有配置值时才回退到默认 heads 与 merge-request 映射。
 
 Fetch 支持 SSH、HTTPS、本地文件和 `git://` 传输。配置了 `vault.ssh.<remote>.privkey` 时，会自动加载 vault-backed SSH 密钥。
 
@@ -32,7 +32,7 @@ Fetch 支持 SSH、HTTPS、本地文件和 `git://` 传输。配置了 `vault.ss
 | 标志 / 参数 | 说明 | 示例 |
 |-----------------|-------------|---------|
 | `<repository>` | 要从中 fetch 的远程名称或 URL。省略时使用当前分支的 upstream 远程。 | `libra fetch origin` |
-| `<refspec>` | 要获取的分支名。需要 `<repository>`。省略时获取远程的所有分支。 | `libra fetch origin main` |
+| `<refspec>` | 源引用或精确 `<src>:<dst>` 映射。需要 `<repository>`。目标支持 `refs/heads/*` 或 `refs/remotes/<repository>/*`；两侧各有一个 `*` 时支持通配。CLI refspec 覆盖 `remote.<name>.fetch` 配置。负 refspec 与标签目标仍不支持。 | `libra fetch origin refs/heads/topic:refs/remotes/origin/review` |
 | `-a`, `--all` | 从每个已配置远程获取。与 `<repository>` 冲突。 | `libra fetch --all` |
 | `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。支持能通告 shallow boundary 的 Git 远程；本地 Libra 远程在该传输能通告 shallow 元数据之前会以 `LBR-REPO-002` fail-closed。 | `libra fetch origin --depth 1` |
 | `--tags` | 从远程获取每个标签到本地 `refs/tags/*`（覆盖默认的 auto-follow 和 `remote.<name>.tagOpt`）。 | `libra fetch origin --tags` |
@@ -58,6 +58,7 @@ Fetch 支持 SSH、HTTPS、本地文件和 `git://` 传输。配置了 `vault.ss
 libra fetch
 libra fetch origin
 libra fetch origin main
+libra fetch origin refs/heads/topic:refs/remotes/origin/review
 libra fetch --all
 libra fetch origin --depth 1               # shallow fetch
 libra fetch origin --tags                  # 同时把所有标签取到 refs/tags/*
@@ -105,7 +106,9 @@ LIBRA_FETCH_IDLE_TIMEOUT_MS=120000 libra fetch origin
 
 ## FETCH_HEAD
 
-每次成功的 fetch 都会把获取到的引用记录在 `.libra/FETCH_HEAD` 中，每个分支一行 `<oid>\tnot-for-merge\tbranch '<name>' of <url>`，每个获取到的标签一行 `<oid>\tnot-for-merge\ttag '<name>' of <url>`。Libra 从不指定合并目标（要合并请使用 `libra pull`），因此每一行都标记为 `not-for-merge`。`--append` 向该文件累积而不是覆盖它；`--dry-run` 不写任何内容。
+每次成功的 fetch 都会把每个已选择源引用记录在 `.libra/FETCH_HEAD` 中，即使对应目标已经是最新。精确 CLI refspec 是 merge candidate，因此中间字段为空；配置或通配 refspec 选中的引用以及标签使用 `not-for-merge`。`--append` 向该文件累积而不是覆盖；`--dry-run` 不写任何内容。fetch 永远不写 `.libra/ORIG_HEAD`。
+
+选中的分支目标、fetch 到的标签、相应 reflog 和缓存的 `refs/remotes/<name>/HEAD` 在一个 SQLite 事务中提交。非快进拒绝或后续引用存储失败会回滚整组引用更新；已经下载的 pack 对象可能像 Git 一样作为不可达对象保留。
 
 ## 人类可读输出
 
@@ -151,7 +154,7 @@ Already up to date with 'origin'
 - `remote_ref`：全限定本地远程跟踪引用，例如 `refs/remotes/origin/main`
 - `old_oid`：之前的对象 ID；引用为新建时为 `null`
 - `new_oid`：获取到的对象 ID
-- `forced`：更新不是快进时为 `true`——非线性移动的分支（无论是否带 `--force` 都会记录；tracking 分支总是被更新），或 `--force` 下被 clobber 的标签
+- `forced`：由前导 `+` refspec / `--force` 接受的非快进分支更新，或 `--force` 下被 clobber 的标签为 `true`；未强制的非快进会拒绝并原子回滚全部已选择引用更新
 
 示例（单个远程）：
 
@@ -255,7 +258,7 @@ Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame
 | 标签 auto-follow（默认） | 从已获取提交可达的标签会自动跟随（通过 `include-tag`） | 相同（默认） | 自动 |
 | 标签获取控制 | `libra fetch --tags` / `--no-tags`；`remote.<name>.tagOpt` | `git fetch --tags` / `--no-tags`；`remote.<name>.tagOpt` | 自动 |
 | 强制 fetch | `libra fetch -f` / `--force`（非 FF + 标签 clobber） | `git fetch --force` | 自动 |
-| Atomic / refmap | 不支持（推迟） | `git fetch --atomic` / `--refmap` | 无 |
+| 原子引用更新 / refmap 标志 | 引用更新默认原子；未提供 `--atomic` 或 `--refmap` 标志 | `git fetch --atomic` / `--refmap` | 无 |
 | 结构化输出 | `--json` / `--machine` | 无 | 无 |
 | 进度事件 | stderr 上的 NDJSON | stderr 上的文本 | stderr 上的文本 |
 
@@ -266,6 +269,7 @@ Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame
 | 没有配置 upstream / detached HEAD | `LBR-REPO-003` | 128 | "checkout a branch or specify a remote" |
 | 找不到远程 | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
 | 找不到远程分支 | `LBR-CLI-003` | 129 | "verify the remote branch name and try again" |
+| fetch refspec 无效或暂不支持 | `LBR-CLI-002` | 129 | "use a branch name or `<src>:<dst>` mapping" |
 | 无效远程 spec（缺少 repo、URL 格式错误、不支持的 scheme） | `LBR-CLI-003` 或 `LBR-REPO-001` | 129 / 128 | 因原因而异 |
 | 发现期间认证失败 | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | 网络超时 / 传输失败 | `LBR-NET-001` | 128 | "check network connectivity and retry" |

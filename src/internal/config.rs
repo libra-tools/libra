@@ -788,9 +788,9 @@ impl ConfigKv {
     /// Boundary conditions:
     /// - Returns `Err` if `<old>` does not exist or `<new>` already exists,
     ///   matching git's "fatal: ..." error format.
-    /// - This function is *not* atomic across rewrites. Wrap in a sea-orm
-    ///   transaction (and call this `_with_conn` variant with `txn`) when
-    ///   atomicity matters.
+    /// - This helper uses the supplied connection. Call it with a sea-orm
+    ///   transaction when its rewrites must be atomic with reference/reflog
+    ///   migration (as `remote rename` does).
     pub async fn rename_remote_with_conn<C: ConnectionTrait>(
         db: &C,
         old: &str,
@@ -819,6 +819,8 @@ impl ConfigKv {
         // Rename remote.old.* → remote.new.*
         let old_prefix = format!("remote.{old}.");
         let new_prefix = format!("remote.{new}.");
+        let old_tracking_prefix = format!("refs/remotes/{old}/");
+        let new_tracking_prefix = format!("refs/remotes/{new}/");
         let entries = config_kv::Entity::find()
             .filter(config_kv::Column::Key.starts_with(&old_prefix))
             .all(db)
@@ -826,8 +828,16 @@ impl ConfigKv {
             .context("failed to query remote entries for rename")?;
         for entry in entries {
             let new_key = entry.key.replacen(&old_prefix, &new_prefix, 1);
+            let rewritten_value = if entry.key == format!("remote.{old}.fetch") {
+                entry
+                    .value
+                    .replace(&old_tracking_prefix, &new_tracking_prefix)
+            } else {
+                entry.value.clone()
+            };
             let mut active: config_kv::ActiveModel = entry.into();
             active.key = Set(new_key);
+            active.value = Set(rewritten_value);
             active
                 .update(db)
                 .await

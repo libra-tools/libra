@@ -95,6 +95,11 @@ Rename an existing remote.
 | `<old>` | Current name | `origin` |
 | `<new>` | New name | `upstream` |
 
+The rename is one SQLite transaction. It rewrites `remote.<old>.*` keys,
+branch upstream values, SSH credential namespaces, configured fetch-refspec
+destinations, cached `refs/remotes/<old>/*` branches and remote HEAD rows, and
+their reflog names. Any failed rewrite rolls the complete rename back.
+
 ### Subcommand: `get-url`
 
 Print URLs configured for a remote.
@@ -129,14 +134,16 @@ Delete local remote-tracking branches that no longer exist on the remote.
 
 ### Subcommand: `update`
 
-Fetch from one or more remotes. With no arguments, every configured remote is
-fetched; otherwise each argument is a remote name, or a `remotes.<group>`
-config entry that expands to that group's member remotes.
+Fetch from one or more remotes. With no arguments, a non-empty
+`remotes.default` value is resolved first (its whitespace-separated entries may
+be remote names or `remotes.<group>` names); if it is unset or empty, every
+configured remote is fetched. Explicit arguments use the same remote/group
+resolution.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
 | `-p`, `--prune` | After fetching, prune remote-tracking branches that no longer exist on the remote (Git's `remote update -p`) | `libra remote update -p` |
-| `[<group> \| <remote>...]` | Remotes or remote groups to fetch (default: all) | `libra remote update origin upstream` |
+| `[<group> \| <remote>...]` | Remotes or remote groups to fetch (default: `remotes.default`, otherwise all) | `libra remote update origin upstream` |
 
 > `-p` / `--prune` runs the same prune logic as `libra remote prune <name>`, but
 > only after every resolved remote has fetched successfully (a two-pass
@@ -147,6 +154,8 @@ config entry that expands to that group's member remotes.
 
 Set the branches tracked by a remote by rewriting its `remote.<name>.fetch`
 refspecs. Each branch becomes `+refs/heads/<branch>:refs/remotes/<name>/<branch>`.
+Subsequent `fetch <name>` and `remote update` consume these values and update
+only the configured branches.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|

@@ -281,7 +281,8 @@ fn resolve_output_symrefs_keeps_only_present_names() {
         entry("a".repeat(40).as_str(), "HEAD"),
         entry("a".repeat(40).as_str(), "refs/heads/main"),
     ];
-    let symrefs = resolve_output_symrefs(&caps, &entries, true);
+    let discovered = vec![disc_ref("HEAD"), disc_ref("refs/heads/main")];
+    let symrefs = resolve_output_symrefs(&caps, &entries, &discovered, true);
     assert_eq!(symrefs.len(), 1);
     assert_eq!(symrefs[0].name, "HEAD");
     assert_eq!(symrefs[0].target, "refs/heads/main");
@@ -292,7 +293,8 @@ fn resolve_output_symrefs_drops_filtered_out_names() {
     // HEAD advertised but excluded from the entries (e.g. `--heads`): no symref.
     let caps = vec!["symref=HEAD:refs/heads/main".to_string()];
     let entries = vec![entry("b".repeat(40).as_str(), "refs/heads/main")];
-    assert!(resolve_output_symrefs(&caps, &entries, true).is_empty());
+    let discovered = vec![disc_ref("HEAD"), disc_ref("refs/heads/main")];
+    assert!(resolve_output_symrefs(&caps, &entries, &discovered, true).is_empty());
 }
 
 #[test]
@@ -303,13 +305,34 @@ fn resolve_output_symrefs_empty_when_not_requested_or_no_capability() {
         resolve_output_symrefs(
             &["symref=HEAD:refs/heads/main".to_string()],
             &entries,
+            &[disc_ref("HEAD"), disc_ref("refs/heads/main")],
             false
         )
         .is_empty()
     );
     // Requested but the remote advertised no `symref=` capability (e.g. a local
     // Libra repo; local Git repos via git-upload-pack do advertise it).
-    assert!(resolve_output_symrefs(&[], &entries, true).is_empty());
+    assert!(resolve_output_symrefs(&[], &entries, &[disc_ref("HEAD")], true).is_empty());
+}
+
+#[test]
+fn resolve_output_symrefs_derives_local_libra_head_without_capability() {
+    let oid = "c".repeat(40);
+    let entries = vec![entry(&oid, "HEAD"), entry(&oid, "refs/heads/main")];
+    let discovered = vec![
+        DiscRef {
+            _hash: oid.clone(),
+            _ref: "HEAD".to_string(),
+        },
+        DiscRef {
+            _hash: oid,
+            _ref: "refs/heads/main".to_string(),
+        },
+    ];
+    let symrefs = resolve_output_symrefs(&[], &entries, &discovered, true);
+    assert_eq!(symrefs.len(), 1);
+    assert_eq!(symrefs[0].name, "HEAD");
+    assert_eq!(symrefs[0].target, "refs/heads/main");
 }
 
 #[test]

@@ -384,6 +384,10 @@ path = "tests/compat/config_defaults_edge_cases_test.rs"
 name = "compat_config_history_defaults"
 path = "tests/compat/config_history_defaults_test.rs"
 
+[[test]]
+name = "compat_fetch_remote_refspec"
+path = "tests/compat/fetch_remote_refspec_test.rs"
+
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).
 [[test]]

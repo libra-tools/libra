@@ -17,8 +17,13 @@ tree or the current branch -- use `libra pull` or `libra merge` for that.
 
 When invoked with no arguments, it fetches from the current branch's configured upstream.
 When `--all` is given, every configured remote is fetched in sequence. When a specific
-`<repository>` is named, only that remote is contacted. An optional `<refspec>` narrows
-the fetch to a single branch.
+`<repository>` is named, only that remote is contacted. An optional `<refspec>`
+selects an exact source and destination. A short branch such as `main` means
+`refs/heads/main:refs/remotes/<repository>/main`; full `<src>:<dst>` writes only
+`<dst>`. Without a CLI refspec, Libra reads every `remote.<name>.fetch` value,
+including exact/wildcard mappings written by `remote add -t` and
+`remote set-branches`. It falls back to the default heads and merge-request
+mappings only when no fetch refspec is configured.
 
 Fetch supports SSH, HTTPS, local file, and `git://` transports. Vault-backed SSH keys
 are loaded automatically when configured via `vault.ssh.<remote>.privkey`.
@@ -63,7 +68,7 @@ libra config remote.origin.prune false  # but never for origin
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
 | `<repository>` | Remote name or URL to fetch from. When omitted, uses the current branch's upstream remote. | `libra fetch origin` |
-| `<refspec>` | Branch name to fetch. Requires `<repository>`. When omitted, all branches from the remote are fetched. | `libra fetch origin main` |
+| `<refspec>` | Source ref or exact `<src>:<dst>` mapping. Requires `<repository>`. Destinations may be `refs/heads/*` or `refs/remotes/<repository>/*`; one `*` wildcard is supported when both sides contain it. CLI refspecs override configured `remote.<name>.fetch` values. Negative refspecs and tag destinations remain unsupported. | `libra fetch origin refs/heads/topic:refs/remotes/origin/review` |
 | `-a`, `--all` | Fetch from every configured remote. Conflicts with `<repository>`. | `libra fetch --all` |
 | `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Supported for Git remotes that advertise shallow boundaries. Local Libra remotes fail closed with `LBR-REPO-002` until that transport can advertise shallow metadata. | `libra fetch origin --depth 1` |
 | `--tags` | Fetch every tag from the remote into the local `refs/tags/*` (overrides the default auto-follow and `remote.<name>.tagOpt`). | `libra fetch origin --tags` |
@@ -89,6 +94,7 @@ libra config remote.origin.prune false  # but never for origin
 libra fetch
 libra fetch origin
 libra fetch origin main
+libra fetch origin refs/heads/topic:refs/remotes/origin/review
 libra fetch --all
 libra fetch origin --depth 1               # shallow fetch
 libra fetch origin --tags                  # also fetch all tags into refs/tags/*
@@ -145,12 +151,17 @@ ref from pointing at a commit whose parents are missing without a shallow marker
 
 ## FETCH_HEAD
 
-Every successful fetch records the fetched refs in `.libra/FETCH_HEAD`, one
-`<oid>\tnot-for-merge\tbranch '<name>' of <url>` line per branch and one
-`<oid>\tnot-for-merge\ttag '<name>' of <url>` line per fetched tag. Libra never
-designates a merge target (merge with `libra pull`), so every line is marked
-`not-for-merge`. `--append` accumulates into the file instead of overwriting it;
-`--dry-run` writes nothing.
+Every successful fetch records every selected source ref in `.libra/FETCH_HEAD`,
+including refs that were already up to date. An exact CLI refspec is the merge
+candidate and therefore has an empty middle field; refs selected by configured
+or wildcard refspecs and fetched tags use `not-for-merge`. `--append` accumulates
+instead of overwriting, and `--dry-run` writes nothing. Fetch never writes
+`.libra/ORIG_HEAD`.
+
+Selected branch destinations, fetched tags, their reflogs, and the cached
+`refs/remotes/<name>/HEAD` are committed in one SQLite transaction. A rejected
+non-fast-forward or later ref-storage failure rolls back the whole ref update;
+downloaded pack objects may remain as unreachable objects, as with Git.
 
 ## Human Output
 
@@ -196,7 +207,7 @@ Already up to date with 'origin'
 - `remote_ref`: fully qualified local remote-tracking ref, e.g. `refs/remotes/origin/main`
 - `old_oid`: previous object id, or `null` when the ref is new
 - `new_oid`: fetched object id
-- `forced`: `true` when the update was not a fast-forward — a branch that moved non-linearly (recorded regardless of `--force`; tracking branches are always updated), or a tag clobbered under `--force`
+- `forced`: `true` for a non-fast-forward branch update accepted by a leading `+` refspec / `--force`, or for a tag clobbered under `--force`; without force, a non-fast-forward rejects and atomically rolls back every selected ref update
 
 Example (single remote):
 
@@ -333,7 +344,7 @@ by default for maximum script friendliness.
 | Tag auto-follow (default) | Tags reachable from fetched commits are followed automatically (via `include-tag`) | Same (default) | Automatic |
 | Tag fetch control | `libra fetch --tags` / `--no-tags`; `remote.<name>.tagOpt` | `git fetch --tags` / `--no-tags`; `remote.<name>.tagOpt` | Automatic |
 | Force fetch | `libra fetch -f` / `--force` (non-FF + tag clobber) | `git fetch --force` | Automatic |
-| Atomic / refmap | Not supported (deferred) | `git fetch --atomic` / `--refmap` | No |
+| Atomic ref updates / refmap flag | Ref updates are atomic by default; no `--atomic` or `--refmap` flag | `git fetch --atomic` / `--refmap` | No |
 | Structured output | `--json` / `--machine` | No | No |
 | Progress events | NDJSON on stderr | Text on stderr | Text on stderr |
 
@@ -344,6 +355,7 @@ by default for maximum script friendliness.
 | No configured upstream / detached HEAD | `LBR-REPO-003` | 128 | "checkout a branch or specify a remote" |
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
 | Remote branch not found | `LBR-CLI-003` | 129 | "verify the remote branch name and try again" |
+| Invalid or unsupported fetch refspec | `LBR-CLI-002` | 129 | "use a branch name or `<src>:<dst>` mapping" |
 | Invalid remote spec (missing repo, malformed URL, unsupported scheme) | `LBR-CLI-003` or `LBR-REPO-001` | 129 / 128 | Varies by cause |
 | Authentication failure during discovery | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | Network timeout / transport failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |

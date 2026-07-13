@@ -8,7 +8,9 @@ use std::{
 
 use clap::Subcommand;
 use git_internal::hash::get_hash_kind;
-use sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, QueryFilter, Set, TransactionTrait,
+};
 use serde::Serialize;
 
 use crate::{
@@ -18,7 +20,7 @@ use crate::{
         config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
-        model::reference,
+        model::{reference, reflog},
         protocol::{DiscRef, set_wire_hash_kind},
     },
     utils::{
@@ -732,13 +734,54 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
         return Err(RemoteError::SshKeyNamespaceExists { name: new });
     }
 
-    let new_for_error = new.clone();
-    ConfigKv::rename_remote(&old, &new).await.map_err(|error| {
+    let db = get_db_conn_instance().await;
+    let txn_old = old.clone();
+    let txn_new = new.clone();
+    db.transaction::<_, (), DbErr>(move |txn| {
+        Box::pin(async move {
+            ConfigKv::rename_remote_with_conn(txn, &txn_old, &txn_new)
+                .await
+                .map_err(|error| DbErr::Custom(error.to_string()))?;
+
+            let old_tracking_prefix = format!("refs/remotes/{txn_old}/");
+            let new_tracking_prefix = format!("refs/remotes/{txn_new}/");
+            let references = reference::Entity::find()
+                .filter(reference::Column::Remote.eq(&txn_old))
+                .all(txn)
+                .await?;
+            for row in references {
+                let renamed_name = row.name.as_ref().and_then(|name| {
+                    name.starts_with(&old_tracking_prefix)
+                        .then(|| name.replacen(&old_tracking_prefix, &new_tracking_prefix, 1))
+                });
+                let mut active: reference::ActiveModel = row.into();
+                active.remote = Set(Some(txn_new.clone()));
+                if let Some(name) = renamed_name {
+                    active.name = Set(Some(name));
+                }
+                active.update(txn).await?;
+            }
+
+            let reflogs = reflog::Entity::find()
+                .filter(reflog::Column::RefName.starts_with(&old_tracking_prefix))
+                .all(txn)
+                .await?;
+            for row in reflogs {
+                let renamed = row
+                    .ref_name
+                    .replacen(&old_tracking_prefix, &new_tracking_prefix, 1);
+                let mut active: reflog::ActiveModel = row.into();
+                active.ref_name = Set(renamed);
+                active.update(txn).await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| {
         let detail = error.to_string();
         if detail.contains("SSH key namespace for remote") {
-            RemoteError::SshKeyNamespaceExists {
-                name: new_for_error,
-            }
+            RemoteError::SshKeyNamespaceExists { name: new.clone() }
         } else {
             RemoteError::ConfigWrite { detail }
         }
@@ -911,9 +954,20 @@ async fn run_set_url(
 /// `remotes.<group>` config (expanded to its space-separated members) or a
 /// single remote name. The result preserves first-seen order and de-duplicates.
 async fn resolve_update_remotes(groups: Vec<String>) -> Result<Vec<String>, RemoteError> {
-    if groups.is_empty() {
-        return list_remote_names().await;
-    }
+    let groups = if groups.is_empty() {
+        match ConfigKv::get("remotes.default")
+            .await
+            .map_err(|error| RemoteError::ConfigRead {
+                detail: error.to_string(),
+            })? {
+            Some(config) if !config.value.trim().is_empty() => {
+                config.value.split_whitespace().map(String::from).collect()
+            }
+            _ => return list_remote_names().await,
+        }
+    } else {
+        groups
+    };
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
     for entry in groups {

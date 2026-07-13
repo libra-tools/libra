@@ -275,11 +275,28 @@ pub(crate) async fn collect_raw_show_ref_entries(
                         error,
                     )
                 })?;
-            for branch in branches {
+            for branch in &branches {
                 entries.push(ShowRefEntry {
                     hash: branch.commit.to_string(),
                     refname: remote_refname(&remote.name, &branch.name),
                 });
+            }
+
+            // A cached remote HEAD is a symbolic ref stored separately from
+            // remote-tracking branches. Resolve it to the target branch so
+            // `show-ref --verify refs/remotes/<remote>/HEAD` observes the same
+            // ref that `for-each-ref` and `remote set-head` expose.
+            if let Some(Head::Branch(target)) = Head::remote_current(&remote.name).await {
+                let target_ref = remote_refname(&remote.name, &target);
+                if let Some(branch) = branches
+                    .iter()
+                    .find(|branch| remote_refname(&remote.name, &branch.name) == target_ref)
+                {
+                    entries.push(ShowRefEntry {
+                        hash: branch.commit.to_string(),
+                        refname: format!("refs/remotes/{}/HEAD", remote.name),
+                    });
+                }
             }
         }
     }

@@ -6,7 +6,7 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。heads/tags/refs filtering、patterns、`--get-url`、`--sort=refname` / `--sort=version:refname`、`--exit-code` 和 `--symref` 已支持。`--symref` 从 discovery capabilities（`symref=<from>:<to>`，通常为 `HEAD`）解析；Git 远端与本地 Git 仓库（`git-upload-pack`）会通告 `symref=HEAD`，故输出 `ref:` 行；本地 **Libra** 仓库不通告该 capability，故不输出（有意与 Git 不同，Libra 从不基于本地 `HEAD` 合成 symref）。
+- 兼容级别：`partial`。heads/tags/refs filtering、patterns、`--get-url`、`--sort=refname` / `--sort=version:refname`、`--exit-code` 和 `--symref` 已支持。`--symref` 优先解析 discovery capabilities（`symref=<from>:<to>`，通常为 `HEAD`）；capability 缺失时（尤其本地 Libra 源），复用 fetch 的默认分支解析器按 HEAD OID / branch tips 合成可见的 `HEAD` 符号行。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -45,14 +45,14 @@ flowchart TD
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/ls-remote.md`。
-- 公开参数/子命令包括：`--heads`、`-t, --tags`、`--refs`、`--get-url`、`--exit-code`、`--sort <KEY>`、`--symref`、`<repository>`、`[patterns]...`。`--sort` 当前支持 `refname`、`-refname`、`version:refname` / `v:refname` 和对应反向形式；未知 key 返回 `LBR-CLI-002`。`--exit-code` 在 discovery 成功但没有匹配 ref 时静默返回 2。`--symref` 经 `parse_symrefs` 解析 discovery capabilities 的 `symref=<from>:<to>`，仅对 output（过滤后）中实际存在的 symref name 输出 `ref: <target>\t<name>` 行；本地 **Libra** 仓库不通告该 capability 故不输出（本地 Git 仓库经 `git-upload-pack` 会通告），无 symref 时 JSON envelope 省略 `symrefs`。
+- 公开参数/子命令包括：`--heads`、`-t, --tags`、`--refs`、`--get-url`、`--exit-code`、`--sort <KEY>`、`--symref`、`<repository>`、`[patterns]...`。`--sort` 当前支持 `refname`、`-refname`、`version:refname` / `v:refname` 和对应反向形式；未知 key 返回 `LBR-CLI-002`。`--exit-code` 在 discovery 成功但没有匹配 ref 时静默返回 2。`--symref` 先解析 capability，仅对过滤后仍存在的 name 输出 `ref: <target>\t<name>`；若 capability 缺失，则从 discovery 的 HEAD / heads 解析默认分支。本地 Libra 因而也可输出 `HEAD`；无可解析符号引用时 JSON 省略 `symrefs`。
 
 
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 设计取舍 | `--symref` 对本地 **Libra** 仓库/不通告 `symref=` 的传输不合成 symbolic-ref 行（本地 Git 仓库经 `git-upload-pack` 会通告 `symref=HEAD`，正常输出）。 | 有意与 Git 不同：Libra 仅从协议 capabilities 读取 symref，不直接读取本地 `HEAD`；无 symref 时 JSON 省略 `symrefs` 数组。 |
+| 设计取舍 | `--symref` 在传输不通告 `symref=` 时需要推断默认分支。 | capability 始终优先；fallback 按 HEAD OID 匹配，再按 `main`、`master`、首个分支，复用 fetch 解析器；无可解析结果时 JSON 省略 `symrefs`。 |
 
 ## 维护要求
 

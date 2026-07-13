@@ -72,6 +72,8 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 | `<old>` | 当前名称 | `origin` |
 | `<new>` | 新名称 | `upstream` |
 
+重命名在一个 SQLite 事务中执行：同时重写 `remote.<old>.*` 配置键、分支 upstream 值、SSH 凭据命名空间、fetch refspec 的目标、缓存的 `refs/remotes/<old>/*` 跟踪分支与远程 HEAD 行，以及相应 reflog 名称。任一步写入失败都会回滚整个重命名。
+
 ### 子命令：`get-url`
 
 打印为远程配置的 URL。
@@ -106,14 +108,22 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 
 ### 子命令：`update`
 
-从一个或多个远程 fetch。无参数时 fetch 所有配置的远程；否则每个参数是一个远程名，或一个 `remotes.<group>` 配置项（展开为该组的成员远程）。
+从一个或多个远程 fetch。无参数时优先解析非空的 `remotes.default`（空白分隔的每项可以是远程名或 `remotes.<group>` 名）；未设置或为空时才 fetch 所有配置远程。显式参数使用相同的远程/组解析。
 
 | 标志 / 参数 | 说明 | 示例 |
 |-----------------|-------------|---------|
 | `-p`, `--prune` | fetch 之后，修剪远端已不存在的远程跟踪分支（对应 Git 的 `remote update -p`） | `libra remote update -p` |
-| `[<group> \| <remote>...]` | 要 fetch 的远程或远程组（默认：全部） | `libra remote update origin upstream` |
+| `[<group> \| <remote>...]` | 要 fetch 的远程或远程组（默认：`remotes.default`，否则全部） | `libra remote update origin upstream` |
 
 > `-p` / `--prune` 运行与 `libra remote prune <name>` 相同的修剪逻辑，但仅在所有 resolved 远端都 fetch 成功后才执行（两段式：先 fetch 全部，再统一 prune，因此后面的远端 fetch 失败不会遗留前面已删除的 ref），并以 `* [pruned] <name>/<branch>` 形式报告被删除的 ref。
+
+### 子命令：`set-branches`
+
+重写远程的 `remote.<name>.fetch` refspec。每个分支写为 `+refs/heads/<branch>:refs/remotes/<name>/<branch>`；`--add` 追加而非替换。后续 `fetch <name>` 与 `remote update` 会消费这些值，只更新已配置分支。
+
+### 子命令：`set-head`
+
+设置或删除 `refs/remotes/<name>/HEAD`。`<branch>` 与 `--auto` 要求对应跟踪分支已经存在；`--auto` 会联系远程解析其默认分支，`--delete` 幂等删除该符号引用。
 
 ## 常用命令
 
