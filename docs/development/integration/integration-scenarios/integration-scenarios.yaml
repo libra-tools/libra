@@ -221,7 +221,7 @@ scenarios:
   - id: cli.restore-reset-diff
     wave: 1
     group: working_tree
-    purpose: "Cover diff (unstaged/staged/old-new/name/status/stat/numstat/raw/compact-summary/diff-filter/full-index/prefix/output/algorithm), restore --staged/--worktree/--source plus the real --overlay/--no-overlay toggle, and reset --soft/--mixed/--hard/--merge/--keep plus path-level reset. Exact P1-08a metadata is owned by compat_diff_review_options; the deeper reset preservation/refusal/rollback matrix is owned by compat_noninteractive_history_controls; negative checks cover missing pathspec files and diff algorithm variants."
+    purpose: "Cover diff (unstaged/staged/old-new/name/status/stat/numstat/raw/compact-summary/diff-filter/-S/-G/full-index/prefix/output/algorithm), restore --staged/--worktree/--source plus the real --overlay/--no-overlay toggle, and reset --soft/--mixed/--hard/--merge/--keep plus path-level reset. Exact P1-08a/b metadata and pickaxe semantics are owned by compat_diff_review_options; the AI textconv/external safety boundary is owned by ai_libra_vcs_safety_test; the deeper reset preservation/refusal/rollback matrix is owned by compat_noninteractive_history_controls; negative checks cover missing pathspec files, invalid pickaxe regexes, and diff algorithm variants."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, negative_exit]

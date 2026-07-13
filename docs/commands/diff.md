@@ -13,6 +13,7 @@ libra diff --old <commit> --new <commit> [<pathspec>...]
 libra diff [--raw | --name-only | --name-status | --numstat | --stat | --shortstat | --summary]
            [-s | --no-patch] [--exit-code] [--check] [-R] [-z]
 libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
+           [-S <STRING> | -G <REGEX>]
            [--src-prefix=<PREFIX> --dst-prefix=<PREFIX>]
            [--algorithm <name>] [--output <file>]
 ```
@@ -21,7 +22,7 @@ libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
 
 `libra diff` shows changes between different states of the repository. By default it compares the index against tracked working-tree paths (unstaged changes). Untracked files are not part of the default diff and therefore do not affect `--quiet`, `--exit-code`, `--name-status`, `--numstat`, or `--shortstat`; use `libra status`, `libra ls-files --others`, or `libra add` to inspect or promote untracked files. With `--staged`, it compares HEAD against the index (staged changes). With `--old` and `--new`, it compares two arbitrary commits.
 
-The diff engine currently uses the histogram backend. The parser accepts the forward-compatible names `myers` and `myersMinimal`, but execution rejects them with `LBR-CLI-002` rather than silently using another algorithm. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity (matching Git's structure; like all Libra diffs, the exact word grouping can differ from Git on ambiguous changes, and hunk headers keep Libra's unified-diff format).
+The diff engine currently uses the histogram backend. The parser accepts the forward-compatible names `myers` and `myersMinimal`, but execution rejects them with `LBR-CLI-002` rather than silently using another algorithm. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). Pickaxe filters `-S <STRING>` and `-G <REGEX>` select file pairs by changed occurrence count or matching added/removed lines. A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity (matching Git's structure; like all Libra diffs, the exact word grouping can differ from Git on ambiguous changes, and hunk headers keep Libra's unified-diff format).
 
 When the working tree contains unmerged conflict entries, the default working-tree diff renders a conflict-aware `diff --cc <path>` record instead of treating the conflict file as a `/dev/null` addition.
 
@@ -54,6 +55,8 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | Stat | | `--stat` | Show a diffstat summary with +/- bar graph. |
 | Compact summary | | `--compact-summary` | Show `--stat` with `(new)`, `(gone)`, and executable/symlink metadata such as `(+x)` or `(+l)`. Implies `--stat`. |
 | Diff filter | | `--diff-filter=<FILTER>` | Select A/C/D/M/R/T/U/X/B statuses. Uppercase letters include, lowercase letters exclude; `*` makes the selection all-or-none. Invalid or empty filters fail with `LBR-CLI-002` before scanning/output. |
+| String pickaxe | `-S <STRING>` | | Keep a file pair only when its number of non-overlapping STRING occurrences changes. Equal counts do not match even if the occurrences moved. Uses textconv output when active; otherwise searches raw bytes, including binary content. An empty STRING matches nothing. Mutually exclusive with `-G`. |
+| Regex pickaxe | `-G <REGEX>` | | Keep a file pair when REGEX matches added or removed hunk content (not context or patch headers). Uses the Rust `regex` dialect (linear-time; no look-around or backreferences). Invalid expressions fail with `LBR-CLI-002` before scanning/output. Mutually exclusive with `-S`. |
 | Context lines | `-U<n>` | `--unified=<n>` | Number of context lines around each change in the patch (default 3; when the flag is absent the `diff.context` config default applies — strict local → global → system cascade, non-negative Git integer with optional `k`/`m`/`g` 1024-based suffix, invalid or overflowing values fail closed with `LBR-CLI-002` before progress or diff output). Changes only the surrounding context, not the `+`/`-` lines, so `--stat`/`--name-only`/`--numstat` counts are unaffected; the `--json` hunk ranges and line arrays follow `<n>`. |
 | Ignore whitespace | `-w` | `--ignore-all-space` | Ignore all whitespace when comparing lines. A change that is only whitespace is not reported (the file drops out if that is its only change); context lines are shown from the new side. Affected files are re-diffed, so `--stat`/`--name-only`/`--numstat`/JSON all reflect the whitespace-ignored result. Honors `-U<n>`. |
 | Ignore whitespace amount | `-b` | `--ignore-space-change` | Ignore changes in the *amount* of whitespace: runs of whitespace are treated as a single space and trailing whitespace is ignored, but the presence of whitespace still matters (`a  b` matches `a b`; `a b` still differs from `ab`). Same re-diff/drop behavior as `-w`. `-w` wins if both are given. |
@@ -146,6 +149,25 @@ libra diff --stat
 # Output:  src/main.rs | 7 +++++--
 ```
 
+**Pickaxe filters:**
+
+```bash
+# Files where the literal's occurrence count changed
+libra diff -S'old_api' --name-only
+
+# Files with matching added or removed lines
+libra diff -G'unsafe\(' --name-status
+```
+
+`-S` and `-G` compose with pathspecs, `--diff-filter`, review output modes,
+JSON, and exit-code checks. Filtering happens before a configured external diff
+driver runs, so the driver is invoked only for selected file pairs. Textconv is
+on by default and `-S` reuses the already-converted side content without running
+the command twice; pass `--no-textconv` to search raw bytes. In AI-mediated
+`run_libra_vcs`, pickaxe remains approval-gated unless both `--no-textconv` and
+`--no-ext-diff` are present, because those configured filters can execute shell
+commands.
+
 ## Common Commands
 
 ```bash
@@ -164,6 +186,10 @@ libra diff --stat src/
 # Emit NUL-safe object/mode metadata and filter review paths
 libra diff --raw -z
 libra diff --name-only --diff-filter=AM
+
+# Search changed file pairs by literal count or changed-line regex
+libra diff -S'old_api' --name-only
+libra diff -G'handler_v[0-9]+' --name-status
 
 # Show full patch object IDs with explicit path prefixes
 libra diff --full-index --src-prefix=old/ --dst-prefix=new/
@@ -333,6 +359,8 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Summary | `--summary` | `--summary` | `--summary` |
 | Raw metadata | `--raw` (`-z` supported) | `--raw` (`-z` supported) | N/A |
 | Change filter | `--diff-filter=<FILTER>` | `--diff-filter=<FILTER>` | N/A |
+| String pickaxe | `-S <STRING>` | `-S <STRING>` | N/A |
+| Regex pickaxe | `-G <REGEX>` (Rust regex dialect) | `-G <REGEX>` | N/A |
 | Compact stat | `--compact-summary` | `--compact-summary` | N/A |
 | Full patch IDs | `--full-index` (`--binary` implies it) | `--full-index` | N/A |
 | Patch prefixes | `--src-prefix` / `--dst-prefix` | `--src-prefix` / `--dst-prefix` | N/A |
@@ -366,6 +394,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 |----------|-----------------|------|
 | Outside a repository | `LBR-REPO-001` | 128 |
 | Invalid revision | `LBR-CLI-003` | 129 |
+| Invalid `-G` regular expression | `LBR-CLI-002` | 129 |
 | Failed to read the index or object store | `LBR-REPO-002` | 128 |
 | Failed to read a file | `LBR-IO-001` | 128 |
 | Failed to write the output file | `LBR-IO-002` | 128 |

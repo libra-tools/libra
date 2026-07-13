@@ -512,3 +512,165 @@ fn rename_detection_does_not_pair_different_file_types() {
         "{output}"
     );
 }
+
+#[test]
+fn pickaxe_string_and_regex_filter_file_pairs_and_compose_with_status_filter() {
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("pickaxe-file-pairs");
+    for (path, content) in [
+        ("count.txt", "needle\n"),
+        ("moved.txt", "needle old\n"),
+        ("regex.txt", "handler_v1\n"),
+        ("unrelated.txt", "old\n"),
+        ("rename-old.txt", "stable rename needle\n"),
+    ] {
+        fs::write(repo.join(path), content).expect("write pickaxe base");
+    }
+    fs::write(repo.join("binary.bin"), b"\0binary-only").expect("write binary base");
+    fixture.commit_all(&repo, "base");
+
+    fs::write(repo.join("count.txt"), "needle\nneedle\n").expect("change count");
+    fs::write(repo.join("moved.txt"), "needle new\n").expect("edit around stable literal");
+    fs::write(repo.join("regex.txt"), "handler_v2\n").expect("change regex line");
+    fs::write(repo.join("unrelated.txt"), "new\n").expect("change unrelated file");
+    fs::write(repo.join("binary.bin"), b"\0binary-only binary-only")
+        .expect("change binary literal count");
+    fs::rename(repo.join("rename-old.txt"), repo.join("rename-new.txt"))
+        .expect("rename stable literal");
+    fs::write(repo.join("added.txt"), "new needle\n").expect("add literal");
+    fixture.success(&repo, &["add", "-A"]);
+
+    let string =
+        stdout(&fixture.success(&repo, &["diff", "--cached", "-S", "needle", "--name-only"]));
+    let selected = string.lines().collect::<Vec<_>>();
+    assert_eq!(selected.len(), 2, "{string}");
+    assert!(selected.contains(&"added.txt"), "{string}");
+    assert!(selected.contains(&"count.txt"), "{string}");
+    assert!(
+        !string.contains("moved.txt"),
+        "equal counts must not match: {string}"
+    );
+    assert!(
+        !string.contains("rename-new.txt"),
+        "exact rename must not match: {string}"
+    );
+
+    let raw = stdout(&fixture.success(&repo, &["diff", "--cached", "-Sneedle", "--raw"]));
+    assert_eq!(raw.lines().count(), 2, "{raw}");
+    assert!(raw.contains(" A\tadded.txt"), "{raw}");
+    assert!(raw.contains(" M\tcount.txt"), "{raw}");
+
+    let regex = stdout(&fixture.success(
+        &repo,
+        &["diff", "--cached", "-Ghandler_v[0-9]", "--name-only"],
+    ));
+    assert_eq!(regex.trim(), "regex.txt");
+
+    let changed_line =
+        stdout(&fixture.success(&repo, &["diff", "--cached", "-G", "needle", "--name-only"]));
+    assert!(changed_line.contains("moved.txt"), "{changed_line}");
+
+    let modified_only = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "-Sneedle",
+            "--diff-filter=M",
+            "--name-only",
+        ],
+    ));
+    assert_eq!(modified_only.trim(), "count.txt");
+
+    let binary =
+        stdout(&fixture.success(&repo, &["diff", "--cached", "-Sbinary-only", "--name-only"]));
+    assert_eq!(binary.trim(), "binary.bin", "{binary}");
+}
+
+#[test]
+fn pickaxe_validation_fails_before_worktree_progress() {
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("pickaxe-validation");
+    fs::write(repo.join("file.txt"), "content\n").expect("write fixture");
+    fixture.commit_all(&repo, "base");
+    fs::write(repo.join("file.txt"), "changed\n").expect("change fixture");
+
+    let invalid = fixture.run(&repo, &["diff", "-G", "["]);
+    assert_eq!(invalid.status.code(), Some(129));
+    assert!(invalid.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+    assert!(stderr.contains("invalid -G regex"), "{stderr}");
+    assert!(!stderr.contains("Scanning working tree"), "{stderr}");
+
+    let conflicting = fixture.run(&repo, &["diff", "-S", "x", "-G", "x"]);
+    assert!(!conflicting.status.success());
+
+    let empty = stdout(&fixture.success(&repo, &["diff", "-S", "", "--name-only"]));
+    assert!(empty.is_empty(), "an empty literal never matches: {empty}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pickaxe_reuses_textconv_and_filters_before_external_driver() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("pickaxe-drivers");
+    fs::write(repo.join(".gitattributes"), "*.dat diff=upper\n").expect("write attributes");
+    fs::write(repo.join("pick.dat"), "token\n").expect("write textconv base");
+    fs::write(repo.join("match.txt"), "old\n").expect("write match base");
+    fs::write(repo.join("other.txt"), "before\n").expect("write other base");
+    fixture.commit_all(&repo, "base");
+
+    fs::write(repo.join("pick.dat"), "token token\n").expect("change textconv file");
+    fs::write(repo.join("match.txt"), "new needle\n").expect("change matching file");
+    fs::write(repo.join("other.txt"), "after\n").expect("change other file");
+    fixture.success(&repo, &["add", "-A"]);
+    fixture.success(
+        &repo,
+        &["config", "set", "diff.upper.textconv", "tr a-z A-Z <"],
+    );
+
+    let converted =
+        stdout(&fixture.success(&repo, &["diff", "--cached", "-S", "TOKEN", "--name-only"]));
+    assert_eq!(converted.trim(), "pick.dat", "{converted}");
+    let raw = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "--no-textconv",
+            "-S",
+            "TOKEN",
+            "--name-only",
+        ],
+    ));
+    assert!(
+        raw.is_empty(),
+        "raw lowercase content must not match TOKEN: {raw}"
+    );
+
+    let driver = repo.join("path-driver.sh");
+    fs::write(&driver, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").expect("write external driver");
+    let mut permissions = fs::metadata(&driver)
+        .expect("stat external driver")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&driver, permissions).expect("chmod external driver");
+    fixture.success(
+        &repo,
+        &[
+            "config",
+            "set",
+            "diff.external",
+            driver.to_str().expect("utf8 driver path"),
+        ],
+    );
+
+    let external = stdout(&fixture.success(
+        &repo,
+        &["diff", "--cached", "--no-textconv", "-S", "needle"],
+    ));
+    assert_eq!(external.trim(), "match.txt", "{external}");
+}

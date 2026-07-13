@@ -68,6 +68,8 @@ EXAMPLES:
     libra diff --stat src/                  Show diff statistics under src/
     libra diff --raw -z                     NUL-safe object/mode records for scripts
     libra diff --diff-filter=AM --name-only Show only added/modified paths
+    libra diff -S'old_api' --name-only      Find files changing a string's occurrence count
+    libra diff -G'unsafe\\('                 Find files with matching added/removed lines
     libra diff --shortstat                  Show just the files-changed/insertions/deletions line
     libra diff --full-index                 Show full object ids in patch index headers
     libra diff --word-diff                   Word-level diff ([-removed-]{+added+} inline)
@@ -217,6 +219,17 @@ pub struct DiffArgs {
     /// retains the whole set when any record matches the other criteria.
     #[clap(long = "diff-filter", value_name = "FILTER")]
     pub diff_filter: Option<String>,
+
+    /// Show only file pairs where the number of non-overlapping occurrences of
+    /// STRING changes between the two sides (Git pickaxe `-S`). Matching uses
+    /// textconv output when textconv is active and raw bytes otherwise.
+    #[clap(short = 'S', value_name = "STRING", conflicts_with = "pickaxe_regex")]
+    pub pickaxe_string: Option<String>,
+
+    /// Show only file pairs whose added or removed patch lines match REGEX (Git
+    /// pickaxe `-G`). The regex is validated before scanning the working tree.
+    #[clap(short = 'G', value_name = "REGEX")]
+    pub pickaxe_regex: Option<String>,
 
     /// Output only the last line of `--stat`: the files-changed / insertions /
     /// deletions summary.
@@ -491,6 +504,9 @@ pub(crate) enum DiffError {
     #[error("invalid argument to diff-filter: '{0}'")]
     InvalidDiffFilter(String),
 
+    #[error("invalid -G regex '{pattern}': {detail}")]
+    InvalidPickaxeRegex { pattern: String, detail: String },
+
     #[error("textconv filter '{command}' failed: {detail}")]
     TextconvFailed { command: String, detail: String },
 
@@ -564,6 +580,9 @@ impl From<DiffError> for CliError {
             DiffError::InvalidDiffFilter(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("use status letters A,C,D,M,R,T,U,X,B; lowercase excludes, and '*' selects all when any requested kind matches"),
+            DiffError::InvalidPickaxeRegex { .. } => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use a valid regular expression after -G, for example: libra diff -G'handler_[0-9]+'"),
             DiffError::TextconvFailed { .. } => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::IoReadFailed)
                 .with_hint(
@@ -611,9 +630,10 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
         .map_err(CliError::from)?;
     validate_diff_algorithm(&args).map_err(CliError::from)?;
     parse_diff_filter(args.diff_filter.as_deref()).map_err(CliError::from)?;
+    let pickaxe = parse_diff_pickaxe(&args).map_err(CliError::from)?;
     let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
-    let mut result = run_diff(&args, output, &config)
+    let mut result = run_diff(&args, output, &config, pickaxe.as_ref())
         .await
         .map_err(CliError::from)?;
     // lore.md 2.2: read-only sparse view — scope ONLY the working-tree diff
@@ -1433,6 +1453,157 @@ fn apply_diff_filter(files: &mut Vec<DiffFileStat>, filter: &DiffFilter) {
     }
 }
 
+#[derive(Debug)]
+enum DiffPickaxe {
+    StringCount(Vec<u8>),
+    DiffRegex(regex::Regex),
+}
+
+fn parse_diff_pickaxe(args: &DiffArgs) -> Result<Option<DiffPickaxe>, DiffError> {
+    if let Some(string) = &args.pickaxe_string {
+        return Ok(Some(DiffPickaxe::StringCount(string.as_bytes().to_vec())));
+    }
+    let Some(pattern) = &args.pickaxe_regex else {
+        return Ok(None);
+    };
+    regex::Regex::new(pattern)
+        .map(DiffPickaxe::DiffRegex)
+        .map(Some)
+        .map_err(|error| DiffError::InvalidPickaxeRegex {
+            pattern: pattern.clone(),
+            detail: error.to_string(),
+        })
+}
+
+/// Count non-overlapping byte-string occurrences in linear time. Git's `-S`
+/// compares occurrence counts, not merely presence, and must also work for
+/// binary files whose content is not valid UTF-8.
+fn count_literal_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+
+    let mut prefix = vec![0usize; needle.len()];
+    let mut matched = 0usize;
+    for idx in 1..needle.len() {
+        while matched > 0 && needle[idx] != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if needle[idx] == needle[matched] {
+            matched += 1;
+            prefix[idx] = matched;
+        }
+    }
+
+    let mut count = 0usize;
+    matched = 0;
+    for &byte in haystack {
+        while matched > 0 && byte != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if byte == needle[matched] {
+            matched += 1;
+            if matched == needle.len() {
+                count += 1;
+                // `str::matches`/Git pickaxe count non-overlapping matches.
+                matched = 0;
+            }
+        }
+    }
+    count
+}
+
+/// Match `-G` only against added/removed hunk content. Header lines (`---`/`+++`)
+/// and `\ No newline at end of file` are deliberately excluded. Combined hunks
+/// carry one prefix column per parent; any `+`/`-` prefix marks a changed line.
+fn changed_diff_line_matches(raw_diff: &str, regex: &regex::Regex) -> bool {
+    let mut prefix_columns = 0usize;
+    for line in raw_diff.lines() {
+        let leading_ats = line.bytes().take_while(|byte| *byte == b'@').count();
+        if leading_ats >= 2 && line.as_bytes().get(leading_ats) == Some(&b' ') {
+            prefix_columns = leading_ats - 1;
+            continue;
+        }
+        if prefix_columns == 0 || line.len() < prefix_columns {
+            continue;
+        }
+        let prefixes = &line.as_bytes()[..prefix_columns];
+        if prefixes
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'+' | b'-'))
+            && prefixes.iter().any(|byte| matches!(byte, b'+' | b'-'))
+            && regex.is_match(&line[prefix_columns..])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_pickaxe(
+    files: &mut Vec<DiffFileStat>,
+    pickaxe: Option<&DiffPickaxe>,
+    first_map: &HashMap<PathBuf, ObjectHash>,
+    second_map: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    textconv_counts: &HashMap<String, (usize, usize)>,
+) -> Result<(), DiffError> {
+    let Some(pickaxe) = pickaxe else {
+        return Ok(());
+    };
+    if let DiffPickaxe::DiffRegex(regex) = pickaxe {
+        files.retain(|file| changed_diff_line_matches(&file.raw_diff, regex));
+        return Ok(());
+    }
+    let DiffPickaxe::StringCount(needle) = pickaxe else {
+        return Ok(());
+    };
+    if needle.is_empty() {
+        files.clear();
+        return Ok(());
+    }
+
+    let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Result<Vec<u8>, DiffError> {
+        let path = PathBuf::from(path);
+        let Some(hash) = map.get(&path) else {
+            return Ok(Vec::new());
+        };
+        if worktree_entries.get(&path) == Some(hash) {
+            read_worktree_blob_content(&path)
+        } else {
+            load_repo_blob_content(hash)
+        }
+    };
+
+    let mut keep = Vec::with_capacity(files.len());
+    for file in files.iter() {
+        if let Some((old, new)) = textconv_counts.get(&file.path) {
+            keep.push(old != new);
+            continue;
+        }
+        let old_path = file.rename_from.as_deref().unwrap_or(&file.path);
+        let old_hash = first_map.get(&PathBuf::from(old_path));
+        let new_hash = second_map.get(&PathBuf::from(&file.path));
+        if old_hash == new_hash {
+            keep.push(false);
+            continue;
+        }
+        let old = load(old_path, first_map)?;
+        let new = load(&file.path, second_map)?;
+        keep.push(
+            count_literal_occurrences(&old, needle) != count_literal_occurrences(&new, needle),
+        );
+    }
+    let mut index = 0usize;
+    files.retain(|_| {
+        let retain = keep[index];
+        index += 1;
+        retain
+    });
+    Ok(())
+}
+
 fn emit_worktree_scan_progress(args: &DiffArgs, output: &OutputConfig) {
     if output.quiet || output.is_json() || args.staged || args.new.is_some() {
         return;
@@ -1463,6 +1634,7 @@ async fn run_diff(
     args: &DiffArgs,
     output: &OutputConfig,
     config: &ResolvedDiffConfig,
+    pickaxe: Option<&DiffPickaxe>,
 ) -> Result<DiffOutput, DiffError> {
     util::require_repo().map_err(|_| DiffError::NotInRepo)?;
     tracing::debug!("diff args: {:?}", args);
@@ -1723,52 +1895,55 @@ async fn run_diff(
     // bytes. Skipped under `--check` (it scans raw added lines) and when an
     // external driver is active (that takes precedence). The post-pass below then
     // leaves textconv'd files alone.
-    let textconv_paths: std::collections::HashSet<String> =
-        if !args.no_textconv && !args.check && external_command.is_none() {
-            let mut command_cache: HashMap<String, Option<String>> = HashMap::new();
-            // Per file: the (old-side, new-side) textconv command. A rename's
-            // old side is at `rename_from` and may resolve a different driver
-            // than the new side (Git resolves textconv per blob/path), so each
-            // side is looked up independently.
-            let mut path_commands: HashMap<String, (Option<String>, Option<String>)> =
-                HashMap::new();
-            for file in &files {
-                let new_path = PathBuf::from(&file.path);
-                let old_path = file
-                    .rename_from
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| new_path.clone());
-                let new_driver = attributes::diff_driver_for_path(&new_path);
-                let new_command =
-                    resolve_textconv_command(new_driver.as_deref(), &mut command_cache).await;
-                let old_command = if old_path == new_path {
-                    new_command.clone()
-                } else {
-                    let old_driver = attributes::diff_driver_for_path(&old_path);
-                    resolve_textconv_command(old_driver.as_deref(), &mut command_cache).await
-                };
-                if old_command.is_some() || new_command.is_some() {
-                    path_commands.insert(file.path.clone(), (old_command, new_command));
-                }
-            }
-            if path_commands.is_empty() {
-                std::collections::HashSet::new()
+    let textconv_outcome = if !args.no_textconv && !args.check && external_command.is_none() {
+        let mut command_cache: HashMap<String, Option<String>> = HashMap::new();
+        // Per file: the (old-side, new-side) textconv command. A rename's
+        // old side is at `rename_from` and may resolve a different driver
+        // than the new side (Git resolves textconv per blob/path), so each
+        // side is looked up independently.
+        let mut path_commands: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        for file in &files {
+            let new_path = PathBuf::from(&file.path);
+            let old_path = file
+                .rename_from
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| new_path.clone());
+            let new_driver = attributes::diff_driver_for_path(&new_path);
+            let new_command =
+                resolve_textconv_command(new_driver.as_deref(), &mut command_cache).await;
+            let old_command = if old_path == new_path {
+                new_command.clone()
             } else {
-                apply_textconv(
-                    &mut files,
-                    &path_commands,
-                    &first_map,
-                    &second_map,
-                    &ext_worktree_entries,
-                    regen_context,
-                    ws_normalize,
-                    args.ignore_blank_lines,
-                )?
+                let old_driver = attributes::diff_driver_for_path(&old_path);
+                resolve_textconv_command(old_driver.as_deref(), &mut command_cache).await
+            };
+            if old_command.is_some() || new_command.is_some() {
+                path_commands.insert(file.path.clone(), (old_command, new_command));
             }
+        }
+        if path_commands.is_empty() {
+            TextconvOutcome::default()
         } else {
-            std::collections::HashSet::new()
-        };
+            apply_textconv(
+                &mut files,
+                &path_commands,
+                &first_map,
+                &second_map,
+                &ext_worktree_entries,
+                regen_context,
+                ws_normalize,
+                args.ignore_blank_lines,
+                match pickaxe {
+                    Some(DiffPickaxe::StringCount(needle)) => Some(needle.as_slice()),
+                    _ => None,
+                },
+            )?
+        }
+    } else {
+        TextconvOutcome::default()
+    };
+    let textconv_paths = &textconv_outcome.paths;
 
     // Binary detection: a file whose content carries a NUL byte is shown as
     // `Binary files … differ` (or, with `--binary`, a `GIT binary patch`) instead
@@ -1782,7 +1957,7 @@ async fn run_diff(
             &first_map,
             &second_map,
             &ext_worktree_entries,
-            &textconv_paths,
+            textconv_paths,
             args.binary,
         )?;
     } else if args.text && !args.check && external_command.is_none() {
@@ -1939,6 +2114,15 @@ async fn run_diff(
             }
         }
     }
+
+    apply_pickaxe(
+        &mut files,
+        pickaxe,
+        &first_map,
+        &second_map,
+        &ext_worktree_entries,
+        &textconv_outcome.pickaxe_counts,
+    )?;
 
     if let Some(filter) = parse_diff_filter(args.diff_filter.as_deref())? {
         apply_diff_filter(&mut files, &filter);
@@ -3274,9 +3458,17 @@ async fn resolve_textconv_command(
 /// side). A side with no command is diffed raw. A modification whose converted
 /// content is unchanged is dropped (like a whitespace-only change), unless its
 /// mode changed; created/deleted/renamed/mode-changed files keep their header.
-/// Returns the set of textconv'd
-/// paths so the later context/whitespace post-pass skips them. Blob read failures
-/// surface as errors (not empty content).
+/// Returns the set of textconv'd paths so the later context/whitespace post-pass
+/// skips them. When `pickaxe_needle` is present, the old/new occurrence counts
+/// are computed while the converted strings already exist and retained without
+/// keeping either potentially-large string alive or executing a command again.
+/// Blob read failures surface as errors (not empty content).
+#[derive(Default)]
+struct TextconvOutcome {
+    paths: HashSet<String>,
+    pickaxe_counts: HashMap<String, (usize, usize)>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_textconv(
     files: &mut Vec<DiffFileStat>,
@@ -3287,7 +3479,8 @@ fn apply_textconv(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
-) -> Result<std::collections::HashSet<String>, DiffError> {
+    pickaxe_needle: Option<&[u8]>,
+) -> Result<TextconvOutcome, DiffError> {
     // `None` = the side is absent from its map (a created/deleted side) and must
     // stay raw-empty — NOT fed through textconv (a converter that emits text for
     // empty input would fabricate hunks). `Some` = a present blob; a mapped blob
@@ -3359,6 +3552,23 @@ fn apply_textconv(
         };
         converted.insert(file.path.clone(), (old_text, new_text));
     }
+
+    let pickaxe_counts = pickaxe_needle
+        .map(|needle| {
+            converted
+                .iter()
+                .map(|(path, (old, new))| {
+                    (
+                        path.clone(),
+                        (
+                            count_literal_occurrences(old.as_bytes(), needle),
+                            count_literal_occurrences(new.as_bytes(), needle),
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Pass 2: splice the re-diffed body (no fallible work).
     let mut done = std::collections::HashSet::new();
@@ -3436,7 +3646,10 @@ fn apply_textconv(
         file.hunks = parse_diff_hunks(&file.raw_diff);
         true
     });
-    Ok(done)
+    Ok(TextconvOutcome {
+        paths: done,
+        pickaxe_counts,
+    })
 }
 
 /// zlib-deflate `data` (for `--binary` literal chunks). Uses `flate2` at the
@@ -5046,6 +5259,8 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         raw: false,
         compact_summary: false,
         diff_filter: None,
+        pickaxe_string: None,
+        pickaxe_regex: None,
         shortstat: false,
         exit_code: false,
         no_patch: false,
@@ -5072,7 +5287,7 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         ext_diff: false,
     };
     let config = resolve_diff_config(&args).await?;
-    let mut result = run_diff(&args, &OutputConfig::default(), &config).await?;
+    let mut result = run_diff(&args, &OutputConfig::default(), &config, None).await?;
     apply_diff_prefixes(&mut result, &config.prefixes);
     Ok(format_unified_diff(&result))
 }
@@ -5532,6 +5747,49 @@ mod test {
             parse_diff_filter(Some("")),
             Err(DiffError::InvalidDiffFilter(value)) if value.is_empty()
         ));
+    }
+
+    #[test]
+    fn pickaxe_literal_count_is_non_overlapping_and_byte_safe() {
+        assert_eq!(count_literal_occurrences(b"aaaa", b"aa"), 2);
+        assert_eq!(count_literal_occurrences(b"ababa", b"aba"), 1);
+        assert_eq!(
+            count_literal_occurrences(b"a\0needle\xffneedle", b"needle"),
+            2
+        );
+        assert_eq!(count_literal_occurrences(b"anything", b""), 0);
+    }
+
+    #[test]
+    fn pickaxe_regex_matches_only_changed_hunk_content() {
+        let patch = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n context needle\n-old\n+changed needle\n";
+        assert!(changed_diff_line_matches(
+            patch,
+            &regex::Regex::new("changed needle").expect("valid regex")
+        ));
+        assert!(!changed_diff_line_matches(
+            patch,
+            &regex::Regex::new("a/file|context needle").expect("valid regex")
+        ));
+
+        let combined = "diff --cc conflict\n@@@ -1,1 -1,1 +1,1 @@@\n -handler_v7\n++handler_v8\n";
+        assert!(changed_diff_line_matches(
+            combined,
+            &regex::Regex::new("handler_v[0-9]").expect("valid regex")
+        ));
+    }
+
+    #[test]
+    fn pickaxe_arguments_conflict_and_invalid_regex_is_rejected() {
+        let args = DiffArgs::try_parse_from(["diff", "-G", "["]).expect("clap accepts regex");
+        assert!(matches!(
+            parse_diff_pickaxe(&args),
+            Err(DiffError::InvalidPickaxeRegex { pattern, .. }) if pattern == "["
+        ));
+        assert!(
+            DiffArgs::try_parse_from(["diff", "-S", "needle", "-G", "needle"]).is_err(),
+            "-S and -G are mutually exclusive"
+        );
     }
 
     #[test]

@@ -388,11 +388,15 @@ fn diff_arg_safety(args: &[String], idx: usize) -> (ArgSafety, usize) {
         || arg.starts_with("--diff-filter=")
         || arg.starts_with("--submodule=")
         || arg.starts_with("--relative=")
+        || (arg.len() > 2 && (arg.starts_with("-S") || arg.starts_with("-G")))
         || !arg.starts_with('-')
     {
         return (ArgSafety::Allow, idx + 1);
     }
-    if matches!(arg, "--diff-filter" | "--submodule" | "--relative") && args.get(idx + 1).is_some()
+    if matches!(
+        arg,
+        "--diff-filter" | "--submodule" | "--relative" | "-S" | "-G"
+    ) && args.get(idx + 1).is_some()
     {
         return (ArgSafety::Allow, idx + 2);
     }

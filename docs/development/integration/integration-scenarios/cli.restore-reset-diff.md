@@ -26,6 +26,8 @@ libra diff --stat
 libra diff --numstat
 libra diff --raw -z
 libra diff --name-status --diff-filter=M
+libra diff -Smodified --name-only
+libra diff -G'^modified$' --name-status
 libra diff --compact-summary
 libra add tracked.txt
 libra diff --staged
@@ -64,6 +66,7 @@ libra fsck --connectivity-only
 ! libra --json restore --pathspec-from-file=restore-paths.txt
 ! libra --json reset --pathspec-from-file=reset-paths.txt
 ! libra diff --algorithm myers tracked.txt
+! libra diff -G'[' tracked.txt
 ! libra diff --old no-such-revision --new HEAD
 ! libra restore nonexistent.txt
 ! libra restore --source no-such-revision tracked.txt
@@ -72,8 +75,8 @@ libra fsck --connectivity-only
 
 关键断言：
 
-- `diff` 在 unstaged、staged、revision-to-revision、文件输出和 JSON 输出路径中返回可观察差异；`--raw -z` 提供 NUL-safe mode/object/status 记录，`--diff-filter=M` 只保留修改项，`--compact-summary` 进入 stat 表面，`--full-index` 与显式 src/dst 前缀改写 patch header。
+- `diff` 在 unstaged、staged、revision-to-revision、文件输出和 JSON 输出路径中返回可观察差异；`--raw -z` 提供 NUL-safe mode/object/status 记录，`--diff-filter=M` 只保留修改项，`-Smodified` 按 literal 次数变化命中，`-G'^modified$'` 按增删行 regex 命中，`--compact-summary` 进入 stat 表面，`--full-index` 与显式 src/dst 前缀改写 patch header。
 - `restore --staged` 取消暂存，`restore --worktree` 和 `restore --source` 恢复工作区内容。
 - `reset <path>` / `reset HEAD -- <path>` 只取消暂存；revision/path 同名时必须用 `--` 消歧；`--soft`、`--mixed`、`--hard` 覆盖基础 HEAD/index/worktree 行为；`--merge`、`--keep` 的 no-op target 正向入口成功。
-- 缺失 pathspec 文件、无效 diff algorithm 和不存在的 revision/path 必须返回稳定错误，且错误路径不能移动 HEAD 或改写目标文件。
+- 缺失 pathspec 文件、无效 diff algorithm/`-G` regex 和不存在的 revision/path 必须返回稳定错误，且错误路径不能移动 HEAD 或改写目标文件。
 - 场景结束时运行 `fsck --connectivity-only`。
