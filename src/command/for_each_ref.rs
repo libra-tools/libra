@@ -18,7 +18,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
-        util,
+        text, util,
     },
 };
 
@@ -2236,72 +2236,10 @@ fn color_word_code(word: &str, slot: u32) -> CliResult<Option<String>> {
 /// default format (a documented narrowing).
 fn format_for_each_ref_date(ts: i64, modifier: &str) -> String {
     if modifier == "relative" {
-        relative_date(ts)
+        text::relative_date(ts)
     } else {
         format_timestamp_with(ts, modifier)
     }
-}
-
-/// Git-compatible relative date (`%(committerdate:relative)` → "2 days ago"),
-/// mirroring git's `show_date_relative` thresholds and singular/plural wording.
-fn relative_date(ts: i64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(ts);
-    relative_date_at(now, ts)
-}
-
-/// Pure relative-date core (testable with an injected `now`); see [`relative_date`].
-fn relative_date_at(now: i64, ts: i64) -> String {
-    if ts > now {
-        return "in the future".to_string();
-    }
-    let unit = |n: u64, word: &str| {
-        if n == 1 {
-            format!("1 {word} ago")
-        } else {
-            format!("{n} {word}s ago")
-        }
-    };
-
-    let mut diff = (now - ts) as u64; // seconds
-    if diff < 90 {
-        return unit(diff, "second");
-    }
-    diff = (diff + 30) / 60; // minutes
-    if diff < 90 {
-        return unit(diff, "minute");
-    }
-    diff = (diff + 30) / 60; // hours
-    if diff < 36 {
-        return unit(diff, "hour");
-    }
-    let days = (diff + 12) / 24; // diff is hours here
-    if days < 14 {
-        return unit(days, "day");
-    }
-    if days < 70 {
-        return unit((days + 3) / 7, "week");
-    }
-    if days < 365 {
-        return unit((days + 15) / 30, "month");
-    }
-    if days < 365 * 5 {
-        // Give years and months for up to ~5 years, matching git's rounding.
-        let total_months = (days * 12 * 2 + 365) / (365 * 2);
-        let years = total_months / 12;
-        let months = total_months % 12;
-        if months > 0 {
-            let y = if years == 1 { "year" } else { "years" };
-            let m = if months == 1 { "month" } else { "months" };
-            return format!("{years} {y}, {months} {m} ago");
-        }
-        return unit(years, "year");
-    }
-    unit((days + 183) / 365, "year")
 }
 
 /// First non-empty line of a commit/tag message (messages can carry leading
@@ -2393,42 +2331,6 @@ fn symref_atom(token: &str, symref: Option<&str>) -> Option<String> {
         return Some(strip_ref_components(target, false, num.parse().ok()?));
     }
     None
-}
-
-#[cfg(test)]
-mod relative_date_tests {
-    use super::relative_date_at;
-
-    const HOUR: i64 = 3600;
-    const DAY: i64 = 86_400;
-
-    /// Mirrors git's `show_date_relative` thresholds + rounding. Note git's
-    /// `+30`/`+12` rounding offsets mean the minute/hour/day/week/month bands
-    /// effectively start at 2 (e.g. 90s rounds straight to "2 minutes ago"), so
-    /// "1 minute/hour/day ago" never appear — only "1 second ago" and the
-    /// year forms are singular.
-    #[test]
-    fn relative_date_matches_git_thresholds() {
-        let now = 1_000_000_000;
-        let ago = |secs: i64| relative_date_at(now, now - secs);
-
-        assert_eq!(ago(0), "0 seconds ago");
-        assert_eq!(ago(1), "1 second ago"); // singular
-        assert_eq!(ago(89), "89 seconds ago");
-        assert_eq!(ago(90), "2 minutes ago"); // (90+30)/60 = 2
-        assert_eq!(ago(3600), "60 minutes ago"); // 1h is still within the minutes band
-        assert_eq!(ago(2 * HOUR), "2 hours ago"); // 7200s → 120min → 2h
-        assert_eq!(ago(2 * DAY), "2 days ago");
-        assert_eq!(ago(20 * DAY), "3 weeks ago"); // (20+3)/7 = 3
-        assert_eq!(ago(100 * DAY), "3 months ago"); // (100+15)/30 = 3
-        assert_eq!(ago(400 * DAY), "1 year, 1 month ago"); // years+months branch
-        assert_eq!(ago(365 * 6 * DAY), "6 years ago"); // >5y: (days+183)/365
-    }
-
-    #[test]
-    fn relative_date_future_is_guarded() {
-        assert_eq!(relative_date_at(1000, 2000), "in the future");
-    }
 }
 
 #[cfg(test)]

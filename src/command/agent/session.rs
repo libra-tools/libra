@@ -16,6 +16,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult},
         output::{OutputConfig, emit_json_data},
+        text,
     },
 };
 
@@ -640,20 +641,82 @@ fn emit_list(page: &SessionListPage, output: &OutputConfig) -> CliResult<()> {
         println!("(no captured sessions)");
         return Ok(());
     }
-    println!(
-        "{:<37}  {:<14}  {:<10}  {:<20}",
-        "session_id", "agent_kind", "state", "started_at"
-    );
-    for r in &page.sessions {
-        println!(
-            "{:<37}  {:<14}  {:<10}  {:<20}",
-            r.session_id, r.agent_kind, r.state, r.started_at
-        );
-    }
-    if let Some(cursor) = &page.next_cursor {
-        println!("(more rows available — next page: --cursor {cursor})");
+    for line in format_session_list_human(page) {
+        println!("{line}");
     }
     Ok(())
+}
+
+fn format_session_list_human(page: &SessionListPage) -> Vec<String> {
+    format_session_list_human_at(page, chrono::Local::now().timestamp())
+}
+
+fn format_session_list_human_at(page: &SessionListPage, now: i64) -> Vec<String> {
+    let started_at_values: Vec<String> = page
+        .sessions
+        .iter()
+        .map(|row| text::relative_date_at(now, row.started_at))
+        .collect();
+    let (session_id_width, agent_kind_width, state_width, started_at_width) =
+        session_list_column_widths(&page.sessions, &started_at_values);
+    let mut lines =
+        Vec::with_capacity(page.sessions.len() + usize::from(page.next_cursor.is_some()) + 1);
+    lines.push(format!(
+        "{:<session_id_width$}  {:<agent_kind_width$}  {:<state_width$}  {:<started_at_width$}",
+        "session_id", "agent_kind", "state", "started_at"
+    ));
+    for (r, started_at) in page.sessions.iter().zip(started_at_values.iter()) {
+        lines.push(format!(
+            "{:<session_id_width$}  {:<agent_kind_width$}  {:<state_width$}  {:<started_at_width$}",
+            r.session_id, r.agent_kind, r.state, started_at
+        ));
+    }
+    if let Some(cursor) = &page.next_cursor {
+        lines.push(format!(
+            "(more rows available — next page: --cursor {cursor})"
+        ));
+    }
+    lines
+}
+
+fn session_list_column_widths(
+    rows: &[SessionRow],
+    started_at_values: &[String],
+) -> (usize, usize, usize, usize) {
+    let session_id_width = rows
+        .iter()
+        .map(|row| row.session_id.len())
+        .chain(std::iter::once("session_id".len()))
+        .max()
+        .unwrap_or("session_id".len())
+        .max(37);
+    let agent_kind_width = rows
+        .iter()
+        .map(|row| row.agent_kind.len())
+        .chain(std::iter::once("agent_kind".len()))
+        .max()
+        .unwrap_or("agent_kind".len())
+        .max(14);
+    let state_width = rows
+        .iter()
+        .map(|row| row.state.len())
+        .chain(std::iter::once("state".len()))
+        .max()
+        .unwrap_or("state".len())
+        .max(10);
+    let started_at_width = started_at_values
+        .iter()
+        .map(String::len)
+        .chain(std::iter::once("started_at".len()))
+        .max()
+        .unwrap_or("started_at".len())
+        .max(20);
+    (
+        session_id_width,
+        agent_kind_width,
+        state_width,
+        started_at_width,
+    )
 }
 
 fn emit_one(row: &SessionRow, output: &OutputConfig) -> CliResult<()> {
@@ -990,6 +1053,53 @@ mod tests {
         assert!(
             !prompt.contains("/Users/eli/repo"),
             "default prompt must not embed the local working_dir"
+        );
+    }
+
+    #[test]
+    fn session_list_human_output_aligns_after_long_session_id() {
+        let now = 1_700_000_000;
+        let page = SessionListPage {
+            schema_version: PAGE_SCHEMA_VERSION,
+            sessions: vec![
+                SessionRow {
+                    session_id: format!("claude__{}", "x".repeat(80)),
+                    agent_kind: "claude_code".to_string(),
+                    state: "active".to_string(),
+                    working_dir: "/tmp/repo".to_string(),
+                    started_at: now - 2 * 3_600,
+                    last_event_at: 1_700_000_100,
+                },
+                SessionRow {
+                    session_id: "short-session".to_string(),
+                    agent_kind: "codex".to_string(),
+                    state: "stopped".to_string(),
+                    working_dir: "/tmp/repo".to_string(),
+                    started_at: now - 20 * 86_400,
+                    last_event_at: 1_700_000_110,
+                },
+            ],
+            next_cursor: Some("v1:1700000010:short-session".to_string()),
+        };
+
+        let lines = format_session_list_human_at(&page, now);
+        let header = &lines[0];
+        let first_row = &lines[1];
+        let second_row = &lines[2];
+
+        let agent_col = header.find("agent_kind").unwrap();
+        let state_col = header.find("state").unwrap();
+        let started_col = header.find("started_at").unwrap();
+
+        assert_eq!(first_row.find("claude_code").unwrap(), agent_col);
+        assert_eq!(second_row.find("codex").unwrap(), agent_col);
+        assert_eq!(first_row.find("active").unwrap(), state_col);
+        assert_eq!(second_row.find("stopped").unwrap(), state_col);
+        assert_eq!(first_row.find("2 hours ago").unwrap(), started_col);
+        assert_eq!(second_row.find("3 weeks ago").unwrap(), started_col);
+        assert_eq!(
+            lines.last().unwrap(),
+            "(more rows available — next page: --cursor v1:1700000010:short-session)"
         );
     }
 

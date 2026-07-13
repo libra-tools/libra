@@ -117,6 +117,10 @@ token to pass back via `--cursor`, `null` once the listing is exhausted.
 Pages are ordered newest-first (`started_at` / `created_at` descending,
 with the row id as tiebreaker).
 
+The human `agent session list` table renders `started_at` as a relative age
+against the current machine clock (for example, `2 hours ago`). JSON output
+keeps the raw Unix timestamp for automation.
+
 Each checkpoint row carries a `scope`. `committed` checkpoints are written at
 turn/session boundaries (`Stop` / `SessionEnd`) and carry the redacted
 transcript snapshot. `subagent` checkpoints are materialized at an observed
