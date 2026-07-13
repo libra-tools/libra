@@ -7,7 +7,8 @@
 ## 概要
 
 ```
-libra rebase [--autosquash] [--reapply-cherry-picks] [--no-autostash] [--no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
+libra rebase [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
+libra rebase --onto <newbase> <upstream> [<branch>]
 libra rebase --continue
 libra rebase --abort
 libra rebase --skip
@@ -19,16 +20,26 @@ libra rebase --skip
 
 如果重放期间发生冲突，rebase 会停止并报告冲突文件。用户手动解决冲突、暂存已解决文件，然后运行 `libra rebase --continue` 继续。或者，`--abort` 会恢复原始分支状态，`--skip` 会丢弃当前提交并继续下一个。
 
-Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）持久化在 SQLite 数据库中。这让 rebase 状态能跨进程重启存活，并避免 Git 使用的脆弱文件式状态。旧 Libra 版本的 legacy file-based 状态会在首次访问时自动迁移到数据库。
+`--autostash` 会在重放前把 tracked index/worktree 变更保存为 held stash，并在成功或中止后分别恢复 staged index 层与 unstaged worktree 层。可重复的 `--exec <cmd>` 会在每个重放提交后通过 Libra 强制 workspace-write、禁网 sandbox 依次执行；失败会停止序列，`--continue` 重试失败命令。exec 失败后的 `--skip` 保留已重放提交并跳过该提交剩余命令。`--update-refs` 原子重定向重写区间中的其他本地分支，但排除任何 worktree 已检出的分支。`--fork-point` 从 upstream reflog 选择仍是 `HEAD` 祖先的最具体旧 tip，找不到时回退普通 merge base。
+
+Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）持久化在 SQLite 数据库中。恢复关键的 autostash、exec 与 update-refs 元数据会原子且强制 fsync 到 `.libra/rebase-aux.json`，直到序列进入终态。旧 Libra 版本的 legacy file-based 状态会在首次访问时自动迁移到数据库。
 
 ## 选项
 
 | 选项 | 长选项 | 说明 |
 |--------|------|-------------|
 | `<upstream>` | | 要 rebase 到的 upstream 分支或提交。除非指定 `--continue`、`--abort` 或 `--skip`，否则必需。可以是分支名、提交哈希或任何 Git 引用。 |
+| | `--onto <newbase>` | 把 `<upstream>..HEAD` 区间重放到 `<newbase>`，而不是 `<upstream>`。 |
 | | `--continue` | 在解决冲突后继续 rebase。与 `--abort`、`--skip` 和 `<upstream>` 互斥。 |
 | | `--abort` | 中止当前 rebase，并将原始分支恢复到 rebase 前状态。与 `--continue`、`--skip` 和 `<upstream>` 互斥。 |
-| | `--skip` | 跳过当前提交，并继续 rebase 序列中的下一个提交。与 `--continue`、`--abort` 和 `<upstream>` 互斥。 |
+| | `--skip` | 跳过当前冲突提交；exec 失败时则保留已重放提交并跳过剩余命令。与 `--continue`、`--abort` 和 `<upstream>` 互斥。 |
+| | `--autosquash` | 在重放时把 `fixup!`、`squash!`、`amend!` 提交移动并折叠到目标提交。 |
+| | `--reapply-cherry-picks` | 显式重放 clean cherry-pick；这与 Libra 默认线性重放行为一致。 |
+| | `--autostash` / `--no-autostash` | 重放前保存 tracked index/worktree 变更，分别保持 staged 与 unstaged 层，并在成功或中止后恢复。恢复冲突时先保存为 `stash@{0}` 并警告。最后一个 toggle 生效。 |
+| | `--exec <cmd>` | 在每个重放提交后，通过强制 workspace-write、禁网 sandbox 执行可重复 shell 命令。非零退出或超时停止 rebase，`--continue` 重试。 |
+| | `--update-refs` / `--no-update-refs` | 原子移动指向重写区间的其他本地分支；排除任何 worktree 已检出的分支。最后一个 toggle 生效。 |
+| | `--fork-point` / `--no-fork-point` | 尽可能从 upstream reflog 选重放边界，否则使用普通 merge base。最后一个 toggle 生效。 |
+| | `--no-rerere-autoupdate` | Git 兼容的接受式 no-op：启用时 rerere 记录已集成，但 rebase 不公开正向 `--rerere-autoupdate`；暂存行为遵循 `rerere.autoUpdate`。 |
 | | `--keep-empty` | 保留 start-empty（重放前就为空）的提交而非丢弃。为 Git 兼容性接受的 no-op：Libra 的 rebase 默认就保留空提交。与 `--no-keep-empty` 组成 toggle，last-wins。 |
 | | `--no-keep-empty` | 丢弃 start-empty 提交（其 tree 等于父 tree，未引入变更）而非重放。与 `--keep-empty` 组成 toggle。（此项控制*开始*就为空的提交；`--empty=<mode>` 控制 replay 后*变空*的提交。） |
 | | `--empty=<mode>` | 如何处理 replay 后*变空*的提交（其变更已在新 base 上）：`drop` 跳过它（HEAD 不前进，并打印 `dropping <sha> <subject> -- patch contents already upstream`），`keep` 保留这个空提交。省略时 Libra **保留**——有意与 Git 不同（Git 默认 drop）；需要 Git 行为请用 `--empty=drop`。该模式会跨冲突 round-trip 到 `--continue`/`--skip`。Git 的 `stop`/`ask`（停下交由你决定）不支持（Libra 非交互 rebase 无 halt-on-empty 续作流）；它们与任何未知值均为用法错误（`LBR-CLI-002`，退出 129）。 |
@@ -82,6 +93,24 @@ Applied: 13579bd test: add parser tests
 Successfully rebased branch 'feature' onto '1234567'.
 ```
 
+**`--autostash`、`--exec`、`--update-refs` 与 `--fork-point`**
+
+```bash
+# 在历史重写前后保存并恢复 tracked 本地变更
+libra rebase --autostash main
+
+# 每个重放提交后按顺序运行两个 sandbox 命令
+libra rebase --exec 'cargo test' --exec 'cargo clippy' main
+
+# 重定向重写区间内未检出的其他本地分支
+libra rebase --update-refs main
+
+# upstream force-move 后通过 reflog 恢复 fork point
+libra rebase --fork-point origin/main
+```
+
+Exec 命令是用户可控 shell 输入。只有内部 sandbox 能强制 workspace-only 写入且禁止网络时 Libra 才会执行；若所需 backend 不可用，则以 `LBR-CONFLICT-002` fail-closed，并保留可续作的 rebase 状态。
+
 ## 常用命令
 
 ```bash
@@ -90,6 +119,18 @@ libra rebase main
 
 # Rebase 到特定提交
 libra rebase abc1234
+
+# 保存 tracked 本地变更后 rebase
+libra rebase --autostash main
+
+# 每个重放提交后运行 sandbox 检查
+libra rebase --exec 'cargo test' main
+
+# 重定向重写区间内其他本地分支
+libra rebase --update-refs main
+
+# upstream force-move 后恢复 fork point
+libra rebase --fork-point origin/main
 
 # 解决冲突后继续
 libra rebase --continue
@@ -220,7 +261,7 @@ Fast-forward start 结果使用相同信封，`status: "fast-forwarded"`，`comm
 }
 ```
 
-跳过已停止提交：
+跳过已停止提交（exec 失败后 `skipped_commit` 缺失，因为已重放提交会保留）：
 
 ```json
 {
@@ -251,8 +292,12 @@ Rebase 状态存储在 `rebase_state` SQLite 表中，包含以下字段：
 | `orig_head` | TEXT | Rebase 开始前的原始 HEAD 提交 |
 | `current_head` | TEXT | 当前新 base（目前已 rebased 提交的 HEAD） |
 | `todo` | TEXT | 剩余待重放提交（换行分隔哈希） |
+| `todo_actions` | TEXT | 剩余重放动作（换行分隔的 `pick` / `fixup` / `squash` / `amend`） |
 | `done` | TEXT | 已重放提交（换行分隔哈希） |
 | `stopped_sha` | TEXT（nullable） | 导致冲突的当前提交 |
+| `autosquash` | INTEGER | 当前 rebase 是否折叠 autosquash 提交（`0` 或 `1`） |
+
+`.libra/rebase-aux.json` 是原子且总是 fsync 的恢复 sidecar，保存可重复 exec 命令与 pending 索引、捕获的 update-refs 分支与 rewrite 映射，以及 held autostash 对象 ID。它会跨冲突、exec 失败、进程重启和 `maintenance gc` 存活（GC 把 held OID 当作 fail-closed reachability root）。最终分支移动在单一 SQLite 事务中完成，并在移动前比较捕获的旧 tip；并发分支移动会 fail-closed。任何 worktree 已检出的分支都不会被捕获。只有 refs、worktree/index、sequencer 状态与 autostash 恢复全部进入终态后才删除 sidecar。若 autostash 重放冲突，会先把对象提升到普通 stash 列表，保证本地变更可恢复。
 
 ## 设计理由
 
@@ -294,10 +339,12 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 | Skip | `--skip` | `--skip` | N/A |
 | Interactive | 不支持 | `-i` / `--interactive` | N/A |
 | Onto | `--onto <newbase>` | `--onto <newbase>` | 带 `-s` / `--source` 的 `-d` |
-| Exec | 不支持 | `--exec <cmd>` | N/A |
+| Exec | 支持；可重复、强制 workspace-write/禁网 sandbox、失败可续作 | `--exec <cmd>` | N/A |
 | Autosquash | 支持（`--autosquash`） | `--autosquash` | N/A |
-| Autostash | `--no-autostash`（no-op；从不 autostash）；`--autostash` 不支持 | `--autostash` / `--no-autostash` | N/A |
-| Rerere autoupdate | `--no-rerere-autoupdate`（no-op；无 rerere）；`--rerere-autoupdate` 不支持 | `--rerere-autoupdate` / `--no-rerere-autoupdate` | N/A |
+| Autostash | 支持 `--autostash` / `--no-autostash`；tracked 变更跨 sequencer 停止保持 held | `--autostash` / `--no-autostash` | N/A |
+| Update refs | 支持；排除已检出分支，并原子比较捕获 tip 后移动 | `--update-refs` / `--no-update-refs` | N/A |
+| Fork point | 支持 upstream reflog 选点与 merge-base 回退 | `--fork-point` / `--no-fork-point` | N/A |
+| Rerere autoupdate | `--no-rerere-autoupdate` 为接受式 no-op；不公开正向 flag，暂存遵循 `rerere.autoUpdate` | `--rerere-autoupdate` / `--no-rerere-autoupdate` | N/A |
 | Rebase merges | 不支持 | `--rebase-merges` | 默认行为 |
 | Keep empty | `--keep-empty`（no-op；默认已保留）/ `--no-keep-empty`（丢弃 start-empty 提交） | `--keep-empty` / `--no-keep-empty` | 默认保留空提交 |
 | Empty mode | `--empty=<drop\|keep>`（become-empty；默认 **keep**） | `--empty=<drop\|keep\|stop>`（默认 drop） | N/A |
@@ -310,7 +357,7 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 
 ## 错误处理
 
-`execute_safe` 当前对 CLI/preflight 失败返回标准结构化 `CliError` 信封。更深层 replay 引擎仍是 legacy text 路径，并作为待完成结构化输出工作跟踪。
+`execute_safe` 与 replay 控制对 CLI、状态、冲突、sandbox 和 durable-sidecar 失败返回标准结构化 `CliError` 信封。
 
 | 场景 | StableErrorCode | 退出码 | 行为 |
 |----------|-----------------|------|----------|
@@ -322,6 +369,10 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 | 没有进行中 rebase 却 `--abort` | `LBR-REPO-003`（RepoStateInvalid） | 128 | 报告没有进行中 rebase |
 | 没有进行中 rebase 却 `--skip` | `LBR-REPO-003`（RepoStateInvalid） | 128 | 报告没有进行中 rebase |
 | `--skip` 但没有已停止或待处理提交 | `LBR-REPO-003`（RepoStateInvalid） | 128 | 报告没有可跳过提交 |
+| 空或包含 NUL 的 `--exec` 命令 | `LBR-CLI-002`（CliInvalidArguments） | 129 | 在创建 rebase 状态或修改 worktree 前拒绝 |
+| Exec 失败、超时或强制 sandbox 不可用 | `LBR-CONFLICT-002`（ConflictOperationBlocked） | 128 | Rebase 保持可续作；修复后 `--continue`，或 `--skip` 剩余 exec 命令 |
+| Autostash 重放冲突 | warning；held 对象提升为 `stash@{0}` | 0 | Rebase 完成且本地变更不丢失；检查 stash |
+| Update-refs 分支被并发移动 | `LBR-IO-002`（IoWriteFailed） | 128 | Ref 事务回滚，rebase 保持可续作 |
 | 找不到共同祖先 | 待定类型映射 | 128 | Legacy text 错误，拒绝 rebase 无关历史 |
 | 提交重放期间冲突 | 待定类型映射 | 128 | Rebase 停止，状态已保存，提示用户解决 |
 | 无法创建 rebased 提交 | 待定类型映射 | 128 | 带提交详情的 legacy text 错误 |

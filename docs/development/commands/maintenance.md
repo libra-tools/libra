@@ -15,7 +15,7 @@
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/maintenance.rs`。参数/子命令类型包括：`MaintenanceSubcommand`、`MaintenanceArgs`；输出、错误或状态类型包括：`TaskResult`、`MaintenanceRunOutput`、`MaintenanceStatusOutput`；主要执行函数包括：`execute_safe`。
-- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；索引路径会加载、比较、刷新或保存 `.libra/index`；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；网络路径会解析 remote 配置、协商协议并处理 pack/idx 数据；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据。
+- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；GC 的 `collect_reachable_objects` 在任何删除前追踪 SQLite refs/reflogs、index stage 0..3、文件型 `refs/stash` tip + `logs/refs/stash` 全部历史条目、`merge-autostash.json` 与 `rebase-aux.json` held OID，任一 root 不可读、OID 非法或对象缺失均 fail-closed；索引路径会加载、比较、刷新或保存 `.libra/index`；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；网络路径会解析 remote 配置、协商协议并处理 pack/idx 数据；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
@@ -37,6 +37,7 @@ flowchart TD
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-06-10 `a4bbe28b`（`feat(gc): add safe repository maintenance command (#386)`）：基础实现节点：add safe repository maintenance command (#386)；当前实现的主要轮廓可追溯到该提交。
+- 2026-07-13（P1-07a autostash review）：GC reachability 增加文件型 stash tip + reflog 全历史、merge held sidecar、rebase held sidecar、reflog old/new 两端与 annotated-tag target；unreadable index、非法 ref/reflog OID 及缺失/损坏可达对象不再静默跳过，统一在删除前 fail-closed。回归覆盖 `stash@{1}` 经 GC 后仍可 pop、annotated-tag-only commit 保留、损坏 index 不删 staged-only blob，以及 merge/rebase conflict-held autostash 经 GC 后仍可 abort 恢复。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态

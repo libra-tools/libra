@@ -483,6 +483,121 @@ fn test_maintenance_run_gc_removes_dangling() {
 }
 
 #[test]
+fn test_maintenance_gc_preserves_file_backed_stash_root() {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("tracked.txt"), "older stashed change\n").unwrap();
+    let older = run_libra_command(&["stash", "push", "-m", "older-gc-root"], repo.path());
+    assert_cli_success(&older, "create older stash before gc");
+    fs::write(repo.path().join("tracked.txt"), "newer stashed change\n").unwrap();
+    let newer = run_libra_command(&["stash", "push", "-m", "newer-gc-root"], repo.path());
+    assert_cli_success(&newer, "create newer stash before gc");
+
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    assert_cli_success(&gc, "gc with stash root");
+
+    let pop_newer = run_libra_command(&["stash", "pop"], repo.path());
+    assert_cli_success(&pop_newer, "restore newest stash after gc");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "newer stashed change\n"
+    );
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", "HEAD"], repo.path()),
+        "clear newest restored change",
+    );
+    let pop_older = run_libra_command(&["stash", "pop"], repo.path());
+    assert_cli_success(&pop_older, "restore older reflog-only stash after gc");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "older stashed change\n"
+    );
+}
+
+#[test]
+fn test_maintenance_gc_traces_annotated_tag_targets() {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("tracked.txt"), "tag-only commit\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "stage tag-only commit",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "tag-only commit", "--no-verify"],
+            repo.path(),
+        ),
+        "create tag-only commit",
+    );
+    let target = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_cli_success(&target, "resolve annotated tag target");
+    let target = String::from_utf8(target.stdout).unwrap().trim().to_string();
+    assert_cli_success(
+        &run_libra_command(
+            &["tag", "-m", "GC traversal", "tagged-gc-root"],
+            repo.path(),
+        ),
+        "create annotated tag",
+    );
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", "HEAD~1"], repo.path()),
+        "move the branch away from the tagged commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["reflog", "expire", "--expire=now", "--all"], repo.path()),
+        "remove reflog roots for the tagged commit",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path()),
+        "run gc with an annotated-tag-only target",
+    );
+    assert_cli_success(
+        &run_libra_command(&["cat-file", "-e", &target], repo.path()),
+        "annotated tag target should survive gc",
+    );
+}
+
+#[test]
+fn test_maintenance_gc_fails_closed_when_index_root_is_corrupt() {
+    let repo = create_committed_repo_via_cli();
+    fs::write(
+        repo.path().join("tracked.txt"),
+        "staged and otherwise unreachable\n",
+    )
+    .unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "stage unique blob",
+    );
+    let staged = run_libra_command(&["ls-files", "--stage", "tracked.txt"], repo.path());
+    assert_cli_success(&staged, "read staged object id");
+    let staged = String::from_utf8(staged.stdout).unwrap();
+    let oid = staged
+        .split_whitespace()
+        .nth(1)
+        .expect("stage row has object id");
+    let object_path = repo
+        .path()
+        .join(".libra/objects")
+        .join(&oid[..2])
+        .join(&oid[2..]);
+    assert!(object_path.exists(), "staged blob starts as a loose object");
+
+    fs::write(repo.path().join(".libra/index"), b"corrupt index").unwrap();
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    assert!(!gc.status.success(), "gc must reject an unreadable root");
+    assert!(
+        String::from_utf8_lossy(&gc.stderr).contains("LBR-IO-001"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    assert!(
+        object_path.exists(),
+        "gc must not delete staged data after silently ignoring a corrupt index"
+    );
+}
+
+#[test]
 
 /// Tests `maintenance run --json` returns structured output envelope.
 /// Verifies JSON output format for the run subcommand.

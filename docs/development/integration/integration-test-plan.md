@@ -93,7 +93,7 @@ cargo test --test ai_agent_test -- --test-threads=1
 | 工作区恢复与差异 | `diff`、`restore`（含真实 `--overlay`/`--no-overlay` 切换）、`reset` 的当前参数面，以及 reset --keep/--merge、restore --pathspec-from-file（缺失文件）的负向路径 | 1 | 已实现 | `cli.restore-reset-diff` |
 | 工作流命令 | `stash`、`bisect`、`worktree` 当前参数面及未支持 Git 参数的负向路径 | 1 | 已实现 | `cli.stash-bisect-worktree` |
 | 历史与引用检查 | `tag`、`notes`、`reflog`、`symbolic-ref`、`grep`、`blame`、`describe`、`shortlog` | 1 | 已实现 | `cli.tag-basic`, `cli.notes-smoke`, `cli.reflog-symbolic-ref`, `cli.grep-blame-describe-shortlog` |
-| 历史编辑 | `merge`、`rebase`、`cherry-pick` / `cherry-pick -x`、`revert`、conflict/continue/abort 状态 | 1 | 已实现 | `cli.merge-rebase-cherry-revert-smoke`, `cli.merge-conflict-continue`, `cli.rebase-conflict-continue` |
+| 历史编辑 | `merge`、`rebase`（含 P1-07a autostash/exec/update-refs/fork-point）、`cherry-pick` / `cherry-pick -x`、`revert`、conflict/continue/abort 状态 | 1 | 已实现 | Runner: `cli.merge-rebase-cherry-revert-smoke`, `cli.merge-conflict-continue`, `cli.rebase-conflict-continue`; Cargo compat: `compat_noninteractive_history_controls` |
 | 文件级命令与 LFS 本地能力 | `clean`、`rm`、`mv`、`lfs track/untrack/ls-files`、本地 lock 负向路径 | 1 | 已实现 | `cli.clean-rm-mv-lfs-basic` |
 | 其他 CLI 外壳能力 | `open`、root `--json/-J`、`--machine`、`--quiet`、颜色/progress/exit-code-on-warning | 1 | 已实现 | `cli.open-smoke`, `cli.cross-cutting-flags` |
 | Schema 与本地协议 | schema 建链自动升级、local clone/remote/ls-remote/fetch/pull（含 refspec 精确映射、remotes.default、rename namespace、symref）、shallow fetch、拒绝 file remote push | 2 | 已实现 | `cli.schema-upgrade-observable`, `cli.clone-fetch-pull-local`, `cli.fetch-depth-local`, `cli.push-local-file-remote-rejected` |

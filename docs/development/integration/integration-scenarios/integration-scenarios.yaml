@@ -266,7 +266,7 @@ scenarios:
   - id: cli.rebase-conflict-continue
     wave: 1
     group: history_edit
-    purpose: "Rebase conflict + resolve + add + rebase --continue; equivalent negative cases."
+    purpose: "Rebase conflict + resolve + add + rebase --continue; equivalent negative cases. P1-07a autostash/exec/update-refs/fork-point history matrices are intentionally kept in the registered offline Cargo target compat_noninteractive_history_controls rather than duplicated in this shell runner."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, conflict_markers, negative_exit]

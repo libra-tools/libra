@@ -11,8 +11,10 @@ libra gc [--dry-run] [--prune=<date> | --no-prune] [--aggressive] [--auto] [--fo
 ## 说明
 
 `libra gc` 会先使用默认的 `gc.reflogExpire` 与
-`gc.reflogExpireUnreachable` 策略过期 reflog，然后从仓库引用、剩余
-reflog、索引、进行中的操作状态以及本地 AI catalog 出发追踪可达对象，并按照
+`gc.reflogExpireUnreachable` 策略过期 reflog，然后从仓库引用、剩余 reflog 的
+old/new 两端、annotated-tag target、全部 index stage、文件型 stash reflog 的每个条目、
+merge/rebase held-autostash sidecar、进行中的操作状态以及本地 AI catalog 出发追踪可达对象；
+root 读取/解析失败或可达对象缺失/损坏会在删除前中止。随后按照
 prune 截止时间删除不可达的 loose object。配置了云备份时，尚未同步的
 `object_index` 行会把对应 loose object 作为待备份数据保留；这些对象会报告为
 retained unreachable object，不会混入 reachable graph roots。它还会检查

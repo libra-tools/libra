@@ -125,6 +125,10 @@
 | `merge --continue` / `--abort` | `cli.merge-rebase-cherry-revert-smoke` | 无会话时明确失败；冲突续跑场景另行补充 |
 | `rebase <upstream>` | `cli.merge-rebase-cherry-revert-smoke` | topic 提交重放到新 base |
 | `rebase --continue` | `cli.merge-rebase-cherry-revert-smoke` | 无会话时明确失败；冲突续跑场景另行补充 |
+| `rebase --autostash` / `--no-autostash` | `compat_noninteractive_history_controls` | tracked dirty state 在成功和 conflict→abort 后精确恢复，sidecar 终态清理 |
+| repeatable `rebase --exec <cmd>` | `compat_noninteractive_history_controls` | 每提交执行、required sandbox 越界写 fail-closed、失败→continue 重试、exec-created commit 不丢失 |
+| `rebase --update-refs` / `--no-update-refs` | `compat_noninteractive_history_controls` | captured-tip 原子移动、linked-worktree checkout 排除、skip/start-empty rewrite 映射 |
+| `rebase --fork-point` / `--no-fork-point` | `compat_noninteractive_history_controls` | force-moved upstream reflog 只 replay topic commit，parent 链落到新 upstream |
 | `cherry-pick <commit>` / `cherry-pick -x <commit>` | `cli.merge-rebase-cherry-revert-smoke` | 指定提交修改被重放到当前分支；默认消息不追加来源行，`-x` 追加来源提交行 |
 | `revert <commit>` / `A..B`, `revert --continue` / `--abort` | `cli.merge-rebase-cherry-revert-smoke` | 单提交反向提交覆盖；范围回滚和空会话控制为负向断言 |
 | `grep` / `grep -F/-i/-n/-c/-l/-L/-e/-f/--tree/--cached` | `cli.grep-blame-describe-shortlog` | 工作区、index、pathspec、pattern file 和历史 tree 搜索可观察 |

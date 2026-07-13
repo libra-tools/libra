@@ -30,7 +30,7 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use git_internal::{
     hash::{HashKind, ObjectHash, get_hash_kind},
-    internal::object::{commit::Commit, tree::Tree, types::ObjectType},
+    internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
 };
 use sea_orm::EntityTrait;
 use serde::Serialize;
@@ -50,7 +50,7 @@ use crate::{
     },
     utils::{
         client_storage::ClientStorage,
-        error::{CliError, CliResult},
+        error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         path,
         util::try_get_storage_path,
@@ -226,6 +226,7 @@ async fn run_tasks(
 
     let mut results = Vec::with_capacity(selected.len());
     let mut overall_success = true;
+    let mut first_task_error = None;
 
     for task in selected {
         if !quiet {
@@ -255,6 +256,9 @@ async fn run_tasks(
             }
             Err(e) => {
                 overall_success = false;
+                if first_task_error.is_none() {
+                    first_task_error = Some(e.clone());
+                }
                 results.push(TaskResult {
                     task: task.to_string(),
                     success: false,
@@ -297,6 +301,9 @@ async fn run_tasks(
     }
 
     if !overall_success {
+        if let Some(error) = first_task_error {
+            return Err(error);
+        }
         return Err(CliError::failure("one or more maintenance tasks failed").with_exit_code(1));
     }
     Ok(())
@@ -1411,9 +1418,15 @@ pub(crate) async fn collect_reachable_objects(
         .map_err(|e| CliError::fatal(format!("failed to load refs: {e}")))?;
 
     for ref_entry in refs {
-        if let Some(commit_hash_str) = &ref_entry.commit
-            && let Some(hash) = parse_object_hash(commit_hash_str)
-        {
+        if let Some(commit_hash_str) = &ref_entry.commit {
+            let hash = parse_object_hash(commit_hash_str).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "reference '{}' contains invalid object id '{}'",
+                    ref_entry.name.as_deref().unwrap_or("<unnamed>"),
+                    commit_hash_str
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
             // Do NOT pre-insert `hash`: `walk_reachable` returns early when the
             // hash is already in the set, so pre-inserting would stop it from
             // descending into the commit's tree — leaving reachable trees/blobs
@@ -1430,21 +1443,77 @@ pub(crate) async fn collect_reachable_objects(
 
     let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
     for entry in reflogs {
-        if !is_null_oid(&entry.new_oid)
-            && let Some(hash) = parse_object_hash(&entry.new_oid)
-        {
+        for (field, oid) in [("old", &entry.old_oid), ("new", &entry.new_oid)] {
+            if is_null_oid(oid) {
+                continue;
+            }
+            let hash = parse_object_hash(oid).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "reflog entry {} contains invalid {field} object id '{}'",
+                    entry.id, oid
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
             // As above: let `walk_reachable` perform the insert so it descends
-            // into the commit's tree instead of returning early.
+            // into the commit's tree instead of returning early. Both sides of
+            // every reflog entry are roots: the oldest retained `old_oid` need
+            // not occur as another row's `new_oid`.
             walk_reachable(&hash, storage, &mut reachable)?;
         }
+    }
+
+    // Held autostashes deliberately do not enter refs/stash while a merge or
+    // rebase is in progress. Their fsynced sidecars are therefore first-class
+    // GC roots; omitting them can irreversibly delete the user's dirty state.
+    let merge_autostash = crate::command::merge::MergeAutostash::load_optional_sync()
+        .map_err(|error| {
+            CliError::fatal(format!("failed to load merge autostash GC root: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+        .map(|held| {
+            parse_object_hash(&held.stash_commit).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "merge-autostash.json contains invalid object id '{}'",
+                    held.stash_commit
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })
+        })
+        .transpose()?;
+    let rebase_autostash = crate::command::rebase::held_autostash_oid()?;
+    for held in [merge_autostash, rebase_autostash].into_iter().flatten() {
+        walk_reachable(&held, storage, &mut reachable)?;
+    }
+
+    // Ordinary stashes are file-backed rather than SQLite reference rows, and
+    // older entries live only in logs/refs/stash. Trace the full reflog, not
+    // just refs/stash, so stash@{1} and later remain recoverable.
+    let stash_roots = crate::command::stash::gc_roots().map_err(|error| {
+        CliError::fatal(format!("failed to load stash GC roots: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    for oid in stash_roots {
+        walk_reachable(&oid, storage, &mut reachable)?;
     }
 
     // Collect from index — every stage, not just stage 0, so a blob referenced
     // only by an unmerged conflict stage (1/2/3) is not treated as garbage.
     let index_path = path::index();
-    if index_path.exists()
-        && let Ok(index) = git_internal::internal::index::Index::load(&index_path)
-    {
+    let index_exists = index_path.try_exists().map_err(|error| {
+        CliError::fatal(format!(
+            "failed to inspect index GC root '{}': {error}",
+            index_path.display()
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    if index_exists {
+        let index = git_internal::internal::index::Index::load(&index_path).map_err(|error| {
+            CliError::fatal(format!(
+                "failed to read index GC root '{}': {error}",
+                index_path.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
         for stage in 0..=3 {
             for entry in index.tracked_entries(stage) {
                 reachable.insert(entry.hash);
@@ -1465,27 +1534,53 @@ fn walk_reachable(
         return Ok(()); // Already visited
     }
 
-    let Ok(obj_type) = storage.get_object_type(hash) else {
-        return Ok(());
-    };
+    let obj_type = storage.get_object_type(hash).map_err(|error| {
+        CliError::fatal(format!(
+            "reachable object {hash} cannot be read while computing GC roots: {error}"
+        ))
+        .with_stable_code(StableErrorCode::RepoCorrupt)
+    })?;
 
     match obj_type {
         ObjectType::Commit => {
-            if let Ok(commit) = load_object::<Commit>(hash) {
-                walk_reachable(&commit.tree_id, storage, reachable)?;
-                for parent in &commit.parent_commit_ids {
-                    walk_reachable(parent, storage, reachable)?;
-                }
+            let commit = load_object::<Commit>(hash).map_err(|error| {
+                CliError::fatal(format!(
+                    "reachable commit {hash} is corrupt while computing GC roots: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            walk_reachable(&commit.tree_id, storage, reachable)?;
+            for parent in &commit.parent_commit_ids {
+                walk_reachable(parent, storage, reachable)?;
             }
         }
         ObjectType::Tree => {
-            if let Ok(tree) = load_object::<Tree>(hash) {
-                for item in &tree.tree_items {
-                    walk_reachable(&item.id, storage, reachable)?;
-                }
+            let tree = load_object::<Tree>(hash).map_err(|error| {
+                CliError::fatal(format!(
+                    "reachable tree {hash} is corrupt while computing GC roots: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            for item in &tree.tree_items {
+                walk_reachable(&item.id, storage, reachable)?;
             }
         }
-        _ => {}
+        ObjectType::Tag => {
+            let tag = load_object::<GitTag>(hash).map_err(|error| {
+                CliError::fatal(format!(
+                    "reachable tag {hash} is corrupt while computing GC roots: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            walk_reachable(&tag.object_hash, storage, reachable)?;
+        }
+        ObjectType::Blob => {}
+        other => {
+            return Err(CliError::fatal(format!(
+                "reachable object {hash} has unsupported stored type {other:?}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt));
+        }
     }
 
     Ok(())

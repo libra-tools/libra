@@ -336,8 +336,8 @@ impl MergeState {
 /// autostash, its stash COMMIT OID lives in this sidecar (atomic + fsynced,
 /// like MergeState) and deliberately NOT in refs/stash — `stash list` stays
 /// clean until the merge concludes. The held commit is reachable only from
-/// this file: any future GC/prune must treat it as a root (recorded in the
-/// dev doc). OID stored as a string (sha1/sha256 both fit; never assume 40).
+/// this file, so repository maintenance treats it as a fail-closed GC root.
+/// OID stored as a string (sha1/sha256 both fit; never assume 40).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MergeAutostash {
     pub stash_commit: String,
@@ -837,7 +837,7 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             return None;
         }
     };
-    match crate::command::stash::apply_stash_commit(&oid).await {
+    match crate::command::stash::apply_held_stash_commit(&oid).await {
         Ok(()) => {
             MergeAutostash::cleanup();
             if !output.quiet {

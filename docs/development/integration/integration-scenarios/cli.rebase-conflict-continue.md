@@ -2,6 +2,8 @@
 
 目的：覆盖 `rebase` 产生冲突后的 `--continue` / `--abort` / `--skip` 成功路径。
 
+范围说明：P1-07a 的 `--autostash`、可重复 `--exec`、`--update-refs`、`--fork-point` 需要多组独立 history/worktree/sandbox fixture，由离线 Cargo target `compat_noninteractive_history_controls` 负责，不在本 shell scenario 重复构造；本场景继续守住通用 conflict marker 与 continue 状态机。
+
 最小步骤：
 
 ```bash
@@ -60,4 +62,3 @@ cd "$RUN_DIR/rebase-conflict-repo"
 - `rebase --continue` 成功后 `libra --json status` 显示 `data.is_clean == true`，且 `data.merge_state` 缺失或 `conflicted_paths` 为空。
 - `libra fsck` 在 rebase --continue/--abort 后通过。
 - 负向 rebase --continue 无会话错误必须可识别（stderr 捕获验证 "rebase" 或 LBR-）。
-

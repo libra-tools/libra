@@ -1969,6 +1969,34 @@ fn test_merge_autostash_clean_merge_reapplies() {
 
 #[test]
 #[serial]
+fn test_merge_autostash_restores_staged_and_worktree_layers() {
+    let temp_repo = create_diverged_repo_clean();
+    let p = temp_repo.path();
+    std::fs::write(p.join("base.txt"), "staged only\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "base.txt"], p), "stage edit");
+    std::fs::write(p.join("base.txt"), "base\n").unwrap();
+
+    let out = run_libra_command(&["merge", "feature", "--autostash"], p);
+    assert_cli_success(&out, "layered autostash merge");
+    assert_eq!(
+        std::fs::read_to_string(p.join("base.txt")).unwrap(),
+        "base\n"
+    );
+
+    let staged = run_libra_command(&["ls-files", "--stage", "base.txt"], p);
+    assert_cli_success(&staged, "inspect restored staged entry");
+    let staged = String::from_utf8(staged.stdout).unwrap();
+    let staged_oid = staged
+        .split_whitespace()
+        .nth(1)
+        .expect("stage row has object id");
+    let blob = run_libra_command(&["cat-file", "-p", staged_oid], p);
+    assert_cli_success(&blob, "read restored staged blob");
+    assert_eq!(blob.stdout, b"staged only\n");
+}
+
+#[test]
+#[serial]
 fn test_merge_autostash_conflict_holds_then_abort_restores() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
@@ -1985,6 +2013,10 @@ fn test_merge_autostash_conflict_holds_then_abort_restores() {
     assert!(
         p.join(".libra/merge-autostash.json").exists(),
         "sidecar holds the stash"
+    );
+    assert_cli_success(
+        &run_libra_command(&["maintenance", "run", "--task", "gc"], p),
+        "gc preserves held merge autostash",
     );
     // --abort restores the pre-merge tree AND re-applies the autostash.
     let abort = run_libra_command(&["--json", "merge", "--abort"], p);

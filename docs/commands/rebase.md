@@ -8,7 +8,7 @@ Reapply commits on top of another base tip.
 
 ```
 libra rebase <upstream>
-libra rebase [--autosquash] [--reapply-cherry-picks] [--no-autostash] [--no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
+libra rebase [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
 libra rebase --onto <newbase> <upstream> [<branch>]
 libra rebase --continue
 libra rebase --abort
@@ -23,7 +23,9 @@ If a conflict occurs during replay, the rebase stops and reports the conflicting
 
 With `--autosquash`, commits whose subject starts with `fixup!`, `squash!`, or `amend!` are moved next to the matching target commit and folded while replaying. Fixup commits keep the target commit message, squash commits append their message to the target message, and amend commits replace the target message with the amend commit message. `--reapply-cherry-picks` is accepted as an explicit request to keep Libra's default behavior of replaying clean cherry-pick commits.
 
-Rebase state (the list of remaining and completed commits, the original HEAD, and the target base) is persisted in the SQLite database. This makes rebase state survive process restarts and avoids the fragile file-based state that Git uses. Legacy file-based state from older Libra versions is automatically migrated to the database on first access.
+`--autostash` preserves tracked index and worktree changes in a held stash object before replay and restores the staged index and unstaged worktree layers separately after success or abort. `--exec <cmd>` runs each repeatable command after every replayed commit through Libra's required workspace-write, network-denied sandbox; a failure stops the sequence and `--continue` retries the failed command. `--skip` after an exec failure keeps the already replayed commit and skips the remaining commands for that commit. `--update-refs` atomically retargets other local branches in the rewritten range, except branches checked out in any worktree. `--fork-point` uses the upstream reflog to recover the most specific old upstream tip that remains an ancestor of `HEAD`, then falls back to the ordinary merge base.
+
+Rebase state (the list of remaining and completed commits, the original HEAD, and the target base) is persisted in the SQLite database. Recovery-critical autostash, exec, and update-refs metadata is fsynced atomically in `.libra/rebase-aux.json` until the sequence reaches a terminal state. Legacy file-based state from older Libra versions is automatically migrated to the database on first access.
 
 ## Options
 
@@ -33,11 +35,14 @@ Rebase state (the list of remaining and completed commits, the original HEAD, an
 | | `--onto <newbase>` | Replay the `<upstream>..HEAD` range onto `<newbase>` instead of onto `<upstream>`. |
 | | `--continue` | Continue the rebase after resolving conflicts. Mutually exclusive with `--abort`, `--skip`, and `<upstream>`. |
 | | `--abort` | Abort the current rebase and restore the original branch to its pre-rebase state. Mutually exclusive with `--continue`, `--skip`, and `<upstream>`. |
-| | `--skip` | Skip the current commit and continue with the next commit in the rebase sequence. Mutually exclusive with `--continue`, `--abort`, and `<upstream>`. |
+| | `--skip` | Skip the current conflicting commit, or skip the remaining commands after an exec failure while keeping the replayed commit. Mutually exclusive with `--continue`, `--abort`, and `<upstream>`. |
 | | `--autosquash` | Move and fold `fixup!`, `squash!`, and `amend!` commits into their target commits during replay. |
 | | `--reapply-cherry-picks` | Explicitly replay clean cherry-pick commits. This matches Libra's default linear replay behavior. |
-| | `--no-autostash` | Do not stash and re-apply a dirty working tree around the rebase. Accepted no-op for Git parity: Libra's rebase never autostashes (it requires a clean tree). (Git's `--autostash` is not implemented.) |
-| | `--no-rerere-autoupdate` | Do not update the rerere index. Accepted no-op for Git parity: Libra has no rerere. (Git's `--rerere-autoupdate` is not exposed.) |
+| | `--autostash` / `--no-autostash` | Stash tracked index/worktree changes before replay, preserving the staged and unstaged layers separately, and restore them after success or abort. A conflicting restore is preserved as `stash@{0}` with a warning. The last toggle wins. |
+| | `--exec <cmd>` | Run a repeatable shell command after each replayed commit in a required workspace-write, network-denied sandbox. Non-zero exit or timeout stops the rebase; `--continue` retries it. |
+| | `--update-refs` / `--no-update-refs` | Atomically move other local branches that point into the rewritten range. Branches checked out in any worktree are excluded. The last toggle wins. |
+| | `--fork-point` / `--no-fork-point` | Select the replay boundary from the upstream reflog when possible, otherwise use the ordinary merge base. The last toggle wins. |
+| | `--no-rerere-autoupdate` | Accepted no-op for Git parity: rerere recording is integrated when enabled, but rebase does not expose positive `--rerere-autoupdate`; staging follows `rerere.autoUpdate`. |
 | | `--keep-empty` | Keep commits that begin empty (already empty before replay) rather than dropping them. Accepted no-op for Git parity: Libra's rebase already keeps empty commits by default. Toggle pair with `--no-keep-empty`; the last one wins. |
 | | `--no-keep-empty` | Drop commits that begin empty (their tree equals their parent's — they introduce no change) instead of replaying them. Toggle pair with `--keep-empty`. (This controls commits that *begin* empty; `--empty=<mode>` controls commits that *become* empty after replay.) |
 | | `--empty=<mode>` | How to handle a commit that *becomes* empty after replay (its change is already on the new base): `drop` skips it (HEAD does not advance; a `dropping <sha> <subject> -- patch contents already upstream` notice is printed), `keep` records the empty commit. Omitted, Libra **keeps** it — an intentional divergence from Git, which drops by default; pass `--empty=drop` for Git's behavior. The mode survives a conflict into `--continue`/`--skip`. Git's `stop`/`ask` (halt for you to decide) are not supported (Libra's non-interactive rebase has no halt-on-empty resume flow); they and any unknown value are usage errors (`LBR-CLI-002`, exit 129). |
@@ -57,6 +62,24 @@ Applied: 987abcd feat: add lexer
 Applied: 13579bd test: add parser tests
 Successfully rebased branch 'feature' onto '1234567'.
 ```
+
+**`--autostash`, `--exec`, `--update-refs`, and `--fork-point`**
+
+```bash
+# Preserve tracked local changes around the rewrite.
+libra rebase --autostash main
+
+# Run both commands, in order, after every replayed commit.
+libra rebase --exec 'cargo test' --exec 'cargo clippy' main
+
+# Retarget non-checked-out local branches in the rewritten range.
+libra rebase --update-refs main
+
+# Use a force-moved upstream's reflog to avoid replaying old upstream commits.
+libra rebase --fork-point origin/main
+```
+
+Exec commands are user-controlled shell input. Libra runs them only when its internal sandbox can enforce workspace-only writes and denied network access; if the required backend is unavailable, the command fails closed with `LBR-CONFLICT-002` and leaves the rebase resumable.
 
 **`--continue`**
 
@@ -118,6 +141,18 @@ libra rebase --autosquash main
 
 # Explicitly keep replaying clean cherry-picks
 libra rebase --reapply-cherry-picks main
+
+# Preserve tracked local changes around the rebase
+libra rebase --autostash main
+
+# Run a sandboxed check after each replayed commit
+libra rebase --exec 'cargo test' main
+
+# Retarget other local branches in the rewritten range
+libra rebase --update-refs main
+
+# Recover the fork point after an upstream force-move
+libra rebase --fork-point origin/main
 
 # Transplant the dev..HEAD range onto main (keep the range, move the base)
 libra rebase --onto main dev
@@ -254,7 +289,7 @@ Continue after resolving a conflict:
 }
 ```
 
-Skip the stopped commit:
+Skip the stopped commit (after an exec failure, `skipped_commit` is absent because the replayed commit is kept):
 
 ```json
 {
@@ -289,6 +324,8 @@ Rebase state is stored in a `rebase_state` SQLite table with the following field
 | `done` | TEXT | Commits already replayed (newline-separated hashes) |
 | `stopped_sha` | TEXT (nullable) | Current commit that caused a conflict |
 | `autosquash` | INTEGER | Whether the current rebase folds autosquash commits (`0` or `1`) |
+
+`.libra/rebase-aux.json` is an atomic, always-fsynced recovery sidecar containing repeatable exec commands and the pending command index, captured update-refs branches and rewrite mappings, and the held autostash object ID. It survives conflicts, exec failures, process restarts, and `maintenance gc` (which treats the held OID as a fail-closed reachability root). Final branch updates use one SQLite transaction and compare captured old tips before moving any branch; concurrent branch movement fails closed. Checked-out branches are never captured. The sidecar is removed only after refs, worktree/index, sequencer state, and autostash restoration have reached a terminal state. If autostash re-application conflicts, the object is first promoted to the normal stash list so the local changes remain recoverable.
 
 ## Design Rationale
 
@@ -356,10 +393,12 @@ Libra provides a middle ground: a linear rebase with conflict-stop semantics (fa
 | Skip | `--skip` | `--skip` | N/A |
 | Interactive | Not supported | `-i` / `--interactive` | N/A |
 | Onto | `--onto <newbase>` | `--onto <newbase>` | `-d` with `-s` / `--source` |
-| Exec | Not supported | `--exec <cmd>` | N/A |
+| Exec | Supported; repeatable, required workspace-write/network-denied sandbox, resumable failure | `--exec <cmd>` | N/A |
 | Autosquash | Supported | `--autosquash` | N/A |
-| Autostash | `--no-autostash` (no-op; never autostashes); `--autostash` not supported | `--autostash` / `--no-autostash` | N/A |
-| Rerere autoupdate | `--no-rerere-autoupdate` (no-op; no rerere); `--rerere-autoupdate` not supported | `--rerere-autoupdate` / `--no-rerere-autoupdate` | N/A |
+| Autostash | `--autostash` / `--no-autostash` supported; tracked changes held through sequencer stops | `--autostash` / `--no-autostash` | N/A |
+| Update refs | Supported; checked-out branches excluded and captured tips compared atomically | `--update-refs` / `--no-update-refs` | N/A |
+| Fork point | Supported with upstream-reflog selection and merge-base fallback | `--fork-point` / `--no-fork-point` | N/A |
+| Rerere autoupdate | `--no-rerere-autoupdate` accepted no-op; positive flag not exposed, staging follows `rerere.autoUpdate` | `--rerere-autoupdate` / `--no-rerere-autoupdate` | N/A |
 | Reapply cherry-picks | Supported; Libra replays by default | `--reapply-cherry-picks` | N/A |
 | Rebase merges | Not supported | `--rebase-merges` | Default behavior |
 | Keep empty | `--keep-empty` (no-op; already keeps empty) / `--no-keep-empty` (drop start-empty commits) | `--keep-empty` / `--no-keep-empty` | Default keeps empty |
@@ -373,7 +412,7 @@ Note: jj does not stop on conflicts during rebase. Instead, conflicts are materi
 
 ## Error Handling
 
-`execute_safe` currently returns standard structured `CliError` envelopes for CLI/preflight failures. The deeper replay engine is still a legacy text path and is tracked as pending structured-output work.
+`execute_safe` and the replay controls return standard structured `CliError` envelopes for CLI, state, conflict, sandbox, and durable-sidecar failures.
 
 | Scenario | StableErrorCode | Exit | Behavior |
 |----------|-----------------|------|----------|
@@ -385,6 +424,10 @@ Note: jj does not stop on conflicts during rebase. Instead, conflicts are materi
 | `--abort` without rebase in progress | `LBR-REPO-003` (RepoStateInvalid) | 128 | Error indicating no rebase in progress |
 | `--skip` without rebase in progress | `LBR-REPO-003` (RepoStateInvalid) | 128 | Error indicating no rebase in progress |
 | `--skip` without stopped or pending commit | `LBR-REPO-003` (RepoStateInvalid) | 128 | Error indicating there is no commit to skip |
+| Empty or NUL-containing `--exec` command | `LBR-CLI-002` (CliInvalidArguments) | 129 | Rejected before rebase state or worktree mutation |
+| Exec failure, timeout, or unavailable required sandbox | `LBR-CONFLICT-002` (ConflictOperationBlocked) | 128 | Rebase remains resumable; fix and `--continue`, or `--skip` the remaining exec commands |
+| Autostash application conflict | warning; held object promoted to `stash@{0}` | 0 | Rebase completes without losing local changes; inspect the stash |
+| Update-refs branch moved concurrently | `LBR-IO-002` (IoWriteFailed) | 128 | Ref transaction rolls back and the rebase remains resumable |
 | No common ancestor found | pending typed mapping | 128 | Legacy text error refusing to rebase unrelated histories |
 | Conflict during commit replay | pending typed mapping | 128 | Rebase stops, state is saved, user prompted to resolve |
 | Failed to create rebased commit | pending typed mapping | 128 | Legacy text error with commit details |

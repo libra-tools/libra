@@ -58,6 +58,7 @@ Libra 仍未实现 octopus merge、自定义策略、策略选项或交互式消
 | `--no-gpg-sign` | 不对合并提交 GPG 签名。为对齐 Git 而接受的 no-op：Libra 的 merge 从不签名。（Git 的 `-S`/`--gpg-sign` 未实现。） |
 | `--continue` | 在冲突已解决并暂存后完成进行中的合并。 |
 | `--abort` | 恢复合并前的 HEAD、索引和工作树。 |
+| `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；发生冲突时 held 在 `stash list` 之外，直到 `--continue`/`--abort`。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
 | `--dry-run` | Libra 扩展：预演合并结果而不写任何东西（见上文）。干净预演退出 0，会冲突退出 1。与 `--continue`/`--abort`/`--restart`/`--squash`/`--no-commit` 互斥。 |
 | `--restart` | Libra 扩展：像 `--abort` 一样恢复合并前状态（丢弃解决工作）后，立刻对记录的目标提交重跑同一合并（见上文）。不接受分支与合并选项。 |
 | `--json` | 输出结构化成功信封。 |

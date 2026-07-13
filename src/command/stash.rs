@@ -34,7 +34,8 @@ use crate::{
         load_object, log,
         merge::{MergeTreeEntry, create_tree_from_items_map},
         reset::{
-            remove_empty_directories, reset_index_to_commit, restore_working_directory_from_tree,
+            rebuild_index_from_tree, remove_empty_directories, reset_index_to_commit,
+            restore_working_directory_from_tree,
         },
         status,
     },
@@ -367,7 +368,8 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
     let index_path = git_dir.join("index");
-    let index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
+    let index = Index::load(&index_path)
+        .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
     let included_untracked_paths = collect_included_untracked_paths(&options)?;
 
     if !has_changes().await && included_untracked_paths.is_empty() {
@@ -383,7 +385,11 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
 
     let index_tree =
         tree::create_tree_from_index(&index).map_err(|e| StashError::WriteObject(e.to_string()))?;
-    let index_tree_hash = index_tree.id;
+    let index_tree_data = index_tree
+        .to_data()
+        .map_err(|error| StashError::WriteObject(error.to_string()))?;
+    let index_tree_hash = object::write_git_object(&git_dir, "tree", &index_tree_data)
+        .map_err(|error| StashError::WriteObject(error.to_string()))?;
 
     let (author, committer) = util::create_signatures().await;
     let (current_branch_name, head_commit_summary) = match Head::current().await {
@@ -513,7 +519,8 @@ pub(crate) async fn create_held_stash_commit(
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
     let index_path = git_dir.join("index");
-    let index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
+    let index = Index::load(&index_path)
+        .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
 
     if !has_changes().await {
         return Ok(None);
@@ -524,12 +531,17 @@ pub(crate) async fn create_held_stash_commit(
         .ok_or(StashError::NoInitialCommit)?;
     let index_tree =
         tree::create_tree_from_index(&index).map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let index_tree_data = index_tree
+        .to_data()
+        .map_err(|error| StashError::WriteObject(error.to_string()))?;
+    let index_tree_hash = object::write_git_object(&git_dir, "tree", &index_tree_data)
+        .map_err(|error| StashError::WriteObject(error.to_string()))?;
     let (author, committer) = util::create_signatures().await;
 
     let index_commit = Commit::new(
         author.clone(),
         committer.clone(),
-        index_tree.id,
+        index_tree_hash,
         vec![head_commit_hash],
         message,
     );
@@ -1317,6 +1329,21 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
 /// are rewritten, leaving the current state intact. The current index is
 /// intentionally preserved by default.
 pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashError> {
+    apply_stash_commit_inner(hash, false).await
+}
+
+/// Apply a held autostash and restore its staged index layer as well as its
+/// working-tree layer. Unlike ordinary `stash apply`, autostash temporarily
+/// resets both layers, so leaving the index untouched would lose staged-only
+/// changes once the held object becomes unreachable.
+pub(crate) async fn apply_held_stash_commit(hash: &ObjectHash) -> Result<(), StashError> {
+    apply_stash_commit_inner(hash, true).await
+}
+
+async fn apply_stash_commit_inner(
+    hash: &ObjectHash,
+    restore_index: bool,
+) -> Result<(), StashError> {
     let stash_commit_hash = *hash;
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -1344,6 +1371,11 @@ pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashErr
     let stash_tree = Tree::from_bytes(&stash_tree_data, stash_commit.tree_id)
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
     let untracked_tree = load_untracked_parent_tree(&stash_commit, &git_dir)?;
+    let stash_index_tree = if restore_index {
+        Some(load_stash_index_parent_tree(&stash_commit, &git_dir)?)
+    } else {
+        None
+    };
 
     let workdir = git_dir.parent().ok_or_else(|| {
         StashError::Other(format!(
@@ -1367,6 +1399,19 @@ pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashErr
 
     let merged_tree = merge_trees(&base_tree, &worktree_tree, &stash_tree, &git_dir)
         .map_err(StashError::MergeConflict)?;
+    let restored_index = if let Some(stash_index_tree) = stash_index_tree.as_ref() {
+        let current_index_tree = tree::create_tree_from_index(&current_index)
+            .map_err(|error| StashError::WriteObject(error.to_string()))?;
+        let merged_index_tree =
+            merge_trees(&base_tree, &current_index_tree, stash_index_tree, &git_dir)
+                .map_err(StashError::MergeConflict)?;
+        let mut restored = Index::new();
+        rebuild_index_from_tree(&merged_index_tree, &mut restored, "")
+            .map_err(StashError::IndexLoad)?;
+        Some(restored)
+    } else {
+        None
+    };
 
     let worktree_files = tree::get_tree_files_recursive(&worktree_tree, &git_dir, &PathBuf::new())
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -1414,11 +1459,33 @@ pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashErr
             .map_err(StashError::WriteObject)?;
     }
 
+    if let Some(restored_index) = restored_index {
+        restored_index
+            .save(&index_path)
+            .map_err(|error| StashError::IndexSave(error.to_string()))?;
+    }
+
     // Git's default `stash apply/pop` restores changes to the working tree only.
-    // Keep the existing index intact; a future `--index` mode should restore the
-    // stash's second parent explicitly instead of rebuilding from `merged_tree`.
+    // Keep the existing index intact unless the caller is restoring a held
+    // autostash, whose reset removed the staged layer as well. A future public
+    // `--index` mode can reuse that path explicitly.
 
     Ok(())
+}
+
+fn load_stash_index_parent_tree(stash_commit: &Commit, git_dir: &Path) -> Result<Tree, StashError> {
+    let index_commit_hash = stash_commit
+        .parent_commit_ids
+        .get(1)
+        .ok_or_else(|| StashError::ReadObject("stash index parent is missing".into()))?;
+    let index_commit_data = object::read_git_object(git_dir, index_commit_hash)
+        .map_err(|error| StashError::ReadObject(error.to_string()))?;
+    let index_commit = Commit::from_bytes(&index_commit_data, *index_commit_hash)
+        .map_err(|error| StashError::ReadObject(error.to_string()))?;
+    let index_tree_data = object::read_git_object(git_dir, &index_commit.tree_id)
+        .map_err(|error| StashError::ReadObject(error.to_string()))?;
+    Tree::from_bytes(&index_tree_data, index_commit.tree_id)
+        .map_err(|error| StashError::ReadObject(error.to_string()))
 }
 
 fn load_untracked_parent_tree(
@@ -1685,6 +1752,69 @@ fn parse_stash_log_entries(lines: Vec<String>) -> Result<Vec<StashLogEntry>, Sta
     }
 
     Ok(entries)
+}
+
+/// Return every file-backed stash object that repository maintenance must
+/// trace. Older stash entries live only in the stash reflog; tracing just the
+/// refs/stash tip would let GC delete stash@{1} and later entries.
+pub(crate) fn gc_roots() -> Result<Vec<ObjectHash>, StashError> {
+    let storage = util::try_get_storage_path(None).map_err(|error| {
+        StashError::ReadObject(format!("failed to resolve stash GC roots: {error}"))
+    })?;
+    let mut roots = HashSet::new();
+    let stash_ref_path = storage.join("refs/stash");
+    match fs::read_to_string(&stash_ref_path) {
+        Ok(raw_oid) => {
+            let oid = ObjectHash::from_str(raw_oid.trim()).map_err(|error| {
+                StashError::ReadObject(format!(
+                    "stash ref '{}' contains an invalid object id: {error}",
+                    stash_ref_path.display()
+                ))
+            })?;
+            roots.insert(oid);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(StashError::ReadObject(format!(
+                "failed to read stash ref '{}': {error}",
+                stash_ref_path.display()
+            )));
+        }
+    }
+
+    let stash_log_path = storage.join("logs/refs/stash");
+    match fs::symlink_metadata(&stash_log_path) {
+        Ok(metadata) if metadata.is_file() => {
+            let entries = parse_stash_log_entries(read_stash_log_lines(&stash_log_path)?)?;
+            for entry in entries {
+                let oid = ObjectHash::from_str(&entry.stash_id).map_err(|error| {
+                    StashError::ReadObject(format!(
+                        "stash log '{}' contains an invalid object id '{}': {error}",
+                        stash_log_path.display(),
+                        entry.stash_id
+                    ))
+                })?;
+                roots.insert(oid);
+            }
+        }
+        Ok(_) => {
+            return Err(StashError::ReadObject(format!(
+                "stash log '{}' is not a regular file",
+                stash_log_path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(StashError::ReadObject(format!(
+                "failed to inspect stash log '{}': {error}",
+                stash_log_path.display()
+            )));
+        }
+    }
+
+    let mut roots = roots.into_iter().collect::<Vec<_>>();
+    roots.sort_by_key(ToString::to_string);
+    Ok(roots)
 }
 
 fn resolve_stash_to_commit_hash(stash_ref: Option<String>) -> Result<(usize, String), StashError> {

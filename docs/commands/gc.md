@@ -18,8 +18,10 @@ libra gc [--dry-run] [--prune=<date> | --no-prune] [--aggressive] [--auto] [--fo
 
 The unpublished design first expires reflogs using the default `gc.reflogExpire` and
 `gc.reflogExpireUnreachable` policy, then traces objects reachable from
-repository references, remaining reflogs, the index, in-progress operation
-state, and local AI catalogs. It prunes unreachable loose objects that match the
+repository references, both endpoints of remaining reflogs, annotated-tag targets,
+every index stage, every file-backed stash reflog entry, held merge/rebase autostash
+sidecars, in-progress operation state, and local AI catalogs. Root read/parse failures
+or missing/corrupt reachable objects stop deletion. It prunes unreachable loose objects that match the
 configured prune cutoff. When cloud backup is configured, unsynced
 `object_index` rows retain matching loose objects as pending backup data; they
 are reported as retained unreachable objects rather than counted as reachable

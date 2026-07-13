@@ -34,7 +34,7 @@ libra maintenance run [--task <task>] [--dry-run] [--quiet]
 
 | 任务 | 说明 |
 |---|---|
-| `gc` | 删除不可达 loose objects |
+| `gc` | 递归追踪 SQLite refs/reflogs（含 annotated-tag target）、全部 index stage、文件型 stash reflog 的每个条目与 merge/rebase held-autostash sidecar 后删除不可达 loose objects；root 或可达对象损坏/不可读时在删除前 fail-closed |
 | `loose-objects` | 将旧 loose objects 打包进新的 pack 文件 |
 | `pack-refs` | 将单独 ref 文件折叠进 `packed-refs` |
 | `incremental-repack` | 重新打包现有 pack 文件 |
