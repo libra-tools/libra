@@ -73,10 +73,28 @@ async fn configured_diff_bool(key: &'static str) -> Result<bool, DiffError> {
 }
 
 async fn configured_diff_prefixes(args: &DiffArgs) -> Result<DiffPrefixes, DiffError> {
+    if let (Some(source), Some(destination)) = (&args.src_prefix, &args.dst_prefix) {
+        let (mut source, mut destination) = (source.clone(), destination.clone());
+        if args.reverse {
+            std::mem::swap(&mut source, &mut destination);
+        }
+        return Ok(DiffPrefixes {
+            source,
+            destination,
+        });
+    }
     let no_prefix = configured_diff_bool("diff.noPrefix").await?;
     let mnemonic = configured_diff_bool("diff.mnemonicPrefix").await?;
-    let configured_source = read_raw_diff_config("diff.srcPrefix").await?;
-    let configured_destination = read_raw_diff_config("diff.dstPrefix").await?;
+    let configured_source = if args.src_prefix.is_none() && !no_prefix && !mnemonic {
+        read_raw_diff_config("diff.srcPrefix").await?
+    } else {
+        None
+    };
+    let configured_destination = if args.dst_prefix.is_none() && !no_prefix && !mnemonic {
+        read_raw_diff_config("diff.dstPrefix").await?
+    } else {
+        None
+    };
 
     let (mut source, mut destination) = if no_prefix {
         (String::new(), String::new())
@@ -88,6 +106,12 @@ async fn configured_diff_prefixes(args: &DiffArgs) -> Result<DiffPrefixes, DiffE
             configured_destination.unwrap_or_else(|| "b/".to_string()),
         )
     };
+    if let Some(explicit) = &args.src_prefix {
+        source.clone_from(explicit);
+    }
+    if let Some(explicit) = &args.dst_prefix {
+        destination.clone_from(explicit);
+    }
     if args.reverse {
         std::mem::swap(&mut source, &mut destination);
     }

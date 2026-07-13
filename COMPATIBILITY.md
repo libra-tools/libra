@@ -227,6 +227,18 @@ display prefixes while continuing to suppress porcelain rename defaults.
 Unreadable local/global stores fail closed; unreadable or unsupported system
 scope is skipped under the established strict-config contract.
 
+### Diff review metadata (P1-08a)
+
+The `diff` row above remains `partial`, but the script-facing metadata slice now
+supports `--raw` (including `-z` rename fields and mode/type changes),
+`--compact-summary`, `--diff-filter` include/exclude/`*` semantics,
+`--full-index`, and CLI `--src-prefix`/`--dst-prefix` overrides. `--summary` now
+includes mode changes. Raw live-worktree object IDs are zero while repository
+sides retain their IDs, including same-content mode-only changes. Remaining
+P1-08 gaps are `-S`/`-G`, `--color-words`/`--word-diff-regex`, and the
+minimal/patience/histogram/anchored algorithm surface; parser-accepted
+`--algorithm=myers|myersMinimal` values still fail explicitly.
+
 ## Git commands intentionally absent from `src/cli.rs`
 
 | Command | Tier | Notes |
