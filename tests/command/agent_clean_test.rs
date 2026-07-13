@@ -131,6 +131,7 @@ async fn seed_checkpoint_commit(
             transcript_redacted: &redacted,
             lifecycle_events_jsonl: &events_redacted,
             redaction_report_json: &report_redacted,
+            txn_extra: None,
         })
         .await
         .expect("append checkpoint commit");

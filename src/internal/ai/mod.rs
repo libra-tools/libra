@@ -82,6 +82,9 @@ pub mod context_budget;
 pub mod goal;
 // Crate-private helpers for capturing artifacts produced by tool calls.
 pub(crate) mod generated_artifacts;
+// Per-turn coverage claim gate for external-agent checkpoint writers
+// (plan-20260713 DR-05c-0).
+pub mod coverage_gate;
 // Conversation history datastructures (compaction, persistence, replay).
 pub mod history;
 // Git hooks integration that lets the agent observe commit events.

@@ -957,10 +957,11 @@ async fn write_committed_checkpoint(
     now: i64,
 ) -> Result<()> {
     use crate::internal::ai::{
+        coverage_gate,
         history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
         observed_agents::{
             AgentKind, RedactedBytes, Redactor, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
-            agent_for, resolve_transcript_source,
+            agent_for, normalize_claude_transcript, resolve_transcript_source,
         },
     };
 
@@ -1043,6 +1044,46 @@ async fn write_committed_checkpoint(
         }
         None => prompt_fallback(),
     };
+
+    // DR-05c-0 live coverage gate (plan-20260713 ADR-DR-09/10). Providers
+    // with a coverage-v1 normalizer (Claude first) reserve their logical
+    // turns BEFORE any object is built:
+    // - every turn already covered by equivalent-or-better content → the
+    //   whole write is a no-op (no duplicate checkpoint on repeated events);
+    // - a reservation failure (DB gate unavailable) fails the write CLOSED —
+    //   no ungated append;
+    // - reserved claims commit inside the ref-CAS transaction below.
+    // Providers without a normalizer keep the legacy ungated path.
+    let mut live_reservation: Option<(String, i64, Vec<coverage_gate::ReservedTurnClaim>)> = None;
+    if agent_kind == "claude_code"
+        && let Some(raw) = transcript_raw_for_extraction.as_deref()
+    {
+        let turns = normalize_claude_transcript(raw);
+        if !turns.is_empty() {
+            let owner = format!("live:{}:{}", std::process::id(), uuid::Uuid::new_v4());
+            let now_ms = Utc::now().timestamp_millis();
+            let outcome = coverage_gate::reserve_live_turn_claims(
+                conn,
+                libra_session_id,
+                &turns,
+                &owner,
+                now_ms,
+            )
+            .await
+            .context("coverage gate reservation failed; checkpoint write aborted (fail-closed)")?;
+            if outcome.is_noop() {
+                tracing::info!(
+                    session_id = %libra_session_id,
+                    skipped_covered = outcome.skipped_covered,
+                    skipped_inflight = outcome.skipped_inflight,
+                    conflicted = outcome.conflicted,
+                    "coverage gate: every turn already covered; skipping checkpoint append"
+                );
+                return Ok(());
+            }
+            live_reservation = Some((owner, now_ms, outcome.reserved));
+        }
+    }
 
     // Build metadata.json (external schema v2 — v1 fields plus `model`;
     // strictly additive so v1 readers keep working). `model` mirrors the
@@ -1182,6 +1223,22 @@ async fn write_committed_checkpoint(
             }
         };
 
+    // DR-05c-0: reserved claims + the catalog row commit INSIDE the ref-CAS
+    // transaction (ADR-DR-10) — ref, catalog, revisions and claim advances
+    // are atomic; a fence violation rolls all of them back.
+    let claim_plan =
+        live_reservation.map(
+            |(owner, now_ms, claims)| coverage_gate::LiveClaimCommitPlan {
+                session_id: libra_session_id.to_string(),
+                checkpoint_id: checkpoint_id.clone(),
+                owner,
+                parent_commit: parent_commit.clone(),
+                created_at: now,
+                now_ms,
+                claims,
+            },
+        );
+
     // Stages (a)–(c): blobs, trees, commit, ref CAS.
     write_span.record("stage", "append");
     let written = manager
@@ -1196,6 +1253,9 @@ async fn write_committed_checkpoint(
             transcript_redacted: &transcript_redacted,
             lifecycle_events_jsonl: &lifecycle_events_redacted,
             redaction_report_json: &redaction_report_redacted,
+            txn_extra: claim_plan
+                .as_ref()
+                .map(|plan| plan as &dyn history::TracesTxnExtra),
         })
         .await
         .context("failed to append checkpoint commit on traces")?;
@@ -1219,23 +1279,29 @@ async fn write_committed_checkpoint(
         );
     }
 
-    // Stage (d), idempotent.
+    // Stage (d), idempotent. The gated path already inserted the catalog
+    // row inside the ref-CAS transaction (ADR-DR-10); only the legacy
+    // (ungated) path inserts it here.
     write_span.record("stage", "catalog");
-    let inserted = insert_agent_checkpoint_row_idempotent(
-        conn,
-        &AgentCheckpointRow {
-            checkpoint_id: &checkpoint_id,
-            session_id: libra_session_id,
-            parent_commit: parent_commit.as_deref(),
-            tree_oid: &written.tree_oid.to_string(),
-            metadata_blob_oid: &written.metadata_blob_oid.to_string(),
-            traces_commit: &written.commit_hash.to_string(),
-            created_at: now,
-        },
-    )
-    .await?;
-    if !inserted {
-        write_span.record("stage", "catalog_deduped");
+    if claim_plan.is_some() {
+        write_span.record("stage", "catalog_in_txn");
+    } else {
+        let inserted = insert_agent_checkpoint_row_idempotent(
+            conn,
+            &AgentCheckpointRow {
+                checkpoint_id: &checkpoint_id,
+                session_id: libra_session_id,
+                parent_commit: parent_commit.as_deref(),
+                tree_oid: &written.tree_oid.to_string(),
+                metadata_blob_oid: &written.metadata_blob_oid.to_string(),
+                traces_commit: &written.commit_hash.to_string(),
+                created_at: now,
+            },
+        )
+        .await?;
+        if !inserted {
+            write_span.record("stage", "catalog_deduped");
+        }
     }
 
     // Stage (d) complete — release the window guard (best-effort; an
@@ -1441,6 +1507,9 @@ async fn write_subagent_checkpoint(
             transcript_redacted: &transcript_redacted,
             lifecycle_events_jsonl: &lifecycle_events_redacted,
             redaction_report_json: &redaction_report_redacted,
+            // Subagent boundary checkpoints are not per-turn content and
+            // stay outside the coverage gate (plan-20260713 ADR-DR-05).
+            txn_extra: None,
         })
         .await
         .context("failed to append subagent checkpoint commit on traces")?;

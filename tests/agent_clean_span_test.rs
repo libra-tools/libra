@@ -108,6 +108,7 @@ async fn seed_temporary_checkpoint(
             transcript_redacted: &redacted,
             lifecycle_events_jsonl: &events_redacted,
             redaction_report_json: &report_redacted,
+            txn_extra: None,
         })
         .await
         .expect("append temporary checkpoint commit");

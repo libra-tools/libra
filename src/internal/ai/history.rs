@@ -752,6 +752,24 @@ impl HistoryManager {
         expected_head: Option<ObjectHash>,
         new_hash: ObjectHash,
     ) -> Result<RefUpdateOutcome> {
+        self.update_ref_if_matches_with_extra(ref_name, expected_head, new_hash, None)
+            .await
+    }
+
+    /// Conditional ref update with optional transactional companion writes
+    /// (plan-20260713 ADR-DR-10). When `extra` is provided, its SQL runs in
+    /// the SAME transaction as the ref write — after the CAS row update
+    /// succeeds, before COMMIT — so catalog/claim/revision state can never
+    /// diverge from the ref. An `extra` error rolls the whole transaction
+    /// back (the ref does not move) and propagates as a hard error, not a
+    /// `HeadChanged` retry.
+    async fn update_ref_if_matches_with_extra(
+        &self,
+        ref_name: &str,
+        expected_head: Option<ObjectHash>,
+        new_hash: ObjectHash,
+        extra: Option<(&dyn TracesTxnExtra, &TracesCommitCtx)>,
+    ) -> Result<RefUpdateOutcome> {
         let expected_commit = expected_head.map(|hash| hash.to_string());
         let new_commit = new_hash.to_string();
 
@@ -849,6 +867,19 @@ impl HistoryManager {
             if rows_affected.is_some_and(|result| result.rows_affected != 1) {
                 let _ = txn.rollback().await;
                 return Ok(RefUpdateOutcome::HeadChanged);
+            }
+
+            // ADR-DR-10: companion writes ride the ref transaction. A
+            // failure here must NOT move the ref — roll back and fail
+            // closed (no HeadChanged retry: the failure is a gate/fence
+            // violation or DB fault, not a CAS race).
+            if let Some((extra, ctx)) = extra
+                && let Err(err) = extra.apply(&txn, ctx).await
+            {
+                let _ = txn.rollback().await;
+                return Err(
+                    err.context("transactional companion writes failed; ref update rolled back")
+                );
             }
 
             match txn.commit().await {
@@ -1094,8 +1125,20 @@ impl HistoryManager {
                 commit_data.len() as i64,
             );
 
+            // Per-attempt ctx: commit hash and root tree change on every CAS
+            // rebuild, so the companion writes get the values of THIS attempt.
+            let commit_ctx = TracesCommitCtx {
+                commit_hash: commit_hash.to_string(),
+                tree_oid: new_root.to_string(),
+                metadata_blob_oid: metadata_blob_oid.to_string(),
+            };
             match self
-                .update_ref_if_matches(&self.ref_name, parent, commit_hash)
+                .update_ref_if_matches_with_extra(
+                    &self.ref_name,
+                    parent,
+                    commit_hash,
+                    params.txn_extra.map(|extra| (extra, &commit_ctx)),
+                )
                 .await?
             {
                 RefUpdateOutcome::Updated => {
@@ -1852,6 +1895,39 @@ pub struct CheckpointCommitParams<'a> {
     /// Typed as [`RedactedBytes`] (AG-19 / G4) to keep the whole checkpoint
     /// tree behind the redaction type.
     pub redaction_report_json: &'a RedactedBytes,
+    /// plan-20260713 DR-05c-0 (ADR-DR-10): extra SQL applied INSIDE the
+    /// winning ref-CAS transaction — catalog row, coverage revision inserts
+    /// and claim advances commit atomically with the ref update, or the
+    /// whole transaction (ref included) rolls back. `None` keeps the legacy
+    /// behavior (catalog inserted separately after the CAS).
+    pub txn_extra: Option<&'a dyn TracesTxnExtra>,
+}
+
+/// Per-attempt commit identifiers handed to [`TracesTxnExtra::apply`] — the
+/// commit hash and root tree change on every CAS rebuild, so the extra must
+/// receive them at apply time rather than capture them up front.
+#[derive(Debug, Clone)]
+pub struct TracesCommitCtx {
+    pub commit_hash: String,
+    pub tree_oid: String,
+    pub metadata_blob_oid: String,
+}
+
+/// Transactional companion writes for a traces ref update (ADR-DR-10).
+///
+/// `apply` runs inside the SAME SQLite transaction as the successful ref
+/// CAS, after the ref row write and before COMMIT. Returning an error rolls
+/// the entire transaction back — the ref does not move, and the caller's
+/// checkpoint write fails closed.
+#[async_trait::async_trait]
+pub trait TracesTxnExtra: Send + Sync {
+    async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()>;
+}
+
+impl std::fmt::Debug for dyn TracesTxnExtra + '_ {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TracesTxnExtra")
+    }
 }
 
 /// Scope tag stamped on each checkpoint, mirroring the
