@@ -37,6 +37,7 @@ pub mod redaction;
 pub mod registry;
 pub mod rpc;
 pub mod skill_projection;
+pub mod transcript_source;
 pub mod trust;
 
 pub use adapter::{
@@ -73,6 +74,11 @@ pub use rpc::{
 pub use skill_projection::{
     DiscoveredSkill, IndexedSkillEvent, SKILL_PROJECTION_SCHEMA_VERSION, SkillEventProjection,
     SkillQuery, discover_skills,
+};
+pub use transcript_source::{
+    AuthorizedTranscriptFile, ExportAuthorized, ProviderRootAuthorized,
+    TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource, resolve_transcript_source,
+    transcript_path_within_provider_root,
 };
 pub use trust::{
     DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY, Provenance,
