@@ -10,16 +10,18 @@ libra diff <commit> [<commit>] [--] [<pathspec>...]
 libra diff <commit>..<commit> | <commit>...<commit> [--] [<pathspec>...]
 libra diff --staged [<commit>] [<pathspec>...]
 libra diff --old <commit> --new <commit> [<pathspec>...]
-libra diff [--name-only | --name-status | --numstat | --stat | --shortstat | --summary]
+libra diff [--raw | --name-only | --name-status | --numstat | --stat | --shortstat | --summary]
            [-s | --no-patch] [--exit-code] [--check] [-R] [-z]
-libra diff [--algorithm <name>] [--output <file>]
+libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
+           [--src-prefix=<PREFIX> --dst-prefix=<PREFIX>]
+           [--algorithm <name>] [--output <file>]
 ```
 
 ## Description
 
 `libra diff` shows changes between different states of the repository. By default it compares the index against tracked working-tree paths (unstaged changes). Untracked files are not part of the default diff and therefore do not affect `--quiet`, `--exit-code`, `--name-status`, `--numstat`, or `--shortstat`; use `libra status`, `libra ls-files --others`, or `libra add` to inspect or promote untracked files. With `--staged`, it compares HEAD against the index (staged changes). With `--old` and `--new`, it compares two arbitrary commits.
 
-The diff engine supports multiple algorithms (histogram by default, with myers and myersMinimal as alternatives). Output can be directed to a file with `--output`, and several summary formats are available (`--name-only`, `--name-status`, `--numstat`, `--stat`, `--shortstat`, `--summary`). A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes the name/numstat outputs NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity (matching Git's structure; like all Libra diffs, the exact word grouping can differ from Git on ambiguous changes, and hunk headers keep Libra's unified-diff format).
+The diff engine currently uses the histogram backend. The parser accepts the forward-compatible names `myers` and `myersMinimal`, but execution rejects them with `LBR-CLI-002` rather than silently using another algorithm. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity (matching Git's structure; like all Libra diffs, the exact word grouping can differ from Git on ambiguous changes, and hunk headers keep Libra's unified-diff format).
 
 When the working tree contains unmerged conflict entries, the default working-tree diff renders a conflict-aware `diff --cc <path>` record instead of treating the conflict file as a `/dev/null` addition.
 
@@ -42,13 +44,16 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | Staged | | `--staged` | Compare HEAD against the index (staged changes). Conflicts with `--new`. |
 | Revisions | | positional | Up to two leading revisions, Git-style: `diff A` (A vs worktree), `diff A B` (≡ `A..B`), `diff A..B`, `diff A...B` (merge-base(A,B) vs B), `diff --staged A` (A vs index). Not interpreted when `--old`/`--new` is given. |
 | Pathspec | | positional | One or more files or directories to restrict the diff (after any revisions; use `--` to force the path reading). Supports exact files, directory prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic. Pre-`--` paths must exist or carry wildcard syntax / supported pathspec magic; post-`--` paths are taken verbatim. |
-| Algorithm | | `--algorithm <name>` | Diff algorithm: `histogram` (default), `myers`, or `myersMinimal`. |
+| Algorithm | | `--algorithm <name>` | Diff algorithm. `histogram` is the only implemented backend; `myers` and `myersMinimal` are accepted by the parser but fail explicitly before scanning. |
 | Output file | | `--output <FILENAME>` | Write human-readable output to a file instead of stdout. Ignored in `--json` mode. |
 | Name only | | `--name-only` | Show only the names of changed files. |
-| Name status | | `--name-status` | Show changed file names with a status letter (A/D/M). |
+| Name status | | `--name-status` | Show changed file names with a status letter (A/D/M/R/T/U when applicable). |
+| Raw | | `--raw` | Show Git-shaped `:<oldmode> <newmode> <oldid> <newid> <status>\t<path>` records. IDs are abbreviated to 7 characters; a live worktree or absent side is zero. Renames carry `R<score>` plus old/new paths. Use `-z` for arbitrary path names. |
 | Word diff | | `--word-diff[=<mode>]` | Re-render the patch at word granularity. MODE is `plain` (default; removed words `[-…-]`, added `{+…+}`), `color` (highlight in a terminal, no brackets), `porcelain` (one token per line, `-`/`+`/` ` prefixes, `~` for newlines), or `none` (regular patch). Words are whitespace-delimited. Must be written as `--word-diff` or `--word-diff=<mode>`. |
 | Numstat | | `--numstat` | Show insertion/deletion counts in a machine-friendly tab-separated format. |
 | Stat | | `--stat` | Show a diffstat summary with +/- bar graph. |
+| Compact summary | | `--compact-summary` | Show `--stat` with `(new)`, `(gone)`, and executable/symlink metadata such as `(+x)` or `(+l)`. Implies `--stat`. |
+| Diff filter | | `--diff-filter=<FILTER>` | Select A/C/D/M/R/T/U/X/B statuses. Uppercase letters include, lowercase letters exclude; `*` makes the selection all-or-none. Invalid or empty filters fail with `LBR-CLI-002` before scanning/output. |
 | Context lines | `-U<n>` | `--unified=<n>` | Number of context lines around each change in the patch (default 3; when the flag is absent the `diff.context` config default applies — strict local → global → system cascade, non-negative Git integer with optional `k`/`m`/`g` 1024-based suffix, invalid or overflowing values fail closed with `LBR-CLI-002` before progress or diff output). Changes only the surrounding context, not the `+`/`-` lines, so `--stat`/`--name-only`/`--numstat` counts are unaffected; the `--json` hunk ranges and line arrays follow `<n>`. |
 | Ignore whitespace | `-w` | `--ignore-all-space` | Ignore all whitespace when comparing lines. A change that is only whitespace is not reported (the file drops out if that is its only change); context lines are shown from the new side. Affected files are re-diffed, so `--stat`/`--name-only`/`--numstat`/JSON all reflect the whitespace-ignored result. Honors `-U<n>`. |
 | Ignore whitespace amount | `-b` | `--ignore-space-change` | Ignore changes in the *amount* of whitespace: runs of whitespace are treated as a single space and trailing whitespace is ignored, but the presence of whitespace still matters (`a  b` matches `a b`; `a b` still differs from `ab`). Same re-diff/drop behavior as `-w`. `-w` wins if both are given. |
@@ -56,14 +61,17 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | Ignore EOL carriage return | | `--ignore-cr-at-eol` | Ignore a carriage return at end of line: a CRLF↔LF-only change drops out; a trailing-space or mid-line `\r` change still shows. The weakest whitespace flag — `-w`/`-b`/`--ignore-space-at-eol` each subsume it and win if combined. (Approximation vs Git: ALL trailing CRs are stripped before comparing, rather than Git's non-transitive allow-one-remaining-CR rule — only pathological multi-CR endings like `a\r\r\r` vs `a\r` differ, matching Git on the everyday CRLF cases.) |
 | Ignore blank lines | | `--ignore-blank-lines` | Ignore changes whose lines are all blank (truly empty): a change consisting only of added/removed empty lines is not reported (an added/deleted file whose only content is blank lines is still listed with zero counts), while a blank line near a real edit is shown in full. Re-diffs affected files (so `--stat`/`--name-only`/`--numstat`/JSON reflect the result); honors `-U<n>`. Composes with a whitespace flag (`-w`/`-b`/`--ignore-space-at-eol`/`--ignore-cr-at-eol`): under any whitespace flag an all-whitespace line counts as blank (matching Git's `xdl_blankline`). |
 | Shortstat | | `--shortstat` | Show only the trailing summary line of `--stat` (files changed / insertions / deletions), omitting a clause when its count is zero. |
-| Summary | | `--summary` | Show a condensed summary of created files, deleted files, and detected renames (rename detection is on by default; `diff.renames=false` or `--no-renames` disables it). No line is shown for plain content edits; mode-only changes are not surfaced. |
+| Summary | | `--summary` | Show a condensed summary of created/deleted files, detected renames, and mode changes (rename detection is on by default; `diff.renames=false` or `--no-renames` disables it). Plain content-only edits produce no line. |
 | No patch | `-s` | `--no-patch` | Suppress the patch (diff body). Combine with `--exit-code` for a status-only check. |
 | Exit code | | `--exit-code` | Still print the diff, but exit with code 1 when there are differences (0 otherwise). Unlike `--quiet`, the diff is not suppressed. |
-| NUL output | `-z` | `--null` | NUL-terminate `--name-only`/`--name-status`/`--numstat` records (and split the `--name-status` status and path into separate NUL fields); other modes are unaffected. |
+| NUL output | `-z` | `--null` | NUL-terminate `--raw`/`--name-only`/`--name-status`/`--numstat` records. Raw renames and name-status fields become separate NUL fields; other modes are unaffected. |
 | Whitespace check | | `--check` | Instead of the diff, warn about safety problems on added lines: trailing whitespace, space-before-tab in the indent, leftover conflict markers, and new blank lines at EOF. Prints `<path>:<line>: <message>` and exits 2 when any are found; takes precedence over other output modes. |
 | Reverse | `-R` | `--reverse` | Swap the two sides so additions become deletions and vice-versa (the patch that would undo the change). |
 | Text | `-a` | `--text` | Treat all files as text: diff the content even of files detected as binary (a NUL byte in either side, or non-UTF-8 content), suppressing the "Binary files … differ" line. Libra's diff is text-based, so a non-UTF-8 change that is identical after lossy-UTF-8 conversion still shows "Binary files … differ". |
-| Binary patch | | `--binary` | Emit a `GIT binary patch` (base85 `literal` chunks for both directions) for binary files instead of "Binary files … differ". The patch is valid and appliable, but its compressed bytes are not byte-identical to Git's (Libra deflates with a different zlib and always emits `literal`, not Git's smaller-of-literal/delta). |
+| Binary patch | | `--binary` | Emit a `GIT binary patch` (base85 `literal` chunks for both directions) for binary files instead of "Binary files … differ". It implies `--full-index`. The patch is valid and appliable, but its compressed bytes are not byte-identical to Git's (Libra deflates with a different zlib and always emits `literal`, not Git's smaller-of-literal/delta). |
+| Full index | | `--full-index` | Show full pre-image and post-image object IDs on patch `index` lines, including ordinary binary-marker diffs. |
+| Source prefix | | `--src-prefix=<PREFIX>` | Replace the patch source prefix. The CLI value overrides `diff.srcPrefix`; include any desired trailing slash. |
+| Destination prefix | | `--dst-prefix=<PREFIX>` | Replace the patch destination prefix. The CLI value overrides `diff.dstPrefix`; `-R` swaps the effective source/destination pair. |
 | No external diff | | `--no-ext-diff` | Disable the external diff driver for this run, forcing the built-in engine. |
 | External diff | | `--ext-diff` | Allow the configured external diff driver (`diff.external`) to generate each file's patch (it is used by default when configured; this flag is the explicit opposite of `--no-ext-diff`). |
 | Color moved lines | | `--color-moved[=<mode>]` | In colored output, color lines that were deleted in one place and added in another with a distinct color (removed → bold magenta, added → bold cyan). Bare `--color-moved` and the block modes (`default`/`zebra`/`blocks`/`dimmed-zebra`) are accepted but approximated by `plain` — every moved line is colored; Libra does not implement Git's conservative moved-block significance/zebra striping. `--color-moved=no` / `--no-color-moved` turns it off. Only affects colored output (a terminal or `--color=always`). |
@@ -103,11 +111,10 @@ libra diff --staged src/
 
 **`--algorithm`**
 
-Select the diff algorithm. Histogram (the default) generally produces more readable diffs for code:
+Select the diff algorithm. Histogram is the only implemented backend. The other parser-accepted names fail explicitly with `LBR-CLI-002` before any worktree scan:
 
 ```bash
-libra diff --algorithm myers
-libra diff --algorithm myersMinimal
+libra diff --algorithm histogram
 ```
 
 **`--output`**
@@ -154,6 +161,13 @@ libra diff --old HEAD~1 --new HEAD
 # Show diff stats for a subdirectory
 libra diff --stat src/
 
+# Emit NUL-safe object/mode metadata and filter review paths
+libra diff --raw -z
+libra diff --name-only --diff-filter=AM
+
+# Show full patch object IDs with explicit path prefixes
+libra diff --full-index --src-prefix=old/ --dst-prefix=new/
+
 # Patch with a different amount of context (0, or more than the default 3)
 libra diff -U0
 libra diff --unified=5 src/main.rs
@@ -176,7 +190,7 @@ libra --json diff --staged
 
 ## Configuration Defaults
 
-When no future command-line prefix override is present, patch path prefixes honor
+When no command-line prefix override is present, patch path prefixes honor
 the strict local → global → system cascade. `diff.noPrefix=true` removes both
 prefixes; otherwise `diff.mnemonicPrefix=true` selects `i/`/`w/`, `c/`/`w/`,
 `c/`/`i/`, or `c/`/`c/` for index–worktree, commit–worktree, commit–index, or
@@ -190,22 +204,27 @@ unsupported system scope is skipped under the established config contract.
 Prefix rewriting happens after
 `--relative`, applies to built-in rename/binary and `commit -v` patches, and does
 not alter verbatim external-diff output. Like Git, `commit -v` always uses the
-built-in staged diff and ignores `diff.external`.
+built-in staged diff and ignores `diff.external`. `--src-prefix` and
+`--dst-prefix` override their respective configured values; when both are given,
+irrelevant prefix defaults are not read. `-R` swaps the resulting pair.
 
 ## Human Output
 
 Supported output modes:
 
 - Default unified diff (with ANSI color when terminal is detected)
+- `--raw` (mode/object/status records; combine with `-z` for arbitrary path names)
 - `--name-only`
 - `--name-status`
 - `--numstat`
 - `--stat`
+- `--compact-summary` (`--stat` plus new/gone/executable/symlink annotations)
 - `--shortstat` (just the trailing summary line of `--stat`, with zero-count clauses omitted)
-- `--summary` (condensed create/delete/rename summary; renames are detected by default unless disabled, and mode-only changes are not surfaced)
+- `--summary` (condensed create/delete/rename/mode-change summary; renames are detected by default unless disabled)
 - `-s` / `--no-patch` suppresses the patch body (for status-only checks)
 - `--exit-code` still prints the diff but exits `1` when there are differences
-- `-z` / `--null` NUL-terminates `--name-only`/`--name-status`/`--numstat` records (status and path become separate NUL fields under `--name-status`)
+- `--diff-filter=<FILTER>` restricts all output, JSON, and exit-code decisions to the selected change kinds
+- `-z` / `--null` NUL-terminates `--raw`/`--name-only`/`--name-status`/`--numstat` records (raw rename and name-status path fields become separate NUL fields)
 - `--check` scans added lines for trailing whitespace, space-before-tab, leftover conflict markers, and new blank lines at EOF; any hit exits `2`
 - `--quiet` suppresses stdout and uses exit `1` to signal that differences exist
 
@@ -282,7 +301,7 @@ The Libra-only named flags (`--old`, `--new`) remain the ambiguity-free programm
 
 ### Why histogram as the default algorithm?
 
-Git defaults to the Myers algorithm for historical reasons. The histogram algorithm (introduced in Git 2.0 as an option) generally produces more readable diffs for source code because it is better at identifying moved blocks and avoids pathological cases with repeated lines. Libra defaults to histogram for better out-of-the-box quality. Myers and myersMinimal remain available for compatibility and edge cases.
+Git defaults to the Myers algorithm for historical reasons. Libra currently has one wired backend, histogram, chosen for readable source-code diffs. The parser reserves `myers` and `myersMinimal` for future compatibility, but execution rejects them explicitly so they cannot become silent no-ops.
 
 ### The `--cached` alias
 
@@ -304,7 +323,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Staged changes | `--staged` | `--staged` / `--cached` | N/A (no staging area) |
 | Two commits | `--old <A> --new <B>` | `<A> <B>` or `<A>..<B>` | `--from <A> --to <B>` |
 | Pathspec filter | `<pathspec>...` | `-- <pathspec>...` | `<paths>...` |
-| Algorithm | `--algorithm` (histogram/myers/myersMinimal) | `--diff-algorithm` (patience/histogram/myers/minimal) | N/A (uses internal algorithm) |
+| Algorithm | `--algorithm=histogram` (only implemented backend; other accepted names fail) | `--diff-algorithm` (patience/histogram/myers/minimal) | N/A (uses internal algorithm) |
 | Output to file | `--output <file>` | `--output <file>` | N/A (use shell redirect) |
 | Name only | `--name-only` | `--name-only` | `--name-only` |
 | Name with status | `--name-status` | `--name-status` | N/A |
@@ -312,9 +331,14 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Stat summary | `--stat` | `--stat` | `--stat` |
 | Short stat | `--shortstat` | `--shortstat` | N/A |
 | Summary | `--summary` | `--summary` | `--summary` |
+| Raw metadata | `--raw` (`-z` supported) | `--raw` (`-z` supported) | N/A |
+| Change filter | `--diff-filter=<FILTER>` | `--diff-filter=<FILTER>` | N/A |
+| Compact stat | `--compact-summary` | `--compact-summary` | N/A |
+| Full patch IDs | `--full-index` (`--binary` implies it) | `--full-index` | N/A |
+| Patch prefixes | `--src-prefix` / `--dst-prefix` | `--src-prefix` / `--dst-prefix` | N/A |
 | Suppress patch | `-s` / `--no-patch` | `-s` / `--no-patch` | N/A |
 | Exit code | `--exit-code` | `--exit-code` | N/A |
-| NUL-terminated output | `-z` / `--null` | `-z` | N/A |
+| NUL-terminated output | `-z` / `--null` (raw/name/numstat) | `-z` | N/A |
 | Whitespace check | `--check` (trailing-ws / space-before-tab / conflict markers / blank-at-eof) | `--check` | N/A |
 | Reverse diff | `-R` / `--reverse` | `-R` | N/A |
 | Treat as text | `-a` / `--text` (force content diff of binary files) | `-a` / `--text` | N/A |

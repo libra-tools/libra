@@ -69,6 +69,10 @@
 | `diff --old --new` | `cli.restore-reset-diff` | 两个 revision 间差异可见 |
 | `diff --name-only` / `--name-status` | `cli.restore-reset-diff` | 文件名和状态摘要可用于脚本断言 |
 | `diff --stat` / `--numstat` | `cli.restore-reset-diff` | 文件级统计输出可见 |
+| `diff --raw -z` | `cli.restore-reset-diff`, `compat_diff_review_options` | NUL-safe mode/object/status 记录；rename 分离旧/新路径字段，工作树侧 ID 为零 |
+| `diff --compact-summary` | `cli.restore-reset-diff`, `compat_diff_review_options` | 隐含 stat；create/delete 与 executable/symlink mode 注记可观察 |
+| `diff --diff-filter=<FILTER>` | `cli.restore-reset-diff`, `compat_diff_review_options` | include/exclude/`*` all-or-none，非法值输出前 fail-closed，sparse-view 后重新判定 |
+| `diff --full-index --src-prefix --dst-prefix` | `cli.restore-reset-diff`, `compat_diff_review_options` | patch 使用完整对象 ID 与 CLI 指定前缀；`-R` 交换前缀 |
 | `diff --output <file>` | `cli.restore-reset-diff` | patch 写入文件，stdout 不输出 hunk |
 | `diff --algorithm=histogram` | `cli.restore-reset-diff` | 当前唯一实现算法可用，其他算法负向断言 |
 | `restore --staged <path>` | `cli.restore-reset-diff` | index 恢复到 HEAD，工作区保持修改 |

@@ -21,7 +21,13 @@ use git_internal::{
     hash::ObjectHash,
     internal::{
         index::{Index, IndexEntry, Time},
-        object::{ObjectTrait, blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
+        object::{
+            ObjectTrait,
+            blob::Blob,
+            commit::Commit,
+            tree::{Tree, TreeItemMode},
+            types::ObjectType,
+        },
         pack::utils::calculate_object_hash,
     },
 };
@@ -43,7 +49,6 @@ use crate::{
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         ignore::{self, IgnorePolicy},
-        object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, ProgressMode, emit_json_data},
         pager::Pager,
         path,
@@ -61,7 +66,10 @@ EXAMPLES:
     libra diff main...feature               Diff from merge-base(main,feature) to feature
     libra diff HEAD -- src/                 '--' separates revisions from paths
     libra diff --stat src/                  Show diff statistics under src/
+    libra diff --raw -z                     NUL-safe object/mode records for scripts
+    libra diff --diff-filter=AM --name-only Show only added/modified paths
     libra diff --shortstat                  Show just the files-changed/insertions/deletions line
+    libra diff --full-index                 Show full object ids in patch index headers
     libra diff --word-diff                   Word-level diff ([-removed-]{+added+} inline)
     libra diff -U0                          Patch with no surrounding context (default is 3)
     libra diff -w                           Ignore whitespace-only changes
@@ -189,9 +197,26 @@ pub struct DiffArgs {
     #[clap(long = "ignore-blank-lines")]
     pub ignore_blank_lines: bool,
 
-    /// Show a condensed summary of created and deleted files
+    /// Show a condensed summary of created/deleted files, detected renames, and
+    /// mode changes. Plain content-only edits produce no line.
     #[clap(long)]
     pub summary: bool,
+
+    /// Show raw object/mode/status records for scripts. Use `-z` for arbitrary
+    /// path names and unambiguous rename fields.
+    #[clap(long)]
+    pub raw: bool,
+
+    /// Add creation, deletion, symlink, and executable-mode metadata to the
+    /// diffstat. Implies `--stat`.
+    #[clap(long = "compact-summary")]
+    pub compact_summary: bool,
+
+    /// Select change kinds by Git status letters. Uppercase letters include;
+    /// lowercase letters exclude. Supported letters are A,C,D,M,R,T,U,X,B; `*`
+    /// retains the whole set when any record matches the other criteria.
+    #[clap(long = "diff-filter", value_name = "FILTER")]
+    pub diff_filter: Option<String>,
 
     /// Output only the last line of `--stat`: the files-changed / insertions /
     /// deletions summary.
@@ -208,8 +233,8 @@ pub struct DiffArgs {
     #[clap(short = 's', long = "no-patch")]
     pub no_patch: bool,
 
-    /// NUL-terminate output records (for `--name-only`/`--name-status`/`--numstat`);
-    /// `--name-status` then emits the status and path as separate NUL fields.
+    /// NUL-terminate output records (for `--raw`/`--name-only`/`--name-status`/
+    /// `--numstat`); raw renames and name-status fields are emitted separately.
     #[clap(short = 'z', long = "null")]
     pub null: bool,
 
@@ -234,11 +259,24 @@ pub struct DiffArgs {
 
     /// Output a binary patch (`GIT binary patch` with base85-encoded literals for
     /// both directions) for files detected as binary, instead of "Binary files …
-    /// differ". The patch is valid and appliable, but its compressed bytes are not
-    /// byte-identical to Git's (Libra deflates with `flate2`, and always emits a
-    /// `literal` chunk rather than Git's smaller-of-literal/delta choice).
+    /// differ". Implies `--full-index`. The patch is valid and appliable, but its
+    /// compressed bytes are not byte-identical to Git's (Libra deflates with
+    /// `flate2`, and always emits a `literal` chunk rather than Git's
+    /// smaller-of-literal/delta choice).
     #[clap(long = "binary")]
     pub binary: bool,
+
+    /// Show full pre-image and post-image object ids on patch `index` lines.
+    #[clap(long = "full-index")]
+    pub full_index: bool,
+
+    /// Use this source prefix instead of `a/` (or the configured source prefix).
+    #[clap(long = "src-prefix", value_name = "PREFIX")]
+    pub src_prefix: Option<String>,
+
+    /// Use this destination prefix instead of `b/` (or the configured destination prefix).
+    #[clap(long = "dst-prefix", value_name = "PREFIX")]
+    pub dst_prefix: Option<String>,
 
     /// Disable the external diff driver (`diff.external`) for this run, forcing
     /// the built-in diff engine even when one is configured.
@@ -378,6 +416,16 @@ pub struct DiffFileStat {
     /// First new-side line in a trailing blank run, used only by `diff --check`.
     #[serde(skip)]
     check_trailing_blank_start: Option<usize>,
+    /// Directional object/mode metadata used by `--raw`, compact summaries, and
+    /// `--diff-filter`. Worktree object ids remain `None`, matching Git raw output.
+    #[serde(skip)]
+    old_id: Option<ObjectHash>,
+    #[serde(skip)]
+    new_id: Option<ObjectHash>,
+    #[serde(skip)]
+    old_mode: Option<u32>,
+    #[serde(skip)]
+    new_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -439,6 +487,9 @@ pub(crate) enum DiffError {
 
     #[error("invalid argument to color-moved: '{0}'")]
     InvalidColorMoved(String),
+
+    #[error("invalid argument to diff-filter: '{0}'")]
+    InvalidDiffFilter(String),
 
     #[error("textconv filter '{command}' failed: {detail}")]
     TextconvFailed { command: String, detail: String },
@@ -510,6 +561,9 @@ impl From<DiffError> for CliError {
             DiffError::InvalidColorMoved(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("expected no, default, plain, blocks, zebra, or dimmed-zebra"),
+            DiffError::InvalidDiffFilter(_) => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use status letters A,C,D,M,R,T,U,X,B; lowercase excludes, and '*' selects all when any requested kind matches"),
             DiffError::TextconvFailed { .. } => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::IoReadFailed)
                 .with_hint(
@@ -556,6 +610,7 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
         .await
         .map_err(CliError::from)?;
     validate_diff_algorithm(&args).map_err(CliError::from)?;
+    parse_diff_filter(args.diff_filter.as_deref()).map_err(CliError::from)?;
     let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
     let mut result = run_diff(&args, output, &config)
@@ -569,6 +624,15 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     // `--relative` prefix strip.
     if !result.external_diff_applied && !args.staged && args.new.is_none() {
         apply_sparse_view_filter(&mut result).await;
+    }
+    if !result.external_diff_applied
+        && let Some(filter) =
+            parse_diff_filter(args.diff_filter.as_deref()).map_err(CliError::from)?
+    {
+        // Re-apply after the sparse-view projection so `*` all-or-none is based
+        // only on the visible result set, not on a hidden out-of-view change.
+        apply_diff_filter(&mut result.files, &filter);
+        refresh_diff_totals(&mut result);
     }
     // External-driver output is verbatim: skip the internal relative-path rewrite
     // and word-diff transforms (they would mangle the driver's own format).
@@ -629,9 +693,7 @@ async fn apply_sparse_view_filter(result: &mut DiffOutput) {
                 .as_deref()
                 .is_some_and(|from| view.contains_str(from))
     });
-    result.files_changed = result.files.len();
-    result.total_insertions = result.files.iter().map(|file| file.insertions).sum();
-    result.total_deletions = result.files.iter().map(|file| file.deletions).sum();
+    refresh_diff_totals(result);
 }
 
 fn apply_relative_filter(args: &DiffArgs, result: &mut DiffOutput) {
@@ -656,6 +718,10 @@ fn apply_relative_filter(args: &DiffArgs, result: &mut DiffOutput) {
         file.raw_diff = strip_relative_prefix_in_diff(&file.raw_diff, &strip, &full, &stripped);
         file.path = stripped;
     }
+    refresh_diff_totals(result);
+}
+
+fn refresh_diff_totals(result: &mut DiffOutput) {
     result.files_changed = result.files.len();
     result.total_insertions = result.files.iter().map(|file| file.insertions).sum();
     result.total_deletions = result.files.iter().map(|file| file.deletions).sum();
@@ -792,8 +858,10 @@ fn apply_word_diff(
         || args.name_status
         || args.numstat
         || args.stat
+        || args.compact_summary
         || args.shortstat
         || args.summary
+        || args.raw
         || args.no_patch
         || output.is_json()
         || (output.quiet && args.output.is_none())
@@ -1303,6 +1371,68 @@ fn validate_diff_algorithm(args: &DiffArgs) -> Result<(), DiffError> {
     }
 }
 
+#[derive(Debug)]
+struct DiffFilter {
+    include: HashSet<char>,
+    exclude: HashSet<char>,
+    all_or_none: bool,
+}
+
+fn parse_diff_filter(raw: Option<&str>) -> Result<Option<DiffFilter>, DiffError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Err(DiffError::InvalidDiffFilter(raw.to_string()));
+    }
+    let mut include = HashSet::new();
+    let mut exclude = HashSet::new();
+    let mut all_or_none = false;
+    for value in raw.chars() {
+        if value == '*' {
+            all_or_none = true;
+            continue;
+        }
+        let normalized = value.to_ascii_uppercase();
+        if !matches!(
+            normalized,
+            'A' | 'C' | 'D' | 'M' | 'R' | 'T' | 'U' | 'X' | 'B'
+        ) {
+            return Err(DiffError::InvalidDiffFilter(raw.to_string()));
+        }
+        if value.is_ascii_lowercase() {
+            exclude.insert(normalized);
+        } else if value.is_ascii_uppercase() {
+            include.insert(normalized);
+        } else {
+            return Err(DiffError::InvalidDiffFilter(raw.to_string()));
+        }
+    }
+    Ok(Some(DiffFilter {
+        include,
+        exclude,
+        all_or_none,
+    }))
+}
+
+fn apply_diff_filter(files: &mut Vec<DiffFileStat>, filter: &DiffFilter) {
+    let matches = |file: &DiffFileStat| {
+        let status = diff_status_code(file);
+        !filter.exclude.contains(&status)
+            && (filter.include.is_empty() || filter.include.contains(&status))
+    };
+    if filter.all_or_none {
+        // Git's `*` is a true all-or-none selector: once any record matches the
+        // other criteria, the original set is retained in full (even records
+        // named by a lowercase exclusion).
+        if !files.iter().any(matches) {
+            files.clear();
+        }
+    } else {
+        files.retain(matches);
+    }
+}
+
 fn emit_worktree_scan_progress(args: &DiffArgs, output: &OutputConfig) {
     if output.quiet || output.is_json() || args.staged || args.new.is_some() {
         return;
@@ -1347,10 +1477,14 @@ async fn run_diff(
     let paths: Vec<PathBuf> = pathspecs.plain_positive_prefixes().unwrap_or_default();
     let diff_pathspecs = paths.clone();
     let worktree_entries = new_side.worktree_entries.clone();
-    // Separate copy for the external-diff pass (the one above is moved into the
-    // diff closure below). Lets the GIT_EXTERNAL_DIFF protocol report a zero hash
-    // for a new side that is the live working tree.
+    // Separate copy for content post-passes (the one above is moved into the diff
+    // closure below). Directional worktree identity for raw/external metadata is
+    // carried explicitly below so same-content mode changes cannot zero both sides.
     let ext_worktree_entries = new_side.worktree_entries.clone();
+    let old_modes = old_side.modes;
+    let new_modes = new_side.modes;
+    let old_is_worktree = old_side.is_worktree;
+    let new_is_worktree = new_side.is_worktree;
     // `Rc` so the `-U<n>` post-pass can read the blob content the diff closure
     // cached (keyed by hash) without re-loading it from the object store/disk.
     let worktree_cache: Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>> =
@@ -1364,10 +1498,23 @@ async fn run_diff(
     // `-R`/`--reverse`: swap the two sides so the diff is computed new->old. The
     // loader resolves blobs by hash (content-addressed) and the worktree check
     // above stays correct regardless of which side a blob lands on.
-    let (first_blobs, second_blobs, old_label, new_label) = if args.reverse {
+    let (
+        first_blobs,
+        second_blobs,
+        first_modes,
+        second_modes,
+        first_is_worktree,
+        second_is_worktree,
+        old_label,
+        new_label,
+    ) = if args.reverse {
         (
             new_side.blobs,
             old_side.blobs,
+            new_modes,
+            old_modes,
+            new_is_worktree,
+            old_is_worktree,
             new_side.label,
             old_side.label,
         )
@@ -1375,6 +1522,10 @@ async fn run_diff(
         (
             old_side.blobs,
             new_side.blobs,
+            old_modes,
+            new_modes,
+            old_is_worktree,
+            new_is_worktree,
             old_side.label,
             new_side.label,
         )
@@ -1454,6 +1605,13 @@ async fn run_diff(
     }
 
     let mut files: Vec<DiffFileStat> = diff_output.iter().map(parse_diff_item).collect();
+    append_mode_only_changes(
+        &mut files,
+        &first_map,
+        &second_map,
+        &first_modes,
+        &second_modes,
+    );
     if args.old.is_none() && args.new.is_none() && !args.staged {
         apply_unmerged_worktree_diff(&mut files, &index, &diff_pathspecs)?;
     }
@@ -1532,6 +1690,8 @@ async fn run_diff(
             &mut files,
             &first_map,
             &second_map,
+            &first_modes,
+            &second_modes,
             &ext_worktree_entries,
             threshold,
             regen_context,
@@ -1543,6 +1703,19 @@ async fn run_diff(
                 "warning: skipped inexact rename detection because more than 1000 sources or destinations changed; exact renames were still detected",
             );
         }
+    }
+
+    populate_diff_metadata(
+        &mut files,
+        &first_map,
+        &second_map,
+        &first_modes,
+        &second_modes,
+        first_is_worktree,
+        second_is_worktree,
+    );
+    for file in &mut files {
+        apply_mode_metadata_to_patch(file);
     }
 
     // Textconv (`--textconv`, on by default unless `--no-textconv`): re-diff the
@@ -1624,14 +1797,14 @@ async fn run_diff(
         )?;
     }
 
-    // `--binary` implies `--full-index`: rewrite EVERY file's `index` line to full
-    // object ids (binary files were already given full ids above; this covers the
-    // text files in the same diff).
-    if args.binary && external_command.is_none() {
+    // `--binary` implies `--full-index`: rewrite every applicable `index` line
+    // to full object ids. Binary-patch entries already carry full ids; ordinary
+    // binary markers still need rewriting when `--full-index` is explicit.
+    if (args.binary || args.full_index) && external_command.is_none() {
         for file in files.iter_mut() {
             // Binary files were already given full ids (with the correct
             // blank-line terminator) in `apply_binary_detection`; don't re-process.
-            if file.binary.is_some() {
+            if args.binary && file.binary.is_some() {
                 continue;
             }
             let old_path = file.rename_from.as_deref().unwrap_or(&file.path);
@@ -1710,15 +1883,21 @@ async fn run_diff(
                     compute_unified_hunks(&old_text, &new_text, regen_context)
                 };
                 // No change survives the rule. Git still reports an added/deleted
-                // filepair (header, zero counts, no hunk) even when its only content
-                // is blank lines — only a modification disappears entirely.
+                // filepair or mode change (header, zero counts, no hunk) even when
+                // its only content is blank lines — only a content-only
+                // modification disappears entirely.
                 if body.trim().is_empty() {
                     // `file.status` is parsed only from the pre-hunk header lines
                     // (`parse_diff_status` stops at the first `@@`), so a body line
                     // that merely contains "new file mode" cannot misclassify a
                     // modification as an add/delete.
-                    let is_add_or_delete = file.status == "added" || file.status == "deleted";
-                    if !is_add_or_delete {
+                    let keep_header = file.status == "added"
+                        || file.status == "deleted"
+                        || matches!(
+                            (file.old_mode, file.new_mode),
+                            (Some(old), Some(new)) if old != new
+                        );
+                    if !keep_header {
                         return false;
                     }
                     file.insertions = 0;
@@ -1761,6 +1940,10 @@ async fn run_diff(
         }
     }
 
+    if let Some(filter) = parse_diff_filter(args.diff_filter.as_deref())? {
+        apply_diff_filter(&mut files, &filter);
+    }
+
     // Apply the external diff driver LAST so its verbatim output is never touched
     // by the internal post-passes (skipped above) or the later word-diff pass
     // (skipped in `execute_safe` via `external_diff_applied`).
@@ -1773,7 +1956,8 @@ async fn run_diff(
             command,
             &first_map,
             &second_map,
-            &ext_worktree_entries,
+            first_is_worktree,
+            second_is_worktree,
         )?;
         true
     } else {
@@ -1862,11 +2046,135 @@ fn filter_diff_files_by_pathspec(files: &mut Vec<DiffFileStat>, pathspecs: &Path
     });
 }
 
+fn append_mode_only_changes(
+    files: &mut Vec<DiffFileStat>,
+    old_blobs: &HashMap<PathBuf, ObjectHash>,
+    new_blobs: &HashMap<PathBuf, ObjectHash>,
+    old_modes: &HashMap<PathBuf, u32>,
+    new_modes: &HashMap<PathBuf, u32>,
+) {
+    let existing: HashSet<PathBuf> = files.iter().map(|file| PathBuf::from(&file.path)).collect();
+    for (path, old_hash) in old_blobs {
+        let Some(new_hash) = new_blobs.get(path) else {
+            continue;
+        };
+        let (Some(old_mode), Some(new_mode)) = (old_modes.get(path), new_modes.get(path)) else {
+            continue;
+        };
+        if old_hash != new_hash || old_mode == new_mode || existing.contains(path) {
+            continue;
+        }
+        let display = path.to_string_lossy();
+        files.push(DiffFileStat {
+            path: display.to_string(),
+            status: "modified".to_string(),
+            insertions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            raw_diff: format!(
+                "diff --git a/{display} b/{display}\nold mode {old_mode:06o}\nnew mode {new_mode:06o}\n"
+            ),
+            rename_from: None,
+            similarity: None,
+            binary: None,
+            check_trailing_blank_start: None,
+            old_id: Some(*old_hash),
+            new_id: Some(*new_hash),
+            old_mode: Some(*old_mode),
+            new_mode: Some(*new_mode),
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+}
+
+fn populate_diff_metadata(
+    files: &mut [DiffFileStat],
+    old_blobs: &HashMap<PathBuf, ObjectHash>,
+    new_blobs: &HashMap<PathBuf, ObjectHash>,
+    old_modes: &HashMap<PathBuf, u32>,
+    new_modes: &HashMap<PathBuf, u32>,
+    old_is_worktree: bool,
+    new_is_worktree: bool,
+) {
+    for file in files {
+        if file.raw_diff.starts_with("diff --cc ") {
+            continue;
+        }
+        let old_path = PathBuf::from(file.rename_from.as_deref().unwrap_or(&file.path));
+        let new_path = PathBuf::from(&file.path);
+        file.old_id = (!old_is_worktree)
+            .then(|| old_blobs.get(&old_path).copied())
+            .flatten();
+        file.new_id = (!new_is_worktree)
+            .then(|| new_blobs.get(&new_path).copied())
+            .flatten();
+        file.old_mode = old_modes.get(&old_path).copied();
+        file.new_mode = new_modes.get(&new_path).copied();
+    }
+}
+
+/// Normalize built-in patch mode headers from the directional tree/index/worktree
+/// metadata. `git_internal` compares blob ids and can render `100644` even when
+/// the real filepair is executable; keeping that placeholder would make ordinary
+/// and `--full-index` patches disagree with `--raw` and external-diff metadata.
+fn apply_mode_metadata_to_patch(file: &mut DiffFileStat) {
+    if file.raw_diff.starts_with("diff --cc ") {
+        return;
+    }
+    let trailing_newline = file.raw_diff.ends_with('\n');
+    let mode_change = match (file.old_mode, file.new_mode) {
+        (Some(old), Some(new)) if old != new => Some((old, new)),
+        _ => None,
+    };
+    let mut output = Vec::new();
+    for (index, line) in file.raw_diff.lines().enumerate() {
+        if index == 1
+            && let Some((old, new)) = mode_change
+        {
+            output.push(format!("old mode {old:06o}"));
+            output.push(format!("new mode {new:06o}"));
+        }
+        if line.starts_with("old mode ") || line.starts_with("new mode ") {
+            continue;
+        }
+        if line.starts_with("new file mode ")
+            && let Some(mode) = file.new_mode
+        {
+            output.push(format!("new file mode {mode:06o}"));
+            continue;
+        }
+        if line.starts_with("deleted file mode ")
+            && let Some(mode) = file.old_mode
+        {
+            output.push(format!("deleted file mode {mode:06o}"));
+            continue;
+        }
+        if let Some(ids) = line
+            .strip_prefix("index ")
+            .and_then(|rest| rest.split_whitespace().next())
+        {
+            let rewritten = match (file.old_mode, file.new_mode) {
+                (Some(old), Some(new)) if old == new => format!("index {ids} {new:06o}"),
+                _ => format!("index {ids}"),
+            };
+            output.push(rewritten);
+            continue;
+        }
+        output.push(line.to_string());
+    }
+    file.raw_diff = output.join("\n");
+    if trailing_newline {
+        file.raw_diff.push('\n');
+    }
+}
+
 #[derive(Debug)]
 struct DiffSide {
     label: String,
     blobs: Vec<(PathBuf, ObjectHash)>,
+    modes: HashMap<PathBuf, u32>,
     worktree_entries: HashMap<PathBuf, ObjectHash>,
+    is_worktree: bool,
 }
 
 /// diff needs to print hashes even if the files have not been staged yet.
@@ -2054,12 +2362,36 @@ fn get_worktree_diff_files(index: &Index) -> Result<Vec<PathBuf>, DiffError> {
 /// Unlike `get_files_blobs`, this uses the hash already recorded in the index
 /// rather than reading the current file on disk, which is essential for
 /// producing a correct working-directory diff (index vs working tree).
-fn get_index_blobs(index: &Index, policy: IgnorePolicy) -> Vec<(PathBuf, ObjectHash)> {
-    index
+fn get_index_side(
+    index: &Index,
+    policy: IgnorePolicy,
+) -> (Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>) {
+    let entries = index
         .tracked_entries(0)
+        .into_iter()
+        .filter(|entry| !ignore::should_ignore(&PathBuf::from(&entry.name), policy, index));
+    let mut blobs = Vec::new();
+    let mut modes = HashMap::new();
+    for entry in entries {
+        let path = PathBuf::from(&entry.name);
+        blobs.push((path.clone(), entry.hash));
+        modes.insert(path, entry.mode);
+    }
+    (blobs, modes)
+}
+
+fn get_worktree_modes(files: &[PathBuf]) -> Result<HashMap<PathBuf, u32>, DiffError> {
+    files
         .iter()
-        .filter(|entry| !ignore::should_ignore(&PathBuf::from(&entry.name), policy, index))
-        .map(|entry| (PathBuf::from(&entry.name), entry.hash))
+        .map(|path| {
+            let absolute = util::workdir_to_absolute(path);
+            let metadata =
+                std::fs::symlink_metadata(&absolute).map_err(|error| DiffError::FileRead {
+                    path: absolute.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+            Ok((path.clone(), index_mode_from_metadata(&metadata)))
+        })
         .collect()
 }
 
@@ -2073,47 +2405,66 @@ async fn resolve_diff_side(
         let commit_hash = get_target_commit(source)
             .await
             .map_err(|_| DiffError::InvalidRevision(source.clone()))?;
+        let (blobs, modes) = get_commit_entries(&commit_hash).await?;
         return Ok(DiffSide {
             label: source.clone(),
-            blobs: get_commit_blobs(&commit_hash).await?,
+            blobs,
+            modes,
             worktree_entries: HashMap::new(),
+            is_worktree: false,
         });
     }
 
     if is_new {
         if staged {
+            let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect);
             Ok(DiffSide {
                 label: "index".to_string(),
-                blobs: get_index_blobs(index, IgnorePolicy::Respect),
+                blobs,
+                modes,
                 worktree_entries: HashMap::new(),
+                is_worktree: false,
             })
         } else {
             let files = get_worktree_diff_files(index)?;
             let blobs = get_files_blobs(&files, index, IgnorePolicy::Respect)?;
+            let modes = get_worktree_modes(&files)?;
             Ok(DiffSide {
                 label: "working tree".to_string(),
                 worktree_entries: blobs.iter().cloned().collect(),
                 blobs,
+                modes,
+                is_worktree: true,
             })
         }
     } else if staged {
         match Head::current_commit().await {
-            Some(commit_hash) => Ok(DiffSide {
-                label: "HEAD".to_string(),
-                blobs: get_commit_blobs(&commit_hash).await?,
-                worktree_entries: HashMap::new(),
-            }),
+            Some(commit_hash) => {
+                let (blobs, modes) = get_commit_entries(&commit_hash).await?;
+                Ok(DiffSide {
+                    label: "HEAD".to_string(),
+                    blobs,
+                    modes,
+                    worktree_entries: HashMap::new(),
+                    is_worktree: false,
+                })
+            }
             None => Ok(DiffSide {
                 label: "HEAD".to_string(),
                 blobs: Vec::new(),
+                modes: HashMap::new(),
                 worktree_entries: HashMap::new(),
+                is_worktree: false,
             }),
         }
     } else {
+        let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect);
         Ok(DiffSide {
             label: "index".to_string(),
-            blobs: get_index_blobs(index, IgnorePolicy::Respect),
+            blobs,
+            modes,
             worktree_entries: HashMap::new(),
+            is_worktree: false,
         })
     }
 }
@@ -2121,6 +2472,14 @@ async fn resolve_diff_side(
 async fn get_commit_blobs(
     commit_hash: &ObjectHash,
 ) -> Result<Vec<(PathBuf, ObjectHash)>, DiffError> {
+    get_commit_entries(commit_hash)
+        .await
+        .map(|(blobs, _)| blobs)
+}
+
+async fn get_commit_entries(
+    commit_hash: &ObjectHash,
+) -> Result<(Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>), DiffError> {
     let commit = load_object::<Commit>(commit_hash).map_err(|e| DiffError::ObjectLoad {
         kind: "commit",
         object_id: commit_hash.to_string(),
@@ -2131,7 +2490,53 @@ async fn get_commit_blobs(
         object_id: commit.tree_id.to_string(),
         detail: e.to_string(),
     })?;
-    Ok(tree.get_plain_items())
+    let mut blobs = Vec::new();
+    let mut modes = HashMap::new();
+    collect_tree_entries(&tree, Path::new(""), &mut blobs, &mut modes)?;
+    Ok((blobs, modes))
+}
+
+fn collect_tree_entries(
+    tree: &Tree,
+    prefix: &Path,
+    blobs: &mut Vec<(PathBuf, ObjectHash)>,
+    modes: &mut HashMap<PathBuf, u32>,
+) -> Result<(), DiffError> {
+    for item in &tree.tree_items {
+        let item_path = prefix.join(&item.name);
+        match item.mode {
+            TreeItemMode::Tree => {
+                let subtree =
+                    load_object::<Tree>(&item.id).map_err(|error| DiffError::ObjectLoad {
+                        kind: "tree",
+                        object_id: item.id.to_string(),
+                        detail: error.to_string(),
+                    })?;
+                collect_tree_entries(&subtree, &item_path, blobs, modes)?;
+            }
+            TreeItemMode::Commit => {
+                crate::utils::error::emit_legacy_stderr(format!(
+                    "Warning: Submodule '{}' is not supported yet; skipping checkout entry",
+                    item_path.display()
+                ));
+            }
+            mode => {
+                blobs.push((item_path.clone(), item.id));
+                modes.insert(item_path, tree_mode_to_index_mode(mode));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tree_mode_to_index_mode(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::Blob => 0o100644,
+        TreeItemMode::BlobExecutable => 0o100755,
+        TreeItemMode::Link => 0o120000,
+        TreeItemMode::Commit => 0o160000,
+        TreeItemMode::Tree => 0o040000,
+    }
 }
 
 /// Render a Git-style `--stat` block for the changes between two commits'
@@ -2263,6 +2668,10 @@ fn build_unmerged_diff_file(entry: &UnmergedEntry) -> Result<DiffFileStat, DiffE
         similarity: None,
         binary: None,
         check_trailing_blank_start: None,
+        old_id: None,
+        new_id: None,
+        old_mode: None,
+        new_mode: None,
     })
 }
 
@@ -2364,16 +2773,18 @@ fn line_count(text: &str) -> usize {
 }
 
 /// Whether the textual patch body is shown for this invocation. The
-/// `--stat`/`--numstat`/`--shortstat`/`--name-only`/`--name-status`/`--summary`/
+/// `--stat`/`--compact-summary`/`--numstat`/`--shortstat`/`--raw`/name/summary/
 /// `-s`/`--check` modes render from the internal diff and bypass external
 /// drivers (matching Git, which never runs `diff.external` for those modes).
 fn patch_body_is_shown(args: &DiffArgs) -> bool {
     !(args.stat
+        || args.compact_summary
         || args.numstat
         || args.shortstat
         || args.name_only
         || args.name_status
         || args.summary
+        || args.raw
         || args.no_patch
         || args.check)
 }
@@ -2505,19 +2916,36 @@ fn similarity_score(old: &[u8], new: &[u8]) -> u32 {
 
 /// Detect renames among the deleted + added files and fold each matched pair into
 /// a single rename entry (`-M`). Exact (same blob id) pairs are matched first,
-/// then the best inexact pairs whose similarity meets the threshold. Each side is
-/// used at most once.
+/// then the best inexact pairs whose similarity meets the threshold. Candidates
+/// must retain their file type (regular file, symlink, and so on), and each side
+/// is used at most once.
 #[allow(clippy::too_many_arguments)]
 fn apply_rename_detection(
     files: &mut Vec<DiffFileStat>,
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
+    first_modes: &HashMap<PathBuf, u32>,
+    second_modes: &HashMap<PathBuf, u32>,
     worktree_entries: &HashMap<PathBuf, ObjectHash>,
     threshold: u32,
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
 ) -> bool {
+    let same_file_type = |old_path: &str, new_path: &str| {
+        let old_type = first_modes
+            .get(&PathBuf::from(old_path))
+            .map(|mode| mode & 0o170000);
+        let new_type = second_modes
+            .get(&PathBuf::from(new_path))
+            .map(|mode| mode & 0o170000);
+        match (old_type, new_type) {
+            (Some(old), Some(new)) => old == new,
+            // Missing mode metadata should not disable otherwise valid rename
+            // detection; populated tree, index, and worktree sides have modes.
+            _ => true,
+        }
+    };
     let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Option<Vec<u8>> {
         let pb = PathBuf::from(path);
         let hash = map.get(&pb)?;
@@ -2559,10 +2987,16 @@ fn apply_rename_detection(
         let Some(dh) = first_map.get(&PathBuf::from(&files[di].path)) else {
             continue;
         };
-        let Some(ai) = added_by_hash
-            .get_mut(&dh.to_string())
-            .and_then(VecDeque::pop_front)
+        let Some(candidates) = added_by_hash.get_mut(&dh.to_string()) else {
+            continue;
+        };
+        let Some(position) = candidates
+            .iter()
+            .position(|&ai| same_file_type(&files[di].path, &files[ai].path))
         else {
+            continue;
+        };
+        let Some(ai) = candidates.remove(position) else {
             continue;
         };
         pairs.push((di, ai, 60000));
@@ -2614,6 +3048,9 @@ fn apply_rename_detection(
             };
             for &ai in &added {
                 if used_add[ai] {
+                    continue;
+                }
+                if !same_file_type(&files[di].path, &files[ai].path) {
                     continue;
                 }
                 let Some(new) = new_contents.get(&ai) else {
@@ -2763,6 +3200,10 @@ fn build_rename_entry(
         similarity: Some(percent),
         binary: None,
         check_trailing_blank_start: None,
+        old_id: None,
+        new_id: None,
+        old_mode: None,
+        new_mode: None,
     }
 }
 
@@ -2831,8 +3272,9 @@ async fn resolve_textconv_command(
 /// patch header (including a rename's `similarity`/`rename from`/`to`, whose old
 /// side lives at `rename_from` and may resolve a DIFFERENT driver than the new
 /// side). A side with no command is diffed raw. A modification whose converted
-/// content is unchanged is dropped (like a whitespace-only change);
-/// created/deleted/renamed files keep their header. Returns the set of textconv'd
+/// content is unchanged is dropped (like a whitespace-only change), unless its
+/// mode changed; created/deleted/renamed/mode-changed files keep their header.
+/// Returns the set of textconv'd
 /// paths so the later context/whitespace post-pass skips them. Blob read failures
 /// surface as errors (not empty content).
 #[allow(clippy::too_many_arguments)]
@@ -2937,7 +3379,12 @@ fn apply_textconv(
             }
             // Converted content is identical: drop a pure modification, but keep a
             // created/deleted/renamed entry (header only, zero counts).
-            let keep_header = matches!(file.status.as_str(), "added" | "deleted" | "renamed");
+            let mode_changed = matches!(
+                (file.old_mode, file.new_mode),
+                (Some(old), Some(new)) if old != new
+            );
+            let keep_header =
+                matches!(file.status.as_str(), "added" | "deleted" | "renamed") || mode_changed;
             if !keep_header {
                 return false;
             }
@@ -2973,8 +3420,12 @@ fn apply_textconv(
             if !raw.ends_with('\n') {
                 raw.push('\n');
             }
+            let index_mode = match (file.old_mode, file.new_mode) {
+                (Some(old), Some(new)) if old == new => format!(" {new:06o}"),
+                _ => String::new(),
+            };
             raw.push_str(&format!(
-                "index {}..{} 100644\n--- a/{old_path}\n+++ b/{}\n",
+                "index {}..{}{index_mode}\n--- a/{old_path}\n+++ b/{}\n",
                 abbrev(first_map, &old_path),
                 abbrev(second_map, &file.path),
                 file.path,
@@ -3265,8 +3716,8 @@ fn apply_binary_detection(
 /// diff driver (`diff.external`), following Git's `GIT_EXTERNAL_DIFF` protocol:
 /// the command is invoked as `cmd path old-file old-hex old-mode new-file
 /// new-hex new-mode` and its stdout becomes that file's diff. A missing side
-/// uses `/dev/null` with `.` for its hex and mode; a new side that is the live
-/// working tree reports an all-zero hash (uncommitted), matching Git. The
+/// uses `/dev/null` with `.` for its hex and mode; whichever directional side is
+/// the live working tree reports an all-zero hash (including under `-R`), matching Git. The
 /// command is run through the shell so a `diff.external` value carrying its own
 /// arguments works.
 fn apply_external_diff(
@@ -3274,7 +3725,8 @@ fn apply_external_diff(
     command: &str,
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    first_is_worktree: bool,
+    second_is_worktree: bool,
 ) -> Result<(), DiffError> {
     use std::io::Write as _;
 
@@ -3329,12 +3781,6 @@ fn apply_external_diff(
         Ok((arg, hex, mode, Some(tmp)))
     };
 
-    // A side reads from the working tree iff its blob id matches the worktree
-    // entry — which can be EITHER side once `-R` swaps them.
-    let side_is_worktree = |path: &Path, hash: Option<&ObjectHash>| -> bool {
-        hash.is_some_and(|h| worktree_entries.get(path) == Some(h))
-    };
-
     let total = files.len();
     for (index, file) in files.iter_mut().enumerate() {
         let path = PathBuf::from(&file.path);
@@ -3345,20 +3791,24 @@ fn apply_external_diff(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| path.clone());
-        let (old_mode, new_mode) = external_diff_modes(&file.raw_diff);
+        let (fallback_old_mode, fallback_new_mode) = external_diff_modes(&file.raw_diff);
+        let old_mode = file
+            .old_mode
+            .map(|mode| format!("{mode:06o}"))
+            .unwrap_or(fallback_old_mode);
+        let new_mode = file
+            .new_mode
+            .map(|mode| format!("{mode:06o}"))
+            .unwrap_or(fallback_new_mode);
 
         let (old_file, old_hex, old_mode_arg, _old_tmp) = materialize(
             first_map.get(&old_path),
-            side_is_worktree(&old_path, first_map.get(&old_path)),
+            first_is_worktree,
             &old_path,
             &old_mode,
         )?;
-        let (new_file, new_hex, new_mode_arg, _new_tmp) = materialize(
-            second_map.get(&path),
-            side_is_worktree(&path, second_map.get(&path)),
-            &path,
-            &new_mode,
-        )?;
+        let (new_file, new_hex, new_mode_arg, _new_tmp) =
+            materialize(second_map.get(&path), second_is_worktree, &path, &new_mode)?;
 
         let result = std::process::Command::new("sh")
             .arg("-c")
@@ -3575,7 +4025,9 @@ fn render_diff_output(
     // when --quiet is set (quiet only suppresses stdout, not file writes).
     // `-z` NUL-terminates each record; `--name-status` then separates the
     // status and path with a NUL instead of a tab.
-    let rendered = if args.name_only {
+    let rendered = if args.raw {
+        format_diff_raw(result, args.null)
+    } else if args.name_only {
         join_diff_records(result.files.iter().map(|file| file.path.clone()), args.null)
     } else if args.name_status {
         let field_sep = if args.null { '\0' } else { '\t' };
@@ -3591,12 +4043,7 @@ fn render_diff_output(
                         sep = field_sep,
                     )
                 } else {
-                    format!(
-                        "{}{}{}",
-                        diff_status_letter(&file.status),
-                        field_sep,
-                        file.path
-                    )
+                    format!("{}{}{}", diff_status_code(file), field_sep, file.path)
                 }
             }),
             args.null,
@@ -3624,8 +4071,8 @@ fn render_diff_output(
             }),
             args.null,
         )
-    } else if args.stat {
-        format_diff_stat_output(result)
+    } else if args.stat || args.compact_summary {
+        format_diff_stat_output_with_compact(result, args.compact_summary)
     } else if args.shortstat {
         format_diff_shortstat_output(result)
     } else if args.summary {
@@ -3675,8 +4122,10 @@ fn render_diff_output(
         || args.name_status
         || args.numstat
         || args.stat
+        || args.compact_summary
         || args.shortstat
         || args.summary
+        || args.raw
         || word_diff_active(args)
         || result.external_diff_applied
         || result.binary_patch
@@ -3696,7 +4145,7 @@ fn render_diff_output(
     };
     // `-z` records carry their own NUL terminators, and external-driver output is
     // emitted byte-for-byte, so neither gets an appended trailing newline.
-    let z_records = args.null && (args.name_only || args.name_status || args.numstat);
+    let z_records = args.null && (args.name_only || args.name_status || args.numstat || args.raw);
     // The verbatim (no trailing-newline) write path applies only when the PATCH
     // body is actually rendered — `--binary --stat`/`--numstat` still get the
     // normal trailing newline even though `binary_patch` is set.
@@ -3733,9 +4182,8 @@ fn diff_exit_result(args: &DiffArgs, result: &DiffOutput) -> CliResult<()> {
     }
 }
 
-/// Render `--summary`: one line per created file, deleted file, or detected
-/// rename; plain content modifications produce no line, matching
-/// `git diff --summary`. Mode-only changes are not surfaced.
+/// Render `--summary`: one line per created/deleted file, detected rename, or
+/// mode change; plain content-only modifications produce no line.
 fn format_diff_summary(result: &DiffOutput) -> String {
     result
         .files
@@ -3747,11 +4195,31 @@ fn format_diff_summary(result: &DiffOutput) -> String {
 
 fn summary_line(file: &DiffFileStat) -> Option<String> {
     if file.status == "renamed" {
-        return Some(format!(
+        let mut summary = format!(
             " rename {} ({}%)",
             rename_display(file.rename_from.as_deref().unwrap_or(""), &file.path),
             file.similarity.unwrap_or(0),
-        ));
+        );
+        if let (Some(old), Some(new)) = (file.old_mode, file.new_mode)
+            && old != new
+        {
+            summary.push_str(&format!(
+                "\n mode change {old:06o} => {new:06o} {}",
+                file.path
+            ));
+        }
+        return Some(summary);
+    }
+    if let (None, Some(new)) = (file.old_mode, file.new_mode) {
+        return Some(format!(" create mode {new:06o} {}", file.path));
+    }
+    if let (Some(old), None) = (file.old_mode, file.new_mode) {
+        return Some(format!(" delete mode {old:06o} {}", file.path));
+    }
+    if let (Some(old), Some(new)) = (file.old_mode, file.new_mode)
+        && old != new
+    {
+        return Some(format!(" mode change {old:06o} => {new:06o} {}", file.path));
     }
     let find = |prefix: &str| {
         file.raw_diff
@@ -3768,12 +4236,80 @@ fn summary_line(file: &DiffFileStat) -> Option<String> {
     None
 }
 
-fn diff_status_letter(status: &str) -> &'static str {
-    match status {
-        "added" => "A",
-        "deleted" => "D",
-        _ => "M",
+fn diff_status_code(file: &DiffFileStat) -> char {
+    if file.raw_diff.starts_with("diff --cc ") {
+        return 'U';
     }
+    if file.status == "renamed" {
+        return 'R';
+    }
+    if file.status == "added" {
+        return 'A';
+    }
+    if file.status == "deleted" {
+        return 'D';
+    }
+    if let (Some(old), Some(new)) = (file.old_mode, file.new_mode)
+        && old & 0o170000 != new & 0o170000
+    {
+        return 'T';
+    }
+    'M'
+}
+
+fn abbreviated_raw_id(id: Option<ObjectHash>) -> String {
+    id.map(|hash| {
+        let full = hash.to_string();
+        full.get(..7).unwrap_or(&full).to_string()
+    })
+    .unwrap_or_else(|| "0000000".to_string())
+}
+
+fn raw_mode(mode: Option<u32>) -> String {
+    mode.map(|mode| format!("{mode:06o}"))
+        .unwrap_or_else(|| "000000".to_string())
+}
+
+fn format_diff_raw(result: &DiffOutput, null: bool) -> String {
+    let mut output = String::new();
+    for file in &result.files {
+        let status = diff_status_code(file);
+        let status_field = if status == 'R' {
+            format!("R{:03}", file.similarity.unwrap_or(0))
+        } else {
+            status.to_string()
+        };
+        let metadata = format!(
+            ":{} {} {} {} {status_field}",
+            raw_mode(file.old_mode),
+            raw_mode(file.new_mode),
+            abbreviated_raw_id(file.old_id),
+            abbreviated_raw_id(file.new_id),
+        );
+        if null {
+            output.push_str(&metadata);
+            output.push('\0');
+            if status == 'R' {
+                output.push_str(file.rename_from.as_deref().unwrap_or(""));
+                output.push('\0');
+            }
+            output.push_str(&file.path);
+            output.push('\0');
+        } else if status == 'R' {
+            let _ = writeln!(
+                output,
+                "{metadata}\t{}\t{}",
+                file.rename_from.as_deref().unwrap_or(""),
+                file.path
+            );
+        } else {
+            let _ = writeln!(output, "{metadata}\t{}", file.path);
+        }
+    }
+    if !null {
+        output.pop();
+    }
+    output
 }
 
 /// Render a rename path pair the way Git's `pprint_rename` does for `--stat` /
@@ -4507,6 +5043,9 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         after_dashdash: Vec::new(),
         ignore_blank_lines: false,
         summary: false,
+        raw: false,
+        compact_summary: false,
+        diff_filter: None,
         shortstat: false,
         exit_code: false,
         no_patch: false,
@@ -4515,6 +5054,9 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         reverse: false,
         text: false,
         binary: false,
+        full_index: false,
+        src_prefix: None,
+        dst_prefix: None,
         // Git's commit-verbose helper always renders the built-in staged diff;
         // `diff.external` must not replace the editor template or stderr patch.
         no_ext_diff: true,
@@ -4604,6 +5146,10 @@ fn format_diff_shortstat_output(result: &DiffOutput) -> String {
 }
 
 fn format_diff_stat_output(result: &DiffOutput) -> String {
+    format_diff_stat_output_with_compact(result, false)
+}
+
+fn format_diff_stat_output_with_compact(result: &DiffOutput, compact: bool) -> String {
     if result.files.is_empty() {
         return String::new();
     }
@@ -4612,11 +5158,16 @@ fn format_diff_stat_output(result: &DiffOutput) -> String {
         .files
         .iter()
         .map(|file| {
-            let name = if file.status == "renamed" {
+            let mut name = if file.status == "renamed" {
                 rename_display(file.rename_from.as_deref().unwrap_or(""), &file.path)
             } else {
                 file.path.clone()
             };
+            if compact && let Some(summary) = compact_summary_label(file) {
+                name.push_str(" (");
+                name.push_str(&summary);
+                name.push(')');
+            }
             // Binary files show `Bin <old> -> <new> bytes` instead of a graph; an
             // UNCHANGED binary (an exact rename, which keeps a header-only body
             // with no `Binary files`/`GIT binary patch`) shows a bare `Bin`,
@@ -4661,6 +5212,40 @@ fn format_diff_stat_output(result: &DiffOutput) -> String {
     lines.join("\n")
 }
 
+fn compact_summary_label(file: &DiffFileStat) -> Option<String> {
+    let mode_suffix = |mode: u32| {
+        if mode & 0o170000 == 0o120000 {
+            Some("+l")
+        } else if mode & 0o111 != 0 {
+            Some("+x")
+        } else {
+            None
+        }
+    };
+    match (file.old_mode, file.new_mode) {
+        (None, Some(new)) => Some(match mode_suffix(new) {
+            Some(suffix) => format!("new {suffix}"),
+            None => "new".to_string(),
+        }),
+        (Some(_), None) => Some("gone".to_string()),
+        (Some(old), Some(new)) if old != new => {
+            let old_link = old & 0o170000 == 0o120000;
+            let new_link = new & 0o170000 == 0o120000;
+            let old_exec = old & 0o111 != 0;
+            let new_exec = new & 0o111 != 0;
+            let mut changes = Vec::new();
+            if old_link != new_link {
+                changes.push(if new_link { "+l" } else { "-l" });
+            }
+            if old_exec != new_exec {
+                changes.push(if new_exec { "+x" } else { "-x" });
+            }
+            (!changes.is_empty()).then(|| changes.join(" "))
+        }
+        _ => None,
+    }
+}
+
 fn parse_diff_item(item: &git_internal::diff::DiffItem) -> DiffFileStat {
     let status = parse_diff_status(&item.data);
     let (insertions, deletions) = count_hunk_line_changes(&item.data);
@@ -4676,6 +5261,10 @@ fn parse_diff_item(item: &git_internal::diff::DiffItem) -> DiffFileStat {
         similarity: None,
         binary: None,
         check_trailing_blank_start: None,
+        old_id: None,
+        new_id: None,
+        old_mode: None,
+        new_mode: None,
     }
 }
 
@@ -4894,6 +5483,93 @@ mod test {
         let _ = parse_rename_score(&format!("{}%", "9".repeat(64))).unwrap();
     }
 
+    fn filter_fixture(path: &str, status: &str) -> DiffFileStat {
+        DiffFileStat {
+            path: path.to_string(),
+            status: status.to_string(),
+            insertions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            raw_diff: String::new(),
+            rename_from: None,
+            similarity: None,
+            binary: None,
+            check_trailing_blank_start: None,
+            old_id: None,
+            new_id: None,
+            old_mode: None,
+            new_mode: None,
+        }
+    }
+
+    #[test]
+    fn diff_filter_parsing_and_all_or_none_match_git_semantics() {
+        let filter = parse_diff_filter(Some("ad*"))
+            .expect("valid filter")
+            .unwrap();
+        assert!(filter.exclude.contains(&'A'));
+        assert!(filter.exclude.contains(&'D'));
+        assert!(filter.all_or_none);
+
+        let mut files = vec![
+            filter_fixture("added", "added"),
+            filter_fixture("deleted", "deleted"),
+            filter_fixture("modified", "modified"),
+        ];
+        apply_diff_filter(&mut files, &filter);
+        assert_eq!(files.len(), 3, "`*` retains the original set after a match");
+
+        let filter = parse_diff_filter(Some("T*"))
+            .expect("valid filter")
+            .unwrap();
+        apply_diff_filter(&mut files, &filter);
+        assert!(files.is_empty(), "no T means the all-or-none set is empty");
+        assert!(matches!(
+            parse_diff_filter(Some("Q")),
+            Err(DiffError::InvalidDiffFilter(value)) if value == "Q"
+        ));
+        assert!(matches!(
+            parse_diff_filter(Some("")),
+            Err(DiffError::InvalidDiffFilter(value)) if value.is_empty()
+        ));
+    }
+
+    #[test]
+    fn compact_summary_labels_mode_metadata() {
+        let mut created = filter_fixture("created", "added");
+        created.new_mode = Some(0o100755);
+        assert_eq!(compact_summary_label(&created).as_deref(), Some("new +x"));
+
+        let mut type_change = filter_fixture("link", "modified");
+        type_change.old_mode = Some(0o100644);
+        type_change.new_mode = Some(0o120000);
+        assert_eq!(compact_summary_label(&type_change).as_deref(), Some("+l"));
+        assert_eq!(diff_status_code(&type_change), 'T');
+
+        type_change.raw_diff =
+            "diff --git a/link b/link\nindex 1111111..2222222 100644\n--- a/link\n+++ b/link\n"
+                .to_string();
+        apply_mode_metadata_to_patch(&mut type_change);
+        assert!(
+            type_change
+                .raw_diff
+                .contains("old mode 100644\nnew mode 120000")
+        );
+        assert!(type_change.raw_diff.contains("index 1111111..2222222\n"));
+
+        let mut executable = filter_fixture("script", "modified");
+        executable.old_mode = Some(0o100755);
+        executable.new_mode = Some(0o100755);
+        executable.raw_diff =
+            "diff --git a/script b/script\nindex 1111111..2222222 100644\n".to_string();
+        apply_mode_metadata_to_patch(&mut executable);
+        assert!(
+            executable
+                .raw_diff
+                .contains("index 1111111..2222222 100755")
+        );
+    }
+
     #[test]
     fn inexact_rename_detection_obeys_git_default_limit() {
         assert!(!inexact_rename_detection_exceeds_limit(1000, 1000));
@@ -4918,6 +5594,10 @@ mod test {
                 similarity: None,
                 binary: None,
                 check_trailing_blank_start: None,
+                old_id: None,
+                new_id: None,
+                old_mode: None,
+                new_mode: None,
             }],
             total_insertions: 1,
             total_deletions: 1,
