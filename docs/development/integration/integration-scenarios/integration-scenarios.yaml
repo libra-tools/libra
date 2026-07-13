@@ -257,7 +257,7 @@ scenarios:
   - id: cli.merge-conflict-continue
     wave: 1
     group: history_edit
-    purpose: "Merge conflict + resolve + add + merge --continue success path; --continue/--abort without session must fail. Verifies merge_state in --json status."
+    purpose: "Merge conflict + resolve + add + merge --continue success path; --continue/--abort without session must fail. Verifies merge_state in --json status. P1-07b strategy/favor/unrelated-history/shortlog matrices live in the registered offline Cargo target compat_noninteractive_history_controls."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, conflict_markers, negative_exit]

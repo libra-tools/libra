@@ -1,4 +1,4 @@
-//! Non-interactive history controls for plan-20260708 P1-07a.
+//! Non-interactive history controls for plan-20260708 P1-07a/P1-07b.
 
 use std::{
     fs,
@@ -164,6 +164,32 @@ fn force_moved_upstream(fixture: &CliFixture, name: &str) -> (PathBuf, String) {
         fixture.commit_file(&repo, "new-upstream.txt", "new upstream\n", "new-upstream");
     fixture.success(&repo, &["switch", "feature"]);
     (repo, new_upstream)
+}
+
+fn conflicting_merge_repo(fixture: &CliFixture, name: &str) -> (PathBuf, String, String) {
+    let repo = fixture.init_repo(name);
+    fixture.commit_file(
+        &repo,
+        "shared.txt",
+        "top\nconflict\nmiddle\nbottom\n",
+        "base",
+    );
+    fixture.success(&repo, &["branch", "feature"]);
+    fixture.success(&repo, &["switch", "feature"]);
+    let feature_tip = fixture.commit_file(
+        &repo,
+        "shared.txt",
+        "top\nTHEIRS\nmiddle\ntheirs-clean\n",
+        "feature-change",
+    );
+    fixture.success(&repo, &["switch", "main"]);
+    let main_tip = fixture.commit_file(
+        &repo,
+        "shared.txt",
+        "top\nOURS\nmiddle\nbottom\n",
+        "main-change",
+    );
+    (repo, main_tip, feature_tip)
 }
 
 #[test]
@@ -527,4 +553,194 @@ fn rebase_fork_point_toggle_is_last_wins() {
     );
     let fork: Value = serde_json::from_slice(&fork.stdout).expect("fork-point JSON");
     assert_eq!(fork["data"]["replay_count"], 1);
+}
+
+#[test]
+fn merge_strategy_option_ours_keeps_clean_target_hunks() {
+    let fixture = CliFixture::new();
+    let (repo, main_tip, feature_tip) = conflicting_merge_repo(&fixture, "merge-x-ours");
+
+    fixture.success(&repo, &["merge", "-X", "theirs", "-X", "ours", "feature"]);
+
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).expect("read favored merge"),
+        "top\nOURS\nmiddle\ntheirs-clean\n",
+        "-X ours must choose ours only for the conflicting hunk"
+    );
+    assert_eq!(fixture.oid(&repo, "HEAD^"), main_tip);
+    assert_eq!(fixture.oid(&repo, "HEAD^2"), feature_tip);
+}
+
+#[test]
+fn merge_strategy_option_theirs_resolves_conflicting_hunks() {
+    let fixture = CliFixture::new();
+    let (repo, main_tip, feature_tip) = conflicting_merge_repo(&fixture, "merge-x-theirs");
+
+    fixture.success(&repo, &["merge", "-Xours", "-Xtheirs", "feature"]);
+
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).expect("read favored merge"),
+        "top\nTHEIRS\nmiddle\ntheirs-clean\n"
+    );
+    assert_eq!(fixture.oid(&repo, "HEAD^"), main_tip);
+    assert_eq!(fixture.oid(&repo, "HEAD^2"), feature_tip);
+}
+
+#[test]
+fn merge_ours_strategy_records_parents_but_retains_current_tree() {
+    let fixture = CliFixture::new();
+    let (repo, main_tip) = divergent_feature(&fixture, "merge-strategy-ours", 2);
+    let feature_tip = fixture.oid(&repo, "HEAD");
+    fixture.success(&repo, &["switch", "main"]);
+
+    let output = fixture.success(&repo, &["merge", "-s", "ours", "--json=compact", "feature"]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse merge JSON");
+    assert_eq!(payload["data"]["strategy"], "ours");
+    assert_eq!(payload["data"]["files_changed"], 0);
+    assert_eq!(fixture.oid(&repo, "HEAD^"), main_tip);
+    assert_eq!(fixture.oid(&repo, "HEAD^2"), feature_tip);
+    assert!(repo.join("main.txt").exists());
+    assert!(!repo.join("feature-1.txt").exists());
+    assert!(!repo.join("feature-2.txt").exists());
+}
+
+#[test]
+fn merge_ours_no_commit_continue_preserves_strategy_and_tree() {
+    let fixture = CliFixture::new();
+    let (repo, main_tip) = divergent_feature(&fixture, "merge-strategy-ours-continue", 1);
+    let feature_tip = fixture.oid(&repo, "HEAD");
+    fixture.success(&repo, &["switch", "main"]);
+
+    fixture.success(&repo, &["merge", "-s", "ours", "--no-commit", "feature"]);
+    assert_eq!(fixture.oid(&repo, "HEAD"), main_tip);
+    assert!(repo.join(".libra/merge-state.json").exists());
+    assert!(!repo.join("feature-1.txt").exists());
+
+    let output = fixture.success(&repo, &["merge", "--continue", "--json=compact"]);
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse continue JSON");
+    assert_eq!(payload["data"]["strategy"], "ours");
+    assert_eq!(fixture.oid(&repo, "HEAD^"), main_tip);
+    assert_eq!(fixture.oid(&repo, "HEAD^2"), feature_tip);
+    assert!(repo.join("main.txt").exists());
+    assert!(!repo.join("feature-1.txt").exists());
+    assert!(!repo.join(".libra/merge-state.json").exists());
+}
+
+#[test]
+fn merge_allow_unrelated_histories_combines_root_trees() {
+    let fixture = CliFixture::new();
+    let repo = fixture.init_repo("merge-unrelated-clean");
+    let main_tip = fixture.commit_file(&repo, "main-root.txt", "main root\n", "main-root");
+    fixture.success(&repo, &["switch", "--orphan", "unrelated"]);
+    let unrelated_tip = fixture.commit_file(&repo, "other-root.txt", "other root\n", "other-root");
+    fixture.success(&repo, &["switch", "main"]);
+
+    let refused = fixture.run(&repo, &["merge", "unrelated"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("refusing to merge unrelated histories")
+    );
+    assert_eq!(fixture.oid(&repo, "HEAD"), main_tip);
+
+    fixture.success(
+        &repo,
+        &["merge", "--allow-unrelated-histories", "unrelated"],
+    );
+    assert_eq!(fixture.oid(&repo, "HEAD^"), main_tip);
+    assert_eq!(fixture.oid(&repo, "HEAD^2"), unrelated_tip);
+    assert_eq!(
+        fs::read_to_string(repo.join("main-root.txt")).expect("read main root"),
+        "main root\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("other-root.txt")).expect("read other root"),
+        "other root\n"
+    );
+}
+
+#[test]
+fn merge_unrelated_conflict_restart_and_continue_round_trip() {
+    let fixture = CliFixture::new();
+    let repo = fixture.init_repo("merge-unrelated-conflict");
+    let main_tip = fixture.commit_file(&repo, "shared.txt", "main root\n", "main-root");
+    fixture.success(&repo, &["switch", "--orphan", "unrelated"]);
+    let unrelated_tip = fixture.commit_file(&repo, "shared.txt", "other root\n", "other-root");
+    fixture.success(&repo, &["switch", "main"]);
+
+    let conflict = fixture.run(
+        &repo,
+        &["merge", "--allow-unrelated-histories", "unrelated"],
+    );
+    assert!(!conflict.status.success());
+    assert!(repo.join(".libra/merge-state.json").exists());
+
+    let restarted = fixture.run(&repo, &["merge", "--restart"]);
+    assert!(!restarted.status.success());
+    let restart_stderr = String::from_utf8_lossy(&restarted.stderr);
+    assert!(
+        restart_stderr.contains("merge has conflicts"),
+        "{restart_stderr}"
+    );
+    assert!(
+        !restart_stderr.contains("unrelated histories"),
+        "--restart must replay the unrelated-history permission: {restart_stderr}"
+    );
+
+    fs::write(repo.join("shared.txt"), "resolved roots\n").expect("resolve root conflict");
+    fixture.success(&repo, &["add", "shared.txt"]);
+    fixture.success(&repo, &["merge", "--continue"]);
+    assert_eq!(fixture.oid(&repo, "HEAD^"), main_tip);
+    assert_eq!(fixture.oid(&repo, "HEAD^2"), unrelated_tip);
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).expect("read resolution"),
+        "resolved roots\n"
+    );
+}
+
+#[test]
+fn merge_log_with_custom_message_survives_conflict_continue() {
+    let fixture = CliFixture::new();
+    let repo = fixture.init_repo("merge-log-continue");
+    fixture.commit_file(&repo, "shared.txt", "base\n", "base");
+    fixture.success(&repo, &["branch", "feature"]);
+    fixture.success(&repo, &["switch", "feature"]);
+    fixture.commit_file(&repo, "shared.txt", "feature\n", "feature-conflict");
+    fixture.commit_file(&repo, "feature-note.txt", "note\n", "feature-note");
+    fixture.success(&repo, &["switch", "main"]);
+    fixture.commit_file(&repo, "shared.txt", "main\n", "main-conflict");
+
+    let conflict = fixture.run(
+        &repo,
+        &["merge", "-m", "custom merge", "--log=1", "feature"],
+    );
+    assert!(!conflict.status.success());
+    fs::write(repo.join("shared.txt"), "resolved\n").expect("resolve merge conflict");
+    fixture.success(&repo, &["add", "shared.txt"]);
+    fixture.success(&repo, &["merge", "--continue"]);
+
+    let message = fixture.success(&repo, &["log", "-1", "--pretty=%B"]);
+    let message = String::from_utf8_lossy(&message.stdout);
+    assert!(message.starts_with("custom merge\n"), "{message}");
+    assert!(message.contains("* feature:\n  feature-note"), "{message}");
+    assert!(
+        !message.contains("feature-conflict"),
+        "--log=1 exceeded its limit: {message}"
+    );
+}
+
+#[test]
+fn merge_log_toggle_is_last_wins() {
+    let fixture = CliFixture::new();
+
+    let (disabled_repo, _) = divergent_feature(&fixture, "merge-log-disabled", 1);
+    fixture.success(&disabled_repo, &["switch", "main"]);
+    fixture.success(&disabled_repo, &["merge", "--log", "--no-log", "feature"]);
+    let disabled = fixture.success(&disabled_repo, &["log", "-1", "--pretty=%B"]);
+    assert!(!String::from_utf8_lossy(&disabled.stdout).contains("* feature:"));
+
+    let (enabled_repo, _) = divergent_feature(&fixture, "merge-log-enabled", 1);
+    fixture.success(&enabled_repo, &["switch", "main"]);
+    fixture.success(&enabled_repo, &["merge", "--no-log", "--log=1", "feature"]);
+    let enabled = fixture.success(&enabled_repo, &["log", "-1", "--pretty=%B"]);
+    assert!(String::from_utf8_lossy(&enabled.stdout).contains("* feature:\n  feature-1"));
 }

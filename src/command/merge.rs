@@ -8,7 +8,7 @@ use std::{
     str::FromStr,
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use git_internal::{
     hash::{ObjectHash, get_hash_kind},
     internal::{
@@ -55,6 +55,11 @@ EXAMPLES:
     libra merge origin/main        Fast-forward onto a remote-tracking branch
     libra merge feature-x --no-edit  Accept the default merge message (no editor)
     libra merge --verify-signatures feature-x  Require a valid PGP signature on the merged tip
+    libra merge -X ours feature-x  Favor HEAD only where content conflicts
+    libra merge -s ours archive   Record archive as merged while retaining the HEAD tree
+    libra merge --allow-unrelated-histories imported-root
+                                     Merge a root with no common ancestor
+    libra merge --log=10 feature-x  Include target subjects in the merge message
     libra merge --continue         Finish an in-progress merge after resolving conflicts
     libra merge --abort            Restore the pre-merge HEAD, index, and worktree
     libra merge --dry-run feature-x  Preview the outcome (ff/clean/conflict) writing nothing
@@ -67,6 +72,23 @@ NOTES:
     or restored with --abort. --dry-run exits 1 when the merge would
     conflict (0 for ff/up-to-date/clean); --restart discards resolution
     work done so far, exactly like --abort, before re-running.";
+
+/// Single-head merge strategies currently implemented by Libra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeStrategy {
+    /// Record the merge relationship while retaining the current HEAD tree.
+    Ours,
+}
+
+/// Conflict-side preference accepted by the default three-way strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MergeFavor {
+    /// Resolve only conflicting paths/hunks in favor of the current HEAD side.
+    Ours,
+    /// Resolve only conflicting paths/hunks in favor of the merged target side.
+    Theirs,
+}
 
 #[derive(Parser, Debug)]
 #[command(after_help = MERGE_EXAMPLES)]
@@ -96,8 +118,10 @@ pub struct MergeArgs {
     /// pre-merge HEAD, index, and working tree exactly like `--abort`, which
     /// DISCARDS any conflict resolution done so far — then immediately re-run
     /// the same merge against the recorded target commit, regenerating fresh
-    /// conflict markers. The re-run uses default merge options (an original
-    /// `-m`/`--no-ff`/`--squash`/`--no-commit` is not replayed).
+    /// conflict markers. The re-run preserves the recovery-critical
+    /// `--allow-unrelated-histories` permission but otherwise uses default
+    /// merge options (an original `-m`/`--no-ff`/`--squash`/`--no-commit` is
+    /// not replayed).
     #[arg(long, conflicts_with_all = ["branch", "continue_merge", "abort", "ff", "ff_only", "no_ff", "message", "squash", "no_commit", "verify_signatures"])]
     pub restart: bool,
 
@@ -112,6 +136,33 @@ pub struct MergeArgs {
     /// Always create a merge commit, even when a fast-forward would be possible.
     #[arg(long = "no-ff", conflicts_with_all = ["ff", "ff_only", "continue_merge", "abort"])]
     pub no_ff: bool,
+
+    /// Select the merge strategy. Libra currently supports only `ours`, which
+    /// records both parents while retaining the current HEAD tree.
+    #[arg(short = 's', long = "strategy", value_enum, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy_option"])]
+    pub strategy: Option<MergeStrategy>,
+
+    /// Pass a strategy option to the default three-way merge. `ours` and
+    /// `theirs` resolve conflicting paths/hunks in favor of that side while
+    /// retaining all non-conflicting changes. May be repeated; the last value
+    /// wins.
+    #[arg(short = 'X', long = "strategy-option", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy"])]
+    pub strategy_option: Vec<MergeFavor>,
+
+    /// Permit a two-parent merge when the histories have no common ancestor.
+    #[arg(long = "allow-unrelated-histories", conflicts_with_all = ["continue_merge", "abort", "restart"])]
+    pub allow_unrelated_histories: bool,
+
+    /// Append up to N target-side commit subjects to the generated merge
+    /// message. Bare `--log` uses 20. With `-m`, an explicit `--log` still
+    /// appends the shortlog; config-only `merge.log` remains suppressed.
+    #[arg(long = "log", value_name = "N", num_args = 0..=1, require_equals = true, default_missing_value = "20", overrides_with = "no_log", conflicts_with_all = ["continue_merge", "abort", "restart"])]
+    pub log: Option<usize>,
+
+    /// Do not append target-side subjects to the merge message. Last one wins
+    /// with `--log[=<N>]` and overrides `merge.log`.
+    #[arg(long = "no-log", overrides_with = "log", conflicts_with_all = ["continue_merge", "abort", "restart"])]
+    pub no_log: bool,
 
     /// Use the given message for the merge commit instead of the default.
     #[arg(short = 'm', long = "message", value_name = "MSG", conflicts_with_all = ["continue_merge", "abort"])]
@@ -236,6 +287,12 @@ pub(crate) struct PullMergeOptions {
     /// (`libra pull --no-ff`). When set, the fast-forward short-circuit is
     /// skipped and a two-parent merge commit is recorded instead.
     pub no_ff: bool,
+    /// Explicit merge strategy. `None` uses the default three-way strategy.
+    pub strategy: Option<MergeStrategy>,
+    /// Conflict-side preference for the default three-way strategy.
+    pub favor: Option<MergeFavor>,
+    /// Permit an empty merge base when histories are unrelated.
+    pub allow_unrelated_histories: bool,
     /// Override the merge-commit message (`libra merge -m <msg>`). `None` uses
     /// the default `Merge <upstream> into <head>` message.
     pub message: Option<String>,
@@ -278,7 +335,20 @@ pub(crate) struct MergeState {
     pub orig_head: String,
     pub target: String,
     pub target_ref: String,
-    pub base: String,
+    /// Common ancestor used by the three-way merge. `None` represents the
+    /// virtual empty base used by `--allow-unrelated-histories`. Deserializing
+    /// older state files remains compatible because a JSON string maps to
+    /// `Some` and missing fields use the default.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Strategy needed to preserve `--no-commit -s ours` through `--continue`.
+    /// `None` is the default three-way strategy and keeps old state compatible.
+    #[serde(default)]
+    pub strategy: Option<MergeStrategy>,
+    /// Replayed by `--restart` so a conflicted merge with a virtual empty base
+    /// does not turn into an unrelated-history rejection after restoration.
+    #[serde(default)]
+    pub allow_unrelated_histories: bool,
     pub conflicted_paths: Vec<String>,
     /// Merge message resolved at merge start (`-m` override or the generated
     /// default including the `merge.log` shortlog), replayed verbatim by
@@ -657,7 +727,9 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                     .await?
                     .unwrap_or(false)
             };
-            let merge_log = if args.message.is_some() {
+            let merge_log = if let Some(limit) = args.log {
+                limit
+            } else if args.no_log || args.message.is_some() {
                 0
             } else {
                 crate::command::history_config::merge_log_limit().await?
@@ -665,6 +737,9 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
             let options = PullMergeOptions {
                 ff_only,
                 no_ff,
+                strategy: args.strategy,
+                favor: args.strategy_option.last().copied(),
+                allow_unrelated_histories: args.allow_unrelated_histories,
                 message: args.message.clone(),
                 squash: args.squash,
                 no_commit: args.no_commit,
@@ -735,7 +810,8 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
         } else {
             info_println!(
                 output,
-                "Would merge cleanly by the 'three-way' strategy.\n(dry run: nothing was written)"
+                "Would merge cleanly by the '{}' strategy.\n(dry run: nothing was written)",
+                result.strategy
             );
         }
         return Ok(());
@@ -755,6 +831,7 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
     } else {
         match result.strategy.as_str() {
             "three-way" => info_println!(output, "Merge made by the 'three-way' strategy."),
+            "ours" => info_println!(output, "Merge made by the 'ours' strategy."),
             "squash" => info_println!(output, "Squash commit -- not updating HEAD"),
             "no-commit" => info_println!(
                 output,
@@ -1021,9 +1098,11 @@ async fn run_merge_for_pull_inner(
     let lca = lca_commit(&current_commit, &target_commit)
         .map_err(|error| PullMergeError::History(error.to_string()))?;
 
-    let lca = lca.ok_or(PullMergeError::UnrelatedHistories)?;
+    if lca.is_none() && !options.allow_unrelated_histories {
+        return Err(PullMergeError::UnrelatedHistories);
+    }
 
-    if lca.id == target_commit.id {
+    if lca.as_ref().is_some_and(|base| base.id == target_commit.id) {
         return Ok(PullMergeSummary {
             strategy: "already-up-to-date".to_string(),
             old_commit: Some(current_commit_id.to_string()),
@@ -1040,7 +1119,14 @@ async fn run_merge_for_pull_inner(
         });
     }
 
-    if lca.id == current_commit.id && !options.no_ff && !options.squash && !options.no_commit {
+    if lca
+        .as_ref()
+        .is_some_and(|base| base.id == current_commit.id)
+        && options.strategy.is_none()
+        && !options.no_ff
+        && !options.squash
+        && !options.no_commit
+    {
         let files_changed = count_changed_files(Some(&current_commit), &target_commit)?;
         // `--dry-run`: report the fast-forward preview without applying it.
         if !options.dry_run {
@@ -1067,28 +1153,36 @@ async fn run_merge_for_pull_inner(
     // a genuinely diverged history: a fast-forwardable `--squash`/`--no-commit`
     // merely skipped the fast-forward branch above and is allowed (Git accepts
     // `merge.ff=only` + `--squash` when the target is fast-forwardable).
-    if options.ff_only && lca.id != current_commit.id {
+    if options.ff_only
+        && !lca
+            .as_ref()
+            .is_some_and(|base| base.id == current_commit.id)
+    {
         return Err(PullMergeError::NonFastForward {
             current: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
         });
     }
 
-    perform_three_way_merge(
-        current_commit,
-        target_commit,
-        lca,
-        upstream,
-        ThreeWayMergeOptions {
-            message_override: options.message.clone(),
-            merge_log: options.merge_log,
-            squash: options.squash,
-            no_commit: options.no_commit,
-            dry_run: options.dry_run,
-            output,
-        },
-    )
-    .await
+    let merge_options = ThreeWayMergeOptions {
+        message_override: options.message.clone(),
+        merge_log: options.merge_log,
+        squash: options.squash,
+        no_commit: options.no_commit,
+        dry_run: options.dry_run,
+        favor: options.favor,
+        allow_unrelated_histories: options.allow_unrelated_histories,
+        output,
+    };
+    match options.strategy {
+        Some(MergeStrategy::Ours) => {
+            perform_ours_merge(current_commit, target_commit, upstream, merge_options).await
+        }
+        None => {
+            perform_three_way_merge(current_commit, target_commit, lca, upstream, merge_options)
+                .await
+        }
+    }
 }
 
 struct ThreeWayMergeResult {
@@ -1115,13 +1209,156 @@ struct ThreeWayMergeOptions<'a> {
     no_commit: bool,
     /// Preview only: compute the outcome, write nothing (lore.md §1.3).
     dry_run: bool,
+    /// Resolve otherwise-conflicting paths in favor of one side.
+    favor: Option<MergeFavor>,
+    /// Persisted in recovery state for unrelated-history restart.
+    allow_unrelated_histories: bool,
     output: &'a OutputConfig,
+}
+
+fn resolve_merge_message(
+    current: ObjectHash,
+    target: ObjectHash,
+    upstream: &str,
+    head_name: &str,
+    message_override: Option<&String>,
+    merge_log: usize,
+) -> Result<String, PullMergeError> {
+    match message_override {
+        Some(message) => crate::command::merge_message::append_shortlog(
+            message.clone(),
+            current,
+            target,
+            upstream,
+            merge_log,
+        )
+        .map_err(PullMergeError::History),
+        None => crate::command::merge_message::default_message(
+            current, target, upstream, head_name, merge_log,
+        )
+        .map_err(PullMergeError::History),
+    }
+}
+
+/// Git's `ours` merge strategy records the target as a second parent while
+/// keeping the current HEAD tree byte-for-byte. It is distinct from `-X ours`:
+/// the latter keeps all non-conflicting target changes and favors ours only
+/// where the default three-way merge would conflict.
+async fn perform_ours_merge(
+    current_commit: Commit,
+    target_commit: Commit,
+    upstream: &str,
+    options: ThreeWayMergeOptions<'_>,
+) -> Result<PullMergeSummary, PullMergeError> {
+    if !options.dry_run {
+        switch::ensure_clean_status(options.output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+    }
+
+    let head_name = current_head_name().await?;
+    let resolved_message = resolve_merge_message(
+        current_commit.id,
+        target_commit.id,
+        upstream,
+        &head_name,
+        options.message_override.as_ref(),
+        options.merge_log,
+    )?;
+
+    if options.dry_run {
+        return Ok(PullMergeSummary {
+            strategy: "ours".to_string(),
+            old_commit: Some(current_commit.id.to_string()),
+            commit: None,
+            files_changed: 0,
+            up_to_date: false,
+            parents: Vec::new(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: true,
+            would_conflict: false,
+            autostash: None,
+        });
+    }
+
+    if options.squash {
+        return Ok(PullMergeSummary {
+            strategy: "squash".to_string(),
+            old_commit: Some(current_commit.id.to_string()),
+            commit: None,
+            files_changed: 0,
+            up_to_date: false,
+            parents: Vec::new(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: false,
+            would_conflict: false,
+            autostash: None,
+        });
+    }
+
+    if options.no_commit {
+        MergeState {
+            head_name: head_name.clone(),
+            orig_head: current_commit.id.to_string(),
+            target: target_commit.id.to_string(),
+            target_ref: upstream.to_string(),
+            base: None,
+            strategy: Some(MergeStrategy::Ours),
+            allow_unrelated_histories: options.allow_unrelated_histories,
+            conflicted_paths: Vec::new(),
+            message: Some(resolved_message),
+        }
+        .save()?;
+        return Ok(PullMergeSummary {
+            strategy: "no-commit".to_string(),
+            old_commit: Some(current_commit.id.to_string()),
+            commit: None,
+            files_changed: 0,
+            up_to_date: false,
+            parents: vec![current_commit.id.to_string(), target_commit.id.to_string()],
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: false,
+            would_conflict: false,
+            autostash: None,
+        });
+    }
+
+    let merge_commit = Commit::from_tree_id(
+        current_commit.tree_id,
+        vec![current_commit.id, target_commit.id],
+        &format_commit_msg(&resolved_message, None),
+    );
+    save_object(&merge_commit, &merge_commit.id)
+        .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
+    update_head_with_reflog(&head_name, merge_commit.id, upstream, "ours").await?;
+    reset_index_and_workdir_to_tree(&current_commit.tree_id)?;
+
+    Ok(PullMergeSummary {
+        strategy: "ours".to_string(),
+        old_commit: Some(current_commit.id.to_string()),
+        commit: Some(merge_commit.id.to_string()),
+        files_changed: 0,
+        up_to_date: false,
+        parents: vec![current_commit.id.to_string(), target_commit.id.to_string()],
+        conflicted_paths: Vec::new(),
+        aborted: false,
+        continued: false,
+        dry_run: false,
+        would_conflict: false,
+        autostash: None,
+    })
 }
 
 async fn perform_three_way_merge(
     current_commit: Commit,
     target_commit: Commit,
-    base_commit: Commit,
+    base_commit: Option<Commit>,
     upstream: &str,
     options: ThreeWayMergeOptions<'_>,
 ) -> Result<PullMergeSummary, PullMergeError> {
@@ -1135,13 +1372,22 @@ async fn perform_three_way_merge(
     }
 
     let head_name = current_head_name().await?;
-    let base_items = commit_tree_items(&base_commit)?;
+    let base_items = match base_commit.as_ref() {
+        Some(base) => commit_tree_items(base)?,
+        None => HashMap::new(),
+    };
     let our_items = commit_tree_items(&current_commit)?;
     let their_items = commit_tree_items(&target_commit)?;
     // Under `--dry-run`, auto-merged blobs are computed in memory only
     // (persist=false) so the preview writes nothing to the object store —
     // under tiered storage a `save_object` would even upload to the remote.
-    let merge_result = merge_tree_items(&base_items, &our_items, &their_items, !options.dry_run)?;
+    let merge_result = merge_tree_items(
+        &base_items,
+        &our_items,
+        &their_items,
+        !options.dry_run,
+        options.favor,
+    )?;
     let files_changed = count_item_map_changes(&our_items, &merge_result.merged_items);
 
     // `--dry-run`: the outcome is fully known here — report it and stop before
@@ -1175,17 +1421,14 @@ async fn perform_three_way_merge(
     // and `--no-commit` states persist it and `merge --continue` replays it
     // instead of regenerating a plain message (which would drop `-m` and the
     // configured shortlog).
-    let resolved_message = match &options.message_override {
-        Some(message) => message.clone(),
-        None => crate::command::merge_message::default_message(
-            current_commit.id,
-            target_commit.id,
-            upstream,
-            &head_name,
-            options.merge_log,
-        )
-        .map_err(PullMergeError::History)?,
-    };
+    let resolved_message = resolve_merge_message(
+        current_commit.id,
+        target_commit.id,
+        upstream,
+        &head_name,
+        options.message_override.as_ref(),
+        options.merge_log,
+    )?;
 
     if !merge_result.conflicts.is_empty() {
         // Resolved only on the conflict path: a clean merge never renders
@@ -1198,7 +1441,8 @@ async fn perform_three_way_merge(
             head_name,
             message: resolved_message,
             upstream: upstream.to_string(),
-            base: base_commit.id,
+            base: base_commit.as_ref().map(|base| base.id),
+            allow_unrelated_histories: options.allow_unrelated_histories,
             ours: current_commit.id,
             theirs: target_commit.id,
             merged_items: merge_result.merged_items,
@@ -1260,7 +1504,9 @@ async fn perform_three_way_merge(
             orig_head: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
             target_ref: upstream.to_string(),
-            base: base_commit.id.to_string(),
+            base: base_commit.as_ref().map(|base| base.id.to_string()),
+            strategy: None,
+            allow_unrelated_histories: options.allow_unrelated_histories,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
         }
@@ -1349,7 +1595,10 @@ struct MergeConflictInput {
     /// Resolved merge message (see [`MergeState::message`]).
     message: String,
     upstream: String,
-    base: ObjectHash,
+    /// Real common ancestor, or `None` for the virtual empty base used by an
+    /// unrelated-history merge.
+    base: Option<ObjectHash>,
+    allow_unrelated_histories: bool,
     ours: ObjectHash,
     theirs: ObjectHash,
     merged_items: HashMap<PathBuf, MergeTreeEntry>,
@@ -1404,7 +1653,9 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         orig_head: input.ours.to_string(),
         target: input.theirs.to_string(),
         target_ref: input.upstream,
-        base: input.base.to_string(),
+        base: input.base.map(|base| base.to_string()),
+        strategy: None,
+        allow_unrelated_histories: input.allow_unrelated_histories,
         conflicted_paths: conflict_paths
             .iter()
             .map(|path| path.display().to_string())
@@ -1505,11 +1756,15 @@ async fn run_merge_continue(output: &OutputConfig) -> Result<MergeOutput, MergeE
     );
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| MergeError::CommitSave(error.to_string()))?;
+    let strategy = match state.strategy {
+        Some(MergeStrategy::Ours) => "ours",
+        None => "three-way",
+    };
     update_head_with_reflog(
         &state.head_name,
         merge_commit.id,
         &state.target_ref,
-        "three-way",
+        strategy,
     )
     .await?;
     reset_index_and_workdir_to_tree(&tree_id)?;
@@ -1519,7 +1774,7 @@ async fn run_merge_continue(output: &OutputConfig) -> Result<MergeOutput, MergeE
     let autostash = resolve_pending_autostash(output).await;
 
     Ok(PullMergeSummary {
-        strategy: "three-way".to_string(),
+        strategy: strategy.to_string(),
         old_commit: Some(orig_head.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed,
@@ -1572,7 +1827,8 @@ async fn restore_pre_merge_state(
 /// moved since the original merge), regenerating fresh conflict markers and
 /// merge state. The re-run uses default merge options: the original
 /// `-m`/`--no-ff`/`--squash`/`--no-commit` are not persisted in [`MergeState`]
-/// and are not replayed (documented limitation).
+/// and are not replayed (documented limitation). The recovery-critical
+/// unrelated-history permission is persisted and replayed below.
 async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
     let state = MergeState::load_required()?;
     // A `--no-commit` merge also persists MergeState — with no conflicts.
@@ -1593,6 +1849,7 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
     let options = PullMergeOptions {
         autostash: Some(false),
         preserve_held_autostash: true,
+        allow_unrelated_histories: state.allow_unrelated_histories,
         ..PullMergeOptions::default()
     };
     run_merge_for_pull_with_options(&target, &target_ref, output, options).await
@@ -1890,6 +2147,7 @@ fn resolve_three_way(
     ours: Option<&MergeTreeEntry>,
     theirs: Option<&MergeTreeEntry>,
     persist_merged_blobs: bool,
+    favor: Option<MergeFavor>,
 ) -> Result<MergeResolution, PullMergeError> {
     let base_present = base.is_some();
     let ours_state = classify_relative_to_base(base, ours);
@@ -1904,6 +2162,8 @@ fn resolve_three_way(
         (false, RelativeState::Added(ours), RelativeState::Added(theirs)) => {
             if ours == theirs {
                 MergeResolution::Use(theirs)
+            } else if let Some(favor) = favor {
+                favored_resolution(favor, Some(ours), Some(theirs))
             } else {
                 MergeResolution::Conflict(ConflictKind::BothChanged {
                     base: None,
@@ -1922,9 +2182,11 @@ fn resolve_three_way(
                 MergeResolution::Use(theirs)
             } else if let Some(base) = base
                 && let Some(merged) =
-                    try_merge_blob_contents(base, ours, theirs, persist_merged_blobs)?
+                    try_merge_blob_contents(base, ours, theirs, persist_merged_blobs, favor)?
             {
                 MergeResolution::Use(merged)
+            } else if let Some(favor) = favor {
+                favored_resolution(favor, Some(ours), Some(theirs))
             } else {
                 MergeResolution::Conflict(ConflictKind::BothChanged {
                     base: base.map(|b| b.hash),
@@ -1937,15 +2199,39 @@ fn resolve_three_way(
         (true, RelativeState::Same(_), RelativeState::Deleted) => MergeResolution::Delete,
         (true, RelativeState::Deleted, RelativeState::Deleted) => MergeResolution::Delete,
         (true, RelativeState::Deleted, RelativeState::Modified(theirs)) => {
-            MergeResolution::Conflict(ConflictKind::TheirsModifiedOursDeleted {
-                theirs: theirs.hash,
-            })
+            if let Some(favor) = favor {
+                favored_resolution(favor, None, Some(theirs))
+            } else {
+                MergeResolution::Conflict(ConflictKind::TheirsModifiedOursDeleted {
+                    theirs: theirs.hash,
+                })
+            }
         }
         (true, RelativeState::Modified(ours), RelativeState::Deleted) => {
-            MergeResolution::Conflict(ConflictKind::OursModifiedTheirsDeleted { ours: ours.hash })
+            if let Some(favor) = favor {
+                favored_resolution(favor, Some(ours), None)
+            } else {
+                MergeResolution::Conflict(ConflictKind::OursModifiedTheirsDeleted {
+                    ours: ours.hash,
+                })
+            }
         }
         _ => MergeResolution::Delete,
     })
+}
+
+fn favored_resolution(
+    favor: MergeFavor,
+    ours: Option<MergeTreeEntry>,
+    theirs: Option<MergeTreeEntry>,
+) -> MergeResolution {
+    match match favor {
+        MergeFavor::Ours => ours,
+        MergeFavor::Theirs => theirs,
+    } {
+        Some(entry) => MergeResolution::Use(entry),
+        None => MergeResolution::Delete,
+    }
 }
 
 fn try_merge_blob_contents(
@@ -1953,6 +2239,7 @@ fn try_merge_blob_contents(
     ours: MergeTreeEntry,
     theirs: MergeTreeEntry,
     persist: bool,
+    favor: Option<MergeFavor>,
 ) -> Result<Option<MergeTreeEntry>, PullMergeError> {
     if base.mode != ours.mode
         || base.mode != theirs.mode
@@ -1965,10 +2252,20 @@ fn try_merge_blob_contents(
     let ours_blob = load_merge_blob(ours.hash)?;
     let theirs_blob = load_merge_blob(theirs.hash)?;
 
-    let Ok(merged_bytes) = diffy::merge_bytes(&base_blob.data, &ours_blob.data, &theirs_blob.data)
-    else {
-        return Ok(None);
-    };
+    let marker_len =
+        unambiguous_conflict_marker_length(&[&base_blob.data, &ours_blob.data, &theirs_blob.data]);
+    let mut merge_options = diffy::MergeOptions::new();
+    merge_options
+        .set_conflict_style(diffy::ConflictStyle::Diff3)
+        .set_conflict_marker_length(marker_len);
+    let merged_bytes =
+        match merge_options.merge_bytes(&base_blob.data, &ours_blob.data, &theirs_blob.data) {
+            Ok(merged) => merged,
+            Err(conflicted) => match favor {
+                Some(favor) => resolve_favored_content(conflicted, marker_len, favor)?,
+                None => return Ok(None),
+            },
+        };
 
     let merged_blob = Blob::from_content_bytes(merged_bytes);
     // `--dry-run` (persist=false): the merged OID is computed in memory only —
@@ -1989,6 +2286,91 @@ fn try_merge_blob_contents(
     }))
 }
 
+/// Choose the requested side only inside `diffy` conflict regions while
+/// preserving every cleanly merged range around them. The marker length is
+/// chosen so none of the four marker runs can occur anywhere in an input,
+/// making byte-level parsing safe even when a conflicted final line has no
+/// trailing newline.
+fn resolve_favored_content(
+    conflicted: Vec<u8>,
+    marker_len: usize,
+    favor: MergeFavor,
+) -> Result<Vec<u8>, PullMergeError> {
+    let marker = |byte: u8, label: Option<&[u8]>| {
+        let mut line = vec![byte; marker_len];
+        if let Some(label) = label {
+            line.push(b' ');
+            line.extend_from_slice(label);
+        }
+        line.push(b'\n');
+        line
+    };
+    let open = marker(b'<', Some(b"ours"));
+    let original = marker(b'|', Some(b"original"));
+    let separator = marker(b'=', None);
+    let close = marker(b'>', Some(b"theirs"));
+
+    let find_after = |haystack: &[u8], start: usize, needle: &[u8]| {
+        haystack
+            .get(start..)
+            .and_then(|tail| {
+                tail.windows(needle.len())
+                    .position(|window| window == needle)
+            })
+            .map(|relative| start + relative)
+    };
+    let malformed = || {
+        PullMergeError::TreeCreate(
+            "internal three-way merge produced malformed conflict markers".to_string(),
+        )
+    };
+
+    let mut output = Vec::with_capacity(conflicted.len());
+    let mut cursor = 0usize;
+    let mut resolved = 0usize;
+    while let Some(open_start) = find_after(&conflicted, cursor, &open) {
+        output.extend_from_slice(&conflicted[cursor..open_start]);
+        let ours_start = open_start + open.len();
+        let original_start =
+            find_after(&conflicted, ours_start, &original).ok_or_else(malformed)?;
+        let base_start = original_start + original.len();
+        let separator_start =
+            find_after(&conflicted, base_start, &separator).ok_or_else(malformed)?;
+        let theirs_start = separator_start + separator.len();
+        let close_start = find_after(&conflicted, theirs_start, &close).ok_or_else(malformed)?;
+        match favor {
+            MergeFavor::Ours => output.extend_from_slice(&conflicted[ours_start..original_start]),
+            MergeFavor::Theirs => output.extend_from_slice(&conflicted[theirs_start..close_start]),
+        }
+        cursor = close_start + close.len();
+        resolved += 1;
+    }
+    if resolved == 0 {
+        return Err(malformed());
+    }
+    output.extend_from_slice(&conflicted[cursor..]);
+    Ok(output)
+}
+
+fn unambiguous_conflict_marker_length(sides: &[&[u8]]) -> usize {
+    const DEFAULT_MARKER_LENGTH: usize = 7;
+    let mut longest = 0usize;
+    for side in sides {
+        for marker in *b"<>=|" {
+            let mut run = 0usize;
+            for byte in *side {
+                if *byte == marker {
+                    run += 1;
+                    longest = longest.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+        }
+    }
+    DEFAULT_MARKER_LENGTH.max(longest.saturating_add(1))
+}
+
 fn load_merge_blob(hash: ObjectHash) -> Result<Blob, PullMergeError> {
     load_object(&hash).map_err(|error| PullMergeError::ObjectLoad {
         object_id: hash.to_string(),
@@ -2001,6 +2383,7 @@ fn merge_tree_items(
     our_items: &HashMap<PathBuf, MergeTreeEntry>,
     their_items: &HashMap<PathBuf, MergeTreeEntry>,
     persist_merged_blobs: bool,
+    favor: Option<MergeFavor>,
 ) -> Result<ThreeWayMergeResult, PullMergeError> {
     let mut all_paths: HashSet<PathBuf> = base_items.keys().cloned().collect();
     all_paths.extend(our_items.keys().cloned());
@@ -2014,6 +2397,7 @@ fn merge_tree_items(
             our_items.get(&path),
             their_items.get(&path),
             persist_merged_blobs,
+            favor,
         )? {
             MergeResolution::Use(hash) => {
                 merged_items.insert(path, hash);
@@ -2637,6 +3021,102 @@ mod tests {
     }
 
     #[test]
+    fn strategy_option_favors_only_conflicting_hunks() {
+        let base = b"top\nconflict\nmiddle\nbottom\n";
+        let ours = b"top\nOURS\nmiddle\nbottom\n";
+        let theirs = b"top\nTHEIRS\nmiddle\ntheirs-clean\n";
+        let marker_len = unambiguous_conflict_marker_length(&[base, ours, theirs]);
+        let mut options = diffy::MergeOptions::new();
+        options
+            .set_conflict_style(diffy::ConflictStyle::Diff3)
+            .set_conflict_marker_length(marker_len);
+        let conflicted = options
+            .merge_bytes(base, ours, theirs)
+            .expect_err("fixture has one conflicting and one clean target hunk");
+
+        assert_eq!(
+            resolve_favored_content(conflicted.clone(), marker_len, MergeFavor::Ours)
+                .expect("favor ours"),
+            b"top\nOURS\nmiddle\ntheirs-clean\n"
+        );
+        assert_eq!(
+            resolve_favored_content(conflicted, marker_len, MergeFavor::Theirs)
+                .expect("favor theirs"),
+            b"top\nTHEIRS\nmiddle\ntheirs-clean\n"
+        );
+    }
+
+    #[test]
+    fn strategy_option_parser_handles_marker_like_content_and_no_final_newline() {
+        let base = b"prefix <<<<<<< ours\nbase";
+        let ours = b"prefix <<<<<<< ours\nOURS";
+        let theirs = b"prefix <<<<<<< ours\nTHEIRS";
+        let marker_len = unambiguous_conflict_marker_length(&[base, ours, theirs]);
+        assert_eq!(
+            marker_len, 8,
+            "mid-line marker runs must bump the parser marker"
+        );
+        let mut options = diffy::MergeOptions::new();
+        options
+            .set_conflict_style(diffy::ConflictStyle::Diff3)
+            .set_conflict_marker_length(marker_len);
+        let conflicted = options
+            .merge_bytes(base, ours, theirs)
+            .expect_err("fixture conflicts at an unterminated final line");
+        assert_eq!(
+            resolve_favored_content(conflicted, marker_len, MergeFavor::Ours)
+                .expect("favor ours without a final newline"),
+            b"prefix <<<<<<< ours\nOURS"
+        );
+    }
+
+    #[test]
+    fn strategy_option_resolves_add_add_and_modify_delete_paths() {
+        let base = merge_entry(1, TreeItemMode::Blob);
+        let ours = merge_entry(2, TreeItemMode::Blob);
+        let theirs = merge_entry(3, TreeItemMode::Blob);
+
+        assert!(matches!(
+            resolve_three_way(None, Some(&ours), Some(&theirs), false, Some(MergeFavor::Ours))
+                .expect("favor ours for add/add"),
+            MergeResolution::Use(entry) if entry == ours
+        ));
+        assert!(matches!(
+            resolve_three_way(
+                None,
+                Some(&ours),
+                Some(&theirs),
+                false,
+                Some(MergeFavor::Theirs),
+            )
+            .expect("favor theirs for add/add"),
+            MergeResolution::Use(entry) if entry == theirs
+        ));
+        assert!(matches!(
+            resolve_three_way(
+                Some(&base),
+                Some(&ours),
+                None,
+                false,
+                Some(MergeFavor::Ours),
+            )
+            .expect("favor ours for modify/delete"),
+            MergeResolution::Use(entry) if entry == ours
+        ));
+        assert!(matches!(
+            resolve_three_way(
+                Some(&base),
+                Some(&ours),
+                None,
+                false,
+                Some(MergeFavor::Theirs),
+            )
+            .expect("favor theirs for modify/delete"),
+            MergeResolution::Delete
+        ));
+    }
+
+    #[test]
     fn merge_args_parse_ff_flags() {
         let no_ff = MergeArgs::try_parse_from(["merge", "--no-ff", "feature"]).unwrap();
         assert!(no_ff.no_ff);
@@ -2665,6 +3145,58 @@ mod tests {
         let err = MergeArgs::try_parse_from(["merge", "--ff-only", "--no-ff", "feature"])
             .expect_err("--ff-only and --no-ff are mutually exclusive");
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn merge_args_parse_noninteractive_strategy_controls() {
+        let args = MergeArgs::try_parse_from([
+            "merge",
+            "-Xours",
+            "-X",
+            "theirs",
+            "--allow-unrelated-histories",
+            "--log=7",
+            "feature",
+        ])
+        .expect("parse strategy options");
+        assert_eq!(
+            args.strategy_option,
+            vec![MergeFavor::Ours, MergeFavor::Theirs]
+        );
+        assert!(args.allow_unrelated_histories);
+        assert_eq!(args.log, Some(7));
+
+        let bare_log =
+            MergeArgs::try_parse_from(["merge", "--log", "feature"]).expect("parse bare --log");
+        assert_eq!(bare_log.log, Some(20));
+
+        let ours = MergeArgs::try_parse_from(["merge", "-s", "ours", "feature"])
+            .expect("parse ours strategy");
+        assert_eq!(ours.strategy, Some(MergeStrategy::Ours));
+        assert!(
+            MergeArgs::try_parse_from(["merge", "-s", "recursive", "feature"]).is_err(),
+            "unsupported strategies fail during argument parsing"
+        );
+    }
+
+    #[test]
+    fn merge_state_deserializes_pre_strategy_schema() {
+        let state: MergeState = serde_json::from_str(
+            r#"{
+                "head_name":"main",
+                "orig_head":"orig",
+                "target":"target",
+                "target_ref":"feature",
+                "base":"base",
+                "conflicted_paths":["shared.txt"],
+                "message":"Merge feature into main"
+            }"#,
+        )
+        .expect("deserialize merge state written before P1-07b");
+
+        assert_eq!(state.base.as_deref(), Some("base"));
+        assert_eq!(state.strategy, None);
+        assert!(!state.allow_unrelated_histories);
     }
 
     /// Pin the `Display` format for every variant of [`PullMergeError`]
@@ -2782,7 +3314,7 @@ mod tests {
         let mut their_items = HashMap::new();
         their_items.insert(path.clone(), theirs);
 
-        let result = merge_tree_items(&base_items, &our_items, &their_items, true)
+        let result = merge_tree_items(&base_items, &our_items, &their_items, true, None)
             .expect("merge tree items");
 
         assert!(result.conflicts.is_empty());

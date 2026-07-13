@@ -438,6 +438,11 @@ pub(crate) async fn run_pull(
             merge::PullMergeOptions {
                 ff_only: effective.ff_only,
                 no_ff: effective.no_ff,
+                // `pull` does not expose merge strategies, strategy options,
+                // or unrelated-history override controls.
+                strategy: None,
+                favor: None,
+                allow_unrelated_histories: false,
                 message: None,
                 squash: args.squash,
                 no_commit: args.no_commit,

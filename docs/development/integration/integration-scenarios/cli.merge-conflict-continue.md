@@ -54,9 +54,10 @@ cd "$RUN_DIR/merge-conflict-repo"
 
 断言：`merge side` 在同一文件产生冲突，工作区出现冲突标记；解决冲突并 `add` 后 `merge --continue` 成功完成合并提交；合并后 `log` 可见 merge commit，`shared.txt` 内容为解决后的文本；无 merge 会话时 `merge --continue` / `merge --abort` 必须失败且不破坏当前分支状态。
 
+P1-07b 的参数矩阵由同 Wave 1 的 Cargo target `compat_noninteractive_history_controls` 承担，避免 shell runner 重复构造多组历史：`-s ours` 固定双父与 current-tree；`-X ours/theirs` 固定同文件 clean/conflict hunk 分离；`--allow-unrelated-histories` 覆盖默认拒绝、clean root 合并和 conflict→restart→continue；`--log[=<n>]`/`--no-log` 覆盖 last-wins 与自定义消息跨 continue。
+
 补充可执行断言（冲突场景核心）：
 - 冲突后 `libra --json status` 必须显示 `data.merge_state.conflicted_paths[]` 非空。
 - `merge --continue` 成功后 `libra --json status` 显示 `data.is_clean == true`，且 `data.merge_state` 缺失或 `conflicted_paths` 为空。
 - `libra fsck` 在 continue/abort 后必须通过。
 - 负向 continue/abort 的错误必须是可识别的 "no merge in progress" 类（捕获 stderr 验证包含 "merge" 或 LBR-CONFLICT 相关）。
-

@@ -77,7 +77,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `config_defaults_edge_cases_test.rs` | P1-05a (plan-20260708) | 加密 local/global 默认值先解密、不可读/不支持 system scope 跳过、Git 转换报告源 `HEAD` 分支，以及配置默认值边界回归 |
 | `config_history_defaults_test.rs` | P1-05b (plan-20260708) | 历史相关默认值：`merge.ff`、`merge.log`、`merge.verifySignatures`、`commit.gpgSign` 与 CLI override 优先级 |
 | `fetch_remote_refspec_test.rs` | P1-06 (plan-20260708) | 显式/配置 fetch refspec 精确映射、FETCH_HEAD/remote HEAD 元数据、`remotes.default`、多 ref 事务回滚、remote rename tracking namespace 迁移与 `ls-remote --symref` |
-| `noninteractive_history_controls_test.rs` | P1-07a (plan-20260708) | rebase `--autostash` staged/worktree 分层恢复、conflict-held OID 经 maintenance GC 后 abort、逐提交 sandbox `--exec` 停止/重试/越界写阻断与 exec-created commit 对齐、`--update-refs` 原子移动/已检出分支排除/skip+start-empty 映射、`--fork-point` reflog 最具体选点，以及三组负向 toggle last-wins |
+| `noninteractive_history_controls_test.rs` | P1-07a/P1-07b (plan-20260708) | rebase `--autostash`/sandbox `--exec`/atomic `--update-refs`/reflog `--fork-point`；merge `-s ours` 双父+当前 tree、`-X ours/theirs` 仅偏向冲突 hunk、无关历史 clean/conflict/restart/continue，以及 `--log` custom-message 持久化与负向 toggle last-wins |
 
 ## Authoring guidelines
 

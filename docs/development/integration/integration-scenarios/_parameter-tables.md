@@ -120,6 +120,10 @@
 | `tag -l` / `tag -l -n` | `cli.tag-basic` | 列表和注释摘要覆盖 |
 | `tag -f` / `tag -d <name>` / JSON delete | `cli.tag-basic` | 强制更新、删除、JSON 删除和缺失 tag 错误覆盖 |
 | `merge <branch>` | `cli.merge-rebase-cherry-revert-smoke` | fast-forward 与三方无冲突 merge 均可观察 |
+| `merge -s ours` | `compat_noninteractive_history_controls` | 双父 merge commit 且 tree 与合并前 HEAD 完全一致；JSON strategy=`ours` |
+| `merge -X ours/theirs` | `compat_noninteractive_history_controls` | 只偏向冲突 hunk，目标侧 clean hunk 保留；两组 parent 链固定 |
+| `merge --allow-unrelated-histories` | `compat_noninteractive_history_controls` | 默认拒绝；显式允许后虚拟空 base clean merge，冲突可 restart→resolve→continue |
+| `merge --log[=<n>]` / `--no-log` | `compat_noninteractive_history_controls` | last-wins；显式 `-m --log=1` shortlog 跨 conflict→continue 原样保留 |
 | `merge --find-renames[=<n>]` | `cli.merge-rebase-cherry-revert-smoke` | 当前未实现，runner 负向断言稳定错误 |
 | `merge --squash --continue` | `cli.merge-rebase-cherry-revert-smoke` | 与 lifecycle action 组合被拒绝 |
 | `merge --continue` / `--abort` | `cli.merge-rebase-cherry-revert-smoke` | 无会话时明确失败；冲突续跑场景另行补充 |

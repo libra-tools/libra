@@ -13,7 +13,25 @@ pub(crate) fn default_message(
     head_name: &str,
     log_limit: usize,
 ) -> Result<String, String> {
-    let mut message = format!("Merge {upstream} into {head_name}");
+    append_shortlog(
+        format!("Merge {upstream} into {head_name}"),
+        current,
+        target,
+        upstream,
+        log_limit,
+    )
+}
+
+/// Append the Git-style target-side shortlog to an already-resolved message.
+/// This is used when an explicit CLI `-m` is combined with `--log`; config-only
+/// `merge.log` is suppressed by the caller for explicit messages.
+pub(crate) fn append_shortlog(
+    mut message: String,
+    current: ObjectHash,
+    target: ObjectHash,
+    upstream: &str,
+    log_limit: usize,
+) -> Result<String, String> {
     if log_limit == 0 {
         return Ok(message);
     }

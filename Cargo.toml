@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.62"
+version = "0.18.63"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
