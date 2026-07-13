@@ -958,7 +958,10 @@ async fn write_committed_checkpoint(
 ) -> Result<()> {
     use crate::internal::ai::{
         history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
-        observed_agents::{AgentKind, AgentSessionCtx, RedactedBytes, Redactor, agent_for},
+        observed_agents::{
+            AgentKind, RedactedBytes, Redactor, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
+            agent_for, resolve_transcript_source,
+        },
     };
 
     let redacted_prompt = event.prompt.as_deref();
@@ -983,45 +986,59 @@ async fn write_committed_checkpoint(
     let transcript_redacted = match AgentKind::from_db_str(agent_kind) {
         Some(kind) => {
             let adapter = agent_for(kind);
-            let ctx = AgentSessionCtx {
-                session_id: libra_session_id.to_string(),
-                provider_session_id: envelope.session_id.clone(),
-                working_dir: std::path::PathBuf::from(&envelope.cwd),
-                transcript_path: envelope
-                    .transcript_path
-                    .as_ref()
-                    .map(std::path::PathBuf::from),
-            };
-            // Security gate (entire.md §8.1 / §13 P0): `transcript_path` comes
-            // from the untrusted hook envelope. Only read + persist it when it
-            // resolves inside the provider's own home-relative transcript root
-            // (e.g. `~/.claude`); a forged path pointing at an arbitrary file
-            // must never be copied into the syncable traces blob.
-            let trusted = ctx
+            let transcript_path = envelope
                 .transcript_path
-                .as_deref()
-                .is_some_and(|path| transcript_path_within_provider_root(adapter, path));
-            if !trusted {
-                prompt_fallback()
-            } else {
-                match adapter.read_transcript(&ctx) {
-                    Ok(Some(raw)) if !raw.is_empty() => {
-                        let (redacted, report) = Redactor::new_default().redact(&raw);
-                        merge_redaction_report_into(&mut report_value, &report);
-                        transcript_raw_for_extraction = Some(raw);
-                        redacted
-                    }
-                    Ok(_) => prompt_fallback(),
-                    Err(err) => {
-                        tracing::warn!(
-                            agent_kind,
-                            error = %format!("{err:#}"),
-                            "failed to read agent transcript for checkpoint; \
-                             falling back to the redacted prompt"
-                        );
-                        prompt_fallback()
+                .as_ref()
+                .map(std::path::PathBuf::from);
+            // DR-04a (ADR-DR-02): resolve the unified `TranscriptSource` seam
+            // instead of reading `transcript_path` directly. `File` sources are
+            // opened once inside the resolver (after the provider-root security
+            // precheck) and read from the held descriptor, so a post-auth path
+            // swap cannot change the bytes; `Bytes` sources (OpenCode export,
+            // DR-04b) carry an `ExportAuthorized` tag the writer binds to this
+            // session. A forged path outside the provider root resolves to
+            // `None` and falls back to the redacted prompt (fail-closed gate).
+            let raw = match resolve_transcript_source(adapter, transcript_path.as_deref()) {
+                Ok(Some(TranscriptSource::File { mut file, .. })) => {
+                    Some(file.read_bounded(TRANSCRIPT_READ_HARD_CAP_BYTES))
+                }
+                Ok(Some(TranscriptSource::Bytes { bytes, auth })) => {
+                    // Only trust export bytes whose tag is bound to the session
+                    // being written; a mismatched tag is treated as no source.
+                    if auth.session_id == libra_session_id && auth.agent_kind == agent_kind {
+                        Some(Ok(bytes))
+                    } else {
+                        Some(Ok(Vec::new()))
                     }
                 }
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        agent_kind,
+                        error = %format!("{err:#}"),
+                        "failed to resolve agent transcript source for checkpoint; \
+                         falling back to the redacted prompt"
+                    );
+                    None
+                }
+            };
+            match raw {
+                Some(Ok(raw)) if !raw.is_empty() => {
+                    let (redacted, report) = Redactor::new_default().redact(&raw);
+                    merge_redaction_report_into(&mut report_value, &report);
+                    transcript_raw_for_extraction = Some(raw);
+                    redacted
+                }
+                Some(Err(err)) => {
+                    tracing::warn!(
+                        agent_kind,
+                        error = %format!("{err:#}"),
+                        "failed to read agent transcript for checkpoint; \
+                         falling back to the redacted prompt"
+                    );
+                    prompt_fallback()
+                }
+                Some(Ok(_)) | None => prompt_fallback(),
             }
         }
         None => prompt_fallback(),
@@ -1895,53 +1912,10 @@ fn checkpoint_model_field(model: Option<&serde_json::Value>) -> String {
 /// its `bytes_scanned` / `bytes_redacted` counters so the stored report stays
 /// consistent with the stored (redacted) transcript blob. A non-object
 /// `report` (only possible from a malformed input string) is left untouched.
-/// Decide whether `path` may be read into a checkpoint transcript blob.
 ///
-/// The transcript path originates from the (untrusted) hook envelope, so a
-/// forged payload could otherwise point it at any file the Libra process can
-/// read and have the contents copied into the syncable `traces` blob
-/// (entire.md §8.1 / §13 P0). Constrain it: after symlink canonicalization,
-/// `path` must live under one of the adapter's home-relative roots (e.g.
-/// `~/.claude` for Claude Code, `~/.gemini` for Gemini). Non-existent paths,
-/// an unresolvable home directory, or a path outside every root all return
-/// `false` so the caller falls back to the already-redacted prompt.
-/// `LIBRA_TEST_HOME` overrides the home directory for tests, mirroring the
-/// vault module.
-fn transcript_path_within_provider_root(
-    adapter: &dyn crate::internal::ai::observed_agents::ObservedAgent,
-    path: &std::path::Path,
-) -> bool {
-    let home = std::env::var_os("LIBRA_TEST_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir);
-    let Some(home) = home else {
-        return false;
-    };
-    let Ok(canonical_path) = path.canonicalize() else {
-        return false;
-    };
-    adapter.protected_dirs().iter().any(|dir| {
-        // Codex relocates its whole home via `$CODEX_HOME` and every other
-        // part of the codex chain honors it (`resolve_codex_home` in
-        // providers/codex/settings.rs). The trust gate must resolve the
-        // same root, or sessions under a relocated CODEX_HOME are silently
-        // captured with empty transcripts (found by the A6.5 real-CLI
-        // smoke, which isolates CODEX_HOME). Only an absolute override is
-        // honored, mirroring `resolve_codex_home`'s validation.
-        let root = if *dir == ".codex" {
-            match std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from) {
-                Some(path) if path.is_absolute() => path,
-                _ => home.join(dir),
-            }
-        } else {
-            home.join(dir)
-        };
-        root.canonicalize()
-            .map(|root| canonical_path.starts_with(root))
-            .unwrap_or(false)
-    })
-}
-
+/// (DR-04a) The provider-root trust gate that used to live here moved to
+/// `observed_agents::transcript_source::transcript_path_within_provider_root`,
+/// the single source of truth behind the `TranscriptSource` seam.
 fn merge_redaction_report_into(
     report: &mut serde_json::Value,
     extra: &crate::internal::ai::observed_agents::RedactionReport,
@@ -3340,11 +3314,15 @@ mod tests {
             std::env::set_var("LIBRA_TEST_HOME", home.path());
             std::env::set_var("CODEX_HOME", codex_home.path());
         }
-        let trusted = transcript_path_within_provider_root(adapter, &rollout);
+        let trusted = crate::internal::ai::observed_agents::transcript_path_within_provider_root(
+            adapter, &rollout,
+        );
         unsafe {
             std::env::remove_var("CODEX_HOME");
         }
-        let untrusted = transcript_path_within_provider_root(adapter, &rollout);
+        let untrusted = crate::internal::ai::observed_agents::transcript_path_within_provider_root(
+            adapter, &rollout,
+        );
         unsafe {
             match prior_codex {
                 Some(value) => std::env::set_var("CODEX_HOME", value),
