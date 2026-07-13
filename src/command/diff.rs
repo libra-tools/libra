@@ -73,6 +73,7 @@ EXAMPLES:
     libra diff --shortstat                  Show just the files-changed/insertions/deletions line
     libra diff --full-index                 Show full object ids in patch index headers
     libra diff --word-diff                   Word-level diff ([-removed-]{+added+} inline)
+    libra diff --color-words                 Word-level diff with colored changes
     libra diff -U0                          Patch with no surrounding context (default is 3)
     libra diff -w                           Ignore whitespace-only changes
     libra diff -b                           Ignore changes in the amount of whitespace
@@ -138,6 +139,13 @@ pub struct DiffArgs {
     /// whitespace-delimited.
     #[clap(long = "word-diff", value_name = "MODE", num_args = 0..=1, require_equals = true, default_missing_value = "plain")]
     pub word_diff: Option<String>,
+
+    /// Show a color word diff. Equivalent to `--word-diff=color`; unlike that
+    /// general form, it enables word colors when color selection is automatic
+    /// even if stdout is redirected. Use global `--color=never` to suppress ANSI.
+    /// A regex value is not accepted yet; use the bare shorthand only.
+    #[clap(long = "color-words")]
+    pub color_words: bool,
 
     /// Show insertion/deletion counts in a machine-friendly format
     #[clap(long)]
@@ -667,7 +675,7 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
 /// Whether `--word-diff` is set to a rendering mode (i.e. not `none`/absent), in
 /// which case the diff body is already fully rendered and must not be re-colored.
 fn word_diff_active(args: &DiffArgs) -> bool {
-    matches!(args.word_diff.as_deref(), Some(mode) if mode != "none")
+    args.color_words || matches!(args.word_diff.as_deref(), Some(mode) if mode != "none")
 }
 
 /// The `--relative[=<path>]` directory prefix (with a trailing `/`) that the diff
@@ -856,14 +864,22 @@ fn apply_word_diff(
     args: &DiffArgs,
     result: &mut DiffOutput,
     output: &OutputConfig,
-    color: bool,
+    stdout_is_terminal: bool,
 ) -> CliResult<()> {
-    let Some(value) = &args.word_diff else {
-        return Ok(());
+    // Resolve (and validate) an explicit mode even when `--color-words` or
+    // another output mode wins, so `--word-diff=<bad>` never becomes hidden.
+    let explicit_mode = args
+        .word_diff
+        .as_deref()
+        .map(resolve_word_diff_mode)
+        .transpose()?
+        .flatten();
+    let mode = if args.color_words {
+        Some(WordDiffMode::Color)
+    } else {
+        explicit_mode
     };
-    // Resolve (and validate) the mode even when another output mode wins, so an
-    // invalid `--word-diff=<bad>` is still reported.
-    let Some(mode) = resolve_word_diff_mode(value)? else {
+    let Some(mode) = mode else {
         return Ok(());
     };
     // Word-diff only rewrites the textual patch body. Summary/check/JSON paths
@@ -888,6 +904,16 @@ fn apply_word_diff(
     {
         return Ok(());
     }
+    // `plain` must stay bracketed even on a terminal or under `--color=always`.
+    // `--word-diff=color` follows the global color policy, while the dedicated
+    // `--color-words` shorthand enables color under `auto` even when redirected
+    // (matching Git's shorthand); an explicit global `--color=never` still wins.
+    let color = mode == WordDiffMode::Color
+        && match output.color {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => args.color_words || stdout_is_terminal,
+        };
     for file in &mut result.files {
         file.raw_diff = word_diff_transform(&file.raw_diff, mode, color);
     }
@@ -1078,7 +1104,9 @@ fn render_word_diff(old: &str, new: &str, mode: WordDiffMode, color: bool) -> St
             ChangeTag::Equal => out.push_str(&text),
             ChangeTag::Delete => {
                 if color {
-                    out.push_str(&text.red().to_string());
+                    out.push_str("\x1b[31m");
+                    out.push_str(&text);
+                    out.push_str("\x1b[0m");
                 } else {
                     out.push_str("[-");
                     out.push_str(&text);
@@ -1087,7 +1115,9 @@ fn render_word_diff(old: &str, new: &str, mode: WordDiffMode, color: bool) -> St
             }
             ChangeTag::Insert => {
                 if color {
-                    out.push_str(&text.green().to_string());
+                    out.push_str("\x1b[32m");
+                    out.push_str(&text);
+                    out.push_str("\x1b[0m");
                 } else {
                     out.push_str("{+");
                     out.push_str(&text);
@@ -5246,6 +5276,7 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         name_only: false,
         name_status: false,
         word_diff: None,
+        color_words: false,
         numstat: false,
         stat: false,
         unified: None,

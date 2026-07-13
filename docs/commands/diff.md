@@ -15,6 +15,7 @@ libra diff [--raw | --name-only | --name-status | --numstat | --stat | --shortst
 libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
            [-S <STRING> | -G <REGEX>]
            [--src-prefix=<PREFIX> --dst-prefix=<PREFIX>]
+           [--word-diff[=<MODE>] | --color-words]
            [--algorithm <name>] [--output <file>]
 ```
 
@@ -22,7 +23,7 @@ libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
 
 `libra diff` shows changes between different states of the repository. By default it compares the index against tracked working-tree paths (unstaged changes). Untracked files are not part of the default diff and therefore do not affect `--quiet`, `--exit-code`, `--name-status`, `--numstat`, or `--shortstat`; use `libra status`, `libra ls-files --others`, or `libra add` to inspect or promote untracked files. With `--staged`, it compares HEAD against the index (staged changes). With `--old` and `--new`, it compares two arbitrary commits.
 
-The diff engine currently uses the histogram backend. The parser accepts the forward-compatible names `myers` and `myersMinimal`, but execution rejects them with `LBR-CLI-002` rather than silently using another algorithm. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). Pickaxe filters `-S <STRING>` and `-G <REGEX>` select file pairs by changed occurrence count or matching added/removed lines. A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity (matching Git's structure; like all Libra diffs, the exact word grouping can differ from Git on ambiguous changes, and hunk headers keep Libra's unified-diff format).
+The diff engine currently uses the histogram backend. The parser accepts the forward-compatible names `myers` and `myersMinimal`, but execution rejects them with `LBR-CLI-002` rather than silently using another algorithm. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). Pickaxe filters `-S <STRING>` and `-G <REGEX>` select file pairs by changed occurrence count or matching added/removed lines. A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity, while bare `--color-words` is its color shorthand (matching Git's structure; like all Libra diffs, the exact word grouping can differ from Git on ambiguous changes, and hunk headers keep Libra's unified-diff format).
 
 When the working tree contains unmerged conflict entries, the default working-tree diff renders a conflict-aware `diff --cc <path>` record instead of treating the conflict file as a `/dev/null` addition.
 
@@ -51,6 +52,7 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | Name status | | `--name-status` | Show changed file names with a status letter (A/D/M/R/T/U when applicable). |
 | Raw | | `--raw` | Show Git-shaped `:<oldmode> <newmode> <oldid> <newid> <status>\t<path>` records. IDs are abbreviated to 7 characters; a live worktree or absent side is zero. Renames carry `R<score>` plus old/new paths. Use `-z` for arbitrary path names. |
 | Word diff | | `--word-diff[=<mode>]` | Re-render the patch at word granularity. MODE is `plain` (default; removed words `[-…-]`, added `{+…+}`), `color` (highlight in a terminal, no brackets), `porcelain` (one token per line, `-`/`+`/` ` prefixes, `~` for newlines), or `none` (regular patch). Words are whitespace-delimited. Must be written as `--word-diff` or `--word-diff=<mode>`. |
+| Color words | | `--color-words` | Bare shorthand for `--word-diff=color`. Under automatic color selection it emits word colors even when stdout is redirected; explicit global `--color=never` suppresses ANSI. Regex-valued `--color-words=<regex>` and `--word-diff-regex` are not implemented yet and fail rather than being ignored. |
 | Numstat | | `--numstat` | Show insertion/deletion counts in a machine-friendly tab-separated format. |
 | Stat | | `--stat` | Show a diffstat summary with +/- bar graph. |
 | Compact summary | | `--compact-summary` | Show `--stat` with `(new)`, `(gone)`, and executable/symlink metadata such as `(+x)` or `(+l)`. Implies `--stat`. |
@@ -339,7 +341,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 
 ### `--word-diff` and `--color-words`
 
-`--word-diff[=<mode>]` is supported (see the option above): it re-renders the patch at word granularity in `plain` (default), `color`, `porcelain`, or `none` mode, with whitespace-delimited words. The shorthand `--color-words` and a custom `--word-diff-regex` are not yet implemented.
+`--word-diff[=<mode>]` is supported (see the option above): it re-renders the patch at word granularity in `plain` (default), `color`, `porcelain`, or `none` mode, with whitespace-delimited words. Bare `--color-words` is supported as the color-mode shorthand and forces word colors under the automatic color policy even through redirected stdout; global `--color=never` still wins. A regex-valued `--color-words=<regex>` and custom `--word-diff-regex` remain unsupported and fail explicitly.
 
 ## Parameter Comparison: Libra vs Git vs jj
 
@@ -370,7 +372,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Whitespace check | `--check` (trailing-ws / space-before-tab / conflict markers / blank-at-eof) | `--check` | N/A |
 | Reverse diff | `-R` / `--reverse` | `-R` | N/A |
 | Treat as text | `-a` / `--text` (force content diff of binary files) | `-a` / `--text` | N/A |
-| Word diff | `--word-diff[=<mode>]` (no `--color-words`/`--word-diff-regex`) | `--word-diff` / `--color-words` | N/A |
+| Word diff | `--word-diff[=<mode>]` / bare `--color-words` (no regex-valued shorthand or `--word-diff-regex`) | `--word-diff` / `--color-words` | N/A |
 | Binary diff (binary patch) | `--binary` (valid/appliable; compressed bytes differ from Git's) | `--binary` | N/A |
 | Context lines | `-U<n>` / `--unified=<n>` (default 3) | `-U<n>` / `--unified=<n>` | `--context <n>` |
 | Ignore whitespace | `-w` / `--ignore-all-space` | `-w` / `--ignore-all-space` | N/A |

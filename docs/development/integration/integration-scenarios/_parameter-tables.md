@@ -73,6 +73,7 @@
 | `diff --compact-summary` | `cli.restore-reset-diff`, `compat_diff_review_options` | 隐含 stat；create/delete 与 executable/symlink mode 注记可观察 |
 | `diff --diff-filter=<FILTER>` | `cli.restore-reset-diff`, `compat_diff_review_options` | include/exclude/`*` all-or-none，非法值输出前 fail-closed，sparse-view 后重新判定 |
 | `diff -S <STRING>` / `-G <REGEX>` | `cli.restore-reset-diff`, `compat_diff_review_options`, `ai_libra_vcs_safety_test` | 每 file pair literal 次数变化 / 增删 hunk 行正则过滤；textconv 结果一次复用，external driver 前过滤，无效 regex pre-progress fail-closed，AI 默认过滤器审批边界不放宽 |
+| `diff --color-words` | `cli.restore-reset-diff`, `command_test::test_diff_word_diff_modes`, `ai_libra_vcs_safety_test` | bare shorthand 进入 word color mode；Auto 下重定向 stdout 仍着色，全局 `--color=never` 抑制 ANSI，plain mode 不受 tty/forced color 污染；regex-valued shorthand 显式拒绝 |
 | `diff --full-index --src-prefix --dst-prefix` | `cli.restore-reset-diff`, `compat_diff_review_options` | patch 使用完整对象 ID 与 CLI 指定前缀；`-R` 交换前缀 |
 | `diff --output <file>` | `cli.restore-reset-diff` | patch 写入文件，stdout 不输出 hunk |
 | `diff --algorithm=histogram` | `cli.restore-reset-diff` | 当前唯一实现算法可用，其他算法负向断言 |

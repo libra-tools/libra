@@ -2058,6 +2058,53 @@ fn test_diff_word_diff_modes() {
     // `--word-diff=plain` is identical to the default.
     assert_eq!(plain, body(&["--word-diff=plain"]));
 
+    // Plain mode stays bracketed even when global color is forced. Previously
+    // terminal/color state leaked into the renderer and silently changed plain
+    // mode into a bracket-less color diff.
+    let forced_plain =
+        run_libra_command(&["--color=always", "diff", "--word-diff=plain", "w.txt"], p);
+    assert_cli_success(&forced_plain, "forced-color plain word-diff");
+    let forced_plain = String::from_utf8_lossy(&forced_plain.stdout);
+    assert!(
+        forced_plain.contains("[-beta-]{+BETA+}"),
+        "plain mode remains bracketed: {forced_plain}"
+    );
+    assert!(
+        !forced_plain.contains("\u{1b}["),
+        "plain word-diff bypasses line colorization: {forced_plain}"
+    );
+
+    // The bare Git-compatible shorthand selects color word diff and forces
+    // word colors under the automatic policy even though the test captures
+    // (redirects) stdout. Explicit global --color=never remains authoritative.
+    let color_words = run_libra_command(&["diff", "--color-words", "w.txt"], p);
+    assert_cli_success(&color_words, "diff --color-words");
+    let color_words = String::from_utf8_lossy(&color_words.stdout);
+    assert!(
+        color_words.contains("\u{1b}["),
+        "--color-words forces ANSI under auto: {color_words}"
+    );
+    assert!(
+        !color_words.contains("[-") && !color_words.contains("{+"),
+        "color shorthand has no plain markers: {color_words}"
+    );
+    let no_color_words = run_libra_command(&["--color=never", "diff", "--color-words", "w.txt"], p);
+    assert_cli_success(&no_color_words, "diff --color=never --color-words");
+    assert!(
+        !String::from_utf8_lossy(&no_color_words.stdout).contains("\u{1b}["),
+        "explicit --color=never suppresses shorthand ANSI"
+    );
+
+    // Regex-valued shorthand is deliberately deferred to the
+    // --word-diff-regex slice; reject it instead of silently ignoring a value.
+    let color_words_regex = run_libra_command(&["diff", "--color-words=\\w+", "w.txt"], p);
+    assert_eq!(
+        color_words_regex.status.code(),
+        Some(129),
+        "unsupported regex-valued shorthand must fail: {}",
+        String::from_utf8_lossy(&color_words_regex.stderr)
+    );
+
     // porcelain: one token per line with ` `/`-`/`+` prefixes and `~` newlines.
     let porcelain = body(&["--word-diff=porcelain"]);
     assert!(

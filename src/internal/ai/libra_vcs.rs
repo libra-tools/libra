@@ -378,6 +378,8 @@ fn diff_arg_safety(args: &[String], idx: usize) -> (ArgSafety, usize) {
             | "--no-color"
             | "--patch"
             | "-p"
+            | "--word-diff"
+            | "--color-words"
             | "--no-ext-diff"
             | "--no-textconv"
             | "--histogram"
@@ -385,6 +387,7 @@ fn diff_arg_safety(args: &[String], idx: usize) -> (ArgSafety, usize) {
             | "--minimal"
     ) || arg.starts_with("--stat=")
         || arg.starts_with("--color=")
+        || arg.starts_with("--word-diff=")
         || arg.starts_with("--diff-filter=")
         || arg.starts_with("--submodule=")
         || arg.starts_with("--relative=")
