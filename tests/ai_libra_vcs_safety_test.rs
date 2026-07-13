@@ -84,6 +84,19 @@ fn ai_libra_vcs_safety_allows_read_only_parameter_combinations() {
             "diff",
             vec!["--no-textconv", "--no-ext-diff", "--color-words"],
         ),
+        (
+            "diff",
+            vec!["--no-textconv", "--no-ext-diff", "--color-words=[A-Za-z]+"],
+        ),
+        (
+            "diff",
+            vec![
+                "--no-textconv",
+                "--no-ext-diff",
+                "--word-diff-regex",
+                "[A-Za-z]+",
+            ],
+        ),
         ("log", vec!["--oneline", "--max-count=5"]),
         ("log", vec!["--patch-with-stat", "--max-count=1"]),
         ("show", vec!["HEAD", "--stat"]),
@@ -143,6 +156,11 @@ fn ai_libra_vcs_safety_requires_human_for_recoverable_or_unknown_combinations() 
         (
             "diff",
             vec!["--color-words"],
+            "libra_vcs.diff_default_filters",
+        ),
+        (
+            "diff",
+            vec!["--word-diff-regex=[A-Za-z]+"],
             "libra_vcs.diff_default_filters",
         ),
         // Filter-disabling flags AFTER `--` are pathspecs, not the flags.

@@ -2095,14 +2095,62 @@ fn test_diff_word_diff_modes() {
         "explicit --color=never suppresses shorthand ANSI"
     );
 
-    // Regex-valued shorthand is deliberately deferred to the
-    // --word-diff-regex slice; reject it instead of silently ignoring a value.
+    // Regex-valued shorthand is accepted and retains color mode.
     let color_words_regex = run_libra_command(&["diff", "--color-words=\\w+", "w.txt"], p);
-    assert_eq!(
-        color_words_regex.status.code(),
-        Some(129),
-        "unsupported regex-valued shorthand must fail: {}",
-        String::from_utf8_lossy(&color_words_regex.stderr)
+    assert_cli_success(&color_words_regex, "regex-valued --color-words");
+    assert!(
+        String::from_utf8_lossy(&color_words_regex.stdout).contains("\u{1b}["),
+        "regex-valued shorthand keeps forced word color"
+    );
+
+    // Custom regex matches define words; old unmatched delimiters disappear,
+    // new delimiters remain visible, and the option alone implies plain mode.
+    fs::write(p.join("regex.txt"), "foo.bar\n").expect("write regex fixture");
+    assert_cli_success(
+        &run_libra_command(&["add", "regex.txt"], p),
+        "add regex fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "regex1", "--no-verify"], p),
+        "commit regex fixture",
+    );
+    fs::write(p.join("regex.txt"), "foo,baz\n").expect("modify regex fixture");
+    let regex_plain =
+        run_libra_command(&["diff", "--word-diff-regex", "[A-Za-z]+", "regex.txt"], p);
+    assert_cli_success(&regex_plain, "diff --word-diff-regex");
+    assert!(
+        String::from_utf8_lossy(&regex_plain.stdout).contains("foo,[-bar-]{+baz+}"),
+        "regex words use the new delimiter: {}",
+        String::from_utf8_lossy(&regex_plain.stdout)
+    );
+    let regex_porcelain = run_libra_command(
+        &[
+            "diff",
+            "--word-diff=porcelain",
+            "--word-diff-regex=[A-Za-z]+",
+            "regex.txt",
+        ],
+        p,
+    );
+    assert_cli_success(&regex_porcelain, "porcelain regex word diff");
+    let regex_porcelain = String::from_utf8_lossy(&regex_porcelain.stdout);
+    assert!(
+        regex_porcelain.contains("\n foo,\n-bar\n+baz\n~\n"),
+        "regex porcelain output: {regex_porcelain}"
+    );
+
+    // Compile regexes before progress/config/diff work and fail closed.
+    let invalid_regex = run_libra_command(&["diff", "--word-diff-regex", "[", "regex.txt"], p);
+    assert_eq!(invalid_regex.status.code(), Some(129));
+    let invalid_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&invalid_regex.stdout),
+        String::from_utf8_lossy(&invalid_regex.stderr)
+    );
+    assert!(invalid_output.contains("invalid --word-diff-regex"));
+    assert!(
+        !invalid_output.contains("Scanning working tree"),
+        "invalid regex must fail before progress: {invalid_output}"
     );
 
     // porcelain: one token per line with ` `/`-`/`+` prefixes and `~` newlines.

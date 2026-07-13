@@ -1076,6 +1076,13 @@ async fn write_committed_checkpoint(
             )
             .await
             .context("coverage gate reservation failed; checkpoint write aborted (fail-closed)")?;
+            if outcome.reserved.is_empty() && outcome.skipped_inflight > 0 {
+                bail!(
+                    "coverage gate reservation is held by another live writer for {} turn(s); \
+                     checkpoint was not appended; retry after that writer finishes or its lease expires",
+                    outcome.skipped_inflight
+                );
+            }
             if outcome.is_noop() {
                 tracing::info!(
                     session_id = %libra_session_id,

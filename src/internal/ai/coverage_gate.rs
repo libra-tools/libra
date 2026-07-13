@@ -103,9 +103,21 @@ async fn read_claim(
         completeness: row.try_get_by("completeness")?,
         revision: row.try_get_by("revision")?,
         state: row.try_get_by("state")?,
-        lease_expires_at: row.try_get_by("lease_expires_at").ok().flatten(),
-        fence_token: row.try_get_by("fence_token").ok().flatten(),
+        lease_expires_at: row.try_get_by("lease_expires_at")?,
+        fence_token: row.try_get_by("fence_token")?,
     }))
+}
+
+fn lease_deadline(now_ms: i64) -> Result<i64> {
+    now_ms
+        .checked_add(LIVE_LEASE_MS)
+        .context("coverage reservation lease timestamp overflow")
+}
+
+fn next_revision(revision: i64) -> Result<i64> {
+    revision
+        .checked_add(1)
+        .context("coverage claim revision overflow")
 }
 
 /// Insert a brand-new `reserved_live` claim. Returns the reservation, or
@@ -119,6 +131,7 @@ async fn try_insert_fresh_claim(
     owner: &str,
     now_ms: i64,
 ) -> Result<Option<ReservedTurnClaim>> {
+    let lease_expires_at = lease_deadline(now_ms)?;
     let result = conn
         .execute(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -137,7 +150,7 @@ async fn try_insert_fresh_claim(
                 digest.into(),
                 turn.completeness.as_db_str().into(),
                 owner.into(),
-                (now_ms + LIVE_LEASE_MS).into(),
+                lease_expires_at.into(),
                 now_ms.into(),
                 now_ms.into(),
             ],
@@ -172,7 +185,11 @@ async fn try_reown_claim(
     owner: &str,
     now_ms: i64,
 ) -> Result<Option<(i64, i64)>> {
-    let new_fence = expected_fence.unwrap_or(0) + 1;
+    let new_fence = expected_fence
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("coverage claim fence token overflow")?;
+    let lease_expires_at = lease_deadline(now_ms)?;
     let expected_fence_value: sea_orm::Value = expected_fence.into();
     let result = conn
         .execute(Statement::from_sql_and_values(
@@ -186,7 +203,7 @@ async fn try_reown_claim(
                AND state = ? AND fence_token IS ?",
             [
                 owner.into(),
-                (now_ms + LIVE_LEASE_MS).into(),
+                lease_expires_at.into(),
                 new_fence.into(),
                 new_digest.into(),
                 new_completeness.as_db_str().into(),
@@ -201,7 +218,7 @@ async fn try_reown_claim(
         .await
         .context("re-own agent_coverage_claim")?;
     if result.rows_affected() == 1 {
-        Ok(Some((new_fence, now_ms + LIVE_LEASE_MS)))
+        Ok(Some((new_fence, lease_expires_at)))
     } else {
         Ok(None)
     }
@@ -215,25 +232,26 @@ async fn try_mark_conflicted(
     logical_turn_key: &str,
     expected_digest: &str,
     now_ms: i64,
-) -> Result<()> {
-    conn.execute(Statement::from_sql_and_values(
-        conn.get_database_backend(),
-        "UPDATE agent_coverage_claim
+) -> Result<bool> {
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "UPDATE agent_coverage_claim
          SET state = 'conflicted', updated_at = ?
          WHERE session_id = ? AND logical_turn_key = ?
            AND coverage_schema_version = ?
            AND state = 'catalog_committed' AND coverage_digest = ?",
-        [
-            now_ms.into(),
-            session_id.into(),
-            logical_turn_key.into(),
-            COVERAGE_SCHEMA_VERSION.into(),
-            expected_digest.into(),
-        ],
-    ))
-    .await
-    .context("mark agent_coverage_claim conflicted")?;
-    Ok(())
+            [
+                now_ms.into(),
+                session_id.into(),
+                logical_turn_key.into(),
+                COVERAGE_SCHEMA_VERSION.into(),
+                expected_digest.into(),
+            ],
+        ))
+        .await
+        .context("mark agent_coverage_claim conflicted")?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// Reserve the turns of one live snapshot (ADR-DR-09 arbitration). Bounded:
@@ -341,14 +359,14 @@ async fn decide_and_attempt(
                             coverage_digest: digest.to_string(),
                             completeness: turn.completeness,
                             fence_token: fence,
-                            next_revision: existing.revision + 1,
+                            next_revision: next_revision(existing.revision)?,
                         })),
                         None => Ok(AttemptOutcome::LostRace),
                     }
                 }
                 ("complete", Completeness::Complete) => {
                     // complete → different complete: never auto-overwrite.
-                    try_mark_conflicted(
+                    let marked = try_mark_conflicted(
                         conn,
                         session_id,
                         &turn.logical_turn_key,
@@ -356,7 +374,11 @@ async fn decide_and_attempt(
                         now_ms,
                     )
                     .await?;
-                    Ok(AttemptOutcome::Conflicted)
+                    Ok(if marked {
+                        AttemptOutcome::Conflicted
+                    } else {
+                        AttemptOutcome::LostRace
+                    })
                 }
                 // A (different) incomplete snapshot never downgrades or
                 // replaces committed content.
@@ -391,7 +413,7 @@ async fn decide_and_attempt(
                     coverage_digest: digest.to_string(),
                     completeness: turn.completeness,
                     fence_token: fence,
-                    next_revision: existing.revision + 1,
+                    next_revision: next_revision(existing.revision)?,
                 })),
                 None => Ok(AttemptOutcome::LostRace),
             }
@@ -415,7 +437,7 @@ async fn decide_and_attempt(
                     coverage_digest: digest.to_string(),
                     completeness: turn.completeness,
                     fence_token: fence,
-                    next_revision: existing.revision + 1,
+                    next_revision: next_revision(existing.revision)?,
                 })),
                 None => Ok(AttemptOutcome::LostRace),
             }

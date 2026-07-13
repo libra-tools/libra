@@ -73,6 +73,7 @@ EXAMPLES:
     libra diff --shortstat                  Show just the files-changed/insertions/deletions line
     libra diff --full-index                 Show full object ids in patch index headers
     libra diff --word-diff                   Word-level diff ([-removed-]{+added+} inline)
+    libra diff --word-diff-regex='[A-Za-z]+' Compare custom regex-defined words
     libra diff --color-words                 Word-level diff with colored changes
     libra diff -U0                          Patch with no surrounding context (default is 3)
     libra diff -w                           Ignore whitespace-only changes
@@ -140,12 +141,18 @@ pub struct DiffArgs {
     #[clap(long = "word-diff", value_name = "MODE", num_args = 0..=1, require_equals = true, default_missing_value = "plain")]
     pub word_diff: Option<String>,
 
-    /// Show a color word diff. Equivalent to `--word-diff=color`; unlike that
-    /// general form, it enables word colors when color selection is automatic
-    /// even if stdout is redirected. Use global `--color=never` to suppress ANSI.
-    /// A regex value is not accepted yet; use the bare shorthand only.
-    #[clap(long = "color-words")]
-    pub color_words: bool,
+    /// Show a color word diff. Equivalent to `--word-diff=color` plus an
+    /// optional `--word-diff-regex=<REGEX>`. Unlike the general color mode, it
+    /// enables word colors when color selection is automatic even if stdout is
+    /// redirected. Use global `--color=never` to suppress ANSI.
+    #[clap(long = "color-words", value_name = "REGEX", num_args = 0..=1, require_equals = true)]
+    pub color_words: Option<Option<String>>,
+
+    /// Use each non-overlapping REGEX match as a word. Text between matches is
+    /// ignored for comparison; new-side delimiters remain visible. Implies
+    /// `--word-diff=plain` when no word mode is otherwise selected.
+    #[clap(long = "word-diff-regex", value_name = "REGEX")]
+    pub word_diff_regex: Option<String>,
 
     /// Show insertion/deletion counts in a machine-friendly format
     #[clap(long)]
@@ -639,6 +646,7 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     validate_diff_algorithm(&args).map_err(CliError::from)?;
     parse_diff_filter(args.diff_filter.as_deref()).map_err(CliError::from)?;
     let pickaxe = parse_diff_pickaxe(&args).map_err(CliError::from)?;
+    let word_diff = resolve_word_diff_options(&args)?;
     let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
     let mut result = run_diff(&args, output, &config, pickaxe.as_ref())
@@ -666,7 +674,13 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     // and word-diff transforms (they would mangle the driver's own format).
     if !result.external_diff_applied {
         apply_relative_filter(&args, &mut result);
-        apply_word_diff(&args, &mut result, output, io::stdout().is_terminal())?;
+        apply_word_diff(
+            &args,
+            &word_diff,
+            &mut result,
+            output,
+            io::stdout().is_terminal(),
+        )?;
         apply_diff_prefixes(&mut result, &config.prefixes);
     }
     render_diff_output(&args, &result, output)
@@ -675,7 +689,14 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
 /// Whether `--word-diff` is set to a rendering mode (i.e. not `none`/absent), in
 /// which case the diff body is already fully rendered and must not be re-colored.
 fn word_diff_active(args: &DiffArgs) -> bool {
-    args.color_words || matches!(args.word_diff.as_deref(), Some(mode) if mode != "none")
+    if args.color_words.is_some() {
+        return true;
+    }
+    match args.word_diff.as_deref() {
+        Some("none") => false,
+        Some(_) => true,
+        None => args.word_diff_regex.is_some(),
+    }
 }
 
 /// The `--relative[=<path>]` directory prefix (with a trailing `/`) that the diff
@@ -843,6 +864,15 @@ enum WordDiffMode {
     Porcelain,
 }
 
+/// Prevalidated word-diff controls. Regex compilation happens before config,
+/// progress, textconv, or external-driver work, and the compiled automaton is
+/// reused for every file/hunk in the result.
+struct ResolvedWordDiff {
+    mode: Option<WordDiffMode>,
+    regex: Option<regex::Regex>,
+    force_auto_color: bool,
+}
+
 /// Resolve a `--word-diff` value to a mode, or `None` for `none` (no transform).
 fn resolve_word_diff_mode(value: &str) -> CliResult<Option<WordDiffMode>> {
     match value {
@@ -857,29 +887,56 @@ fn resolve_word_diff_mode(value: &str) -> CliResult<Option<WordDiffMode>> {
     }
 }
 
+fn resolve_word_diff_options(args: &DiffArgs) -> CliResult<ResolvedWordDiff> {
+    // Preserve the distinction between an absent mode and explicit `none`:
+    // --word-diff-regex alone implies plain, while explicit none disables it.
+    let explicit_mode = match args.word_diff.as_deref() {
+        Some(value) => Some(resolve_word_diff_mode(value)?),
+        None => None,
+    };
+    let mode = if args.color_words.is_some() {
+        Some(WordDiffMode::Color)
+    } else {
+        match explicit_mode {
+            Some(mode) => mode,
+            None if args.word_diff_regex.is_some() => Some(WordDiffMode::Plain),
+            None => None,
+        }
+    };
+    // An explicit --word-diff-regex deterministically overrides the optional
+    // regex carried by --color-words. This avoids silently compiling two
+    // different tokenizers when both forms are present.
+    let regex_source = args
+        .word_diff_regex
+        .as_deref()
+        .or_else(|| args.color_words.as_ref().and_then(|value| value.as_deref()));
+    let regex = regex_source
+        .map(|pattern| {
+            regex::Regex::new(pattern).map_err(|error| {
+                CliError::command_usage(format!("invalid --word-diff-regex '{pattern}': {error}"))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint("use a valid Rust regular expression for word matching")
+            })
+        })
+        .transpose()?;
+    Ok(ResolvedWordDiff {
+        mode,
+        regex,
+        force_auto_color: args.color_words.is_some(),
+    })
+}
+
 /// Apply `--word-diff`: rewrite each file's unified diff body into word-diff
 /// form (the headers/`@@` lines are kept; each hunk's old side vs new side is
 /// re-diffed at word granularity). `none`/absent is a no-op.
 fn apply_word_diff(
     args: &DiffArgs,
+    resolved: &ResolvedWordDiff,
     result: &mut DiffOutput,
     output: &OutputConfig,
     stdout_is_terminal: bool,
 ) -> CliResult<()> {
-    // Resolve (and validate) an explicit mode even when `--color-words` or
-    // another output mode wins, so `--word-diff=<bad>` never becomes hidden.
-    let explicit_mode = args
-        .word_diff
-        .as_deref()
-        .map(resolve_word_diff_mode)
-        .transpose()?
-        .flatten();
-    let mode = if args.color_words {
-        Some(WordDiffMode::Color)
-    } else {
-        explicit_mode
-    };
-    let Some(mode) = mode else {
+    let Some(mode) = resolved.mode else {
         return Ok(());
     };
     // Word-diff only rewrites the textual patch body. Summary/check/JSON paths
@@ -912,10 +969,10 @@ fn apply_word_diff(
         && match output.color {
             ColorChoice::Always => true,
             ColorChoice::Never => false,
-            ColorChoice::Auto => args.color_words || stdout_is_terminal,
+            ColorChoice::Auto => resolved.force_auto_color || stdout_is_terminal,
         };
     for file in &mut result.files {
-        file.raw_diff = word_diff_transform(&file.raw_diff, mode, color);
+        file.raw_diff = word_diff_transform(&file.raw_diff, mode, color, resolved.regex.as_ref());
     }
     Ok(())
 }
@@ -924,7 +981,12 @@ fn apply_word_diff(
 /// lines (`diff --git`, `index`, `---`, `+++`, `@@`) are preserved; each hunk's
 /// body is reconstructed into its old side (context + removed lines) and new
 /// side (context + added lines), word-diffed, and re-rendered.
-fn word_diff_transform(raw_diff: &str, mode: WordDiffMode, color: bool) -> String {
+fn word_diff_transform(
+    raw_diff: &str,
+    mode: WordDiffMode,
+    color: bool,
+    regex: Option<&regex::Regex>,
+) -> String {
     let lines: Vec<&str> = raw_diff.lines().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -970,14 +1032,14 @@ fn word_diff_transform(raw_diff: &str, mode: WordDiffMode, color: bool) -> Strin
         };
         let old_side = with_trailing(&old_lines);
         let new_side = with_trailing(&new_lines);
-        out.push_str(&render_word_diff(&old_side, &new_side, mode, color));
+        out.push_str(&render_word_diff(&old_side, &new_side, mode, color, regex));
     }
     out
 }
 
 /// Split text into word-diff tokens: a single newline, a run of non-newline
 /// whitespace, or a run of non-whitespace (a "word"). Matches Git's default
-/// whitespace-delimited tokenization (`--word-diff-regex` is not supported).
+/// whitespace-delimited tokenization when no custom word regex is selected.
 fn word_tokens(text: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut chars = text.char_indices().peekable();
@@ -1073,20 +1135,255 @@ fn normalize_word_changes(changes: Vec<(ChangeTag, &str)>) -> Vec<(ChangeTag, &s
     out
 }
 
+#[derive(Clone, Copy)]
+struct RegexWordToken<'a> {
+    text: &'a str,
+    start: usize,
+    end: usize,
+    line: usize,
+    newline: bool,
+}
+
+/// Tokenize only regex matches plus explicit newline boundaries. A regex match
+/// that crosses a newline contributes only its prefix before the first newline,
+/// matching Git's documented truncation rule; the match still consumes its
+/// full range, while every consumed newline remains a hard render boundary.
+fn regex_word_tokens<'a>(text: &'a str, regex: &regex::Regex) -> Vec<RegexWordToken<'a>> {
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    let mut line = 0;
+    let push_newlines = |range_start: usize,
+                         range: &'a str,
+                         tokens: &mut Vec<RegexWordToken<'a>>,
+                         line: &mut usize| {
+        for (offset, byte) in range.bytes().enumerate() {
+            if byte == b'\n' {
+                let start = range_start + offset;
+                tokens.push(RegexWordToken {
+                    text: &text[start..start + 1],
+                    start,
+                    end: start + 1,
+                    line: *line,
+                    newline: true,
+                });
+                *line += 1;
+            }
+        }
+    };
+    for matched in regex.find_iter(text) {
+        push_newlines(
+            cursor,
+            &text[cursor..matched.start()],
+            &mut tokens,
+            &mut line,
+        );
+        let matched_text = matched.as_str();
+        let word_end = matched_text
+            .find('\n')
+            .map(|offset| matched.start() + offset)
+            .unwrap_or(matched.end());
+        if word_end > matched.start() {
+            tokens.push(RegexWordToken {
+                text: &text[matched.start()..word_end],
+                start: matched.start(),
+                end: word_end,
+                line,
+                newline: false,
+            });
+        }
+        push_newlines(matched.start(), matched_text, &mut tokens, &mut line);
+        cursor = matched.end();
+    }
+    push_newlines(cursor, &text[cursor..], &mut tokens, &mut line);
+    tokens
+}
+
+#[derive(Clone, Copy)]
+struct IndexedWordChange {
+    tag: ChangeTag,
+    old_index: Option<usize>,
+    new_index: Option<usize>,
+}
+
+fn push_owned_change(changes: &mut Vec<(ChangeTag, String)>, tag: ChangeTag, text: &str) {
+    if !text.is_empty() {
+        changes.push((tag, text.to_string()));
+    }
+}
+
+/// Build Git-shaped regex-word changes. Regex matches are the comparison keys;
+/// unmatched old-side delimiters are ignored, unmatched new-side delimiters are
+/// displayed, and a line with no equal word keeps its complete punctuation
+/// inside the insertion/deletion marker.
+fn regex_word_changes(old: &str, new: &str, regex: &regex::Regex) -> Vec<(ChangeTag, String)> {
+    let old_tokens = regex_word_tokens(old, regex);
+    let new_tokens = regex_word_tokens(new, regex);
+    let old_keys: Vec<&str> = old_tokens.iter().map(|token| token.text).collect();
+    let new_keys: Vec<&str> = new_tokens.iter().map(|token| token.text).collect();
+    let diff = TextDiff::from_slices(&old_keys, &new_keys);
+    let indexed: Vec<IndexedWordChange> = diff
+        .iter_all_changes()
+        .map(|change| IndexedWordChange {
+            tag: change.tag(),
+            old_index: change.old_index(),
+            new_index: change.new_index(),
+        })
+        .collect();
+
+    let old_line_count = old.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let new_line_count = new.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let mut old_equal = vec![false; old_line_count];
+    let mut new_equal = vec![false; new_line_count];
+    let mut old_changed = vec![false; old_line_count];
+    let mut new_changed = vec![false; new_line_count];
+    let mut old_newline_deleted = vec![false; old_line_count];
+    let mut new_newline_inserted = vec![false; new_line_count];
+    for change in &indexed {
+        if let Some(index) = change.old_index {
+            let token = old_tokens[index];
+            match change.tag {
+                ChangeTag::Equal if !token.newline => old_equal[token.line] = true,
+                ChangeTag::Delete if token.newline => old_newline_deleted[token.line] = true,
+                ChangeTag::Delete => old_changed[token.line] = true,
+                _ => {}
+            }
+        }
+        if let Some(index) = change.new_index {
+            let token = new_tokens[index];
+            match change.tag {
+                ChangeTag::Equal if !token.newline => new_equal[token.line] = true,
+                ChangeTag::Insert if token.newline => new_newline_inserted[token.line] = true,
+                ChangeTag::Insert => new_changed[token.line] = true,
+                _ => {}
+            }
+        }
+    }
+    let old_full_change: Vec<bool> = old_changed
+        .iter()
+        .zip(&old_equal)
+        .zip(&old_newline_deleted)
+        .map(|((&changed, &equal), &newline_deleted)| newline_deleted || (changed && !equal))
+        .collect();
+    let new_full_change: Vec<bool> = new_changed
+        .iter()
+        .zip(&new_equal)
+        .zip(&new_newline_inserted)
+        .map(|((&changed, &equal), &newline_inserted)| newline_inserted || (changed && !equal))
+        .collect();
+
+    // Avoid rescanning the remainder of the change list for every deletion:
+    // an all-delete input would otherwise turn delimiter placement into O(n²).
+    let mut next_new_indices = vec![None; indexed.len()];
+    let mut next_new_index = None;
+    for position in (0..indexed.len()).rev() {
+        if indexed[position].new_index.is_some() {
+            next_new_index = indexed[position].new_index;
+        }
+        next_new_indices[position] = next_new_index;
+    }
+
+    let mut changes = Vec::new();
+    let mut old_cursor = 0;
+    let mut new_cursor = 0;
+    for (position, change) in indexed.iter().enumerate() {
+        match change.tag {
+            ChangeTag::Equal => {
+                // INVARIANT: similar supplies both indices for an Equal change.
+                let old_token = old_tokens[change
+                    .old_index
+                    .expect("INVARIANT: equal word change has an old index")];
+                let new_token = new_tokens[change
+                    .new_index
+                    .expect("INVARIANT: equal word change has a new index")];
+                push_owned_change(
+                    &mut changes,
+                    ChangeTag::Equal,
+                    &new[new_cursor..new_token.start],
+                );
+                push_owned_change(&mut changes, ChangeTag::Equal, new_token.text);
+                old_cursor = old_token.end;
+                new_cursor = new_token.end;
+            }
+            ChangeTag::Delete => {
+                // INVARIANT: similar supplies an old index for Delete.
+                let old_token = old_tokens[change
+                    .old_index
+                    .expect("INVARIANT: delete word change has an old index")];
+                if old_full_change[old_token.line] {
+                    push_owned_change(
+                        &mut changes,
+                        ChangeTag::Delete,
+                        &old[old_cursor..old_token.start],
+                    );
+                } else if let Some(next_new) =
+                    next_new_indices[position].map(|index| new_tokens[index])
+                    && new_cursor < next_new.start
+                {
+                    // New-side delimiter belongs before the whole replacement
+                    // run, including its leading deletions (`foo,[-bar-]{+baz+}`).
+                    push_owned_change(
+                        &mut changes,
+                        ChangeTag::Equal,
+                        &new[new_cursor..next_new.start],
+                    );
+                    new_cursor = next_new.start;
+                }
+                push_owned_change(&mut changes, ChangeTag::Delete, old_token.text);
+                old_cursor = old_token.end;
+            }
+            ChangeTag::Insert => {
+                // INVARIANT: similar supplies a new index for Insert.
+                let new_token = new_tokens[change
+                    .new_index
+                    .expect("INVARIANT: insert word change has a new index")];
+                let gap_tag = if new_full_change[new_token.line] {
+                    ChangeTag::Insert
+                } else {
+                    ChangeTag::Equal
+                };
+                push_owned_change(&mut changes, gap_tag, &new[new_cursor..new_token.start]);
+                push_owned_change(&mut changes, ChangeTag::Insert, new_token.text);
+                new_cursor = new_token.end;
+            }
+        }
+    }
+    push_owned_change(&mut changes, ChangeTag::Equal, &new[new_cursor..]);
+    changes
+}
+
 /// Word-diff `old` vs `new` and render the body in the chosen mode (ending with
 /// a trailing newline). Newlines always break lines and close any open marker.
-fn render_word_diff(old: &str, new: &str, mode: WordDiffMode, color: bool) -> String {
-    let old_toks = word_tokens(old);
-    let new_toks = word_tokens(new);
-    let diff = TextDiff::from_slices(&old_toks, &new_toks);
-    let changes: Vec<(ChangeTag, &str)> = normalize_word_changes(
-        diff.iter_all_changes()
-            .map(|change| (change.tag(), change.value()))
-            .collect(),
-    );
+fn render_word_diff(
+    old: &str,
+    new: &str,
+    mode: WordDiffMode,
+    color: bool,
+    regex: Option<&regex::Regex>,
+) -> String {
+    let owned_changes;
+    let changes: Vec<(ChangeTag, &str)> = if let Some(regex) = regex {
+        owned_changes = regex_word_changes(old, new, regex);
+        owned_changes
+            .iter()
+            .map(|(tag, text)| (*tag, text.as_str()))
+            .collect()
+    } else {
+        let old_toks = word_tokens(old);
+        let new_toks = word_tokens(new);
+        let diff = TextDiff::from_slices(&old_toks, &new_toks);
+        normalize_word_changes(
+            diff.iter_all_changes()
+                .map(|change| (change.tag(), change.value()))
+                .collect(),
+        )
+    };
 
+    render_word_changes(&changes, mode, color)
+}
+
+fn render_word_changes(changes: &[(ChangeTag, &str)], mode: WordDiffMode, color: bool) -> String {
     if mode == WordDiffMode::Porcelain {
-        return render_word_porcelain(&changes);
+        return render_word_porcelain(changes);
     }
 
     // Plain / color: emit a running line per output line; removed-word runs are
@@ -1127,7 +1424,7 @@ fn render_word_diff(old: &str, new: &str, mode: WordDiffMode, color: bool) -> St
         }
         run.clear();
     };
-    for &(tag, token) in &changes {
+    for &(tag, token) in changes {
         if token == "\n" {
             flush(&mut out, &mut run, run_tag);
             out.push('\n');
@@ -5276,7 +5573,8 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         name_only: false,
         name_status: false,
         word_diff: None,
-        color_words: false,
+        color_words: None,
+        word_diff_regex: None,
         numstat: false,
         stat: false,
         unified: None,
@@ -5672,6 +5970,82 @@ mod test {
 
     use super::*;
     use crate::utils::test;
+
+    #[test]
+    fn regex_word_diff_matches_git_delimiter_and_whole_line_semantics() {
+        let regex = regex::Regex::new("[A-Za-z]+").expect("test regex is valid");
+        assert_eq!(
+            render_word_diff(
+                "foo.bar\n",
+                "foo,baz\n",
+                WordDiffMode::Plain,
+                false,
+                Some(&regex),
+            ),
+            "foo,[-bar-]{+baz+}\n"
+        );
+        assert_eq!(
+            render_word_diff("foo.bar\n", "\n", WordDiffMode::Plain, false, Some(&regex),),
+            "[-foo.bar-]\n"
+        );
+        assert_eq!(
+            render_word_diff("\n", "foo.bar\n", WordDiffMode::Plain, false, Some(&regex),),
+            "{+foo.bar+}\n"
+        );
+        assert_eq!(
+            render_word_diff(
+                "foo...bar\n",
+                "foo+++bar\n",
+                WordDiffMode::Plain,
+                false,
+                Some(&regex),
+            ),
+            "foo+++bar\n"
+        );
+        assert_eq!(
+            render_word_diff(
+                "foo.bar\n",
+                "foo,baz\n",
+                WordDiffMode::Porcelain,
+                false,
+                Some(&regex),
+            ),
+            " foo,\n-bar\n+baz\n~\n"
+        );
+    }
+
+    #[test]
+    fn regex_word_tokens_truncate_cross_newline_match() {
+        let regex = regex::Regex::new("(?s)foo.*baz").expect("test regex is valid");
+        let tokens = regex_word_tokens("foo\nbar\nbaz", &regex);
+        assert_eq!(
+            tokens.iter().map(|token| token.text).collect::<Vec<_>>(),
+            vec!["foo", "\n", "\n"]
+        );
+    }
+
+    #[test]
+    fn word_diff_regex_resolution_preserves_none_and_explicit_precedence() {
+        let disabled =
+            DiffArgs::try_parse_from(["diff", "--word-diff=none", "--word-diff-regex=[A-Za-z]+"])
+                .expect("valid word diff arguments");
+        let disabled = resolve_word_diff_options(&disabled).expect("valid word regex");
+        assert!(disabled.mode.is_none());
+
+        let explicit = DiffArgs::try_parse_from([
+            "diff",
+            "--color-words=[0-9]+",
+            "--word-diff-regex=[A-Za-z]+",
+        ])
+        .expect("valid word diff arguments");
+        let explicit = resolve_word_diff_options(&explicit).expect("valid word regex");
+        assert!(matches!(explicit.mode, Some(WordDiffMode::Color)));
+        assert_eq!(
+            explicit.regex.as_ref().map(regex::Regex::as_str),
+            Some("[A-Za-z]+")
+        );
+        assert!(explicit.force_auto_color);
+    }
 
     #[tokio::test]
     async fn preview_object_count_is_rejected_before_batch_sizing() {

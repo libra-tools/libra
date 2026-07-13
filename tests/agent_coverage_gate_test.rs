@@ -14,6 +14,8 @@
 //!   (`coverage_same_turn_truncated_then_complete_single_current_revision`);
 //! - concurrent writers on the same content produce exactly one append
 //!   (`coverage_gate_concurrent_writers_single_append`);
+//! - a still-live foreign reservation is a visible replayable error, never a
+//!   silent successful no-op (`coverage_gate_inflight_only_fails_visibly`);
 //! - a missing/broken claim gate fails the write CLOSED — no ungated append
 //!   (`coverage_gate_db_error_does_not_append`).
 
@@ -306,14 +308,20 @@ async fn coverage_gate_concurrent_writers_single_append() {
         drop(child.stdin.take());
         children.push(child);
     }
+    let mut successes = 0;
     for child in children {
         let out = child.wait_with_output().expect("wait hook");
-        assert!(
-            out.status.success(),
-            "concurrent stop must succeed (winner appends, loser no-ops): {}",
-            describe(&out)
-        );
+        if out.status.success() {
+            successes += 1;
+        } else {
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("another live writer"),
+                "loser must fail with a replayable in-flight diagnostic: {}",
+                describe(&out)
+            );
+        }
     }
+    assert!(successes >= 1, "one concurrent writer must commit");
 
     assert_eq!(
         repo.checkpoints().len(),
@@ -326,6 +334,65 @@ async fn coverage_gate_concurrent_writers_single_append() {
     assert_eq!(claims.len(), 1);
     let state: String = claims[0].try_get_by("state").unwrap();
     assert_eq!(state, "catalog_committed");
+}
+
+#[tokio::test]
+async fn coverage_gate_inflight_only_fails_visibly() {
+    let repo = HookRepo::init();
+    let transcript = repo.write_transcript("s-inflight.jsonl", TURN_COMPLETE);
+    let start_envelope = json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "sess-inflight",
+        "cwd": repo.repo.to_string_lossy(),
+        "transcript_path": transcript.to_string_lossy(),
+    })
+    .to_string();
+    let start = repo.run(
+        &["agent", "hooks", "claude-code", "session-start"],
+        Some(&start_envelope),
+    );
+    assert!(
+        start.status.success(),
+        "session-start: {}",
+        describe(&start)
+    );
+
+    let url = format!(
+        "sqlite://{}?mode=rw",
+        repo.repo.join(".libra").join("libra.db").display()
+    );
+    let conn = Database::connect(url).await.expect("open rw");
+    let inserted = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_coverage_claim (
+                session_id, logical_turn_key, coverage_schema_version,
+                coverage_digest, completeness, revision, state, owner,
+                lease_expires_at, fence_token, source_channel, created_at, updated_at
+             ) SELECT session_id, 'u1', 1, 'foreign-digest', 'complete', 0,
+                      'reserved_live', 'foreign-owner', 4102444800000, 1, 'live', 0, 0
+               FROM agent_session WHERE provider_session_id = ?",
+            ["sess-inflight".into()],
+        ))
+        .await
+        .expect("insert foreign reservation");
+    assert_eq!(inserted.rows_affected(), 1);
+
+    let blocked = repo.hook(&repo.envelope("sess-inflight", &transcript));
+    assert!(
+        !blocked.status.success(),
+        "an uncovered in-flight turn must not report success: {}",
+        describe(&blocked)
+    );
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("another live writer"),
+        "failure must tell the caller to retry: {}",
+        describe(&blocked)
+    );
+    assert!(
+        repo.checkpoints().is_empty(),
+        "no checkpoint is durably covered while the foreign lease is active"
+    );
 }
 
 #[tokio::test]
