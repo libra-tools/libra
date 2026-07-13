@@ -660,6 +660,49 @@ mod tests {
         Ok(())
     }
 
+    /// crash_after_claim_before_objects_recovers: a writer that reserved a
+    /// claim and died before building objects must not block the turn — after
+    /// the lease expires the next writer takes over and commits normally.
+    #[tokio::test]
+    async fn crash_after_claim_before_objects_recovers() {
+        let conn = gate_db().await;
+        let session = "claude_code__s1";
+        let t = turn("u1", "hi", Completeness::Complete);
+
+        // Crashed writer: reserved, never committed.
+        let dead = reserve_live_turn_claims(&conn, session, std::slice::from_ref(&t), "dead", 0)
+            .await
+            .expect("reserve");
+        assert_eq!(dead.reserved.len(), 1);
+
+        // Before lease expiry the turn is in-flight (no takeover).
+        let blocked =
+            reserve_live_turn_claims(&conn, session, std::slice::from_ref(&t), "next", 1_000)
+                .await
+                .expect("reserve while leased");
+        assert_eq!(blocked.skipped_inflight, 1);
+        assert!(blocked.reserved.is_empty());
+
+        // After expiry: takeover + normal commit → the turn recovers.
+        let recovered =
+            reserve_live_turn_claims(&conn, session, std::slice::from_ref(&t), "next", 100_000)
+                .await
+                .expect("takeover");
+        assert_eq!(recovered.reserved.len(), 1);
+        commit_reserved(
+            &conn,
+            session,
+            "next",
+            &recovered.reserved[0],
+            "cp-recovered",
+        )
+        .await
+        .expect("commit after takeover");
+        let (state, revision, _) = claim_row(&conn, "u1").await;
+        assert_eq!(state, "catalog_committed");
+        assert_eq!(revision, 1);
+    }
+
     /// live_takeover_increments_fence_and_blocks_(import|stale)_ref_cas:
     /// an expired reservation is taken over with a HIGHER fence; the stale
     /// holder's commit then fails its fence check and must roll back.

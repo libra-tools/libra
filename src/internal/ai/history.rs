@@ -2963,6 +2963,208 @@ mod tests {
         assert_eq!(resolved, hash);
     }
 
+    // -- plan-20260713 DR-05c-0 required M1 tests ---------------------------
+
+    fn traces_manager(dir: &tempfile::TempDir, db_conn: Arc<DatabaseConnection>) -> HistoryManager {
+        let repo_path = dir.path().join(".libra");
+        std::fs::create_dir_all(repo_path.join("objects")).unwrap();
+        let storage = Arc::new(LocalStorage::new(repo_path.join("objects")));
+        HistoryManager::new_with_ref(
+            storage,
+            repo_path,
+            db_conn,
+            crate::internal::branch::TRACES_BRANCH,
+        )
+    }
+
+    fn checkpoint_params<'a>(
+        checkpoint_id: &'a str,
+        blobs: &'a RedactedBytes,
+        txn_extra: Option<&'a dyn TracesTxnExtra>,
+    ) -> CheckpointCommitParams<'a> {
+        CheckpointCommitParams {
+            checkpoint_id,
+            session_id: "claude_code__s1",
+            agent_kind: "claude_code",
+            parent_commit: None,
+            scope: CheckpointScope::Committed,
+            tool_use_id: None,
+            metadata_json: blobs,
+            transcript_redacted: blobs,
+            lifecycle_events_jsonl: blobs,
+            redaction_report_json: blobs,
+            txn_extra,
+        }
+    }
+
+    /// ref_cas_head_changed_rebuilds_commit_before_retry: drive the exact
+    /// step contract of the CAS loop — a commit built against a stale head
+    /// must NOT be attachable (CAS returns HeadChanged), and the retry must
+    /// REBUILD the commit against the freshly-read head so the chain stays
+    /// linear on the new parent, never the stale one.
+    #[tokio::test]
+    async fn ref_cas_head_changed_rebuilds_commit_before_retry() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        let manager = traces_manager(&dir, db_conn.clone());
+        let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
+
+        // Seed head H0.
+        let first = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "aaaa0000-0000-0000-0000-000000000001",
+                &blobs,
+                None,
+            ))
+            .await
+            .expect("seed checkpoint");
+        let h0 = first.commit_hash;
+
+        // A writer reads H0 … and a CONCURRENT writer lands H1 first.
+        let concurrent = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "bbbb0000-0000-0000-0000-000000000002",
+                &blobs,
+                None,
+            ))
+            .await
+            .expect("concurrent checkpoint");
+        let h1 = concurrent.commit_hash;
+        assert_ne!(h0, h1);
+
+        // The stale writer's CAS against H0 must be rejected …
+        let stale_commit =
+            ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap();
+        let outcome = manager
+            .update_ref_if_matches(&manager.ref_name, Some(h0), stale_commit)
+            .await
+            .expect("cas call");
+        assert!(matches!(outcome, RefUpdateOutcome::HeadChanged));
+        // … and the integrated retry (append_checkpoint_commit re-resolves
+        // and REBUILDS) attaches the rebuilt commit to H1, not H0.
+        let rebuilt = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "cccc0000-0000-0000-0000-000000000003",
+                &blobs,
+                None,
+            ))
+            .await
+            .expect("rebuilt checkpoint");
+        let data = read_git_object(&manager.repo_path, &rebuilt.commit_hash).unwrap();
+        let content = String::from_utf8_lossy(&data);
+        assert!(
+            content.contains(&format!("parent {h1}")),
+            "rebuilt commit must parent the NEW head, got:\n{content}"
+        );
+        assert!(
+            !content.contains(&format!("parent {h0}")),
+            "rebuilt commit must not still parent the stale head"
+        );
+        // Chain stays linear: head == rebuilt, rebuilt.parent == h1.
+        let head = manager.resolve_history_head().await.unwrap().unwrap();
+        assert_eq!(head, rebuilt.commit_hash);
+    }
+
+    /// crash_after_objects_before_ref_leaves_only_gc_objects AND
+    /// crash_after_ref_before_catalog_is_impossible_or_atomically_recovers:
+    /// with a transactional extra, ref + companion writes are one atomic
+    /// unit. A failing extra (simulating the claim/catalog write dying after
+    /// objects were built) must leave the ref UNMOVED — only unreachable
+    /// loose objects remain; the success path lands ref + companion row
+    /// together, so a "ref moved but catalog missing" window cannot exist.
+    #[tokio::test]
+    async fn crash_between_objects_ref_and_catalog_is_atomic() {
+        struct FailingExtra;
+        #[async_trait::async_trait]
+        impl TracesTxnExtra for FailingExtra {
+            async fn apply(
+                &self,
+                _txn: &DatabaseTransaction,
+                _ctx: &TracesCommitCtx,
+            ) -> Result<()> {
+                anyhow::bail!("simulated crash after objects, inside the final transaction")
+            }
+        }
+        struct MarkerExtra;
+        #[async_trait::async_trait]
+        impl TracesTxnExtra for MarkerExtra {
+            async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()> {
+                // Stand-in for the catalog INSERT: a reference row keyed by
+                // the commit, written in the SAME transaction as the ref.
+                let marker = reference::ActiveModel {
+                    name: Set(Some(format!("marker/{}", ctx.commit_hash))),
+                    kind: Set(ConfigKind::Branch),
+                    commit: Set(Some(ctx.commit_hash.clone())),
+                    remote: Set(None),
+                    ..Default::default()
+                };
+                marker.insert(txn).await?;
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        let manager = traces_manager(&dir, db_conn.clone());
+        let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
+
+        // Seed head H0.
+        let seeded = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "aaaa0000-0000-0000-0000-00000000000a",
+                &blobs,
+                None,
+            ))
+            .await
+            .expect("seed");
+        let h0 = seeded.commit_hash;
+
+        // Failing extra: append errors, ref must NOT move (objects on disk
+        // are the only residue — the documented GC-only window).
+        let failing = FailingExtra;
+        let err = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "bbbb0000-0000-0000-0000-00000000000b",
+                &blobs,
+                Some(&failing),
+            ))
+            .await
+            .expect_err("failing extra must fail the append closed");
+        assert!(
+            format!("{err:#}").contains("simulated crash"),
+            "got {err:#}"
+        );
+        assert_eq!(
+            manager.resolve_history_head().await.unwrap().unwrap(),
+            h0,
+            "ref must not move when the companion transaction fails"
+        );
+
+        // Success path: ref + companion row land atomically.
+        let marker = MarkerExtra;
+        let committed = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "cccc0000-0000-0000-0000-00000000000c",
+                &blobs,
+                Some(&marker),
+            ))
+            .await
+            .expect("append with marker extra");
+        assert_eq!(
+            manager.resolve_history_head().await.unwrap().unwrap(),
+            committed.commit_hash
+        );
+        let marker_row = reference::Entity::find()
+            .filter(reference::Column::Name.eq(format!("marker/{}", committed.commit_hash)))
+            .one(&*db_conn)
+            .await
+            .unwrap();
+        assert!(
+            marker_row.is_some(),
+            "companion row must exist the instant the ref moved (same txn)"
+        );
+    }
+
     #[tokio::test]
     async fn test_update_ref_if_matches_rejects_stale_history_head() {
         let dir = tempdir().unwrap();
