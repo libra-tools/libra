@@ -150,6 +150,13 @@ pub struct HistoryManager {
     db_conn: Arc<DatabaseConnection>,
     /// The reference name this manager writes to (e.g. "libra/intent").
     ref_name: String,
+    /// Test-only injection point: runs right after the checkpoint CAS loop
+    /// reads the head, BEFORE objects are spliced/committed against it —
+    /// the deterministic window for `ref_cas_head_changed_rebuilds_commit_
+    /// before_retry` to move the head under a competing writer.
+    #[cfg(test)]
+    pub(crate) test_after_head_read:
+        Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync>>,
 }
 
 impl HistoryManager {
@@ -188,6 +195,8 @@ impl HistoryManager {
             repo_path,
             db_conn,
             ref_name: ref_name.into(),
+            #[cfg(test)]
+            test_after_head_read: None,
         }
     }
 
@@ -1086,6 +1095,12 @@ impl HistoryManager {
         let rest = params.checkpoint_id[2..].to_string();
         for attempt in 0..=HISTORY_HEAD_CONFLICT_MAX_RETRIES {
             let parent = self.resolve_history_head().await?;
+            // Test-only: deterministic head-moved-between-read-and-CAS
+            // injection (see the struct field's doc).
+            #[cfg(test)]
+            if let Some(hook) = &self.test_after_head_read {
+                hook().await?;
+            }
             let new_root = self.splice_checkpoint_tree(parent, &prefix, &rest, inner_tree)?;
             // splice_checkpoint_tree writes exactly three trees
             // (rest→prefix→checkpoint→root splice) per attempt; +1 commit.
@@ -2997,20 +3012,20 @@ mod tests {
         }
     }
 
-    /// ref_cas_head_changed_rebuilds_commit_before_retry: drive the exact
-    /// step contract of the CAS loop — a commit built against a stale head
-    /// must NOT be attachable (CAS returns HeadChanged), and the retry must
-    /// REBUILD the commit against the freshly-read head so the chain stays
-    /// linear on the new parent, never the stale one.
+    /// ref_cas_head_changed_rebuilds_commit_before_retry: a competing commit
+    /// lands BETWEEN the loop's head read and its CAS (deterministically, via
+    /// the test-only injection hook) — the CAS must reject the stale attempt,
+    /// the loop must RETRY (cas_retries > 0) and REBUILD the commit parented
+    /// on the freshly-read head, keeping the chain linear.
     #[tokio::test]
     async fn ref_cas_head_changed_rebuilds_commit_before_retry() {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
-        let manager = traces_manager(&dir, db_conn.clone());
+        let mut manager = traces_manager(&dir, db_conn.clone());
         let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
 
         // Seed head H0.
-        let first = manager
+        let seeded = manager
             .append_checkpoint_commit(checkpoint_params(
                 "aaaa0000-0000-0000-0000-000000000001",
                 &blobs,
@@ -3018,30 +3033,40 @@ mod tests {
             ))
             .await
             .expect("seed checkpoint");
-        let h0 = first.commit_hash;
+        let h0 = seeded.commit_hash;
 
-        // A writer reads H0 … and a CONCURRENT writer lands H1 first.
-        let concurrent = manager
-            .append_checkpoint_commit(checkpoint_params(
-                "bbbb0000-0000-0000-0000-000000000002",
-                &blobs,
-                None,
-            ))
-            .await
-            .expect("concurrent checkpoint");
-        let h1 = concurrent.commit_hash;
-        assert_ne!(h0, h1);
+        // Competing writer, fired from INSIDE the tested append's
+        // read→CAS window (first attempt only) via the injection hook.
+        let interloper = Arc::new(traces_manager(&dir, db_conn.clone()));
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interloper_commit: Arc<std::sync::Mutex<Option<ObjectHash>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        {
+            let interloper = interloper.clone();
+            let fired = fired.clone();
+            let interloper_commit = interloper_commit.clone();
+            manager.test_after_head_read = Some(Arc::new(move || {
+                let interloper = interloper.clone();
+                let fired = fired.clone();
+                let interloper_commit = interloper_commit.clone();
+                Box::pin(async move {
+                    if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return Ok(()); // only the first attempt races
+                    }
+                    let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
+                    let won = interloper
+                        .append_checkpoint_commit(checkpoint_params(
+                            "bbbb0000-0000-0000-0000-000000000002",
+                            &blobs,
+                            None,
+                        ))
+                        .await?;
+                    *interloper_commit.lock().unwrap() = Some(won.commit_hash);
+                    Ok(())
+                })
+            }));
+        }
 
-        // The stale writer's CAS against H0 must be rejected …
-        let stale_commit =
-            ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap();
-        let outcome = manager
-            .update_ref_if_matches(&manager.ref_name, Some(h0), stale_commit)
-            .await
-            .expect("cas call");
-        assert!(matches!(outcome, RefUpdateOutcome::HeadChanged));
-        // … and the integrated retry (append_checkpoint_commit re-resolves
-        // and REBUILDS) attaches the rebuilt commit to H1, not H0.
         let rebuilt = manager
             .append_checkpoint_commit(checkpoint_params(
                 "cccc0000-0000-0000-0000-000000000003",
@@ -3049,20 +3074,31 @@ mod tests {
                 None,
             ))
             .await
-            .expect("rebuilt checkpoint");
+            .expect("append survives the mid-window head move");
+        let h1 = interloper_commit
+            .lock()
+            .unwrap()
+            .expect("interloper committed");
+
+        // A real retry happened …
+        assert!(
+            rebuilt.cas_retries > 0,
+            "the first attempt must lose the CAS and retry, got cas_retries = {}",
+            rebuilt.cas_retries
+        );
+        // … and the rebuilt commit parents the interloper's head, not H0.
         let data = read_git_object(&manager.repo_path, &rebuilt.commit_hash).unwrap();
         let content = String::from_utf8_lossy(&data);
         assert!(
             content.contains(&format!("parent {h1}")),
-            "rebuilt commit must parent the NEW head, got:\n{content}"
+            "rebuilt commit must parent the NEW head {h1}, got:\n{content}"
         );
         assert!(
             !content.contains(&format!("parent {h0}")),
-            "rebuilt commit must not still parent the stale head"
+            "rebuilt commit must not still parent the stale head {h0}"
         );
-        // Chain stays linear: head == rebuilt, rebuilt.parent == h1.
         let head = manager.resolve_history_head().await.unwrap().unwrap();
-        assert_eq!(head, rebuilt.commit_hash);
+        assert_eq!(head, rebuilt.commit_hash, "chain stays linear");
     }
 
     /// crash_after_objects_before_ref_leaves_only_gc_objects AND

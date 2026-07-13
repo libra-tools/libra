@@ -74,8 +74,11 @@ source order. Exactly four record shapes exist in v1:
   file paths, session/agent identifiers, cwd. Different sources expose these
   with different fidelity; including them would create false conflicts
   (ADR-DR-12).
-- **Unknown fields are dropped**, both from the digest and from persistence.
-  No "raw fragment" passthrough.
+- **Unknown fields are dropped** from the digest (all paths) and from the
+  per-turn projections persisted by the import (M4) and export (M3) writers.
+  No "raw fragment" passthrough in either. The LIVE whole-blob baseline is
+  the one documented exception (§1 persistence scope note): unknown fields
+  survive there in generically-redacted form.
 
 ## 4. Canonical JSON form (JCS-equivalent for the v1 value domain)
 
