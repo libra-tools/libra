@@ -316,6 +316,12 @@ impl MigrationRunner {
     /// the down DDL entirely, so no down DDL ever runs twice for the
     /// same version. The returned `Vec` for the loser may therefore be a
     /// strict subset of `(target, current]`.
+    ///
+    /// A caller whose initial current-version read is scheduled only after
+    /// another caller has emptied the registry still receives
+    /// [`MigrationError::RollbackOnEmptyDatabase`]. At that point it did not
+    /// observe an applied version and is indistinguishable from an ordinary
+    /// rollback request against an empty database.
     pub async fn rollback_to(
         &self,
         conn: &DatabaseConnection,

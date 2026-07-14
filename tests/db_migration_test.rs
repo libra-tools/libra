@@ -744,8 +744,20 @@ async fn concurrent_rollback_calls_partition_owned_versions_without_double_ddl()
 
     let task_a = tokio::spawn(async move { runner_a.rollback_to(&conn_a, 0).await });
     let task_b = tokio::spawn(async move { runner_b.rollback_to(&conn_b, 0).await });
-    let a = task_a.await.expect("task A").expect("runner A succeeds");
-    let b = task_b.await.expect("task B").expect("runner B succeeds");
+    let a = task_a.await.expect("task A");
+    let b = task_b.await.expect("task B");
+
+    // Tokio may schedule one task only after the other has completed both
+    // down migrations. Such a late observer correctly sees an empty registry
+    // and preserves rollback_to's dedicated empty-database error contract;
+    // normalize that valid serialized outcome to an empty ownership set.
+    let completed_or_serialized_empty = |runner: &str, result| match result {
+        Ok(versions) => versions,
+        Err(MigrationError::RollbackOnEmptyDatabase { target: 0 }) => Vec::new(),
+        Err(err) => panic!("{runner} failed unexpectedly: {err}"),
+    };
+    let a = completed_or_serialized_empty("runner A", a);
+    let b = completed_or_serialized_empty("runner B", b);
 
     // Union must cover {1, 2} exactly; intersection must be empty. A
     // regression that re-ran down DDL would either show duplicates in
