@@ -10,48 +10,17 @@
 
 Libra is an AI-native infrastructure that captures and structures the full lifecycle of software development, documenting every step from human intent and AI reasoning to validation and release.
 
-Our vision is to turn creation records into reusable intelligence assets, enabling software knowledge to become reusable, ownable, and increasingly valuable over time.
-
 Our mission is to ensure that every software creation becomes lasting knowledge instead of discarded workflow data, empowering developers, teams, and AI systems to retrieve, reuse, and build upon the intelligence behind every piece of software.
 
 As AI becomes the primary producer of software, Libra provides the foundational infrastructure that preserves, compounds, and unlocks the long-term value of software creation.
 
 </div>
 
----
-
-<div align="center">
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/wingwangsz/libra/actions/workflows/base.yml/badge.svg)](https://github.com/wingwangsz/libra/actions/workflows/base.yml)
 [![Discord](https://img.shields.io/badge/Discord-join-%235865F2?logo=discord&logoColor=white)](https://t.co/425ibAmBb8)
 [![X](https://img.shields.io/badge/X-%40git_mono_AI-%231DA1F2?logo=x&logoColor=white)](https://x.com/git_mono_AI)
 [![Docs](https://img.shields.io/badge/docs-docs.libra.tools-29B1FF)](https://docs.libra.tools)
-
-</div>
-
----
-
-![Libra Code TUI](docs/image/libra-demo.png)
-
----
-
-## What is Libra?
-
-Libra is an **AI-native version control system** designed for the era of AI agent programming. While it remains fully compatible with Git's on-disk formats and wire protocols, Libra extends far beyond traditional version control by versioning the **entire software creation lifecycle**.
-
-Every interaction, every AI reasoning step, every validation result, and every decision made during the development process is captured, structured, and made queryable in your repository. This is not just code history — it is **intelligence history**.
-
-### Key Differentiators
-
-| Capability | Traditional VCS (Git) | Libra |
-|-----------|----------------------|-------|
-| **Versioned Artifacts** | Source code only | Code + AI reasoning + decisions + validation reports + session transcripts |
-| **AI Collaboration** | Manual commit messages | Native AI agent threads with full audit trail |
-| **Knowledge Reuse** | Code snapshots | Reusable intelligence assets across projects |
-| **Security** | External GPG/SSH setup | Built-in vault with per-repo key isolation |
-| **Provider Lock-in** | N/A | 7+ AI providers, switch freely |
-| **Automation** | External CI/CD | Built-in cron-driven agent automation |
 
 ---
 

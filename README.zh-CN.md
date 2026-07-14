@@ -10,48 +10,17 @@
 
 Libra 是一个 AI 原生基础设施，捕获并结构化软件开发的完整生命周期，记录从人类意图、AI 推理到验证和发布的每一个步骤。
 
-我们的愿景是将创造记录转化为可复用的智能资产，使软件知识变得可复用、可拥有，并随着时间的推移不断增值。
-
 我们的使命是确保每一次软件创造都成为持久的知识，而非被丢弃的工作流数据，赋能开发者、团队和 AI 系统去检索、复用并基于每一份软件背后的智能进行构建。
 
 当 AI 成为软件的主要生产者时，Libra 提供基础架构来保存、累积并释放软件创造的长期价值。
 
 </div>
 
----
-
-<div align="center">
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/wingwangsz/libra/actions/workflows/base.yml/badge.svg)](https://github.com/wingwangsz/libra/actions/workflows/base.yml)
 [![Discord](https://img.shields.io/badge/Discord-加入社区-%235865F2?logo=discord&logoColor=white)](https://t.co/425ibAmBb8)
 [![X](https://img.shields.io/badge/X-%40git_mono_AI-%231DA1F2?logo=x&logoColor=white)](https://x.com/git_mono_AI)
 [![文档](https://img.shields.io/badge/文档-docs.libra.tools-29B1FF)](https://docs.libra.tools)
-
-</div>
-
----
-
-![Libra Code TUI](docs/image/libra-demo.png)
-
----
-
-## Libra 是什么？
-
-Libra 是一个**面向 AI Agent 编程时代的 AI 原生版本控制系统**。它在保持与 Git 磁盘格式和传输协议完全兼容的同时，将版本控制的范围从传统代码扩展到了**整个软件创造生命周期**。
-
-每一次交互、每一个 AI 推理步骤、每一个验证结果、每一个开发过程中的决策，都被捕获、结构化并存储在仓库中，可随时查询和回放。这不仅仅是代码历史——它是**智能历史**。
-
-### 核心差异
-
-| 能力 | 传统版本控制（Git） | Libra |
-|-----------|----------------------|-------|
-| **版本化内容** | 仅源代码 | 代码 + AI 推理 + 决策 + 验证报告 + 会话记录 |
-| **AI 协作** | 手动提交信息 | 原生 AI Agent 线程，完整审计追踪 |
-| **知识复用** | 代码快照 | 跨项目可复用的智能资产 |
-| **安全** | 外部 GPG/SSH 配置 | 内置 Vault，每个仓库独立隔离密钥 |
-| **供应商锁定** | 不适用 | 7+ 家 AI 提供商，自由切换 |
-| **自动化** | 外部 CI/CD | 内置 Cron 驱动的 Agent 自动化 |
 
 ---
 
