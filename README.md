@@ -16,13 +16,15 @@ Our mission is to ensure that every software creation becomes lasting knowledge 
 
 As AI becomes the primary producer of software, Libra provides the foundational infrastructure that preserves, compounds, and unlocks the long-term value of software creation.
 
-<p align="center">
+<div align="center">
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/wingwangsz/libra/actions/workflows/base.yml/badge.svg)](https://github.com/wingwangsz/libra/actions/workflows/base.yml)
 [![Discord](https://img.shields.io/badge/Discord-join-%235865F2?logo=discord&logoColor=white)](https://t.co/425ibAmBb8)
 [![X](https://img.shields.io/badge/X-%40git_mono_AI-%231DA1F2?logo=x&logoColor=white)](https://x.com/git_mono_AI)
 [![Docs](https://img.shields.io/badge/docs-docs.libra.tools-29B1FF)](https://docs.libra.tools)
-</p>
+
+</div>
 
 ---
 
