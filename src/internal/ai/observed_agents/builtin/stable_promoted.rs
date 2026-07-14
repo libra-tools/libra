@@ -18,7 +18,10 @@
 //! [`StablePromotedSpec`] table rather than five hand-written
 //! near-duplicates.
 
-use std::{fs, io};
+use std::{
+    fs, io,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -244,7 +247,51 @@ pub fn stable_promoted_spec_for(kind: AgentKind) -> Option<&'static StablePromot
 /// hard bounds so a hostile/bloated `$CODEX_HOME` cannot stall a hook or
 /// import (GC-DR-08).
 const ROLLOUT_MAX_ENTRIES_PER_DIR: usize = 4_096;
+const ROLLOUT_MAX_ENTRIES_SCANNED: usize = 20_000;
 const ROLLOUT_MAX_FILES_SCANNED: usize = 10_000;
+const ROLLOUT_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct RolloutScanBudget {
+    entries_scanned: usize,
+    max_entries: usize,
+    deadline: Instant,
+}
+
+impl RolloutScanBudget {
+    fn new(max_entries: usize, timeout: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            entries_scanned: 0,
+            max_entries,
+            deadline: now.checked_add(timeout).unwrap_or(now),
+        }
+    }
+
+    fn check_time(&self, dir: &std::path::Path) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(anyhow!(
+                "rollout discovery exceeded its time budget while scanning {}; refusing a stale answer (GC-DR-08 bounded discovery)",
+                dir.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn charge_entry(&mut self, dir: &std::path::Path) -> Result<()> {
+        self.check_time(dir)?;
+        self.entries_scanned = self
+            .entries_scanned
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("rollout discovery entry counter overflow"))?;
+        if self.entries_scanned > self.max_entries {
+            return Err(anyhow!(
+                "rollout discovery scanned more than {} total entries; refusing a stale answer (GC-DR-08 bounded discovery)",
+                self.max_entries
+            ));
+        }
+        Ok(())
+    }
+}
 
 fn codex_sessions_root() -> Option<std::path::PathBuf> {
     // $CODEX_HOME (absolute) wins WITHOUT requiring a resolvable home dir;
@@ -269,7 +316,9 @@ fn codex_sessions_root() -> Option<std::path::PathBuf> {
 fn sorted_desc_entries(
     dir: &std::path::Path,
     keep: impl Fn(&str) -> bool,
+    budget: &mut RolloutScanBudget,
 ) -> Result<Vec<std::ffi::OsString>> {
+    budget.check_time(dir)?;
     let read = match fs::read_dir(dir) {
         Ok(read) => read,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -287,6 +336,7 @@ fn sorted_desc_entries(
                 ROLLOUT_MAX_ENTRIES_PER_DIR
             ));
         }
+        budget.charge_entry(dir)?;
         let entry =
             entry.with_context(|| format!("read rollout directory entry in {}", dir.display()))?;
         let name = entry.file_name();
@@ -298,8 +348,34 @@ fn sorted_desc_entries(
     Ok(names)
 }
 
-fn all_ascii_digits(name: &str, len: usize) -> bool {
-    name.len() == len && name.bytes().all(|b| b.is_ascii_digit())
+fn fixed_ascii_u32(name: &str, len: usize) -> Option<u32> {
+    (name.len() == len && name.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| name.parse().ok())
+        .flatten()
+}
+
+fn valid_year(name: &str) -> Option<i32> {
+    fixed_ascii_u32(name, 4)
+        .filter(|year| (1..=9_999).contains(year))
+        .and_then(|year| i32::try_from(year).ok())
+}
+
+fn valid_month(name: &str) -> Option<u32> {
+    fixed_ascii_u32(name, 2).filter(|month| (1..=12).contains(month))
+}
+
+fn real_directory(path: &std::path::Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(anyhow!(
+            "refusing symlinked Codex rollout directory {} (fail-closed)",
+            path.display()
+        )),
+        Ok(meta) => Ok(meta.is_dir()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("stat Codex rollout directory {}", path.display()))
+        }
+    }
 }
 
 /// Locate the newest Codex rollout JSONL for `session_id` under
@@ -325,25 +401,43 @@ pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>
     let Some(root) = codex_sessions_root() else {
         return Ok(None);
     };
+    let mut budget = RolloutScanBudget::new(ROLLOUT_MAX_ENTRIES_SCANNED, ROLLOUT_SCAN_TIMEOUT);
     let suffix = format!("-{session_id}.jsonl");
     let mut files_seen = 0usize;
-    for year in sorted_desc_entries(&root, |n| all_ascii_digits(n, 4))? {
+    for year in sorted_desc_entries(&root, |n| valid_year(n).is_some(), &mut budget)? {
         let year_dir = root.join(&year);
-        if !year_dir.is_dir() {
+        if !real_directory(&year_dir)? {
             continue;
         }
-        for month in sorted_desc_entries(&year_dir, |n| all_ascii_digits(n, 2))? {
+        let Some(year_number) = valid_year(&year.to_string_lossy()) else {
+            continue;
+        };
+        for month in sorted_desc_entries(&year_dir, |n| valid_month(n).is_some(), &mut budget)? {
             let month_dir = year_dir.join(&month);
-            if !month_dir.is_dir() {
+            if !real_directory(&month_dir)? {
                 continue;
             }
-            for day in sorted_desc_entries(&month_dir, |n| all_ascii_digits(n, 2))? {
+            let Some(month_number) = valid_month(&month.to_string_lossy()) else {
+                continue;
+            };
+            for day in sorted_desc_entries(
+                &month_dir,
+                |name| {
+                    fixed_ascii_u32(name, 2).is_some_and(|day| {
+                        chrono::NaiveDate::from_ymd_opt(year_number, month_number, day).is_some()
+                    })
+                },
+                &mut budget,
+            )? {
                 let day_dir = month_dir.join(&day);
-                if !day_dir.is_dir() {
+                if !real_directory(&day_dir)? {
                     continue;
                 }
-                let names = sorted_desc_entries(&day_dir, |n| n.starts_with("rollout-"))?;
-                files_seen += names.len();
+                let names =
+                    sorted_desc_entries(&day_dir, |n| n.starts_with("rollout-"), &mut budget)?;
+                files_seen = files_seen
+                    .checked_add(names.len())
+                    .ok_or_else(|| anyhow!("rollout discovery file counter overflow"))?;
                 if files_seen > ROLLOUT_MAX_FILES_SCANNED {
                     return Err(anyhow!(
                         "rollout discovery scanned more than {ROLLOUT_MAX_FILES_SCANNED} files; \
@@ -358,6 +452,12 @@ pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>
                             .context("stat candidate Codex rollout")?;
                         if meta.file_type().is_symlink() {
                             return Err(anyhow!("refusing symlinked Codex rollout (fail-closed)"));
+                        }
+                        if !meta.is_file() {
+                            return Err(anyhow!(
+                                "refusing non-file Codex rollout {} (fail-closed)",
+                                candidate.display()
+                            ));
                         }
                         return Ok(Some(candidate));
                     }
@@ -432,8 +532,16 @@ mod tests {
             "{}\n",
         )
         .unwrap();
+        // Numeric but impossible dates must not outrank a real partition.
+        let invalid_date = codex_home.join("sessions/9999/99/99");
+        std::fs::create_dir_all(&invalid_date).unwrap();
+        std::fs::write(
+            invalid_date.join(format!("rollout-9999-99-99T00-00-00-{sid}.jsonl")),
+            "{}\n",
+        )
+        .unwrap();
         let found = find_codex_rollout(sid).unwrap().expect("found");
-        assert_eq!(found, real, "digit-validated partitions only");
+        assert_eq!(found, real, "calendar-valid date partitions only");
 
         // I/O error (unreadable year dir) surfaces as Err, not Ok(None).
         #[cfg(unix)]
@@ -450,6 +558,31 @@ mod tests {
                 "permission failure must be diagnosable, not \"not found\""
             );
         }
+    }
+
+    #[test]
+    fn codex_rollout_global_entry_budget_is_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["one", "two", "three"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let mut budget = RolloutScanBudget::new(2, Duration::from_secs(1));
+        let err = sorted_desc_entries(dir.path(), |_| true, &mut budget).unwrap_err();
+        assert!(
+            err.to_string().contains("more than 2 total entries"),
+            "global traversal budget must fail loudly: {err:#}"
+        );
+    }
+
+    #[test]
+    fn codex_rollout_time_budget_is_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = RolloutScanBudget::new(usize::MAX, Duration::ZERO);
+        let err = sorted_desc_entries(dir.path(), |_| true, &mut budget).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeded its time budget"),
+            "traversal deadline must fail loudly even for an empty directory: {err:#}"
+        );
     }
 
     /// DR-03: date-partitioned rollout lookup by session id — newest match
@@ -506,6 +639,23 @@ mod tests {
             assert!(
                 find_codex_rollout(sid_link).is_err(),
                 "symlinked rollout must be rejected"
+            );
+
+            // A symlink in any date component must be rejected before the
+            // walk can escape the configured sessions root.
+            let sid_dir_link = "abcdef00-5555-6666-7777-888888888888";
+            let outside_year = tmp.path().join("outside-year");
+            let outside_day = outside_year.join("07/14");
+            std::fs::create_dir_all(&outside_day).unwrap();
+            std::fs::write(
+                outside_day.join(format!("rollout-2027-07-14T12-00-00-{sid_dir_link}.jsonl")),
+                "{}\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&outside_year, codex_home.join("sessions/2027")).unwrap();
+            assert!(
+                find_codex_rollout(sid_dir_link).is_err(),
+                "symlinked date partition must be rejected"
             );
         }
     }

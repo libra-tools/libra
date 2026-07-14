@@ -4,7 +4,8 @@
 
 - release/tag: `pre-review`
 - commit: `1fa5d0a`
-- UTC time: 2026-07-14T0x:xxZ
+- UTC time (evidence commit): 2026-07-13T17:02:37Z; the exact live-run
+  instant was not retained in this sanitized pre-review record
 - providers: `claude` (Claude Code CLI 2.1.207) real session store; `codex`
   real `~/.codex/sessions` store (layout verification only)
 - scope: M2 = DR-01 flush-wait (live path) + DR-02 Claude discovery contract
