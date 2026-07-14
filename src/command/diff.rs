@@ -9,6 +9,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write as _,
     io::{self, IsTerminal},
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -76,6 +77,7 @@ EXAMPLES:
     libra diff --word-diff-regex='[A-Za-z]+' Compare custom regex-defined words
     libra diff --color-words                 Word-level diff with colored changes
     libra diff --patience                    Use unique-line anchors for reordered code
+    libra diff --anchored='fn '              Keep unique matching function lines as anchors
     libra diff -U0                          Patch with no surrounding context (default is 3)
     libra diff -w                           Ignore whitespace-only changes
     libra diff -b                           Ignore changes in the amount of whitespace
@@ -118,7 +120,7 @@ pub struct DiffArgs {
     #[clap(
         long,
         value_name = "NAME",
-        overrides_with_all = ["patience", "histogram"],
+        overrides_with_all = ["patience", "histogram", "anchored"],
     )]
     pub algorithm: Option<String>,
 
@@ -131,16 +133,31 @@ pub struct DiffArgs {
     /// Generate a diff using the patience algorithm.
     #[clap(
         long,
-        overrides_with_all = ["algorithm", "histogram"],
+        overrides_with_all = ["algorithm", "histogram", "anchored"],
     )]
     pub patience: bool,
 
     /// Generate a diff using the histogram algorithm.
     #[clap(
         long,
-        overrides_with_all = ["algorithm", "patience"],
+        overrides_with_all = ["algorithm", "patience", "anchored"],
     )]
     pub histogram: bool,
+
+    /// Generate an anchored patience diff. May be repeated; a line qualifies
+    /// when it is unique on both sides and starts with any supplied text.
+    #[clap(
+        long,
+        value_name = "TEXT",
+        action = clap::ArgAction::Append,
+        overrides_with_all = ["algorithm", "patience", "histogram"],
+    )]
+    pub anchored: Vec<String>,
+
+    /// Raw selector order captured by the top-level parser. `clap`'s final
+    /// fields cannot represent Git's retained-anchor precedence by themselves.
+    #[clap(skip)]
+    algorithm_events: Vec<DiffAlgorithmEvent>,
 
     /// Write the diff to `FILENAME` instead of stdout
     #[clap(long, value_name = "FILENAME")]
@@ -596,7 +613,7 @@ impl From<DiffError> for CliError {
             }
             DiffError::InvalidAlgorithm(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint("choose --minimal, --patience, --histogram, or a supported --algorithm value"),
+                .with_hint("choose --minimal, --patience, --histogram, --anchored=<text>, or a supported --algorithm value"),
             DiffError::InvalidRenameScore(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint(
@@ -667,7 +684,7 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     let word_diff = resolve_word_diff_options(&args)?;
     let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
-    let mut result = run_diff(&args, output, &config, pickaxe.as_ref(), diff_algorithm)
+    let mut result = run_diff(&args, output, &config, pickaxe.as_ref(), &diff_algorithm)
         .await
         .map_err(CliError::from)?;
     // lore.md 2.2: read-only sparse view — scope ONLY the working-tree diff
@@ -1728,42 +1745,136 @@ async fn resolve_positional_revisions(args: &mut DiffArgs) -> Result<(), DiffErr
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffAlgorithmEvent {
+    Named(String),
+    Patience,
+    Histogram,
+    Anchored(String),
+}
+
+/// Preserve selector order that `clap`'s final-state fields cannot express.
+/// Git retains anchors across named/Myers/Histogram selectors, clears them only
+/// for the `--patience` shorthand, and reactivates the retained set if a later
+/// `--anchored` selects patience again.
+pub(crate) fn record_algorithm_selector_events(args: &mut DiffArgs, argv: &[String]) {
+    args.algorithm_events.clear();
+    let Some(diff_idx) = argv.iter().position(|arg| arg == "diff") else {
+        return;
+    };
+    let mut idx = diff_idx + 1;
+    while idx < argv.len() {
+        let arg = &argv[idx];
+        if arg == "--" {
+            break;
+        }
+        if let Some(value) = arg.strip_prefix("--algorithm=") {
+            args.algorithm_events
+                .push(DiffAlgorithmEvent::Named(value.to_string()));
+            idx += 1;
+            continue;
+        }
+        if arg == "--algorithm" {
+            if let Some(value) = argv.get(idx + 1) {
+                args.algorithm_events
+                    .push(DiffAlgorithmEvent::Named(value.clone()));
+            }
+            idx += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--anchored=") {
+            args.algorithm_events
+                .push(DiffAlgorithmEvent::Anchored(value.to_string()));
+            idx += 1;
+            continue;
+        }
+        if arg == "--anchored" {
+            if let Some(value) = argv.get(idx + 1) {
+                args.algorithm_events
+                    .push(DiffAlgorithmEvent::Anchored(value.clone()));
+            }
+            idx += 2;
+            continue;
+        }
+        match arg.as_str() {
+            "--patience" => args.algorithm_events.push(DiffAlgorithmEvent::Patience),
+            "--histogram" => args.algorithm_events.push(DiffAlgorithmEvent::Histogram),
+            _ => {}
+        }
+        idx += 1;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DiffAlgorithm {
     Myers,
     MyersMinimal,
     Patience,
     Histogram,
+    Anchored(Vec<String>),
 }
 
 impl DiffAlgorithm {
-    fn backend(self) -> Algorithm {
+    fn backend(&self) -> Algorithm {
         match self {
             Self::Myers | Self::MyersMinimal => Algorithm::Myers,
-            Self::Patience => Algorithm::Patience,
+            Self::Patience | Self::Anchored(_) => Algorithm::Patience,
             Self::Histogram => Algorithm::Histogram,
         }
     }
 
     /// git_internal already renders Myers with the same dependency backend.
     /// Other algorithms must replace that initial body in the post-pass.
-    fn needs_backend_rediff(self) -> bool {
-        matches!(self, Self::Patience | Self::Histogram)
+    fn needs_backend_rediff(&self) -> bool {
+        matches!(self, Self::Patience | Self::Histogram | Self::Anchored(_))
+    }
+}
+
+fn named_diff_algorithm(value: &str) -> Result<DiffAlgorithm, DiffError> {
+    match value {
+        "myers" => Ok(DiffAlgorithm::Myers),
+        "myersMinimal" => Ok(DiffAlgorithm::MyersMinimal),
+        "patience" => Ok(DiffAlgorithm::Patience),
+        "histogram" => Ok(DiffAlgorithm::Histogram),
+        value => Err(DiffError::InvalidAlgorithm(value.to_string())),
     }
 }
 
 fn resolve_diff_algorithm(args: &DiffArgs) -> Result<DiffAlgorithm, DiffError> {
-    let selected = if args.patience {
-        DiffAlgorithm::Patience
-    } else if args.histogram {
-        DiffAlgorithm::Histogram
+    let selected = if args.algorithm_events.is_empty() {
+        if !args.anchored.is_empty() {
+            DiffAlgorithm::Anchored(args.anchored.clone())
+        } else if args.patience {
+            DiffAlgorithm::Patience
+        } else if args.histogram {
+            DiffAlgorithm::Histogram
+        } else {
+            match args.algorithm.as_deref() {
+                None => DiffAlgorithm::Myers,
+                Some(value) => named_diff_algorithm(value)?,
+            }
+        }
     } else {
-        match args.algorithm.as_deref() {
-            None | Some("myers") => DiffAlgorithm::Myers,
-            Some("myersMinimal") => DiffAlgorithm::MyersMinimal,
-            Some("patience") => DiffAlgorithm::Patience,
-            Some("histogram") => DiffAlgorithm::Histogram,
-            Some(value) => return Err(DiffError::InvalidAlgorithm(value.to_string())),
+        let mut selected = DiffAlgorithm::Myers;
+        let mut anchors = Vec::new();
+        for event in &args.algorithm_events {
+            match event {
+                DiffAlgorithmEvent::Named(value) => selected = named_diff_algorithm(value)?,
+                DiffAlgorithmEvent::Patience => {
+                    anchors.clear();
+                    selected = DiffAlgorithm::Patience;
+                }
+                DiffAlgorithmEvent::Histogram => selected = DiffAlgorithm::Histogram,
+                DiffAlgorithmEvent::Anchored(value) => {
+                    anchors.push(value.clone());
+                    selected = DiffAlgorithm::Patience;
+                }
+            }
+        }
+        if selected == DiffAlgorithm::Patience && !anchors.is_empty() {
+            DiffAlgorithm::Anchored(anchors)
+        } else {
+            selected
         }
     };
     Ok(if args.minimal && selected == DiffAlgorithm::Myers {
@@ -2017,7 +2128,7 @@ async fn run_diff(
     output: &OutputConfig,
     config: &ResolvedDiffConfig,
     pickaxe: Option<&DiffPickaxe>,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
 ) -> Result<DiffOutput, DiffError> {
     util::require_repo().map_err(|_| DiffError::NotInRepo)?;
     tracing::debug!("diff args: {:?}", args);
@@ -3517,7 +3628,7 @@ fn apply_rename_detection(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
 ) -> bool {
     let same_file_type = |old_path: &str, new_path: &str| {
         let old_type = first_modes
@@ -3735,7 +3846,7 @@ fn build_rename_entry(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
 ) -> DiffFileStat {
     let mut raw = format!(
         "diff --git a/{old_path} b/{new_path}\nsimilarity index {percent}%\nrename from {old_path}\nrename to {new_path}\n"
@@ -3899,7 +4010,7 @@ fn apply_textconv(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
     pickaxe_needle: Option<&[u8]>,
 ) -> Result<TextconvOutcome, DiffError> {
     // `None` = the side is absent from its map (a created/deleted side) and must
@@ -4163,7 +4274,7 @@ fn force_text_for_bare_binary(
     second_map: &HashMap<PathBuf, ObjectHash>,
     worktree_entries: &HashMap<PathBuf, ObjectHash>,
     context: usize,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
 ) -> Result<(), DiffError> {
     let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Result<Vec<u8>, DiffError> {
         let pb = PathBuf::from(path);
@@ -5009,7 +5120,7 @@ fn rewrite_unified_diff_context(
     old_text: &str,
     new_text: &str,
     context: usize,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
 ) -> String {
     splice_unified_body(
         raw_diff,
@@ -5051,25 +5162,363 @@ enum UnifiedEditLine<'a> {
     Insert(usize, &'a str),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum IndexedLineChange {
+    Equal { new_index: usize },
+    Delete { old_index: usize },
+    Insert { new_index: usize },
+}
+
+impl IndexedLineChange {
+    fn tag(self) -> ChangeTag {
+        match self {
+            Self::Equal { .. } => ChangeTag::Equal,
+            Self::Delete { .. } => ChangeTag::Delete,
+            Self::Insert { .. } => ChangeTag::Insert,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PatienceCandidate {
+    old_index: usize,
+    new_index: usize,
+    previous: Option<usize>,
+}
+
+fn unique_line_positions<'a>(
+    lines: &[&'a str],
+    range: Range<usize>,
+) -> HashMap<&'a str, Option<usize>> {
+    let mut positions = HashMap::with_capacity(range.len());
+    for index in range {
+        positions
+            .entry(lines[index])
+            .and_modify(|position| *position = None)
+            .or_insert(Some(index));
+    }
+    positions
+}
+
+/// Split Git-style raw records while preserving each line terminator. Anchored
+/// comparison and prefix matching use these records; emission strips the
+/// terminator to match the existing unified-hunk assembler.
+fn raw_anchor_records(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split_inclusive('\n').collect()
+    }
+}
+
+/// Git's anchored mode is patience diff with an anchor-aware LIS. All lines
+/// unique on both sides remain candidates; an anchored candidate locks its LIS
+/// position so a later candidate cannot displace it. This is the key behavior
+/// that prevents a qualifying line from surfacing as delete+insert.
+fn anchored_patience_sequence(
+    old: &[&str],
+    old_range: Range<usize>,
+    new: &[&str],
+    new_range: Range<usize>,
+    anchor_lines: &[&str],
+    anchors: &[String],
+) -> Vec<(usize, usize)> {
+    let old_unique = unique_line_positions(old, old_range.clone());
+    let new_unique = unique_line_positions(new, new_range);
+    let mut candidates = Vec::new();
+    for old_index in old_range {
+        let line = old[old_index];
+        if old_unique.get(line).copied().flatten() != Some(old_index) {
+            continue;
+        }
+        let Some(new_index) = new_unique.get(line).copied().flatten() else {
+            continue;
+        };
+        candidates.push(PatienceCandidate {
+            old_index,
+            new_index,
+            previous: None,
+        });
+    }
+
+    let mut sequence: Vec<usize> = Vec::with_capacity(candidates.len());
+    let mut longest = 0usize;
+    let mut locked_anchor: Option<usize> = None;
+    for candidate_index in 0..candidates.len() {
+        let new_index = candidates[candidate_index].new_index;
+        let insert_at =
+            sequence[..longest].partition_point(|index| candidates[*index].new_index < new_index);
+        candidates[candidate_index].previous = insert_at
+            .checked_sub(1)
+            .and_then(|index| sequence.get(index).copied());
+        if locked_anchor.is_some_and(|locked| insert_at <= locked) {
+            continue;
+        }
+        if insert_at == sequence.len() {
+            sequence.push(candidate_index);
+        } else {
+            sequence[insert_at] = candidate_index;
+        }
+
+        let is_anchor = anchor_lines
+            .get(new_index)
+            .is_some_and(|line| anchors.iter().any(|prefix| line.starts_with(prefix)));
+        if is_anchor {
+            locked_anchor = Some(insert_at);
+            longest = insert_at + 1;
+        } else if insert_at == longest {
+            longest += 1;
+        }
+    }
+
+    let Some(mut candidate_index) = longest
+        .checked_sub(1)
+        .and_then(|index| sequence.get(index).copied())
+    else {
+        return Vec::new();
+    };
+    let mut result = Vec::with_capacity(longest);
+    loop {
+        let candidate = candidates[candidate_index];
+        result.push((candidate.old_index, candidate.new_index));
+        let Some(previous) = candidate.previous else {
+            break;
+        };
+        candidate_index = previous;
+    }
+    result.reverse();
+    result
+}
+
+fn append_similar_range(
+    old: &[&str],
+    old_range: Range<usize>,
+    new: &[&str],
+    new_range: Range<usize>,
+    algorithm: Algorithm,
+    out: &mut Vec<IndexedLineChange>,
+) {
+    let diff = TextDiff::configure()
+        .algorithm(algorithm)
+        .diff_slices(&old[old_range.clone()], &new[new_range.clone()]);
+    let mut old_index = old_range.start;
+    let mut new_index = new_range.start;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                out.push(IndexedLineChange::Equal { new_index });
+                old_index += 1;
+                new_index += 1;
+            }
+            ChangeTag::Delete => {
+                out.push(IndexedLineChange::Delete { old_index });
+                old_index += 1;
+            }
+            ChangeTag::Insert => {
+                out.push(IndexedLineChange::Insert { new_index });
+                new_index += 1;
+            }
+        }
+    }
+}
+
+fn anchored_diff_range(
+    old: &[&str],
+    old_range: Range<usize>,
+    new: &[&str],
+    new_range: Range<usize>,
+    anchor_lines: &[&str],
+    anchors: &[String],
+    out: &mut Vec<IndexedLineChange>,
+) {
+    enum Task {
+        Diff(Range<usize>, Range<usize>),
+        Equal(Range<usize>, Range<usize>),
+    }
+
+    let mut stack = vec![Task::Diff(old_range, new_range)];
+    while let Some(task) = stack.pop() {
+        let (old_range, new_range) = match task {
+            Task::Diff(old_range, new_range) => (old_range, new_range),
+            Task::Equal(old_range, new_range) => {
+                out.extend(
+                    old_range
+                        .zip(new_range)
+                        .map(|(_, new_index)| IndexedLineChange::Equal { new_index }),
+                );
+                continue;
+            }
+        };
+
+        if old_range.is_empty() {
+            out.extend(new_range.map(|new_index| IndexedLineChange::Insert { new_index }));
+            continue;
+        }
+        if new_range.is_empty() {
+            out.extend(old_range.map(|old_index| IndexedLineChange::Delete { old_index }));
+            continue;
+        }
+
+        let sequence = anchored_patience_sequence(
+            old,
+            old_range.clone(),
+            new,
+            new_range.clone(),
+            anchor_lines,
+            anchors,
+        );
+        if sequence.is_empty() {
+            append_similar_range(old, old_range, new, new_range, Algorithm::Myers, out);
+            continue;
+        }
+
+        // Build the recursive walk as ordered tasks, then push them in reverse.
+        // This preserves Git's patience recursion exactly without exposing the
+        // process to stack exhaustion on adversarially nested inputs.
+        let mut tasks = Vec::with_capacity(sequence.len().saturating_mul(3).saturating_add(2));
+        let mut old_current = old_range.start;
+        let mut new_current = new_range.start;
+        for (anchor_old, anchor_new) in sequence {
+            let mut common_old = anchor_old;
+            let mut common_new = anchor_new;
+            while common_old > old_current
+                && common_new > new_current
+                && old[common_old - 1] == new[common_new - 1]
+            {
+                common_old -= 1;
+                common_new -= 1;
+            }
+
+            let prefix_old = old_current;
+            let prefix_new = new_current;
+            while old_current < common_old
+                && new_current < common_new
+                && old[old_current] == new[new_current]
+            {
+                old_current += 1;
+                new_current += 1;
+            }
+            if old_current > prefix_old {
+                tasks.push(Task::Equal(
+                    prefix_old..old_current,
+                    prefix_new..new_current,
+                ));
+            }
+            if old_current < common_old || new_current < common_new {
+                tasks.push(Task::Diff(old_current..common_old, new_current..common_new));
+            }
+            tasks.push(Task::Equal(
+                common_old..anchor_old + 1,
+                common_new..anchor_new + 1,
+            ));
+            old_current = anchor_old + 1;
+            new_current = anchor_new + 1;
+        }
+
+        let prefix_old = old_current;
+        let prefix_new = new_current;
+        while old_current < old_range.end
+            && new_current < new_range.end
+            && old[old_current] == new[new_current]
+        {
+            old_current += 1;
+            new_current += 1;
+        }
+        if old_current > prefix_old {
+            tasks.push(Task::Equal(
+                prefix_old..old_current,
+                prefix_new..new_current,
+            ));
+        }
+        if old_current < old_range.end || new_current < new_range.end {
+            tasks.push(Task::Diff(
+                old_current..old_range.end,
+                new_current..new_range.end,
+            ));
+        }
+        stack.extend(tasks.into_iter().rev());
+    }
+}
+
+fn anchored_indexed_changes(
+    old: &[&str],
+    new: &[&str],
+    anchor_lines: &[&str],
+    anchors: &[String],
+) -> Vec<IndexedLineChange> {
+    let mut changes = Vec::with_capacity(old.len() + new.len());
+    anchored_diff_range(
+        old,
+        0..old.len(),
+        new,
+        0..new.len(),
+        anchor_lines,
+        anchors,
+        &mut changes,
+    );
+    changes
+}
+
+fn materialize_indexed_changes<'a>(
+    changes: &[IndexedLineChange],
+    old_lines: &[&'a str],
+    new_lines: &[&'a str],
+) -> Vec<(ChangeTag, &'a str)> {
+    changes
+        .iter()
+        .map(|change| {
+            let line = match *change {
+                IndexedLineChange::Delete { old_index } => old_lines[old_index],
+                IndexedLineChange::Insert { new_index } => new_lines[new_index],
+                // Context comes from the post-image, matching Git and the
+                // normalized non-anchored path below.
+                IndexedLineChange::Equal { new_index } => new_lines[new_index],
+            };
+            (change.tag(), line)
+        })
+        .collect()
+}
+
 /// Compute the unified-diff hunk body (the `@@ … @@` blocks, no file header)
 /// for `old_text` vs `new_text` at `context` lines of surrounding context.
 /// Selected line diff with a rolling-context assembler — a context-parameterized
 /// copy of git_internal's `compute_unified_diff`. Myers matches git_internal's
-/// initial body; Patience/Histogram replace it with their selected anchors.
+/// initial body; Patience/Histogram/Anchored replace it with their selected
+/// anchors.
 fn compute_unified_hunks(
     old_text: &str,
     new_text: &str,
     context: usize,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
 ) -> String {
-    let diff = TextDiff::configure()
-        .algorithm(diff_algorithm.backend())
-        .diff_lines(old_text, new_text);
-    let changes: Vec<(ChangeTag, &str)> = diff
-        .iter_all_changes()
-        .map(|c| (c.tag(), c.value().trim_end_matches(['\r', '\n'])))
-        .collect();
-    assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+    match diff_algorithm {
+        DiffAlgorithm::Anchored(anchors) => {
+            let old_records = raw_anchor_records(old_text);
+            let new_records = raw_anchor_records(new_text);
+            let old_lines: Vec<&str> = old_records
+                .iter()
+                .map(|line| line.trim_end_matches(['\r', '\n']))
+                .collect();
+            let new_lines: Vec<&str> = new_records
+                .iter()
+                .map(|line| line.trim_end_matches(['\r', '\n']))
+                .collect();
+            let indexed =
+                anchored_indexed_changes(&old_records, &new_records, &new_records, anchors);
+            let changes = materialize_indexed_changes(&indexed, &old_lines, &new_lines);
+            assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+        }
+        _ => {
+            let diff = TextDiff::configure()
+                .algorithm(diff_algorithm.backend())
+                .diff_lines(old_text, new_text);
+            let changes: Vec<(ChangeTag, &str)> = diff
+                .iter_all_changes()
+                .map(|c| (c.tag(), c.value().trim_end_matches(['\r', '\n'])))
+                .collect();
+            assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+        }
+    }
 }
 
 /// Normalizer for `-w` / `--ignore-all-space`: drop every whitespace character
@@ -5131,7 +5580,7 @@ fn compute_unified_hunks_normalized(
     old_text: &str,
     new_text: &str,
     context: usize,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
     normalize: fn(&str) -> String,
 ) -> String {
     let old_lines: Vec<&str> = old_text.lines().collect();
@@ -5141,25 +5590,36 @@ fn compute_unified_hunks_normalized(
     // `diff_slices` compares `&[&str]` elements; borrow the normalized strings.
     let old_norm_ref: Vec<&str> = old_norm.iter().map(String::as_str).collect();
     let new_norm_ref: Vec<&str> = new_norm.iter().map(String::as_str).collect();
-    let diff = TextDiff::configure()
-        .algorithm(diff_algorithm.backend())
-        .diff_slices(&old_norm_ref, &new_norm_ref);
-    let mut changes: Vec<(ChangeTag, &str)> = Vec::with_capacity(old_lines.len() + new_lines.len());
-    for change in diff.iter_all_changes() {
-        let tag = change.tag();
-        let text = match tag {
-            ChangeTag::Delete => change.old_index().map(|i| old_lines[i]).unwrap_or(""),
-            ChangeTag::Insert => change.new_index().map(|i| new_lines[i]).unwrap_or(""),
-            // Context: both sides are equal under `normalize`; Git emits the
-            // post-image (new) line, falling back to the old side.
-            ChangeTag::Equal => change
-                .new_index()
-                .map(|i| new_lines[i])
-                .or_else(|| change.old_index().map(|i| old_lines[i]))
-                .unwrap_or(""),
-        };
-        changes.push((tag, text));
-    }
+    let changes: Vec<(ChangeTag, &str)> = match diff_algorithm {
+        DiffAlgorithm::Anchored(anchors) => {
+            let anchor_lines = raw_anchor_records(new_text);
+            let indexed =
+                anchored_indexed_changes(&old_norm_ref, &new_norm_ref, &anchor_lines, anchors);
+            materialize_indexed_changes(&indexed, &old_lines, &new_lines)
+        }
+        _ => {
+            let diff = TextDiff::configure()
+                .algorithm(diff_algorithm.backend())
+                .diff_slices(&old_norm_ref, &new_norm_ref);
+            let mut changes = Vec::with_capacity(old_lines.len() + new_lines.len());
+            for change in diff.iter_all_changes() {
+                let tag = change.tag();
+                let text = match tag {
+                    ChangeTag::Delete => change.old_index().map(|i| old_lines[i]).unwrap_or(""),
+                    ChangeTag::Insert => change.new_index().map(|i| new_lines[i]).unwrap_or(""),
+                    // Context: both sides are equal under `normalize`; Git emits
+                    // the post-image (new) line, falling back to the old side.
+                    ChangeTag::Equal => change
+                        .new_index()
+                        .map(|i| new_lines[i])
+                        .or_else(|| change.old_index().map(|i| old_lines[i]))
+                        .unwrap_or(""),
+                };
+                changes.push((tag, text));
+            }
+            changes
+        }
+    };
     assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
 }
 
@@ -5211,7 +5671,7 @@ fn compute_unified_hunks_ignore_blank(
     old_text: &str,
     new_text: &str,
     context: usize,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
 ) -> String {
     compute_unified_hunks_ignore_blank_inner(old_text, new_text, context, diff_algorithm, None)
 }
@@ -5222,7 +5682,7 @@ fn compute_unified_hunks_ignore_blank_normalized(
     old_text: &str,
     new_text: &str,
     context: usize,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
     normalize: fn(&str) -> String,
 ) -> String {
     compute_unified_hunks_ignore_blank_inner(
@@ -5238,7 +5698,7 @@ fn compute_unified_hunks_ignore_blank_inner(
     old_text: &str,
     new_text: &str,
     context: usize,
-    diff_algorithm: DiffAlgorithm,
+    diff_algorithm: &DiffAlgorithm,
     normalize: Option<fn(&str) -> String>,
 ) -> String {
     // Raw records: split on '\n' WITHOUT trimming '\r', so a `\r`-only CRLF blank
@@ -5279,9 +5739,24 @@ fn compute_unified_hunks_ignore_blank_inner(
     let cmp_new = to_cmp(new_recs);
     let old_ref: Vec<&str> = cmp_old.iter().map(String::as_str).collect();
     let new_ref: Vec<&str> = cmp_new.iter().map(String::as_str).collect();
-    let diff = TextDiff::configure()
-        .algorithm(diff_algorithm.backend())
-        .diff_slices(&old_ref, &new_ref);
+    let indexed_changes = match diff_algorithm {
+        DiffAlgorithm::Anchored(anchors) => {
+            let anchor_lines = raw_anchor_records(new_text);
+            anchored_indexed_changes(&old_ref, &new_ref, &anchor_lines, anchors)
+        }
+        _ => {
+            let mut changes = Vec::with_capacity(old_ref.len() + new_ref.len());
+            append_similar_range(
+                &old_ref,
+                0..old_ref.len(),
+                &new_ref,
+                0..new_ref.len(),
+                diff_algorithm.backend(),
+                &mut changes,
+            );
+            changes
+        }
+    };
 
     // Build change groups (maximal runs of insert/delete), tracking 0-based old/new
     // positions exactly as Git records i1/i2/chg1/chg2.
@@ -5289,7 +5764,7 @@ fn compute_unified_hunks_ignore_blank_inner(
     let mut old_pos = 0usize;
     let mut new_pos = 0usize;
     let mut cur: Option<DiffChangeGroup> = None;
-    for change in diff.iter_all_changes() {
+    for change in indexed_changes {
         match change.tag() {
             ChangeTag::Equal => {
                 if let Some(g) = cur.take() {
@@ -5693,6 +6168,8 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         minimal: false,
         patience: false,
         histogram: false,
+        anchored: Vec::new(),
+        algorithm_events: Vec::new(),
         output: None,
         name_only: false,
         name_status: false,
@@ -5745,7 +6222,7 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         &OutputConfig::default(),
         &config,
         None,
-        DiffAlgorithm::Myers,
+        &DiffAlgorithm::Myers,
     )
     .await?;
     apply_diff_prefixes(&mut result, &config.prefixes);
@@ -6429,10 +6906,10 @@ mod test {
     fn test_diff_algorithms_use_selected_line_anchors() {
         let old = "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n";
         let new = "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n";
-        let myers = compute_unified_hunks(old, new, 3, DiffAlgorithm::Myers);
-        let minimal = compute_unified_hunks(old, new, 3, DiffAlgorithm::MyersMinimal);
-        let patience = compute_unified_hunks(old, new, 3, DiffAlgorithm::Patience);
-        let histogram = compute_unified_hunks(old, new, 3, DiffAlgorithm::Histogram);
+        let myers = compute_unified_hunks(old, new, 3, &DiffAlgorithm::Myers);
+        let minimal = compute_unified_hunks(old, new, 3, &DiffAlgorithm::MyersMinimal);
+        let patience = compute_unified_hunks(old, new, 3, &DiffAlgorithm::Patience);
+        let histogram = compute_unified_hunks(old, new, 3, &DiffAlgorithm::Histogram);
 
         assert_eq!(minimal, myers, "minimal uses the no-deadline Myers backend");
         assert_ne!(patience, myers, "patience must use its own anchors");
@@ -6443,13 +6920,158 @@ mod test {
     }
 
     #[test]
+    fn anchored_patience_locks_qualifying_crossing_line() {
+        let old = ["ANCHOR", "b", "c"];
+        let new = ["b", "c", "ANCHOR"];
+
+        assert_eq!(
+            anchored_patience_sequence(&old, 0..old.len(), &new, 0..new.len(), &new, &[]),
+            vec![(1, 0), (2, 1)],
+            "ordinary patience chooses the longest b/c sequence"
+        );
+        assert_eq!(
+            anchored_patience_sequence(
+                &old,
+                0..old.len(),
+                &new,
+                0..new.len(),
+                &new,
+                &["ANCH".to_string()],
+            ),
+            vec![(0, 2)],
+            "the qualifying unique line locks its LIS position"
+        );
+
+        let anchored = compute_unified_hunks(
+            "ANCHOR\nb\nc\n",
+            "b\nc\nANCHOR\n",
+            3,
+            &DiffAlgorithm::Anchored(vec!["ANCH".to_string()]),
+        );
+        assert!(
+            anchored.lines().any(|line| line == " ANCHOR"),
+            "the anchor must be context, not delete+insert:\n{anchored}"
+        );
+        assert!(!anchored.lines().any(|line| line == "-ANCHOR"));
+        assert!(!anchored.lines().any(|line| line == "+ANCHOR"));
+
+        let crlf_anchored = compute_unified_hunks(
+            "ANCHOR\r\nb\r\nc\r\n",
+            "b\r\nc\r\nANCHOR\r\n",
+            3,
+            &DiffAlgorithm::Anchored(vec!["ANCHOR\r\n".to_string()]),
+        );
+        assert!(
+            crlf_anchored.lines().any(|line| line == " ANCHOR"),
+            "anchor prefixes are matched against the raw CRLF record:\n{crlf_anchored}"
+        );
+        let crlf_change = compute_unified_hunks(
+            "a\r\n",
+            "a\n",
+            3,
+            &DiffAlgorithm::Anchored(vec!["a".to_string()]),
+        );
+        assert!(
+            crlf_change.lines().any(|line| line == "-a")
+                && crlf_change.lines().any(|line| line == "+a"),
+            "raw record comparison must preserve a CRLF-to-LF change:\n{crlf_change}"
+        );
+
+        let duplicate_old = ["ANCHOR", "ANCHOR", "b", "c"];
+        let duplicate_new = ["b", "c", "ANCHOR", "ANCHOR"];
+        assert_eq!(
+            anchored_patience_sequence(
+                &duplicate_old,
+                0..duplicate_old.len(),
+                &duplicate_new,
+                0..duplicate_new.len(),
+                &duplicate_new,
+                &["ANCH".to_string()],
+            ),
+            vec![(2, 0), (3, 1)],
+            "a matching prefix cannot anchor a line repeated on either side"
+        );
+
+        let no_unique_old = "x\nx\na\n";
+        let no_unique_new = "x\nx\nb\n";
+        assert_eq!(
+            compute_unified_hunks(
+                no_unique_old,
+                no_unique_new,
+                3,
+                &DiffAlgorithm::Anchored(vec!["x".to_string()]),
+            ),
+            compute_unified_hunks(no_unique_old, no_unique_new, 3, &DiffAlgorithm::Myers),
+            "a range without a unique common candidate falls back to Myers"
+        );
+    }
+
+    #[test]
+    fn anchored_selector_events_match_git_retention_and_clear_rules() {
+        let resolve = |tail: &[&str]| {
+            let mut parse_argv = vec!["diff"];
+            parse_argv.extend_from_slice(tail);
+            let mut args = DiffArgs::try_parse_from(parse_argv).expect("selectors should parse");
+            let mut raw_argv = vec!["libra".to_string(), "diff".to_string()];
+            raw_argv.extend(tail.iter().map(|value| value.to_string()));
+            record_algorithm_selector_events(&mut args, &raw_argv);
+            resolve_diff_algorithm(&args).expect("selectors should resolve")
+        };
+
+        assert_eq!(
+            resolve(&["--anchored=A", "--histogram", "--anchored", "B",]),
+            DiffAlgorithm::Anchored(vec!["A".to_string(), "B".to_string()]),
+            "histogram leaves earlier anchors dormant for later reactivation"
+        );
+        assert_eq!(
+            resolve(&["--anchored=A", "--patience", "--anchored=B"]),
+            DiffAlgorithm::Anchored(vec!["B".to_string()]),
+            "the patience shorthand clears retained anchors"
+        );
+        assert_eq!(
+            resolve(&["--anchored=A", "--algorithm=myers"]),
+            DiffAlgorithm::Myers,
+            "a later named Myers selector wins"
+        );
+        assert_eq!(
+            resolve(&["--anchored=A", "--algorithm=patience"]),
+            DiffAlgorithm::Anchored(vec!["A".to_string()]),
+            "named patience retains and reactivates existing anchors"
+        );
+        assert_eq!(
+            resolve(&["--algorithm=histogram", "--anchored=A", "--minimal"]),
+            DiffAlgorithm::Anchored(vec!["A".to_string()]),
+            "minimal does not replace an anchored selection"
+        );
+    }
+
+    #[test]
+    fn anchored_uses_git_patience_tie_break_without_a_matching_prefix() {
+        let old = ["b", "a"];
+        let new = ["a", "b"];
+        let tags: Vec<ChangeTag> =
+            anchored_indexed_changes(&old, &new, &new, &["never".to_string()])
+                .into_iter()
+                .map(IndexedLineChange::tag)
+                .collect();
+
+        // Upstream xpatience replaces the length-1 LIS tail when it encounters
+        // `a`, so `a` is the common line. `similar` chooses the other valid tie;
+        // anchored mode intentionally follows Git's ordering.
+        assert_eq!(
+            tags,
+            vec![ChangeTag::Delete, ChangeTag::Equal, ChangeTag::Insert]
+        );
+    }
+
+    #[test]
     fn test_ignore_blank_lines_far_blank_is_suppressed() {
         // `a..h` -> `a,<blank>,b..g,H`. The blank (old~1) and h->H (old-8) are
         // distance 7 apart > 2*ctx(6), so they do NOT merge: the blank-only hunk
         // is suppressed and only the content hunk survives (Git: `@@ -5,4 +6,4 @@`).
         let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
         let new = "a\n\nb\nc\nd\ne\nf\ng\nH\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3, DiffAlgorithm::Myers);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, &DiffAlgorithm::Myers);
         assert_eq!(
             hunk_count(&body),
             1,
@@ -6480,7 +7102,7 @@ mod test {
         // extends to d (Git: `@@ -1,4 +1,5 @@`).
         let old = "a\nb\nc\nd\n";
         let new = "A\nb\n\nc\nd\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 2, DiffAlgorithm::Myers);
+        let body = compute_unified_hunks_ignore_blank(old, new, 2, &DiffAlgorithm::Myers);
         assert_eq!(hunk_count(&body), 1, "single merged hunk:\n{body}");
         assert!(
             body.contains("@@ -1,4 +1,5 @@"),
@@ -6504,7 +7126,7 @@ mod test {
         // them (Git: `@@ -1,8 +1,9 @@`).
         let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
         let new = "A\nb\nc\n\nd\ne\nf\ng\nH\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3, DiffAlgorithm::Myers);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, &DiffAlgorithm::Myers);
         assert_eq!(
             hunk_count(&body),
             1,
@@ -6535,7 +7157,7 @@ mod test {
         // context (Git: `@@ -1,4 +1,4 @@`, no blank).
         let old = "a\nb\nc\nd\ne\nf\n";
         let new = "A\nb\nc\nd\ne\n\nf\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3, DiffAlgorithm::Myers);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, &DiffAlgorithm::Myers);
         assert_eq!(hunk_count(&body), 1, "only the content hunk:\n{body}");
         assert!(
             body.contains("@@ -1,4 +1,4 @@"),
@@ -6551,14 +7173,14 @@ mod test {
     fn test_ignore_blank_lines_drops_blank_only_and_keeps_ws() {
         // A change that is only an added blank line -> empty body (file drops out).
         assert!(
-            compute_unified_hunks_ignore_blank("x\ny\n", "x\n\ny\n", 3, DiffAlgorithm::Myers,)
+            compute_unified_hunks_ignore_blank("x\ny\n", "x\n\ny\n", 3, &DiffAlgorithm::Myers,)
                 .trim()
                 .is_empty(),
             "blank-only change yields no hunks"
         );
         // A whitespace-only added line is NOT blank -> a hunk survives.
         let ws =
-            compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3, DiffAlgorithm::Myers);
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3, &DiffAlgorithm::Myers);
         assert!(
             !ws.trim().is_empty(),
             "whitespace-only line is not blank: {ws}"
@@ -6574,7 +7196,7 @@ mod test {
         // A `\r`-only (CRLF) empty line is NOT blank to Git's xdl_blankline without
         // a whitespace flag (size <= 1 means LF-only), so its insertion is shown.
         let body =
-            compute_unified_hunks_ignore_blank("a\nb\n", "a\n\r\nb\n", 3, DiffAlgorithm::Myers);
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n\r\nb\n", 3, &DiffAlgorithm::Myers);
         // `split('\n')` (unlike `lines()`) keeps the `\r`, so the emitted `+\r` line
         // is visible verbatim.
         assert!(
@@ -6591,7 +7213,7 @@ mod test {
             "a\nb\n",
             "a\n  \nb\n",
             3,
-            DiffAlgorithm::Myers,
+            &DiffAlgorithm::Myers,
             normalize_ignore_all_space,
         );
         assert!(
@@ -6600,7 +7222,7 @@ mod test {
         );
         // Without the normalizer, a whitespace-only line is NOT blank -> shown.
         let plain =
-            compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3, DiffAlgorithm::Myers);
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3, &DiffAlgorithm::Myers);
         assert!(
             plain.lines().any(|l| l == "+  "),
             "without -w the whitespace-only line is shown:\n{plain}"
@@ -6616,7 +7238,7 @@ mod test {
         let old = "a\nc\nd\ne\ne\nf\ng\nf\ng\nc\ne\nf\n";
         let new = "a\nc\n\nd\n\ne\ne\nf\ng\nf\ng\nc\ne\nf\n";
         assert!(
-            compute_unified_hunks_ignore_blank(old, new, 3, DiffAlgorithm::Myers)
+            compute_unified_hunks_ignore_blank(old, new, 3, &DiffAlgorithm::Myers)
                 .trim()
                 .is_empty(),
             "blank-only inserts (even adjacent) with no real change produce no hunks"

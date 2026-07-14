@@ -1011,13 +1011,25 @@ async fn test_diff_algorithms() {
         .await
         .expect("Histogram backend should execute");
 
+    let anchored_file = output_dir.path().join("anchored_diff.txt");
+    let anchored_str = anchored_file.to_str().unwrap();
+    let args = DiffArgs::parse_from(["diff", "--anchored=void alpha", "--output", anchored_str]);
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("Anchored backend should execute");
+
     let myers = fs::read_to_string(&myers_file).unwrap();
     let myers_min = fs::read_to_string(&myers_min_file).unwrap();
     let patience = fs::read_to_string(&patience_file).unwrap();
     let histogram = fs::read_to_string(&histogram_file).unwrap();
+    let anchored = fs::read_to_string(&anchored_file).unwrap();
     assert_eq!(myers_min, myers, "minimal uses the exact Myers edit script");
     assert_ne!(patience, myers, "Patience must use different anchors here");
     assert!(histogram.contains("diff --git"), "Histogram emits a patch");
+    assert!(
+        anchored.lines().any(|line| line == " void alpha() {"),
+        "Anchored keeps the selected unique line as context:\n{anchored}"
+    );
 }
 
 #[test]

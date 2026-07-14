@@ -121,6 +121,10 @@ fn algorithm_selectors_execute_real_backends_and_obey_precedence() {
     let histogram = stdout(&fixture.success(&repo, &["diff", "--histogram", "--", "code.c"]));
     let named_histogram =
         stdout(&fixture.success(&repo, &["diff", "--algorithm=histogram", "--", "code.c"]));
+    let anchored_alpha =
+        stdout(&fixture.success(&repo, &["diff", "--anchored=void alpha", "--", "code.c"]));
+    let anchored_beta =
+        stdout(&fixture.success(&repo, &["diff", "--anchored=void beta", "--", "code.c"]));
 
     assert_eq!(default, myers, "Myers is the truthful default");
     assert_eq!(minimal, myers, "Myers already computes a shortest script");
@@ -133,6 +137,47 @@ fn algorithm_selectors_execute_real_backends_and_obey_precedence() {
     assert_eq!(
         named_histogram, histogram,
         "named and shorthand Histogram agree"
+    );
+    assert!(
+        anchored_alpha.lines().any(|line| line == " void alpha() {"),
+        "the unique alpha line stays context:\n{anchored_alpha}"
+    );
+    assert!(
+        !anchored_alpha
+            .lines()
+            .any(|line| line == "-void alpha() {" || line == "+void alpha() {"),
+        "the selected anchor must not surface as delete+insert:\n{anchored_alpha}"
+    );
+
+    let retained_across_histogram = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--anchored=void alpha",
+            "--histogram",
+            "--anchored=void beta",
+            "--",
+            "code.c",
+        ],
+    ));
+    let cleared_by_patience = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--anchored=void alpha",
+            "--patience",
+            "--anchored=void beta",
+            "--",
+            "code.c",
+        ],
+    ));
+    assert_eq!(
+        retained_across_histogram, anchored_alpha,
+        "histogram leaves the earlier alpha anchor available when anchored is reselected"
+    );
+    assert_eq!(
+        cleared_by_patience, anchored_beta,
+        "the patience shorthand clears the earlier alpha anchor"
     );
 
     let histogram_last = stdout(&fixture.success(
@@ -172,6 +217,23 @@ fn algorithm_selectors_execute_real_backends_and_obey_precedence() {
         patience_filtered, myers_filtered,
         "whitespace/blank re-diff must retain the selected backend"
     );
+    let anchored_filtered = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--anchored=void alpha",
+            "-w",
+            "--ignore-blank-lines",
+            "--",
+            "code.c",
+        ],
+    ));
+    assert!(
+        anchored_filtered
+            .lines()
+            .any(|line| line == " void alpha() {"),
+        "whitespace/blank re-diff must retain anchors:\n{anchored_filtered}"
+    );
 
     fs::write(repo.join(".libra_attributes"), "*.c diff=identity\n")
         .expect("write textconv attributes");
@@ -183,6 +245,14 @@ fn algorithm_selectors_execute_real_backends_and_obey_precedence() {
     assert_ne!(
         patience_textconv, myers_textconv,
         "textconv re-diff must retain the selected backend"
+    );
+    let anchored_textconv =
+        stdout(&fixture.success(&repo, &["diff", "--anchored=void alpha", "--", "code.c"]));
+    assert!(
+        anchored_textconv
+            .lines()
+            .any(|line| line == " void alpha() {"),
+        "textconv re-diff must retain anchors:\n{anchored_textconv}"
     );
 
     fs::rename(repo.join("code.c"), repo.join("moved.c")).expect("rename changed file");
@@ -218,6 +288,25 @@ fn algorithm_selectors_execute_real_backends_and_obey_precedence() {
     assert_ne!(
         patience_rename, myers_rename,
         "rename body must retain the selected backend"
+    );
+    let anchored_rename = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "--anchored=void alpha",
+            "--no-textconv",
+            "--",
+            "code.c",
+            "moved.c",
+        ],
+    ));
+    assert!(anchored_rename.contains("rename from code.c"));
+    assert!(
+        anchored_rename
+            .lines()
+            .any(|line| line == " void alpha() {"),
+        "rename body must retain anchors:\n{anchored_rename}"
     );
 
     let invalid = fixture.run(&repo, &["diff", "--algorithm=bogus", "--", "code.c"]);

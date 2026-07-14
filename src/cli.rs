@@ -1729,7 +1729,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
     }
-    let args = match Cli::try_parse_from(argv.clone()) {
+    let mut args = match Cli::try_parse_from(argv.clone()) {
         Ok(args) => args,
         Err(err) => match err.kind() {
             ErrorKind::DisplayHelp
@@ -1743,6 +1743,9 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    if let Commands::Diff(diff_args) = &mut args.command {
+        command::diff::record_algorithm_selector_events(diff_args, &argv);
+    }
     apply_global_runtime_flags(&args)?;
     enforce_global_config_schema_policy(&args.command).await?;
     if let Commands::Tag(tag_args) = &args.command {

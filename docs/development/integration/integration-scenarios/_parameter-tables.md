@@ -74,10 +74,9 @@
 | `diff --diff-filter=<FILTER>` | `cli.restore-reset-diff`, `compat_diff_review_options` | include/exclude/`*` all-or-none，非法值输出前 fail-closed，sparse-view 后重新判定 |
 | `diff -S <STRING>` / `-G <REGEX>` | `cli.restore-reset-diff`, `compat_diff_review_options`, `ai_libra_vcs_safety_test` | 每 file pair literal 次数变化 / 增删 hunk 行正则过滤；textconv 结果一次复用，external driver 前过滤，无效 regex pre-progress fail-closed，AI 默认过滤器审批边界不放宽 |
 | `diff --word-diff-regex=<REGEX>` / `--color-words[=<REGEX>]` | `cli.restore-reset-diff`, `command_test::test_diff_word_diff_modes`, `ai_libra_vcs_safety_test` | regex 非重叠匹配定义比较词，standalone regex 隐含 plain；valued color shorthand 进入同一 tokenizer + color mode，显式 word regex 优先；无效 regex pre-progress fail-closed，AI 默认过滤器审批边界不放宽 |
-| `diff --algorithm=<NAME>` / `--minimal` / `--patience` / `--histogram` | `cli.restore-reset-diff`, `command_test::test_diff_algorithms`, `compat_diff_review_options`, `ai_libra_vcs_safety_test` | 默认与实际底层均为 Myers；MyersMinimal/Patience/Histogram 命名与简写进入真实 backend，backend selector last-wins，minimal 不覆盖显式 Patience/Histogram；AI 仍要求 `--no-textconv --no-ext-diff` 双门 |
+| `diff --algorithm=<NAME>` / `--minimal` / `--patience` / `--histogram` / `--anchored=<TEXT>` | `cli.restore-reset-diff`, `command_test::test_diff_algorithms`, `compat_diff_review_options`, `ai_libra_vcs_safety_test` | 默认与实际底层均为 Myers；MyersMinimal/Patience/Histogram 命名与简写进入真实 backend；可重复 Anchored 要求两侧唯一+prefix 匹配并使用 Git anchor-locked Patience LIS。selector retention/clear 与 Git 一致，minimal 不覆盖显式 Patience/Histogram/Anchored；AI 仍要求 `--no-textconv --no-ext-diff` 双门 |
 | `diff --full-index --src-prefix --dst-prefix` | `cli.restore-reset-diff`, `compat_diff_review_options` | patch 使用完整对象 ID 与 CLI 指定前缀；`-R` 交换前缀 |
 | `diff --output <file>` | `cli.restore-reset-diff` | patch 写入文件，stdout 不输出 hunk |
-| `diff --algorithm=histogram` | `cli.restore-reset-diff` | 当前唯一实现算法可用，其他算法负向断言 |
 | `restore --staged <path>` | `cli.restore-reset-diff` | index 恢复到 HEAD，工作区保持修改 |
 | `restore --worktree <path>` | `cli.restore-reset-diff` | 工作区文件恢复到 index 或 source 内容 |
 | `restore --source <rev>` | `cli.restore-reset-diff` | source revision 可恢复文件；不存在时失败且不改写文件 |

@@ -60,6 +60,7 @@ libra diff --algorithm=myers tracked.txt
 libra diff --minimal tracked.txt
 libra diff --patience tracked.txt
 libra diff --histogram tracked.txt
+libra diff --anchored='diff output' tracked.txt
 libra diff --color-words tracked.txt
 libra diff --word-diff-regex='[[:alnum:]]+' tracked.txt
 libra diff --color-words='[[:alnum:]]+' tracked.txt
@@ -82,7 +83,7 @@ libra fsck --connectivity-only
 
 关键断言：
 
-- `diff` 在 unstaged、staged、revision-to-revision、文件输出和 JSON 输出路径中返回可观察差异；`--raw -z` 提供 NUL-safe mode/object/status 记录，`--diff-filter=M` 只保留修改项，`-Smodified` 按 literal 次数变化命中，`-G'^modified$'` 按增删行 regex 命中，bare/regex-valued `--color-words` 与 standalone `--word-diff-regex` 进入自定义单词表面，Myers 默认、`--minimal`、`--patience`、`--histogram` 均成功进入真实 backend，`--compact-summary` 进入 stat 表面，`--full-index` 与显式 src/dst 前缀改写 patch header。
+- `diff` 在 unstaged、staged、revision-to-revision、文件输出和 JSON 输出路径中返回可观察差异；`--raw -z` 提供 NUL-safe mode/object/status 记录，`--diff-filter=M` 只保留修改项，`-Smodified` 按 literal 次数变化命中，`-G'^modified$'` 按增删行 regex 命中，bare/regex-valued `--color-words` 与 standalone `--word-diff-regex` 进入自定义单词表面，Myers 默认、`--minimal`、`--patience`、`--histogram` 与可重复 `--anchored=<text>` 均成功进入真实 backend，`--compact-summary` 进入 stat 表面，`--full-index` 与显式 src/dst 前缀改写 patch header。
 - `restore --staged` 取消暂存，`restore --worktree` 和 `restore --source` 恢复工作区内容。
 - `reset <path>` / `reset HEAD -- <path>` 只取消暂存；revision/path 同名时必须用 `--` 消歧；`--soft`、`--mixed`、`--hard` 覆盖基础 HEAD/index/worktree 行为；`--merge`、`--keep` 的 no-op target 正向入口成功。
 - 缺失 pathspec 文件、无效 diff algorithm/`-G` regex/word regex 和不存在的 revision/path 必须返回稳定错误，且错误路径不能移动 HEAD 或改写目标文件。

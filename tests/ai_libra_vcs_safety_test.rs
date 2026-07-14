@@ -98,6 +98,14 @@ fn ai_libra_vcs_safety_allows_read_only_parameter_combinations() {
         ),
         (
             "diff",
+            vec!["--no-textconv", "--no-ext-diff", "--anchored", "fn "],
+        ),
+        (
+            "diff",
+            vec!["--no-textconv", "--no-ext-diff", "--anchored=struct "],
+        ),
+        (
+            "diff",
             vec![
                 "--no-textconv",
                 "--no-ext-diff",
