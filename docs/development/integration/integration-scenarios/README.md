@@ -38,19 +38,19 @@
 | History | `blame` | `cli.grep-blame-describe-shortlog` |
 | History | `describe` | `cli.grep-blame-describe-shortlog` |
 | History | `notes` | `cli.notes-smoke` |
-| Branching | `commit` | `cli.commit-status-log` |
+| Branching | `commit` | `cli.commit-status-log`（仓库 hook lifecycle：Cargo `compat_libra_hooks_lifecycle`） |
 | Branching | `branch` | `cli.branch-switch-checkout` |
-| Branching | `switch` | `cli.branch-switch-checkout` |
-| Branching | `checkout` | `cli.branch-switch-checkout` |
+| Branching | `switch` | `cli.branch-switch-checkout`（`post-checkout`：Cargo `compat_libra_hooks_lifecycle`） |
+| Branching | `checkout` | `cli.branch-switch-checkout`（`post-checkout`：Cargo `compat_libra_hooks_lifecycle`） |
 | Branching | `tag` | `cli.tag-basic` |
-| Branching | `merge` | `cli.merge-rebase-cherry-revert-smoke`、`cli.merge-conflict-continue` |
-| Branching | `rebase` | `cli.merge-rebase-cherry-revert-smoke`、`cli.rebase-conflict-continue` |
+| Branching | `merge` | `cli.merge-rebase-cherry-revert-smoke`、`cli.merge-conflict-continue`（hooks：Cargo `compat_libra_hooks_lifecycle`） |
+| Branching | `rebase` | `cli.merge-rebase-cherry-revert-smoke`、`cli.rebase-conflict-continue`（hooks：Cargo `compat_libra_hooks_lifecycle`） |
 | Branching | `reset` | `cli.restore-reset-diff` |
 | Branching | `cherry-pick` | `cli.merge-rebase-cherry-revert-smoke` |
 | Branching | `revert` | `cli.merge-rebase-cherry-revert-smoke` |
 | Remote | `remote` | `cli.clone-fetch-pull-local`、`cli.push-local-file-remote-rejected` |
 | Remote | `fetch` | `cli.clone-fetch-pull-local`、`cli.fetch-depth-local` |
-| Remote | `pull` | `cli.clone-fetch-pull-local` |
+| Remote | `pull` | `cli.clone-fetch-pull-local`（`pull --rebase` hooks/JSON 隔离：`command_test::test_pull_rebase_runs_pre_rebase_before_moving_local_history`） |
 | Remote | `push` | `cli.push-local-file-remote-rejected`、`live.github-create-push-clone-fetch` |
 | Remote | `open` | `cli.open-smoke` |
 | Maintenance | `db` | `cli.schema-upgrade-observable` |

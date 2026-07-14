@@ -408,7 +408,7 @@ pub(crate) async fn run_pull(
     let integrate_result: Result<PullOutput, PullError> = if effective.rebase {
         // Rebase resolves `<remote>/<branch>` through the same public ref
         // path used by `libra rebase`, so keep the human-readable upstream form.
-        match rebase::run_rebase_for_pull(&target.upstream).await {
+        match rebase::run_rebase_for_pull(&target.upstream, &child_output).await {
             Ok(rebase_summary) => {
                 let up_to_date = matches!(
                     rebase_summary.status.as_str(),
@@ -446,6 +446,7 @@ pub(crate) async fn run_pull(
                 message: None,
                 squash: args.squash,
                 no_commit: args.no_commit,
+                skip_hooks: false,
                 // `pull` does not expose `--verify-signatures`.
                 verify_signatures: false,
                 // P1-05b scopes `merge.log` to the public merge command.
@@ -1023,6 +1024,15 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         | merge::PullMergeError::BadMergeSignature { .. }
         | merge::PullMergeError::SignatureCheck(..) => {
             CliError::failure(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
+        }
+        merge::PullMergeError::RepositoryHook { .. } => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint("set LIBRA_NO_HOOKS=1 to bypass repository hooks for pull"),
+        merge::PullMergeError::MessageFileWrite { .. } => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+        }
+        merge::PullMergeError::MessageFileRead { .. } => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
     }
 }

@@ -25,6 +25,12 @@ libra checkout [<tree-ish>] -- <pathspec>...
 
 如果恢复的路径在来源 tree 中是符号链接，Libra 会在支持 symlink 的平台上恢复为真正的 symlink，而不是写入一个普通文件。链接内容按 blob 字节作为目标路径保存；不会跟随或打开该目标。
 
+真正改变状态的 checkout 完成后，advisory `.libra/hooks/post-checkout` 会收到
+`<old-oid> <new-oid> <flag>`；分支/detached checkout 的 flag 为 `1`，路径恢复为
+`0`。只显示当前分支或 checkout 已在当前的分支时不运行。只有显式绕过策略时才设置
+`LIBRA_NO_HOOKS=1`。
+详见[仓库 hooks](repository-hooks.md)。
+
 ## 选项
 
 | 标志 | 长选项 | 值 | 说明 |

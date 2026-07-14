@@ -6,7 +6,9 @@
 
 use std::{
     collections::HashMap,
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::Stdio,
 };
 
 use serde::{Deserialize, Serialize};
@@ -47,6 +49,13 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
+    /// Clear the ambient process environment before applying `env`. Use this
+    /// for repository-controlled programs so caller secrets are not inherited.
+    pub clear_env: bool,
+    /// Exact bytes supplied on stdin. `None` preserves the caller's ambient
+    /// stdin; `Some` uses an anonymous seekable file so a child that does not
+    /// read stdin cannot deadlock its parent on a full pipe.
+    pub stdin: Option<Vec<u8>>,
     pub timeout_ms: Option<u64>,
     pub sandbox_permissions: SandboxPermissions,
     pub justification: Option<String>,
@@ -93,6 +102,8 @@ impl CommandSpec {
             args: vec!["-c".to_string(), command],
             cwd,
             env,
+            clear_env: false,
+            stdin: None,
             timeout_ms,
             sandbox_permissions,
             justification,
@@ -252,6 +263,8 @@ pub struct ExecEnv {
     pub cwd: PathBuf,
     pub spawn_cwd: PathBuf,
     pub env: HashMap<String, String>,
+    pub clear_env: bool,
+    pub stdin: Option<Vec<u8>>,
     pub timeout_ms: Option<u64>,
     pub sandbox: SandboxType,
     pub sandbox_permissions: SandboxPermissions,
@@ -259,6 +272,10 @@ pub struct ExecEnv {
     pub arg0: Option<String>,
     pub new_session: bool,
     pub allowlist_proxy_services: Option<Vec<NetworkService>>,
+    /// Host paths that the built-in Bubblewrap command will create solely as
+    /// mountpoints for absent protected metadata. The caller must remove only
+    /// the mountpoints it prepared after the child exits.
+    pub protected_mount_cleanup_paths: Vec<PathBuf>,
     /// Optional seccomp BPF policy file. When `Some`, the
     /// command's `pre_exec` hook opens this file inside the child
     /// (just before exec) and dups it to [`SECCOMP_POLICY_FD`].
@@ -290,7 +307,19 @@ impl ExecEnv {
             .canonicalize()
             .unwrap_or_else(|_| self.spawn_cwd.clone());
         command.current_dir(canonical_cwd);
+        if self.clear_env {
+            command.env_clear();
+        }
         command.envs(self.env);
+        if let Some(stdin) = self.stdin {
+            let mut file = tempfile::tempfile()
+                .map_err(|error| format!("failed to create command stdin file: {error}"))?;
+            file.write_all(&stdin)
+                .map_err(|error| format!("failed to write command stdin: {error}"))?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| format!("failed to rewind command stdin: {error}"))?;
+            command.stdin(Stdio::from(file));
+        }
         if self.new_session {
             configure_new_session(&mut command);
         }
@@ -619,6 +648,7 @@ impl SandboxManager {
             });
         }
 
+        let mut protected_mount_cleanup_paths = Vec::new();
         let (command, arg0, effective_sandbox) = match sandbox {
             SandboxType::None => (command, None, SandboxType::None),
             SandboxType::MacosSeatbelt => {
@@ -687,6 +717,8 @@ impl SandboxManager {
                             deny_read_paths,
                             seccomp_fd,
                         );
+                        protected_mount_cleanup_paths =
+                            protected_mount_cleanup_paths_from_bwrap_args(&bwrap_args);
                         let mut full = Vec::with_capacity(1 + bwrap_args.len());
                         full.push(bwrap_path.to_string_lossy().into_owned());
                         full.append(&mut bwrap_args);
@@ -736,6 +768,8 @@ impl SandboxManager {
             cwd: spec.cwd,
             spawn_cwd,
             env,
+            clear_env: spec.clear_env,
+            stdin: spec.stdin,
             timeout_ms: spec.timeout_ms,
             sandbox: effective_sandbox,
             sandbox_permissions: spec.sandbox_permissions,
@@ -746,6 +780,7 @@ impl SandboxManager {
                 SandboxType::MacosSeatbelt | SandboxType::LinuxSeccomp
             ),
             allowlist_proxy_services,
+            protected_mount_cleanup_paths,
             seccomp_policy_path: seccomp_policy_path_for_transform,
         })
     }
@@ -914,9 +949,10 @@ pub fn create_bwrap_command_args_with_seccomp(
         push_bwrap_mount(&mut args, "--ro-bind", sandbox_policy_cwd);
     } else {
         for writable_root in writable_roots {
+            push_bwrap_tmp_mount_parents(&mut args, &writable_root.root);
             push_bwrap_mount(&mut args, "--bind", &writable_root.root);
             for read_only_subpath in writable_root.read_only_subpaths {
-                push_bwrap_mount(&mut args, "--ro-bind", &read_only_subpath);
+                push_bwrap_read_only_subpath(&mut args, &read_only_subpath);
             }
         }
     }
@@ -929,6 +965,60 @@ pub fn create_bwrap_command_args_with_seccomp(
     args.push("--".to_string());
     args.extend(command);
     args
+}
+
+/// Bubblewrap starts with an empty tmpfs at `/tmp`, so an exact writable root
+/// nested below `/tmp` has no destination path for `--bind`. Recreate only the
+/// directory chain needed by that mount; never bind the host's whole `/tmp`.
+fn push_bwrap_tmp_mount_parents(args: &mut Vec<String>, root: &Path) {
+    // Exact writable files are used for narrowly-scoped metadata exceptions
+    // (for example a commit message beneath an otherwise read-only `.libra`).
+    // Their parent is already provided by an earlier directory root; creating
+    // the file path as a directory would make the later bind fail.
+    if !root.is_dir() {
+        return;
+    }
+    let slash_tmp = Path::new("/tmp");
+    let Ok(relative) = root.strip_prefix(slash_tmp) else {
+        return;
+    };
+    let mut destination = slash_tmp.to_path_buf();
+    for component in relative.components() {
+        destination.push(component.as_os_str());
+        args.push("--dir".to_string());
+        args.push(destination.to_string_lossy().into_owned());
+    }
+}
+
+/// Keep a metadata path read-only even when it does not exist yet. Skipping an
+/// absent path would let an untrusted command create it beneath the writable
+/// workspace root. An empty read-only tmpfs reserves the name without exposing
+/// host contents; existing paths retain their real contents through a read-only
+/// bind. Unexpected metadata errors deliberately choose the bind path so bwrap
+/// fails closed instead of silently dropping the protection.
+fn push_bwrap_read_only_subpath(args: &mut Vec<String>, path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let path = path.to_string_lossy().into_owned();
+            args.push("--tmpfs".to_string());
+            args.push(path.clone());
+            args.push("--remount-ro".to_string());
+            args.push(path);
+        }
+        Ok(_) | Err(_) => push_bwrap_mount(args, "--ro-bind", path),
+    }
+}
+
+/// Extract only the synthetic empty mounts emitted by
+/// [`push_bwrap_read_only_subpath`]. Other `--tmpfs` arguments, including the
+/// private `/tmp` and sensitive-read masks, are not host mountpoint artifacts.
+fn protected_mount_cleanup_paths_from_bwrap_args(args: &[String]) -> Vec<PathBuf> {
+    args.windows(4)
+        .filter(|window| {
+            window[0] == "--tmpfs" && window[2] == "--remount-ro" && window[1] == window[3]
+        })
+        .map(|window| PathBuf::from(&window[1]))
+        .collect()
 }
 
 /// Locate `bwrap` on the host PATH and return the resolved
@@ -1512,6 +1602,69 @@ mod tests {
     }
 
     #[test]
+    fn create_bwrap_command_args_creates_exact_tmp_mount_destinations() {
+        let temp = tempfile::Builder::new()
+            .prefix("libra-bwrap-mount-test-")
+            .tempdir_in("/tmp")
+            .expect("create mount-argument fixture under /tmp");
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).expect("create writable directory root");
+        let message_file = root.join("message");
+        std::fs::write(&message_file, b"message").expect("create exact writable file root");
+        let cwd = root.as_path();
+        let policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![root.clone(), message_file.clone()],
+            network_access: NetworkAccess::Denied,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        };
+
+        let args = create_bwrap_command_args(
+            command(),
+            network_access_mode_for_policy(&policy),
+            &policy,
+            cwd,
+            &[],
+        );
+
+        let relative_root = root
+            .strip_prefix("/tmp")
+            .expect("fixture is rooted beneath /tmp");
+        let mut destination = PathBuf::from("/tmp");
+        for component in relative_root.components() {
+            destination.push(component.as_os_str());
+            let destination = destination.to_string_lossy();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--dir" && pair[1] == destination),
+                "missing exact tmpfs mount destination {destination}: {args:?}"
+            );
+        }
+        assert!(
+            args.windows(3).any(|triple| {
+                triple[0] == "--bind"
+                    && triple[1] == root.to_string_lossy()
+                    && triple[2] == root.to_string_lossy()
+            }),
+            "exact writable root must be bound without exposing host /tmp: {args:?}"
+        );
+        assert!(
+            args.windows(3).any(|triple| {
+                triple[0] == "--bind"
+                    && triple[1] == message_file.to_string_lossy()
+                    && triple[2] == message_file.to_string_lossy()
+            }),
+            "exact writable file must be rebound over its read-only parent: {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| { pair[0] == "--dir" && pair[1] == message_file.to_string_lossy() }),
+            "an exact writable file must not be created as a directory: {args:?}"
+        );
+    }
+
+    #[test]
     fn create_bwrap_command_args_allows_full_network_with_share_net() {
         let cwd = Path::new("/tmp/libra-sandbox-workspace");
         let policy = SandboxPolicy::WorkspaceWrite {
@@ -1579,14 +1732,21 @@ mod tests {
 
     #[test]
     fn create_bwrap_command_args_binds_workspace_roots_and_protected_subpaths() {
-        let cwd = Path::new("/tmp/libra-sandbox-workspace");
+        let temp = tempfile::Builder::new()
+            .prefix("libra-bwrap-protected-test-")
+            .tempdir_in("/tmp")
+            .expect("create protected-subpath fixture under /tmp");
+        let cwd = temp.path();
+        let writable_root = cwd.join("src");
+        std::fs::create_dir(&writable_root).expect("create writable root");
+        let existing_metadata = writable_root.join(".libra");
+        std::fs::create_dir(&existing_metadata).expect("create existing protected metadata");
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![PathBuf::from("src")],
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
         };
-        let writable_root = cwd.join("src");
 
         let args = create_bwrap_command_args(
             command(),
@@ -1597,8 +1757,17 @@ mod tests {
         );
 
         assert_mount(&args, "--bind", &writable_root);
-        assert_mount(&args, "--ro-bind", &writable_root.join(".git"));
-        assert_mount(&args, "--ro-bind", &writable_root.join(".libra"));
+        assert_mount(&args, "--ro-bind", &existing_metadata);
+        for absent_metadata in [".git", ".codex", ".agents"] {
+            let absent_metadata = writable_root.join(absent_metadata);
+            let absent_metadata = absent_metadata.to_string_lossy();
+            assert_option_value(&args, "--tmpfs", &absent_metadata);
+            assert_option_value(&args, "--remount-ro", &absent_metadata);
+        }
+        assert!(
+            !args.iter().any(|arg| arg == "--ro-bind-try"),
+            "protected paths must never be skipped when absent: {args:?}"
+        );
     }
 
     #[test]
@@ -2044,6 +2213,8 @@ mod tests {
             cwd: std::env::temp_dir(),
             spawn_cwd: std::env::temp_dir(),
             env: HashMap::new(),
+            clear_env: false,
+            stdin: None,
             timeout_ms: Some(1_000),
             sandbox: SandboxType::MacosSeatbelt,
             sandbox_permissions: SandboxPermissions::UseDefault,
@@ -2051,6 +2222,7 @@ mod tests {
             arg0: None,
             new_session: true,
             allowlist_proxy_services: None,
+            protected_mount_cleanup_paths: Vec::new(),
             seccomp_policy_path: None,
         };
         let (mut command, _) = env.into_command().expect("exec env should build");

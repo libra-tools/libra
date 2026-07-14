@@ -24,6 +24,11 @@ The command supports multiple modes: switching to an existing local branch (defa
 
 Fuzzy branch name suggestions are provided via Levenshtein distance when a branch is not found, helping catch typos without requiring exact matches.
 
+After a state-changing switch, advisory `.libra/hooks/post-checkout` receives the old
+OID, new OID, and branch flag `1`. Already-on no-ops do not invoke it. Set
+`LIBRA_NO_HOOKS=1` only for an explicit policy bypass. See
+[Repository hooks](repository-hooks.md) for sandbox and output behavior.
+
 ## Options
 
 | Flag | Long | Value | Description |

@@ -728,7 +728,19 @@ impl SandboxPolicy {
         self.writable_root_paths_with_cwd(cwd)
             .into_iter()
             .map(|root| WritableRoot {
-                read_only_subpaths: protected_subpaths(&root),
+                // Exact writable files are narrow exceptions beneath an
+                // otherwise protected metadata directory. Appending
+                // `file/.git`-style pseudo-children makes bubblewrap fail with
+                // ENOTDIR and has no security value because a regular file has
+                // no descendants to protect.
+                read_only_subpaths: if root.is_file() {
+                    Vec::new()
+                } else {
+                    // Missing roots are conservatively treated as directories:
+                    // a command may create them after sandbox setup, and their
+                    // future metadata children must remain protected.
+                    protected_subpaths(&root)
+                },
                 root,
             })
             .collect()
@@ -973,6 +985,26 @@ mod tests {
 
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].root, PathBuf::from("/tmp/workspace/src/main.rs"));
+        assert_eq!(roots[0].read_only_subpaths.len(), 4);
+    }
+
+    #[test]
+    fn exact_writable_file_has_no_impossible_protected_children() {
+        let temp = tempfile::tempdir().expect("create exact-file policy fixture");
+        let file = temp.path().join("COMMIT_EDITMSG");
+        std::fs::write(&file, b"message").expect("create exact writable file");
+        let policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![file.clone()],
+            network_access: NetworkAccess::Denied,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        };
+
+        let roots = policy.get_writable_roots_with_cwd(temp.path());
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].root, file);
+        assert!(roots[0].read_only_subpaths.is_empty());
     }
 
     #[test]

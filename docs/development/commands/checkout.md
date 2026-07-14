@@ -35,6 +35,7 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-07-14（plan-20260708 P1-10）：branch/detached checkout 与显式路径恢复成功后 advisory 运行 `.libra/hooks/post-checkout <old> <new> <flag>`（branch=`1`、path=`0`）；show-current 与 already-on no-op 不运行，`LIBRA_NO_HOOKS=1` 显式绕过。回归 target：`compat_libra_hooks_lifecycle`。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-05-17 `d11ed7ca`（`feat(checkout): complete CheckoutError typed enum + remote proxy error layering`）：基础实现节点：complete CheckoutError typed enum + remote proxy error layering；当前实现的主要轮廓可追溯到该提交。
 - 2026-06-04 `b00c9532`（`feat(checkout): implement --ours, --theirs conflict path checkout and --force switch (v0.17.1304)`）：功能演进：implement --ours, --theirs conflict path checkout and --force switch (v0.17.1304)；该节点扩展了当前命令可用的参数或行为。

@@ -2,6 +2,10 @@
 
 目的：覆盖 `branch`、`switch`、`checkout` 的分支创建、切换、`switch -C`、`switch --orphan`、`--track` 远端分支、`branch -r`/`-a` 远端列出、detached HEAD（`switch --detach` 与 `checkout --detach`）、兼容 alias、分支重命名/删除和路径恢复行为，覆盖 `switch --guess`/`--no-guess` 的 DWIM 远端跟踪猜测，并保留 `switch -f` 未公开的负向检查。
 
+P1-10 的 sandboxed `post-checkout` old/new/flag 参数、show-current/already-on no-op 和
+`LIBRA_NO_HOOKS` 逃逸阀由注册的 Wave 1 Cargo target
+`compat_libra_hooks_lifecycle` 负责。
+
 最小步骤：
 
 ```bash

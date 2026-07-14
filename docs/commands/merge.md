@@ -5,7 +5,7 @@ Merge one target into the current branch.
 ## Synopsis
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>
+libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>
 libra merge --continue
 libra merge --abort
 libra merge --restart
@@ -65,6 +65,7 @@ Libra still does not implement octopus merges, merge strategies other than `ours
 | `--no-log` | Disable the merge-message shortlog, overriding `merge.log` and an earlier `--log`. |
 | `--squash` | Produce the merged index/working tree but create no commit and do not move HEAD; finish with a plain `libra commit`. |
 | `--no-commit` | Perform the merge and stage the result but stop before committing; finish with `libra merge --continue`. |
+| `--no-verify` | Skip all `.libra/hooks` for this merge. With `--continue`, bypass the pending commit/message/post hooks. |
 | `--no-edit` | Accept the auto-generated merge message without launching an editor. Libra never opens an editor for merge, so this is a no-op accepted for Git parity. |
 | `--stat` | Show a diffstat of the merge result (the changes between the pre-merge HEAD and the new commit) after the merge completes. Git shows this by default; Libra defaults to no diffstat, so `--stat` opts in. Last-one-wins toggle with `--no-stat`/`-n`. Human output only. |
 | `-n`, `--no-stat` | Do not show a diffstat at the end of the merge (Libra's default). Last-one-wins toggle with `--stat`. |
@@ -81,6 +82,18 @@ Libra still does not implement octopus merges, merge strategies other than `ours
 | `--json` | Emit a structured success envelope. |
 | `--machine` | Emit the same structured envelope as one compact JSON line. |
 | `--quiet` | Suppress human success output. |
+
+## Repository hooks
+
+`pre-merge-commit` blocks an automatic merge commit (including `--continue`) but does not
+run for fast-forward, squash, or a pending `--no-commit` result. Automatic merge commits
+then run `prepare-commit-msg <file> merge`, `commit-msg <file>`, and advisory
+`post-commit`; message hooks may modify `.libra/COMMIT_EDITMSG`. `post-merge` runs
+advisory after a completed merge/fast-forward with argument `0`, or after squash with
+argument `1`; it does not run for already-up-to-date or conflicted outcomes.
+`--no-verify` skips every hook in that merge lifecycle. Pull uses the same lifecycle; use
+`LIBRA_NO_HOOKS=1` when an explicit bypass is required. See
+[Repository hooks](repository-hooks.md) for the sandbox and failure contract.
 
 ## Common Commands
 
@@ -201,6 +214,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Force merge commit | `--no-ff` | `--no-ff` | N/A |
 | Squash | `--squash` | `--squash` | N/A |
 | No-commit | `--no-commit` | `--no-commit` | N/A |
+| Skip all merge-lifecycle hooks | `--no-verify` | `--no-verify` | N/A |
 | Commit message | `-m <msg>` | `-m <msg>` | N/A |
 | No editor | `--no-edit` (no-op; never edits) | `--no-edit` | N/A |
 | Post-merge diffstat | `--stat` (prints it); `-n` / `--no-stat` (default: omit) | `--stat` (default) / `-n` / `--no-stat` | N/A |

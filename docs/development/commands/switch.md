@@ -35,6 +35,7 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-07-14（plan-20260708 P1-10）：所有真正改变状态的 switch 在渲染成功输出前 advisory 运行 `.libra/hooks/post-checkout <old> <new> 1`；already-on no-op 不运行，`LIBRA_NO_HOOKS=1` 显式绕过。回归 target：`compat_libra_hooks_lifecycle`。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-01-21 `27f2ae2f`（`feat(switch): add --track flag to switch command (#157)`）：基础实现节点：add --track flag to switch command (#157)；当前实现的主要轮廓可追溯到该提交。
 - 2026-06-06 `7e94b815`（`feat(switch): add -C/--force-create (create or reset branch then switch)`）：当前 HEAD 已保留 `SwitchArgs::force_create`，`libra switch -C <name> [<start-point>]` 会删除并重建非当前目标分支后切换；对应行为已有 `tests/command/switch_test.rs` 覆盖。

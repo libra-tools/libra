@@ -2,6 +2,12 @@
 
 目的：覆盖当前 history-edit 命令的本地成功路径，并用负向断言记录未支持或受限的 Git 参数。
 
+P1-10 的 required-sandbox `pre-merge-commit` / merge message hooks / `pre-rebase`、
+advisory `post-commit` / `post-merge` / `post-rewrite`、rewrite stdin、
+`--no-verify`/环境逃逸阀，以及
+blocking failure 和 hook-created untracked collision 的 ref 原子性由注册的 Wave 1
+Cargo target `compat_libra_hooks_lifecycle` 负责。
+
 最小步骤：
 
 ```bash

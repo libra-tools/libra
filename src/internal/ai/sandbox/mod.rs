@@ -1204,13 +1204,24 @@ pub async fn run_shell_command_with_approval(
 pub async fn run_command_spec(
     mut spec: CommandSpec,
     max_output_bytes: usize,
-    sandbox: Option<ToolSandboxContext>,
+    mut sandbox: Option<ToolSandboxContext>,
     sandbox_runtime: Option<&SandboxRuntimeConfig>,
     network_access_override: Option<NetworkAccess>,
     evidence_sink: Option<std::sync::Arc<dyn evidence::SandboxEvidenceSink>>,
 ) -> Result<SandboxExecOutput, String> {
     let command_tmpdir = create_command_tmpdir()?;
     inject_command_tmp_env(&mut spec, &command_tmpdir);
+    // The built-in bubblewrap profile replaces `/tmp` with a private tmpfs.
+    // Add only this command's 0700 temp directory as an explicit writable
+    // root so TMPDIR remains usable without granting the whole host `/tmp`.
+    if let Some(ToolSandboxContext {
+        policy: SandboxPolicy::WorkspaceWrite { writable_roots, .. },
+        ..
+    }) = sandbox.as_mut()
+        && !writable_roots.contains(&command_tmpdir)
+    {
+        writable_roots.push(command_tmpdir.clone());
+    }
 
     let output = run_command_spec_inner(
         spec,
@@ -1237,13 +1248,31 @@ async fn run_command_spec_inner(
     network_access_override: Option<NetworkAccess>,
     evidence_sink: Option<std::sync::Arc<dyn evidence::SandboxEvidenceSink>>,
 ) -> Result<SandboxExecOutput, String> {
-    let mut built = build_command_from_spec(
+    let built = build_command_from_spec(
         spec,
         sandbox.as_ref(),
         sandbox_runtime,
         network_access_override,
         evidence_sink.as_deref(),
     )?;
+    let mut protected_mountpoints =
+        PreparedProtectedMountpoints::prepare(&built.protected_mount_cleanup_paths)?;
+    let output = run_built_command(built, max_output_bytes, sandbox_runtime, evidence_sink).await;
+    let cleanup = protected_mountpoints.cleanup();
+    match (output, cleanup) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(format!("{error}; additionally, {cleanup_error}")),
+    }
+}
+
+async fn run_built_command(
+    mut built: BuiltCommand,
+    max_output_bytes: usize,
+    sandbox_runtime: Option<&SandboxRuntimeConfig>,
+    evidence_sink: Option<std::sync::Arc<dyn evidence::SandboxEvidenceSink>>,
+) -> Result<SandboxExecOutput, String> {
     let proxy_evidence_sink = evidence_sink
         .clone()
         .or_else(|| sandbox_runtime.and_then(|cfg| cfg.evidence_sink.clone()));
@@ -1541,6 +1570,7 @@ fn build_command_from_spec(
         .cloned()
         .unwrap_or_else(|| "<missing>".to_string());
     let allowlist_proxy_services = exec_env.allowlist_proxy_services.clone();
+    let protected_mount_cleanup_paths = exec_env.protected_mount_cleanup_paths.clone();
     let spawn_cwd = exec_env.cwd.clone();
     let process_cwd = exec_env.spawn_cwd.clone();
     #[cfg(test)]
@@ -1550,6 +1580,7 @@ fn build_command_from_spec(
         command,
         timeout_ms,
         allowlist_proxy_services,
+        protected_mount_cleanup_paths,
         spawn_cwd,
         process_cwd,
         #[cfg(test)]
@@ -1619,6 +1650,8 @@ fn run_std_command_fallback_blocking(
     max_output_bytes: usize,
     timeout_override: Option<u64>,
 ) -> Result<SandboxExecOutput, String> {
+    use std::io::{Seek, SeekFrom, Write};
+
     let (program, args) = exec_env
         .command
         .split_first()
@@ -1639,10 +1672,21 @@ fn run_std_command_fallback_blocking(
         .map_err(|error| format!("clone stderr tempfile for fallback: {error}"))?;
 
     let mut command = std::process::Command::new(program);
+    command.args(args).current_dir(canonical_cwd);
+    if exec_env.clear_env {
+        command.env_clear();
+    }
+    command.envs(exec_env.env);
+    if let Some(stdin) = exec_env.stdin {
+        let mut file = tempfile::tempfile()
+            .map_err(|error| format!("create stdin tempfile for fallback: {error}"))?;
+        file.write_all(&stdin)
+            .map_err(|error| format!("write stdin tempfile for fallback: {error}"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind stdin tempfile for fallback: {error}"))?;
+        command.stdin(Stdio::from(file));
+    }
     command
-        .args(args)
-        .current_dir(canonical_cwd)
-        .envs(exec_env.env)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
@@ -1733,10 +1777,145 @@ fn read_limited_tempfile(
     )
 }
 
+#[cfg(target_os = "linux")]
+struct PreparedProtectedMountpoint {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct PreparedProtectedMountpoints {
+    entries: Vec<PreparedProtectedMountpoint>,
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedProtectedMountpoints {
+    fn prepare(paths: &[PathBuf]) -> Result<Self, String> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+        let mut prepared = Self::default();
+        for path in paths {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            if let Err(error) = builder.create(path) {
+                let cleanup = prepared.cleanup();
+                let mut message = if error.kind() == ErrorKind::AlreadyExists {
+                    format!(
+                        "protected sandbox mountpoint `{}` appeared while the command was being prepared; refusing to race with a concurrent filesystem change",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "failed to prepare protected sandbox mountpoint `{}`: {error}",
+                        path.display()
+                    )
+                };
+                if let Err(cleanup_error) = cleanup {
+                    message.push_str(&format!("; additionally, {cleanup_error}"));
+                }
+                return Err(message);
+            }
+
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    let remove_error = fs::remove_dir(path).err();
+                    let cleanup = prepared.cleanup();
+                    let mut message = format!(
+                        "failed to inspect protected sandbox mountpoint `{}` after creating it: {error}",
+                        path.display()
+                    );
+                    if let Some(remove_error) = remove_error {
+                        message.push_str(&format!(
+                            "; failed to remove that mountpoint: {remove_error}"
+                        ));
+                    }
+                    if let Err(cleanup_error) = cleanup {
+                        message.push_str(&format!("; additionally, {cleanup_error}"));
+                    }
+                    return Err(message);
+                }
+            };
+            prepared.entries.push(PreparedProtectedMountpoint {
+                path: path.clone(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        }
+        Ok(prepared)
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut failures = Vec::new();
+        for mountpoint in self.entries.drain(..).rev() {
+            let metadata = match fs::symlink_metadata(&mountpoint.path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    failures.push(format!("`{}`: {error}", mountpoint.path.display()));
+                    continue;
+                }
+            };
+            if !metadata.is_dir()
+                || metadata.dev() != mountpoint.device
+                || metadata.ino() != mountpoint.inode
+            {
+                failures.push(format!(
+                    "`{}` changed identity while the sandboxed command ran",
+                    mountpoint.path.display()
+                ));
+                continue;
+            }
+            match fs::remove_dir(&mountpoint.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => failures.push(format!("`{}`: {error}", mountpoint.path.display())),
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to clean protected sandbox mountpoints: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PreparedProtectedMountpoints {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            tracing::error!(%error, "protected sandbox mountpoint cleanup failed");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct PreparedProtectedMountpoints;
+
+#[cfg(not(target_os = "linux"))]
+impl PreparedProtectedMountpoints {
+    fn prepare(_paths: &[PathBuf]) -> Result<Self, String> {
+        Ok(Self)
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 struct BuiltCommand {
     command: tokio::process::Command,
     timeout_ms: Option<u64>,
     allowlist_proxy_services: Option<Vec<NetworkService>>,
+    protected_mount_cleanup_paths: Vec<PathBuf>,
     spawn_cwd: PathBuf,
     process_cwd: PathBuf,
     #[cfg(test)]
@@ -3188,6 +3367,52 @@ mod tests {
         assert!(!tmpdir.exists());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protected_mountpoint_cleanup_removes_only_prepared_empty_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create protected mountpoint fixture");
+        let git = temp.path().join(".git");
+        let codex = temp.path().join(".codex");
+        let mut prepared = PreparedProtectedMountpoints::prepare(&[git.clone(), codex.clone()])
+            .expect("prepare absent protected mountpoints");
+
+        assert_eq!(
+            fs::metadata(&git)
+                .expect("read prepared mountpoint metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        prepared
+            .cleanup()
+            .expect("remove unchanged empty mountpoints");
+        assert!(!git.exists());
+        assert!(!codex.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protected_mountpoint_cleanup_refuses_replaced_paths() {
+        let temp = tempfile::tempdir().expect("create protected mountpoint fixture");
+        let git = temp.path().join(".git");
+        let mut prepared = PreparedProtectedMountpoints::prepare(std::slice::from_ref(&git))
+            .expect("prepare absent protected mountpoint");
+        fs::remove_dir(&git).expect("remove prepared mountpoint");
+        fs::write(&git, b"replacement").expect("replace mountpoint with a file");
+
+        let error = prepared
+            .cleanup()
+            .expect_err("cleanup must not remove a replaced path");
+        assert!(error.contains("changed identity"), "{error}");
+        assert_eq!(
+            fs::read(&git).expect("replacement must remain"),
+            b"replacement"
+        );
+    }
+
     /// Pin the structured `TmpdirCleanupFailed` Evidence event the
     /// sandbox emits when `remove_dir_all` fails. We force a
     /// failure by pointing the cleanup at a path that exists as a
@@ -3292,6 +3517,8 @@ mod tests {
             args: Vec::new(),
             cwd: std::env::temp_dir(),
             env: std::collections::HashMap::new(),
+            clear_env: false,
+            stdin: None,
             timeout_ms: None,
             sandbox_permissions: SandboxPermissions::default(),
             justification: None,
@@ -3361,6 +3588,8 @@ mod tests {
             args: Vec::new(),
             cwd: PathBuf::from("/tmp/workspace"),
             env: std::collections::HashMap::new(),
+            clear_env: false,
+            stdin: None,
             timeout_ms: None,
             sandbox_permissions: SandboxPermissions::default(),
             justification: None,
@@ -3420,6 +3649,8 @@ mod tests {
                 "TMPDIR".to_string(),
                 caller_tmp.to_string_lossy().into_owned(),
             )]),
+            clear_env: false,
+            stdin: None,
             timeout_ms: Some(5_000),
             sandbox_permissions: SandboxPermissions::UseDefault,
             justification: None,
@@ -3492,6 +3723,8 @@ mod tests {
             ],
             cwd: std::env::temp_dir(),
             env: std::collections::HashMap::new(),
+            clear_env: false,
+            stdin: None,
             timeout_ms: Some(5_000),
             sandbox_permissions: SandboxPermissions::UseDefault,
             justification: None,

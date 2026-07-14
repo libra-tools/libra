@@ -4,7 +4,6 @@ use std::{
     collections::HashSet,
     io::{IsTerminal, Read, Write},
     path::PathBuf,
-    process::{Command, Stdio},
     str::FromStr,
 };
 
@@ -41,6 +40,9 @@ use crate::{
         head::Head,
         log::date_parser::parse_date,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        repo_hooks::{
+            RepoHook, replay_repo_hook_output, run_advisory_repo_hook, run_repo_hook_with_io,
+        },
         tree_plumbing,
     },
     utils::{
@@ -125,7 +127,8 @@ pub struct CommitArgs {
     #[arg(short = 's', long)]
     pub signoff: bool,
 
-    /// Skip pre-commit hooks for this invocation (narrower than --no-verify, which also skips commit-msg hooks)
+    /// Skip only the pre-commit hook for this invocation. Message and advisory
+    /// repository hooks still run.
     #[arg(long)]
     pub disable_pre: bool,
 
@@ -133,7 +136,7 @@ pub struct CommitArgs {
     #[arg(short = 'a', long)]
     pub all: bool,
 
-    /// Skip all pre-commit and commit-msg hooks/validations (align with Git --no-verify)
+    /// Skip all `.libra/hooks` lifecycle hooks and commit-message validations.
     #[arg(long = "no-verify")]
     pub no_verify: bool,
 
@@ -307,6 +310,12 @@ pub enum CommitError {
     #[error("pre-commit hook failed: {0}")]
     PreCommitHook(String),
 
+    #[error("{hook} hook failed: {detail}")]
+    RepositoryHook { hook: &'static str, detail: String },
+
+    #[error("failed to write commit message file '{path}': {detail}")]
+    MessageFileWrite { path: String, detail: String },
+
     #[error("conventional commit validation failed: {0}")]
     ConventionalCommit(String),
 
@@ -407,6 +416,9 @@ impl From<CommitError> for CliError {
             CommitError::MessageFileRead { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
+            CommitError::MessageFileWrite { .. } => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+            }
             CommitError::TemplateRead { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -435,9 +447,11 @@ impl From<CommitError> for CliError {
             CommitError::HeadUpdate(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
-            CommitError::PreCommitHook(..) => CliError::failure(error.to_string())
+            CommitError::PreCommitHook(..) | CommitError::RepositoryHook { .. } => {
+                CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
-                .with_hint("use --no-verify to bypass the hook"),
+                .with_hint("use --no-verify to bypass repository hooks")
+            }
             CommitError::ConventionalCommit(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("see https://www.conventionalcommits.org for format rules"),
@@ -976,7 +990,8 @@ async fn run_commit_with_index(
     let is_amend = args.amend;
     let is_signoff = args.signoff;
     let is_conventional = args.conventional;
-    let skip_hooks = args.disable_pre || args.no_verify;
+    let skip_pre_commit = args.disable_pre || args.no_verify;
+    let skip_all_hooks = args.no_verify;
     let skip_conventional_check = args.no_verify;
     // `commit.status` only controls an editor template. Avoid reading it when no
     // editor can open or cleanup would retain comments; explicit CLI toggles
@@ -1107,8 +1122,8 @@ async fn run_commit_with_index(
     // no longer block the commit without explicit rollback logic.
     // Hooks are subprocesses and cannot inherit the task-local preview index.
     // Dry-runs therefore skip them entirely, keeping the live index unreachable.
-    if !dry_run && !skip_hooks {
-        run_pre_commit_hook(output)?;
+    if !dry_run && !skip_pre_commit {
+        run_pre_commit_hook(output).await?;
     }
 
     // Resolve parent commits (needed to seed the editor with the amend parent's
@@ -1123,6 +1138,7 @@ async fn run_commit_with_index(
         message_settings,
         status_section,
         dry_run,
+        !skip_all_hooks,
     )
     .await?;
 
@@ -1204,13 +1220,17 @@ async fn run_commit_with_index(
             message.clone()
         };
 
-        let commit_message = match &signoff_line {
+        let mut commit_message = match &signoff_line {
             // Route through append_trailers so `-s` joins an existing trailer
             // block (e.g. from `--trailer`) instead of opening a second
             // paragraph a Git-strict trailer parser would not see.
             Some(line) => append_trailers(&final_message, std::slice::from_ref(line)),
             None => final_message.clone(),
         };
+        if !dry_run {
+            commit_message =
+                persist_and_run_commit_msg_hook(&commit_message, output, !skip_all_hooks).await?;
+        }
         let mut committer = committer;
         refresh_noop_amend_committer_timestamp(
             &parent_commit,
@@ -1294,6 +1314,17 @@ async fn run_commit_with_index(
         // after ref update never points the branch at a missing object.
         save_commit_object(&storage, &commit)?;
         update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
+        if !skip_all_hooks {
+            run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
+            let rewrite_input = format!("{} {}\n", parents_commit_ids[0], commit.id);
+            run_advisory_repo_hook(
+                RepoHook::PostRewrite,
+                &["amend".to_string()],
+                Some(rewrite_input.as_bytes()),
+                output,
+            )
+            .await;
+        }
 
         let conventional_result = if is_conventional && !skip_conventional_check {
             Some(true)
@@ -1314,11 +1345,15 @@ async fn run_commit_with_index(
     }
 
     // Normal (non-amend) path
-    let commit_message = match &signoff_line {
+    let mut commit_message = match &signoff_line {
         // See the amend path: `-s` must join an existing trailer block.
         Some(line) => append_trailers(&message, std::slice::from_ref(line)),
         None => message.clone(),
     };
+    if !dry_run {
+        commit_message =
+            persist_and_run_commit_msg_hook(&commit_message, output, !skip_all_hooks).await?;
+    }
 
     // Conventional commit validation
     if is_conventional
@@ -1393,6 +1428,9 @@ async fn run_commit_with_index(
     // ref update never points the branch at a missing object.
     save_commit_object(&storage, &commit)?;
     update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
+    if !skip_all_hooks {
+        run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
+    }
 
     let conventional_result = if is_conventional && !skip_conventional_check {
         Some(true)
@@ -1456,6 +1494,7 @@ async fn resolve_final_message(
     settings: CommitMessageSettings,
     status_section: Option<String>,
     dry_run: bool,
+    run_prepare_hook: bool,
 ) -> Result<String, CommitError> {
     let CommitMessageSettings {
         needs_editor,
@@ -1514,17 +1553,44 @@ async fn resolve_final_message(
     };
 
     let cleanup_strips_comments = matches!(mode, CleanupMode::Strip | CleanupMode::Default);
-
     let editor_opened = editor_cmd.is_some();
-    let resolved = if let Some(editor_cmd) = editor_cmd {
-        let buffer = if verbose {
+    let buffer = if editor_opened {
+        if verbose {
             build_verbose_template(&initial, status_section.as_deref(), cleanup_strips_comments)
                 .await?
         } else {
             append_status_section(initial.clone(), status_section.as_deref())
-        };
-        let path = util::storage_path().join("COMMIT_EDITMSG");
-        let raw = editor::edit_message(&path, &buffer, &editor_cmd, true)
+        }
+    } else {
+        initial.clone()
+    };
+    let message_path = commit_message_path()?;
+    let (prepared_buffer, prepare_modified) = if run_prepare_hook {
+        write_commit_message_file(&message_path, &buffer)?;
+        let hook_args = prepare_commit_msg_hook_args(
+            args,
+            parent_ids,
+            template_content.is_some(),
+            &message_path,
+        )
+        .await?;
+        run_checked_repo_hook(
+            RepoHook::PrepareCommitMsg,
+            &hook_args,
+            None,
+            Some(&message_path),
+            output,
+        )
+        .await?;
+        let prepared = read_commit_message_file(&message_path)?;
+        let modified = prepared != buffer;
+        (prepared, modified)
+    } else {
+        (buffer, false)
+    };
+
+    let resolved = if let Some(editor_cmd) = editor_cmd {
+        let raw = editor::edit_message(&message_path, &prepared_buffer, &editor_cmd, true)
             .await
             .map_err(|e| CommitError::EditorFailed(e.to_string()))?;
         // `-v` only appends the staged diff below a scissors marker — drop that
@@ -1558,7 +1624,7 @@ async fn resolve_final_message(
             CleanupMode::Default | CleanupMode::Scissors => CleanupMode::Whitespace,
             other => other,
         };
-        cleanup_commit_message(&initial, effective_mode)
+        cleanup_commit_message(&prepared_buffer, effective_mode)
     };
 
     // When a template seeded the message and the editor was meant to open
@@ -1571,7 +1637,7 @@ async fn resolve_final_message(
         let unedited = if editor_opened {
             resolved == cleanup_commit_message(template, mode)
         } else {
-            needs_editor
+            needs_editor && !prepare_modified
         };
         if unedited {
             return Err(CommitError::TemplateUnedited);
@@ -1887,60 +1953,160 @@ fn append_trailers(message: &str, trailers: &[String]) -> String {
     }
 }
 
-/// Run the pre-commit hook, respecting OutputConfig for I/O isolation.
-fn run_pre_commit_hook(output: &OutputConfig) -> Result<(), CommitError> {
-    let hooks_dir = path::hooks();
+fn commit_message_path() -> Result<PathBuf, CommitError> {
+    util::try_get_worktree_gitdir(None)
+        .map(|gitdir| gitdir.join("COMMIT_EDITMSG"))
+        .map_err(|error| CommitError::MessageFileWrite {
+            path: ".libra/COMMIT_EDITMSG".to_string(),
+            detail: format!("failed to locate the current worktree metadata directory: {error}"),
+        })
+}
 
-    #[cfg(not(target_os = "windows"))]
-    let hook_path = hooks_dir.join("pre-commit.sh");
+fn write_commit_message_file(path: &std::path::Path, message: &str) -> Result<(), CommitError> {
+    atomic_write::write_atomic(path, message.as_bytes(), false).map_err(|error| {
+        CommitError::MessageFileWrite {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        }
+    })
+}
 
-    #[cfg(target_os = "windows")]
-    let hook_path = hooks_dir.join("pre-commit.ps1");
+fn read_commit_message_file(path: &std::path::Path) -> Result<String, CommitError> {
+    std::fs::read_to_string(path).map_err(|error| CommitError::MessageFileRead {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })
+}
 
-    if !hook_path.exists() {
-        return Ok(());
+async fn prepare_commit_msg_hook_args(
+    args: &CommitArgs,
+    parent_ids: &[ObjectHash],
+    template_seeded: bool,
+    message_path: &std::path::Path,
+) -> Result<Vec<String>, CommitError> {
+    let message_path = message_path
+        .to_str()
+        .ok_or_else(|| CommitError::RepositoryHook {
+            hook: RepoHook::PrepareCommitMsg.as_str(),
+            detail: format!(
+                "commit message path '{}' is not valid UTF-8",
+                message_path.display()
+            ),
+        })?;
+    let mut hook_args = vec![message_path.to_string()];
+
+    if let Some(spec) = args.reuse_message.as_ref().or(args.reedit_message.as_ref()) {
+        let commit = util::get_commit_base_typed(spec).await.map_err(|error| {
+            CommitError::ParentCommitLoad {
+                commit_id: spec.clone(),
+                detail: error.to_string(),
+            }
+        })?;
+        hook_args.push("commit".to_string());
+        hook_args.push(commit.to_string());
+    } else if args.amend
+        && let Some(parent) = parent_ids.first()
+    {
+        hook_args.push("commit".to_string());
+        hook_args.push(parent.to_string());
+    } else if args.message.is_some()
+        || args.file.is_some()
+        || args.fixup.is_some()
+        || args.squash.is_some()
+    {
+        hook_args.push("message".to_string());
+    } else if template_seeded {
+        hook_args.push("template".to_string());
+    } else if parent_ids.len() > 1 {
+        hook_args.push("merge".to_string());
     }
+    Ok(hook_args)
+}
 
-    let hook_display = hook_path.display().to_string();
+async fn persist_and_run_commit_msg_hook(
+    message: &str,
+    output: &OutputConfig,
+    run_hook: bool,
+) -> Result<String, CommitError> {
+    let message_path = commit_message_path()?;
+    write_commit_message_file(&message_path, message)?;
+    if !run_hook {
+        return Ok(message.to_string());
+    }
+    let hook_args = vec![
+        message_path
+            .to_str()
+            .ok_or_else(|| CommitError::RepositoryHook {
+                hook: RepoHook::CommitMsg.as_str(),
+                detail: format!(
+                    "commit message path '{}' is not valid UTF-8",
+                    message_path.display()
+                ),
+            })?
+            .to_string(),
+    ];
+    run_checked_repo_hook(
+        RepoHook::CommitMsg,
+        &hook_args,
+        None,
+        Some(&message_path),
+        output,
+    )
+    .await?;
+    let message = read_commit_message_file(&message_path)?;
+    if message.trim().is_empty() {
+        return Err(CommitError::EmptyMessage);
+    }
+    Ok(message)
+}
 
-    // In JSON/machine mode, capture hook output to prevent stdout/stderr pollution.
-    // In human mode, inherit so the user sees hook output directly.
-    let (stdout_cfg, stderr_cfg) = if output.is_json() {
-        (Stdio::piped(), Stdio::piped())
-    } else {
-        (Stdio::inherit(), Stdio::inherit())
+async fn run_checked_repo_hook(
+    hook: RepoHook,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    writable_message_file: Option<&std::path::Path>,
+    output: &OutputConfig,
+) -> Result<(), CommitError> {
+    let Some(hook_output) = run_repo_hook_with_io(hook, args, stdin, writable_message_file)
+        .await
+        .map_err(|error| CommitError::RepositoryHook {
+            hook: hook.as_str(),
+            detail: error.to_string(),
+        })?
+    else {
+        return Ok(());
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let hook_output = Command::new("sh")
-        .arg(&hook_path)
-        .current_dir(util::working_dir())
-        .stdout(stdout_cfg)
-        .stderr(stderr_cfg)
-        .output()
-        .map_err(|e| {
-            CommitError::PreCommitHook(format!("failed to execute hook {hook_display}: {e}"))
-        })?;
-
-    #[cfg(target_os = "windows")]
-    let hook_output = Command::new("powershell")
-        .arg("-File")
-        .arg(&hook_path)
-        .current_dir(util::working_dir())
-        .stdout(stdout_cfg)
-        .stderr(stderr_cfg)
-        .output()
-        .map_err(|e| {
-            CommitError::PreCommitHook(format!("failed to execute hook {hook_display}: {e}"))
-        })?;
-
-    if !hook_output.status.success() {
-        return Err(CommitError::PreCommitHook(format!(
-            "hook {hook_display} failed with exit code {}",
-            hook_output.status.code().unwrap_or(-1)
-        )));
+    replay_repo_hook_output(&hook_output, output).map_err(|detail| {
+        CommitError::RepositoryHook {
+            hook: hook.as_str(),
+            detail,
+        }
+    })?;
+    if hook_output.timed_out {
+        return Err(CommitError::RepositoryHook {
+            hook: hook.as_str(),
+            detail: format!(
+                "hook '{}' exceeded the 15 minute timeout",
+                hook_output.path.display()
+            ),
+        });
+    }
+    if hook_output.exit_code != 0 {
+        return Err(CommitError::RepositoryHook {
+            hook: hook.as_str(),
+            detail: format!(
+                "hook '{}' failed with exit code {}",
+                hook_output.path.display(),
+                hook_output.exit_code
+            ),
+        });
     }
     Ok(())
+}
+
+/// Run the pre-commit hook through the required repository-hook sandbox.
+async fn run_pre_commit_hook(output: &OutputConfig) -> Result<(), CommitError> {
+    run_checked_repo_hook(RepoHook::PreCommit, &[], None, None, output).await
 }
 
 /// Save a commit object to storage.

@@ -13,7 +13,7 @@ fn status_template_errors_precede_hook_editor_and_history_and_no_status_bypasses
     fixture.success(&repo, &["add", "next.txt"]);
     fixture.success(&repo, &["config", "status.showUntrackedFiles", "invalid"]);
 
-    let hook_sentinel = fixture.path("hook-ran");
+    let hook_sentinel = repo.join(".hook-ran");
     let hook = repo.join(".libra").join("hooks").join("pre-commit.sh");
     fs::write(
         &hook,
@@ -92,7 +92,7 @@ fn stash_status_read_failure_precedes_hook_editor_and_ref_write() {
     fs::write(libra_dir.join("logs/refs/stash"), "corrupt stash log\n")
         .expect("seed corrupt stash log");
 
-    let hook_sentinel = fixture.path("stash-hook-ran");
+    let hook_sentinel = repo.join(".stash-hook-ran");
     let hook = libra_dir.join("hooks/pre-commit.sh");
     fs::write(
         &hook,

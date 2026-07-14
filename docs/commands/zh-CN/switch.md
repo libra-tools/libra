@@ -24,6 +24,10 @@ libra switch [--guess | --no-guess] <branch>
 
 当找不到分支时，会通过 Levenshtein 距离提供模糊分支名建议，帮助捕获拼写错误，而无需精确匹配。
 
+真正改变状态的 switch 完成后，advisory `.libra/hooks/post-checkout` 会收到旧 OID、
+新 OID 和 branch flag `1`；already-on no-op 不运行。只有显式绕过策略时才设置
+`LIBRA_NO_HOOKS=1`。sandbox 与输出行为见[仓库 hooks](repository-hooks.md)。
+
 ## 选项
 
 | 标志 | 长选项 | 值 | 说明 |

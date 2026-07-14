@@ -37,6 +37,9 @@ use crate::{
         head::Head,
         merge_base,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        repo_hooks::{
+            RepoHook, replay_repo_hook_output, run_advisory_repo_hook, run_repo_hook_with_io,
+        },
         tree_plumbing,
     },
     utils::{
@@ -179,6 +182,11 @@ pub struct MergeArgs {
     #[arg(long = "no-commit", conflicts_with_all = ["squash", "continue_merge", "abort"])]
     pub no_commit: bool,
 
+    /// Skip every `.libra/hooks` lifecycle hook for this merge. With
+    /// `--continue`, this bypasses the pending commit/message/post hooks.
+    #[arg(long = "no-verify", conflicts_with_all = ["abort", "restart"])]
+    pub no_verify: bool,
+
     /// Automatically stash local changes before the merge and re-apply them
     /// when it concludes (also on failure to start). On a merge conflict the
     /// stash is HELD (not in `stash list`) and re-applied by `--continue` or
@@ -305,6 +313,9 @@ pub(crate) struct PullMergeOptions {
     /// fast-forward) but stop before committing, recording a MergeState so
     /// `libra merge --continue` can finalize the two-parent commit.
     pub no_commit: bool,
+    /// Suppress repository hooks for this merge. Persisted into merge state so
+    /// a conflict/no-commit continuation keeps the original trust decision.
+    pub skip_hooks: bool,
     /// `libra merge --verify-signatures`: verify the resolved tip commit's PGP
     /// signature before mutating any state and abort if it is unsigned or invalid.
     /// Checked on the SAME loaded commit that is merged (no re-resolution), so the
@@ -350,6 +361,9 @@ pub(crate) struct MergeState {
     /// does not turn into an unrelated-history rejection after restoration.
     #[serde(default)]
     pub allow_unrelated_histories: bool,
+    /// Whether the starting invocation used `--no-verify`.
+    #[serde(default)]
+    pub skip_hooks: bool,
     pub conflicted_paths: Vec<String>,
     /// Merge message resolved at merge start (`-m` override or the generated
     /// default including the `merge.log` shortlog), replayed verbatim by
@@ -531,6 +545,12 @@ pub(crate) enum PullMergeError {
     BadMergeSignature { commit: String },
     #[error("failed to verify the signature of the merged commit: {0}")]
     SignatureCheck(String),
+    #[error("{hook} hook failed: {detail}")]
+    RepositoryHook { hook: &'static str, detail: String },
+    #[error("failed to write merge commit message file '{path}': {detail}")]
+    MessageFileWrite { path: String, detail: String },
+    #[error("failed to read merge commit message file '{path}': {detail}")]
+    MessageFileRead { path: String, detail: String },
     #[error(transparent)]
     HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
 }
@@ -566,6 +586,13 @@ impl From<PullMergeError> for CliError {
                     "ensure the repository vault is initialized and unsealed for signature verification",
                 )
                 .with_hint("re-run without --verify-signatures to merge without verification"),
+            PullMergeError::RepositoryHook { .. } => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("use --no-verify to bypass repository hooks"),
+            PullMergeError::MessageFileWrite { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::IoWriteFailed),
+            PullMergeError::MessageFileRead { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::IoReadFailed),
             PullMergeError::NonFastForward { .. } => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
@@ -744,6 +771,7 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                 message: args.message.clone(),
                 squash: args.squash,
                 no_commit: args.no_commit,
+                skip_hooks: args.no_verify,
                 // `--verify-signatures` is enforced inside the merge on the loaded
                 // tip commit, so the verified object is exactly the merged object.
                 verify_signatures,
@@ -760,11 +788,123 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
             };
             run_merge_for_pull_with_options(branch, branch, output, options).await
         }
-        (None, true, false) => run_merge_continue(output).await,
+        (None, true, false) => run_merge_continue(output, args.no_verify).await,
         (None, false, true) => run_merge_abort(output).await,
         (None, false, false) => Err(MergeError::MissingAction),
         _ => Err(MergeError::ConflictingAction),
     }
+}
+
+async fn run_pre_merge_commit_hook(output: &OutputConfig) -> Result<(), PullMergeError> {
+    run_blocking_merge_hook(RepoHook::PreMergeCommit, &[], None, output).await
+}
+
+async fn run_blocking_merge_hook(
+    hook: RepoHook,
+    args: &[String],
+    writable_message_file: Option<&Path>,
+    output: &OutputConfig,
+) -> Result<(), PullMergeError> {
+    let Some(hook_output) = run_repo_hook_with_io(hook, args, None, writable_message_file)
+        .await
+        .map_err(|error| PullMergeError::RepositoryHook {
+            hook: hook.as_str(),
+            detail: error.to_string(),
+        })?
+    else {
+        return Ok(());
+    };
+    replay_repo_hook_output(&hook_output, output).map_err(|detail| {
+        PullMergeError::RepositoryHook {
+            hook: hook.as_str(),
+            detail,
+        }
+    })?;
+    if hook_output.timed_out {
+        return Err(PullMergeError::RepositoryHook {
+            hook: hook.as_str(),
+            detail: format!(
+                "hook '{}' exceeded the 15 minute timeout",
+                hook_output.path.display()
+            ),
+        });
+    }
+    if hook_output.exit_code != 0 {
+        return Err(PullMergeError::RepositoryHook {
+            hook: hook.as_str(),
+            detail: format!(
+                "hook '{}' failed with exit code {}",
+                hook_output.path.display(),
+                hook_output.exit_code
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn merge_message_path() -> Result<PathBuf, PullMergeError> {
+    util::try_get_worktree_gitdir(None)
+        .map(|gitdir| gitdir.join("COMMIT_EDITMSG"))
+        .map_err(|error| PullMergeError::MessageFileWrite {
+            path: ".libra/COMMIT_EDITMSG".to_string(),
+            detail: format!("failed to locate the current worktree metadata directory: {error}"),
+        })
+}
+
+fn write_merge_message(path: &Path, message: &str) -> Result<(), PullMergeError> {
+    crate::utils::atomic_write::write_atomic(path, message.as_bytes(), false).map_err(|error| {
+        PullMergeError::MessageFileWrite {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        }
+    })
+}
+
+fn read_merge_message(path: &Path) -> Result<String, PullMergeError> {
+    fs::read_to_string(path).map_err(|error| PullMergeError::MessageFileRead {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })
+}
+
+async fn run_merge_message_hooks(
+    message: &str,
+    output: &OutputConfig,
+) -> Result<String, PullMergeError> {
+    let message_path = merge_message_path()?;
+    write_merge_message(&message_path, message)?;
+    let message_path_arg = message_path
+        .to_str()
+        .ok_or_else(|| PullMergeError::RepositoryHook {
+            hook: RepoHook::PrepareCommitMsg.as_str(),
+            detail: format!(
+                "merge commit message path '{}' is not valid UTF-8",
+                message_path.display()
+            ),
+        })?
+        .to_string();
+    run_blocking_merge_hook(
+        RepoHook::PrepareCommitMsg,
+        &[message_path_arg.clone(), "merge".to_string()],
+        Some(&message_path),
+        output,
+    )
+    .await?;
+    run_blocking_merge_hook(
+        RepoHook::CommitMsg,
+        &[message_path_arg],
+        Some(&message_path),
+        output,
+    )
+    .await?;
+    let message = read_merge_message(&message_path)?;
+    if message.trim().is_empty() {
+        return Err(PullMergeError::RepositoryHook {
+            hook: RepoHook::CommitMsg.as_str(),
+            detail: "hook left the merge commit message empty".to_string(),
+        });
+    }
+    Ok(message)
 }
 
 /// Verify `commit`'s PGP signature for a `--verify-signatures` merge, returning
@@ -961,6 +1101,7 @@ pub(crate) async fn run_merge_for_pull_with_options(
     output: &OutputConfig,
     options: PullMergeOptions,
 ) -> Result<PullMergeSummary, PullMergeError> {
+    let skip_hooks = options.skip_hooks;
     if MergeState::load_optional_sync()
         .map_err(PullMergeError::StateLoad)?
         .is_some()
@@ -1053,10 +1194,27 @@ pub(crate) async fn run_merge_for_pull_with_options(
     match result {
         Ok(mut summary) => {
             summary.autostash = autostash_outcome;
+            if !skip_hooks && merge_completed_for_post_hook(&summary) {
+                let squash = if summary.strategy == "squash" {
+                    "1"
+                } else {
+                    "0"
+                };
+                run_advisory_repo_hook(RepoHook::PostMerge, &[squash.to_string()], None, output)
+                    .await;
+            }
             Ok(summary)
         }
         Err(error) => Err(error),
     }
+}
+
+fn merge_completed_for_post_hook(summary: &PullMergeSummary) -> bool {
+    !summary.dry_run
+        && !summary.aborted
+        && !summary.up_to_date
+        && summary.conflicted_paths.is_empty()
+        && (summary.commit.is_some() || summary.strategy == "squash")
 }
 
 async fn run_merge_for_pull_inner(
@@ -1170,6 +1328,7 @@ async fn run_merge_for_pull_inner(
         merge_log: options.merge_log,
         squash: options.squash,
         no_commit: options.no_commit,
+        skip_hooks: options.skip_hooks,
         dry_run: options.dry_run,
         favor: options.favor,
         allow_unrelated_histories: options.allow_unrelated_histories,
@@ -1208,6 +1367,7 @@ struct ThreeWayMergeOptions<'a> {
     merge_log: usize,
     squash: bool,
     no_commit: bool,
+    skip_hooks: bool,
     /// Preview only: compute the outcome, write nothing (lore.md §1.3).
     dry_run: bool,
     /// Resolve otherwise-conflicting paths in favor of one side.
@@ -1310,6 +1470,7 @@ async fn perform_ours_merge(
             base: None,
             strategy: Some(MergeStrategy::Ours),
             allow_unrelated_histories: options.allow_unrelated_histories,
+            skip_hooks: options.skip_hooks,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message),
         }
@@ -1330,15 +1491,31 @@ async fn perform_ours_merge(
         });
     }
 
+    let message = if !options.skip_hooks {
+        run_pre_merge_commit_hook(options.output).await?;
+        switch::ensure_clean_status(options.output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+        let message = run_merge_message_hooks(&resolved_message, options.output).await?;
+        switch::ensure_clean_status(options.output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+        message
+    } else {
+        resolved_message
+    };
     let merge_commit = Commit::from_tree_id(
         current_commit.tree_id,
         vec![current_commit.id, target_commit.id],
-        &format_commit_msg(&resolved_message, None),
+        &format_commit_msg(&message, None),
     );
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
     update_head_with_reflog(&head_name, merge_commit.id, upstream, "ours").await?;
     reset_index_and_workdir_to_tree(&current_commit.tree_id)?;
+    if !options.skip_hooks {
+        run_advisory_repo_hook(RepoHook::PostCommit, &[], None, options.output).await;
+    }
 
     Ok(PullMergeSummary {
         strategy: "ours".to_string(),
@@ -1444,6 +1621,7 @@ async fn perform_three_way_merge(
             upstream: upstream.to_string(),
             base: base_commit.as_ref().map(|base| base.id),
             allow_unrelated_histories: options.allow_unrelated_histories,
+            skip_hooks: options.skip_hooks,
             ours: current_commit.id,
             theirs: target_commit.id,
             merged_items: merge_result.merged_items,
@@ -1508,6 +1686,7 @@ async fn perform_three_way_merge(
             base: base_commit.as_ref().map(|base| base.id.to_string()),
             strategy: None,
             allow_unrelated_histories: options.allow_unrelated_histories,
+            skip_hooks: options.skip_hooks,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
         }
@@ -1528,7 +1707,25 @@ async fn perform_three_way_merge(
         });
     }
 
-    let message = resolved_message;
+    let message = if !options.skip_hooks {
+        run_pre_merge_commit_hook(options.output).await?;
+        switch::ensure_clean_status(options.output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+        // The hook may create an untracked path after the merge result was
+        // computed. Recheck before saving the commit or moving HEAD; relying
+        // on the reset-time guard would detect the collision too late and
+        // leave a partially completed merge.
+        ensure_no_untracked_conflicts(&current_index, &paths_to_write)?;
+        let message = run_merge_message_hooks(&resolved_message, options.output).await?;
+        switch::ensure_clean_status(options.output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+        ensure_no_untracked_conflicts(&current_index, &paths_to_write)?;
+        message
+    } else {
+        resolved_message
+    };
     let merge_commit = Commit::from_tree_id(
         tree_id,
         vec![current_commit.id, target_commit.id],
@@ -1538,6 +1735,9 @@ async fn perform_three_way_merge(
         .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
     update_head_with_reflog(&head_name, merge_commit.id, upstream, "three-way").await?;
     reset_index_and_workdir_to_tree(&tree_id)?;
+    if !options.skip_hooks {
+        run_advisory_repo_hook(RepoHook::PostCommit, &[], None, options.output).await;
+    }
 
     Ok(PullMergeSummary {
         strategy: "three-way".to_string(),
@@ -1600,6 +1800,7 @@ struct MergeConflictInput {
     /// unrelated-history merge.
     base: Option<ObjectHash>,
     allow_unrelated_histories: bool,
+    skip_hooks: bool,
     ours: ObjectHash,
     theirs: ObjectHash,
     merged_items: HashMap<PathBuf, MergeTreeEntry>,
@@ -1657,6 +1858,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         base: input.base.map(|base| base.to_string()),
         strategy: None,
         allow_unrelated_histories: input.allow_unrelated_histories,
+        skip_hooks: input.skip_hooks,
         conflicted_paths: conflict_paths
             .iter()
             .map(|path| path.display().to_string())
@@ -1715,9 +1917,13 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     Ok(())
 }
 
-async fn run_merge_continue(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
+async fn run_merge_continue(
+    output: &OutputConfig,
+    skip_hooks_for_continue: bool,
+) -> Result<MergeOutput, MergeError> {
     let state = MergeState::load_required()?;
     ensure_no_unstaged_changes_for_continue()?;
+    let skip_hooks = state.skip_hooks || skip_hooks_for_continue;
     let index =
         Index::load(path::index()).map_err(|error| MergeError::IndexLoad(error.to_string()))?;
     if has_unmerged_entries(&index) {
@@ -1750,6 +1956,15 @@ async fn run_merge_continue(output: &OutputConfig) -> Result<MergeOutput, MergeE
         .message
         .clone()
         .unwrap_or_else(|| format!("Merge {} into {}", state.target_ref, state.head_name));
+    let message = if !skip_hooks {
+        run_pre_merge_commit_hook(output).await?;
+        ensure_no_unstaged_changes_for_continue()?;
+        let message = run_merge_message_hooks(&message, output).await?;
+        ensure_no_unstaged_changes_for_continue()?;
+        message
+    } else {
+        message
+    };
     let merge_commit = Commit::from_tree_id(
         tree_id,
         vec![orig_head, target],
@@ -1773,8 +1988,11 @@ async fn run_merge_continue(output: &OutputConfig) -> Result<MergeOutput, MergeE
     // Merge concluded: re-apply the held autostash onto the finalized tree
     // (clean → dropped; conflict → promoted to the stash list with a notice).
     let autostash = resolve_pending_autostash(output).await;
+    if !skip_hooks {
+        run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
+    }
 
-    Ok(PullMergeSummary {
+    let summary = PullMergeSummary {
         strategy: strategy.to_string(),
         old_commit: Some(orig_head.to_string()),
         commit: Some(merge_commit.id.to_string()),
@@ -1787,7 +2005,11 @@ async fn run_merge_continue(output: &OutputConfig) -> Result<MergeOutput, MergeE
         dry_run: false,
         would_conflict: false,
         autostash,
-    })
+    };
+    if !skip_hooks {
+        run_advisory_repo_hook(RepoHook::PostMerge, &["0".to_string()], None, output).await;
+    }
+    Ok(summary)
 }
 
 fn ensure_no_unstaged_changes_for_continue() -> Result<(), PullMergeError> {
@@ -1851,6 +2073,7 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
         autostash: Some(false),
         preserve_held_autostash: true,
         allow_unrelated_histories: state.allow_unrelated_histories,
+        skip_hooks: state.skip_hooks,
         ..PullMergeOptions::default()
     };
     run_merge_for_pull_with_options(&target, &target_ref, output, options).await

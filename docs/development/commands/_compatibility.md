@@ -114,8 +114,23 @@ unsupported 子面。
 
 ### D3：Git hooks bridge 作为核心特性
 
-- 状态：延后/拒绝作为核心默认能力。Libra 使用 `.libra/hooks` 和 AI provider hook 体系，不读取 `.git/hooks` 或 `core.hooksPath` 作为默认核心行为。
-- 重启条件：Agent hook 体系完成统一收口后，再评估 stock Git hooks bridge 的安全边界。
+- 状态：stock Git bridge 延后/拒绝作为核心默认能力。Libra 不读取 `.git/hooks`
+  或 `core.hooksPath`；P1-10 选择 Option A，在 `.libra/hooks` 支持
+  `pre-commit`、`prepare-commit-msg`、`commit-msg`、`post-commit`、
+  `post-checkout`、`pre-rebase`、`pre-merge-commit`、`post-merge` 和
+  `post-rewrite`。无扩展名 canonical 文件优先于 Unix `.sh` / Windows `.ps1`；
+  symlink、非普通文件和 Unix 非可执行文件均 fail-closed，不会回落低优先级候选。
+  hook 从私有副本经强制 workspace-only、禁网 sandbox 运行；`.git`、`.libra`、
+  `.codex`、`.agents` 受保护，仅消息 hook 可写 `.libra/COMMIT_EDITMSG`；调用方
+  环境先清空，只透传显式 process/locale allowlist 与 Libra hook/temp 变量。
+  自动 merge commit 运行 message/post-commit hooks，pull 复用所选 merge/rebase
+  lifecycle。blocking hook 在历史变更前中止，post hook 为 advisory；人类模式
+  重放输出，quiet/JSON/machine 保持静默。逃逸阀为 `commit --no-verify`、
+  `merge --no-verify` 与 `LIBRA_NO_HOOKS=1`。Windows 自定义 hook 在 restricted-token
+  backend 落地前 fail-closed，内置原样空操作模板会跳过。用户契约见
+  [`repository-hooks.md`](../../commands/repository-hooks.md)。
+- 重启条件：出现必须与 stock Git 在同一工作树共享 hook policy 的生产场景，
+  且完成 opt-in `hooks.gitCompatibility=true` 的信任边界、路径竞态与 sandbox RFC。
 
 ### D4：`clone --recurse-submodules`
 

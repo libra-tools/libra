@@ -5,7 +5,7 @@
 ## 概要
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
+libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
 libra merge --continue
 libra merge --abort
 libra merge --restart
@@ -57,6 +57,7 @@ Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`the
 | `--no-log` | 禁用 merge 消息 shortlog，覆盖 `merge.log` 和更早的 `--log`。 |
 | `--squash` | 生成合并后的索引/工作树但不创建提交、不移动 HEAD；随后用普通 `libra commit` 收尾。 |
 | `--no-commit` | 执行合并并暂存结果但停在提交之前；随后用 `libra merge --continue` 收尾。 |
+| `--no-verify` | 本次 merge 跳过全部 `.libra/hooks`；与 `--continue` 一起使用时绕过待执行的 commit/消息/post hooks。 |
 | `--no-edit` | 接受自动生成的合并消息而不启动编辑器。Libra 从不为 merge 打开编辑器，故此为对齐 Git 而接受的 no-op。 |
 | `--stat` | 合并完成后显示 diffstat（合并前 HEAD 与新提交之间的变更）。Git 默认显示；Libra 默认不显示，故用 `--stat` 主动开启。与 `--no-stat`/`-n` 构成 last-wins 切换。仅人类输出。 |
 | `-n`, `--no-stat` | 合并结束时不显示 diffstat（Libra 默认）。与 `--stat` 构成 last-wins 切换。 |
@@ -73,6 +74,18 @@ Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`the
 | `--json` | 输出结构化成功信封。 |
 | `--machine` | 以一行紧凑 JSON 输出同一结构化信封。 |
 | `--quiet` | 抑制人类可读的成功输出。 |
+
+## 仓库 hooks
+
+`pre-merge-commit` 会阻止自动 merge commit（含 `--continue`），但不在 fast-forward、
+squash 或尚未继续的 `--no-commit` 结果上运行。自动 merge commit 随后运行
+`prepare-commit-msg <file> merge`、`commit-msg <file>` 和 advisory `post-commit`；
+消息 hooks 可修改 `.libra/COMMIT_EDITMSG`。merge/fast-forward 完成后
+`post-merge` 以参数 `0` advisory 运行，squash 后参数为 `1`；already-up-to-date
+和冲突结果不运行。`--no-verify` 跳过该 merge 生命周期的全部 hooks。pull 共用同一
+merge 生命周期；需要
+显式绕过时设置 `LIBRA_NO_HOOKS=1`。sandbox 与失败契约见
+[仓库 hooks](repository-hooks.md)。
 
 ## 常用命令
 
@@ -176,6 +189,7 @@ Merge aborted.
 | 强制合并提交 | `--no-ff` | `--no-ff` | N/A |
 | Squash | `--squash` | `--squash` | N/A |
 | 不提交 | `--no-commit` | `--no-commit` | N/A |
+| 跳过全部 merge lifecycle hooks | `--no-verify` | `--no-verify` | N/A |
 | 提交消息 | `-m <msg>` | `-m <msg>` | N/A |
 | 不编辑 | `--no-edit`（no-op；从不编辑） | `--no-edit` | N/A |
 | 合并后 diffstat | `--stat`（打印）；`-n` / `--no-stat`（默认：不打印） | `--stat`（默认） / `-n` / `--no-stat` | N/A |

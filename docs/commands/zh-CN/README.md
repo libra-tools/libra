@@ -8,6 +8,9 @@
 `config-aware`、`plumbing-compatible`）细分 P0/P1 命令表面的兼容等级。脚本依赖
 porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表面时，应以该子面表为准。
 
+仓库级 VCS hook 另见[仓库 hooks](repository-hooks.md)；隐藏的 `libra hooks`
+命令是无关的 AI-agent 事件摄入表面。
+
 ## 全局标志
 
 每个 Libra 命令都接受以下全局标志：
