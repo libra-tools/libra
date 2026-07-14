@@ -8,19 +8,21 @@
 
 **版本化整个软件创造生命周期，而非仅仅是代码。**
 
+</div>
+
 Libra 是一个 AI 原生基础设施，捕获并结构化软件开发的完整生命周期，记录从人类意图、AI 推理到验证和发布的每一个步骤。
 
 我们的使命是确保每一次软件创造都成为持久的知识，而非被丢弃的工作流数据，赋能开发者、团队和 AI 系统去检索、复用并基于每一份软件背后的智能进行构建。
 
 当 AI 成为软件的主要生产者时，Libra 提供基础架构来保存、累积并释放软件创造的长期价值。
 
-</div>
-
+<p align="center">
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/wingwangsz/libra/actions/workflows/base.yml/badge.svg)](https://github.com/wingwangsz/libra/actions/workflows/base.yml)
 [![Discord](https://img.shields.io/badge/Discord-加入社区-%235865F2?logo=discord&logoColor=white)](https://t.co/425ibAmBb8)
 [![X](https://img.shields.io/badge/X-%40git_mono_AI-%231DA1F2?logo=x&logoColor=white)](https://x.com/git_mono_AI)
 [![文档](https://img.shields.io/badge/文档-docs.libra.tools-29B1FF)](https://docs.libra.tools)
+</p>
 
 ---
 
@@ -78,7 +80,7 @@ libra code --web
 libra code --stdio
 ```
 
-> 查看[完整文档](https://docs.libra.tools)获取高级配置和使用指南。
+> 查看[完整文档](https://docs.libra.tools/en/docs/getting-started)获取高级配置和使用指南。
 
 ---
 
@@ -218,6 +220,6 @@ Copyright (c) 2025-2026 Web3 Infrastructure Foundation.
 
 <div align="center">
 
-**[开始使用](https://docs.libra.tools) · [加入 Discord](https://t.co/425ibAmBb8) · [关注 X](https://x.com/git_mono_AI)**
+**[开始使用](https://docs.libra.tools/en/docs/getting-started) · [加入 Discord](https://t.co/425ibAmBb8) · [关注 X](https://x.com/git_mono_AI)**
 
 </div>

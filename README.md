@@ -8,19 +8,21 @@
 
 **Versioning the entire software creation lifecycle, not just code.**
 
+</div>
+
 Libra is an AI-native infrastructure that captures and structures the full lifecycle of software development, documenting every step from human intent and AI reasoning to validation and release.
 
 Our mission is to ensure that every software creation becomes lasting knowledge instead of discarded workflow data, empowering developers, teams, and AI systems to retrieve, reuse, and build upon the intelligence behind every piece of software.
 
 As AI becomes the primary producer of software, Libra provides the foundational infrastructure that preserves, compounds, and unlocks the long-term value of software creation.
 
-</div>
-
+<p align="center">
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/wingwangsz/libra/actions/workflows/base.yml/badge.svg)](https://github.com/wingwangsz/libra/actions/workflows/base.yml)
 [![Discord](https://img.shields.io/badge/Discord-join-%235865F2?logo=discord&logoColor=white)](https://t.co/425ibAmBb8)
 [![X](https://img.shields.io/badge/X-%40git_mono_AI-%231DA1F2?logo=x&logoColor=white)](https://x.com/git_mono_AI)
 [![Docs](https://img.shields.io/badge/docs-docs.libra.tools-29B1FF)](https://docs.libra.tools)
+</p>
 
 ---
 
@@ -78,7 +80,7 @@ libra code --web
 libra code --stdio
 ```
 
-> See the [full documentation](https://docs.libra.tools) for advanced setup, configuration, and usage guides.
+> See the [full documentation](https://docs.libra.tools/en/docs/getting-started) for advanced setup, configuration, and usage guides.
 
 ---
 
@@ -218,6 +220,6 @@ Copyright (c) 2025-2026 Web3 Infrastructure Foundation.
 
 <div align="center">
 
-**[Get Started](https://docs.libra.tools) · [Join Discord](https://t.co/425ibAmBb8) · [Follow on X](https://x.com/git_mono_AI)**
+**[Get Started](https://docs.libra.tools/en/docs/getting-started) · [Join Discord](https://t.co/425ibAmBb8) · [Follow on X](https://x.com/git_mono_AI)**
 
 </div>
