@@ -64,7 +64,7 @@ fn porcelain_v2_rename_line_emits_r100() {
 
     assert!(
         output.lines().any(|line| {
-            line.starts_with("2 R  ") && line.contains(" R100 ") && line.ends_with("b.txt\ta.txt")
+            line.starts_with("2 R. ") && line.contains(" R100 ") && line.ends_with("b.txt\ta.txt")
         }),
         "expected porcelain v2 R100 rename row, got:\n{output}"
     );
@@ -82,13 +82,23 @@ fn porcelain_v2_rename_partial_score() {
     let output = status_stdout(repo.path(), &["status", "--porcelain", "v2"]);
     let rename_line = output
         .lines()
-        .find(|line| line.starts_with("2 R  "))
+        .find(|line| line.starts_with("2 R. "))
         .expect("expected porcelain v2 rename row");
-    let score_field = rename_line
-        .split_whitespace()
-        .find(|field| field.starts_with('R') && field.len() > 1)
-        .expect("rename row should contain R score");
-    let score: u32 = score_field[1..].parse().expect("score should be numeric");
+    // Porcelain v2 fixed positions: xy at [1] is "R." and must not be mistaken
+    // for the similarity field at [8] ("R75").
+    let fields: Vec<&str> = rename_line.split_whitespace().collect();
+    assert!(
+        fields.len() >= 9,
+        "expected ≥9 whitespace fields on v2 rename row, got {}: {rename_line}",
+        fields.len()
+    );
+    let score_field = fields[8];
+    let score: u32 = score_field
+        .strip_prefix('R')
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .expect("fields[8] should be R<digits>")
+        .parse()
+        .expect("score should be numeric");
 
     assert!(
         (50..100).contains(&score),
@@ -196,7 +206,7 @@ fn json_includes_renames_array() {
 
 #[test]
 #[serial]
-fn rename_skipped_for_large_file() {
+fn rename_large_file_staged_exact_r100() {
     let content = format!("{}\n", "x".repeat(2 * 1024 * 1024 + 1));
     let repo = create_repo_with_committed_file("a.txt", &content);
     fs::rename(repo.path().join("a.txt"), repo.path().join("b.txt"))
@@ -206,16 +216,42 @@ fn rename_skipped_for_large_file() {
     let output = status_stdout(repo.path(), &["status", "--porcelain", "v2"]);
 
     assert!(
+        output.lines().any(|line| {
+            line.starts_with("2 R. ") && line.contains(" R100 ") && line.ends_with("b.txt\ta.txt")
+        }),
+        "staged large-file rename with known OID must emit R100, got:\n{output}"
+    );
+}
+
+#[test]
+#[serial]
+fn rename_large_file_worktree_inexact_skips() {
+    let content = format!("{}\n", "x".repeat(2 * 1024 * 1024 + 1));
+    let repo = create_repo_with_committed_file("a.txt", &content);
+    fs::remove_file(repo.path().join("a.txt")).expect("failed to remove source fixture");
+    // Dest is untracked and content differs so Exact OID cannot pair; >2MiB
+    // forces worktree/inexact skip. Must enable renameUntracked so probe runs.
+    let mut altered = content.into_bytes();
+    if let Some(last) = altered.last_mut() {
+        *last = b'y';
+    }
+    fs::write(repo.path().join("b.txt"), altered).expect("failed to write large dest");
+    let cfg = run_libra_command(&["config", "set", "status.renameUntracked", "true"], repo.path());
+    assert_cli_success(&cfg, "enable renameUntracked");
+
+    let output = status_stdout(repo.path(), &["status", "--porcelain", "v2", "--renames"]);
+
+    assert!(
         !output.lines().any(|line| line.starts_with("2 ")),
-        "large rename should be left as add/delete, got:\n{output}"
+        "worktree/inexact large rename should not emit 2-line, got:\n{output}"
     );
     assert!(
-        output.lines().any(|line| line.starts_with("1 A ")),
-        "large rename should retain added row:\n{output}"
+        output.lines().any(|line| line.starts_with("1 .D")),
+        "deleted source should remain .D when rename fails, got:\n{output}"
     );
     assert!(
-        output.lines().any(|line| line.starts_with("1 D ")),
-        "large rename should retain deleted row:\n{output}"
+        output.lines().any(|line| line == "? b.txt"),
+        "untracked dest must stay ?, not staged A, got:\n{output}"
     );
 }
 
