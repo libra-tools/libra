@@ -19,7 +19,10 @@ use std::{
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 
-use super::{loose_object_path, parse_cli_error_stderr, parse_json_stdout};
+use super::{
+    loose_object_path, parse_cli_error_stderr, parse_json_stdout,
+    run_libra_command_with_stdin_and_env,
+};
 
 /// Spawn `libra init` in a fresh tempdir and return the `TempDir` (kept
 /// alive by the caller for RAII cleanup).
@@ -203,6 +206,49 @@ async fn test_cat_file_batch_check_reports_type_size_and_missing() {
         lines[0]
     );
     assert_eq!(lines[1], "not-a-real-ref missing");
+}
+
+/// A corrupt object is a repository failure, not an ordinary batch "missing"
+/// response. This keeps automation from silently treating damaged storage as an
+/// absent user-supplied name.
+#[tokio::test]
+async fn test_cat_file_batch_check_surfaces_corrupt_object() {
+    let temp_dir = init_temp_repo();
+    let temp_path = temp_dir.path();
+
+    configure_user_identity(temp_path);
+    create_commit(temp_path, "hello.txt", "hello world\n", "first commit");
+
+    let head = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .current_dir(temp_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("Failed to resolve HEAD");
+    assert!(head.status.success());
+    let head_hash = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    std::fs::write(
+        loose_object_path(temp_path, &head_hash),
+        b"not a zlib object",
+    )
+    .expect("Failed to corrupt HEAD object");
+
+    let output = run_libra_command_with_stdin_and_env(
+        &["cat-file", "--batch-check"],
+        temp_path,
+        &format!("{head_hash}\n"),
+        &[("LIBRA_ERROR_JSON", "1")],
+    );
+
+    assert!(
+        !output.status.success(),
+        "corrupt object must fail batch mode"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("missing"),
+        "corrupt storage must not be reported as a missing object"
+    );
+    let (_, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-002");
 }
 
 /// Scenario: `cat-file --batch` prints the `<sha> <type> <size>` header AND the

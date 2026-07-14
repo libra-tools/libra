@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.76"
+version = "0.18.80"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -396,6 +396,14 @@ path = "tests/compat/noninteractive_history_controls_test.rs"
 [[test]]
 name = "compat_diff_review_options"
 path = "tests/compat/diff_review_options_test.rs"
+
+[[test]]
+name = "compat_rev_parse_peel_selectors"
+path = "tests/compat/rev_parse_peel_selectors_test.rs"
+
+[[test]]
+name = "compat_libra_hooks_lifecycle"
+path = "tests/compat/libra_hooks_lifecycle_test.rs"
 
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).

@@ -47,7 +47,7 @@
 # from source. So declaring a category is a promise that check-plan verifies.
 
 version: 1
-last_updated: "2026-06"   # keep in sync with major doc edits
+last_updated: "2026-07"   # keep in sync with major doc edits
 notes: |
   Default Waves 0/1/2 are deterministic, no secrets, local only.
   Wave 3 requires `gh` auth + create/delete private repo permission.
@@ -203,7 +203,7 @@ scenarios:
   - id: cli.commit-status-log
     wave: 1
     group: core
-    purpose: "Core status/add/commit/log closed loop with message sources, dry-run/amend/conventional commits, status --exit-code, porcelain v2 rename/typechange visibility, explicit --untracked-files/--branch behavior, status -z NUL output, JSON status/log envelopes, and log --follow coverage."
+    purpose: "Core status/add/commit/log closed loop with message sources, dry-run/amend/conventional commits, status --exit-code, porcelain v2 rename/typechange visibility, explicit --untracked-files/--branch behavior, status -z NUL output, JSON status/log envelopes, and log --follow coverage. Required-sandbox repository hook lifecycle, caller-env isolation, and post-hook order are delegated to compat_libra_hooks_lifecycle."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, global_db_isolation, lbr_error, negative_exit]
@@ -212,7 +212,7 @@ scenarios:
   - id: cli.branch-switch-checkout
     wave: 1
     group: branching
-    purpose: "Cover branch/switch/checkout creation, switching, switch -c, switch -C, switch --orphan, checkout -b, --detach, path checkout, rename, safe/forced delete, remote branch visibility, switch --guess/--no-guess DWIM remote-tracking, and negative checks for the unsupported switch -f flag."
+    purpose: "Cover branch/switch/checkout creation, switching, switch -c, switch -C, switch --orphan, checkout -b, --detach, path checkout, rename, safe/forced delete, remote branch visibility, switch --guess/--no-guess DWIM remote-tracking, and negative checks for the unsupported switch -f flag. Sandboxed post-checkout argv/show-current/already-on/bypass behavior is delegated to compat_libra_hooks_lifecycle."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, negative_exit]
@@ -248,7 +248,7 @@ scenarios:
   - id: cli.merge-rebase-cherry-revert-smoke
     wave: 1
     group: history_edit
-    purpose: "Smoke for merge, rebase, cherry-pick default messages, cherry-pick -x source recording, and single-commit revert; negative checks cover revert range, empty lifecycle actions, unsupported merge --find-renames/--squash, and missing merge targets. Criss-cross fixture currently asserts rebase JSON success."
+    purpose: "Smoke for merge, rebase, cherry-pick default messages, cherry-pick -x source recording, and single-commit revert; negative checks cover revert range, empty lifecycle actions, unsupported merge --find-renames/--squash, and missing merge targets. Criss-cross fixture currently asserts rebase JSON success. Required-sandbox merge message/post hooks, rebase hooks, and atomicity are delegated to compat_libra_hooks_lifecycle."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, negative_exit, lbr_error]
@@ -339,7 +339,7 @@ scenarios:
   - id: cli.clone-fetch-pull-local
     wave: 2
     group: protocol_local
-    purpose: "Local-path Git remote interop for current clone/remote/ls-remote/fetch/pull surfaces, including local clone content, remote get/set/show/prune basics, remote update remotes.default, remote rename tracking namespace migration, ls-remote heads/tags/refs/get-url/sort/exit-code and --symref (local Git remote via git-upload-pack advertises symref=HEAD → prints the ref line), explicit/configured fetch refspec mapping with atomic multi-ref rollback and FETCH_HEAD metadata, fetch --all/--depth, pull --ff-only/--rebase basics, and negative checks for unsupported remote/fetch/pull flags. Uses gitfix() for fixtures."
+    purpose: "Local-path Git remote interop for current clone/remote/ls-remote/fetch/pull surfaces, including local clone content, remote get/set/show/prune basics, remote update remotes.default, remote rename tracking namespace migration, ls-remote heads/tags/refs/get-url/sort/exit-code and --symref (local Git remote via git-upload-pack advertises symref=HEAD → prints the ref line), explicit/configured fetch refspec mapping with atomic multi-ref rollback and FETCH_HEAD metadata, fetch --all/--depth, pull --ff-only/--rebase basics, and negative checks for unsupported remote/fetch/pull flags. Pull --rebase hook/JSON isolation is delegated to command_test. Uses gitfix() for fixtures."
     gh_required: false
     requires_git: true
     key_assertion_categories: [json_envelope, fsck, gitfix_isolation]

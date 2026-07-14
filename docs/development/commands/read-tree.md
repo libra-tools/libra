@@ -7,7 +7,7 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：`read-tree <tree-ish>`（tree id / commit / ref / tag / `HEAD`，剥离到 tree），`--json`/`--machine`。
+- 已支持：`read-tree <tree-ish>`（tree id / commit / ref / tag / `HEAD`，以及 `^{tree}`/`^{commit}` 等共享 revision 语法，严格剥离到 tree），`--json`/`--machine`。
 - 未公开：`-m`（合并）、`-u`（更新工作树）、`--reset`、`--prefix`、多 tree 合并（延后）。因此首版**不可能**静默覆盖工作树文件——它只写 index。
 
 ## 设计方案
@@ -16,7 +16,7 @@
 - 源码分层：
   - `src/command/read_tree.rs`：`ReadTreeArgs { tree_ish }`、`execute`/`execute_safe`、`ReadTreeOutput`（`--json`：`tree` + `entries`）、`resolve_tree_ish`。
   - `src/internal/tree_plumbing.rs::read_tree_into_index(tree_id)`：递归展平 tree 的叶子为 stage-0 index 条目（mode 由 `tree_mode_to_index_mode` 还原；blob size 置 0，tree id 仅由 `(mode,id,name)` 决定故 round-trip 不受影响）。
-- 执行路径：`require_repo` → `resolve_tree_ish`（先试 `ObjectHash::from_str`：tree→直接用，commit→`tree_id`；否则 `util::get_commit_base` 解析 ref/tag/HEAD→commit→tree） → `read_tree_into_index` → `index.save(path::index())`。
+- 执行路径：`require_repo` → `resolve_tree_ish`（委托 `util::resolve_tree_ish_typed`，共享严格 revision/typed-peel/tag 解析并验证最终对象为 tree-ish） → `read_tree_into_index` → `index.save(path::index())`。
 - 安全：仅写 index，不动工作树，故无覆盖风险；无效 tree-ish → 128。
 - 底层操作对象：对象库（读 tree）、`.libra/index`（写）。无 refs/网络/工作树写入。
 - 输出与错误契约：默认静默（Git read-tree 风格），`--json` 给 `{tree, entries}`；仓库缺失 `repo_not_found()`，无效 tree-ish `CliInvalidTarget`+exit 128，缺参数为 clap 用法错误。

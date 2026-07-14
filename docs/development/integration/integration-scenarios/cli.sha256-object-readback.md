@@ -21,6 +21,12 @@ libra commit -m "test: sha256 commit"
 
 HEAD_ID="$(libra rev-parse HEAD)"
 test "${#HEAD_ID}" -eq 64          # sha256 对象 id 为 64 位 hex（sha1 为 40 位）
+TREE_ID="$(libra rev-parse 'HEAD^{tree}')"
+PAYLOAD_ID="$(libra rev-parse 'HEAD:payload.txt')"
+test "${#TREE_ID}" -eq 64
+test "${#PAYLOAD_ID}" -eq 64
+libra cat-file -t 'HEAD^{tree}'
+libra cat-file -p 'HEAD:payload.txt'
 libra cat-file -t "$HEAD_ID"
 libra cat-file -p "$HEAD_ID"
 libra show --stat HEAD
@@ -32,11 +38,10 @@ test "${#BLOB_ID}" -eq 64
 libra cat-file -p "$BLOB_ID"
 ```
 
-断言：`core.objectformat` 为 `sha256`；commit 与 blob 的对象 id 均为 64 位 hex，证明 hash-kind preflight 正确按仓库格式 pin（而非默认 sha1）；`cat-file -t/-p`、`show --stat`、`log --oneline`、`fsck --connectivity-only`、`hash-object -w` 在 sha256 仓库全部成功且写入对象可读回；与默认 sha1 的 `cli.object-readback` 形成对照。
+断言：`core.objectformat` 为 `sha256`；commit、tree 与 blob 的对象 id 均为 64 位 hex，证明 hash-kind preflight 正确按仓库格式 pin（而非默认 sha1）；typed peel、`REV:path`、`cat-file -t/-p`、`show --stat`、`log --oneline`、`fsck --connectivity-only`、`hash-object -w` 在 sha256 仓库全部成功且写入对象可读回；与默认 sha1 的 `cli.object-readback` 形成对照。
 
 补充可执行断言：
 - `libra --json config get core.objectformat` 验证值为 "sha256"。
 - `libra --json cat-file -p HEAD` 成功且 commit ID 为 64 字符 hex。
 - 写入 blob 后 `libra --json cat-file -t $BLOB_ID` 返回 "blob"。
 - 全流程 `libra fsck --connectivity-only` 通过。
-

@@ -11,6 +11,10 @@ grades the P0/P1 command surface by sub-face (`common-user-flow`,
 specific Git-compatible surface such as porcelain output, conflict handling, or
 plumbing syntax.
 
+Repository-local VCS hooks are documented separately in
+[Repository hooks](repository-hooks.md); the hidden `libra hooks` command is an
+unrelated AI-agent event ingestion surface.
+
 ## Global Flags
 
 Every Libra command accepts the following global flags:

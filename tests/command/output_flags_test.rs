@@ -289,8 +289,11 @@ fn json_commit_returns_structured_summary() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn json_commit_suppresses_successful_hook_output() {
+    use std::os::unix::fs::PermissionsExt;
+
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
     init_repo_via_cli(&repo);
@@ -299,19 +302,20 @@ fn json_commit_suppresses_successful_hook_output() {
     let hooks_dir = repo.join(".libra").join("hooks");
     fs::create_dir_all(&hooks_dir).unwrap();
 
-    #[cfg(unix)]
-    fs::write(
-        hooks_dir.join("pre-commit.sh"),
-        "#!/bin/sh\necho hook-stdout\necho hook-stderr >&2\nexit 0\n",
-    )
-    .unwrap();
-
-    #[cfg(windows)]
-    fs::write(
-        hooks_dir.join("pre-commit.ps1"),
-        "[Console]::Out.WriteLine('hook-stdout')\n[Console]::Error.WriteLine('hook-stderr')\nexit 0\n",
-    )
-    .unwrap();
+    for name in [
+        "pre-commit.sh",
+        "prepare-commit-msg.sh",
+        "commit-msg.sh",
+        "post-commit.sh",
+    ] {
+        let hook = hooks_dir.join(name);
+        fs::write(
+            &hook,
+            "#!/bin/sh\necho hook-stdout\necho hook-stderr >&2\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     fs::write(repo.join("f.txt"), "hello").unwrap();
     let add = run(&["add", "f.txt"], &repo);

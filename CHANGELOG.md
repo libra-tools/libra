@@ -4,6 +4,15 @@
 
 ### Added
 
+- **Sandboxed repository hooks (v0.18.80)**: adds an Option-A-compatible
+  `.libra/hooks` lifecycle for commit, checkout/switch, merge, rebase, and
+  pull without executing `.git/hooks`. Hooks run with structured arguments,
+  a cleared/allowlisted environment, offline required sandboxing, bounded
+  input/output/file sizes, protected repository metadata, blocking pre/message
+  semantics, and advisory post-hook warnings. `--no-verify`, command-specific
+  pre-hook controls, and `LIBRA_NO_HOOKS` provide documented escape valves;
+  English and Chinese repository-hook and command documentation are included.
+
 - **`libra ls-files` compatibility expansion**: adds `<pathspec>...`
   filtering resolved from the caller's current working directory,
   `--error-unmatch`, and `-z` NUL-delimited text output. The release

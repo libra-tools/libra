@@ -50,7 +50,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
-            2026070802, 2026070803, 2026071301
+            2026070802, 2026070803, 2026071301, 2026071401
         ]
     );
     assert_eq!(
@@ -80,13 +80,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_checkpoint_paging",
             "agent_audit_log",
             "agent_coverage_gate",
+            "agent_export_job",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 24);
-    assert_eq!(runner.max_registered_version(), Some(2026071301));
+    assert_eq!(runner.len(), 25);
+    assert_eq!(runner.max_registered_version(), Some(2026071401));
 }
 
 // ---------------------------------------------------------------------------
@@ -743,8 +744,20 @@ async fn concurrent_rollback_calls_partition_owned_versions_without_double_ddl()
 
     let task_a = tokio::spawn(async move { runner_a.rollback_to(&conn_a, 0).await });
     let task_b = tokio::spawn(async move { runner_b.rollback_to(&conn_b, 0).await });
-    let a = task_a.await.expect("task A").expect("runner A succeeds");
-    let b = task_b.await.expect("task B").expect("runner B succeeds");
+    let a = task_a.await.expect("task A");
+    let b = task_b.await.expect("task B");
+
+    // Tokio may schedule one task only after the other has completed both
+    // down migrations. Such a late observer correctly sees an empty registry
+    // and preserves rollback_to's dedicated empty-database error contract;
+    // normalize that valid serialized outcome to an empty ownership set.
+    let completed_or_serialized_empty = |runner: &str, result| match result {
+        Ok(versions) => versions,
+        Err(MigrationError::RollbackOnEmptyDatabase { target: 0 }) => Vec::new(),
+        Err(err) => panic!("{runner} failed unexpectedly: {err}"),
+    };
+    let a = completed_or_serialized_empty("runner A", a);
+    let b = completed_or_serialized_empty("runner B", b);
 
     // Union must cover {1, 2} exactly; intersection must be empty. A
     // regression that re-ran down DDL would either show duplicates in
@@ -1064,7 +1077,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
-            2026070802, 2026070803, 2026071301
+            2026070802, 2026070803, 2026071301, 2026071401
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1111,6 +1124,10 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     assert!(index_exists(&conn, "idx_agent_coverage_claim_session_state").await);
     assert!(index_exists(&conn, "idx_agent_coverage_claim_checkpoint_id").await);
     assert!(index_exists(&conn, "idx_agent_coverage_revision_checkpoint_id").await);
+    // plan-20260713 DR-04b: OpenCode export-bridge job state.
+    assert!(table_exists(&conn, "agent_export_job").await);
+    assert!(index_exists(&conn, "idx_agent_export_job_session").await);
+    assert!(index_exists(&conn, "idx_agent_export_job_ttl").await);
 }
 
 /// OC-Phase 2 P2.5 regression guard: `approved_permission` survives an
@@ -1140,9 +1157,9 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
-            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
-            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601,
+            2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401,
+            2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -1168,7 +1185,7 @@ async fn approved_permission_up_down_up_round_trip() {
         vec![
             2026050601, 2026050801, 2026052301, 2026053101, 2026060201, 2026060401, 2026060801,
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
-            2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301
+            2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);

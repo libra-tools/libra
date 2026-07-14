@@ -35,6 +35,7 @@ use crate::{
         model::{reference as ref_model, reflog as reflog_model},
         reflog,
         reflog::{ReflogAction, ReflogContext, ReflogError, with_reflog},
+        repo_hooks::{RepoHook, replay_repo_hook_output, run_advisory_repo_hook, run_repo_hook},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode, emit_warning},
@@ -1084,6 +1085,8 @@ pub(crate) enum RebaseError {
     StateSave(String),
     #[error("failed to finalize rebase: {0}")]
     Finalize(String),
+    #[error("pre-rebase hook failed: {0}")]
+    RepositoryHook(String),
 }
 
 impl From<RebaseError> for CliError {
@@ -1107,6 +1110,9 @@ impl From<RebaseError> for CliError {
             RebaseError::InvalidExec(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("pass a non-empty shell command without NUL bytes"),
+            RebaseError::RepositoryHook(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set LIBRA_NO_HOOKS=1 to bypass repository hooks"),
             RebaseError::ExecFailed {
                 commit,
                 command,
@@ -1282,14 +1288,17 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
         return render_rebase_output(&result, output);
     }
     if args.continue_rebase {
-        let result = run_rebase_continue().await.map_err(CliError::from)?;
+        let result = run_rebase_continue(output).await.map_err(CliError::from)?;
         return render_rebase_output(&result, output);
     }
     if args.skip {
-        let result = run_rebase_skip().await.map_err(CliError::from)?;
+        let result = run_rebase_skip(output).await.map_err(CliError::from)?;
         return render_rebase_output(&result, output);
     }
     if let Some(upstream) = args.upstream.as_deref() {
+        run_pre_rebase_hook(upstream, args.branch.as_deref(), output)
+            .await
+            .map_err(CliError::from)?;
         prepare_rebase_aux(&args).await.map_err(CliError::from)?;
         // `git rebase --onto <newbase> <upstream> <branch>` form: check out the
         // named branch first (no-op when it is already current), so the rest of
@@ -1302,10 +1311,10 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
                 upstream,
                 args.onto.as_deref(),
                 args.autosquash,
-                args.reapply_cherry_picks,
                 args.no_keep_empty,
                 empty_mode,
                 args.fork_point,
+                output,
             )
             .await
             .map_err(CliError::from)
@@ -1321,6 +1330,38 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
         }
         let result = start_result?;
         return render_rebase_output(&result, output);
+    }
+    Ok(())
+}
+
+async fn run_pre_rebase_hook(
+    upstream: &str,
+    branch: Option<&str>,
+    output: &OutputConfig,
+) -> Result<(), RebaseError> {
+    let mut args = vec![upstream.to_string()];
+    if let Some(branch) = branch {
+        args.push(branch.to_string());
+    }
+    let Some(hook_output) = run_repo_hook(RepoHook::PreRebase, &args)
+        .await
+        .map_err(|error| RebaseError::RepositoryHook(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    replay_repo_hook_output(&hook_output, output).map_err(RebaseError::RepositoryHook)?;
+    if hook_output.timed_out {
+        return Err(RebaseError::RepositoryHook(format!(
+            "hook '{}' exceeded the 15 minute timeout",
+            hook_output.path.display()
+        )));
+    }
+    if hook_output.exit_code != 0 {
+        return Err(RebaseError::RepositoryHook(format!(
+            "hook '{}' failed with exit code {}",
+            hook_output.path.display(),
+            hook_output.exit_code
+        )));
     }
     Ok(())
 }
@@ -1834,9 +1875,9 @@ async fn prepare_rebase_aux(args: &RebaseArgs) -> Result<(), RebaseError> {
             Err(error) => return Err(RebaseError::Autostash(error.to_string())),
         }
     }
-    if !aux.exec_commands.is_empty() || aux.update_refs || aux.autostash.is_some() {
-        aux.save()?;
-    }
+    // Rewrites are also the stdin contract for `post-rewrite`; keep the sidecar
+    // for every rebase, not only exec/update-refs/autostash runs.
+    aux.save()?;
     Ok(())
 }
 
@@ -2224,10 +2265,10 @@ async fn run_rebase_start(
     upstream: &str,
     onto: Option<&str>,
     autosquash: bool,
-    _reapply_cherry_picks: bool,
     no_keep_empty: bool,
     empty_mode: RebaseEmptyMode,
     fork_point: bool,
+    output: &OutputConfig,
 ) -> Result<RebaseOutput, RebaseError> {
     let db = get_db_conn_instance().await;
 
@@ -2505,7 +2546,14 @@ async fn run_rebase_start(
     state.save().await.map_err(RebaseError::StateSave)?;
     Head::update_with_conn(&db, Head::Detached(newbase_id), None).await;
 
-    let replay = continue_replay(&mut state, &current_branch_name, landing_display, false).await?;
+    let replay = continue_replay(
+        &mut state,
+        &current_branch_name,
+        landing_display,
+        false,
+        output,
+    )
+    .await?;
 
     Ok(RebaseOutput {
         action: "start".to_string(),
@@ -2555,16 +2603,20 @@ pub(crate) struct PullRebaseSummary {
 /// [`RebaseError`] which already has a `From<…> for CliError` impl
 /// with structured hints — pull just wraps it in its own error
 /// variant so the `phase=rebase` detail can be attached.
-pub(crate) async fn run_rebase_for_pull(upstream: &str) -> Result<PullRebaseSummary, RebaseError> {
+pub(crate) async fn run_rebase_for_pull(
+    upstream: &str,
+    output: &OutputConfig,
+) -> Result<PullRebaseSummary, RebaseError> {
+    run_pre_rebase_hook(upstream, None, output).await?;
     // `pull --rebase` keeps Libra's default (keep become-empty commits).
     let output = run_rebase_start(
         upstream,
         None,
         false,
         false,
-        false,
         RebaseEmptyMode::Keep,
         false,
+        output,
     )
     .await?;
     let old_commit = output
@@ -2587,6 +2639,7 @@ async fn continue_replay(
     branch_name: &str,
     upstream_display: &str,
     emit_human: bool,
+    output: &OutputConfig,
 ) -> Result<RebaseReplaySummary, RebaseError> {
     let db = get_db_conn_instance().await;
     let mut summary = RebaseReplaySummary::default();
@@ -2750,14 +2803,18 @@ async fn continue_replay(
     }
 
     // All commits replayed successfully - finalize
-    finalize_rebase(state, emit_human)
+    finalize_rebase(state, emit_human, output)
         .await
         .map_err(|e| RebaseError::Finalize(e.to_string()))?;
     Ok(summary)
 }
 
 /// Finalize rebase after all commits are replayed
-async fn finalize_rebase(state: &RebaseState, emit_human: bool) -> anyhow::Result<()> {
+async fn finalize_rebase(
+    state: &RebaseState,
+    emit_human: bool,
+    output: &OutputConfig,
+) -> anyhow::Result<()> {
     let db = get_db_conn_instance().await;
     let final_commit_id = state.current_head;
     let aux = RebaseAuxState::load_optional().context("failed to load rebase auxiliary state")?;
@@ -2921,6 +2978,22 @@ async fn finalize_rebase(state: &RebaseState, emit_human: bool) -> anyhow::Resul
     resolve_rebase_autostash()
         .await
         .context("failed to restore rebase autostash")?;
+    if let Some(aux) = aux.as_ref()
+        && !aux.rewrites.is_empty()
+    {
+        let rewrite_input = aux
+            .rewrites
+            .iter()
+            .map(|(old, new)| format!("{old} {new}\n"))
+            .collect::<String>();
+        run_advisory_repo_hook(
+            RepoHook::PostRewrite,
+            &["rebase".to_string()],
+            Some(rewrite_input.as_bytes()),
+            output,
+        )
+        .await;
+    }
     RebaseAuxState::cleanup().context("failed to clean up rebase auxiliary state")?;
 
     if emit_human {
@@ -2933,7 +3006,7 @@ async fn finalize_rebase(state: &RebaseState, emit_human: bool) -> anyhow::Resul
     Ok(())
 }
 
-async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
+async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, RebaseError> {
     ensure_rebase_in_progress().await?;
     let mut state = RebaseState::load().await.map_err(RebaseError::StateLoad)?;
     let previous_commit = state.current_head.to_string();
@@ -2948,11 +3021,11 @@ async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
     {
         run_pending_rebase_exec(&mut state).await?;
         if state.todo.is_empty() {
-            finalize_rebase(&state, false)
+            finalize_rebase(&state, false, output)
                 .await
                 .map_err(|error| RebaseError::Finalize(error.to_string()))?;
         } else {
-            let replay = continue_replay(&mut state, &branch, &onto_display, false).await?;
+            let replay = continue_replay(&mut state, &branch, &onto_display, false, output).await?;
             applied_commits.extend(replay.applied_commits);
             dropped_commits.extend(replay.dropped_commits);
         }
@@ -3045,12 +3118,12 @@ async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
     }
 
     if state.todo.is_empty() {
-        finalize_rebase(&state, false)
+        finalize_rebase(&state, false, output)
             .await
             .map_err(|e| RebaseError::Finalize(e.to_string()))?;
     } else {
         state.save().await.map_err(RebaseError::StateSave)?;
-        let replay = continue_replay(&mut state, &branch, &onto_display, false).await?;
+        let replay = continue_replay(&mut state, &branch, &onto_display, false, output).await?;
         applied_commits.extend(replay.applied_commits);
         dropped_commits.extend(replay.dropped_commits);
     }
@@ -3205,7 +3278,7 @@ async fn run_rebase_abort() -> Result<RebaseOutput, RebaseError> {
     })
 }
 
-async fn run_rebase_skip() -> Result<RebaseOutput, RebaseError> {
+async fn run_rebase_skip(output: &OutputConfig) -> Result<RebaseOutput, RebaseError> {
     ensure_rebase_in_progress().await?;
     let mut state = RebaseState::load().await.map_err(RebaseError::StateLoad)?;
     let previous_commit = state.current_head.to_string();
@@ -3231,11 +3304,11 @@ async fn run_rebase_skip() -> Result<RebaseOutput, RebaseError> {
         let mut applied_commits = Vec::new();
         let mut dropped_commits = Vec::new();
         if state.todo.is_empty() {
-            finalize_rebase(&state, false)
+            finalize_rebase(&state, false, output)
                 .await
                 .map_err(|error| RebaseError::Finalize(error.to_string()))?;
         } else {
-            let replay = continue_replay(&mut state, &branch, &onto_display, false).await?;
+            let replay = continue_replay(&mut state, &branch, &onto_display, false, output).await?;
             applied_commits.extend(replay.applied_commits);
             dropped_commits.extend(replay.dropped_commits);
         }
@@ -3301,12 +3374,12 @@ async fn run_rebase_skip() -> Result<RebaseOutput, RebaseError> {
     let mut applied_commits = Vec::new();
     let mut dropped_commits = Vec::new();
     if state.todo.is_empty() {
-        finalize_rebase(&state, false)
+        finalize_rebase(&state, false, output)
             .await
             .map_err(|e| RebaseError::Finalize(e.to_string()))?;
     } else {
         state.save().await.map_err(RebaseError::StateSave)?;
-        let replay = continue_replay(&mut state, &branch, &onto_display, false).await?;
+        let replay = continue_replay(&mut state, &branch, &onto_display, false, output).await?;
         applied_commits.extend(replay.applied_commits);
         dropped_commits.extend(replay.dropped_commits);
     }

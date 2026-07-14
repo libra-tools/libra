@@ -126,3 +126,100 @@ fn live_codex_rollout_resolves_by_id() {
     );
     eprintln!("live codex by-id lookup ok (session id len {})", sid.len());
 }
+
+/// DR-04b live (M3): trust the REAL local `opencode` binary (operator-grade
+/// registration: trusted dir + provenance record), then run a REAL
+/// `opencode export` of a REAL session under the Required bwrap offline
+/// profile and normalize it through coverage-v1. Skips when the store or
+/// binary is absent.
+#[tokio::test]
+async fn live_opencode_sandboxed_export_normalizes_real_session() {
+    if !gate_enabled() {
+        eprintln!("skipped (set LIBRA_RUN_LIVE_AGENT_GATE=1 for the live agent gate)");
+        return;
+    }
+    use libra::internal::ai::observed_agents::{
+        add_trusted_dir, normalize_opencode_export,
+        opencode_export::{ExportLimits, run_export_subprocess_sandboxed, trusted_opencode_binary},
+        record_trust,
+    };
+
+    let Some(binary) = home()
+        .map(|h| h.join(".opencode/bin/opencode"))
+        .filter(|p| p.is_file())
+    else {
+        eprintln!("skipped (no real ~/.opencode/bin/opencode)");
+        return;
+    };
+    let Some(db) = home()
+        .map(|h| h.join(".local/share/opencode/opencode.db"))
+        .filter(|p| p.is_file())
+    else {
+        eprintln!("skipped (no real opencode session store)");
+        return;
+    };
+    // A real session id straight from the real store.
+    let sid = {
+        let conn = rusqlite_less_query(&db);
+        match conn {
+            Some(sid) => sid,
+            None => {
+                eprintln!("skipped (no session rows in the real opencode store)");
+                return;
+            }
+        }
+    };
+
+    // Operator-grade trust registration for the real binary (idempotent;
+    // exactly what the plan expects the acceptance machine to do).
+    let dir = binary.parent().expect("binary has a parent");
+    add_trusted_dir(dir).await.expect("register trusted dir");
+    record_trust("opencode", &binary)
+        .await
+        .expect("record opencode trust");
+    let trusted = trusted_opencode_binary()
+        .await
+        .expect("trusted binary resolves");
+
+    let bytes = run_export_subprocess_sandboxed(&trusted, &sid, ExportLimits::default())
+        .await
+        .expect("real sandboxed export must succeed offline");
+    assert!(!bytes.is_empty());
+    let turns = normalize_opencode_export(&bytes);
+    assert!(
+        !turns.is_empty(),
+        "a real session must normalize to at least one turn"
+    );
+    eprintln!(
+        "live opencode sandboxed export ok ({} bytes, {} turns)",
+        bytes.len(),
+        turns.len()
+    );
+}
+
+/// Pull one session id out of the real opencode SQLite store without adding
+/// a rusqlite dev-dependency: shell out to the `sqlite3` binary when
+/// present, else skip.
+fn rusqlite_less_query(db: &Path) -> Option<String> {
+    // Prefer the sqlite3 CLI; fall back to python3's stdlib sqlite3 (one of
+    // the two is present on any dev acceptance machine).
+    let try_cmd = |program: &str, args: &[&std::ffi::OsStr]| -> Option<String> {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()?;
+        let sid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!sid.is_empty()).then_some(sid)
+    };
+    let sql = "SELECT id FROM session ORDER BY rowid DESC LIMIT 1;";
+    try_cmd("sqlite3", &[db.as_os_str(), std::ffi::OsStr::new(sql)]).or_else(|| {
+        let script = format!(
+            "import sqlite3;print(sqlite3.connect({:?}).execute({sql:?}).fetchone()[0])",
+            db.display().to_string()
+        );
+        try_cmd(
+            "python3",
+            &[std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(&script)],
+        )
+    })
+}

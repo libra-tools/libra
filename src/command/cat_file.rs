@@ -17,7 +17,7 @@
 //! - `--ai-list <type>`:     list all AI objects of the given type
 //! - `--ai-list-types`:      list all AI object types present in history
 
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 
 use clap::Parser;
 use git_internal::{
@@ -25,12 +25,11 @@ use git_internal::{
     hash::ObjectHash,
     internal::object::{blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::{
     command::load_object,
     common_utils::parse_commit_msg,
-    internal::{ai::history::HistoryManager, db, model::reference},
+    internal::{ai::history::HistoryManager, db},
     utils::{
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
@@ -62,6 +61,8 @@ Notes:
 
 const CAT_FILE_AFTER_HELP: &str = "EXAMPLES:
     libra cat-file -p HEAD                                  Pretty-print the commit object at HEAD
+    libra cat-file -t 'HEAD^{tree}'                         Print the type of HEAD's tree
+    libra cat-file -p 'HEAD:src/main.rs'                    Print a blob selected by tree path
     libra cat-file -t 40d352ee7190f9…                       Print the object type (blob/tree/commit/tag)
     libra cat-file -e HEAD --json                           Check existence as JSON ({ exists: bool }; exit 0/1 preserved)
     libra cat-file --batch-command                          Read info/contents commands from stdin (one per line)
@@ -189,8 +190,6 @@ const AI_OBJECT_TYPES: &[&str] = &[
     "run_usage",
     "snapshot",
 ];
-const TAG_REF_PREFIX: &str = "refs/tags/";
-
 fn is_known_ai_object_type(type_name: &str) -> bool {
     AI_OBJECT_TYPES.contains(&type_name)
 }
@@ -605,7 +604,7 @@ async fn run_batch(include_content: bool, format: &str) -> CliResult<()> {
         if spec.is_empty() {
             continue;
         }
-        let buf = build_batch_object(spec, include_content, format, &storage).await;
+        let buf = build_batch_object(spec, include_content, format, &storage).await?;
         match out.write_all(&buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
@@ -623,14 +622,15 @@ async fn run_batch(include_content: bool, format: &str) -> CliResult<()> {
 /// Build the batch output bytes for one object spec: the `<sha> <type> <size>`
 /// header (or `format`-expanded line), optionally followed by the raw contents
 /// and a trailing newline (`include_content`), or `<spec> missing` when the
-/// object cannot be resolved or loaded. Shared by `--batch`/`--batch-check` and
-/// the `--batch-command` `contents`/`info` commands.
+/// object does not exist. Resolver and storage failures are returned instead of
+/// being misreported as a missing object. Shared by `--batch`/`--batch-check`
+/// and the `--batch-command` `contents`/`info` commands.
 async fn build_batch_object(
     spec: &str,
     include_content: bool,
     format: &str,
     storage: &ClientStorage,
-) -> Vec<u8> {
+) -> CliResult<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     match resolve_object_safe(spec, storage).await {
         Ok(hash) => match (storage.get_object_type(&hash), storage.get(&hash)) {
@@ -646,11 +646,33 @@ async fn build_batch_object(
                     buf.push(b'\n');
                 }
             }
-            _ => buf.extend_from_slice(format!("{spec} missing\n").as_bytes()),
+            (Err(GitError::ObjectNotFound(_)), _) | (_, Err(GitError::ObjectNotFound(_))) => {
+                buf.extend_from_slice(format!("{spec} missing\n").as_bytes());
+            }
+            (Err(error), _) => {
+                return Err(CliError::fatal(format!(
+                    "could not resolve object type for '{spec}' in cat-file batch mode: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt));
+            }
+            (_, Err(error)) => {
+                return Err(CliError::fatal(format!(
+                    "could not read object '{spec}' ({hash}) in cat-file batch mode: {error}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed));
+            }
         },
-        Err(_) => buf.extend_from_slice(format!("{spec} missing\n").as_bytes()),
+        Err(error)
+            if matches!(
+                error.stable_code(),
+                StableErrorCode::CliInvalidTarget | StableErrorCode::CliInvalidArguments
+            ) =>
+        {
+            buf.extend_from_slice(format!("{spec} missing\n").as_bytes());
+        }
+        Err(error) => return Err(error),
     }
-    buf
+    Ok(buf)
 }
 
 /// `cat-file --batch[-check] --batch-all-objects`: emit a batch line for every
@@ -665,7 +687,7 @@ async fn run_batch_all_objects(include_content: bool, format: &str) -> CliResult
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for id in ids {
-        let buf = build_batch_object(&id.to_string(), include_content, format, &storage).await;
+        let buf = build_batch_object(&id.to_string(), include_content, format, &storage).await?;
         match out.write_all(&buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
@@ -837,7 +859,7 @@ async fn run_batch_command(format: &str, buffer: bool) -> CliResult<()> {
             ))
             .with_stable_code(StableErrorCode::CliInvalidArguments));
         }
-        let buf = build_batch_object(arg, include_content, format, &storage).await;
+        let buf = build_batch_object(arg, include_content, format, &storage).await?;
         if buffer {
             pending.extend_from_slice(&buf);
         } else if !emit(&mut out, &buf)? {
@@ -864,38 +886,28 @@ fn format_batch_line(format: &str, hash: &ObjectHash, obj_type: &str, size: usiz
     result
 }
 
-async fn resolve_object_safe(object_ref: &str, storage: &ClientStorage) -> CliResult<ObjectHash> {
-    if let Some(hash) = resolve_tag_object_ref(object_ref).await {
-        return Ok(hash);
-    }
-
-    if let Ok(hash) = util::get_commit_base(object_ref).await {
-        return Ok(hash);
-    }
-
-    if let Ok(hash) = ObjectHash::from_str(object_ref) {
-        return Ok(hash);
-    }
-
-    let results = storage.search_result(object_ref).await.map_err(|error| {
-        CliError::fatal(format!(
-            "failed to search objects while resolving '{object_ref}': {error}"
-        ))
-        .with_stable_code(StableErrorCode::IoReadFailed)
-    })?;
-    if results.len() == 1 {
-        return Ok(results[0]);
-    }
-    if results.len() > 1 {
-        return Err(CliError::command_usage(format!(
-            "ambiguous argument '{}': matched {} objects",
-            object_ref,
-            results.len()
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidArguments));
-    }
-
-    Err(invalid_object_name_error(object_ref))
+async fn resolve_object_safe(object_ref: &str, _storage: &ClientStorage) -> CliResult<ObjectHash> {
+    util::resolve_object_spec_typed(object_ref)
+        .await
+        .map_err(|error| match error {
+            util::CommitBaseError::InvalidReference(detail)
+                if detail.starts_with("ambiguous argument:") =>
+            {
+                CliError::command_usage(detail)
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+            }
+            util::CommitBaseError::HeadUnborn | util::CommitBaseError::InvalidReference(_) => {
+                invalid_object_name_error(object_ref)
+            }
+            util::CommitBaseError::ReadFailure(detail) => {
+                CliError::fatal(format!("failed to resolve '{object_ref}': {detail}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            util::CommitBaseError::CorruptReference(detail) => {
+                CliError::fatal(format!("failed to resolve '{object_ref}': {detail}"))
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+            }
+        })
 }
 
 fn emit_pretty_print_json(
@@ -1122,64 +1134,10 @@ async fn ai_show_type_data(uuid: &str) -> CliResult<String> {
 ///
 /// Supports branch names, tags, HEAD, and raw hex hashes.
 async fn resolve_object(object_ref: &str, storage: &ClientStorage) -> ObjectHash {
-    // Resolve tags without dereferencing annotated tag objects to commits.
-    if let Some(hash) = resolve_tag_object_ref(object_ref).await {
-        return hash;
+    match resolve_object_safe(object_ref, storage).await {
+        Ok(object_id) => object_id,
+        Err(error) => cat_file_exit_error(error),
     }
-
-    // Try as a ref (branch/tag/HEAD) first
-    if let Ok(hash) = util::get_commit_base(object_ref).await {
-        return hash;
-    }
-
-    // Try as a raw hex hash
-    if let Ok(hash) = ObjectHash::from_str(object_ref) {
-        return hash;
-    }
-
-    // Try abbreviated hash via storage search
-    let results = match storage.search_result(object_ref).await {
-        Ok(results) => results,
-        Err(error) => cat_file_exit_error(
-            CliError::fatal(format!(
-                "failed to search objects while resolving '{object_ref}': {error}"
-            ))
-            .with_stable_code(StableErrorCode::IoReadFailed),
-        ),
-    };
-    if results.len() == 1 {
-        return results[0];
-    } else if results.len() > 1 {
-        cat_file_exit_error(CliError::command_usage(format!(
-            "ambiguous argument '{object_ref}': matched {} objects",
-            results.len()
-        )));
-    }
-
-    cat_file_exit_error(invalid_object_name_error(object_ref));
-}
-
-fn normalize_tag_ref_name(object_ref: &str) -> String {
-    if object_ref.starts_with(TAG_REF_PREFIX) {
-        object_ref.to_string()
-    } else {
-        format!("{TAG_REF_PREFIX}{object_ref}")
-    }
-}
-
-async fn resolve_tag_object_ref(object_ref: &str) -> Option<ObjectHash> {
-    let full_ref_name = normalize_tag_ref_name(object_ref);
-    let db_conn = db::get_db_conn_instance().await;
-    let tag_ref = reference::Entity::find()
-        .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
-        .filter(reference::Column::Name.eq(full_ref_name))
-        .one(&db_conn)
-        .await
-        .ok()
-        .flatten()?;
-
-    let target_hash = tag_ref.commit?;
-    ObjectHash::from_str(&target_hash).ok()
 }
 
 /// Exit with 0 if the object exists, 1 otherwise, without printing diagnostics.
@@ -1778,19 +1736,6 @@ mod tests {
         );
         assert_eq!(split_typed_ai_selector("unknown:call_123"), None);
         assert_eq!(split_typed_ai_selector("plain-id"), None);
-    }
-
-    #[test]
-    fn test_normalize_tag_ref_name_short() {
-        assert_eq!(normalize_tag_ref_name("v1.0.0"), "refs/tags/v1.0.0");
-    }
-
-    #[test]
-    fn test_normalize_tag_ref_name_full() {
-        assert_eq!(
-            normalize_tag_ref_name("refs/tags/v1.0.0"),
-            "refs/tags/v1.0.0"
-        );
     }
 
     #[test]

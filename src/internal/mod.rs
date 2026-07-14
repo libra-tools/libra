@@ -43,6 +43,7 @@ pub mod pack_writer;
 pub mod protocol;
 pub mod publish;
 pub mod reflog;
+pub mod repo_hooks;
 pub mod revision_ordinal;
 pub mod sequencer;
 pub mod sparse;

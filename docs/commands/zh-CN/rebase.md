@@ -111,6 +111,15 @@ libra rebase --fork-point origin/main
 
 Exec 命令是用户可控 shell 输入。只有内部 sandbox 能强制 workspace-only 写入且禁止网络时 Libra 才会执行；若所需 backend 不可用，则以 `LBR-CONFLICT-002` fail-closed，并保留可续作的 rebase 状态。
 
+## 仓库 hooks
+
+新 rebase（包括 `pull --rebase`）修改本地历史前，`pre-rebase` 会收到
+`<upstream> [branch]` 并可阻止操作。
+成功重写后，advisory `post-rewrite rebase` 从 stdin 接收排序后的多行
+`<old-oid> <new-oid>`。恢复动作不会重新运行 `pre-rebase`。rebase 没有专用
+`--no-verify`；只有需要显式绕过策略时才设置 `LIBRA_NO_HOOKS=1`。详见
+[仓库 hooks](repository-hooks.md)。
+
 ## 常用命令
 
 ```bash

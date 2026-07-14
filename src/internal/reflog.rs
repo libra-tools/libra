@@ -287,6 +287,7 @@ impl Reflog {
             ref_name,
         )
         .order_by_desc(reflog::Column::Timestamp)
+        .order_by_desc(reflog::Column::Id)
         .all(db)
         .await?)
     }
@@ -300,6 +301,7 @@ impl Reflog {
             ref_name,
         )
         .order_by_desc(reflog::Column::Timestamp)
+        .order_by_desc(reflog::Column::Id)
         .one(db)
         .await?)
     }

@@ -620,6 +620,230 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
     turns
 }
 
+/// Split an `opencode export` JSON document into normalized turns
+/// (plan-20260713 DR-04b; probe: opencode 1.17.x `{info, messages:[{info:
+/// {role,id,…}, parts:[{type:"text",text}|{type:"tool",tool,callID,state:
+/// {input,output,status,…}}]}]}`).
+///
+/// Mapping: a `user`-role message opens a turn (`logical_turn_key` = its
+/// validated `info.id`, else ordinal); its text parts join as the user
+/// record. Assistant messages contribute one Assistant record (joined text
+/// parts) plus, per completed tool part, a ToolCall (callID/tool/state.input)
+/// AND a ToolResult (state.output, is_error = status=="error"). A tool part
+/// still `running`/`pending` marks the turn `incomplete` (a later export
+/// upgrades it — ADR-DR-16); wrong-typed semantic fields fail closed exactly
+/// like the Claude splitter.
+pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
+    let mut turns: Vec<NormalizedTurn> = Vec::new();
+    let Ok(document) = parse_canon_value(data) else {
+        // Whole-document parse failure (truncated export, duplicate keys):
+        // one poisoned empty turn is the honest representation.
+        turns.push(NormalizedTurn {
+            logical_turn_key: ordinal_key(0),
+            ordinal: 0,
+            completeness: Completeness::Incomplete,
+            records: Vec::new(),
+        });
+        return turns;
+    };
+    let Some(messages) = document.get("messages").and_then(CanonValue::as_array) else {
+        // Valid JSON but structurally NOT an export document (missing or
+        // wrong-typed `messages`): poison, never "no work" — advancing the
+        // job on this would silently drop capture (Codex M3 R1 P1-5).
+        turns.push(NormalizedTurn {
+            logical_turn_key: ordinal_key(0),
+            ordinal: 0,
+            completeness: Completeness::Incomplete,
+            records: Vec::new(),
+        });
+        return turns;
+    };
+
+    fn open_turn(turns: &mut Vec<NormalizedTurn>, key: Option<String>) -> &mut NormalizedTurn {
+        let ordinal = turns.len();
+        let logical_turn_key = key
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 64
+                    && id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+            .unwrap_or_else(|| ordinal_key(ordinal));
+        turns.push(NormalizedTurn {
+            logical_turn_key,
+            ordinal,
+            completeness: Completeness::Complete,
+            records: Vec::new(),
+        });
+        turns.last_mut().expect("just pushed") // INVARIANT: push above
+    }
+    fn current_or_open(turns: &mut Vec<NormalizedTurn>) -> &mut NormalizedTurn {
+        if turns.is_empty() {
+            return open_turn(turns, None);
+        }
+        turns.last_mut().expect("non-empty checked") // INVARIANT: checked above
+    }
+
+    for message in messages {
+        // Structural validation: a message must be an object with an object
+        // `info` carrying a string `role`, and an array `parts`. Anything
+        // else poisons the enclosing turn instead of defaulting away
+        // (Codex M3 R1 P1-5).
+        let mut structural_violation = false;
+        let info = message.get("info");
+        if !matches!(message, CanonValue::Object(_)) || !matches!(info, Some(CanonValue::Object(_)))
+        {
+            structural_violation = true;
+        }
+        let role = match info.and_then(|i| i.get("role")) {
+            Some(CanonValue::Str(role)) => role.as_str(),
+            _ => {
+                structural_violation = true;
+                ""
+            }
+        };
+        let msg_id = match info.and_then(|i| i.get("id")) {
+            Some(CanonValue::Str(id)) => Some(id.clone()),
+            Some(CanonValue::Null) | None => None,
+            Some(_) => {
+                structural_violation = true;
+                None
+            }
+        };
+        let parts: &[CanonValue] = match message.get("parts") {
+            Some(CanonValue::Array(parts)) => parts,
+            _ => {
+                structural_violation = true;
+                &[]
+            }
+        };
+        // A structural violation poisons THIS message's own turn (Codex M3 R2
+        // P1-3), never a neighbor — fold it into the per-turn `violation` flag
+        // that is applied at role dispatch below.
+        let mut text_fragments: Vec<&str> = Vec::new();
+        let mut violation = structural_violation;
+        for part in parts {
+            // A part that is not even an object is itself malformed — poison
+            // the turn rather than silently skipping it (Codex M3 R2 P1-3).
+            if !matches!(part, CanonValue::Object(_)) {
+                violation = true;
+                continue;
+            }
+            if part.get("type").and_then(CanonValue::as_str) == Some("text") {
+                match part.get("text") {
+                    Some(CanonValue::Str(t)) => text_fragments.push(t),
+                    Some(_) | None => violation = true,
+                }
+            }
+        }
+        let text = text_fragments.join("\n");
+
+        match role {
+            "user" => {
+                let turn = open_turn(&mut turns, msg_id);
+                if violation {
+                    turn.completeness = Completeness::Incomplete;
+                }
+                turn.records.push(SemanticRecord::User { text });
+            }
+            "assistant" => {
+                let turn = current_or_open(&mut turns);
+                if violation {
+                    turn.completeness = Completeness::Incomplete;
+                }
+                if !text.is_empty() {
+                    turn.records.push(SemanticRecord::Assistant { text });
+                }
+                for part in parts {
+                    if part.get("type").and_then(CanonValue::as_str) != Some("tool") {
+                        continue;
+                    }
+                    let mut part_violation = false;
+                    let name = match part.get("tool") {
+                        Some(CanonValue::Str(t)) => t.clone(),
+                        Some(_) => {
+                            part_violation = true;
+                            String::new()
+                        }
+                        None => String::new(),
+                    };
+                    let call_id = match part.get("callID") {
+                        Some(CanonValue::Str(c)) => Some(c.clone()),
+                        Some(CanonValue::Null) | None => None,
+                        Some(_) => {
+                            part_violation = true;
+                            None
+                        }
+                    };
+                    let state = part.get("state");
+                    let status = state
+                        .and_then(|st| st.get("status"))
+                        .and_then(CanonValue::as_str)
+                        .unwrap_or("");
+                    let mut input = state
+                        .and_then(|st| st.get("input"))
+                        .cloned()
+                        .unwrap_or(CanonValue::Null);
+                    if contains_float(&input) {
+                        part_violation = true;
+                        sanitize_floats(&mut input);
+                    }
+                    let turn = current_or_open(&mut turns);
+                    turn.records.push(SemanticRecord::ToolCall {
+                        call_id: call_id.clone(),
+                        input,
+                        name,
+                    });
+                    match status {
+                        "completed" | "error" => {
+                            let content = match state.and_then(|st| st.get("output")) {
+                                Some(CanonValue::Str(o)) => o.clone(),
+                                Some(CanonValue::Null) | None => String::new(),
+                                Some(_) => {
+                                    part_violation = true;
+                                    String::new()
+                                }
+                            };
+                            turn.records.push(SemanticRecord::ToolResult {
+                                call_id,
+                                content,
+                                is_error: status == "error",
+                            });
+                        }
+                        // Tool still in flight at export time: the turn is
+                        // not faithfully complete yet.
+                        _ => part_violation = true,
+                    }
+                    if part_violation {
+                        turn.completeness = Completeness::Incomplete;
+                    }
+                }
+            }
+            // Unreadable / unsupported role. A structural violation must still
+            // surface as an incomplete turn of its OWN (Codex M3 R2 P1-3)
+            // rather than vanishing into a neighbor; a clean unknown role is
+            // simply skipped.
+            _ => {
+                if violation {
+                    open_turn(&mut turns, msg_id).completeness = Completeness::Incomplete;
+                }
+            }
+        }
+    }
+
+    turns.retain(|turn| !turn.records.is_empty() || turn.completeness == Completeness::Incomplete);
+    for (i, turn) in turns.iter_mut().enumerate() {
+        if turn.ordinal != i {
+            if turn.logical_turn_key == ordinal_key(turn.ordinal) {
+                turn.logical_turn_key = ordinal_key(i);
+            }
+            turn.ordinal = i;
+        }
+    }
+    turns
+}
+
 /// Redact every allowlisted string field of the normalized turns IN PLACE —
 /// coverage-v1.md §1 pins the order: typed normalize → **typed-field redact**
 /// → canonicalize/digest. Digests are therefore always computed over
@@ -838,6 +1062,117 @@ mod tests {
         assert!(
             !canonical.contains("AKIAAAAAAAAAAAAAAAAA"),
             "got: {canonical}"
+        );
+    }
+
+    /// DR-04b: the OpenCode export normalizer maps the probed 1.17.x shape
+    /// (messages[].info.role/id + text/tool parts with state) into turns —
+    /// and the SAME semantic content yields the SAME digest as the Claude
+    /// path (shared_splitter cross-path contract, golden vector 1).
+    #[test]
+    fn opencode_export_normalizer_maps_turns_and_matches_cross_path_digest() {
+        let export = br#"{
+            "info": {"id": "ses_x", "directory": "/w"},
+            "messages": [
+                {"info": {"role": "user", "id": "msg_u1", "time": {"created": 1.5}},
+                 "parts": [{"type": "text", "text": "hi"}]},
+                {"info": {"role": "assistant", "id": "msg_a1", "model": "m"},
+                 "parts": [{"type": "text", "text": "hello"}]}
+            ]
+        }"#;
+        let turns = normalize_opencode_export(export);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].logical_turn_key, "msg_u1");
+        assert_eq!(turns[0].completeness, Completeness::Complete);
+        // Cross-path: identical semantic content == golden vector 1 digest,
+        // which the Claude splitter also produces.
+        assert_eq!(
+            turns[0].digest_hex(),
+            "df991cd9a1ac5c12c32b8cdf0254c3dfbbf26485b505a5afc83a90d1128ebc54"
+        );
+
+        // Tool part: completed tool yields call + result records; a running
+        // tool marks the turn incomplete (upgradeable on the next export).
+        let export = br#"{
+            "info": {"id": "ses_x"},
+            "messages": [
+                {"info": {"role": "user", "id": "msg_u1"},
+                 "parts": [{"type": "text", "text": "run"}]},
+                {"info": {"role": "assistant", "id": "msg_a1"},
+                 "parts": [{"type": "tool", "tool": "grep", "callID": "c1",
+                            "state": {"status": "completed", "input": {"b": 2, "a": "x"},
+                                      "output": "2 matches"}}]}
+            ]
+        }"#;
+        let turns = normalize_opencode_export(export);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].records.len(), 3); // user, tool_call, tool_result
+        assert_eq!(turns[0].completeness, Completeness::Complete);
+
+        let running = br#"{
+            "info": {"id": "ses_x"},
+            "messages": [
+                {"info": {"role": "user", "id": "msg_u1"},
+                 "parts": [{"type": "text", "text": "run"}]},
+                {"info": {"role": "assistant", "id": "msg_a1"},
+                 "parts": [{"type": "tool", "tool": "grep", "callID": "c1",
+                            "state": {"status": "running", "input": {}}}]}
+            ]
+        }"#;
+        let turns = normalize_opencode_export(running);
+        assert_eq!(turns[0].completeness, Completeness::Incomplete);
+
+        // Truncated export document: one poisoned turn, never a panic.
+        let turns = normalize_opencode_export(br#"{"info": {"id": "ses_x"}, "mess"#);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].completeness, Completeness::Incomplete);
+    }
+
+    /// Codex M3 R2 P1-3: a structurally malformed message poisons ITS OWN turn
+    /// (never a healthy neighbor), and a malformed element inside an otherwise
+    /// valid `parts` array poisons that turn too — no silent skip.
+    #[test]
+    fn opencode_normalizer_poisons_malformed_message_own_turn() {
+        // A clean user turn followed by a user message with a non-string `id`:
+        // the first turn stays Complete, the malformed message's own (new)
+        // turn is Incomplete — not the reverse.
+        let export = br#"{
+            "info": {"id": "ses_x"},
+            "messages": [
+                {"info": {"role": "user", "id": "msg_ok"},
+                 "parts": [{"type": "text", "text": "clean"}]},
+                {"info": {"role": "user", "id": 7},
+                 "parts": [{"type": "text", "text": "malformed id"}]}
+            ]
+        }"#;
+        let turns = normalize_opencode_export(export);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].logical_turn_key, "msg_ok");
+        assert_eq!(
+            turns[0].completeness,
+            Completeness::Complete,
+            "healthy neighbor must stay complete"
+        );
+        assert_eq!(
+            turns[1].completeness,
+            Completeness::Incomplete,
+            "malformed message's own turn must be poisoned"
+        );
+
+        // A non-object element inside a valid parts array poisons that turn.
+        let export = br#"{
+            "info": {"id": "ses_x"},
+            "messages": [
+                {"info": {"role": "user", "id": "msg_u"},
+                 "parts": ["not-an-object", {"type": "text", "text": "ok"}]}
+            ]
+        }"#;
+        let turns = normalize_opencode_export(export);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].completeness,
+            Completeness::Incomplete,
+            "malformed part entry must poison the turn"
         );
     }
 

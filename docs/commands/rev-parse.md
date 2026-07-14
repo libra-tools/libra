@@ -1,6 +1,6 @@
 # `libra rev-parse`
 
-Parse revision names and print normalized commit IDs, symbolic refs, or repository paths.
+Parse revision names and print normalized object IDs, symbolic refs, or repository paths.
 
 ## Synopsis
 
@@ -12,11 +12,19 @@ libra rev-parse [OPTIONS] [SPEC]...
 
 `libra rev-parse` resolves a revision-like input into one of three forms:
 
-- the full commit ID (default)
-- a short commit ID with `--short`
+- the full object ID (default)
+- a short object ID with `--short`
 - a symbolic branch name with `--abbrev-ref`
 
 It also supports `--show-toplevel` to print the absolute repository root for a working tree. When no `<SPEC>` is provided, the command defaults to `HEAD`; multiple `<SPEC>` arguments are each resolved on their own line. The output-filter flags (`--flags`/`--no-flags`/`--revs-only`/`--no-revs`) instead classify each argument as a flag, revision, or path and print a filtered subset.
+
+The shared strict object-spec parser supports `@` as `HEAD`, full tag refs,
+`^N`/`~N`, `^{commit|tree|blob|tag|object}` and recursive `^{}` peeling,
+numeric reflog selectors (`main@{1}`, `HEAD@{0}`, or `@{1}` for the current
+branch), and `<tree-ish>:<path>`. It consumes the entire spec, so malformed
+suffixes cannot silently degrade to a different object. Reflog date selectors,
+`@{-N}`, `@{upstream}`/`@{push}`, and relative `./`/`../` tree paths remain
+unsupported and fail explicitly.
 
 ## Options
 
@@ -37,13 +45,16 @@ It also supports `--show-toplevel` to print the absolute repository root for a w
 | `--is-shallow-repository` | Print `true` when `.libra/shallow` contains at least one shallow boundary, `false` otherwise. |
 | `--git-dir` | Print the path to the `.libra` directory (Libra's `$GIT_DIR`). In Libra this is always absolute. |
 | `--absolute-git-dir` | Like `--git-dir`, but always the canonicalized absolute path. (In Libra `--git-dir` is already absolute, so the two coincide.) |
-| `<SPEC>` | Revision to resolve. Defaults to `HEAD` when omitted. |
+| `<SPEC>` | Object/revision spec to resolve. Supports typed peel, numeric reflog selectors, and `REV:path`; defaults to `HEAD` when omitted. |
 
 ## Common Commands
 
 ```bash
 libra rev-parse
 libra rev-parse HEAD~1
+libra rev-parse 'HEAD^{tree}'
+libra rev-parse 'HEAD:src/main.rs'
+libra rev-parse 'main@{1}'
 libra rev-parse --short HEAD
 libra rev-parse --abbrev-ref HEAD
 libra rev-parse --show-toplevel
@@ -93,7 +104,7 @@ With `--show-toplevel`:
 }
 ```
 
-`mode` is one of `resolve`, `short`, `abbrev_ref`, `symbolic_full_name`, `symbolic`, `show_toplevel`, `show_prefix`, `show_cdup`, `is_inside_work_tree`, `is_inside_git_dir`, `is_bare_repository`, `git_dir`, or `absolute_git_dir`.
+`mode` is one of `resolve`, `short`, `abbrev_ref`, `symbolic_full_name`, `symbolic`, `show_toplevel`, `show_prefix`, `show_cdup`, `is_inside_work_tree`, `is_inside_git_dir`, `is_bare_repository`, `is_shallow_repository`, `git_dir`, or `absolute_git_dir`.
 
 With a **single** `<SPEC>`, `data` is one such object (the shape above). With **multiple** `<SPEC>` arguments, `data` is a JSON **array** of those objects, one per spec, in order. In an **output-filter** mode (`--flags`/`--no-flags`/`--revs-only`/`--no-revs`), `data` is a JSON **array of strings** — the filtered tokens (resolved object names for revisions, verbatim for kept flags/paths).
 
@@ -101,8 +112,11 @@ With a **single** `<SPEC>`, `data` is one such object (the shape above). With **
 
 | Feature | Libra | Git | jj |
 |---------|-------|-----|----|
-| Resolve full commit ID | `rev-parse <spec>` | `git rev-parse <spec>` | `jj log -r <rev> --no-graph -T commit_id` |
-| Abbreviated commit ID | `--short` | `--short` | `jj log -r <rev> -T change_id.short()` |
+| Resolve full object ID | `rev-parse <spec>` | `git rev-parse <spec>` | `jj log -r <rev> --no-graph -T commit_id` |
+| Typed/recursive peel | `^{commit/tree/blob/tag/object}` / `^{}` | same | N/A |
+| Tree path | `REV:path` | same | `jj file show -r REV path` |
+| Reflog selector | numeric `ref@{N}` | numeric/date/upstream/push/checkout forms | N/A |
+| Abbreviated object ID | `--short` | `--short` | `jj log -r <rev> -T change_id.short()` |
 | Symbolic branch name | `--abbrev-ref` | `--abbrev-ref` | N/A |
 | Full ref name | `--symbolic-full-name` | `--symbolic-full-name` | N/A |
 | Symbolic (verbatim) name | `--symbolic` | `--symbolic` | N/A |

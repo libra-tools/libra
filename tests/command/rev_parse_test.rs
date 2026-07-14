@@ -450,17 +450,20 @@ fn test_rev_parse_git_dir_points_at_libra_dir() {
 }
 
 #[test]
-fn test_rev_parse_rejects_tag_object_that_points_to_tree() {
+fn test_rev_parse_keeps_tag_object_and_supports_typed_tree_peel() {
     let repo = create_committed_repo_via_cli();
     let tag_id = create_non_commit_tag_object(repo.path());
 
     let output = run_libra_command(&["rev-parse", tag_id.as_str()], repo.path());
-    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_cli_success(&output, "rev-parse raw tag object");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), tag_id);
 
-    assert_eq!(output.status.code(), Some(129));
-    assert!(stderr.contains("not a valid object name"));
-    assert!(stderr.contains("tag points to tree"));
-    assert_eq!(report.error_code, "LBR-CLI-003");
+    let peeled = run_libra_command(&["rev-parse", &format!("{tag_id}^{{tree}}")], repo.path());
+    assert_cli_success(&peeled, "rev-parse tag^{tree}");
+    let tree_id = String::from_utf8_lossy(&peeled.stdout).trim().to_string();
+    let object_type = run_libra_command(&["cat-file", "-t", &tree_id], repo.path());
+    assert_cli_success(&object_type, "cat-file -t peeled tree");
+    assert_eq!(String::from_utf8_lossy(&object_type.stdout).trim(), "tree");
 }
 
 #[test]
@@ -686,6 +689,14 @@ fn test_rev_parse_symbolic_full_name() {
     assert_eq!(code, Some(0));
     assert_eq!(v, full, "HEAD resolves to its full branch ref");
 
+    let (v, code) = out(&["rev-parse", "--symbolic-full-name", "@"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(v, full, "@ resolves like HEAD in symbolic-full-name mode");
+
+    let (v, code) = out(&["rev-parse", "--abbrev-ref", "@"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(v, head_branch, "@ resolves like HEAD in abbrev-ref mode");
+
     // A bare branch name -> refs/heads/<name>.
     let (v, _) = out(&["rev-parse", "--symbolic-full-name", &head_branch]);
     assert_eq!(v, full);
@@ -831,24 +842,15 @@ fn test_rev_parse_symbolic_echoes_resolvable_specs_verbatim() {
     let (_, code) = out(&["rev-parse", "--symbolic", "HEAD^garbage"]);
     assert_eq!(code, Some(128));
 
-    // KNOWN, COMMAND-WIDE LIMITATION (shared with `--symbolic-full-name` and plain
-    // `rev-parse`): Libra's revision parser does not support `^{<type>}` peeling or
-    // full-ref `~N` navigation, so these git-accepted specs exit 128 here rather
-    // than being echoed. This asserts the documented behavior so it stays in sync
-    // across modes (it is NOT introduced by `--symbolic`).
+    // Typed peel and fully-qualified ref navigation are valid revision
+    // expressions. `--symbolic` preserves the spelling while plain rev-parse
+    // emits the resolved object id.
     for spec in ["HEAD^{commit}", "HEAD^{tree}", &format!("{full}~0")] {
         let sym = run_libra_command(&["rev-parse", "--symbolic", spec], p);
         let plain = run_libra_command(&["rev-parse", spec], p);
-        assert_eq!(
-            sym.status.code(),
-            Some(128),
-            "{spec}: --symbolic inherits the command-wide parser limitation (exit 128)"
-        );
-        assert_ne!(
-            plain.status.code(),
-            Some(0),
-            "{spec}: plain rev-parse also cannot resolve it (confirms a command-wide limitation)"
-        );
+        assert_cli_success(&sym, &format!("rev-parse --symbolic {spec}"));
+        assert_eq!(String::from_utf8_lossy(&sym.stdout).trim(), spec);
+        assert_cli_success(&plain, &format!("rev-parse {spec}"));
     }
 
     // --symbolic and --symbolic-full-name are mutually exclusive (clap usage error).

@@ -27,7 +27,7 @@ and updates HEAD and refs.
 The command reads the index to determine which files are staged, constructs a tree object
 hierarchy matching the staged content, creates a commit object with the provided message and
 author/committer metadata, and advances the current branch ref. When vault signing is enabled,
-the commit is automatically GPG-signed. Pre-commit and commit-msg hooks are executed unless
+the commit is automatically GPG-signed. The `.libra/hooks` commit lifecycle runs unless
 bypassed with `--no-verify`.
 
 Before computing staged changes or writing tree/commit objects, `commit` validates stage-0
@@ -172,7 +172,7 @@ libra commit --allow-empty -m "Trigger CI"
 
 ### `--disable-pre`
 
-Skip the pre-commit hook only. The commit-msg hook still runs.
+Skip only `pre-commit`. Message hooks and post-operation hooks still run.
 
 ```bash
 libra commit --disable-pre -m "Quick fix"
@@ -180,12 +180,20 @@ libra commit --disable-pre -m "Quick fix"
 
 ### `--no-verify`
 
-Skip all pre-commit and commit-msg hooks/validations. Aligns with Git's `--no-verify`
-behavior.
+Skip every `.libra/hooks` lifecycle hook and commit-message validation for this invocation.
 
 ```bash
 libra commit --no-verify -m "WIP: work in progress"
 ```
+
+### Repository hooks
+
+The order is `pre-commit` → `prepare-commit-msg` → editor/trailers → `commit-msg` →
+commit/ref update → `post-commit` → `post-rewrite` for amend. The two message hooks may
+edit `.libra/COMMIT_EDITMSG`; blocking hook failures leave history unchanged, while the
+post hooks are advisory after success. All hooks use the required workspace-only,
+network-denied sandbox. See [Repository hooks](repository-hooks.md) for arguments,
+resolution, output behavior, and escape valves.
 
 ### `--author <AUTHOR>`
 
@@ -237,7 +245,7 @@ libra config commit.cleanup whitespace   # default cleanup when --cleanup is omi
 ### `--dry-run`
 
 Do not actually create the commit. Show the commit summary that would be produced.
-The preview does not run the pre-commit hook or open the commit-message editor, so
+The preview does not run repository hooks or open the commit-message editor, so
 no message is required and subprocesses cannot observe or mutate a live index while
 `-a` is being previewed. `-v` still prints the staged preview diff directly.
 
@@ -578,8 +586,8 @@ can use `commit.gpgSign` for a Git-compatible scoped default; when it is unset,
 
 ### `--disable-pre` flag
 
-The `--disable-pre` flag skips only the pre-commit hook while still running the commit-msg
-hook. This is more granular than Git's `--no-verify`, which skips all hooks. The use case
+The `--disable-pre` flag skips only the pre-commit hook while still running the message and
+post-operation hooks. This is more granular than `--no-verify`, which skips all repository hooks. The use case
 is when a developer trusts the commit message validation (e.g., conventional commit checks
 via commit-msg hook) but wants to skip expensive pre-commit checks (e.g., full test suite,
 large linter runs) during rapid iteration. This separation of concerns is intentional: the
@@ -589,9 +597,9 @@ iterations.
 ### `--no-verify` to skip hooks
 
 For cases where all hook validation needs to be bypassed (e.g., emergency fixes, WIP commits),
-`--no-verify` skips both pre-commit and commit-msg hooks. This aligns with Git's behavior
-and naming convention. The flag name was chosen for Git compatibility so that developers
-switching from Git do not need to learn a new flag name.
+`--no-verify` skips every `.libra/hooks` lifecycle hook plus commit-message validation.
+The flag name follows Git's convention, while Libra's additional post-hook bypass is
+documented explicitly because post hooks are otherwise advisory.
 
 ## Parameter Comparison: Libra vs Git vs jj
 
@@ -646,7 +654,7 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | Object storage failed | `LBR-IO-002` | 128 | -- |
 | Parent commit missing | `LBR-REPO-002` | 128 | "the parent commit is missing or corrupted" |
 | HEAD update failed | `LBR-IO-002` | 128 | -- |
-| Pre-commit hook failed | `LBR-REPO-003` | 128 | "use --no-verify to bypass the hook" |
+| Blocking repository hook failed | `LBR-REPO-003` | 128 | "use --no-verify to bypass repository hooks" |
 | Conventional commit invalid | `LBR-CLI-002` | 129 | "see https://www.conventionalcommits.org for format rules" |
 | Vault signing failed | `LBR-AUTH-001` | 128 | "check vault configuration with 'libra config --list'" |
 | Auto-stage source read/hash failed | `LBR-IO-001` | 128 | Check the named working-tree file |

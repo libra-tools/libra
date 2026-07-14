@@ -12,8 +12,9 @@ use std::{
 };
 
 use git_internal::{
-    hash::ObjectHash,
-    internal::object::{commit::Commit, types::ObjectType},
+    errors::GitError,
+    hash::{ObjectHash, get_hash_kind},
+    internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
 };
 use ignore::{
     Match,
@@ -28,7 +29,9 @@ use crate::{
     internal::{
         branch::{Branch, BranchStoreError},
         config::{ConfigKv, LocalIdentityTarget, read_cascaded_config_value},
+        db::get_db_conn_instance,
         head::Head,
+        reflog::Reflog,
         tag,
     },
     utils::{client_storage::ClientStorage, path, path_ext::PathExt},
@@ -956,12 +959,6 @@ async fn resolve_branch_commit_typed(
     }
 }
 
-fn split_revision_navigation(name: &str) -> Option<(&str, &str)> {
-    name.char_indices()
-        .find(|(_, ch)| *ch == '~' || *ch == '^')
-        .map(|(index, _)| name.split_at(index))
-}
-
 pub(crate) fn remote_tracking_candidates(name: &str) -> impl Iterator<Item = (&str, &str)> + '_ {
     name.char_indices().filter_map(|(index, ch)| {
         if ch != '/' {
@@ -974,192 +971,287 @@ pub(crate) fn remote_tracking_candidates(name: &str) -> impl Iterator<Item = (&s
     })
 }
 
-fn nth_parent_commit_typed(
-    commit_id: &ObjectHash,
-    n: usize,
+#[derive(Debug)]
+struct ResolvedAtom {
+    object_id: ObjectHash,
+    reflog_ref: Option<String>,
+}
+
+fn invalid_reference(name: &str) -> CommitBaseError {
+    CommitBaseError::InvalidReference(format!("invalid reference: {name}"))
+}
+
+fn ensure_hash_kind(
+    object_id: ObjectHash,
     display_name: &str,
+    stored_reference: bool,
 ) -> Result<ObjectHash, CommitBaseError> {
-    let commit: Commit = load_object(commit_id).map_err(|error| {
+    let expected = get_hash_kind();
+    if object_id.kind() == expected {
+        return Ok(object_id);
+    }
+
+    let message = format!(
+        "object id for '{display_name}' uses {}, but this repository uses {expected}",
+        object_id.kind()
+    );
+    if stored_reference {
+        Err(CommitBaseError::CorruptReference(message))
+    } else {
+        Err(CommitBaseError::InvalidReference(message))
+    }
+}
+
+fn object_type_typed(
+    storage: &ClientStorage,
+    object_id: &ObjectHash,
+    display_name: &str,
+) -> Result<ObjectType, CommitBaseError> {
+    storage
+        .get_object_type(object_id)
+        .map_err(|error| match error {
+            GitError::ObjectNotFound(_) => CommitBaseError::InvalidReference(format!(
+                "object {object_id} does not exist while resolving '{display_name}'"
+            )),
+            other => CommitBaseError::classify_storage_failure(format!(
+                "could not read object {object_id} while resolving '{display_name}': {other}"
+            )),
+        })
+}
+
+fn validate_referenced_object(
+    storage: &ClientStorage,
+    object_id: ObjectHash,
+    display_name: &str,
+    expected_type: Option<ObjectType>,
+) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = ensure_hash_kind(object_id, display_name, true)?;
+    let actual_type = storage.get_object_type(&object_id).map_err(|error| {
         CommitBaseError::classify_storage_failure(format!(
-            "failed to load commit object while resolving '{display_name}': {error}"
+            "reference '{display_name}' points to unreadable object {object_id}: {error}"
         ))
     })?;
-
-    if n == 0 || n > commit.parent_commit_ids.len() {
-        return Err(CommitBaseError::InvalidReference(format!(
-            "invalid reference: {display_name}"
+    if let Some(expected_type) = expected_type
+        && actual_type != expected_type
+    {
+        return Err(CommitBaseError::CorruptReference(format!(
+            "reference '{display_name}' points to {actual_type}, expected {expected_type}"
         )));
     }
-
-    Ok(commit.parent_commit_ids[n - 1])
+    Ok(object_id)
 }
 
-fn navigate_commit_path_typed(
-    mut current: ObjectHash,
-    path: &str,
+/// Require that a resolved object id exists in the current repository.
+///
+/// This is the additional contract used by `rev-parse --verify`/`--short`:
+/// plain rev parsing may echo a syntactically complete object id, while these
+/// modes must prove that the object is readable.
+pub fn require_object_exists_typed(
+    object_id: ObjectHash,
     display_name: &str,
 ) -> Result<ObjectHash, CommitBaseError> {
-    let mut chars = path.chars().peekable();
-
-    while let Some(symbol) = chars.next() {
-        if symbol != '^' && symbol != '~' {
-            return Err(CommitBaseError::InvalidReference(format!(
-                "invalid reference: {display_name}"
-            )));
-        }
-
-        let mut digits = String::new();
-        while let Some(ch) = chars.peek() {
-            if ch.is_ascii_digit() {
-                digits.push(*ch);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-
-        let step = if digits.is_empty() {
-            1
-        } else {
-            digits.parse::<usize>().map_err(|_| {
-                CommitBaseError::InvalidReference(format!("invalid reference: {display_name}"))
-            })?
-        };
-
-        if step == 0 {
-            // `~0` is identity. `^0` is also identity here because
-            // `resolve_commit_base_atom_typed()` already peels named tags and
-            // direct tag-object hashes to their referenced object before
-            // navigation runs.
-            continue;
-        }
-
-        match symbol {
-            '^' => {
-                current = nth_parent_commit_typed(&current, step, display_name)?;
-            }
-            '~' => {
-                for _ in 0..step {
-                    current = nth_parent_commit_typed(&current, 1, display_name)?;
-                }
-            }
-            // INVARIANT: the leading `symbol != '^' && symbol != '~'` guard at
-            // line 727 returns InvalidReference for every other character, so
-            // by this match the only reachable values are '^' and '~'.
-            _ => unreachable!("symbol guard above rejects all other chars"),
-        }
-    }
-
-    Ok(current)
+    object_type_typed(&objects_storage(), &object_id, display_name)?;
+    Ok(object_id)
 }
 
-async fn resolve_commit_base_atom_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
-    // 1. Check for HEAD
-    if name == "HEAD" {
-        return match Head::current_commit_result().await {
-            Ok(Some(commit_id)) => Ok(commit_id),
-            Ok(None) => Err(CommitBaseError::HeadUnborn),
-            Err(error) => Err(CommitBaseError::from_branch_store_error(
-                "failed to resolve HEAD".to_string(),
-                error,
-            )),
-        };
-    }
-
-    // 2. Check for a local branch
-    if let Some(commit) = resolve_branch_commit_typed(name, None, name).await? {
-        return Ok(commit);
-    }
-
-    // Support both short remote branches (`origin/main`) and fetched
-    // remote-tracking refs (`refs/remotes/origin/main`), including multi-segment
-    // remotes like `upstream/origin/main`.
-    if let Some(short_name) = name.strip_prefix("refs/remotes/") {
-        if let Some(commit) = resolve_branch_commit_typed(name, None, name).await? {
-            return Ok(commit);
-        }
-
-        for (remote, branch_name) in remote_tracking_candidates(short_name) {
-            if let Some(commit) = resolve_branch_commit_typed(name, Some(remote), name).await? {
-                return Ok(commit);
-            }
-
-            if let Some(commit) =
-                resolve_branch_commit_typed(branch_name, Some(remote), name).await?
-            {
-                return Ok(commit);
-            }
-        }
-    } else {
-        for (remote, branch_name) in remote_tracking_candidates(name) {
-            if let Some(commit) = resolve_branch_commit_typed(
-                &format!("refs/remotes/{remote}/{branch_name}"),
-                Some(remote),
-                name,
-            )
-            .await?
-            {
-                return Ok(commit);
-            }
-
-            if let Some(commit) =
-                resolve_branch_commit_typed(branch_name, Some(remote), name).await?
-            {
-                return Ok(commit);
-            }
-        }
-    }
-
-    // 3. Check for a tag
-    match tag::find_tag_and_commit(name).await {
-        Ok(Some((_tag_object, commit))) => return Ok(commit.id),
-        Ok(None) => {}
-        Err(error) => {
-            return Err(CommitBaseError::classify_storage_failure(format!(
-                "failed to resolve tag '{name}': {error}"
-            )));
-        }
-    }
-
-    // 4. Check for a hash prefix
+async fn resolve_tag_atom_typed(
+    name: &str,
+    display_name: &str,
+) -> Result<Option<ResolvedAtom>, CommitBaseError> {
+    let tag_name = name.strip_prefix("refs/tags/").unwrap_or(name);
+    let tag_ref = tag::find_tag_ref(tag_name).await.map_err(|error| {
+        CommitBaseError::ReadFailure(format!("failed to resolve tag '{display_name}': {error}"))
+    })?;
+    let Some(tag_ref) = tag_ref else {
+        return Ok(None);
+    };
+    let target = tag_ref.target.ok_or_else(|| {
+        CommitBaseError::CorruptReference(format!(
+            "tag reference 'refs/tags/{tag_name}' has no object id"
+        ))
+    })?;
+    let object_id = target.parse::<ObjectHash>().map_err(|error| {
+        CommitBaseError::CorruptReference(format!(
+            "tag reference 'refs/tags/{tag_name}' has invalid object id '{target}': {error}"
+        ))
+    })?;
     let storage = objects_storage();
-    let commits = storage.search_result(name).await.map_err(|error| {
+    let object_id = validate_referenced_object(&storage, object_id, display_name, None)?;
+    Ok(Some(ResolvedAtom {
+        object_id,
+        reflog_ref: Some(format!("refs/tags/{tag_name}")),
+    }))
+}
+
+async fn resolve_local_branch_atom_typed(
+    name: &str,
+    display_name: &str,
+) -> Result<Option<ResolvedAtom>, CommitBaseError> {
+    let short_name = name.strip_prefix("refs/heads/").unwrap_or(name);
+    let commit = match resolve_branch_commit_typed(short_name, None, display_name).await? {
+        Some(commit) => Some(commit),
+        None if short_name != name => resolve_branch_commit_typed(name, None, display_name).await?,
+        None => None,
+    };
+    let Some(commit) = commit else {
+        return Ok(None);
+    };
+    let storage = objects_storage();
+    let object_id =
+        validate_referenced_object(&storage, commit, display_name, Some(ObjectType::Commit))?;
+    Ok(Some(ResolvedAtom {
+        object_id,
+        reflog_ref: Some(format!("refs/heads/{short_name}")),
+    }))
+}
+
+async fn resolve_remote_branch_atom_typed(
+    name: &str,
+    display_name: &str,
+) -> Result<Option<ResolvedAtom>, CommitBaseError> {
+    let short_name = name.strip_prefix("refs/remotes/").unwrap_or(name);
+    for (remote, branch_name) in remote_tracking_candidates(short_name) {
+        let full_ref = format!("refs/remotes/{remote}/{branch_name}");
+        let candidates = [
+            (full_ref.as_str(), Some(remote)),
+            (branch_name, Some(remote)),
+        ];
+        for (candidate, candidate_remote) in candidates {
+            if let Some(commit) =
+                resolve_branch_commit_typed(candidate, candidate_remote, display_name).await?
+            {
+                let storage = objects_storage();
+                let object_id = validate_referenced_object(
+                    &storage,
+                    commit,
+                    display_name,
+                    Some(ObjectType::Commit),
+                )?;
+                return Ok(Some(ResolvedAtom {
+                    object_id,
+                    reflog_ref: Some(full_ref.clone()),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn resolve_hash_atom_typed(name: &str) -> Result<ResolvedAtom, CommitBaseError> {
+    let hash_kind = get_hash_kind();
+    let expected_len = hash_kind.hex_len();
+    if name.len() == expected_len && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let object_id = name
+            .parse::<ObjectHash>()
+            .map_err(|_| invalid_reference(name))?;
+        return Ok(ResolvedAtom {
+            object_id: ensure_hash_kind(object_id, name, false)?,
+            reflog_ref: None,
+        });
+    }
+
+    if !(4..expected_len).contains(&name.len())
+        || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid_reference(name));
+    }
+
+    let storage = objects_storage();
+    let matches = storage.search_result(name).await.map_err(|error| {
         CommitBaseError::classify_storage_failure(format!(
             "failed to search objects while resolving '{name}': {error}"
         ))
     })?;
-    if commits.is_empty() {
-        return Err(CommitBaseError::InvalidReference(format!(
-            "invalid reference: {name}"
-        )));
-    } else if commits.len() > 1 {
-        return Err(CommitBaseError::InvalidReference(format!(
-            "ambiguous argument: {name}"
-        )));
-    }
-
-    let object_id = commits[0];
-    let object_type = storage.get_object_type(&object_id).map_err(|e| {
-        CommitBaseError::classify_storage_failure(format!(
-            "could not read object type for {name}: {e}"
-        ))
-    })?;
-
-    match object_type {
-        ObjectType::Commit => Ok(object_id),
-        ObjectType::Tag => peel_tag_hash_to_commit(&storage, object_id, name),
+    let matches = matches
+        .into_iter()
+        .filter(|object_id| object_id.kind() == hash_kind)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [object_id] => Ok(ResolvedAtom {
+            object_id: *object_id,
+            reflog_ref: None,
+        }),
+        [] => Err(invalid_reference(name)),
         _ => Err(CommitBaseError::InvalidReference(format!(
-            "reference is not a commit: {name}, is {object_type}"
+            "ambiguous argument: {name}"
         ))),
     }
 }
 
-fn peel_tag_hash_to_commit(
+async fn resolve_object_atom_typed(name: &str) -> Result<ResolvedAtom, CommitBaseError> {
+    if name == "HEAD" || name == "@" {
+        let object_id = match Head::current_commit_result().await {
+            Ok(Some(commit_id)) => commit_id,
+            Ok(None) => return Err(CommitBaseError::HeadUnborn),
+            Err(error) => {
+                return Err(CommitBaseError::from_branch_store_error(
+                    "failed to resolve HEAD".to_string(),
+                    error,
+                ));
+            }
+        };
+        let storage = objects_storage();
+        let object_id =
+            validate_referenced_object(&storage, object_id, "HEAD", Some(ObjectType::Commit))?;
+        return Ok(ResolvedAtom {
+            object_id,
+            reflog_ref: Some("HEAD".to_string()),
+        });
+    }
+
+    if name.starts_with("refs/tags/") || name.starts_with("tags/") {
+        let canonical = name.strip_prefix("tags/").unwrap_or(name);
+        return resolve_tag_atom_typed(canonical, name)
+            .await?
+            .ok_or_else(|| invalid_reference(name));
+    }
+    if name.starts_with("refs/heads/") || name.starts_with("heads/") {
+        let canonical = name.strip_prefix("heads/").unwrap_or(name);
+        return resolve_local_branch_atom_typed(canonical, name)
+            .await?
+            .ok_or_else(|| invalid_reference(name));
+    }
+    if name.starts_with("refs/remotes/") || name.starts_with("remotes/") {
+        let canonical = name.strip_prefix("remotes/").unwrap_or(name);
+        return resolve_remote_branch_atom_typed(canonical, name)
+            .await?
+            .ok_or_else(|| invalid_reference(name));
+    }
+
+    // Git's short-ref precedence checks tags before local and remote branches.
+    if let Some(tag) = resolve_tag_atom_typed(name, name).await? {
+        return Ok(tag);
+    }
+    if let Some(branch) = resolve_local_branch_atom_typed(name, name).await? {
+        return Ok(branch);
+    }
+    if let Some(branch) = resolve_remote_branch_atom_typed(name, name).await? {
+        return Ok(branch);
+    }
+
+    resolve_hash_atom_typed(name).await
+}
+
+fn peel_tag_target_typed(
     storage: &ClientStorage,
     object_id: ObjectHash,
     display_name: &str,
 ) -> Result<ObjectHash, CommitBaseError> {
-    let mut current = object_id;
+    let tag_object: GitTag = load_object(&object_id).map_err(|error| {
+        CommitBaseError::classify_storage_failure(format!(
+            "failed to load tag object {object_id} while resolving '{display_name}': {error}"
+        ))
+    })?;
+    validate_referenced_object(storage, tag_object.object_hash, display_name, None)
+}
+
+fn peel_object_to_type_typed(
+    object_id: ObjectHash,
+    expected: Option<ObjectType>,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let storage = objects_storage();
+    let mut current = ensure_hash_kind(object_id, display_name, false)?;
     let mut seen = HashSet::new();
 
     loop {
@@ -1168,46 +1260,299 @@ fn peel_tag_hash_to_commit(
                 "tag cycle detected while resolving '{display_name}'"
             )));
         }
-
-        let tag_obj: git_internal::internal::object::tag::Tag =
-            load_object(&current).map_err(|error| {
-                CommitBaseError::classify_storage_failure(format!(
-                    "failed to load tag object while resolving '{display_name}': {error}"
-                ))
-            })?;
-        let target_type = storage
-            .get_object_type(&tag_obj.object_hash)
-            .map_err(|error| {
-                CommitBaseError::classify_storage_failure(format!(
-                    "could not read tag target type while resolving '{display_name}': {error}"
-                ))
-            })?;
-
-        match target_type {
-            ObjectType::Commit => return Ok(tag_obj.object_hash),
-            ObjectType::Tag => current = tag_obj.object_hash,
-            _ => {
+        let current_type = object_type_typed(&storage, &current, display_name)?;
+        match expected {
+            Some(ObjectType::Commit) if current_type == ObjectType::Commit => return Ok(current),
+            Some(ObjectType::Tree) if current_type == ObjectType::Tree => return Ok(current),
+            Some(ObjectType::Blob) if current_type == ObjectType::Blob => return Ok(current),
+            Some(ObjectType::Tag) if current_type == ObjectType::Tag => return Ok(current),
+            Some(expected_type) if expected_type == current_type => return Ok(current),
+            None if current_type != ObjectType::Tag => return Ok(current),
+            Some(ObjectType::Tree) if current_type == ObjectType::Commit => {
+                let commit: Commit = load_object(&current).map_err(|error| {
+                    CommitBaseError::classify_storage_failure(format!(
+                        "failed to load commit {current} while resolving '{display_name}': {error}"
+                    ))
+                })?;
+                return validate_referenced_object(
+                    &storage,
+                    commit.tree_id,
+                    display_name,
+                    Some(ObjectType::Tree),
+                );
+            }
+            _ if current_type == ObjectType::Tag => {
+                current = peel_tag_target_typed(&storage, current, display_name)?;
+            }
+            Some(expected_type) => {
                 return Err(CommitBaseError::InvalidReference(format!(
-                    "reference is not a commit: {display_name}, tag points to {target_type}"
+                    "reference '{display_name}' cannot be peeled from {current_type} to {expected_type}"
                 )));
             }
+            None => return Ok(current),
         }
     }
 }
 
-pub async fn get_commit_base_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
-    if let Some((base_ref, path)) = split_revision_navigation(name) {
-        if base_ref.is_empty() {
-            return Err(CommitBaseError::InvalidReference(format!(
-                "invalid reference: {name}"
-            )));
+fn nth_parent_commit_typed(
+    commit_id: ObjectHash,
+    n: usize,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let commit_id = peel_object_to_type_typed(commit_id, Some(ObjectType::Commit), display_name)?;
+    if n == 0 {
+        return Ok(commit_id);
+    }
+    let commit: Commit = load_object(&commit_id).map_err(|error| {
+        CommitBaseError::classify_storage_failure(format!(
+            "failed to load commit {commit_id} while resolving '{display_name}': {error}"
+        ))
+    })?;
+    let parent = commit
+        .parent_commit_ids
+        .get(n - 1)
+        .copied()
+        .ok_or_else(|| invalid_reference(display_name))?;
+    validate_referenced_object(
+        &objects_storage(),
+        parent,
+        display_name,
+        Some(ObjectType::Commit),
+    )
+}
+
+async fn current_branch_reflog_ref(display_name: &str) -> Result<String, CommitBaseError> {
+    match Head::current_result().await {
+        Ok(Head::Branch(name)) => Ok(format!("refs/heads/{name}")),
+        Ok(Head::Detached(_)) => Err(CommitBaseError::InvalidReference(format!(
+            "'{display_name}' requires a current branch reflog, but HEAD is detached"
+        ))),
+        Err(error) => Err(CommitBaseError::from_branch_store_error(
+            "failed to resolve current branch for reflog selector".to_string(),
+            error,
+        )),
+    }
+}
+
+async fn resolve_reflog_selector_typed(
+    ref_name: &str,
+    index: usize,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let db = get_db_conn_instance().await;
+    let entries = Reflog::find_all(&db, ref_name).await.map_err(|error| {
+        CommitBaseError::ReadFailure(format!(
+            "failed to read reflog '{ref_name}' while resolving '{display_name}': {error}"
+        ))
+    })?;
+    let entry = entries.get(index).ok_or_else(|| {
+        CommitBaseError::InvalidReference(format!(
+            "reflog entry '{ref_name}@{{{index}}}' does not exist"
+        ))
+    })?;
+    let object_id = entry.new_oid.parse::<ObjectHash>().map_err(|error| {
+        CommitBaseError::CorruptReference(format!(
+            "reflog entry '{ref_name}@{{{index}}}' has invalid object id '{}': {error}",
+            entry.new_oid
+        ))
+    })?;
+    validate_referenced_object(&objects_storage(), object_id, display_name, None)
+}
+
+fn first_revision_operator(spec: &str) -> Option<usize> {
+    spec.char_indices().find_map(|(index, ch)| {
+        (ch == '^' || ch == '~' || (ch == '@' && spec[index..].starts_with("@{"))).then_some(index)
+    })
+}
+
+fn parse_decimal_prefix(
+    value: &str,
+    default: usize,
+    display_name: &str,
+) -> Result<(usize, usize), CommitBaseError> {
+    let digit_len = value
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_len == 0 {
+        return Ok((default, 0));
+    }
+    let parsed = value[..digit_len]
+        .parse::<usize>()
+        .map_err(|_| invalid_reference(display_name))?;
+    Ok((parsed, digit_len))
+}
+
+async fn resolve_revision_expression_typed(spec: &str) -> Result<ObjectHash, CommitBaseError> {
+    if spec.is_empty() {
+        return Err(invalid_reference(spec));
+    }
+    let operator_index = first_revision_operator(spec).unwrap_or(spec.len());
+    let atom_text = &spec[..operator_index];
+    let mut rest = &spec[operator_index..];
+    let mut atom = if atom_text.is_empty() {
+        None
+    } else {
+        Some(resolve_object_atom_typed(atom_text).await?)
+    };
+
+    while !rest.is_empty() {
+        if let Some(selector) = rest.strip_prefix("@{") {
+            let close = selector.find('}').ok_or_else(|| invalid_reference(spec))?;
+            let index_text = &selector[..close];
+            if index_text.is_empty() || !index_text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(CommitBaseError::InvalidReference(format!(
+                    "unsupported reflog selector in '{spec}'; use a non-negative numeric index"
+                )));
+            }
+            let index = index_text
+                .parse::<usize>()
+                .map_err(|_| invalid_reference(spec))?;
+            let ref_name = match atom
+                .as_ref()
+                .and_then(|resolved| resolved.reflog_ref.clone())
+            {
+                Some(ref_name) => ref_name,
+                None if atom_text.is_empty() => current_branch_reflog_ref(spec).await?,
+                None => return Err(invalid_reference(spec)),
+            };
+            let object_id = resolve_reflog_selector_typed(&ref_name, index, spec).await?;
+            atom = Some(ResolvedAtom {
+                object_id,
+                reflog_ref: Some(ref_name),
+            });
+            rest = &selector[close + 1..];
+            continue;
         }
 
-        let base_commit = resolve_commit_base_atom_typed(base_ref).await?;
-        return navigate_commit_path_typed(base_commit, path, name);
+        let current = atom
+            .as_ref()
+            .map(|resolved| resolved.object_id)
+            .ok_or_else(|| invalid_reference(spec))?;
+        if let Some(peel) = rest.strip_prefix("^{") {
+            let close = peel.find('}').ok_or_else(|| invalid_reference(spec))?;
+            let expected = match &peel[..close] {
+                "" => None,
+                "object" => Some(object_type_typed(&objects_storage(), &current, spec)?),
+                "commit" => Some(ObjectType::Commit),
+                "tree" => Some(ObjectType::Tree),
+                "blob" => Some(ObjectType::Blob),
+                "tag" => Some(ObjectType::Tag),
+                _ => return Err(invalid_reference(spec)),
+            };
+            let object_id = peel_object_to_type_typed(current, expected, spec)?;
+            atom = Some(ResolvedAtom {
+                object_id,
+                reflog_ref: None,
+            });
+            rest = &peel[close + 1..];
+            continue;
+        }
+        if let Some(parent) = rest.strip_prefix('^') {
+            let (parent_number, consumed) = parse_decimal_prefix(parent, 1, spec)?;
+            let object_id = nth_parent_commit_typed(current, parent_number, spec)?;
+            atom = Some(ResolvedAtom {
+                object_id,
+                reflog_ref: None,
+            });
+            rest = &parent[consumed..];
+            continue;
+        }
+        if let Some(ancestor) = rest.strip_prefix('~') {
+            let (generations, consumed) = parse_decimal_prefix(ancestor, 1, spec)?;
+            let mut object_id = peel_object_to_type_typed(current, Some(ObjectType::Commit), spec)?;
+            for _ in 0..generations {
+                object_id = nth_parent_commit_typed(object_id, 1, spec)?;
+            }
+            atom = Some(ResolvedAtom {
+                object_id,
+                reflog_ref: None,
+            });
+            rest = &ancestor[consumed..];
+            continue;
+        }
+        return Err(invalid_reference(spec));
     }
 
-    resolve_commit_base_atom_typed(name).await
+    atom.map(|resolved| resolved.object_id)
+        .ok_or_else(|| invalid_reference(spec))
+}
+
+fn resolve_tree_path_typed(
+    root: ObjectHash,
+    path_spec: &str,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let mut current = peel_object_to_type_typed(root, Some(ObjectType::Tree), display_name)?;
+    if path_spec.is_empty() {
+        return Ok(current);
+    }
+
+    let components = path_spec.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || *component == "." || *component == "..")
+    {
+        return Err(CommitBaseError::InvalidReference(format!(
+            "invalid tree path in '{display_name}'"
+        )));
+    }
+
+    for (index, component) in components.iter().enumerate() {
+        let tree: Tree = load_object(&current).map_err(|error| {
+            CommitBaseError::classify_storage_failure(format!(
+                "failed to load tree {current} while resolving '{display_name}': {error}"
+            ))
+        })?;
+        let item = tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == *component)
+            .ok_or_else(|| {
+                CommitBaseError::InvalidReference(format!(
+                    "path '{path_spec}' does not exist in '{display_name}'"
+                ))
+            })?;
+        current = validate_referenced_object(
+            &objects_storage(),
+            item.id,
+            display_name,
+            if index + 1 < components.len() {
+                Some(ObjectType::Tree)
+            } else {
+                None
+            },
+        )?;
+    }
+    Ok(current)
+}
+
+/// Resolve one strict Git object specification to its concrete object id.
+///
+/// Supported forms include refs, unique object-id prefixes, `@`, numeric reflog
+/// selectors, parent/ancestor navigation, typed or recursive peel suffixes, and
+/// `<tree-ish>:<path>`. Parsing consumes the entire input; trailing garbage is
+/// never ignored.
+pub async fn resolve_object_spec_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
+    if let Some((revision, tree_path)) = name.split_once(':') {
+        if revision.is_empty() {
+            return Err(invalid_reference(name));
+        }
+        let root = resolve_revision_expression_typed(revision).await?;
+        return resolve_tree_path_typed(root, tree_path, name);
+    }
+    resolve_revision_expression_typed(name).await
+}
+
+/// Resolve a tree-ish expression and peel commits or annotated tags to a tree.
+pub async fn resolve_tree_ish_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = resolve_object_spec_typed(name).await?;
+    peel_object_to_type_typed(object_id, Some(ObjectType::Tree), name)
+}
+
+pub async fn get_commit_base_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = resolve_object_spec_typed(name).await?;
+    peel_object_to_type_typed(object_id, Some(ObjectType::Commit), name)
 }
 
 /// Resolve a string to a commit [`ObjectHash`].
@@ -1215,9 +1560,9 @@ pub async fn get_commit_base_typed(name: &str) -> Result<ObjectHash, CommitBaseE
 /// (such as `origin/main`), a tag name, or a commit hash prefix.
 /// Order of resolution:
 /// 1. HEAD
-/// 2. Local branch
-/// 3. Remote-tracking branch (e.g. `origin/main`)
-/// 4. Tag
+/// 2. Tag
+/// 3. Local branch
+/// 4. Remote-tracking branch (e.g. `origin/main`)
 /// 5. Commit hash prefix
 pub async fn get_commit_base(name: &str) -> Result<ObjectHash, String> {
     get_commit_base_typed(name)

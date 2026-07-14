@@ -2,6 +2,10 @@
 
 目的：验证当前本地路径 Git remote 的 clone、remote、ls-remote、fetch、pull 基础互操作，并用负向断言记录仍未实现的 Git 参数。
 
+P1-10 的 `pull --rebase` required-sandbox `pre-rebase`、blocking 时 HEAD 原子性与
+parent JSON envelope 隔离由 `command_test::test_pull_rebase_runs_pre_rebase_before_moving_local_history`
+负责；shell runner 不重复裸跑仓库任意代码。
+
 最小步骤：
 
 ```bash

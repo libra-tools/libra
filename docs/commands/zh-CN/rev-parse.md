@@ -1,6 +1,6 @@
 # `libra rev-parse`
 
-解析修订名，并打印规范化的提交 ID、符号引用或仓库路径。
+解析修订名，并打印规范化的对象 ID、符号引用或仓库路径。
 
 ## 概要
 
@@ -12,16 +12,19 @@ libra rev-parse [OPTIONS] [SPEC]...
 
 `libra rev-parse` 会将类似修订的输入解析为以下三种形式之一：
 
-- 完整提交 ID（默认）
-- 使用 `--short` 得到的短提交 ID
+- 完整对象 ID（默认）
+- 使用 `--short` 得到的短对象 ID
 - 使用 `--abbrev-ref` 得到的符号分支名
 
 它还支持 `--show-toplevel`，用于打印工作树的绝对仓库根目录。未提供 `<SPEC>` 时默认为 `HEAD`；提供多个 `<SPEC>` 时各自单独成行解析。输出过滤标志（`--flags`/`--no-flags`/`--revs-only`/`--no-revs`）则把每个参数分类为 flag、revision 或 path，并打印过滤后的子集。
+
+共享的严格对象 spec 解析器支持：`@` 作为 `HEAD`、完整 tag ref、`^N`/`~N`、`^{commit|tree|blob|tag|object}` 与递归 `^{}` peel、数字 reflog selector（`main@{1}`、`HEAD@{0}`，以及表示当前分支的 `@{1}`）和 `<tree-ish>:<path>`。解析必须消费完整输入，非法后缀不会静默退化到另一个对象。reflog 日期 selector、`@{-N}`、`@{upstream}`/`@{push}` 与相对 `./`/`../` tree path 仍不支持，并会明确失败。
 
 ## 选项
 
 | 标志 | 说明 |
 |------|-------------|
+| `--verify` | 断言 `<SPEC>` 恰好解析为一个实际存在的对象；成功时打印对象 ID，失败退出 128（全局 `--quiet` / `-q` 下静默退出 1）。 |
 | `--short` | 打印无歧义的缩写对象 ID。 |
 | `--sq` | 对解析出的对象名做单引号 shell 引用，便于安全地交给 shell 消费。仅影响解析出的修订输出，不影响 `--show-toplevel` 等查询模式。 |
 | `--abbrev-ref` | 打印符号分支名，而不是提交哈希。 |
@@ -32,16 +35,20 @@ libra rev-parse [OPTIONS] [SPEC]...
 | `--revs-only` | 输出过滤模式：仅打印解析为 revision 的参数（以对象名输出），丢弃 flag 与非 revision 的 path。 |
 | `--no-revs` | 输出过滤模式：丢弃 revision 参数，保留 flag 与非 revision 的 path。 |
 | `--show-toplevel` | 打印顶层工作树的绝对路径。 |
+| `--is-inside-git-dir` | 当前目录位于 `.libra`（Libra 的 `$GIT_DIR`）内时打印 `true`，否则打印 `false`。 |
 | `--is-shallow-repository` | 当 `.libra/shallow` 至少包含一个 shallow boundary 时打印 `true`，否则打印 `false`。 |
 | `--git-dir` | 打印 `.libra` 目录路径（Libra 的 `$GIT_DIR`）；在 Libra 中始终为绝对路径。 |
 | `--absolute-git-dir` | 同 `--git-dir`，但始终为规范化后的绝对路径。（Libra 中 `--git-dir` 已是绝对路径，故两者一致。） |
-| `<SPEC>...` | 要解析的修订（可多个）。省略时默认为 `HEAD`；多个时各自解析。 |
+| `<SPEC>...` | 要解析的对象/修订 spec（可多个），支持 typed peel、数字 reflog selector 与 `REV:path`。省略时默认为 `HEAD`；多个时各自解析。 |
 
 ## 常用命令
 
 ```bash
 libra rev-parse
 libra rev-parse HEAD~1
+libra rev-parse 'HEAD^{tree}'
+libra rev-parse 'HEAD:src/main.rs'
+libra rev-parse 'main@{1}'
 libra rev-parse --short HEAD
 libra rev-parse --abbrev-ref HEAD
 libra rev-parse --show-toplevel
@@ -90,7 +97,7 @@ main
 }
 ```
 
-`mode` 是 `resolve`、`short`、`abbrev_ref`、`symbolic_full_name`、`symbolic`、`show_toplevel`、`show_prefix`、`show_cdup`、`is_inside_work_tree`、`is_inside_git_dir`、`is_bare_repository`、`git_dir` 或 `absolute_git_dir` 之一。
+`mode` 是 `resolve`、`short`、`abbrev_ref`、`symbolic_full_name`、`symbolic`、`show_toplevel`、`show_prefix`、`show_cdup`、`is_inside_work_tree`、`is_inside_git_dir`、`is_bare_repository`、`is_shallow_repository`、`git_dir` 或 `absolute_git_dir` 之一。
 
 单个 `<SPEC>` 时，`data` 是上述单个对象；**多个** `<SPEC>` 时 `data` 是这些对象按顺序组成的 JSON **数组**（每个 spec 一项）。在**输出过滤**模式（`--flags`/`--no-flags`/`--revs-only`/`--no-revs`）下，`data` 是过滤后 token 的 JSON **字符串数组**（revision 为解析出的对象名，保留的 flag/path 原样）。
 
@@ -98,8 +105,11 @@ main
 
 | 功能 | Libra | Git | jj |
 |---------|-------|-----|----|
-| 解析完整提交 ID | `rev-parse <spec>` | `git rev-parse <spec>` | `jj log -r <rev> --no-graph -T commit_id` |
-| 缩写提交 ID | `--short` | `--short` | `jj log -r <rev> -T change_id.short()` |
+| 解析完整对象 ID | `rev-parse <spec>` | `git rev-parse <spec>` | `jj log -r <rev> --no-graph -T commit_id` |
+| typed/递归 peel | `^{commit/tree/blob/tag/object}` / `^{}` | 同 | N/A |
+| tree path | `REV:path` | 同 | `jj file show -r REV path` |
+| reflog selector | 数字 `ref@{N}` | 数字/日期/upstream/push/checkout 形式 | N/A |
+| 缩写对象 ID | `--short` | `--short` | `jj log -r <rev> -T change_id.short()` |
 | 符号分支名 | `--abbrev-ref` | `--abbrev-ref` | N/A |
 | 完整 ref 名 | `--symbolic-full-name` | `--symbolic-full-name` | N/A |
 | 符号（原样）名 | `--symbolic` | `--symbolic` | N/A |

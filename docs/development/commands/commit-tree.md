@@ -12,8 +12,8 @@ GIT_INDEX_FILE 等价物）合成离线修订组合环路。发布走 `update-re
 
 - 级别：`partial`。`-p` 可重复（重复告警忽略，父必须 load 为 commit）；
   `-m` 段落可重复 + `-F`（`-` = stdin）+ 裸管道 stdin；`-m`+`-F` 可混用但
-  按组序拼接（argv 交错不保留——文档化差异）；tree 操作数额外剥 commit-ish
-  （Libra 超集）。
+  按组序拼接（argv 交错不保留——文档化差异）；tree 操作数复用严格 tree-ish
+  resolver，支持 commit/tag/ref 与 `^{tree}` 等 typed peel（Libra 超集）。
 - 有意差异：空消息拒绝（D-empty-message 全库规则；git plumbing 接受——
   重放含空消息的外部历史暂不可行，已注明）；v1 恒不签名（git 此处尊重
   commit.gpgsign——vault 签名为后续项；注意 libra init 默认 vault.signing=true

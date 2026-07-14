@@ -81,6 +81,15 @@ libra rebase --fork-point origin/main
 
 Exec commands are user-controlled shell input. Libra runs them only when its internal sandbox can enforce workspace-only writes and denied network access; if the required backend is unavailable, the command fails closed with `LBR-CONFLICT-002` and leaves the rebase resumable.
 
+## Repository hooks
+
+Before a new rebase (including `pull --rebase`) mutates local history, `pre-rebase`
+receives `<upstream> [branch]` and may block the operation. After a successful rewrite,
+advisory `post-rewrite rebase` receives
+sorted `<old-oid> <new-oid>` lines on stdin. Recovery actions do not rerun `pre-rebase`.
+Rebase has no dedicated `--no-verify` flag; set `LIBRA_NO_HOOKS=1` only when an explicit
+policy bypass is required. See [Repository hooks](repository-hooks.md).
+
 **`--continue`**
 
 After resolving conflicts and staging the resolved files, continue the rebase:

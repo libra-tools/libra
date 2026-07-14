@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra commit` 的目标是把索引快照记录为新提交，并处理消息来源、作者/提交者、vault 签名、Libra 自有 pre-commit hook、结构化输出和兼容拒绝。这里的 hook 只指 `.libra/hooks/pre-commit.*`；Git hooks bridge（`.git/hooks` / `core.hooksPath`，包括 stock `commit-msg` bridge）按 [`_compatibility.md` D3](_compatibility.md#d3git-hooks-bridge-作为核心特性) 拒绝。常用 Git commit 表面已经覆盖：消息/模板/复用、amend、auto-stage、author/date/env、cleanup、dry-run/porcelain、trailers、编辑器、verbose diff 与稳定错误码。编辑器模板默认含注释化 status；`commit.status=false` 可关闭，`--status`/`--no-status` 显式覆盖，且仅在 cleanup 会剥离注释时注入。`commit.cleanup`/`commit.verbose` 提供既有 local→global 默认；`commit.gpgSign` 与 `--no-gpg-sign` 控制 vault 签名。Git 正向 `-S`/`--gpg-sign` 尚未公开。
+`libra commit` 的目标是把索引快照记录为新提交，并处理消息来源、作者/提交者、vault 签名、`.libra/hooks` commit 生命周期、结构化输出和兼容拒绝。P1-10 支持 `pre-commit`、`prepare-commit-msg`、`commit-msg`、`post-rewrite` 与 `post-commit`；Git hooks bridge（`.git/hooks` / `core.hooksPath`）仍按 [`_compatibility.md` D3](_compatibility.md#d3git-hooks-bridge-作为核心特性) 拒绝。常用 Git commit 表面已经覆盖：消息/模板/复用、amend、auto-stage、author/date/env、cleanup、dry-run/porcelain、trailers、编辑器、verbose diff 与稳定错误码。编辑器模板默认含注释化 status；`commit.status=false` 可关闭，`--status`/`--no-status` 显式覆盖，且仅在 cleanup 会剥离注释时注入。`commit.cleanup`/`commit.verbose` 提供既有 local→global 默认；`commit.gpgSign` 与 `--no-gpg-sign` 控制 vault 签名。Git 正向 `-S`/`--gpg-sign` 尚未公开。
 
 ## 对比 Git 与兼容性
 
@@ -35,9 +35,11 @@ flowchart TD
 - 底层操作对象：`IndexEntry`（索引条目，承载路径、mode、object id 和 stat 元数据）；`Index` / `.libra/index`（暂存区状态、路径条目和刷新/保存边界）；`Blob`（文件内容或 LFS pointer 写入对象库后的 blob 对象）；`Commit`（提交对象、父提交关系和提交消息载荷）；`TreeItem` / `TreeItemMode`（tree 中的路径项和 mode）；`Tree`（由索引或对象遍历生成的目录树对象）；`Branch` / branch store（SQLite refs 上的分支读写、过滤和上游关系）；`Head`（SQLite 中的 HEAD 指向、当前分支和 detached 状态）；`ReflogContext` / `with_reflog`（SQLite reflog 写入和动作记录）；`ClientStorage`（本地/分层对象存储读写入口）；SeaORM / `.libra/libra.db`（配置、refs、reflog、AI/发布元数据等 SQLite 表）；`ObjectHash`（SHA-1/SHA-256 对象 ID 和 revision 解析结果）
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。P0-09 起，commit 在计算 staged changes 和写 tree/commit 前调用 `tree_plumbing::validate_index_objects`，缺失或类型不匹配的 blob/tree index 对象返回 `LBR-REPO-002`，且不得移动 `HEAD`。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
+- Hook 边界：共享 `internal::repo_hooks` 解析 canonical 名称、复制到私有执行位置并经 required workspace-write/禁网 sandbox 运行。hook 子进程清空调用方环境，仅保留进程/locale allowlist 与 Libra hook/temp 变量，避免把 API token 等 secret 交给仓库代码。`.libra` 默认只读，仅 `prepare-commit-msg`/`commit-msg` 可写 worktree 私有 `COMMIT_EDITMSG`；blocking hook 在对象/ref 更新前失败，`post-commit`/`post-rewrite` 在成功后 advisory 运行。quiet/JSON/machine 不重放 hook 输出。
 
 ## 实现历史
 
+- 2026-07-14（plan-20260708 P1-10）：commit hook 顺序收敛为 `pre-commit` → `prepare-commit-msg` → editor/trailers → `commit-msg` → object/ref update → `post-commit` → amend `post-rewrite`；`--no-verify` 跳过全部仓库 hook，`--disable-pre` 只跳过首项。消息 hook 通过原子 `.libra/COMMIT_EDITMSG` round-trip 修改消息；post hooks 失败不回滚已完成提交。回归 target：`compat_libra_hooks_lifecycle`。
 - 2026-07-12（plan-20260708 P1-05）：`run_commit` 在 auto-stage、hook、对象与 ref 写入前解析 `commit.status`；严格 local→global→system 级联，未设置默认 true，Git 布尔解析，`--status`/`--no-status` 短路覆盖。无效值 `LBR-CLI-002`、读取失败 `LBR-IO-001`。回归 target：`compat_config_defaults_semantics`。
 - 2026-07-10（plan-20260708 P1-05b）：`run_commit` 在 auto-stage、hook、对象与 ref 写入前严格读取 `commit.gpgSign`。`true` 强制使用仓库 vault key 签名，`false` 禁用签名，未配置时继承 `vault.signing`；`--no-gpg-sign` 优先级最高。无效值 `LBR-CLI-002`、读取失败 `LBR-IO-001`。回归 target：`compat_config_history_defaults`。
 
@@ -56,7 +58,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/commit.md`。
 - Synopsis：`libra commit [OPTIONS] (-m <MESSAGE> | -F <FILE> | -C <COMMIT> | -c <COMMIT> | --fixup <COMMIT> | --squash <COMMIT> | --amend --no-edit)`。
-- 公开参数/子命令包括：`-m, --message <MESSAGE>`、`-F, --file <FILE>`、`--amend`、`--no-edit`、`--conventional`、`-a, --all`、`-s, --signoff`、`--author <AUTHOR>`、`--date <DATE>`、`--allow-empty`、`--disable-pre`（跳过 Libra 自有 `.libra/hooks/pre-commit.*`）、`--no-verify`（跳过 Libra 自有 pre-commit 与消息校验，不启用 Git `commit-msg` hook bridge）、`--cleanup <MODE>`、`--dry-run`、`--fixup <COMMIT>`、`--squash <COMMIT>`、`-C/--reuse-message <COMMIT>`、`-c/--reedit-message <COMMIT>`、`--trailer <TRAILER>`、`--reset-author`、`-e/--edit`、`-v/--verbose`、`-t/--template <FILE>`（初始模板，回落 `commit.template` 配置）、`--porcelain`、`--status`/`--no-status`（last-wins 切换；`--status` 把工作树 status 以注释行注入编辑器模板）、`--no-gpg-sign`（抑制本次提交的 vault GPG 签名：在 `run_commit` 的 amend 与普通提交两条路径中，`args.no_gpg_sign` 为真时跳过 `vault_sign_commit`（`gpg_sig = None`），覆盖 `vault.signing=true` 配置；仅当本就不会签名时才是 no-op。Git 正向 `-S`/`--gpg-sign` 未公开——签名由 `vault.signing` 配置驱动）等。
+- 公开参数/子命令包括：`-m, --message <MESSAGE>`、`-F, --file <FILE>`、`--amend`、`--no-edit`、`--conventional`、`-a, --all`、`-s, --signoff`、`--author <AUTHOR>`、`--date <DATE>`、`--allow-empty`、`--disable-pre`（只跳过 `.libra/hooks/pre-commit[.sh|.ps1]`）、`--no-verify`（跳过全部 `.libra/hooks` 生命周期及消息校验；不启用 `.git/hooks` bridge）、`--cleanup <MODE>`、`--dry-run`、`--fixup <COMMIT>`、`--squash <COMMIT>`、`-C/--reuse-message <COMMIT>`、`-c/--reedit-message <COMMIT>`、`--trailer <TRAILER>`、`--reset-author`、`-e/--edit`、`-v/--verbose`、`-t/--template <FILE>`（初始模板，回落 `commit.template` 配置）、`--porcelain`、`--status`/`--no-status`（last-wins 切换；`--status` 把工作树 status 以注释行注入编辑器模板）、`--no-gpg-sign`（抑制本次提交的 vault GPG 签名：在 `run_commit` 的 amend 与普通提交两条路径中，`args.no_gpg_sign` 为真时跳过 `vault_sign_commit`（`gpg_sig = None`），覆盖 `vault.signing=true` 配置；仅当本就不会签名时才是 no-op。Git 正向 `-S`/`--gpg-sign` 未公开——签名由 `vault.signing` 配置驱动）等。
 
 
 ## 还未实现的功能

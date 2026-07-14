@@ -19,7 +19,7 @@ libra commit --amend [--no-edit]
 
 `libra commit` 从已暂存更改创建新提交，构建 tree 和 commit 对象，验证消息（包括可选的 conventional commit 格式，以及通过 vault 进行 GPG 签名），并更新 HEAD 和 refs。
 
-该命令读取索引以确定哪些文件已暂存，构造与暂存内容匹配的 tree 对象层级，使用提供的消息和 author/committer 元数据创建 commit 对象，并推进当前分支 ref。启用 vault signing 时，提交会自动进行 GPG 签名。除非用 `--no-verify` 绕过，pre-commit 和 commit-msg hooks 会被执行。
+该命令读取索引以确定哪些文件已暂存，构造与暂存内容匹配的 tree 对象层级，使用提供的消息和 author/committer 元数据创建 commit 对象，并推进当前分支 ref。启用 vault signing 时，提交会自动进行 GPG 签名。除非用 `--no-verify` 绕过，否则会运行 `.libra/hooks` 的 commit 生命周期。
 
 在计算暂存变更或写入 tree/commit 对象之前，`commit` 会校验 stage-0 index 条目是否指向缺失或类型不匹配的 blob/tree 对象。损坏的 index 条目会 fail-closed，返回 `LBR-REPO-002`，并保持 `HEAD` 不变。
 
@@ -106,7 +106,7 @@ libra commit --allow-empty -m "Trigger CI"
 
 ### `--disable-pre`
 
-只跳过 pre-commit hook。commit-msg hook 仍会运行。
+只跳过 `pre-commit`；消息 hooks 与操作后的 hooks 仍会运行。
 
 ```bash
 libra commit --disable-pre -m "Quick fix"
@@ -114,15 +114,23 @@ libra commit --disable-pre -m "Quick fix"
 
 ### `--no-verify`
 
-跳过所有 pre-commit 和 commit-msg hooks/validations。与 Git 的 `--no-verify` 行为一致。
+本次调用跳过全部 `.libra/hooks` 生命周期和提交消息校验。
 
 ```bash
 libra commit --no-verify -m "WIP: work in progress"
 ```
 
+### 仓库 hooks
+
+顺序为 `pre-commit` → `prepare-commit-msg` → 编辑器/trailers → `commit-msg` →
+commit/ref 更新 → `post-commit` → amend 时的 `post-rewrite`。两个消息 hook 可修改
+`.libra/COMMIT_EDITMSG`；blocking hook 失败时历史保持不变，post hook 则在成功后
+以 advisory 方式运行。所有 hook 都经过强制 workspace-only、禁网 sandbox。参数、
+解析顺序、输出行为与逃逸阀见[仓库 hooks](repository-hooks.md)。
+
 ### `--dry-run`
 
-只显示将生成的提交摘要，不创建提交。预览不会运行 pre-commit hook，也不会打开提交消息编辑器，因此无需提供消息；这样子进程不会在 `-a` 预览期间观察或修改 live index。`-v` 仍会直接打印 staged 预览 diff。
+只显示将生成的提交摘要，不创建提交。预览不会运行仓库 hooks，也不会打开提交消息编辑器，因此无需提供消息；这样子进程不会在 `-a` 预览期间观察或修改 live index。`-v` 仍会直接打印 staged 预览 diff。
 
 ```bash
 libra commit --dry-run -a
@@ -340,11 +348,11 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 
 ### `--disable-pre` 标志
 
-`--disable-pre` 只跳过 pre-commit hook，但仍运行 commit-msg hook。这比 Git 的 `--no-verify` 更细粒度，后者会跳过所有 hooks。用例是开发者信任提交消息验证（例如通过 commit-msg hook 做 conventional commit 检查），但在快速迭代中想跳过昂贵的 pre-commit 检查（例如完整测试套件、大型 linter 运行）。这种关注点分离是有意的：提交消息是永久记录的一部分，即使快速迭代时也应被验证。
+`--disable-pre` 只跳过 pre-commit hook，但仍运行消息与 post-operation hooks。它比 `--no-verify` 更细粒度，后者会跳过全部仓库 hooks。用例是开发者信任提交消息验证，但在快速迭代中想跳过昂贵的 pre-commit 检查。
 
 ### 用 `--no-verify` 跳过 hooks
 
-当需要绕过所有 hook 验证时（例如紧急修复、WIP commits），`--no-verify` 会跳过 pre-commit 和 commit-msg hooks。这与 Git 的行为和命名约定一致。选择该标志名是为了 Git 兼容性，让从 Git 切换的开发者无需学习新标志名。
+当需要绕过全部仓库策略时（例如紧急修复、WIP commits），`--no-verify` 会跳过每个 `.libra/hooks` 生命周期及提交消息校验。名称遵循 Git 约定；Libra 额外跳过 advisory post hooks 的行为在此明确记录。
 
 ## 参数对比：Libra vs Git vs jj
 
@@ -399,7 +407,7 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 | 对象存储失败 | `LBR-IO-002` | 128 | -- |
 | 父提交缺失 | `LBR-REPO-002` | 128 | "the parent commit is missing or corrupted" |
 | HEAD 更新失败 | `LBR-IO-002` | 128 | -- |
-| Pre-commit hook 失败 | `LBR-REPO-003` | 128 | "use --no-verify to bypass the hook" |
+| Blocking 仓库 hook 失败 | `LBR-REPO-003` | 128 | "use --no-verify to bypass repository hooks" |
 | Conventional commit 无效 | `LBR-CLI-002` | 129 | "see https://www.conventionalcommits.org for format rules" |
 | Vault signing 失败 | `LBR-AUTH-001` | 128 | "check vault configuration with 'libra config --list'" |
 | Auto-stage 源文件读取/hash 失败 | `LBR-IO-001` | 128 | 检查报错中点名的工作树文件 |

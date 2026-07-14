@@ -77,6 +77,17 @@ global storage config for that run.
 | `--machine` | Compact single-line JSON; suppresses progress (global flag). | `libra pull --machine` |
 | `--quiet` | Suppress all progress and merge summary output. | `libra pull --quiet` |
 
+## Repository hooks
+
+The integration phase uses the same `.libra/hooks` lifecycle as its selected
+operation. Merge mode runs the merge hooks, including message hooks for an
+automatic merge commit. Rebase mode runs blocking `pre-rebase <upstream>`
+after fetch but before local history moves, then advisory `post-rewrite rebase`
+after a successful rewrite. Pull has no dedicated `--no-verify`; set
+`LIBRA_NO_HOOKS=1` only after reviewing the policy impact. Quiet, JSON, and
+machine output suppress nested hook stdout/stderr. See
+[Repository hooks](repository-hooks.md).
+
 ## Examples
 
 ```bash

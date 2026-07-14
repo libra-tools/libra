@@ -63,6 +63,16 @@ impl LiveReservationOutcome {
     pub fn is_noop(&self) -> bool {
         self.reserved.is_empty()
     }
+
+    /// Codex M3 R2 P1-2: this pass reserved nothing to append, yet at least
+    /// one turn is held by another LIVE writer (unexpired lease). The export
+    /// job must then be released `dirty` (retryable) rather than advanced
+    /// clean — if that writer crashes, its claim lease expires and only a
+    /// dirty job lets a later idle recapture the transcript. A genuine
+    /// all-covered no-op (nothing in flight) is NOT this case.
+    pub fn is_inflight_only_skip(&self) -> bool {
+        self.reserved.is_empty() && self.skipped_inflight > 0
+    }
 }
 
 struct ExistingClaim {
@@ -130,6 +140,7 @@ async fn try_insert_fresh_claim(
     digest: &str,
     owner: &str,
     now_ms: i64,
+    source_channel: &'static str,
 ) -> Result<Option<ReservedTurnClaim>> {
     let lease_expires_at = lease_deadline(now_ms)?;
     let result = conn
@@ -140,7 +151,7 @@ async fn try_insert_fresh_claim(
                 coverage_digest, completeness, revision, state,
                 owner, lease_expires_at, fence_token, source_channel,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 0, 'reserved_live', ?, ?, 1, 'live', ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, 0, 'reserved_live', ?, ?, 1, ?, ?, ?)
              ON CONFLICT(session_id, logical_turn_key, coverage_schema_version)
              DO NOTHING",
             [
@@ -151,6 +162,7 @@ async fn try_insert_fresh_claim(
                 turn.completeness.as_db_str().into(),
                 owner.into(),
                 lease_expires_at.into(),
+                source_channel.into(),
                 now_ms.into(),
                 now_ms.into(),
             ],
@@ -184,6 +196,7 @@ async fn try_reown_claim(
     new_completeness: Completeness,
     owner: &str,
     now_ms: i64,
+    source_channel: &'static str,
 ) -> Result<Option<(i64, i64)>> {
     let new_fence = expected_fence
         .unwrap_or(0)
@@ -197,7 +210,7 @@ async fn try_reown_claim(
             "UPDATE agent_coverage_claim
              SET state = 'reserved_live', owner = ?, lease_expires_at = ?,
                  fence_token = ?, coverage_digest = ?, completeness = ?,
-                 source_channel = 'live', updated_at = ?
+                 source_channel = ?, updated_at = ?
              WHERE session_id = ? AND logical_turn_key = ?
                AND coverage_schema_version = ?
                AND state = ? AND fence_token IS ?",
@@ -207,6 +220,7 @@ async fn try_reown_claim(
                 new_fence.into(),
                 new_digest.into(),
                 new_completeness.as_db_str().into(),
+                source_channel.into(),
                 now_ms.into(),
                 session_id.into(),
                 logical_turn_key.into(),
@@ -264,6 +278,21 @@ pub async fn reserve_live_turn_claims(
     owner: &str,
     now_ms: i64,
 ) -> Result<LiveReservationOutcome> {
+    reserve_turn_claims_for_channel(conn, session_id, turns, owner, now_ms, "live").await
+}
+
+/// [`reserve_live_turn_claims`] with an explicit provenance channel
+/// (`live` for hook events, `export` for the OpenCode bridge, `import` for
+/// M4). The channel NEVER participates in arbitration (ADR-DR-09) — it is
+/// recorded provenance only.
+pub async fn reserve_turn_claims_for_channel(
+    conn: &DatabaseConnection,
+    session_id: &str,
+    turns: &[NormalizedTurn],
+    owner: &str,
+    now_ms: i64,
+    source_channel: &'static str,
+) -> Result<LiveReservationOutcome> {
     let mut outcome = LiveReservationOutcome::default();
     for turn in turns {
         let digest = turn.digest_hex();
@@ -271,9 +300,17 @@ pub async fn reserve_live_turn_claims(
         loop {
             rounds += 1;
             let existing = read_claim(conn, session_id, &turn.logical_turn_key).await?;
-            let decision =
-                decide_and_attempt(conn, session_id, turn, &digest, owner, now_ms, existing)
-                    .await?;
+            let decision = decide_and_attempt(
+                conn,
+                session_id,
+                turn,
+                &digest,
+                owner,
+                now_ms,
+                existing,
+                source_channel,
+            )
+            .await?;
             match decision {
                 AttemptOutcome::Reserved(claim) => {
                     outcome.reserved.push(claim);
@@ -313,6 +350,7 @@ enum AttemptOutcome {
     LostRace,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn decide_and_attempt(
     conn: &DatabaseConnection,
     session_id: &str,
@@ -321,10 +359,21 @@ async fn decide_and_attempt(
     owner: &str,
     now_ms: i64,
     existing: Option<ExistingClaim>,
+    source_channel: &'static str,
 ) -> Result<AttemptOutcome> {
     let Some(existing) = existing else {
         return Ok(
-            match try_insert_fresh_claim(conn, session_id, turn, digest, owner, now_ms).await? {
+            match try_insert_fresh_claim(
+                conn,
+                session_id,
+                turn,
+                digest,
+                owner,
+                now_ms,
+                source_channel,
+            )
+            .await?
+            {
                 Some(claim) => AttemptOutcome::Reserved(claim),
                 None => AttemptOutcome::LostRace,
             },
@@ -351,6 +400,7 @@ async fn decide_and_attempt(
                         turn.completeness,
                         owner,
                         now_ms,
+                        source_channel,
                     )
                     .await?
                     {
@@ -405,6 +455,7 @@ async fn decide_and_attempt(
                 turn.completeness,
                 owner,
                 now_ms,
+                source_channel,
             )
             .await?
             {
@@ -429,6 +480,7 @@ async fn decide_and_attempt(
                 turn.completeness,
                 owner,
                 now_ms,
+                source_channel,
             )
             .await?
             {
@@ -452,6 +504,8 @@ async fn decide_and_attempt(
 /// catalog row, coverage revisions and claim advances all commit or all roll
 /// back together).
 pub struct LiveClaimCommitPlan {
+    /// Provenance channel recorded on revisions ('live' | 'export' | 'import').
+    pub source_channel: &'static str,
     pub session_id: String,
     pub checkpoint_id: String,
     pub owner: String,
@@ -495,7 +549,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
                     session_id, logical_turn_key, coverage_schema_version,
                     revision, checkpoint_id, coverage_digest, completeness,
                     source_channel, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'live', ?)",
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     self.session_id.clone().into(),
                     claim.logical_turn_key.clone().into(),
@@ -504,6 +558,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
                     self.checkpoint_id.clone().into(),
                     claim.coverage_digest.clone().into(),
                     claim.completeness.as_db_str().into(),
+                    self.source_channel.into(),
                     self.now_ms.into(),
                 ],
             ))
@@ -561,6 +616,29 @@ mod tests {
     use crate::internal::{
         ai::observed_agents::SemanticRecord, db::migration::run_builtin_migrations,
     };
+
+    /// Codex M3 R2 P1-2: the export path must release DIRTY (retryable) only
+    /// when it reserved nothing yet turns are held in flight by another writer,
+    /// and must NOT confuse that with a genuine all-covered no-op.
+    #[test]
+    fn inflight_only_skip_distinguishes_foreign_hold_from_covered_noop() {
+        // Nothing reserved, one turn held by another live writer → retry dirty.
+        let foreign_hold = LiveReservationOutcome {
+            skipped_inflight: 1,
+            ..Default::default()
+        };
+        assert!(foreign_hold.is_inflight_only_skip());
+
+        // Genuine all-covered no-op (nothing in flight) → advance honestly.
+        let all_covered = LiveReservationOutcome {
+            skipped_covered: 3,
+            ..Default::default()
+        };
+        assert!(!all_covered.is_inflight_only_skip());
+
+        // A fully empty outcome is not an in-flight skip either.
+        assert!(!LiveReservationOutcome::default().is_inflight_only_skip());
+    }
 
     async fn gate_db() -> DatabaseConnection {
         let conn = Database::connect("sqlite::memory:").await.expect("mem db");
@@ -642,6 +720,7 @@ mod tests {
         ))
         .await?;
         let plan = LiveClaimCommitPlan {
+            source_channel: "live",
             session_id: session_id.to_string(),
             checkpoint_id: checkpoint_id.to_string(),
             owner: owner.to_string(),

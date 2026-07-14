@@ -7,17 +7,11 @@
 //! so this command can never silently overwrite working-tree files. Document
 //! those as deferred.
 
-use std::str::FromStr;
-
 use clap::Parser;
-use git_internal::{
-    hash::ObjectHash,
-    internal::object::{commit::Commit, tree::Tree},
-};
+use git_internal::hash::ObjectHash;
 use serde::Serialize;
 
 use crate::{
-    command::load_object,
     internal::tree_plumbing,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -101,36 +95,21 @@ pub async fn execute_safe(args: ReadTreeArgs, output: &OutputConfig) -> CliResul
 /// commit id (peeled to its tree), or any revision name `util::get_commit_base`
 /// understands (branch, tag, `HEAD`, …, peeled to its tree).
 pub(crate) async fn resolve_tree_ish(tree_ish: &str) -> CliResult<ObjectHash> {
-    if let Ok(hash) = ObjectHash::from_str(tree_ish) {
-        if let Ok(tree) = load_object::<Tree>(&hash) {
-            return Ok(tree.id);
-        }
-        if let Ok(commit) = load_object::<Commit>(&hash) {
-            return validate_peeled_tree(commit.tree_id, tree_ish);
-        }
-    }
-
-    let commit_hash = util::get_commit_base(tree_ish).await.map_err(|error| {
-        CliError::fatal(format!("not a valid tree-ish '{tree_ish}': {error}"))
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::CliInvalidTarget)
-    })?;
-    let commit = load_object::<Commit>(&commit_hash).map_err(|error| {
-        CliError::fatal(format!("failed to load commit for '{tree_ish}': {error}"))
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
-    validate_peeled_tree(commit.tree_id, tree_ish)
-}
-
-/// A peeled commit's `tree` header could point at a missing or non-tree
-/// object in a malformed repository — validate before anyone builds on it
-/// (commit-tree would otherwise mint a commit with a broken tree pointer).
-fn validate_peeled_tree(tree_id: ObjectHash, tree_ish: &str) -> CliResult<ObjectHash> {
-    load_object::<Tree>(&tree_id).map_err(|error| {
-        CliError::fatal(format!(
-            "'{tree_ish}' peels to {tree_id}, which is not a loadable tree: {error}"
-        ))
-        .with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
-    Ok(tree_id)
+    util::resolve_tree_ish_typed(tree_ish)
+        .await
+        .map_err(|error| match error {
+            util::CommitBaseError::HeadUnborn | util::CommitBaseError::InvalidReference(_) => {
+                CliError::fatal(format!("not a valid tree-ish '{tree_ish}': {error}"))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+            }
+            util::CommitBaseError::ReadFailure(detail) => {
+                CliError::fatal(format!("failed to read tree-ish '{tree_ish}': {detail}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            util::CommitBaseError::CorruptReference(detail) => {
+                CliError::fatal(format!("tree-ish '{tree_ish}' is corrupt: {detail}"))
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+            }
+        })
 }

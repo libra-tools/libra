@@ -35,92 +35,6 @@ The `libra code` command launches an interactive TUI (with a background web serv
 
 The repository also contains a Next.js frontend (`web/`) embedded into the binary via `rust-embed` and a Cloudflare Worker (`worker/`) for read-only `libra publish` hosting.
 
-## Repository Structure
-
-```
-src/
-├── main.rs                      # Binary entry point (tracing setup, 32 MiB-stack worker thread, tokio runtime)
-├── lib.rs                       # Library root, sync/async exec helpers
-├── cli.rs                       # Clap CLI definition, subcommand dispatch, hash-kind preflight
-├── common_utils.rs, git_protocol.rs, lfs_structs.rs
-├── command/                     # All subcommand implementations (~61 top-level modules + 9 under agent/)
-│   ├── mod.rs                   # Re-exports, shared helpers (load/save objects, auth)
-│   ├── init.rs, clone.rs, add.rs, commit.rs, push.rs, pull.rs, fetch.rs, fsck.rs
-│   ├── status.rs, log.rs, show.rs, diff.rs, blame.rs, shortlog.rs, describe.rs
-│   ├── branch.rs, tag.rs, switch.rs, checkout.rs, merge.rs, rebase.rs, cherry_pick.rs
-│   ├── reset.rs, restore.rs, remove.rs, mv.rs, clean.rs, stash.rs, revert.rs
-│   ├── reflog.rs, config.rs, remote.rs, worktree.rs, worktree-fuse.rs, cloud.rs, lfs.rs, lfs_schema.rs
-│   ├── bisect.rs, cat_file.rs, ls_remote.rs, show_ref.rs, symbolic_ref.rs, rev_parse.rs, rev_list.rs, grep.rs
-│   ├── open.rs, index_pack.rs, db.rs, hooks.rs, web_assets.rs, usage.rs
-│   ├── code.rs, code_control.rs, code_control_files.rs   # `libra code` TUI + automation control session
-│   ├── automation.rs, graph.rs, sandbox.rs, publish.rs   # AI automation, version-graph, sandbox, Worker publish
-│   └── agent/                   # `libra agent` subcommands (checkpoint, clean, doctor, hooks, push, rpc, session, status)
-├── internal/                    # Core logic
-│   ├── ai/                      # AI Agent Infrastructure
-│   │   ├── agent/               # Agent framework: builder, profiles (architect/coder/…), runtime, classifier, budget
-│   │   ├── agent_run/           # Run records: budget, context_pack, decision, evidence, patchset, permission, task
-│   │   ├── automation/          # Rule-based automation runtime, scheduler, history, executor
-│   │   ├── codex/               # Codex protocol/schema bridge (history, model, schema_v2, view)
-│   │   ├── commands/            # Agent command parsing & dispatch (+ embedded/*.md command prompts)
-│   │   ├── completion/          # CompletionModel trait, request/response, retry/throttle, JSON repair
-│   │   ├── context_budget/      # Context window allocator, compaction, frame, handoff, memory anchors
-│   │   ├── goal/                # Goal state, supervisor, verifier, spec
-│   │   ├── hooks/               # Git hooks integration (config, lifecycle, runner, providers)
-│   │   ├── intentspec/          # Intent canonicalisation, draft/repair/validator/review/scope/profiles
-│   │   ├── mcp/                 # Model Context Protocol server (server, resource)
-│   │   ├── observed_agents/     # External-agent capture adapters (Claude Code, Gemini, …) + redaction/preview
-│   │   ├── orchestrator/        # Plan/decide/execute pipeline (planner, decider, executor, verifier, replan, gate, ACL)
-│   │   ├── permission/          # Permission rules, evaluation, approved-permission inheritance
-│   │   ├── projection/          # Thread/intent projection index, resolver, rebuild scheduler
-│   │   ├── prompt/              # Prompt engineering (builder, context, dynamic_context, rules, loader, embedded/*.md)
-│   │   ├── providers/           # LLM backends (anthropic, openai, deepseek, gemini, kimi, zhipu, ollama, fake) + factory/transform
-│   │   ├── runtime/             # Runtime contracts, phase3/phase4 state machines, hardening, environment, snapshot
-│   │   ├── sandbox/             # Command-safety policy, runtime, macOS seatbelt SBPL policies
-│   │   ├── session/             # Session state, JSONL store, file history, migration
-│   │   ├── skills/              # Skill loader/scanner/parser/dispatcher
-│   │   ├── sources/             # External source pool (MCP, OpenAPI) configuration
-│   │   ├── tools/               # Tool registry, handlers (apply_patch, shell, read_file, grep, plan, …), semantic-search tools
-│   │   ├── usage/               # Usage stats: recorder, pricing, query, format
-│   │   └── web/                 # Code-UI bridge (code_ui.rs, headless)
-│   ├── tui/                     # Terminal UI (ratatui + crossterm): app, chatwidget, history_cell, slash_command, theme
-│   ├── model/                   # Sea-ORM data models (config, config_kv, reference, reflog, object_index, schema_version, ai_*)
-│   ├── protocol/                # Network clients (git, https, ssh, lfs, local)
-│   ├── publish/                 # Read-only Cloudflare Worker publishing (contract, snapshot, upload, preflight, incremental, ai_export)
-│   ├── db/migration.rs          # Versioned schema migrations runner (MigrationRunner)
-│   ├── db.rs                    # SQLite database initialization
-│   ├── vault.rs                 # libvault-backed secret storage
-│   ├── branch.rs, tag.rs, config.rs, head.rs, reflog.rs
-│   └── log/                     # Log formatting & date parsing
-└── utils/                       # Shared utilities
-    ├── client_storage.rs        # Tiered storage (local + S3/R2 with LRU cache)
-    ├── storage/                 # Storage backends (local, remote, tiered, publish_storage)
-    ├── d1_client.rs             # Cloudflare D1 client
-    ├── error.rs, output.rs      # CliError/CliResult + stable error codes; OutputConfig (--json / --machine)
-    ├── pager.rs, ignore.rs, lfs.rs, fuse.rs, worktree.rs
-    ├── object.rs, object_ext.rs, tree.rs, path.rs, path_ext.rs, storage_ext.rs, text.rs, convert.rs, util.rs
-    └── test.rs                  # Test helpers (ChangeDirGuard, setup_with_new_libra_in)
-
-tests/                           # ~98 top-level integration test files + ~21 tests/compat/ surface guards, layered L1/L2/L3 (see "Test Layers" below)
-├── command/                     # Per-command integration tests mirroring real Git workflows
-├── compat/                      # Compatibility-surface guards (must be registered as [[test]] in Cargo.toml)
-├── harness/, helpers/, fixtures/, data/, objects/
-├── ai_*.rs                      # AI agent, runtime, provider, scheduler, goal, projection, context, …
-├── code_*.rs                    # `libra code` CLI dispatch, runtime, TUI scenarios, remote SSE/lease/state matrices
-├── publish_*.rs                 # Publish snapshot/upload/preflight/refs/redaction/ai_export tests
-└── command_test.rs, e2e_mcp_flow.rs, mcp_integration_test.rs, network_remotes_test.rs, storage_r2_test.rs, …
-
-build.rs                         # Builds the Next.js web frontend into web/out/ unless LIBRA_SKIP_WEB_BUILD=1
-docs/                            # Community docs, contributing guide, agent specs, improvement walkthroughs, error-codes
-sql/
-├── sqlite_20260309_init.sql                 # SQLite bootstrap schema
-├── sqlite_20260415_ai_runtime_contract.sql  # AI runtime contract extension
-├── migrations/                              # Versioned forward + matching `_down.sql` migrations (YYYYMMDDNN naming)
-└── publish/                                 # Publish Worker D1 schema (0001_publish.sql, …)
-template/                        # Git hook templates (pre-commit.sh, pre-commit.ps1, exclude, description) + sandbox seccomp filter (seccomp-default.json)
-web/                             # Next.js 16 frontend (pnpm); built into web/out/ and embedded via rust-embed
-worker/                          # Cloudflare Worker for read-only publishing (OpenNext + wrangler + playwright)
-```
-
 ## Build & Development Commands
 
 ### Essential Commands
@@ -263,36 +177,9 @@ docs(readme): update provider table
 - Keep changes small and cohesive
 - Update README/CLI docs when adding flags or altering behavior
 
-## Key Dependencies
-
-| Category | Crates |
-|----------|--------|
-| Git internals | `git-internal` |
-| CLI | `clap` (derive) |
-| Async runtime | `tokio` (multi-thread), `async-stream`, `tokio-stream` |
-| Database | `sea-orm` + `sqlx-sqlite` |
-| HTTP server | `axum`, `tower`, `tower-http`, `hyper-util` |
-| HTTP client | `reqwest` (rustls), `tokio-tungstenite` |
-| AI/LLM | `rig-core` (rmcp/rustls features), `rmcp` (MCP protocol), `dagrs` (DAG scheduler) |
-| TUI | `ratatui`, `crossterm`, `unicode-width`, `pulldown-cmark` (markdown render) |
-| Cloud storage | `object_store` (S3/R2/Azure/GCP), `lru-mem` |
-| Embedded assets | `rust-embed`, `mime_guess` |
-| Code analysis | `tree-sitter` + `tree-sitter-bash`, `tree-sitter-rust` |
-| FUSE worktrees (Unix) | `libfuse-fs`, `rfuse3`, `pager`, `libc` |
-| Secret storage | `libvault` (SQLite-backed) |
-| Error handling | `anyhow`, `thiserror` |
-| Serialization | `serde`, `serde_json`, `toml` |
-| Logging | `tracing`, `tracing-subscriber` |
-| Diff/patch | `diffy`, `diffs`, `similar` |
-| Dev/test | `serial_test`, `testcontainers`, `assert_cmd`, `tempfile`, `gag`, `portable-pty`, `pgp` |
-
 ## Database Schema
 
-SQLite database at `.libra/libra.db`. Tables fall into three groups:
-
-- **Git core**: `config`, `config_kv`, `reference`, `reflog`, `rebase_state`, `object_index`, `schema_version`, `metadata_kv` (branch/repo metadata KV, lore.md 1.5), `working_dirty`/`working_dirty_meta` (dirty-set cache, lore.md 1.1)
-- **AI threads & scheduling**: `ai_thread`, `ai_thread_participant`, `ai_thread_intent`, `ai_thread_provider_metadata`, `ai_scheduler_state`, `ai_scheduler_plan_head`, `ai_scheduler_selected_plan`, `ai_live_context_window`
-- **AI runtime contracts**: `ai_index_intent_plan`, `ai_index_intent_task`, `ai_index_intent_context_frame`, `ai_index_plan_step_task`, `ai_index_run_event`, `ai_index_run_patchset`, `ai_index_task_run`, `ai_decision_proposal`, `ai_risk_score_breakdown`, `ai_validation_report`
+SQLite database at `.libra/libra.db` — inspect the concrete table set in the bootstrap SQL below (Git core, AI threads/scheduling, and AI runtime-contract groups).
 
 Bootstrap files: `sql/sqlite_20260309_init.sql` (core + AI baseline) and `sql/sqlite_20260415_ai_runtime_contract.sql` (runtime-contract extension).
 

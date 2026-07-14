@@ -3,7 +3,10 @@
 use std::str::FromStr;
 
 use clap::Parser;
-use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
+use git_internal::{
+    hash::{ObjectHash, get_hash_kind},
+    internal::object::commit::Commit,
+};
 use serde::Serialize;
 
 use crate::{
@@ -16,6 +19,7 @@ use crate::{
     internal::{
         branch::{Branch, BranchStoreError, is_ai_managed_branch},
         head::Head,
+        repo_hooks::{RepoHook, run_advisory_repo_hook},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -293,6 +297,26 @@ pub async fn execute(args: CheckoutArgs) {
 /// writes fail.
 pub async fn execute_safe(args: CheckoutArgs, output: &OutputConfig) -> CliResult<()> {
     let result = run_checkout(args, output).await.map_err(CliError::from)?;
+    if !matches!(result.action.as_str(), "show-current" | "already-on") {
+        let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let old = result
+            .previous_commit
+            .clone()
+            .unwrap_or_else(|| zero.clone());
+        let new = result.commit.clone().unwrap_or(zero);
+        let branch_checkout = if result.action == "restore-paths" {
+            "0"
+        } else {
+            "1"
+        };
+        run_advisory_repo_hook(
+            RepoHook::PostCheckout,
+            &[old, new, branch_checkout.to_string()],
+            None,
+            output,
+        )
+        .await;
+    }
     render_checkout_output(&result, output)
 }
 

@@ -150,8 +150,8 @@
 | `blame` / `blame -L` / `blame <file> <commit>` / `blame --porcelain` | `cli.grep-blame-describe-shortlog` | 行级作者、提交、范围限制和 porcelain 头部可观察 |
 | `describe --tags/--always/--abbrev/--exact-match/--dirty[=<mark>]` | `cli.grep-blame-describe-shortlog` | tag 描述、hash fallback、exact match 和 tracked dirty 后缀可观察；HEAD 越过 tag 后的 `--exact-match` 为负向断言 |
 | `shortlog` / `shortlog -s` / `shortlog -n` / `shortlog -e` | `cli.grep-blame-describe-shortlog` | 作者汇总、排序、邮箱和 revision 限制可观察；扩展 flags 为负向断言 |
-| `rev-parse HEAD` / `--short` / `--show-toplevel` | `cli.object-readback` | 完整哈希、短哈希和工作树根路径可传递给后续 plumbing 命令 |
-| `rev-parse --verify` / `--verify --short` / `--default` | `cli.object-readback` | 单对象断言、短哈希断言、默认 revision 回退和 quiet 失败退出 1 可观察 |
+| `rev-parse HEAD` / `@` / `^N` / `~N` / `^{type}` / `^{}` / `REV:path` / numeric `@{N}` / `--short` / `--show-toplevel` | `cli.object-readback`、`cli.sha256-object-readback` | 完整/短哈希、typed/recursive peel、数字 reflog、tree path 和 SHA-1/SHA-256 解析可传递给 plumbing 命令 |
+| `rev-parse --verify` / `--verify --short` / `--default` | `cli.object-readback` | 单对象存在性断言、短哈希断言、默认 revision 回退和 quiet 失败退出 1 可观察；不存在的完整 OID 不得通过 `--verify` |
 | `show --no-patch` / `--stat` / `<rev>:<path>` / `<blob>` | `cli.object-readback` | commit 元数据、统计、历史文件内容、文本 blob 与 binary blob 元数据可观察 |
 | `show-ref --head` / `--no-head` / `--heads` / `--branches` / `--no-branches` / `--tags` / `--no-tags` / `--hash[=<n>]` / `--no-hash` / `--abbrev[=<n>]` / `--no-abbrev` / `--dereference` / `--no-dereference` / `--exists` / `--no-exists` / `--verify` / `--no-verify` / `--exclude-existing[=<pattern>]` / pattern | `cli.object-readback`, `cli.show-ref-exclude-existing` | HEAD/分支引用可列出且 reset aliases 可恢复默认范围，annotated tag peel、完整 refname 存在性、精确验证、hash-only/abbrev 输出、stdin filter、pattern 过滤和缺失 ref 退出码可观察 |
 | `for-each-ref --points-at <object>` | `cli.object-readback` | branch、lightweight tag 和 annotated tag peeled target 过滤可观察，JSON envelope 可用 |
@@ -217,7 +217,7 @@
 |---|---|---|
 | `notes add/show/list/remove` `--ref` | `cli.notes-smoke` | 已注册：add + show/list（文本与 `--json`）、自定义 `--ref` 命名空间、无 `-f` 重复 add 的 'already has a note' 稳定错误、remove 后清空，并运行 fsck |
 | `ls-tree` | `cli.ls-tree-smoke` | 已公开基础 tree inspection：默认输出、递归路径过滤、`--name-only`、JSON envelope、缺失路径负向和 fsck |
-| `cat-file -t/-s/-p/-e <object>` | `cli.object-readback` | object 类型、大小、内容和存在性退出码可观察 |
+| `cat-file -t/-s/-p/-e <object>` / typed peel / `REV:path` | `cli.object-readback`、`cli.sha256-object-readback` | object 类型、大小、内容、存在性退出码和共享严格 resolver 可观察 |
 | `cat-file --ai*` | 无（显式排除） | AI object inspection 属 Libra AI 扩展，不纳入 Git 兼容黑盒计划 |
 | `hash-object -w` / `--stdin` / `--path` / `--no-filters` / `-t` | `cli.object-readback`、`cli.sha256-object-readback` | blob 写入、stdin 输入、路径上下文/no-filters 兼容入口、类型校验和 sha256 object id 可观察 |
 | `show --no-patch` / `<rev>:<path>` / `<blob>` | `cli.object-readback` | commit 元数据、历史文件内容和 blob 内容可观察 |

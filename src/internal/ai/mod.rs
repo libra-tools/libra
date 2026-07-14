@@ -85,6 +85,8 @@ pub(crate) mod generated_artifacts;
 // Per-turn coverage claim gate for external-agent checkpoint writers
 // (plan-20260713 DR-05c-0).
 pub mod coverage_gate;
+// OpenCode export-bridge job coordination (plan-20260713 DR-04b, ADR-DR-11).
+pub mod export_job;
 // Conversation history datastructures (compaction, persistence, replay).
 pub mod history;
 // Git hooks integration that lets the agent observe commit events.

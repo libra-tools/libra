@@ -919,6 +919,96 @@ async fn test_pull_rebase_replays_local_commit_onto_diverged_upstream() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_pull_rebase_runs_pre_rebase_before_moving_local_history() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("failed to create local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "initial pull",
+    );
+
+    push_remote_commit(
+        &work_dir,
+        &branch,
+        "remote-hook.txt",
+        "remote hook change\n",
+        "remote hook update",
+    );
+    fs::write(
+        local_repo.path().join("local-hook.txt"),
+        "local hook change\n",
+    )
+    .expect("write local hook fixture");
+    assert_cli_success(
+        &run_libra_command(&["add", "local-hook.txt"], local_repo.path()),
+        "stage local hook fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "--no-verify", "-m", "local hook update"],
+            local_repo.path(),
+        ),
+        "commit local hook fixture",
+    );
+    let head_before =
+        String::from_utf8(run_libra_command(&["rev-parse", "HEAD"], local_repo.path()).stdout)
+            .expect("HEAD output is utf8")
+            .trim()
+            .to_string();
+
+    let hook = local_repo.path().join(".libra/hooks/pre-rebase");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'hook-stdout-must-not-pollute-json\\n'\nprintf 'hook-stderr-must-not-pollute-json\\n' >&2\nprintf '%s:%s\\n' \"$1\" \"$2\" > \"$LIBRA_WORK_TREE/pre-rebase.log\"\nexit 23\n",
+    )
+    .expect("write pull pre-rebase hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+        .expect("make pull pre-rebase hook executable");
+
+    let blocked = run_libra_command(&["--json", "pull", "--rebase"], local_repo.path());
+    assert!(
+        !blocked.status.success(),
+        "pre-rebase must be able to block pull --rebase"
+    );
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("pre-rebase hook failed"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert!(
+        blocked.stdout.is_empty(),
+        "nested hook stdout must not pollute pull's JSON error surface: {}",
+        String::from_utf8_lossy(&blocked.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&blocked.stderr).contains("hook-stderr-must-not-pollute-json"),
+        "nested hook stderr must be suppressed in JSON mode: {}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(local_repo.path().join("pre-rebase.log"))
+            .expect("read pull pre-rebase argv"),
+        format!("origin/{branch}:\n")
+    );
+    let head_after =
+        String::from_utf8(run_libra_command(&["rev-parse", "HEAD"], local_repo.path()).stdout)
+            .expect("HEAD output is utf8")
+            .trim()
+            .to_string();
+    assert_eq!(
+        head_after, head_before,
+        "blocked pull must not rewrite HEAD"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_pull_rebase_already_up_to_date_reports_noop() {

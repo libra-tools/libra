@@ -21,6 +21,7 @@ use crate::{
         db::get_db_conn_instance,
         head::Head,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        repo_hooks::{RepoHook, run_advisory_repo_hook},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -728,6 +729,19 @@ pub async fn execute(args: SwitchArgs) {
 /// No-op "already on" cases return before the cleanliness check.
 pub async fn execute_safe(args: SwitchArgs, output: &OutputConfig) -> CliResult<()> {
     let result = run_switch(args, output).await.map_err(CliError::from)?;
+    if !result.already_on {
+        let old = result
+            .previous_commit
+            .clone()
+            .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
+        run_advisory_repo_hook(
+            RepoHook::PostCheckout,
+            &[old, result.commit.clone(), "1".to_string()],
+            None,
+            output,
+        )
+        .await;
+    }
     render_switch_output(&result, output)?;
     if !result.already_on {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_SWITCH).await;

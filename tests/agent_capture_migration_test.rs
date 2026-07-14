@@ -134,10 +134,10 @@ async fn agent_capture_rollback_drops_tables_and_indexes_only() {
     assert_eq!(
         rolled_back,
         vec![
-            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
-            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
-            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601, 2026050501,
-            2026050303
+            2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601,
+            2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401,
+            2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601,
+            2026050501, 2026050303
         ]
     );
 
@@ -229,7 +229,7 @@ async fn agent_checkpoint_paging_up_down_up_round_trip() {
         .rollback_to(&conn, 2026070801)
         .await
         .expect("rollback_to(2026070801)");
-    assert_eq!(rolled, vec![2026071301, 2026070803, 2026070802]);
+    assert_eq!(rolled, vec![2026071401, 2026071301, 2026070803, 2026070802]);
     for index in paging_indexes {
         assert!(
             !index_exists(&conn, index).await,
@@ -247,7 +247,10 @@ async fn agent_checkpoint_paging_up_down_up_round_trip() {
     // (2026071301) migrations, all of which rolled off when we rewound to
     // 2026070801 above.
     let reapplied = runner.run_pending(&conn).await.expect("up #2");
-    assert_eq!(reapplied, vec![2026070802, 2026070803, 2026071301]);
+    assert_eq!(
+        reapplied,
+        vec![2026070802, 2026070803, 2026071301, 2026071401]
+    );
     for index in paging_indexes {
         assert!(
             index_exists(&conn, index).await,

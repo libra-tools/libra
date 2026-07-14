@@ -388,6 +388,34 @@ fn real_directory(path: &std::path::Path) -> Result<bool> {
 /// partitions first, first match wins. Fail-closed on an invalid id or a
 /// symlinked match; `Ok(None)` only when nothing matches.
 pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>> {
+    find_codex_rollout_bounded(session_id, RolloutDiscoveryLimits::default())
+}
+
+/// Injectable discovery bounds (GC-DR-07) so tests drive the FULL finder
+/// against every cap deterministically; production uses [`Default`].
+#[derive(Debug, Clone, Copy)]
+pub struct RolloutDiscoveryLimits {
+    /// Total entries (directories + files) the walk may charge.
+    pub max_entries_scanned: usize,
+    /// Monotonic wall-clock deadline for one discovery pass.
+    pub deadline: Duration,
+}
+
+impl Default for RolloutDiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_entries_scanned: ROLLOUT_MAX_ENTRIES_SCANNED,
+            deadline: ROLLOUT_SCAN_TIMEOUT,
+        }
+    }
+}
+
+/// [`find_codex_rollout`] with injectable bounds. Every bound fails LOUDLY —
+/// a truncated walk must never silently claim "newest" or "not found".
+pub fn find_codex_rollout_bounded(
+    session_id: &str,
+    limits: RolloutDiscoveryLimits,
+) -> Result<Option<std::path::PathBuf>> {
     let valid = !session_id.is_empty()
         && session_id.len() <= 64
         && session_id
@@ -401,7 +429,7 @@ pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>
     let Some(root) = codex_sessions_root() else {
         return Ok(None);
     };
-    let mut budget = RolloutScanBudget::new(ROLLOUT_MAX_ENTRIES_SCANNED, ROLLOUT_SCAN_TIMEOUT);
+    let mut budget = RolloutScanBudget::new(limits.max_entries_scanned, limits.deadline);
     let suffix = format!("-{session_id}.jsonl");
     let mut files_seen = 0usize;
     for year in sorted_desc_entries(&root, |n| valid_year(n).is_some(), &mut budget)? {
@@ -582,6 +610,71 @@ mod tests {
         assert!(
             err.to_string().contains("exceeded its time budget"),
             "traversal deadline must fail loudly even for an empty directory: {err:#}"
+        );
+    }
+
+    /// M2 R3: FULL-finder loud-bounds regression — nested empty date trees,
+    /// oversized file fan-out, and an expired deadline all error through
+    /// `find_codex_rollout_bounded`, never returning a silent Ok(None).
+    #[test]
+    #[serial_test::serial]
+    fn codex_rollout_discovery_bounds_fail_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_home = tmp.path().join("codex-abs");
+        let _g = CodexHomeGuard::set(&tmp.path().join("no-such-home"), &codex_home);
+        let sid = "0199a213-81a0-7800-8aa2-58a4a352b423";
+
+        // Nested EMPTY numeric date tree: dirs alone exhaust a small entry
+        // budget → loud error (the fan-out case).
+        for y in 0..6 {
+            std::fs::create_dir_all(codex_home.join(format!("sessions/20{:02}/01/01", 10 + y)))
+                .unwrap();
+        }
+        let tight = RolloutDiscoveryLimits {
+            max_entries_scanned: 4,
+            ..Default::default()
+        };
+        let err = find_codex_rollout_bounded(sid, tight)
+            .expect_err("empty-tree fan-out must fail loudly");
+        assert!(format!("{err:#}").contains("total entries"), "got {err:#}");
+
+        // File fan-out: many rollout files exceed the budget → loud error.
+        let day = codex_home.join("sessions/2015/01/01");
+        std::fs::create_dir_all(&day).unwrap();
+        for i in 0..8 {
+            std::fs::write(
+                day.join(format!(
+                    "rollout-2015-01-01T00-00-0{i}-ffffffff-0000-0000-0000-00000000000{i}.jsonl"
+                )),
+                "{}\n",
+            )
+            .unwrap();
+        }
+        let tight_files = RolloutDiscoveryLimits {
+            max_entries_scanned: 10,
+            ..Default::default()
+        };
+        let err = find_codex_rollout_bounded(sid, tight_files)
+            .expect_err("file fan-out must fail loudly");
+        assert!(format!("{err:#}").contains("total entries"), "got {err:#}");
+
+        // Expired deadline errors on the first charge.
+        let expired = RolloutDiscoveryLimits {
+            deadline: Duration::ZERO,
+            ..Default::default()
+        };
+        let err = find_codex_rollout_bounded(sid, expired)
+            .expect_err("expired deadline must fail loudly");
+        assert!(format!("{err:#}").contains("time budget"), "got {err:#}");
+
+        // A generous budget still finds nothing here without erroring.
+        assert!(
+            find_codex_rollout_bounded(
+                "eeeeeeee-0000-0000-0000-000000000000",
+                RolloutDiscoveryLimits::default()
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

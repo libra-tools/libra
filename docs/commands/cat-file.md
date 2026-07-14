@@ -25,6 +25,16 @@ require a positional `OBJECT` argument. AI modes (`--ai`, `--ai-type`,
 `--ai-list`, `--ai-list-types`) ignore `OBJECT` and operate on the AI history
 branch.
 
+Git object modes and batch inputs use the same strict resolver as `rev-parse`:
+refs and unique OID prefixes, `@`, parent navigation, typed/recursive peel,
+numeric reflog selectors, and `REV:path` are accepted. The resolver consumes
+the whole input, so a malformed suffix such as `HEAD^{tree}junk` is rejected
+instead of being partially interpreted.
+
+In batch modes, only an unresolvable or nonexistent name is rendered as
+`<input> missing`. A ref-database read failure or corrupt/unreadable object
+fails the command with a structured error so storage damage is not hidden.
+
 ## Options
 
 | Flag | Short | Description |
@@ -42,7 +52,7 @@ branch.
 | `--ai-type <ID>` | | Print the AI object type for the given ID. |
 | `--ai-list <TYPE>` | | List all AI objects of the given type (e.g., `intent`, `patchset`, `event`). |
 | `--ai-list-types` | | List all AI object types present in the history branch. |
-| `<OBJECT>` | | Git object hash or ref. Required for `-t`/`-s`/`-p`/`-e`; ignored for `--ai*` modes; batch modes read object names from stdin instead. |
+| `<OBJECT>` | | Git object spec: hash/ref, typed peel, numeric reflog selector, or `REV:path`. Required for `-t`/`-s`/`-p`/`-e`; ignored for `--ai*` modes; batch modes read object specs from stdin instead. |
 
 ### Examples
 
@@ -55,6 +65,10 @@ libra cat-file -s 40d352ee7190f92dcf7883b8a81f2c730fd8a860
 
 # Pretty-print HEAD commit
 libra cat-file -p HEAD
+
+# Inspect a peeled tree or a blob selected by path
+libra cat-file -t 'HEAD^{tree}'
+libra cat-file -p 'HEAD:src/main.rs'
 
 # Check existence (exit code 0 = exists)
 libra cat-file -e abc1234
@@ -84,6 +98,8 @@ libra cat-file --ai-list-types --json
 libra cat-file -t HEAD
 libra cat-file -s HEAD
 libra cat-file -p HEAD
+libra cat-file -t 'HEAD^{tree}'
+libra cat-file -p 'HEAD:src/main.rs'
 libra cat-file -t HEAD --json
 libra cat-file --ai-list-types --json
 libra cat-file --ai-list intent
@@ -228,7 +244,7 @@ hard error (`LBR-CLI-003`, exit 129) that emits no envelope.
 | AI object inspection | `--ai`, `--ai-type` | N/A | N/A |
 | AI object listing | `--ai-list`, `--ai-list-types` | N/A | N/A |
 | JSON output | `--json` | No | No |
-| Object resolution | SHA-1, refs, `HEAD~N` | SHA-1, refs, all rev-parse syntax | Change IDs, revsets |
+| Object resolution | SHA-1/SHA-256, refs, `@`, `^N`/`~N`, typed/recursive peel, numeric reflog selectors, `REV:path` | full rev-parse syntax | Change IDs, revsets |
 | `--filters` | No | `--filters` (convert to/from external) | N/A |
 | `--textconv` | No | `--textconv` | N/A |
 

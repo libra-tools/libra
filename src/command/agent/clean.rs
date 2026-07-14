@@ -75,6 +75,9 @@ struct CleanReport {
     /// objectized findings blob is left for a future repo-wide object GC (it is
     /// content-addressed and may be shared with a reachable object).
     findings_runs_pruned: u64,
+    /// plan-20260713 DR-04b (GC-DR-12): expired `agent_export_job` rows
+    /// scavenged by TTL under `--gc`.
+    export_jobs_pruned: u64,
     /// A0-09: whether this was a `--dry-run` preview (nothing was deleted; all
     /// counts are what *would* be removed).
     dry_run: bool,
@@ -97,6 +100,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
                 stderr_logs_pruned: 0,
                 stderr_runs_pruned: 0,
                 findings_runs_pruned: 0,
+                export_jobs_pruned: 0,
                 dry_run: args.dry_run,
                 note: "agent_checkpoint table not present (run `libra init`?)",
             },
@@ -201,6 +205,34 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
         _ => (0, 0),
     };
 
+    // plan-20260713 DR-04b: TTL-scavenge expired export-job rows under --gc
+    // (bounded by the ttl index; dry-run counts without deleting).
+    let export_jobs_pruned = if args.gc && table_exists(&conn, "agent_export_job").await? {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if args.dry_run {
+            let row = conn
+                .query_one(sea_orm::Statement::from_sql_and_values(
+                    backend,
+                    "SELECT COUNT(*) AS n FROM agent_export_job WHERE ttl_expires_at <= ?",
+                    [now_ms.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    CliError::fatal(format!("failed to count expired export jobs: {err}"))
+                })?;
+            row.and_then(|r| r.try_get_by::<i64, _>("n").ok())
+                .unwrap_or(0) as u64
+        } else {
+            crate::internal::ai::export_job::scavenge_expired(&conn, now_ms)
+                .await
+                .map_err(|err| {
+                    CliError::fatal(format!("failed to scavenge expired export jobs: {err:#}"))
+                })?
+        }
+    } else {
+        0
+    };
+
     let findings_runs_pruned = match findings_cutoff {
         Some(Some(cutoff)) => {
             gc_expired_findings_runs(&sessions_root, cutoff, args.dry_run).await?
@@ -228,6 +260,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
             stderr_logs_pruned,
             stderr_runs_pruned,
             findings_runs_pruned,
+            export_jobs_pruned,
             dry_run: args.dry_run,
             note,
         },

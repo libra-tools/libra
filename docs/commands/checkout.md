@@ -28,6 +28,13 @@ symlink on Unix using the stored link target bytes. Platforms without symlink
 support return an explicit unsupported-symlink diagnostic instead of silently
 writing a regular file that contains the target path.
 
+After a state-changing checkout, advisory `.libra/hooks/post-checkout` receives
+`<old-oid> <new-oid> <flag>`; the flag is `1` for branch/detached checkout and `0`
+for path restoration. Showing the current branch or checking out the
+already-current branch does not invoke it. Set
+`LIBRA_NO_HOOKS=1` only for an explicit policy bypass. See
+[Repository hooks](repository-hooks.md).
+
 ## Options
 
 | Flag | Long | Value | Description |

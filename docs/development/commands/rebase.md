@@ -32,9 +32,11 @@ flowchart TD
 - 底层操作对象：`IndexEntry`（索引条目，承载路径、mode、object id 和 stat 元数据）；`Index` / `.libra/index`（暂存区状态、路径条目和刷新/保存边界）；`Blob`（文件内容或 LFS pointer 写入对象库后的 blob 对象）；`Commit`（提交对象、父提交关系和提交消息载荷）；`TreeItem` / `TreeItemMode`（tree 中的路径项和 mode）；`Tree`（由索引或对象遍历生成的目录树对象）；`Branch` / branch store（SQLite refs 上的分支读写、过滤和上游关系）；`Head`（SQLite 中的 HEAD 指向、当前分支和 detached 状态）；`ReflogContext` / `with_reflog`（SQLite reflog 写入和动作记录）；`DatabaseTransaction`（需要原子性的数据库写入事务）；SeaORM / `.libra/libra.db`（配置、refs、reflog、AI/发布元数据等 SQLite 表）；`ObjectHash`（SHA-1/SHA-256 对象 ID 和 revision 解析结果）
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet 分支继续走 `OutputConfig` / `emit_json_data` / `CliError`。无效 exec 为 `LBR-CLI-002`；exec/sandbox stop 为 `LBR-CONFLICT-002`；sidecar/ref 写失败为 `LBR-IO-002`；所有错误保留可操作的 continue/skip/abort 提示。
 - 副作用边界：recovery-critical sidecar 无条件 fsync，不依赖 `--sync-data`。`--exec` 信任边界是用户 shell 命令，但只允许 required workspace-write、network-denied sandbox；缺 backend 不降级裸执行。Update-refs 捕获时排除所有 worktree 的 HEAD，并在最终事务中重新比较 old OID；任一分支并发移动会回滚整个 ref 事务。Autostash re-apply 冲突先把 held object 提升到普通 stash，再清 sidecar，避免数据丢失。
+- Hook 边界：新序列在任何 rebase mutation 前 blocking 运行 `pre-rebase <upstream> [branch]`；rewrite map 始终持久化到 `RebaseAuxState`，终态 ref/state/autostash 完成后 advisory 运行 `post-rewrite rebase`，stdin 为稳定排序的 old/new OID 对。无专用 `--no-verify`；中央 `LIBRA_NO_HOOKS=1` 为显式逃逸阀。
 
 ## 实现历史
 
+- 2026-07-14（plan-20260708 P1-10）：新增 required-sandbox `pre-rebase` 与 advisory `post-rewrite rebase`；public rebase 与 `pull --rebase` 都在本地历史修改前运行同一 blocking pre hook，quiet/JSON parent 不重放 child hook 输出，post hook failure 不回滚已完成重写。回归：`compat_libra_hooks_lifecycle` 与 `command_test::test_pull_rebase_runs_pre_rebase_before_moving_local_history`。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-01-04 `1089fd43`（`feat(rebase): add --continue/--abort/--skip for conflict handling (#100)`）：基础实现节点：add --continue/--abort/--skip for conflict handling (#100)；当前实现的主要轮廓可追溯到该提交。
 - 2026-05-16 `e21096fc`（`feat(cloud,rebase): align typed outputs and error classification with improvements`）：功能演进：align typed outputs and error classification with improvements；该节点扩展了当前命令可用的参数或行为。
