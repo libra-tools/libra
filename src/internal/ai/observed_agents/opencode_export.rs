@@ -114,8 +114,22 @@ pub async fn run_export_subprocess(
         bail!("exporter binary path must be absolute (trusted provenance)");
     }
 
-    let mut command = tokio::process::Command::new(binary);
+    run_bounded_exporter(binary, &[], session_id, limits).await
+}
+
+/// Core bounded runner: `<program> [<pre_args>…] export <session_id>` with
+/// the module's env/caps/deadline contract. `pre_args` lets the sandboxed
+/// variant prepend the bwrap arg vector while keeping ONE code path for the
+/// bounds (GC-DR-04).
+async fn run_bounded_exporter(
+    program: &std::path::Path,
+    pre_args: &[String],
+    session_id: &str,
+    limits: ExportLimits,
+) -> Result<Vec<u8>> {
+    let mut command = tokio::process::Command::new(program);
     command
+        .args(pre_args)
         .arg("export")
         .arg(session_id)
         .env_clear()
@@ -180,6 +194,105 @@ pub async fn run_export_subprocess(
         );
     }
     Ok(out)
+}
+
+/// Run the export under the DR-04b minimal offline sandbox profile
+/// (`SandboxEnforcement::Required` semantics): Linux bubblewrap with
+/// `--unshare-net` (no network), read-only host paths + read-only HOME (the
+/// exporter's session store/config), tmpfs `/tmp` as the only writable
+/// location, `--die-with-parent`, no shell anywhere. Fail-CLOSED when the
+/// sandbox cannot be provided (bwrap missing, non-Linux): the capability is
+/// unavailable — never a degraded unsandboxed run (GC-DR-14).
+pub async fn run_export_subprocess_sandboxed(
+    binary: &std::path::Path,
+    session_id: &str,
+    limits: ExportLimits,
+) -> Result<Vec<u8>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (binary, session_id, limits);
+        bail!(
+            "the OpenCode export sandbox profile is Linux-only for now; \
+             refusing an unsandboxed export (fail-closed, GC-DR-14)"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !valid_session_id(session_id) {
+            bail!("invalid OpenCode session id (expected alnum/dash/underscore, ≤64 chars)");
+        }
+        if !binary.is_absolute() {
+            bail!("exporter binary path must be absolute (trusted provenance)");
+        }
+        let bwrap = std::env::var_os("LIBRA_LINUX_SANDBOX_EXE")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute() && p.is_file())
+            .or_else(|| which_bwrap())
+            .ok_or_else(|| {
+                anyhow!(
+                    "bubblewrap (bwrap) is required for the OpenCode export sandbox and was \
+                     not found; install bwrap or set LIBRA_LINUX_SANDBOX_EXE (fail-closed)"
+                )
+            })?;
+
+        use crate::internal::ai::sandbox::{
+            policy::SandboxPolicy, proxy::NetworkAccessMode, runtime::create_bwrap_command_args,
+        };
+        // ReadOnly policy + Denied network: the policy cwd is ro-bound,
+        // /tmp is tmpfs (the ONLY writable location), net is unshared. The
+        // policy cwd must NOT be /tmp — a later ro-bind would shadow the
+        // tmpfs mount and leave the exporter with no writable scratch (bwrap
+        // applies mounts in order). Use the binary's parent, which is
+        // ro-bound anyway. The command tail handed to the builder is only
+        // the binary; `export <sid>` is appended by the shared runner.
+        let sandbox_cwd = binary
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr"));
+        let mut args = create_bwrap_command_args(
+            vec![binary.to_string_lossy().into_owned()],
+            NetworkAccessMode::Denied,
+            &SandboxPolicy::ReadOnly,
+            &sandbox_cwd,
+            &[],
+        );
+        // The exporter must READ its own session store/config: ro-bind HOME
+        // (and the XDG dirs when set) before the `--` separator.
+        let sep = args
+            .iter()
+            .position(|a| a == "--")
+            .ok_or_else(|| anyhow!("bwrap arg builder produced no separator"))?;
+        let mut extra: Vec<String> = Vec::new();
+        for var in ["HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"] {
+            if let Some(dir) = std::env::var_os(var).map(std::path::PathBuf::from)
+                && dir.is_absolute()
+                && dir.is_dir()
+            {
+                let d = dir.to_string_lossy().into_owned();
+                extra.extend(["--ro-bind".to_string(), d.clone(), d]);
+            }
+        }
+        // The trusted binary itself may live outside the standard host paths
+        // (e.g. ~/.opencode/bin) — HOME ro-bind above usually covers it; add
+        // its parent dir defensively when it does not.
+        if let Some(parent) = binary.parent() {
+            let p = parent.to_string_lossy().into_owned();
+            extra.extend(["--ro-bind".to_string(), p.clone(), p]);
+        }
+        let tail = args.split_off(sep);
+        args.extend(extra);
+        args.extend(tail);
+
+        run_bounded_exporter(&bwrap, &args, session_id, limits).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn which_bwrap() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("bwrap"))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -280,6 +393,48 @@ mod tests {
             "raw secret leaked: {text}"
         );
         assert!(text.contains("status"), "got {text}");
+    }
+
+    /// opencode_export_offline_sandbox_profile: the bwrap Required profile
+    /// actually runs an exporter offline — network is unshared (a connect
+    /// attempt fails instantly), HOME is readable (store locator), /tmp is
+    /// writable tmpfs, and stdout flows through the same bounds. Skips when
+    /// bwrap is unavailable (the production path then fails closed).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn opencode_export_offline_sandbox_profile() {
+        if which_bwrap().is_none() && std::env::var_os("LIBRA_LINUX_SANDBOX_EXE").is_none() {
+            eprintln!("skipped (bwrap not installed)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // The fake exporter proves: HOME readable, /tmp writable, then emits.
+        let bin = fake_exporter(
+            dir.path(),
+            r#"ls "$HOME" >/dev/null 2>&1 || { echo home-unreadable >&2; exit 4; }
+touch /tmp/probe || { echo tmp-unwritable >&2; exit 5; }
+printf '{"info":{},"messages":[]}'"#,
+        );
+        let out = run_export_subprocess_sandboxed(&bin, "sess-1", ExportLimits::default())
+            .await
+            .expect("sandboxed export must run offline");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            r#"{"info":{},"messages":[]}"#
+        );
+
+        // Network must be unshared: a resolver/socket attempt fails fast.
+        let net_bin = fake_exporter(
+            dir.path(),
+            r#"if command -v getent >/dev/null 2>&1; then
+  getent hosts example.com >/dev/null 2>&1 && { echo net-open >&2; exit 6; }
+fi
+printf 'offline-ok'"#,
+        );
+        let out = run_export_subprocess_sandboxed(&net_bin, "sess-2", ExportLimits::default())
+            .await
+            .expect("offline probe must succeed");
+        assert_eq!(String::from_utf8_lossy(&out), "offline-ok");
     }
 
     /// Untrusted binary: no trust record → capability unavailable with an
