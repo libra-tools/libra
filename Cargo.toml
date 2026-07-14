@@ -18,6 +18,7 @@ test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
 test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
 test-provider  = []   # deterministic hidden provider for local TUI automation tests
+test-live-agent = [] # plan-20260713 live agent gate: real local claude/codex/opencode CLI data (dev machine acceptance; env LIBRA_RUN_LIVE_AGENT_GATE=1)
 fastcdc        = []   # lore.md §6: default-OFF FastCDC LFS media chunking client substrate (no new deps; reuses ring sha256; server protocol frozen)
 subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/tracing/agent.md "Step 2 audit closure")
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]  # lore.md 1.7: OTLP trace export (default binary unaffected)
@@ -413,6 +414,11 @@ required-features = ["keyring"]
 # `test-live-ai` feature), require the feature so a bare `cargo test --all`
 # excludes them — a machine with DEEPSEEK_API_KEY / LIBRA_AI_LIVE_OLLAMA set
 # can no longer hit live providers in default L1 (C3, codex review).
+[[test]]
+name = "agent_live_gate_test"
+path = "tests/agent_live_gate_test.rs"
+required-features = ["test-live-agent"]
+
 [[test]]
 name = "ai_agent_test"
 path = "tests/ai_agent_test.rs"

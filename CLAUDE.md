@@ -159,6 +159,7 @@ pnpm --dir web install --frozen-lockfile && pnpm --dir web build
 | `test-live-ai` | Gate L3 tests calling real LLM APIs |
 | `test-live-cloud` | Gate L3 tests hitting real D1/R2 endpoints |
 | `test-provider` | Deterministic hidden provider for local TUI automation tests (requires `LIBRA_ENABLE_TEST_PROVIDER=1`) |
+| `test-live-agent` | plan-20260713 live agent gate: real local `claude`/`codex`/`opencode` CLI data on the dev acceptance machine (requires `LIBRA_RUN_LIVE_AGENT_GATE=1`; missing stores print skipped) |
 | `subagent-scaffold` | Schema-only sub-agent contract scaffold (CEX-S2-10, gated on CP-4 in production) |
 | `otlp` | OTLP trace export (lore.md 1.7): one vetted command-span to an explicitly configured collector; default binary unaffected |
 

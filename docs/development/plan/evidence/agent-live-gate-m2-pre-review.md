@@ -1,26 +1,26 @@
 # Live agent gate evidence — M2 (pre-review)
 
 > plan-20260713「本机 live agent 执行验证门」固定字段记录。sanitized-only。
+> Gate identity: `LIBRA_RUN_LIVE_AGENT_GATE=1` + `--features test-live-agent`
+> (registered this milestone; test target `tests/agent_live_gate_test.rs`).
 
 - release/tag: `pre-review`
-- commit: `1fa5d0a`
-- UTC time (evidence commit): 2026-07-13T17:02:37Z; the exact live-run
-  instant was not retained in this sanitized pre-review record
-- providers: `claude` (Claude Code CLI 2.1.207) real session store; `codex`
-  real `~/.codex/sessions` store (layout verification only)
-- scope: M2 = DR-01 flush-wait (live path) + DR-02 Claude discovery contract
-  + DR-03 Codex rollout discovery contract
+- commit: `4e0d33d` + R2 fixes (bounded fan-out, live gate registration)
+- UTC time: 2026-07-14T01:36:15Z
+- providers: `claude` (Claude Code CLI 2.1.207), `codex` (real local store)
+- scope: M2 = DR-01 flush-wait (live path) + DR-02 Claude discovery +
+  DR-03 Codex rollout discovery
 - procedure & results:
-  - real Claude transcript (~451 KiB) ingested twice through the NEW live
-    path (flush-wait now runs inside `resolve_transcript_source`): both
-    ingests succeeded; repeat fully deduplicated (checkpoints = 1)
-  - real `~/.claude/projects/` layout matches the DR-02 contract on this
-    machine: slug dirs including `-run-media-eli-data-gitmono-libra`
-    (pinned vector), sessions stored as `<uuid>.jsonl`
-  - real `~/.codex/sessions/2026/07/…` matches the DR-03 contract:
-    date-partitioned `YYYY/MM/DD` dirs holding
-    `rollout-<timestamp>-<session-id>.jsonl`
+  - real Claude transcript (~451 KiB) ingested twice through the live path
+    (flush-wait active in `resolve_transcript_source`): success; repeat
+    fully deduplicated (checkpoints = 1)
+  - **real BY-ID lookups** via `LIBRA_RUN_LIVE_AGENT_GATE=1 cargo test
+    --features test-live-agent --test agent_live_gate_test`:
+    - `live_claude_session_resolves_by_id` — a real session id taken from
+      this repo's real `~/.claude/projects/<slug>` dir resolved through
+      `resolve_session_file`: **ok** (2/2 tests passed)
+    - `live_codex_rollout_resolves_by_id` — a real session id extracted
+      from a real rollout filename resolved through `find_codex_rollout`:
+      **ok**
 - stable result: success
-- note: DR-02/03 discovery functions are groundwork consumed by M4 import /
-  M5 subagent scan; per-DR live exercise of the full lookup happens there.
-  OpenCode not exercised (content source lands in M3).
+- note: OpenCode not exercised (content source lands in M3).

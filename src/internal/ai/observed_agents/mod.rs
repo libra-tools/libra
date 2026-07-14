@@ -50,8 +50,10 @@ use builtin::stable_promoted::{
     FACTORY_AI_STABLE_PROMOTED_SPEC, OPENCODE_STABLE_PROMOTED_SPEC,
 };
 pub use builtin::{
-    ClaudeCodeObservedAgent, GeminiObservedAgent, STABLE_PROMOTED_SPECS, StablePromotedAgent,
-    rfc3339_boundary_for_unix_seconds, stable_promoted_spec_for, write_truncated_transcript,
+    ClaudeCodeObservedAgent, FlushOutcome, GeminiObservedAgent, STABLE_PROMOTED_SPECS,
+    StablePromotedAgent, claude_project_slug, claude_session_dir, find_codex_rollout, flush_wait,
+    resolve_session_file, rfc3339_boundary_for_unix_seconds, stable_promoted_spec_for,
+    write_truncated_transcript,
 };
 pub use capability::{
     CapabilityDeclarer, DeclaredAgentCaps, HookResponseWriter, ModelExtractor, PromptExtractor,
