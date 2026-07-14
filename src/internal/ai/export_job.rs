@@ -210,6 +210,7 @@ pub enum AdvanceOutcome {
 /// Release the lease under owner+fence, marking the terminal state honestly:
 /// `dirty` when work remains, `failed` with a stable code, else `idle`. A
 /// fenced-out release is a silent no-op (the new owner's state wins).
+#[allow(clippy::too_many_arguments)]
 pub async fn release(
     conn: &DatabaseConnection,
     agent_kind: &str,

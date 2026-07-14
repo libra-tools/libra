@@ -33,6 +33,7 @@ pub mod compliance;
 pub mod coverage;
 pub mod derived;
 pub mod extract;
+pub mod opencode_export;
 pub mod preview;
 pub mod redaction;
 pub mod registry;
