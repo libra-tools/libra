@@ -185,8 +185,6 @@ Libra supports Gemini (default), OpenAI, Anthropic, DeepSeek, Kimi, Zhipu, and O
 | **Documentation** | [docs.libra.tools](https://docs.libra.tools) |
 | **Discord** | [Join the community](https://t.co/425ibAmBb8) |
 | **X / Twitter** | [@git_mono_AI](https://x.com/git_mono_AI) |
-| **GitHub** | [github.com/wingwangsz/libra](https://github.com/wingwangsz/libra) |
-
 ---
 
 ## Contributing
