@@ -20,7 +20,7 @@ As AI becomes the primary producer of software, Libra provides the foundational 
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/wingwangsz/libra/actions/workflows/base.yml/badge.svg)](https://github.com/wingwangsz/libra/actions/workflows/base.yml)
-[![Discord](https://img.shields.io/badge/Discord-join-%235865F2?logo=discord&logoColor=white)](https://t.co/425ibAmBb8)
+[![Discord](https://img.shields.io/badge/Discord-join-%235865F2?logo=discord&logoColor=white)](https://discord.gg/MTbb5rDYsC)
 [![X](https://img.shields.io/badge/X-%40git_mono_AI-%231DA1F2?logo=x&logoColor=white)](https://x.com/git_mono_AI)
 [![Docs](https://img.shields.io/badge/docs-docs.libra.tools-29B1FF)](https://docs.libra.tools)
 
@@ -187,7 +187,7 @@ Libra supports Gemini (default), OpenAI, Anthropic, DeepSeek, Kimi, Zhipu, and O
 |----------|------|
 | **Website** | [libra.tools](https://www.libra.tools) |
 | **Documentation** | [docs.libra.tools](https://docs.libra.tools) |
-| **Discord** | [Join the community](https://t.co/425ibAmBb8) |
+| **Discord** | [Join the community](https://discord.gg/MTbb5rDYsC) |
 | **X / Twitter** | [@git_mono_AI](https://x.com/git_mono_AI) |
 ---
 
@@ -222,6 +222,6 @@ Copyright (c) 2025-2026 Web3 Infrastructure Foundation.
 
 <div align="center">
 
-**[Get Started](https://docs.libra.tools/en/docs/getting-started) · [Join Discord](https://t.co/425ibAmBb8) · [Follow on X](https://x.com/git_mono_AI)**
+**[Get Started](https://docs.libra.tools/en/docs/getting-started) · [Join Discord](https://discord.gg/MTbb5rDYsC) · [Follow on X](https://x.com/git_mono_AI)**
 
 </div>
