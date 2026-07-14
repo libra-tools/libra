@@ -69,20 +69,21 @@ cd my-project
 libra init --from-git-repository /path/to/existing/git/repo
 ```
 
-### 开始 AI 原生编程
+### 使用 Agent 捕获
 
 ```bash
-# 启动交互式 TUI（终端 + Web + MCP）
-libra code
+# 为你的 Agent 启用捕获钩子（以 codex 为例）
+libra agent enable
 
-# 或仅运行 Web 模式
-libra code --web
+# 正常使用你的 Agent 工具——Libra 会自动捕获会话和检查点
+codex
 
-# 或作为 MCP 服务器供 Claude Desktop 使用
-libra code --stdio
+# 查看已捕获的会话
+libra agent session list
+libra agent checkpoint list
 ```
 
-> 查看[完整文档](https://docs.libra.tools/en/docs/getting-started)获取高级配置和使用指南。
+> 查看 [Agent 捕获文档](https://docs.libra.tools/en/docs/getting-started/agent)了解所有支持的 Agent、高级配置和会话管理。
 
 ---
 

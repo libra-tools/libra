@@ -69,20 +69,21 @@ cd my-project
 libra init --from-git-repository /path/to/existing/git/repo
 ```
 
-### Start AI-Native Coding
+### Use Agent Capture
 
 ```bash
-# Launch the interactive TUI (Terminal + Web + MCP)
-libra code
+# Enable capture hooks for your agent (e.g., codex)
+libra agent enable
 
-# Or run in web-only mode
-libra code --web
+# Run your agent tool normally — Libra captures sessions and checkpoints
+codex
 
-# Or as an MCP server for Claude Desktop
-libra code --stdio
+# Inspect captured sessions
+libra agent session list
+libra agent checkpoint list
 ```
 
-> See the [full documentation](https://docs.libra.tools/en/docs/getting-started) for advanced setup, configuration, and usage guides.
+> See [Agent Capture documentation](https://docs.libra.tools/en/docs/getting-started/agent) for all supported agents, advanced configuration, and session management.
 
 ---
 
