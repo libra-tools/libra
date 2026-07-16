@@ -61,6 +61,11 @@ pub(crate) fn collect(index: &Index) -> Vec<UnmergedEntry> {
         }
     }
 
+    // A stage-0 entry marks the path as resolved: Git treats the merged entry
+    // as authoritative, so leftover higher stages must not surface as `u`
+    // conflict rows alongside the normal tracked row.
+    by_path.retain(|path, _| !index.tracked(path, 0));
+
     by_path
         .into_iter()
         .map(|(path, stages)| UnmergedEntry::new(PathBuf::from(path), stages))

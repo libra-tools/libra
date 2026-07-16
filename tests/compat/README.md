@@ -87,6 +87,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `config_history_defaults_test.rs` | P1-05b (plan-20260708) | 历史相关默认值：`merge.ff`、`merge.log`、`merge.verifySignatures`、`commit.gpgSign` 与 CLI override 优先级 |
 | `fetch_remote_refspec_test.rs` | P1-06 (plan-20260708) | 显式/配置 fetch refspec 精确映射、FETCH_HEAD/remote HEAD 元数据、`remotes.default`、多 ref 事务回滚、remote rename tracking namespace 迁移与 `ls-remote --symref` |
 | `noninteractive_history_controls_test.rs` | P1-07a/P1-07b/P1-07c (plan-20260708) | rebase 非交互 controls；merge `-s ours`、hunk-level `-X`、无关历史与 `--log`；cherry-pick/revert last-wins hunk-level `-X`、revert cleanup conflict→continue 与 corrupt-index fail-closed，以及 reset merge/keep staged/unstaged 保留或拒绝、untracked collision、file/directory 转换、symlink ancestor no-follow 和原子回滚（Unix 33 E2E） |
+| `compat_status_wave0_register.rs` (+ `status_wave0_manifest.rs`) | plan-20260714 R0-0 | `STATUS_WAVE0_TESTS` canonical manifest ↔ `tests/command/status_wave0_test.rs` bidirectional set equality via `cargo test --test command_test -- --list`; strict alphabetical ordering; non-empty guard |
 
 ## Authoring guidelines
 

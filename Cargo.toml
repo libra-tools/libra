@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.91"
+version = "0.18.92"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -428,6 +428,10 @@ path = "tests/compat/libra_hooks_lifecycle_test.rs"
 [[test]]
 name = "compat_import_export_roundtrip"
 path = "tests/compat/import_export_roundtrip_test.rs"
+
+[[test]]
+name = "compat_status_wave0_register"
+path = "tests/compat/compat_status_wave0_register.rs"
 
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).
