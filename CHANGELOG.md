@@ -4,6 +4,23 @@
 
 ### Added
 
+- **Signed release-manifest verification core (v0.18.95, plan-20260714 §A.6)**:
+  new `internal::upgrade::{manifest,trusted_keys,platform}` — a pure
+  `verify_envelope_bytes` implementing the full §A.6 order (envelope parse
+  with duplicate-key-id rejection, domain-separated Ed25519 verification via
+  `ring`, strict payload semantics: `stable` channel, release-SemVer-only
+  versions, exact four-platform artifact matrix with unique platforms,
+  structural artifact-URL grammar pinned to
+  `https://download.libra.tools/libra/releases/v{tag}/libra-{platform}` with
+  `tag == version` and URL-platform == artifact-platform binding, 128 MiB
+  size bound, then key-generation floor and key-validity windows). The
+  compiled production trust table ships EMPTY until the release-key ceremony,
+  so verification fails closed and auto-upgrade stays inert. The new
+  `test-upgrade` cargo feature (plus `LIBRA_TEST=1` at runtime) is the only
+  trust-root injection path; release builds contain no override code.
+  Windows stays published-but-unsupported for auto-upgrade (§A.1). Internal
+  machinery only — no CLI surface changes.
+
 - **Reserved `upgrade.mode` config namespace (v0.18.94, plan-20260714 §A.3)**:
   the auto-upgrade switch now lives in `{LIBRA_HOME}/upgrade/settings.json`
   (atomic writes, `0700`/`0600` permissions on Unix), backed by a single

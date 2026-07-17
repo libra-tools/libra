@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.94"
+version = "0.18.95"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -19,6 +19,7 @@ test-live-ai   = []   # L3: tests calling real LLM APIs
 test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
 test-provider  = []   # deterministic hidden provider for local TUI automation tests
 test-live-agent = [] # plan-20260713 live agent gate: real local claude/codex/opencode CLI data (dev machine acceptance; env LIBRA_RUN_LIVE_AGENT_GATE=1)
+test-upgrade   = []   # plan-20260714 §A.11: auto-upgrade test hooks (trust-root/endpoint injection; requires LIBRA_TEST=1 at runtime; release workflow must NEVER enable this feature)
 fastcdc        = []   # lore.md §6: default-OFF FastCDC LFS media chunking client substrate (no new deps; reuses ring sha256; server protocol frozen)
 subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/tracing/agent.md "Step 2 audit closure")
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]  # lore.md 1.7: OTLP trace export (default binary unaffected)

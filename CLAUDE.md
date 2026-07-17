@@ -75,6 +75,7 @@ pnpm --dir web install --frozen-lockfile && pnpm --dir web build
 | `test-provider` | Deterministic hidden provider for local TUI automation tests (requires `LIBRA_ENABLE_TEST_PROVIDER=1`) |
 | `test-live-agent` | plan-20260713 live agent gate: real local `claude`/`codex`/`opencode` CLI data on the dev acceptance machine (requires `LIBRA_RUN_LIVE_AGENT_GATE=1`; missing stores print skipped) |
 | `subagent-scaffold` | Schema-only sub-agent contract scaffold (CEX-S2-10, gated on CP-4 in production) |
+| `test-upgrade` | plan-20260714 §A.11 auto-upgrade test hooks (trust-root/endpoint injection; needs `LIBRA_TEST=1` at runtime; release builds must never enable it) |
 | `otlp` | OTLP trace export (lore.md 1.7): one vetted command-span to an explicitly configured collector; default binary unaffected |
 
 ### CI Pipeline (`.github/workflows/base.yml`)
