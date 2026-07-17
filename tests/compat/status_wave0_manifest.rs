@@ -20,5 +20,6 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "rename_porcelain_v2_emits_rename_record",
     "rename_short_format_uses_arrow",
     "resolved_conflict_with_stage0_emits_no_u_line",
+    "tracked_unreadable_path_fails_closed_not_deleted",
     "unmerged_stage_presence_to_xy_mapping",
 ];

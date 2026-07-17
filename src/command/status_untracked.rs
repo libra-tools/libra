@@ -107,9 +107,24 @@ fn collect_tracked_worktree_changes(
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
         let file_abs = workdir.join(file);
-        if file_abs.symlink_metadata().is_err() {
-            changes.deleted.push(file.clone());
-        } else if index.is_modified(file_str, 0, workdir) {
+        // A tracked path that is genuinely gone is a deletion; but a real I/O
+        // error (permission denied, I/O failure) only means "can't tell" — it
+        // must NOT be reported as a deletion (§B.6.0.1). Fail closed instead,
+        // so `commit -a`/`status` never records a spurious removal.
+        match file_abs.symlink_metadata() {
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                changes.deleted.push(file.clone());
+                continue;
+            }
+            Err(source) => {
+                return Err(StatusError::WorktreeRead {
+                    path: file_abs.clone(),
+                    source,
+                });
+            }
+            Ok(_) => {}
+        }
+        if index.is_modified(file_str, 0, workdir) {
             let file_hash =
                 calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
                     path: file_abs.clone(),

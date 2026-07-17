@@ -431,6 +431,8 @@ pub enum StatusError {
     InvalidPathEncoding { path: PathBuf },
     #[error("failed to hash '{path}': {source}")]
     FileHash { path: PathBuf, source: io::Error },
+    #[error("cannot read tracked path '{path}': {source}")]
+    WorktreeRead { path: PathBuf, source: io::Error },
     #[error("failed to list files in '{path}': {source}")]
     ListWorkdirFiles { path: PathBuf, source: io::Error },
     #[error("failed to determine working directory: {source}")]
@@ -452,6 +454,12 @@ impl From<StatusError> for CliError {
             StatusError::FileHash { .. } => {
                 CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed)
             }
+            StatusError::WorktreeRead { .. } => CliError::fatal(msg)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint(
+                    "a tracked file could not be read (e.g. permission denied); \
+                     status fails closed rather than reporting it as deleted",
+                ),
             StatusError::ListWorkdirFiles { .. } => {
                 CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed)
             }

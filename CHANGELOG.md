@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`status` no longer reports an unreadable tracked file as deleted (v0.19.7,
+  plan-20260714 Part B §B.6.0.1)**: `collect_tracked_worktree_changes`
+  previously treated ANY `symlink_metadata` error on a tracked path as a
+  deletion, so a permission-denied or I/O error would surface as `deleted:`
+  and could make `commit -a` record a spurious removal. Now only a genuine
+  `NotFound` counts as a deletion; a real I/O error fails closed with
+  `LBR-IO-001` and a hint, rather than inventing a deletion.
+
 ### Changed
 
 - **`status` porcelain v2 and JSON emit proper rename records (v0.19.6,

@@ -275,6 +275,52 @@ fn rename_short_format_uses_arrow() {
     );
 }
 
+/// A tracked file that cannot be read (permission denied on its parent) must
+/// NOT be reported as deleted — status fails closed instead (§B.6.0.1). This
+/// prevents `commit -a` from recording a spurious removal.
+#[test]
+#[cfg(unix)]
+fn tracked_unreadable_path_fails_closed_not_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir(repo.path().join("locked")).unwrap();
+    fs::write(repo.path().join("locked/secret.txt"), "top secret\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "locked/secret.txt"], repo.path()),
+        "stage tracked file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit tracked file",
+    );
+
+    // Make the parent directory unreadable/untraversable so symlink_metadata
+    // on the tracked file returns EACCES rather than NotFound.
+    let dir = repo.path().join("locked");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_libra_command(&["status"], repo.path());
+    // Restore permissions before asserting so the tempdir can be cleaned up.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "unreadable tracked path must fail closed, not succeed with a deletion"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LBR-IO-001") || stderr.contains("cannot read tracked path"),
+        "fails closed with an IO error: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("deleted:") && !stdout.contains("secret.txt"),
+        "must not report the unreadable file as deleted: {stdout}"
+    );
+}
+
 /// `--porcelain=v2` emits Git's single `2 R<score> …\t<old>` rename record
 /// (real HEAD/index modes and hashes), not two `1 R` change rows (§B.6.4).
 #[test]
