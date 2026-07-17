@@ -4,6 +4,21 @@
 
 ### Added
 
+- **Crash-safe install transaction and candidate probes (v0.18.99,
+  plan-20260714 §A.7)**: new `internal::upgrade::{txn,probe}`. `txn`
+  journals the install to `.libra-upgrade-txn.json` through the seven-state
+  machine (Prepared → BackupDurable → CandidateInstalled → PostProbePassed →
+  Committed, with RollbackIntent/AbortAbsentIntent branches), always writing
+  intent before each filesystem mutation and implementing the full §A.7
+  recovery decision table so any crash point resolves idempotently to
+  committed, rolled-back-to-previous, or aborted-fresh — the post-probe is
+  injected so every intermediate on-disk layout is covered by a direct
+  reconstruction test. `probe` spawns the candidate/target self-check in its
+  own process group with `kill_on_drop` and a hard per-probe timeout,
+  killing and reaping the whole group on timeout so no descendant survives;
+  any nonzero exit, signal, timeout or spawn failure is a fail-closed probe
+  failure. Internal machinery only.
+
 - **Install-directory lock and official-install marker (v0.18.98,
   plan-20260714 §A.2/§A.4/§A.5)**: new `internal::upgrade::{lock,marker}` —
   `InstallDir` opens the install directory once with

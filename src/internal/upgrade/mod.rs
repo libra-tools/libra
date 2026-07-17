@@ -19,6 +19,8 @@ pub mod lock;
 pub mod manifest;
 pub mod marker;
 pub mod platform;
+pub mod probe;
 pub mod settings;
 pub mod state;
 pub mod trusted_keys;
+pub mod txn;

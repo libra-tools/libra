@@ -32,7 +32,7 @@ pub const OFFICIAL_INSTALL_SOURCE: &str = "official_signed_manifest";
 pub const TARGET_BINARY_NAME: &str = "libra";
 
 /// On-disk marker document (§A.4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallMarker {
     pub schema_version: u32,
     /// RFC3339 install time (informational).
