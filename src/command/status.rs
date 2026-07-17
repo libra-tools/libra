@@ -518,6 +518,11 @@ struct StatusData {
     /// enabled-but-empty view is a no-op, so no advisory.
     sparse_view_active: bool,
     porcelain_v2: Option<std::sync::Arc<PorcelainV2Data>>,
+    /// Score/exactness per staged rename pair (display-base keys, §B.6.4/5).
+    staged_rename_details: RenameDetails,
+    /// Score/exactness per unstaged rename pair (only populated under
+    /// `status.renameUntracked=true`).
+    unstaged_rename_details: RenameDetails,
 }
 
 /// Human advisory for a non-merge sequence in progress (read-only detection).
@@ -632,7 +637,11 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
 
     // Apply rename detection before collapsing untracked dirs / porcelain
     // metadata. Staged snapshot: old = HEAD tree, new = index stage-0.
-    // Unstaged snapshot: old = index stage-0, new = worktree (§B.4.1).
+    // Unstaged snapshot: old = index stage-0, new = worktree — but untracked
+    // paths only become destinations under the `status.renameUntracked`
+    // extension (§B.3.1; Git default: a tracked→untracked move is `D` + `??`).
+    let mut staged_rename_details: RenameDetails = HashMap::new();
+    let mut unstaged_rename_details: RenameDetails = HashMap::new();
     if let Some(percent) = rename_percent
         && percent > 0
     {
@@ -655,12 +664,14 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             &config,
             RenameBlobSide::Known(&head_blobs),
             RenameBlobSide::Known(&index_blobs),
+            &mut staged_rename_details,
         );
         detect_renames_in_changes(
             &mut unstaged,
             &config,
             RenameBlobSide::Known(&index_blobs),
             RenameBlobSide::Worktree,
+            &mut unstaged_rename_details,
         );
     }
 
@@ -725,6 +736,8 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             .await
             .is_active(),
         porcelain_v2,
+        staged_rename_details,
+        unstaged_rename_details,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
     Ok(data)
@@ -897,16 +910,22 @@ fn build_rename_side(
     map
 }
 
+/// Per-pair rename detail: percentage score and exactness (§B.6.4/§B.6.5),
+/// keyed by the display-base `(old, new)` pair recorded in `Changes.renamed`.
+type RenameDetails = HashMap<(PathBuf, PathBuf), (u32, bool)>;
+
 /// Detect renames between the `deleted` (old) and `new` sides of `changes`
 /// using the diffcore engine (exact by OID → unique basename → bounded
 /// exhaustive inexact, §B.4.2). Matched pairs are recorded in
-/// `changes.renamed` and pruned from `deleted`/`new`. Paths keep the change
-/// list's original base for display; detection runs on repo-relative keys.
+/// `changes.renamed` and pruned from `deleted`/`new`; each pair's score and
+/// exactness are added to `details`. Paths keep the change list's original
+/// base for display; detection runs on repo-relative keys.
 fn detect_renames_in_changes(
     changes: &mut Changes,
     config: &rename_detect::RenameDetectConfig,
     old_side: RenameBlobSide<'_>,
     new_side: RenameBlobSide<'_>,
+    details: &mut RenameDetails,
 ) {
     if changes.deleted.is_empty() || changes.new.is_empty() {
         return;
@@ -936,6 +955,10 @@ fn detect_renames_in_changes(
         let new_display = util::workdir_to_current(&m.new);
         consumed_old.insert(old_display.clone());
         consumed_new.insert(new_display.clone());
+        details.insert(
+            (old_display.clone(), new_display.clone()),
+            (m.score_percent(), m.exact),
+        );
         renamed.push((old_display, new_display));
     }
     changes.deleted.retain(|p| !consumed_old.contains(p));
@@ -1525,6 +1548,8 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
             .await
             .is_active(),
         porcelain_v2: None,
+        staged_rename_details: RenameDetails::new(),
+        unstaged_rename_details: RenameDetails::new(),
     };
     filter_status_data_by_pathspec(&mut data, args)?;
 
@@ -1617,6 +1642,8 @@ async fn render_status_to_writer(
                 &data.unmerged,
                 &data.ignored_files,
                 data.porcelain_v2.as_deref(),
+                &data.staged_rename_details,
+                &data.unstaged_rename_details,
                 args.null_terminated,
                 &mut buffer,
             )?;
@@ -2199,6 +2226,29 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
             .collect()
     };
 
+    // Top-level `renames[]` with score/exactness/side (§B.6.5), sorted by the
+    // destination path for determinism.
+    let mut renames: Vec<serde_json::Value> = Vec::new();
+    let mut push_renames = |pairs: &[(PathBuf, PathBuf)], details: &RenameDetails, staged: bool| {
+        for (old, new) in pairs {
+            let (score, exact) = details
+                .get(&(old.clone(), new.clone()))
+                .copied()
+                .unwrap_or((100, true));
+            renames.push(serde_json::json!({
+                "from": old.display().to_string(),
+                "to": new.display().to_string(),
+                "score": score,
+                "exact": exact,
+                "staged": staged,
+                "unstaged": !staged,
+            }));
+        }
+    };
+    push_renames(&data.staged.renamed, &data.staged_rename_details, true);
+    push_renames(&data.unstaged.renamed, &data.unstaged_rename_details, false);
+    renames.sort_by(|a, b| a["to"].as_str().cmp(&b["to"].as_str()));
+
     let head = match &data.head {
         Head::Branch(name) => serde_json::json!({"type": "branch", "name": name}),
         Head::Detached(hash) => {
@@ -2240,6 +2290,7 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
         ),
         "untracked": paths_to_json(&data.unstaged.new),
         "ignored": paths_to_json(&data.ignored_files),
+        "renames": renames,
         "is_clean": !data.is_dirty(),
     });
 
@@ -2408,13 +2459,96 @@ fn build_porcelain_v2_data(index: Index, head_oid: Option<&ObjectHash>) -> Porce
     }
 }
 
+/// Emit a porcelain v2 `2 <xy> …` rename record (§B.6.4):
+/// `2 <xy> <sub> <mH> <mI> <mW> <hH> <hI> R<pct> <new>\t<old>`. Under `-z` the
+/// path field becomes `<new> NUL <old> NUL`.
+#[allow(clippy::too_many_arguments)]
+fn write_rename_porcelain_v2(
+    old: &Path,
+    new: &Path,
+    x: char,
+    y: char,
+    score: u32,
+    metadata: &PorcelainV2Data,
+    zero_hash: &str,
+    null_terminated: bool,
+    writer: &mut impl Write,
+) -> CliResult<()> {
+    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let old_workdir = current_to_workdir(old);
+    let new_workdir = current_to_workdir(new);
+
+    // Staged rename: HEAD side is the OLD path, index side is the NEW path.
+    // Unstaged-only rename (`.R`): there is no staged component, so Git copies
+    // the index fields into the HEAD fields.
+    let staged_rename = x == 'R';
+    let (mode_head, hash_head) = if staged_rename {
+        metadata
+            .head_tree_items
+            .get(&old_workdir)
+            .map(|info| (info.mode, info.hash.clone()))
+            .unwrap_or((0, zero_hash.to_string()))
+    } else {
+        // `.R`: filled from the index below (fixup).
+        (0, zero_hash.to_string())
+    };
+    let index_key = if staged_rename {
+        &new_workdir
+    } else {
+        &old_workdir
+    };
+    let index_str = index_key.to_str().unwrap_or_default();
+    let (mode_index, hash_index) = metadata
+        .index
+        .get(index_str, 0)
+        .map(|entry| (entry.mode, entry.hash.to_string()))
+        .unwrap_or((0o100644, zero_hash.to_string()));
+    let (mode_head, hash_head) = if staged_rename {
+        (mode_head, hash_head)
+    } else {
+        (mode_index, hash_index.clone())
+    };
+    let mode_worktree = get_worktree_mode(new);
+    let sub = if is_submodule_mode(mode_index) || is_submodule_mode(mode_head) {
+        get_submodule_status(new)
+    } else {
+        "N...".to_string()
+    };
+
+    write!(
+        writer,
+        "2 {x}{y} {} {} {} {} {} {} R{} ",
+        sub,
+        format_mode(mode_head),
+        format_mode(mode_index),
+        format_mode(mode_worktree),
+        hash_head,
+        hash_index,
+        score,
+    )
+    .map_err(write_err)?;
+    if null_terminated {
+        write!(writer, "{}", new.display()).map_err(write_err)?;
+        writer.write_all(b"\0").map_err(write_err)?;
+        write!(writer, "{}", old.display()).map_err(write_err)?;
+        writer.write_all(b"\0").map_err(write_err)?;
+    } else {
+        write!(writer, "{}\t{}", new.display(), old.display()).map_err(write_err)?;
+        writer.write_all(b"\n").map_err(write_err)?;
+    }
+    Ok(())
+}
+
 /// Output porcelain v2 format using metadata collected during status computation.
+#[allow(clippy::too_many_arguments)]
 fn output_porcelain_v2(
     staged: &Changes,
     unstaged: &Changes,
     unmerged: &[UnmergedEntry],
     ignored: &[PathBuf],
     metadata: Option<&PorcelainV2Data>,
+    staged_rename_details: &RenameDetails,
+    unstaged_rename_details: &RenameDetails,
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
@@ -2427,8 +2561,58 @@ fn output_porcelain_v2(
         write_unmerged_porcelain_v2(entry, &zero_hash, null_terminated, writer)?;
     }
 
+    // Rename records (`2 …`) render separately from the flattened `1 …` list;
+    // their endpoints are excluded below so they never double as change rows.
+    let mut endpoints: HashSet<PathBuf> = HashSet::new();
+    for (old, new) in &staged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        let unstaged_char = if unstaged.modified.contains(new) {
+            'M'
+        } else {
+            '.'
+        };
+        let score = staged_rename_details
+            .get(&(old.clone(), new.clone()))
+            .map(|(pct, _)| *pct)
+            .unwrap_or(100);
+        write_rename_porcelain_v2(
+            old,
+            new,
+            'R',
+            unstaged_char,
+            score,
+            metadata,
+            &zero_hash,
+            null_terminated,
+            writer,
+        )?;
+    }
+    for (old, new) in &unstaged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        let score = unstaged_rename_details
+            .get(&(old.clone(), new.clone()))
+            .map(|(pct, _)| *pct)
+            .unwrap_or(100);
+        write_rename_porcelain_v2(
+            old,
+            new,
+            '.',
+            'R',
+            score,
+            metadata,
+            &zero_hash,
+            null_terminated,
+            writer,
+        )?;
+    }
+
     let status_list = generate_short_format_status(staged, unstaged);
     for (file, staged_status, unstaged_status) in status_list {
+        if endpoints.contains(&file) {
+            continue;
+        }
         if staged_status == '?' && unstaged_status == '?' {
             write!(writer, "? {}", file.display()).map_err(write_err)?;
             if null_terminated {

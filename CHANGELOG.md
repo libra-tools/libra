@@ -4,6 +4,17 @@
 
 ### Changed
 
+- **`status` porcelain v2 and JSON emit proper rename records (v0.19.6,
+  plan-20260714 Part B R0-5 + R0-7 JSON)**: `--porcelain=v2` now renders a
+  detected rename as Git's single `2 R<score> N... <mH> <mI> <mW> <hH> <hI>
+  R<pct> <new>\t<old>` record — with the real HEAD tree modes/hashes, index
+  modes/hashes, and worktree mode (`<new> NUL <old> NUL` path field under
+  `-z`) — instead of two `1 R` change rows for the endpoints. `--json` gains
+  a top-level `data.renames[]` array of `{from, to, score, exact, staged,
+  unstaged}` (destination-sorted) alongside the existing nested
+  `staged.renamed`/`unstaged.renamed` `{from,to}` entries. The similarity
+  score is threaded from the diffcore engine through the render pipeline.
+
 - **`status --short` renders renames with Git's arrow form (v0.19.5,
   plan-20260714 Part B R0-6 first slice)**: a detected rename now renders as
   one `R  <old> -> <new>` line (colored `R` in color mode) instead of two

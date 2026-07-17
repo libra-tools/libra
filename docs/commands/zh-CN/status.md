@@ -116,6 +116,8 @@ libra status --no-column
 
 renames 由共享 diffcore 引擎匹配：先按 blob id 找 exact，再按唯一 basename，最后是带 per-side 上限（1000）与相似度比较预算的有界 inexact spanhash 扫描。staged rename 配对 HEAD tree 与 index；unstaged rename 配对 index 与工作树。检测在仓库根相对路径上运行，因此即使从子目录调用 `status` 也能正确检测 rename。
 
+renames 在每种格式中都以 Git 兼容记录呈现：human 长格式为 `renamed: <old> -> <new>`；`--short` 为 `R  <old> -> <new>`（`-z` 下为 `XY SP <new> NUL <old> NUL`）；`--porcelain=v2` 为单条 `2 R<score> … <new>\t<old>` 记录，带真实的 HEAD/index/工作树 mode 与 hash；`--json` 为顶层 `renames[]` 数组（`{from, to, score, exact, staged, unstaged}`）——绝不将端点渲染为两条独立的 `R`/`1 R` 行。
+
 ```bash
 libra status --find-renames
 libra status --find-renames=75

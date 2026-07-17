@@ -275,6 +275,73 @@ fn rename_short_format_uses_arrow() {
     );
 }
 
+/// `--porcelain=v2` emits Git's single `2 R<score> …\t<old>` rename record
+/// (real HEAD/index modes and hashes), not two `1 R` change rows (§B.6.4).
+#[test]
+fn rename_porcelain_v2_emits_rename_record() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("2 "))
+        .unwrap_or_else(|| panic!("expected a porcelain v2 rename record: {out}"));
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(fields[0], "2", "{line}");
+    assert_eq!(fields[1], "R.", "staged rename xy: {line}");
+    // Score field is `R<digits>` at index 8 (NOT the xy `R.` at index 1).
+    let score = fields[8];
+    assert!(
+        score.starts_with('R') && score[1..].chars().all(|c| c.is_ascii_digit()),
+        "score field is R<pct>: {line}"
+    );
+    assert_eq!(&score[1..], "100", "exact rename scores 100: {line}");
+    // HEAD/index hashes must be real (non-zero) for an exact staged rename.
+    assert_ne!(
+        fields[6],
+        "0".repeat(fields[6].len()),
+        "hH non-zero: {line}"
+    );
+    assert_ne!(
+        fields[7],
+        "0".repeat(fields[7].len()),
+        "hI non-zero: {line}"
+    );
+    // The record carries both paths (new\told); endpoints must not also
+    // appear as separate `1 R` rows.
+    assert!(line.contains("b.txt") && line.contains("a.txt"), "{line}");
+    assert!(
+        !out.lines().any(|l| l.starts_with("1 R")),
+        "endpoints must not double as `1 R` rows: {out}"
+    );
+}
+
+/// `--json` includes a top-level `renames[]` array with `score`, `exact`, and
+/// side flags (§B.6.5).
+#[test]
+fn rename_json_includes_score_and_side() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&out).expect("json status");
+    let renames = doc["data"]["renames"]
+        .as_array()
+        .expect("renames array present");
+    let entry = renames
+        .iter()
+        .find(|r| r["to"] == "b.txt")
+        .unwrap_or_else(|| panic!("rename entry for b.txt: {out}"));
+    assert_eq!(entry["from"], "a.txt");
+    assert_eq!(entry["score"], 100);
+    assert_eq!(entry["exact"], true);
+    assert_eq!(entry["staged"], true);
+    assert_eq!(entry["unstaged"], false);
+}
+
 /// Detection runs on repo-relative keys, so a rename is found even when
 /// `status` is invoked from a subdirectory (the historical subdir bug).
 #[test]

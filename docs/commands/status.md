@@ -181,6 +181,12 @@ and a similarity-comparison budget. Staged renames pair the HEAD tree with the i
 renames pair the index with the worktree. Detection runs on repository-root-relative paths, so
 renames are found correctly even when `status` is invoked from a subdirectory.
 
+Renames render as Git-compatible records in every format: `renamed: <old> -> <new>` in the
+human long format, `R  <old> -> <new>` in `--short` (`XY SP <new> NUL <old> NUL` under `-z`),
+a single `2 R<score> … <new>\t<old>` record with real HEAD/index/worktree modes and hashes in
+`--porcelain=v2`, and a top-level `renames[]` array (`{from, to, score, exact, staged,
+unstaged}`) in `--json` — never as two separate `R`/`1 R` rows for the endpoints.
+
 ```bash
 libra status --find-renames
 libra status --find-renames=75
