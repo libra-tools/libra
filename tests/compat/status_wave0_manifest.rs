@@ -9,6 +9,7 @@
 
 pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "porcelain_v1_rename_output_stays_add_delete",
+    "porcelain_v1_uses_rename_arrow_when_detected",
     "porcelain_v2_unmerged_u_line",
     "rename_config_cli_find_renames_overrides_false",
     "rename_config_status_renames_false_disables",

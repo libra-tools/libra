@@ -14,6 +14,13 @@
 
 ### Changed
 
+- **`status --porcelain` (v1) renders renames with Git's arrow form (v0.19.8,
+  plan-20260714 Part B R0-6 v1 slice)**: a detected rename in porcelain v1 now
+  renders as a single `R  <old> -> <new>` record (`XY SP <new> NUL <old> NUL`
+  under `-z`) rather than two `R` endpoint rows, matching Git. This completes
+  Git-compatible rename rendering across every `status` output format (human,
+  short, porcelain v1/v2, JSON).
+
 - **`status` porcelain v2 and JSON emit proper rename records (v0.19.6,
   plan-20260714 Part B R0-5 + R0-7 JSON)**: `--porcelain=v2` now renders a
   detected rename as Git's single `2 R<score> N... <mH> <mI> <mW> <hH> <hI>

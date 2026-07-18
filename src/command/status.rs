@@ -2343,21 +2343,52 @@ fn output_porcelain_with_unmerged(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+
+    // Renames render as a single `R  <old> -> <new>` record (Git porcelain v1
+    // §B.6.3), never as two `R` endpoint rows. Under `-z` the record is
+    // `XY SP <new> NUL <old> NUL` (new before old, matching Git).
+    let mut endpoints: HashSet<PathBuf> = HashSet::new();
+    let mut rename_lines: Vec<(char, char, PathBuf, PathBuf)> = Vec::new();
+    for (old, new) in &staged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        let y = if unstaged.modified.contains(new) {
+            'M'
+        } else {
+            ' '
+        };
+        rename_lines.push(('R', y, old.clone(), new.clone()));
+    }
+    for (old, new) in &unstaged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        rename_lines.push((' ', 'R', old.clone(), new.clone()));
+    }
+
+    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
     for (file, staged_status, unstaged_status) in status_list {
+        if endpoints.contains(&file) {
+            continue;
+        }
         write!(
             writer,
-            "{}{} {}",
-            staged_status,
-            unstaged_status,
+            "{staged_status}{unstaged_status} {}",
             file.display()
         )
         .map_err(write_err)?;
+        writer
+            .write_all(if null_terminated { b"\0" } else { b"\n" })
+            .map_err(write_err)?;
+    }
+    for (x, y, old, new) in rename_lines {
         if null_terminated {
+            write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
+            writer.write_all(b"\0").map_err(write_err)?;
+            write!(writer, "{}", old.display()).map_err(write_err)?;
             writer.write_all(b"\0").map_err(write_err)?;
         } else {
-            writer.write_all(b"\n").map_err(write_err)?;
+            writeln!(writer, "{x}{y} {} -> {}", old.display(), new.display()).map_err(write_err)?;
         }
     }
     Ok(())

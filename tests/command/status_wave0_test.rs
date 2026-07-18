@@ -159,6 +159,25 @@ fn porcelain_v1_rename_output_stays_add_delete() {
     assert_eq!(rendered, "D  a.txt\nA  b.txt\n");
 }
 
+/// `--porcelain` (v1) renders a detected rename as a single `R  old -> new`
+/// record, not two `R` endpoint rows (§B.6.3).
+#[test]
+fn porcelain_v1_uses_rename_arrow_when_detected() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        out.lines().any(|l| l == "R  a.txt -> b.txt"),
+        "porcelain v1 rename should be a single arrow record: {out:?}"
+    );
+    assert!(
+        !out.lines().any(|l| l == "R  a.txt" || l == "R  b.txt"),
+        "endpoints must not double as separate R rows: {out:?}"
+    );
+}
+
 // ── R0-2/R0-4: engine-backed rename detection, default-on (§B.4/§B.5) ─────────
 
 /// A staged move of unchanged content is an exact rename, detected by default
