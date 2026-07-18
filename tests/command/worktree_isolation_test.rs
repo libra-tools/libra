@@ -300,6 +300,50 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
     );
 }
 
+/// Part C W0 (§C.11 line 1507a): plain `status` works in a linked worktree
+/// (it never consults the shared dirty cache), but the cache-semantic modes
+/// `--scan`/`--cached`/`--check-dirty` fail closed until W1 scopes the cache.
+#[test]
+fn status_cache_modes_refused_in_linked_but_plain_status_works() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Plain status must succeed in the linked worktree.
+    assert_cli_success(
+        &run_libra_command(&["status"], &wt),
+        "plain status works in a linked worktree",
+    );
+    assert_cli_success(
+        &run_libra_command(&["status", "--porcelain"], &wt),
+        "porcelain status works in a linked worktree",
+    );
+
+    // The dirty-cache modes fail closed.
+    for mode in [
+        vec!["status", "--scan"],
+        vec!["status", "--cached"],
+        vec!["status", "--check-dirty"],
+    ] {
+        let out = run_libra_command(&mode, &wt);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{mode:?} must fail closed in a linked worktree"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
+            "{mode:?} should hit the linked-worktree guard: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

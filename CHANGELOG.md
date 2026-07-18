@@ -4,6 +4,13 @@
 
 ### Changed
 
+- **`status --scan`/`--cached`/`--check-dirty` fail closed in a linked worktree
+  (v0.19.15, plan-20260714 Part C W0)**: these dirty-cache modes read/prune the
+  repository-global `working_dirty`/`working_dirty_meta`, so they now refuse to
+  run in a linked worktree until W1 scopes the cache. Plain `status` (and
+  `status --porcelain`/`--short`) is unaffected — it never consults the dirty
+  cache, so it already computes a fresh, correct result in any worktree.
+
 - **Repository-global-state commands fail closed in a linked worktree
   (v0.19.14, plan-20260714 Part C W0 transition guards)**: `stash` (all
   subcommands, incl. `stash branch`), `layer`, `sparse-view`, `dirty`, and the
