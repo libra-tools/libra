@@ -1115,9 +1115,11 @@ fn test_checkout_ignore_other_worktrees_is_accepted_noop() {
         "create feature",
     );
 
-    // `--ignore-other-worktrees` is accepted and a no-op: Libra worktrees share a
-    // single HEAD/refs store, so a branch is never locked to one worktree and the
-    // checkout proceeds normally.
+    // `--ignore-other-worktrees` is accepted and, in a SINGLE-worktree repo, a
+    // no-op: there is no other worktree that could have `feature` checked out,
+    // so the same-branch guard never fires and the checkout proceeds. (Part C
+    // W0: in a MULTI-worktree repo the flag does NOT bypass the guard — Libra
+    // never allows the same branch checked out twice; see the isolation tests.)
     let output = run_libra_command(&["checkout", "--ignore-other-worktrees", "feature"], p);
     assert_cli_success(&output, "checkout --ignore-other-worktrees feature");
     let current = run_libra_command(&["branch", "--show-current"], p);

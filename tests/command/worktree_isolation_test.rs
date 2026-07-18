@@ -474,6 +474,44 @@ fn symbolic_ref_refuses_branch_checked_out_elsewhere() {
     );
 }
 
+/// Part C W0 (§C.11, intentionally-different from Git): `--ignore-other-worktrees`
+/// does NOT bypass the same-branch guard in a multi-worktree repo. Libra never
+/// allows the same branch checked out in two worktrees.
+#[test]
+fn ignore_other_worktrees_flag_cannot_bypass_in_multi_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    // main is on `main`; the linked worktree takes `feature`.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // From main, `checkout --ignore-other-worktrees feature` is STILL refused.
+    let co = run_libra_command(&["checkout", "--ignore-other-worktrees", "feature"], main);
+    assert_ne!(co.status.code(), Some(0), "checkout flag cannot bypass");
+    let co_err = String::from_utf8_lossy(&co.stderr);
+    assert!(
+        co_err.contains("already checked out") && co_err.contains("ignore-other-worktrees"),
+        "error explains the flag is not honored: {co_err}"
+    );
+
+    // Plain `switch feature` is also refused (the same-branch guard).
+    let sw = run_libra_command(&["switch", "feature"], main);
+    assert_ne!(sw.status.code(), Some(0), "switch to wt branch refused");
+    assert!(
+        String::from_utf8_lossy(&sw.stderr).contains("already checked out"),
+        "switch refused: {}",
+        String::from_utf8_lossy(&sw.stderr)
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

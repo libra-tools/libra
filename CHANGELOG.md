@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **`checkout`/`switch --ignore-other-worktrees` no longer bypasses the
+  same-branch guard (v0.19.19, plan-20260714 Part C W0 §C.11,
+  intentionally-different from Git)**: Libra never allows the same shared branch
+  checked out in two worktrees, so `--ignore-other-worktrees` is now accepted
+  only for CLI compatibility — it does NOT override the refusal in a
+  multi-worktree repo (against a real collision the checkout is still refused,
+  with a note that the flag is not honored). It remains a silent no-op in a
+  single-worktree repo (no collision to override). Docs, `COMPATIBILITY.md`, and
+  the error hint (which no longer suggests the flag) are updated accordingly.
+
 - **`symbolic-ref HEAD` refuses a branch checked out in another worktree
   (v0.19.18, plan-20260714 Part C W0 §C.11)**: `symbolic-ref HEAD
   refs/heads/<branch>` now fails closed when `<branch>` is already checked out

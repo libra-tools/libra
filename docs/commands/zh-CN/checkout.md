@@ -45,7 +45,7 @@ libra checkout [<tree-ish>] -- <pathspec>...
 | | `--orphan` | `<name>` | 创建 unborn orphan 分支，保留索引/工作树，并把 HEAD 切到该分支。不支持额外 start-point。 |
 | `-d` | `--detach` | | 即使目标是分支也在其提交处 detach HEAD（而非切换到分支） |
 | `-t` | `--track` | | checkout 远程跟踪分支时配置 upstream。接受式 no-op：Libra 在 checkout 远程跟踪分支时本就通过 DWIM 配置跟踪，故该标志请求的正是已有行为；对非远程目标无效果。独立显式跟踪请用 `libra switch --track`。 |
-| | `--ignore-other-worktrees` | | 即使另一个 linked worktree 已 checkout 这个共享分支，也允许 checkout；该标志会绕过 Libra 的 other-worktree 安全保护。 |
+| | `--ignore-other-worktrees` | | 为 CLI 兼容而接受，但**不会**绕过 Libra 的 other-worktree 安全保护（有意与 Git 不同）：Libra 绝不允许同一共享分支在两个 worktree 同时 checkout。单 worktree 仓库中为静默 no-op；存在真实冲突时 checkout 仍被拒绝。 |
 | | `--no-progress` | | 不显示进度条。接受式 no-op：Libra 的 checkout 从不渲染进度条。 |
 | | `--no-overlay` | | 不以 overlay 模式检出路径（source 中缺失的路径仍会被移除）。接受式 no-op：Libra 的 checkout 从不处于 overlay 模式，已是 Git 默认。（Git 的 `--overlay` 未实现。） |
 | | `[<tree-ish>] -- <pathspec>...` | 位置参数 | 用共享 pathspec magic 恢复路径。没有 `<tree-ish>` 时，从索引恢复工作树。带 `<tree-ish>` 时，从该来源同时恢复索引和工作树。 |

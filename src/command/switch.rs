@@ -1409,18 +1409,26 @@ async fn move_to_resolved_branch(
         return Ok(target_commit_id);
     }
 
-    // lore.md 2.1: branches are SHARED across worktrees, so refuse switching to
-    // a branch already checked out in another worktree (both would move the
-    // same pointer). git parity — detach instead to share the tip read-only.
-    if !ignore_other_worktrees
-        && let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await
-    {
+    // Part C W0 (§C.11): branches are SHARED across worktrees, so refuse
+    // switching to a branch already checked out in another worktree (both would
+    // move the same pointer). Unlike Git, `--ignore-other-worktrees` does NOT
+    // bypass this in a multi-worktree repo (intentionally-different): Libra
+    // never allows the same branch checked out twice. Detach instead to share
+    // the tip read-only. Single-worktree repos never hit this (no collision).
+    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+        let hint = if ignore_other_worktrees {
+            "Libra does not honor --ignore-other-worktrees (it never allows the same branch \
+             checked out in two worktrees): switch to a different branch, or use --detach to \
+             share its tip"
+        } else {
+            "switch to a different branch, or use --detach to share its tip"
+        };
         return Err(SwitchError::WorktreeConflict(
             CliError::fatal(format!(
                 "branch '{branch_name}' is already checked out at worktree '{other}'"
             ))
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-            .with_hint("switch to a different branch, or use --detach to share its tip"),
+            .with_hint(hint),
         ));
     }
 

@@ -713,17 +713,26 @@ async fn switch_branch_with_output(
             branch_name.to_string(),
         ));
     }
-    // lore.md 2.1: refuse a branch already checked out in another worktree
-    // (branches are shared) unless --ignore-other-worktrees. git parity.
-    if !ignore_other_worktrees
-        && let Some(other) = Head::branch_checked_out_elsewhere(branch_name).await
-    {
+    // Part C W0 (§C.11): refuse a branch already checked out in another
+    // worktree (branches are SHARED, so both worktrees would move the same
+    // pointer). Unlike Git, `--ignore-other-worktrees` does NOT bypass this in a
+    // multi-worktree repo (intentionally-different): Libra never allows the same
+    // branch checked out in two worktrees. `branch_checked_out_elsewhere` only
+    // returns Some when a real collision exists, so single-worktree repos are
+    // unaffected and the flag is a silent no-op there.
+    if let Some(other) = Head::branch_checked_out_elsewhere(branch_name).await {
+        let hint = if ignore_other_worktrees {
+            "Libra does not honor --ignore-other-worktrees (it never allows the same branch \
+             checked out in two worktrees): check out a different branch, or use --detach"
+        } else {
+            "check out a different branch, or use --detach"
+        };
         return Err(CheckoutError::DelegatedCli(
             crate::utils::error::CliError::fatal(format!(
                 "branch '{branch_name}' is already checked out at worktree '{other}'"
             ))
             .with_stable_code(crate::utils::error::StableErrorCode::ConflictOperationBlocked)
-            .with_hint("check out a different branch, use --detach, or --ignore-other-worktrees"),
+            .with_hint(hint),
         ));
     }
     let target_branch = Branch::find_branch_result(branch_name, None)
