@@ -121,6 +121,19 @@
   worktree/architecture docs and `COMPATIBILITY.md` (which had described a
   shared HEAD and `--delete-dir`-gated scoped-row GC) to the isolated reality.
 
+### Changed
+
+- **`FETCH_HEAD` is worktree-local and `fetch` is allowed in a linked worktree
+  (v0.19.29, plan-20260714 Part C W1 §C.4.2)**: `FETCH_HEAD` — the record of the
+  refs a worktree just fetched, which `pull` reads back — was written to the
+  shared common storage, so a fetch in one worktree overwrote another's record.
+  It now lives in the invoking worktree's own gitdir (per Git). With that the
+  only per-worktree state fetch touched, the W0 linked-worktree refusal on
+  standalone `fetch` is lifted: its other writes (`refs/remotes/*` and the
+  object store) are repository-scoped, and fetching into a branch checked out in
+  another worktree is still refused. `pull` stays refused in a linked worktree
+  because its merge/rebase state is still repository-global.
+
 ### Fixed
 
 - **Editor scratch buffers are now per-worktree (v0.19.28, plan-20260714

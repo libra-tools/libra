@@ -988,15 +988,13 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
         );
     }
-    // Part C W0 (§C.11): standalone `fetch` is composite — it writes the shared
-    // `FETCH_HEAD` (repository-global), so it fails closed in a linked worktree
-    // (before any FETCH_HEAD/ref side-effect) until W1 makes `FETCH_HEAD`
-    // worktree-local. This is the same guard as `pull`; it cannot be bypassed by
-    // switching entry points.
-    crate::command::ensure_main_worktree_because(
-        "fetch",
-        "the shared FETCH_HEAD is not yet worktree-scoped",
-    )?;
+    // Part C W1 (§C.4.2): `FETCH_HEAD` is now worktree-local (see
+    // `fetch_head_path`), and fetch's other writes — the shared object store and
+    // `refs/remotes/*` — are repository-scoped by design, so a standalone fetch
+    // no longer touches another worktree's state. The W0 linked-worktree guard
+    // is therefore lifted here. (Fetching INTO a local branch checked out in
+    // another worktree is still refused by `reject_checked_out_destination`, and
+    // `pull` remains guarded because its merge/rebase state is still shared.)
     let porcelain = args.porcelain;
     let dry_run = args.dry_run;
     let append = args.append;
@@ -2834,10 +2832,16 @@ fn fetch_destination_storage(
 }
 
 fn fetch_head_path() -> Result<PathBuf, FetchError> {
-    util::try_get_storage_path(None)
-        .map(|storage| storage.join("FETCH_HEAD"))
+    // Part C W1 (§C.4.2): `FETCH_HEAD` is per-worktree in Git — it records the
+    // refs THIS worktree just fetched, and `pull` reads it back. Storing it in
+    // common storage let a fetch in one worktree overwrite another's record. It
+    // now lives in this worktree's own local gitdir (identical path for the main
+    // worktree, where local and common storage coincide), so a linked worktree's
+    // fetch no longer touches the main worktree's `FETCH_HEAD`.
+    util::try_get_worktree_gitdir(None)
+        .map(|gitdir| gitdir.join("FETCH_HEAD"))
         .map_err(|source| FetchError::LocalState {
-            message: format!("failed to locate repository storage for FETCH_HEAD: {source}"),
+            message: format!("failed to locate this worktree's gitdir for FETCH_HEAD: {source}"),
         })
 }
 

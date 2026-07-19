@@ -253,9 +253,11 @@ fn same_branch_is_refused_across_worktrees() {
 
 /// Part C W0 (§C.11 transition guards): the states whose stores are still
 /// repository-global — the stash stack, the dirty cache, the layer/sparse
-/// tables, and the composite `fetch`/`pull` (shared `FETCH_HEAD`) — must fail
+/// tables, and the composite `pull` (shared merge/rebase state) — must fail
 /// closed in a linked worktree until W1/W2 make them worktree-scoped. The
 /// guard fires before any side effect, so no remote/network is needed.
+/// (`fetch` was un-guarded in W1 once `FETCH_HEAD` became worktree-local — see
+/// `fetch_uses_worktree_local_fetch_head`.)
 #[test]
 fn repository_global_state_commands_refused_in_linked_worktree() {
     let repo = repo_with_feature();
@@ -272,7 +274,6 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         &["layer", "list"],
         &["sparse-view", "status"],
         &["dirty", "--list"],
-        &["fetch"],
         &["pull"],
     ];
     for argv in cases {
@@ -740,6 +741,56 @@ fn editor_buffers_are_worktree_local_not_shared() {
         std::path::Path::new(paths[1]),
         expected,
         "the linked worktree's buffer lives in its own gitdir: {paths:?}"
+    );
+}
+
+/// Part C W1 (§C.4.2): `fetch` is no longer refused in a linked worktree, and
+/// its `FETCH_HEAD` is written to that worktree's OWN gitdir — a fetch there
+/// never overwrites the main worktree's `FETCH_HEAD`.
+#[test]
+fn fetch_uses_worktree_local_fetch_head() {
+    // An upstream repo to fetch FROM (a plain local path remote).
+    let upstream = repo_with_feature();
+    let up = upstream.path();
+
+    // A clone that will host the linked worktree.
+    let clone_parent = tempfile::tempdir().expect("clone parent");
+    let clone_dir = clone_parent.path().join("clone");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", up.to_str().unwrap(), clone_dir.to_str().unwrap()],
+            clone_parent.path(),
+        ),
+        "clone upstream",
+    );
+    let main = clone_dir.as_path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Fetch from the LINKED worktree — must NOT hit the linked-worktree guard.
+    let out = run_libra_command(&["fetch", "origin"], &wt);
+    assert!(
+        out.status.success(),
+        "fetch from a linked worktree should work: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
+        "fetch must no longer be refused in a linked worktree"
+    );
+
+    // The FETCH_HEAD it wrote lives in the LINKED worktree's gitdir, not main's.
+    assert!(
+        wt.join(".libra/FETCH_HEAD").exists(),
+        "the linked worktree's fetch wrote its own FETCH_HEAD"
+    );
+    assert!(
+        !main.join(".libra/FETCH_HEAD").exists(),
+        "the linked worktree's fetch must not write the main worktree's FETCH_HEAD"
     );
 }
 
