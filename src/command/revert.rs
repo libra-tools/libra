@@ -146,7 +146,10 @@ async fn edit_revert_message(initial: &str) -> Result<String, RevertError> {
                 .to_string(),
         ));
     };
-    let path = util::storage_path().join("REVERT_EDITMSG");
+    // Part C §C.4.3: transient per-worktree editor scratch — on shared storage
+    // two worktrees composing a message concurrently would truncate each other's
+    // buffer. Identical path for the main worktree (local == common storage).
+    let path = util::worktree_gitdir().join("REVERT_EDITMSG");
     let raw = editor::edit_message(&path, initial, &editor_cmd, true)
         .await
         .map_err(|e| RevertError::Editor(e.to_string()))?;

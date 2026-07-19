@@ -1295,7 +1295,10 @@ async fn edit_description_impl(branch: &str) -> Result<bool, BranchError> {
         None => return Err(BranchError::NoEditor),
     };
 
-    let path = crate::utils::util::storage_path().join("BRANCH_DESCRIPTION_EDITMSG");
+    // Part C §C.4.3: transient per-worktree editor scratch — on shared storage
+    // two worktrees composing a message concurrently would truncate each other's
+    // buffer. Identical path for the main worktree (local == common storage).
+    let path = crate::utils::util::worktree_gitdir().join("BRANCH_DESCRIPTION_EDITMSG");
     let raw = crate::command::editor::edit_message(&path, &template, &editor_cmd, true)
         .await
         .map_err(|e| BranchError::EditorFailed(e.to_string()))?;

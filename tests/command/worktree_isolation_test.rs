@@ -670,6 +670,79 @@ fn gc_skips_prune_in_multi_worktree_repo() {
     );
 }
 
+/// Part C §C.4.3: transient editor buffers live in each worktree's OWN gitdir.
+/// `tag` is a Repository-scope command allowed in ANY worktree, so a shared
+/// `TAG_EDITMSG` would let two worktrees composing a message concurrently
+/// truncate each other's buffer.
+#[test]
+fn editor_buffers_are_worktree_local_not_shared() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Drive the editor via a script that records WHICH file it was handed, then
+    // writes a message. Each worktree must be handed its own gitdir's buffer.
+    let probe = parent.path().join("probe.sh");
+    let seen = parent.path().join("seen.txt");
+    fs::write(
+        &probe,
+        format!(
+            "#!/bin/sh\necho \"$1\" >> {}\necho 'the tag message' > \"$1\"\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // `-e` is Libra's editor-driven annotated-tag flow (there is no `-a`), and
+    // `GIT_EDITOR` is the highest-precedence explicit editor (runs without a
+    // TTY). The probe records which TAG_EDITMSG path it was handed.
+    for (dir, tag) in [(main, "t-main"), (wt.as_path(), "t-wt")] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+            .args(["tag", "-e", tag])
+            .current_dir(dir)
+            .env("GIT_EDITOR", probe.to_str().unwrap())
+            .output()
+            .expect("run libra tag -e");
+        assert!(
+            out.status.success(),
+            "tag -e in {dir:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let seen_text = fs::read_to_string(&seen).unwrap_or_default();
+    let paths: Vec<&str> = seen_text.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        paths.len(),
+        2,
+        "the editor ran once per worktree: {paths:?}"
+    );
+    assert_ne!(
+        paths[0], paths[1],
+        "each worktree must get its OWN TAG_EDITMSG, not a shared one: {paths:?}"
+    );
+    // The linked worktree's buffer lives under ITS gitdir. Compare against the
+    // canonicalized worktree path rather than a raw prefix, which `/tmp` →
+    // `/private/tmp` symlink resolution would otherwise break.
+    let wt_canon = wt.canonicalize().expect("canonicalize wt");
+    let expected = wt_canon.join(".libra").join("TAG_EDITMSG");
+    assert_eq!(
+        std::path::Path::new(paths[1]),
+        expected,
+        "the linked worktree's buffer lives in its own gitdir: {paths:?}"
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

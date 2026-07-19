@@ -1433,7 +1433,11 @@ async fn edit_cherry_pick_message(
     message: &str,
     editor: &str,
 ) -> Result<String, CherryPickSingleError> {
-    let path = util::storage_path().join("CHERRY_PICK_MSG");
+    // Part C §C.4.3: the editor buffer is transient per-worktree scratch, so it
+    // lives in THIS worktree's gitdir. On shared storage two worktrees editing a
+    // message concurrently would truncate each other's buffer. Unchanged for the
+    // main worktree, where local and common storage are the same directory.
+    let path = util::worktree_gitdir().join("CHERRY_PICK_MSG");
     crate::command::editor::edit_message(&path, message, editor, false)
         .await
         .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))

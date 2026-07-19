@@ -500,7 +500,12 @@ async fn compose_tag_message(name: &str, base: Option<&str>) -> Result<String, T
         None => return Err(TagError::NoEditor),
     };
 
-    let path = crate::utils::util::storage_path().join("TAG_EDITMSG");
+    // Part C §C.4.3: `tag` is a Repository-scope command that IS allowed in any
+    // worktree, so its editor buffer must not be shared — on common storage two
+    // worktrees composing a tag message at the same time would truncate each
+    // other's `TAG_EDITMSG`. The buffer is transient scratch, so it lives in
+    // THIS worktree's gitdir (identical path for the main worktree).
+    let path = crate::utils::util::worktree_gitdir().join("TAG_EDITMSG");
     let raw = crate::command::editor::edit_message(&path, &template, &editor_cmd, true)
         .await
         .map_err(|e| TagError::EditorFailed(e.to_string()))?;

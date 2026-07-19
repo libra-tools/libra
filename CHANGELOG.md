@@ -123,6 +123,15 @@
 
 ### Fixed
 
+- **Editor scratch buffers are now per-worktree (v0.19.28, plan-20260714
+  Part C §C.4.3)**: `TAG_EDITMSG`, `NOTES_EDITMSG`, `BRANCH_DESCRIPTION_EDITMSG`,
+  `CHERRY_PICK_MSG`, and `REVERT_EDITMSG` were written to the shared common
+  storage. `tag`/`notes`/`branch --edit-description` are Repository-scope
+  commands allowed in any worktree, so two worktrees composing a message at the
+  same time would truncate each other's buffer. Each now lives in the invoking
+  worktree's own gitdir (identical path for the main worktree, where local and
+  common storage are the same directory).
+
 - **The cherry-pick/am/revert sequencer state is now per-worktree (v0.19.26,
   plan-20260714 Part C W1 §C.4.2)**: `sequence_state` was declared
   `id INTEGER PRIMARY KEY CHECK (id = 1)` — one active sequence per
