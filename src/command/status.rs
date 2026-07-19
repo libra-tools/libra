@@ -3901,8 +3901,8 @@ mod test {
         db.execute(Statement::from_string(
             db.get_database_backend(),
             "INSERT INTO sequence_state \
-             (id, kind, head_name, head_orig, current_oid, todo, payload) \
-             VALUES (1, 'corrupt', 'main', 'a', 'b', '', '{}')",
+             (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
+             VALUES ('', 'corrupt', 'main', 'a', 'b', '', '{}')",
         ))
         .await
         .expect("insert corrupt sequence row");

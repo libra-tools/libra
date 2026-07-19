@@ -51,7 +51,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405
+            2026071405, 2026071901
         ]
     );
     assert_eq!(
@@ -86,13 +86,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_import_tombstone",
             "agent_tombstone_compat_barrier",
             "agent_coverage_conflict",
+            "sequencer_worktree_scope",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 29);
-    assert_eq!(runner.max_registered_version(), Some(2026071405));
+    assert_eq!(runner.len(), 30);
+    assert_eq!(runner.max_registered_version(), Some(2026071901));
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,7 +1084,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405
+            2026071405, 2026071901
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1163,7 +1164,10 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         .rollback_to(&conn, 2026071401)
         .await
         .expect("rollback M4 import migrations");
-    assert_eq!(rolled, vec![2026071405, 2026071404, 2026071403, 2026071402]);
+    assert_eq!(
+        rolled,
+        vec![2026071901, 2026071405, 2026071404, 2026071403, 2026071402]
+    );
     assert!(!table_exists(&conn, "agent_import_identity").await);
     assert!(!table_exists(&conn, "agent_import_tombstone").await);
     assert!(!table_exists(&conn, "agent_coverage_conflict").await);
@@ -1175,7 +1179,7 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     let reapplied = runner.run_pending(&conn).await.expect("M4 up #2");
     assert_eq!(
         reapplied,
-        vec![2026071402, 2026071403, 2026071404, 2026071405]
+        vec![2026071402, 2026071403, 2026071404, 2026071405, 2026071901]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1202,7 +1206,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         .rollback_to(&conn, 2026071403)
         .await
         .expect("construct released 1403 schema shape");
-    assert_eq!(rolled, vec![2026071405, 2026071404]);
+    assert_eq!(rolled, vec![2026071901, 2026071405, 2026071404]);
     assert!(table_exists(&conn, "agent_import_tombstone").await);
     assert!(!trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
     assert!(!trigger_exists(&conn, "agent_tombstone_block_session_update").await);
@@ -1212,7 +1216,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         .run_pending(&conn)
         .await
         .expect("upgrade existing 1403 schema");
-    assert_eq!(applied, vec![2026071404, 2026071405]);
+    assert_eq!(applied, vec![2026071404, 2026071405, 2026071901]);
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_update").await);
     assert!(trigger_exists(&conn, "agent_tombstone_block_checkpoint_insert").await);
@@ -1555,10 +1559,10 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301, 2026070803,
-            2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301,
-            2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201,
-            2026053101, 2026052301, 2026050801, 2026050601
+            2026071901, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301,
+            2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401,
+            2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401,
+            2026060201, 2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -1585,7 +1589,7 @@ async fn approved_permission_up_down_up_round_trip() {
             2026050601, 2026050801, 2026052301, 2026053101, 2026060201, 2026060401, 2026060801,
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
-            2026071402, 2026071403, 2026071404, 2026071405
+            2026071402, 2026071403, 2026071404, 2026071405, 2026071901
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);

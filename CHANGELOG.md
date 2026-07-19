@@ -123,6 +123,24 @@
 
 ### Fixed
 
+- **The cherry-pick/am/revert sequencer state is now per-worktree (v0.19.26,
+  plan-20260714 Part C W1 §C.4.2)**: `sequence_state` was declared
+  `id INTEGER PRIMARY KEY CHECK (id = 1)` — one active sequence per
+  *repository*. Since `save` is a `DELETE`+`INSERT`, a sequence started in a
+  second worktree would overwrite the first worktree's todo list and stopping
+  point. Migration `2026071901` re-keys the table on `worktree_id` (main = the
+  empty string, deliberately not NULL: SQLite treats every NULL as distinct, so
+  a nullable key cannot express "at most one row per scope"), and every
+  load/save/clear now carries that key — including `clear`, which previously
+  matched on `kind` alone and so could erase another worktree's sequence of the
+  same kind. An in-progress sequence survives the upgrade as the main
+  worktree's row, and the down-migration restores the single-row shape.
+  `rebase_state`/`bisect_state` are deliberately NOT migrated: their column set
+  is defined by lazy `CREATE TABLE`/`ADD COLUMN` DDL in the command code, so a
+  static rebuild could drop columns it did not know about and destroy an
+  in-progress rebase — they stay refused in linked worktrees (hence no
+  concurrent writer) until that lazy DDL is retired.
+
 - **Every worktree's index is now a reachability root (v0.19.25,
   plan-20260714 Part C §C.9)**: the reachability walks used by `gc`/`repack`
   and by `fsck` each read only the CURRENT worktree's index, so a blob staged

@@ -131,11 +131,13 @@ struct StoredSequenceState {
 
 async fn load_stored() -> Result<Option<StoredSequenceState>, String> {
     let db = get_db_conn_instance().await;
-    let stmt = Statement::from_string(
+    // Part C W1 (§C.4.2): the row is keyed by worktree scope — never read
+    // another worktree's in-progress sequence. `storage_key()` is "" for main.
+    let stmt = Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "SELECT kind, head_name, head_orig, current_oid, todo, payload \
-         FROM sequence_state WHERE id = 1"
-            .to_string(),
+         FROM sequence_state WHERE worktree_id = ?",
+        [current_scope_key().into()],
     );
     let row = match db.query_one(stmt).await {
         Ok(row) => row,
@@ -302,18 +304,24 @@ async fn save_fields<C>(
 where
     C: ConnectionTrait,
 {
-    db.execute(Statement::from_string(
+    // Part C W1 (§C.4.2): replace only THIS worktree's row. An unscoped
+    // `DELETE FROM sequence_state` would wipe every other worktree's
+    // in-progress sequence.
+    let scope_key = current_scope_key();
+    db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "DELETE FROM sequence_state".to_string(),
+        "DELETE FROM sequence_state WHERE worktree_id = ?",
+        [scope_key.clone().into()],
     ))
     .await?;
     let todo = todo.join("\n");
     db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO sequence_state \
-         (id, kind, head_name, head_orig, current_oid, todo, payload) \
-         VALUES (1, ?, ?, ?, ?, ?, ?)",
+         (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
+            scope_key.into(),
             kind.to_string().into(),
             head_name.to_string().into(),
             head_orig.to_string().into(),
@@ -324,6 +332,17 @@ where
     ))
     .await?;
     Ok(())
+}
+
+/// This process's worktree scope key for the sequencer tables (`""` = main).
+///
+/// Resolved through [`WorktreeScope`] so the NOT NULL empty-string convention
+/// is applied in exactly one place — see `src/internal/worktree_scope.rs` for
+/// why it differs from the `reference` table's nullable spelling.
+fn current_scope_key() -> String {
+    crate::internal::worktree_scope::WorktreeScope::current()
+        .storage_key()
+        .to_string()
 }
 
 /// Clear the active sequence of a SPECIFIC kind (completion or abort).
@@ -342,10 +361,12 @@ pub(crate) async fn clear_with_conn<C>(db: &C, kind: SequenceKind) -> Result<(),
 where
     C: ConnectionTrait,
 {
+    // Part C W1 (§C.4.2): scoped by worktree AND kind — a mis-routed abort can
+    // erase neither a different consumer's row nor another worktree's sequence.
     db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "DELETE FROM sequence_state WHERE kind = ?",
-        [kind.as_str().into()],
+        "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ?",
+        [kind.as_str().into(), current_scope_key().into()],
     ))
     .await?;
     Ok(())
@@ -362,10 +383,12 @@ pub(crate) async fn clear_am_with_conn<C>(db: &C) -> Result<(), sea_orm::DbErr>
 where
     C: ConnectionTrait,
 {
+    // Part C W1 (§C.4.2): scoped like `clear_with_conn` — clearing this
+    // worktree's `am` sequence must not touch another worktree's.
     db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "DELETE FROM sequence_state WHERE kind = ?",
-        ["am".into()],
+        "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ?",
+        ["am".into(), current_scope_key().into()],
     ))
     .await?;
     Ok(())

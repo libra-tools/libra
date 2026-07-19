@@ -814,6 +814,18 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026071405_agent_coverage_conflict.sql"),
             include_str!("../../../sql/migrations/2026071405_agent_coverage_conflict_down.sql"),
         ),
+        // plan-20260714 Part C W1 (§C.4.2): re-key `sequence_state` from the
+        // repository-global `CHECK(id = 1)` single row to one row per worktree
+        // (`worktree_id`, main = ""), so a cherry-pick/am/revert sequence in one
+        // worktree can no longer overwrite another's. `rebase_state` is
+        // deliberately excluded — its shape is owned by lazy DDL in
+        // `command/rebase.rs`, so a static rebuild could drop columns.
+        sql_migration(
+            2026071901,
+            "sequencer_worktree_scope",
+            include_str!("../../../sql/migrations/2026071901_sequencer_worktree_scope.sql"),
+            include_str!("../../../sql/migrations/2026071901_sequencer_worktree_scope_down.sql"),
+        ),
     ]
 }
 
@@ -942,9 +954,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 29);
+        assert_eq!(runner.len(), 30);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026071405));
+        assert_eq!(runner.max_registered_version(), Some(2026071901));
     }
 
     #[test]
