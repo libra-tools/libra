@@ -4,6 +4,17 @@
 
 ### Changed
 
+- **Internal: `WorktreeScope` is now the single worktree-scope value object
+  (v0.19.24, plan-20260714 Part C §C.4.1)**: scope resolution no longer passes a
+  bare `Option<String>` around for each layer to reinterpret. The type encodes
+  both storage conventions explicitly — `worktree_id()` for the `reference`
+  (HEAD) table, where the main worktree is spelled `NULL`, and `storage_key()`
+  for `worktree_id TEXT NOT NULL` columns, where main is the empty string (a
+  nullable unique key cannot express "at most one row per scope" in SQLite).
+  A linked worktree can never alias onto main in either form. The HEAD scope
+  query and the linked-worktree guards now resolve through it; behavior is
+  unchanged.
+
 - **`fast-import` refuses a branch checked out in another worktree (v0.19.22,
   plan-20260714 Part C W0 §C.11)**: the batch ref flush rewrites and deletes
   shared branch refs; it now fails closed, before the transaction, if any

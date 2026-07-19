@@ -180,7 +180,7 @@ pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
 /// linked invocation could read or clobber the wrong (or the main worktree's)
 /// state, so it fails closed. Always allowed in the main worktree.
 pub fn ensure_main_worktree_because(op: &str, reason: &str) -> crate::utils::error::CliResult<()> {
-    if crate::utils::util::is_linked_worktree() {
+    if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
         return Err(crate::utils::error::CliError::fatal(format!(
             "'{op}' is not yet supported inside a linked worktree (lore.md 2.1: {reason}) \
              \u{2014} run it in the main worktree"

@@ -64,7 +64,12 @@ impl Head {
         // worktree resolves ONLY its own HEAD row, so every caller — public AND
         // `_with_conn` (commit/switch/reset/reflog inside a txn) — reads the
         // same worktree's HEAD and can never leak the main worktree's.
-        let worktree_id = crate::utils::util::current_worktree_id();
+        // Part C §C.4.1: resolve the scope through the single `WorktreeScope`
+        // value object rather than re-interpreting a bare `Option<String>` —
+        // `worktree_id()` encodes the `reference` table's convention that main
+        // is spelled NULL, so a linked worktree can never alias onto main.
+        let scope = crate::internal::worktree_scope::WorktreeScope::current();
+        let worktree_id = scope.worktree_id().map(str::to_string);
         for attempt in 0..=Self::SQLITE_BUSY_MAX_RETRIES {
             let mut query = reference::Entity::find()
                 .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
