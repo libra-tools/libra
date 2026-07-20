@@ -931,6 +931,51 @@ fn am_applies_in_linked_worktree() {
     assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
 }
 
+/// Part C W1 (§C.4.2): `revert` is allowed in a linked worktree — its
+/// `revert-state.json` and `REVERT_EDITMSG` live in that worktree's own gitdir,
+/// and it replays onto that worktree's own branch.
+#[test]
+fn revert_runs_in_linked_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    // Give the linked worktree its own branch with a commit to revert.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+    fs::write(wt.join("r.txt"), "to be reverted\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "r.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add r.txt", "--no-verify"], &wt),
+        "wt commit",
+    );
+
+    // Revert that commit from the linked worktree — must not be refused.
+    let out = run_libra_command(&["revert", "HEAD", "--no-edit"], &wt);
+    assert!(
+        out.status.success(),
+        "revert in a linked worktree should work: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
+        "revert must no longer be refused in a linked worktree"
+    );
+    // The revert removed r.txt in the linked worktree; main never had it.
+    assert!(
+        !wt.join("r.txt").exists(),
+        "the revert undid the change in the linked worktree"
+    );
+    assert!(!main.join("r.txt").exists(), "main is untouched");
+    assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();
@@ -941,10 +986,10 @@ fn sequencer_ops_refused_in_linked_worktree() {
         &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
         "worktree add",
     );
-    // merge/rebase/revert are still refused in a linked worktree (their state
-    // is repository-global). cherry-pick was lifted in W1 once its state became
-    // fully worktree-scoped — see `cherry_pick_runs_concurrently_in_worktrees`.
-    for op in ["merge", "rebase", "revert"] {
+    // merge/rebase are still refused in a linked worktree (their state is
+    // repository-global). cherry-pick/am/revert were lifted in W1 once their
+    // state became fully worktree-scoped.
+    for op in ["merge", "rebase"] {
         let out = run_libra_command(&[op, "feature"], &wt);
         assert_ne!(
             out.status.code(),

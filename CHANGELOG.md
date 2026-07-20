@@ -123,6 +123,16 @@
 
 ### Changed
 
+- **`revert` is now allowed in a linked worktree (v0.19.32, plan-20260714
+  Part C W1 §C.4.2)**: `revert`'s in-progress state (`revert-state.json`) and its
+  editor buffer (`REVERT_EDITMSG`, moved in v0.19.28) now live in the invoking
+  worktree's own gitdir, and the start-time sequencer mutex probes that
+  worktree-local revert state — so a revert in one worktree neither collides
+  with nor is blocked by another's. The `ensure_main_worktree` refusal is lifted.
+  (For the main worktree the local gitdir is the common storage, so an
+  in-progress revert started by an older binary is still found after upgrade.)
+  merge/rebase/bisect remain refused.
+
 - **`am` is now allowed in a linked worktree (v0.19.31, plan-20260714 Part C W1
   §C.4.2)**: like `cherry-pick`, `am`'s entire persistent state is the
   worktree-scoped `sequence_state` row (the patch queue is serialized into its

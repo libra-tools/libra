@@ -464,22 +464,28 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
     if let Some(kind) = unified_active().await? {
         return Ok(Some(kind));
     }
-    // Part C §C.4.4: the remaining probes below cover merge/revert/rebase, whose
-    // state is repository-global AND whose operations are refused in a linked
-    // worktree (main-only). So in a LINKED worktree none of them can be active
-    // "for this worktree", and main's in-progress merge/rebase must NOT block a
-    // linked worktree's own sequence (that was the pre-fix cross-worktree
-    // blocking). Only the scoped unified sequence above is relevant there.
+    // `revert` state is a per-worktree sidecar (`revert-state.json` in this
+    // worktree's gitdir, §C.4.2), and revert IS allowed in a linked worktree —
+    // so it is probed with the worktree-local path, before the main-only
+    // early-return below. For the main worktree the local gitdir == common
+    // storage, so this is unchanged.
+    let scope_gitdir = util::worktree_gitdir();
+    if scope_gitdir.join("revert-state.json").exists() {
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Revert)));
+    }
+
+    // Part C §C.4.4: the remaining probes cover merge/rebase, whose state is
+    // repository-global AND whose operations are refused in a linked worktree
+    // (main-only). So in a LINKED worktree neither can be active "for this
+    // worktree", and main's in-progress merge/rebase must NOT block a linked
+    // worktree's own sequence (that was the pre-fix cross-worktree blocking).
     if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
         return Ok(None);
     }
     let storage = util::storage_path();
-    // Legacy JSON sidecars (merge, revert).
+    // Legacy JSON sidecar (merge).
     if storage.join("merge-state.json").exists() {
         return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Merge)));
-    }
-    if storage.join("revert-state.json").exists() {
-        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Revert)));
     }
     // Legacy rebase: DB table row or the on-disk rebase-merge dir.
     let db = get_db_conn_instance().await;
