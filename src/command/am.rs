@@ -206,7 +206,12 @@ struct AmOutput {
 
 pub async fn execute_safe(args: AmArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
-    crate::command::ensure_main_worktree("am")?;
+    // Part C W1 (§C.4.2): `am` is safe in a LINKED worktree — its entire
+    // persistent state is the worktree-scoped `sequence_state` row (kind `am`,
+    // the patch queue serialized into its `payload`; no common-storage sidecar),
+    // the start-time mutex is scope-aware, and it applies patches to THIS
+    // worktree's own index/worktree and advances its own branch. So the
+    // `ensure_main_worktree` guard is lifted here, matching `cherry-pick`.
 
     let result = if args.continue_am {
         continue_am(output).await?

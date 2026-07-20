@@ -123,6 +123,14 @@
 
 ### Changed
 
+- **`am` is now allowed in a linked worktree (v0.19.31, plan-20260714 Part C W1
+  §C.4.2)**: like `cherry-pick`, `am`'s entire persistent state is the
+  worktree-scoped `sequence_state` row (the patch queue is serialized into its
+  `payload`; there is no common-storage sidecar), so applying a mail series in a
+  linked worktree lands on that worktree's own branch without touching another's
+  state. The `ensure_main_worktree` refusal is lifted. merge/rebase/revert/bisect
+  remain refused.
+
 - **`cherry-pick` is now allowed in a linked worktree (v0.19.30, plan-20260714
   Part C W1 §C.4.2)**: with its state fully worktree-scoped — the
   `sequence_state` row keyed by `worktree_id` (v0.19.26) and the local-gitdir

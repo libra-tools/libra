@@ -858,6 +858,79 @@ fn cherry_pick_runs_concurrently_in_worktrees() {
     assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
 }
 
+/// Part C W1 (§C.4.2): `am` is allowed in a linked worktree — its state is the
+/// worktree-scoped `sequence_state` row, and it applies onto that worktree's
+/// own branch.
+#[test]
+fn am_applies_in_linked_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+
+    // Build a one-patch series on a side branch, then format-patch it.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "src"], main),
+        "branch src",
+    );
+    fs::write(main.join("mailed.txt"), "from a patch\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "mailed.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "mailed change", "--no-verify"], main),
+        "commit",
+    );
+    let patch_dir = repo.path().join("patches");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "format-patch",
+                "-o",
+                patch_dir.to_str().unwrap(),
+                "main..HEAD",
+            ],
+            main,
+        ),
+        "format-patch",
+    );
+    let patch = fs::read_dir(&patch_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "patch"))
+        .expect("a .patch file");
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], main),
+        "back to main",
+    );
+
+    // A linked worktree on `feature` applies the patch via `am`.
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    let out = run_libra_command(&["am", patch.to_str().unwrap()], &wt);
+    assert!(
+        out.status.success(),
+        "am in a linked worktree should work: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
+        "am must no longer be refused in a linked worktree"
+    );
+    // The patch landed on `feature`, in the linked worktree only.
+    assert!(wt.join("mailed.txt").exists(), "am applied onto feature");
+    assert!(
+        !main.join("mailed.txt").exists(),
+        "main worktree is untouched by the linked am"
+    );
+    assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();
