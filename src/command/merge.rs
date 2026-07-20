@@ -375,7 +375,11 @@ pub(crate) struct MergeState {
 
 impl MergeState {
     fn path() -> PathBuf {
-        util::storage_path().join("merge-state.json")
+        // Part C W1 (§C.4.2/§C.4.3): an in-progress merge belongs to the
+        // worktree whose index holds the conflict, so its state lives in THIS
+        // worktree's gitdir. Identical path for the main worktree (local ==
+        // common storage), so a merge started by an older binary is still found.
+        util::worktree_gitdir().join("merge-state.json")
     }
 
     pub(crate) fn load_optional_sync() -> Result<Option<Self>, String> {
@@ -430,7 +434,11 @@ pub(crate) struct MergeAutostash {
 
 impl MergeAutostash {
     fn path() -> PathBuf {
-        util::storage_path().join("merge-autostash.json")
+        // Part C W1 (§C.4.3): the held autostash belongs to this worktree's
+        // in-progress merge, so it lives in this worktree's gitdir alongside
+        // `merge-state.json`. It remains a fail-closed GC root; the held commit
+        // is protected in a multi-worktree repo by GC's per-repo prune skip.
+        util::worktree_gitdir().join("merge-autostash.json")
     }
 
     pub(crate) fn load_optional_sync() -> Result<Option<Self>, String> {
@@ -672,7 +680,15 @@ pub async fn execute(args: MergeArgs) {
 /// Returns [`CliError`] when the target is invalid, histories are unrelated,
 /// conflicts need resolution, objects cannot be read, or HEAD/worktree updates fail.
 pub async fn execute_safe(args: MergeArgs, output: &OutputConfig) -> CliResult<()> {
-    crate::command::ensure_main_worktree("merge")?;
+    // Part C W1 (§C.4.2/§C.4.3): merge is now safe in a LINKED worktree — its
+    // in-progress state (`merge-state.json`) and held autostash
+    // (`merge-autostash.json`, still a fail-closed GC root, protected by GC's
+    // multi-worktree prune skip) live in this worktree's own gitdir, the mutex
+    // resolves the merge per-worktree, and it merges into THIS worktree's index
+    // and current branch. So the `ensure_main_worktree` guard is lifted, matching
+    // cherry-pick/am/revert. (`pull` remains guarded — it drives merge through an
+    // internal path that has not yet been routed through a scoped API.)
+    //
     // Symmetric sequencer mutex (lore.md 2.6): refuse a merge while ANY other
     // sequence (cherry-pick/revert/rebase) is unresolved. Same-op (a merge
     // already in progress) is intentionally deferred to merge's OWN typed

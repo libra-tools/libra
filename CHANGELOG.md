@@ -123,6 +123,18 @@
 
 ### Changed
 
+- **`merge` is now allowed in a linked worktree (v0.19.33, plan-20260714
+  Part C W1 §C.4.2/§C.4.3)**: `merge`'s in-progress state (`merge-state.json`)
+  and its held autostash (`merge-autostash.json` — still a fail-closed GC root,
+  protected in a multi-worktree repo by GC's per-repo prune skip) now live in
+  the invoking worktree's own gitdir, and the sequencer mutex probes that
+  worktree-local merge state. So a merge in one worktree neither collides with
+  nor is blocked by another's, and it merges into that worktree's own branch.
+  The `ensure_main_worktree` refusal is lifted. `pull` remains refused in a
+  linked worktree (it drives merge through a not-yet-scoped internal path), and
+  rebase/bisect remain refused. This completes the linked-worktree lift for
+  every sequencer op except rebase and bisect.
+
 - **`revert` is now allowed in a linked worktree (v0.19.32, plan-20260714
   Part C W1 §C.4.2)**: `revert`'s in-progress state (`revert-state.json`) and its
   editor buffer (`REVERT_EDITMSG`, moved in v0.19.28) now live in the invoking

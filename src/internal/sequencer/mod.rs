@@ -464,29 +464,28 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
     if let Some(kind) = unified_active().await? {
         return Ok(Some(kind));
     }
-    // `revert` state is a per-worktree sidecar (`revert-state.json` in this
-    // worktree's gitdir, §C.4.2), and revert IS allowed in a linked worktree —
-    // so it is probed with the worktree-local path, before the main-only
-    // early-return below. For the main worktree the local gitdir == common
-    // storage, so this is unchanged.
+    // `merge` and `revert` state are per-worktree JSON sidecars in THIS
+    // worktree's gitdir (§C.4.2/§C.4.3), and both are allowed in a linked
+    // worktree — so they are probed with the worktree-local path, before the
+    // main-only early-return below. For the main worktree the local gitdir ==
+    // common storage, so this is unchanged.
     let scope_gitdir = util::worktree_gitdir();
+    if scope_gitdir.join("merge-state.json").exists() {
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Merge)));
+    }
     if scope_gitdir.join("revert-state.json").exists() {
         return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Revert)));
     }
 
-    // Part C §C.4.4: the remaining probes cover merge/rebase, whose state is
-    // repository-global AND whose operations are refused in a linked worktree
-    // (main-only). So in a LINKED worktree neither can be active "for this
-    // worktree", and main's in-progress merge/rebase must NOT block a linked
-    // worktree's own sequence (that was the pre-fix cross-worktree blocking).
+    // Part C §C.4.4: the remaining probes cover rebase, whose state is
+    // repository-global AND whose operation is refused in a linked worktree
+    // (main-only). So in a LINKED worktree it can never be active "for this
+    // worktree", and main's in-progress rebase must NOT block a linked worktree's
+    // own sequence (that was the pre-fix cross-worktree blocking).
     if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
         return Ok(None);
     }
     let storage = util::storage_path();
-    // Legacy JSON sidecar (merge).
-    if storage.join("merge-state.json").exists() {
-        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Merge)));
-    }
     // Legacy rebase: DB table row or the on-disk rebase-merge dir.
     let db = get_db_conn_instance().await;
     if legacy_table_active(&db, "rebase_state").await?

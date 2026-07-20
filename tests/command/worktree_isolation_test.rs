@@ -976,6 +976,62 @@ fn revert_runs_in_linked_worktree() {
     assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
 }
 
+/// Part C W1 (§C.4.2/§C.4.3): `merge` is allowed in a linked worktree — its
+/// state (`merge-state.json`/`merge-autostash.json`) lives in that worktree's
+/// gitdir, and it merges into that worktree's own branch.
+#[test]
+fn merge_runs_in_linked_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+
+    // Advance `main` with a commit that `feature` does not have.
+    fs::write(main.join("m.txt"), "on main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "m.txt"], main), "add m");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main change", "--no-verify"], main),
+        "commit main",
+    );
+
+    // A linked worktree on `feature`, with its own divergent commit.
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+    fs::write(wt.join("f.txt"), "on feature\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &wt), "wt add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature change", "--no-verify"], &wt),
+        "wt commit",
+    );
+
+    // Merge `main` into `feature` FROM the linked worktree (no conflict — the
+    // two touched different files) — must not be refused.
+    let out = run_libra_command(&["merge", "main", "--no-edit"], &wt);
+    assert!(
+        out.status.success(),
+        "merge in a linked worktree should work: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
+        "merge must no longer be refused in a linked worktree"
+    );
+    // The merge brought main's file into feature; main is untouched.
+    assert!(wt.join("m.txt").exists(), "merge pulled m.txt into feature");
+    assert!(wt.join("f.txt").exists(), "feature keeps its own file");
+    assert!(
+        !main.join("f.txt").exists(),
+        "the main worktree is untouched by the linked merge"
+    );
+    assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();
@@ -986,26 +1042,25 @@ fn sequencer_ops_refused_in_linked_worktree() {
         &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
         "worktree add",
     );
-    // merge/rebase are still refused in a linked worktree (their state is
-    // repository-global). cherry-pick/am/revert were lifted in W1 once their
-    // state became fully worktree-scoped.
-    for op in ["merge", "rebase"] {
-        let out = run_libra_command(&[op, "feature"], &wt);
-        assert_ne!(
-            out.status.code(),
-            Some(0),
-            "{op} refused in linked worktree"
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
-            "{op}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    // The same op works in the main worktree.
+    // rebase is still refused in a linked worktree (its state is
+    // repository-global: lazy-DDL `rebase_state` + common sidecars).
+    // cherry-pick/am/revert/merge were lifted in W1 once their state became
+    // fully worktree-scoped.
+    let rebase = run_libra_command(&["rebase", "feature"], &wt);
+    assert_ne!(
+        rebase.status.code(),
+        Some(0),
+        "rebase is still refused in a linked worktree"
+    );
+    assert!(
+        String::from_utf8_lossy(&rebase.stderr).contains("linked worktree"),
+        "rebase: {}",
+        String::from_utf8_lossy(&rebase.stderr)
+    );
+    // rebase still works in the main worktree.
     assert_cli_success(
-        &run_libra_command(&["merge", "feature"], main),
-        "merge in main",
+        &run_libra_command(&["rebase", "feature"], main),
+        "rebase in main",
     );
 }
 
