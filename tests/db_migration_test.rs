@@ -51,7 +51,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071901
+            2026071405, 2026071901, 2026072101
         ]
     );
     assert_eq!(
@@ -87,13 +87,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_tombstone_compat_barrier",
             "agent_coverage_conflict",
             "sequencer_worktree_scope",
+            "rebase_state_worktree_scope",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 30);
-    assert_eq!(runner.max_registered_version(), Some(2026071901));
+    assert_eq!(runner.len(), 31);
+    assert_eq!(runner.max_registered_version(), Some(2026072101));
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,7 +1085,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071901
+            2026071405, 2026071901, 2026072101
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1166,7 +1167,9 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         .expect("rollback M4 import migrations");
     assert_eq!(
         rolled,
-        vec![2026071901, 2026071405, 2026071404, 2026071403, 2026071402]
+        vec![
+            2026072101, 2026071901, 2026071405, 2026071404, 2026071403, 2026071402
+        ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
     assert!(!table_exists(&conn, "agent_import_tombstone").await);
@@ -1179,7 +1182,9 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     let reapplied = runner.run_pending(&conn).await.expect("M4 up #2");
     assert_eq!(
         reapplied,
-        vec![2026071402, 2026071403, 2026071404, 2026071405, 2026071901]
+        vec![
+            2026071402, 2026071403, 2026071404, 2026071405, 2026071901, 2026072101
+        ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1206,7 +1211,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         .rollback_to(&conn, 2026071403)
         .await
         .expect("construct released 1403 schema shape");
-    assert_eq!(rolled, vec![2026071901, 2026071405, 2026071404]);
+    assert_eq!(rolled, vec![2026072101, 2026071901, 2026071405, 2026071404]);
     assert!(table_exists(&conn, "agent_import_tombstone").await);
     assert!(!trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
     assert!(!trigger_exists(&conn, "agent_tombstone_block_session_update").await);
@@ -1216,7 +1221,10 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         .run_pending(&conn)
         .await
         .expect("upgrade existing 1403 schema");
-    assert_eq!(applied, vec![2026071404, 2026071405, 2026071901]);
+    assert_eq!(
+        applied,
+        vec![2026071404, 2026071405, 2026071901, 2026072101]
+    );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_update").await);
     assert!(trigger_exists(&conn, "agent_tombstone_block_checkpoint_insert").await);
@@ -1559,10 +1567,10 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026071901, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301,
-            2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401,
-            2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401,
-            2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026072101, 2026071901, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401,
+            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
+            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
+            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -1589,13 +1597,146 @@ async fn approved_permission_up_down_up_round_trip() {
             2026050601, 2026050801, 2026052301, 2026053101, 2026060201, 2026060401, 2026060801,
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
-            2026071402, 2026071403, 2026071404, 2026071405, 2026071901
+            2026071402, 2026071403, 2026071404, 2026071405, 2026071901, 2026072101
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
     assert!(index_exists(&conn, "idx_approved_permission_project").await);
     assert!(column_exists(&conn, "agent_usage_stats", "agent_name").await);
     assert!(index_exists(&conn, "idx_agent_usage_stats_agent_name_provider_model").await);
+}
+
+// ---------------------------------------------------------------------------
+// 2026072101 rebase_state worktree scope (plan-20260714 Part C W1 §C.4.2)
+// ---------------------------------------------------------------------------
+
+/// A database whose `rebase_state` still has a lazy-DDL-era column subset
+/// (here the 8-column bootstrap shape: no autosquash / todo_actions /
+/// empty_mode) upgrades through `run_builtin_migrations` — the normalize hook
+/// fills the missing columns, then the 2026072101 static rebuild re-keys the
+/// table by `worktree_id` — with the in-progress row preserved at the MAIN
+/// scope (`worktree_id = ''`) and lazy-column defaults applied.
+#[tokio::test]
+async fn rebase_state_migration_preserves_active_row_from_lazy_shape() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `rebase_state` (
+            `id`           INTEGER PRIMARY KEY AUTOINCREMENT,
+            `head_name`    TEXT NOT NULL,
+            `onto`         TEXT NOT NULL,
+            `orig_head`    TEXT NOT NULL,
+            `current_head` TEXT NOT NULL,
+            `todo`         TEXT NOT NULL,
+            `done`         TEXT NOT NULL,
+            `stopped_sha`  TEXT
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("legacy 8-column table");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO rebase_state \
+         (head_name, onto, orig_head, current_head, todo, done, stopped_sha) \
+         VALUES ('refs/heads/main', 'aa11', 'bb22', 'cc33', 'dd44', '', NULL);"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy in-progress row");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(column_exists(&conn, "rebase_state", "worktree_id").await);
+    assert!(
+        !column_exists(&conn, "rebase_state", "id").await,
+        "the AUTOINCREMENT id is retired by the worktree_id re-key"
+    );
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT worktree_id, head_name, todo_actions, autosquash, empty_mode \
+             FROM rebase_state"
+                .to_string(),
+        ))
+        .await
+        .expect("query migrated row")
+        .expect("row survives the rebuild");
+    let worktree_id: String = row.try_get_by_index(0).expect("worktree_id");
+    let head_name: String = row.try_get_by_index(1).expect("head_name");
+    let todo_actions: String = row.try_get_by_index(2).expect("todo_actions");
+    let autosquash: i64 = row.try_get_by_index(3).expect("autosquash");
+    let empty_mode: String = row.try_get_by_index(4).expect("empty_mode");
+    assert_eq!(
+        worktree_id, "",
+        "pre-existing row belongs to the main scope"
+    );
+    assert_eq!(head_name, "refs/heads/main");
+    assert_eq!(todo_actions, "", "lazy-column default filled in");
+    assert_eq!(autosquash, 0, "lazy-column default filled in");
+    assert_eq!(empty_mode, "keep", "lazy-column default filled in");
+}
+
+/// The 2026072101 down migration FAILS CLOSED while a linked worktree's
+/// rebase row exists (the legacy single-row schema cannot represent it, so
+/// rolling back would silently discard that worktree's rebase). After the
+/// linked row is gone, the same rollback succeeds and restores the legacy
+/// shape with the main row intact.
+#[tokio::test]
+async fn rebase_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO rebase_state \
+         (worktree_id, head_name, onto, orig_head, current_head, todo, done) \
+         VALUES ('', 'refs/heads/main', 'aa', 'bb', 'cc', 'dd', ''), \
+                ('wt1234', 'refs/heads/feature', 'ee', 'ff', 'aa', 'bb', '');"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked rows");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026071901)
+        .await
+        .expect_err("rollback with a linked rebase row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    // The scoped table survives the refused rollback (txn rolled back).
+    assert!(column_exists(&conn, "rebase_state", "worktree_id").await);
+
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM rebase_state WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("finish the linked rebase");
+    let rolled = runner
+        .rollback_to(&conn, 2026071901)
+        .await
+        .expect("rollback succeeds once only the main row remains");
+    assert_eq!(rolled, vec![2026072101]);
+    assert!(column_exists(&conn, "rebase_state", "id").await);
+    assert!(!column_exists(&conn, "rebase_state", "worktree_id").await);
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT head_name FROM rebase_state".to_string(),
+        ))
+        .await
+        .expect("query restored row")
+        .expect("main row survives the rollback");
+    let head_name: String = row.try_get_by_index(0).expect("head_name");
+    assert_eq!(head_name, "refs/heads/main");
 }
 
 // ---------------------------------------------------------------------------

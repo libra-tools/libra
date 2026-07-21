@@ -923,6 +923,7 @@ async fn gc_worktree_scoped_rows(worktree_id: &str) {
         "DELETE FROM reference WHERE worktree_id = ? AND kind = 'Head'",
         "DELETE FROM reflog WHERE worktree_id = ?",
         "DELETE FROM sequence_state WHERE worktree_id = ?",
+        "DELETE FROM rebase_state WHERE worktree_id = ?",
     ];
     // `bisect_state` is created lazily on first bisect use — only purge when
     // the table exists (a DELETE on a missing table would log a spurious warn).

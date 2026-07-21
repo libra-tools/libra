@@ -4,6 +4,22 @@
 
 ### Changed
 
+- **Internal: `rebase_state` is re-keyed per-worktree and its lazy DDL is
+  retired (v0.19.36, plan-20260714 Part C §C.4.2, W1 rebase slice 1/4)**:
+  migration `2026072101_rebase_state_worktree_scope` rebuilds the table to
+  `worktree_id TEXT PRIMARY KEY NOT NULL` (main = `""`, the sequencer
+  convention), migrating the newest in-progress row to the main scope. The
+  historical lazy ADD-COLUMN DDL produced databases with any subset of
+  `autosquash`/`todo_actions`/`empty_mode`, so a `normalize_rebase_state_shape`
+  hook runs before the migration runner on every connection open and fills the
+  missing columns first; the lazy DDL in `command/rebase.rs` is deleted and
+  the schema is now owned by the migration. Every runtime statement is scoped
+  `WHERE worktree_id = ?` — no more unconditional `DELETE FROM rebase_state` —
+  and `worktree remove` purges the removed worktree's row. The down migration
+  FAILS CLOSED while a linked worktree's rebase row exists. Behavior is
+  unchanged for now: `rebase` itself is still refused in a linked worktree
+  until the sidecar/mutex slices land.
+
 - **`pull` (merge/ff mode) now runs in linked worktrees (v0.19.35,
   plan-20260714 Part C §C.4.4)**: pull's fetch phase writes only
   repository-scoped state (`refs/remotes/*` + objects — it writes no

@@ -56,11 +56,11 @@ DROP TABLE `sequence_state__old_2026071901`;
 -- a static rebuild here would silently DROP whichever of those columns this
 -- migration did not know about — destroying an in-progress rebase.
 --
--- Retiring that lazy DDL is its own W1 step (§C.11 "清除 lazy DDL"); until then
--- `rebase` remains refused in a linked worktree by `ensure_main_worktree`, so
--- the repository-global `rebase_state` has no concurrent writer and no
--- cross-worktree hazard. The lazily-created `bisect_state` is scoped IN PLACE
--- instead (v0.19.34): `src/command/bisect.rs` lazily ADDs a
--- `worktree_id TEXT NOT NULL DEFAULT ''` column (safe regardless of the
--- table's current column set) and keys every query by it, so bisect runs
--- per-worktree without a static rebuild here.
+-- That retirement later happened in `2026072101_rebase_state_worktree_scope`
+-- (v0.19.36): `normalize_rebase_state_shape` in the migration runner
+-- normalizes the variable lazy-DDL column set on every connection open, and
+-- the 2026072101 static rebuild then re-keys `rebase_state` by `worktree_id`.
+-- The lazily-created `bisect_state` is scoped IN PLACE instead (v0.19.34):
+-- `src/command/bisect.rs` lazily ADDs a `worktree_id TEXT NOT NULL DEFAULT ''`
+-- column (safe regardless of the table's current column set) and keys every
+-- query by it, so bisect runs per-worktree without a static rebuild here.

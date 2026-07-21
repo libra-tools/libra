@@ -826,6 +826,18 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026071901_sequencer_worktree_scope.sql"),
             include_str!("../../../sql/migrations/2026071901_sequencer_worktree_scope_down.sql"),
         ),
+        // plan-20260714 Part C W1 (§C.4.2): re-key `rebase_state` to one row
+        // per worktree too, retiring its lazy DDL. The variable historical
+        // column set is normalized by `normalize_rebase_state_shape` (run
+        // before the runner on every connection open), so this static rebuild
+        // can assume the full pre-scope shape. Down fails closed on linked
+        // rows.
+        sql_migration(
+            2026072101,
+            "rebase_state_worktree_scope",
+            include_str!("../../../sql/migrations/2026072101_rebase_state_worktree_scope.sql"),
+            include_str!("../../../sql/migrations/2026072101_rebase_state_worktree_scope_down.sql"),
+        ),
     ]
 }
 
@@ -868,6 +880,63 @@ pub async fn current_builtin_schema_version_readonly(
     builtin_runner()?.current_version_readonly(conn).await
 }
 
+/// Normalize `rebase_state` to the full pre-scope column set so the static
+/// `2026072101_rebase_state_worktree_scope` rebuild can reference every
+/// column (plan-20260714 §C.4.2).
+///
+/// Historically the table's shape was owned by lazy DDL in
+/// `command/rebase.rs` — `autosquash`, `todo_actions`, and `empty_mode` were
+/// `ALTER TABLE ADD COLUMN`ed on demand — so databases in the wild carry any
+/// subset of them, and a static `INSERT .. SELECT` naming a missing column
+/// fails at prepare time. This runs BEFORE the migration runner on every
+/// connection open and is idempotent by construction: `CREATE TABLE IF NOT
+/// EXISTS` covers a missing table, and each `ADD COLUMN` tolerates the
+/// "duplicate column name" error (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+/// It never touches `worktree_id`, so it is a no-op on an already-migrated
+/// table.
+async fn normalize_rebase_state_shape(conn: &DatabaseConnection) -> Result<()> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    conn.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        r#"
+            CREATE TABLE IF NOT EXISTS `rebase_state` (
+                `id`           INTEGER PRIMARY KEY AUTOINCREMENT,
+                `head_name`    TEXT NOT NULL,
+                `onto`         TEXT NOT NULL,
+                `orig_head`    TEXT NOT NULL,
+                `current_head` TEXT NOT NULL,
+                `todo`         TEXT NOT NULL,
+                `todo_actions` TEXT NOT NULL DEFAULT '',
+                `done`         TEXT NOT NULL,
+                `stopped_sha`  TEXT,
+                `autosquash`   INTEGER NOT NULL DEFAULT 0,
+                `empty_mode`   TEXT NOT NULL DEFAULT 'keep'
+            );
+        "#
+        .to_string(),
+    ))
+    .await
+    .with_context(|| "failed to ensure the rebase_state table exists")?;
+    for add_column in [
+        "ALTER TABLE `rebase_state` ADD COLUMN `autosquash` INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE `rebase_state` ADD COLUMN `todo_actions` TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE `rebase_state` ADD COLUMN `empty_mode` TEXT NOT NULL DEFAULT 'keep'",
+    ] {
+        if let Err(error) = conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                add_column.to_string(),
+            ))
+            .await
+            && !error.to_string().contains("duplicate column name")
+        {
+            return Err(error)
+                .with_context(|| format!("failed to normalize rebase_state shape: {add_column}"));
+        }
+    }
+    Ok(())
+}
+
 /// Run all built-in migrations on the given connection. This is the
 /// canonical entry point used by [`crate::internal::db::establish_connection`]
 /// (and by tests that want the same wiring as production). Both registry-
@@ -876,6 +945,10 @@ pub async fn current_builtin_schema_version_readonly(
 pub async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64>> {
     let runner =
         builtin_runner().with_context(|| "failed to build the built-in migration registry")?;
+    // The rebase_state shape normalization must precede the runner: the
+    // 2026072101 static rebuild names every pre-scope column, and pre-existing
+    // databases carry a lazy-DDL-era subset of them.
+    normalize_rebase_state_shape(conn).await?;
     runner
         .run_pending(conn)
         .await
@@ -954,9 +1027,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 30);
+        assert_eq!(runner.len(), 31);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026071901));
+        assert_eq!(runner.max_registered_version(), Some(2026072101));
     }
 
     #[test]

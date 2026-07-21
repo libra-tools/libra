@@ -241,33 +241,29 @@ impl RebaseState {
         Ok(())
     }
 
+    /// The current worktree's `rebase_state` scope key (Part C W1, §C.4.2):
+    /// main worktree = `""`, a linked worktree = its stable instance id —
+    /// the `worktree_id TEXT NOT NULL` storage convention shared with
+    /// `sequence_state`/`bisect_state`.
+    fn scope_key() -> String {
+        crate::internal::worktree_scope::WorktreeScope::current()
+            .storage_key()
+            .to_string()
+    }
+
+    /// Ensure `rebase_state` exists in its migrated per-worktree shape.
+    ///
+    /// The schema is owned by migration `2026072101_rebase_state_worktree_scope`
+    /// (which retired the historical lazy ADD-COLUMN DDL); production
+    /// connections have always run it by the time rebase code executes. This
+    /// idempotent CREATE covers only bare test databases that skip the
+    /// migration runner.
     async fn ensure_rebase_state_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        let stmt = Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            r#"
-                SELECT COUNT(*)
-                FROM sqlite_master
-                WHERE type='table' AND name=?;
-            "#,
-            ["rebase_state".into()],
-        );
-
-        if let Some(result) = db
-            .query_one(stmt)
-            .await
-            .map_err(|e| format!("failed to check rebase_state table: {e}"))?
-        {
-            let count: i64 = result.try_get_by_index(0).unwrap_or(0);
-            if count > 0 {
-                return Self::ensure_rebase_state_columns(db).await;
-            }
-        }
-
         let create_table_stmt = Statement::from_string(
             DbBackend::Sqlite,
             r#"
                 CREATE TABLE IF NOT EXISTS `rebase_state` (
-                    `id`           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    `worktree_id`  TEXT PRIMARY KEY NOT NULL,
                     `head_name`    TEXT NOT NULL,
                     `onto`         TEXT NOT NULL,
                     `orig_head`    TEXT NOT NULL,
@@ -276,7 +272,8 @@ impl RebaseState {
                     `todo_actions` TEXT NOT NULL DEFAULT '',
                     `done`         TEXT NOT NULL,
                     `stopped_sha`  TEXT,
-                    `autosquash`   INTEGER NOT NULL DEFAULT 0
+                    `autosquash`   INTEGER NOT NULL DEFAULT 0,
+                    `empty_mode`   TEXT NOT NULL DEFAULT 'keep'
                 );
             "#
             .to_string(),
@@ -285,61 +282,14 @@ impl RebaseState {
         db.execute(create_table_stmt)
             .await
             .map_err(|e| format!("failed to create rebase_state table: {e}"))?;
-        Self::ensure_rebase_state_columns(db).await
-    }
-
-    async fn ensure_rebase_state_columns<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        let stmt = Statement::from_string(DbBackend::Sqlite, "PRAGMA table_info(rebase_state)");
-        let rows = db
-            .query_all(stmt)
-            .await
-            .map_err(|e| format!("failed to inspect rebase_state schema: {e}"))?;
-        let mut columns = HashSet::new();
-        for row in rows {
-            let name: String = row
-                .try_get_by_index(1)
-                .map_err(|e| format!("failed to inspect rebase_state column: {e}"))?;
-            columns.insert(name);
-        }
-        if !columns.contains("autosquash") {
-            let stmt = Statement::from_string(
-                DbBackend::Sqlite,
-                "ALTER TABLE rebase_state ADD COLUMN autosquash INTEGER NOT NULL DEFAULT 0"
-                    .to_string(),
-            );
-            db.execute(stmt)
-                .await
-                .map_err(|e| format!("failed to add rebase_state.autosquash: {e}"))?;
-        }
-        if !columns.contains("todo_actions") {
-            let stmt = Statement::from_string(
-                DbBackend::Sqlite,
-                "ALTER TABLE rebase_state ADD COLUMN todo_actions TEXT NOT NULL DEFAULT ''"
-                    .to_string(),
-            );
-            db.execute(stmt)
-                .await
-                .map_err(|e| format!("failed to add rebase_state.todo_actions: {e}"))?;
-        }
-        if !columns.contains("empty_mode") {
-            // Default `keep` preserves Libra's existing behavior (replay become-empty
-            // commits) for any state row written before this column existed.
-            let stmt = Statement::from_string(
-                DbBackend::Sqlite,
-                "ALTER TABLE rebase_state ADD COLUMN empty_mode TEXT NOT NULL DEFAULT 'keep'"
-                    .to_string(),
-            );
-            db.execute(stmt)
-                .await
-                .map_err(|e| format!("failed to add rebase_state.empty_mode: {e}"))?;
-        }
         Ok(())
     }
 
     async fn has_state_in_db<C: ConnectionTrait>(db: &C) -> Result<bool, String> {
-        let stmt = Statement::from_string(
+        let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT 1 FROM rebase_state LIMIT 1".to_string(),
+            "SELECT 1 FROM rebase_state WHERE worktree_id = ? LIMIT 1;",
+            [Self::scope_key().into()],
         );
         let row = db
             .query_one(stmt)
@@ -349,14 +299,15 @@ impl RebaseState {
     }
 
     async fn load_from_db<C: ConnectionTrait>(db: &C) -> Result<Option<Self>, String> {
-        let stmt = Statement::from_string(
+        let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             r#"
                 SELECT head_name, onto, orig_head, current_head, todo, done, stopped_sha, autosquash, todo_actions, empty_mode
                 FROM rebase_state
+                WHERE worktree_id = ?
                 LIMIT 1
-            "#
-            .to_string(),
+            "#,
+            [Self::scope_key().into()],
         );
         let row = db
             .query_one(stmt)
@@ -434,8 +385,13 @@ impl RebaseState {
     }
 
     async fn save_with_conn<C: ConnectionTrait>(db: &C, state: &RebaseState) -> Result<(), String> {
-        let delete_stmt =
-            Statement::from_string(DbBackend::Sqlite, "DELETE FROM rebase_state".to_string());
+        // Part C W1 (§C.4.2): scoped DELETE — never the whole table, which
+        // would clobber another worktree's in-progress rebase.
+        let delete_stmt = Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM rebase_state WHERE worktree_id = ?;",
+            [Self::scope_key().into()],
+        );
         db.execute(delete_stmt)
             .await
             .map_err(|e| format!("failed to clear existing rebase_state: {e}"))?;
@@ -464,10 +420,11 @@ impl RebaseState {
             DbBackend::Sqlite,
             r#"
                 INSERT INTO rebase_state
-                (head_name, onto, orig_head, current_head, todo, todo_actions, done, stopped_sha, autosquash, empty_mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                (worktree_id, head_name, onto, orig_head, current_head, todo, todo_actions, done, stopped_sha, autosquash, empty_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             "#,
             [
+                Self::scope_key().into(),
                 state.head_name.clone().into(),
                 state.onto.to_string().into(),
                 state.orig_head.to_string().into(),
@@ -488,8 +445,12 @@ impl RebaseState {
     }
 
     async fn clear_state_in_db<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        let stmt =
-            Statement::from_string(DbBackend::Sqlite, "DELETE FROM rebase_state".to_string());
+        // Part C W1 (§C.4.2): clear only THIS worktree's row.
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM rebase_state WHERE worktree_id = ?;",
+            [Self::scope_key().into()],
+        );
         db.execute(stmt)
             .await
             .map_err(|e| format!("failed to clear rebase_state: {e}"))?;
