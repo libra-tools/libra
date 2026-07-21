@@ -448,9 +448,11 @@ async fn legacy_table_active<C: ConnectionTrait>(db: &C, table: &str) -> Result<
     }
 }
 
-/// Resolve the ONE active sequence across the unified table and the three
-/// still-legacy stores (merge / revert JSON sidecars; rebase table + legacy
-/// dir). Strictly read-only — `libra status` and the mutex both rely on this
+/// Resolve the ONE active sequence for THIS worktree across the unified
+/// table, the per-worktree stores (merge / revert JSON sidecars in the local
+/// gitdir; the scoped `rebase_state` row), and the main-owned legacy stores
+/// (`rebase-merge`/`rebase-apply` dirs, pre-2.6 `cherry_pick_state`).
+/// Strictly read-only — `libra status` and the mutex both rely on this
 /// never mutating repo state (a killed sequence must stay resumable, and
 /// status must never trigger a migration).
 ///
@@ -477,21 +479,23 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
         return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Revert)));
     }
 
-    // Part C §C.4.4: the remaining probes cover rebase, whose state is
-    // repository-global AND whose operation is refused in a linked worktree
-    // (main-only). So in a LINKED worktree it can never be active "for this
-    // worktree", and main's in-progress rebase must NOT block a linked worktree's
-    // own sequence (that was the pre-fix cross-worktree blocking).
+    // Part C W1 (§C.4.2/§C.4.4): `rebase_state` is keyed by `worktree_id`
+    // (migration 2026072101), so probe THIS worktree's row BEFORE the linked
+    // early-return — once the rebase guard lifts, a linked worktree's own
+    // rebase must occupy its own mutex, while main's rebase must not block a
+    // linked worktree's sequence (and vice versa).
+    let db = get_db_conn_instance().await;
+    if scoped_rebase_state_active(&db).await? {
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Rebase)));
+    }
+    // The remaining probes cover main-owned COMMON state only (the legacy
+    // rebase dirs and the pre-2.6 cherry_pick_state table have no worktree
+    // scope — ambiguous-sidecar rule: they belong to main).
     if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
         return Ok(None);
     }
     let storage = util::storage_path();
-    // Legacy rebase: DB table row or the on-disk rebase-merge dir.
-    let db = get_db_conn_instance().await;
-    if legacy_table_active(&db, "rebase_state").await?
-        || storage.join("rebase-merge").exists()
-        || storage.join("rebase-apply").exists()
-    {
+    if storage.join("rebase-merge").exists() || storage.join("rebase-apply").exists() {
         return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Rebase)));
     }
     // Compat window: an old binary may have recreated the pre-2.6
@@ -500,6 +504,23 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
         return Ok(Some(ActiveSequenceKind::Known(SequenceKind::CherryPick)));
     }
     Ok(None)
+}
+
+/// READ-ONLY probe of THIS worktree's `rebase_state` row (Part C W1 §C.4.2).
+/// A missing table (bare test database that never ran the migration runner)
+/// resolves to `false`; any other DB error propagates (fail-closed). Never
+/// mutates.
+async fn scoped_rebase_state_active<C: ConnectionTrait>(db: &C) -> Result<bool, String> {
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT 1 FROM rebase_state WHERE worktree_id = ? LIMIT 1",
+        [current_scope_key().into()],
+    );
+    match db.query_one(stmt).await {
+        Ok(row) => Ok(row.is_some()),
+        Err(err) if is_missing_table(&err) => Ok(false),
+        Err(err) => Err(format!("failed to probe rebase_state: {err}")),
+    }
 }
 
 /// Backward-compatible public facade for the pre-`am` enum surface. An active

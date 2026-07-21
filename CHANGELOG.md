@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **Internal: the sequencer mutex probes rebase per-worktree (v0.19.38,
+  plan-20260714 Part C §C.4.4, W1 rebase slice 3/4)**:
+  `detect_active_operation` now probes THIS worktree's scoped `rebase_state`
+  row before the linked-worktree early-return, so once the rebase guard lifts,
+  a linked worktree's rebase occupies its own mutex while never blocking (or
+  being blocked by) another worktree's sequence. The legacy
+  `rebase-merge`/`rebase-apply` directory probes and the pre-2.6
+  `cherry_pick_state` probe remain main-only (ambiguous-sidecar rule).
+  No behavior change until the guard lifts.
+
 - **Internal: rebase sidecars become worktree-local; the legacy
   `rebase-merge/` directory is no longer auto-adopted on ambiguous ownership
   (v0.19.37, plan-20260714 Part C §C.4.2, W1 rebase slice 2/4)**:
