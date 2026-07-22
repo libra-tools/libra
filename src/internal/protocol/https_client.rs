@@ -4,7 +4,7 @@ use std::{io::Error as IoError, ops::Deref, sync::Mutex, time::Duration};
 
 use futures_util::{StreamExt, TryStreamExt};
 use git_internal::errors::GitError;
-use reqwest::{Body, RequestBuilder, Response, StatusCode, header::CONTENT_TYPE};
+use reqwest::{RequestBuilder, Response, StatusCode, header::CONTENT_TYPE};
 use url::Url;
 
 use super::{
@@ -464,10 +464,7 @@ impl HttpsClient {
         Ok(result)
     }
 
-    pub async fn send_pack<T: Into<Body> + Clone>(
-        &self,
-        data: T,
-    ) -> Result<Response, reqwest::Error> {
+    pub async fn send_pack(&self, data: bytes::Bytes) -> Result<Response, reqwest::Error> {
         // INVARIANT: "git-receive-pack" is a valid relative URL onto self.url.
         let receive_pack_url = self
             .url
@@ -477,6 +474,12 @@ impl HttpsClient {
             self.client
                 .post(receive_pack_url.clone())
                 .header(CONTENT_TYPE, "application/x-git-receive-pack-request")
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/x-git-receive-pack-result",
+                )
+                .header(reqwest::header::USER_AGENT, "git/2.43.0 libra")
+                .header(reqwest::header::CONTENT_LENGTH, data.len())
                 .body(data.clone())
         })
         .await
