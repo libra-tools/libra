@@ -3,7 +3,10 @@
 Libra can run repository-local lifecycle hooks from `.libra/hooks`. These are
 separate from the hidden `libra hooks` command used by external AI-agent
 integrations. Libra deliberately does not read `.git/hooks` or
-`core.hooksPath`.
+`core.hooksPath`, and the `hooks.gitCompatibility` config key is not
+implemented — setting it is inert (an opt-in Git hooks bridge was evaluated
+and declined on 2026-07-22; see decision D3 in the development compatibility
+register).
 
 ## Discovery and trust boundary
 

@@ -236,6 +236,7 @@ mod unix_impl {
                     size: stat.st_size as u64,
                     // `st_mode` is u16 on macOS and u32 on Linux; widen
                     // portably to the field type.
+                    #[allow(clippy::unnecessary_cast)]
                     mode: (stat.st_mode & 0o7777) as u32,
                 },
                 libc::S_IFDIR => EntryKind::Directory,

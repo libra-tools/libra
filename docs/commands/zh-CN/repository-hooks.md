@@ -2,7 +2,9 @@
 
 Libra 可从 `.libra/hooks` 运行仓库级生命周期 hook。它与外部 AI agent
 集成所调用的隐藏命令 `libra hooks` 完全不同。Libra 有意不读取
-`.git/hooks` 或 `core.hooksPath`。
+`.git/hooks` 或 `core.hooksPath`；`hooks.gitCompatibility` 配置键未实现，
+设置后无任何效果（opt-in Git hooks bridge 已于 2026-07-22 评估后维持
+不桥接，见开发兼容登记 D3）。
 
 ## 发现顺序与信任边界
 

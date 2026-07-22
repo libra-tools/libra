@@ -4,6 +4,22 @@
 
 ### Changed
 
+- **PD-08 decision closed: no Git hooks bridge (v0.19.43, plan-20260714
+  Part D)**: the opt-in `hooks.gitCompatibility` bridge (plan-20260708 P1-10
+  Option B) was evaluated and **declined** — Libra keeps never reading
+  `.git/hooks` or `core.hooksPath`, and the config key stays an inert,
+  unimplemented setting. Decision recorded in the compatibility register
+  (D3) and both EN/zh `repository-hooks.md`; a new guard
+  (`compat_libra_hooks_lifecycle::git_hooks_bridge_stays_inert_with_gitcompatibility_config`)
+  pins that `.git/hooks`, `core.hooksPath`, and the key never execute hooks
+  while the sandboxed `.libra/hooks` machinery stays active. Also closes
+  PD-00: version strings are re-synced across **four** surfaces
+  (`Cargo.toml`, `web/package.json`, `worker/package.json`, and the
+  `install.sh` `DEFAULT_VERSION` fallback — the fourth surface found by the
+  release-path sweep), and a stale-on-Linux `unnecessary_cast` clippy break
+  from the portable `st_mode` widening is annotated in
+  `internal::upgrade::lock`.
+
 - **`rebase` (and `pull --rebase`) now run in linked worktrees (v0.19.42,
   plan-20260714 Part C §C.4.2 — the final W1 sequencer lift)**: with
   `rebase_state` keyed per-worktree, the aux sidecar in the worktree-local

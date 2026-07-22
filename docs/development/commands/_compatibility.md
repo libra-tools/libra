@@ -133,6 +133,12 @@ unsupported 子面。
   [`repository-hooks.md`](../../commands/repository-hooks.md)。
 - 重启条件：出现必须与 stock Git 在同一工作树共享 hook policy 的生产场景，
   且完成 opt-in `hooks.gitCompatibility=true` 的信任边界、路径竞态与 sandbox RFC。
+- 2026-07-22 决策（plan-20260714 Part D **PD-08** 决策门）：评估后**维持不桥接**——
+  无生产场景要求与 stock Git 共享 hook policy；`hooks.gitCompatibility` 保持未实现，
+  设置后为惰性普通 config 键。守卫
+  `compat_libra_hooks_lifecycle::git_hooks_bridge_stays_inert_with_gitcompatibility_config`
+  钉住 `.git/hooks`、`core.hooksPath` 与该键均不触发执行且 `.libra/hooks` 机制不受影响。
+  重启条件保持上一条不变。
 
 ### D4：`clone --recurse-submodules`
 

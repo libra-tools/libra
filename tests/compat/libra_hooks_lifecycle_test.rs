@@ -648,3 +648,86 @@ fn rebase_hooks_receive_upstream_and_complete_rewrite_map() {
         String::from_utf8_lossy(&bypassed.stderr)
     );
 }
+
+#[test]
+fn git_hooks_bridge_stays_inert_with_gitcompatibility_config() {
+    // plan-20260714 PD-08 decision gate (2026-07-22): the opt-in Git hooks
+    // bridge (`hooks.gitCompatibility`, plan-20260708 P1-10 Option B) was
+    // evaluated and declined. `.git/hooks`, `core.hooksPath`, and the config
+    // key itself must never trigger hook execution, while the sandboxed
+    // `.libra/hooks` machinery stays active.
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("bridge-inert");
+
+    let git_sentinel = repo.join("git-hook-ran");
+    let git_hooks = repo.join(".git/hooks");
+    fs::create_dir_all(&git_hooks).expect("create .git/hooks");
+    let git_hook = git_hooks.join("pre-commit");
+    fs::write(
+        &git_hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", git_sentinel.display()),
+    )
+    .expect("write .git/hooks/pre-commit");
+    fs::set_permissions(&git_hook, fs::Permissions::from_mode(0o755))
+        .expect("make .git hook executable");
+
+    let custom_sentinel = repo.join("custom-hook-ran");
+    let custom_dir = repo.join("custom-hooks");
+    fs::create_dir_all(&custom_dir).expect("create core.hooksPath dir");
+    let custom_hook = custom_dir.join("pre-commit");
+    fs::write(
+        &custom_hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", custom_sentinel.display()),
+    )
+    .expect("write core.hooksPath pre-commit");
+    fs::set_permissions(&custom_hook, fs::Permissions::from_mode(0o755))
+        .expect("make core.hooksPath hook executable");
+
+    fixture.success(&repo, &["config", "set", "core.hooksPath", "custom-hooks"]);
+    fixture.success(&repo, &["config", "set", "hooks.gitCompatibility", "true"]);
+    // Read both keys back so the guard cannot pass vacuously if `config set`
+    // ever starts dropping unsupported keys as a silent no-op.
+    let hooks_path = String::from_utf8(
+        fixture
+            .success(&repo, &["config", "get", "core.hooksPath"])
+            .stdout,
+    )
+    .expect("core.hooksPath value is utf8");
+    assert_eq!(hooks_path.trim(), "custom-hooks");
+    let bridge = String::from_utf8(
+        fixture
+            .success(&repo, &["config", "get", "hooks.gitCompatibility"])
+            .stdout,
+    )
+    .expect("hooks.gitCompatibility value is utf8");
+    assert_eq!(bridge.trim(), "true");
+
+    fixture.stage(&repo, "bridge.txt", "bridge stays inert\n");
+    fixture.success(&repo, &["commit", "-m", "bridge inert commit"]);
+    assert!(
+        !git_sentinel.exists(),
+        ".git/hooks/pre-commit must never run"
+    );
+    assert!(
+        !custom_sentinel.exists(),
+        "core.hooksPath pre-commit must never run"
+    );
+
+    // Control: the sandboxed `.libra/hooks` machinery is still active — a
+    // blocking pre-commit there rejects the next commit.
+    write_hook(
+        &repo,
+        "pre-commit",
+        "#!/bin/sh\necho native hook blocks >&2\nexit 1\n",
+    );
+    fixture.stage(&repo, "blocked.txt", "native hook blocks\n");
+    let blocked = fixture.run(&repo, &["commit", "-m", "must be blocked"]);
+    assert!(
+        !blocked.status.success(),
+        ".libra/hooks pre-commit must still block commits"
+    );
+    assert!(
+        !git_sentinel.exists() && !custom_sentinel.exists(),
+        "bridge hooks must stay inert even when native hooks fire"
+    );
+}
