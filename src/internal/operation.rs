@@ -59,6 +59,9 @@ pub struct OperationRecord {
     pub start_ts: i64,
     pub end_ts: Option<i64>,
     pub status: OperationStatus,
+    /// Worktree scope the operation ran in (Part C W1 §C.9): main = `""`,
+    /// linked = its stable instance id.
+    pub worktree_id: String,
 }
 
 /// Parent edge for operation lineage.
@@ -215,6 +218,7 @@ impl OperationService {
             start_ts: model.start_ts,
             end_ts: model.end_ts,
             status,
+            worktree_id: model.worktree_id,
         })
     }
 
@@ -236,6 +240,7 @@ impl OperationService {
             start_ts: Set(record.start_ts),
             end_ts: Set(record.end_ts),
             status: Set(record.status.as_db_value().to_string()),
+            worktree_id: Set(record.worktree_id.clone()),
         };
 
         let inserted = model.insert(db).await.map_err(|err| {
@@ -971,6 +976,7 @@ mod tests {
             start_ts: 100,
             end_ts: Some(120),
             status: OperationStatus::Succeeded,
+            worktree_id: String::new(),
         }
     }
 
@@ -1298,7 +1304,7 @@ mod tests {
     async fn commit7_persist_and_find_operation_graph_roundtrip() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let ddl = concat!(
-            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '');",
             "CREATE TABLE IF NOT EXISTS operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
             "CREATE TABLE IF NOT EXISTS operation_view(view_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,head_kind TEXT NOT NULL,head_target TEXT NOT NULL,created_at INTEGER NOT NULL);",
             "CREATE TABLE IF NOT EXISTS operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
@@ -1320,6 +1326,7 @@ mod tests {
                 start_ts: 200,
                 end_ts: Some(205),
                 status: OperationStatus::Succeeded,
+                worktree_id: String::new(),
             },
             parents: vec![OperationParentRecord {
                 op_id: "op_7".to_string(),
@@ -1380,7 +1387,7 @@ mod tests {
 
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '');",
         ))
         .await
         .unwrap();
@@ -1397,6 +1404,7 @@ mod tests {
                 start_ts: end_ts - 10,
                 end_ts: Some(end_ts),
                 status: OperationStatus::Succeeded,
+                worktree_id: String::new(),
             };
             OperationService::insert_operation_with_conn(&db, &record)
                 .await

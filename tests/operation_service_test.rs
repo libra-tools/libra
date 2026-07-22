@@ -20,7 +20,8 @@ async fn create_operation_schema(db: &DatabaseConnection) {
             args_digest TEXT,\
             start_ts INTEGER NOT NULL,\
             end_ts INTEGER,\
-            status TEXT NOT NULL\
+            status TEXT NOT NULL,\
+            worktree_id TEXT NOT NULL DEFAULT ''\
         );",
         "CREATE TABLE IF NOT EXISTS operation_parent(\
             op_id TEXT NOT NULL,\
@@ -73,6 +74,7 @@ fn sample_operation(op_id: &str, repo_id: &str, view_id: &str, end_ts: i64) -> O
         start_ts: end_ts - 10,
         end_ts: Some(end_ts),
         status: OperationStatus::Succeeded,
+        worktree_id: String::new(),
     }
 }
 
@@ -94,6 +96,7 @@ async fn invalid_arguments_are_rejected() {
             start_ts: 10,
             end_ts: Some(20),
             status: OperationStatus::Succeeded,
+            worktree_id: String::new(),
         },
     )
     .await
@@ -536,6 +539,7 @@ async fn graph_roundtrip_and_duplicate_constraint_failure() {
             start_ts: 500,
             end_ts: Some(510),
             status: OperationStatus::Succeeded,
+            worktree_id: String::new(),
         },
         parents: vec![OperationParentRecord {
             op_id: "op_graph".to_string(),

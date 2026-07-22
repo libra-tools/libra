@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **Internal: the operation duplicate-submission window is scoped
+  per-worktree (v0.19.41, plan-20260714 Part C §C.9, W1 slice 3b)**: the
+  `operation` audit table gains a `worktree_id` column (migration
+  `2026072201`; main = `""`), the in-process active-key set embeds the scope,
+  and the 5s duplicate window only consults THIS worktree's history — the
+  same command with identical arguments run concurrently in two worktrees is
+  two legitimate operations, not a duplicate submission. The down migration
+  preserves every audit row (only the scope attribution is dropped, which the
+  old schema cannot represent).
+
 - **Captured agent sessions now have a privacy-preserving read-only graph**:
   `libra agent graph <session>` renders turn, revision, checkpoint, and
   subagent-link structure in a two-pane TUI, with frozen JSON schema v1 for

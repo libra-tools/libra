@@ -16,6 +16,10 @@ pub struct Model {
     pub start_ts: i64,
     pub end_ts: Option<i64>,
     pub status: String,
+    /// Worktree scope the operation ran in (Part C W1 §C.9): main = `""`,
+    /// linked = its stable instance id. Scopes the duplicate-submission
+    /// window per-worktree.
+    pub worktree_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

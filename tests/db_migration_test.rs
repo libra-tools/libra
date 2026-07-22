@@ -51,7 +51,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407, 2026071901, 2026072101
+            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201
         ]
     );
     assert_eq!(
@@ -90,13 +90,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_subagent_replication",
             "sequencer_worktree_scope",
             "rebase_state_worktree_scope",
+            "operation_worktree_scope",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 33);
-    assert_eq!(runner.max_registered_version(), Some(2026072101));
+    assert_eq!(runner.len(), 34);
+    assert_eq!(runner.max_registered_version(), Some(2026072201));
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,7 +1088,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407, 2026071901, 2026072101
+            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1274,7 +1275,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             .run_pending(&conn)
             .await
             .expect("restore 1407 after the 1406 link-only rollback guard"),
-        vec![2026071407, 2026071901, 2026072101]
+        vec![2026071407, 2026071901, 2026072101, 2026072201]
     );
     conn.execute(Statement::from_string(
         conn.get_database_backend(),
@@ -1334,7 +1335,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
     assert!(!column_exists(&conn, "agent_checkpoint", "sync_revision").await);
     assert_eq!(
         runner.run_pending(&conn).await.expect("M5 up #2"),
-        vec![2026071406, 2026071407, 2026071901, 2026072101]
+        vec![2026071406, 2026071407, 2026071901, 2026072101, 2026072201]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
     assert!(table_exists(&conn, "agent_capture_incarnation").await);
@@ -1433,7 +1434,7 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             .run_pending(&conn)
             .await
             .expect("upgrade immutable 1406 schema"),
-        vec![2026071407, 2026071901, 2026072101]
+        vec![2026071407, 2026071901, 2026072101, 2026072201]
     );
     let claim = conn
         .query_one(Statement::from_string(
@@ -1562,7 +1563,7 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             .run_pending(&conn)
             .await
             .expect("upgrade evolved 1406 schema"),
-        vec![2026071407, 2026071901, 2026072101]
+        vec![2026071407, 2026071901, 2026072101, 2026072201]
     );
     let cursor = conn
         .query_one(Statement::from_string(
@@ -1605,8 +1606,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
-            2026071402
+            2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404,
+            2026071403, 2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1622,7 +1623,7 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         reapplied,
         vec![
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101
+            2026072101, 2026072201
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1653,7 +1654,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404
+            2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1668,7 +1669,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         applied,
         vec![
-            2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101
+            2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -2013,11 +2014,11 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
-            2026071402, 2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701,
-            2026070601, 2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301,
-            2026061401, 2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801,
-            2026050601
+            2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404,
+            2026071403, 2026071402, 2026071401, 2026071301, 2026070803, 2026070802, 2026070801,
+            2026070701, 2026070601, 2026070501, 2026070401, 2026070301, 2026070202, 2026070201,
+            2026062301, 2026061401, 2026060801, 2026060401, 2026060201, 2026053101, 2026052301,
+            2026050801, 2026050601
         ]
     );
     assert!(
@@ -2045,7 +2046,7 @@ async fn approved_permission_up_down_up_round_trip() {
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101
+            2026072101, 2026072201
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);

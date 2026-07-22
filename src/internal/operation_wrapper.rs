@@ -212,11 +212,22 @@ fn is_sqlite_busy_operation_error(err: &OperationError) -> bool {
     }
 }
 
-fn operation_dedup_key(meta: &OperationMeta) -> Option<String> {
+/// Part C W1 (§C.9): the dedup key includes the WORKTREE scope — the same
+/// command with identical arguments run concurrently in two worktrees is two
+/// legitimate operations, not a duplicate submission.
+fn operation_dedup_key(meta: &OperationMeta, scope_key: &str) -> Option<String> {
     meta.args_digest
         .as_ref()
         .filter(|digest| !digest.trim().is_empty())
-        .map(|digest| format!("{}::{}::{}", meta.repo_id, meta.command_name, digest.trim()))
+        .map(|digest| {
+            format!(
+                "{}::{}::{}::{}",
+                meta.repo_id,
+                scope_key,
+                meta.command_name,
+                digest.trim()
+            )
+        })
 }
 
 struct ActiveDedupGuard {
@@ -252,6 +263,7 @@ async fn ensure_not_recent_duplicate_with_conn<C: sea_orm::ConnectionTrait>(
     db: &C,
     meta: &OperationMeta,
     now_ts: i64,
+    scope_key: &str,
 ) -> Result<(), OperationError> {
     let Some(digest) = meta
         .args_digest
@@ -272,7 +284,10 @@ async fn ensure_not_recent_duplicate_with_conn<C: sea_orm::ConnectionTrait>(
         })?;
 
     let duplicated = records.into_iter().any(|record| {
-        record.command_name == meta.command_name
+        // Part C W1 (§C.9): only THIS worktree's history counts toward the
+        // duplicate window.
+        record.worktree_id == scope_key
+            && record.command_name == meta.command_name
             && record.args_digest.as_deref().map(str::trim) == Some(digest)
             && record.status == OperationStatus::Succeeded
             && record
@@ -351,11 +366,14 @@ where
     let view_id = Uuid::now_v7().to_string();
     let start_ts = Utc::now().timestamp();
 
-    let _active_dedup_guard = operation_dedup_key(&meta)
+    let scope_key = crate::internal::worktree_scope::WorktreeScope::current()
+        .storage_key()
+        .to_string();
+    let _active_dedup_guard = operation_dedup_key(&meta, &scope_key)
         .map(try_acquire_active_dedup_guard)
         .transpose()?;
 
-    ensure_not_recent_duplicate_with_conn(db, &meta, start_ts).await?;
+    ensure_not_recent_duplicate_with_conn(db, &meta, start_ts, &scope_key).await?;
 
     let mut txn = None;
     let mut parent_selection = None;
@@ -479,6 +497,7 @@ where
         start_ts,
         end_ts: Some(end_ts),
         status: OperationStatus::Succeeded,
+        worktree_id: scope_key.clone(),
     };
     let parents = selected_parents
         .into_iter()
@@ -711,6 +730,7 @@ mod tests {
     };
 
     use super::{
+        ensure_not_recent_duplicate_with_conn, operation_dedup_key,
         resolve_parent_operation_id_with_conn, OperationError, OperationMeta, OperationScope,
         with_operation_log_with_conn,
     };
@@ -745,6 +765,51 @@ mod tests {
         assert!(!scope.include_remote_tracking);
     }
 
+    /// Part C W1 (§C.9): the same command + args submitted from ANOTHER
+    /// worktree within the 5s window is NOT a duplicate — the window is
+    /// scoped by `worktree_id`. The same scope IS still rejected.
+    #[tokio::test]
+    async fn concurrent_identical_control_actions_in_two_worktrees_not_deduped() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        create_operation_table(&db).await;
+        let now = Utc::now().timestamp();
+        // Worktree "wt-a" just succeeded with this exact command + digest.
+        let mut record = sample_record("op_prev", OperationStatus::Succeeded, now - 1);
+        record.worktree_id = "wt-a".to_string();
+        OperationService::insert_operation_with_conn(&db, &record)
+            .await
+            .unwrap();
+
+        // The identical submission from MAIN ("") passes...
+        ensure_not_recent_duplicate_with_conn(&db, &valid_meta(), now, "")
+            .await
+            .expect("another worktree's history must not dedup this scope");
+        // ...and from a third worktree too.
+        ensure_not_recent_duplicate_with_conn(&db, &valid_meta(), now, "wt-b")
+            .await
+            .expect("scopes are independent");
+        // The SAME scope within the window is still rejected.
+        let err = ensure_not_recent_duplicate_with_conn(&db, &valid_meta(), now, "wt-a")
+            .await
+            .expect_err("same-scope duplicate within the window is rejected");
+        assert!(matches!(err, OperationError::Business(_)));
+    }
+
+    /// Part C W1 (§C.9): the in-process active-key set is scope-aware too —
+    /// the key embeds the worktree id, so identical metas from different
+    /// scopes never collide (`op restore`'s digest is the target op id,
+    /// identical in every worktree that restores it).
+    #[test]
+    fn op_restore_dedup_key_is_scope_aware() {
+        let mut meta = valid_meta();
+        meta.command_name = "op-restore".to_string();
+        meta.args_digest = Some("op_0123".to_string());
+        let main_key = operation_dedup_key(&meta, "").expect("key");
+        let linked_key = operation_dedup_key(&meta, "wt-a").expect("key");
+        assert_ne!(main_key, linked_key, "scope must discriminate the key");
+        assert!(linked_key.contains("::wt-a::"));
+    }
+
     fn sample_record(op_id: &str, status: OperationStatus, end_ts: i64) -> OperationRecord {
         OperationRecord {
             op_id: op_id.to_string(),
@@ -757,6 +822,7 @@ mod tests {
             start_ts: end_ts - 5,
             end_ts: Some(end_ts),
             status,
+            worktree_id: String::new(),
         }
     }
 
@@ -774,7 +840,8 @@ mod tests {
                 args_digest TEXT,
                 start_ts INTEGER NOT NULL,
                 end_ts INTEGER,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                worktree_id TEXT NOT NULL DEFAULT ''
             )
             "#
             .to_string(),
