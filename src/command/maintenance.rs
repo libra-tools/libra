@@ -1654,9 +1654,9 @@ fn worktree_gitdir_roots() -> Vec<std::path::PathBuf> {
 ///
 /// Fail-closed contract: a row that cannot be read or a structured OID column
 /// that does not parse is a hard error (callers never prune against a partial
-/// root set). A MISSING table resolves to "no roots from that store" — only
-/// `bisect_state` is still lazily created, but bare test databases may lack
-/// any of them. The free-form `payload` column is scanned leniently: JSON
+/// root set). A MISSING table resolves to "no roots from that store" — all
+/// three are migration-owned now (`bisect_state` since `2026072301`), but
+/// bare test databases may lack any of them. The free-form `payload` column is scanned leniently: JSON
 /// string values that parse as OIDs are walked only when the object exists
 /// (payload content is op-specific, not a structured OID column).
 async fn collect_sequencer_state_roots(

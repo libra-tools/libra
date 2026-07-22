@@ -9,10 +9,13 @@
 //! # Concepts
 //!
 //! - [`Migration`] — one named, versioned schema change. Carries an `up`
-//!   forward DDL and an optional `down` rollback DDL. The DDL **must be
+//!   forward DDL and an optional `down` rollback DDL. The DDL **should be
 //!   idempotent** at the SQL level (`CREATE TABLE IF NOT EXISTS`,
-//!   `CREATE INDEX IF NOT EXISTS`) so re-running on a partially-applied
-//!   database does not error.
+//!   `CREATE INDEX IF NOT EXISTS`) so re-running against a pre-existing
+//!   table does not error; non-idempotent RENAME-based rebuilds
+//!   (2026072101/2026072301) are safe only because the runner claims the
+//!   version row before executing the DDL, guaranteeing single
+//!   application even under concurrent upgraders.
 //! - [`MigrationRunner`] — owns the registered migration set and applies
 //!   pending migrations in monotonic version order. Tracks applied
 //!   migrations in a dedicated `schema_versions` table.
@@ -57,8 +60,11 @@ pub struct Migration {
     /// is loaded from `sql/migrations/`.
     pub name: &'static str,
 
-    /// Forward DDL. Must be idempotent (use `IF NOT EXISTS` for tables /
-    /// indexes; tolerate columns that already exist).
+    /// Forward DDL. Should be idempotent (use `IF NOT EXISTS` for tables /
+    /// indexes; tolerate columns that already exist). Non-idempotent
+    /// RENAME-based rebuilds are permitted because the runner claims the
+    /// `schema_versions` row before running the DDL (claim-first), so the
+    /// DDL never executes twice.
     pub up: &'static str,
 
     /// Optional rollback DDL for [`MigrationRunner::rollback_to`]. `None`
@@ -260,12 +266,36 @@ impl MigrationRunner {
     /// Returns the list of versions that were newly applied **by this
     /// call** (empty when the database is already up to date, or when a
     /// concurrent process beat us to every pending migration).
-    /// Migrations that lost the race in `INSERT OR IGNORE` are NOT
-    /// included in the return value even though their up-DDL ran
-    /// idempotently.
+    /// Concurrency: each migration claims its `schema_versions` row FIRST
+    /// (`INSERT OR IGNORE` + `changes()`); a caller that loses the claim
+    /// SKIPS that migration's up-DDL entirely — required because
+    /// RENAME-based rebuilds (2026072101/2026072301) are not idempotent —
+    /// and does not include it in the return value.
     pub async fn run_pending(&self, conn: &DatabaseConnection) -> Result<Vec<i64>, MigrationError> {
+        self.run_pending_with_post_read_gate(conn, || async {})
+            .await
+    }
+
+    /// Test seam for deterministic concurrency coverage: identical to
+    /// [`Self::run_pending`], except `gate` runs once immediately AFTER the
+    /// current-version read and BEFORE the first claim. Racing callers can
+    /// rendezvous in `gate` so both hold the same pending list, forcing
+    /// every subsequent version claim to be contended (the exact window the
+    /// claim-first ordering exists for). Production code must call
+    /// [`Self::run_pending`].
+    #[doc(hidden)]
+    pub async fn run_pending_with_post_read_gate<F, Fut>(
+        &self,
+        conn: &DatabaseConnection,
+        gate: F,
+    ) -> Result<Vec<i64>, MigrationError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         ensure_schema_versions_table(conn).await?;
         let current = self.current_version(conn).await?;
+        gate().await;
         let mut applied = Vec::new();
 
         for migration in &self.migrations {
@@ -440,16 +470,17 @@ async fn apply_one_migration(
             let applied_at = now.to_rfc3339();
             Box::pin(async move {
                 let backend = txn.get_database_backend();
-                // Apply the user DDL first; if it fails the schema_versions
-                // insert never happens and the transaction rolls back.
-                apply_migration_compatibility(txn, version, name).await?;
-                txn.execute(Statement::from_string(backend, up)).await?;
-                // `INSERT OR IGNORE` plus `changes()` lets us tell whether
-                // we won the race or not without a separate read query.
-                // SQLite's `changes()` reports rows changed by the LAST
-                // INSERT/UPDATE/DELETE on this connection, so we read it
-                // immediately after the insert, still inside the
-                // transaction.
+                // Claim the version row FIRST (W1-hardening review P1#1):
+                // `INSERT OR IGNORE` plus `changes()` decides the race
+                // winner inside the same transaction, and this first write
+                // also takes SQLite's write lock, serializing concurrent
+                // upgraders. The loser sees `changes() = 0` and skips the
+                // DDL entirely — RENAME-based rebuilds (2026072101,
+                // 2026072301) are NOT idempotent, so re-running their up
+                // DDL against an already-rebuilt table must never happen.
+                // If the DDL below fails, the whole transaction (including
+                // this claim) rolls back, so a failed apply never leaves a
+                // phantom version row.
                 txn.execute(Statement::from_sql_and_values(
                     backend,
                     "INSERT OR IGNORE INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
@@ -465,7 +496,14 @@ async fn apply_one_migration(
                 let changed: i64 = row
                     .try_get_by_index(0)
                     .map_err(|err| DbErr::Custom(format!("changes() decode failed: {err}")))?;
-                Ok::<bool, DbErr>(changed > 0)
+                if changed == 0 {
+                    // Another process already applied this version; nothing
+                    // to do and nothing to record.
+                    return Ok::<bool, DbErr>(false);
+                }
+                apply_migration_compatibility(txn, version, name).await?;
+                txn.execute(Statement::from_string(backend, up)).await?;
+                Ok::<bool, DbErr>(true)
             })
         })
         .await
@@ -964,6 +1002,19 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072201_operation_worktree_scope.sql"),
             include_str!("../../../sql/migrations/2026072201_operation_worktree_scope_down.sql"),
         ),
+        // plan-20260714 Part C W1 (§C.4.2): re-key `bisect_state` to one row
+        // per worktree, retiring the last sequencer-family lazy DDL. The
+        // variable historical column set is normalized by
+        // `normalize_bisect_state_shape` (run before the runner on every
+        // connection open). Linked-scope rows may already exist in the wild
+        // (the lazy `worktree_id` shipped in v0.19.34), so the rebuild keeps
+        // the newest row per scope. Down fails closed on linked rows.
+        sql_migration(
+            2026072301,
+            "bisect_state_worktree_scope",
+            include_str!("../../../sql/migrations/2026072301_bisect_state_worktree_scope.sql"),
+            include_str!("../../../sql/migrations/2026072301_bisect_state_worktree_scope_down.sql"),
+        ),
     ]
 }
 
@@ -1063,6 +1114,61 @@ async fn normalize_rebase_state_shape(conn: &DatabaseConnection) -> Result<()> {
     Ok(())
 }
 
+/// Normalize `bisect_state` to the full lazy column set so the static
+/// `2026072301_bisect_state_worktree_scope` rebuild can reference every
+/// column (plan-20260714 §C.4.2).
+///
+/// Historically the table's shape was owned by lazy DDL in
+/// `command/bisect.rs` — `completed`, `first_parent`, and `worktree_id` were
+/// `ALTER TABLE ADD COLUMN`ed on demand — so databases in the wild carry any
+/// subset of them. Same contract as [`normalize_rebase_state_shape`]: runs
+/// BEFORE the migration runner on every connection open, idempotent by
+/// construction, and a no-op once 2026072301 has re-keyed the table (the
+/// rebuilt table has no `id` column, `CREATE IF NOT EXISTS` skips it, and
+/// every `ADD COLUMN` hits "duplicate column name").
+async fn normalize_bisect_state_shape(conn: &DatabaseConnection) -> Result<()> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    conn.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        r#"
+            CREATE TABLE IF NOT EXISTS `bisect_state` (
+                `id`             INTEGER PRIMARY KEY AUTOINCREMENT,
+                `orig_head`      TEXT NOT NULL,
+                `orig_head_name` TEXT,
+                `bad`            TEXT,
+                `good`           TEXT NOT NULL,
+                `current`        TEXT,
+                `skipped`        TEXT,
+                `steps`          INTEGER,
+                `completed`      INTEGER NOT NULL DEFAULT 0,
+                `first_parent`   INTEGER NOT NULL DEFAULT 0,
+                `worktree_id`    TEXT NOT NULL DEFAULT ''
+            );
+        "#
+        .to_string(),
+    ))
+    .await
+    .with_context(|| "failed to ensure the bisect_state table exists")?;
+    for add_column in [
+        "ALTER TABLE `bisect_state` ADD COLUMN `completed` INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE `bisect_state` ADD COLUMN `first_parent` INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE `bisect_state` ADD COLUMN `worktree_id` TEXT NOT NULL DEFAULT ''",
+    ] {
+        if let Err(error) = conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                add_column.to_string(),
+            ))
+            .await
+            && !error.to_string().contains("duplicate column name")
+        {
+            return Err(error)
+                .with_context(|| format!("failed to normalize bisect_state shape: {add_column}"));
+        }
+    }
+    Ok(())
+}
+
 /// Run all built-in migrations on the given connection. This is the
 /// canonical entry point used by [`crate::internal::db::establish_connection`]
 /// (and by tests that want the same wiring as production). Both registry-
@@ -1071,10 +1177,11 @@ async fn normalize_rebase_state_shape(conn: &DatabaseConnection) -> Result<()> {
 pub async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64>> {
     let runner =
         builtin_runner().with_context(|| "failed to build the built-in migration registry")?;
-    // The rebase_state shape normalization must precede the runner: the
-    // 2026072101 static rebuild names every pre-scope column, and pre-existing
-    // databases carry a lazy-DDL-era subset of them.
+    // The rebase_state/bisect_state shape normalizations must precede the
+    // runner: the 2026072101/2026072301 static rebuilds name every pre-scope
+    // column, and pre-existing databases carry a lazy-DDL-era subset of them.
     normalize_rebase_state_shape(conn).await?;
+    normalize_bisect_state_shape(conn).await?;
     runner
         .run_pending(conn)
         .await
@@ -1153,9 +1260,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 34);
+        assert_eq!(runner.len(), 35);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072201));
+        assert_eq!(runner.max_registered_version(), Some(2026072301));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # Schema migrations directory
 
-This directory holds **versioned, idempotent SQL migrations** managed by
+This directory holds **versioned SQL migrations** (idempotent by default,
+with a narrow claim-first RENAME-rebuild exception — see below) managed by
 `crate::internal::db::migration::MigrationRunner` (CEX-12.5).
 
 ## Filename convention
@@ -25,18 +26,27 @@ YYYYMMDDNN_<snake_case_name>_down.sql    # optional matching rollback
 
 ## Idempotency requirement
 
-Forward DDL **must be idempotent** at the SQL level:
+Forward DDL **should be idempotent** at the SQL level:
 
 - `CREATE TABLE IF NOT EXISTS ...` (never bare `CREATE TABLE`)
 - `CREATE INDEX IF NOT EXISTS ...`
 - `ALTER TABLE ... ADD COLUMN` is OK only when guarded by a column-exists
   check (sqlite-specific) or scoped behind a feature flag.
 
+Exception: RENAME-based table rebuilds (e.g. `2026072101`, `2026072301`)
+are inherently non-idempotent. They are safe only because the runner claims
+the `schema_versions` row *before* executing the up DDL inside the same
+transaction (claim-first), so the DDL can never run twice — including under
+concurrent upgraders. Plain additive migrations must still be written
+idempotently (see the rationale below).
+
 Rationale: legacy databases initialized via `sqlite_20260309_init.sql` may
 already contain tables that an early migration tries to create. Idempotent
 DDL means the explicit upgrade command can safely apply every pending
-migration; the `schema_versions` table is the bookkeeping layer, not the
-safety layer. Normal command connections do not apply migrations implicitly.
+migration over such pre-existing shapes. For plain additive migrations the
+`schema_versions` table is bookkeeping; for the RENAME-rebuild exception it
+is also the safety layer — the claim-first transaction is what prevents a
+second execution. Normal command connections do not apply migrations implicitly.
 They check compatibility first and ask the user to run `libra db upgrade` when
 the repository is stale.
 
@@ -120,6 +130,16 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026050501`  | `agent_checkpoint_parent_nullable` | `2026050501_agent_checkpoint_parent_nullable{,_down}.sql` |
 | `2026050601`  | `approved_permission` | `2026050601_approved_permission{,_down}.sql`  |
 | `2026050801`  | `agent_usage_stats_agent_name` | `2026050801_agent_usage_stats_agent_name{,_down}.sql` |
+| `2026052301`  | `source_call_log` | `2026052301_source_call_log{,_down}.sql` |
+| `2026053101`  | `ai_final_decision` | `2026053101_ai_final_decision{,_down}.sql` |
+| `2026060201`  | `source_call_log_agent_run_id` | `2026060201_source_call_log_agent_run_id{,_down}.sql` |
+| `2026060401`  | `cherry_pick_state` | `2026060401_cherry_pick_state{,_down}.sql` |
+| `2026060801`  | `revert_sequence` | `2026060801_revert_sequence{,_down}.sql` |
+| `2026061401`  | `notes` | `2026061401_notes{,_down}.sql` |
+| `2026062301`  | `rename_agent_traces_branch` | `2026062301_rename_agent_traces_branch{,_down}.sql` |
+| `2026070201`  | `metadata_kv` | `2026070201_metadata_kv{,_down}.sql` |
+| `2026070202`  | `working_dirty` | `2026070202_working_dirty{,_down}.sql` |
+| `2026070301`  | `revision_ordinal` | `2026070301_revision_ordinal{,_down}.sql` |
 | `2026070401`  | `sequence_state` | `2026070401_sequence_state{,_down}.sql` (lore.md 2.6: unified sequencer store; folds cherry-pick forward, drops the `cherry_pick_state`/`revert_sequence` legacy tables) |
 | `2026070501`  | `layer` | `2026070501_layer{,_down}.sql` (lore.md 2.4: `layer`+`layer_path` local-overlay side-tables; owner `internal::layer`) |
 | `2026070601`  | `object_obliteration` | `2026070601_object_obliteration{,_down}.sql` (lore.md 2.5: intentional-absence tombstone registry; owner `internal::obliteration`) |
@@ -135,6 +155,10 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026071405`  | `agent_coverage_conflict` | `2026071405_agent_coverage_conflict{,_down}.sql` (M4: bounded complete-coverage conflict evidence) |
 | `2026071406`  | `agent_subagent_content` | `2026071406_agent_subagent_content{,_down}.sql` (M5 immutable base: opaque child-source claims, append-only revisions, and boundary/content links; down refuses durable attribution or active reservations) |
 | `2026071407`  | `agent_subagent_replication` | `2026071407_agent_subagent_replication{,_down}.sql` (M5 compatibility: adds monotonic source/cloud generations, incarnation/cloud-base state, checkpoint-prune fences, and boundary-delete unlinking to repositories that already applied the immutable 1406 base schema) |
+| `2026071901`  | `sequencer_worktree_scope` | `2026071901_sequencer_worktree_scope{,_down}.sql` (plan-20260714 §C.4.2: `sequence_state` re-keyed to one row per worktree; down fails closed on linked rows) |
+| `2026072101`  | `rebase_state_worktree_scope` | `2026072101_rebase_state_worktree_scope{,_down}.sql` (§C.4.2: `rebase_state` re-keyed per worktree, lazy DDL retired; down fails closed on linked rows) |
+| `2026072201`  | `operation_worktree_scope` | `2026072201_operation_worktree_scope{,_down}.sql` (§C.9: per-worktree operation dedup scope column) |
+| `2026072301`  | `bisect_state_worktree_scope` | `2026072301_bisect_state_worktree_scope{,_down}.sql` (§C.4.2: `bisect_state` re-keyed per worktree — newest row per scope wins — lazy DDL retired; down fails closed on linked rows) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no

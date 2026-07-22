@@ -51,7 +51,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201
+            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301
         ]
     );
     assert_eq!(
@@ -91,13 +91,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "sequencer_worktree_scope",
             "rebase_state_worktree_scope",
             "operation_worktree_scope",
+            "bisect_state_worktree_scope",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 34);
-    assert_eq!(runner.max_registered_version(), Some(2026072201));
+    assert_eq!(runner.len(), 35);
+    assert_eq!(runner.max_registered_version(), Some(2026072301));
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,7 +1089,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201
+            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1275,7 +1276,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             .run_pending(&conn)
             .await
             .expect("restore 1407 after the 1406 link-only rollback guard"),
-        vec![2026071407, 2026071901, 2026072101, 2026072201]
+        vec![2026071407, 2026071901, 2026072101, 2026072201, 2026072301]
     );
     conn.execute(Statement::from_string(
         conn.get_database_backend(),
@@ -1335,7 +1336,9 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
     assert!(!column_exists(&conn, "agent_checkpoint", "sync_revision").await);
     assert_eq!(
         runner.run_pending(&conn).await.expect("M5 up #2"),
-        vec![2026071406, 2026071407, 2026071901, 2026072101, 2026072201]
+        vec![
+            2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301
+        ]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
     assert!(table_exists(&conn, "agent_capture_incarnation").await);
@@ -1434,7 +1437,7 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             .run_pending(&conn)
             .await
             .expect("upgrade immutable 1406 schema"),
-        vec![2026071407, 2026071901, 2026072101, 2026072201]
+        vec![2026071407, 2026071901, 2026072101, 2026072201, 2026072301]
     );
     let claim = conn
         .query_one(Statement::from_string(
@@ -1563,7 +1566,7 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             .run_pending(&conn)
             .await
             .expect("upgrade evolved 1406 schema"),
-        vec![2026071407, 2026071901, 2026072101, 2026072201]
+        vec![2026071407, 2026071901, 2026072101, 2026072201, 2026072301]
     );
     let cursor = conn
         .query_one(Statement::from_string(
@@ -1606,8 +1609,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404,
-            2026071403, 2026071402
+            2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405,
+            2026071404, 2026071403, 2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1623,7 +1626,7 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         reapplied,
         vec![
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101, 2026072201
+            2026072101, 2026072201, 2026072301
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1654,7 +1657,8 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404
+            2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405,
+            2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1669,7 +1673,8 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         applied,
         vec![
-            2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201
+            2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201,
+            2026072301
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -2014,11 +2019,11 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404,
-            2026071403, 2026071402, 2026071401, 2026071301, 2026070803, 2026070802, 2026070801,
-            2026070701, 2026070601, 2026070501, 2026070401, 2026070301, 2026070202, 2026070201,
-            2026062301, 2026061401, 2026060801, 2026060401, 2026060201, 2026053101, 2026052301,
-            2026050801, 2026050601
+            2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405,
+            2026071404, 2026071403, 2026071402, 2026071401, 2026071301, 2026070803, 2026070802,
+            2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301, 2026070202,
+            2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201, 2026053101,
+            2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -2046,7 +2051,7 @@ async fn approved_permission_up_down_up_round_trip() {
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101, 2026072201
+            2026072101, 2026072201, 2026072301
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -2186,6 +2191,324 @@ async fn rebase_down_migration_rejects_linked_rows() {
         .expect("main row survives the rollback");
     let head_name: String = row.try_get_by_index(0).expect("head_name");
     assert_eq!(head_name, "refs/heads/main");
+}
+
+/// The 2026071901 down migration FAILS CLOSED while a linked worktree's
+/// sequence row exists (the legacy `CHECK(id = 1)` single-row schema cannot
+/// represent it, so rolling back would silently discard that worktree's
+/// cherry-pick/am/revert sequence). After the linked row is gone, the same
+/// rollback succeeds and restores the legacy shape with the main row intact.
+#[tokio::test]
+async fn sequence_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO sequence_state \
+         (worktree_id, kind, head_name, head_orig, current_oid, todo) \
+         VALUES ('', 'cherry_pick', 'refs/heads/main', 'aa', 'bb', '[]'), \
+                ('wt1234', 'revert', 'refs/heads/feature', 'cc', 'dd', '[]');"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked sequence rows");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026071407)
+        .await
+        .expect_err("rollback with a linked sequence row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    // The scoped table survives the refused rollback (txn rolled back).
+    assert!(column_exists(&conn, "sequence_state", "worktree_id").await);
+
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM sequence_state WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("finish the linked sequence");
+    // The runner commits each down migration separately, so the refused
+    // attempt already rolled back 2026072301/2026072201/2026072101 before
+    // failing closed at 2026071901 — only the guarded one remains.
+    let rolled = runner
+        .rollback_to(&conn, 2026071407)
+        .await
+        .expect("rollback succeeds once only the main row remains");
+    assert_eq!(rolled, vec![2026071901]);
+    assert!(!column_exists(&conn, "sequence_state", "worktree_id").await);
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT kind, head_name FROM sequence_state".to_string(),
+        ))
+        .await
+        .expect("query restored row")
+        .expect("main row survives the rollback");
+    let kind: String = row.try_get_by_index(0).expect("kind");
+    let head_name: String = row.try_get_by_index(1).expect("head_name");
+    assert_eq!(kind, "cherry_pick");
+    assert_eq!(head_name, "refs/heads/main");
+}
+
+/// A database whose `bisect_state` still carries the OLDEST lazy shape
+/// (before `completed`/`first_parent`/`worktree_id` were ADD COLUMNed) is
+/// normalized on connection open and re-keyed by 2026072301: the newest row
+/// wins, lands in the main scope, and the lazy defaults are filled in.
+#[tokio::test]
+async fn bisect_state_migration_preserves_active_row_from_lazy_shape() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `bisect_state` (
+            `id`             INTEGER PRIMARY KEY AUTOINCREMENT,
+            `orig_head`      TEXT NOT NULL,
+            `orig_head_name` TEXT,
+            `bad`            TEXT,
+            `good`           TEXT NOT NULL,
+            `current`        TEXT,
+            `skipped`        TEXT,
+            `steps`          INTEGER
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("oldest lazy 8-column table");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO bisect_state \
+         (orig_head, orig_head_name, bad, good, current, skipped, steps) \
+         VALUES ('aa11', 'refs/heads/main', 'bb22', '[\"cc33\"]', 'dd44', '[]', 3), \
+                ('ee55', NULL, 'ff66', '[\"aa77\"]', 'bb88', '[]', 2);"
+            .to_string(),
+    ))
+    .await
+    .expect("stale + newest lazy rows");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(column_exists(&conn, "bisect_state", "worktree_id").await);
+    assert!(
+        !column_exists(&conn, "bisect_state", "id").await,
+        "the AUTOINCREMENT id is retired by the worktree_id re-key"
+    );
+    let rows = conn
+        .query_all(Statement::from_string(
+            backend,
+            "SELECT worktree_id, orig_head, completed, first_parent FROM bisect_state".to_string(),
+        ))
+        .await
+        .expect("query migrated rows");
+    assert_eq!(rows.len(), 1, "newest id wins per scope");
+    let worktree_id: String = rows[0].try_get_by_index(0).expect("worktree_id");
+    let orig_head: String = rows[0].try_get_by_index(1).expect("orig_head");
+    let completed: i64 = rows[0].try_get_by_index(2).expect("completed");
+    let first_parent: i64 = rows[0].try_get_by_index(3).expect("first_parent");
+    assert_eq!(
+        worktree_id, "",
+        "pre-existing rows belong to the main scope"
+    );
+    assert_eq!(orig_head, "ee55", "newest lazy row survives");
+    assert_eq!(completed, 0, "lazy-column default filled in");
+    assert_eq!(first_parent, 0, "lazy-column default filled in");
+}
+
+/// A v0.19.34-era lazy shape (worktree_id already ADD COLUMNed, AUTOINCREMENT
+/// id, stale + newest rows in SEVERAL scopes) is re-keyed to exactly one row
+/// per scope — the newest id in each scope wins, linked rows included.
+#[tokio::test]
+async fn bisect_state_migration_keeps_newest_row_per_scope() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `bisect_state` (
+            `id`             INTEGER PRIMARY KEY AUTOINCREMENT,
+            `orig_head`      TEXT NOT NULL,
+            `orig_head_name` TEXT,
+            `bad`            TEXT,
+            `good`           TEXT NOT NULL,
+            `current`        TEXT,
+            `skipped`        TEXT,
+            `steps`          INTEGER,
+            `completed`      INTEGER NOT NULL DEFAULT 0,
+            `first_parent`   INTEGER NOT NULL DEFAULT 0,
+            `worktree_id`    TEXT NOT NULL DEFAULT ''
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("v0.19.34-era lazy full shape");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO bisect_state \
+         (orig_head, good, completed, first_parent, worktree_id) \
+         VALUES ('main-old', '[]', 1, 0, ''), \
+                ('main-new', '[]', 0, 0, ''), \
+                ('wt1-old', '[]', 0, 1, 'wt1'), \
+                ('wt1-new', '[]', 0, 1, 'wt1'), \
+                ('wt2-only', '[]', 0, 0, 'wt2');"
+            .to_string(),
+    ))
+    .await
+    .expect("stale + newest rows across three scopes");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    let rows = conn
+        .query_all(Statement::from_string(
+            backend,
+            "SELECT worktree_id, orig_head FROM bisect_state ORDER BY worktree_id".to_string(),
+        ))
+        .await
+        .expect("query migrated rows");
+    let survivors: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get_by_index(0).expect("worktree_id"),
+                row.try_get_by_index(1).expect("orig_head"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        survivors,
+        vec![
+            ("".to_string(), "main-new".to_string()),
+            ("wt1".to_string(), "wt1-new".to_string()),
+            ("wt2".to_string(), "wt2-only".to_string()),
+        ],
+        "newest id per scope wins; no scope is dropped"
+    );
+}
+
+/// Two runners racing `run_pending` on the same fresh database: the version
+/// claim happens before the up DDL inside each migration's transaction, so
+/// every migration is applied exactly once (RENAME-based rebuilds like
+/// 2026072101/2026072301 are not idempotent and must never run twice) and
+/// both callers finish without error.
+///
+/// The race is FORCED deterministically: both racers rendezvous in the
+/// runner's post-read gate (`run_pending_with_post_read_gate`), i.e. AFTER
+/// each has read the same empty current-version and computed the full
+/// pending list, but BEFORE either has claimed anything. Every subsequent
+/// version claim is therefore contended by construction — under the old
+/// DDL-before-claim order the claim loser re-ran the RENAME rebuilds
+/// against already-rebuilt tables and errored deterministically. The
+/// path intentionally skips the normalize hooks (raw `builtin_runner` on a
+/// fresh database — the rebuild migrations self-provision their input
+/// shape), so nothing outside the gate can serialize the racers.
+/// Three rounds vary the interleaving of the claims themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_run_pending_applies_each_migration_exactly_once() {
+    for round in 0..3 {
+        let (_dir, url, _path) = fresh_db_url();
+        let conn_a = connect(&url).await;
+        let conn_b = connect(&url).await;
+        let runner_a = builtin_runner().expect("builtin runner A");
+        let runner_b = builtin_runner().expect("builtin runner B");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let barrier_a = barrier.clone();
+        let barrier_b = barrier;
+        let race_a = runner_a.run_pending_with_post_read_gate(&conn_a, || async move {
+            barrier_a.wait().await;
+        });
+        let race_b = runner_b.run_pending_with_post_read_gate(&conn_b, || async move {
+            barrier_b.wait().await;
+        });
+        let (applied_a, applied_b) = tokio::join!(race_a, race_b);
+        let applied_a = applied_a.expect("racer A succeeds");
+        let applied_b = applied_b.expect("racer B succeeds");
+
+        // Each version is owned by exactly one racer.
+        let mut all: Vec<i64> = applied_a.iter().chain(applied_b.iter()).copied().collect();
+        all.sort_unstable();
+        let mut deduped = all.clone();
+        deduped.dedup();
+        assert_eq!(all, deduped, "round {round}: no version applied twice");
+
+        // The union covers every registered migration, and the rebuilt
+        // table is in the re-keyed shape exactly once.
+        let runner = builtin_runner().expect("builtin runner");
+        assert_eq!(
+            all.len(),
+            runner.len(),
+            "round {round}: union covers the full registry"
+        );
+        assert!(column_exists(&conn_a, "bisect_state", "worktree_id").await);
+        assert!(!column_exists(&conn_a, "bisect_state", "id").await);
+        assert!(column_exists(&conn_a, "rebase_state", "worktree_id").await);
+    }
+}
+
+/// The 2026072301 down migration FAILS CLOSED while a linked worktree's
+/// bisect row exists; after the linked session is reset, the rollback
+/// succeeds and restores the lazy shape with the main row intact.
+#[tokio::test]
+async fn bisect_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO bisect_state \
+         (worktree_id, orig_head, good, completed, first_parent) \
+         VALUES ('', 'aa11', '[\"bb22\"]', 0, 0), \
+                ('wt1234', 'cc33', '[\"dd44\"]', 0, 1);"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked bisect rows");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026072201)
+        .await
+        .expect_err("rollback with a linked bisect row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    // The re-keyed table survives the refused rollback (txn rolled back).
+    assert!(!column_exists(&conn, "bisect_state", "id").await);
+
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM bisect_state WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("reset the linked bisect");
+    let rolled = runner
+        .rollback_to(&conn, 2026072201)
+        .await
+        .expect("rollback succeeds once only the main row remains");
+    assert_eq!(rolled, vec![2026072301]);
+    assert!(column_exists(&conn, "bisect_state", "id").await);
+    assert!(column_exists(&conn, "bisect_state", "worktree_id").await);
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT orig_head, worktree_id FROM bisect_state".to_string(),
+        ))
+        .await
+        .expect("query restored row")
+        .expect("main row survives the rollback");
+    let orig_head: String = row.try_get_by_index(0).expect("orig_head");
+    let worktree_id: String = row.try_get_by_index(1).expect("worktree_id");
+    assert_eq!(orig_head, "aa11");
+    assert_eq!(worktree_id, "");
 }
 
 // ---------------------------------------------------------------------------

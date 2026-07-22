@@ -4,6 +4,25 @@
 
 ### Changed
 
+- **Sequencer-family DB scope hardening: migration claim-first + formal
+  `bisect_state` re-key (v0.19.44, plan-20260714 Part C §C.4.2, W1
+  close-out)**: two audit-found defects are fixed. (1) The
+  `sequencer_worktree_scope` (2026071901) down migration silently dropped
+  linked-worktree sequence rows on rollback; it now FAILS CLOSED with the
+  same CHECK-guard pattern as 2026072101. (2) `bisect_state` graduates from
+  lazy `ADD COLUMN` scoping to a formal migration (`2026072301`): re-keyed
+  to `worktree_id TEXT PRIMARY KEY` (newest row per scope wins — linked
+  rows shipped since v0.19.34 are preserved), down fails closed on linked
+  rows, and the lazy DDL in `command/bisect.rs` is deleted (`save` becomes
+  a single-statement upsert on the scope key, removing a concurrent-save
+  UNIQUE-violation window). Systemically, `MigrationRunner` now claims the
+  `schema_versions` row BEFORE running up-DDL inside the same transaction
+  (claim-first): a concurrent upgrader that loses the claim skips the DDL
+  entirely, which is what makes non-idempotent RENAME-based rebuilds
+  (2026072101/2026072301) safe under races — previously the loser re-ran
+  them against already-rebuilt tables and errored. A deterministic
+  two-racer regression rides on a new `#[doc(hidden)]` post-read gate seam.
+
 - **PD-08 decision closed: no Git hooks bridge (v0.19.43, plan-20260714
   Part D)**: the opt-in `hooks.gitCompatibility` bridge (plan-20260708 P1-10
   Option B) was evaluated and **declined** — Libra keeps never reading

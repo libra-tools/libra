@@ -5,9 +5,9 @@
 //! ancestor and a known "bad" descendant.
 //!
 //! Persistent state lives in a dedicated `bisect_state` table inside the
-//! repository's SQLite store; the schema is created lazily by
-//! [`BisectState::ensure_bisect_state_table_exists`] and migrated in place
-//! when the `completed` column is missing on older databases.
+//! repository's SQLite store; the schema is owned by the versioned migration
+//! `2026072301_bisect_state_worktree_scope` (one row per worktree,
+//! `worktree_id` primary key — lazy DDL was retired with it).
 //!
 //! Non-obvious responsibilities:
 //! - Detached vs. branch HEAD recovery: `start` records the original branch
@@ -86,7 +86,6 @@ impl BisectState {
     /// the bare-repo guard and by `start` to refuse re-entry.
     pub async fn is_in_progress() -> Result<bool, String> {
         let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
         Self::has_active_state_in_db(&db).await
     }
 
@@ -94,19 +93,17 @@ impl BisectState {
     /// state was preserved for `bisect reset`.
     pub async fn has_state() -> Result<bool, String> {
         let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
         Self::has_any_state_in_db(&db).await
     }
 
-    /// Persist `self` as the single row in `bisect_state`.
+    /// Persist `self` as THIS worktree's single row in `bisect_state`.
     ///
     /// Boundary conditions:
-    /// - Wipes any pre-existing row first (the table is always single-row),
-    ///   so concurrent writers race for last-writer-wins semantics.
+    /// - Upserts on the `worktree_id` primary key in one statement, so
+    ///   concurrent writers in the same worktree get last-writer-wins
+    ///   semantics instead of one of them hitting a UNIQUE violation.
     pub async fn save(&self) -> Result<(), String> {
         let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
-        Self::clear_state_in_db(&db).await?;
         Self::save_with_conn(&db, self).await
     }
 
@@ -117,7 +114,6 @@ impl BisectState {
     ///   propagates as a fatal CLI error in every caller.
     pub async fn load() -> Result<Self, String> {
         let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
         Self::load_from_db(&db)
             .await?
             .ok_or_else(|| "No bisect in progress".to_string())
@@ -126,162 +122,7 @@ impl BisectState {
     /// Drop the bisect state row. Idempotent on an empty table.
     pub async fn cleanup() -> Result<(), String> {
         let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
         Self::clear_state_in_db(&db).await
-    }
-
-    /// Lazy DDL: ensure the `bisect_state` table exists and has the
-    /// `completed` column.
-    ///
-    /// Functional scope:
-    /// - Creates the table with `CREATE TABLE IF NOT EXISTS`.
-    /// - Inspects `pragma_table_info` to detect older schemas missing the
-    ///   `completed` column and adds it via `ALTER TABLE`.
-    ///
-    /// Boundary conditions:
-    /// - Concurrent migrations are tolerated: if `ALTER TABLE` fails with
-    ///   `"duplicate column name"` because another process won the race, the
-    ///   error is swallowed and the function returns `Ok(())`.
-    /// - Any other DDL failure is bubbled up as a `String` error.
-    async fn ensure_bisect_state_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        // Use IF NOT EXISTS for idempotency (handles concurrent creation)
-        let create_table_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                CREATE TABLE IF NOT EXISTS bisect_state (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    orig_head    TEXT NOT NULL,
-                    orig_head_name TEXT,
-                    bad          TEXT,
-                    good         TEXT NOT NULL,
-                    current      TEXT,
-                    skipped      TEXT,
-                    steps        INTEGER,
-                    completed    INTEGER NOT NULL DEFAULT 0,
-                    first_parent INTEGER NOT NULL DEFAULT 0
-                );
-            "#
-            .to_string(),
-        );
-
-        db.execute(create_table_stmt)
-            .await
-            .map_err(|e| format!("failed to create bisect_state table: {e}"))?;
-
-        // Check if completed column exists (migration for older tables without it)
-        let check_column_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                SELECT COUNT(*)
-                FROM pragma_table_info('bisect_state')
-                WHERE name='completed';
-            "#
-            .to_string(),
-        );
-
-        if let Some(result) = db
-            .query_one(check_column_stmt)
-            .await
-            .map_err(|e| format!("failed to check bisect_state columns: {e}"))?
-        {
-            let count: i64 = result.try_get_by_index(0).unwrap_or(0);
-            if count == 0 {
-                // completed column doesn't exist - add it
-                let alter_stmt = Statement::from_string(
-                    DbBackend::Sqlite,
-                    "ALTER TABLE bisect_state ADD COLUMN completed INTEGER NOT NULL DEFAULT 0;"
-                        .to_string(),
-                );
-
-                // Handle concurrent migration: if another process already added the column,
-                // SQLite returns "duplicate column name" error which we should treat as success
-                match db.execute(alter_stmt).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("duplicate column name") {
-                            return Err(format!("failed to add completed column: {e}"));
-                        }
-                        // Column already exists (added by concurrent process) - continue
-                    }
-                }
-            }
-        }
-
-        // Check if first_parent column exists (migration for older tables without it)
-        let check_first_parent_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                SELECT COUNT(*)
-                FROM pragma_table_info('bisect_state')
-                WHERE name='first_parent';
-            "#
-            .to_string(),
-        );
-
-        if let Some(result) = db
-            .query_one(check_first_parent_stmt)
-            .await
-            .map_err(|e| format!("failed to check bisect_state columns: {e}"))?
-        {
-            let count: i64 = result.try_get_by_index(0).unwrap_or(0);
-            if count == 0 {
-                let alter_stmt = Statement::from_string(
-                    DbBackend::Sqlite,
-                    "ALTER TABLE bisect_state ADD COLUMN first_parent INTEGER NOT NULL DEFAULT 0;"
-                        .to_string(),
-                );
-                match db.execute(alter_stmt).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("duplicate column name") {
-                            return Err(format!("failed to add first_parent column: {e}"));
-                        }
-                        // Column already exists (added by concurrent process) - continue
-                    }
-                }
-            }
-        }
-
-        // Part C W1 (§C.4.2): `worktree_id` scopes the bisect to the worktree
-        // that started it (empty string = main). Added by plain `ADD COLUMN`
-        // (not a table rebuild) so it works regardless of which of the lazily
-        // added columns above already exist. Existing rows belong to main
-        // (`''`), and each worktree keeps its own single bisect row.
-        let check_worktree_id_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                SELECT COUNT(*)
-                FROM pragma_table_info('bisect_state')
-                WHERE name='worktree_id';
-            "#
-            .to_string(),
-        );
-        if let Some(result) = db
-            .query_one(check_worktree_id_stmt)
-            .await
-            .map_err(|e| format!("failed to check bisect_state columns: {e}"))?
-        {
-            let count: i64 = result.try_get_by_index(0).unwrap_or(0);
-            if count == 0 {
-                let alter_stmt = Statement::from_string(
-                    DbBackend::Sqlite,
-                    "ALTER TABLE bisect_state ADD COLUMN worktree_id TEXT NOT NULL DEFAULT '';"
-                        .to_string(),
-                );
-                match db.execute(alter_stmt).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if !e.to_string().contains("duplicate column name") {
-                            return Err(format!("failed to add worktree_id column: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// This worktree's scope key for `bisect_state` (`""` = main worktree).
@@ -335,8 +176,8 @@ impl BisectState {
         Ok(false)
     }
 
-    /// Insert `state` into `bisect_state`. Vector fields are JSON-encoded.
-    /// Caller is responsible for clearing any existing row first.
+    /// Upsert `state` as this scope's `bisect_state` row (conflict target:
+    /// the `worktree_id` primary key). Vector fields are JSON-encoded.
     async fn save_with_conn<C: ConnectionTrait>(db: &C, state: &BisectState) -> Result<(), String> {
         let good_json = serde_json::to_string(&state.good)
             .map_err(|e| format!("failed to serialize good commits: {e}"))?;
@@ -347,7 +188,17 @@ impl BisectState {
             DbBackend::Sqlite,
             r#"
                 INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent, worktree_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(worktree_id) DO UPDATE SET
+                    orig_head = excluded.orig_head,
+                    orig_head_name = excluded.orig_head_name,
+                    bad = excluded.bad,
+                    good = excluded.good,
+                    current = excluded.current,
+                    skipped = excluded.skipped,
+                    steps = excluded.steps,
+                    completed = excluded.completed,
+                    first_parent = excluded.first_parent;
             "#,
             [
                 state.orig_head.to_string().into(),
@@ -444,7 +295,7 @@ impl BisectState {
     }
 
     /// Truncate THIS worktree's bisect-state row (Part C W1 §C.4.2). Used by
-    /// both `save` (before insert) and `cleanup` (after a session ends). Never
+    /// `cleanup` after a session ends (`save` upserts in place instead). Never
     /// an unconditional `DELETE`, which would wipe another worktree's bisect.
     async fn clear_state_in_db<C: ConnectionTrait>(db: &C) -> Result<(), String> {
         let stmt = Statement::from_sql_and_values(

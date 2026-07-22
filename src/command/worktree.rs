@@ -925,8 +925,9 @@ async fn gc_worktree_scoped_rows(worktree_id: &str) {
         "DELETE FROM sequence_state WHERE worktree_id = ?",
         "DELETE FROM rebase_state WHERE worktree_id = ?",
     ];
-    // `bisect_state` is created lazily on first bisect use — only purge when
-    // the table exists (a DELETE on a missing table would log a spurious warn).
+    // `bisect_state` is owned by migration `2026072301`, but bare or
+    // pre-migration test databases may still lack it — only purge when the
+    // table exists (a DELETE on a missing table would log a spurious warn).
     let has_bisect_table = db
         .query_one(Statement::from_string(
             DbBackend::Sqlite,

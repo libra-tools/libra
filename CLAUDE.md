@@ -184,7 +184,7 @@ SQLite database at `.libra/libra.db` — inspect the concrete table set in the b
 
 Bootstrap files: `sql/sqlite_20260309_init.sql` (core + AI baseline) and `sql/sqlite_20260415_ai_runtime_contract.sql` (runtime-contract extension).
 
-**Versioned migrations** live under `sql/migrations/` and are applied by `internal::db::migration::MigrationRunner`. Filenames follow `YYYYMMDDNN_<snake_case_name>.sql` (forward) with optional matching `*_down.sql` (rollback). Forward DDL must be idempotent (`CREATE TABLE IF NOT EXISTS …`). See `sql/migrations/README.md`.
+**Versioned migrations** live under `sql/migrations/` and are applied by `internal::db::migration::MigrationRunner`. Filenames follow `YYYYMMDDNN_<snake_case_name>.sql` (forward) with optional matching `*_down.sql` (rollback). Forward DDL should be idempotent (`CREATE TABLE IF NOT EXISTS …`); RENAME-based rebuilds are the exception — the runner's claim-first transaction guarantees single application. See `sql/migrations/README.md`.
 
 The publish Worker uses its own D1 schema in `sql/publish/` (`0001_publish.sql`, `0002_publish_digest_check.sql`, `0003_publish_max_preview_trigger_replace.sql`, `0004_publish_refs_index.sql`).
 

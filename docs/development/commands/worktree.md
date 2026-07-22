@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra worktree` 的目标是管理同一仓库状态的附加工作目录。实现需要明确 Libra worktree 的隔离布局：多个 worktree 共享同一个 `.libra` SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但每个 linked worktree 拥有自己真实的 `.libra` gitdir（本地目录，非 symlink），保存私有 HEAD、index 和 HEAD reflog，并记录 `commondir` 指针与稳定 `worktree_id`；sequencer/merge/rebase 等 mutable 状态目前对 linked worktree 仍拒绝（W1/W2 落地前）。由更早版本创建的 worktree 可能仍是旧共享 `.libra` symlink 布局。remove 默认保留磁盘目录，只有 `--delete-dir` 执行 Git 风格删除。
+`libra worktree` 的目标是管理同一仓库状态的附加工作目录。实现需要明确 Libra worktree 的隔离布局：多个 worktree 共享同一个 `.libra` SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但每个 linked worktree 拥有自己真实的 `.libra` gitdir（本地目录，非 symlink），保存私有 HEAD、index 和 HEAD reflog，并记录 `commondir` 指针与稳定 `worktree_id`；sequencer 家族（cherry-pick/am/revert/merge/bisect/rebase）自 W1（v0.19.42）起在 linked worktree 以 per-worktree DB scope 运行，`bisect_state` 的 lazy DDL 已由正式迁移 `2026072301` 收编；stash/layer/sparse-view/dirty 等 advisory 状态仍拒绝（W2 落地前）。由更早版本创建的 worktree 可能仍是旧共享 `.libra` symlink 布局。remove 默认保留磁盘目录，只有 `--delete-dir` 执行 Git 风格删除。
 
 ## 对比 Git 与兼容性
 

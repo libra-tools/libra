@@ -1263,7 +1263,7 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 | DR-05/M4 import tombstone | `agent_import_identity` + `agent_import_tombstone` + anti-resurrection triggers | 删除传播待建 | identity 可在测试中 down；tombstone 仅在表为空时可 down，已有 erase 记录则事务性拒绝，必须前滚 | empty up/down/up + non-empty rollback refusal |
 | AG-24a audit | 新增 `agent_audit_log` append-only 表 | D1 mirror 已生效；不可变 audit 摘要同步待建 | down 不得删除审计数据；只能停止新写入 | raw export 写 audit；clean/GC 不删 audit |
 
-Forward DDL 必须 idempotent；每个 forward migration 如有 `_down.sql`，不得删除用户 transcript/checkpoint/audit 数据。涉及 `agent_session`、`agent_checkpoint`、`agent_usage_stats` 行 shape 的变更必须 bump DB row `schema_version` 并提供 backfill SQL；external JSON `schema_version` 与 RPC `protocol_version` 不随 DB migration 自动变化。
+Forward DDL 默认必须 idempotent（RENAME-rebuild 例外由 runner 的 claim-first 事务保证单次执行，见 `sql/migrations/README.md`）；每个 forward migration 如有 `_down.sql`，不得删除用户 transcript/checkpoint/audit 数据。涉及 `agent_session`、`agent_checkpoint`、`agent_usage_stats` 行 shape 的变更必须 bump DB row `schema_version` 并提供 backfill SQL；external JSON `schema_version` 与 RPC `protocol_version` 不随 DB migration 自动变化。
 
 #### 4. 稳定错误码语义目录（E10）
 
