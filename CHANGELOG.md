@@ -4,6 +4,20 @@
 
 ### Changed
 
+- **`status` structured warnings + warning-over-dirty exit arbitration
+  (v0.19.47, plan-20260714 Part B §B.5, R0-8a)**: rename-engine degradations
+  are no longer silently dropped — `rename_limit_product_skipped` and
+  `similarity_budget_exceeded` surface as structured `StatusWarning`s
+  (snake_case-pinned `code`/`source`). Human/short/porcelain print them as
+  `warning: …` on stderr (even under `--quiet`); `--json` carries them in a
+  new top-level `data.warnings[]` and never touches stderr. Every
+  `--exit-code` return point now arbitrates locally: with the global
+  `--exit-code-on-warning`, warnings exit 9 and beat the dirty exit 1 —
+  previously the early `silent_exit(1)` preempted the top-level exit-9 pass
+  entirely. Guards: `json_warnings_schema_snapshot`,
+  `rename_limit_warning_exit_nine_over_dirty`. Remaining for R0-8b:
+  dirty-cache warning mapping onto the same schema plus fault injection.
+
 - **`status` unstaged rename detection now matches Git's default; `RM`/`RD`
   combined records (v0.19.46, plan-20260714 Part B §B.3.1)**: every unstaged
   "new" path is by definition untracked, and Git never consumes untracked

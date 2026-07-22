@@ -671,3 +671,175 @@ fn staged_rename_then_delete_emits_rd() {
         "mW is zero for a deleted destination: {record}"
     );
 }
+
+// ── R0-8a: structured warnings + 9≻1 exit arbitration (§B.5) ────────────────
+
+/// Serialization names of the warning schema are pinned (§B.5): `code` and
+/// `source` serialize in snake_case exactly as documented.
+#[test]
+fn json_warnings_schema_snapshot() {
+    let warning = libra::command::status::StatusWarning {
+        code: libra::command::status::StatusWarningCode::RenameLimitProductSkipped,
+        message: "m".to_string(),
+        source: libra::command::status::StatusWarningSource::RenameDetect,
+    };
+    let value = serde_json::to_value(&warning).expect("serialize warning");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "code": "rename_limit_product_skipped",
+            "message": "m",
+            "source": "rename_detect",
+        }),
+        "full object shape is pinned"
+    );
+    let budget =
+        serde_json::to_value(libra::command::status::StatusWarningCode::SimilarityBudgetExceeded)
+            .expect("serialize code");
+    assert_eq!(budget, "similarity_budget_exceeded");
+}
+
+/// Exceeding the per-side rename limit (1000) degrades the inexact pass with
+/// a structured warning; with `--exit-code-on-warning` the warning exit 9
+/// beats the `--exit-code` dirty exit 1 in text AND JSON modes, and JSON
+/// carries the warning in `data.warnings[]` with no stderr line.
+#[test]
+fn rename_limit_warning_exit_nine_over_dirty() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    for i in 0..1001 {
+        fs::write(repo.path().join(format!("f{i}.txt")), format!("base {i}\n")).unwrap();
+    }
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage base files");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit base files");
+    for i in 0..1001 {
+        fs::remove_file(repo.path().join(format!("f{i}.txt"))).unwrap();
+        fs::write(
+            repo.path().join(format!("g{i}.txt")),
+            format!("completely different payload {i}\n"),
+        )
+        .unwrap();
+    }
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage mass rename");
+
+    // Text mode: warning on stderr; exit 9 beats dirty 1.
+    let text = run_libra_command(
+        &["--exit-code-on-warning", "status", "--exit-code"],
+        repo.path(),
+    );
+    assert_eq!(
+        text.status.code(),
+        Some(9),
+        "text: warning exit 9 over dirty 1"
+    );
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("renameLimit"),
+        "text stderr carries the structured warning: {stderr}"
+    );
+
+    // JSON mode: warnings ride in data.warnings[], stderr stays clean, and
+    // the same silent exit 9 wins.
+    let json = run_libra_command(
+        &["--json", "--exit-code-on-warning", "status", "--exit-code"],
+        repo.path(),
+    );
+    assert_eq!(
+        json.status.code(),
+        Some(9),
+        "json: warning exit 9 over dirty 1"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json.stdout)).expect("json envelope");
+    let warnings = doc["data"]["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "rename_limit_product_skipped"),
+        "json data.warnings carries the code: {doc}"
+    );
+    assert!(
+        json.stderr.is_empty(),
+        "json mode keeps stderr completely empty: {:?}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+
+    // Without --exit-code-on-warning the dirty exit 1 still applies.
+    let plain = run_libra_command(&["status", "--exit-code"], repo.path());
+    assert_eq!(
+        plain.status.code(),
+        Some(1),
+        "dirty exit stays 1 without on-warning"
+    );
+
+    // --quiet suppresses the body but never the diagnostics; 9 still wins.
+    let quiet = run_libra_command(
+        &["--quiet", "--exit-code-on-warning", "status", "--exit-code"],
+        repo.path(),
+    );
+    assert_eq!(quiet.status.code(), Some(9), "quiet: warning exit 9");
+    assert!(
+        String::from_utf8_lossy(&quiet.stderr).contains("warning:"),
+        "quiet keeps stderr diagnostics"
+    );
+
+    // --scan runs the same collection: delivery + arbitration hold there too.
+    let scan = run_libra_command(
+        &["--exit-code-on-warning", "status", "--scan", "--exit-code"],
+        repo.path(),
+    );
+    assert_eq!(scan.status.code(), Some(9), "scan path: warning exit 9");
+    assert!(
+        String::from_utf8_lossy(&scan.stderr).contains("warning:"),
+        "scan path delivers stderr warnings"
+    );
+}
+
+/// Exceeding the similarity-comparison budget surfaces
+/// `similarity_budget_exceeded` end to end: 750 deleted paths sharing one
+/// blob OID × 750 added paths sharing another are only TWO object reads
+/// (per-OID caching) but 562k inexact comparisons > the 500k budget.
+#[test]
+fn similarity_budget_warning() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    for i in 0..750 {
+        fs::write(
+            repo.path().join(format!("old{i}.txt")),
+            "shared alpha payload with enough content to hash\n",
+        )
+        .unwrap();
+    }
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage base");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit base");
+    for i in 0..750 {
+        fs::remove_file(repo.path().join(format!("old{i}.txt"))).unwrap();
+        fs::write(
+            repo.path().join(format!("zz{i}.dat")),
+            "shared omega payload with enough content to hash\n",
+        )
+        .unwrap();
+    }
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage churn");
+
+    let json = run_libra_command(&["--json", "status"], repo.path());
+    assert_cli_success(&json, "json status");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json.stdout)).expect("envelope");
+    assert!(
+        doc["data"]["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|w| w["code"] == "similarity_budget_exceeded"),
+        "budget exhaustion surfaces end to end: {doc}"
+    );
+}

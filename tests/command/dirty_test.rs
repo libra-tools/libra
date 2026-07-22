@@ -117,6 +117,36 @@ fn dirty_cache_status_modes_honor_pathspec_filters() {
     );
 }
 
+/// §B.5 rule 2: the stale-cache fallback's legacy warning must exit 9 under
+/// `--exit-code-on-warning`, beating the `--exit-code` dirty exit 1 (the
+/// warning rides the global tracker until its R0-8b structured mapping).
+#[test]
+fn cache_stale_fallback_warning_exit_nine_over_dirty() {
+    let repo = dirty_repo();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["status", "--scan"], p), "scan");
+    fs::write(p.join("f.txt"), "two\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add");
+    let fallback = run_libra_command(
+        &[
+            "--exit-code-on-warning",
+            "status",
+            "--cached",
+            "--exit-code",
+        ],
+        p,
+    );
+    assert_eq!(
+        fallback.status.code(),
+        Some(9),
+        "stale-fallback warning exits 9 before the dirty exit 1"
+    );
+    assert!(
+        String::from_utf8_lossy(&fallback.stderr).contains("--scan"),
+        "fallback hint still delivered on stderr"
+    );
+}
+
 #[test]
 fn dirty_cache_invalidated_by_index_write() {
     let repo = dirty_repo();

@@ -9,6 +9,7 @@
 
 pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "chain_rename_default_untracked_d_and_question",
+    "json_warnings_schema_snapshot",
     "pathspec_old_only_new_only_matrix",
     "porcelain_v1_rename_output_stays_add_delete",
     "porcelain_v1_uses_rename_arrow_when_detected",
@@ -19,11 +20,13 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "rename_from_subdirectory_detected",
     "rename_inexact_content_change_detected",
     "rename_json_includes_score_and_side",
+    "rename_limit_warning_exit_nine_over_dirty",
     "rename_no_renames_flag_splits_add_delete",
     "rename_porcelain_v2_emits_rename_record",
     "rename_short_format_uses_arrow",
     "rename_untracked_config_cascade",
     "resolved_conflict_with_stage0_emits_no_u_line",
+    "similarity_budget_warning",
     "staged_rename_then_delete_emits_rd",
     "staged_rename_then_modify_emits_rm",
     "tracked_unreadable_path_fails_closed_not_deleted",

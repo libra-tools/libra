@@ -123,6 +123,11 @@ libra status --find-renames
 libra status --find-renames=75
 ```
 
+### 警告与退出码仲裁
+
+rename 引擎降级以结构化警告呈现：`rename_limit_product_skipped`（单侧超过 per-side 上限，跳过 inexact 匹配）与 `similarity_budget_exceeded`（inexact 阶段被丢弃），source 均为 `rename_detect`。human/short/porcelain 模式在 stderr 打印 `warning: …`（`--quiet` 也不抑制诊断）；`--json` 把它们放入 `data.warnings[]`（`{code, message, source}`），绝不写 stderr。开启全局 `--exit-code-on-warning` 时，警告以退出码 9 优先于 `--exit-code` 的 dirty 退出码 1，覆盖所有输出模式。
+
+
 ### `--renames` / `--no-renames`
 
 切换 rename 检测。`--renames` 以默认（或 `--find-renames` 给出的）阈值启用它；`--no-renames` 禁用它，并覆盖 `--renames`/`--find-renames`、`status.renames` 与默认开启行为。`status.renames` 配置（回退到 `diff.renames`）经严格 local → global → system 级联设置默认：`false` 禁用检测，truthy 值或未设置则以 50% 启用。`copy`/`copies` 被拒绝（尚不支持 copy 检测），不会降级为普通 rename。非法值在任何输出前以 `LBR-CLI-002` fail-closed。Libra dirty-cache 扩展（`--cached`/`--check-dirty`）不运行 rename 检测。

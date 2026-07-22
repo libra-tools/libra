@@ -234,6 +234,34 @@ struct StatusConfigExtras {
     rename_untracked: bool,
 }
 
+/// Structured status degradation warning (§B.5; reused verbatim by the JSON
+/// `data.warnings[]` array). Human/short/porcelain modes render these on
+/// stderr; JSON never writes them to stderr.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct StatusWarning {
+    pub code: StatusWarningCode,
+    pub message: String,
+    pub source: StatusWarningSource,
+}
+
+/// Stable warning codes (§B.5). Serialization names are pinned by
+/// `json_warnings_schema_snapshot`.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusWarningCode {
+    SimilarityBudgetExceeded,
+    RenameLimitProductSkipped,
+}
+
+/// Which subsystem produced a warning (§B.5).
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusWarningSource {
+    RenameDetect,
+}
+
 /// Resolve the Git-compatible `status.*` config defaults (plan-20260708
 /// P1-05d): `status.showUntrackedFiles`, `status.short`, `status.branch`,
 /// `status.showStash`, `status.relativePaths`, plus the rename keys
@@ -558,6 +586,10 @@ struct StatusData {
     /// Score/exactness per unstaged rename pair (only populated under
     /// `status.renameUntracked=true`).
     unstaged_rename_details: RenameDetails,
+    /// Structured degradation warnings collected during data assembly
+    /// (§B.5): rename-engine budget/limit downgrades. Rendered per the
+    /// delivery matrix by the callers.
+    warnings: Vec<StatusWarning>,
 }
 
 /// Human advisory for a non-merge sequence in progress (read-only detection).
@@ -680,6 +712,7 @@ async fn collect_status_data(
     // extension (§B.3.1; Git default: a tracked→untracked move is `D` + `??`).
     let mut staged_rename_details: RenameDetails = HashMap::new();
     let mut unstaged_rename_details: RenameDetails = HashMap::new();
+    let mut warnings: Vec<StatusWarning> = Vec::new();
     if let Some(percent) = rename_percent
         && percent > 0
     {
@@ -703,6 +736,7 @@ async fn collect_status_data(
             RenameBlobSide::Known(&head_blobs),
             RenameBlobSide::Known(&index_blobs),
             &mut staged_rename_details,
+            &mut warnings,
         );
         // §B.3.1 Git default: unstaged "new" entries are untracked paths,
         // which may only be consumed as rename destinations under the
@@ -715,6 +749,7 @@ async fn collect_status_data(
                 RenameBlobSide::Known(&index_blobs),
                 RenameBlobSide::Worktree,
                 &mut unstaged_rename_details,
+                &mut warnings,
             );
         }
     }
@@ -782,6 +817,7 @@ async fn collect_status_data(
         porcelain_v2,
         staged_rename_details,
         unstaged_rename_details,
+        warnings,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
     Ok(data)
@@ -979,12 +1015,37 @@ type RenameDetails = HashMap<(PathBuf, PathBuf), (u32, bool)>;
 /// `changes.renamed` and pruned from `deleted`/`new`; each pair's score and
 /// exactness are added to `details`. Paths keep the change list's original
 /// base for display; detection runs on repo-relative keys.
+/// Map rename-engine degradation stats onto structured warnings (§B.5).
+/// Split out so the seam is unit-testable independent of read budgets.
+fn warnings_from_rename_stats(
+    stats: &rename_detect::RenameDetectStats,
+    warnings: &mut Vec<StatusWarning>,
+) {
+    if stats.skipped_by_limit {
+        warnings.push(StatusWarning {
+            code: StatusWarningCode::RenameLimitProductSkipped,
+            message: "rename detection skipped inexact matching: too many candidates on one side (renameLimit)".to_string(),
+            source: StatusWarningSource::RenameDetect,
+        });
+    }
+    if stats.exhaustive_discarded {
+        warnings.push(StatusWarning {
+            code: StatusWarningCode::SimilarityBudgetExceeded,
+            message:
+                "rename detection discarded the inexact pass: similarity comparison budget exceeded"
+                    .to_string(),
+            source: StatusWarningSource::RenameDetect,
+        });
+    }
+}
+
 fn detect_renames_in_changes(
     changes: &mut Changes,
     config: &rename_detect::RenameDetectConfig,
     old_side: RenameBlobSide<'_>,
     new_side: RenameBlobSide<'_>,
     details: &mut RenameDetails,
+    warnings: &mut Vec<StatusWarning>,
 ) {
     if changes.deleted.is_empty() || changes.new.is_empty() {
         return;
@@ -1000,6 +1061,7 @@ fn detect_renames_in_changes(
         worktree: rename_detect::WorktreeReadBudget::with_defaults(),
     };
     let outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    warnings_from_rename_stats(&outcome.stats, warnings);
     if outcome.matches.is_empty() {
         return;
     }
@@ -1169,11 +1231,22 @@ pub async fn execute_safe(mut args: StatusArgs, output: &OutputConfig) -> CliRes
     if output.is_json() {
         let json_data = build_status_json(&data, &args);
         emit_json_data("status", &json_data, output)?;
-    } else if !output.quiet {
-        let mut stdout = std::io::stdout();
-        render_status_to_writer(&data, &args, output, &mut stdout).await?;
+    } else {
+        // §B.5 delivery matrix: stderr warnings even under `--quiet`
+        // (quiet suppresses the body, never diagnostics).
+        deliver_warnings_stderr(&data.warnings);
+        if !output.quiet {
+            let mut stdout = std::io::stdout();
+            render_status_to_writer(&data, &args, output, &mut stdout).await?;
+        }
     }
 
+    // §B.5 exit arbitration: warnings + --exit-code-on-warning (9) beats
+    // the --exit-code dirty exit (1); JSON gets the same silent 9 without a
+    // second stderr envelope.
+    if let Some(exit) = warning_exit(output, &data.warnings) {
+        return Err(exit);
+    }
     // --exit-code: dirty → exit 1 (silent; do not emit an error line)
     if args.exit_code && data.is_dirty() {
         return Err(CliError::silent_exit(1));
@@ -1341,10 +1414,16 @@ async fn run_status_scan_locked(
         json_data["mode"] = serde_json::json!("scan");
         json_data["cached_paths"] = serde_json::json!(row_count);
         emit_json_data("status", &json_data, output)?;
-    } else if !output.quiet {
-        let mut stdout = std::io::stdout();
-        render_status_to_writer(&data, args, output, &mut stdout).await?;
-        println!("dirty cache rebuilt ({row_count} paths)");
+    } else {
+        deliver_warnings_stderr(&data.warnings);
+        if !output.quiet {
+            let mut stdout = std::io::stdout();
+            render_status_to_writer(&data, args, output, &mut stdout).await?;
+            println!("dirty cache rebuilt ({row_count} paths)");
+        }
+    }
+    if let Some(exit) = warning_exit(output, &data.warnings) {
+        return Err(exit);
     }
     if args.exit_code && data.is_dirty() {
         return Err(CliError::silent_exit(1));
@@ -1424,9 +1503,15 @@ async fn run_status_cache_mode(
             json_data["freshness"] = serde_json::json!("full");
             json_data["cache_state"] = serde_json::json!(state.as_str());
             emit_json_data("status", &json_data, output)?;
-        } else if !output.quiet {
-            let mut stdout = std::io::stdout();
-            render_status_to_writer(&data, args, output, &mut stdout).await?;
+        } else {
+            deliver_warnings_stderr(&data.warnings);
+            if !output.quiet {
+                let mut stdout = std::io::stdout();
+                render_status_to_writer(&data, args, output, &mut stdout).await?;
+            }
+        }
+        if let Some(exit) = warning_exit(output, &data.warnings) {
+            return Err(exit);
         }
         if args.exit_code && data.is_dirty() {
             return Err(CliError::silent_exit(1));
@@ -1550,9 +1635,15 @@ async fn run_status_cache_mode(
             json_data["freshness"] = serde_json::json!("full");
             json_data["cache_state"] = serde_json::json!("stale");
             emit_json_data("status", &json_data, output)?;
-        } else if !output.quiet {
-            let mut stdout = std::io::stdout();
-            render_status_to_writer(&data, args, output, &mut stdout).await?;
+        } else {
+            deliver_warnings_stderr(&data.warnings);
+            if !output.quiet {
+                let mut stdout = std::io::stdout();
+                render_status_to_writer(&data, args, output, &mut stdout).await?;
+            }
+        }
+        if let Some(exit) = warning_exit(output, &data.warnings) {
+            return Err(exit);
         }
         if args.exit_code && data.is_dirty() {
             return Err(CliError::silent_exit(1));
@@ -1631,6 +1722,7 @@ async fn run_status_cache_mode(
         porcelain_v2: None,
         staged_rename_details: RenameDetails::new(),
         unstaged_rename_details: RenameDetails::new(),
+        warnings: Vec::new(),
     };
     filter_status_data_by_pathspec(&mut data, args)?;
 
@@ -1661,6 +1753,9 @@ async fn run_status_cache_mode(
             );
         }
     }
+    if let Some(exit) = warning_exit(output, &data.warnings) {
+        return Err(exit);
+    }
     if args.exit_code && data.is_dirty() {
         return Err(CliError::silent_exit(1));
     }
@@ -1690,6 +1785,7 @@ pub(crate) async fn execute_to_resolved(
     // second (potentially inconsistent) read ever happens here.
     let ResolvedStatusArgs { args, extras } = resolved;
     let data = collect_status_data(&args, extras).await?;
+    deliver_warnings_stderr(&data.warnings);
     let output = OutputConfig::default();
     render_status_to_writer(&data, &args, &output, writer).await
 }
@@ -2291,6 +2387,30 @@ fn render_upstream_human(upstream: &UpstreamInfo, buffer: &mut Vec<u8>) -> CliRe
 // JSON rendering
 // ---------------------------------------------------------------------------
 
+/// Render collected warnings to stderr (`warning: …`) and mark the global
+/// warning tracker — human/short/porcelain delivery only (§B.5 matrix).
+/// JSON callers must NOT use this: their warnings ride in `data.warnings[]`.
+fn deliver_warnings_stderr(warnings: &[StatusWarning]) {
+    for warning in warnings {
+        eprintln!("warning: {}", warning.message);
+    }
+    if !warnings.is_empty() {
+        crate::utils::output::record_warning();
+    }
+}
+
+/// §B.5 exit arbitration, rule 2: warnings + `--exit-code-on-warning` exit 9
+/// and take precedence over the dirty exit 1. Local to each return point
+/// because an early `silent_exit(1)` would otherwise preempt the top-level
+/// exit-9 pass in `cli.rs` (and JSON never records globally).
+fn warning_exit(output: &OutputConfig, warnings: &[StatusWarning]) -> Option<CliError> {
+    // Legacy `emit_warning` paths (dirty-cache fallbacks, pending their
+    // R0-8b structured mapping) only mark the global tracker — honor it too,
+    // so no warning can be preempted by the dirty exit 1.
+    let any = !warnings.is_empty() || crate::utils::output::warning_was_emitted();
+    (output.exit_code_on_warning && any).then(|| CliError::silent_exit(9))
+}
+
 fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value {
     let paths_to_json = |paths: &[PathBuf]| -> Vec<serde_json::Value> {
         paths
@@ -2375,6 +2495,7 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
         ),
         "untracked": paths_to_json(&data.unstaged.new),
         "ignored": paths_to_json(&data.ignored_files),
+        "warnings": data.warnings,
         "renames": renames,
         "is_clean": !data.is_dirty(),
     });
@@ -4032,5 +4153,33 @@ mod test {
         );
 
         reset_db_conn_instance_for_path(&db_path).await;
+    }
+
+    /// §B.5 seam: engine degradation stats map onto both structured warning
+    /// codes (the end-to-end similarity path is covered by
+    /// `similarity_budget_warning`; this pins the mapping in isolation).
+    #[test]
+    fn rename_stats_map_to_structured_warnings() {
+        let stats = rename_detect::RenameDetectStats {
+            skipped_by_limit: true,
+            exhaustive_discarded: true,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+        warnings_from_rename_stats(&stats, &mut warnings);
+        assert_eq!(warnings.len(), 2);
+        assert!(matches!(
+            warnings[0].code,
+            StatusWarningCode::RenameLimitProductSkipped
+        ));
+        assert!(matches!(
+            warnings[1].code,
+            StatusWarningCode::SimilarityBudgetExceeded
+        ));
+        assert!(
+            warnings
+                .iter()
+                .all(|w| matches!(w.source, StatusWarningSource::RenameDetect))
+        );
     }
 }

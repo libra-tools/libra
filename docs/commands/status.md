@@ -203,6 +203,17 @@ libra status --find-renames
 libra status --find-renames=75
 ```
 
+### Warnings and exit arbitration
+
+Rename-engine degradations surface as structured warnings: `rename_limit_product_skipped`
+(one side exceeded the per-side rename limit, inexact matching skipped) and
+`similarity_budget_exceeded` (inexact pass discarded), both with source `rename_detect`.
+Human/short/porcelain modes print them as `warning: …` on stderr (even under `--quiet`);
+`--json` carries them in `data.warnings[]` (`{code, message, source}`) and never writes them
+to stderr. With the global `--exit-code-on-warning`, a warning exits 9 and takes precedence
+over the `--exit-code` dirty exit 1 in every output mode.
+
+
 ### `--renames` / `--no-renames`
 
 Toggle rename detection. `--renames` enables it at the default (or `--find-renames`)
