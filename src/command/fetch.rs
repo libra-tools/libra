@@ -835,7 +835,7 @@ pub enum FetchError {
     #[error("fetch destination update rejected: {message}")]
     RefUpdateRejected { message: String },
     #[error(
-        "local Libra remotes do not support --depth yet because they cannot advertise shallow boundaries"
+        "local Libra remotes do not support --depth: they cannot advertise shallow boundaries (declined by design, register D20)"
     )]
     UnsupportedShallowLocalLibra,
     #[error("failed to inspect local repository state: {message}")]

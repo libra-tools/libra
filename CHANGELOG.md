@@ -4,6 +4,20 @@
 
 ### Changed
 
+- **PD-06 decision closed: local-Libra shallow negotiation stays declined
+  (v0.19.45, plan-20260714 Part D)**: the last open decision gate from the
+  plan-20260708 migration is resolved — a local Libra source will keep
+  failing closed on `--depth` (`LBR-REPO-002` before object transfer, the
+  P0-03 end state) instead of growing `shallow <oid>` negotiation. Demand
+  is near zero (a local Libra source is directly readable in full) while a
+  correct implementation would need boundary generation, `.libra/shallow`
+  bookkeeping, deepen/unshallow round-trips, and GC-boundary coupling.
+  Recorded as register entry **D20** with rationale and restart conditions;
+  `COMPATIBILITY.md`'s Shallow Transfer Integrity section now states the
+  fail-closed behavior is the accepted end state. Guard unchanged:
+  `compat_clone_shallow_integrity` (re-run green). With this, Part D has no
+  undecided items left.
+
 - **Sequencer-family DB scope hardening: migration claim-first + formal
   `bisect_state` re-key (v0.19.44, plan-20260714 Part C §C.4.2, W1
   close-out)**: two audit-found defects are fixed. (1) The

@@ -96,7 +96,7 @@ libra config remote.origin.prune false  # but never for origin
 | `<repository>` | Remote name or URL to fetch from. When omitted, uses the current branch's upstream remote. | `libra fetch origin` |
 | `<refspec>` | Source ref or exact `<src>:<dst>` mapping. Requires `<repository>`. When omitted, `remote.<name>.fetch` mappings are used, falling back to all remote branches. | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | Fetch from every configured remote. Conflicts with `<repository>`. | `libra fetch --all` |
-| `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Supported for Git remotes that advertise shallow boundaries. Local Libra remotes fail closed with `LBR-REPO-002` until that transport can advertise shallow metadata. | `libra fetch origin --depth 1` |
+| `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Supported for Git remotes that advertise shallow boundaries. Local Libra remotes fail closed with `LBR-REPO-002` — the accepted end state (decision D20), since that transport cannot advertise shallow metadata. | `libra fetch origin --depth 1` |
 | `--tags` | Fetch every tag from the remote into the local `refs/tags/*` (overrides the default auto-follow and `remote.<name>.tagOpt`). | `libra fetch origin --tags` |
 | `--no-tags` | Fetch no tags at all, not even tags reachable from fetched commits (overrides the default auto-follow). | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | Do not run a repacking/gc pass after fetching. Accepted no-op for Git parity: Libra's fetch never triggers an automatic gc, so there is nothing to disable. | `libra fetch origin --no-auto-gc` |
@@ -170,7 +170,8 @@ so a typo never leaves a fetch with a zero or nonsensical timeout.
 
 `--depth <N>` is accepted only when the selected transport can return shallow
 boundary metadata. Local Git repositories and network Git remotes can do this.
-Local Libra repositories currently cannot, so `libra fetch <local-libra-remote>
+Local Libra repositories cannot (the accepted end state — decision D20 in the
+development compatibility register), so `libra fetch <local-libra-remote>
 --depth <N>` fails before downloading objects or writing `.libra/shallow`,
 classified as `LBR-REPO-002`. This fail-closed behavior prevents a remote-tracking
 ref from pointing at a commit whose parents are missing without a shallow marker.

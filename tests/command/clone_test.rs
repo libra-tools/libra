@@ -950,7 +950,7 @@ fn test_clone_local_flag_accepted_for_local_source() {
 }
 
 /// `--reject-shallow` allows a normal clone. Local Libra `--depth` is rejected
-/// before fetch because that source cannot advertise shallow boundaries yet; the
+/// before fetch because that source cannot advertise shallow boundaries (D20 end state); the
 /// pure post-fetch `clone_should_reject_shallow_only_for_unrequested_shallowness`
 /// unit test covers the remaining remote-shallow decision.
 #[test]
@@ -1000,7 +1000,7 @@ fn test_clone_reject_shallow_rejects_local_libra_depth() {
     );
     assert!(full.join(".libra").exists(), "full clone created");
 
-    // Local Libra sources cannot produce shallow boundary metadata yet, so
+    // Local Libra sources cannot produce shallow boundary metadata (D20 end state), so
     // `--depth` must fail closed rather than leaving a missing-parent clone.
     let shallow = dest_root.path().join("shallow");
     let out = run_libra_command(

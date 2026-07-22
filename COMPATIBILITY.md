@@ -212,11 +212,14 @@ compatibility guard is pinned by `compat_global_config_schema_future`.
 ### Shallow Transfer Integrity (P0-03)
 
 `clone --depth`, `fetch --depth`, and `pull --depth` are supported only for Git
-transports that can advertise shallow boundaries. A local Libra source currently
-cannot send `shallow <oid>` metadata, so these commands fail closed before object
+transports that can advertise shallow boundaries. A local Libra source cannot
+send `shallow <oid>` metadata, so these commands fail closed before object
 transfer with `LBR-REPO-002` instead of leaving refs that point at commits whose
 parents are missing. `rev-parse --is-shallow-repository` is supported and reports
-whether `.libra/shallow` contains at least one boundary.
+whether `.libra/shallow` contains at least one boundary. Decision (2026-07-23,
+plan-20260714 PD-06 / register D20): local-Libra shallow negotiation stays
+**declined** — fail-closed is the accepted end state, not a pending gap; see the
+development compatibility register D20 for rationale and restart conditions.
 
 Diff prefix configuration is part of the `diff` compatibility surface:
 `diff.noPrefix`, `diff.mnemonicPrefix`, `diff.srcPrefix`, and `diff.dstPrefix`

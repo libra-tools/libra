@@ -1014,10 +1014,8 @@ async fn test_fetch_full_then_shallow_is_idempotent() {
     // common workflow where a developer first does a regular fetch and then
     // wants to refresh just the tip.
     //
-    // Note: the converse case (shallow → shallow re-fetch) currently has known
-    // plumbing limitations on file:// transport when the local commit graph
-    // contains a shallow boundary; that scenario is tracked separately and is
-    // not part of the C3 public-flag contract.
+    // The converse case (shallow → shallow re-fetch) is covered by
+    // `test_fetch_shallow_then_shallow_is_idempotent` below.
     let (_temp_root, repo_dir, _current_branch, _pushed_commit) =
         setup_local_fetch_cli_fixture().await;
 

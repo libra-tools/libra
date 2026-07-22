@@ -70,7 +70,7 @@ global storage config for that run.
 | `--autostash` | Stash tracked changes before integrating and re-apply them afterwards (even on failure), so `pull` works on a dirty tree. Untracked/ignored files are left in place. | `libra pull --autostash` |
 | `--no-progress` | Suppress the fetch progress meter (the "Receiving objects" spinner), matching `git pull --no-progress`. | `libra pull --no-progress` |
 | `--notes` | Forward to the fetch: also import the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from a **local Libra** upstream. Default OFF (Git parity); a network/plain-Git upstream warns and imports nothing (deferred, D17). See `libra fetch --notes`. | `libra pull --notes` |
-| `--depth <n>` | Limit the fetch phase to a shallow history of `n` commits per tip. Conflicts with `--rebase`. Local Libra upstreams fail closed with `LBR-REPO-002` because they cannot advertise shallow boundaries yet. | `libra pull --depth 1` |
+| `--depth <n>` | Limit the fetch phase to a shallow history of `n` commits per tip. Conflicts with `--rebase`. Local Libra upstreams fail closed with `LBR-REPO-002` because they cannot advertise shallow boundaries (accepted end state, decision D20). | `libra pull --depth 1` |
 | `-r`, `--rebase` | After fetching, rebase the current branch onto the upstream tip instead of merging. | `libra pull --rebase` |
 | `--no-rebase` | Merge instead of rebasing, countermanding an earlier `--rebase`/`-r` and overriding `pull.rebase` for this invocation. | `libra pull --no-rebase` |
 | `--json` | Emit structured JSON envelope to stdout (global flag). | `libra pull --json` |

@@ -220,6 +220,13 @@ unsupported 子面。
 - 测试证据：`compat_matrix_alignment::send_email_policy_is_explicit_and_non_sending` 钉死 CLI 无此 variant、`LBR-CLI-001` 失败面、用户/开发/兼容文档一致性；P2-03 的 `compat_format_patch_mail_roundtrip` 继续守卫交接产物。
 - 重启条件：有明确的内建投递需求，并完成 SMTP/TLS 威胁模型、凭据存储与日志脱敏、Git `sendemail.*`/alias/recipient 语义、timeout/retry/idempotency 边界，以及可控邮件服务器端到端测试后，再以新 RFC 重启。
 
+### D20：本地 Libra remote 的 shallow 协商
+
+- 状态：2026-07-23 决策（plan-20260714 Part D **PD-06** 决策门）——**维持 fail-closed，不实现**。本地 Libra 源的 `fetch --depth` 无法像 Git upload-pack 一样应答 `shallow <oid>` 边界，历史实现会截断 commit walk 产出缺父提交且无 `.libra/shallow` 的 broken 仓库；P0-03（plan-20260708，v0.18.37）起在对象传输前拒绝（`FetchError::UnsupportedShallowLocalLibra` → `LBR-REPO-002`），`clone`/`pull` 继承且失败清理不留 initialized target。本地 Git / 网络 Git 的 shallow 协商路径不受影响；`rev-parse --is-shallow-repository` 可查询边界。
+- 原因：需求面小（本地 Libra 源通常整仓可直读，浅化收益趋近于零），而实现完整协商需要 shallow 边界生成、`.libra/shallow` 写入、deepen/unshallow 往返与 GC 边界（`shallow_repo_gc_stops_at_boundary`）联动，成本远超收益；fail-closed 已消除数据损坏风险。
+- 测试证据：`compat_clone_shallow_integrity` 钉死本地 Libra `--depth` 的 clone/fetch fail-closed 与 shallow 布尔查询。
+- 重启条件：出现真实的本地 Libra 浅克隆需求（如超大仓库 CI 本地缓存源），并完成 shallow 边界协议、deepen/unshallow 语义与 GC/fsck 联动设计后重启。
+
 ## 维护要求
 
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。

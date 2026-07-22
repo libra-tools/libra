@@ -170,7 +170,7 @@ pub struct CloneArgs {
     /// that can negotiate shallow boundaries, Libra cannot distinguish a shallow
     /// source from `--depth`-induced shallowness, so passing `--depth`
     /// suppresses the post-fetch check (Git would still reject); (2) local Libra
-    /// sources do not advertise shallow boundaries yet, so `--depth` fails
+    /// sources do not advertise shallow boundaries (declined by design, D20), so `--depth` fails
     /// closed before this check.
     #[clap(long = "reject-shallow")]
     pub reject_shallow: bool,
@@ -283,7 +283,7 @@ pub struct CloneArgs {
 /// `--depth`-induced shallowness (both only leave a `.libra/shallow` marker), so
 /// when `--depth` is given Libra does NOT reject after fetch. Local Libra
 /// sources are rejected earlier by fetch when `--depth` is present because they
-/// cannot advertise shallow boundaries yet. The common cases still match Git:
+/// cannot advertise shallow boundaries (accepted end state, D20). The common cases still match Git:
 /// `--reject-shallow` alone rejects a shallow result, and a full clone of a
 /// non-shallow source is allowed.
 /// Warn when `--reference`/`--shared` were given: those flags ask Git to share

@@ -46,7 +46,7 @@ libra config set --add remote.origin.fetch \
 | `<repository>` | 要从中 fetch 的远程名称或 URL。省略时使用当前分支的 upstream 远程。 | `libra fetch origin` |
 | `<refspec>` | 源引用或精确 `<src>:<dst>` 映射。需要 `<repository>`。省略时使用 `remote.<name>.fetch`，再回退为所有远程分支。 | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | 从每个已配置远程获取。与 `<repository>` 冲突。 | `libra fetch --all` |
-| `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。支持能通告 shallow boundary 的 Git 远程；本地 Libra 远程在该传输能通告 shallow 元数据之前会以 `LBR-REPO-002` fail-closed。 | `libra fetch origin --depth 1` |
+| `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。支持能通告 shallow boundary 的 Git 远程；本地 Libra 远程以 `LBR-REPO-002` fail-closed（已决终态，D20）。 | `libra fetch origin --depth 1` |
 | `--tags` | 从远程获取每个标签到本地 `refs/tags/*`（覆盖默认的 auto-follow 和 `remote.<name>.tagOpt`）。 | `libra fetch origin --tags` |
 | `--no-tags` | 完全不获取标签，连从已获取提交可达的标签也不获取（覆盖默认的 auto-follow）。 | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | fetch 后不运行 repack/gc。为对齐 Git 而接受的 no-op：Libra 的 fetch 从不触发自动 gc，故无可禁用。 | `libra fetch origin --no-auto-gc` |
@@ -114,7 +114,7 @@ LIBRA_FETCH_IDLE_TIMEOUT_MS=120000 libra fetch origin
 
 ## 浅 fetch 完整性
 
-`--depth <N>` 只有在所选传输能返回 shallow boundary 元数据时才被接受。本地 Git 仓库和网络 Git 远程可以做到这一点；本地 Libra 仓库当前不能，因此 `libra fetch <本地 Libra 远程> --depth <N>` 会在下载对象或写入 `.libra/shallow` 之前失败，归类为 `LBR-REPO-002`。该 fail-closed 行为避免 remote-tracking ref 指向一个父提交缺失且没有 shallow 标记的提交。
+`--depth <N>` 只有在所选传输能返回 shallow boundary 元数据时才被接受。本地 Git 仓库和网络 Git 远程可以做到这一点；本地 Libra 仓库不能（维持 fail-closed 为已决终态，D20），因此 `libra fetch <本地 Libra 远程> --depth <N>` 会在下载对象或写入 `.libra/shallow` 之前失败，归类为 `LBR-REPO-002`。该 fail-closed 行为避免 remote-tracking ref 指向一个父提交缺失且没有 shallow 标记的提交。
 
 ## FETCH_HEAD
 
