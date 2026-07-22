@@ -365,14 +365,18 @@ pub(crate) async fn run_pull(
 ) -> Result<PullOutput, PullError> {
     let branch = current_branch_for_pull().await?;
     let effective = resolve_effective_pull_options(&args, &branch).await?;
-    // Part C W1 (§C.4.4): the rebase mode (whether from `--rebase` or from
-    // `pull.rebase`/`branch.<name>.rebase` config) still uses the
-    // repository-global `rebase_state` and the stash-stack autostash, so it
-    // alone stays refused in a linked worktree — before any fetch runs.
-    if effective.rebase
+    // Part C W1 (§C.4.2/§C.4.4): the rebase mode is allowed in linked
+    // worktrees too — `run_rebase_for_pull` runs on the same worktree-scoped
+    // rebase state as the public `rebase` command (scoped `rebase_state` row,
+    // local-gitdir aux sidecar, scope-aware mutex). Only the `--autostash`
+    // combination stays refused there: its legacy wrap pushes onto the
+    // repository-global stash stack, which is main-only until W2 — and it
+    // must fail fast, before target resolution or any fetch.
+    if args.autostash
+        && effective.rebase
         && let Err(guard) = crate::command::ensure_main_worktree_because(
-            "pull --rebase",
-            "pull's rebase state is not yet worktree-scoped; use the merge mode (--no-rebase)",
+            "pull --rebase --autostash",
+            "the rebase-path autostash uses the repository-global stash stack",
         )
     {
         return Err(PullError::RebaseInLinkedWorktree(guard));

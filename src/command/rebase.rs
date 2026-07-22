@@ -1236,7 +1236,16 @@ pub async fn execute(args: RebaseArgs) {
 
 /// Safe CLI entry point with preflight validation for argument and state errors.
 pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<()> {
-    crate::command::ensure_main_worktree("rebase")?;
+    // Part C W1 (§C.4.2): rebase is now safe in a LINKED worktree — its state
+    // row is keyed by `worktree_id` (migration 2026072101), its aux sidecar
+    // (exec queue / update-refs plan / rewrites / held autostash) lives in
+    // THIS worktree's gitdir, the sequencer mutex probes the scoped row, GC
+    // traces every scope's state as reachability roots, and the operation
+    // dedup window is per-worktree. Two worktrees can rebase their own
+    // branches concurrently without interfering, so the former
+    // `ensure_main_worktree` guard is lifted. Branch-ref finish safety is
+    // unchanged: update-refs excludes branches checked out in ANY worktree
+    // and the finish CAS detects concurrent tip movement.
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
     // Refuse to start a NEW rebase while a cherry-pick sequence is in progress

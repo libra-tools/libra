@@ -3,8 +3,9 @@
 //!
 //! Verifies: a linked worktree gets its own HEAD, index, and HEAD-reflog while
 //! sharing the object store + shared branches; a commit/switch in one worktree
-//! never moves another's HEAD; the same-branch guard; the linked-worktree
-//! sequencer refusal; and `worktree remove` GCs the private rows. A
+//! never moves another's HEAD; the same-branch guard; per-worktree
+//! sequencer state (all six ops run in linked worktrees); and
+//! `worktree remove` GCs the private rows. A
 //! single-worktree repo is unchanged.
 //!
 //! Layer: L1 (deterministic; tempdir + isolated HOME, no network).
@@ -271,22 +272,29 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         "worktree add",
     );
 
-    // `pull --rebase` alone: needs the worktree ON a branch (mode resolution
-    // runs after the not-on-a-branch check), and fires before any fetch.
+    // Part C W1 final lift: `pull --rebase` itself is no longer refused in a
+    // linked worktree (rebase state is scoped). Only the `--autostash` combo
+    // stays guarded — its legacy wrap uses the repository-global stash stack.
     assert_cli_success(
         &run_libra_command(&["switch", "feature"], &wt),
         "wt switch feature",
     );
     let rebase_pull = run_libra_command(&["pull", "--rebase"], &wt);
+    assert!(
+        !String::from_utf8_lossy(&rebase_pull.stderr).contains("linked worktree"),
+        "pull --rebase must not hit the linked-worktree guard anymore: {}",
+        String::from_utf8_lossy(&rebase_pull.stderr)
+    );
+    let autostash_pull = run_libra_command(&["pull", "--rebase", "--autostash"], &wt);
     assert_ne!(
-        rebase_pull.status.code(),
+        autostash_pull.status.code(),
         Some(0),
-        "pull --rebase must fail closed in a linked worktree"
+        "pull --rebase --autostash must fail closed in a linked worktree"
     );
     assert!(
-        String::from_utf8_lossy(&rebase_pull.stderr).contains("linked worktree"),
-        "pull --rebase fails with the linked-worktree guard: {}",
-        String::from_utf8_lossy(&rebase_pull.stderr)
+        String::from_utf8_lossy(&autostash_pull.stderr).contains("linked worktree"),
+        "the autostash combo fails with the linked-worktree guard: {}",
+        String::from_utf8_lossy(&autostash_pull.stderr)
     );
 
     let cases: &[&[&str]] = &[
@@ -1439,8 +1447,14 @@ fn legacy_rebase_merge_dir_not_auto_adopted_with_linked_worktrees() {
     );
 }
 
+/// Part C W1 (§C.4.2, the final lift): `rebase` runs in a LINKED worktree on
+/// fully worktree-scoped state. A conflicted rebase stopped in the linked
+/// worktree does not block the MAIN worktree's own sequencer op (scoped
+/// mutex), and the linked `--abort` restores only that worktree. Covers the
+/// plan-named `linked_rebase_conflict_does_not_block_main_cherry_pick` and
+/// the abort half of `two_linked_rebases_keep_independent_todo_and_abort`.
 #[test]
-fn sequencer_ops_refused_in_linked_worktree() {
+fn rebase_runs_in_linked_worktree_and_conflict_does_not_block_main() {
     let repo = repo_with_feature();
     let main = repo.path();
     let parent = tempfile::tempdir().expect("wt parent");
@@ -1449,26 +1463,84 @@ fn sequencer_ops_refused_in_linked_worktree() {
         &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
         "worktree add",
     );
-    // rebase is still refused in a linked worktree (its state is
-    // repository-global: lazy-DDL `rebase_state` + common sidecars).
-    // cherry-pick/am/revert/merge were lifted in W1 once their state became
-    // fully worktree-scoped.
-    let rebase = run_libra_command(&["rebase", "feature"], &wt);
+
+    // Diverge: main edits a.txt on `main`; the wt edits a.txt on `feature`.
+    fs::write(main.join("a.txt"), "main-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "main add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-edit", "--no-verify"], main),
+        "main commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+    fs::write(wt.join("a.txt"), "feature-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature-edit", "--no-verify"], &wt),
+        "wt commit",
+    );
+    let wt_tip = head_sha(&wt);
+    let main_head_before = head_sha(main);
+
+    // Rebase `feature` onto main IN THE LINKED WORKTREE — allowed, and it
+    // stops on the content conflict with worktree-scoped state.
+    let rebase = run_libra_command(&["rebase", "main"], &wt);
+    assert!(
+        !String::from_utf8_lossy(&rebase.stderr).contains("not yet supported inside a linked"),
+        "rebase must no longer be refused in a linked worktree: {}",
+        String::from_utf8_lossy(&rebase.stderr)
+    );
     assert_ne!(
         rebase.status.code(),
         Some(0),
-        "rebase is still refused in a linked worktree"
+        "the conflicting rebase stops for resolution"
     );
+
+    // The MAIN worktree is not blocked by the linked worktree's stopped
+    // rebase: its own cherry-pick of the wt's commit proceeds (it conflicts
+    // in MAIN too — a same-file change — but the point is the scoped MUTEX
+    // let it START; abort it right away).
+    let cp = run_libra_command(&["cherry-pick", &wt_tip], main);
     assert!(
-        String::from_utf8_lossy(&rebase.stderr).contains("linked worktree"),
-        "rebase: {}",
-        String::from_utf8_lossy(&rebase.stderr)
+        !String::from_utf8_lossy(&cp.stderr).contains("rebase in progress"),
+        "main's sequencer mutex must not see the linked worktree's rebase: {}",
+        String::from_utf8_lossy(&cp.stderr)
     );
-    // rebase still works in the main worktree.
+    if !cp.status.success() {
+        assert_cli_success(
+            &run_libra_command(&["cherry-pick", "--abort"], main),
+            "abort main cherry-pick",
+        );
+    }
+
+    // Abort the linked worktree's rebase: only ITS state restores.
     assert_cli_success(
-        &run_libra_command(&["rebase", "feature"], main),
-        "rebase in main",
+        &run_libra_command(&["rebase", "--abort"], &wt),
+        "wt rebase --abort",
     );
+    assert_eq!(head_sha(&wt), wt_tip, "wt restored to its pre-rebase tip");
+    assert_eq!(abbrev_head(&wt), "feature", "wt back on its branch");
+    assert_eq!(head_sha(main), main_head_before, "main HEAD untouched");
+
+    // Full conflict flow in the linked worktree: rebase again, resolve, and
+    // `--continue` to completion — the continue path reads/clears only THIS
+    // worktree's scoped state.
+    let rerebase = run_libra_command(&["rebase", "main"], &wt);
+    assert_ne!(
+        rerebase.status.code(),
+        Some(0),
+        "stops on the conflict again"
+    );
+    fs::write(wt.join("a.txt"), "main-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &wt), "resolve");
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--continue"], &wt),
+        "linked rebase --continue completes",
+    );
+    assert_eq!(abbrev_head(&wt), "feature", "wt still on feature");
+    assert_eq!(head_sha(main), main_head_before, "main still untouched");
 }
 
 #[test]

@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **`rebase` (and `pull --rebase`) now run in linked worktrees (v0.19.42,
+  plan-20260714 Part C §C.4.2 — the final W1 sequencer lift)**: with
+  `rebase_state` keyed per-worktree, the aux sidecar in the worktree-local
+  gitdir, a scope-aware sequencer mutex, per-scope GC reachability roots, and
+  a worktree-scoped operation dedup window all in place, the blanket
+  linked-worktree refusal is lifted. Two worktrees can rebase their own
+  branches concurrently; a conflicted rebase stopped in one worktree never
+  blocks (and cannot be continued/aborted from) another. Branch-ref finish
+  safety is unchanged: `--update-refs` excludes branches checked out in any
+  worktree and the finish compare-and-swap detects concurrent tip movement.
+  Only `pull --rebase --autostash` remains refused in a linked worktree — its
+  legacy wrap uses the repository-global stash stack (main-only until W2).
+
 - **Internal: the operation duplicate-submission window is scoped
   per-worktree (v0.19.41, plan-20260714 Part C §C.9, W1 slice 3b)**: the
   `operation` audit table gains a `worktree_id` column (migration
