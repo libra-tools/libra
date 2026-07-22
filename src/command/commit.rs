@@ -1760,7 +1760,7 @@ fn append_status_section(mut buffer: String, status_section: Option<&str>) -> St
 /// empty; collection/config/rendering failures abort with their original stable
 /// CLI error rather than silently omitting the section.
 async fn build_status_section(
-    status_args: status::StatusArgs,
+    status_args: status::ResolvedStatusArgs,
 ) -> Result<Option<String>, CommitError> {
     let mut raw: Vec<u8> = Vec::new();
     status::execute_to_resolved(status_args, &mut raw)

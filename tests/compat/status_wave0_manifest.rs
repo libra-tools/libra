@@ -8,6 +8,8 @@
 //! together — never edit only one side.
 
 pub const STATUS_WAVE0_TESTS: &[&str] = &[
+    "chain_rename_default_untracked_d_and_question",
+    "pathspec_old_only_new_only_matrix",
     "porcelain_v1_rename_output_stays_add_delete",
     "porcelain_v1_uses_rename_arrow_when_detected",
     "porcelain_v2_unmerged_u_line",
@@ -20,7 +22,10 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "rename_no_renames_flag_splits_add_delete",
     "rename_porcelain_v2_emits_rename_record",
     "rename_short_format_uses_arrow",
+    "rename_untracked_config_cascade",
     "resolved_conflict_with_stage0_emits_no_u_line",
+    "staged_rename_then_delete_emits_rd",
+    "staged_rename_then_modify_emits_rm",
     "tracked_unreadable_path_fails_closed_not_deleted",
     "unmerged_stage_presence_to_xy_mapping",
 ];

@@ -114,9 +114,9 @@ libra status --no-column
 
 设置 rename 检测的相似度阈值。rename 检测**默认开启**（50%，与 Git 一致），因此仅在需要改变阈值或在 `status.renames=false` 后重新启用时才需要 `--find-renames`。当被删除文件与新文件足够相似时，它们会作为一个 rename 对（`renamed: old -> new`）报告，而不是分开的 delete/add 条目。可选值是最小相似度百分比（0-100）；`100` 表示仅 exact。
 
-renames 由共享 diffcore 引擎匹配：先按 blob id 找 exact，再按唯一 basename，最后是带 per-side 上限（1000）与相似度比较预算的有界 inexact spanhash 扫描。staged rename 配对 HEAD tree 与 index；unstaged rename 配对 index 与工作树。检测在仓库根相对路径上运行，因此即使从子目录调用 `status` 也能正确检测 rename。
+renames 由共享 diffcore 引擎匹配：先按 blob id 找 exact，再按唯一 basename，最后是带 per-side 上限（1000）与相似度比较预算的有界 inexact spanhash 扫描。staged rename 配对 HEAD tree 与 index；unstaged rename 配对 index 与工作树——但仅在 `status.renameUntracked` 配置（Libra 扩展，严格布尔，默认 `false`）启用时才会检测，因为 unstaged 的"新"路径都是未跟踪文件。默认关闭时，已跟踪→未跟踪的移动按 Git 语义呈现为 `D` + `??`，不产生 unstaged rename 记录。启用扩展后，destination 候选当前来自 status 自身计算的 untracked 列表——`-uno` 会隐藏全部候选、折叠的 untracked 目录会隐藏其内文件；把配对与显示设置解耦的独立有界 worktree probe 是 plan-20260714 Part B 的后续 R0-3 切片。检测在仓库根相对路径上运行，因此即使从子目录调用 `status` 也能正确检测 rename。
 
-renames 在每种格式中都以 Git 兼容记录呈现：human 长格式为 `renamed: <old> -> <new>`；`--short` 为 `R  <old> -> <new>`（`-z` 下为 `XY SP <new> NUL <old> NUL`）；`--porcelain=v2` 为单条 `2 R<score> … <new>\t<old>` 记录，带真实的 HEAD/index/工作树 mode 与 hash；`--json` 为顶层 `renames[]` 数组（`{from, to, score, exact, staged, unstaged}`）——绝不将端点渲染为两条独立的 `R`/`1 R` 行。
+renames 在每种格式中都以 Git 兼容记录呈现：human 长格式为 `renamed: <old> -> <new>`；`--short` 为 `R  <old> -> <new>`（`-z` 下为 `XY SP <new> NUL <old> NUL`）；`--porcelain=v2` 为单条 `2 R<score> … <new>\t<old>` 记录，带真实的 HEAD/index/工作树 mode 与 hash；`--json` 为顶层 `renames[]` 数组（`{from, to, score, exact, staged, unstaged}`）——绝不将端点渲染为两条独立的 `R`/`1 R` 行。当 rename 目标随后在工作树被修改或删除时，该状态并入记录的第二个 XY 列（`RM` / `RD`，与 Git 一致）；被删除目标在 porcelain v2 中的 `mW` 为 `000000`。
 
 ```bash
 libra status --find-renames

@@ -178,14 +178,25 @@ entries. The optional value is the minimum similarity percentage (0-100); `100` 
 Renames are matched by the shared diffcore engine: exact matches are found by blob id, then a
 unique-basename pass, then a bounded inexact spanhash pass with a per-side rename limit (1000)
 and a similarity-comparison budget. Staged renames pair the HEAD tree with the index; unstaged
-renames pair the index with the worktree. Detection runs on repository-root-relative paths, so
-renames are found correctly even when `status` is invoked from a subdirectory.
+renames pair the index with the worktree — but only when the `status.renameUntracked` config
+(a Libra extension, strict boolean, default `false`) is enabled, because every unstaged "new"
+path is an untracked file. With the default, a tracked→untracked move renders as `D` + `??`,
+matching Git, and no unstaged rename record is produced. When the extension is enabled,
+destination candidates currently come from the untracked listing that status itself computes,
+so `-uno` hides all candidates and a collapsed untracked directory hides the files inside it
+— the independent bounded worktree probe that decouples pairing from display settings is the
+upcoming R0-3 slice of plan-20260714 Part B. Detection runs on
+repository-root-relative paths, so renames are found correctly even when `status` is invoked
+from a subdirectory.
 
 Renames render as Git-compatible records in every format: `renamed: <old> -> <new>` in the
 human long format, `R  <old> -> <new>` in `--short` (`XY SP <new> NUL <old> NUL` under `-z`),
 a single `2 R<score> … <new>\t<old>` record with real HEAD/index/worktree modes and hashes in
 `--porcelain=v2`, and a top-level `renames[]` array (`{from, to, score, exact, staged,
-unstaged}`) in `--json` — never as two separate `R`/`1 R` rows for the endpoints.
+unstaged}`) in `--json` — never as two separate `R`/`1 R` rows for the endpoints. When the
+rename's destination is then modified or deleted in the worktree, that state rides in the
+record's second XY column (`RM` / `RD`, like Git); a deleted destination reports `mW` as
+`000000` in porcelain v2.
 
 ```bash
 libra status --find-renames

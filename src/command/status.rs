@@ -223,17 +223,30 @@ impl StatusArgs {
     }
 }
 
+/// Module-private resolved status config that deliberately does NOT live on
+/// the public `StatusArgs` (adding fields there breaks exhaustive struct
+/// literals in downstream code, even with the `Default` derive).
+#[derive(Clone, Copy, Default)]
+struct StatusConfigExtras {
+    /// `status.renameUntracked` (§B.3.1): untracked worktree paths may be
+    /// unstaged rename destinations only when true (default false = Git
+    /// parity: a tracked→untracked move renders as `D` + `??`).
+    rename_untracked: bool,
+}
+
 /// Resolve the Git-compatible `status.*` config defaults (plan-20260708
 /// P1-05d): `status.showUntrackedFiles`, `status.short`, `status.branch`,
-/// `status.showStash`, and `status.relativePaths`, each read through the
-/// strict local → global → system cascade. All five keys are validated
+/// `status.showStash`, `status.relativePaths`, plus the rename keys
+/// (`status.renames`→`diff.renames` and the `status.renameUntracked`
+/// extension, §B.3.1), each read through the strict
+/// local → global → system cascade. Every key is validated
 /// UP FRONT — an invalid value is a usage error and an unreadable
 /// local/global scope an IO error, both before any status output — and then
 /// applied only where Git applies them: CLI flags always win;
 /// `status.short` yields to an explicit `--long`/`--porcelain`;
 /// `status.branch` affects only the short format (porcelain stays
 /// config-immune, matching Git's stable-script contract).
-async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
+async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<StatusConfigExtras> {
     use crate::internal::config::{
         LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
     };
@@ -315,6 +328,11 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
         None => read_renames("diff.renames").await?,
     };
 
+    // Libra extension (§B.3.1): untracked paths become unstaged rename
+    // destinations only under `status.renameUntracked=true`. Strict Git
+    // boolean; invalid values fail closed before any output.
+    let rename_untracked = read_bool("status.renameUntracked").await?.unwrap_or(false);
+
     if args.untracked_files.is_none() {
         args.untracked_files = untracked;
     }
@@ -331,15 +349,24 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
     }
     args.relative_paths = relative_paths.unwrap_or(true);
     args.renames_config = renames_config;
-    Ok(())
+    Ok(StatusConfigExtras { rename_untracked })
 }
 
 /// Resolve and validate all `status.*` defaults without collecting repository
 /// state or producing output. Embedded consumers use this before side effects,
 /// then pass the returned arguments to [`execute_to_resolved`].
-pub(crate) async fn resolve_config_defaults(mut args: StatusArgs) -> CliResult<StatusArgs> {
-    apply_status_config_defaults(&mut args).await?;
-    Ok(args)
+pub(crate) async fn resolve_config_defaults(mut args: StatusArgs) -> CliResult<ResolvedStatusArgs> {
+    let extras = apply_status_config_defaults(&mut args).await?;
+    Ok(ResolvedStatusArgs { args, extras })
+}
+
+/// Resolved status arguments bundled with the module-private extras,
+/// produced by [`resolve_config_defaults`] exactly once and consumed by
+/// [`execute_to_resolved`]. Opaque outside this module, so the single-read
+/// contract cannot be bypassed and the public `StatusArgs` stays unchanged.
+pub(crate) struct ResolvedStatusArgs {
+    args: StatusArgs,
+    extras: StatusConfigExtras,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -575,7 +602,10 @@ impl StatusData {
 
 /// Collect all status data in one pass, eliminating duplicate computation
 /// between human/JSON/short/porcelain renderers.
-async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
+async fn collect_status_data(
+    args: &StatusArgs,
+    extras: StatusConfigExtras,
+) -> CliResult<StatusData> {
     // lore.md 2.4: layer-overlay paths are excluded from status like ignored
     // files (a no-op with no layers).
     crate::internal::layer::refresh_exclusion_snapshot().await;
@@ -674,13 +704,19 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             RenameBlobSide::Known(&index_blobs),
             &mut staged_rename_details,
         );
-        detect_renames_in_changes(
-            &mut unstaged,
-            &config,
-            RenameBlobSide::Known(&index_blobs),
-            RenameBlobSide::Worktree,
-            &mut unstaged_rename_details,
-        );
+        // §B.3.1 Git default: unstaged "new" entries are untracked paths,
+        // which may only be consumed as rename destinations under the
+        // `status.renameUntracked` extension. Skipping detection keeps a
+        // tracked→untracked move rendered as `D` + `??`.
+        if extras.rename_untracked {
+            detect_renames_in_changes(
+                &mut unstaged,
+                &config,
+                RenameBlobSide::Known(&index_blobs),
+                RenameBlobSide::Worktree,
+                &mut unstaged_rename_details,
+            );
+        }
     }
 
     let stash_count = if args.show_stash {
@@ -784,9 +820,24 @@ fn filter_changes_by_pathspec(changes: &mut Changes, pathspecs: &PathspecSet) {
     changes
         .deleted
         .retain(|path| current_relative_matches(path, pathspecs));
-    changes.renamed.retain(|(old, new)| {
-        current_relative_matches(old, pathspecs) || current_relative_matches(new, pathspecs)
-    });
+    // Per-end pathspec semantics (§B.3): a rename pair survives only when
+    // BOTH endpoints match. An old-only match demotes to a deletion and a
+    // new-only match to an addition, so an out-of-scope endpoint can never
+    // leak into the output through a rename record.
+    let mut kept: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (old, new) in changes.renamed.drain(..) {
+        let old_in = current_relative_matches(&old, pathspecs);
+        let new_in = current_relative_matches(&new, pathspecs);
+        match (old_in, new_in) {
+            (true, true) => kept.push((old, new)),
+            (true, false) => changes.deleted.push(old),
+            (false, true) => changes.new.push(new),
+            (false, false) => {}
+        }
+    }
+    changes.deleted.sort();
+    changes.new.sort();
+    changes.renamed = kept;
 }
 
 fn current_relative_matches(path: &Path, pathspecs: &PathspecSet) -> bool {
@@ -1062,9 +1113,9 @@ pub async fn collect_status_json_envelope_for_api(
     // Byte-parity with `libra status --json`: the API honors the same
     // resolved `status.*` defaults (and the same fail-closed validation) as
     // the CLI entry points.
-    apply_status_config_defaults(&mut args).await?;
+    let extras = apply_status_config_defaults(&mut args).await?;
     let args = args;
-    let data = collect_status_data(&args).await?;
+    let data = collect_status_data(&args, extras).await?;
     let inner = build_status_json(&data, &args);
     Ok(serde_json::json!({
         "ok": true,
@@ -1087,7 +1138,7 @@ pub async fn execute_safe(mut args: StatusArgs, output: &OutputConfig) -> CliRes
 
     // Fail closed on invalid `status.*` config before any mode runs or any
     // output is produced; CLI flags keep precedence inside the resolver.
-    apply_status_config_defaults(&mut args).await?;
+    let extras = apply_status_config_defaults(&mut args).await?;
     let args = args;
 
     // Dirty-set cache modes (lore.md 1.1). NOTE: only this CLI entry routes
@@ -1107,13 +1158,13 @@ pub async fn execute_safe(mut args: StatusArgs, output: &OutputConfig) -> CliRes
         )?;
     }
     if args.scan {
-        return run_status_scan(&args, output).await;
+        return run_status_scan(&args, extras, output).await;
     }
     if args.cached || args.check_dirty {
-        return run_status_cache_mode(&args, output).await;
+        return run_status_cache_mode(&args, extras, output).await;
     }
 
-    let data = collect_status_data(&args).await?;
+    let data = collect_status_data(&args, extras).await?;
 
     if output.is_json() {
         let json_data = build_status_json(&data, &args);
@@ -1190,7 +1241,11 @@ fn snapshot_rows(
 /// captured BEFORE the reconcile and re-verified AFTER — a concurrent index
 /// writer aborts the cache commit (the old snapshot stays intact) instead of
 /// stamping rows computed against an older index as fresh.
-async fn run_status_scan(args: &StatusArgs, output: &OutputConfig) -> CliResult<()> {
+async fn run_status_scan(
+    args: &StatusArgs,
+    extras: StatusConfigExtras,
+    output: &OutputConfig,
+) -> CliResult<()> {
     use crate::internal::{
         db::get_db_conn_instance,
         dirty::{DirtyCache, ScanLockOutcome},
@@ -1220,7 +1275,7 @@ async fn run_status_scan(args: &StatusArgs, output: &OutputConfig) -> CliResult<
         }
     }
     // Everything below must release the lock — including error paths.
-    let result = run_status_scan_locked(args, output, &index_path).await;
+    let result = run_status_scan_locked(args, output, &index_path, extras).await;
     let _ = DirtyCache::release_scan_lock_with_conn(&db, pid).await;
     result?;
     // Re-open a plain connection for the final read in JSON mode is not
@@ -1232,6 +1287,7 @@ async fn run_status_scan_locked(
     args: &StatusArgs,
     output: &OutputConfig,
     index_path: &std::path::Path,
+    extras: StatusConfigExtras,
 ) -> CliResult<()> {
     use sea_orm::TransactionTrait;
 
@@ -1247,7 +1303,7 @@ async fn run_status_scan_locked(
 
     // The same full safe reconcile as the default status, raw + display.
     let (staged_raw, unstaged_raw) = compute_raw_sets().await?;
-    let data = collect_status_data(args).await?;
+    let data = collect_status_data(args, extras).await?;
 
     let fingerprint_after =
         current_index_fingerprint(index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
@@ -1331,7 +1387,11 @@ fn classify_manual_mark(
 /// `status --cached` and `status --check-dirty`: consume / re-verify the
 /// cache. Any freshness doubt degrades to the full reconcile (the cache may
 /// over-report or degrade, never silently under-report).
-async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliResult<()> {
+async fn run_status_cache_mode(
+    args: &StatusArgs,
+    extras: StatusConfigExtras,
+    output: &OutputConfig,
+) -> CliResult<()> {
     use sea_orm::TransactionTrait;
 
     use crate::internal::{
@@ -1356,7 +1416,7 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
             "dirty cache is {}; falling back to the full status (run 'libra status --scan' to rebuild)",
             state.as_str()
         ));
-        let data = collect_status_data(args).await?;
+        let data = collect_status_data(args, extras).await?;
         if output.is_json() {
             let mut json_data = build_status_json(&data, args);
             json_data["mode"] =
@@ -1482,7 +1542,7 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         crate::utils::error::emit_warning(
             "the index or HEAD changed while reading the dirty cache; falling back to the full status",
         );
-        let data = collect_status_data(args).await?;
+        let data = collect_status_data(args, extras).await?;
         if output.is_json() {
             let mut json_data = build_status_json(&data, args);
             json_data["mode"] =
@@ -1612,8 +1672,8 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
 pub async fn execute_to(mut args: StatusArgs, writer: &mut impl Write) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
-    apply_status_config_defaults(&mut args).await?;
-    execute_to_resolved(args, writer).await
+    let extras = apply_status_config_defaults(&mut args).await?;
+    execute_to_resolved(ResolvedStatusArgs { args, extras }, writer).await
 }
 
 /// Collect and render status from arguments whose config defaults were already
@@ -1621,11 +1681,15 @@ pub async fn execute_to(mut args: StatusArgs, writer: &mut impl Write) -> CliRes
 /// inconsistent config read after an embedded caller has crossed a side-effect
 /// boundary.
 pub(crate) async fn execute_to_resolved(
-    args: StatusArgs,
+    resolved: ResolvedStatusArgs,
     writer: &mut impl Write,
 ) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
-    let data = collect_status_data(&args).await?;
+    // Exactly one config read: the bundle carries the resolution performed
+    // by `resolve_config_defaults` across the side-effect boundary, so no
+    // second (potentially inconsistent) read ever happens here.
+    let ResolvedStatusArgs { args, extras } = resolved;
+    let data = collect_status_data(&args, extras).await?;
     let output = OutputConfig::default();
     render_status_to_writer(&data, &args, &output, writer).await
 }
@@ -2366,8 +2430,13 @@ fn output_porcelain_with_unmerged(
     for (old, new) in &staged.renamed {
         endpoints.insert(old.clone());
         endpoints.insert(new.clone());
+        // The Y column carries the worktree state of the rename's NEW path
+        // (Git: `RM`/`RD` when the destination is modified/deleted unstaged;
+        // the endpoint row is suppressed below so this is its only signal).
         let y = if unstaged.modified.contains(new) {
             'M'
+        } else if unstaged.deleted.contains(new) {
+            'D'
         } else {
             ' '
         };
@@ -2560,7 +2629,9 @@ fn write_rename_porcelain_v2(
     } else {
         (mode_index, hash_index.clone())
     };
-    let mode_worktree = get_worktree_mode(new);
+    // A worktree-deleted destination (`RD`) has no worktree entry: mW must
+    // be 000000 like an ordinary v2 deleted row, not a fabricated 100644.
+    let mode_worktree = if y == 'D' { 0 } else { get_worktree_mode(new) };
     let sub = if is_submodule_mode(mode_index) || is_submodule_mode(mode_head) {
         get_submodule_status(new)
     } else {
@@ -2619,8 +2690,12 @@ fn output_porcelain_v2(
     for (old, new) in &staged.renamed {
         endpoints.insert(old.clone());
         endpoints.insert(new.clone());
+        // Worktree state of the NEW path rides in the second XY column
+        // (`RM`/`RD`), mirroring Git — the endpoint row is suppressed.
         let unstaged_char = if unstaged.modified.contains(new) {
             'M'
+        } else if unstaged.deleted.contains(new) {
+            'D'
         } else {
             '.'
         };
@@ -2932,11 +3007,20 @@ async fn output_short_format_with_config(
     for (old, new) in &staged.renamed {
         endpoints.insert(old.clone());
         endpoints.insert(new.clone());
+        // The Y column carries the worktree state of the NEW path (`RM`/`RD`)
+        // — the endpoint row is suppressed, so this is its only signal.
+        let y = if unstaged.modified.contains(new) {
+            'M'
+        } else if unstaged.deleted.contains(new) {
+            'D'
+        } else {
+            ' '
+        };
         items.push(ShortItem::Rename {
             old: old.clone(),
             new: new.clone(),
             x: 'R',
-            y: ' ',
+            y,
         });
     }
     for (old, new) in &unstaged.renamed {

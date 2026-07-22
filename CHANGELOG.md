@@ -4,6 +4,24 @@
 
 ### Changed
 
+- **`status` unstaged rename detection now matches Git's default; `RM`/`RD`
+  combined records (v0.19.46, plan-20260714 Part B §B.3.1)**: every unstaged
+  "new" path is by definition untracked, and Git never consumes untracked
+  files as rename destinations — Libra now only pairs them under the new
+  config-only extension `status.renameUntracked` (strict boolean cascade,
+  default `false`, invalid values fail closed before output). By default a
+  tracked→untracked move renders as `D` + `??` instead of a fabricated
+  unstaged rename. Additionally, a staged rename whose destination is then
+  modified or deleted in the worktree now carries that state in the record's
+  Y column (`RM`/`RD` in short/porcelain-v1/v2) — previously the short
+  format dropped even the `M`, and a worktree deletion of the destination
+  vanished from machine output entirely because the endpoint row was
+  suppressed without merging its state. New wave-0 guards:
+  `chain_rename_default_untracked_d_and_question`,
+  `rename_untracked_config_cascade`, `staged_rename_then_modify_emits_rm`;
+  existing unstaged-rename tests now opt in explicitly, and the case-only
+  `mv` JSON assertion is updated for default-on rename folding.
+
 - **PD-06 decision closed: local-Libra shallow negotiation stays declined
   (v0.19.45, plan-20260714 Part D)**: the last open decision gate from the
   plan-20260708 migration is resolved — a local Libra source will keep

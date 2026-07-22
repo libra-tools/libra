@@ -434,3 +434,240 @@ fn rename_from_subdirectory_detected() {
         "rename must be detected from a subdirectory: {out}"
     );
 }
+
+// ── §B.3.1: untracked paths as rename destinations (Libra extension) ─────────
+
+/// Default (`status.renameUntracked` unset = false, Git parity): a chain of
+/// staged `a→b` plus an unstaged worktree move `b→c` reports the staged
+/// rename normally, but the second hop stays `D` + `??` — the untracked
+/// destination is NOT consumed into an unstaged rename record.
+#[test]
+fn chain_rename_default_untracked_d_and_question() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv (staged hop)");
+    // Unstaged second hop: move b.txt → c.txt purely in the worktree.
+    let contents = fs::read(repo.path().join("b.txt")).expect("read staged move target");
+    fs::remove_file(repo.path().join("b.txt")).expect("remove worktree b.txt");
+    fs::write(repo.path().join("c.txt"), contents).expect("write untracked c.txt");
+
+    let out = status_stdout(repo.path(), &["status", "--porcelain"]);
+    // Git parity: the worktree deletion of the rename destination rides in
+    // the Y column of the rename record (`RD`), not as a separate ` D` row.
+    assert!(
+        out.lines().any(|l| l == "RD a.txt -> b.txt"),
+        "staged rename record carries the worktree delete as Y=D: {out:?}"
+    );
+    assert!(
+        out.lines().any(|l| l == "?? c.txt"),
+        "unstaged hop destination stays untracked: {out:?}"
+    );
+    assert!(
+        !out.lines().any(|l| l.contains("b.txt -> c.txt")),
+        "no unstaged rename record without status.renameUntracked: {out:?}"
+    );
+
+    // Porcelain v2: xy = RD and mW = 000000 (no worktree entry for the
+    // deleted destination — must not fabricate 100644).
+    let v2 = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    let record = v2
+        .lines()
+        .find(|l| l.starts_with("2 "))
+        .unwrap_or_else(|| panic!("expected v2 rename record: {v2}"));
+    let fields: Vec<&str> = record.split_whitespace().collect();
+    assert_eq!(
+        fields[1], "RD",
+        "v2 xy carries the worktree delete: {record}"
+    );
+    assert_eq!(
+        fields[5], "000000",
+        "mW is zero for a deleted destination: {record}"
+    );
+
+    // `-z` v1: `RD SP <new> NUL <old> NUL` record shape.
+    let z = run_libra_command(&["status", "--porcelain", "-z"], repo.path());
+    assert!(z.status.success());
+    let raw = String::from_utf8_lossy(&z.stdout);
+    assert!(
+        raw.contains("RD b.txt\0a.txt\0"),
+        "-z record keeps the RD xy with NUL-separated new/old: {raw:?}"
+    );
+}
+
+/// A staged rename whose destination is then modified in the worktree emits
+/// a single `RM old -> new` record (§B.9 `staged_rename_then_modify_emits_rm`)
+/// in short and porcelain v1, and `R.`→`RM` in the v2 xy field.
+#[test]
+fn staged_rename_then_modify_emits_rm() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    fs::write(
+        repo.path().join("b.txt"),
+        "hello rename world\ncontent line two\nworktree edit\n",
+    )
+    .expect("modify rename destination in worktree");
+
+    let v1 = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        v1.lines().any(|l| l == "RM a.txt -> b.txt"),
+        "porcelain v1 merges the worktree edit into RM: {v1:?}"
+    );
+    let short = status_stdout(repo.path(), &["--no-color", "status", "--short"]);
+    assert!(
+        short.lines().any(|l| l.starts_with("RM ")),
+        "short format carries Y=M on the rename line: {short:?}"
+    );
+    let v2 = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    let record = v2
+        .lines()
+        .find(|l| l.starts_with("2 "))
+        .unwrap_or_else(|| panic!("expected v2 rename record: {v2}"));
+    assert!(
+        record.split_whitespace().nth(1) == Some("RM"),
+        "v2 xy is RM when the destination has a worktree edit: {record}"
+    );
+}
+
+/// `status.renameUntracked` is a strict-bool config cascade: enabling it (in
+/// either scope, local overriding global) lets the same worktree move pair
+/// into an unstaged rename, and an invalid value fails closed before output.
+#[test]
+fn rename_untracked_config_cascade() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    fs::remove_file(repo.path().join("a.txt")).expect("remove worktree a.txt");
+    fs::write(
+        repo.path().join("moved.txt"),
+        "hello rename world\ncontent line two\n",
+    )
+    .expect("write untracked moved.txt");
+
+    // Default off: D + ??.
+    let off = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        off.lines().any(|l| l == " D a.txt") && off.lines().any(|l| l == "?? moved.txt"),
+        "default keeps D + ??: {off:?}"
+    );
+
+    // Global scope enables it (numeric Git boolean exercises strict parsing).
+    let global = run_libra_command(
+        &["config", "set", "--global", "status.renameUntracked", "1"],
+        repo.path(),
+    );
+    assert_cli_success(&global, "set global status.renameUntracked=1");
+    let on = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        on.lines().any(|l| l == " R a.txt -> moved.txt"),
+        "global true enables the unstaged rename pair: {on:?}"
+    );
+
+    // Local false overrides global true (cascade order).
+    let local = run_libra_command(
+        &["config", "set", "status.renameUntracked", "false"],
+        repo.path(),
+    );
+    assert_cli_success(&local, "set local status.renameUntracked=false");
+    let overridden = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        overridden.lines().any(|l| l == " D a.txt"),
+        "local false wins over global true: {overridden:?}"
+    );
+
+    // Invalid value fails closed before any status output.
+    let invalid = run_libra_command(
+        &["config", "set", "status.renameUntracked", "sideways"],
+        repo.path(),
+    );
+    assert_cli_success(&invalid, "store invalid value");
+    let failed = run_libra_command(&["status", "--porcelain"], repo.path());
+    assert!(
+        !failed.status.success(),
+        "invalid status.renameUntracked must fail closed"
+    );
+    assert!(
+        failed.stdout.is_empty(),
+        "no partial porcelain before the config failure: {:?}",
+        String::from_utf8_lossy(&failed.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("status.renameUntracked"),
+        "diagnostic names the offending key: {stderr}"
+    );
+}
+
+/// Per-end pathspec semantics (§B.3): a rename record survives only when
+/// BOTH endpoints match the pathspec. An old-only match reports the in-scope
+/// deletion, a new-only match the in-scope addition — an out-of-scope
+/// endpoint never leaks through a rename record (default staged path).
+#[test]
+fn pathspec_old_only_new_only_matrix() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    // Old endpoint only: the deletion is in scope, the rename is not.
+    let old_only = status_stdout(repo.path(), &["status", "--porcelain=v1", "a.txt"]);
+    assert!(
+        old_only.lines().any(|l| l == "D  a.txt"),
+        "old-only pathspec demotes to a deletion: {old_only:?}"
+    );
+    assert!(
+        !old_only.contains("b.txt"),
+        "out-of-scope destination must not leak: {old_only:?}"
+    );
+
+    // New endpoint only: the addition is in scope, the rename is not.
+    let new_only = status_stdout(repo.path(), &["status", "--porcelain=v1", "b.txt"]);
+    assert!(
+        new_only.lines().any(|l| l == "A  b.txt"),
+        "new-only pathspec demotes to an addition: {new_only:?}"
+    );
+    assert!(
+        !new_only.contains("a.txt"),
+        "out-of-scope source must not leak: {new_only:?}"
+    );
+
+    // Both endpoints in scope: the rename record is kept.
+    let both = status_stdout(repo.path(), &["status", "--porcelain=v1", "a.txt", "b.txt"]);
+    assert!(
+        both.lines().any(|l| l == "R  a.txt -> b.txt"),
+        "both endpoints in scope keep the rename record: {both:?}"
+    );
+}
+
+/// A staged rename whose destination is then DELETED in the worktree emits a
+/// single `RD old -> new` record in short and porcelain v1, and `RD` with
+/// `mW=000000` in v2 (§B.9 `staged_rename_then_delete_emits_rd`).
+#[test]
+fn staged_rename_then_delete_emits_rd() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    fs::remove_file(repo.path().join("b.txt")).expect("delete rename destination in worktree");
+
+    let short = status_stdout(repo.path(), &["--no-color", "status", "--short"]);
+    assert!(
+        short.lines().any(|l| l == "RD a.txt -> b.txt"),
+        "short format carries Y=D on the rename line: {short:?}"
+    );
+    let v1 = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        v1.lines().any(|l| l == "RD a.txt -> b.txt"),
+        "porcelain v1 merges the worktree delete into RD: {v1:?}"
+    );
+    let v2 = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    let record = v2
+        .lines()
+        .find(|l| l.starts_with("2 "))
+        .unwrap_or_else(|| panic!("expected v2 rename record: {v2}"));
+    let fields: Vec<&str> = record.split_whitespace().collect();
+    assert_eq!(
+        fields[1], "RD",
+        "v2 xy carries the worktree delete: {record}"
+    );
+    assert_eq!(
+        fields[5], "000000",
+        "mW is zero for a deleted destination: {record}"
+    );
+}

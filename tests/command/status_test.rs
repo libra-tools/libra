@@ -2609,6 +2609,11 @@ fn test_status_find_renames_detects_content_rename() {
     let output = run_libra_command(&["config", "set", "user.email", "test@example.com"], &repo);
     assert!(output.status.success());
 
+    assert!(
+        run_libra_command(&["config", "set", "status.renameUntracked", "true"], &repo)
+            .status
+            .success()
+    );
     std::fs::write(repo.join("old.txt"), "content").unwrap();
     let output = run_libra_command(&["add", "old.txt"], &repo);
     assert!(output.status.success());
@@ -2649,6 +2654,11 @@ fn test_status_find_renames_honors_threshold() {
     let output = run_libra_command(&["config", "set", "user.email", "test@example.com"], &repo);
     assert!(output.status.success());
 
+    assert!(
+        run_libra_command(&["config", "set", "status.renameUntracked", "true"], &repo)
+            .status
+            .success()
+    );
     std::fs::write(repo.join("aaaa.txt"), "content-a").unwrap();
     let output = run_libra_command(&["add", "aaaa.txt"], &repo);
     assert!(output.status.success());
@@ -2685,6 +2695,11 @@ fn test_status_renames_and_no_renames_toggle_detection() {
             .success()
     );
 
+    assert!(
+        run_libra_command(&["config", "set", "status.renameUntracked", "true"], &repo)
+            .status
+            .success()
+    );
     std::fs::write(repo.join("old.txt"), "content").unwrap();
     assert!(
         run_libra_command(&["add", "old.txt"], &repo)
