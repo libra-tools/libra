@@ -156,7 +156,14 @@ pub async fn execute_safe(args: HydrateArgs, output: &OutputConfig) -> CliResult
     // set to avoid materializing large out-of-view assets must not be bypassed
     // by a dependency edge. Gate on is_active() FIRST (a no-op view returns
     // contains()==true for everything).
-    let sparse = SparseView::load().await;
+    // W1 §C.4.1.1: hydrate MATERIALIZES files, so an unreadable view must
+    // fail closed instead of degrading to "everything in view" (which would
+    // bypass the sparse gate on a probe failure).
+    let scope = crate::internal::worktree_scope::WorktreeScope::current();
+    let sparse = SparseView::try_load(&scope).await.map_err(|e| {
+        CliError::fatal(format!("cannot load the sparse view before hydrating: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
     let sparse_active = sparse.is_active() && !args.ignore_sparse;
 
     let workdir = util::working_dir();

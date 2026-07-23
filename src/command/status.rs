@@ -1011,9 +1011,11 @@ async fn collect_status_data(
         upstream,
         merge_state,
         sequence_notice: sequence_notice().await?,
-        sparse_view_active: crate::internal::sparse::SparseView::load()
-            .await
-            .is_active(),
+        sparse_view_active: crate::internal::sparse::SparseView::load(
+            &crate::internal::worktree_scope::WorktreeScope::current(),
+        )
+        .await
+        .is_active(),
         porcelain_v2,
         staged_rename_details,
         unstaged_rename_details,
@@ -2016,9 +2018,11 @@ async fn run_status_cache_mode(
         upstream,
         merge_state,
         sequence_notice: sequence_notice().await?,
-        sparse_view_active: crate::internal::sparse::SparseView::load()
-            .await
-            .is_active(),
+        sparse_view_active: crate::internal::sparse::SparseView::load(
+            &crate::internal::worktree_scope::WorktreeScope::current(),
+        )
+        .await
+        .is_active(),
         porcelain_v2: None,
         staged_rename_details: RenameDetails::new(),
         unstaged_rename_details: RenameDetails::new(),

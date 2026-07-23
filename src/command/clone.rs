@@ -3288,7 +3288,14 @@ async fn apply_deps_of_view(
         .iter()
         .map(|p| sparse_include_pattern(p))
         .collect();
-    if let Err(e) = crate::internal::sparse::SparseViewStore::replace(&patterns).await {
+    // A fresh clone has exactly one (main) worktree — the deps-of view
+    // belongs to the main scope by construction (W1 §C.4.1.1).
+    if let Err(e) = crate::internal::sparse::SparseViewStore::replace(
+        &crate::internal::worktree_scope::WorktreeScope::Main,
+        &patterns,
+    )
+    .await
+    {
         warnings.push(format!(
             "--deps-of: computed the dependency closure but could not set the sparse view: {e}"
         ));

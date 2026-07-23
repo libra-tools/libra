@@ -22,7 +22,9 @@
 
 Pattern 语义是 ALLOWLIST：最后匹配的 pattern 获胜，`!pat` 会在更宽泛 include 下重新 carve a hole，未匹配任何 pattern 的路径为 out-of-view（default-exclude）。没有 ancestor-dominance shortcut（它会破坏 `!child` negations）。禁用或空 view 是 no-op（输出与未配置 view 字节一致）。
 
-状态：patterns 存在 `sparse_view` SQLite 表（owner `internal::sparse`）；toggle 存在 config_kv `sparse.enabled`。
+状态：patterns 存在 `sparse_view` SQLite 表（owner `internal::sparse`）；toggle 存在按 worktree 投影的 `sparse_view_meta` 表（W1 §C.4.1.1，迁移 `2026072304`——已废弃无 scope 的 config_kv `sparse.enabled` 键）。
+
+**自 W1 起按 worktree 隔离**：patterns 与 enabled toggle 是 per-worktree 事实——所有子命令与 `ls-files`/`diff`/`hydrate` 门都作用于当前 worktree 自己的视图；worktree 目录消失后 remove/prune 会回收其行。旧的仓库全局状态仅在不存在 linked worktree 时归属 main worktree；否则 schema 迁移 fail-closed，要求先显式 `sparse-view clear`（或在目标 worktree 重建视图）——patterns 绝不复制到所有 worktree。
 
 ## 示例
 

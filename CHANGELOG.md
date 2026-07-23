@@ -4,6 +4,21 @@
 
 ### Changed
 
+- **The sparse view is worktree-scoped (v0.19.52, plan-20260714 Part C
+  §C.4.1.1, W1 advisory slice 3)**: migration `2026072304` re-keys
+  `sparse_view` to UNIQUE(worktree_id, ordinal) and re-projects the
+  scope-less `sparse.enabled` config key into the per-worktree
+  `sparse_view_meta` table (the config key is retired). Every `sparse-view`
+  subcommand and the `ls-files`/`diff`/`status`-advisory/`hydrate` gates act
+  on the current worktree's own patterns and toggle; `hydrate` (a
+  materialization path) now FAILS CLOSED on an unreadable view instead of
+  degrading to "everything in view". Legacy state adopts to main only when
+  no linked worktree exists; otherwise the migration fails closed (CHECK
+  guard) pending an explicit `sparse-view clear` — patterns are never copied
+  to every worktree. The down migration fails closed on linked rows and
+  re-projects the main toggle back into config_kv. `worktree remove
+  --delete-dir`/`prune` GC sparse rows under the same directory-gone rule as
+  layer rows, and the linked-worktree guard on `sparse-view` is lifted.
 - **The layer overlay registry is worktree-scoped (v0.19.51, plan-20260714
   Part C §C.4.1.1, W1 advisory slice 2)**: migration `2026072303` re-keys
   `layer` to UNIQUE(worktree_id, name) and `layer_path` to

@@ -1041,6 +1041,19 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072303_layer_worktree_scope.sql"),
             include_str!("../../../sql/migrations/2026072303_layer_worktree_scope_down.sql"),
         ),
+        // plan-20260714 Part C W1 (§C.4.1.1): scope the read-only sparse
+        // view per worktree — `sparse_view` keyed by (worktree_id, ordinal)
+        // and the `sparse.enabled` toggle re-projected from the scope-less
+        // `config_kv` key into the per-worktree `sparse_view_meta` table.
+        // Legacy state adopts to main only when no linked worktree exists;
+        // the up migration fails closed (CHECK guard) on legacy state +
+        // linked HEAD evidence, and down fails closed on linked rows.
+        sql_migration(
+            2026072304,
+            "sparse_view_worktree_scope",
+            include_str!("../../../sql/migrations/2026072304_sparse_view_worktree_scope.sql"),
+            include_str!("../../../sql/migrations/2026072304_sparse_view_worktree_scope_down.sql"),
+        ),
     ]
 }
 
@@ -1286,9 +1299,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 37);
+        assert_eq!(runner.len(), 38);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072303));
+        assert_eq!(runner.max_registered_version(), Some(2026072304));
     }
 
     #[test]

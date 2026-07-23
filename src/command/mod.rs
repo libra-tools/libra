@@ -176,11 +176,13 @@ pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
 }
 
 /// plan-20260714 Part C W0 transition guard: refuse `op` inside a LINKED
-/// worktree with a caller-supplied reason. Used for the states whose stores are
-/// still repository-global (stash stack, dirty cache, layer/sparse tables,
-/// composite fetch/pull) until the W1/W2 slices make them worktree-scoped — a
-/// linked invocation could read or clobber the wrong (or the main worktree's)
-/// state, so it fails closed. Always allowed in the main worktree.
+/// worktree with a caller-supplied reason. Used for the states whose stores
+/// are still repository-global until their scoping slice lands — after the
+/// W1 slices scoped the dirty cache, layer, and sparse tables, that is the
+/// stash stack (and the `pull --rebase --autostash` combo that wraps it;
+/// W2). A linked invocation could read or clobber the wrong (or the main
+/// worktree's) state, so it fails closed. Always allowed in the main
+/// worktree.
 pub fn ensure_main_worktree_because(op: &str, reason: &str) -> crate::utils::error::CliResult<()> {
     if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
         return Err(crate::utils::error::CliError::fatal(format!(

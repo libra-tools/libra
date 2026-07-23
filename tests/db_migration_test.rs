@@ -52,7 +52,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302, 2026072303
+            2026072302, 2026072303, 2026072304
         ]
     );
     assert_eq!(
@@ -95,13 +95,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "bisect_state_worktree_scope",
             "working_dirty_worktree_scope",
             "layer_worktree_scope",
+            "sparse_view_worktree_scope",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 37);
-    assert_eq!(runner.max_registered_version(), Some(2026072303));
+    assert_eq!(runner.len(), 38);
+    assert_eq!(runner.max_registered_version(), Some(2026072304));
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,7 +1094,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302, 2026072303
+            2026072302, 2026072303, 2026072304
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1281,7 +1282,8 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             .await
             .expect("restore 1407 after the 1406 link-only rollback guard"),
         vec![
-            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
+            2026072304
         ]
     );
     conn.execute(Statement::from_string(
@@ -1344,7 +1346,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
         runner.run_pending(&conn).await.expect("M5 up #2"),
         vec![
             2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302,
-            2026072303
+            2026072303, 2026072304
         ]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
@@ -1445,7 +1447,8 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             .await
             .expect("upgrade immutable 1406 schema"),
         vec![
-            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
+            2026072304
         ]
     );
     let claim = conn
@@ -1576,7 +1579,8 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             .await
             .expect("upgrade evolved 1406 schema"),
         vec![
-            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
+            2026072304
         ]
     );
     let cursor = conn
@@ -1620,8 +1624,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404, 2026071403, 2026071402
+            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
+            2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1637,7 +1641,7 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         reapplied,
         vec![
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101, 2026072201, 2026072301, 2026072302, 2026072303
+            2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1668,8 +1672,8 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404
+            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
+            2026071407, 2026071406, 2026071405, 2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1685,7 +1689,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         applied,
         vec![
             2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201,
-            2026072301, 2026072302, 2026072303
+            2026072301, 2026072302, 2026072303, 2026072304
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -2030,11 +2034,11 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301,
-            2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401,
-            2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401,
-            2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
+            2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401,
+            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
+            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
+            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -2062,7 +2066,7 @@ async fn approved_permission_up_down_up_round_trip() {
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101, 2026072201, 2026072301, 2026072302, 2026072303
+            2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -2756,7 +2760,7 @@ async fn layer_migration_fails_closed_with_linked_evidence() {
             .rollback_to(&conn, 2026072302)
             .await
             .expect("rollback layer scope"),
-        vec![2026072303]
+        vec![2026072304, 2026072303]
     );
     conn.execute(Statement::from_string(
         backend,
@@ -2805,7 +2809,7 @@ async fn layer_migration_fails_closed_with_linked_evidence() {
     .expect("clear linked evidence");
     assert_eq!(
         runner.run_pending(&conn).await.expect("retry succeeds"),
-        vec![2026072303]
+        vec![2026072303, 2026072304]
     );
     let row = conn
         .query_one(Statement::from_string(
@@ -2963,4 +2967,323 @@ async fn column_exists(conn: &DatabaseConnection, table: &str, column: &str) -> 
         let name: String = row.try_get_by_index(1).expect("column name");
         name == column
     })
+}
+
+/// 2026072304 re-keys `sparse_view` per worktree and projects the legacy
+/// `sparse.enabled` `config_kv` key into `sparse_view_meta` — legacy
+/// patterns/toggle adopt to the main scope ('') when no linked worktree
+/// exists, and the retired config key is removed.
+#[tokio::test]
+async fn sparse_migration_adopts_main_state_without_linked_evidence() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    // Pre-create the legacy shape with rows + the legacy config toggle:
+    // 2026070701's CREATE IF NOT EXISTS skips the table, and 2026072304
+    // must rebuild + adopt + project.
+    conn.execute(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `sparse_view` (
+            `id`      INTEGER PRIMARY KEY AUTOINCREMENT,
+            `pattern` TEXT NOT NULL,
+            `ordinal` INTEGER NOT NULL
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("legacy sparse table");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO sparse_view (pattern, ordinal) VALUES ('src/**', 0), ('!src/gen/**', 1);"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy patterns");
+    conn.execute(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `config_kv` (
+            `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+            `key` TEXT NOT NULL,
+            `value` TEXT NOT NULL,
+            `encrypted` INTEGER NOT NULL DEFAULT 0
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("config_kv table");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', 'true');".to_string(),
+    ))
+    .await
+    .expect("legacy toggle");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
+    assert!(table_exists(&conn, "sparse_view_meta").await);
+    let rows = conn
+        .query_all(Statement::from_string(
+            backend,
+            "SELECT worktree_id, pattern FROM sparse_view ORDER BY ordinal".to_string(),
+        ))
+        .await
+        .expect("query");
+    let adopted: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get_by_index(0).expect("scope"),
+                row.try_get_by_index(1).expect("pattern"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        adopted,
+        vec![
+            ("".to_string(), "src/**".to_string()),
+            ("".to_string(), "!src/gen/**".to_string())
+        ]
+    );
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ''".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("projected toggle");
+    let enabled: i32 = row.try_get_by_index(0).expect("enabled");
+    assert_eq!(enabled, 1, "truthy legacy toggle projected as enabled");
+    let leftover = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM config_kv WHERE key = 'sparse.enabled'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let count: i64 = leftover.try_get_by_index(0).expect("count");
+    assert_eq!(count, 0, "the legacy config key is retired");
+}
+
+/// 2026072304 follows `ConfigKv::get` last-wins semantics for the legacy
+/// toggle: with duplicate `sparse.enabled` rows, only the HIGHEST-id value
+/// counts — a stale earlier `true` under a later `false` projects as
+/// DISABLED and does not count as legacy-enabled state for the guard, so
+/// the migration proceeds even alongside linked worktree evidence.
+#[tokio::test]
+async fn sparse_migration_projects_last_wins_toggle() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072303)
+            .await
+            .expect("rollback sparse scope"),
+        vec![2026072304]
+    );
+    // Duplicate legacy rows: stale `true` (lower id) then effective `false`
+    // (higher id) — `ConfigKv::get` reads the LAST one. Plus linked HEAD
+    // evidence: since the effective toggle is falsy and there are no
+    // patterns, there is NO legacy-enabled state and the guard must pass.
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', 'true');".to_string(),
+    ))
+    .await
+    .expect("stale truthy row");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', 'false');".to_string(),
+    ))
+    .await
+    .expect("effective falsy row");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO reference (name, kind, `commit`, worktree_id) \
+         VALUES (NULL, 'Head', 'aa11', 'wt1');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked HEAD evidence");
+
+    assert_eq!(
+        runner
+            .run_pending(&conn)
+            .await
+            .expect("falsy effective toggle does not trip the guard"),
+        vec![2026072304]
+    );
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ''".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("projected toggle");
+    let enabled: i32 = row.try_get_by_index(0).expect("enabled");
+    assert_eq!(enabled, 0, "last-wins falsy value projects as disabled");
+}
+
+/// 2026072304 FAILS CLOSED when legacy sparse state (patterns OR a truthy
+/// toggle) coexists with linked worktree evidence — ownership must not be
+/// guessed, and patterns are never copied to every worktree (§C.4.1.1).
+#[tokio::test]
+async fn sparse_migration_fails_closed_with_linked_evidence() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+    // Re-open the legacy window: roll back ONLY 2026072304 (its empty
+    // tables pass the down guard), then plant a truthy legacy toggle plus
+    // linked HEAD evidence — the toggle ALONE (no patterns) must trip the
+    // guard too.
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072303)
+            .await
+            .expect("rollback sparse scope"),
+        vec![2026072304]
+    );
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', 'true');".to_string(),
+    ))
+    .await
+    .expect("legacy toggle");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO reference (name, kind, `commit`, worktree_id) \
+         VALUES (NULL, 'Head', 'aa11', 'wt1');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked HEAD evidence");
+
+    let err = runner
+        .run_pending(&conn)
+        .await
+        .expect_err("legacy toggle + linked evidence must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the adopt guard CHECK: {rendered}"
+    );
+    assert!(!column_exists(&conn, "sparse_view", "worktree_id").await);
+
+    // Clearing the ambiguity (dropping the legacy toggle) lets the retry
+    // apply; no meta row is projected for a state-less repo... except the
+    // config row existed, so the main row records disabled-after-clear.
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM config_kv WHERE key = 'sparse.enabled';".to_string(),
+    ))
+    .await
+    .expect("clear legacy toggle");
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("retry succeeds"),
+        vec![2026072304]
+    );
+    assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
+}
+
+/// The 2026072304 down migration FAILS CLOSED while linked-scope rows exist
+/// (patterns or a meta row); after clearing them it restores the legacy
+/// shape and re-projects the main toggle back into `config_kv`.
+#[tokio::test]
+async fn sparse_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO sparse_view (worktree_id, pattern, ordinal) \
+         VALUES ('', 'main/**', 0), ('wt1', 'linked/**', 0);"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked patterns");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES ('', 1);".to_string(),
+    ))
+    .await
+    .expect("main toggle");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026072303)
+        .await
+        .expect_err("rollback with a linked pattern row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
+
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM sparse_view WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked pattern");
+
+    // Second guard branch: a linked META row alone must also fail closed.
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES ('wt1', 0);".to_string(),
+    ))
+    .await
+    .expect("linked meta row");
+    let err = runner
+        .rollback_to(&conn, 2026072303)
+        .await
+        .expect_err("rollback with a linked meta row must fail closed");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "meta guard CHECK fires"
+    );
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM sparse_view_meta WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked meta");
+
+    let rolled = runner
+        .rollback_to(&conn, 2026072303)
+        .await
+        .expect("rollback succeeds once only main rows remain");
+    assert_eq!(rolled, vec![2026072304]);
+    assert!(!column_exists(&conn, "sparse_view", "worktree_id").await);
+    assert!(!table_exists(&conn, "sparse_view_meta").await);
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'sparse.enabled'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("re-projected toggle");
+    let value: String = row.try_get_by_index(0).expect("value");
+    assert_eq!(value, "true", "main toggle re-projected into config_kv");
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT pattern FROM sparse_view".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("main pattern survives");
+    let pattern: String = row.try_get_by_index(0).expect("pattern");
+    assert_eq!(pattern, "main/**");
 }

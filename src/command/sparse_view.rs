@@ -63,19 +63,14 @@ pub enum SparseViewCommand {
 
 pub async fn execute_safe(args: SparseViewArgs, output: &OutputConfig) -> CliResult<()> {
     crate::utils::util::require_repo().map_err(|_| CliError::repo_not_found())?;
-    // Part C W0 (§C.11 transition guard): `sparse_view` rows and
-    // `sparse.enabled` are repository-global, but the matcher/hydrate acts on
-    // the current workdir — so one worktree set/clear/enable would change
-    // another's ls-files/diff/materialization. All subcommands fail closed in a
-    // linked worktree until W1 scopes the SparseViewStore call chain.
-    crate::command::ensure_main_worktree_because(
-        "sparse-view",
-        "sparse view state is not yet worktree-scoped",
-    )?;
+    // W1 §C.4.1.1: the sparse view is worktree-scoped — resolve the scope
+    // ONCE for this request and pass it down the whole SparseViewStore call
+    // chain (the former W0 linked-worktree guard is lifted).
+    let scope = crate::internal::worktree_scope::WorktreeScope::current();
     match args.command {
         SparseViewCommand::Set { patterns } => {
             validate_patterns(&patterns)?;
-            SparseViewStore::replace(&patterns)
+            SparseViewStore::replace(&scope, &patterns)
                 .await
                 .map_err(store_err)?;
             done(
@@ -85,14 +80,16 @@ pub async fn execute_safe(args: SparseViewArgs, output: &OutputConfig) -> CliRes
         }
         SparseViewCommand::Add { patterns } => {
             validate_patterns(&patterns)?;
-            SparseViewStore::add(&patterns).await.map_err(store_err)?;
+            SparseViewStore::add(&scope, &patterns)
+                .await
+                .map_err(store_err)?;
             done(
                 output,
                 &format!("added {} pattern(s) (enabled)", patterns.len()),
             )
         }
         SparseViewCommand::List => {
-            let patterns = SparseViewStore::list().await.map_err(store_err)?;
+            let patterns = SparseViewStore::list(&scope).await.map_err(store_err)?;
             if output.is_json() {
                 return emit_json_data(
                     "sparse-view",
@@ -110,20 +107,20 @@ pub async fn execute_safe(args: SparseViewArgs, output: &OutputConfig) -> CliRes
             Ok(())
         }
         SparseViewCommand::Enable => {
-            SparseViewStore::enable().await.map_err(store_err)?;
+            SparseViewStore::enable(&scope).await.map_err(store_err)?;
             done(output, "sparse view enabled")
         }
         SparseViewCommand::Disable => {
-            SparseViewStore::disable().await.map_err(store_err)?;
+            SparseViewStore::disable(&scope).await.map_err(store_err)?;
             done(output, "sparse view disabled")
         }
         SparseViewCommand::Clear => {
-            SparseViewStore::clear().await.map_err(store_err)?;
+            SparseViewStore::clear(&scope).await.map_err(store_err)?;
             done(output, "sparse view cleared and disabled")
         }
         SparseViewCommand::Status => {
-            let enabled = SparseViewStore::is_enabled().await;
-            let patterns = SparseViewStore::list().await.map_err(store_err)?;
+            let enabled = SparseViewStore::is_enabled(&scope).await;
+            let patterns = SparseViewStore::list(&scope).await.map_err(store_err)?;
             if output.is_json() {
                 return emit_json_data(
                     "sparse-view",

@@ -436,6 +436,59 @@ fn state_path() -> PathBuf {
 /// If the state file does not exist or is empty, this function initializes a
 /// fresh state with a single main worktree derived from the storage path, then
 /// persists it before returning.
+/// RAII guard over the worktree REGISTRY mutation lock (`worktrees.lock` in
+/// the common storage). Serializes every registry mutator's
+/// load → check → mutate → write sequence across processes: without it, a
+/// concurrent `worktree add`'s strict pre-seed sweep could delete rows
+/// another add just seeded for the same deterministic instance id, and two
+/// load/modify/write registry updates could drop each other's entries. The
+/// flock is BLOCKING (concurrent mutators queue rather than fail) and
+/// released on drop (or process exit). Read-only paths (`list`) stay
+/// lock-free.
+struct RegistryLockGuard {
+    #[allow(dead_code)] // held for its flock; released on drop
+    file: fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for RegistryLockGuard {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
+    let lock_path = util::storage_path().join("worktrees.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| {
+            WorktreeError::IoWrite(format!(
+                "cannot open the worktree registry lock '{}': {e}",
+                lock_path.display()
+            ))
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(WorktreeError::IoWrite(format!(
+                "cannot lock the worktree registry '{}': {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(RegistryLockGuard { file })
+}
+
 fn load_state() -> WorktreeResult<WorktreeState> {
     let path = state_path();
     if !path.exists() {
@@ -700,6 +753,10 @@ fn find_entry<'a>(state: &'a WorktreeState, path: &Path) -> Option<&'a WorktreeE
 /// - when `HEAD` exists, populates the new worktree from committed `HEAD`
 ///   content (not staged-only index changes).
 async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
+    // Registry mutation lock: the whole precheck → sweep → seed → registry
+    // write sequence runs under it (a concurrent add's sweep must not
+    // delete this add's freshly seeded rows).
+    let _registry_lock = acquire_registry_lock()?;
     let storage = util::storage_path();
     let target = resolve_path(&path, "worktree path")?;
 
@@ -782,6 +839,21 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
     }
 
     let worktree_id = util::worktree_instance_id(&canonical_target);
+    // W1 §C.4.1.1: instance ids are DETERMINISTIC (path-derived), so a
+    // worktree re-added where one was previously removed would inherit any
+    // scoped rows a best-effort remove/prune GC failed to delete — stale
+    // sparse filters would silently re-gate ls-files/diff/hydrate, stale
+    // layer ownership would block staging. Sweep the scope STRICTLY before
+    // seeding; a sweep failure fails the add (fail closed, nothing seeded).
+    gc_worktree_scoped_rows_strict(&worktree_id, true)
+        .await
+        .map_err(|e| {
+            WorktreeError::IoWrite(format!(
+                "cannot register worktree '{}': failed to clear stale scoped rows for its \
+                 instance id: {e}",
+                target.display()
+            ))
+        })?;
     create_worktree_gitdir(&storage, &link_path, &worktree_id).map_err(|source| {
         WorktreeError::IoWrite(format!(
             "failed to create per-worktree .libra gitdir in '{}': {source}",
@@ -932,7 +1004,24 @@ fn resolve_worktree_id(target: &Path) -> Option<String> {
 /// fresh worktree silently resume a dead session (a resumed bisect step even
 /// repaints candidate trees — data loss). Best-effort: a failure is logged,
 /// not fatal (the registry drop is the source of truth).
-async fn gc_worktree_scoped_rows(worktree_id: &str, purge_layer_ownership: bool) {
+async fn gc_worktree_scoped_rows(worktree_id: &str, directory_gone: bool) {
+    // Best-effort on the REMOVAL side only: `worktree add` re-sweeps the
+    // same scope STRICTLY before seeding (deterministic ids), so a failure
+    // logged here can never silently leak stale state into a future
+    // worktree at the same path.
+    if let Err(e) = gc_worktree_scoped_rows_strict(worktree_id, directory_gone).await {
+        tracing::warn!(worktree_id, error = %e, "failed to GC per-worktree rows");
+    }
+}
+
+/// Strict variant of [`gc_worktree_scoped_rows`]: the first failed DELETE
+/// aborts and surfaces the error. `worktree add` uses this as its pre-seed
+/// sweep — inheriting another (removed) worktree's rows must fail the add,
+/// not proceed with a polluted scope.
+async fn gc_worktree_scoped_rows_strict(
+    worktree_id: &str,
+    directory_gone: bool,
+) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let db = crate::internal::db::get_db_conn_instance().await;
     let mut stmts = vec![
@@ -943,18 +1032,22 @@ async fn gc_worktree_scoped_rows(worktree_id: &str, purge_layer_ownership: bool)
         "DELETE FROM working_dirty WHERE worktree_id = ?",
         "DELETE FROM working_dirty_meta WHERE worktree_id = ?",
     ];
-    // Layer registrations/ownership (W1 §C.4.1.1): purged ONLY when the
-    // worktree directory is actually gone (`--delete-dir`, or it had already
-    // vanished). A default `remove` RETAINS the directory — and a retained
-    // `.libra` still operates as a repository — so its ownership rows must
-    // survive to keep the still-materialized overlay files un-stageable
-    // (never-enters-commit). The retained directory cannot be re-registered
+    // Layer registrations/ownership and the sparse view (W1 §C.4.1.1):
+    // purged ONLY when the worktree directory is actually gone
+    // (`--delete-dir`, prune, or it had already vanished). A default
+    // `remove` RETAINS the directory — and a retained `.libra` still
+    // operates as a repository — so its layer ownership rows must survive
+    // to keep the still-materialized overlay files un-stageable
+    // (never-enters-commit), and its sparse view keeps filtering that
+    // directory's queries. The retained directory cannot be re-registered
     // while non-empty (`worktree add` refuses), so the rows guard it until
     // the directory is cleared; orphaned rows are then reclaimed by the W3
     // worktree doctor (they are invisible to every live scope meanwhile).
-    if purge_layer_ownership {
+    if directory_gone {
         stmts.push("DELETE FROM layer WHERE worktree_id = ?");
         stmts.push("DELETE FROM layer_path WHERE worktree_id = ?");
+        stmts.push("DELETE FROM sparse_view WHERE worktree_id = ?");
+        stmts.push("DELETE FROM sparse_view_meta WHERE worktree_id = ?");
     }
     // `bisect_state` is owned by migration `2026072301`, but bare or
     // pre-migration test databases may still lack it — only purge when the
@@ -972,17 +1065,15 @@ async fn gc_worktree_scoped_rows(worktree_id: &str, purge_layer_ownership: bool)
         stmts.push("DELETE FROM bisect_state WHERE worktree_id = ?");
     }
     for sql in stmts {
-        if let Err(e) = db
-            .execute(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                sql,
-                [worktree_id.into()],
-            ))
-            .await
-        {
-            tracing::warn!(worktree_id, error = %e, "failed to GC per-worktree rows");
-        }
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [worktree_id.into()],
+        ))
+        .await
+        .map_err(|e| format!("{sql}: {e}"))?;
     }
+    Ok(())
 }
 
 /// Create a linked worktree's REAL `.libra` gitdir (lore.md 2.1) instead of a
@@ -1148,6 +1239,7 @@ async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()>
 /// human-readable reason. Locking is a state-only operation and does not
 /// alter directories on disk.
 fn lock_worktree(path: String, reason: Option<String>) -> WorktreeResult<WorktreeLockOutput> {
+    let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
     let entry = match find_entry_mut(&mut state, &target) {
@@ -1186,6 +1278,7 @@ fn render_lock_worktree(result: &WorktreeLockOutput, output: &OutputConfig) -> C
 /// Clears the lock flag and reason for the specified worktree entry if it is
 /// currently locked. Unlocking is idempotent and leaves the filesystem untouched.
 fn unlock_worktree(path: String) -> WorktreeResult<WorktreeUnlockOutput> {
+    let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
     let entry = match find_entry_mut(&mut state, &target) {
@@ -1226,6 +1319,7 @@ fn render_unlock_worktree(result: &WorktreeUnlockOutput, output: &OutputConfig) 
 /// - renames the directory on disk, attempting to roll back registry changes
 ///   if the rename fails.
 fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMoveOutput> {
+    let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
     let src_path = resolve_path(&src, "source worktree path")?;
     let dest_path = resolve_path(&dest, "destination worktree path")?;
@@ -1313,6 +1407,7 @@ fn render_move_worktree(result: &WorktreeMoveOutput, output: &OutputConfig) -> C
 /// to guard); leaked rows would otherwise be re-inherited by a worktree
 /// re-created at the same path (deterministic instance id).
 async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
+    let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
     let to_prune: Vec<_> = state
         .worktrees
@@ -1371,6 +1466,7 @@ fn render_prune_worktrees(result: &WorktreePruneOutput, output: &OutputConfig) -
 /// Order matters: registry last — a half-completed delete cannot silently
 /// unregister a worktree whose directory is still present.
 async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<WorktreeRemoveOutput> {
+    let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
 
@@ -1557,6 +1653,7 @@ fn render_umount_fuse_path(result: &WorktreeUmountOutput, output: &OutputConfig)
 /// main worktree entry. The repaired state is only written back if changes
 /// were actually made.
 fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
+    let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
     let mut changed = false;
 

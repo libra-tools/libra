@@ -766,7 +766,9 @@ fn relative_prefix(args: &DiffArgs) -> Option<String> {
 /// lore.md 2.2: retain only in-view files in a working-tree diff and recompute
 /// the stat totals. A no-op when the view is inactive.
 async fn apply_sparse_view_filter(result: &mut DiffOutput) {
-    let view = crate::internal::sparse::SparseView::load().await;
+    // W1 §C.4.1.1: per-worktree view (read-only display filter).
+    let scope = crate::internal::worktree_scope::WorktreeScope::current();
+    let view = crate::internal::sparse::SparseView::load(&scope).await;
     if !view.is_active() {
         return;
     }

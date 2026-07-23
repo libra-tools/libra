@@ -12,7 +12,10 @@
 
 use std::fs;
 
-use super::{assert_cli_success, run_libra_command, run_libra_command_with_stdin};
+use super::{
+    assert_cli_success, base_libra_command, parse_json_stdout, run_libra_command,
+    run_libra_command_with_stdin,
+};
 
 /// A committed repo (a.txt @ c1) with a `feature` branch. Returns its dir.
 fn repo_with_feature() -> tempfile::TempDir {
@@ -297,7 +300,7 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         String::from_utf8_lossy(&autostash_pull.stderr)
     );
 
-    let cases: &[&[&str]] = &[&["stash", "list"], &["sparse-view", "status"]];
+    let cases: &[&[&str]] = &[&["stash", "list"]];
     for argv in cases {
         let out = run_libra_command(argv, &wt);
         assert_ne!(
@@ -317,8 +320,9 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         &run_libra_command(&["stash", "list"], main),
         "stash list works in main",
     );
-    // W1 §C.4.1.1: the dirty cache and the layer registry are worktree-scoped
-    // now — both run in a linked worktree against their own rows.
+    // W1 §C.4.1.1: the dirty cache, the layer registry, and the sparse view
+    // are worktree-scoped now — all run in a linked worktree against their
+    // own rows.
     assert_cli_success(
         &run_libra_command(&["dirty", "--list"], &wt),
         "dirty --list runs in a linked worktree since W1",
@@ -326,6 +330,10 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
     assert_cli_success(
         &run_libra_command(&["layer", "list"], &wt),
         "layer list runs in a linked worktree since W1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["sparse-view", "status"], &wt),
+        "sparse-view status runs in a linked worktree since W1",
     );
 }
 
@@ -1725,6 +1733,253 @@ fn layer_registry_is_worktree_scoped() {
     );
 }
 
+/// W1 §C.4.1.1: the sparse view is per-worktree — the same repo filters
+/// `ls-files` differently per worktree, and one scope's disable/clear never
+/// leaks into another's view.
+#[test]
+fn sparse_view_is_worktree_scoped() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let wt_root = tempfile::tempdir().expect("wt root");
+    let wt = wt_root.path().join("sparse-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    // Two tracked files exist from the fixture; add distinct view scopes.
+    let main_ls_all = run_libra_command(&["ls-files"], main);
+    assert_cli_success(&main_ls_all, "main ls-files baseline");
+    let baseline = String::from_utf8_lossy(&main_ls_all.stdout).lines().count();
+    assert!(baseline >= 1, "fixture has tracked files");
+
+    // Main scopes to a never-matching pattern; linked keeps everything.
+    assert_cli_success(
+        &run_libra_command(&["sparse-view", "set", "nothing-matches/**"], main),
+        "main sparse-view set",
+    );
+    let main_ls = run_libra_command(&["ls-files"], main);
+    assert_cli_success(&main_ls, "main ls-files filtered");
+    assert_eq!(
+        String::from_utf8_lossy(&main_ls.stdout).trim(),
+        "",
+        "main view filters everything out"
+    );
+    let wt_ls = run_libra_command(&["ls-files"], &wt);
+    assert_cli_success(&wt_ls, "wt ls-files unfiltered");
+    assert_eq!(
+        String::from_utf8_lossy(&wt_ls.stdout).lines().count(),
+        baseline,
+        "linked worktree is NOT filtered by main's view"
+    );
+
+    // The linked worktree sets its own view; disabling it does not disable
+    // main's, and clearing main's leaves linked's patterns intact.
+    assert_cli_success(
+        &run_libra_command(&["sparse-view", "set", "also-nothing/**"], &wt),
+        "wt sparse-view set",
+    );
+    assert_cli_success(
+        &run_libra_command(&["sparse-view", "disable"], &wt),
+        "wt disable",
+    );
+    let main_status = run_libra_command(&["--json", "sparse-view", "status"], main);
+    assert_cli_success(&main_status, "main sparse-view status");
+    let json = parse_json_stdout(&main_status);
+    assert_eq!(
+        json["data"]["enabled"].as_bool(),
+        Some(true),
+        "main stays enabled after linked disable"
+    );
+    assert_cli_success(
+        &run_libra_command(&["sparse-view", "clear"], main),
+        "main clear",
+    );
+    let wt_status = run_libra_command(&["--json", "sparse-view", "status"], &wt);
+    assert_cli_success(&wt_status, "wt sparse-view status");
+    let json = parse_json_stdout(&wt_status);
+    assert_eq!(
+        json["data"]["pattern_count"].as_i64(),
+        Some(1),
+        "linked patterns survive main's clear"
+    );
+}
+
+/// W1 §C.4.1.1: every registry mutator serializes on `worktrees.lock`. A
+/// held lock BLOCKS a concurrent `worktree add` (it queues rather than
+/// fails) and the add proceeds once the lock is released; concurrent adds
+/// therefore both land in the registry (no load-modify-write lost update,
+/// and a second add's strict pre-seed sweep can never run between another
+/// add's seed and registry commit).
+#[cfg(unix)]
+#[test]
+fn registry_mutators_serialize_on_worktrees_lock() {
+    use std::os::unix::io::AsRawFd;
+
+    /// Kill-and-reap on every exit path — an assertion failure must never
+    /// leave a spawned add running against a removed temp repository.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let wt_root = tempfile::tempdir().expect("wt root");
+
+    // Take the registry lock, THEN spawn all three adds: the held lock is a
+    // start barrier — every child must queue on the flock (add's FIRST
+    // operation) before any of them can proceed, so the contention below is
+    // guaranteed, not timing-dependent.
+    let lock_path = main.join(".libra/worktrees.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open registry lock");
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) },
+        0,
+        "test takes the registry lock"
+    );
+    let spawn_add = |wt: &std::path::Path| {
+        ChildGuard(
+            base_libra_command(&["worktree", "add", wt.to_str().unwrap()], main)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn add"),
+        )
+    };
+    let targets = [
+        wt_root.path().join("lock-wt-a"),
+        wt_root.path().join("lock-wt-b"),
+        wt_root.path().join("lock-wt-c"),
+    ];
+    let mut children: Vec<(std::path::PathBuf, ChildGuard)> = targets
+        .iter()
+        .map(|wt| (wt.clone(), spawn_add(wt)))
+        .collect();
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    for (wt, child) in &mut children {
+        assert!(
+            child.0.try_wait().expect("try_wait").is_none(),
+            "add for {} queues on the held registry lock instead of finishing",
+            wt.display()
+        );
+        // STRONGER than liveness (which a slow start could fake): the lock
+        // is add's first operation, before the target directory is even
+        // created — zero side effects prove the child is parked ON the
+        // flock, not merely slow.
+        assert!(
+            !wt.exists(),
+            "no side effect for {} while the lock is held (add parks on the flock \
+             before creating anything)",
+            wt.display()
+        );
+    }
+
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
+        0,
+        "test releases the registry lock"
+    );
+    for (wt, mut child) in children {
+        let status = child.0.wait().expect("wait add");
+        assert!(
+            status.success(),
+            "add for {} succeeds once the lock is released",
+            wt.display()
+        );
+        assert!(wt.join(".libra").exists(), "worktree materialized");
+    }
+
+    // All three serialized through the lock — none lost the others' entry.
+    let registry =
+        std::fs::read_to_string(main.join(".libra/worktrees.json")).expect("registry file");
+    for name in ["lock-wt-a", "lock-wt-b", "lock-wt-c"] {
+        assert!(
+            registry.contains(name),
+            "{name} survives concurrent registry writes: {registry}"
+        );
+    }
+}
+
+/// W1 §C.4.1.1: instance ids are deterministic (path-derived), and the
+/// remove/prune GC is best-effort — so `worktree add` STRICTLY sweeps its
+/// instance id's scoped rows before seeding. Stale rows a failed GC left
+/// behind (planted here directly) must never be inherited by a new
+/// worktree at the same path: its sparse view starts disabled/empty and
+/// its layer registry starts empty.
+#[test]
+#[serial_test::serial]
+fn worktree_add_sweeps_stale_scope_rows() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let wt_root = tempfile::tempdir().expect("wt root");
+    let wt = wt_root.path().join("swept-wt");
+    // Pre-create the (empty) directory so its canonical path — and thus the
+    // deterministic instance id — can be computed before the add.
+    std::fs::create_dir_all(&wt).unwrap();
+    let canonical = std::fs::canonicalize(&wt).unwrap();
+    let stale_id = libra::utils::util::worktree_instance_id(&canonical);
+
+    // Plant "leaked" rows for that id, as if a prior remove's GC failed.
+    {
+        let _guard = libra::utils::test::ChangeDirGuard::new(main);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            use sea_orm::{ConnectionTrait, Statement};
+            let db = libra::internal::db::get_db_conn_instance().await;
+            for sql in [
+                format!(
+                    "INSERT INTO sparse_view (worktree_id, pattern, ordinal) \
+                     VALUES ('{stale_id}', 'stale/**', 0);"
+                ),
+                format!(
+                    "INSERT INTO sparse_view_meta (worktree_id, enabled) \
+                     VALUES ('{stale_id}', 1);"
+                ),
+                format!(
+                    "INSERT INTO layer (worktree_id, name, source) \
+                     VALUES ('{stale_id}', 'stale-ov', '/nonexistent');"
+                ),
+                format!(
+                    "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
+                     VALUES ('{stale_id}', 'stale-ov', 'stale.txt', 'h0');"
+                ),
+            ] {
+                db.execute(Statement::from_string(db.get_database_backend(), sql))
+                    .await
+                    .expect("plant stale row");
+            }
+        });
+    }
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add sweeps the stale scope",
+    );
+
+    // The new worktree inherits NOTHING: sparse disabled/empty, no layers.
+    let status = run_libra_command(&["--json", "sparse-view", "status"], &wt);
+    assert_cli_success(&status, "wt sparse-view status");
+    let json = parse_json_stdout(&status);
+    assert_eq!(json["data"]["enabled"].as_bool(), Some(false));
+    assert_eq!(json["data"]["pattern_count"].as_i64(), Some(0));
+    let layers = run_libra_command(&["layer", "list"], &wt);
+    assert_cli_success(&layers, "wt layer list");
+    assert!(
+        !String::from_utf8_lossy(&layers.stdout).contains("stale-ov"),
+        "stale layer registration not inherited"
+    );
+}
+
 /// W1 §C.4.1.1: `worktree remove` purges the removed scope's layer rows ONLY
 /// when the directory is deleted too. A default (directory-retaining) remove
 /// keeps the ownership rows — the retained `.libra` still operates as a
@@ -1754,6 +2009,10 @@ fn worktree_remove_purges_layer_scope_rows() {
             "linked layer add",
         );
         assert_cli_success(&run_libra_command(&["layer", "apply"], wt), "wt apply");
+        assert_cli_success(
+            &run_libra_command(&["sparse-view", "set", "scoped/**"], wt),
+            "wt sparse-view set",
+        );
     };
     let linked_rows = |table: &str| -> i64 {
         let _guard = libra::utils::test::ChangeDirGuard::new(main);
@@ -1787,6 +2046,10 @@ fn worktree_remove_purges_layer_scope_rows() {
     assert!(
         linked_rows("layer") > 0 && linked_rows("layer_path") > 0,
         "retained directory keeps its layer ownership rows"
+    );
+    assert!(
+        linked_rows("sparse_view") > 0 && linked_rows("sparse_view_meta") > 0,
+        "retained directory keeps its sparse view rows"
     );
     let forced = run_libra_command(&["add", "-f", "ov.txt"], &wt_kept);
     assert_ne!(
@@ -1829,7 +2092,7 @@ fn worktree_remove_purges_layer_scope_rows() {
         ),
         "worktree remove --delete-dir",
     );
-    for table in ["layer", "layer_path"] {
+    for table in ["layer", "layer_path", "sparse_view", "sparse_view_meta"] {
         assert_eq!(
             linked_rows(table),
             1,
@@ -1846,7 +2109,7 @@ fn worktree_remove_purges_layer_scope_rows() {
         &run_libra_command(&["worktree", "prune"], main),
         "worktree prune",
     );
-    for table in ["layer", "layer_path"] {
+    for table in ["layer", "layer_path", "sparse_view", "sparse_view_meta"] {
         assert_eq!(
             linked_rows(table),
             1,

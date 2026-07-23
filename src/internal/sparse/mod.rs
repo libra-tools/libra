@@ -8,9 +8,12 @@
 //! do). `status` only surfaces a one-line advisory that a view is active.
 //!
 //! State: the ordered pattern list lives in the `sparse_view` table (owned
-//! solely by [`SparseViewStore`], §3.6); the `sparse.enabled` toggle lives in
-//! `config_kv` (mirroring git's `core.sparseCheckout` split). Absence-tolerant:
-//! a missing table (pre-migration / old binary) resolves to an empty view.
+//! solely by [`SparseViewStore`], §3.6); the enabled toggle lives in the
+//! per-worktree `sparse_view_meta` projection (W1 §C.4.1.1 — it replaced the
+//! scope-less `sparse.enabled` `config_kv` key via migration `2026072304`).
+//! Absence-tolerant: a missing table (pre-migration / old binary) resolves
+//! to an empty, disabled view. Every method takes the request's ONE resolved
+//! [`WorktreeScope`] — patterns and the toggle are per-worktree facts.
 
 use std::path::Path;
 
@@ -18,28 +21,40 @@ use ignore::{Match, gitignore::Gitignore};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 use crate::{
-    internal::{config::ConfigKv, db::get_db_conn_instance},
+    internal::{db::get_db_conn_instance, worktree_scope::WorktreeScope},
     utils::util,
 };
 
-const ENABLED_KEY: &str = "sparse.enabled";
-
-/// Single-owner store over `sparse_view` + the `sparse.enabled` config toggle.
+/// Single-owner store over `sparse_view` + the `sparse_view_meta` toggle.
 pub struct SparseViewStore;
 
 impl SparseViewStore {
-    /// The ordered include patterns (empty if the table is absent).
-    pub async fn list() -> Result<Vec<String>, String> {
+    /// The ordered include patterns of `scope` (empty if the table is
+    /// absent — tolerant, for read-only display callers).
+    pub async fn list(scope: &WorktreeScope) -> Result<Vec<String>, String> {
+        match Self::list_strict(scope).await {
+            Err(e) if e.contains("no such table") => Ok(Vec::new()),
+            other => other,
+        }
+    }
+
+    /// The ordered include patterns of `scope`, PROPAGATING every read
+    /// error INCLUDING a missing table — the migration runner creates the
+    /// table on every connection, so its absence here means a corrupted or
+    /// tampered store, and a materialization gate (hydrate) must fail
+    /// closed on it rather than see an empty (no-op) view.
+    pub async fn list_strict(scope: &WorktreeScope) -> Result<Vec<String>, String> {
         let db = get_db_conn_instance().await;
-        let stmt = Statement::from_string(
+        let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT pattern FROM sparse_view ORDER BY ordinal ASC, id ASC".to_string(),
+            "SELECT pattern FROM sparse_view WHERE worktree_id = ? \
+             ORDER BY ordinal ASC, id ASC",
+            [scope.storage_key().into()],
         );
-        let rows = match db.query_all(stmt).await {
-            Ok(rows) => rows,
-            Err(e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
-            Err(e) => return Err(format!("failed to list the sparse view: {e}")),
-        };
+        let rows = db
+            .query_all(stmt)
+            .await
+            .map_err(|e| format!("failed to list the sparse view: {e}"))?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(row.try_get_by_index(0).map_err(|e| e.to_string())?);
@@ -47,70 +62,95 @@ impl SparseViewStore {
         Ok(out)
     }
 
-    /// Whether the view is enabled (config toggle). Default false.
-    pub async fn is_enabled() -> bool {
-        ConfigKv::get(ENABLED_KEY)
-            .await
-            .ok()
-            .flatten()
-            .map(|entry| matches!(entry.value.trim(), "true" | "1" | "yes" | "on"))
-            .unwrap_or(false)
-    }
-
-    async fn set_enabled(enabled: bool) -> Result<(), String> {
+    /// Whether `scope`'s view is enabled, PROPAGATING every read error
+    /// INCLUDING a missing `sparse_view_meta` table — the mutation/
+    /// materialization gates (hydrate) must fail closed instead of treating
+    /// an unreadable or missing toggle store as "disabled" (the migration
+    /// runner creates the table on every connection; absence = corruption).
+    pub async fn is_enabled_strict(scope: &WorktreeScope) -> Result<bool, String> {
         let db = get_db_conn_instance().await;
-        ConfigKv::set_with_conn(
-            &db,
-            ENABLED_KEY,
-            if enabled { "true" } else { "false" },
-            false,
-        )
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
+            [scope.storage_key().into()],
+        );
+        match db.query_one(stmt).await {
+            Ok(Some(row)) => Ok(row.try_get_by_index::<i32>(0).map_err(|e| e.to_string())? != 0),
+            Ok(None) => Ok(false),
+            Err(e) => Err(format!("failed to read the sparse view toggle: {e}")),
+        }
+    }
+
+    /// Whether `scope`'s view is enabled. Read errors resolve to `false` —
+    /// acceptable ONLY for read-only display filtering (a query command must
+    /// not fail on an advisory probe); hydrate uses [`Self::is_enabled_strict`].
+    pub async fn is_enabled(scope: &WorktreeScope) -> bool {
+        Self::is_enabled_strict(scope).await.unwrap_or(false)
+    }
+
+    async fn set_enabled(scope: &WorktreeScope, enabled: bool) -> Result<(), String> {
+        let db = get_db_conn_instance().await;
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
+             ON CONFLICT(worktree_id) DO UPDATE SET enabled = excluded.enabled",
+            [
+                scope.storage_key().into(),
+                (if enabled { 1 } else { 0 }).into(),
+            ],
+        ))
         .await
-        .map_err(|e| format!("failed to set {ENABLED_KEY}: {e}"))
+        .map_err(|e| format!("failed to set the sparse view toggle: {e}"))?;
+        Ok(())
     }
 
-    /// Replace the whole pattern list (transactional) and ENABLE the view.
-    pub async fn replace(patterns: &[String]) -> Result<(), String> {
-        Self::rewrite(patterns).await?;
-        Self::set_enabled(true).await
+    /// Replace `scope`'s pattern list (transactional) and ENABLE its view.
+    pub async fn replace(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
+        Self::rewrite(scope, patterns).await?;
+        Self::set_enabled(scope, true).await
     }
 
-    /// Append patterns (keeping order) and ENABLE the view.
-    pub async fn add(patterns: &[String]) -> Result<(), String> {
-        let mut all = Self::list().await?;
+    /// Append patterns (keeping order) and ENABLE `scope`'s view.
+    pub async fn add(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
+        let mut all = Self::list(scope).await?;
         all.extend(patterns.iter().cloned());
-        Self::rewrite(&all).await?;
-        Self::set_enabled(true).await
+        Self::rewrite(scope, &all).await?;
+        Self::set_enabled(scope, true).await
     }
 
-    /// Drop every pattern and DISABLE the view.
-    pub async fn clear() -> Result<(), String> {
-        Self::rewrite(&[]).await?;
-        Self::set_enabled(false).await
+    /// Drop every pattern and DISABLE `scope`'s view.
+    pub async fn clear(scope: &WorktreeScope) -> Result<(), String> {
+        Self::rewrite(scope, &[]).await?;
+        Self::set_enabled(scope, false).await
     }
 
-    /// Enable / disable without changing the patterns.
-    pub async fn enable() -> Result<(), String> {
-        Self::set_enabled(true).await
+    /// Enable / disable `scope`'s view without changing the patterns.
+    pub async fn enable(scope: &WorktreeScope) -> Result<(), String> {
+        Self::set_enabled(scope, true).await
     }
-    pub async fn disable() -> Result<(), String> {
-        Self::set_enabled(false).await
+    pub async fn disable(scope: &WorktreeScope) -> Result<(), String> {
+        Self::set_enabled(scope, false).await
     }
 
-    async fn rewrite(patterns: &[String]) -> Result<(), String> {
+    async fn rewrite(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
         let db = get_db_conn_instance().await;
         let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute(Statement::from_string(
+        txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "DELETE FROM sparse_view".to_string(),
+            "DELETE FROM sparse_view WHERE worktree_id = ?",
+            [scope.storage_key().into()],
         ))
         .await
         .map_err(|e| format!("failed to clear the sparse view: {e}"))?;
         for (ordinal, pattern) in patterns.iter().enumerate() {
             txn.execute(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO sparse_view (pattern, ordinal) VALUES (?, ?)",
-                [pattern.as_str().into(), (ordinal as i64).into()],
+                "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
+                [
+                    scope.storage_key().into(),
+                    pattern.as_str().into(),
+                    (ordinal as i64).into(),
+                ],
             ))
             .await
             .map_err(|e| format!("failed to record a sparse pattern: {e}"))?;
@@ -130,22 +170,34 @@ pub struct SparseView {
 }
 
 impl SparseView {
-    /// Load + compile the active view. Returns a no-op view (`is_active()` ==
-    /// false) when disabled/empty or on any load error (read-only filters must
-    /// never fail a query command).
-    pub async fn load() -> Self {
+    /// Load + compile `scope`'s active view. Returns a no-op view
+    /// (`is_active()` == false) when disabled/empty or on any load error —
+    /// acceptable ONLY for read-only display filtering (`ls-files`/`diff`/
+    /// `status` advisory); materialization paths use [`Self::try_load`].
+    pub async fn load(scope: &WorktreeScope) -> Self {
+        Self::try_load(scope).await.unwrap_or_else(|_| Self {
+            matcher: None,
+            workdir: util::working_dir(),
+        })
+    }
+
+    /// Load + compile `scope`'s active view, PROPAGATING store read errors
+    /// (W1 §C.4.1.1: a mutation/materialization gate like `hydrate` must not
+    /// treat an unreadable view as "everything in view" — that would
+    /// materialize past the gate on a probe failure). A disabled or empty
+    /// view still resolves Ok to a no-op view: that is its true state.
+    pub async fn try_load(scope: &WorktreeScope) -> Result<Self, String> {
         let workdir = util::working_dir();
-        if !SparseViewStore::is_enabled().await {
-            return Self {
+        if !SparseViewStore::is_enabled_strict(scope).await? {
+            return Ok(Self {
                 matcher: None,
                 workdir,
-            };
+            });
         }
-        let patterns = SparseViewStore::list().await.unwrap_or_default();
+        let patterns = SparseViewStore::list_strict(scope).await?;
         let matcher = util::build_exclude_matcher(&workdir, &patterns)
-            .ok()
-            .flatten();
-        Self { matcher, workdir }
+            .map_err(|e| format!("failed to compile the sparse view patterns: {e}"))?;
+        Ok(Self { matcher, workdir })
     }
 
     /// Whether the view actually filters anything.
@@ -227,32 +279,143 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
         setup_with_new_libra_in(tmp.path()).await;
+        let scope = WorktreeScope::Main;
 
-        assert!(!SparseViewStore::is_enabled().await);
-        SparseViewStore::replace(&["a/**".to_string(), "b/**".to_string()])
+        assert!(!SparseViewStore::is_enabled(&scope).await);
+        SparseViewStore::replace(&scope, &["a/**".to_string(), "b/**".to_string()])
             .await
             .expect("replace");
-        assert!(SparseViewStore::is_enabled().await, "replace enables");
+        assert!(SparseViewStore::is_enabled(&scope).await, "replace enables");
         assert_eq!(
-            SparseViewStore::list().await.expect("list"),
+            SparseViewStore::list(&scope).await.expect("list"),
             vec!["a/**", "b/**"]
         );
-        SparseViewStore::add(&["!a/x/**".to_string()])
+        SparseViewStore::add(&scope, &["!a/x/**".to_string()])
             .await
             .expect("add");
         assert_eq!(
-            SparseViewStore::list().await.expect("list"),
+            SparseViewStore::list(&scope).await.expect("list"),
             vec!["a/**", "b/**", "!a/x/**"]
         );
-        SparseViewStore::disable().await.expect("disable");
-        assert!(!SparseViewStore::is_enabled().await);
+        SparseViewStore::disable(&scope).await.expect("disable");
+        assert!(!SparseViewStore::is_enabled(&scope).await);
         assert_eq!(
-            SparseViewStore::list().await.expect("list").len(),
+            SparseViewStore::list(&scope).await.expect("list").len(),
             3,
             "patterns kept"
         );
-        SparseViewStore::clear().await.expect("clear");
-        assert!(SparseViewStore::list().await.expect("list").is_empty());
-        assert!(!SparseViewStore::is_enabled().await);
+        SparseViewStore::clear(&scope).await.expect("clear");
+        assert!(
+            SparseViewStore::list(&scope)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        assert!(!SparseViewStore::is_enabled(&scope).await);
+    }
+
+    /// W1 §C.4.1.1: two scopes hold patterns and enabled state independently
+    /// — one scope's replace/clear/disable never leaks into the other's view.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn scopes_are_isolated() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        let main = WorktreeScope::Main;
+        let linked = WorktreeScope::Linked("wt-test".to_string());
+
+        SparseViewStore::replace(&main, &["main/**".to_string()])
+            .await
+            .expect("main replace");
+        SparseViewStore::replace(&linked, &["linked/**".to_string()])
+            .await
+            .expect("linked replace");
+        assert_eq!(
+            SparseViewStore::list(&main).await.expect("list"),
+            vec!["main/**"]
+        );
+        assert_eq!(
+            SparseViewStore::list(&linked).await.expect("list"),
+            vec!["linked/**"]
+        );
+
+        // Disabling one scope leaves the other enabled.
+        SparseViewStore::disable(&linked).await.expect("disable");
+        assert!(SparseViewStore::is_enabled(&main).await);
+        assert!(!SparseViewStore::is_enabled(&linked).await);
+
+        // Clearing one scope leaves the other's patterns intact.
+        SparseViewStore::clear(&main).await.expect("clear");
+        assert!(SparseViewStore::list(&main).await.expect("list").is_empty());
+        assert_eq!(
+            SparseViewStore::list(&linked).await.expect("list"),
+            vec!["linked/**"],
+            "linked patterns survive main's clear"
+        );
+    }
+
+    /// W1 §C.4.1.1: the STRICT load path (the hydrate materialization gate)
+    /// fails closed when either sparse table is missing — the migration
+    /// runner creates both on every connection, so absence means a
+    /// corrupted/tampered store, and it must NOT degrade to a no-op
+    /// "everything in view" verdict. The tolerant display path (`load`)
+    /// still degrades.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn try_load_fails_closed_on_missing_tables() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        let scope = WorktreeScope::Main;
+        SparseViewStore::replace(&scope, &["src/**".to_string()])
+            .await
+            .expect("replace");
+
+        // Enabled view + missing PATTERN table → strict load refuses.
+        let db = crate::internal::db::get_db_conn_instance().await;
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ALTER TABLE sparse_view RENAME TO sparse_view__hidden".to_string(),
+        ))
+        .await
+        .expect("hide pattern table");
+        let err = SparseView::try_load(&scope)
+            .await
+            .err()
+            .expect("missing pattern table must fail closed");
+        assert!(err.contains("no such table"), "{err}");
+        // The tolerant display path degrades to a no-op view instead.
+        assert!(!SparseView::load(&scope).await.is_active());
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ALTER TABLE sparse_view__hidden RENAME TO sparse_view".to_string(),
+        ))
+        .await
+        .expect("restore pattern table");
+
+        // Missing META table → strict load refuses too (the toggle store
+        // is unreadable, not "disabled").
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ALTER TABLE sparse_view_meta RENAME TO sparse_view_meta__hidden".to_string(),
+        ))
+        .await
+        .expect("hide meta table");
+        let err = SparseView::try_load(&scope)
+            .await
+            .err()
+            .expect("missing meta table must fail closed");
+        assert!(err.contains("no such table"), "{err}");
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ALTER TABLE sparse_view_meta__hidden RENAME TO sparse_view_meta".to_string(),
+        ))
+        .await
+        .expect("restore meta table");
+        let view = SparseView::try_load(&scope).await.expect("restored");
+        assert!(view.is_active(), "restored view is active again");
     }
 }
