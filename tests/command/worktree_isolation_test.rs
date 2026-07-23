@@ -297,11 +297,7 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         String::from_utf8_lossy(&autostash_pull.stderr)
     );
 
-    let cases: &[&[&str]] = &[
-        &["stash", "list"],
-        &["layer", "list"],
-        &["sparse-view", "status"],
-    ];
+    let cases: &[&[&str]] = &[&["stash", "list"], &["sparse-view", "status"]];
     for argv in cases {
         let out = run_libra_command(argv, &wt);
         assert_ne!(
@@ -321,15 +317,15 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         &run_libra_command(&["stash", "list"], main),
         "stash list works in main",
     );
-    assert_cli_success(
-        &run_libra_command(&["layer", "list"], main),
-        "layer list works in main",
-    );
-    // W1 §C.4.1.1: the dirty cache is worktree-scoped now — `dirty` runs in
-    // a linked worktree against its own rows.
+    // W1 §C.4.1.1: the dirty cache and the layer registry are worktree-scoped
+    // now — both run in a linked worktree against their own rows.
     assert_cli_success(
         &run_libra_command(&["dirty", "--list"], &wt),
         "dirty --list runs in a linked worktree since W1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["layer", "list"], &wt),
+        "layer list runs in a linked worktree since W1",
     );
 }
 
@@ -1637,4 +1633,224 @@ fn worktree_remove_purges_dirty_scope_rows() {
             assert_eq!(count, 0, "{table} keeps no removed-scope rows");
         }
     });
+}
+
+/// W1 §C.4.1.1: the layer registry is worktree-scoped — the same layer name
+/// registers/applies independently per worktree, each scope's overlay is
+/// excluded from its own `status`/`add`, and one scope's unapply never
+/// touches another worktree's materialized files.
+#[test]
+fn layer_registry_is_worktree_scoped() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let wt_root = tempfile::tempdir().expect("wt root");
+    let wt = wt_root.path().join("layer-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Two external source dirs, same overlay filename, different content.
+    let sources = tempfile::tempdir().expect("sources");
+    let src_main = sources.path().join("src-main");
+    let src_linked = sources.path().join("src-linked");
+    std::fs::create_dir_all(&src_main).unwrap();
+    std::fs::create_dir_all(&src_linked).unwrap();
+    std::fs::write(src_main.join("ov.txt"), "from-main\n").unwrap();
+    std::fs::write(src_linked.join("ov.txt"), "from-linked\n").unwrap();
+
+    // The SAME layer name registers independently in each worktree.
+    assert_cli_success(
+        &run_libra_command(
+            &["layer", "add", "ov", "--source", src_main.to_str().unwrap()],
+            main,
+        ),
+        "main layer add",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "layer",
+                "add",
+                "ov",
+                "--source",
+                src_linked.to_str().unwrap(),
+            ],
+            &wt,
+        ),
+        "linked layer add (same name)",
+    );
+    assert_cli_success(&run_libra_command(&["layer", "apply"], main), "main apply");
+    assert_cli_success(&run_libra_command(&["layer", "apply"], &wt), "wt apply");
+    assert_eq!(
+        std::fs::read_to_string(main.join("ov.txt")).unwrap(),
+        "from-main\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("ov.txt")).unwrap(),
+        "from-linked\n"
+    );
+
+    // Each scope lists only its own registration.
+    let listed = run_libra_command(&["layer", "list"], &wt);
+    assert_cli_success(&listed, "wt layer list");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("src-linked") && !stdout.contains("src-main"),
+        "linked list shows only its own layer: {stdout}"
+    );
+
+    // The overlay is excluded from the linked worktree's status…
+    let status = run_libra_command(&["status", "--porcelain=v1"], &wt);
+    assert_cli_success(&status, "wt status");
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("ov.txt"),
+        "layer overlay excluded from linked status"
+    );
+    // …and the linked add guard refuses to stage it even under --force.
+    let forced = run_libra_command(&["add", "-f", "ov.txt"], &wt);
+    assert_ne!(
+        forced.status.code(),
+        Some(0),
+        "layer-owned path must not stage in the linked scope"
+    );
+
+    // Unapply in the linked scope removes ITS file only.
+    assert_cli_success(&run_libra_command(&["layer", "unapply"], &wt), "wt unapply");
+    assert!(!wt.join("ov.txt").exists(), "linked overlay removed");
+    assert_eq!(
+        std::fs::read_to_string(main.join("ov.txt")).unwrap(),
+        "from-main\n",
+        "main's materialized overlay is untouched"
+    );
+}
+
+/// W1 §C.4.1.1: `worktree remove` purges the removed scope's layer rows ONLY
+/// when the directory is deleted too. A default (directory-retaining) remove
+/// keeps the ownership rows — the retained `.libra` still operates as a
+/// repository, so the still-materialized overlay files must stay
+/// un-stageable (never-enters-commit).
+#[test]
+#[serial_test::serial]
+fn worktree_remove_purges_layer_scope_rows() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let wt_root = tempfile::tempdir().expect("wt root");
+    let sources = tempfile::tempdir().expect("sources");
+    let src = sources.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("ov.txt"), "x\n").unwrap();
+
+    let add_layer_and_apply = |wt: &std::path::Path| {
+        assert_cli_success(
+            &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+            "worktree add",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["layer", "add", "ov", "--source", src.to_str().unwrap()],
+                wt,
+            ),
+            "linked layer add",
+        );
+        assert_cli_success(&run_libra_command(&["layer", "apply"], wt), "wt apply");
+    };
+    let linked_rows = |table: &str| -> i64 {
+        let _guard = libra::utils::test::ChangeDirGuard::new(main);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let table = table.to_string();
+        rt.block_on(async {
+            use sea_orm::{ConnectionTrait, Statement};
+            let db = libra::internal::db::get_db_conn_instance().await;
+            let row = db
+                .query_one(Statement::from_string(
+                    db.get_database_backend(),
+                    format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
+                ))
+                .await
+                .expect("count")
+                .expect("row");
+            row.try_get_by_index(0).expect("count value")
+        })
+    };
+
+    // Branch 1 — default remove RETAINS the directory: ownership rows
+    // survive, and the retained directory still refuses to stage the
+    // overlay (never-enters-commit holds for the files left on disk).
+    let wt_kept = wt_root.path().join("layer-kept-wt");
+    add_layer_and_apply(&wt_kept);
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt_kept.to_str().unwrap()], main),
+        "default worktree remove",
+    );
+    assert!(wt_kept.join("ov.txt").exists(), "overlay file retained");
+    assert!(
+        linked_rows("layer") > 0 && linked_rows("layer_path") > 0,
+        "retained directory keeps its layer ownership rows"
+    );
+    let forced = run_libra_command(&["add", "-f", "ov.txt"], &wt_kept);
+    assert_ne!(
+        forced.status.code(),
+        Some(0),
+        "retained overlay stays un-stageable after a directory-keeping remove"
+    );
+
+    // Branch 2 — `--delete-dir` removes the files WITH the directory, so the
+    // scope rows are purged (nothing left on disk to guard). An applied
+    // overlay alone does NOT count as dirty, but a REAL uncommitted file
+    // still refuses — the explicit overlay subtraction must not fail open.
+    let wt_gone = wt_root.path().join("layer-gone-wt");
+    add_layer_and_apply(&wt_gone);
+    std::fs::write(wt_gone.join("real-work.txt"), "uncommitted\n").unwrap();
+    let refused = run_libra_command(
+        &[
+            "worktree",
+            "remove",
+            wt_gone.to_str().unwrap(),
+            "--delete-dir",
+        ],
+        main,
+    );
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "a real uncommitted file still refuses --delete-dir"
+    );
+    std::fs::remove_file(wt_gone.join("real-work.txt")).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "worktree",
+                "remove",
+                wt_gone.to_str().unwrap(),
+                "--delete-dir",
+            ],
+            main,
+        ),
+        "worktree remove --delete-dir",
+    );
+    for table in ["layer", "layer_path"] {
+        assert_eq!(
+            linked_rows(table),
+            1,
+            "{table} keeps only the retained (kept-dir) scope's row"
+        );
+    }
+
+    // Branch 3 — `worktree prune` GCs the scoped rows of an externally
+    // deleted worktree the same way (nothing on disk left to guard).
+    let wt_pruned = wt_root.path().join("layer-pruned-wt");
+    add_layer_and_apply(&wt_pruned);
+    std::fs::remove_dir_all(&wt_pruned).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["worktree", "prune"], main),
+        "worktree prune",
+    );
+    for table in ["layer", "layer_path"] {
+        assert_eq!(
+            linked_rows(table),
+            1,
+            "{table} keeps only the retained (kept-dir) scope's row after prune"
+        );
+    }
 }

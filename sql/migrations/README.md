@@ -159,6 +159,8 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026072101`  | `rebase_state_worktree_scope` | `2026072101_rebase_state_worktree_scope{,_down}.sql` (§C.4.2: `rebase_state` re-keyed per worktree, lazy DDL retired; down fails closed on linked rows) |
 | `2026072201`  | `operation_worktree_scope` | `2026072201_operation_worktree_scope{,_down}.sql` (§C.9: per-worktree operation dedup scope column) |
 | `2026072301`  | `bisect_state_worktree_scope` | `2026072301_bisect_state_worktree_scope{,_down}.sql` (§C.4.2: `bisect_state` re-keyed per worktree — newest row per scope wins — lazy DDL retired; down fails closed on linked rows) |
+| `2026072302`  | `working_dirty_worktree_scope` | `2026072302_working_dirty_worktree_scope{,_down}.sql` (§C.4.1.1: `working_dirty` re-keyed to (worktree_id, path, kind), `working_dirty_meta` from the `id = 1` singleton to one freshness row per worktree; legacy rows cleared — rebuildable advisory state, each scope rescans; down fails closed on linked rows) |
+| `2026072303`  | `layer_worktree_scope` | `2026072303_layer_worktree_scope{,_down}.sql` (§C.4.1.1: `layer` re-keyed to (worktree_id, name), `layer_path` to (worktree_id, path); ownership is NOT rebuildable — legacy global rows adopt to main only when no linked HEAD row exists, else the up migration fails closed (CHECK guard) pending explicit `layer unapply`/`remove`; down fails closed on linked rows) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no

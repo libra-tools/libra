@@ -404,7 +404,15 @@ pub fn is_linked_worktree() -> bool {
 }
 
 pub fn current_worktree_id() -> Option<String> {
-    let gitdir = try_get_worktree_gitdir(None).ok()?;
+    worktree_id_for_base(None)
+}
+
+/// [`current_worktree_id`] resolved from an EXPLICIT base directory instead
+/// of the process cwd (W1 §C.4.1.1 scope↔workdir binding): a command that
+/// captured its working directory once can derive the matching scope from
+/// that same value, immune to a concurrent cwd switch in the process.
+pub fn worktree_id_for_base(base: Option<PathBuf>) -> Option<String> {
+    let gitdir = try_get_worktree_gitdir(base).ok()?;
     if let Ok(id) = fs::read_to_string(gitdir.join("worktree_id")) {
         let id = id.trim();
         if !id.is_empty() {

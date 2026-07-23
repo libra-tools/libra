@@ -403,7 +403,9 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             render_move_worktree(&result, output)
         }
         WorktreeSubcommand::Prune => {
-            let result = prune_worktrees().map_err(WorktreeError::into_cli_error)?;
+            let result = prune_worktrees()
+                .await
+                .map_err(WorktreeError::into_cli_error)?;
             render_prune_worktrees(&result, output)
         }
         WorktreeSubcommand::Remove { path, delete_dir } => {
@@ -930,7 +932,7 @@ fn resolve_worktree_id(target: &Path) -> Option<String> {
 /// fresh worktree silently resume a dead session (a resumed bisect step even
 /// repaints candidate trees — data loss). Best-effort: a failure is logged,
 /// not fatal (the registry drop is the source of truth).
-async fn gc_worktree_scoped_rows(worktree_id: &str) {
+async fn gc_worktree_scoped_rows(worktree_id: &str, purge_layer_ownership: bool) {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let db = crate::internal::db::get_db_conn_instance().await;
     let mut stmts = vec![
@@ -941,6 +943,19 @@ async fn gc_worktree_scoped_rows(worktree_id: &str) {
         "DELETE FROM working_dirty WHERE worktree_id = ?",
         "DELETE FROM working_dirty_meta WHERE worktree_id = ?",
     ];
+    // Layer registrations/ownership (W1 §C.4.1.1): purged ONLY when the
+    // worktree directory is actually gone (`--delete-dir`, or it had already
+    // vanished). A default `remove` RETAINS the directory — and a retained
+    // `.libra` still operates as a repository — so its ownership rows must
+    // survive to keep the still-materialized overlay files un-stageable
+    // (never-enters-commit). The retained directory cannot be re-registered
+    // while non-empty (`worktree add` refuses), so the rows guard it until
+    // the directory is cleared; orphaned rows are then reclaimed by the W3
+    // worktree doctor (they are invisible to every live scope meanwhile).
+    if purge_layer_ownership {
+        stmts.push("DELETE FROM layer WHERE worktree_id = ?");
+        stmts.push("DELETE FROM layer_path WHERE worktree_id = ?");
+    }
     // `bisect_state` is owned by migration `2026072301`, but bare or
     // pre-migration test databases may still lack it — only purge when the
     // table exists (a DELETE on a missing table would log a spurious warn).
@@ -1293,7 +1308,11 @@ fn render_move_worktree(result: &WorktreeMoveOutput, output: &OutputConfig) -> C
 /// Any non-main worktree whose directory no longer exists on disk is removed
 /// from the registry. Before mutating state, the function prints the set of
 /// paths that will be pruned so the user can see what is being cleaned up.
-fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
+/// Each pruned worktree's scoped DB rows are GC'd like `remove` does — the
+/// directory is gone, so layer ownership is purged too (nothing left on disk
+/// to guard); leaked rows would otherwise be re-inherited by a worktree
+/// re-created at the same path (deterministic instance id).
+async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
     let mut state = load_state()?;
     let to_prune: Vec<_> = state
         .worktrees
@@ -1306,6 +1325,11 @@ fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
         .collect();
 
     if !to_prune.is_empty() {
+        for path in &to_prune {
+            if let Some(id) = resolve_worktree_id(Path::new(path)) {
+                gc_worktree_scoped_rows(&id, true).await;
+            }
+        }
         state.worktrees.retain(|w| {
             let path = Path::new(&w.path);
             path.exists() || w.is_main || w.locked
@@ -1382,6 +1406,27 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
         let _guard = DirGuard::change_to(&target).map_err(|e| {
             WorktreeError::IoRead(format!("cannot enter worktree '{}': {e}", target.display()))
         })?;
+        // W1 §C.4.1.1: applied layer overlays are excluded from status by
+        // design, so they alone are not "uncommitted changes". This is a
+        // DESTRUCTIVE gate (`remove_dir_all` follows), so it must NOT consult
+        // the process-global advisory exclusion snapshot — another scope's
+        // refresh could hide REAL uncommitted files behind same-named overlay
+        // paths. The target scope's overlay set is read straight from the DB
+        // (fail-closed on error) and subtracted explicitly from the UNSTAGED
+        // side only; anything staged always refuses.
+        let overlay: std::collections::HashSet<String> =
+            crate::internal::layer::LayerStore::materialized_paths(
+                &crate::internal::worktree_scope::WorktreeScope::for_workdir(&target),
+            )
+            .await
+            .map_err(|e| {
+                WorktreeError::IoRead(format!(
+                    "cannot verify layer-owned paths before the dirty check: {e}"
+                ))
+            })?
+            .into_iter()
+            .map(|p| p.path)
+            .collect();
         let staged = crate::command::status::changes_to_be_committed_safe()
             .await
             .map_err(|e| {
@@ -1390,7 +1435,17 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
         let unstaged = crate::command::status::changes_to_be_staged().map_err(|e| {
             WorktreeError::IoRead(format!("failed to inspect worktree status: {e}"))
         })?;
-        if !staged.is_empty() || !unstaged.is_empty() {
+        let is_real_change = |path: &std::path::PathBuf| {
+            crate::internal::layer::normalize_key(path).is_none_or(|key| !overlay.contains(&key))
+        };
+        let unstaged_dirty = unstaged
+            .new
+            .iter()
+            .chain(unstaged.modified.iter())
+            .chain(unstaged.deleted.iter())
+            .any(is_real_change)
+            || !unstaged.renamed.is_empty();
+        if !staged.is_empty() || unstaged_dirty {
             return Err(WorktreeError::DirtyWorktree {
                 path: target.to_string_lossy().to_string(),
             });
@@ -1406,7 +1461,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     }
 
     if let Some(id) = worktree_id_for_gc {
-        gc_worktree_scoped_rows(&id).await;
+        gc_worktree_scoped_rows(&id, delete_dir || !target.exists()).await;
     }
     state.worktrees.remove(index);
     write_state(&state)?;

@@ -478,9 +478,6 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
 /// See: tests::test_add_all_flag in tests/command/add_test.rs:100;
 /// tests::test_add_force_tracks_ignored_file in tests/command/add_test.rs:319.
 pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
-    // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
-    // ignore resolver skips layer-owned paths (a no-op with no layers).
-    crate::internal::layer::refresh_exclusion_snapshot().await;
     let workdir = util::try_working_dir().map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AddError::NotInRepo
@@ -488,6 +485,13 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             AddError::Workdir { source }
         }
     })?;
+    // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
+    // ignore resolver skips layer-owned paths (a no-op with no layers).
+    // W1 §C.4.1.1: the scope is derived from the CAPTURED workdir (not the
+    // ambient cwd) so it stays bound to the tree this request stages into —
+    // resolved ONCE and reused by the staging guard below.
+    let layer_scope = crate::internal::worktree_scope::WorktreeScope::for_workdir(&workdir);
+    crate::internal::layer::refresh_exclusion_snapshot(&layer_scope).await;
     let index_path = path::try_index().map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AddError::NotInRepo
@@ -613,12 +617,18 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // Under Respect, layer paths are already ignore-excluded so `files` is
     // empty of them (this loop is a no-op — zero overhead with no layers).
     {
+        // W1 §C.4.1.1 scope↔workdir binding, last-moment re-verification:
+        // awaits ran since `layer_scope` was derived from the entry workdir.
+        // If the process cwd moved to ANOTHER worktree meanwhile, the index
+        // this request stages into would no longer belong to `layer_scope` —
+        // refuse rather than guard the wrong tree (fail closed).
+        crate::internal::layer::verify_staging_context(&workdir, &layer_scope)?;
         // Fail-CLOSED (Codex P1): a real DB read failure here must NOT allow
         // staging (the invariant is never-enters-commit). `materialized_paths`
         // is absence-tolerant for a missing table (fresh repo) but propagates
         // any other error.
         let owned: std::collections::HashSet<String> =
-            crate::internal::layer::LayerStore::materialized_paths()
+            crate::internal::layer::LayerStore::materialized_paths(&layer_scope)
                 .await
                 .map_err(|e| {
                     CliError::fatal(format!(

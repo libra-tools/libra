@@ -1028,6 +1028,19 @@ pub fn builtin_migrations() -> Vec<Migration> {
                 "../../../sql/migrations/2026072302_working_dirty_worktree_scope_down.sql"
             ),
         ),
+        // plan-20260714 Part C W1 (§C.4.1.1): scope the layer overlay
+        // registry per worktree — `layer` keyed by (worktree_id, name),
+        // `layer_path` by (worktree_id, path). Layer ownership is NOT
+        // rebuildable (clearing it would make overlay files committable), so
+        // legacy rows adopt to main ONLY when no linked worktree exists; the
+        // up migration fails closed (CHECK guard) on legacy rows + linked
+        // HEAD evidence, and down fails closed on linked rows.
+        sql_migration(
+            2026072303,
+            "layer_worktree_scope",
+            include_str!("../../../sql/migrations/2026072303_layer_worktree_scope.sql"),
+            include_str!("../../../sql/migrations/2026072303_layer_worktree_scope_down.sql"),
+        ),
     ]
 }
 
@@ -1273,9 +1286,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 36);
+        assert_eq!(runner.len(), 37);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072302));
+        assert_eq!(runner.max_registered_version(), Some(2026072303));
     }
 
     #[test]

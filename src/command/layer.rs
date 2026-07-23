@@ -81,14 +81,10 @@ struct LayerRow {
 }
 
 pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<()> {
-    // Part C W0 (§C.11 transition guard): the `layer`/`layer_path` tables are
-    // repository-global with no worktree scope yet, so a linked worktree could
-    // read or delete another worktree's layer ownership. All subcommands fail
-    // closed in a linked worktree until W1 scopes the LayerStore call chain.
-    crate::command::ensure_main_worktree_because(
-        "layer",
-        "the layer registry is not yet worktree-scoped",
-    )?;
+    // W1 §C.4.1.1: the layer registry is worktree-scoped — resolve the scope
+    // ONCE for this request and pass it down the whole LayerStore call chain
+    // (the former W0 linked-worktree guard is lifted).
+    let scope = crate::internal::worktree_scope::WorktreeScope::current();
     match args.command {
         LayerCommand::Add {
             name,
@@ -105,7 +101,7 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
                         .with_stable_code(StableErrorCode::IoReadFailed),
                 );
             }
-            LayerStore::add(&name, &source, priority, !disabled)
+            LayerStore::add(&scope, &name, &source, priority, !disabled)
                 .await
                 .map_err(|e| {
                     CliError::fatal(e).with_stable_code(StableErrorCode::CliInvalidArguments)
@@ -119,7 +115,7 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
             Ok(())
         }
         LayerCommand::List => {
-            let layers = load_rows().await?;
+            let layers = load_rows(&scope).await?;
             if output.is_json() {
                 return emit_json_data("layer", &serde_json::json!({ "layers": layers }), output);
             }
@@ -138,13 +134,13 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
             }
             Ok(())
         }
-        LayerCommand::Enable { name } => set_enabled(&name, true, output).await,
-        LayerCommand::Disable { name } => set_enabled(&name, false, output).await,
+        LayerCommand::Enable { name } => set_enabled(&scope, &name, true, output).await,
+        LayerCommand::Disable { name } => set_enabled(&scope, &name, false, output).await,
         LayerCommand::Remove { name } => {
             // Remove the materialized files first (skipping user-edited ones),
             // then unregister.
-            let (_removed, _skipped) = layer::unapply(Some(&name)).await?;
-            let existed = LayerStore::remove(&name)
+            let (_removed, _skipped) = layer::unapply(&scope, Some(&name)).await?;
+            let existed = LayerStore::remove(&scope, &name)
                 .await
                 .map_err(|e| CliError::fatal(e).with_stable_code(StableErrorCode::IoWriteFailed))?;
             if !existed {
@@ -152,15 +148,15 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
                     .with_stable_code(StableErrorCode::CliInvalidTarget));
             }
             // Keep the exclusion snapshot fresh for subsequent commands.
-            layer::refresh_exclusion_snapshot().await;
+            layer::refresh_exclusion_snapshot(&scope).await;
             if !output.quiet {
                 println!("removed layer '{name}'");
             }
             Ok(())
         }
         LayerCommand::Apply => {
-            let report = layer::apply().await?;
-            layer::refresh_exclusion_snapshot().await;
+            let report = layer::apply(&scope).await?;
+            layer::refresh_exclusion_snapshot(&scope).await;
             if output.is_json() {
                 return emit_json_data(
                     "layer",
@@ -182,8 +178,8 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
             Ok(())
         }
         LayerCommand::Unapply { layer: filter } => {
-            let (removed, skipped) = layer::unapply(filter.as_deref()).await?;
-            layer::refresh_exclusion_snapshot().await;
+            let (removed, skipped) = layer::unapply(&scope, filter.as_deref()).await?;
+            layer::refresh_exclusion_snapshot(&scope).await;
             if output.is_json() {
                 return emit_json_data(
                     "layer",
@@ -201,8 +197,8 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
             Ok(())
         }
         LayerCommand::Status => {
-            let layers = load_rows().await?;
-            let paths = LayerStore::materialized_paths()
+            let layers = load_rows(&scope).await?;
+            let paths = LayerStore::materialized_paths(&scope)
                 .await
                 .map_err(|e| CliError::fatal(e).with_stable_code(StableErrorCode::IoReadFailed))?;
             if output.is_json() {
@@ -231,8 +227,10 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
     }
 }
 
-async fn load_rows() -> CliResult<Vec<LayerRow>> {
-    Ok(LayerStore::list()
+async fn load_rows(
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> CliResult<Vec<LayerRow>> {
+    Ok(LayerStore::list(scope)
         .await
         .map_err(|e| CliError::fatal(e).with_stable_code(StableErrorCode::IoReadFailed))?
         .into_iter()
@@ -245,8 +243,13 @@ async fn load_rows() -> CliResult<Vec<LayerRow>> {
         .collect())
 }
 
-async fn set_enabled(name: &str, enabled: bool, output: &OutputConfig) -> CliResult<()> {
-    let changed = LayerStore::set_enabled(name, enabled)
+async fn set_enabled(
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+    name: &str,
+    enabled: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let changed = LayerStore::set_enabled(scope, name, enabled)
         .await
         .map_err(|e| CliError::fatal(e).with_stable_code(StableErrorCode::IoWriteFailed))?;
     if !changed {

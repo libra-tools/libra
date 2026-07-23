@@ -844,8 +844,12 @@ async fn collect_status_data(
     extras: StatusConfigExtras,
 ) -> CliResult<StatusData> {
     // lore.md 2.4: layer-overlay paths are excluded from status like ignored
-    // files (a no-op with no layers).
-    crate::internal::layer::refresh_exclusion_snapshot().await;
+    // files (a no-op with no layers). W1 §C.4.1.1: refreshed with this
+    // request's resolved worktree scope.
+    crate::internal::layer::refresh_exclusion_snapshot(
+        &crate::internal::worktree_scope::WorktreeScope::current(),
+    )
+    .await;
     if is_bare_repository().await {
         return Err(CliError::fatal("this operation must be run in a work tree")
             .with_stable_code(StableErrorCode::RepoStateInvalid)

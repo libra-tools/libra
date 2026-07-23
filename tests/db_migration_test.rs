@@ -52,7 +52,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302
+            2026072302, 2026072303
         ]
     );
     assert_eq!(
@@ -94,13 +94,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "operation_worktree_scope",
             "bisect_state_worktree_scope",
             "working_dirty_worktree_scope",
+            "layer_worktree_scope",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 36);
-    assert_eq!(runner.max_registered_version(), Some(2026072302));
+    assert_eq!(runner.len(), 37);
+    assert_eq!(runner.max_registered_version(), Some(2026072303));
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,7 +1093,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302
+            2026072302, 2026072303
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1280,7 +1281,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             .await
             .expect("restore 1407 after the 1406 link-only rollback guard"),
         vec![
-            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303
         ]
     );
     conn.execute(Statement::from_string(
@@ -1342,7 +1343,8 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
     assert_eq!(
         runner.run_pending(&conn).await.expect("M5 up #2"),
         vec![
-            2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302
+            2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302,
+            2026072303
         ]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
@@ -1443,7 +1445,7 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             .await
             .expect("upgrade immutable 1406 schema"),
         vec![
-            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303
         ]
     );
     let claim = conn
@@ -1574,7 +1576,7 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             .await
             .expect("upgrade evolved 1406 schema"),
         vec![
-            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303
         ]
     );
     let cursor = conn
@@ -1618,8 +1620,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406,
-            2026071405, 2026071404, 2026071403, 2026071402
+            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
+            2026071406, 2026071405, 2026071404, 2026071403, 2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1635,7 +1637,7 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         reapplied,
         vec![
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101, 2026072201, 2026072301, 2026072302
+            2026072101, 2026072201, 2026072301, 2026072302, 2026072303
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1666,8 +1668,8 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406,
-            2026071405, 2026071404
+            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
+            2026071406, 2026071405, 2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1683,7 +1685,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         applied,
         vec![
             2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201,
-            2026072301, 2026072302
+            2026072301, 2026072302, 2026072303
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -2028,11 +2030,11 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406,
-            2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301, 2026070803,
-            2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301,
-            2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201,
-            2026053101, 2026052301, 2026050801, 2026050601
+            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
+            2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301,
+            2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401,
+            2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401,
+            2026060201, 2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -2060,7 +2062,7 @@ async fn approved_permission_up_down_up_round_trip() {
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101, 2026072201, 2026072301, 2026072302
+            2026072101, 2026072201, 2026072301, 2026072302, 2026072303
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -2650,6 +2652,262 @@ async fn dirty_down_migration_rejects_linked_rows() {
         .expect("main row survives");
     let path: String = row.try_get_by_index(0).expect("path");
     assert_eq!(path, "main.txt");
+}
+
+/// 2026072303 re-keys `layer`/`layer_path` per worktree. Layer ownership is
+/// NOT rebuildable (§C.4.1.1), so legacy global rows are ADOPTED to the main
+/// scope ('') — permitted because the guard proved no linked worktree exists.
+#[tokio::test]
+async fn layer_migration_adopts_main_rows_without_linked_evidence() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    // Pre-create the legacy shapes with rows: 2026070501's CREATE IF NOT
+    // EXISTS skips them, and 2026072303 must rebuild + adopt.
+    conn.execute(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `layer` (
+            `id`         INTEGER PRIMARY KEY AUTOINCREMENT,
+            `name`       TEXT NOT NULL UNIQUE,
+            `source`     TEXT NOT NULL,
+            `priority`   INTEGER NOT NULL DEFAULT 0,
+            `enabled`    INTEGER NOT NULL DEFAULT 1,
+            `created_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("legacy layer table");
+    conn.execute(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `layer_path` (
+            `id`              INTEGER PRIMARY KEY AUTOINCREMENT,
+            `layer_name`      TEXT NOT NULL,
+            `path`            TEXT NOT NULL UNIQUE,
+            `content_hash`    TEXT NOT NULL,
+            `materialized_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("legacy layer_path table");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO layer (name, source, priority, enabled) VALUES ('ov', '/src/ov', 3, 1);"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy layer row");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO layer_path (layer_name, path, content_hash) \
+         VALUES ('ov', 'dir/f.txt', 'hash1');"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy path row");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(column_exists(&conn, "layer", "worktree_id").await);
+    assert!(column_exists(&conn, "layer_path", "worktree_id").await);
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT worktree_id, name, source, priority FROM layer".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("adopted layer row");
+    let scope: String = row.try_get_by_index(0).expect("worktree_id");
+    let name: String = row.try_get_by_index(1).expect("name");
+    let source: String = row.try_get_by_index(2).expect("source");
+    let priority: i64 = row.try_get_by_index(3).expect("priority");
+    assert_eq!((scope.as_str(), name.as_str()), ("", "ov"));
+    assert_eq!((source.as_str(), priority), ("/src/ov", 3));
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT worktree_id, path, content_hash FROM layer_path".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("adopted path row");
+    let scope: String = row.try_get_by_index(0).expect("worktree_id");
+    let path: String = row.try_get_by_index(1).expect("path");
+    assert_eq!((scope.as_str(), path.as_str()), ("", "dir/f.txt"));
+}
+
+/// 2026072303 FAILS CLOSED when legacy global layer rows coexist with linked
+/// worktree evidence (a linked HEAD row): ownership must not be guessed —
+/// the user unapplies/removes from the owning worktree first (§C.4.1.1).
+#[tokio::test]
+async fn layer_migration_fails_closed_with_linked_evidence() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+    // Re-open the legacy window: roll back ONLY 2026072303 (its empty tables
+    // pass the down guard), then plant legacy rows + linked HEAD evidence.
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072302)
+            .await
+            .expect("rollback layer scope"),
+        vec![2026072303]
+    );
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO layer (name, source) VALUES ('ov', '/src/ov');".to_string(),
+    ))
+    .await
+    .expect("legacy layer row");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO reference (name, kind, `commit`, worktree_id) \
+         VALUES (NULL, 'Head', 'aa11', 'wt1');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked HEAD evidence");
+
+    let err = runner
+        .run_pending(&conn)
+        .await
+        .expect_err("legacy rows + linked evidence must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the adopt guard CHECK: {rendered}"
+    );
+    // Nothing was claimed or rebuilt: the legacy shape and row survive.
+    assert!(!column_exists(&conn, "layer", "worktree_id").await);
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT name FROM layer".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("legacy row untouched");
+    let name: String = row.try_get_by_index(0).expect("name");
+    assert_eq!(name, "ov");
+
+    // After the user clears the ambiguity (here: the linked evidence goes
+    // away), the migration applies and adopts to main.
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM reference WHERE worktree_id = 'wt1';".to_string(),
+    ))
+    .await
+    .expect("clear linked evidence");
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("retry succeeds"),
+        vec![2026072303]
+    );
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT worktree_id FROM layer WHERE name = 'ov'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("adopted row");
+    let scope: String = row.try_get_by_index(0).expect("worktree_id");
+    assert_eq!(scope, "");
+}
+
+/// The 2026072303 down migration FAILS CLOSED while linked-scope layer rows
+/// exist (dropping them would make overlay files committable); after the
+/// linked scopes are explicitly cleared it restores the legacy shapes with
+/// the main rows intact.
+#[tokio::test]
+async fn layer_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO layer (worktree_id, name, source) \
+         VALUES ('', 'ov', '/src/main'), ('wt1', 'ov', '/src/linked');"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked rows");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
+         VALUES ('', 'ov', 'main.txt', 'h1');"
+            .to_string(),
+    ))
+    .await
+    .expect("main path row");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026072302)
+        .await
+        .expect_err("rollback with a linked layer row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    assert!(column_exists(&conn, "layer", "worktree_id").await);
+
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM layer WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked layer row");
+
+    // Second guard branch: a linked PATH row alone must also fail closed.
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
+         VALUES ('wt1', 'ov', 'linked.txt', 'h2');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked path row");
+    let err = runner
+        .rollback_to(&conn, 2026072302)
+        .await
+        .expect_err("rollback with a linked layer_path row must fail closed");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "path guard CHECK fires"
+    );
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM layer_path WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked path row");
+
+    let rolled = runner
+        .rollback_to(&conn, 2026072302)
+        .await
+        .expect("rollback succeeds once only main rows remain");
+    assert_eq!(rolled, vec![2026072303]);
+    assert!(!column_exists(&conn, "layer", "worktree_id").await);
+    assert!(!column_exists(&conn, "layer_path", "worktree_id").await);
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT name, source FROM layer".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("main row survives");
+    let name: String = row.try_get_by_index(0).expect("name");
+    let source: String = row.try_get_by_index(1).expect("source");
+    assert_eq!((name.as_str(), source.as_str()), ("ov", "/src/main"));
 }
 
 // ---------------------------------------------------------------------------

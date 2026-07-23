@@ -48,6 +48,20 @@ impl WorktreeScope {
         }
     }
 
+    /// Resolve the scope of an EXPLICIT working directory (W1 §C.4.1.1
+    /// scope↔workdir binding). A command that captures its workdir once can
+    /// derive the matching scope from that same value — deterministic for a
+    /// given path, immune to a concurrent process-cwd switch between the
+    /// capture and a later mutation/guard step. The same fail-closed rule as
+    /// [`WorktreeScope::current`] applies: a linked worktree with a
+    /// missing/unreadable `worktree_id` file still resolves as `Linked`.
+    pub fn for_workdir(workdir: &std::path::Path) -> Self {
+        match util::worktree_id_for_base(Some(workdir.to_path_buf())) {
+            Some(id) => WorktreeScope::Linked(id),
+            None => WorktreeScope::Main,
+        }
+    }
+
     /// True when this is a linked (non-main) worktree.
     pub fn is_linked(&self) -> bool {
         matches!(self, WorktreeScope::Linked(_))

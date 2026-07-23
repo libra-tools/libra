@@ -4,6 +4,21 @@
 
 ### Changed
 
+- **The layer overlay registry is worktree-scoped (v0.19.51, plan-20260714
+  Part C §C.4.1.1, W1 advisory slice 2)**: migration `2026072303` re-keys
+  `layer` to UNIQUE(worktree_id, name) and `layer_path` to
+  UNIQUE(worktree_id, path); every `LayerStore` method, `apply`/`unapply`,
+  the `add` staging guard, and the sync ignore-exclusion snapshot carry the
+  request's one resolved `WorktreeScope`. All `layer` subcommands now run in
+  linked worktrees against their own registrations — the same layer name and
+  destination can exist independently per worktree, and `worktree remove`
+  purges the removed scope's rows when the directory is deleted too (a
+  retained directory keeps its ownership rows so the still-materialized
+  overlay files stay un-stageable). Layer ownership is not rebuildable, so
+  legacy repository-global rows adopt to main only when no linked worktree
+  exists; otherwise the migration FAILS CLOSED (CHECK guard) and asks for an
+  explicit `layer unapply`/`layer remove` from the owning worktree. The down
+  migration equally fails closed while linked-scope rows exist.
 - **The dirty-set cache is worktree-scoped (v0.19.50, plan-20260714 Part C
   §C.4.1.1, W1 advisory slice 1)**: migration `2026072302` re-keys
   `working_dirty` to UNIQUE(worktree_id, path, kind) and
