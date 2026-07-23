@@ -22,7 +22,7 @@ libra merge-file [-p|--stdout] [--diff3] [-q|--quiet] <current> <base> <other>
 
 带 `--diff3` 时，base 段落出现在 `|||||||` 与 `=======` 之间。
 
-默认把结果写回 `<current>`；带 `-p` 则打印到 stdout、不改文件。在仓库内就地写入时，原 `<current>` 会先复制到 `.libra/merge-file-backup/`：干净合并后删除备份，仍有冲突时保留并提示。
+默认把结果写回 `<current>`；带 `-p` 则打印到 stdout、不改文件。在仓库内就地写入时，原 `<current>` 会先复制到本 worktree local gitdir 的 `merge-file-backup/`（每个 worktree 各自持有备份，互不干扰）：干净合并后删除备份，仍有冲突时保留并提示。
 
 三个参数按原始字节读取；不要求它们被跟踪或对应已存 blob。
 
@@ -49,7 +49,7 @@ libra merge-file [-p|--stdout] [--diff3] [-q|--quiet] <current> <base> <other>
 # 打印合并结果，不动任何文件
 libra merge-file -p ours.txt base.txt theirs.txt
 
-# 就地合并进 ours.txt（备份在 .libra/merge-file-backup/）
+# 就地合并进 ours.txt（备份在本 worktree 的 merge-file-backup/）
 libra merge-file ours.txt base.txt theirs.txt
 
 # diff3 风格标记，同时展示共同祖先

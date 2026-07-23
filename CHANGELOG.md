@@ -4,6 +4,12 @@
 
 ### Changed
 
+- **`merge-file` backups are worktree-local (v0.19.55, plan-20260714 Part C
+  §C.4.3, W2 slice 3)**: the in-place backup of `<current>` moves from the
+  shared `.libra/merge-file-backup/` into the acting worktree's local gitdir
+  — two worktrees merging same-named files no longer overwrite or clean up
+  each other's conflict backups (main's location is unchanged since its
+  local gitdir IS `.libra`).
 - **The stash stack protocol is worktree-aware (v0.19.54, plan-20260714
   Part C §C.4.3, W2 slice 2)**: the stack (`refs/stash` + reflog) stays
   deliberately repository-shared — an entry pushed in one worktree lists,

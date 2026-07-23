@@ -218,10 +218,13 @@ fn write_with_backup(
     Ok(())
 }
 
-/// The backup path for `<current>` under `.libra/merge-file-backup/`, or `None`
-/// when not inside a repository (the merge still proceeds, without a backup).
+/// The backup path for `<current>` under the WORKTREE-LOCAL gitdir's
+/// `merge-file-backup/` (W2 §C.4.3), or `None` when not inside a repository
+/// (the merge still proceeds, without a backup). Worktree-local because two
+/// worktrees merging same-named files must not overwrite or clean up each
+/// other's backups — the file being backed up belongs to THIS worktree.
 fn backup_path(current_path: &str) -> Option<PathBuf> {
-    let storage = util::try_get_storage_path(None).ok()?;
+    let gitdir = util::try_get_worktree_gitdir(None).ok()?;
     let sanitized = current_path.replace(['/', '\\'], "_");
-    Some(storage.join("merge-file-backup").join(sanitized))
+    Some(gitdir.join("merge-file-backup").join(sanitized))
 }

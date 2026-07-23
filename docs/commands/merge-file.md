@@ -29,7 +29,7 @@ With `--diff3`, the base section is included between `|||||||` and `=======`.
 
 By default the result is written back into `<current>`; with `-p` it is printed
 to stdout and no file is touched. When writing in place inside a repository, the
-original `<current>` is first copied to `.libra/merge-file-backup/`; the backup
+original `<current>` is first copied to this worktree's `merge-file-backup/` (in its local gitdir — each worktree keeps its own backups); the backup
 is removed on a clean merge and kept (with a note) when conflicts remain.
 
 The three arguments are read as raw bytes; `merge-file` does not require them to
@@ -58,7 +58,7 @@ be tracked or to correspond to stored blobs.
 # Print a merged result without touching any file
 libra merge-file -p ours.txt base.txt theirs.txt
 
-# Merge in place into ours.txt (backed up under .libra/merge-file-backup/)
+# Merge in place into ours.txt (backed up under this worktree's merge-file-backup/)
 libra merge-file ours.txt base.txt theirs.txt
 
 # diff3-style markers that also show the common ancestor
