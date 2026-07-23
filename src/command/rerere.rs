@@ -1,10 +1,18 @@
 //! `libra rerere` — REuse REcorded REsolution. Records how a merge conflict was
 //! resolved and replays that resolution when the identical conflict reappears.
 //!
-//! Storage lives under `.libra/rerere/`:
-//! - `<id>/preimage`  — the conflicted file content (with markers) as first seen
-//! - `<id>/postimage` — the resolved content once the user fixes it
-//! - `MERGE_RR`       — `id<TAB>path` lines for conflicts currently being tracked
+//! Storage split (W2 §C.4.3):
+//! - the REUSABLE resolution cache stays repository-scoped under
+//!   `.libra/rerere/<id>/{preimage,postimage}` — any worktree may replay a
+//!   resolution any other worktree recorded;
+//! - `MERGE_RR` (`id<TAB>path` lines for the conflicts CURRENTLY tracked) is a
+//!   per-worktree fact and lives in the worktree's LOCAL gitdir
+//!   (`<local_gitdir>/MERGE_RR`) — one worktree's clear/auto-update can never
+//!   drop, stage, or record another worktree's current conflicts. A legacy
+//!   common `.libra/rerere/MERGE_RR` follows the ambiguous-sidecar rules: a
+//!   linked scope NEVER reads it; main reads (and migrates on first write)
+//!   only while no linked worktree exists; with linked evidence it is left
+//!   untouched for the worktree doctor (W3) and a one-line notice is printed.
 //!
 //! `<id>` is the SHA-256 of the conflicted file's bytes. This version matches a
 //! conflict only when the whole conflicted file is byte-identical to a recorded
@@ -27,7 +35,7 @@ use git_internal::internal::index::Index;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    internal::config::ConfigKv,
+    internal::{config::ConfigKv, worktree_scope::WorktreeScope},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::OutputConfig,
@@ -82,15 +90,19 @@ pub async fn execute(args: RerereArgs) {
 
 pub async fn execute_safe(args: RerereArgs, _output: &OutputConfig) -> CliResult<()> {
     let rr_dir = rerere_dir()?;
+    // W2 §C.4.3: MERGE_RR is per-worktree — resolve the scope ONCE for this
+    // request and pass it down (the shared cache under `rr_dir` stays
+    // repository-scoped).
+    let scope = WorktreeScope::current();
     match args.command {
         // The bare `libra rerere` never auto-stages replayed resolutions — that
         // is what `rerere.autoUpdate` / `--rerere-autoupdate` control, and they
         // only apply to the automatic merge/rebase/cherry-pick integration.
-        None => apply(&rr_dir, false).await,
-        Some(RerereSubcommand::Status) => status(&rr_dir),
-        Some(RerereSubcommand::Diff) => diff(&rr_dir),
-        Some(RerereSubcommand::Forget { paths }) => forget(&rr_dir, &paths),
-        Some(RerereSubcommand::Clear) => clear(&rr_dir),
+        None => apply(&scope, &rr_dir, false).await,
+        Some(RerereSubcommand::Status) => status(&scope, &rr_dir),
+        Some(RerereSubcommand::Diff) => diff(&scope, &rr_dir),
+        Some(RerereSubcommand::Forget { paths }) => forget(&scope, &rr_dir, &paths),
+        Some(RerereSubcommand::Clear) => clear(&scope, &rr_dir),
         Some(RerereSubcommand::Gc) => gc(&rr_dir),
     }
 }
@@ -140,18 +152,19 @@ pub(crate) async fn auto_update(auto_update: bool) -> CliResult<()> {
         return Ok(());
     }
     let rr_dir = rerere_dir()?;
+    let scope = WorktreeScope::current();
     let stage_replayed = auto_update || autoupdate_configured().await;
-    apply(&rr_dir, stage_replayed).await
+    apply(&scope, &rr_dir, stage_replayed).await
 }
 
 /// The default action: for every tracked file that currently contains conflict
 /// markers, record its preimage (or replay a known resolution); for every
 /// tracked conflict that has since been resolved, record its postimage. When
 /// `stage_replayed` is set, a file resolved by replay is also staged.
-async fn apply(rr_dir: &Path, stage_replayed: bool) -> CliResult<()> {
+async fn apply(scope: &WorktreeScope, rr_dir: &Path, stage_replayed: bool) -> CliResult<()> {
     let workdir = util::working_dir();
     let index = load_index()?;
-    let mut merge_rr = read_merge_rr(rr_dir)?;
+    let mut merge_rr = read_merge_rr(scope, rr_dir)?;
 
     // 1. Record postimages for previously-tracked conflicts that are now resolved.
     let mut resolved_paths = Vec::new();
@@ -214,8 +227,8 @@ async fn apply(rr_dir: &Path, stage_replayed: bool) -> CliResult<()> {
     // exists that may need updating/clearing. This keeps an ordinary commit in a
     // `rerere.enabled` repo — where `auto_update` runs after every commit — from
     // creating a spurious empty MERGE_RR, so it stays a true no-op.
-    if !merge_rr.is_empty() || rr_dir.join("MERGE_RR").exists() {
-        write_merge_rr(rr_dir, &merge_rr)?;
+    if !merge_rr.is_empty() || merge_rr_file(scope)?.exists() || legacy_is_readable(scope, rr_dir) {
+        write_merge_rr(scope, rr_dir, &merge_rr)?;
     }
     Ok(())
 }
@@ -267,16 +280,16 @@ async fn stage_path(path: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn status(rr_dir: &Path) -> CliResult<()> {
-    for (path, _) in read_merge_rr(rr_dir)? {
+fn status(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
+    for (path, _) in read_merge_rr(scope, rr_dir)? {
         println!("{path}");
     }
     Ok(())
 }
 
-fn diff(rr_dir: &Path) -> CliResult<()> {
+fn diff(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
     let workdir = util::working_dir();
-    for (path, id) in read_merge_rr(rr_dir)? {
+    for (path, id) in read_merge_rr(scope, rr_dir)? {
         let Ok(preimage) = fs::read_to_string(entry_path(rr_dir, &id, "preimage")) else {
             continue;
         };
@@ -289,10 +302,10 @@ fn diff(rr_dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
-fn forget(rr_dir: &Path, paths: &[String]) -> CliResult<()> {
+fn forget(scope: &WorktreeScope, rr_dir: &Path, paths: &[String]) -> CliResult<()> {
     let mut removed = false;
     let mut kept = Vec::new();
-    for (path, id) in read_merge_rr(rr_dir)? {
+    for (path, id) in read_merge_rr(scope, rr_dir)? {
         if paths.iter().any(|p| p == &path) {
             remove_dir_all_ok(&rr_dir.join(&id))?;
             removed = true;
@@ -300,7 +313,7 @@ fn forget(rr_dir: &Path, paths: &[String]) -> CliResult<()> {
             kept.push((path, id));
         }
     }
-    write_merge_rr(rr_dir, &kept)?;
+    write_merge_rr(scope, rr_dir, &kept)?;
     if !removed {
         return Err(CliError::command_usage(format!(
             "no recorded resolution for: {}",
@@ -312,10 +325,25 @@ fn forget(rr_dir: &Path, paths: &[String]) -> CliResult<()> {
     Ok(())
 }
 
-fn clear(rr_dir: &Path) -> CliResult<()> {
-    let merge_rr = rr_dir.join("MERGE_RR");
+fn clear(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
+    let merge_rr = merge_rr_file(scope)?;
     if merge_rr.exists() {
         fs::remove_file(&merge_rr).map_err(write_err)?;
+    }
+    // A single-worktree main also clears the legacy common file it may still
+    // be reading from (re-checked under the registry lock — a concurrent
+    // `worktree add` makes it ambiguous and it must then stay). A linked
+    // scope never touches it (rule 2); main surfaces the ambiguity notice
+    // when the file is left behind (rule 3).
+    let legacy = legacy_merge_rr_file(rr_dir);
+    if !scope.is_linked()
+        && legacy.exists()
+        && matches!(
+            remove_legacy_if_unambiguous(rr_dir)?,
+            LegacyRemoval::Ambiguous
+        )
+    {
+        print_ambiguous_legacy_notice(&legacy);
     }
     Ok(())
 }
@@ -400,9 +428,103 @@ fn write_entry(rr_dir: &Path, id: &str, name: &str, content: &[u8]) -> CliResult
     fs::write(dir.join(name), content).map_err(write_err)
 }
 
-fn read_merge_rr(rr_dir: &Path) -> CliResult<Vec<(String, String)>> {
-    let merge_rr = rr_dir.join("MERGE_RR");
-    let text = match fs::read_to_string(&merge_rr) {
+/// This worktree's MERGE_RR file: `<local_gitdir>/MERGE_RR` (W2 §C.4.3).
+/// For the main worktree the local gitdir IS the common `.libra`, so main's
+/// canonical location is `.libra/MERGE_RR`.
+fn merge_rr_file(scope: &WorktreeScope) -> CliResult<PathBuf> {
+    Ok(scope.local_gitdir()?.join("MERGE_RR"))
+}
+
+/// The pre-W2 repository-global location (inside the shared cache dir).
+fn legacy_merge_rr_file(rr_dir: &Path) -> PathBuf {
+    rr_dir.join("MERGE_RR")
+}
+
+/// Whether the worktree registry shows (or cannot rule out) linked
+/// worktrees. A missing registry file is a single-worktree repository; an
+/// unreadable or corrupt one counts as evidence (ambiguous → fail safe).
+fn registry_has_linked_evidence() -> bool {
+    let registry = util::storage_path().join("worktrees.json");
+    match fs::read_to_string(&registry) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(raw) => serde_json::from_str::<crate::command::worktree::WorktreeState>(&raw)
+            .map(|state| !state.is_single_main())
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// Whether the LEGACY common MERGE_RR is readable as this scope's active
+/// file: only for the MAIN scope, only while no linked worktree exists (the
+/// ambiguous-sidecar rules — a linked scope never reads it, and with linked
+/// evidence nobody auto-consumes it).
+fn legacy_is_readable(scope: &WorktreeScope, rr_dir: &Path) -> bool {
+    !scope.is_linked() && legacy_merge_rr_file(rr_dir).exists() && !registry_has_linked_evidence()
+}
+
+/// Outcome of a guarded legacy-MERGE_RR deletion attempt. `Ambiguous` is the
+/// only state that warrants the user-facing notice — `AlreadyGone` (another
+/// process removed it first, e.g. two concurrent `clear`s) must not print a
+/// false "linked worktrees exist" line.
+enum LegacyRemoval {
+    Removed,
+    Ambiguous,
+    AlreadyGone,
+}
+
+/// Delete the legacy common MERGE_RR — but only after RE-CHECKING the
+/// registry UNDER the worktree registry lock, so a concurrent `worktree
+/// add` cannot make the file ambiguous between the evidence probe and the
+/// unlink (an ambiguous sidecar must be left for the W3 doctor).
+fn remove_legacy_if_unambiguous(rr_dir: &Path) -> CliResult<LegacyRemoval> {
+    let legacy = legacy_merge_rr_file(rr_dir);
+    if !legacy.exists() {
+        return Ok(LegacyRemoval::AlreadyGone);
+    }
+    let _registry_lock = crate::command::worktree::acquire_registry_lock()
+        .map_err(crate::command::worktree::WorktreeError::into_cli_error)?;
+    if registry_has_linked_evidence() {
+        return Ok(LegacyRemoval::Ambiguous);
+    }
+    match fs::remove_file(&legacy) {
+        Ok(()) => Ok(LegacyRemoval::Removed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(LegacyRemoval::AlreadyGone)
+        }
+        Err(error) => Err(write_err(error)),
+    }
+}
+
+/// The one-line ambiguity notice (main scope only): the legacy file exists
+/// but linked worktrees do too, so nobody auto-consumes it.
+fn print_ambiguous_legacy_notice(legacy: &Path) {
+    eprintln!(
+        "note: ignoring legacy '{}' — linked worktrees exist, so its owner is \
+         ambiguous; resolve it from the owning worktree (worktree doctor lands in W3)",
+        legacy.display()
+    );
+}
+
+fn read_merge_rr(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<Vec<(String, String)>> {
+    let canonical = merge_rr_file(scope)?;
+    let source = if canonical.exists() {
+        canonical
+    } else {
+        let legacy = legacy_merge_rr_file(rr_dir);
+        if !legacy.exists() || scope.is_linked() {
+            // Rule 2: a linked scope NEVER reads the common sidecar (its
+            // presence cannot prove an owner, nor may it block this scope).
+            return Ok(Vec::new());
+        }
+        if registry_has_linked_evidence() {
+            // Rule 3: ambiguous — leave the file untouched for the worktree
+            // doctor, surface a one-line notice, and act on an empty list.
+            print_ambiguous_legacy_notice(&legacy);
+            return Ok(Vec::new());
+        }
+        legacy
+    };
+    let text = match fs::read_to_string(&source) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(read_err(error)),
@@ -449,13 +571,30 @@ fn read_or_empty(path: &Path) -> CliResult<Vec<u8>> {
     }
 }
 
-fn write_merge_rr(rr_dir: &Path, entries: &[(String, String)]) -> CliResult<()> {
-    fs::create_dir_all(rr_dir).map_err(write_err)?;
+fn write_merge_rr(
+    scope: &WorktreeScope,
+    rr_dir: &Path,
+    entries: &[(String, String)],
+) -> CliResult<()> {
+    let canonical = merge_rr_file(scope)?;
     let body: String = entries
         .iter()
         .map(|(path, id)| format!("{id}\t{path}\n"))
         .collect();
-    fs::write(rr_dir.join("MERGE_RR"), body).map_err(write_err)
+    // Atomic + fsynced: the migrate-on-first-write below deletes the ONLY
+    // other copy, so the canonical file must be durably on disk first (a
+    // crash between a plain write and the unlink could lose the list).
+    crate::utils::atomic_write::write_atomic(&canonical, body.as_bytes(), true)
+        .map_err(write_err)?;
+    // Migrate-on-first-write: once the canonical file is durably written, a
+    // single-worktree main removes the legacy common file it was reading —
+    // re-checked under the registry lock so a concurrent `worktree add`
+    // cannot make it ambiguous between probe and unlink. With linked
+    // evidence the legacy file is never touched (rule 3 — doctor territory).
+    if legacy_is_readable(scope, rr_dir) {
+        remove_legacy_if_unambiguous(rr_dir)?;
+    }
+    Ok(())
 }
 
 fn rerere_dir() -> CliResult<PathBuf> {

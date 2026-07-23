@@ -14,7 +14,9 @@ libra rerere [status | diff | forget <path>... | clear | gc]
 With no subcommand, `rerere` scans the tracked files for conflict markers and:
 
 - records a **preimage** (the conflicted file) for each new conflict, tracking
-  it in `.libra/rerere/MERGE_RR`;
+  it in this worktree's `MERGE_RR` (in the worktree's local gitdir — since
+  W2 each worktree tracks its own current conflicts, while the recorded
+  resolutions below stay shared across worktrees);
 - if a recorded **postimage** (resolution) already matches a conflict, **replays**
   it — writing the resolved content back to the file;
 - once a tracked conflict has been resolved by hand, records its postimage so

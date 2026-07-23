@@ -445,22 +445,17 @@ fn state_path() -> PathBuf {
 /// flock is BLOCKING (concurrent mutators queue rather than fail) and
 /// released on drop (or process exit). Read-only paths (`list`) stay
 /// lock-free.
-struct RegistryLockGuard {
-    #[allow(dead_code)] // held for its flock; released on drop
+pub(crate) struct RegistryLockGuard {
     file: fs::File,
 }
 
-#[cfg(unix)]
 impl Drop for RegistryLockGuard {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = self.file.unlock();
     }
 }
 
-fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
+pub(crate) fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
     let lock_path = util::storage_path().join("worktrees.lock");
     let file = fs::OpenOptions::new()
         .create(true)
@@ -474,18 +469,14 @@ fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
                 lock_path.display()
             ))
         })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(WorktreeError::IoWrite(format!(
-                "cannot lock the worktree registry '{}': {}",
-                lock_path.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-    }
+    // std file locking is CROSS-PLATFORM (flock on Unix, LockFileEx on
+    // Windows) and BLOCKING — concurrent mutators queue rather than fail.
+    file.lock().map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "cannot lock the worktree registry '{}': {e}",
+            lock_path.display()
+        ))
+    })?;
     Ok(RegistryLockGuard { file })
 }
 

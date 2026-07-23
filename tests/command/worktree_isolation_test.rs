@@ -1810,11 +1810,8 @@ fn sparse_view_is_worktree_scoped() {
 /// therefore both land in the registry (no load-modify-write lost update,
 /// and a second add's strict pre-seed sweep can never run between another
 /// add's seed and registry commit).
-#[cfg(unix)]
 #[test]
 fn registry_mutators_serialize_on_worktrees_lock() {
-    use std::os::unix::io::AsRawFd;
-
     /// Kill-and-reap on every exit path — an assertion failure must never
     /// leave a spawned add running against a removed temp repository.
     struct ChildGuard(std::process::Child);
@@ -1841,11 +1838,9 @@ fn registry_mutators_serialize_on_worktrees_lock() {
         .truncate(false)
         .open(&lock_path)
         .expect("open registry lock");
-    assert_eq!(
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) },
-        0,
-        "test takes the registry lock"
-    );
+    // std file locking mirrors the production guard cross-platform (flock
+    // on Unix, LockFileEx on Windows) — the test itself needs no cfg gate.
+    lock_file.lock().expect("test takes the registry lock");
     let spawn_add = |wt: &std::path::Path| {
         ChildGuard(
             base_libra_command(&["worktree", "add", wt.to_str().unwrap()], main)
@@ -1884,11 +1879,7 @@ fn registry_mutators_serialize_on_worktrees_lock() {
         );
     }
 
-    assert_eq!(
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
-        0,
-        "test releases the registry lock"
-    );
+    lock_file.unlock().expect("test releases the registry lock");
     for (wt, mut child) in children {
         let status = child.0.wait().expect("wait add");
         assert!(

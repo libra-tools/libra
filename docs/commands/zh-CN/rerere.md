@@ -12,7 +12,7 @@ libra rerere [status | diff | forget <path>... | clear | gc]
 
 不带子命令时，`rerere` 扫描已跟踪文件中的冲突标记并：
 
-- 为每个新冲突记录 **preimage**（带标记的冲突文件），并在 `.libra/rerere/MERGE_RR` 中跟踪；
+- 为每个新冲突记录 **preimage**（带标记的冲突文件），并在本 worktree 的 `MERGE_RR`（位于该 worktree 的 local gitdir——自 W2 起每个 worktree 各自跟踪当前冲突，而下述已记录的 resolution 仍跨 worktree 共享）中跟踪；
 - 若已记录的 **postimage**（解决方案）匹配某冲突，则**复用**——把解决后的内容写回文件；
 - 一旦被跟踪的冲突被手工解决，记录其 postimage，使下一次相同冲突自动解决。
 

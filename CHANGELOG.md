@@ -4,6 +4,18 @@
 
 ### Changed
 
+- **rerere `MERGE_RR` is worktree-local (v0.19.53, plan-20260714 Part C
+  §C.4.3, W2 slice 1)**: the currently-tracked-conflicts list moves from the
+  shared `.libra/rerere/MERGE_RR` into each worktree's local gitdir
+  (`<local_gitdir>/MERGE_RR`), so one worktree's `rerere clear`/auto-update
+  can no longer drop, stage, or record another worktree's current
+  conflicts; the reusable resolution cache
+  (`.libra/rerere/<id>/{preimage,postimage}`) stays repository-shared — a
+  resolution recorded in one worktree still replays in any other. A legacy
+  shared `MERGE_RR` follows the ambiguous-sidecar rules: a linked scope
+  never reads it, a single-worktree main reads it and migrates it on first
+  write, and once linked worktrees exist it is ignored with a notice and
+  left untouched for the worktree doctor (W3).
 - **The sparse view is worktree-scoped (v0.19.52, plan-20260714 Part C
   §C.4.1.1, W1 advisory slice 3)**: migration `2026072304` re-keys
   `sparse_view` to UNIQUE(worktree_id, ordinal) and re-projects the
