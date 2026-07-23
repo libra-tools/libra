@@ -238,6 +238,48 @@ async fn dirty_mark_handler(
     if request.paths.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "paths must be non-empty".into()));
     }
+    // §C.4.1.1 service contract: a legacy request carries only `paths` — in
+    // a multi-worktree repository it is REJECTED rather than defaulted to
+    // the service process's own scope (the dirty cache is per-worktree and
+    // the caller's worktree is unknown). Scope-carrying requests arrive with
+    // the composite-dispatcher work (W4-adjacent).
+    let registry = crate::utils::util::storage_path().join("worktrees.json");
+    match std::fs::read_to_string(&registry) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No registry file: single (main-only) worktree repository.
+        }
+        Ok(raw) => {
+            // Parse the registry with the REAL persisted schema (the same
+            // `WorktreeState` type `libra worktree` writes) and only accept
+            // a validated single-main state. Everything else fails closed:
+            // deserialization failures (syntactically invalid JSON, `[null]`,
+            // entries missing required fields like `is_main`/`locked`) AND
+            // deserializable-but-corrupt shapes (an empty worktree list or a
+            // sole non-main entry — the real loader treats those as needing
+            // main-entry repair). Never guess the scope.
+            let single_main = serde_json::from_str::<crate::command::worktree::WorktreeState>(&raw)
+                .is_ok_and(|state| state.is_single_main());
+            if !single_main {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "dirty-mark requests without a worktree scope are rejected in a \
+                     multi-worktree repository; run `libra dirty <paths>` in the \
+                     target worktree instead"
+                        .into(),
+                ));
+            }
+        }
+        Err(_) => {
+            // Unreadable registry: fail closed for the same reason.
+            return Err((
+                StatusCode::CONFLICT,
+                "the worktree registry is unreadable; scope-less dirty-mark \
+                 requests are rejected — run `libra dirty <paths>` in the \
+                 target worktree instead"
+                    .into(),
+            ));
+        }
+    }
     let workdir_relative: Vec<PathBuf> = request.paths.iter().map(util::to_workdir_path).collect();
     // The owner API enforces the repo-escape gate (whole batch refused).
     match DirtyCache::mark_paths(&workdir_relative).await {

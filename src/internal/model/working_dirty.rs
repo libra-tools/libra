@@ -8,6 +8,9 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub id: i64,
+    /// Worktree scope key (`""` = main worktree); rows are unique per
+    /// (worktree_id, path, kind).
+    pub worktree_id: String,
     /// Repo-relative path, '/'-separated on every platform.
     pub path: String,
     /// `new`/`modified`/`deleted` (unstaged), `staged_new`/`staged_modified`/

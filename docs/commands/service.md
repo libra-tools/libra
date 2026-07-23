@@ -32,7 +32,7 @@ libra service events
 |---|---|---|
 | `GET /api/health` | loopback | Liveness probe. |
 | `GET /api/service/events` | token | SSE notification stream. |
-| `POST /api/service/dirty/mark` | token | `{"paths":[...]}` — advisory dirty marks through the validated owner API (whole batch refused if any path escapes the repo; over-report-only). |
+| `POST /api/service/dirty/mark` | token | `{"paths":[...]}` — advisory dirty marks through the validated owner API (whole batch refused if any path escapes the repo; over-report-only). In a multi-worktree repository (or when the worktree registry is corrupt/unreadable — including parseable states without exactly one main entry) scope-less requests are rejected with **409** — the dirty cache is per-worktree and the caller's scope is unknown; run `libra dirty <paths>` in the target worktree instead. |
 | `POST /api/service/notify` | token | `{"type":"...","data":{...}}` — publish a custom notification (automation triggers). |
 
 **Notification v1 semantics**: events are `{seq,type,at,data}` with `seq`

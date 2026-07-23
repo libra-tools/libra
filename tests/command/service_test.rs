@@ -196,3 +196,89 @@ fn service_end_to_end_events_marks_and_fault_recovery() {
     let status = run_libra_command(&["service", "status"], p);
     assert_eq!(status.status.code(), Some(1), "stopped service exits 1");
 }
+
+/// W1 §C.4.1.1: scope-less dirty-mark requests are rejected (409) in a
+/// multi-worktree repository — the dirty cache is per-worktree and the
+/// caller's scope is unknown. A corrupt registry rejects too (fail closed).
+#[test]
+#[serial]
+fn dirty_mark_rejected_in_multi_worktree_repo() {
+    let repo = service_repo();
+    let main = repo.path();
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("svc-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let (_guard, base_url, token) = spawn_service(main);
+    let client = reqwest::blocking::Client::new();
+    let refused = client
+        .post(format!("{base_url}/api/service/dirty/mark"))
+        .header("x-libra-service-token", token.clone())
+        .json(&serde_json::json!({ "paths": ["f.txt"] }))
+        .send()
+        .expect("request");
+    assert_eq!(
+        refused.status().as_u16(),
+        409,
+        "multi-worktree scope-less mark is refused"
+    );
+    let body = refused.text().unwrap_or_default();
+    assert!(body.contains("worktree"), "actionable message: {body}");
+
+    // Corrupt registry: fail closed too.
+    fs::write(main.join(".libra/worktrees.json"), "{not json").expect("corrupt registry");
+    let corrupt = client
+        .post(format!("{base_url}/api/service/dirty/mark"))
+        .header("x-libra-service-token", token.clone())
+        .json(&serde_json::json!({ "paths": ["f.txt"] }))
+        .send()
+        .expect("request");
+    assert_eq!(
+        corrupt.status().as_u16(),
+        409,
+        "corrupt registry fails closed"
+    );
+
+    // Schema-corrupt registry (valid JSON, but the entry is missing the
+    // required `is_main`/`locked` fields the real schema persists): the
+    // parser mirrors the persisted `WorktreeState`, so this fails closed
+    // too instead of counting the entry as a lone main worktree.
+    fs::write(
+        main.join(".libra/worktrees.json"),
+        r#"{"worktrees":[{"path":"/repo"}]}"#,
+    )
+    .expect("schema-corrupt registry");
+    let schema_corrupt = client
+        .post(format!("{base_url}/api/service/dirty/mark"))
+        .header("x-libra-service-token", token.clone())
+        .json(&serde_json::json!({ "paths": ["f.txt"] }))
+        .send()
+        .expect("request");
+    assert_eq!(
+        schema_corrupt.status().as_u16(),
+        409,
+        "schema-corrupt registry (missing required fields) fails closed"
+    );
+
+    // Deserializable-but-corrupt shapes: an empty worktree list and a sole
+    // non-main entry both lack the main entry the real loader requires —
+    // neither is a validated single-main state, so both fail closed.
+    for (shape, label) in [
+        (r#"{"worktrees":[]}"#, "empty worktree list"),
+        (
+            r#"{"worktrees":[{"path":"/repo","is_main":false,"locked":false,"lock_reason":null}]}"#,
+            "sole non-main entry",
+        ),
+    ] {
+        fs::write(main.join(".libra/worktrees.json"), shape).expect("corrupt-shape registry");
+        let refused = client
+            .post(format!("{base_url}/api/service/dirty/mark"))
+            .header("x-libra-service-token", token.clone())
+            .json(&serde_json::json!({ "paths": ["f.txt"] }))
+            .send()
+            .expect("request");
+        assert_eq!(refused.status().as_u16(), 409, "{label} fails closed");
+    }
+}

@@ -123,8 +123,11 @@ pub enum WorktreeSubcommand {
 /// A single worktree entry persisted in `worktrees.json`.
 ///
 /// `path` is always stored as a canonical absolute path.
+///
+/// `pub(crate)` so the service dirty-mark gate deserializes the registry with
+/// this exact schema (a drifting mirror would fail open on missing fields).
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct WorktreeEntry {
+pub(crate) struct WorktreeEntry {
     path: String,
     is_main: bool,
     locked: bool,
@@ -135,8 +138,19 @@ struct WorktreeEntry {
 ///
 /// The state contains the main worktree and any number of linked worktrees.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
-struct WorktreeState {
-    worktrees: Vec<WorktreeEntry>,
+pub(crate) struct WorktreeState {
+    pub(crate) worktrees: Vec<WorktreeEntry>,
+}
+
+impl WorktreeState {
+    /// True when the registry holds exactly the main worktree entry — the
+    /// only shape under which a scope-less service dirty-mark may default
+    /// to the main scope. Anything else (empty, multi-entry, or a sole
+    /// non-main entry) is indistinguishable from corruption or a
+    /// multi-worktree layout and must fail closed.
+    pub(crate) fn is_single_main(&self) -> bool {
+        matches!(self.worktrees.as_slice(), [entry] if entry.is_main)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -924,6 +938,8 @@ async fn gc_worktree_scoped_rows(worktree_id: &str) {
         "DELETE FROM reflog WHERE worktree_id = ?",
         "DELETE FROM sequence_state WHERE worktree_id = ?",
         "DELETE FROM rebase_state WHERE worktree_id = ?",
+        "DELETE FROM working_dirty WHERE worktree_id = ?",
+        "DELETE FROM working_dirty_meta WHERE worktree_id = ?",
     ];
     // `bisect_state` is owned by migration `2026072301`, but bare or
     // pre-migration test databases may still lack it — only purge when the

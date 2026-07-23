@@ -301,7 +301,6 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         &["stash", "list"],
         &["layer", "list"],
         &["sparse-view", "status"],
-        &["dirty", "--list"],
     ];
     for argv in cases {
         let out = run_libra_command(argv, &wt);
@@ -326,13 +325,19 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         &run_libra_command(&["layer", "list"], main),
         "layer list works in main",
     );
+    // W1 §C.4.1.1: the dirty cache is worktree-scoped now — `dirty` runs in
+    // a linked worktree against its own rows.
+    assert_cli_success(
+        &run_libra_command(&["dirty", "--list"], &wt),
+        "dirty --list runs in a linked worktree since W1",
+    );
 }
 
-/// Part C W0 (§C.11 line 1507a): plain `status` works in a linked worktree
-/// (it never consults the shared dirty cache), but the cache-semantic modes
+/// W1 §C.4.1.1: plain `status` and ALL cache-semantic modes run in a
+/// linked worktree — the dirty cache is scoped per worktree. (Formerly the
 /// `--scan`/`--cached`/`--check-dirty` fail closed until W1 scopes the cache.
 #[test]
-fn status_cache_modes_refused_in_linked_but_plain_status_works() {
+fn status_cache_modes_run_in_linked_worktree() {
     let repo = repo_with_feature();
     let main = repo.path();
     let parent = tempfile::tempdir().expect("wt parent");
@@ -352,23 +357,15 @@ fn status_cache_modes_refused_in_linked_but_plain_status_works() {
         "porcelain status works in a linked worktree",
     );
 
-    // The dirty-cache modes fail closed.
+    // W1 §C.4.1.1: the cache-semantic modes run in a linked worktree against
+    // their own scoped rows.
     for mode in [
         vec!["status", "--scan"],
         vec!["status", "--cached"],
         vec!["status", "--check-dirty"],
     ] {
         let out = run_libra_command(&mode, &wt);
-        assert_ne!(
-            out.status.code(),
-            Some(0),
-            "{mode:?} must fail closed in a linked worktree"
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
-            "{mode:?} should hit the linked-worktree guard: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert_cli_success(&out, "cache-semantic mode runs in a linked worktree");
     }
 }
 
@@ -1336,6 +1333,17 @@ fn bisect_reset_does_not_steal_branch_attached_elsewhere() {
 /// commit is pruned (proving the positive case was not vacuous).
 #[test]
 fn sequencer_state_rows_are_gc_roots_across_scopes() {
+    // Environment gate: this fixture shells out to `sqlite3`; print skipped
+    // instead of hard-failing where the tool is absent (repo test convention).
+    if std::process::Command::new("sqlite3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped (sqlite3 not installed)");
+        return;
+    }
+
     let repo = repo_with_feature();
     let main = repo.path();
 
@@ -1579,4 +1587,54 @@ fn remove_gcs_private_head_rows() {
         "HEAD",
         "re-added worktree is cleanly detached"
     );
+}
+
+/// W1 §C.4.1.1: removing a worktree purges its dirty-cache rows AND meta —
+/// a later re-add (fresh worktree_id) never inherits or leaks stale scope
+/// rows.
+#[test]
+#[serial_test::serial]
+fn worktree_remove_purges_dirty_scope_rows() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let wt_root = tempfile::tempdir().expect("wt root");
+    let wt = wt_root.path().join("purge-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    std::fs::write(wt.join("dirt.txt"), "x\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["status", "--scan"], &wt),
+        "linked scan",
+    );
+    assert_cli_success(
+        &run_libra_command(&["dirty", "dirt.txt"], &wt),
+        "linked manual mark",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "worktree remove",
+    );
+
+    // In-process: no linked-scope rows survive in either dirty table.
+    let _guard = libra::utils::test::ChangeDirGuard::new(main);
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db = libra::internal::db::get_db_conn_instance().await;
+        for table in ["working_dirty", "working_dirty_meta"] {
+            let row = db
+                .query_one(Statement::from_string(
+                    db.get_database_backend(),
+                    format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
+                ))
+                .await
+                .expect("count")
+                .expect("row");
+            let count: i64 = row.try_get_by_index(0).expect("count value");
+            assert_eq!(count, 0, "{table} keeps no removed-scope rows");
+        }
+    });
 }

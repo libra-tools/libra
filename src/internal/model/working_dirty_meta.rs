@@ -1,14 +1,16 @@
-//! SeaORM entity for the single-row `working_dirty_meta` freshness record
-//! (lore.md 1.1). All access goes through `internal::dirty::DirtyCache`.
+//! SeaORM entity for the per-worktree `working_dirty_meta` freshness record
+//! (lore.md 1.1; scoped by plan-20260714 §C.4.1.1). All access goes through
+//! `internal::dirty::DirtyCache`.
 
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "working_dirty_meta")]
 pub struct Model {
-    /// Always 1 (single row, enforced by a CHECK constraint).
+    /// Worktree scope key (`""` = main worktree): one freshness row per
+    /// worktree.
     #[sea_orm(primary_key, auto_increment = false)]
-    pub id: i64,
+    pub worktree_id: String,
     /// `fresh` / `stale`.
     pub state: String,
     /// Hex of the index file's trailing content checksum at scan time

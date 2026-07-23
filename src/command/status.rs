@@ -1417,18 +1417,8 @@ pub(crate) async fn execute_safe_with_resolution(
     // them — the legacy `execute_to` writer entry ignores the flags (its
     // callers never set them).
     //
-    // Part C W0 (§C.11 line 1507a): `working_dirty`/`working_dirty_meta` are
-    // repository-global (id=1 meta), so these cache-SEMANTIC modes fail closed
-    // in a linked worktree until W1 scopes the DirtyCache call chain — they
-    // would otherwise read or prune the main worktree's dirty state. Plain
-    // `status` (below) is unaffected: it never consults the dirty cache, so it
-    // already computes a fresh, correct result in any worktree.
-    if args.scan || args.cached || args.check_dirty {
-        crate::command::ensure_main_worktree_because(
-            "status --scan/--cached/--check-dirty",
-            "the dirty cache is not yet worktree-scoped",
-        )?;
-    }
+    // Part C W1 (§C.4.1.1): the dirty cache is worktree-scoped, so the
+    // cache-semantic modes run in any worktree against their own rows.
     if args.scan {
         return run_status_scan(&args, extras, output).await;
     }

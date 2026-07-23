@@ -1015,6 +1015,19 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072301_bisect_state_worktree_scope.sql"),
             include_str!("../../../sql/migrations/2026072301_bisect_state_worktree_scope_down.sql"),
         ),
+        // plan-20260714 Part C W1 (§C.4.1.1): scope the dirty-set advisory
+        // cache per worktree — `working_dirty` keyed by (worktree_id, path,
+        // kind), `working_dirty_meta` re-keyed to worktree_id. Legacy rows
+        // are cleared (rebuildable advisory state; each scope rescans). Down
+        // fails closed on linked rows.
+        sql_migration(
+            2026072302,
+            "working_dirty_worktree_scope",
+            include_str!("../../../sql/migrations/2026072302_working_dirty_worktree_scope.sql"),
+            include_str!(
+                "../../../sql/migrations/2026072302_working_dirty_worktree_scope_down.sql"
+            ),
+        ),
     ]
 }
 
@@ -1260,9 +1273,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 35);
+        assert_eq!(runner.len(), 36);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072301));
+        assert_eq!(runner.max_registered_version(), Some(2026072302));
     }
 
     #[test]

@@ -326,7 +326,7 @@ fn scan_lock_stolen_warning() {
         let db = libra::internal::db::get_db_conn_instance().await;
         db.execute(Statement::from_string(
             db.get_database_backend(),
-            "UPDATE working_dirty_meta SET scan_lock_pid = 999999999,              scan_lock_at = '2000-01-01T00:00:00Z' WHERE id = 1;"
+            "UPDATE working_dirty_meta SET scan_lock_pid = 999999999,              scan_lock_at = '2000-01-01T00:00:00Z' WHERE worktree_id = '';"
                 .to_string(),
         ))
         .await
@@ -352,7 +352,7 @@ fn scan_lock_stolen_warning() {
         let db = libra::internal::db::get_db_conn_instance().await;
         db.execute(Statement::from_string(
             db.get_database_backend(),
-            "UPDATE working_dirty_meta SET scan_lock_pid = 999999999,              scan_lock_at = '2000-01-01T00:00:00Z' WHERE id = 1;"
+            "UPDATE working_dirty_meta SET scan_lock_pid = 999999999,              scan_lock_at = '2000-01-01T00:00:00Z' WHERE worktree_id = '';"
                 .to_string(),
         ))
         .await
@@ -381,7 +381,7 @@ fn scan_lock_stolen_warning() {
         db.execute(Statement::from_string(
             db.get_database_backend(),
             "UPDATE working_dirty_meta SET scan_lock_pid = 999999999, \
-             scan_lock_at = '2000-01-01T00:00:00Z' WHERE id = 1;"
+             scan_lock_at = '2000-01-01T00:00:00Z' WHERE worktree_id = '';"
                 .to_string(),
         ))
         .await
@@ -416,7 +416,7 @@ fn scan_stale_lock_broken_pipe_stays_silent() {
         db.execute(Statement::from_string(
             db.get_database_backend(),
             "UPDATE working_dirty_meta SET scan_lock_pid = 999999999, \
-             scan_lock_at = '2000-01-01T00:00:00Z' WHERE id = 1;"
+             scan_lock_at = '2000-01-01T00:00:00Z' WHERE worktree_id = '';"
                 .to_string(),
         ))
         .await
@@ -482,4 +482,106 @@ fn json_check_dirty_concurrent_invalidate_warning() {
         "mid-read invalidation surfaces the concurrent code: {doc}"
     );
     assert!(out.stderr.is_empty(), "json fallback keeps stderr empty");
+}
+
+/// W1 §C.4.1.1: dirty-cache rows and meta are per-worktree. Scans in the
+/// main and a linked worktree keep independent freshness/rows: each
+/// `--cached` sees only its own scope, and a linked scan never invalidates
+/// or prunes the main worktree's snapshot.
+#[test]
+#[serial]
+fn linked_dirty_cache_rows_and_meta_isolated() {
+    let repo = dirty_repo();
+    let main = repo.path();
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("dirty-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Main: one dirty file, scan, cached view sees it.
+    fs::write(main.join("f.txt"), "main dirt\n").unwrap();
+    assert_cli_success(&run_libra_command(&["status", "--scan"], main), "main scan");
+    let main_cached = run_libra_command(&["--json", "status", "--cached"], main);
+    assert_cli_success(&main_cached, "main cached");
+    let main_json = parse_json_stdout(&main_cached);
+    assert_eq!(main_json["data"]["cache_state"].as_str(), Some("fresh"));
+
+    // Linked: different dirt, own scan — must not touch main's snapshot.
+    fs::write(wt.join("linked.txt"), "linked dirt\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["status", "--scan"], &wt),
+        "linked scan",
+    );
+    let wt_cached = run_libra_command(&["--json", "status", "--cached"], &wt);
+    assert_cli_success(&wt_cached, "linked cached");
+    let wt_json = parse_json_stdout(&wt_cached);
+    assert_eq!(wt_json["data"]["cache_state"].as_str(), Some("fresh"));
+    assert!(
+        wt_json["data"]["untracked"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("linked.txt"))),
+        "linked cache sees its own dirt: {wt_json}"
+    );
+    assert!(
+        !wt_json["data"]["unstaged"]["modified"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("f.txt"))),
+        "linked cache does not leak main's rows: {wt_json}"
+    );
+
+    // Main's snapshot is still FRESH after the linked scan (separate meta).
+    let main_again = run_libra_command(&["--json", "status", "--cached"], main);
+    assert_cli_success(&main_again, "main cached after linked scan");
+    let again = parse_json_stdout(&main_again);
+    assert_eq!(
+        again["data"]["cache_state"].as_str(),
+        Some("fresh"),
+        "linked scan must not invalidate main's meta: {again}"
+    );
+    assert!(
+        again["data"]["unstaged"]["modified"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("f.txt"))),
+        "main cache keeps its own rows: {again}"
+    );
+}
+
+/// W1 §C.4.1.1: `libra dirty <path>` (manual mark) in a linked worktree
+/// writes only that scope's rows — the main worktree's list stays clean.
+#[test]
+#[serial]
+fn linked_dirty_mark_is_scoped() {
+    let repo = dirty_repo();
+    let main = repo.path();
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("dirty-mark-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(&run_libra_command(&["status", "--scan"], main), "main scan");
+    assert_cli_success(
+        &run_libra_command(&["status", "--scan"], &wt),
+        "linked scan",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["dirty", "f.txt"], &wt),
+        "manual mark in linked scope",
+    );
+    let wt_list = run_libra_command(&["--json", "dirty", "--list"], &wt);
+    assert_cli_success(&wt_list, "linked dirty list");
+    assert!(
+        String::from_utf8_lossy(&wt_list.stdout).contains("f.txt"),
+        "linked list sees its own mark"
+    );
+    let main_list = run_libra_command(&["--json", "dirty", "--list"], main);
+    assert_cli_success(&main_list, "main dirty list");
+    assert!(
+        !String::from_utf8_lossy(&main_list.stdout).contains("f.txt"),
+        "main list must not see the linked mark: {}",
+        String::from_utf8_lossy(&main_list.stdout)
+    );
 }

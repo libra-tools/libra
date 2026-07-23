@@ -24,7 +24,7 @@ libra service events
 |---|---|---|
 | `GET /api/health` | loopback | Liveness probe。 |
 | `GET /api/service/events` | token | SSE notification stream。 |
-| `POST /api/service/dirty/mark` | token | `{"paths":[...]}` — 通过已验证 owner API 的咨询式 dirty marks（只要任何路径逃出 repo，整个 batch 拒绝；仅 over-report）。 |
+| `POST /api/service/dirty/mark` | token | `{"paths":[...]}` — 通过已验证 owner API 的咨询式 dirty marks（只要任何路径逃出 repo，整个 batch 拒绝；仅 over-report）。多 worktree 仓库（或 registry 损坏/不可读——包括可解析但缺少唯一 main 条目的状态）下无 scope 请求返回 **409**——dirty cache 按 worktree 隔离，请在目标 worktree 内运行 `libra dirty <paths>`。 |
 | `POST /api/service/notify` | token | `{"type":"...","data":{...}}` — 发布自定义通知（automation triggers）。 |
 
 **Notification v1 语义**：事件为 `{seq,type,at,data}`，`seq` 在每次 service run 内单调递增。投递是 **at-most-once** — 落后的消费者会收到 `resync` 事件，并应重新读取权威状态（`libra dirty --list`、`libra status`）；服务重启时 `seq` 重置。持久事实（marks）保存在 SQLite 中且能跨 `kill -9` 存活；bus 上的一切都可派生。请求体上限 256 KiB。

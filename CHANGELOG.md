@@ -4,6 +4,20 @@
 
 ### Changed
 
+- **The dirty-set cache is worktree-scoped (v0.19.50, plan-20260714 Part C
+  §C.4.1.1, W1 advisory slice 1)**: migration `2026072302` re-keys
+  `working_dirty` to UNIQUE(worktree_id, path, kind) and
+  `working_dirty_meta` from the repository `id = 1` singleton to one
+  freshness row per worktree; every `DirtyCache` query/write carries the
+  scope predicate. `libra dirty` and `status --scan/--cached/--check-dirty`
+  now run in linked worktrees against their own rows — a linked scan can no
+  longer read, invalidate, or prune the main worktree's snapshot (and vice
+  versa). Legacy rows are cleared by the migration (rebuildable advisory
+  state per the plan's owner-never-guessed rule; each scope rescans once);
+  the rollback fails closed while linked-scope rows exist. The W0
+  entry-guards on `dirty` and the status cache modes are lifted; `stash`/
+  `layer`/`sparse-view` stay guarded until their own scoping slices.
+
 - **`status` argv normalization: Git raw `--find-renames` grammar, true
   last-one-wins, `--null`, bare `-z` → porcelain v1 (v0.19.49, plan-20260714
   Part B §B.4.3, R0-4 first slice)**: a pre-clap normalizer (driven by the
