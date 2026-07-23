@@ -863,3 +863,192 @@ fn similarity_budget_warning() {
         "budget exhaustion surfaces end to end: {doc}"
     );
 }
+
+// ── R0-4 (first slice): bare -z/--null format arbitration ───────────────────
+
+/// Bare `-z` with no explicit format forces porcelain v1 + NUL records
+/// (§B.6): machine intent, not a NUL-terminated human format.
+#[test]
+fn bare_z_emits_porcelain_v1() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    fs::write(repo.path().join("b.txt"), "untracked\n").unwrap();
+    let out = run_libra_command(&["status", "-z"], repo.path());
+    assert_cli_success(&out, "bare -z status");
+    let raw = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        raw.contains("?? b.txt\0"),
+        "porcelain v1 NUL records: {raw:?}"
+    );
+    assert!(
+        !raw.contains("Untracked files"),
+        "no human sections under bare -z: {raw:?}"
+    );
+}
+
+/// The `st` alias behaves identically for bare `-z`.
+#[test]
+fn st_bare_z_emits_porcelain_v1() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    fs::write(repo.path().join("b.txt"), "untracked\n").unwrap();
+    let out = run_libra_command(&["st", "-z"], repo.path());
+    assert_cli_success(&out, "st -z");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("?? b.txt\0"),
+        "alias parity"
+    );
+}
+
+/// `--null` is the Git-parity long alias of `-z`, with the same bare-format
+/// forcing; combining it with `--long` or `--cached` fails closed.
+#[test]
+fn bare_null_emits_porcelain_v1() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    fs::write(repo.path().join("b.txt"), "untracked\n").unwrap();
+    let out = run_libra_command(&["status", "--null"], repo.path());
+    assert_cli_success(&out, "bare --null status");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("?? b.txt\0"),
+        "--null ≡ bare -z"
+    );
+    let conflict = run_libra_command(&["status", "--long", "--null"], repo.path());
+    assert!(!conflict.status.success(), "--long --null fails closed");
+    let cached = run_libra_command(&["status", "--cached", "-z"], repo.path());
+    assert!(!cached.status.success(), "--cached -z fails closed");
+    let scan = run_libra_command(&["status", "--scan", "-z"], repo.path());
+    assert!(!scan.status.success(), "--scan -z fails closed");
+}
+
+// ── R0-4: Git raw --find-renames grammar + three-way last-wins ──────────────
+
+/// Git raw score grammar reaches status via the argv resolution, verified
+/// with an INEXACT rename (~70% similar) so the threshold actually decides:
+/// `=505` (50.5%) pairs it, `=80%` splits it, and the three spellings obey
+/// last-one-wins including `--renames`.
+#[test]
+fn find_renames_raw_grammar_and_last_wins() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = create_repo_with_committed_file("orig.txt", &base);
+    // ~30% of lines changed → similarity ≈ 70%: between 50.5% and 80%.
+    let mut edited = base.clone();
+    for i in 0..12 {
+        edited = edited.replace(&format!("line {i}\n"), &format!("edited {i}\n"));
+    }
+    let mv = run_libra_command(&["mv", "orig.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    fs::write(repo.path().join("moved.txt"), edited).unwrap();
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage edited move");
+
+    let arrow = "R  orig.txt -> moved.txt";
+    let run = |args: &[&str]| {
+        let out = run_libra_command(args, repo.path());
+        assert_cli_success(&out, "status run");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    // Raw integer 505 = 50.5%: pairs the ~70% rename.
+    assert!(
+        run(&["status", "--porcelain=v1", "--find-renames=505"]).contains(arrow),
+        "=505 (50.5%) pairs a ~70% rename"
+    );
+    // 80% literal percent: does NOT pair → threshold is really applied.
+    let strict = run(&["status", "--porcelain=v1", "--find-renames=80%"]);
+    assert!(
+        !strict.contains("->") && strict.contains("orig.txt"),
+        "=80% splits the ~70% rename: {strict:?}"
+    );
+    // Decimal form equivalence.
+    assert!(
+        run(&["status", "--porcelain=v1", "--find-renames=0.505"]).contains(arrow),
+        "decimal raw form works"
+    );
+    // Three-way last-wins including --renames: strict 80% is overridden by a
+    // later --renames (50% default) → pairs again.
+    assert!(
+        run(&[
+            "status",
+            "--porcelain=v1",
+            "--find-renames=80%",
+            "--renames"
+        ])
+        .contains(arrow),
+        "--renames after a strict threshold rewinds to the 50% default"
+    );
+    // Disable last vs find last.
+    let disabled = run(&[
+        "status",
+        "--porcelain=v1",
+        "--find-renames=505",
+        "--no-renames",
+    ]);
+    assert!(!disabled.contains("->"), "--no-renames last disables");
+    assert!(
+        run(&[
+            "status",
+            "--porcelain=v1",
+            "--no-renames",
+            "--find-renames=505"
+        ])
+        .contains(arrow),
+        "--find-renames after --no-renames re-enables at 50.5%"
+    );
+    // An optional-value GLOBAL before the subcommand must not shift the
+    // normalizer's status detection: raw grammar still works under --json.
+    let global = run_libra_command(&["--json", "status", "--find-renames=505"], repo.path());
+    assert_cli_success(&global, "--json + raw grammar");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&global.stdout)).expect("envelope");
+    assert!(
+        doc["data"]["renames"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "raw threshold applied under a global optional-value flag: {doc}"
+    );
+
+    // Invalid raw LAST fails closed; invalid overridden by later valid wins.
+    let bad_last = run_libra_command(
+        &["status", "--find-renames=505", "--find-renames=foo"],
+        repo.path(),
+    );
+    assert!(!bad_last.status.success(), "invalid last raw fails closed");
+    assert!(
+        run(&[
+            "status",
+            "--porcelain=v1",
+            "--find-renames=foo",
+            "--find-renames=505"
+        ])
+        .contains(arrow),
+        "invalid overridden by later valid wins"
+    );
+}
+
+/// `status`/`st` as another command's argument is never rewritten. The pin:
+/// diff's own bare `--find-renames` EATS the next token as its value (clap
+/// `num_args=0..=1`), so `libra diff --find-renames status` must fail with
+/// diff's invalid-value error — if the normalizer had rewritten the bare
+/// flag to a placeholder, `status` would have survived as a pathspec and the
+/// command would behave differently.
+#[test]
+fn normalize_ignores_diff_pathspec_status() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let eaten = run_libra_command(&["diff", "--find-renames", "status"], repo.path());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&eaten.stdout),
+        String::from_utf8_lossy(&eaten.stderr)
+    );
+    assert!(
+        !eaten.status.success() && combined.contains("status"),
+        "diff still eats 'status' as its --find-renames value (no rewrite): {combined}"
+    );
+    // Same for the `st` spelling.
+    let st = run_libra_command(&["diff", "--find-renames", "st"], repo.path());
+    assert!(
+        !st.status.success(),
+        "'st' after diff's bare --find-renames stays its (invalid) value"
+    );
+    // And in status itself the SAME shape succeeds because the placeholder
+    // rewrite protects the pathspec.
+    let ours = run_libra_command(&["status", "--find-renames", "a.txt"], repo.path());
+    assert_cli_success(&ours, "status bare --find-renames keeps the pathspec");
+}

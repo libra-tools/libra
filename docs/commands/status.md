@@ -138,9 +138,12 @@ libra status --porcelain --branch --no-ahead-behind
 
 ### `-z`
 
-Terminate each machine-readable status entry with a NUL (`\0`) byte instead of a newline. This
-is intended for use with `--porcelain` or `--short` so that paths containing spaces or newlines
-can be parsed reliably.
+Terminate each machine-readable status entry with a NUL (`\0`) byte instead of a newline
+(`--null` is the Git-parity long alias). With `--porcelain` or `--short` it NUL-terminates
+that format; a bare `-z`/`--null` with no explicit format forces porcelain v1 (machine
+intent, matching Git); a config-selected `status.short=true` counts as a format, so short
+stays short + NUL. Combining it with `--long` or the cache modes
+(`--scan`/`--cached`/`--check-dirty`) fails closed.
 
 ```bash
 libra status --porcelain -z
@@ -173,7 +176,15 @@ Set the rename-detection similarity threshold. Rename detection is **on by defau
 (matching Git), so `--find-renames` is only needed to change the threshold or to re-enable
 detection after `status.renames=false`. When a deleted file and a new file are similar enough,
 they are reported as one rename pair (`renamed: old -> new`) instead of separate delete/add
-entries. The optional value is the minimum similarity percentage (0-100); `100` is exact-only.
+entries. The CLI accepts Git's full raw score grammar — a bare integer is read as
+`0.<digits>` (so `505` is 50.5%), `N%` is a literal percent (`100%` = exact-only), and
+decimals work (`0.8`); `0`/bare re-enable the 50% default. The three spellings
+`--no-renames` / `--renames` / `--find-renames[=N]` obey true last-one-wins in argv order
+(so `--no-renames --find-renames=80` re-enables at 80%). `-z` also has the Git-parity
+`--null` long alias; a bare `-z`/`--null` with no explicit format forces porcelain v1, and
+combining it with `--long` or the cache modes fails closed. The embedding API's
+`find_renames: Option<u8>` keeps the simpler 0–100 percent range (documented narrowing —
+the CLI grammar is the complete surface).
 
 Renames are matched by the shared diffcore engine: exact matches are found by blob id, then a
 unique-basename pass, then a bounded inexact spanhash pass with a per-side rename limit (1000)
@@ -220,9 +231,10 @@ over the `--exit-code` dirty exit 1 in every output mode.
 
 ### `--renames` / `--no-renames`
 
-Toggle rename detection. `--renames` enables it at the default (or `--find-renames`)
-threshold; `--no-renames` disables it and overrides `--renames`/`--find-renames`,
-`status.renames`, and the on-by-default behavior. The `status.renames` config (falling back to
+Toggle rename detection. The three spellings `--renames` / `--no-renames` /
+`--find-renames[=N]` obey true last-one-wins in argv order — whichever appears last decides
+(`--no-renames --find-renames=80` re-enables at 80%; `--find-renames=80 --no-renames`
+disables). Config applies only when none is given. The `status.renames` config (falling back to
 `diff.renames`) sets the default through the strict local → global → system cascade: `false`
 disables detection, a truthy value or an unset key enables it at 50%. `copy`/`copies` are
 rejected (copy detection is not yet supported) rather than degrading to plain renames. Invalid

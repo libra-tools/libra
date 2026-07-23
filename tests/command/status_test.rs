@@ -2734,17 +2734,25 @@ fn test_status_renames_and_no_renames_toggle_detection() {
         "both paths listed: {n}"
     );
 
-    // --no-renames overrides --find-renames (no rename reported).
-    let both = run_libra_command(
+    // R0-4 last-one-wins (§B.4.3): `--find-renames` AFTER `--no-renames`
+    // re-enables detection; the reverse order disables it.
+    let reenabled = run_libra_command(
         &["status", "--no-renames", "--find-renames", "--short"],
         &repo,
     );
-    assert!(both.status.success());
-    let b = String::from_utf8_lossy(&both.stdout);
+    assert!(reenabled.status.success());
+    let r = String::from_utf8_lossy(&reenabled.stdout);
     assert!(
-        !b.contains('R'),
-        "--no-renames must override --find-renames: {b}"
+        r.contains('R'),
+        "--find-renames after --no-renames re-enables (last wins): {r}"
     );
+    let disabled = run_libra_command(
+        &["status", "--find-renames", "--no-renames", "--short"],
+        &repo,
+    );
+    assert!(disabled.status.success());
+    let d = String::from_utf8_lossy(&disabled.stdout);
+    assert!(!d.contains('R'), "--no-renames last disables: {d}");
 }
 
 #[test]

@@ -236,7 +236,7 @@ fn resolve_rename_threshold(args: &DiffArgs) -> Result<Option<u32>, DiffError> {
 }
 
 /// Parse Git's `-M` score syntax onto the 0..60000 similarity scale.
-pub(super) fn parse_rename_score(raw: &str) -> Result<u32, DiffError> {
+pub(crate) fn parse_rename_score(raw: &str) -> Result<u32, DiffError> {
     let invalid = || DiffError::InvalidRenameScore(raw.to_string());
     let parse_decimal = |s: &str| -> Option<(u128, u128)> {
         let mut num = 0u128;

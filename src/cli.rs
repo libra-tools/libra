@@ -1849,6 +1849,14 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);
+    // §B.4.3 (R0-4): rewrite the status/st argument slice so Git's raw
+    // `--find-renames` grammar survives clap and the three rename spellings
+    // obey true last-one-wins via the occurrence list.
+    let status_resolution = command::status::normalize_status_argv(
+        argv.clone(),
+        &<Cli as clap::CommandFactory>::command(),
+    );
+    let argv = status_resolution.argv.clone();
     prepare_cli_invocation_state();
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
@@ -1990,7 +1998,14 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
             Commands::Restore(cmd_args) => {
                 command::restore::execute_safe(cmd_args, &output).await?
             }
-            Commands::Status(cmd_args) => command::status::execute_safe(cmd_args, &output).await?,
+            Commands::Status(cmd_args) => {
+                command::status::execute_safe_with_resolution(
+                    cmd_args,
+                    &output,
+                    Some(&status_resolution),
+                )
+                .await?
+            }
             Commands::Clean(cmd_args) => command::clean::execute_safe(cmd_args, &output).await?,
             Commands::Stash(cmd) => command::stash::execute_safe(cmd, &output).await?,
             Commands::Lfs(cmd) => command::lfs::execute_safe(cmd, &output).await?,

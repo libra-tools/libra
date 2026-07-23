@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **`status` argv normalization: Git raw `--find-renames` grammar, true
+  last-one-wins, `--null`, bare `-z` → porcelain v1 (v0.19.49, plan-20260714
+  Part B §B.4.3, R0-4 first slice)**: a pre-clap normalizer (driven by the
+  root command's global-arg metadata, never a hand-written flag list)
+  rewrites only the `status`/`st` argument slice: raw score values (`505` =
+  50.5%, `100%` = exact-only, decimals) ride an occurrence list so the LAST
+  of `--no-renames`/`--renames`/`--find-renames[=N]` wins in argv order —
+  `--no-renames --find-renames=80` now re-enables at 80% like Git. `-z`
+  gains the `--null` alias (conflicting with `--long` and the cache modes),
+  and a bare `-z`/`--null` with no explicit format forces porcelain v1
+  instead of NUL-terminating the human format. Other commands' argv is
+  never touched (`diff status --find-renames=505` stays a pathspec).
+
 - **`status` dirty-cache degradations join the structured warning schema
   (v0.19.48, plan-20260714 Part B §B.5, R0-8b)**: the three legacy
   stderr-only cache warnings — stale-lock steal, stale-cache fallback, and

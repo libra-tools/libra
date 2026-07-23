@@ -1,6 +1,6 @@
 //! Provides diff command logic comparing commits, the index, and the working tree with algorithm selection, pathspec filtering, and optional file output.
 
-mod options;
+pub(crate) mod options;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;

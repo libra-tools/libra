@@ -168,7 +168,14 @@ pub struct StatusArgs {
 
     /// Terminate each status entry with a NUL byte instead of a newline.
     /// This is intended for machine-readable short/porcelain output.
-    #[clap(short = 'z')]
+    #[clap(
+        short = 'z',
+        long = "null",
+        conflicts_with = "long_format",
+        conflicts_with = "cached",
+        conflicts_with = "check_dirty",
+        conflicts_with = "scan"
+    )]
     pub null_terminated: bool,
 
     /// Detect renames in staged/unstaged changes.
@@ -177,17 +184,18 @@ pub struct StatusArgs {
         long = "find-renames",
         value_name = "PERCENT",
         num_args = 0..=1,
-        default_missing_value = "50"
+        default_missing_value = "50",
+        overrides_with = "find_renames"
     )]
     pub find_renames: Option<u8>,
 
-    /// Enable rename detection at the default (or `--find-renames`) threshold
-    /// (Git's `--renames`).
+    /// Enable rename detection at the default threshold (Git's
+    /// `--renames`); the LAST of the three rename spellings wins.
     #[clap(long = "renames", overrides_with = "no_renames")]
     pub renames: bool,
 
-    /// Disable rename detection, overriding `--renames`/`--find-renames`
-    /// (Git's `--no-renames`).
+    /// Disable rename detection (Git's `--no-renames`); the LAST of the
+    /// three rename spellings on the command line wins.
     #[clap(long = "no-renames", overrides_with = "renames")]
     pub no_renames: bool,
 
@@ -223,6 +231,184 @@ impl StatusArgs {
     }
 }
 
+/// One rename-threshold-affecting occurrence in argv order (§B.4.3, R0-4).
+#[derive(Clone, Debug)]
+pub(crate) enum RenameThresholdOccurrence {
+    /// `--find-renames[=RAW]`; empty string = bare.
+    FindRaw(String),
+    /// `--renames`.
+    EnableDefault,
+    /// `--no-renames`.
+    Disable,
+}
+
+/// Result of the pre-clap status argv normalization (§B.4.3, R0-4): the
+/// rewritten argv (raw `--find-renames` values replaced by a clap-safe
+/// placeholder) plus the full occurrence order so the LAST occurrence wins
+/// across all three spellings — clap's pairwise `overrides_with` cannot
+/// express that.
+pub(crate) struct StatusArgvResolution {
+    pub(crate) argv: Vec<String>,
+    rename_occurrences: Vec<RenameThresholdOccurrence>,
+}
+
+/// Locate the `status`/`st` subcommand using the ROOT command's global-arg
+/// metadata (never a hand-written flag list) and rewrite only its argument
+/// slice. Any other subcommand — including `status` appearing as a pathspec
+/// of another command — returns argv unchanged.
+pub(crate) fn normalize_status_argv(
+    raw_argv: Vec<String>,
+    root: &clap::Command,
+) -> StatusArgvResolution {
+    let unchanged = |argv: Vec<String>| StatusArgvResolution {
+        argv,
+        rename_occurrences: Vec::new(),
+    };
+    // Global long/short tables: name → takes-a-separate-value.
+    let mut longs: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut shorts: std::collections::HashMap<char, bool> = std::collections::HashMap::new();
+    for arg in root.get_arguments() {
+        // Consume a SEPARATE next token only when a value is REQUIRED and
+        // `require_equals` is off; optional-value globals (`--json[=v]`)
+        // never eat the following token, so they cannot shift the
+        // subcommand position.
+        let takes_value = arg
+            .get_num_args()
+            .map(|r| r.min_values() >= 1)
+            .unwrap_or(false)
+            && !arg.is_require_equals_set();
+        if let Some(long) = arg.get_long() {
+            longs.insert(long.to_string(), takes_value);
+        }
+        for alias in arg.get_all_aliases().unwrap_or_default() {
+            longs.insert(alias.to_string(), takes_value);
+        }
+        if let Some(short) = arg.get_short() {
+            shorts.insert(short, takes_value);
+        }
+    }
+
+    let mut i = 1usize; // skip argv[0]
+    while i < raw_argv.len() {
+        let token = &raw_argv[i];
+        if token == "--" {
+            return unchanged(raw_argv); // root-level `--`: no subcommand area
+        }
+        if let Some(long) = token.strip_prefix("--") {
+            let name = long.split_once('=').map(|(n, _)| n).unwrap_or(long);
+            let attached = long.contains('=');
+            match longs.get(name) {
+                Some(true) if !attached => i += 2,
+                Some(_) => i += 1,
+                None => return unchanged(raw_argv), // unknown root option: clap will report
+            }
+            continue;
+        }
+        if let Some(cluster) = token.strip_prefix('-') {
+            if cluster.is_empty() {
+                break; // bare "-": positional
+            }
+            let mut consumed_value = false;
+            for ch in cluster.chars() {
+                match shorts.get(&ch) {
+                    Some(true) => {
+                        consumed_value = true;
+                        break; // rest of cluster (or next token) is the value
+                    }
+                    Some(false) => {}
+                    None => return unchanged(raw_argv),
+                }
+            }
+            if consumed_value && !cluster.ends_with(|c: char| shorts.get(&c) == Some(&true)) {
+                // value attached inside the cluster
+                i += 1;
+            } else if consumed_value {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // First non-option token: the subcommand.
+        if token != "status" && token != "st" {
+            return unchanged(raw_argv);
+        }
+        // Rewrite the slice after the subcommand up to `--`.
+        let mut argv = raw_argv.clone();
+        let mut occurrences = Vec::new();
+        let mut j = i + 1;
+        while j < argv.len() {
+            let tok = argv[j].clone();
+            if tok == "--" {
+                break;
+            }
+            if tok == "--find-renames" {
+                occurrences.push(RenameThresholdOccurrence::FindRaw(String::new()));
+                // Placeholder stops clap's num_args=0..=1 from eating the
+                // next pathspec token.
+                argv[j] = "--find-renames=50".to_string();
+            } else if let Some(raw) = tok.strip_prefix("--find-renames=") {
+                occurrences.push(RenameThresholdOccurrence::FindRaw(raw.to_string()));
+                // Placeholder keeps clap from rejecting Git raw syntax the
+                // resolver validates later.
+                argv[j] = "--find-renames=50".to_string();
+            } else if tok == "--renames" {
+                occurrences.push(RenameThresholdOccurrence::EnableDefault);
+            } else if tok == "--no-renames" {
+                occurrences.push(RenameThresholdOccurrence::Disable);
+            }
+            j += 1;
+        }
+        return StatusArgvResolution {
+            argv,
+            rename_occurrences: occurrences,
+        };
+    }
+    unchanged(raw_argv)
+}
+
+/// Resolve the engine-scale rename threshold (§B.4.3): with a CLI resolution
+/// the LAST occurrence wins (`Disable` → None, `EnableDefault`/bare/0 →
+/// 30000, raw → Git score grammar via the shared diff parser); without one
+/// (API/struct-literal path) the existing percent field + config cascade
+/// applies. Cache modes force None upstream.
+pub(crate) fn resolve_status_threshold(
+    args: &StatusArgs,
+    resolution: Option<&StatusArgvResolution>,
+) -> CliResult<Option<u32>> {
+    if let Some(resolution) = resolution
+        && let Some(last) = resolution.rename_occurrences.last()
+    {
+        return Ok(match last {
+            RenameThresholdOccurrence::Disable => None,
+            RenameThresholdOccurrence::EnableDefault => Some(30000),
+            RenameThresholdOccurrence::FindRaw(raw) if raw.is_empty() => Some(30000),
+            RenameThresholdOccurrence::FindRaw(raw) => {
+                let score =
+                    crate::command::diff::options::parse_rename_score(raw).map_err(|_| {
+                        CliError::command_usage(format!("invalid --find-renames value '{raw}'"))
+                            .with_stable_code(StableErrorCode::CliInvalidArguments)
+                            .with_hint("use Git score syntax: N (0.N), N%, or a decimal")
+                    })?;
+                Some(if score == 0 { 30000 } else { score })
+            }
+        });
+    }
+    // Legacy percent path (config cascade already resolved into args).
+    Ok(if args.no_renames {
+        None
+    } else if let Some(percent) = args.find_renames {
+        Some(u32::from(percent).min(100) * 600)
+    } else if args.renames {
+        Some(30000)
+    } else {
+        match args.renames_config {
+            Some(false) => None,
+            Some(true) | None => Some(30000),
+        }
+    })
+}
+
 /// Module-private resolved status config that deliberately does NOT live on
 /// the public `StatusArgs` (adding fields there breaks exhaustive struct
 /// literals in downstream code, even with the `Default` derive).
@@ -232,6 +418,10 @@ struct StatusConfigExtras {
     /// unstaged rename destinations only when true (default false = Git
     /// parity: a tracked→untracked move renders as `D` + `??`).
     rename_untracked: bool,
+    /// Engine-scale rename threshold resolved by
+    /// [`resolve_status_threshold`] (None = detection disabled). Cache modes
+    /// force None at collection time regardless.
+    rename_threshold: Option<u32>,
 }
 
 /// Structured status degradation warning (§B.5; reused verbatim by the JSON
@@ -379,9 +569,20 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<Status
     if !args.show_stash && !args.no_show_stash && show_stash == Some(true) {
         args.show_stash = true;
     }
+
+    // Bare `-z`/`--null` with no explicit format (§B.6, R0-4): Git treats it
+    // as machine intent — force porcelain v1 + NUL instead of NUL-ing the
+    // human format. Config-selected short (status.short) counts as a format.
+    if args.null_terminated && args.porcelain.is_none() && !args.short && !args.long_format {
+        args.porcelain = Some(PorcelainVersion::V1);
+    }
     args.relative_paths = relative_paths.unwrap_or(true);
     args.renames_config = renames_config;
-    Ok(StatusConfigExtras { rename_untracked })
+    let rename_threshold = resolve_status_threshold(args, None)?;
+    Ok(StatusConfigExtras {
+        rename_untracked,
+        rename_threshold,
+    })
 }
 
 /// Resolve and validate all `status.*` defaults without collecting repository
@@ -696,17 +897,10 @@ async fn collect_status_data(
     // `status.renames`/`diff.renames` config applies (`false` disables). When
     // nothing is set, rename detection is ON at 50%, matching Git.
     // `--cached`/`--check-dirty` (Libra dirty-cache extensions) never run it.
-    let rename_percent: Option<u8> = if args.no_renames || args.cached || args.check_dirty {
+    let rename_threshold: Option<u32> = if args.cached || args.check_dirty {
         None
-    } else if let Some(explicit) = args.find_renames {
-        Some(explicit)
-    } else if args.renames {
-        Some(50)
     } else {
-        match args.renames_config {
-            Some(false) => None,
-            Some(true) | None => Some(50),
-        }
+        extras.rename_threshold
     };
 
     // Apply rename detection before collapsing untracked dirs / porcelain
@@ -717,9 +911,7 @@ async fn collect_status_data(
     let mut staged_rename_details: RenameDetails = HashMap::new();
     let mut unstaged_rename_details: RenameDetails = HashMap::new();
     let mut warnings: Vec<StatusWarning> = Vec::new();
-    if let Some(percent) = rename_percent
-        && percent > 0
-    {
+    if let Some(threshold) = rename_threshold {
         let head_blobs = head_oid
             .as_ref()
             .map(load_head_tree_blobs)
@@ -728,9 +920,9 @@ async fn collect_status_data(
             .as_ref()
             .map(load_index_stage0_blobs)
             .unwrap_or_default();
-        // Git 0..=60000 similarity scale; percent × 600 (100% → exact-only).
+        // Git 0..=60000 similarity scale (already engine-scale here).
         let config = rename_detect::RenameDetectConfig {
-            threshold: (percent as u32).min(100) * 600,
+            threshold,
             rename_limit: 1000,
             comparison_budget: Some(rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS),
         };
@@ -1199,12 +1391,26 @@ pub async fn execute(args: StatusArgs) {
 /// Safe entry point that returns structured [`CliResult`] instead of printing
 /// errors and exiting. JSON mode propagates status-computation failures as
 /// structured CLI errors; text mode uses the same structured error contract.
-pub async fn execute_safe(mut args: StatusArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute_safe(args: StatusArgs, output: &OutputConfig) -> CliResult<()> {
+    execute_safe_with_resolution(args, output, None).await
+}
+
+/// CLI entry with the pre-clap argv resolution (§B.4.3): the occurrence list
+/// overrides the legacy percent field so all three rename spellings obey
+/// true last-one-wins.
+pub(crate) async fn execute_safe_with_resolution(
+    mut args: StatusArgs,
+    output: &OutputConfig,
+    resolution: Option<&StatusArgvResolution>,
+) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
     // Fail closed on invalid `status.*` config before any mode runs or any
     // output is produced; CLI flags keep precedence inside the resolver.
-    let extras = apply_status_config_defaults(&mut args).await?;
+    let mut extras = apply_status_config_defaults(&mut args).await?;
+    if resolution.is_some() {
+        extras.rename_threshold = resolve_status_threshold(&args, resolution)?;
+    }
     let args = args;
 
     // Dirty-set cache modes (lore.md 1.1). NOTE: only this CLI entry routes

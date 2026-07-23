@@ -8,8 +8,12 @@
 //! together — never edit only one side.
 
 pub const STATUS_WAVE0_TESTS: &[&str] = &[
+    "bare_null_emits_porcelain_v1",
+    "bare_z_emits_porcelain_v1",
     "chain_rename_default_untracked_d_and_question",
+    "find_renames_raw_grammar_and_last_wins",
     "json_warnings_schema_snapshot",
+    "normalize_ignores_diff_pathspec_status",
     "pathspec_old_only_new_only_matrix",
     "porcelain_v1_rename_output_stays_add_delete",
     "porcelain_v1_uses_rename_arrow_when_detected",
@@ -27,6 +31,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "rename_untracked_config_cascade",
     "resolved_conflict_with_stage0_emits_no_u_line",
     "similarity_budget_warning",
+    "st_bare_z_emits_porcelain_v1",
     "staged_rename_then_delete_emits_rd",
     "staged_rename_then_modify_emits_rm",
     "tracked_unreadable_path_fails_closed_not_deleted",
