@@ -382,6 +382,9 @@ pub(crate) async fn run_pull(
     )
     .await
     .map_err(PullError::Fetch)?;
+    // The pull-internal fetch writes no FETCH_HEAD and its ref updates
+    // completed inside — release the pack's `.keep` pin now.
+    fetch_result.release_pack_pin();
 
     let fetch_summary = PullFetchResult {
         remote: fetch_result.remote,

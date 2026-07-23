@@ -717,6 +717,12 @@ pub struct FetchRefUpdate {
 pub struct FetchRepositoryResult {
     pub remote: String,
     pub url: String,
+    /// `.keep` sentinel pinning this fetch's pack until the caller records
+    /// FETCH_HEAD (internal plumbing, never serialized). Release via
+    /// [`FetchRepositoryResult::release_pack_pin`] AFTER the last root
+    /// record for this fetch has landed.
+    #[serde(skip)]
+    pub pack_keep_sentinel: Option<std::path::PathBuf>,
     pub refs_updated: Vec<FetchRefUpdate>,
     pub objects_fetched: usize,
     /// Bytes received in the fetch pack stream (the `.pack` payload size). Zero
@@ -732,6 +738,17 @@ pub struct FetchRepositoryResult {
     /// Git records these in FETCH_HEAD even when no local destination moved.
     #[serde(skip)]
     fetch_head_records: Vec<FetchHeadRecord>,
+}
+
+impl FetchRepositoryResult {
+    /// Release the fetch pack's `.keep` pin — call ONLY after the caller has
+    /// recorded every root for this fetch (refs/tags inside `run_fetch`,
+    /// plus FETCH_HEAD where the surface writes one). Idempotent.
+    pub fn release_pack_pin(&self) {
+        if let Some(keep) = &self.pack_keep_sentinel {
+            let _ = std::fs::remove_file(keep);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1002,6 +1019,11 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     // FETCH_HEAD records the fetched refs; `--dry-run` writes nothing.
     if !dry_run {
         write_fetch_head(&result, append).map_err(CliError::from)?;
+    }
+    // FETCH_HEAD (the fetch's last root record) has landed — release each
+    // pack's `.keep` pin so a later repack may consolidate it.
+    for remote in &result.remotes {
+        remote.release_pack_pin();
     }
     if porcelain {
         render_fetch_porcelain(&result, output)
@@ -1747,7 +1769,13 @@ pub async fn fetch_repository_safe(
         output,
     )
     .await
-    .map(|_| ())
+    .map(|result| {
+        // This surface records no FETCH_HEAD and the fetch's ref updates
+        // completed inside — release the pack's `.keep` pin before the
+        // result is discarded (leaking it would exempt every prefetch /
+        // `remote update` pack from repack forever).
+        result.release_pack_pin();
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1796,6 +1824,7 @@ pub(crate) async fn fetch_repository_with_result(
         // (a transient/broken advertisement) so a single empty response cannot
         // wipe every remote-tracking ref.
         return Ok(FetchRepositoryResult {
+            pack_keep_sentinel: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated: Vec::new(),
@@ -1903,6 +1932,7 @@ pub(crate) async fn fetch_repository_with_result(
             Vec::new()
         };
         return Ok(FetchRepositoryResult {
+            pack_keep_sentinel: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated,
@@ -1930,6 +1960,7 @@ pub(crate) async fn fetch_repository_with_result(
             Vec::new()
         };
         return Ok(FetchRepositoryResult {
+            pack_keep_sentinel: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated,
@@ -1962,6 +1993,14 @@ pub(crate) async fn fetch_repository_with_result(
     let objects_fetched = pack_object_count(&fetch_data.pack_data);
     let bytes_received = fetch_data.pack_data.len();
     let pack_file = write_pack_and_index(&fetch_data.pack_data)?;
+    // W2 §C.4.3: the `.keep` sentinel was created INSIDE
+    // `write_pack_and_index`, before the pack's final name became visible.
+    // It is carried out in the result and released by the caller only after
+    // FETCH_HEAD lands (the last root record of a fetch); a crash leaves it
+    // behind, which fails SAFE — repack retains the pack and reports it.
+    let keep_sentinel = pack_file
+        .as_ref()
+        .map(|pack| std::path::PathBuf::from(pack.replace(".pack", ".keep")));
     if let Some(pack_file) = pack_file {
         let index_version = match get_hash_kind() {
             HashKind::Sha1 => None,
@@ -2051,6 +2090,7 @@ pub(crate) async fn fetch_repository_with_result(
     };
 
     Ok(FetchRepositoryResult {
+        pack_keep_sentinel: keep_sentinel,
         remote: remote_config.name,
         url: normalized_url,
         refs_updated,
@@ -2614,6 +2654,17 @@ fn write_pack_and_index(pack_data: &[u8]) -> Result<Option<String>, FetchError> 
 
     let checksum = checksum.to_string();
     let pack_file = pack_dir.join(format!("pack-{checksum}.pack"));
+    // W2 §C.4.3: pin the pack BEFORE it becomes visible at its final name —
+    // the `.keep` sentinel must exist for every instant a repack could list
+    // this pack, so the pack-written→refs-recorded window has no gap at
+    // either end (the caller releases the pin only after FETCH_HEAD lands).
+    let keep_file = pack_dir.join(format!("pack-{checksum}.keep"));
+    fs::write(&keep_file, b"libra fetch in progress\n").map_err(|source| {
+        FetchError::PackWrite {
+            path: keep_file.clone(),
+            source,
+        }
+    })?;
     let mut file = fs::File::create(&pack_file).map_err(|source| FetchError::PackWrite {
         path: pack_file.clone(),
         source,
@@ -3740,6 +3791,7 @@ mod tests {
             requested_remote: Some("origin".to_string()),
             refspec: None,
             remotes: vec![FetchRepositoryResult {
+                pack_keep_sentinel: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 2,
@@ -3792,6 +3844,7 @@ mod tests {
             requested_remote: Some("origin".to_string()),
             refspec: None,
             remotes: vec![FetchRepositoryResult {
+                pack_keep_sentinel: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 1,
@@ -3832,6 +3885,7 @@ mod tests {
             requested_remote: Some("origin".to_string()),
             refspec: None,
             remotes: vec![FetchRepositoryResult {
+                pack_keep_sentinel: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 0,
@@ -3884,6 +3938,7 @@ mod tests {
             requested_remote: Some("origin".to_string()),
             refspec: None,
             remotes: vec![FetchRepositoryResult {
+                pack_keep_sentinel: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 0,

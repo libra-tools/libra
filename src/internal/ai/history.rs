@@ -2647,10 +2647,11 @@ impl HistoryManager {
         });
 
         let mut candidates = HashSet::new();
-        for marker in markers
-            .iter()
-            .filter(|marker| marker.cleanup_pending || !marker.is_live(now_ms))
-        {
+        for marker in markers.iter().filter(|marker| {
+            marker.cleanup_pending
+                || !marker.is_live(now_ms)
+                || !marker.time_fields_trustworthy(now_ms)
+        }) {
             let cataloged = conn
                 .query_one(Statement::from_sql_and_values(
                     conn.get_database_backend(),
@@ -3094,7 +3095,13 @@ impl HistoryManager {
         };
         let marker =
             decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)?;
-        if !marker.cleanup_pending && marker.is_live(now_ms) {
+        // A LIVE marker refuses retirement — but only when its time fields
+        // are trustworthy: a future-dated row would otherwise read as "live"
+        // forever and be unrepairable (W2 §C.4.3).
+        if !marker.cleanup_pending
+            && marker.time_fields_trustworthy(now_ms)
+            && marker.is_live(now_ms)
+        {
             return Ok(false);
         }
         self.drain_rejected_checkpoint_cleanup_jobs().await?;
@@ -3139,13 +3146,22 @@ impl HistoryManager {
             .db
             .markers
             .iter()
-            .filter(|marker| marker.cleanup_pending || !marker.is_live(now_ms))
+            .filter(|marker| {
+                marker.cleanup_pending
+                    || !marker.is_live(now_ms)
+                    // W2 §C.4.3: a future-dated (untrustworthy) row reads as
+                    // "live" under the absolute deadline forever — it must be
+                    // RETIRABLE here, or doctor can never unblock the
+                    // fail-closed listing.
+                    || !marker.time_fields_trustworthy(now_ms)
+            })
             .collect::<Vec<_>>();
         if pending.is_empty() {
             return Ok(());
         }
         if let Some(other) = initial.db.markers.iter().find(|marker| {
             !marker.cleanup_pending
+                && marker.time_fields_trustworthy(now_ms)
                 && marker.is_live(now_ms)
                 && ignored_attempt.is_none_or(|(session_id, attempt_id)| {
                     marker.session_id != session_id || marker.attempt_id != attempt_id
@@ -3251,7 +3267,11 @@ impl HistoryManager {
         let pending = locked_db
             .markers
             .iter()
-            .filter(|marker| marker.cleanup_pending || !marker.is_live(locked_now_ms))
+            .filter(|marker| {
+                marker.cleanup_pending
+                    || !marker.is_live(locked_now_ms)
+                    || !marker.time_fields_trustworthy(locked_now_ms)
+            })
             .collect::<Vec<_>>();
         if pending.is_empty() {
             txn.commit()
@@ -3261,6 +3281,7 @@ impl HistoryManager {
         }
         if let Some(other) = locked_db.markers.iter().find(|marker| {
             !marker.cleanup_pending
+                && marker.time_fields_trustworthy(locked_now_ms)
                 && marker.is_live(locked_now_ms)
                 && ignored_attempt.is_none_or(|(session_id, attempt_id)| {
                     marker.session_id != session_id || marker.attempt_id != attempt_id
@@ -5251,10 +5272,44 @@ impl TracesInflightMarker {
     }
 
     /// Whether the marker is still live at `now_ms`.
+    ///
+    /// BOUNDED (W2 §C.4.3): a deterministic absolute deadline from the
+    /// persisted fields with `ttl_ms` capped at
+    /// [`TRACES_INFLIGHT_MAX_LIVE_MS`]. Future-dated rows are handled by
+    /// [`Self::time_fields_trustworthy`] (the listing fails closed on them
+    /// and doctor retires them) — this predicate never re-anchors to the
+    /// reading clock. Every liveness consumer inherits these definitions.
     pub fn is_live(&self, now_ms: i64) -> bool {
-        self.started_at_ms.saturating_add(self.ttl_ms) > now_ms
+        // DETERMINISTIC absolute deadline from the PERSISTED fields only —
+        // never re-anchored to the reading clock. TTL is capped so nothing
+        // counts as live more than 24h past its recorded start. Rows whose
+        // start lies beyond clock-skew tolerance in the FUTURE never reach
+        // this predicate through the listing: `time_fields_trustworthy`
+        // fails the listing CLOSED for them (they are corrupt, and silently
+        // dropping them would strip a possibly-writing session's only
+        // protection).
+        self.started_at_ms
+            .saturating_add(self.ttl_ms.clamp(0, TRACES_INFLIGHT_MAX_LIVE_MS))
+            > now_ms
+    }
+
+    /// Whether the persisted time fields are plausible at `now_ms`: a start
+    /// more than [`TRACES_INFLIGHT_FUTURE_SKEW_MS`] in the future cannot
+    /// come from a healthy writer — the row is corrupt and every
+    /// destructive consumer must stop (fail closed) rather than guess.
+    pub fn time_fields_trustworthy(&self, now_ms: i64) -> bool {
+        self.started_at_ms <= now_ms.saturating_add(TRACES_INFLIGHT_FUTURE_SKEW_MS)
     }
 }
+
+/// Upper bound on how long ANY ordinary in-flight marker may count as live,
+/// regardless of what its persisted `ttl_ms` claims (fail-safe clamp; the
+/// ordinary writer TTL is 10 minutes, so 24h is generous headroom).
+pub const TRACES_INFLIGHT_MAX_LIVE_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Clock-skew tolerance for `started_at_ms` (a healthy writer stamps "now";
+/// anything further in the future is a corrupt row, not a long-lived one).
+pub const TRACES_INFLIGHT_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
 fn validate_traces_inflight_marker(
     marker: &TracesInflightMarker,
@@ -5570,6 +5625,21 @@ pub async fn list_live_traces_inflight_markers<C: ConnectionTrait>(
     for entry in entries {
         match decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key) {
             Ok(marker) => {
+                // A future-dated start beyond skew tolerance is a CORRUPT
+                // row, not an expired one: silently filtering it would strip
+                // a possibly-still-writing session's only protection, so the
+                // listing fails CLOSED and destructive consumers stop.
+                if !marker.time_fields_trustworthy(now_ms) {
+                    bail!(
+                        "traces in-flight marker for session {} attempt {} carries a \
+                         future-dated started_at_ms ({} vs now {now_ms}) — the row is \
+                         corrupt; inspect it with `libra agent doctor` before destructive \
+                         maintenance",
+                        marker.session_id,
+                        marker.attempt_id,
+                        marker.started_at_ms
+                    );
+                }
                 if marker.cleanup_pending || marker.is_live(now_ms) {
                     live.push(marker);
                 }
@@ -6128,6 +6198,12 @@ fn collect_exclusive_unreachable_oids(
             .into_iter()
             .filter_map(|oid| oid.clone())
         {
+            // Legacy rows may spell "no traces commit" as an EMPTY string
+            // rather than NULL — an empty id is not an object to deindex,
+            // and passing it to the deletion fence aborts the whole prune.
+            if oid.is_empty() {
+                continue;
+            }
             if !still_referenced.contains(&oid) && seen.insert(oid.clone()) {
                 unreachable.push(oid);
             }
@@ -6289,6 +6365,123 @@ mod tests {
     }
 
     use super::*;
+
+    /// W2 §C.4.3 end-to-end unblock: an `i64::MAX`-dated marker row blocks
+    /// the listing fail-closed, and `agent doctor --repair`'s retirement
+    /// entry point RETIRES it (the drain classifies untrustworthy rows as
+    /// retirable), after which the listing succeeds again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn doctor_repair_retires_future_dated_marker_and_unblocks_listing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        let db = crate::internal::db::get_db_conn_instance().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut marker = TracesInflightMarker::new("sess-max", "attempt-max", now);
+        marker.started_at_ms = i64::MAX;
+        crate::internal::metadata::MetadataKv::set_with_conn(
+            &db,
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            "sess-max",
+            "attempt-max",
+            &serde_json::to_string(&marker).expect("encode"),
+            crate::internal::metadata::MetadataValueType::Text,
+        )
+        .await
+        .expect("seed i64::MAX marker");
+
+        list_live_traces_inflight_markers(&db, now)
+            .await
+            .expect_err("the corrupt row blocks the listing");
+
+        let storage: Arc<dyn crate::utils::storage::Storage + Send + Sync> =
+            Arc::new(crate::utils::storage::local::LocalStorage::new(
+                crate::utils::util::storage_path().join("objects"),
+            ));
+        let history = HistoryManager::new_with_ref(
+            storage,
+            crate::utils::util::storage_path(),
+            Arc::new(db.clone()),
+            "refs/libra/traces",
+        );
+        let retired = history
+            .repair_expired_traces_inflight_marker("sess-max", "attempt-max", now)
+            .await
+            .expect("doctor repair retires the untrustworthy marker");
+        assert!(retired, "the marker row was fully retired");
+
+        let live = list_live_traces_inflight_markers(&db, now)
+            .await
+            .expect("the listing is unblocked after retirement");
+        assert!(live.is_empty(), "no marker remains: {live:?}");
+    }
+
+    /// W2 §C.4.3: the LISTING fails closed on a future-dated marker row —
+    /// every destructive consumer (gc defer/roots, prune, erasure) stops
+    /// instead of silently losing or trusting the row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn listing_fails_closed_on_future_dated_marker_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        let db = crate::internal::db::get_db_conn_instance().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let marker = TracesInflightMarker::new("sess-f", "attempt-f", now + 48 * 60 * 60 * 1000);
+        crate::internal::metadata::MetadataKv::set_with_conn(
+            &db,
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            "sess-f",
+            "attempt-f",
+            &serde_json::to_string(&marker).expect("encode"),
+            crate::internal::metadata::MetadataValueType::Text,
+        )
+        .await
+        .expect("seed future-dated marker");
+
+        let err = list_live_traces_inflight_markers(&db, now)
+            .await
+            .expect_err("future-dated row must fail the listing closed");
+        assert!(
+            format!("{err:#}").contains("future-dated"),
+            "actionable corruption error: {err:#}"
+        );
+    }
+
+    /// W2 §C.4.3: marker liveness is a DETERMINISTIC absolute deadline from
+    /// the persisted fields (TTL capped at 24h, no per-read re-anchoring),
+    /// and a future-dated start beyond skew tolerance marks the ROW ITSELF
+    /// untrustworthy — the listing fails closed on it instead of silently
+    /// filtering or trusting it.
+    #[test]
+    fn inflight_marker_liveness_is_bounded_and_deterministic() {
+        let now = 1_700_000_000_000_i64;
+        let mut marker = TracesInflightMarker::new("s", "a", now - 60_000);
+        // Normal recent marker with its ordinary TTL: live and trustworthy.
+        assert!(marker.time_fields_trustworthy(now));
+        assert!(marker.is_live(now));
+        // Absurd TTL is capped: dead 24h past start no matter the claim.
+        marker.ttl_ms = i64::MAX;
+        assert!(marker.is_live(now));
+        assert!(!marker.is_live(marker.started_at_ms + TRACES_INFLIGHT_MAX_LIVE_MS + 1));
+        // Future-dated start beyond skew: UNTRUSTWORTHY at any read time
+        // before the claimed start — the listing bails rather than judging
+        // liveness; once real time catches up the row is trustworthy again
+        // and the ordinary capped deadline applies.
+        marker.started_at_ms = now + 48 * 60 * 60 * 1000;
+        marker.ttl_ms = 600_000;
+        assert!(!marker.time_fields_trustworthy(now));
+        assert!(!marker.time_fields_trustworthy(now + 60 * 60 * 1000));
+        assert!(marker.time_fields_trustworthy(marker.started_at_ms));
+        assert!(marker.is_live(marker.started_at_ms + 1));
+        assert!(!marker.is_live(marker.started_at_ms + 600_001));
+        // Small clock skew is tolerated deterministically.
+        marker.started_at_ms = now + 60_000;
+        assert!(marker.time_fields_trustworthy(now));
+        assert!(marker.is_live(now));
+        assert!(!marker.is_live(now + TRACES_INFLIGHT_MAX_LIVE_MS + 120_000));
+    }
     use crate::{internal::db, utils::storage::local::LocalStorage};
 
     #[cfg(unix)]

@@ -687,7 +687,7 @@ fn fast_import_refuses_branch_checked_out_elsewhere() {
 /// lands, `maintenance run --task gc` must skip the loose-object prune in a
 /// multi-worktree repository rather than delete objects it cannot see.
 #[test]
-fn gc_skips_prune_in_multi_worktree_repo() {
+fn gc_and_repack_run_in_multi_worktree_repo_keeping_private_roots() {
     let repo = repo_with_feature();
     let main = repo.path();
     let parent = tempfile::tempdir().expect("wt parent");
@@ -711,13 +711,17 @@ fn gc_skips_prune_in_multi_worktree_repo() {
     .to_string();
     assert!(!oid.is_empty(), "hashed the staged blob");
 
-    // GC from the MAIN worktree must skip the prune (not delete the blob).
+    // W2 §C.4.3: gc RUNS in a multi-worktree repository (the W0 skip is
+    // lifted) — the linked worktree's private index is a reachability root.
+    // Age every loose object past the prune grace window first, so survival
+    // below proves the ROOT, not the freshness belt.
+    backdate_loose_objects(main);
     let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
     assert_cli_success(&gc, "maintenance gc");
     let text = String::from_utf8_lossy(&gc.stdout) + String::from_utf8_lossy(&gc.stderr);
     assert!(
-        text.contains("linked worktree"),
-        "gc should report skipping the prune for linked worktrees: {text}"
+        !text.contains("skipped loose-object prune"),
+        "the multi-worktree gc skip is lifted: {text}"
     );
 
     // The staged-only blob must still be readable (no data loss).
@@ -739,8 +743,8 @@ fn gc_skips_prune_in_multi_worktree_repo() {
         "the linked worktree's staged blob must not be reported unreachable: {fsck_text}"
     );
 
-    // The incremental-repack task has the same gap (it rebuilds one pack from
-    // the reachable set and deletes the old packs), so it must skip too.
+    // incremental-repack runs too (same lifted skip); the staged-only blob
+    // must still be readable afterwards (it is in the consolidated root set).
     let repack = run_libra_command(
         &["maintenance", "run", "--task", "incremental-repack"],
         main,
@@ -749,9 +753,44 @@ fn gc_skips_prune_in_multi_worktree_repo() {
     let repack_text =
         String::from_utf8_lossy(&repack.stdout) + String::from_utf8_lossy(&repack.stderr);
     assert!(
-        repack_text.contains("linked worktree"),
-        "incremental-repack should skip in a multi-worktree repo: {repack_text}"
+        !repack_text.contains("skipped repack: this repository has linked worktrees"),
+        "the multi-worktree repack skip is lifted: {repack_text}"
     );
+    let cat = run_libra_command(&["cat-file", "-p", &oid], main);
+    assert_cli_success(&cat, "staged-only blob survives repack");
+}
+
+/// Age every loose object file past the gc prune grace window so a test can
+/// prove ROOT-based survival rather than freshness-based survival.
+pub(crate) fn backdate_loose_objects(repo: &std::path::Path) {
+    // POSIX `touch -t [[CC]YY]MMDDhhmm` (portable, unlike GNU `-d`).
+    let stamp = (chrono::Utc::now() - chrono::Duration::hours(2))
+        .format("%Y%m%d%H%M")
+        .to_string();
+    let objects = repo.join(".libra/objects");
+    let shards = std::fs::read_dir(&objects).expect("read objects dir");
+    for shard in shards {
+        let shard = shard.expect("objects shard entry");
+        if !shard.path().is_dir() || shard.file_name() == "pack" {
+            continue;
+        }
+        let files = std::fs::read_dir(shard.path()).expect("read objects shard");
+        for file in files {
+            let file = file.expect("loose object entry");
+            let status = std::process::Command::new("touch")
+                .arg("-t")
+                .arg(&stamp)
+                .arg(file.path())
+                .status()
+                .expect("spawn touch");
+            assert!(
+                status.success(),
+                "backdating '{}' must succeed (a silently-fresh object would let the \
+                 grace window mask a missing root)",
+                file.path().display()
+            );
+        }
+    }
 }
 
 /// Part C §C.4.3: transient editor buffers live in each worktree's OWN gitdir.

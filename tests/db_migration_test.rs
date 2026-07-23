@@ -3287,3 +3287,83 @@ async fn sparse_down_migration_rejects_linked_rows() {
     let pattern: String = row.try_get_by_index(0).expect("pattern");
     assert_eq!(pattern, "main/**");
 }
+
+/// W2 §C.4.3 inventory guard: every OID-shaped column in the LIVE schema
+/// must be accounted for in `GC_OBJECT_SOURCE_INVENTORY` — either as a
+/// traced reachability root or as a documented non-root. A new store that
+/// adds an OID column without updating the inventory (and, when a root, the
+/// collector) fails here instead of silently shipping un-traced.
+#[tokio::test]
+async fn gc_object_source_inventory_covers_every_oid_column() {
+    use libra::command::maintenance::GC_OBJECT_SOURCE_INVENTORY;
+
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    let oid_keywords = ["oid", "commit", "blob", "tree", "sha", "hash"];
+    // Table-level exemptions: stores whose OID-shaped columns are not
+    // object-store OIDs at all (AI capture bookkeeping uses provider ids and
+    // sync hashes; `agent_checkpoint` itself IS inventoried).
+    let exempt_tables: [&str; 0] = [];
+
+    let tables = conn
+        .query_all(Statement::from_string(
+            backend,
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND name NOT LIKE 'sqlite_%'"
+                .to_string(),
+        ))
+        .await
+        .expect("list tables");
+    let mut uncovered: Vec<String> = Vec::new();
+    for table_row in tables {
+        let table: String = table_row.try_get_by_index(0).expect("table name");
+        if exempt_tables.contains(&table.as_str()) {
+            continue;
+        }
+        let columns = conn
+            .query_all(Statement::from_string(
+                backend,
+                format!("PRAGMA table_info({table})"),
+            ))
+            .await
+            .expect("table info");
+        for column_row in columns {
+            let column: String = column_row.try_get_by_index(1).expect("column name");
+            let is_oid_shaped = column
+                .split('_')
+                .any(|segment| oid_keywords.contains(&segment));
+            if !is_oid_shaped {
+                continue;
+            }
+            let inventoried = GC_OBJECT_SOURCE_INVENTORY
+                .iter()
+                .any(|(t, c, _, _)| *t == table && *c == column);
+            if !inventoried {
+                uncovered.push(format!("{table}.{column}"));
+            }
+        }
+    }
+    // Semantic OID columns the name heuristic cannot flag — pinned by hand;
+    // each must be inventoried too.
+    for (table, column) in [
+        ("operation_view", "head_target"),
+        ("operation_view_workspace", "pointer_value"),
+        ("object_index", "o_id"),
+        ("metadata_kv", "value"),
+    ] {
+        let inventoried = GC_OBJECT_SOURCE_INVENTORY
+            .iter()
+            .any(|(t, c, _, _)| *t == table && *c == column);
+        if !inventoried {
+            uncovered.push(format!("{table}.{column} (semantic)"));
+        }
+    }
+    assert!(
+        uncovered.is_empty(),
+        "OID-shaped columns missing from GC_OBJECT_SOURCE_INVENTORY (add each as a traced \
+         root in collect_reachable_objects or a documented non-root): {uncovered:?}"
+    );
+}

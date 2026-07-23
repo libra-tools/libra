@@ -1123,6 +1123,32 @@ async fn scan_checkpoint_store(
             &entry.target,
             &entry.key,
         ) {
+            Ok(marker) if !marker.time_fields_trustworthy(now_ms) => {
+                // W2 §C.4.3: a future-dated start beyond skew tolerance is a
+                // CORRUPT row — the prune-side listing fails closed on it,
+                // blocking GC/prune/erasure until it is retired. Doctor must
+                // therefore surface it as repairable (the same serialized
+                // root-fenced retirement drains its listed OIDs safely),
+                // never classify it as live.
+                findings.push(CheckpointFinding {
+                    inconsistency_type: CLASS_EXPIRED_INFLIGHT_MARKER.to_string(),
+                    checkpoint_id: marker.attempt_id.clone(),
+                    detail: format!(
+                        "future-dated traces marker for session '{}' (started_at_ms {} is \
+                         beyond clock-skew tolerance) blocks destructive maintenance \
+                         fail-closed; `libra agent doctor --repair` will run serialized \
+                         root-fenced ownership retirement",
+                        marker.session_id, marker.started_at_ms
+                    ),
+                    repaired: false,
+                    manual_required: false,
+                });
+                plans.push(RepairPlan::RepairExpiredInflightMarker {
+                    session_id: marker.session_id,
+                    attempt_id: marker.attempt_id,
+                    observed_at_ms: now_ms,
+                });
+            }
             Ok(marker) if marker.is_live(now_ms) && !marker.cleanup_pending => markers.push(marker),
             Ok(marker) => {
                 findings.push(CheckpointFinding {

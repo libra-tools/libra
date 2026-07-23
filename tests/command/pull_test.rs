@@ -1296,3 +1296,148 @@ async fn test_stash_push_works_on_a_packed_head_from_pull() {
         "pop restored the stashed change"
     );
 }
+
+/// W2 §C.4.3: `incremental-repack` actually CONSOLIDATES in a multi-worktree
+/// repository — the five fetch packs collapse into one (old packs deleted),
+/// while history and a blob staged only in a linked worktree stay readable.
+#[tokio::test]
+#[serial]
+async fn test_incremental_repack_consolidates_with_linked_worktree_roots() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(&run_libra_command(&["pull"], local_repo.path()), "pull 1");
+    for i in 0..4 {
+        push_remote_commit(
+            &work_dir,
+            &branch,
+            &format!("packfill-{i}.txt"),
+            "x\n",
+            &format!("packfill {i}"),
+        );
+        assert_cli_success(&run_libra_command(&["pull"], local_repo.path()), "pull n");
+    }
+    let pack_dir = local_repo.path().join(".libra/objects/pack");
+    let count_packs = |dir: &std::path::Path| {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert!(
+        count_packs(&pack_dir) >= 5,
+        "fixture produced enough packs to trigger consolidation"
+    );
+
+    // A linked worktree with a staged-only blob (an index root).
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("repack-wt");
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "add", wt.to_str().unwrap()],
+            local_repo.path(),
+        ),
+        "worktree add",
+    );
+    fs::write(wt.join("staged-only.txt"), "packed root\n").expect("stage file");
+    assert_cli_success(
+        &run_libra_command(&["add", "staged-only.txt"], &wt),
+        "wt add",
+    );
+    let oid = String::from_utf8_lossy(
+        &run_libra_command(&["hash-object", "staged-only.txt"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+
+    // Age the fetch packs past the deletion grace window (a just-written
+    // pack is deliberately RETAINED so an in-flight fetch's ref update can
+    // land — here we prove the aged-out deletion path).
+    let stamp = (chrono::Utc::now() - chrono::Duration::hours(2))
+        .format("%Y%m%d%H%M")
+        .to_string();
+    for entry in std::fs::read_dir(&pack_dir).expect("read pack dir") {
+        let entry = entry.expect("pack entry");
+        let status = std::process::Command::new("touch")
+            .arg("-t")
+            .arg(&stamp)
+            .arg(entry.path())
+            .status()
+            .expect("spawn touch");
+        assert!(status.success(), "backdating pack must succeed");
+    }
+    let repack = run_libra_command(
+        &["maintenance", "run", "--task", "incremental-repack"],
+        local_repo.path(),
+    );
+    assert_cli_success(&repack, "incremental-repack");
+    let text = String::from_utf8_lossy(&repack.stdout) + String::from_utf8_lossy(&repack.stderr);
+    assert!(
+        !text.contains("skipped repack"),
+        "no skip in a multi-worktree repository: {text}"
+    );
+    assert_eq!(
+        count_packs(&pack_dir),
+        1,
+        "aged-out old packs were deleted and consolidated into one"
+    );
+    // History from the deleted packs and the linked worktree's staged blob
+    // are both still readable.
+    assert_cli_success(
+        &run_libra_command(&["log", "--oneline", "-n", "3"], local_repo.path()),
+        "history readable after consolidation",
+    );
+    let cat = run_libra_command(&["cat-file", "-p", &oid], local_repo.path());
+    assert_cli_success(&cat, "staged-only blob readable after repack");
+    assert!(String::from_utf8_lossy(&cat.stdout).contains("packed root"));
+}
+
+/// W2 §C.4.3: `maintenance run --task prefetch` goes through
+/// `fetch_repository_safe`, which must RELEASE each pack's `.keep` pin on
+/// success — a leaked pin would exempt every prefetched pack from repack
+/// forever.
+#[tokio::test]
+#[serial]
+async fn test_prefetch_releases_pack_keep_pins() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    // New remote content so the prefetch transfers a pack.
+    push_remote_commit(&work_dir, &branch, "prefetched.txt", "p\n", "prefetch me");
+
+    let prefetch = run_libra_command(
+        &["maintenance", "run", "--task", "prefetch"],
+        local_repo.path(),
+    );
+    assert_cli_success(&prefetch, "maintenance prefetch");
+
+    // The prefetch actually transferred: the new remote commit is readable
+    // locally and at least one pack exists (rules out a no-op pass).
+    let remote_tip = git_stdout(&["rev-parse", "HEAD"], &work_dir);
+    let cat = run_libra_command(&["cat-file", "-t", &remote_tip], local_repo.path());
+    assert_cli_success(&cat, "prefetched commit readable");
+    let pack_dir = local_repo.path().join(".libra/objects/pack");
+    let mut packs = 0usize;
+    let mut leftover_keeps: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&pack_dir).expect("read pack dir") {
+        let path = entry.expect("pack dir entry").path();
+        match path.extension().and_then(|x| x.to_str()) {
+            Some("pack") => packs += 1,
+            Some("keep") => leftover_keeps.push(path),
+            _ => {}
+        }
+    }
+    assert!(packs >= 1, "the prefetch wrote at least one pack");
+    assert!(
+        leftover_keeps.is_empty(),
+        "prefetch released every pack .keep pin: {leftover_keeps:?}"
+    );
+}

@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **gc/repack run in multi-worktree repositories via the typed GC root
+  inventory (v0.19.56, plan-20260714 Part C §C.4.3, W2 final slice)**: the
+  versioned `GC_OBJECT_SOURCE_INVENTORY` accounts for every persistent
+  OID-bearing store as a traced reachability root or a documented non-root,
+  a schema-scan guard test fails any future OID column that ships
+  un-inventoried, and the W0 multi-worktree prune/repack skips are lifted.
+  New root classes fix real data-loss holes that also affected
+  single-worktree repositories: note blobs (`notes.blob` is their only
+  anchor), undo view snapshots (`operation_view_ref.target_oid`), AI capture
+  checkpoints (`agent_checkpoint` OIDs), in-progress merge/revert/rebase-aux
+  sidecar OIDs, and per-worktree `FETCH_HEAD` tips are now kept alive by
+  `maintenance run` gc/repack. Unreadable roots still fail the walk closed —
+  pruning never proceeds against a partial root set.
 - **`merge-file` backups are worktree-local (v0.19.55, plan-20260714 Part C
   §C.4.3, W2 slice 3)**: the in-place backup of `<current>` moves from the
   shared `.libra/merge-file-backup/` into the acting worktree's local gitdir

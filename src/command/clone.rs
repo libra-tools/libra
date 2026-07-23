@@ -3406,6 +3406,9 @@ async fn clone_into_destination(
     )
     .await
     .map_err(|source| CloneError::FetchFailed { source })?;
+    // Clone owns this fresh repository exclusively; the fetch's ref updates
+    // landed inside — release the pack's `.keep` pin now.
+    fetch_result.release_pack_pin();
 
     // --- Step 6–7: Configure repository + checkout ---
     if !output.quiet && !output.is_json() {

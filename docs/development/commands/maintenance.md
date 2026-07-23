@@ -33,6 +33,12 @@ flowchart TD
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 
+## GC 类型化根清单（W2 §C.4.3）
+
+- `GC_OBJECT_SOURCE_INVENTORY`（`src/command/maintenance.rs`,版本 1）登记**每一个**可含对象库 OID 的持久存储:traced root(refs、双侧 reflog、全 scope sequencer/rebase/bisect 行、全 worktree index 各 stage、全 gitdir held-autostash + merge/revert/rebase-aux sidecar + FETCH_HEAD、stash reflog、`notes.blob`、`operation_view_ref.target_oid`、`agent_checkpoint.*`)或 documented non-root(advisory 校验键、可重建缓存、obliteration 墓碑、layer 磁盘身份)。
+- 守卫测试 `gc_object_source_inventory_covers_every_oid_column`(db_migration_test)扫描 live schema 的 OID 形态列,未登记即失败——新表新列不可能静默漏根。
+- 由此 W0 的多 worktree gc/repack skip 已解除;任何根读取失败仍 fail-closed(绝不在部分根集上 prune)。本切片同时修复了单 worktree 下 note blob / undo 快照 / AI checkpoint 对象会被 prune 的既有数据丢失洞。
+
 ## 实现历史
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。

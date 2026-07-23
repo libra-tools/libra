@@ -796,3 +796,60 @@ fn count_loose_objects(objects_dir: &std::path::Path) -> usize {
     }
     count
 }
+
+/// W2 §C.4.3: with the typed `GcObjectSource` inventory complete, gc prune
+/// RUNS in a multi-worktree repository (the W0 skip is lifted) and keeps
+/// every root class alive: a blob staged ONLY in a linked worktree's
+/// private index, and a note blob anchored ONLY by the `notes` table.
+#[test]
+fn gc_runs_multi_worktree_and_keeps_private_and_registered_roots() {
+    let repo = super::create_committed_repo_via_cli();
+    let main = repo.path();
+    let wt_root = tempfile::tempdir().expect("wt root");
+    let wt = wt_root.path().join("gc-wt");
+    super::assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // A blob reachable ONLY from the linked worktree's private index.
+    std::fs::write(wt.join("staged-only.txt"), "linked staged blob\n").unwrap();
+    super::assert_cli_success(
+        &run_libra_command(&["add", "staged-only.txt"], &wt),
+        "wt add",
+    );
+    // A note blob anchored ONLY by the notes table.
+    super::assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "keep-this-note", "HEAD"], main),
+        "notes add",
+    );
+
+    // Age loose objects past the prune grace window so survival proves the
+    // ROOTS below, not the freshness belt.
+    super::worktree_isolation_test::backdate_loose_objects(main);
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
+    super::assert_cli_success(&gc, "gc in a multi-worktree repository");
+    let stdout = String::from_utf8_lossy(&gc.stdout);
+    assert!(
+        !stdout.contains("skipped loose-object prune"),
+        "the W0 multi-worktree skip is lifted: {stdout}"
+    );
+
+    // Both roots survived: the note still renders, and the staged-only blob
+    // still commits cleanly from the linked worktree.
+    let note = run_libra_command(&["notes", "show", "HEAD"], main);
+    super::assert_cli_success(&note, "notes show after gc");
+    assert!(
+        String::from_utf8_lossy(&note.stdout).contains("keep-this-note"),
+        "the notes-table blob survived the prune"
+    );
+    // `diff --cached` must read the staged blob's CONTENT back from the
+    // object store — it errors (or shows nothing) if the prune dropped it.
+    let cached = run_libra_command(&["diff", "--cached"], &wt);
+    super::assert_cli_success(&cached, "diff --cached after gc");
+    assert!(
+        String::from_utf8_lossy(&cached.stdout).contains("linked staged blob"),
+        "the linked worktree's staged-only blob content survived the prune: {}",
+        String::from_utf8_lossy(&cached.stdout)
+    );
+}

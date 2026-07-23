@@ -183,6 +183,20 @@ where
     T::from_bytes(&data.to_vec(), hash)
 }
 
+/// RAW load: NO `refs/replace` substitution (plan-20260714 §C.4.1.1 process
+/// cache rules — the GC/repack reachability walk must traverse the ORIGINAL
+/// graph byte-for-byte; resolving replacements would leave the replaced
+/// object's own tree/parents unrooted and expose a corrupt history the
+/// moment the replace ref is deleted).
+pub fn load_object_raw<T>(hash: &ObjectHash) -> Result<T, GitError>
+where
+    T: ObjectTrait,
+{
+    let storage = util::objects_storage();
+    let data = storage.get(hash)?;
+    T::from_bytes(&data.to_vec(), *hash)
+}
+
 // impl save for all objects
 pub fn save_object<T>(object: &T, obj_id: &ObjectHash) -> Result<(), GitError>
 where
