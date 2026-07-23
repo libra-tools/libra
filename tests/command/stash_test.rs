@@ -1703,3 +1703,46 @@ async fn test_stash_push_pathspec_rejects_options() {
         assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), "A1\n");
     }
 }
+
+/// W2 §C.4.3: a failed `stash branch` apply rolls back the half-created
+/// state — the new branch is deleted (tip-conditionally), HEAD returns to
+/// the original branch, and the stash entry is kept.
+#[test]
+fn stash_branch_failed_apply_rolls_back_branch_and_head() {
+    let repo = create_committed_repo_via_cli();
+    let path = repo.path();
+    // Stash a tracked change, then dirty the SAME file differently so the
+    // apply inside `stash branch` conflicts and fails.
+    std::fs::write(path.join("tracked.txt"), "stash me\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["stash", "push", "-m", "rollback-probe"], path),
+        "stash push",
+    );
+    std::fs::write(path.join("tracked.txt"), "conflicting local edit\n").unwrap();
+
+    let branched = run_libra_command(&["stash", "branch", "rollback-nb"], path);
+    assert_ne!(
+        branched.status.code(),
+        Some(0),
+        "conflicting apply fails the branch command"
+    );
+    let branches = run_libra_command(&["branch"], path);
+    assert_cli_success(&branches, "branch list");
+    assert!(
+        !String::from_utf8_lossy(&branches.stdout).contains("rollback-nb"),
+        "the half-created branch was rolled back: {}",
+        String::from_utf8_lossy(&branches.stdout)
+    );
+    let listed = run_libra_command(&["stash", "list"], path);
+    assert_cli_success(&listed, "stash list");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("rollback-probe"),
+        "the stash entry is kept after the failed branch"
+    );
+    let status = run_libra_command(&["status"], path);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("main"),
+        "HEAD returned to the original branch: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}

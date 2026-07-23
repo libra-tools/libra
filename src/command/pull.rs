@@ -202,11 +202,6 @@ pub(crate) enum PullError {
     #[error("pull failed during rebase phase: {0}")]
     Rebase(#[source] rebase::RebaseError),
 
-    /// Part C W1: the rebase mode alone is refused in a linked worktree (its
-    /// state is still repository-global); carries the ready-made guard error.
-    #[error("'pull --rebase' is not yet supported inside a linked worktree")]
-    RebaseInLinkedWorktree(CliError),
-
     #[error("pull --autostash failed: {0}")]
     Autostash(String),
 
@@ -253,7 +248,6 @@ impl From<PullError> for CliError {
             PullError::Fetch(error) => map_fetch_error_to_cli(&error).with_detail("phase", "fetch"),
             PullError::Merge(error) => map_merge_error_to_cli(&error).with_detail("phase", "merge"),
             PullError::Rebase(error) => CliError::from(error).with_detail("phase", "rebase"),
-            PullError::RebaseInLinkedWorktree(guard) => guard.with_detail("phase", "rebase"),
             PullError::Autostash(detail) => {
                 CliError::failure(format!("pull --autostash failed: {detail}"))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
@@ -347,14 +341,10 @@ pub async fn execute(args: PullArgs) {
 /// Returns [`CliError`] when the pull target cannot be resolved, fetch fails,
 /// histories cannot be merged safely, or refs/worktree updates fail.
 pub async fn execute_safe(args: PullArgs, output: &OutputConfig) -> CliResult<()> {
-    // Part C W1 (§C.4.4): pull's fetch phase writes only repository-scoped
-    // state (`refs/remotes/*` + objects; the pull-internal fetch writes no
-    // FETCH_HEAD) and its merge phase runs on fully worktree-scoped merge
-    // state (v0.19.33), so the merge/ff modes are safe in a linked worktree.
-    // Only the REBASE mode still rides the repository-global `rebase_state`
-    // (plus the legacy stash-stack autostash) — `run_pull` refuses that mode
-    // alone, after config resolution (so `pull.rebase = true` cannot sneak
-    // past a flag-only check).
+    // Part C W2 (§C.4.3/§C.4.4): every pull mode runs in any worktree —
+    // the fetch phase writes only repository-scoped state, merge/rebase run
+    // on worktree-scoped state, and the rebase-path `--autostash` wrap uses
+    // the shared stash stack through the stack-lock + by-id CAS protocol.
     let result = run_pull(args, output).await.map_err(CliError::from)?;
     render_pull_output(&result, output)
 }
@@ -365,22 +355,10 @@ pub(crate) async fn run_pull(
 ) -> Result<PullOutput, PullError> {
     let branch = current_branch_for_pull().await?;
     let effective = resolve_effective_pull_options(&args, &branch).await?;
-    // Part C W1 (§C.4.2/§C.4.4): the rebase mode is allowed in linked
-    // worktrees too — `run_rebase_for_pull` runs on the same worktree-scoped
-    // rebase state as the public `rebase` command (scoped `rebase_state` row,
-    // local-gitdir aux sidecar, scope-aware mutex). Only the `--autostash`
-    // combination stays refused there: its legacy wrap pushes onto the
-    // repository-global stash stack, which is main-only until W2 — and it
-    // must fail fast, before target resolution or any fetch.
-    if args.autostash
-        && effective.rebase
-        && let Err(guard) = crate::command::ensure_main_worktree_because(
-            "pull --rebase --autostash",
-            "the rebase-path autostash uses the repository-global stash stack",
-        )
-    {
-        return Err(PullError::RebaseInLinkedWorktree(guard));
-    }
+    // Part C W2 (§C.4.3): the `--rebase --autostash` combination is allowed
+    // in linked worktrees now — its wrap pushes/pops the shared stash stack
+    // through the W2 stack-lock + by-id CAS protocol, and the snapshot/apply
+    // side acts on this worktree's own index/workdir.
     let target = resolve_pull_target(&args, branch, effective.rebase).await?;
     // `--no-progress` forwards to the fetch: suppress its "Receiving objects"
     // meter just like `git pull --no-progress`.
@@ -425,12 +403,12 @@ pub(crate) async fn run_pull(
     // has no autostash machinery of its own — see COMPATIBILITY.md rebase
     // row). The MERGE path uses the Git-faithful merge-owned autostash below
     // (held on conflict rather than popped back into a conflicted tree).
-    let stashed = if args.autostash && effective.rebase {
+    let autostash_entry = if args.autostash && effective.rebase {
         stash::autostash_push()
             .await
             .map_err(PullError::Autostash)?
     } else {
-        false
+        None
     };
 
     // Capture the integrate result so the autostash can be popped afterwards
@@ -515,8 +493,13 @@ pub(crate) async fn run_pull(
         }
     };
 
-    if stashed {
-        stash::autostash_pop().await.map_err(PullError::Autostash)?;
+    if let Some((id, raw_line)) = autostash_entry {
+        // Pop EXACTLY the entry this pull pushed — named by the push-time
+        // raw reflog line (immune even to a duplicate commit id another
+        // worktree pushed onto the shared stack meanwhile).
+        stash::autostash_pop_by_entry(&id, &raw_line)
+            .await
+            .map_err(PullError::Autostash)?;
     }
 
     integrate_result

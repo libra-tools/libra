@@ -1172,3 +1172,127 @@ fn pull_no_progress_flag_is_accepted() {
         "--no-progress is accepted by the parser: {err}"
     );
 }
+
+/// W2 §C.4.3: `pull --rebase --autostash` runs in a LINKED worktree — the
+/// autostash wrap pushes onto the shared stack, rebases, then pops EXACTLY
+/// its own entry by id: the linked worktree's dirty change survives the
+/// pull, and a pre-existing foreign entry on the shared stack is untouched.
+#[tokio::test]
+#[serial]
+async fn test_pull_rebase_autostash_in_linked_worktree_pops_only_its_own_entry() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "seed pull",
+    );
+
+    // A linked worktree on its own branch tracking the same remote branch.
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("autostash-wt");
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "add", wt.to_str().unwrap()],
+            local_repo.path(),
+        ),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "wt-line"], &wt),
+        "wt branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "branch.wt-line.remote", "origin"], &wt),
+        "wt branch remote",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "branch.wt-line.merge",
+                &format!("refs/heads/{branch}"),
+            ],
+            &wt,
+        ),
+        "wt branch merge",
+    );
+
+    // A FOREIGN stash pushed from the main worktree sits on the shared stack.
+    fs::write(local_repo.path().join("README.md"), "main dirty\n").expect("dirty main");
+    assert_cli_success(
+        &run_libra_command(&["stash", "push", "-m", "foreign-entry"], local_repo.path()),
+        "foreign stash push",
+    );
+
+    // The remote moves ahead; the linked worktree has a dirty tracked file.
+    push_remote_commit(
+        &work_dir,
+        &branch,
+        "upstream.txt",
+        "up\n",
+        "upstream change",
+    );
+    fs::write(wt.join("README.md"), "wt dirty\n").expect("dirty wt");
+
+    let pulled = run_libra_command(&["pull", "--rebase", "--autostash"], &wt);
+    assert_cli_success(&pulled, "pull --rebase --autostash in linked worktree");
+
+    // The linked worktree got the upstream commit AND kept its dirty change.
+    assert!(wt.join("upstream.txt").exists(), "rebased onto upstream");
+    assert_eq!(
+        fs::read_to_string(wt.join("README.md")).expect("read wt file"),
+        "wt dirty\n",
+        "the autostash was popped back into the LINKED worktree"
+    );
+    // The foreign entry survives untouched as the only stack entry, and the
+    // main worktree's file was never touched by the linked pull.
+    let listed = run_libra_command(&["stash", "list"], local_repo.path());
+    assert_cli_success(&listed, "stash list");
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listing.contains("foreign-entry") && listing.lines().count() == 1,
+        "exactly the foreign entry remains: {listing}"
+    );
+}
+
+/// W2 §C.4.3 packed-HEAD regression: a HEAD that arrived via `pull` lives in
+/// a PACK — `stash push` must still see the dirty tracked file and stash it
+/// (the pre-W2 loose-only object reads made it silently no-op with
+/// "No local changes to save").
+#[tokio::test]
+#[serial]
+async fn test_stash_push_works_on_a_packed_head_from_pull() {
+    let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "seed pull",
+    );
+
+    fs::write(local_repo.path().join("README.md"), "dirty after pull\n").expect("dirty file");
+    let pushed = run_libra_command(&["stash", "push", "-m", "packed-head"], local_repo.path());
+    assert_cli_success(&pushed, "stash push on packed HEAD");
+    assert!(
+        String::from_utf8_lossy(&pushed.stdout).contains("Saved working directory"),
+        "the push actually saved (not a silent no-op): {}",
+        String::from_utf8_lossy(&pushed.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(local_repo.path().join("README.md")).expect("read"),
+        "hello libra\n",
+        "the working tree was restored to HEAD"
+    );
+    let popped = run_libra_command(&["stash", "pop"], local_repo.path());
+    assert_cli_success(&popped, "stash pop on packed HEAD");
+    assert_eq!(
+        fs::read_to_string(local_repo.path().join("README.md")).expect("read"),
+        "dirty after pull\n",
+        "pop restored the stashed change"
+    );
+}

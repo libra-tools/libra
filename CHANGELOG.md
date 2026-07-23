@@ -4,6 +4,28 @@
 
 ### Changed
 
+- **The stash stack protocol is worktree-aware (v0.19.54, plan-20260714
+  Part C §C.4.3, W2 slice 2)**: the stack (`refs/stash` + reflog) stays
+  deliberately repository-shared — an entry pushed in one worktree lists,
+  applies, and pops from any other — while `push`/`apply`/`pop` snapshot and
+  mutate ONLY the acting worktree's own index/workdir (fixing the former
+  common-storage index/parent-workdir reads that made a linked `stash push`
+  report "No local changes to save"). Stash object reads now go through the
+  storage-backed loader (loose AND packed): previously every stash flow read
+  loose objects only, so a HEAD that arrived via clone/pull (in a pack) made
+  `stash push` silently no-op — an unreadable HEAD commit now reports
+  "changed" (fail-safe) instead of masquerading as a clean tree. `pull
+  --rebase --autostash` pops EXACTLY the entry it pushed (located by commit
+  id, applied by hash) — a shared-stack top that moved concurrently can no
+  longer make it apply and delete another worktree's stash. Every stack mutation serializes on a
+  cross-platform `stash-stack.lock`; `pop` and `stash branch` delete their
+  applied entry through the single by-id CAS `do_drop` (a concurrent stack
+  change keeps the entry and reports — never deletes the wrong entry, never
+  rolls back the successful apply); `stash branch` preflights the
+  branch-name collision and switches HEAD via the fallible API. The W0
+  linked-worktree guards on `stash` and `pull --rebase --autostash` are
+  lifted — no command remains refused in a linked worktree on
+  repository-global-state grounds.
 - **rerere `MERGE_RR` is worktree-local (v0.19.53, plan-20260714 Part C
   §C.4.3, W2 slice 1)**: the currently-tracked-conflicts list moves from the
   shared `.libra/rerere/MERGE_RR` into each worktree's local gitdir

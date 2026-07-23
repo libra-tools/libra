@@ -255,17 +255,13 @@ fn same_branch_is_refused_across_worktrees() {
     );
 }
 
-/// Part C W0 (§C.11 transition guards): the states whose stores are still
-/// repository-global — the stash stack, the dirty cache, and the layer/sparse
-/// tables — must fail closed in a linked worktree until W1/W2 make them
-/// worktree-scoped. The guard fires before any side effect, so no
-/// remote/network is needed. (`fetch` was un-guarded in W1 once `FETCH_HEAD`
-/// became worktree-local — see `fetch_uses_worktree_local_fetch_head`; `pull`
-/// in merge mode was un-guarded once merge state was scoped — only its
-/// `--rebase` mode still refuses, asserted below on a branch-attached
-/// worktree since the mode is resolved after HEAD.)
+/// Part C §C.11 transition-guard retirement ledger: every store that W0
+/// fail-closed in linked worktrees has been scoped (dirty/layer/sparse in
+/// W1, the stash stack protocol + pull's autostash wrap in W2), so ALL the
+/// formerly guarded commands now run in a linked worktree. This test pins
+/// the lifted contract — none of them may hit a linked-worktree guard.
 #[test]
-fn repository_global_state_commands_refused_in_linked_worktree() {
+fn formerly_guarded_commands_run_in_linked_worktree() {
     let repo = repo_with_feature();
     let main = repo.path();
     let parent = tempfile::tempdir().expect("wt parent");
@@ -275,54 +271,29 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         "worktree add",
     );
 
-    // Part C W1 final lift: `pull --rebase` itself is no longer refused in a
-    // linked worktree (rebase state is scoped). Only the `--autostash` combo
-    // stays guarded — its legacy wrap uses the repository-global stash stack.
+    // Part C W2 final lift: `pull --rebase` AND its `--autostash` combo run
+    // in a linked worktree — the autostash wrap uses the W2 stack-lock +
+    // CAS protocol on the shared stash stack.
     assert_cli_success(
         &run_libra_command(&["switch", "feature"], &wt),
         "wt switch feature",
     );
-    let rebase_pull = run_libra_command(&["pull", "--rebase"], &wt);
-    assert!(
-        !String::from_utf8_lossy(&rebase_pull.stderr).contains("linked worktree"),
-        "pull --rebase must not hit the linked-worktree guard anymore: {}",
-        String::from_utf8_lossy(&rebase_pull.stderr)
-    );
-    let autostash_pull = run_libra_command(&["pull", "--rebase", "--autostash"], &wt);
-    assert_ne!(
-        autostash_pull.status.code(),
-        Some(0),
-        "pull --rebase --autostash must fail closed in a linked worktree"
-    );
-    assert!(
-        String::from_utf8_lossy(&autostash_pull.stderr).contains("linked worktree"),
-        "the autostash combo fails with the linked-worktree guard: {}",
-        String::from_utf8_lossy(&autostash_pull.stderr)
-    );
-
-    let cases: &[&[&str]] = &[&["stash", "list"]];
-    for argv in cases {
-        let out = run_libra_command(argv, &wt);
-        assert_ne!(
-            out.status.code(),
-            Some(0),
-            "{argv:?} must fail closed in a linked worktree"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    for argv in [
+        vec!["pull", "--rebase"],
+        vec!["pull", "--rebase", "--autostash"],
+        vec!["stash", "list"],
+    ] {
+        let out = run_libra_command(&argv, &wt);
         assert!(
-            stderr.contains("linked worktree"),
-            "{argv:?} should fail with the linked-worktree guard, got: {stderr}"
+            !String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
+            "{argv:?} must not hit the linked-worktree guard anymore: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
-    // The SAME commands succeed in the main worktree (guard is main-only).
-    assert_cli_success(
-        &run_libra_command(&["stash", "list"], main),
-        "stash list works in main",
-    );
-    // W1 §C.4.1.1: the dirty cache, the layer registry, and the sparse view
-    // are worktree-scoped now — all run in a linked worktree against their
-    // own rows.
+    // W1/W2 §C.4: the dirty cache, the layer registry, the sparse view, and
+    // the stash stack protocol are worktree-aware now — all run in a linked
+    // worktree.
     assert_cli_success(
         &run_libra_command(&["dirty", "--list"], &wt),
         "dirty --list runs in a linked worktree since W1",
@@ -334,6 +305,90 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
     assert_cli_success(
         &run_libra_command(&["sparse-view", "status"], &wt),
         "sparse-view status runs in a linked worktree since W1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["stash", "list"], &wt),
+        "stash list runs in a linked worktree since W2",
+    );
+}
+
+/// W2 §C.4.3: the stash STACK is deliberately repository-shared (an entry
+/// pushed in one worktree lists and applies in another), while push/pop
+/// snapshot and mutate only the ACTING worktree's index/workdir; `stash
+/// branch` preflights the branch collision before touching anything.
+#[test]
+fn stash_stack_is_shared_with_scoped_snapshots() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("stash-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Dirty a TRACKED file in the linked worktree and stash there.
+    let tracked = std::fs::read_dir(&wt)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().is_file())
+        .expect("tracked file in wt")
+        .path();
+    let original = std::fs::read_to_string(&tracked).unwrap();
+    std::fs::write(&tracked, "stashed-from-wt\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], &wt), "wt stash push");
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap(),
+        original,
+        "push restores the LINKED worktree's file"
+    );
+
+    // The shared stack lists the entry from MAIN...
+    let listed = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&listed, "main stash list");
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+        "the stack is repository-shared"
+    );
+    // ...and `stash branch` with a COLLIDING name refuses up front, keeping
+    // the entry and both worktrees untouched.
+    let collided = run_libra_command(&["stash", "branch", "feature"], main);
+    assert_ne!(
+        collided.status.code(),
+        Some(0),
+        "stash branch preflights the existing-branch collision"
+    );
+    let listed = run_libra_command(&["stash", "list"], main);
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+        "the refused branch kept the entry"
+    );
+
+    // Pop in MAIN: the change materializes in MAIN's workdir (the acting
+    // scope), the linked worktree stays clean, and the entry is CAS-dropped.
+    let main_file = main.join(
+        tracked
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("file name"),
+    );
+    assert_cli_success(&run_libra_command(&["stash", "pop"], main), "main pop");
+    assert_eq!(
+        std::fs::read_to_string(&main_file).unwrap(),
+        "stashed-from-wt\n",
+        "pop applies to the ACTING worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap(),
+        original,
+        "the linked worktree is untouched by main's pop"
+    );
+    let listed = run_libra_command(&["stash", "list"], &wt);
+    assert_cli_success(&listed, "wt stash list");
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout).trim(),
+        "",
+        "the CAS pop removed the entry from the shared stack"
     );
 }
 

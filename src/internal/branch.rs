@@ -23,7 +23,7 @@ use std::{str::FromStr, time::Duration};
 use git_internal::hash::ObjectHash;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    QueryFilter,
+    QueryFilter, TransactionTrait,
 };
 use tokio::time::sleep;
 
@@ -571,6 +571,46 @@ impl Branch {
         let db_conn = get_db_conn_instance().await;
         Self::delete_branch_result_with_conn(&db_conn, branch_name, remote).await
     }
+
+    /// ATOMIC tip-conditional delete (W2 §C.4.3 `stash branch` rollback):
+    /// the tip check and the delete run in ONE transaction, so a branch a
+    /// concurrent writer moved between "looks unchanged" and "delete" can
+    /// never be destroyed — the whole check-then-delete either sees the
+    /// moved tip (and keeps the branch) or deletes the unmoved one.
+    pub async fn delete_branch_if_tip_result(
+        branch_name: &str,
+        expected_tip: &git_internal::hash::ObjectHash,
+    ) -> Result<ConditionalDeleteOutcome, BranchStoreError> {
+        let db_conn = get_db_conn_instance().await;
+        let txn = db_conn
+            .begin()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        let found = Self::find_branch_result_with_conn(&txn, branch_name, None).await?;
+        let outcome = match found {
+            None => ConditionalDeleteOutcome::NotFound,
+            Some(branch) if branch.commit != *expected_tip => ConditionalDeleteOutcome::TipMoved,
+            Some(_) => {
+                Self::delete_branch_result_with_conn(&txn, branch_name, None).await?;
+                ConditionalDeleteOutcome::Deleted
+            }
+        };
+        txn.commit()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        Ok(outcome)
+    }
+}
+
+/// Outcome of [`Branch::delete_branch_if_tip_result`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConditionalDeleteOutcome {
+    /// The branch still pointed at the expected tip and was deleted.
+    Deleted,
+    /// The branch tip moved concurrently — left in place.
+    TipMoved,
+    /// No branch of that name exists (already gone).
+    NotFound,
 }
 
 #[cfg(test)]
@@ -581,6 +621,52 @@ mod tests {
 
     use super::*;
     use crate::utils::test;
+
+    /// W2 §C.4.3: the tip-conditional delete is ATOMIC — a branch whose tip
+    /// moved is kept (TipMoved), an unmoved one is deleted, a missing one
+    /// reports NotFound; no query→delete window exists (single txn).
+    #[tokio::test]
+    #[serial]
+    async fn conditional_delete_only_removes_the_unmoved_tip() {
+        let temp_path = tempdir().unwrap();
+        test::setup_with_new_libra_in(temp_path.path()).await;
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        let base = ObjectHash::zero_str(get_hash_kind()).to_string();
+        Branch::update_branch("rb", &base, None)
+            .await
+            .expect("create branch");
+        let base_hash = ObjectHash::from_str(&base).unwrap();
+        let moved_hash = {
+            // Any different valid hash.
+            let mut hex = base.clone();
+            hex.replace_range(0..2, "aa");
+            ObjectHash::from_str(&hex).unwrap()
+        };
+
+        // Wrong expected tip → kept.
+        let outcome = Branch::delete_branch_if_tip_result("rb", &moved_hash)
+            .await
+            .expect("conditional delete");
+        assert_eq!(outcome, ConditionalDeleteOutcome::TipMoved);
+        assert!(
+            Branch::find_branch_result("rb", None)
+                .await
+                .expect("find")
+                .is_some(),
+            "moved-tip branch survives"
+        );
+
+        // Matching tip → deleted; second call reports NotFound.
+        let outcome = Branch::delete_branch_if_tip_result("rb", &base_hash)
+            .await
+            .expect("conditional delete");
+        assert_eq!(outcome, ConditionalDeleteOutcome::Deleted);
+        let outcome = Branch::delete_branch_if_tip_result("rb", &base_hash)
+            .await
+            .expect("conditional delete");
+        assert_eq!(outcome, ConditionalDeleteOutcome::NotFound);
+    }
 
     /// Scenario: a branch name like `"upstream/origin/master"` is ambiguous —
     /// it could be a local name, or any of three `(remote, branch)` splits.

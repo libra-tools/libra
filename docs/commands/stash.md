@@ -21,6 +21,14 @@ libra stash clear [--force]
 
 Stash entries are stored as specially-structured commit objects under `.libra/refs/stash`, with a flat-file list tracking the stash stack. Each stash captures both the index state and worktree state at the time of creation.
 
+**Worktrees (since W2)**: the stash *stack* is deliberately shared across all
+worktrees — an entry pushed in one worktree can be listed, applied, or popped
+from any other — while `push`/`apply`/`pop` snapshot and modify only the
+worktree you run them in. Stack mutations are serialized by a lock, and
+`pop`/`stash branch` delete exactly the entry they applied (if the stack
+changed concurrently, the entry is kept and reported rather than deleting the
+wrong one; the successful apply is never rolled back).
+
 ## Options
 
 ### Subcommands

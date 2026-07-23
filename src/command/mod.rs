@@ -164,35 +164,11 @@ use crate::{
 };
 
 // impl load for all objects
-/// lore.md 2.1: refuse an in-progress sequencer operation inside a LINKED
-/// worktree. Only `rebase` still needs this (Part C W1): its `rebase_state`
-/// row and sidecar files are still repository-global, so running it in a
-/// linked worktree could collide with the main worktree's operation.
-/// Merge/cherry-pick/am/revert/bisect state is worktree-scoped (per-scope
-/// `sequence_state`/`bisect_state` rows + local-gitdir sidecars) and those
-/// commands run in any worktree. Allowed in the main worktree.
-pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
-    ensure_main_worktree_because(op, "in-progress operation state is shared across worktrees")
-}
-
-/// plan-20260714 Part C W0 transition guard: refuse `op` inside a LINKED
-/// worktree with a caller-supplied reason. Used for the states whose stores
-/// are still repository-global until their scoping slice lands — after the
-/// W1 slices scoped the dirty cache, layer, and sparse tables, that is the
-/// stash stack (and the `pull --rebase --autostash` combo that wraps it;
-/// W2). A linked invocation could read or clobber the wrong (or the main
-/// worktree's) state, so it fails closed. Always allowed in the main
-/// worktree.
-pub fn ensure_main_worktree_because(op: &str, reason: &str) -> crate::utils::error::CliResult<()> {
-    if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
-        return Err(crate::utils::error::CliError::fatal(format!(
-            "'{op}' is not yet supported inside a linked worktree (lore.md 2.1: {reason}) \
-             \u{2014} run it in the main worktree"
-        ))
-        .with_stable_code(crate::utils::error::StableErrorCode::Unsupported));
-    }
-    Ok(())
-}
+// NOTE (Part C ledger): the W0 `ensure_main_worktree`/`ensure_main_worktree_because`
+// transition guards were RETIRED with the W2 stash slice — every formerly
+// repository-global store (sequencers, dirty cache, layer, sparse view, the
+// stash stack protocol) is worktree-aware now, and no command refuses to run
+// in a linked worktree on those grounds.
 
 pub fn load_object<T>(hash: &ObjectHash) -> Result<T, GitError>
 where

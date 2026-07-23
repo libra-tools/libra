@@ -48,7 +48,7 @@ use crate::{
         object,
         object_ext::TreeExt,
         output::{OutputConfig, emit_json_data},
-        tree, util,
+        path, tree, util,
     },
 };
 
@@ -87,6 +87,22 @@ pub(crate) enum StashError {
 
     #[error("clearing all stash entries requires --force in interactive mode")]
     ClearRequiresForce,
+
+    #[error(
+        "the stash stack changed concurrently while this command ran; nothing further was \
+         modified — inspect `libra stash list` and re-run"
+    )]
+    StackChanged,
+
+    #[error(
+        "the stash was applied to this worktree, but the stash stack changed concurrently so \
+         entry {stash_id} was KEPT (the successful apply is not rolled back) — inspect \
+         `libra stash list` and `libra stash drop` it explicitly if desired"
+    )]
+    StackChangedAfterApply { stash_id: String },
+
+    #[error("cannot lock the stash stack: {0}")]
+    StackLock(String),
 
     #[error("failed to read object: {0}")]
     ReadObject(String),
@@ -132,6 +148,10 @@ impl StashError {
             Self::ResetFailed(_) => StableErrorCode::IoWriteFailed,
             Self::PathspecNoMatch(_) => StableErrorCode::CliInvalidTarget,
             Self::PathspecWithOption(_) => StableErrorCode::CliInvalidArguments,
+            Self::StackChanged | Self::StackChangedAfterApply { .. } => {
+                StableErrorCode::ConflictOperationBlocked
+            }
+            Self::StackLock(_) => StableErrorCode::IoWriteFailed,
             Self::Other(_) => StableErrorCode::InternalInvariant,
         }
     }
@@ -199,6 +219,11 @@ pub enum StashOutput {
         included_untracked: usize,
         #[serde(default, skip_serializing_if = "is_false")]
         kept_index: bool,
+        /// The exact reflog line this push appended — the entry's identity
+        /// for a later raw-line CAS delete (autostash). Internal only, never
+        /// serialized (the JSON envelope is a stable public surface).
+        #[serde(skip)]
+        raw_line: String,
     },
     #[serde(rename = "pop")]
     Pop {
@@ -303,14 +328,13 @@ pub async fn execute(stash_cmd: Stash) {
 /// errors and exiting. Dispatches to stash sub-commands (push, pop, list,
 /// apply, drop, show, branch, clear).
 pub async fn execute_safe(stash_cmd: Stash, output: &OutputConfig) -> CliResult<()> {
-    // Part C W0 (§C.4.3): the stash stack (`refs/stash` + push/apply/pop index
-    // and worktree snapshots) is repository-shared with no per-worktree scoping
-    // yet, so every stash subcommand (including `stash branch`) fails closed in
-    // a linked worktree until W2 lands the scoped apply/CAS-drop protocol.
-    crate::command::ensure_main_worktree_because(
-        "stash",
-        "the stash stack and its index/worktree snapshots are not yet worktree-scoped",
-    )?;
+    // W2 §C.4.3: the stash STACK (`refs/stash` + reflog) stays deliberately
+    // repository-shared — a stash pushed in one worktree may be applied in
+    // another — while push/apply/pop snapshot and mutate only the CURRENT
+    // worktree's index/workdir (both are cwd-scoped since lore 2.1). Every
+    // stack mutation serializes on the stack lock, and pop/branch delete
+    // their applied entry via the by-id CAS `do_drop`, so linked worktrees
+    // run every subcommand (the former W0 guard is lifted).
     let result = run_stash(stash_cmd, output).await.map_err(CliError::from)?;
     render_stash_output(&result, output)
 }
@@ -375,7 +399,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
 
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let index_path = git_dir.join("index");
+    let index_path = path::index();
     let index = Index::load(&index_path)
         .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
     let included_untracked_paths = collect_included_untracked_paths(&options)?;
@@ -402,17 +426,13 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
     let (author, committer) = util::create_signatures().await;
     let (current_branch_name, head_commit_summary) = match Head::current().await {
         Head::Branch(name) => {
-            let data = object::read_git_object(&git_dir, &head_commit_hash)
-                .map_err(|e| StashError::ReadObject(e.to_string()))?;
-            let c = Commit::from_bytes(&data, head_commit_hash)
+            let c: Commit = load_object(&head_commit_hash)
                 .map_err(|e| StashError::ReadObject(e.to_string()))?;
             let summary = c.message.lines().next().unwrap_or("").to_string();
             (name, summary)
         }
         Head::Detached(_) => {
-            let data = object::read_git_object(&git_dir, &head_commit_hash)
-                .map_err(|e| StashError::ReadObject(e.to_string()))?;
-            let c = Commit::from_bytes(&data, head_commit_hash)
+            let c: Commit = load_object(&head_commit_hash)
                 .map_err(|e| StashError::ReadObject(e.to_string()))?;
             let summary = c.message.lines().next().unwrap_or("").to_string();
             ("(no branch)".to_string(), summary)
@@ -441,9 +461,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
     let index_commit_hash = object::write_git_object(&git_dir, "commit", &data)
         .map_err(|e| StashError::WriteObject(e.to_string()))?;
 
-    let workdir = git_dir
-        .parent()
-        .ok_or_else(|| StashError::Other("cannot find workdir".into()))?;
+    let workdir = &util::working_dir();
     let worktree_tree =
         create_tree_from_workdir(workdir, &git_dir, &index).map_err(StashError::WriteObject)?;
     let worktree_tree_data = worktree_tree
@@ -488,8 +506,8 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
     let stash_commit_hash = object::write_git_object(&git_dir, "commit", &stash_commit_data)
         .map_err(|e| StashError::WriteObject(e.to_string()))?;
 
-    update_stash_ref(&git_dir, &stash_commit_hash, &committer, &final_message)
-        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let pushed_raw_line =
+        update_stash_ref_locked(&git_dir, &stash_commit_hash, &committer, &final_message)?;
 
     perform_hard_reset(&head_commit_hash)
         .await
@@ -509,6 +527,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         stash_id: stash_commit_hash.to_string(),
         included_untracked: included_untracked_paths.len(),
         kept_index: options.keep_index,
+        raw_line: pushed_raw_line,
     })
 }
 
@@ -526,7 +545,7 @@ pub(crate) async fn create_held_stash_commit(
 ) -> Result<Option<ObjectHash>, StashError> {
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let index_path = git_dir.join("index");
+    let index_path = path::index();
     let index = Index::load(&index_path)
         .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
 
@@ -559,9 +578,7 @@ pub(crate) async fn create_held_stash_commit(
     let index_commit_hash = object::write_git_object(&git_dir, "commit", &data)
         .map_err(|e| StashError::WriteObject(e.to_string()))?;
 
-    let workdir = git_dir
-        .parent()
-        .ok_or_else(|| StashError::Other("cannot find workdir".into()))?;
+    let workdir = &util::working_dir();
     let worktree_tree =
         create_tree_from_workdir(workdir, &git_dir, &index).map_err(StashError::WriteObject)?;
     let worktree_tree_data = worktree_tree
@@ -604,8 +621,7 @@ pub(crate) async fn store_stash_commit(hash: &ObjectHash, message: &str) -> Resu
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
     let (_, committer) = util::create_signatures().await;
-    update_stash_ref(&git_dir, hash, &committer, message)
-        .map_err(|e| StashError::WriteObject(e.to_string()))
+    update_stash_ref_locked(&git_dir, hash, &committer, message).map(|_| ())
 }
 
 /// Map an index entry's raw mode to the tree-item mode used for stash trees.
@@ -695,11 +711,9 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
 
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let index_path = git_dir.join("index");
+    let index_path = path::index();
     let index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
-    let workdir = git_dir
-        .parent()
-        .ok_or_else(|| StashError::Other("cannot find workdir".into()))?;
+    let workdir = &util::working_dir();
 
     let head_commit_hash = Head::current_commit()
         .await
@@ -854,8 +868,8 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
     let stash_commit_hash = object::write_git_object(&git_dir, "commit", &stash_commit_data)
         .map_err(|e| StashError::WriteObject(e.to_string()))?;
 
-    update_stash_ref(&git_dir, &stash_commit_hash, &committer, &final_message)
-        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let pushed_raw_line =
+        update_stash_ref_locked(&git_dir, &stash_commit_hash, &committer, &final_message)?;
 
     // Reset ONLY the matched paths to HEAD (worktree + index); leave the rest.
     reset_pathspec_to_head(&matched, &head_map, workdir, &index_path)?;
@@ -865,6 +879,7 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
         stash_id: stash_commit_hash.to_string(),
         included_untracked: 0,
         kept_index: false,
+        raw_line: pushed_raw_line,
     })
 }
 
@@ -925,22 +940,30 @@ fn reset_pathspec_to_head(
 }
 
 async fn run_pop(stash: Option<String>) -> Result<StashOutput, StashError> {
-    let apply_result = do_apply(stash.clone()).await?;
-    let (index, stash_id, branch) = match apply_result {
-        StashOutput::Apply {
-            index,
-            stash_id,
-            branch,
-        } => (index, stash_id, branch),
-        other => {
-            return Err(StashError::Other(format!(
-                "internal error: expected stash apply to return StashOutput::Apply, got {other:?}",
-            )));
-        }
+    // Phase 1 (C.10): resolve ONCE — the entry's commit hash pins the apply
+    // content, and its RAW REFLOG LINE is the unambiguous entry identity for
+    // the later CAS delete (the same commit id can legitimately appear more
+    // than once on the stack; reflog lines chain the previous tip, so a
+    // line identifies exactly one entry).
+    let (index, stash_id, raw_line) = resolve_stash_to_commit_hash(stash)?;
+    let stash_commit_hash =
+        ObjectHash::from_str(&stash_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    apply_stash_commit(&stash_commit_hash).await?;
+    let branch = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "(no branch)".to_string(),
     };
 
-    // Drop after successful apply
-    do_drop(stash)?;
+    // Phase 2 (C.10): drop ONLY the applied entry — located by its raw line
+    // under the stack lock. A CAS miss keeps the entry and reports; the
+    // successful local apply is never rolled back.
+    match do_drop(None, Some(&raw_line)) {
+        Ok(_) => {}
+        Err(StashError::StackChanged) => {
+            return Err(StashError::StackChangedAfterApply { stash_id });
+        }
+        Err(other) => return Err(other),
+    }
 
     Ok(StashOutput::Pop {
         index,
@@ -949,10 +972,14 @@ async fn run_pop(stash: Option<String>) -> Result<StashOutput, StashError> {
     })
 }
 
-/// Stash the tracked working-tree changes for `pull --autostash`. Returns `true`
-/// when a stash was created, `false` when there was nothing to stash (clean
-/// tree). Untracked/ignored files are left in place, matching Git's autostash.
-pub(crate) async fn autostash_push() -> Result<bool, String> {
+/// Stash the tracked working-tree changes for `pull --autostash`. Returns
+/// the created entry's `(commit id, raw reflog line)`, or `None` when there
+/// was nothing to stash (clean tree). Untracked/ignored files are left in
+/// place, matching Git's autostash. The caller must pop via
+/// [`autostash_pop_by_entry`] with BOTH values — the raw line captured at
+/// push time names exactly this entry even if another worktree later pushes
+/// the same commit id onto the shared stack.
+pub(crate) async fn autostash_push() -> Result<Option<(String, String)>, String> {
     let options = StashPushOptions {
         message: Some("autostash before pull".to_string()),
         include_untracked: false,
@@ -961,15 +988,53 @@ pub(crate) async fn autostash_push() -> Result<bool, String> {
         pathspec: Vec::new(),
     };
     match run_push(options).await.map_err(|e| e.to_string())? {
-        StashOutput::Noop { .. } => Ok(false),
-        _ => Ok(true),
+        StashOutput::Noop { .. } => Ok(None),
+        StashOutput::Push {
+            stash_id, raw_line, ..
+        } => Ok(Some((stash_id, raw_line))),
+        other => Err(format!(
+            "internal error: expected stash push output, got {other:?}"
+        )),
     }
 }
 
-/// Re-apply and drop the autostash created by [`autostash_push`].
-pub(crate) async fn autostash_pop() -> Result<(), String> {
-    run_pop(None).await.map_err(|e| e.to_string())?;
-    Ok(())
+/// Re-apply and drop EXACTLY the autostash created by [`autostash_push`]
+/// (W2 §C.4.3): the push-time RAW REFLOG LINE names the entry (immune to a
+/// duplicate commit id pushed by another worktree), the apply is pinned BY
+/// HASH, and the delete goes through the raw-line CAS `do_drop`.
+pub(crate) async fn autostash_pop_by_entry(
+    expected_id: &str,
+    expected_line: &str,
+) -> Result<(), String> {
+    let entries = stack_entries().map_err(|e| e.to_string())?;
+    if !entries.iter().any(|entry| entry.raw_line == expected_line) {
+        return Err(format!(
+            "the autostash entry {expected_id} is no longer on the stash stack (a concurrent \
+             pop/drop consumed it) — your stashed changes may have been applied elsewhere; \
+             inspect `libra stash list`"
+        ));
+    }
+    let hash = ObjectHash::from_str(expected_id).map_err(|e| e.to_string())?;
+    apply_stash_commit(&hash).await.map_err(|e| e.to_string())?;
+    match do_drop(None, Some(expected_line)) {
+        Ok(_) => Ok(()),
+        Err(StashError::StackChanged) => Err(format!(
+            "the autostash was re-applied, but the stash stack changed concurrently so entry \
+             {expected_id} was kept — `libra stash drop` it explicitly if desired"
+        )),
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// One consistent read of the shared stack's entries (empty when absent).
+fn stack_entries() -> Result<Vec<StashLogEntry>, StashError> {
+    let git_dir =
+        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_log_path = git_dir.join("logs/refs/stash");
+    if !stash_log_path.exists() {
+        return Ok(Vec::new());
+    }
+    parse_stash_log_entries(read_stash_log_lines(&stash_log_path)?)
 }
 
 async fn run_list() -> Result<StashOutput, StashError> {
@@ -1005,7 +1070,7 @@ async fn run_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
 }
 
 async fn run_drop(stash: Option<String>) -> Result<StashOutput, StashError> {
-    do_drop(stash)
+    do_drop(stash, None)
 }
 
 async fn run_show(
@@ -1014,34 +1079,26 @@ async fn run_show(
     name_status: bool,
     patch: bool,
 ) -> Result<StashOutput, StashError> {
-    let (index, stash_id_str) = resolve_stash_to_commit_hash(stash)?;
+    let (index, stash_id_str, _raw_line) = resolve_stash_to_commit_hash(stash)?;
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
     let stash_hash =
         ObjectHash::from_str(&stash_id_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_commit_data = object::read_git_object(&git_dir, &stash_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_commit = Commit::from_bytes(&stash_commit_data, stash_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_commit: Commit =
+        load_object(&stash_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
     let base_hash = *stash_commit
         .parent_commit_ids
         .first()
         .ok_or_else(|| StashError::ReadObject("stash commit is malformed".into()))?;
-    let base_commit_data = object::read_git_object(&git_dir, &base_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let base_commit = Commit::from_bytes(&base_commit_data, base_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let base_commit: Commit =
+        load_object(&base_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
-    let base_tree_data = object::read_git_object(&git_dir, &base_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let base_tree = Tree::from_bytes(&base_tree_data, base_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_tree_data = object::read_git_object(&git_dir, &stash_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_tree = Tree::from_bytes(&stash_tree_data, stash_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let base_tree: Tree =
+        load_object(&base_commit.tree_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_tree: Tree =
+        load_object(&stash_commit.tree_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
     let base_files = tree::get_tree_files_recursive(&base_tree, &git_dir, &PathBuf::new())
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -1112,6 +1169,25 @@ async fn run_show(
     })
 }
 
+/// Best-effort, TIP-CONDITIONAL rollback of a branch `stash branch` just
+/// created: the tip check and the delete run in ONE store transaction
+/// (`delete_branch_if_tip_result`), so a branch someone concurrently moved
+/// is never destroyed — no query→delete window. Failures warn (the caller
+/// is already surfacing the original error).
+async fn rollback_created_branch(branch_name: &str, base_hash: &ObjectHash) {
+    use crate::internal::branch::ConditionalDeleteOutcome;
+    match InternalBranch::delete_branch_if_tip_result(branch_name, base_hash).await {
+        Ok(ConditionalDeleteOutcome::Deleted | ConditionalDeleteOutcome::NotFound) => {}
+        Ok(ConditionalDeleteOutcome::TipMoved) => eprintln!(
+            "warning: branch '{branch_name}' moved concurrently; leaving it in place during \
+             rollback"
+        ),
+        Err(delete_error) => eprintln!(
+            "warning: could not delete the half-created branch '{branch_name}': {delete_error}"
+        ),
+    }
+}
+
 async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashOutput, StashError> {
     if InternalBranch::exists_result(&branch_name, None)
         .await
@@ -1120,34 +1196,65 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
         return Err(StashError::BranchExists(branch_name));
     }
 
-    // Resolve stash & metadata for the new branch base.
-    let (index, stash_id_str) = resolve_stash_to_commit_hash(stash.clone())?;
+    // Resolve stash & metadata for the new branch base. The raw reflog line
+    // is the unambiguous entry identity for the post-apply CAS delete.
+    let (index, stash_id_str, raw_line) = resolve_stash_to_commit_hash(stash)?;
     let stash_hash =
         ObjectHash::from_str(&stash_id_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_commit_data = object::read_git_object(&git_dir, &stash_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_commit = Commit::from_bytes(&stash_commit_data, stash_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_commit: Commit =
+        load_object(&stash_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
     let base_hash = *stash_commit
         .parent_commit_ids
         .first()
         .ok_or_else(|| StashError::ReadObject("stash commit is malformed".into()))?;
 
+    // Capture the restore point BEFORE any persistent mutation (W2 §C.4.3):
+    // both the branch creation and the HEAD switch may need rolling back.
+    let prior_head = Head::current().await;
     InternalBranch::update_branch(&branch_name, &base_hash.to_string(), None)
         .await
         .map_err(|e| StashError::Other(format!("failed to create branch '{branch_name}': {e}")))?;
 
-    // Switch HEAD to the new branch so apply runs on the right tip.
-    Head::update(Head::Branch(branch_name.clone()), None).await;
+    // Switch HEAD to the new branch so apply runs on the right tip — via the
+    // RESULT-returning API (W2 §C.4.3 scoped HEAD guard): a swallowed HEAD
+    // failure would apply the stash onto the wrong branch tip. On failure
+    // the just-created branch is rolled back (tip-conditionally).
+    if let Err(head_error) = Head::update_result(Head::Branch(branch_name.clone()), None).await {
+        rollback_created_branch(&branch_name, &base_hash).await;
+        return Err(StashError::Other(format!(
+            "failed to switch HEAD to new branch '{branch_name}': {head_error}"
+        )));
+    }
 
-    let apply_result = do_apply(stash.clone()).await?;
-    let applied = matches!(apply_result, StashOutput::Apply { .. });
-    let dropped = if applied {
-        do_drop(stash).is_ok()
-    } else {
-        false
+    // Apply BY HASH (pinned to the resolved entry's content).
+    if let Err(apply_error) = apply_stash_commit(&stash_hash).await {
+        // Best-effort rollback of the half-created state (new branch +
+        // switched HEAD) so a failed apply does not strand the user on an
+        // empty branch; the ORIGINAL apply error surfaces either way.
+        match Head::update_result(prior_head, None).await {
+            Err(head_error) => eprintln!(
+                "warning: could not switch HEAD back after the failed stash apply: {head_error}"
+            ),
+            Ok(()) => rollback_created_branch(&branch_name, &base_hash).await,
+        }
+        return Err(apply_error);
+    }
+    let applied = true;
+    let dropped = {
+        // Unified CAS deletion (same do_drop path as pop): locate the applied
+        // entry by its raw line under the stack lock; a CAS miss keeps the
+        // entry and reports without failing the branch creation or the apply.
+        match do_drop(None, Some(&raw_line)) {
+            Ok(_) => true,
+            Err(StashError::StackChanged) => {
+                eprintln!(
+                    "warning: the stash stack changed concurrently — entry {stash_id_str} was \
+                     kept; `libra stash drop` it explicitly if desired"
+                );
+                false
+            }
+            Err(other) => return Err(other),
+        }
     };
 
     Ok(StashOutput::Branch {
@@ -1171,6 +1278,9 @@ async fn run_clear(force: bool, output: &OutputConfig) -> Result<StashOutput, St
         return Err(StashError::ClearRequiresForce);
     }
 
+    // The whole read→count→delete sequence runs under the stack lock (W2
+    // §C.4.3) so a concurrent push/drop cannot interleave.
+    let _stack_lock = acquire_stash_stack_lock()?;
     if !has_stash()? {
         return Ok(StashOutput::Clear { cleared_count: 0 });
     }
@@ -1313,7 +1423,7 @@ fn render_stash_output(result: &StashOutput, output: &OutputConfig) -> CliResult
 // ── Internal helpers ─────────────────────────────────────────────────
 
 async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
-    let (index, hash_str) = resolve_stash_to_commit_hash(stash)?;
+    let (index, hash_str, _raw_line) = resolve_stash_to_commit_hash(stash)?;
     let stash_commit_hash =
         ObjectHash::from_str(&hash_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
     apply_stash_commit(&stash_commit_hash).await?;
@@ -1356,42 +1466,29 @@ async fn apply_stash_commit_inner(
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
-    let stash_commit_data = object::read_git_object(&git_dir, &stash_commit_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_commit = Commit::from_bytes(&stash_commit_data, stash_commit_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_commit: Commit =
+        load_object(&stash_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
     let base_commit_hash = *stash_commit
         .parent_commit_ids
         .first()
         .ok_or_else(|| StashError::ReadObject("stash commit is malformed".into()))?;
-    let base_commit_data = object::read_git_object(&git_dir, &base_commit_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let base_commit = Commit::from_bytes(&base_commit_data, base_commit_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let base_tree_data = object::read_git_object(&git_dir, &base_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let base_tree = Tree::from_bytes(&base_tree_data, base_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let base_commit: Commit =
+        load_object(&base_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let base_tree: Tree =
+        load_object(&base_commit.tree_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
-    let stash_tree_data = object::read_git_object(&git_dir, &stash_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_tree = Tree::from_bytes(&stash_tree_data, stash_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let untracked_tree = load_untracked_parent_tree(&stash_commit, &git_dir)?;
+    let stash_tree: Tree =
+        load_object(&stash_commit.tree_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let untracked_tree = load_untracked_parent_tree(&stash_commit)?;
     let stash_index_tree = if restore_index {
-        Some(load_stash_index_parent_tree(&stash_commit, &git_dir)?)
+        Some(load_stash_index_parent_tree(&stash_commit)?)
     } else {
         None
     };
 
-    let workdir = git_dir.parent().ok_or_else(|| {
-        StashError::Other(format!(
-            "internal error: storage path '{}' has no parent",
-            git_dir.display()
-        ))
-    })?;
-    let index_path = git_dir.join("index");
+    let workdir = &util::working_dir();
+    let index_path = path::index();
 
     // "ours" for the three-way apply is the CURRENT working tree, NOT HEAD. This
     // preserves uncommitted changes that are not part of the stash — the paths a
@@ -1481,36 +1578,24 @@ async fn apply_stash_commit_inner(
     Ok(())
 }
 
-fn load_stash_index_parent_tree(stash_commit: &Commit, git_dir: &Path) -> Result<Tree, StashError> {
+fn load_stash_index_parent_tree(stash_commit: &Commit) -> Result<Tree, StashError> {
     let index_commit_hash = stash_commit
         .parent_commit_ids
         .get(1)
         .ok_or_else(|| StashError::ReadObject("stash index parent is missing".into()))?;
-    let index_commit_data = object::read_git_object(git_dir, index_commit_hash)
-        .map_err(|error| StashError::ReadObject(error.to_string()))?;
-    let index_commit = Commit::from_bytes(&index_commit_data, *index_commit_hash)
-        .map_err(|error| StashError::ReadObject(error.to_string()))?;
-    let index_tree_data = object::read_git_object(git_dir, &index_commit.tree_id)
-        .map_err(|error| StashError::ReadObject(error.to_string()))?;
-    Tree::from_bytes(&index_tree_data, index_commit.tree_id)
-        .map_err(|error| StashError::ReadObject(error.to_string()))
+    let index_commit: Commit =
+        load_object(index_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    load_object(&index_commit.tree_id).map_err(|error| StashError::ReadObject(error.to_string()))
 }
 
-fn load_untracked_parent_tree(
-    stash_commit: &Commit,
-    git_dir: &Path,
-) -> Result<Option<Tree>, StashError> {
+fn load_untracked_parent_tree(stash_commit: &Commit) -> Result<Option<Tree>, StashError> {
     let Some(untracked_commit_hash) = stash_commit.parent_commit_ids.get(2) else {
         return Ok(None);
     };
 
-    let untracked_commit_data = object::read_git_object(git_dir, untracked_commit_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let untracked_commit = Commit::from_bytes(&untracked_commit_data, *untracked_commit_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let untracked_tree_data = object::read_git_object(git_dir, &untracked_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    Tree::from_bytes(&untracked_tree_data, untracked_commit.tree_id)
+    let untracked_commit: Commit =
+        load_object(untracked_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    load_object(&untracked_commit.tree_id)
         .map(Some)
         .map_err(|e| StashError::ReadObject(e.to_string()))
 }
@@ -1539,9 +1624,59 @@ fn ensure_untracked_restore_paths_clear(
     )))
 }
 
-fn do_drop(stash: Option<String>) -> Result<StashOutput, StashError> {
+/// RAII guard over the shared stash-STACK mutation lock (W2 §C.4.3):
+/// `refs/stash` + its reflog are repository-shared across worktrees, so every
+/// stack mutation (push/store, drop, pop's drop phase, clear, branch's drop)
+/// serializes on `stash-stack.lock` in the common storage. Blocking,
+/// cross-platform (std `File::lock`), released on drop.
+struct StashStackLockGuard {
+    file: fs::File,
+}
+
+impl Drop for StashStackLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn acquire_stash_stack_lock() -> Result<StashStackLockGuard, StashError> {
+    let git_dir =
+        util::try_get_storage_path(None).map_err(|e| StashError::StackLock(e.to_string()))?;
+    let lock_path = git_dir.join("stash-stack.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| StashError::StackLock(format!("{}: {e}", lock_path.display())))?;
+    file.lock()
+        .map_err(|e| StashError::StackLock(format!("{}: {e}", lock_path.display())))?;
+    Ok(StashStackLockGuard { file })
+}
+
+/// The SINGLE shared-stack deletion path (W2 §C.4.3): every stash-entry
+/// removal — `drop`, `pop`'s post-apply phase, and `stash branch`'s
+/// post-apply phase — goes through here. The whole read→resolve→rewrite runs
+/// UNDER the stack lock; when `expected_id` is given (the two post-apply
+/// callers) the entry is located BY ID under the lock (indexes shift when a
+/// concurrent push lands) and a missing id fails the CAS with
+/// [`StashError::StackChanged`] — the caller keeps its successful apply and
+/// reports, never rolls back, never deletes a different entry.
+fn do_drop(stash: Option<String>, expected_line: Option<&str>) -> Result<StashOutput, StashError> {
+    let _stack_lock = acquire_stash_stack_lock()?;
+    // A CAS caller APPLIED an entry that was on the stack moments ago — the
+    // stack's wholesale disappearance IS a concurrent change, not a user
+    // error about an empty stash.
+    let missing = |cas: bool| {
+        if cas {
+            StashError::StackChanged
+        } else {
+            StashError::NoStashFound
+        }
+    };
     if !has_stash()? {
-        return Err(StashError::NoStashFound);
+        return Err(missing(expected_line.is_some()));
     }
 
     let git_dir =
@@ -1549,22 +1684,38 @@ fn do_drop(stash: Option<String>) -> Result<StashOutput, StashError> {
     let stash_ref_path = git_dir.join("refs/stash");
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
-        return Err(StashError::NoStashFound);
+        return Err(missing(expected_line.is_some()));
     }
 
     let mut entries = parse_stash_log_entries(read_stash_log_lines(&stash_log_path)?)?;
     if entries.is_empty() {
-        return Err(StashError::NoStashFound);
+        return Err(missing(expected_line.is_some()));
     }
 
-    let index_to_drop = match stash {
-        None => 0,
-        Some(s) => parse_stash_index(&s)?,
+    let index_to_drop = if let Some(expected_line) = expected_line {
+        // CAS: locate the applied entry by its RAW REFLOG LINE under the
+        // lock. The raw line is the unambiguous per-entry identity — the
+        // same commit id can appear more than once on the stack (store /
+        // stale-autostash recovery), but each reflog line chains the
+        // previous tip, so a line names exactly one entry. No match fails
+        // the CAS and keeps the stack untouched.
+        match entries
+            .iter()
+            .position(|entry| entry.raw_line == expected_line)
+        {
+            Some(index) => index,
+            None => return Err(StashError::StackChanged),
+        }
+    } else {
+        let index = match stash {
+            None => 0,
+            Some(s) => parse_stash_index(&s)?,
+        };
+        if index >= entries.len() {
+            return Err(StashError::StashNotExist(index));
+        }
+        index
     };
-
-    if index_to_drop >= entries.len() {
-        return Err(StashError::StashNotExist(index_to_drop));
-    }
     let removed_entry = entries.remove(index_to_drop);
     let stash_commit_hash = removed_entry.stash_id;
 
@@ -1612,24 +1763,21 @@ fn parse_stash_index(s: &str) -> Result<usize, StashError> {
 // ── Unchanged helpers ────────────────────────────────────────────────
 
 async fn has_changes() -> bool {
-    let Some(git_dir) = util::try_get_storage_path(None).ok() else {
-        return false;
-    };
-
     let head_tree_hash = match Head::current_commit().await {
         Some(hash) => {
-            let Ok(commit_data) = object::read_git_object(&git_dir, &hash) else {
-                return false;
-            };
-            let Ok(commit) = Commit::from_bytes(&commit_data, hash) else {
-                return false;
+            // Storage-backed load (loose OR packed — a HEAD that arrived via
+            // clone/pull lives in a pack). An unreadable commit reports
+            // CHANGED (fail-safe): the old silent `false` made `stash push`
+            // no-op as "No local changes to save" on a mere read failure.
+            let Ok(commit) = load_object::<Commit>(&hash) else {
+                return true;
             };
             commit.tree_id
         }
         None => ObjectHash::from_type_and_data(ObjectType::Tree, &[]),
     };
 
-    let index_path = git_dir.join("index");
+    let index_path = path::index();
     let Ok(index) = Index::load(&index_path) else {
         return false;
     };
@@ -1642,9 +1790,7 @@ async fn has_changes() -> bool {
         return true;
     }
 
-    let Some(workdir) = git_dir.parent() else {
-        return false;
-    };
+    let workdir = util::working_dir();
     for entry in index.tracked_entries(0) {
         let file_path = workdir.join(&entry.name);
 
@@ -1825,7 +1971,9 @@ pub(crate) fn gc_roots() -> Result<Vec<ObjectHash>, StashError> {
     Ok(roots)
 }
 
-fn resolve_stash_to_commit_hash(stash_ref: Option<String>) -> Result<(usize, String), StashError> {
+fn resolve_stash_to_commit_hash(
+    stash_ref: Option<String>,
+) -> Result<(usize, String, String), StashError> {
     if !has_stash()? {
         return Err(StashError::NoStashFound);
     }
@@ -1848,15 +1996,35 @@ fn resolve_stash_to_commit_hash(stash_ref: Option<String>) -> Result<(usize, Str
         return Err(StashError::StashNotExist(index_to_resolve));
     }
 
-    Ok((index_to_resolve, entries[index_to_resolve].stash_id.clone()))
+    Ok((
+        index_to_resolve,
+        entries[index_to_resolve].stash_id.clone(),
+        entries[index_to_resolve].raw_line.clone(),
+    ))
 }
 
+/// Locked wrapper for the push/store side: the read-old-tip → write-tip →
+/// append-reflog sequence must not interleave with another worktree's stack
+/// mutation (W2 §C.4.3).
+fn update_stash_ref_locked(
+    git_dir: &Path,
+    stash_hash: &ObjectHash,
+    committer: &Signature,
+    message: &str,
+) -> Result<String, StashError> {
+    let _stack_lock = acquire_stash_stack_lock()?;
+    update_stash_ref(git_dir, stash_hash, committer, message)
+        .map_err(|e| StashError::WriteObject(e.to_string()))
+}
+
+/// Returns the exact reflog line appended (the entry's unambiguous identity
+/// for a later raw-line CAS delete — see `do_drop`).
 fn update_stash_ref(
     git_dir: &Path,
     stash_hash: &ObjectHash,
     committer: &Signature,
     message: &str,
-) -> Result<(), GitError> {
+) -> Result<String, GitError> {
     let stash_ref_path = git_dir.join("refs/stash");
     let stash_log_path = git_dir.join("logs/refs/stash");
 
@@ -1895,19 +2063,16 @@ fn update_stash_ref(
         Vec::new()
     };
 
-    lines.insert(0, reflog_entry);
+    lines.insert(0, reflog_entry.clone());
     let new_content = lines.join("\n") + "\n";
     fs::write(stash_log_path, new_content)?;
 
-    Ok(())
+    Ok(reflog_entry)
 }
 
 async fn perform_hard_reset(target_commit_id: &ObjectHash) -> Result<(), String> {
-    let git_dir = util::try_get_storage_path(None).map_err(|e| e.to_string())?;
-    let workdir = git_dir
-        .parent()
-        .ok_or_else(|| "cannot find workdir".to_string())?;
-    let index_path = git_dir.join("index");
+    let workdir = &util::working_dir();
+    let index_path = path::index();
 
     let index_before_reset = Index::load(&index_path).unwrap_or_else(|_| Index::new());
     let all_tracked_paths: Vec<PathBuf> = index_before_reset
@@ -2439,6 +2604,125 @@ fn remove_empty_parent_dirs(workdir: &Path, relative_path: &Path) -> Result<(), 
 mod tests {
     use super::*;
 
+    /// W2 §C.4.3: the raw-line CAS branch of the unified `do_drop` — a
+    /// caller that applied an entry may only delete THAT entry (identified
+    /// by its raw reflog line, which stays unambiguous even when the SAME
+    /// commit id appears twice on the stack); a missing line fails the CAS
+    /// with `StackChanged` and leaves the stack byte-for-byte untouched,
+    /// and a stack that vanished entirely maps to `StackChanged` too.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn do_drop_cas_misses_leave_the_stack_untouched() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        let storage = util::storage_path();
+
+        // Craft a three-entry stack whose two OLDER entries share ONE id
+        // (duplicate OIDs are legitimate: store / stale-autostash recovery).
+        let id_top = "1111111111111111111111111111111111111111";
+        let id_dup = "2222222222222222222222222222222222222222";
+        let zero = "0000000000000000000000000000000000000000";
+        fs::create_dir_all(storage.join("refs")).unwrap();
+        fs::create_dir_all(storage.join("logs/refs")).unwrap();
+        fs::write(storage.join("refs/stash"), format!("{id_top}\n")).unwrap();
+        let line_top = format!("{zero} {id_top} t <t@x> 3 +0000\tWIP on main: top");
+        let line_dup_new = format!("{zero} {id_dup} t <t@x> 2 +0000\tWIP on main: dup-new");
+        let line_dup_old = format!("{zero} {id_dup} t <t@x> 1 +0000\tWIP on main: dup-old");
+        let log = format!("{line_top}\n{line_dup_new}\n{line_dup_old}\n");
+        let log_path = storage.join("logs/refs/stash");
+        fs::write(&log_path, &log).unwrap();
+        let ref_bytes = fs::read(storage.join("refs/stash")).unwrap();
+        let log_bytes = fs::read(&log_path).unwrap();
+
+        // CAS miss: a line not on the stack → StackChanged, nothing touched.
+        let missing_line = format!("{zero} {id_top} t <t@x> 9 +0000\tWIP on main: elsewhere");
+        let err = do_drop(None, Some(&missing_line)).expect_err("missing line must fail the CAS");
+        assert!(matches!(err, StashError::StackChanged), "{err:?}");
+        assert_eq!(fs::read(storage.join("refs/stash")).unwrap(), ref_bytes);
+        assert_eq!(fs::read(&log_path).unwrap(), log_bytes);
+
+        // CAS hit on the OLDER duplicate: exactly that line leaves; the
+        // NEWER duplicate with the same id and the tip both stay.
+        let out = do_drop(None, Some(&line_dup_old)).expect("existing line drops");
+        match out {
+            StashOutput::Drop { stash_id, .. } => assert_eq!(stash_id, id_dup),
+            other => panic!("unexpected output: {other:?}"),
+        }
+        assert_eq!(
+            fs::read(storage.join("refs/stash")).unwrap(),
+            ref_bytes,
+            "dropping a non-top entry leaves the tip"
+        );
+        let remaining = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            remaining.contains(&line_top)
+                && remaining.contains(&line_dup_new)
+                && !remaining.contains(&line_dup_old),
+            "exactly the older duplicate left: {remaining}"
+        );
+
+        // Stack vanished entirely between apply and CAS → StackChanged (not
+        // a misleading "no stash found").
+        fs::remove_file(&log_path).unwrap();
+        fs::remove_file(storage.join("refs/stash")).unwrap();
+        let err = do_drop(None, Some(&line_top)).expect_err("vanished stack fails the CAS");
+        assert!(matches!(err, StashError::StackChanged), "{err:?}");
+        // ...while a plain drop still reports the ordinary empty-stash error.
+        let err = do_drop(None, None).expect_err("plain drop on empty stack");
+        assert!(matches!(err, StashError::NoStashFound), "{err:?}");
+    }
+
+    /// W2 §C.4.3: the raw line `update_stash_ref` RETURNS is byte-identical
+    /// to what a later stack read parses — the push-time capture really is
+    /// the entry's identity (autostash carries it across the pull).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_stash_ref_returns_the_parsed_raw_line() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        let storage = util::storage_path();
+        let hash = ObjectHash::from_str("00000000000000000000000000000000000000bb").expect("hash");
+        let committer = Signature::from_data(
+            "committer T <t@x> 1700000000 +0000"
+                .to_string()
+                .into_bytes(),
+        )
+        .expect("signature");
+
+        let returned = update_stash_ref(&storage, &hash, &committer, "autostash before pull")
+            .expect("update stash ref");
+        let entries = stack_entries().expect("stack entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].raw_line, returned,
+            "the returned line is exactly what a later read parses"
+        );
+        assert_eq!(entries[0].stash_id, hash.to_string());
+    }
+
+    /// W2 §C.4.3 fail-safe: an UNREADABLE HEAD commit must report "changed"
+    /// (so `stash push` proceeds and surfaces real errors) instead of the
+    /// old silent `false` that no-op'd as "No local changes to save".
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn has_changes_fails_safe_on_unreadable_head_commit() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        // Point HEAD at a commit that does not exist in the object store.
+        let bogus =
+            ObjectHash::from_str("00000000000000000000000000000000000000aa").expect("bogus hash");
+        Head::update_result(Head::Detached(bogus), None)
+            .await
+            .expect("detach onto bogus commit");
+        assert!(
+            has_changes().await,
+            "an unreadable HEAD commit reports CHANGED (fail-safe)"
+        );
+    }
+
     /// Pin the `Display` format for the static-message and direct-message
     /// variants of [`StashError`]. These strings are used as the
     /// `CliError` message via the From<StashError> mapping and surface
@@ -2450,6 +2734,24 @@ mod tests {
     /// representative cases (Other does that explicitly).
     #[test]
     fn stash_error_display_pins_each_variant() {
+        assert_eq!(
+            StashError::StackChanged.to_string(),
+            "the stash stack changed concurrently while this command ran; nothing further was \
+         modified — inspect `libra stash list` and re-run",
+        );
+        assert_eq!(
+            StashError::StackChangedAfterApply {
+                stash_id: "abc".to_string()
+            }
+            .to_string(),
+            "the stash was applied to this worktree, but the stash stack changed concurrently \
+         so entry abc was KEPT (the successful apply is not rolled back) — inspect \
+         `libra stash list` and `libra stash drop` it explicitly if desired",
+        );
+        assert_eq!(
+            StashError::StackLock("busy".to_string()).to_string(),
+            "cannot lock the stash stack: busy",
+        );
         assert_eq!(StashError::NotInRepo.to_string(), "not a libra repository");
         assert_eq!(
             StashError::NoInitialCommit.to_string(),
@@ -2526,6 +2828,21 @@ mod tests {
     /// owns the stable_code surface contract exhaustively.
     #[test]
     fn stash_error_stable_code_pins_each_variant() {
+        assert_eq!(
+            StashError::StackChanged.stable_code(),
+            StableErrorCode::ConflictOperationBlocked,
+        );
+        assert_eq!(
+            StashError::StackChangedAfterApply {
+                stash_id: "ignored".to_string()
+            }
+            .stable_code(),
+            StableErrorCode::ConflictOperationBlocked,
+        );
+        assert_eq!(
+            StashError::StackLock("ignored".to_string()).stable_code(),
+            StableErrorCode::IoWriteFailed,
+        );
         assert_eq!(
             StashError::NotInRepo.stable_code(),
             StableErrorCode::RepoNotFound,
