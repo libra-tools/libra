@@ -252,6 +252,9 @@ pub struct StatusWarning {
 pub enum StatusWarningCode {
     SimilarityBudgetExceeded,
     RenameLimitProductSkipped,
+    DirtyCacheLockStolen,
+    DirtyCacheStaleFallback,
+    DirtyCacheConcurrentInvalidate,
 }
 
 /// Which subsystem produced a warning (§B.5).
@@ -260,6 +263,7 @@ pub enum StatusWarningCode {
 #[non_exhaustive]
 pub enum StatusWarningSource {
     RenameDetect,
+    Cache,
 }
 
 /// Resolve the Git-compatible `status.*` config defaults (plan-20260708
@@ -1327,6 +1331,7 @@ async fn run_status_scan(
     let index_path =
         path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
     let db = get_db_conn_instance().await;
+    let mut cache_warnings: Vec<StatusWarning> = Vec::new();
     let pid = std::process::id() as i64;
     match DirtyCache::try_acquire_scan_lock_with_conn(&db, pid)
         .await
@@ -1334,9 +1339,10 @@ async fn run_status_scan(
     {
         ScanLockOutcome::Acquired { stole } => {
             if stole {
-                crate::utils::error::emit_warning(
+                cache_warnings.push(cache_warning(
+                    StatusWarningCode::DirtyCacheLockStolen,
                     "stole a stale dirty-cache scan lock (previous scanner crashed?)",
-                );
+                ));
             }
         }
         ScanLockOutcome::Held { pid, since } => {
@@ -1348,7 +1354,7 @@ async fn run_status_scan(
         }
     }
     // Everything below must release the lock — including error paths.
-    let result = run_status_scan_locked(args, output, &index_path, extras).await;
+    let result = run_status_scan_locked(args, output, &index_path, extras, cache_warnings).await;
     let _ = DirtyCache::release_scan_lock_with_conn(&db, pid).await;
     result?;
     // Re-open a plain connection for the final read in JSON mode is not
@@ -1361,6 +1367,40 @@ async fn run_status_scan_locked(
     output: &OutputConfig,
     index_path: &std::path::Path,
     extras: StatusConfigExtras,
+    mut cache_warnings: Vec<StatusWarning>,
+) -> CliResult<()> {
+    // Preserve the stolen-lock diagnostic on EVERY failure inside the locked
+    // scan (fingerprints, raw sets, collection, cache txn, even a failed
+    // JSON emit after the payload append) — parity with the pre-R0-8b
+    // immediate stderr warning. The snapshot makes delivery independent of
+    // where the failure lands; JSON mode also gets the stderr line on ERROR
+    // paths only (the success-path matrix — clean stderr — is untouched,
+    // and losing the diagnostic entirely would be worse than annotating an
+    // already-broken envelope exchange). Success delivers exactly once via
+    // the payload.
+    let result =
+        run_status_scan_locked_inner(args, output, index_path, extras, &mut cache_warnings).await;
+    if result.as_ref().is_err_and(|error| !error.is_silent()) {
+        // Silent exits skip the fallback BY DESIGN: (a) the 9≻1 arbitration
+        // already delivered via the rendered payload; (b) a stdout
+        // BrokenPipe maps to a silent exit whose P0-06 contract
+        // (`compat_broken_pipe_output`) pins stderr to ZERO noise after the
+        // downstream closes — delivering there would violate that guard.
+        // Only real failures need the fallback. The vec is the CANONICAL
+        // pending set: the inner fn drains collected rename warnings into it
+        // right after collection and only moves everything into the payload
+        // at the final render, so whatever failed leaves the full set here.
+        deliver_warnings_stderr(&cache_warnings);
+    }
+    result
+}
+
+async fn run_status_scan_locked_inner(
+    args: &StatusArgs,
+    output: &OutputConfig,
+    index_path: &std::path::Path,
+    extras: StatusConfigExtras,
+    cache_warnings: &mut Vec<StatusWarning>,
 ) -> CliResult<()> {
     use sea_orm::TransactionTrait;
 
@@ -1376,7 +1416,11 @@ async fn run_status_scan_locked(
 
     // The same full safe reconcile as the default status, raw + display.
     let (staged_raw, unstaged_raw) = compute_raw_sets().await?;
-    let data = collect_status_data(args, extras).await?;
+    let mut data = collect_status_data(args, extras).await?;
+    // Fold the collected (rename) warnings into the canonical pending vec so
+    // ANY later failure — recheck, txn, JSON emit, render, summary — reaches
+    // the wrapper fallback with the complete set.
+    cache_warnings.append(&mut data.warnings);
 
     let fingerprint_after =
         current_index_fingerprint(index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
@@ -1409,18 +1453,32 @@ async fn run_status_scan_locked(
         .await
         .map_err(|e| dirty_cache_error("commit", anyhow::anyhow!(e)))?;
 
+    // NON-DESTRUCTIVE copy into the render payload: the canonical vec stays
+    // intact so the wrapper's fallback still holds the complete set if the
+    // JSON emit / body render / summary write below fails non-silently.
+    // (Success delivers via the payload; the wrapper only fires on Err.)
+    data.warnings = cache_warnings.clone();
+
     if output.is_json() {
         let mut json_data = build_status_json(&data, args);
         json_data["mode"] = serde_json::json!("scan");
         json_data["cached_paths"] = serde_json::json!(row_count);
         emit_json_data("status", &json_data, output)?;
     } else {
-        deliver_warnings_stderr(&data.warnings);
+        // Deliver AFTER the body renders: a render failure then reaches the
+        // wrapper's snapshot fallback instead of double-printing (warnings
+        // still fire under --quiet, which only skips the body).
         if !output.quiet {
+            use std::io::Write;
             let mut stdout = std::io::stdout();
             render_status_to_writer(&data, args, output, &mut stdout).await?;
-            println!("dirty cache rebuilt ({row_count} paths)");
+            // Fallible write (a bare println! would panic on stdout failure
+            // and bypass the wrapper's warning fallback).
+            writeln!(stdout, "dirty cache rebuilt ({row_count} paths)").map_err(|error| {
+                crate::utils::output::stdout_write_error("write the status scan summary", error)
+            })?;
         }
+        deliver_warnings_stderr(&data.warnings);
     }
     if let Some(exit) = warning_exit(output, &data.warnings) {
         return Err(exit);
@@ -1491,24 +1549,41 @@ async fn run_status_cache_mode(
 
     if state != CacheState::Fresh {
         // Degrade to the full reconcile — never trust a doubtful cache.
-        crate::utils::error::emit_warning(format!(
-            "dirty cache is {}; falling back to the full status (run 'libra status --scan' to rebuild)",
-            state.as_str()
+        let mut data = collect_status_data(args, extras).await?;
+        data.warnings.push(cache_warning(
+            StatusWarningCode::DirtyCacheStaleFallback,
+            format!(
+                "dirty cache is {}; falling back to the full status (run 'libra status --scan' to rebuild)",
+                state.as_str()
+            ),
         ));
-        let data = collect_status_data(args, extras).await?;
         if output.is_json() {
             let mut json_data = build_status_json(&data, args);
             json_data["mode"] =
                 serde_json::json!(if args.cached { "cached" } else { "check_dirty" });
             json_data["freshness"] = serde_json::json!("full");
             json_data["cache_state"] = serde_json::json!(state.as_str());
-            emit_json_data("status", &json_data, output)?;
+            if let Err(error) = emit_json_data("status", &json_data, output) {
+                if !error.is_silent() {
+                    deliver_warnings_stderr(&data.warnings);
+                }
+                return Err(error);
+            }
         } else {
-            deliver_warnings_stderr(&data.warnings);
+            // Deliver AFTER the body: EPIPE mid-render stays fully silent
+            // (P0-06), while a real render failure still surfaces the
+            // warning before propagating.
             if !output.quiet {
                 let mut stdout = std::io::stdout();
-                render_status_to_writer(&data, args, output, &mut stdout).await?;
+                if let Err(error) = render_status_to_writer(&data, args, output, &mut stdout).await
+                {
+                    if !error.is_silent() {
+                        deliver_warnings_stderr(&data.warnings);
+                    }
+                    return Err(error);
+                }
             }
+            deliver_warnings_stderr(&data.warnings);
         }
         if let Some(exit) = warning_exit(output, &data.warnings) {
             return Err(exit);
@@ -1617,6 +1692,16 @@ async fn run_status_cache_mode(
         }
     }
     let checked = rows.len();
+    // Test-only fault-injection seam (runtime-gated on LIBRA_TEST): widen the
+    // read→re-verify window so the mid-read concurrent-invalidate branch can
+    // be triggered deterministically. Inert in production (env absent).
+    if std::env::var_os("LIBRA_TEST").is_some_and(|v| v == "1")
+        && let Some(ms) = std::env::var("LIBRA_TEST_CACHE_READ_PAUSE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
     // Re-verify the epoch AFTER processing: a concurrent index/HEAD change
     // since the initial classify would make this view (and any prune) stale —
     // degrade instead of committing or rendering it as fresh.
@@ -1624,23 +1709,38 @@ async fn run_status_cache_mode(
         current_index_fingerprint(&index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
     let head_now = Head::current_commit().await.map(|oid| oid.to_string());
     if fingerprint_now != fingerprint || head_now != head_oid {
-        crate::utils::error::emit_warning(
+        let mut data = collect_status_data(args, extras).await?;
+        data.warnings.push(cache_warning(
+            StatusWarningCode::DirtyCacheConcurrentInvalidate,
             "the index or HEAD changed while reading the dirty cache; falling back to the full status",
-        );
-        let data = collect_status_data(args, extras).await?;
+        ));
         if output.is_json() {
             let mut json_data = build_status_json(&data, args);
             json_data["mode"] =
                 serde_json::json!(if args.cached { "cached" } else { "check_dirty" });
             json_data["freshness"] = serde_json::json!("full");
             json_data["cache_state"] = serde_json::json!("stale");
-            emit_json_data("status", &json_data, output)?;
+            if let Err(error) = emit_json_data("status", &json_data, output) {
+                if !error.is_silent() {
+                    deliver_warnings_stderr(&data.warnings);
+                }
+                return Err(error);
+            }
         } else {
-            deliver_warnings_stderr(&data.warnings);
+            // Deliver AFTER the body: EPIPE mid-render stays fully silent
+            // (P0-06), while a real render failure still surfaces the
+            // warning before propagating.
             if !output.quiet {
                 let mut stdout = std::io::stdout();
-                render_status_to_writer(&data, args, output, &mut stdout).await?;
+                if let Err(error) = render_status_to_writer(&data, args, output, &mut stdout).await
+                {
+                    if !error.is_silent() {
+                        deliver_warnings_stderr(&data.warnings);
+                    }
+                    return Err(error);
+                }
             }
+            deliver_warnings_stderr(&data.warnings);
         }
         if let Some(exit) = warning_exit(output, &data.warnings) {
             return Err(exit);
@@ -1743,14 +1843,20 @@ async fn run_status_cache_mode(
         }
         emit_json_data("status", &json_data, output)?;
     } else if !output.quiet {
+        use std::io::Write;
         let mut stdout = std::io::stdout();
         render_status_to_writer(&data, args, output, &mut stdout).await?;
         if args.check_dirty {
-            println!(
+            // Fallible write: a bare println! would panic on stdout EPIPE.
+            writeln!(
+                stdout,
                 "dirty cache re-verified ({} checked, {} pruned)",
                 checked,
                 pruned.len()
-            );
+            )
+            .map_err(|error| {
+                crate::utils::output::stdout_write_error("write the check-dirty summary", error)
+            })?;
         }
     }
     if let Some(exit) = warning_exit(output, &data.warnings) {
@@ -1801,7 +1907,7 @@ async fn render_status_to_writer(
     writer: &mut impl Write,
 ) -> CliResult<()> {
     let write_error =
-        |err: io::Error| CliError::io(format!("failed to write status output: {err}"));
+        |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
     let mut buffer = Vec::new();
 
     // Porcelain modes
@@ -1967,7 +2073,7 @@ fn render_human_status(
     buffer: &mut Vec<u8>,
 ) -> CliResult<()> {
     let write_error =
-        |err: io::Error| CliError::io(format!("failed to write status output: {err}"));
+        |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
 
     // Branch header
     match &data.head {
@@ -2204,7 +2310,7 @@ fn render_columnated_labeled_entries(
     color: colored::Color,
 ) -> CliResult<()> {
     let write_error =
-        |err: io::Error| CliError::io(format!("failed to write status output: {err}"));
+        |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
     if entries.is_empty() {
         return Ok(());
     }
@@ -2224,7 +2330,7 @@ fn render_columnated_labeled_entries(
 /// Render plain paths in multiple columns like `ls`.
 fn render_columnated_paths(buffer: &mut Vec<u8>, paths: &[PathBuf]) -> CliResult<()> {
     let write_error =
-        |err: io::Error| CliError::io(format!("failed to write status output: {err}"));
+        |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
     if paths.is_empty() {
         return Ok(());
     }
@@ -2275,7 +2381,7 @@ fn terminal_width() -> Option<usize> {
 
 fn render_merge_state_human(merge_state: &MergeStatusInfo, buffer: &mut Vec<u8>) -> CliResult<()> {
     let write_error =
-        |err: io::Error| CliError::io(format!("failed to write status output: {err}"));
+        |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
 
     writeln!(
         buffer,
@@ -2308,7 +2414,7 @@ fn render_merge_state_human(merge_state: &MergeStatusInfo, buffer: &mut Vec<u8>)
 
 fn render_upstream_human(upstream: &UpstreamInfo, buffer: &mut Vec<u8>) -> CliResult<()> {
     let write_error =
-        |err: io::Error| CliError::io(format!("failed to write status output: {err}"));
+        |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
 
     if upstream.gone {
         writeln!(
@@ -2399,14 +2505,23 @@ fn deliver_warnings_stderr(warnings: &[StatusWarning]) {
     }
 }
 
+/// Build a `source = cache` structured warning (§B.5 R0-8b).
+fn cache_warning(code: StatusWarningCode, message: impl Into<String>) -> StatusWarning {
+    StatusWarning {
+        code,
+        message: message.into(),
+        source: StatusWarningSource::Cache,
+    }
+}
+
 /// §B.5 exit arbitration, rule 2: warnings + `--exit-code-on-warning` exit 9
 /// and take precedence over the dirty exit 1. Local to each return point
 /// because an early `silent_exit(1)` would otherwise preempt the top-level
 /// exit-9 pass in `cli.rs` (and JSON never records globally).
 fn warning_exit(output: &OutputConfig, warnings: &[StatusWarning]) -> Option<CliError> {
-    // Legacy `emit_warning` paths (dirty-cache fallbacks, pending their
-    // R0-8b structured mapping) only mark the global tracker — honor it too,
-    // so no warning can be preempted by the dirty exit 1.
+    // Any non-status-owned warning (e.g. future callers) may still mark the
+    // global tracker — honor it too, so no warning can be preempted by the
+    // dirty exit 1.
     let any = !warnings.is_empty() || crate::utils::output::warning_was_emitted();
     (output.exit_code_on_warning && any).then(|| CliError::silent_exit(9))
 }
@@ -2541,7 +2656,8 @@ fn output_porcelain_with_unmerged(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let write_err =
+        |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
 
     // Renames render as a single `R  <old> -> <new>` record (Git porcelain v1
     // §B.6.3), never as two `R` endpoint rows. Under `-z` the record is
@@ -2716,7 +2832,8 @@ fn write_rename_porcelain_v2(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let write_err =
+        |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
     let old_workdir = current_to_workdir(old);
     let new_workdir = current_to_workdir(new);
 
@@ -2799,7 +2916,8 @@ fn output_porcelain_v2(
     let metadata =
         metadata.ok_or_else(|| CliError::internal("missing porcelain v2 metadata for status"))?;
     let zero_hash = zero_hash_str();
-    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let write_err =
+        |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
 
     for entry in unmerged {
         write_unmerged_porcelain_v2(entry, &zero_hash, null_terminated, writer)?;
@@ -2942,7 +3060,8 @@ fn write_unmerged_porcelain_v2(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let write_err =
+        |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
     let (staged_status, unstaged_status) = entry.xy();
     let mode = |stage| {
         entry
@@ -3119,7 +3238,8 @@ async fn output_short_format_with_config(
     writer: &mut impl Write,
 ) -> CliResult<()> {
     let use_colors = should_use_colors(output).await;
-    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let write_err =
+        |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
 
     // Collect rename pairs and their endpoints so the flattened tuple list can
     // exclude them (they render as arrow lines instead).
@@ -3287,7 +3407,8 @@ fn print_branch_info(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let write_err =
+        |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
     match head {
         Head::Detached(commit_hash) => {
             let line = format!("## HEAD (detached at {})", &commit_hash.to_string()[..8]);
@@ -3341,7 +3462,8 @@ fn write_branch_info_v2(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let write_err =
+        |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
     let term = if null_terminated { b"\0" } else { b"\n" };
 
     match head {

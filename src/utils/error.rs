@@ -694,6 +694,11 @@ impl CliError {
         }
     }
 
+    /// Whether this error is a silent exit-code carrier (renders nothing).
+    pub fn is_silent(&self) -> bool {
+        self.silent
+    }
+
     /// Create a silent exit error that only sets the process exit code
     /// without printing anything to stderr. Used for `--exit-code` style
     /// flags where a non-zero exit is a signal, not an error.

@@ -697,6 +697,26 @@ fn json_warnings_schema_snapshot() {
         serde_json::to_value(libra::command::status::StatusWarningCode::SimilarityBudgetExceeded)
             .expect("serialize code");
     assert_eq!(budget, "similarity_budget_exceeded");
+    for (code, name) in [
+        (
+            libra::command::status::StatusWarningCode::DirtyCacheLockStolen,
+            "dirty_cache_lock_stolen",
+        ),
+        (
+            libra::command::status::StatusWarningCode::DirtyCacheStaleFallback,
+            "dirty_cache_stale_fallback",
+        ),
+        (
+            libra::command::status::StatusWarningCode::DirtyCacheConcurrentInvalidate,
+            "dirty_cache_concurrent_invalidate",
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(code).expect("serialize code"), name);
+    }
+    assert_eq!(
+        serde_json::to_value(libra::command::status::StatusWarningSource::Cache).expect("src"),
+        "cache"
+    );
 }
 
 /// Exceeding the per-side rename limit (1000) degrades the inexact pass with

@@ -207,10 +207,14 @@ libra status --find-renames=75
 
 Rename-engine degradations surface as structured warnings: `rename_limit_product_skipped`
 (one side exceeded the per-side rename limit, inexact matching skipped) and
-`similarity_budget_exceeded` (inexact pass discarded), both with source `rename_detect`.
+`similarity_budget_exceeded` (inexact pass discarded), both with source `rename_detect`; and the dirty-cache
+degradations `dirty_cache_lock_stolen`, `dirty_cache_stale_fallback`, and
+`dirty_cache_concurrent_invalidate`, with source `cache`.
 Human/short/porcelain modes print them as `warning: …` on stderr (even under `--quiet`);
-`--json` carries them in `data.warnings[]` (`{code, message, source}`) and never writes them
-to stderr. With the global `--exit-code-on-warning`, a warning exits 9 and takes precedence
+`--json` carries them in `data.warnings[]` (`{code, message, source}`) and keeps stderr
+clean on every successful run; the single exception is a non-EPIPE stdout failure while
+emitting the JSON envelope itself, where the pending warnings are flushed to stderr rather
+than silently lost. With the global `--exit-code-on-warning`, a warning exits 9 and takes precedence
 over the `--exit-code` dirty exit 1 in every output mode.
 
 

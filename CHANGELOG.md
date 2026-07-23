@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **`status` dirty-cache degradations join the structured warning schema
+  (v0.19.48, plan-20260714 Part B §B.5, R0-8b)**: the three legacy
+  stderr-only cache warnings — stale-lock steal, stale-cache fallback, and
+  concurrent index/HEAD invalidation — now emit
+  `dirty_cache_lock_stolen`/`dirty_cache_stale_fallback`/
+  `dirty_cache_concurrent_invalidate` with source `cache`: JSON cache modes
+  carry them in `data.warnings[]` with a clean stderr, human modes keep the
+  stderr line via the shared delivery, and the 9-over-1 exit arbitration
+  covers them natively.
+
 - **`status` structured warnings + warning-over-dirty exit arbitration
   (v0.19.47, plan-20260714 Part B §B.5, R0-8a)**: rename-engine degradations
   are no longer silently dropped — `rename_limit_product_skipped` and
