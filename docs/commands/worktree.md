@@ -34,17 +34,31 @@ When a new worktree is added and HEAD points to a commit, the worktree is automa
 
 Create a new linked worktree at the given filesystem path.
 
-| Argument | Description |
-|----------|-------------|
+| Argument / Flag | Description |
+|-----------------|-------------|
 | `<path>` | Filesystem path for the new worktree. Can be relative or absolute. The directory is created if it does not exist. Must not be inside `.libra` storage, must not already be registered, and must be empty if it exists. |
+| `<branch-or-commit>` | Optional target. An existing branch is checked out ATTACHED (refused before any side effect if any worktree — including the invoking one — already has it out). Anything else must resolve as a commit-ish and seeds a DETACHED worktree populated from that commit. A nonexistent branch fails closed: Git's remote-branch DWIM, `worktree.guessRemote`, and `--track`/`--no-track` are deferred. |
+| `--detach` | Detach HEAD even when the target names a branch (the branch stays free for checkout elsewhere). |
+| `-b, --create-branch <NEW_BRANCH>` | Create `NEW_BRANCH` at `<branch-or-commit>` (default: the source worktree's HEAD) and check it out. Refused if the branch already exists (`-B`/`--force` are deferred); any later failure rolls the branch back — no branch-only residue. |
+
+Without a target the new worktree is created **detached at the source
+commit** — intentionally different from Git's default (which creates a
+branch named after the path basename). `--lock`, `--orphan`, and
+`--no-checkout` are deferred; use the separate `worktree lock` subcommand.
 
 ```bash
-# Create a new worktree for a feature branch
+# Detached at the source commit (Libra's default)
 libra worktree add ../my-feature
 libra --json worktree add ../my-feature
 
-# Create using absolute path
-libra worktree add /tmp/libra-test
+# Check an existing branch out
+libra worktree add ../fix-1 hotfix
+
+# Detached at a commit-ish (tag, sha, branch tip)
+libra worktree add --detach ../probe v1.2.0
+
+# Create a new branch from a start point and check it out
+libra worktree add -b topic ../topic main
 ```
 
 ### Subcommand: `list`
@@ -463,9 +477,9 @@ When creating a linked worktree, Libra restores content from the HEAD commit rat
 
 | Operation | Libra | Git | jj |
 |-----------|-------|-----|----|
-| Create worktree | `worktree add <path>` | `worktree add <path> [<branch>]` | `workspace add <path>` |
-| Create on branch | Not supported | `worktree add <path> <branch>` | `workspace add <path>` (then `jj edit`) |
-| Create detached | Not supported | `worktree add --detach <path> <commit>` | N/A |
+| Create worktree | `worktree add <path> [<branch-or-commit>]` (no target: detached at source commit) | `worktree add <path> [<branch>]` | `workspace add <path>` |
+| Create on branch | `worktree add <path> <branch>` (attached; refused if checked out anywhere; no DWIM) | `worktree add <path> <branch>` | `workspace add <path>` (then `jj edit`) |
+| Create detached | `worktree add --detach <path> [<commit>]` (also `add <path> <commit>`) | `worktree add --detach <path> <commit>` | N/A |
 | List worktrees | `worktree list` | `worktree list [--porcelain]` | `workspace list` |
 | Lock | `worktree lock <path> [--reason]` | `worktree lock [--reason] <worktree>` | N/A |
 | Unlock | `worktree unlock <path>` | `worktree unlock <worktree>` | N/A |
@@ -474,7 +488,7 @@ When creating a linked worktree, Libra restores content from the HEAD commit rat
 | Remove | `worktree remove <path>` (detaches — directory + state kept, frozen) | `worktree remove [--force] <worktree>` (deletes dir) | `workspace forget <name>` |
 | Repair | `worktree repair [<path>]` | `worktree repair [<path>...]` | N/A |
 | Alias | `wt` | N/A | N/A |
-| Branch per worktree | Not supported | Automatic (new branch or existing) | Automatic (new working copy commit) |
+| Branch per worktree | `-b <new> [<start>]` explicit (full rollback; no basename default) | Automatic (new branch or existing) | Automatic (new working copy commit) |
 | Storage | JSON file (`worktrees.json`) | Filesystem structure (`.git/worktrees/`) | Operation log |
 | Worktree link | Real local `.libra` gitdir with a `commondir` pointer to shared storage (legacy layouts: symlink) | `.git` file pointing to `gitdir` | Symlink to shared `.jj` |
 

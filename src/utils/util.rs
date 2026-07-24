@@ -494,6 +494,44 @@ pub fn storage_path() -> PathBuf {
 }
 
 /// Return an error instead of printing when the current directory is not a repository.
+/// RAII guard for the repository-wide BRANCH-ATTACH lock (W3-s2 §C.7).
+///
+/// `switch`/`checkout` and `worktree add <branch>` all publish "branch X is
+/// checked out in scope Y" state, but only worktree mutators hold the
+/// registry lock — so the checked-out-elsewhere check and the HEAD
+/// publication must share THIS lock or two processes can attach the same
+/// branch in two scopes. (The full writer inventory joins in the dedicated
+/// shared-helper slice; see plan-20260714 W-branch item.)
+/// Deterministic fault injection for cold recovery/guard paths (R0-8
+/// style): active only when `LIBRA_TEST_FAULT` names the site. Never set in
+/// production.
+pub fn fault_injected(site: &str) -> bool {
+    std::env::var("LIBRA_TEST_FAULT").is_ok_and(|value| value == site)
+}
+
+pub struct BranchAttachLockGuard {
+    file: fs::File,
+}
+
+impl Drop for BranchAttachLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Acquire the branch-attach lock (blocking). The lock file lives in the
+/// COMMON storage, so every worktree of the repository serializes on it.
+pub fn acquire_branch_attach_lock() -> io::Result<BranchAttachLockGuard> {
+    let path = storage_path().join("branch-attach.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    file.lock()?;
+    Ok(BranchAttachLockGuard { file })
+}
+
 pub fn require_repo() -> io::Result<()> {
     try_get_storage_path(None).map(|_| ())
 }

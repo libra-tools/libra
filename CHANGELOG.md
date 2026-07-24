@@ -4,6 +4,23 @@
 
 ### Changed
 
+- **Canonical `worktree add` targets: branch, commit, `--detach`, `-b`
+  (v0.19.59, plan-20260714 Part C §C.7, W3 slice 2)**: `worktree add
+  <path> [<branch-or-commit>]` checks an existing branch out ATTACHED
+  (refused before any side effect when any worktree — including the
+  invoking one — already has it out), or seeds a DETACHED worktree
+  populated from a resolved commit-ish; `--detach` forces detachment for
+  branch targets (the branch stays free); `-b <new> [<start>]` creates
+  and checks out a new branch with full rollback on any later failure
+  (no branch-only or orphan-registry residue), refusing an existing name.
+  A nonexistent branch fails closed — Git's remote-branch DWIM,
+  `worktree.guessRemote`, `--track`/`--no-track`, `-B`/`--force`,
+  `--lock`, `--orphan`, and `--no-checkout` are deferred and declared in
+  COMPATIBILITY.md. The no-target default (detached at the source
+  commit, intentionally different from Git's basename-branch default)
+  is unchanged. Re-attach and already-registered paths refuse checkout
+  arguments instead of silently ignoring them.
+
 - **Worktree lifecycle: detach instead of drop, tombstones, and a durable
   intent journal (v0.19.58, plan-20260714 Part C §C.7, W3 slice 1b)**:
   `worktree remove` (keep-dir) now DETACHES — the registry entry moves to

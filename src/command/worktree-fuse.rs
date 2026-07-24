@@ -58,9 +58,16 @@ pub enum WorktreeSubcommand {
     Add {
         /// Filesystem path at which to create the new worktree.
         path: String,
+        /// Existing branch to check out, or a commit-ish for a detached
+        /// HEAD (canonical non-FUSE surface, W3 §C.7).
+        target: Option<String>,
+        /// Detach HEAD in the new worktree even for a branch target
+        /// (non-FUSE surface).
+        #[clap(long)]
+        detach: bool,
         #[clap(short = 'f', long, help = "Use FUSE overlay worktree mode (Unix only)")]
         fuse: bool,
-        #[clap(long, help = "Checkout this branch in the new worktree")]
+        #[clap(long, help = "Checkout this branch in the new worktree (FUSE mode)")]
         branch: Option<String>,
         #[clap(
             short = 'b',
@@ -71,7 +78,7 @@ pub enum WorktreeSubcommand {
         #[clap(
             long,
             conflicts_with = "create_branch",
-            help = "Base ref for --create-branch"
+            help = "Base ref for --create-branch (FUSE mode)"
         )]
         from: Option<String>,
         #[clap(long, help = "Use privileged mount mode")]
@@ -267,6 +274,8 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     match command {
         WorktreeSubcommand::Add {
             path,
+            target,
+            detach,
             fuse,
             branch,
             create_branch,
@@ -275,19 +284,30 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             allow_other,
         } => {
             if !fuse {
-                if branch.is_some() || create_branch.is_some() || from.is_some() {
-                    return Err(CliError::command_usage(
-                        "--branch/--create-branch/--from require --fuse",
-                    ));
+                // --branch/--from stay FUSE-only; the canonical surface uses
+                // the positional target and -b/--create-branch (forwarded).
+                if branch.is_some() || from.is_some() {
+                    return Err(CliError::command_usage("--branch/--from require --fuse"));
                 }
                 legacy::execute_safe(
                     legacy::WorktreeArgs {
-                        command: legacy::WorktreeSubcommand::Add { path },
+                        command: legacy::WorktreeSubcommand::Add {
+                            path,
+                            target,
+                            detach,
+                            new_branch: create_branch,
+                        },
                     },
                     output,
                 )
                 .await
             } else {
+                if target.is_some() || detach {
+                    return Err(CliError::command_usage(
+                        "the positional <BRANCH-OR-COMMIT> and --detach are not supported \
+                         with --fuse; use --branch/--create-branch/--from",
+                    ));
+                }
                 add_fuse_worktree(path, branch, create_branch, from, privileged, allow_other)
                     .await
                     .map_err(|e| CliError::fatal(e.to_string()))

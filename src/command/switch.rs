@@ -1415,7 +1415,25 @@ async fn move_to_resolved_branch(
     // bypass this in a multi-worktree repo (intentionally-different): Libra
     // never allows the same branch checked out twice. Detach instead to share
     // the tip read-only. Single-worktree repos never hit this (no collision).
-    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+    // W3-s2 (§C.7): the check and the HEAD publication below hold the
+    // repository-wide branch-attach lock, closing the race with a
+    // concurrent `worktree add <path> <branch>` (which holds it across ITS
+    // final check + seed).
+    let _attach_lock = crate::utils::util::acquire_branch_attach_lock().map_err(|error| {
+        SwitchError::HeadUpdate(format!("cannot acquire the branch-attach lock: {error}"))
+    })?;
+    // Fail-closed probe (W3-s2): a query failure refuses the switch — it
+    // must never read as "the branch is free". Covers every scope; the
+    // current scope cannot appear here (the already-on case returned
+    // earlier).
+    let other_scope = Head::branch_checked_out_anywhere_result(&branch_name)
+        .await
+        .map_err(|error| {
+            SwitchError::HeadUpdate(format!(
+                "cannot verify whether branch '{branch_name}' is checked out: {error}"
+            ))
+        })?;
+    if let Some(other) = other_scope {
         let hint = if ignore_other_worktrees {
             "Libra does not honor --ignore-other-worktrees (it never allows the same branch \
              checked out in two worktrees): switch to a different branch, or use --detach to \
@@ -1460,6 +1478,7 @@ async fn move_to_resolved_branch(
     {
         return Err(SwitchError::HeadUpdate(e.to_string()));
     }
+    drop(_attach_lock);
 
     restore_to_commit(target_commit_id, output).await?;
     Ok(target_commit_id)

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::utils::fuse as fuse_utils;
 use crate::{
     command::restore::{self, RestoreArgs},
-    internal::head::Head,
+    internal::{branch::Branch, head::Head},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -28,7 +28,12 @@ use crate::{
 /// `--help` examples shown in `libra worktree --help` output.
 pub const WORKTREE_EXAMPLES: &str = "\
 EXAMPLES:
-    libra worktree add ../feature-x                Create a linked worktree
+    libra worktree add ../feature-x                Create a linked worktree (detached at
+                                                   the source commit)
+    libra worktree add ../fix-1 hotfix             Check the existing branch `hotfix` out
+    libra worktree add --detach ../probe v1.2.0    Detached worktree at a commit-ish
+    libra worktree add -b topic ../topic main      Create branch `topic` from `main` and
+                                                   check it out
     libra worktree list                            List every registered worktree
     libra worktree list --porcelain                Machine-readable worktree list
     libra worktree lock ../feature-x --reason wip  Lock a worktree to prevent prune/remove
@@ -67,6 +72,21 @@ pub enum WorktreeSubcommand {
     Add {
         /// Filesystem path at which to create the new worktree.
         path: String,
+        /// Existing branch to check out in the new worktree, or a
+        /// commit-ish for a detached HEAD. Omitted: detached at the source
+        /// worktree's current commit (intentionally different from Git's
+        /// basename-branch default). A nonexistent branch fails closed —
+        /// Git's remote-branch DWIM is deferred.
+        target: Option<String>,
+        /// Detach HEAD in the new worktree even when <BRANCH-OR-COMMIT>
+        /// names a branch.
+        #[clap(long)]
+        detach: bool,
+        /// Create NEW_BRANCH (from <BRANCH-OR-COMMIT> or the source HEAD)
+        /// and check it out in the new worktree. Refused if the branch
+        /// already exists (no -B/--force).
+        #[clap(short = 'b', long = "create-branch", value_name = "NEW_BRANCH")]
+        new_branch: Option<String>,
     },
     /// List all known worktrees and their state.
     List {
@@ -709,8 +729,13 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     }
 
     match command {
-        WorktreeSubcommand::Add { path } => {
-            let result = add_worktree(path)
+        WorktreeSubcommand::Add {
+            path,
+            target,
+            detach,
+            new_branch,
+        } => {
+            let result = add_worktree(path, target, detach, new_branch)
                 .await
                 .map_err(WorktreeError::into_cli_error)?;
             render_add_worktree(&result, output)
@@ -1201,7 +1226,31 @@ fn find_entry<'a>(state: &'a WorktreeState, path: &Path) -> Option<&'a WorktreeE
 ///   store and a stable `worktree_id` — it is NOT a symlink to shared storage,
 /// - when `HEAD` exists, populates the new worktree from committed `HEAD`
 ///   content (not staged-only index changes).
-async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
+///
+/// The checkout the new worktree is seeded with (W3-s2 §C.7), resolved
+/// FAIL-CLOSED before any side effect.
+enum AddCheckout {
+    /// No target: detached at the source worktree's current commit
+    /// (intentionally different from Git's basename-branch default).
+    DetachedAtSource,
+    /// Explicit commit-ish (or a branch under `--detach`).
+    Detached(git_internal::hash::ObjectHash),
+    /// Check out an existing branch (refused when any scope has it out).
+    AttachBranch { name: String },
+    /// `-b`: create the branch at `start`, then check it out. Fully rolled
+    /// back on any later failure (no branch-only residue).
+    CreateBranch {
+        name: String,
+        start: git_internal::hash::ObjectHash,
+    },
+}
+
+async fn add_worktree(
+    path: String,
+    target_spec: Option<String>,
+    detach: bool,
+    new_branch: Option<String>,
+) -> WorktreeResult<WorktreeAddOutput> {
     // Registry mutation lock: the whole precheck → sweep → seed → registry
     // write sequence runs under it (a concurrent add's sweep must not
     // delete this add's freshly seeded rows).
@@ -1240,8 +1289,16 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
     {
         match state.entries[existing_index].state {
             // W3-s1b (§C.7): re-adding a DETACHED worktree re-attaches it —
-            // the frozen directory resumes with ITS OWN scoped state.
+            // the frozen directory resumes with ITS OWN scoped state, so a
+            // checkout target would be silently ignored: refuse it.
             WorktreeEntryState::DetachedFromRegistry => {
+                if target_spec.is_some() || detach || new_branch.is_some() {
+                    return Err(WorktreeError::InvalidTarget(format!(
+                        "'{}' is a detached worktree; re-attaching resumes its own \
+                         HEAD — drop the branch/commit arguments (then switch inside it)",
+                        canonical_target.display()
+                    )));
+                }
                 return reattach_worktree(&mut state, existing_index, &canonical_target).await;
             }
             WorktreeEntryState::Tombstone => {
@@ -1252,6 +1309,13 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
                 )));
             }
             WorktreeEntryState::Active => {
+                if target_spec.is_some() || detach || new_branch.is_some() {
+                    return Err(WorktreeError::InvalidTarget(format!(
+                        "'{}' is already a registered worktree; switch branches inside \
+                         it instead",
+                        canonical_target.display()
+                    )));
+                }
                 return Ok(WorktreeAddOutput {
                     path: canonical_target.to_string_lossy().to_string(),
                     already_exists: true,
@@ -1284,6 +1348,91 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
             target.display()
         )));
     }
+
+    // W3-s2 (§C.7): resolve the checkout target FAIL-CLOSED before any side
+    // effect — a bad branch/commit, a branch checked out in any scope, or a
+    // `-b` collision must refuse with the directory, branch set, registry,
+    // and journal untouched.
+    let source_commit = Head::current_commit_result().await.map_err(|e| {
+        WorktreeError::IoRead(format!(
+            "failed to read HEAD while resolving the target: {e}"
+        ))
+    })?;
+    let checkout = if let Some(name) = new_branch {
+        if detach {
+            return Err(WorktreeError::InvalidTarget(
+                "-b/--create-branch cannot be combined with --detach".to_string(),
+            ));
+        }
+        if Branch::find_branch_result(&name, None)
+            .await
+            .map_err(|e| WorktreeError::IoRead(format!("failed to look up branch: {e}")))?
+            .is_some()
+        {
+            return Err(WorktreeError::OperationBlocked(format!(
+                "branch '{name}' already exists; -B/--force are not supported — pick a new \
+                 name or check the existing branch out with `worktree add <path> {name}`"
+            )));
+        }
+        let start = match &target_spec {
+            Some(spec) => util::get_commit_base(spec).await.map_err(|error| {
+                WorktreeError::InvalidTarget(format!(
+                    "cannot resolve start-point '{spec}': {error}"
+                ))
+            })?,
+            None => source_commit.ok_or_else(|| {
+                WorktreeError::OperationBlocked(
+                    "cannot create a branch in an unborn repository (no commits yet)".to_string(),
+                )
+            })?,
+        };
+        AddCheckout::CreateBranch { name, start }
+    } else if let Some(spec) = &target_spec {
+        match Branch::find_branch_result(spec, None)
+            .await
+            .map_err(|e| WorktreeError::IoRead(format!("failed to look up branch: {e}")))?
+        {
+            Some(branch) => {
+                if detach {
+                    AddCheckout::Detached(branch.commit)
+                } else {
+                    // Branches are SHARED: refuse when ANY scope (including
+                    // the one running this command) has the branch out. The
+                    // probe is Result-returning — a query failure refuses
+                    // (fail closed), never reads as "the branch is free".
+                    match Head::branch_checked_out_anywhere_result(spec).await {
+                        Err(error) => {
+                            return Err(WorktreeError::IoRead(format!(
+                                "cannot verify whether branch '{spec}' is checked out: \
+                                 {error}"
+                            )));
+                        }
+                        Ok(Some(scope)) => {
+                            return Err(WorktreeError::OperationBlocked(format!(
+                                "branch '{spec}' is already checked out at worktree \
+                                 '{scope}'; use --detach to share its tip read-only"
+                            )));
+                        }
+                        Ok(None) => {}
+                    }
+                    AddCheckout::AttachBranch { name: spec.clone() }
+                }
+            }
+            None => {
+                let commit = util::get_commit_base(spec).await.map_err(|error| {
+                    WorktreeError::InvalidTarget(format!(
+                        "'{spec}' is neither a local branch nor a resolvable commit \
+                         ({error}); Libra does not create branches from remote-tracking \
+                         names automatically (Git's DWIM is deferred) — use `-b {spec} \
+                         <path> <remote>/{spec}` explicitly"
+                    ))
+                })?;
+                AddCheckout::Detached(commit)
+            }
+        }
+    } else {
+        AddCheckout::DetachedAtSource
+    };
 
     let mut created_target = false;
     if !target.exists() {
@@ -1326,14 +1475,18 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
     // leaves this row for `worktree repair`, whose `add` recovery sweeps
     // the scope and resolves it (directories are never deleted in
     // recovery).
-    let add_journal_id = journal_append(
-        &db,
-        "add",
-        Some(&worktree_id),
-        &serde_json::json!({ "path": canonical_target.to_string_lossy() }),
-    )
-    .await
-    .map_err(WorktreeError::OperationBlocked)?;
+    let mut add_payload = serde_json::json!({ "path": canonical_target.to_string_lossy() });
+    if let AddCheckout::CreateBranch { name, start } = &checkout {
+        // Recovery must be able to roll the `-b` branch back tip-
+        // conditionally if we crash between its creation and publication.
+        add_payload["create_branch"] = serde_json::json!({
+            "name": name,
+            "start": start.to_string(),
+        });
+    }
+    let add_journal_id = journal_append(&db, "add", Some(&worktree_id), &add_payload)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
     create_worktree_gitdir(&storage, &link_path, &worktree_id).map_err(|source| {
         WorktreeError::IoWrite(format!(
             "failed to create per-worktree .libra gitdir in '{}': {source}",
@@ -1357,40 +1510,147 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
         }
     };
 
-    // The main worktree's current commit (cwd is still the main repo here).
-    // Codex P1: use the RESULT-returning API so a storage error is not silently
-    // downgraded to "unborn repo" — only a genuinely unborn HEAD (Ok(None))
-    // skips seeding; a real read error rolls back the half-created worktree.
-    let seed_commit = match Head::current_commit_result().await {
-        Ok(commit) => commit,
-        Err(e) => {
-            rollback_partial_add();
-            return Err(WorktreeError::IoRead(format!(
-                "failed to read HEAD while creating worktree '{}': {e}",
-                target.display()
-            )));
+    // W3-s2: the seed HEAD per resolved checkout mode. `source_commit` was
+    // read via the RESULT-returning API before any side effect — only a
+    // genuinely unborn HEAD (None) skips seeding, and only for the
+    // no-target mode (explicit targets always carry a commit).
+    // Branch-attach lock (W3-s2 §C.7): held from the final
+    // checked-out-anywhere re-check through the HEAD seed, serializing with
+    // `switch`/`checkout` (which hold it across their check + publication).
+    let _attach_lock = if matches!(
+        &checkout,
+        AddCheckout::AttachBranch { .. } | AddCheckout::CreateBranch { .. }
+    ) {
+        match util::acquire_branch_attach_lock() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                rollback_partial_add();
+                return Err(WorktreeError::IoWrite(format!(
+                    "cannot acquire the branch-attach lock: {error}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    let (seed_head, seed_commit, created_branch): (Option<Head>, Option<_>, Option<(String, _)>) =
+        match &checkout {
+            AddCheckout::DetachedAtSource => {
+                (source_commit.map(Head::Detached), source_commit, None)
+            }
+            AddCheckout::Detached(commit) => (Some(Head::Detached(*commit)), Some(*commit), None),
+            AddCheckout::AttachBranch { name } => {
+                // Final re-check UNDER the branch-attach lock, just before
+                // the attach becomes durable — over EVERY scope (a
+                // concurrent switch may have moved THIS worktree onto the
+                // branch), and fail-closed on query errors.
+                match Head::branch_checked_out_anywhere_result(name).await {
+                    Err(error) => {
+                        rollback_partial_add();
+                        return Err(WorktreeError::IoRead(format!(
+                            "cannot verify whether branch '{name}' is checked out: {error}"
+                        )));
+                    }
+                    Ok(Some(scope)) => {
+                        rollback_partial_add();
+                        return Err(WorktreeError::OperationBlocked(format!(
+                            "branch '{name}' is already checked out at worktree \
+                             '{scope}'; use --detach to share its tip read-only"
+                        )));
+                    }
+                    Ok(None) => {}
+                }
+                let branch = match Branch::find_branch_result(name, None).await {
+                    Ok(Some(branch)) => branch,
+                    Ok(None) => {
+                        rollback_partial_add();
+                        return Err(WorktreeError::InvalidTarget(format!(
+                            "branch '{name}' disappeared while creating the worktree"
+                        )));
+                    }
+                    Err(e) => {
+                        rollback_partial_add();
+                        return Err(WorktreeError::IoRead(format!(
+                            "failed to re-read branch '{name}': {e}"
+                        )));
+                    }
+                };
+                (Some(Head::Branch(name.clone())), Some(branch.commit), None)
+            }
+            AddCheckout::CreateBranch { name, start } => {
+                // Collision re-check UNDER the branch-attach lock: the
+                // preflight ran before the lock, and `update_branch` would
+                // silently overwrite an existing row — a concurrent
+                // `add -b <same-name>` must lose here, not double-attach.
+                match Branch::find_branch_result(name, None).await {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        rollback_partial_add();
+                        return Err(WorktreeError::OperationBlocked(format!(
+                            "branch '{name}' was created concurrently; pick another name"
+                        )));
+                    }
+                    Err(e) => {
+                        rollback_partial_add();
+                        return Err(WorktreeError::IoRead(format!(
+                            "failed to re-check branch '{name}': {e}"
+                        )));
+                    }
+                }
+                // Create the branch row NOW (cwd is still the source
+                // worktree); every failure below deletes it back
+                // tip-conditionally — no branch-only residue.
+                if let Err(e) = Branch::update_branch(name, &start.to_string(), None).await {
+                    rollback_partial_add();
+                    return Err(WorktreeError::IoWrite(format!(
+                        "failed to create branch '{name}': {e}"
+                    )));
+                }
+                (
+                    Some(Head::Branch(name.clone())),
+                    Some(*start),
+                    Some((name.clone(), *start)),
+                )
+            }
+        };
+    let rollback_created_branch = |created: Option<(String, git_internal::hash::ObjectHash)>| async move {
+        if let Some((name, tip)) = created {
+            match Branch::delete_branch_if_tip_result(&name, &tip).await {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        branch = name,
+                        %error,
+                        "could not roll back the created branch; delete it manually"
+                    );
+                }
+            }
         }
     };
-    if let Some(commit) = seed_commit {
+    if let (Some(seed_head), Some(commit)) = (seed_head, seed_commit) {
+        let _ = commit;
         let _guard = match DirGuard::change_to(&target) {
             Ok(g) => g,
             Err(e) => {
                 rollback_partial_add();
+                rollback_created_branch(created_branch).await;
                 return Err(WorktreeError::IoRead(format!(
                     "failed to enter worktree directory '{}': {e}",
                     target.display()
                 )));
             }
         };
+        let created_branch = created_branch.clone();
         // lore.md 2.1: cwd is now the new worktree, so `current_worktree_id()`
-        // resolves to its private id. Seed its OWN HEAD as DETACHED at the main
-        // worktree's commit (v1 detaches to avoid a same-branch collision), so
-        // `Head::current()` resolves here and the populate below can read it.
-        // Codex P1: a seed-update failure must roll back, not silently leave the
-        // worktree without a private HEAD.
-        if let Err(e) = Head::update_result(Head::Detached(commit), None).await {
+        // resolves to its private id. Seed its OWN HEAD per the resolved
+        // checkout (detached commit, attached branch, or the just-created
+        // `-b` branch), so `Head::current()` resolves here and the populate
+        // below can read it. A seed-update failure rolls EVERYTHING back —
+        // including a `-b` branch row.
+        if let Err(e) = Head::update_result(seed_head, None).await {
             drop(_guard);
             rollback_partial_add();
+            rollback_created_branch(created_branch).await;
             return Err(WorktreeError::IoWrite(format!(
                 "failed to seed HEAD for worktree '{}': {e}",
                 target.display()
@@ -1420,7 +1680,12 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
         })
         .await
         {
+            // Restore the invoker's cwd BEFORE the rollbacks: deleting the
+            // target while it is the cwd would break the branch rollback's
+            // storage resolution (and strand the shell in a removed dir).
+            drop(_guard);
             rollback_partial_add();
+            rollback_created_branch(created_branch).await;
             return Err(WorktreeError::IoWrite(format!(
                 "failed to populate worktree '{}': {e}",
                 target.display()
@@ -1441,6 +1706,15 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
     });
     if let Err(e) = write_state(&state) {
         rollback_partial_add();
+        if let AddCheckout::CreateBranch { name, start } = &checkout
+            && let Err(error) = Branch::delete_branch_if_tip_result(name, start).await
+        {
+            tracing::warn!(
+                branch = name,
+                %error,
+                "could not roll back the created branch; delete it manually"
+            );
+        }
         return Err(e);
     }
     if let Err(error) = journal_resolve(&db, add_journal_id).await {
@@ -3325,6 +3599,98 @@ async fn recover_pending_intents(
                     continue;
                 }
                 let registered = state.entries.iter().any(|w| w.path == path);
+                if !registered
+                    && let Some(spec) = payload.get("create_branch")
+                    && let Some(name) = spec["name"].as_str()
+                {
+                    // The `-b` branch may have been created before the
+                    // crash: roll it back tip-conditionally under the
+                    // attach lock — a moved tip means someone committed on
+                    // it, which is not ours to delete (journal kept).
+                    match spec["start"]
+                        .as_str()
+                        .and_then(|raw| raw.parse::<git_internal::hash::ObjectHash>().ok())
+                    {
+                        Some(start) => {
+                            // FAIL CLOSED on lock failure: without the
+                            // attach lock a concurrent scope could be
+                            // attaching this branch right now. And never
+                            // delete a branch ANY scope has attached, even
+                            // at the original tip.
+                            match util::acquire_branch_attach_lock() {
+                                Err(error) => {
+                                    resolve_row = false;
+                                    notes.push(format!(
+                                        "cannot acquire the branch-attach lock to roll \
+                                         back branch '{name}' ({error}); journal kept for \
+                                         the next repair"
+                                    ));
+                                }
+                                Ok(_attach_lock) => {
+                                    // Result-returning probe over EVERY
+                                    // scope: a read failure fails CLOSED
+                                    // (no delete, journal kept) — never
+                                    // "could not check, so not attached".
+                                    match Head::branch_checked_out_anywhere_result(name).await {
+                                        Err(error) => {
+                                            resolve_row = false;
+                                            notes.push(format!(
+                                                "cannot verify whether branch '{name}' is \
+                                                 attached ({error}); not deleting it — \
+                                                 journal kept for the next repair"
+                                            ));
+                                        }
+                                        Ok(Some(scope)) => {
+                                            resolve_row = false;
+                                            notes.push(format!(
+                                                "branch '{name}' from an interrupted \
+                                                 `worktree add -b` is checked out at \
+                                                 worktree '{scope}'; not deleting it — \
+                                                 journal kept, resolve manually"
+                                            ));
+                                        }
+                                        Ok(None) => {
+                                            match Branch::delete_branch_if_tip_result(name, &start)
+                                            .await
+                                        {
+                                Ok(crate::internal::branch::ConditionalDeleteOutcome::Deleted) => {
+                                    notes.push(format!(
+                                        "rolled back branch '{name}' from an interrupted \
+                                         `worktree add -b`"
+                                    ));
+                                }
+                                Ok(crate::internal::branch::ConditionalDeleteOutcome::NotFound) => {
+                                }
+                                Ok(crate::internal::branch::ConditionalDeleteOutcome::TipMoved) => {
+                                    resolve_row = false;
+                                    notes.push(format!(
+                                        "branch '{name}' from an interrupted `worktree add \
+                                         -b` has NEW commits; not deleting it — journal \
+                                         kept, resolve manually"
+                                    ));
+                                }
+                                Err(error) => {
+                                    resolve_row = false;
+                                    notes.push(format!(
+                                        "could not roll back branch '{name}' ({error}); \
+                                         journal kept for the next repair"
+                                    ));
+                                }
+                                        }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "interrupted `worktree add -b {name}' journal has an \
+                                 unparsable start tip; journal kept — resolve manually"
+                            ));
+                        }
+                    }
+                }
                 if !registered && let Some(id_str) = worktree_id.as_deref() {
                     // The add never published; sweep the scope it may have
                     // seeded. The half-created directory (if any) is left

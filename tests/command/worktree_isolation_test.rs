@@ -3518,3 +3518,529 @@ async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
     let count: i64 = row.try_get_by_index(0).expect("count");
     assert_eq!(count, 0, "stale reattach intent resolved as rolled back");
 }
+
+/// W3-s2 (§C.7): `worktree add <path> <branch>` checks the branch out in
+/// the new worktree (attached HEAD), and the branch is then held — no
+/// other worktree can switch to it.
+#[test]
+fn worktree_add_with_branch_attaches() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-branch");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap(), "feature"], main),
+        "worktree add <path> <branch>",
+    );
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head, "feature", "new worktree is ATTACHED to the branch");
+
+    // The branch is now held by the new worktree.
+    let refused = run_libra_command(&["switch", "feature"], main);
+    assert!(
+        !refused.status.success(),
+        "main cannot switch to a branch held by the new worktree"
+    );
+}
+
+/// Branch targets already checked out ANYWHERE refuse before side effects:
+/// no directory, no registry change (matrix:
+/// worktree_add_branch_collision_has_zero_side_effects covers `-b` too).
+#[test]
+fn worktree_add_branch_collision_has_zero_side_effects() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let main_branch = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], main).stdout,
+    )
+    .trim()
+    .to_string();
+    let registry = main.join(".libra").join("worktrees.json");
+    // Materialize the registry (a locked no-op mutator) so the byte
+    // comparison below has a baseline.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "initialize registry",
+    );
+    let registry_before = std::fs::read(&registry).expect("registry before");
+
+    // Checking out the branch the CURRENT worktree holds is refused.
+    let wt = main.join("wt-collision");
+    let refused = run_libra_command(
+        &["worktree", "add", wt.to_str().unwrap(), &main_branch],
+        main,
+    );
+    assert!(!refused.status.success(), "current-branch target refused");
+    assert!(!wt.exists(), "no directory is created on refusal");
+
+    // `-b` with an existing branch name is refused (no -B/--force).
+    let refused = run_libra_command(
+        &["worktree", "add", "-b", "feature", wt.to_str().unwrap()],
+        main,
+    );
+    assert!(!refused.status.success(), "-b collision refused");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("already exists"),
+        "collision explained: {stderr}"
+    );
+    assert!(!wt.exists(), "no directory is created on -b collision");
+    assert_eq!(
+        std::fs::read(&registry).expect("registry after"),
+        registry_before,
+        "registry byte-identical after refusals"
+    );
+
+    // A nonexistent target fails closed (no DWIM) with zero side effects.
+    let refused = run_libra_command(
+        &["worktree", "add", wt.to_str().unwrap(), "no-such-thing"],
+        main,
+    );
+    assert!(!refused.status.success(), "unknown target fails closed");
+    assert!(!wt.exists());
+
+    // -b together with --detach is a usage error.
+    let refused = run_libra_command(
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "-b",
+            "brand-new",
+            wt.to_str().unwrap(),
+        ],
+        main,
+    );
+    assert!(!refused.status.success(), "-b with --detach refused");
+}
+
+/// `worktree add <path> <commit>` and `--detach <path> <branch>` both seed
+/// a DETACHED worktree at the resolved commit; a detached branch target is
+/// NOT held (other worktrees can still check the branch out).
+#[test]
+fn worktree_add_commit_and_detach_are_detached() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+
+    // Grow one extra commit so HEAD and feature diverge in content.
+    std::fs::write(main.join("second.txt"), "2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], main),
+        "commit",
+    );
+    let feature_tip =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], main).stdout)
+            .trim()
+            .to_string();
+
+    // Explicit commit target: detached at THAT commit, populated from it.
+    let wt_commit = main.join("wt-at-commit");
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "add", wt_commit.to_str().unwrap(), &feature_tip],
+            main,
+        ),
+        "worktree add <path> <commit>",
+    );
+    let head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &wt_commit).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(head, feature_tip, "detached at the requested commit");
+    assert!(
+        !wt_commit.join("second.txt").exists(),
+        "populated from the target commit, not the source HEAD"
+    );
+
+    // --detach with a BRANCH target: same tip, branch not held.
+    let wt_detach = main.join("wt-detached-branch");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                wt_detach.to_str().unwrap(),
+                "feature",
+            ],
+            main,
+        ),
+        "worktree add --detach <path> <branch>",
+    );
+    let abbrev = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt_detach).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(abbrev, "HEAD", "--detach forces a detached HEAD");
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt_detach),
+        "the branch stays free for checkout (detached add does not hold it)",
+    );
+}
+
+/// `worktree add -b <new> <path> [<start>]` creates the branch at the
+/// start point and attaches the new worktree to it.
+#[test]
+fn worktree_add_new_branch_from_start_point() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let feature_tip =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], main).stdout)
+            .trim()
+            .to_string();
+
+    let wt = main.join("wt-new-branch");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "topic-x",
+                wt.to_str().unwrap(),
+                "feature",
+            ],
+            main,
+        ),
+        "worktree add -b <new> <path> <start>",
+    );
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head, "topic-x", "attached to the created branch");
+    let tip = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "topic-x"], main).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(tip, feature_tip, "created at the requested start point");
+}
+
+/// `-b` full-rollback regression (§C.7): a populate failure (objects made
+/// unreadable) on a SIBLING target must roll back the created branch, the
+/// directory, and the registry — no branch-only or orphan residue, and the
+/// invoker's cwd-based storage resolution must survive the rollback.
+#[test]
+fn worktree_add_new_branch_rolls_back_on_populate_failure() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let sibling_parent = tempfile::tempdir().expect("sibling parent");
+    let wt = sibling_parent.path().join("wt-populate-fail");
+
+    // Make populate fail deterministically: drop every loose object so the
+    // restore step cannot read the seed commit's tree.
+    let objects = main.join(".libra").join("objects");
+    for entry in std::fs::read_dir(&objects).expect("objects dir") {
+        let entry = entry.expect("entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() == 2 && entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path()).expect("drop loose fan-out dir");
+        }
+    }
+
+    let out = run_libra_command(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "doomed-topic",
+            wt.to_str().unwrap(),
+            "feature",
+        ],
+        main,
+    );
+    assert!(
+        !out.status.success(),
+        "populate must fail with unreadable objects: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Branch rolled back — no branch-only residue.
+    let rev = run_libra_command(&["rev-parse", "doomed-topic"], main);
+    assert!(
+        !rev.status.success(),
+        "created branch must be rolled back on populate failure"
+    );
+    // No directory, no registry entry.
+    assert!(!wt.exists(), "sibling target directory rolled back");
+    let registry = main.join(".libra").join("worktrees.json");
+    if let Ok(bytes) = std::fs::read(&registry) {
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("registry json");
+        assert!(
+            !doc["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| {
+                    entry["path"]
+                        .as_str()
+                        .is_some_and(|p| p.contains("wt-populate-fail"))
+                }),
+            "no orphan registry entry"
+        );
+    }
+}
+
+/// Concurrent `worktree add -b <same-name>` (§C.7): exactly ONE attempt may
+/// win — the loser refuses under the branch-attach lock instead of
+/// silently overwriting the branch row and double-attaching.
+#[test]
+fn concurrent_add_same_new_branch_single_winner() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt_a = main.join("wt-race-a");
+    let wt_b = main.join("wt-race-b");
+
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let spawn = |wt: &std::path::Path| {
+        std::process::Command::new(libra)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "raced-topic",
+                wt.to_str().unwrap(),
+                "feature",
+            ])
+            .current_dir(main)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn add")
+    };
+    let child_a = spawn(&wt_a);
+    let child_b = spawn(&wt_b);
+    let out_a = child_a.wait_with_output().expect("wait a");
+    let out_b = child_b.wait_with_output().expect("wait b");
+
+    let successes = [&out_a, &out_b]
+        .iter()
+        .filter(|out| out.status.success())
+        .count();
+    assert_eq!(
+        successes,
+        1,
+        "exactly one -b attempt may win\na: {}\nb: {}",
+        String::from_utf8_lossy(&out_a.stderr),
+        String::from_utf8_lossy(&out_b.stderr)
+    );
+
+    // The branch is attached in exactly one registered worktree.
+    let list = run_libra_command(&["worktree", "list", "--porcelain"], main);
+    assert_cli_success(&list, "list after race");
+    let porcelain = String::from_utf8_lossy(&list.stdout);
+    let attached = porcelain
+        .lines()
+        .filter(|line| line.trim() == "branch refs/heads/raced-topic")
+        .count();
+    assert_eq!(attached, 1, "branch attached exactly once:\n{porcelain}");
+}
+
+/// Crash window between `-b` branch creation and publication (§C.7): the
+/// add journal carries the branch identity, so repair rolls the branch
+/// back tip-conditionally — and REFUSES to delete it once the tip moved.
+#[tokio::test]
+async fn interrupted_add_new_branch_crash_repair() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let feature_tip =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], main).stdout)
+            .trim()
+            .to_string();
+    let wt = main.join("wt-crash-b");
+    let wt_id = "deadbeef-crash-b";
+
+    // Simulate: journal row written, branch created, nothing published.
+    assert_cli_success(
+        &run_libra_command(&["branch", "crash-topic", "feature"], main),
+        "create the orphan branch by hand",
+    );
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let plant = |payload: String| {
+        let db_url = db_url.clone();
+        async move {
+            let conn = Database::connect(&db_url).await.expect("connect");
+            let backend = conn.get_database_backend();
+            conn.execute(Statement::from_string(
+                backend,
+                format!(
+                    "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
+                     created_at) VALUES ('add', '{wt_id}', '{payload}', 0);"
+                ),
+            ))
+            .await
+            .expect("plant journal");
+            conn.close().await.expect("close");
+        }
+    };
+    plant(format!(
+        "{{\"path\":\"{}\",\"create_branch\":{{\"name\":\"crash-topic\",\"start\":\"{feature_tip}\"}}}}",
+        wt.to_string_lossy()
+    ))
+    .await;
+
+    // Lock-failure leg first: with the branch-attach lock unacquirable
+    // (the lock path is a DIRECTORY), repair must fail closed — branch and
+    // journal both survive.
+    let lock_path = main.join(".libra").join("branch-attach.lock");
+    std::fs::create_dir_all(&lock_path).expect("block the lock path");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with an unacquirable attach lock",
+    );
+    let kept = run_libra_command(&["rev-parse", "crash-topic"], main);
+    assert!(
+        kept.status.success(),
+        "lock failure must not delete the branch"
+    );
+    {
+        let conn = Database::connect(&db_url).await.expect("connect");
+        let backend = conn.get_database_backend();
+        let row = conn
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        let count: i64 = row.try_get_by_index(0).expect("count");
+        conn.close().await.expect("close");
+        assert_eq!(count, 1, "journal kept while the lock is unacquirable");
+    }
+    std::fs::remove_dir_all(&lock_path).expect("unblock the lock path");
+
+    // Probe-failure leg: an injected attachment-lookup fault must also fail
+    // closed — branch and journal both survive.
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let faulted = std::process::Command::new(libra)
+        .args(["worktree", "repair"])
+        .env("LIBRA_TEST_FAULT", "branch-attach-probe")
+        .current_dir(main)
+        .output()
+        .expect("faulted repair");
+    assert!(faulted.status.success(), "faulted repair still succeeds");
+    let kept = run_libra_command(&["rev-parse", "crash-topic"], main);
+    assert!(
+        kept.status.success(),
+        "an attachment-probe failure must not delete the branch"
+    );
+    {
+        let conn = Database::connect(&db_url).await.expect("connect");
+        let backend = conn.get_database_backend();
+        let row = conn
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        let count: i64 = row.try_get_by_index(0).expect("count");
+        conn.close().await.expect("close");
+        assert_eq!(count, 1, "journal kept while the probe faults");
+    }
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair rolls the orphan branch back",
+    );
+    let gone = run_libra_command(&["rev-parse", "crash-topic"], main);
+    assert!(!gone.status.success(), "orphan -b branch rolled back");
+
+    // Tip-moved variant: the branch points at a NEWER commit than the
+    // journaled start tip (as if someone committed on it post-crash).
+    std::fs::write(main.join("bump.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "bump.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "bump", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "crash-topic-2", "HEAD"], main),
+        "create second branch at the moved tip",
+    );
+    plant(format!(
+        "{{\"path\":\"{}\",\"create_branch\":{{\"name\":\"crash-topic-2\",\"start\":\"{feature_tip}\"}}}}",
+        wt.to_string_lossy()
+    ))
+    .await;
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with a moved tip",
+    );
+    let kept = run_libra_command(&["rev-parse", "crash-topic-2"], main);
+    assert!(
+        kept.status.success(),
+        "a moved tip is never deleted by recovery"
+    );
+    let conn = Database::connect(&db_url).await.expect("reconnect");
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let count: i64 = row.try_get_by_index(0).expect("count");
+    assert_eq!(
+        count, 1,
+        "the tip-moved journal row is kept for manual review"
+    );
+}
+
+/// Fail-closed attachment probes (§C.7): an injected HEAD-query failure
+/// refuses canonical `worktree add <branch>` (no side effects) and
+/// `switch <branch>` — a transient DB error must never read as "the
+/// branch is free".
+#[test]
+fn injected_probe_fault_refuses_attach_and_switch() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let libra = env!("CARGO_BIN_EXE_libra");
+
+    let wt = main.join("wt-probe-fault");
+    let add = std::process::Command::new(libra)
+        .args(["worktree", "add", wt.to_str().unwrap(), "feature"])
+        .env("LIBRA_TEST_FAULT", "branch-attach-probe")
+        .current_dir(main)
+        .output()
+        .expect("faulted add");
+    assert!(!add.status.success(), "faulted add must refuse");
+    assert!(!wt.exists(), "faulted add leaves no directory");
+
+    // A detached worktree trying to switch onto the branch under the fault.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "detached worktree add",
+    );
+    let switch = std::process::Command::new(libra)
+        .args(["switch", "feature"])
+        .env("LIBRA_TEST_FAULT", "branch-attach-probe")
+        .current_dir(&wt)
+        .output()
+        .expect("faulted switch");
+    assert!(!switch.status.success(), "faulted switch must refuse");
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        head, "HEAD",
+        "worktree stays detached after the refused switch"
+    );
+}

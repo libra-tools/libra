@@ -422,6 +422,33 @@ impl Head {
     /// currently has `branch` checked out as HEAD. Branches are SHARED across
     /// worktrees, so two worktrees on one branch would both move the same
     /// pointer — `switch`/`checkout` use this to refuse (git parity).
+    /// Result-returning probe over EVERY scope (including the caller's):
+    /// which worktree, if any, has `branch` checked out. Recovery paths use
+    /// this so a query failure FAILS CLOSED instead of reading as
+    /// "not attached anywhere" (the infallible probe below folds errors
+    /// into an empty result, which is fine for its advisory callers but
+    /// not before a destructive ref delete).
+    pub async fn branch_checked_out_anywhere_result(
+        branch: &str,
+    ) -> Result<Option<String>, sea_orm::DbErr> {
+        if crate::utils::util::fault_injected("branch-attach-probe") {
+            return Err(sea_orm::DbErr::Custom(
+                "injected branch-attach probe fault".to_string(),
+            ));
+        }
+        let db = get_db_conn_instance().await;
+        let rows = reference::Entity::find()
+            .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+            .filter(reference::Column::Remote.is_null())
+            .filter(reference::Column::Name.eq(branch))
+            .all(&db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string())))
+    }
+
     pub async fn branch_checked_out_elsewhere(branch: &str) -> Option<String> {
         let db = get_db_conn_instance().await;
         let current = crate::utils::util::current_worktree_id();
