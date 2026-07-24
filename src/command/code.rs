@@ -3780,7 +3780,7 @@ pub(crate) fn resolve_storage_root(working_dir: &std::path::Path) -> std::path::
         tracing::warn!(
             working_dir = %working_dir.display(),
             %error,
-            "storage-root resolution failed; falling back to <working_dir>/.libra — if this is a linked worktree, run `libra worktree repair`"
+            "storage-root resolution failed; falling back to <working_dir>/.libra — if this is a linked worktree, run `libra worktree repair <worktree-path>`"
         );
         working_dir.join(".libra")
     })

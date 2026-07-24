@@ -39,7 +39,9 @@ EXAMPLES:
     libra worktree remove ../feature-x --delete-dir
                                                    Unregister and delete the directory
                                                    (refused on a dirty worktree)
-    libra worktree repair                          Fix stale or duplicate registry rows";
+    libra worktree repair                          Fix stale or duplicate registry rows
+    libra worktree repair ../feature-x             Restore that worktree's gitdir identity
+                                                   from the registry (registry v2)";
 
 /// Manage multiple working trees attached to this repository.
 //
@@ -117,12 +119,22 @@ pub enum WorktreeSubcommand {
         cleanup: bool,
     },
     /// Repair worktree metadata, attempting to recover from inconsistencies.
-    Repair,
+    /// With a path, restores that linked worktree's gitdir identity
+    /// (`.libra/worktree_id` + `commondir`) from the registry's persisted
+    /// stable id (registry v2, W3 §C.7).
+    Repair {
+        /// Linked worktree whose gitdir identity should be restored.
+        path: Option<String>,
+    },
 }
 
-/// A single worktree entry persisted in `worktrees.json`.
+/// A single worktree entry persisted in `worktrees.json` (registry v2,
+/// plan-20260714 §C.7).
 ///
-/// `path` is always stored as a canonical absolute path.
+/// `path` is always stored as a canonical absolute path. `worktree_id` is
+/// the STABLE per-worktree identity (None for main, whose scope is NULL) —
+/// persisted so `worktree repair <path>` can restore a corrupt/missing
+/// `.libra/worktree_id` from the registry instead of guessing.
 ///
 /// `pub(crate)` so the service dirty-mark gate deserializes the registry with
 /// this exact schema (a drifting mirror would fail open on missing fields).
@@ -132,24 +144,194 @@ pub(crate) struct WorktreeEntry {
     is_main: bool,
     locked: bool,
     lock_reason: Option<String>,
+    /// Stable worktree identity (v2). `None` for the main worktree. Old v1
+    /// entries lack it; the v1→v2 upgrade backfills from each worktree's
+    /// gitdir (or the canonical-path synthesis fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree_id: Option<String>,
 }
 
-/// Top-level state persisted in `worktrees.json`.
+/// Registry schema version this binary reads and writes.
+const REGISTRY_SCHEMA_VERSION: u32 = 2;
+
+/// Top-level registry v2 persisted in `worktrees.json` (plan-20260714 §C.7).
 ///
-/// The state contains the main worktree and any number of linked worktrees.
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+/// v2 deliberately renames the top-level array to `entries`: a v1 binary's
+/// `{ worktrees: Vec<_> }` parser FAILS on a v2 file (missing field) instead
+/// of silently reading stale data and rewriting it — the second belt behind
+/// the SQLite capability marker that already refuses old binaries at
+/// connect time (future-schema fail-closed).
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct WorktreeState {
-    pub(crate) worktrees: Vec<WorktreeEntry>,
+    pub(crate) schema_version: u32,
+    pub(crate) entries: Vec<WorktreeEntry>,
+}
+
+impl Default for WorktreeState {
+    fn default() -> Self {
+        Self {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+/// The LEGACY v1 on-disk shape, parsed only to upgrade in place.
+#[derive(Deserialize)]
+struct WorktreeStateV1 {
+    worktrees: Vec<WorktreeEntryV1>,
+}
+
+#[derive(Deserialize)]
+struct WorktreeEntryV1 {
+    path: String,
+    is_main: bool,
+    locked: bool,
+    lock_reason: Option<String>,
+}
+
+/// Which on-disk shape a registry file parsed as (v1 files are upgraded
+/// in memory; only the LOCKED loader persists the upgrade).
+enum RegistryShape {
+    V2,
+    V1,
 }
 
 impl WorktreeState {
+    /// Parse registry bytes, discriminating on the top-level shape BEFORE
+    /// choosing a parser (fail-closed): a document carrying any v2 key
+    /// (`schema_version`/`entries`) must be a fully valid, supported v2
+    /// registry — it never falls through to the lenient v1 reader, so a
+    /// malformed or future v2 file cannot be misread as (and rewritten from)
+    /// a stale embedded `worktrees` array. A pure v1 document upgrades in
+    /// memory with ids unfilled; anything else is corrupt.
+    fn parse_document(data: &[u8]) -> Result<(Self, RegistryShape), String> {
+        let document: serde_json::Value = serde_json::from_slice(data)
+            .map_err(|error| format!("registry parse failed: {error}"))?;
+        let Some(object) = document.as_object() else {
+            return Err("registry root is not a JSON object".to_string());
+        };
+        let has_v2_keys = object.contains_key("schema_version") || object.contains_key("entries");
+        let has_v1_keys = object.contains_key("worktrees");
+        if has_v2_keys && has_v1_keys {
+            return Err(
+                "registry mixes v2 (`schema_version`/`entries`) and legacy v1 (`worktrees`) \
+                 keys; refusing the ambiguous file"
+                    .to_string(),
+            );
+        }
+        if has_v2_keys {
+            let state: WorktreeState = serde_json::from_value(document)
+                .map_err(|error| format!("registry v2 parse failed: {error}"))?;
+            if state.schema_version != REGISTRY_SCHEMA_VERSION {
+                return Err(format!(
+                    "unsupported registry schema_version {}",
+                    state.schema_version
+                ));
+            }
+            return Ok((state, RegistryShape::V2));
+        }
+        if has_v1_keys {
+            let legacy: WorktreeStateV1 = serde_json::from_value(document)
+                .map_err(|error| format!("registry v1 parse failed: {error}"))?;
+            return Ok((
+                WorktreeState {
+                    schema_version: REGISTRY_SCHEMA_VERSION,
+                    entries: legacy
+                        .worktrees
+                        .into_iter()
+                        .map(|entry| WorktreeEntry {
+                            path: entry.path,
+                            is_main: entry.is_main,
+                            locked: entry.locked,
+                            lock_reason: entry.lock_reason,
+                            worktree_id: None,
+                        })
+                        .collect(),
+                },
+                RegistryShape::V1,
+            ));
+        }
+        Err("registry has neither an `entries` (v2) nor a `worktrees` (v1) array".to_string())
+    }
+
+    /// Parse registry bytes accepting BOTH the v2 shape and the legacy v1
+    /// shape (read-only in-memory upgrade; ids stay unfilled — read-side
+    /// consumers like the service dirty-mark gate and rerere's
+    /// linked-evidence probe only inspect `is_main`). The locked loader
+    /// performs the durable v1→v2 upgrade separately.
+    pub(crate) fn parse(data: &[u8]) -> Result<Self, String> {
+        let (state, shape) = Self::parse_document(data)?;
+        match shape {
+            RegistryShape::V2 => state.validate_v2()?,
+            // v1 has no persisted ids, but the structural main-entry
+            // invariant still applies: read-side consumers (the service
+            // dirty gate, rerere's evidence probe, the rejected-cleanup
+            // snapshot) must fail closed on a mainless/multi-main document
+            // instead of consuming it as an empty or ambiguous root set.
+            // Only the LOCKED worktree loaders (which go through
+            // `parse_document` directly) may repair the main entry.
+            RegistryShape::V1 => state.validate_main_count()?,
+        }
+        Ok(state)
+    }
+
+    /// v2 identity invariants (§C.7): the registry is the persisted identity
+    /// AUTHORITY — main carries no id, every linked entry carries a non-empty
+    /// one. A v2 file violating this is corrupt and must be refused, never
+    /// silently patched from the mutable gitdir.
+    fn validate_v2(&self) -> Result<(), String> {
+        self.validate_main_count()?;
+        for entry in &self.entries {
+            if entry.is_main {
+                if entry.worktree_id.is_some() {
+                    return Err(format!(
+                        "main worktree entry '{}' must not carry a worktree_id",
+                        entry.path
+                    ));
+                }
+            } else if entry
+                .worktree_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err(format!(
+                    "linked worktree entry '{}' is missing its persisted worktree_id",
+                    entry.path
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every registered worktree path (main and linked), for read-side
+    /// consumers that only need the paths (e.g. the rejected-object-cleanup
+    /// index snapshot).
+    pub(crate) fn entry_paths(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    /// Structural invariant shared by BOTH shapes: exactly one main entry.
+    fn validate_main_count(&self) -> Result<(), String> {
+        let main_count = self.entries.iter().filter(|entry| entry.is_main).count();
+        if main_count != 1 {
+            return Err(format!(
+                "registry must contain exactly one main worktree entry (found {main_count})"
+            ));
+        }
+        Ok(())
+    }
+
     /// True when the registry holds exactly the main worktree entry — the
     /// only shape under which a scope-less service dirty-mark may default
     /// to the main scope. Anything else (empty, multi-entry, or a sole
     /// non-main entry) is indistinguishable from corruption or a
     /// multi-worktree layout and must fail closed.
     pub(crate) fn is_single_main(&self) -> bool {
-        matches!(self.worktrees.as_slice(), [entry] if entry.is_main)
+        matches!(self.entries.as_slice(), [entry] if entry.is_main)
     }
 }
 
@@ -371,6 +553,53 @@ pub async fn execute(args: WorktreeArgs) {
 /// Safe entry point that returns structured [`CliResult`] instead of printing
 /// errors and exiting. Dispatches to the appropriate worktree sub-command
 /// (add, list, lock, unlock, move, prune, remove, repair, and Unix umount).
+/// Part C bare boundary (plan-20260714 §C.4.1): a bare repository has no
+/// working trees at all — `WorktreeScope::Main` presumes a main working
+/// tree, and the registry's authoritative-root election presumes storage
+/// lives at `<root>/.libra`. The whole worktree family is refused with a
+/// stable error BEFORE any registry IO; bare worktree semantics are
+/// deferred by design (intentionally-different, see COMPATIBILITY.md).
+///
+/// Classification is CONFIG-FIRST: `init` records `core.bare` in the
+/// repository config, which survives any directory name (`init --bare
+/// .libra` creates bare storage literally named `.libra`, defeating a
+/// basename probe). The storage-basename heuristic remains only as a
+/// fallback for repositories predating the config key.
+pub(crate) async fn reject_bare_repository() -> CliResult<()> {
+    let storage = util::storage_path();
+    use crate::internal::config::parse_git_bool;
+    // FAIL CLOSED on read failures and unparseable values — a bare boundary
+    // that cannot be determined must refuse, not fall through to the
+    // basename heuristic (which a `.libra`-named bare directory defeats).
+    let is_bare = match crate::internal::config::ConfigKv::get("core.bare").await {
+        Ok(Some(entry)) => parse_git_bool(&entry.value).ok_or_else(|| {
+            CliError::fatal(format!(
+                "invalid core.bare value '{}': expected true/false/yes/no/on/off/1/0",
+                entry.value
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+        })?,
+        // Key absent: repositories predating the recorded flag — fall back
+        // to the standard-layout heuristic.
+        Ok(None) => storage.file_name() != Some(std::ffi::OsStr::new(util::ROOT_DIR)),
+        Err(error) => {
+            return Err(CliError::fatal(format!(
+                "cannot read core.bare to classify this repository: {error}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed));
+        }
+    };
+    if is_bare {
+        return Err(CliError::fatal(format!(
+            "this is a bare repository ('{}'): it has no working trees, so the \
+             `worktree` command family is unavailable here",
+            storage.display()
+        ))
+        .with_stable_code(StableErrorCode::RepoStateInvalid));
+    }
+    Ok(())
+}
+
 pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResult<()> {
     let command = args.command;
     #[cfg(unix)]
@@ -380,6 +609,27 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
 
     if needs_repo {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
+        // §C.7 ordering: apply pending repository migrations — including the
+        // registry-v2 capability marker (2026072401) — BEFORE any
+        // worktrees.json read or rewrite, so a pre-v2 binary is refused at
+        // connect time no matter which worktree command first touches the v2
+        // file. This also refuses a future-schema database gracefully
+        // instead of parsing a registry this binary does not understand.
+        // (Migrations may already have applied at the top-level CLI
+        // preflight — the contract shared by repository commands using the
+        // standard schema preflight, not a worktree-family side effect.)
+        crate::internal::db::get_db_conn_instance_for_path(&crate::utils::path::database())
+            .await
+            .map_err(|source| {
+                CliError::fatal(format!(
+                    "cannot open the repository database before touching the worktree \
+                     registry: {source}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+        // Bare boundary: refused before ANY registry IO (the config read
+        // needs the database opened just above).
+        reject_bare_repository().await?;
     }
 
     match command {
@@ -419,7 +669,12 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             let result = umount_fuse_path(path, cleanup).map_err(WorktreeError::into_cli_error)?;
             render_umount_fuse_path(&result, output)
         }
-        WorktreeSubcommand::Repair => {
+        WorktreeSubcommand::Repair { path } => {
+            if let Some(path) = path {
+                let result =
+                    repair_worktree_identity(path).map_err(WorktreeError::into_cli_error)?;
+                return render_repair_identity(&result, output);
+            }
             let result = repair_worktrees().map_err(WorktreeError::into_cli_error)?;
             render_repair_worktrees(&result, output)
         }
@@ -433,9 +688,9 @@ fn state_path() -> PathBuf {
 
 /// Loads the current `WorktreeState` from disk, ensuring a main worktree entry.
 ///
-/// If the state file does not exist or is empty, this function initializes a
-/// fresh state with a single main worktree derived from the storage path, then
-/// persists it before returning.
+/// If the state file does not exist, this function initializes a fresh state
+/// with a single main worktree derived from the storage path and persists it
+/// before returning; an existing zero-byte file is refused as a torn write.
 /// RAII guard over the worktree REGISTRY mutation lock (`worktrees.lock` in
 /// the common storage). Serializes every registry mutator's
 /// load → check → mutate → write sequence across processes: without it, a
@@ -480,7 +735,29 @@ pub(crate) fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
     Ok(RegistryLockGuard { file })
 }
 
+/// Load the registry for MUTATION. The caller MUST hold the registry lock
+/// (`acquire_registry_lock`): this variant performs DURABLE repairs — it
+/// creates a MISSING registry (an existing zero-byte file is refused as a
+/// torn write), rewrites a legacy v1 file as v2 with
+/// each linked entry's stable id backfilled, and persists main-entry fixes.
+/// A v2 file violating the identity invariants is REFUSED (only the
+/// explicit no-arg `worktree repair` may heal it — see
+/// `load_state_for_repair`). Lockless readers use `load_state_readonly`
+/// instead (a lockless writer could overwrite a concurrent locked mutation).
 fn load_state() -> WorktreeResult<WorktreeState> {
+    load_state_impl(false)
+}
+
+/// The no-arg `worktree repair` loader: like `load_state` but HEALS v2
+/// identity-invariant violations instead of refusing them — the user
+/// explicitly asked for a repair, so a main entry's stray id is cleared and
+/// a linked entry's missing id is deterministically backfilled from its
+/// gitdir (or the canonical-path synthesis fallback) and persisted.
+fn load_state_for_repair() -> WorktreeResult<WorktreeState> {
+    load_state_impl(true)
+}
+
+fn load_state_impl(heal_identity_invariants: bool) -> WorktreeResult<WorktreeState> {
     let path = state_path();
     if !path.exists() {
         let mut state = WorktreeState::default();
@@ -494,56 +771,145 @@ fn load_state() -> WorktreeResult<WorktreeState> {
         source,
     })?;
     if data.is_empty() {
-        let mut state = WorktreeState::default();
-        let _ = ensure_main_entry(&mut state)
-            .map_err(|source| WorktreeError::StateRepair { source })?;
-        write_state(&state)?;
-        return Ok(state);
-    }
-    let mut state: WorktreeState =
-        serde_json::from_slice(&data).map_err(|source| WorktreeError::StateCorrupt {
+        return Err(WorktreeError::StateCorrupt {
             path: path.clone(),
-            source: source.to_string(),
+            source: "registry file exists but is EMPTY (torn write?); restore it from a \
+                     backup, or delete it to let the next worktree command reinitialize \
+                     a fresh registry"
+                .to_string(),
+        });
+    }
+    let (mut state, shape) =
+        WorktreeState::parse_document(&data).map_err(|source| WorktreeError::StateCorrupt {
+            path: path.clone(),
+            source,
         })?;
+    if !heal_identity_invariants && matches!(shape, RegistryShape::V2) {
+        // A validated v2 file is used AS-IS: exactly-one-main and the id
+        // invariants already hold, so ordinary mutators never silently
+        // re-elect mains or rewrite ids — that authority belongs to the
+        // explicit no-arg `worktree repair` alone (heal mode below).
+        return match state.validate_v2() {
+            Ok(()) => Ok(state),
+            Err(source) => Err(WorktreeError::StateCorrupt {
+                path: path.clone(),
+                source: format!("{source}; run `libra worktree repair` to heal it"),
+            }),
+        };
+    }
+    // v1→v2 upgrade path (§C.7): a legacy `{ worktrees: [...] }` file is
+    // parsed once, each linked entry's STABLE id backfilled from its gitdir
+    // (or the canonical-path synthesis fallback), and the registry
+    // rewritten as v2 — durably, and only here, under the registry lock.
+    // Heal mode (no-arg repair) runs the same main-entry/id repairs on a v2
+    // file whose invariants were violated.
+    let mut dirty = matches!(shape, RegistryShape::V1);
     if ensure_main_entry(&mut state).map_err(|source| WorktreeError::StateRepair { source })? {
+        dirty = true;
+    }
+    if normalize_v2_ids(&mut state) {
+        dirty = true;
+    }
+    if dirty {
         write_state(&state)?;
     }
     Ok(state)
 }
 
-/// Atomically writes the given `WorktreeState` to disk.
-///
-/// The state is first written to a temporary file and then moved into place.
-/// On Windows, the existing file is removed before `rename` to avoid platform
-/// specific failures when the destination already exists.
-fn save_state(state: &WorktreeState) -> io::Result<()> {
+/// Read-only registry view for LOCKLESS consumers (`worktree list`): parses
+/// both shapes and synthesizes a missing main entry IN MEMORY, but never
+/// touches the file — the durable v1→v2 upgrade happens only in the locked
+/// loader. Legacy v1 entries keep `worktree_id: None`; per-entry consumers
+/// fall back to the gitdir probe.
+fn load_state_readonly() -> WorktreeResult<WorktreeState> {
     let path = state_path();
-    let tmp = path.with_extension("json.tmp");
-    let data = serde_json::to_vec_pretty(state).map_err(|e| io::Error::other(e.to_string()))?;
-    if let Some(parent) = tmp.parent() {
-        fs::create_dir_all(parent)?;
+    if !path.exists() {
+        let mut state = WorktreeState::default();
+        let _ = ensure_main_entry(&mut state)
+            .map_err(|source| WorktreeError::StateRepair { source })?;
+        return Ok(state);
     }
-    fs::write(&tmp, data)?;
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(e);
-                }
+    let data = fs::read(&path).map_err(|source| WorktreeError::StateRead {
+        path: path.clone(),
+        source,
+    })?;
+    if data.is_empty() {
+        return Err(WorktreeError::StateCorrupt {
+            path: path.clone(),
+            source: "registry file exists but is EMPTY (torn write?); restore it from a \
+                     backup, or delete it to let the next worktree command reinitialize \
+                     a fresh registry"
+                .to_string(),
+        });
+    }
+    let (mut state, shape) =
+        WorktreeState::parse_document(&data).map_err(|source| WorktreeError::StateCorrupt {
+            path: path.clone(),
+            source,
+        })?;
+    // A valid v2 registry already guarantees exactly one main entry — use it
+    // as-is (a lockless reader must not even repair flags in memory, or the
+    // synthesized main would carry a persisted linked id). Only the legacy
+    // v1 shape needs the in-memory main-entry synthesis.
+    match shape {
+        RegistryShape::V2 => {
+            if let Err(source) = state.validate_v2() {
+                return Err(WorktreeError::StateCorrupt {
+                    path: path.clone(),
+                    source: format!("{source}; run `libra worktree repair` to heal it"),
+                });
             }
         }
-        fs::rename(&tmp, &path)?;
+        RegistryShape::V1 => {
+            let _ = ensure_main_entry(&mut state)
+                .map_err(|source| WorktreeError::StateRepair { source })?;
+        }
     }
+    Ok(state)
+}
 
-    #[cfg(not(windows))]
-    {
-        fs::rename(&tmp, &path)?;
+/// Restore the v2 identity invariants after an in-memory repair mutated
+/// `is_main` flags or upgraded a v1 file: main carries no id, every linked
+/// entry gets its stable id backfilled from the gitdir (or the
+/// canonical-path synthesis fallback, which always resolves).
+fn normalize_v2_ids(state: &mut WorktreeState) -> bool {
+    let mut changed = false;
+    for entry in &mut state.entries {
+        if entry.is_main {
+            if entry.worktree_id.is_some() {
+                entry.worktree_id = None;
+                changed = true;
+            }
+        } else if entry
+            .worktree_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            entry.worktree_id = resolve_worktree_id(Path::new(&entry.path));
+            changed = true;
+        }
     }
-    Ok(())
+    changed
+}
+
+/// Atomically writes the given `WorktreeState` to disk.
+///
+/// Uses a uniquely-named temporary file plus atomic replacement on every
+/// platform (Windows replaces via `MoveFileExW`), so a concurrent reader
+/// sees the old registry or the new one — never a missing or partial file.
+fn save_state(state: &WorktreeState) -> io::Result<()> {
+    let path = state_path();
+    let data = serde_json::to_vec_pretty(state).map_err(|e| io::Error::other(e.to_string()))?;
+    // Unique-temp + atomic replacement on every platform (Windows uses
+    // MoveFileExW replacement) — a concurrent reader sees the old registry
+    // or the new one, never a missing or partial file. The old
+    // remove-then-rename Windows path opened exactly that missing-file
+    // window, which a lockless reader would misread as a fresh repository.
+    crate::utils::atomic_write::write_atomic(
+        &path,
+        &data,
+        crate::utils::atomic_write::sync_data_enabled(),
+    )
 }
 
 fn write_state(state: &WorktreeState) -> WorktreeResult<()> {
@@ -624,14 +990,12 @@ fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     Ok(normalized)
 }
 
-/// Ensures that the main worktree entry exists and is unique.
-///
-/// If the current `is_main` marker is invalid or duplicated, this function
-/// repairs it by preferring a valid existing worktree path and then enforcing
-/// uniqueness. Only when no entries exist does it infer a new main path from
-/// repository layout.
-///
-/// Returns `true` when the state is mutated.
+/// Ensure the registry designates EXACTLY ONE main entry. In the standard
+/// layout the repository root (the directory holding `.libra`) is
+/// authoritative: it is crowned when present and restored when absent —
+/// other entries are never elected main. The valid-path/first-entry/cwd
+/// heuristics apply only to non-standard layouts where the root cannot be
+/// inferred.
 fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
     fn is_valid_worktree_path(path: &Path) -> bool {
         path.join(util::ROOT_DIR).exists()
@@ -639,7 +1003,7 @@ fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
 
     fn apply_unique_main(state: &mut WorktreeState, idx: usize) -> bool {
         let mut changed = false;
-        for (i, w) in state.worktrees.iter_mut().enumerate() {
+        for (i, w) in state.entries.iter_mut().enumerate() {
             let should_be_main = i == idx;
             if w.is_main != should_be_main {
                 w.is_main = should_be_main;
@@ -649,16 +1013,12 @@ fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
         changed
     }
 
-    // First prefer a currently marked main entry if it points to an actual
-    // worktree root.
-    if let Some(idx) =
-        state.worktrees.iter().enumerate().find_map(|(i, w)| {
-            (w.is_main && is_valid_worktree_path(Path::new(&w.path))).then_some(i)
-        })
-    {
-        return Ok(apply_unique_main(state, idx));
-    }
-
+    // The repository's OWN root (the directory holding the `.libra` common
+    // storage) is the AUTHORITATIVE main worktree whenever it can be
+    // inferred. A stray `is_main` marker on a linked entry — or a mainless
+    // legacy file whose only entries are linked worktrees — must never
+    // crown a linked path as main: that would durably swap the
+    // main-versus-linked scope mapping (§C.7).
     let storage = util::storage_path();
     let inferred_standard_main =
         if storage.file_name() == Some(std::ffi::OsStr::new(util::ROOT_DIR)) {
@@ -670,49 +1030,65 @@ fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
             None
         };
 
-    // No valid main marker exists. Prefer an existing real worktree path so
-    // the original main is stable even when running from linked worktrees.
-    if let Some(idx) = inferred_standard_main
-        .as_ref()
-        .and_then(|p| {
-            state
-                .worktrees
-                .iter()
-                .position(|w| Path::new(&w.path) == p && is_valid_worktree_path(Path::new(&w.path)))
+    if let Some(root) = inferred_standard_main.as_ref() {
+        if let Some(idx) = state
+            .entries
+            .iter()
+            .position(|w| Path::new(&w.path) == root)
+        {
+            return Ok(apply_unique_main(state, idx));
+        }
+        // The true main is absent from the registry: restore it instead of
+        // electing one of the remaining (linked) entries.
+        for w in &mut *state.entries {
+            w.is_main = false;
+        }
+        state.entries.push(WorktreeEntry {
+            path: root.to_string_lossy().to_string(),
+            is_main: true,
+            locked: false,
+            lock_reason: None,
+            worktree_id: None,
+        });
+        return Ok(true);
+    }
+
+    // Non-standard layout — the root cannot be inferred. Fall back to the
+    // conservative heuristics: keep a valid marked main, else prefer any
+    // real worktree path, else the first entry, else infer from cwd.
+    if let Some(idx) =
+        state.entries.iter().enumerate().find_map(|(i, w)| {
+            (w.is_main && is_valid_worktree_path(Path::new(&w.path))).then_some(i)
         })
-        .or_else(|| {
-            state
-                .worktrees
-                .iter()
-                .position(|w| is_valid_worktree_path(Path::new(&w.path)))
-        })
-        .or_else(|| (!state.worktrees.is_empty()).then_some(0))
+    {
+        return Ok(apply_unique_main(state, idx));
+    }
+    if let Some(idx) = state
+        .entries
+        .iter()
+        .position(|w| is_valid_worktree_path(Path::new(&w.path)))
+        .or_else(|| (!state.entries.is_empty()).then_some(0))
     {
         return Ok(apply_unique_main(state, idx));
     }
 
-    // Empty state fallback: infer a new main entry.
-    let inferred_main = if let Some(p) = inferred_standard_main {
-        p
-    } else {
-        canonicalize(util::working_dir())?
-    };
-
+    let inferred_main = canonicalize(util::working_dir())?;
     if let Some(idx) = state
-        .worktrees
+        .entries
         .iter()
         .position(|w| Path::new(&w.path) == inferred_main)
     {
         Ok(apply_unique_main(state, idx))
     } else {
-        for w in &mut *state.worktrees {
+        for w in &mut *state.entries {
             w.is_main = false;
         }
-        state.worktrees.push(WorktreeEntry {
+        state.entries.push(WorktreeEntry {
             path: inferred_main.to_string_lossy().to_string(),
             is_main: true,
             locked: false,
             lock_reason: None,
+            worktree_id: None,
         });
         Ok(true)
     }
@@ -721,14 +1097,14 @@ fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
 /// Finds a mutable worktree entry by canonical path.
 fn find_entry_mut<'a>(state: &'a mut WorktreeState, path: &Path) -> Option<&'a mut WorktreeEntry> {
     state
-        .worktrees
+        .entries
         .iter_mut()
         .find(|w| Path::new(&w.path) == path)
 }
 
 /// Finds an immutable worktree entry by canonical path.
 fn find_entry<'a>(state: &'a WorktreeState, path: &Path) -> Option<&'a WorktreeEntry> {
-    state.worktrees.iter().find(|w| Path::new(&w.path) == path)
+    state.entries.iter().find(|w| Path::new(&w.path) == path)
 }
 
 /// Implements `worktree add <path>`.
@@ -776,7 +1152,7 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
 
     let mut state = load_state()?;
     if state
-        .worktrees
+        .entries
         .iter()
         .any(|w| Path::new(&w.path) == canonical_target)
     {
@@ -939,11 +1315,15 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
         }
     }
 
-    state.worktrees.push(WorktreeEntry {
+    state.entries.push(WorktreeEntry {
         path: canonical_target.to_string_lossy().to_string(),
         is_main: false,
         locked: false,
         lock_reason: None,
+        // v2 (§C.7): persist the stable id at creation so `worktree repair
+        // <path>` can later restore a corrupt/missing gitdir identity from
+        // the registry.
+        worktree_id: Some(worktree_id.clone()),
     });
     if let Err(e) = write_state(&state) {
         rollback_partial_add();
@@ -1102,12 +1482,18 @@ fn remove_worktree_storage_link(link_path: &Path) -> io::Result<()> {
 /// `main <path>` or `worktree <path>`, with optional `[locked: <reason>]`
 /// suffix when the entry is locked.
 pub(crate) fn run_list_worktrees() -> WorktreeResult<WorktreeListOutput> {
-    let state = load_state()?;
+    let state = load_state_readonly()?;
     let worktrees = state
-        .worktrees
+        .entries
         .into_iter()
         .map(|w| {
-            let worktree_id = resolve_entry_worktree_id(&w.path, w.is_main);
+            // v2: prefer the registry's PERSISTED stable id; fall back to
+            // the gitdir/synthesis probe for rows the upgrade could not
+            // backfill.
+            let worktree_id = w
+                .worktree_id
+                .clone()
+                .or_else(|| resolve_entry_worktree_id(&w.path, w.is_main));
             WorktreeListEntry {
                 kind: if w.is_main { "main" } else { "worktree" },
                 exists: Path::new(&w.path).exists(),
@@ -1331,18 +1717,18 @@ fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMoveOutput
     }
 
     let index = state
-        .worktrees
+        .entries
         .iter()
         .position(|w| Path::new(&w.path) == src_path)
         .ok_or(WorktreeError::NoSuchWorktree { path: src })?;
 
-    if state.worktrees[index].is_main {
+    if state.entries[index].is_main {
         return Err(WorktreeError::MainWorktree {
             action: "move",
             path: src_path.to_string_lossy().to_string(),
         });
     }
-    if state.worktrees[index].locked {
+    if state.entries[index].locked {
         return Err(WorktreeError::LockedWorktree {
             action: "move",
             path: src_path.to_string_lossy().to_string(),
@@ -1356,15 +1742,15 @@ fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMoveOutput
         )));
     }
 
-    let old_path = state.worktrees[index].path.clone();
-    state.worktrees[index].path = dest_path.to_string_lossy().to_string();
+    let old_path = state.entries[index].path.clone();
+    state.entries[index].path = dest_path.to_string_lossy().to_string();
     if let Err(e) = write_state(&state) {
-        state.worktrees[index].path = old_path;
+        state.entries[index].path = old_path;
         return Err(e);
     }
 
     if let Err(e) = fs::rename(&src_path, &dest_path) {
-        state.worktrees[index].path = old_path;
+        state.entries[index].path = old_path;
         write_state(&state)?;
         return Err(WorktreeError::IoWrite(format!(
             "failed to move worktree directory '{}' to '{}': {e}",
@@ -1401,7 +1787,7 @@ async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
     let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
     let to_prune: Vec<_> = state
-        .worktrees
+        .entries
         .iter()
         .filter(|w| {
             let path = Path::new(&w.path);
@@ -1416,7 +1802,7 @@ async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
                 gc_worktree_scoped_rows(&id, true).await;
             }
         }
-        state.worktrees.retain(|w| {
+        state.entries.retain(|w| {
             let path = Path::new(&w.path);
             path.exists() || w.is_main || w.locked
         });
@@ -1462,12 +1848,12 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     let target = resolve_path(&path, "worktree path")?;
 
     let index = state
-        .worktrees
+        .entries
         .iter()
         .position(|w| Path::new(&w.path) == target)
         .ok_or(WorktreeError::NoSuchWorktree { path })?;
 
-    let entry = &state.worktrees[index];
+    let entry = &state.entries[index];
     if entry.is_main {
         return Err(WorktreeError::MainWorktree {
             action: "remove",
@@ -1550,7 +1936,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     if let Some(id) = worktree_id_for_gc {
         gc_worktree_scoped_rows(&id, delete_dir || !target.exists()).await;
     }
-    state.worktrees.remove(index);
+    state.entries.remove(index);
     write_state(&state)?;
 
     Ok(WorktreeRemoveOutput {
@@ -1643,13 +2029,188 @@ fn render_umount_fuse_path(result: &WorktreeUmountOutput, output: &OutputConfig)
 /// canonical path and re-applies the invariant that there is exactly one
 /// main worktree entry. The repaired state is only written back if changes
 /// were actually made.
+#[derive(Debug, Serialize)]
+struct WorktreeRepairIdentityOutput {
+    path: String,
+    worktree_id: String,
+    worktree_id_restored: bool,
+    commondir_restored: bool,
+}
+
+/// `worktree repair <path>` (W3 §C.7): restore a linked worktree's gitdir
+/// identity from the registry's PERSISTED stable id — never from guesses.
+/// Rewrites `.libra/worktree_id` when missing/corrupt and `commondir` when
+/// missing (pointing at this repository's common storage). Refuses for
+/// unregistered paths, the main worktree, and entries whose registry row
+/// carries no persisted id (pre-v2 rows: run the no-arg `worktree repair`
+/// once to upgrade the registry, or re-add the worktree).
+fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdentityOutput> {
+    let _registry_lock = acquire_registry_lock()?;
+    // A legacy v1 registry carries NO persisted identities — refuse before
+    // the locked loader would durably upgrade it (backfilling ids from the
+    // possibly-damaged gitdirs this command is meant to repair). The no-arg
+    // repair is the explicit, documented upgrade step.
+    if let Ok(raw) = fs::read(state_path())
+        && !raw.is_empty()
+        && matches!(
+            WorktreeState::parse_document(&raw),
+            Ok((_, RegistryShape::V1))
+        )
+    {
+        return Err(WorktreeError::OperationBlocked(
+            "the worktree registry still uses the legacy v1 format with no persisted \
+             identities; run `libra worktree repair` (no argument) once to upgrade it, \
+             then retry"
+                .to_string(),
+        ));
+    }
+    let state = load_state()?;
+    let target = resolve_path(&path, "worktree path")?;
+    let entry =
+        find_entry(&state, &target).ok_or(WorktreeError::NoSuchWorktree { path: path.clone() })?;
+    if entry.is_main {
+        return Err(WorktreeError::MainWorktree {
+            action: "repair",
+            path: target.to_string_lossy().to_string(),
+        });
+    }
+    let Some(stable_id) = entry.worktree_id.clone() else {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "the registry entry for '{}' predates registry v2 and carries no persisted \
+             worktree id; run the no-arg `libra worktree repair` once to upgrade the \
+             registry, then retry",
+            target.display()
+        )));
+    };
+    let gitdir = target.join(util::ROOT_DIR);
+    if !gitdir.is_dir() {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{}' has no .libra gitdir to repair; re-add the worktree instead",
+            target.display()
+        )));
+    }
+
+    // Classify the commondir pointer FIRST — a foreign-storage refusal must
+    // happen before ANY write, or a failed repair would still have mutated
+    // the target worktree's identity.
+    let commondir_path = gitdir.join("commondir");
+    let common = util::storage_path();
+    // A commondir pointer needs restoring when it is MISSING or CORRUPT
+    // (unreadable / empty first line — the same states the storage resolver
+    // fails closed on). A VALID pointer at a DIFFERENT storage is refused:
+    // that worktree belongs to another repository and silently re-homing it
+    // would alias two repos' state. Relative pointers resolve against the
+    // local gitdir, exactly like the storage resolver.
+    let current_common = match fs::read_to_string(&commondir_path) {
+        Ok(contents) => contents
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from),
+        Err(_) => None,
+    };
+    let commondir_restored = match current_common {
+        Some(existing) => {
+            let existing_abs = if existing.is_absolute() {
+                existing
+            } else {
+                gitdir.join(existing)
+            };
+            let existing_resolved = fs::canonicalize(&existing_abs).unwrap_or(existing_abs);
+            let common_resolved = fs::canonicalize(&common).unwrap_or_else(|_| common.clone());
+            if existing_resolved != common_resolved {
+                return Err(WorktreeError::OperationBlocked(format!(
+                    "'{}' already points at a different common storage ('{}'); refusing to \
+                     re-home the worktree — remove and re-add it if this is intended",
+                    commondir_path.display(),
+                    existing_resolved.display()
+                )));
+            }
+            false
+        }
+        None => true,
+    };
+
+    let id_path = gitdir.join("worktree_id");
+    let current_id = fs::read_to_string(&id_path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let worktree_id_restored = current_id.as_deref() != Some(stable_id.as_str());
+    if worktree_id_restored {
+        crate::utils::atomic_write::write_atomic(
+            &id_path,
+            format!("{stable_id}\n").as_bytes(),
+            true,
+        )
+        .map_err(|source| {
+            WorktreeError::IoWrite(format!(
+                "failed to restore '{}': {source}",
+                id_path.display()
+            ))
+        })?;
+    }
+
+    if commondir_restored {
+        crate::utils::atomic_write::write_atomic(
+            &commondir_path,
+            format!("{}\n", common.display()).as_bytes(),
+            true,
+        )
+        .map_err(|source| {
+            WorktreeError::IoWrite(format!(
+                "failed to restore '{}': {source}",
+                commondir_path.display()
+            ))
+        })?;
+    }
+
+    Ok(WorktreeRepairIdentityOutput {
+        path: target.to_string_lossy().to_string(),
+        worktree_id: stable_id,
+        worktree_id_restored,
+        commondir_restored,
+    })
+}
+
+fn render_repair_identity(
+    result: &WorktreeRepairIdentityOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if output.is_json() {
+        return emit_json_data("worktree.repair", result, output);
+    }
+    if !output.quiet {
+        println!(
+            "repaired '{}': worktree_id {}{}{}",
+            result.path,
+            result.worktree_id,
+            if result.worktree_id_restored {
+                " (restored)"
+            } else {
+                " (already correct)"
+            },
+            if result.commondir_restored {
+                "; commondir restored"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
 fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
     let _registry_lock = acquire_registry_lock()?;
-    let mut state = load_state()?;
-    let mut changed = false;
+    // The healing loader may itself rewrite the file (v1 upgrade, identity
+    // invariants); report that as a change too.
+    let bytes_before = fs::read(state_path()).ok();
+    let mut state = load_state_for_repair()?;
+    let mut changed = fs::read(state_path()).ok() != bytes_before;
 
     let mut seen = HashSet::<PathBuf>::new();
-    state.worktrees.retain(|w| {
+    state.entries.retain(|w| {
         let p = PathBuf::from(&w.path);
         if !seen.insert(p) {
             changed = true;
@@ -1664,6 +2225,7 @@ fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
     }
 
     if changed {
+        let _ = normalize_v2_ids(&mut state);
         write_state(&state)?;
     }
 
@@ -1682,6 +2244,167 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn registry_parse_accepts_v2_shape() {
+        let data = br#"{
+            "schema_version": 2,
+            "entries": [
+                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
+                {"path": "/w", "is_main": false, "locked": false, "lock_reason": null,
+                 "worktree_id": "abc123"}
+            ]
+        }"#;
+        let state = WorktreeState::parse(data).expect("v2 parses");
+        assert_eq!(state.schema_version, REGISTRY_SCHEMA_VERSION);
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.entries[0].worktree_id, None);
+        assert_eq!(state.entries[1].worktree_id.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn registry_parse_upgrades_v1_shape_in_memory() {
+        let data = br#"{
+            "worktrees": [
+                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
+                {"path": "/w", "is_main": false, "locked": true, "lock_reason": "keep"}
+            ]
+        }"#;
+        let state = WorktreeState::parse(data).expect("v1 upgrades in memory");
+        assert_eq!(state.schema_version, REGISTRY_SCHEMA_VERSION);
+        assert_eq!(state.entries.len(), 2);
+        // Ids stay unfilled on the read-only path; the durable upgrade
+        // (load_state) backfills them.
+        assert_eq!(state.entries[1].worktree_id, None);
+        assert!(state.entries[1].locked);
+        assert_eq!(state.entries[1].lock_reason.as_deref(), Some("keep"));
+    }
+
+    /// Fail-closed discrimination: a document carrying any v2 key must be a
+    /// fully valid v2 registry — it never falls through to the lenient v1
+    /// reader, so a malformed/hybrid file cannot be misread as (and later
+    /// rewritten from) a stale embedded `worktrees` array.
+    #[test]
+    fn registry_parse_refuses_hybrid_and_malformed_v2_shapes() {
+        // v2 marker + malformed entries + a plausible legacy array: must NOT
+        // fall back to reading the stale v1 array.
+        let hybrid = br#"{
+            "schema_version": 2,
+            "entries": "corrupt",
+            "worktrees": [
+                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null}
+            ]
+        }"#;
+        assert!(WorktreeState::parse(hybrid).is_err());
+
+        // Valid v2 alongside a stray legacy array is ambiguous — refused,
+        // never silently ignored.
+        let ambiguous = br#"{"schema_version": 2, "entries": [], "worktrees": []}"#;
+        assert!(WorktreeState::parse(ambiguous).is_err());
+
+        // A v2-marked document with malformed entries and NO legacy array is
+        // corrupt, not empty.
+        let malformed = br#"{"schema_version": 2, "entries": 7}"#;
+        assert!(WorktreeState::parse(malformed).is_err());
+
+        // Neither shape at all.
+        assert!(WorktreeState::parse(br#"{}"#).is_err());
+        assert!(WorktreeState::parse(br#"[]"#).is_err());
+    }
+
+    /// The main-entry invariant applies to v1 documents too: read-side
+    /// consumers (service gate, rerere probe, cleanup snapshot) must not
+    /// consume a mainless legacy registry as an empty root set.
+    #[test]
+    fn registry_parse_refuses_mainless_v1_shapes() {
+        let empty = br#"{"worktrees": []}"#;
+        let err = WorktreeState::parse(empty).expect_err("empty v1 fails closed");
+        assert!(err.contains("exactly one main"), "{err}");
+
+        let sole_linked = br#"{
+            "worktrees": [
+                {"path": "/w", "is_main": false, "locked": false, "lock_reason": null}
+            ]
+        }"#;
+        assert!(WorktreeState::parse(sole_linked).is_err());
+    }
+
+    /// v2 must contain exactly one main entry — zero (or several) mains is
+    /// corruption a lockless reader must refuse, not silently re-elect.
+    #[test]
+    fn registry_parse_requires_exactly_one_main() {
+        let zero_main = br#"{
+            "schema_version": 2,
+            "entries": [
+                {"path": "/w", "is_main": false, "locked": false, "lock_reason": null,
+                 "worktree_id": "abc123"}
+            ]
+        }"#;
+        let err = WorktreeState::parse(zero_main).expect_err("zero mains fail closed");
+        assert!(err.contains("exactly one main"), "{err}");
+
+        let two_mains = br#"{
+            "schema_version": 2,
+            "entries": [
+                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
+                {"path": "/n", "is_main": true, "locked": false, "lock_reason": null}
+            ]
+        }"#;
+        let err = WorktreeState::parse(two_mains).expect_err("two mains fail closed");
+        assert!(err.contains("exactly one main"), "{err}");
+    }
+
+    /// v2 identity invariants: the registry is the persisted identity
+    /// authority — a linked entry with no id (or a main entry with one) is
+    /// corruption and must be refused, never patched from the gitdir.
+    #[test]
+    fn registry_parse_enforces_v2_identity_invariants() {
+        let linked_without_id = br#"{
+            "schema_version": 2,
+            "entries": [
+                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
+                {"path": "/w", "is_main": false, "locked": false, "lock_reason": null}
+            ]
+        }"#;
+        let err = WorktreeState::parse(linked_without_id).expect_err("missing id fails closed");
+        assert!(err.contains("missing its persisted worktree_id"), "{err}");
+
+        let main_with_id = br#"{
+            "schema_version": 2,
+            "entries": [
+                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null,
+                 "worktree_id": "oops"}
+            ]
+        }"#;
+        let err = WorktreeState::parse(main_with_id).expect_err("main id fails closed");
+        assert!(err.contains("must not carry a worktree_id"), "{err}");
+    }
+
+    #[test]
+    fn registry_parse_refuses_future_schema_version() {
+        let data = br#"{"schema_version": 3, "entries": []}"#;
+        let err = WorktreeState::parse(data).expect_err("future version fails closed");
+        assert!(err.contains("schema_version 3"), "{err}");
+    }
+
+    /// The second belt (§C.7): a v1 binary's `{ worktrees: [...] }` parser
+    /// must FAIL on v2 bytes (renamed top-level key) instead of silently
+    /// reading an empty registry and rewriting the file.
+    #[test]
+    fn v1_parser_fails_on_v2_bytes() {
+        let v2 = serde_json::to_vec(&WorktreeState {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            entries: vec![WorktreeEntry {
+                path: "/w".to_string(),
+                is_main: false,
+                locked: false,
+                lock_reason: None,
+                worktree_id: Some("abc123".to_string()),
+            }],
+        })
+        .expect("serialize v2");
+        assert!(serde_json::from_slice::<WorktreeStateV1>(&v2).is_err());
+    }
 
     #[test]
     fn umount_fuse_path_cleans_task_worktree_root_without_repo() {

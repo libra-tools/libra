@@ -257,7 +257,7 @@ async fn dirty_mark_handler(
             // deserializable-but-corrupt shapes (an empty worktree list or a
             // sole non-main entry — the real loader treats those as needing
             // main-entry repair). Never guess the scope.
-            let single_main = serde_json::from_str::<crate::command::worktree::WorktreeState>(&raw)
+            let single_main = crate::command::worktree::WorktreeState::parse(raw.as_bytes())
                 .is_ok_and(|state| state.is_single_main());
             if !single_main {
                 return Err((

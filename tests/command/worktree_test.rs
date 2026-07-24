@@ -62,7 +62,7 @@ fn test_worktree_help_header_is_user_facing() {
     );
 }
 
-/// Mirror of the on-disk `WorktreeEntry` used only in tests.
+/// Mirror of the on-disk `WorktreeEntry` used only in tests (registry v2).
 ///
 /// This type allows tests to deserialize `worktrees.json` without depending
 /// on internal, non-public structs from the main crate.
@@ -72,12 +72,15 @@ struct TestWorktreeEntry {
     is_main: bool,
     locked: bool,
     lock_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree_id: Option<String>,
 }
 
-/// Mirror of the on-disk `WorktreeState` used only in tests.
+/// Mirror of the on-disk `WorktreeState` used only in tests (registry v2).
 #[derive(Deserialize, Serialize)]
 struct TestWorktreeState {
-    worktrees: Vec<TestWorktreeEntry>,
+    schema_version: u32,
+    entries: Vec<TestWorktreeEntry>,
 }
 
 /// Loads the current `worktrees.json` into a test-friendly `TestWorktreeState`.
@@ -90,7 +93,7 @@ fn read_worktree_state() -> TestWorktreeState {
 /// Returns all worktree paths from the persisted test state.
 fn worktree_paths() -> Vec<String> {
     read_worktree_state()
-        .worktrees
+        .entries
         .into_iter()
         .map(|w| w.path)
         .collect()
@@ -375,12 +378,12 @@ async fn test_worktree_repair_json_reports_changed_state() {
 
     let mut state = read_worktree_state();
     let duplicate = state
-        .worktrees
+        .entries
         .iter()
         .find(|w| w.path.ends_with("wt_repair_json"))
         .cloned()
         .expect("expected worktree entry for wt_repair_json");
-    state.worktrees.push(duplicate);
+    state.entries.push(duplicate);
 
     let state_path = util::storage_path().join("worktrees.json");
     let data = serde_json::to_string_pretty(&state)
@@ -455,9 +458,9 @@ async fn test_worktree_lock_json_no_such_worktree_reports_invalid_target() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["list"])
+    exec_worktree(&["repair"])
         .await
-        .expect("worktree list should initialize state");
+        .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
 
     let output = run_libra_command(
@@ -486,9 +489,9 @@ async fn test_worktree_remove_machine_rejects_main_with_stable_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["list"])
+    exec_worktree(&["repair"])
         .await
-        .expect("worktree list should initialize state");
+        .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
     let main_path = repo_dir.path().canonicalize().unwrap();
     let main_arg = main_path.to_string_lossy().to_string();
@@ -596,9 +599,9 @@ async fn test_worktree_add_json_rejects_storage_path_as_invalid_target() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["list"])
+    exec_worktree(&["repair"])
         .await
-        .expect("worktree list should initialize state");
+        .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
     let inside_storage = util::storage_path().join("wt_inside_storage");
     let inside_arg = inside_storage.to_string_lossy().to_string();
@@ -633,9 +636,9 @@ async fn test_worktree_list_json_corrupt_state_reports_repo_corrupt() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["list"])
+    exec_worktree(&["repair"])
         .await
-        .expect("worktree list should initialize state");
+        .expect("worktree repair should initialize state");
     let state_path = util::storage_path().join("worktrees.json");
     fs::write(&state_path, b"{ invalid json").expect("failed to corrupt state file");
     let before = fs::read_to_string(&state_path).unwrap();
@@ -697,7 +700,7 @@ async fn test_worktree_add_normalizes_missing_parent_with_dotdot() {
     let expected = repo_dir.path().join("wt_norm").canonicalize().unwrap();
     let state = read_worktree_state();
     let entry = state
-        .worktrees
+        .entries
         .iter()
         .find(|w| w.path.ends_with("wt_norm"))
         .expect("state should contain the added worktree");
@@ -1054,9 +1057,9 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
     let wt_path = repo_dir.path().join("wt_state_save_fail");
     fs::create_dir_all(&wt_path).expect("failed to create existing empty target");
 
-    exec_worktree(&["list"])
+    exec_worktree(&["repair"])
         .await
-        .expect("worktree list should initialize worktree state");
+        .expect("worktree repair should initialize worktree state");
     assert!(
         util::storage_path().join("worktrees.json").exists(),
         "worktrees.json should exist before forcing save_state failure"
@@ -1165,9 +1168,9 @@ async fn test_worktree_corrupted_state_file_is_handled_without_side_effects() {
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
 
-    exec_worktree(&["list"])
+    exec_worktree(&["repair"])
         .await
-        .expect("worktree list should initialize state first");
+        .expect("worktree repair should initialize state first");
 
     let state_path = util::storage_path().join("worktrees.json");
     fs::write(&state_path, b"{ invalid json").expect("failed to corrupt state file");
@@ -1434,9 +1437,9 @@ async fn test_worktree_move_main_is_rejected_without_side_effects() {
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
 
-    exec_worktree(&["list"])
+    exec_worktree(&["repair"])
         .await
-        .expect("worktree list should initialize worktree state");
+        .expect("worktree repair should initialize worktree state");
 
     let before_paths = worktree_paths();
     let main_path = repo_dir.path().canonicalize().unwrap();
@@ -1516,7 +1519,7 @@ async fn test_worktree_move_locked_is_rejected_without_side_effects() {
 
     let state = read_worktree_state();
     let locked_entry = state
-        .worktrees
+        .entries
         .into_iter()
         .find(|w| w.path == src_canonical.to_string_lossy())
         .expect("locked worktree entry should still exist");
@@ -1669,7 +1672,7 @@ async fn test_worktree_prune_keeps_locked_worktrees() {
 
     let state = read_worktree_state();
     let locked_entry = state
-        .worktrees
+        .entries
         .into_iter()
         .find(|w| w.path == canonical)
         .expect("locked worktree should remain registered");
@@ -1728,12 +1731,12 @@ async fn test_worktree_repair_deduplicates_entries() {
 
     let mut state = read_worktree_state();
     let duplicate = state
-        .worktrees
+        .entries
         .iter()
         .find(|w| w.path.ends_with("wt_repair"))
         .cloned()
         .expect("expected worktree entry for wt_repair");
-    state.worktrees.push(duplicate);
+    state.entries.push(duplicate);
 
     let state_path = util::storage_path().join("worktrees.json");
     let data = serde_json::to_string_pretty(&state)
@@ -1745,7 +1748,7 @@ async fn test_worktree_repair_deduplicates_entries() {
         .expect("worktree repair should succeed");
 
     let repaired = read_worktree_state();
-    let paths: Vec<String> = repaired.worktrees.iter().map(|w| w.path.clone()).collect();
+    let paths: Vec<String> = repaired.entries.iter().map(|w| w.path.clone()).collect();
     let unique_paths = paths
         .iter()
         .cloned()
@@ -1770,7 +1773,7 @@ async fn test_worktree_repair_persists_main_flag_fix_without_duplicates() {
         .expect("worktree add should succeed");
 
     let mut state = read_worktree_state();
-    for w in &mut state.worktrees {
+    for w in &mut state.entries {
         w.is_main = false;
     }
 
@@ -1784,7 +1787,7 @@ async fn test_worktree_repair_persists_main_flag_fix_without_duplicates() {
         .expect("worktree repair should succeed");
 
     let repaired = read_worktree_state();
-    let main_entries: Vec<_> = repaired.worktrees.iter().filter(|w| w.is_main).collect();
+    let main_entries: Vec<_> = repaired.entries.iter().filter(|w| w.is_main).collect();
     assert_eq!(
         main_entries.len(),
         1,
@@ -1818,7 +1821,7 @@ async fn test_worktree_main_flag_remains_single_and_stable() {
         .expect("worktree list from linked worktree should succeed");
 
     let state = read_worktree_state();
-    let main_entries: Vec<_> = state.worktrees.iter().filter(|w| w.is_main).collect();
+    let main_entries: Vec<_> = state.entries.iter().filter(|w| w.is_main).collect();
     assert_eq!(
         main_entries.len(),
         1,

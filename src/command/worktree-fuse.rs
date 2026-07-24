@@ -27,7 +27,7 @@ mod legacy;
 // `worktree-fuse` feature routed compilation through this file or directly
 // through `worktree.rs`.
 pub use legacy::WORKTREE_EXAMPLES;
-pub(crate) use legacy::run_list_worktrees;
+pub(crate) use legacy::{WorktreeError, WorktreeState, acquire_registry_lock, run_list_worktrees};
 
 const FUSE_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
 const FUSE_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -119,7 +119,14 @@ pub enum WorktreeSubcommand {
         )]
         cleanup: bool,
     },
-    Repair,
+    /// Repair worktree metadata, attempting to recover from inconsistencies.
+    /// With a path, restores that linked worktree's gitdir identity
+    /// (`.libra/worktree_id` + `commondir`) from the registry's persisted
+    /// stable id (registry v2, W3 §C.7).
+    Repair {
+        /// Linked worktree whose gitdir identity should be restored.
+        path: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -238,6 +245,23 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     let command = args.command;
     if !matches!(&command, WorktreeSubcommand::Umount { .. }) {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
+        // §C.7 ordering (same as the legacy entry point): apply pending
+        // migrations — including the registry-v2 capability marker — before
+        // any registry IO, and refuse a future-schema database gracefully.
+        // The fuse-native list path reads the legacy registry directly, so
+        // the guarantee must hold here too, not only via legacy delegation.
+        crate::internal::db::get_db_conn_instance_for_path(&crate::utils::path::database())
+            .await
+            .map_err(|source| {
+                CliError::fatal(format!(
+                    "cannot open the repository database before touching the worktree \
+                     registry: {source}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+        // Bare boundary (config-first, same as legacy): refused before any
+        // registry IO.
+        legacy::reject_bare_repository().await?;
     }
 
     match command {
@@ -336,15 +360,21 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             )
             .await
         }
-        WorktreeSubcommand::Repair => {
-            repair_fuse_worktrees().map_err(|e| CliError::fatal(e.to_string()))?;
+        WorktreeSubcommand::Repair { path } => {
+            // Core registry first: a corrupt/zero-byte core registry must
+            // fail the command BEFORE any fuse metadata is mutated.
+            let run_fuse_repair = path.is_none();
             legacy::execute_safe(
                 legacy::WorktreeArgs {
-                    command: legacy::WorktreeSubcommand::Repair,
+                    command: legacy::WorktreeSubcommand::Repair { path },
                 },
                 output,
             )
-            .await
+            .await?;
+            if run_fuse_repair {
+                repair_fuse_worktrees().map_err(|e| CliError::fatal(e.to_string()))?;
+            }
+            Ok(())
         }
     }
 }

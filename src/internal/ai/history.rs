@@ -578,24 +578,23 @@ fn collect_rejected_cleanup_index_snapshot(
             registry_path.to_string_lossy().into_owned(),
             hex::encode(Sha256::digest(&bytes)),
         ));
-        let document: serde_json::Value = serde_json::from_slice(&bytes)
+        // Route through the DISCRIMINATING registry parser (§C.7): it
+        // accepts exactly one of the v2/v1 shapes and refuses hybrid or
+        // malformed documents — an ad-hoc key probe here could pick an
+        // empty `entries` over a populated legacy array and silently omit
+        // linked-worktree index roots from the cleanup snapshot.
+        let registry = crate::command::worktree::WorktreeState::parse(&bytes)
+            .map_err(|error| anyhow!("worktree registry rejected: {error}"))
             .context("parse worktree registry before rejected object cleanup")?;
-        let worktrees = document
-            .get("worktrees")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow!("worktree registry has no worktrees array"))?;
-        if worktrees.len() > REJECTED_CLEANUP_MAX_INDEX_FILES {
+        let worktree_paths = registry.entry_paths();
+        if worktree_paths.len() > REJECTED_CLEANUP_MAX_INDEX_FILES {
             bail!(
                 "worktree registry exceeds the {} index-file cleanup limit",
                 REJECTED_CLEANUP_MAX_INDEX_FILES
             );
         }
-        for worktree in worktrees {
-            let path = worktree
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("worktree registry entry has no path"))?;
-            index_paths.push(Path::new(path).join(".libra/index"));
+        for path in worktree_paths {
+            index_paths.push(Path::new(&path).join(".libra/index"));
         }
     }
     index_paths.sort();

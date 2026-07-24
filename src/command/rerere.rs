@@ -447,7 +447,7 @@ fn registry_has_linked_evidence() -> bool {
     let registry = util::storage_path().join("worktrees.json");
     match fs::read_to_string(&registry) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Ok(raw) => serde_json::from_str::<crate::command::worktree::WorktreeState>(&raw)
+        Ok(raw) => crate::command::worktree::WorktreeState::parse(raw.as_bytes())
             .map(|state| !state.is_single_main())
             .unwrap_or(true),
         Err(_) => true,

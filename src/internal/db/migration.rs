@@ -1054,6 +1054,19 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072304_sparse_view_worktree_scope.sql"),
             include_str!("../../../sql/migrations/2026072304_sparse_view_worktree_scope_down.sql"),
         ),
+        // plan-20260714 Part C W3 (§C.7): worktree registry v2 capability
+        // marker — its presence makes older binaries refuse the repository
+        // (future-schema fail-closed) before they can parse or recreate the
+        // registry file. Down drops only the marker: the v2 JSON layout
+        // itself still fails a v1 parser closed (renamed top-level key), so
+        // no silent misread window opens; s1b's lifecycle tables will add
+        // CHECK-guarded refusal while v2-only state exists.
+        sql_migration(
+            2026072401,
+            "worktree_registry_v2",
+            include_str!("../../../sql/migrations/2026072401_worktree_registry_v2.sql"),
+            include_str!("../../../sql/migrations/2026072401_worktree_registry_v2_down.sql"),
+        ),
     ]
 }
 
@@ -1299,9 +1312,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 38);
+        assert_eq!(runner.len(), 39);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072304));
+        assert_eq!(runner.max_registered_version(), Some(2026072401));
     }
 
     #[test]

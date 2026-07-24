@@ -2202,3 +2202,675 @@ fn worktree_remove_purges_layer_scope_rows() {
         );
     }
 }
+
+/// Registry v2 (plan-20260714 §C.7): a legacy v1 `{ worktrees: [...] }` file
+/// is durably upgraded on first touch — rewritten as
+/// `{ schema_version: 2, entries: [...] }` with each linked entry's STABLE id
+/// backfilled from its gitdir — while preserving every v1 field.
+#[test]
+fn registry_v1_file_upgrades_to_v2_with_backfilled_ids() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-v1up");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let gitdir_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("linked gitdir id")
+        .trim()
+        .to_string();
+
+    // Downgrade the registry file to the v1 shape by hand.
+    let registry = main.join(".libra").join("worktrees.json");
+    let v2: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry")).expect("v2 json");
+    assert_eq!(v2["schema_version"], 2, "fresh registry is v2");
+    let v1_entries: Vec<serde_json::Value> = v2["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry["path"],
+                "is_main": entry["is_main"],
+                "locked": entry["locked"],
+                "lock_reason": entry["lock_reason"],
+            })
+        })
+        .collect();
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&serde_json::json!({ "worktrees": v1_entries }))
+            .expect("serialize v1"),
+    )
+    .expect("write v1 registry");
+
+    // A LOCKLESS reader (list) reads the v1 file through the in-memory
+    // upgrade — with correct ids via the gitdir fallback — but must NOT
+    // rewrite it (an unlocked writer could overwrite a concurrent locked
+    // mutation).
+    let v1_bytes = std::fs::read(&registry).expect("v1 bytes");
+    let list = run_libra_command(&["worktree", "list", "--json"], main);
+    assert_cli_success(&list, "worktree list after v1 downgrade");
+    let listed = parse_json_stdout(&list);
+    let entries = listed["data"]["worktrees"]
+        .as_array()
+        .expect("list entries");
+    let linked = entries
+        .iter()
+        .find(|entry| entry["is_main"] == false)
+        .expect("linked entry listed");
+    assert_eq!(
+        linked["worktree_id"].as_str(),
+        Some(gitdir_id.as_str()),
+        "listed id survives the v1 round-trip"
+    );
+    assert_eq!(
+        std::fs::read(&registry).expect("registry after list"),
+        v1_bytes,
+        "a lockless reader never rewrites the registry"
+    );
+
+    // The first MUTATING command (here: no-arg repair, which loads under the
+    // registry lock) performs the durable upgrade.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair drives the durable upgrade",
+    );
+
+    let upgraded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read upgraded registry"))
+            .expect("upgraded json");
+    assert_eq!(upgraded["schema_version"], 2, "file rewritten as v2");
+    let upgraded_entries = upgraded["entries"].as_array().expect("v2 entries");
+    assert_eq!(upgraded_entries.len(), 2, "both entries preserved");
+    let upgraded_linked = upgraded_entries
+        .iter()
+        .find(|entry| entry["is_main"] == false)
+        .expect("linked entry persisted");
+    assert_eq!(
+        upgraded_linked["worktree_id"].as_str(),
+        Some(gitdir_id.as_str()),
+        "stable id backfilled from the gitdir during the upgrade"
+    );
+    assert!(
+        upgraded.get("worktrees").is_none(),
+        "legacy top-level key does not survive"
+    );
+}
+
+/// `worktree repair <path>` (§C.7): restores a linked worktree's deleted
+/// `.libra/worktree_id` and `commondir` from the registry's PERSISTED id, so
+/// the worktree maps back to ITS OWN scoped rows (never a fresh synthesized
+/// scope and never main's).
+#[test]
+fn worktree_repair_path_restores_identity_from_registry() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-repair");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "switch in linked worktree",
+    );
+    let gitdir = wt.join(".libra");
+    let original_id = std::fs::read_to_string(gitdir.join("worktree_id"))
+        .expect("original id")
+        .trim()
+        .to_string();
+    let original_commondir =
+        std::fs::read_to_string(gitdir.join("commondir")).expect("original commondir");
+
+    // Simulate identity loss: both gitdir pointer files vanish.
+    std::fs::remove_file(gitdir.join("worktree_id")).expect("drop id file");
+    std::fs::remove_file(gitdir.join("commondir")).expect("drop commondir");
+
+    let repaired = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        main,
+    );
+    assert_cli_success(&repaired, "worktree repair <path>");
+    let payload = parse_json_stdout(&repaired);
+    assert_eq!(
+        payload["data"]["worktree_id"].as_str(),
+        Some(original_id.as_str()),
+        "repair restores the persisted id, not a fresh synthesis"
+    );
+    assert_eq!(payload["data"]["worktree_id_restored"], true);
+    assert_eq!(payload["data"]["commondir_restored"], true);
+
+    let restored_id = std::fs::read_to_string(gitdir.join("worktree_id"))
+        .expect("restored id")
+        .trim()
+        .to_string();
+    assert_eq!(restored_id, original_id);
+    let restored_commondir =
+        std::fs::read_to_string(gitdir.join("commondir")).expect("restored commondir");
+    assert_eq!(
+        restored_commondir.trim(),
+        original_commondir.trim(),
+        "commondir points back at the shared storage"
+    );
+
+    // The repaired worktree still resolves ITS OWN scope: HEAD stays on
+    // `feature`, proving the id did not silently change.
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        head, "feature",
+        "repaired worktree keeps its own HEAD scope"
+    );
+
+    // Idempotent second run: nothing left to restore.
+    let second = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        main,
+    );
+    assert_cli_success(&second, "second repair run");
+    let payload = parse_json_stdout(&second);
+    assert_eq!(payload["data"]["worktree_id_restored"], false);
+    assert_eq!(payload["data"]["commondir_restored"], false);
+
+    // A CORRUPT (empty) commondir — the exact state the storage resolver
+    // fails closed on — is restored too, not just a missing file.
+    std::fs::write(gitdir.join("commondir"), "").expect("corrupt commondir");
+    let third = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        main,
+    );
+    assert_cli_success(&third, "repair of a corrupt commondir");
+    let payload = parse_json_stdout(&third);
+    assert_eq!(payload["data"]["commondir_restored"], true);
+    let healed = std::fs::read_to_string(gitdir.join("commondir")).expect("healed commondir");
+    assert_eq!(healed.trim(), original_commondir.trim());
+
+    // A RELATIVE pointer that resolves (against the gitdir) to THIS
+    // repository's storage is recognized as correct — not misclassified as
+    // foreign against the caller's cwd.
+    std::fs::write(gitdir.join("commondir"), "../../.libra\n").expect("relative commondir");
+    let relative = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        main,
+    );
+    assert_cli_success(&relative, "repair with a valid relative commondir");
+    let payload = parse_json_stdout(&relative);
+    assert_eq!(
+        payload["data"]["commondir_restored"], false,
+        "a valid relative pointer is not foreign and needs no restore"
+    );
+
+    // A VALID pointer at a DIFFERENT storage is refused — and the refusal
+    // must be side-effect free: NEITHER gitdir file may change, even when
+    // the worktree_id also needs restoring.
+    let other = tempfile::tempdir().expect("other storage");
+    let foreign_pointer = format!("{}\n", other.path().display());
+    std::fs::write(gitdir.join("commondir"), &foreign_pointer).expect("foreign commondir");
+    std::fs::write(gitdir.join("worktree_id"), "stale-or-corrupt\n").expect("stale id");
+    let refused = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "repair must refuse to re-home a worktree pointing at another storage"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gitdir.join("commondir")).expect("commondir after refusal"),
+        foreign_pointer,
+        "refusal leaves commondir byte-for-byte unchanged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gitdir.join("worktree_id")).expect("id after refusal"),
+        "stale-or-corrupt\n",
+        "refusal leaves worktree_id byte-for-byte unchanged"
+    );
+}
+
+/// `worktree repair <path>` refuses unregistered paths and the main worktree
+/// instead of guessing identities (§C.7 fail-closed).
+#[test]
+fn worktree_repair_path_refuses_main_and_unregistered() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+
+    let main_refused = run_libra_command(&["worktree", "repair", main.to_str().unwrap()], main);
+    assert!(
+        !main_refused.status.success(),
+        "repair <main> must be refused"
+    );
+
+    let stranger = main.join("never-registered");
+    std::fs::create_dir_all(&stranger).expect("mkdir");
+    let unregistered = run_libra_command(&["worktree", "repair", stranger.to_str().unwrap()], main);
+    assert!(
+        !unregistered.status.success(),
+        "repair on an unregistered path must be refused"
+    );
+}
+
+/// §C.7 ordering: every worktree command applies pending repository
+/// migrations — including the registry-v2 capability marker (2026072401) —
+/// BEFORE any `worktrees.json` read or rewrite. A repo whose database predates
+/// the marker gains it from a plain `worktree list`, so an old binary is
+/// refused at connect time no matter which command first touches the v2 file.
+#[tokio::test]
+async fn worktree_commands_apply_capability_marker_before_registry_io() {
+    use libra::internal::db::migration::builtin_runner;
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+
+    // Re-open the pre-v2 window: roll back ONLY the capability marker.
+    {
+        let conn = Database::connect(&db_url).await.expect("connect repo db");
+        let rolled = builtin_runner()
+            .expect("builtin runner")
+            .rollback_to(&conn, 2026072304)
+            .await
+            .expect("roll back capability marker");
+        assert_eq!(rolled, vec![2026072401]);
+        conn.close().await.expect("close");
+    }
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "list"], main),
+        "worktree list on a pre-marker database",
+    );
+
+    let conn = Database::connect(&db_url).await.expect("reconnect repo db");
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+             AND name = 'worktree_registry_capability'"
+                .to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("count row");
+    let count: i32 = row.try_get_by_index(0).expect("count");
+    assert_eq!(
+        count, 1,
+        "the preflight re-applied the capability marker before registry IO"
+    );
+}
+
+/// v2 identity invariants (§C.7): a v2 registry whose linked entry lost its
+/// persisted id is CORRUPT — readers and mutators refuse it (never silently
+/// falling back to the mutable gitdir) until the explicit no-arg
+/// `worktree repair` deterministically heals and persists it.
+#[test]
+fn v2_identity_invariant_violations_refuse_until_explicit_repair() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-invariant");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let gitdir_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("linked gitdir id")
+        .trim()
+        .to_string();
+
+    // Corrupt the v2 registry: strip the linked entry's persisted id.
+    let registry = main.join(".libra").join("worktrees.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry"))
+            .expect("registry json");
+    for entry in doc["entries"].as_array_mut().expect("entries") {
+        if entry["is_main"] == false {
+            entry.as_object_mut().expect("entry").remove("worktree_id");
+        }
+    }
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&doc).expect("serialize"),
+    )
+    .expect("write corrupt registry");
+
+    // Both a lockless reader and a locked mutator refuse, pointing at repair.
+    let list = run_libra_command(&["worktree", "list"], main);
+    assert!(
+        !list.status.success(),
+        "list refuses the corrupt v2 registry"
+    );
+    let lock = run_libra_command(
+        &["worktree", "lock", wt.to_str().unwrap(), "--reason", "x"],
+        main,
+    );
+    assert!(
+        !lock.status.success(),
+        "mutators refuse the corrupt v2 registry"
+    );
+    let stderr = String::from_utf8_lossy(&lock.stderr);
+    assert!(
+        stderr.contains("worktree repair"),
+        "refusal directs at the explicit repair: {stderr}"
+    );
+
+    // The explicit no-arg repair heals deterministically (gitdir backfill).
+    let repaired = run_libra_command(&["--json", "worktree", "repair"], main);
+    assert_cli_success(&repaired, "no-arg repair heals the invariants");
+    let payload = parse_json_stdout(&repaired);
+    assert_eq!(
+        payload["data"]["changed"], true,
+        "heal is reported as a change"
+    );
+
+    let healed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read healed registry"))
+            .expect("healed json");
+    let linked = healed["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["is_main"] == false)
+        .expect("linked entry");
+    assert_eq!(
+        linked["worktree_id"].as_str(),
+        Some(gitdir_id.as_str()),
+        "heal backfills the id from the gitdir"
+    );
+
+    // Mutators work again.
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "lock", wt.to_str().unwrap(), "--reason", "x"],
+            main,
+        ),
+        "mutators run after the heal",
+    );
+}
+
+/// A zero-byte registry is a torn write, not a fresh repository: readers and
+/// mutators fail closed and NOTHING reinitializes or overwrites it — a silent
+/// main-only rewrite would drop every linked entry.
+#[test]
+fn zero_byte_registry_fails_closed_everywhere() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-torn");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let registry = main.join(".libra").join("worktrees.json");
+    std::fs::write(&registry, b"").expect("truncate registry");
+
+    for argv in [
+        vec!["worktree", "list"],
+        vec!["worktree", "lock", wt.to_str().unwrap(), "--reason", "x"],
+        vec!["worktree", "repair"],
+        vec!["worktree", "repair", wt.to_str().unwrap()],
+    ] {
+        let out = run_libra_command(&argv, main);
+        assert!(
+            !out.status.success(),
+            "{argv:?} must fail closed on a zero-byte registry"
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(&registry)
+            .expect("registry still present")
+            .len(),
+        0,
+        "nothing may reinitialize or overwrite the torn registry"
+    );
+}
+
+/// `worktree repair <path>` refuses a legacy v1 registry outright: v1 carries
+/// no persisted identities, so restoring from it would launder a freshly
+/// synthesized id into the gitdir. The explicit no-arg repair upgrade comes
+/// first, then the path form works.
+#[test]
+fn worktree_repair_path_refuses_v1_registry_until_upgrade() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-v1-repair");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Downgrade the registry to the v1 shape.
+    let registry = main.join(".libra").join("worktrees.json");
+    let v2: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry")).expect("v2 json");
+    let v1_entries: Vec<serde_json::Value> = v2["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry["path"],
+                "is_main": entry["is_main"],
+                "locked": entry["locked"],
+                "lock_reason": entry["lock_reason"],
+            })
+        })
+        .collect();
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&serde_json::json!({ "worktrees": v1_entries }))
+            .expect("serialize v1"),
+    )
+    .expect("write v1 registry");
+
+    let refused = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "path repair must refuse a v1 registry"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("legacy v1"),
+        "refusal explains the v1 state: {stderr}"
+    );
+
+    // The explicit upgrade, then the path form works.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "no-arg repair upgrades the registry",
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main),
+        "path repair works on the upgraded registry",
+    );
+}
+
+/// §C.7: the repository root is the AUTHORITATIVE main. A malformed v1
+/// registry that marks a LINKED entry as main (or omits the main entirely)
+/// must never durably crown the linked worktree during the upgrade — the
+/// root is restored as main and the linked entry stays linked with its id.
+#[test]
+fn v1_upgrade_never_crowns_a_linked_entry_as_main() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let canonical_main = main.canonicalize().expect("canonical main");
+    let wt = main.join("wt-crown");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let gitdir_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("linked gitdir id")
+        .trim()
+        .to_string();
+    let canonical_wt = wt.canonicalize().expect("canonical wt");
+    let registry = main.join(".libra").join("worktrees.json");
+
+    // Case 1: multi-main v1 — the linked entry is (wrongly) marked main too.
+    // Case 2: mainless v1 — ONLY the linked entry exists.
+    let multi_main = serde_json::json!({ "worktrees": [
+        {"path": canonical_main.to_string_lossy(), "is_main": true,
+         "locked": false, "lock_reason": null},
+        {"path": canonical_wt.to_string_lossy(), "is_main": true,
+         "locked": false, "lock_reason": null},
+    ]});
+    let mainless = serde_json::json!({ "worktrees": [
+        {"path": canonical_wt.to_string_lossy(), "is_main": false,
+         "locked": false, "lock_reason": null},
+    ]});
+    for (label, doc) in [("multi-main", multi_main), ("mainless", mainless)] {
+        std::fs::write(
+            &registry,
+            serde_json::to_vec_pretty(&doc).expect("serialize"),
+        )
+        .expect("write malformed v1");
+        assert_cli_success(
+            &run_libra_command(&["worktree", "repair"], main),
+            "upgrade via no-arg repair",
+        );
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).expect("read upgraded"))
+                .expect("upgraded json");
+        let entries = upgraded["entries"].as_array().expect("entries");
+        let mains: Vec<_> = entries.iter().filter(|e| e["is_main"] == true).collect();
+        assert_eq!(mains.len(), 1, "{label}: exactly one main");
+        assert_eq!(
+            mains[0]["path"].as_str(),
+            Some(canonical_main.to_string_lossy().as_ref()),
+            "{label}: the repository root is main, never the linked path"
+        );
+        let linked = entries
+            .iter()
+            .find(|e| e["path"].as_str() == Some(canonical_wt.to_string_lossy().as_ref()))
+            .expect("linked entry survives");
+        assert_eq!(linked["is_main"], false, "{label}: linked stays linked");
+        assert_eq!(
+            linked["worktree_id"].as_str(),
+            Some(gitdir_id.as_str()),
+            "{label}: linked id backfilled from ITS OWN gitdir"
+        );
+    }
+}
+
+/// Part C bare boundary (§C.4.1): a bare repository has no working trees —
+/// the entire worktree family refuses with the stable `LBR-REPO-003` before
+/// any registry IO (no worktrees.json may appear).
+#[test]
+fn bare_repository_refuses_worktree_family() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bare = dir.path().join("repo.git");
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", bare.to_str().unwrap()], dir.path()),
+        "init --bare",
+    );
+
+    let wt_target = dir.path().join("wt-from-bare");
+    for argv in [
+        vec!["worktree", "list"],
+        vec!["worktree", "add", wt_target.to_str().unwrap()],
+        vec!["worktree", "repair"],
+    ] {
+        let out = run_libra_command(&argv, &bare);
+        assert!(
+            !out.status.success(),
+            "{argv:?} must be refused in a bare repository"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003"),
+            "stable LBR-REPO-003 refusal for {argv:?}: {stderr}"
+        );
+    }
+    assert!(
+        !bare.join("worktrees.json").exists(),
+        "no registry may be created in a bare repository"
+    );
+    assert!(!wt_target.exists(), "no worktree directory may be created");
+
+    // Adversarial layout: a bare repository whose directory is literally
+    // named `.libra` defeats any basename heuristic — the recorded
+    // `core.bare` config must still refuse it.
+    let disguised_parent = dir.path().join("disguised");
+    std::fs::create_dir_all(&disguised_parent).expect("mkdir");
+    let disguised = disguised_parent.join(".libra");
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", disguised.to_str().unwrap()], dir.path()),
+        "init --bare .libra",
+    );
+    for cwd in [&disguised, &disguised_parent] {
+        let out = run_libra_command(&["worktree", "list"], cwd);
+        assert!(
+            !out.status.success(),
+            "worktree list from {cwd:?} must be refused for a .libra-named bare repo"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003"),
+            "config-first classifier refuses the disguised bare repo: {stderr}"
+        );
+    }
+    assert!(!disguised.join("worktrees.json").exists());
+
+    // Every git boolean spelling of core.bare=true must classify as bare —
+    // `yes`/`on`/`1` are as bare as `true` (fail-open here would let the
+    // disguised layout through).
+    for spelling in ["yes", "on", "1"] {
+        assert_cli_success(
+            &run_libra_command(&["config", "core.bare", spelling], &disguised),
+            "set core.bare spelling",
+        );
+        let out = run_libra_command(&["worktree", "list"], &disguised);
+        assert!(
+            !out.status.success(),
+            "core.bare={spelling} must still classify as bare"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003"),
+            "core.bare={spelling}: {stderr}"
+        );
+
+        // The SHARED classifier must hold beyond the worktree family:
+        // `status` refuses a bare repository on the same spellings.
+        let status_out = run_libra_command(&["status"], &disguised);
+        assert!(
+            !status_out.status.success(),
+            "status must refuse a bare repo with core.bare={spelling}"
+        );
+        let status_stderr = String::from_utf8_lossy(&status_out.stderr);
+        assert!(
+            status_stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003"),
+            "status bare refusal for core.bare={spelling}: {status_stderr}"
+        );
+    }
+
+    // An unparseable core.bare fails CLOSED (refusal, not fall-through).
+    assert_cli_success(
+        &run_libra_command(&["config", "core.bare", "maybe"], &disguised),
+        "set invalid core.bare",
+    );
+    let out = run_libra_command(&["worktree", "list"], &disguised);
+    assert!(
+        !out.status.success(),
+        "an unparseable core.bare must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.trim() == "Error-Code: LBR-CLI-002"),
+        "unparseable core.bare pins LBR-CLI-002: {stderr}"
+    );
+}

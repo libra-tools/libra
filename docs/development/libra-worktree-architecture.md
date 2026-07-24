@@ -47,8 +47,13 @@ Agent 机制是更高层的架构。它把 worktree 当作由 Libra 调度器（
   本地目录（非 symlink），保存该 worktree 私有的 HEAD、index 和 HEAD
   reflog，并记录 `commondir` 指针（指回共享存储）与稳定 `worktree_id`。
   由更早版本创建的 worktree 可能仍是旧的 `.libra` symlink 共享布局。
-- `worktrees.json` 存储规范化路径、主 worktree 标记、锁
-  状态以及可选的锁定原因。
+- `worktrees.json` 自 v0.19.57 起为 registry v2：顶层为
+  `{schema_version: 2, entries: [...]}`（顶层键由 `worktrees` 更名为
+  `entries`，使 v1 解析器对 v2 文件 fail-closed），每个条目存储规范化
+  路径、主 worktree 标记、锁状态、可选锁定原因，linked 条目还持久化其
+  stable `worktree_id`。旧 v1 文件在首个变更类命令（registry 锁内）就
+  地升级并回填 id；无锁读取（`worktree list`）不重写文件。数据库迁移
+  2026072401 的 capability 标记使 pre-v2 二进制在连接时即被拒绝。
 - 状态写入是原子的：Libra 先写入一个临时 JSON 文件，再将其重命名
   到目标位置。
 - `libra worktree add` 会创建一个空的关联目录，并在 `HEAD`
@@ -57,7 +62,10 @@ Agent 机制是更高层的架构。它把 worktree 当作由 Libra 调度器（
 - `libra worktree remove` 会注销该 worktree，但有意不
   删除目录，以降低意外丢数据的风险。
 - `libra worktree repair` 会对注册表条目去重，并恢复
-  「恰有一个条目是主 worktree」这一不变量。
+  「恰有一个条目是主 worktree」这一不变量。`repair <path>` 则依据
+  registry 持久化的 stable id 恢复 linked worktree 缺失/损坏的
+  `.libra/worktree_id` 与 `commondir`（指向另一存储的有效指针会被
+  拒绝，且拒绝不产生写入）。
 
 启用 `worktree-fuse` 特性后，Libra 还可以维护
 `worktrees-fuse.json`，以及位于 `.libra/worktrees-fuse/` 下的
@@ -201,7 +209,7 @@ linked checkout
 | 主要拥有者 | Git ref 与检出机制 | Libra 调度器（Scheduler）与执行环境 |
 | 主要隔离单元 | 分支、分离 commit，以及每个 worktree 各自的 index | 任务尝试、基线快照与写入合约 |
 | 元数据布局 | `.git/worktrees/<id>` 下分散的文件系统控制文件，外加 `.git` 指针文件 | 持久化 worktree 使用人类/Agent 可读的 JSON；Agent worktree 使用临时任务状态 |
-| 仓库存储链接 | `.git` 文件指向每个 worktree 各自的 Git 管理目录；`commondir` 指回公共存储 | `.libra` symlink 直接指向共享的 Libra 存储；任务的 FUSE backend 将存储链接进可写的 upper 层 |
+| 仓库存储链接 | `.git` 文件指向每个 worktree 各自的 Git 管理目录；`commondir` 指回公共存储 | 每个关联 worktree 拥有真实本地 `.libra` gitdir，内含 `commondir` 指针指回共享 Libra 存储（legacy 布局为 symlink）；任务的 FUSE backend 将存储链接进可写的 upper 层 |
 | 起始内容 | Git 从某个分支或 commit 检出到 worktree 与 index | CLI 关联 worktree 恢复 `HEAD`；Agent worktree 对当前工作区状态拍快照，包括未被忽略的未提交文件 |
 | 并行工作 | 多个持久化的分支检出 | 多次临时任务尝试可并行运行，而无需分配分支 |
 | 集成方式 | 用户运行 merge、rebase、cherry-pick 或手动复制 | Libra 在通过作用域与并发检查后，将成功的任务变更同步回去 |

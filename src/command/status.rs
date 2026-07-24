@@ -850,7 +850,7 @@ async fn collect_status_data(
         &crate::internal::worktree_scope::WorktreeScope::current(),
     )
     .await;
-    if is_bare_repository().await {
+    if is_bare_repository().await? {
         return Err(CliError::fatal("this operation must be run in a work tree")
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("this command requires a working tree; bare repositories do not have one"));
@@ -3860,11 +3860,24 @@ pub(crate) fn compute_ahead_behind(local: &ObjectHash, remote: &ObjectHash) -> (
 // Bare repository detection
 // ---------------------------------------------------------------------------
 
-async fn is_bare_repository() -> bool {
-    matches!(
-        ConfigKv::get("core.bare").await.ok().flatten().map(|e| e.value),
-        Some(value) if value.eq_ignore_ascii_case("true")
-    )
+/// Shared-parser `core.bare` read (all git boolean spellings). FAILS CLOSED:
+/// an unparseable value or a config read failure refuses status rather than
+/// silently proceeding into worktree-status collection on a bare repository.
+async fn is_bare_repository() -> CliResult<bool> {
+    match ConfigKv::get("core.bare").await {
+        Ok(Some(entry)) => crate::internal::config::parse_git_bool(&entry.value).ok_or_else(|| {
+            CliError::fatal(format!(
+                "invalid core.bare value '{}': expected true/false/yes/no/on/off/1/0",
+                entry.value
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+        }),
+        Ok(None) => Ok(false),
+        Err(error) => Err(CliError::fatal(format!(
+            "cannot read core.bare to classify this repository: {error}"
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)),
+    }
 }
 
 // ---------------------------------------------------------------------------

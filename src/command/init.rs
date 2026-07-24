@@ -770,7 +770,7 @@ async fn reinitialize_existing(
         .unwrap_or_default();
     let bare = read_config_string(&conn, "core.bare")
         .await?
-        .map(|value| value == "true")
+        .and_then(|value| crate::internal::config::parse_git_bool(&value))
         .unwrap_or(args.bare);
     let vault_signing = read_config_string(&conn, "vault.signing")
         .await?

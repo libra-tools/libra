@@ -4339,7 +4339,7 @@ fn session_jsonl_store_for_thread(
             tracing::warn!(
                 working_dir = %working_dir.display(),
                 %error,
-                "cannot resolve storage root for the session store; skipping (run `libra worktree repair` if this is a linked worktree)"
+                "cannot resolve storage root for the session store; skipping (run `libra worktree repair <worktree-path>` if this is a linked worktree)"
             );
             return None;
         }

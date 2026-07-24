@@ -94,7 +94,7 @@ impl WorktreeScope {
         util::try_get_worktree_gitdir(None).map_err(|error| {
             CliError::fatal(format!(
                 "cannot resolve this worktree's gitdir: {error}; if this is a linked worktree, \
-                 run `libra worktree repair`"
+                 run `libra worktree repair <worktree-path>` from the main worktree"
             ))
             .with_stable_code(crate::utils::error::StableErrorCode::IoReadFailed)
         })

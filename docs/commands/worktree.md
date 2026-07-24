@@ -15,14 +15,14 @@ libra worktree move <src> <dest>
 libra worktree prune
 libra worktree remove <path>
 libra worktree umount <path> [--cleanup]
-libra worktree repair
+libra worktree repair [<path>]
 ```
 
 ## Description
 
 `libra worktree` manages multiple working trees that share a single repository database and object store. This allows you to have several checkouts of the same repository simultaneously, which is useful for working on multiple branches at once, running builds while editing code, or testing changes in isolation.
 
-Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; run `libra worktree repair` to check.)
+Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; run `libra worktree repair` to check.) The registry file `worktrees.json` is versioned (`schema_version: 2` since v0.19.57): each linked entry persists its stable `worktree_id`, a legacy v1 file is upgraded in place by the first mutating worktree command (ids backfilled from each worktree's gitdir; lockless readers like `worktree list` read a v1 file without rewriting it), and older binaries are refused at the database layer before they can misread or rewrite the v2 file.
 
 Worktree metadata is persisted in a `worktrees.json` file inside the `.libra` storage directory. Each entry tracks the filesystem path, whether it is the main worktree, its lock status, and an optional lock reason. The state file is written atomically via a temporary file rename to prevent corruption.
 
@@ -194,11 +194,15 @@ JSON / machine output envelope:
 
 ### Subcommand: `repair`
 
-Repair worktree metadata by removing duplicate entries (same canonical path) and ensuring exactly one main worktree entry exists. Only writes the state file if changes are actually made.
+Repair worktree metadata. Without an argument, removes duplicate registry entries (same canonical path) and ensures exactly one main worktree entry exists; the state file is only rewritten when something actually changed.
+
+With a path, restores that **linked** worktree's gitdir identity from the registry (registry v2): rewrites a missing or corrupt `.libra/worktree_id` from the entry's persisted stable id and restores a missing or corrupt (empty/unreadable) `commondir` pointer to this repository's shared storage. The identity always comes from the registry — never from a guess — so the repaired worktree maps back to its own scoped state (HEAD, index, stash snapshots) instead of a fresh scope or the main worktree's. A `commondir` that validly points at a **different** storage is refused (repair never silently re-homes a worktree onto another repository), and the refusal is side-effect free — neither gitdir file is touched. Unregistered paths and the main worktree are refused, and so is a registry still in the legacy v1 format (it carries no persisted identities) — run the no-argument `libra worktree repair` once to upgrade it, then retry.
 
 ```bash
 libra worktree repair
 libra --json worktree repair
+libra worktree repair ../experiment
+libra --json worktree repair ../experiment
 ```
 
 ## Common Commands
@@ -227,6 +231,9 @@ libra wt remove ../experiment-v2
 
 # Fix inconsistent worktree metadata
 libra wt repair
+
+# Restore a linked worktree's gitdir identity from the registry
+libra wt repair ../experiment
 ```
 
 ## Human Output
@@ -390,13 +397,28 @@ single-line JSON.
 }
 ```
 
+**`worktree.repair` with a path**:
+
+```json
+{
+  "ok": true,
+  "command": "worktree.repair",
+  "data": {
+    "path": "/abs/path/to/experiment",
+    "worktree_id": "1f0c…",
+    "worktree_id_restored": true,
+    "commondir_restored": true
+  }
+}
+```
+
 ## Design Rationale
 
 ### Why JSON-file persistence instead of filesystem links like Git?
 
 Git tracks worktrees through a combination of filesystem structure: the main `.git/worktrees/` directory contains per-worktree directories with `gitdir`, `HEAD`, and `commondir` files, and each linked worktree has a `.git` file (not directory) pointing back. This approach is tightly coupled to Git's file-based architecture and requires careful cross-referencing between multiple locations.
 
-Libra uses a single `worktrees.json` file in the shared storage directory. This provides several advantages: all worktree metadata is in one queryable location, state is written atomically (via temp-file rename), and the format is trivially inspectable by both humans and AI agents. The symlink from each linked worktree's `.libra` back to the shared storage is simpler than Git's bidirectional pointer system. The trade-off is that the JSON file is a single point of truth that must be kept consistent, which is why `repair` exists.
+Libra uses a single `worktrees.json` file in the shared storage directory. This provides several advantages: all worktree metadata is in one queryable location, state is written atomically (via temp-file rename), and the format is trivially inspectable by both humans and AI agents. Each linked worktree's real `.libra` gitdir holds a one-way `commondir` pointer back to the shared storage (plus its stable `worktree_id`), which is simpler than Git's bidirectional pointer system. The trade-off is that the JSON file is a single point of truth that must be kept consistent, which is why `repair` exists.
 
 ### Why `--reason` on lock?
 
@@ -427,11 +449,11 @@ When creating a linked worktree, Libra restores content from the HEAD commit rat
 | Move | `worktree move <src> <dest>` | `worktree move <worktree> <new-path>` | N/A |
 | Prune | `worktree prune` | `worktree prune [--dry-run]` | N/A (automatic) |
 | Remove | `worktree remove <path>` (registry only) | `worktree remove [--force] <worktree>` (deletes dir) | `workspace forget <name>` |
-| Repair | `worktree repair` | `worktree repair [<path>...]` | N/A |
+| Repair | `worktree repair [<path>]` | `worktree repair [<path>...]` | N/A |
 | Alias | `wt` | N/A | N/A |
 | Branch per worktree | Not supported | Automatic (new branch or existing) | Automatic (new working copy commit) |
 | Storage | JSON file (`worktrees.json`) | Filesystem structure (`.git/worktrees/`) | Operation log |
-| Worktree link | Symlink to shared `.libra` | `.git` file pointing to `gitdir` | Symlink to shared `.jj` |
+| Worktree link | Real local `.libra` gitdir with a `commondir` pointer to shared storage (legacy layouts: symlink) | `.git` file pointing to `gitdir` | Symlink to shared `.jj` |
 
 Note: jj uses the term "workspace" instead of "worktree". Each workspace automatically gets its own working copy commit, and workspaces are tracked in the operation log. jj workspaces are simpler than Git worktrees because jj's change-based model does not require separate branch management per workspace.
 

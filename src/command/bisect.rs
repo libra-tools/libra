@@ -692,25 +692,7 @@ fn hashes_to_strings(hashes: &[ObjectHash]) -> Vec<String> {
 ///   safely if we cannot tell whether a worktree exists.
 /// - Underlying DB read failure -> fatal `CliError`.
 async fn is_bare_repository() -> CliResult<bool> {
-    fn parse_git_bool(value: &str) -> Option<bool> {
-        match value.trim() {
-            v if v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-                || v == "1" =>
-            {
-                Some(true)
-            }
-            v if v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-                || v.eq_ignore_ascii_case("off")
-                || v == "0" =>
-            {
-                Some(false)
-            }
-            _ => None,
-        }
-    }
+    use crate::internal::config::parse_git_bool;
 
     match ConfigKv::get("core.bare").await {
         Ok(Some(entry)) => parse_git_bool(&entry.value).ok_or_else(|| {

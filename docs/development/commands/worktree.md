@@ -49,7 +49,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/worktree.md`。
 - Synopsis：`libra worktree <subcommand>`（`add | list | lock | unlock | move | prune | remove | umount | repair`）。
-- 公开参数/子命令包括：`add <path>`、`list [--porcelain]`、`lock <path> [--reason <TEXT>]`、`unlock <path>`、`move <src> <dest>`、`prune`、`remove <path> [--delete-dir]`、`umount <path> [--cleanup]`（Unix，别名 `unmount`）、`repair`。`list --porcelain` 经共享 `format_worktree_porcelain`（worktree.rs，被 worktree-fuse.rs 复用）为每个 worktree 输出 `worktree <path>`、该 worktree 自己 scope 的 `HEAD <sha>` 与 `branch <ref>`/`detached` 行（经 `Head::head_for_worktree_scope` 按 `worktree_id` 解析）、被锁定时 `locked [reason]`，条目间空行分隔；HEAD 无法解析（legacy symlink 布局或缺失/损坏 scope）的 entry 省略 HEAD 行，绝不把其它 worktree 的 sha 标给它。
+- 公开参数/子命令包括：`add <path>`、`list [--porcelain]`、`lock <path> [--reason <TEXT>]`、`unlock <path>`、`move <src> <dest>`、`prune`、`remove <path> [--delete-dir]`、`umount <path> [--cleanup]`（Unix，别名 `unmount`）、`repair [<path>]`（无参数：registry 去重 + main entry 兜底；带 path：按 registry v2 持久化的 stable `worktree_id` 重写目标 linked worktree 的 `.libra/worktree_id` 并补建 `commondir` 指针，绝不猜测身份 — 未注册路径与 main worktree 拒绝）。`list --porcelain` 经共享 `format_worktree_porcelain`（worktree.rs，被 worktree-fuse.rs 复用）为每个 worktree 输出 `worktree <path>`、该 worktree 自己 scope 的 `HEAD <sha>` 与 `branch <ref>`/`detached` 行（经 `Head::head_for_worktree_scope` 按 `worktree_id` 解析）、被锁定时 `locked [reason]`，条目间空行分隔；HEAD 无法解析（legacy symlink 布局或缺失/损坏 scope）的 entry 省略 HEAD 行，绝不把其它 worktree 的 sha 标给它。
 - 在 `worktree-fuse` 特性下（`src/command/worktree-fuse.rs`），`add` 子命令额外提供：`-f`/`--fuse`、`--branch <BRANCH>`、`-b`/`--create-branch <CREATE_BRANCH>`、`--from <FROM>`、`--privileged`、`--allow-other`。
 
 

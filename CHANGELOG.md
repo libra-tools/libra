@@ -4,6 +4,30 @@
 
 ### Changed
 
+- **Worktree registry v2 with persisted identities and `worktree repair
+  <path>` (v0.19.57, plan-20260714 Part C §C.7, W3 slice 1a)**:
+  `worktrees.json` moves to `{schema_version: 2, entries: [...]}` and each
+  linked entry now PERSISTS its stable `worktree_id`. A legacy v1 file is
+  upgraded in place under the registry lock by the first MUTATING worktree
+  command (ids backfilled from each worktree's gitdir, all v1 fields
+  preserved; lockless readers like `worktree list` never rewrite it);
+  every worktree command applies pending migrations before touching the
+  registry, so the 2026072401 capability marker refuses pre-v2 binaries at
+  connect time before they can misread or rewrite the v2 file, and the
+  renamed top-level key makes a v1 parser fail closed as a second belt.
+  Parsing discriminates on the top-level shape and validates the v2
+  identity invariants (main has no id, linked entries must have one), so
+  hybrid/malformed files are refused instead of reinterpreted.
+  `worktree repair <path>` restores a linked worktree's missing or corrupt
+  `.libra/worktree_id` and `commondir` from the registry's persisted id —
+  never a guess — so the worktree maps back to its own scoped
+  HEAD/index/stash state; a commondir validly pointing at a different
+  storage is refused without touching either file, unregistered paths, the
+  main worktree, and a still-v1 registry (no persisted identities — run the
+  no-arg repair once to upgrade) are refused, `worktree list` prefers the
+  persisted id,
+  and the identity-corruption hints now point at the path form.
+
 - **gc/repack run in multi-worktree repositories via the typed GC root
   inventory (v0.19.56, plan-20260714 Part C §C.4.3, W2 final slice)**: the
   versioned `GC_OBJECT_SOURCE_INVENTORY` accounts for every persistent

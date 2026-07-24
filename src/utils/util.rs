@@ -310,7 +310,8 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
                     io::ErrorKind::InvalidData,
                     format!(
                         "worktree commondir pointer at '{}' is empty; the linked worktree is \
-                         corrupt — run `libra worktree repair`",
+                         corrupt — run `libra worktree repair <worktree-path>` from the main \
+                         worktree",
                         commondir_file.display()
                     ),
                 ));
@@ -330,8 +331,9 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
         Err(err) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "cannot read worktree commondir pointer at '{}': {err}; the linked worktree is \
-                 corrupt — run `libra worktree repair`",
+                "cannot read worktree commondir pointer at '{}': {err}; the linked worktree \
+                 is corrupt — run `libra worktree repair <worktree-path>` from the main \
+                 worktree",
                 commondir_file.display()
             ),
         )),

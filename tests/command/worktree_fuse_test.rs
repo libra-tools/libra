@@ -401,3 +401,51 @@ async fn test_fuse_worktree_add_with_branch_and_create_branch() {
     assert_eq!(state.worktrees.len(), 1);
     assert_eq!(state.worktrees[0].branch, "feature/fuse-wt");
 }
+
+/// Regression (W3 §C.7): the fuse build REPLACES the worktree subcommand
+/// surface, and its `Repair` variant must accept the same optional path as
+/// the legacy command — `libra worktree repair <path>` restores a linked
+/// worktree's gitdir identity in `--features worktree-fuse` builds too. No
+/// FUSE mount is involved; this guards the CLI surface only.
+#[test]
+fn repair_path_restores_identity_in_fuse_build() {
+    let dir = tempdir().expect("tempdir");
+    let main = dir.path();
+    assert_cli_success(&run_libra_command(&["init", "--vault=false"], main), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "t"], main),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t"], main),
+        "email",
+    );
+    fs::write(main.join("a.txt"), "a").expect("seed file");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], main),
+        "commit",
+    );
+
+    let wt = main.join("wt-fuse-repair");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add (non-fuse) in fuse build",
+    );
+    let id_file = wt.join(".libra").join("worktree_id");
+    let original_id = fs::read_to_string(&id_file)
+        .expect("gitdir id")
+        .trim()
+        .to_string();
+    fs::remove_file(&id_file).expect("drop id file");
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main),
+        "worktree repair <path> in fuse build",
+    );
+    let restored = fs::read_to_string(&id_file)
+        .expect("restored id")
+        .trim()
+        .to_string();
+    assert_eq!(restored, original_id, "identity restored from the registry");
+}

@@ -998,7 +998,7 @@ pub async fn init_mcp_server(working_dir: &Path) -> Arc<LibraMcpServer> {
         tracing::warn!(
             working_dir = %working_dir.display(),
             %error,
-            "storage-root resolution failed for the MCP server; falling back to <working_dir>/.libra — run `libra worktree repair` for a linked worktree"
+            "storage-root resolution failed for the MCP server; falling back to <working_dir>/.libra — run `libra worktree repair <worktree-path>` for a linked worktree"
         );
         working_dir.join(".libra")
     });
