@@ -170,15 +170,17 @@ fn corrupt_commondir_fails_closed_not_phantom_repo() {
         "a corrupt commondir must fail closed, not operate on a phantom repo"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The failure happens at path resolution (repo-not-found), NOT by routing
-    // the DB lookup at a phantom `<wt>/.libra/libra.db` — the pre-fix symptom.
+    // The failure happens at path resolution, NOT by routing the DB lookup
+    // at a phantom `<wt>/.libra/libra.db` — the pre-fix symptom. Since
+    // W3-s1b the resolver's own diagnosis surfaces VERBATIM (LBR-REPO-003 +
+    // the repair hint) instead of being masked as repo-not-found.
     assert!(
         !stderr.contains(".libra/libra.db"),
         "must not route db lookups at the phantom local gitdir: {stderr}"
     );
     assert!(
-        stderr.contains("LBR-REPO-001") || stderr.contains("not a libra repository"),
-        "fails closed at repo resolution: {stderr}"
+        stderr.contains("Error-Code: LBR-REPO-003") && stderr.contains("worktree repair"),
+        "fails closed with the actionable corrupt-commondir diagnosis: {stderr}"
     );
 }
 
@@ -1350,13 +1352,26 @@ fn readded_worktree_does_not_inherit_bisect_session() {
         "bisect start",
     );
 
-    // Remove the worktree MID-BISECT, clear its directory, and re-add at the
-    // same path (same deterministic worktree id).
-    assert_cli_success(
-        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
-        "worktree remove",
+    // W3-s1b (§C.7): a worktree with an ACTIVE bisect refuses BOTH remove
+    // modes — detaching would strand the session behind the fail-closed
+    // gate, deleting would destroy it.
+    let refused = run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "remove must refuse mid-bisect: {}",
+        String::from_utf8_lossy(&refused.stderr)
     );
-    fs::remove_dir_all(&wt).expect("clear removed worktree dir");
+    assert_cli_success(
+        &run_libra_command(&["bisect", "reset"], &wt),
+        "bisect reset before removal",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "remove", "--delete-dir", wt.to_str().unwrap()],
+            main,
+        ),
+        "worktree remove --delete-dir",
+    );
     assert_cli_success(
         &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
         "worktree re-add",
@@ -1687,12 +1702,13 @@ fn remove_gcs_private_head_rows() {
     );
 }
 
-/// W1 §C.4.1.1: removing a worktree purges its dirty-cache rows AND meta —
-/// a later re-add (fresh worktree_id) never inherits or leaks stale scope
-/// rows.
+/// W3-s1b (§C.7): keep-dir remove DETACHES and preserves the scope's rows
+/// (the directory still holds the user's state); only `--delete-dir` (and
+/// prune of a missing path) purges them. The add-time strict sweep still
+/// guarantees a fresh re-add never inherits stale rows.
 #[test]
 #[serial_test::serial]
-fn worktree_remove_purges_dirty_scope_rows() {
+fn worktree_remove_keep_dir_preserves_or_tombstones_scope() {
     let repo = repo_with_feature();
     let main = repo.path();
     let wt_root = tempfile::tempdir().expect("wt root");
@@ -1711,12 +1727,18 @@ fn worktree_remove_purges_dirty_scope_rows() {
         "linked manual mark",
     );
 
+    // W3-s1b (§C.7): keep-dir remove DETACHES — the directory and its scoped
+    // rows are preserved (deleting the rows would leave a directory that
+    // still operates but lost its HEAD); `--delete-dir` purges them.
     assert_cli_success(
         &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
-        "worktree remove",
+        "worktree remove (detach)",
+    );
+    assert!(
+        wt.join(".libra").join("detached_from_registry").exists(),
+        "detach writes the fail-closed marker"
     );
 
-    // In-process: no linked-scope rows survive in either dirty table.
     let _guard = libra::utils::test::ChangeDirGuard::new(main);
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -1732,7 +1754,41 @@ fn worktree_remove_purges_dirty_scope_rows() {
                 .expect("count")
                 .expect("row");
             let count: i64 = row.try_get_by_index(0).expect("count value");
-            assert_eq!(count, 0, "{table} keeps no removed-scope rows");
+            assert!(count > 0, "{table} PRESERVES the detached scope's rows");
+        }
+    });
+    drop(_guard);
+
+    // Re-add then --delete-dir: the destructive path purges the rows.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "re-attach",
+    );
+    // The re-attached worktree is dirty (dirt.txt); clean it so --delete-dir
+    // passes its dirty gate.
+    std::fs::remove_file(wt.join("dirt.txt")).expect("drop dirt");
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "remove", "--delete-dir", wt.to_str().unwrap()],
+            main,
+        ),
+        "worktree remove --delete-dir",
+    );
+    let _guard = libra::utils::test::ChangeDirGuard::new(main);
+    rt.block_on(async {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db = libra::internal::db::get_db_conn_instance().await;
+        for table in ["working_dirty", "working_dirty_meta"] {
+            let row = db
+                .query_one(Statement::from_string(
+                    db.get_database_backend(),
+                    format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
+                ))
+                .await
+                .expect("count")
+                .expect("row");
+            let count: i64 = row.try_get_by_index(0).expect("count value");
+            assert_eq!(count, 0, "{table} keeps no rows after --delete-dir");
         }
     });
 }
@@ -2477,7 +2533,7 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
             .rollback_to(&conn, 2026072304)
             .await
             .expect("roll back capability marker");
-        assert_eq!(rolled, vec![2026072401]);
+        assert_eq!(rolled, vec![2026072402, 2026072401]);
         conn.close().await.expect("close");
     }
 
@@ -2873,4 +2929,592 @@ fn bare_repository_refuses_worktree_family() {
             .any(|line| line.trim() == "Error-Code: LBR-CLI-002"),
         "unparseable core.bare pins LBR-CLI-002: {stderr}"
     );
+}
+
+/// W3-s1b (§C.7): a detached worktree is FROZEN — every command inside it
+/// fails closed with a re-add/delete hint — and `worktree add` re-attaches
+/// it with its own scoped state intact (HEAD stays where it was).
+#[test]
+fn detached_worktree_fails_closed_until_reattach() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-detach");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "switch in linked worktree",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "detach",
+    );
+
+    // Frozen: reads and writes both refuse with the actionable hint.
+    for argv in [
+        vec!["status"],
+        vec!["log", "--oneline"],
+        vec!["switch", "main"],
+    ] {
+        let out = run_libra_command(&argv, &wt);
+        assert!(
+            !out.status.success(),
+            "{argv:?} must fail closed in a detached worktree"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("detached"),
+            "refusal explains the detached state for {argv:?}: {stderr}"
+        );
+    }
+
+    // Repeat keep-dir remove refuses (already detached).
+    let again = run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main);
+    assert!(!again.status.success(), "double detach refused");
+
+    // Re-attach restores the SAME scope: HEAD is still `feature`.
+    let readd = run_libra_command(&["--json", "worktree", "add", wt.to_str().unwrap()], main);
+    assert_cli_success(&readd, "re-attach");
+    let payload = parse_json_stdout(&readd);
+    assert_eq!(payload["data"]["reattached"], true);
+    assert!(
+        !wt.join(".libra").join("detached_from_registry").exists(),
+        "marker lifted on re-attach"
+    );
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head, "feature", "re-attached worktree resumes ITS OWN HEAD");
+}
+
+/// Re-attach refuses an identity mismatch: a directory recreated at the
+/// same path with a different (or missing) gitdir id is never adopted.
+#[test]
+fn reattach_refuses_identity_mismatch() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-swap");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "detach",
+    );
+    std::fs::write(wt.join(".libra").join("worktree_id"), "someone-else\n").expect("swap identity");
+    let refused = run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "re-attach must refuse a swapped identity"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("does not match"),
+        "identity mismatch explained: {stderr}"
+    );
+}
+
+/// W3-s1b crash matrix (§C.7): an interrupted `remove --delete-dir` —
+/// simulated by planting the journal row and deleting the directory by
+/// hand — is completed by `worktree repair`: scoped rows purged, entry
+/// dropped, journal resolved.
+#[tokio::test]
+async fn worktree_remove_delete_crash_repair() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-crash");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "seed scoped HEAD row",
+    );
+    let canonical_wt = wt.canonicalize().expect("canonical wt");
+    let worktree_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+
+    // Simulate the crash window: intent recorded, directory deleted, but
+    // neither the scoped cleanup nor the registry update happened.
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(&db_url).await.expect("connect repo db");
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        format!(
+            "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+             VALUES ('remove', '{worktree_id}', '{{\"path\":\"{}\",\"delete_dir\":true}}', 0);",
+            canonical_wt.to_string_lossy().replace('\\', "/")
+        ),
+    ))
+    .await
+    .expect("plant journal row");
+    conn.close().await.expect("close");
+    std::fs::remove_dir_all(&wt).expect("simulate deleted dir");
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair completes the interrupted remove",
+    );
+
+    let conn = Database::connect(&db_url).await.expect("reconnect");
+    for (query, what) in [
+        (
+            format!(
+                "SELECT COUNT(*) FROM reference WHERE worktree_id = '{worktree_id}' AND \
+                 kind = 'Head'"
+            ),
+            "scoped HEAD rows purged",
+        ),
+        (
+            "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+            "journal resolved",
+        ),
+        (
+            "SELECT COUNT(*) FROM worktree_lifecycle".to_string(),
+            "no lifecycle residue",
+        ),
+    ] {
+        let row = conn
+            .query_one(Statement::from_string(backend, query))
+            .await
+            .expect("query")
+            .expect("row");
+        let count: i64 = row.try_get_by_index(0).expect("count");
+        assert_eq!(count, 0, "{what}");
+    }
+
+    let list = run_libra_command(&["worktree", "list", "--json"], main);
+    assert_cli_success(&list, "list after repair");
+    let listed = parse_json_stdout(&list);
+    assert!(
+        !listed["data"]["worktrees"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|entry| entry["path"].as_str() == Some(canonical_wt.to_string_lossy().as_ref())),
+        "entry dropped after the completed remove"
+    );
+}
+
+/// §C.7: prune only acts on paths PROVEN missing — a stat failure that is
+/// not NotFound (here: a permission-denied parent) must not classify the
+/// worktree as missing.
+#[cfg(unix)]
+#[test]
+fn prune_does_not_treat_permission_error_as_missing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix_effective_root() {
+        eprintln!("skipped (running as root; permission bits are not enforced)");
+        return;
+    }
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("guarded");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Make the parent unreadable: stat on the worktree path now fails with
+    // EACCES, not NotFound.
+    let mut perms = std::fs::metadata(parent.path())
+        .expect("meta")
+        .permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(parent.path(), perms).expect("chmod 000");
+
+    let prune = run_libra_command(&["--json", "worktree", "prune"], main);
+
+    // Restore before asserting so cleanup works even on failure.
+    let mut restore = std::fs::metadata(parent.path())
+        .map(|m| m.permissions())
+        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o755));
+    restore.set_mode(0o755);
+    std::fs::set_permissions(parent.path(), restore).expect("chmod back");
+
+    assert_cli_success(&prune, "prune with unreadable entry");
+    let payload = parse_json_stdout(&prune);
+    assert_eq!(
+        payload["data"]["pruned_count"], 0,
+        "a permission error must not classify the worktree as missing"
+    );
+}
+
+#[cfg(unix)]
+fn nix_effective_root() -> bool {
+    // SAFETY: geteuid has no preconditions and returns a plain integer.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `worktree remove --delete-dir .` run from INSIDE the target: the command
+/// must move its own cwd out before deleting, complete cleanly, and leave
+/// no journal/lifecycle residue.
+#[tokio::test]
+async fn remove_delete_dir_dot_from_inside_worktree() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-self-delete");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    let out = run_libra_command(&["worktree", "remove", "--delete-dir", "."], &wt);
+    assert!(
+        out.status.success(),
+        "remove --delete-dir . from inside the worktree: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!wt.exists(), "directory deleted");
+
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(&db_url).await.expect("connect repo db");
+    let backend = conn.get_database_backend();
+    for (query, what) in [
+        (
+            "SELECT COUNT(*) FROM worktree_intent_journal",
+            "journal resolved",
+        ),
+        (
+            "SELECT COUNT(*) FROM worktree_lifecycle",
+            "no lifecycle residue",
+        ),
+    ] {
+        let row = conn
+            .query_one(Statement::from_string(backend, query.to_string()))
+            .await
+            .expect("query")
+            .expect("row");
+        let count: i64 = row.try_get_by_index(0).expect("count");
+        assert_eq!(count, 0, "{what}");
+    }
+}
+
+/// Move-recovery ambiguity (§C.7): when the crash window leaves BOTH paths
+/// present (destination recreated by someone else) or BOTH missing, repair
+/// must KEEP the journal row and report — resolving would abandon a
+/// registry pointing at an unrelated directory.
+#[tokio::test]
+async fn move_crash_ambiguous_states_keep_journal() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-move-src");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let canonical_wt = wt.canonicalize().expect("canonical src");
+    let dest = main.join("wt-move-dest");
+    let worktree_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let plant = |payload: String| {
+        let db_url = db_url.clone();
+        let worktree_id = worktree_id.clone();
+        async move {
+            let conn = Database::connect(&db_url).await.expect("connect");
+            let backend = conn.get_database_backend();
+            conn.execute(Statement::from_string(
+                backend,
+                format!(
+                    "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
+                     created_at) VALUES ('move', '{worktree_id}', '{payload}', 0);"
+                ),
+            ))
+            .await
+            .expect("plant journal row");
+            conn.close().await.expect("close");
+        }
+    };
+    let journal_count = || {
+        let db_url = db_url.clone();
+        async move {
+            let conn = Database::connect(&db_url).await.expect("connect");
+            let backend = conn.get_database_backend();
+            let row = conn
+                .query_one(Statement::from_string(
+                    backend,
+                    "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+                ))
+                .await
+                .expect("query")
+                .expect("row");
+            let count: i64 = row.try_get_by_index(0).expect("count");
+            conn.close().await.expect("close");
+            count
+        }
+    };
+
+    // Case 1: Present/Present — entry registered at src, dest recreated.
+    std::fs::create_dir_all(&dest).expect("recreate dest");
+    let payload = format!(
+        "{{\"src\":\"{}\",\"dest\":\"{}\"}}",
+        canonical_wt.to_string_lossy(),
+        dest.to_string_lossy()
+    );
+    plant(payload.clone()).await;
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with ambiguous move (present/present)",
+    );
+    assert_eq!(
+        journal_count().await,
+        1,
+        "present/present ambiguity keeps the journal row"
+    );
+
+    // Case 2: Missing/Missing — both directories gone.
+    std::fs::remove_dir_all(&dest).expect("drop dest");
+    std::fs::remove_dir_all(&wt).expect("drop src");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with ambiguous move (missing/missing)",
+    );
+    assert_eq!(
+        journal_count().await,
+        1,
+        "missing/missing ambiguity keeps the journal row"
+    );
+
+    // Cleanup so the repo is not left with a pending journal (settle the
+    // move as never-started: restore src and remove dest).
+    std::fs::create_dir_all(wt.join(".libra")).expect("restore src shell");
+    std::fs::write(
+        wt.join(".libra").join("worktree_id"),
+        format!("{worktree_id}\n"),
+    )
+    .expect("restore id");
+    std::fs::write(
+        wt.join(".libra").join("commondir"),
+        format!("{}\n", main.join(".libra").display()),
+    )
+    .expect("restore commondir");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair settles the never-started move",
+    );
+    assert_eq!(
+        journal_count().await,
+        0,
+        "journal resolved once unambiguous"
+    );
+}
+
+/// Move recovery is IDENTITY-bound (§C.7): a stale move journal for
+/// worktree X must never rename X's directory onto a path now occupied by
+/// a DIFFERENT registry entry (here: a tombstone Y at the old destination).
+/// The row is kept and nothing moves.
+#[tokio::test]
+async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let x = main.join("wt-move-x");
+    let y = main.join("wt-move-y");
+    for wt in [&x, &y] {
+        assert_cli_success(
+            &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+            "worktree add",
+        );
+    }
+    let x_canonical = x.canonicalize().expect("canonical x");
+    let y_canonical = y.canonicalize().expect("canonical y");
+    let x_id = std::fs::read_to_string(x.join(".libra").join("worktree_id"))
+        .expect("x id")
+        .trim()
+        .to_string();
+    let y_id = std::fs::read_to_string(y.join(".libra").join("worktree_id"))
+        .expect("y id")
+        .trim()
+        .to_string();
+
+    // Turn Y into a tombstone: mark the registry entry, mirror the row,
+    // delete the directory.
+    let registry = main.join(".libra").join("worktrees.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry"))
+            .expect("registry json");
+    for entry in doc["entries"].as_array_mut().expect("entries") {
+        if entry["path"].as_str() == Some(y_canonical.to_string_lossy().as_ref()) {
+            entry["state"] = serde_json::json!("tombstone");
+        }
+    }
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&doc).expect("serialize"),
+    )
+    .expect("write registry");
+    std::fs::remove_dir_all(&y).expect("delete y dir");
+
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(&db_url).await.expect("connect");
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        format!(
+            "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, \
+             updated_at) VALUES ('{y_id}', 'tombstone', '{}', 0, 0);",
+            y_canonical.to_string_lossy()
+        ),
+    ))
+    .await
+    .expect("mirror row");
+    // Stale move journal for X targeting Y's (now-tombstoned) path.
+    conn.execute(Statement::from_string(
+        backend,
+        format!(
+            "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+             VALUES ('move', '{x_id}', '{{\"src\":\"{}\",\"dest\":\"{}\"}}', 0);",
+            x_canonical.to_string_lossy(),
+            y_canonical.to_string_lossy()
+        ),
+    ))
+    .await
+    .expect("plant move journal");
+    conn.close().await.expect("close");
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with a foreign-destination move journal",
+    );
+
+    // X untouched, journal kept, no rename onto Y's path.
+    assert!(x.is_dir(), "X's directory stays at its source");
+    assert!(!y.exists(), "nothing was renamed onto the tombstoned path");
+    let conn = Database::connect(&db_url).await.expect("reconnect");
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let count: i64 = row.try_get_by_index(0).expect("count");
+    assert_eq!(count, 1, "the ambiguous move journal row survives");
+}
+
+/// Stale re-attach journals must never unfreeze a LATER detach at the same
+/// path (linked ids are deterministic, so a delete/re-add/re-detach cycle
+/// reuses the id): repair rolls the stale intent back, the entry stays
+/// frozen, and the marker survives.
+#[tokio::test]
+async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-stale-reattach");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let canonical_wt = wt.canonicalize().expect("canonical wt");
+    let worktree_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+
+    // The worktree is CURRENTLY detached (a later detach the stale journal
+    // must not betray).
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "detach",
+    );
+
+    // Plant a stale re-attach journal (as if an earlier `worktree add`
+    // crashed after verification but its resolution was lost).
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(&db_url).await.expect("connect");
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        format!(
+            "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+             VALUES ('add', '{worktree_id}', '{{\"path\":\"{}\",\"reattach\":true}}', 0);",
+            canonical_wt.to_string_lossy()
+        ),
+    ))
+    .await
+    .expect("plant stale reattach journal");
+    conn.close().await.expect("close");
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with a stale reattach journal",
+    );
+
+    // Still frozen: marker present, registry still detached, and commands
+    // inside the directory still refuse.
+    assert!(
+        wt.join(".libra").join("detached_from_registry").exists(),
+        "the later detach stays frozen"
+    );
+    let status = run_libra_command(&["status"], &wt);
+    assert!(!status.status.success(), "directory remains fail-closed");
+    let registry = main.join(".libra").join("worktrees.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry"))
+            .expect("registry json");
+    let entry = doc["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(canonical_wt.to_string_lossy().as_ref()))
+        .expect("entry present");
+    assert_eq!(
+        entry["state"].as_str(),
+        Some("detached_from_registry"),
+        "registry stays detached"
+    );
+
+    // The stale row itself resolved as rolled back.
+    let conn = Database::connect(&db_url).await.expect("reconnect");
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let count: i64 = row.try_get_by_index(0).expect("count");
+    assert_eq!(count, 0, "stale reattach intent resolved as rolled back");
 }

@@ -59,8 +59,11 @@ Agent 机制是更高层的架构。它把 worktree 当作由 Libra 调度器（
 - `libra worktree add` 会创建一个空的关联目录，并在 `HEAD`
   存在时，将已提交的 `HEAD` 内容恢复到该目录中。它不会
   复制仅暂存（staged-only）的 index 状态。
-- `libra worktree remove` 会注销该 worktree，但有意不
-  删除目录，以降低意外丢数据的风险。
+- `libra worktree remove` 默认保留目录：自 v0.19.58 起为分离
+  （`detached_from_registry`——scoped 状态保留、目录内命令 fail-closed、
+  `worktree add` 按持久化 id 校验后重挂接）；`--delete-dir` 删除并
+  fsync 父目录后才清理 scoped 行，失败保留 tombstone 由 repair 重试；
+  add/move/remove/prune 均先写 durable intent journal。
 - `libra worktree repair` 会对注册表条目去重，并恢复
   「恰有一个条目是主 worktree」这一不变量。`repair <path>` 则依据
   registry 持久化的 stable id 恢复 linked worktree 缺失/损坏的

@@ -1744,6 +1744,14 @@ pub(crate) fn worktree_index_roots() -> CliResult<Vec<std::path::PathBuf>> {
         if entry.is_main {
             continue;
         }
+        // W3-s1b (§C.7): a TOMBSTONE proves the directory was durably
+        // deleted — its private index no longer exists to be a root (the
+        // scope's DB rows are still enumerated by the row-scan roots until
+        // repair finishes the cleanup). Every other registered state with a
+        // missing directory still fails the walk closed.
+        if entry.state == "tombstone" {
+            continue;
+        }
         if !entry.exists {
             return Err(CliError::fatal(format!(
                 "cannot enumerate worktree GC roots: registered worktree '{}' is missing on \

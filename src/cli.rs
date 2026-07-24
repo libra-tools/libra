@@ -1366,6 +1366,18 @@ fn repo_not_found_error(path: Option<&Path>) -> CliError {
     error
 }
 
+/// Map a repository-resolution failure without masking actionable states:
+/// only a genuine NotFound renders the classic "not a libra repository"
+/// message — a detached-from-registry marker or a corrupt commondir carries
+/// its own remedy (re-add/repair) and must reach the user verbatim.
+fn repo_resolution_error(error: std::io::Error, path: Option<&Path>) -> CliError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return repo_not_found_error(path);
+    }
+    CliError::fatal(error.to_string())
+        .with_stable_code(utils::error::StableErrorCode::RepoStateInvalid)
+}
+
 struct CommandPreflight {
     storage: Option<std::path::PathBuf>,
     /// When `true`, the repository database is opened through the pooled,
@@ -1475,24 +1487,25 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         Commands::Code(code_args) => {
             let working_dir = command::code::resolve_code_preflight_working_dir(code_args)?;
             let storage = utils::util::try_get_storage_path(Some(working_dir.clone()))
-                .map_err(|_| repo_not_found_error(Some(&working_dir)))?;
+                .map_err(|error| repo_resolution_error(error, Some(&working_dir)))?;
             Ok(CommandPreflight::repo(storage))
         }
         Commands::Graph(graph_args) => {
             let storage = utils::util::try_get_storage_path(graph_args.repo.clone())
-                .map_err(|_| repo_not_found_error(graph_args.repo.as_deref()))?;
+                .map_err(|error| repo_resolution_error(error, graph_args.repo.as_deref()))?;
             Ok(CommandPreflight::repo(storage))
         }
         Commands::Agent(command::agent::AgentArgs {
             command: command::agent::AgentSubcommand::Graph(graph_args),
         }) => {
             let storage = utils::util::try_get_storage_path(graph_args.repo.clone())
-                .map_err(|_| repo_not_found_error(graph_args.repo.as_deref()))?;
+                .map_err(|error| repo_resolution_error(error, graph_args.repo.as_deref()))?;
             Ok(CommandPreflight::repo(storage))
         }
         _ => {
             let storage =
-                utils::util::try_get_storage_path(None).map_err(|_| repo_not_found_error(None))?;
+                utils::util::try_get_storage_path(None)
+                    .map_err(|error| repo_resolution_error(error, None))?;
             Ok(CommandPreflight::repo(storage))
         }
     }

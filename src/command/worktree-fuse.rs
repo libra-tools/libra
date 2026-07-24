@@ -659,6 +659,7 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 locked: entry.locked,
                 lock_reason: entry.lock_reason.clone(),
                 exists: Path::new(&entry.path).exists(),
+                state: "active",
             });
         }
         return emit_json_data("worktree.list", &result, output);
@@ -680,6 +681,7 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 locked: entry.locked,
                 lock_reason: entry.lock_reason.clone(),
                 exists: Path::new(&entry.path).exists(),
+                state: "active",
             });
         }
         print!("{}", legacy::format_worktree_porcelain(&all).await);

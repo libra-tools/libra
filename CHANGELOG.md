@@ -4,6 +4,27 @@
 
 ### Changed
 
+- **Worktree lifecycle: detach instead of drop, tombstones, and a durable
+  intent journal (v0.19.58, plan-20260714 Part C §C.7, W3 slice 1b)**:
+  `worktree remove` (keep-dir) now DETACHES — the registry entry moves to
+  `detached_from_registry`, the worktree's scoped DB rows are preserved
+  (previously they were GC'd, leaving a directory that still operated but
+  lost its HEAD), and a gitdir marker fail-closes every command inside the
+  directory with a re-add/delete hint. `worktree add <path>` re-attaches a
+  detached worktree after verifying its gitdir identity against the
+  registry's persisted id. `--delete-dir` deletes + fsyncs the parent
+  BEFORE cleaning scoped rows; a cleanup failure keeps a `tombstone` entry
+  that `worktree repair` retries. Both modes refuse while a
+  rebase/cherry-pick/bisect is in progress; `prune` treats only a NotFound
+  stat as missing (permission errors never classify a worktree as
+  missing) and skips tombstones and active-sequencer scopes. add, move,
+  remove, and prune record a durable intent-journal row (migration
+  2026072402) before mutating; `worktree repair` rolls interrupted
+  operations forward or back deterministically (never deleting
+  directories), and the migration's down path refuses while any
+  detached/tombstone/journal state exists. `worktree list` reports each
+  entry's lifecycle state.
+
 - **Worktree registry v2 with persisted identities and `worktree repair
   <path>` (v0.19.57, plan-20260714 Part C §C.7, W3 slice 1a)**:
   `worktrees.json` moves to `{schema_version: 2, entries: [...]}` and each

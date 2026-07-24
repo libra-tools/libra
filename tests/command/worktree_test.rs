@@ -1859,10 +1859,21 @@ async fn test_worktree_remove_default_keeps_disk_directory() {
         wt_path.is_dir(),
         "default remove must preserve the directory on disk"
     );
-    let paths = worktree_paths();
+    // W3-s1b: the entry is RETAINED in `detached_from_registry` state (its
+    // scoped rows and directory are preserved) rather than dropped.
+    let state = read_worktree_state();
+    let detached = state
+        .entries
+        .iter()
+        .find(|w| w.path.ends_with("wt_keep"))
+        .expect("detached entry retained");
+    assert!(!detached.is_main);
     assert!(
-        !paths.iter().any(|p| p.ends_with("wt_keep")),
-        "registry should no longer track wt_keep, paths: {paths:?}"
+        wt_path
+            .join(".libra")
+            .join("detached_from_registry")
+            .exists(),
+        "detach writes the fail-closed marker"
     );
 }
 
@@ -1897,8 +1908,9 @@ async fn test_worktree_remove_json_reports_kept_directory() {
     assert_eq!(parsed["ok"], true);
     assert_eq!(parsed["command"], "worktree.remove");
     assert_eq!(parsed["data"]["path"], canonical.to_string_lossy().as_ref());
-    assert_eq!(parsed["data"]["registry_removed"], true);
+    assert_eq!(parsed["data"]["registry_removed"], false);
     assert_eq!(parsed["data"]["disk_directory_deleted"], false);
+    assert_eq!(parsed["data"]["detached"], true, "keep-dir remove detaches");
     assert!(
         wt_path.is_dir(),
         "json remove without --delete-dir must keep directory"

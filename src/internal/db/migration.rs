@@ -1067,6 +1067,17 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072401_worktree_registry_v2.sql"),
             include_str!("../../../sql/migrations/2026072401_worktree_registry_v2_down.sql"),
         ),
+        // plan-20260714 Part C W3-s1b (§C.7): worktree lifecycle
+        // (detached_from_registry / tombstone) mirror + durable intent
+        // journal for registry mutators. Down REFUSES (CHECK guard) while
+        // any lifecycle or journal row exists — v2 lifecycle must never be
+        // folded into a v1 active entry or silently dropped.
+        sql_migration(
+            2026072402,
+            "worktree_lifecycle_journal",
+            include_str!("../../../sql/migrations/2026072402_worktree_lifecycle_journal.sql"),
+            include_str!("../../../sql/migrations/2026072402_worktree_lifecycle_journal_down.sql"),
+        ),
     ]
 }
 
@@ -1312,9 +1323,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 39);
+        assert_eq!(runner.len(), 40);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072401));
+        assert_eq!(runner.max_registered_version(), Some(2026072402));
     }
 
     #[test]

@@ -52,7 +52,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302, 2026072303, 2026072304, 2026072401
+            2026072302, 2026072303, 2026072304, 2026072401, 2026072402
         ]
     );
     assert_eq!(
@@ -97,13 +97,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "layer_worktree_scope",
             "sparse_view_worktree_scope",
             "worktree_registry_v2",
+            "worktree_lifecycle_journal",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 39);
-    assert_eq!(runner.max_registered_version(), Some(2026072401));
+    assert_eq!(runner.len(), 40);
+    assert_eq!(runner.max_registered_version(), Some(2026072402));
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,7 +1096,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302, 2026072303, 2026072304, 2026072401
+            2026072302, 2026072303, 2026072304, 2026072401, 2026072402
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1284,7 +1285,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             .expect("restore 1407 after the 1406 link-only rollback guard"),
         vec![
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
-            2026072304, 2026072401
+            2026072304, 2026072401, 2026072402
         ]
     );
     conn.execute(Statement::from_string(
@@ -1347,7 +1348,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
         runner.run_pending(&conn).await.expect("M5 up #2"),
         vec![
             2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302,
-            2026072303, 2026072304, 2026072401
+            2026072303, 2026072304, 2026072401, 2026072402
         ]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
@@ -1449,7 +1450,7 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             .expect("upgrade immutable 1406 schema"),
         vec![
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
-            2026072304, 2026072401
+            2026072304, 2026072401, 2026072402
         ]
     );
     let claim = conn
@@ -1581,7 +1582,7 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             .expect("upgrade evolved 1406 schema"),
         vec![
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
-            2026072304, 2026072401
+            2026072304, 2026072401, 2026072402
         ]
     );
     let cursor = conn
@@ -1625,8 +1626,9 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101,
-            2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
+            2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1642,7 +1644,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         reapplied,
         vec![
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401
+            2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
+            2026072402
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1673,8 +1676,8 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101,
-            2026071901, 2026071407, 2026071406, 2026071405, 2026071404
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1690,7 +1693,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         applied,
         vec![
             2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201,
-            2026072301, 2026072302, 2026072303, 2026072304, 2026072401
+            2026072301, 2026072302, 2026072303, 2026072304, 2026072401, 2026072402
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -2035,11 +2038,12 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101,
-            2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402,
-            2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601,
-            2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401,
-            2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
+            2026071402, 2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701,
+            2026070601, 2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301,
+            2026061401, 2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801,
+            2026050601
         ]
     );
     assert!(
@@ -2067,7 +2071,8 @@ async fn approved_permission_up_down_up_round_trip() {
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401
+            2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
+            2026072402
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -2194,7 +2199,13 @@ async fn rebase_down_migration_rejects_linked_rows() {
         .rollback_to(&conn, 2026071901)
         .await
         .expect("rollback succeeds once only the main row remains");
-    assert_eq!(rolled, vec![2026072101]);
+    assert_eq!(
+        rolled,
+        vec![
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101
+        ]
+    );
     assert!(column_exists(&conn, "rebase_state", "id").await);
     assert!(!column_exists(&conn, "rebase_state", "worktree_id").await);
     let row = conn
@@ -2257,7 +2268,13 @@ async fn sequence_down_migration_rejects_linked_rows() {
         .rollback_to(&conn, 2026071407)
         .await
         .expect("rollback succeeds once only the main row remains");
-    assert_eq!(rolled, vec![2026071901]);
+    assert_eq!(
+        rolled,
+        vec![
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101, 2026071901
+        ]
+    );
     assert!(!column_exists(&conn, "sequence_state", "worktree_id").await);
     let row = conn
         .query_one(Statement::from_string(
@@ -2510,7 +2527,12 @@ async fn bisect_down_migration_rejects_linked_rows() {
         .rollback_to(&conn, 2026072201)
         .await
         .expect("rollback succeeds once only the main row remains");
-    assert_eq!(rolled, vec![2026072301]);
+    assert_eq!(
+        rolled,
+        vec![
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301
+        ]
+    );
     assert!(column_exists(&conn, "bisect_state", "id").await);
     assert!(column_exists(&conn, "bisect_state", "worktree_id").await);
     let row = conn
@@ -2761,7 +2783,7 @@ async fn layer_migration_fails_closed_with_linked_evidence() {
             .rollback_to(&conn, 2026072302)
             .await
             .expect("rollback layer scope"),
-        vec![2026072401, 2026072304, 2026072303]
+        vec![2026072402, 2026072401, 2026072304, 2026072303]
     );
     conn.execute(Statement::from_string(
         backend,
@@ -2810,7 +2832,7 @@ async fn layer_migration_fails_closed_with_linked_evidence() {
     .expect("clear linked evidence");
     assert_eq!(
         runner.run_pending(&conn).await.expect("retry succeeds"),
-        vec![2026072303, 2026072304, 2026072401]
+        vec![2026072303, 2026072304, 2026072401, 2026072402]
     );
     let row = conn
         .query_one(Statement::from_string(
@@ -3085,7 +3107,7 @@ async fn sparse_migration_projects_last_wins_toggle() {
             .rollback_to(&conn, 2026072303)
             .await
             .expect("rollback sparse scope"),
-        vec![2026072401, 2026072304]
+        vec![2026072402, 2026072401, 2026072304]
     );
     // Duplicate legacy rows: stale `true` (lower id) then effective `false`
     // (higher id) — `ConfigKv::get` reads the LAST one. Plus linked HEAD
@@ -3117,7 +3139,7 @@ async fn sparse_migration_projects_last_wins_toggle() {
             .run_pending(&conn)
             .await
             .expect("falsy effective toggle does not trip the guard"),
-        vec![2026072304, 2026072401]
+        vec![2026072304, 2026072401, 2026072402]
     );
     let row = conn
         .query_one(Statement::from_string(
@@ -3150,7 +3172,7 @@ async fn sparse_migration_fails_closed_with_linked_evidence() {
             .rollback_to(&conn, 2026072303)
             .await
             .expect("rollback sparse scope"),
-        vec![2026072401, 2026072304]
+        vec![2026072402, 2026072401, 2026072304]
     );
     conn.execute(Statement::from_string(
         backend,
@@ -3189,7 +3211,7 @@ async fn sparse_migration_fails_closed_with_linked_evidence() {
     .expect("clear legacy toggle");
     assert_eq!(
         runner.run_pending(&conn).await.expect("retry succeeds"),
-        vec![2026072304, 2026072401]
+        vec![2026072304, 2026072401, 2026072402]
     );
     assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
 }
@@ -3400,18 +3422,132 @@ async fn worktree_registry_v2_capability_marker_round_trip() {
             .rollback_to(&conn, 2026072304)
             .await
             .expect("rollback capability marker"),
-        vec![2026072401]
+        vec![2026072402, 2026072401]
     );
     assert!(!table_exists(&conn, "worktree_registry_capability").await);
 
     // Re-apply, then a second full pass is a no-op (idempotent DDL).
     assert_eq!(
         runner.run_pending(&conn).await.expect("re-apply"),
-        vec![2026072401]
+        vec![2026072401, 2026072402]
     );
     assert!(table_exists(&conn, "worktree_registry_capability").await);
     assert_eq!(
         runner.run_pending(&conn).await.expect("idempotent"),
         Vec::<i64>::new()
+    );
+}
+
+/// 2026072402 (§C.7 W3-s1b): the down migration REFUSES while any lifecycle
+/// (detached_from_registry / tombstone) or in-flight journal row exists —
+/// v2 lifecycle must never be folded into a v1 active entry or dropped.
+/// After the pending state is resolved, the rollback proceeds and re-apply
+/// is idempotent.
+#[tokio::test]
+async fn registry_v2_down_migration_rejects_nonterminal_state() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, updated_at) \
+         VALUES ('wt1', 'detached_from_registry', '/wt1', 0, 0);"
+            .to_string(),
+    ))
+    .await
+    .expect("lifecycle row");
+    let err = runner
+        .rollback_to(&conn, 2026072401)
+        .await
+        .expect_err("down must refuse while a detached row exists");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "refusal comes from the down-guard CHECK: {rendered}"
+    );
+    assert!(table_exists(&conn, "worktree_lifecycle").await);
+
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM worktree_lifecycle;".to_string(),
+    ))
+    .await
+    .expect("clear lifecycle");
+
+    // A pending journal row alone must refuse too.
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+         VALUES ('remove', 'wt1', '{}', 0);"
+            .to_string(),
+    ))
+    .await
+    .expect("journal row");
+    let err = runner
+        .rollback_to(&conn, 2026072401)
+        .await
+        .expect_err("down must refuse while a journal row exists");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "journal guard CHECK fires"
+    );
+
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM worktree_intent_journal;".to_string(),
+    ))
+    .await
+    .expect("clear journal");
+
+    // Linked-scope sequencer state alone must refuse too (§C.7 line 1261);
+    // main-scope rows (empty worktree_id) do not block.
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO rebase_state (worktree_id, head_name, onto, orig_head, current_head, \
+         todo, done) VALUES ('wt1', 'refs/heads/f', 'aa', 'bb', 'cc', '', '');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked rebase row");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO sequence_state (worktree_id, kind, head_name, head_orig, current_oid, \
+         todo) VALUES ('', 'CherryPick', 'refs/heads/m', 'dd', 'ee', '');"
+            .to_string(),
+    ))
+    .await
+    .expect("main sequencer row (must not block)");
+    let err = runner
+        .rollback_to(&conn, 2026072401)
+        .await
+        .expect_err("down must refuse while linked sequencer state exists");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "sequencer guard CHECK fires"
+    );
+    conn.execute(Statement::from_string(
+        backend,
+        "DELETE FROM rebase_state WHERE worktree_id = 'wt1';".to_string(),
+    ))
+    .await
+    .expect("clear linked rebase row");
+
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072401)
+            .await
+            .expect("rollback proceeds once terminal"),
+        vec![2026072402]
+    );
+    assert!(!table_exists(&conn, "worktree_lifecycle").await);
+    assert!(!table_exists(&conn, "worktree_intent_journal").await);
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("re-apply"),
+        vec![2026072402]
     );
 }

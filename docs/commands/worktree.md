@@ -65,8 +65,9 @@ libra --machine worktree list
 ```
 
 Structured output uses the `worktree.list` command envelope. Each entry reports
-`kind`, `path`, `is_main`, `locked`, `lock_reason`, and whether the path currently
-exists on disk.
+`kind`, `path`, `is_main`, `locked`, `lock_reason`, whether the path currently
+exists on disk, the persisted `worktree_id`, and the lifecycle `state`
+(`active`, `detached_from_registry`, or `tombstone` — see `remove`).
 
 ### Subcommand: `lock`
 
@@ -115,7 +116,13 @@ libra --json worktree move ../my-feature ../my-feature-v2
 
 ### Subcommand: `prune`
 
-Remove worktrees from the registry whose directories no longer exist on disk. The main worktree and locked worktrees are never pruned.
+Remove worktrees from the registry whose directories no longer exist on disk.
+Only a path whose stat fails with NotFound counts as missing — a permission
+error or an unmounted volume never classifies a worktree as missing. The main
+worktree, locked worktrees, tombstone entries (repair's job), and scopes with
+an in-progress rebase/cherry-pick/bisect are never pruned. If a pruned
+entry's scoped-state cleanup fails, the entry is kept as a `tombstone` for
+`libra worktree repair` to retry (reported in the `tombstoned` field).
 
 ```bash
 libra worktree prune
@@ -124,11 +131,22 @@ libra --machine worktree prune
 
 ### Subcommand: `remove`
 
-Unregister a worktree from the state file. By default the directory on disk
-is intentionally left untouched to avoid destructive behavior. Pass
-`--delete-dir` for Git-style behavior — the directory is removed only after
-a dirty-state check passes. Cannot remove the main worktree or a locked
-worktree.
+Remove a worktree. By default (keep-dir) the directory on disk is
+intentionally left untouched — since v0.19.58 this DETACHES the worktree:
+the registry entry moves to the `detached_from_registry` state, its scoped
+database state (HEAD, index metadata, reflog, layer/sparse/dirty rows) is
+preserved, and a marker in the worktree's gitdir makes every command run
+inside the directory fail closed with a re-add/delete hint. Re-attach it
+with `libra worktree add <path>` (the directory's identity is verified
+against the registry's persisted id) or finish the removal with
+`--delete-dir`.
+
+Pass `--delete-dir` for Git-style behavior — the directory is removed only
+after a dirty-state check passes, the parent directory entry is fsynced,
+and only then the scoped database state is cleaned. If that cleanup fails,
+a `tombstone` entry remains and `libra worktree repair` retries it. Cannot
+remove the main worktree, a locked worktree, or one with an in-progress
+rebase/cherry-pick/bisect.
 
 | Argument / Flag | Description |
 |-----------------|-------------|
@@ -151,8 +169,9 @@ fatal: cannot delete dirty worktree '../dirty-feature' (uncommitted changes)
 ```
 
 Behavior intentionally differs from Git: Git's default deletes the directory.
-Libra keeps it by default to prevent accidental data loss; `--delete-dir`
-restores Git-like semantics opt-in. See
+Libra keeps it by default (as a frozen, re-attachable detached worktree) to
+prevent accidental data loss; `--delete-dir` restores Git-like semantics
+opt-in. See
 [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and
 [`compatibility/worktree-surface.md`](../development/commands/worktree.md)
 for the rationale.
@@ -194,7 +213,7 @@ JSON / machine output envelope:
 
 ### Subcommand: `repair`
 
-Repair worktree metadata. Without an argument, removes duplicate registry entries (same canonical path) and ensures exactly one main worktree entry exists; the state file is only rewritten when something actually changed.
+Repair worktree metadata. Without an argument, removes duplicate registry entries (same canonical path), ensures exactly one main worktree entry exists, and runs the W3 lifecycle recovery engine: stale intent-journal rows (from an interrupted add/move/remove/prune) are rolled forward or back deterministically (recovery never deletes directories), tombstone entries get their scoped cleanup retried, and detached markers plus the SQL lifecycle mirror are reconciled with the registry. The state file is only rewritten when something actually changed.
 
 With a path, restores that **linked** worktree's gitdir identity from the registry (registry v2): rewrites a missing or corrupt `.libra/worktree_id` from the entry's persisted stable id and restores a missing or corrupt (empty/unreadable) `commondir` pointer to this repository's shared storage. The identity always comes from the registry — never from a guess — so the repaired worktree maps back to its own scoped state (HEAD, index, stash snapshots) instead of a fresh scope or the main worktree's. A `commondir` that validly points at a **different** storage is refused (repair never silently re-homes a worktree onto another repository), and the refusal is side-effect free — neither gitdir file is touched. Unregistered paths and the main worktree are refused, and so is a registry still in the legacy v1 format (it carries no persisted identities) — run the no-argument `libra worktree repair` once to upgrade it, then retry.
 
@@ -392,7 +411,11 @@ single-line JSON.
   "ok": true,
   "command": "worktree.repair",
   "data": {
-    "changed": true
+    "changed": true,
+    "journal_recovered": 1,
+    "tombstones_cleaned": 1,
+    "tombstones_pending": 0,
+    "notes": ["completed interrupted remove of '/abs/path/wt'"]
   }
 }
 ```
@@ -426,7 +449,7 @@ Git's `git worktree lock` also supports `--reason`, and Libra preserves this. Lo
 
 ### Why does `remove` not delete directories on disk?
 
-Deleting files is a destructive operation that cannot be undone. Libra's `remove` only unregisters the worktree from the JSON state file, leaving the directory intact. This is a deliberate safety choice: the user can inspect and manually delete the directory when they are confident it is no longer needed. This also prevents accidental data loss if a worktree contains uncommitted work. Git's `git worktree remove` does delete the directory by default, which has been a source of lost work.
+Deleting files is a destructive operation that cannot be undone. Libra's default `remove` DETACHES the worktree instead: the directory, its scoped database state, and its identity stay intact while the entry moves to `detached_from_registry` and the directory is frozen (every command inside it fails closed with a re-add/delete hint). This is a deliberate safety choice: the user can re-attach with `worktree add`, or finish the removal with `--delete-dir` once confident nothing is needed. It also prevents accidental data loss if a worktree contains uncommitted work. Git's `git worktree remove` deletes the directory by default, which has been a source of lost work.
 
 ### Why does `move` reject locked worktrees?
 
@@ -448,7 +471,7 @@ When creating a linked worktree, Libra restores content from the HEAD commit rat
 | Unlock | `worktree unlock <path>` | `worktree unlock <worktree>` | N/A |
 | Move | `worktree move <src> <dest>` | `worktree move <worktree> <new-path>` | N/A |
 | Prune | `worktree prune` | `worktree prune [--dry-run]` | N/A (automatic) |
-| Remove | `worktree remove <path>` (registry only) | `worktree remove [--force] <worktree>` (deletes dir) | `workspace forget <name>` |
+| Remove | `worktree remove <path>` (detaches — directory + state kept, frozen) | `worktree remove [--force] <worktree>` (deletes dir) | `workspace forget <name>` |
 | Repair | `worktree repair [<path>]` | `worktree repair [<path>...]` | N/A |
 | Alias | `wt` | N/A | N/A |
 | Branch per worktree | Not supported | Automatic (new branch or existing) | Automatic (new working copy commit) |

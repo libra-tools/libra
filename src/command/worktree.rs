@@ -149,7 +149,50 @@ pub(crate) struct WorktreeEntry {
     /// gitdir (or the canonical-path synthesis fallback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     worktree_id: Option<String>,
+    /// Lifecycle state (W3-s1b). Absent in files written before v0.19.58;
+    /// serde defaults it to `Active`.
+    #[serde(default, skip_serializing_if = "WorktreeEntryState::is_active")]
+    state: WorktreeEntryState,
 }
+
+/// Lifecycle state of a registry entry (W3-s1b, §C.7).
+///
+/// * `Active` — a normal registered worktree (default; not serialized).
+/// * `DetachedFromRegistry` — `worktree remove` (keep-dir) unregistered the
+///   directory: its scoped DB rows are KEPT (the directory still holds the
+///   user's files and would otherwise lose its HEAD), and every command in
+///   that directory fails closed via the gitdir marker until re-add or
+///   `--delete-dir` completes.
+/// * `Tombstone` — `--delete-dir` durably deleted the directory but the
+///   scoped-row cleanup failed; `worktree repair` retries it. Only a
+///   tombstone proves the directory is gone, letting GC stop treating its
+///   private index as a potential root.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorktreeEntryState {
+    #[default]
+    Active,
+    DetachedFromRegistry,
+    Tombstone,
+}
+
+impl WorktreeEntryState {
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::DetachedFromRegistry => "detached_from_registry",
+            Self::Tombstone => "tombstone",
+        }
+    }
+}
+
+/// Gitdir marker file that fail-closes every command inside a
+/// detached-from-registry worktree (checked by the storage resolver).
+pub(crate) const DETACHED_MARKER: &str = "detached_from_registry";
 
 /// Registry schema version this binary reads and writes.
 const REGISTRY_SCHEMA_VERSION: u32 = 2;
@@ -246,6 +289,7 @@ impl WorktreeState {
                             locked: entry.locked,
                             lock_reason: entry.lock_reason,
                             worktree_id: None,
+                            state: WorktreeEntryState::Active,
                         })
                         .collect(),
                 },
@@ -288,6 +332,13 @@ impl WorktreeState {
                     return Err(format!(
                         "main worktree entry '{}' must not carry a worktree_id",
                         entry.path
+                    ));
+                }
+                if !entry.state.is_active() {
+                    return Err(format!(
+                        "main worktree entry '{}' must be active, not {}",
+                        entry.path,
+                        entry.state.as_str()
                     ));
                 }
             } else if entry
@@ -352,12 +403,19 @@ pub(crate) struct WorktreeListEntry {
     /// (`worktree_id IS NULL`), `Some(id)` = a linked worktree. Consumers must
     /// use this as the primary key, never the path.
     pub(crate) worktree_id: Option<String>,
+    /// Lifecycle state (W3-s1b): `active`, `detached_from_registry`, or
+    /// `tombstone`.
+    pub(crate) state: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 struct WorktreeAddOutput {
     path: String,
     already_exists: bool,
+    /// The path was a DETACHED worktree and this add re-attached it (its
+    /// scoped state and identity resume unchanged).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    reattached: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -387,6 +445,9 @@ struct WorktreeMoveOutput {
 struct WorktreePruneOutput {
     pruned: Vec<String>,
     pruned_count: usize,
+    /// Entries whose directory is gone but whose scoped cleanup failed —
+    /// kept as tombstones for `worktree repair` to retry.
+    tombstoned: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -394,11 +455,26 @@ struct WorktreeRemoveOutput {
     path: String,
     registry_removed: bool,
     disk_directory_deleted: bool,
+    /// Keep-dir remove (W3-s1b): the entry moved to `detached_from_registry`
+    /// — scoped DB rows are preserved and the directory is frozen until
+    /// re-add or `--delete-dir`.
+    detached: bool,
+    /// `--delete-dir` deleted the directory but the scoped-row cleanup
+    /// failed; a tombstone entry remains for `worktree repair` to retry.
+    tombstone: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct WorktreeRepairOutput {
     changed: bool,
+    /// Stale intent-journal rows rolled forward/back and resolved.
+    journal_recovered: usize,
+    /// Tombstone entries whose scoped cleanup finally succeeded.
+    tombstones_cleaned: usize,
+    /// Tombstone entries still pending (cleanup failed again).
+    tombstones_pending: usize,
+    /// Human-readable recovery notes (also printed).
+    notes: Vec<String>,
 }
 
 #[cfg(unix)]
@@ -649,7 +725,9 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             render_unlock_worktree(&result, output)
         }
         WorktreeSubcommand::Move { src, dest } => {
-            let result = move_worktree(src, dest).map_err(WorktreeError::into_cli_error)?;
+            let result = move_worktree(src, dest)
+                .await
+                .map_err(WorktreeError::into_cli_error)?;
             render_move_worktree(&result, output)
         }
         WorktreeSubcommand::Prune => {
@@ -675,7 +753,9 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                     repair_worktree_identity(path).map_err(WorktreeError::into_cli_error)?;
                 return render_repair_identity(&result, output);
             }
-            let result = repair_worktrees().map_err(WorktreeError::into_cli_error)?;
+            let result = repair_worktrees()
+                .await
+                .map_err(WorktreeError::into_cli_error)?;
             render_repair_worktrees(&result, output)
         }
     }
@@ -1049,6 +1129,7 @@ fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
             locked: false,
             lock_reason: None,
             worktree_id: None,
+            state: WorktreeEntryState::Active,
         });
         return Ok(true);
     }
@@ -1089,6 +1170,7 @@ fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
             locked: false,
             lock_reason: None,
             worktree_id: None,
+            state: WorktreeEntryState::Active,
         });
         Ok(true)
     }
@@ -1151,15 +1233,32 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
     }
 
     let mut state = load_state()?;
-    if state
+    if let Some(existing_index) = state
         .entries
         .iter()
-        .any(|w| Path::new(&w.path) == canonical_target)
+        .position(|w| Path::new(&w.path) == canonical_target)
     {
-        return Ok(WorktreeAddOutput {
-            path: canonical_target.to_string_lossy().to_string(),
-            already_exists: true,
-        });
+        match state.entries[existing_index].state {
+            // W3-s1b (§C.7): re-adding a DETACHED worktree re-attaches it —
+            // the frozen directory resumes with ITS OWN scoped state.
+            WorktreeEntryState::DetachedFromRegistry => {
+                return reattach_worktree(&mut state, existing_index, &canonical_target).await;
+            }
+            WorktreeEntryState::Tombstone => {
+                return Err(WorktreeError::OperationBlocked(format!(
+                    "'{}' is a tombstone (scoped cleanup pending); run `libra worktree \
+                     repair` first, then add",
+                    canonical_target.display()
+                )));
+            }
+            WorktreeEntryState::Active => {
+                return Ok(WorktreeAddOutput {
+                    path: canonical_target.to_string_lossy().to_string(),
+                    already_exists: true,
+                    reattached: false,
+                });
+            }
+        }
     }
 
     if target_exists
@@ -1212,7 +1311,8 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
     // sparse filters would silently re-gate ls-files/diff/hydrate, stale
     // layer ownership would block staging. Sweep the scope STRICTLY before
     // seeding; a sweep failure fails the add (fail closed, nothing seeded).
-    gc_worktree_scoped_rows_strict(&worktree_id, true)
+    let db = crate::internal::db::get_db_conn_instance().await;
+    gc_worktree_scoped_rows_strict(&db, &worktree_id, true)
         .await
         .map_err(|e| {
             WorktreeError::IoWrite(format!(
@@ -1221,6 +1321,19 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
                 target.display()
             ))
         })?;
+    // Durable intent for the whole gitdir/populate/registry window (§C.7).
+    // Failure paths below roll the filesystem back themselves; a CRASH
+    // leaves this row for `worktree repair`, whose `add` recovery sweeps
+    // the scope and resolves it (directories are never deleted in
+    // recovery).
+    let add_journal_id = journal_append(
+        &db,
+        "add",
+        Some(&worktree_id),
+        &serde_json::json!({ "path": canonical_target.to_string_lossy() }),
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
     create_worktree_gitdir(&storage, &link_path, &worktree_id).map_err(|source| {
         WorktreeError::IoWrite(format!(
             "failed to create per-worktree .libra gitdir in '{}': {source}",
@@ -1324,15 +1437,136 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
         // <path>` can later restore a corrupt/missing gitdir identity from
         // the registry.
         worktree_id: Some(worktree_id.clone()),
+        state: WorktreeEntryState::Active,
     });
     if let Err(e) = write_state(&state) {
         rollback_partial_add();
         return Err(e);
     }
+    if let Err(error) = journal_resolve(&db, add_journal_id).await {
+        tracing::warn!(
+            error,
+            "add journal entry not resolved; repair will reconcile"
+        );
+    }
 
     Ok(WorktreeAddOutput {
         path: canonical_target.to_string_lossy().to_string(),
         already_exists: false,
+        reattached: false,
+    })
+}
+
+/// Re-attach a detached worktree (W3-s1b, §C.7): verify the directory still
+/// carries the SAME identity the registry persisted, then lift the
+/// fail-closed marker and reactivate the entry. An identity mismatch (the
+/// directory was recreated or swapped) refuses — never silently adopt.
+async fn reattach_worktree(
+    state: &mut WorktreeState,
+    index: usize,
+    target: &Path,
+) -> WorktreeResult<WorktreeAddOutput> {
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let Some(expected_id) = state.entries[index].worktree_id.clone() else {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "cannot re-attach '{}': the registry entry has no persisted worktree id; run \
+             `libra worktree repair` first",
+            target.display()
+        )));
+    };
+    let gitdir = target.join(util::ROOT_DIR);
+    let current_id = fs::read_to_string(gitdir.join("worktree_id"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if current_id.as_deref() != Some(expected_id.as_str()) {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "cannot re-attach '{}': its gitdir identity ({}) does not match the registry's \
+             persisted id ({expected_id}); run `libra worktree repair {}` first",
+            target.display(),
+            current_id.as_deref().unwrap_or("missing"),
+            target.display()
+        )));
+    }
+    // The commondir must point at THIS repository's storage: a directory
+    // whose (mutable) id happens to match but whose commondir targets
+    // another repo must never be re-attached into this one. Missing or
+    // corrupt pointers are repair's job, not re-attach's.
+    let storage = util::storage_path();
+    let commondir_ok = fs::read_to_string(gitdir.join("commondir"))
+        .ok()
+        .and_then(|contents| {
+            contents
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+        })
+        .map(|existing| {
+            let existing_abs = if existing.is_absolute() {
+                existing
+            } else {
+                gitdir.join(existing)
+            };
+            fs::canonicalize(&existing_abs).unwrap_or(existing_abs)
+                == fs::canonicalize(&storage).unwrap_or_else(|_| storage.clone())
+        })
+        .unwrap_or(false);
+    if !commondir_ok {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "cannot re-attach '{}': its commondir pointer is missing, corrupt, or targets a \
+             different repository's storage; run `libra worktree repair {}` first",
+            target.display(),
+            target.display()
+        )));
+    }
+
+    let payload = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "reattach": true,
+    });
+    let journal_id = journal_append(&db, "add", Some(&expected_id), &payload)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
+
+    // Publish Active FIRST, then lift the marker: a crash in between leaves
+    // an Active entry whose gitdir still carries the marker — repair's
+    // reconcile pass removes a stale marker whose entry is Active with a
+    // matching id (and the pending journal row rolls the re-attach
+    // forward). The reverse order would leave an UNFROZEN detached entry.
+    state.entries[index].state = WorktreeEntryState::Active;
+    write_state(state)?;
+    let marker = gitdir.join(DETACHED_MARKER);
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            // Journal kept: repair finishes lifting the marker.
+            return Err(WorktreeError::IoWrite(format!(
+                "cannot remove the detached marker '{}' (run `libra worktree repair` to \
+                 finish the re-attach): {error}",
+                marker.display()
+            )));
+        }
+    }
+    if let Err(error) = lifecycle_delete(&db, &expected_id).await {
+        tracing::warn!(
+            error,
+            "lifecycle row not cleared on re-attach; repair reconciles"
+        );
+    }
+    if let Err(error) = journal_resolve(&db, journal_id).await {
+        tracing::warn!(
+            error,
+            "re-attach journal entry not resolved; repair will reconcile"
+        );
+    }
+
+    Ok(WorktreeAddOutput {
+        path: target.to_string_lossy().to_string(),
+        already_exists: false,
+        reattached: true,
     })
 }
 
@@ -1345,6 +1579,8 @@ fn render_add_worktree(result: &WorktreeAddOutput, output: &OutputConfig) -> Cli
     }
     if result.already_exists {
         println!("worktree already exists at {}", result.path);
+    } else if result.reattached {
+        println!("re-attached detached worktree at {}", result.path);
     } else {
         println!("{}", result.path);
     }
@@ -1375,26 +1611,225 @@ fn resolve_worktree_id(target: &Path) -> Option<String> {
 /// fresh worktree silently resume a dead session (a resumed bisect step even
 /// repaints candidate trees — data loss). Best-effort: a failure is logged,
 /// not fatal (the registry drop is the source of truth).
-async fn gc_worktree_scoped_rows(worktree_id: &str, directory_gone: bool) {
-    // Best-effort on the REMOVAL side only: `worktree add` re-sweeps the
-    // same scope STRICTLY before seeding (deterministic ids), so a failure
-    // logged here can never silently leak stale state into a future
-    // worktree at the same path.
-    if let Err(e) = gc_worktree_scoped_rows_strict(worktree_id, directory_gone).await {
-        tracing::warn!(worktree_id, error = %e, "failed to GC per-worktree rows");
-    }
-}
-
-/// Strict variant of [`gc_worktree_scoped_rows`]: the first failed DELETE
+/// Scoped-row sweep (W3-s1b: every caller is STRICT — a failed cleanup
+/// becomes a tombstone or fails the operation, never a silent orphan): the
+/// first failed DELETE
 /// aborts and surfaces the error. `worktree add` uses this as its pre-seed
 /// sweep — inheriting another (removed) worktree's rows must fail the add,
 /// not proceed with a polluted scope.
+/// Upsert this worktree's row in the SQL `worktree_lifecycle` mirror
+/// (§C.7 W3-s1b) — the down-migration guard and doctor read lifecycle state
+/// from SQL, so every registry state change writes the mirror too.
+async fn lifecycle_upsert(
+    db: &sea_orm::DatabaseConnection,
+    worktree_id: &str,
+    state: &str,
+    path: &str,
+) -> Result<(), String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let now = chrono::Utc::now().timestamp_millis();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(worktree_id) DO UPDATE SET state = excluded.state, \
+         path = excluded.path, updated_at = excluded.updated_at",
+        [
+            worktree_id.into(),
+            state.into(),
+            path.into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
+    .await
+    .map_err(|error| format!("cannot record worktree lifecycle state: {error}"))?;
+    Ok(())
+}
+
+/// Delete this worktree's lifecycle mirror row (entry back to active, or
+/// fully cleaned up).
+async fn lifecycle_delete(
+    db: &sea_orm::DatabaseConnection,
+    worktree_id: &str,
+) -> Result<(), String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM worktree_lifecycle WHERE worktree_id = ?",
+        [worktree_id.into()],
+    ))
+    .await
+    .map_err(|error| format!("cannot clear worktree lifecycle state: {error}"))?;
+    Ok(())
+}
+
+/// Every row of the SQL lifecycle mirror, for the repair sweep that keeps
+/// it convergent with the registry (stale rows would block the down
+/// migration forever; missing rows would let it proceed wrongly).
+async fn lifecycle_rows(db: &sea_orm::DatabaseConnection) -> Result<Vec<(String, String)>, String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let rows = db
+        .query_all(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT worktree_id, state FROM worktree_lifecycle".to_string(),
+        ))
+        .await
+        .map_err(|error| format!("cannot read the worktree lifecycle mirror: {error}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let id: String = row
+            .try_get_by_index(0)
+            .map_err(|error| format!("corrupt lifecycle row: {error}"))?;
+        let state: String = row
+            .try_get_by_index(1)
+            .map_err(|error| format!("corrupt lifecycle row: {error}"))?;
+        out.push((id, state));
+    }
+    Ok(out)
+}
+
+/// Tri-state path probe for recovery decisions: only a NotFound stat
+/// PROVES absence; any other error is AMBIGUOUS (permissions, an unmounted
+/// volume) and must keep the intent journal pending rather than letting a
+/// recovery branch guess.
+enum PathPresence {
+    Present,
+    Missing,
+    Unknown(String),
+}
+
+fn probe_path(path: &Path) -> PathPresence {
+    match fs::symlink_metadata(path) {
+        Ok(_) => PathPresence::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => PathPresence::Missing,
+        Err(error) => PathPresence::Unknown(error.to_string()),
+    }
+}
+
+/// A pending row in the durable intent journal.
+#[derive(Debug, Clone)]
+struct PendingIntent {
+    id: i64,
+    op: String,
+    worktree_id: Option<String>,
+    payload: serde_json::Value,
+}
+
+/// Record a registry-mutation intent BEFORE any filesystem/registry write
+/// (§C.7). SQLite cannot join a filesystem rename into one transaction, so
+/// this is the recovery anchor: a crash leaves the row behind and
+/// `worktree repair` rolls the operation forward or back deterministically.
+/// A journal write failure ABORTS the mutation (fail-closed).
+async fn journal_append(
+    db: &sea_orm::DatabaseConnection,
+    op: &str,
+    worktree_id: Option<&str>,
+    payload: &serde_json::Value,
+) -> Result<i64, String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let now = chrono::Utc::now().timestamp_millis();
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+             VALUES (?, ?, ?, ?)",
+            [
+                op.into(),
+                worktree_id.into(),
+                payload.to_string().into(),
+                now.into(),
+            ],
+        ))
+        .await
+        .map_err(|error| format!("cannot record the {op} intent journal entry: {error}"))?;
+    Ok(result.last_insert_id() as i64)
+}
+
+/// Resolve (delete) a journal row after the mutation is fully published.
+async fn journal_resolve(db: &sea_orm::DatabaseConnection, id: i64) -> Result<(), String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM worktree_intent_journal WHERE id = ?",
+        [id.into()],
+    ))
+    .await
+    .map_err(|error| format!("cannot resolve intent journal entry {id}: {error}"))?;
+    Ok(())
+}
+
+/// Enumerate stale pending intents for `worktree repair` recovery.
+async fn journal_pending(db: &sea_orm::DatabaseConnection) -> Result<Vec<PendingIntent>, String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let rows = db
+        .query_all(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT id, op, worktree_id, payload FROM worktree_intent_journal ORDER BY id"
+                .to_string(),
+        ))
+        .await
+        .map_err(|error| format!("cannot read the intent journal: {error}"))?;
+    let mut pending = Vec::new();
+    for row in rows {
+        let id: i64 = row
+            .try_get_by_index(0)
+            .map_err(|error| format!("corrupt intent journal row (id): {error}"))?;
+        let op: String = row
+            .try_get_by_index(1)
+            .map_err(|error| format!("corrupt intent journal row (op): {error}"))?;
+        let worktree_id: Option<String> = row
+            .try_get_by_index(2)
+            .map_err(|error| format!("corrupt intent journal row (worktree_id): {error}"))?;
+        let payload_raw: String = row
+            .try_get_by_index(3)
+            .map_err(|error| format!("corrupt intent journal row (payload): {error}"))?;
+        let payload = serde_json::from_str(&payload_raw)
+            .map_err(|error| format!("corrupt intent journal payload (id {id}): {error}"))?;
+        pending.push(PendingIntent {
+            id,
+            op,
+            worktree_id,
+            payload,
+        });
+    }
+    Ok(pending)
+}
+
+/// True when this scope has ACTIVE sequencer/rebase/bisect state — remove
+/// and prune refuse to detach/GC such a worktree (§C.7: "active
+/// sequencer/bisect … 默认拒绝"). Fails CLOSED (treated active) on a read
+/// error: an unreadable state must not be destroyed.
+async fn scoped_state_active(db: &sea_orm::DatabaseConnection, worktree_id: &str) -> bool {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    for table in ["sequence_state", "rebase_state", "bisect_state"] {
+        let query = format!("SELECT COUNT(*) FROM {table} WHERE worktree_id = ?");
+        match db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                &query,
+                [worktree_id.into()],
+            ))
+            .await
+        {
+            Ok(Some(row)) => match row.try_get_by_index::<i64>(0) {
+                Ok(0) => {}
+                Ok(_) => return true,
+                Err(_) => return true,
+            },
+            Ok(None) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 async fn gc_worktree_scoped_rows_strict(
+    db: &sea_orm::DatabaseConnection,
     worktree_id: &str,
     directory_gone: bool,
 ) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    let db = crate::internal::db::get_db_conn_instance().await;
     let mut stmts = vec![
         "DELETE FROM reference WHERE worktree_id = ? AND kind = 'Head'",
         "DELETE FROM reflog WHERE worktree_id = ?",
@@ -1498,6 +1933,7 @@ pub(crate) fn run_list_worktrees() -> WorktreeResult<WorktreeListOutput> {
                 kind: if w.is_main { "main" } else { "worktree" },
                 exists: Path::new(&w.path).exists(),
                 worktree_id,
+                state: w.state.as_str(),
                 path: w.path,
                 is_main: w.is_main,
                 locked: w.locked,
@@ -1695,7 +2131,7 @@ fn render_unlock_worktree(result: &WorktreeUnlockOutput, output: &OutputConfig) 
 /// - updates the registry to point at the new path and saves it, and then
 /// - renames the directory on disk, attempting to roll back registry changes
 ///   if the rename fails.
-fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMoveOutput> {
+async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMoveOutput> {
     let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
     let src_path = resolve_path(&src, "source worktree path")?;
@@ -1742,21 +2178,45 @@ fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMoveOutput
         )));
     }
 
+    // Durable intent BEFORE the first cross-medium mutation (§C.7): a crash
+    // between the registry write and the directory rename is rolled forward
+    // (or back) by `worktree repair` from this record.
+    let journal_worktree_id = state.entries[index]
+        .worktree_id
+        .clone()
+        .or_else(|| resolve_worktree_id(&src_path));
+    let payload = serde_json::json!({
+        "src": src_path.to_string_lossy(),
+        "dest": dest_path.to_string_lossy(),
+    });
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let journal_id = journal_append(&db, "move", journal_worktree_id.as_deref(), &payload)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
+
     let old_path = state.entries[index].path.clone();
     state.entries[index].path = dest_path.to_string_lossy().to_string();
     if let Err(e) = write_state(&state) {
         state.entries[index].path = old_path;
+        let _ = journal_resolve(&db, journal_id).await;
         return Err(e);
     }
 
     if let Err(e) = fs::rename(&src_path, &dest_path) {
         state.entries[index].path = old_path;
         write_state(&state)?;
+        let _ = journal_resolve(&db, journal_id).await;
         return Err(WorktreeError::IoWrite(format!(
             "failed to move worktree directory '{}' to '{}': {e}",
             src_path.display(),
             dest_path.display()
         )));
+    }
+    if let Err(error) = journal_resolve(&db, journal_id).await {
+        tracing::warn!(
+            error,
+            "move journal entry not resolved; repair will reconcile"
+        );
     }
 
     Ok(WorktreeMoveOutput {
@@ -1786,32 +2246,130 @@ fn render_move_worktree(result: &WorktreeMoveOutput, output: &OutputConfig) -> C
 async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
     let _registry_lock = acquire_registry_lock()?;
     let mut state = load_state()?;
-    let to_prune: Vec<_> = state
-        .entries
-        .iter()
-        .filter(|w| {
-            let path = Path::new(&w.path);
-            !path.exists() && !w.is_main && !w.locked
-        })
-        .map(|w| w.path.clone())
-        .collect();
 
+    // §C.7: prune only handles entries whose path is PROVEN missing
+    // (NotFound). Any other stat error — permissions, an unmounted volume —
+    // must NOT classify the worktree as missing; those entries are kept.
+    fn path_proven_missing(path: &Path) -> bool {
+        matches!(
+            fs::symlink_metadata(path),
+            Err(ref error) if error.kind() == io::ErrorKind::NotFound
+        )
+    }
+
+    let mut to_prune: Vec<(String, Option<String>)> = Vec::new();
+    for entry in &state.entries {
+        if entry.is_main || entry.locked || entry.state == WorktreeEntryState::Tombstone {
+            // Tombstones are repair's job (the directory is already gone by
+            // definition; only the scoped cleanup is pending).
+            continue;
+        }
+        if !path_proven_missing(Path::new(&entry.path)) {
+            continue;
+        }
+        let id = entry
+            .worktree_id
+            .clone()
+            .or_else(|| resolve_worktree_id(Path::new(&entry.path)));
+        to_prune.push((entry.path.clone(), id));
+    }
+
+    let mut pruned: Vec<String> = Vec::new();
+    let mut tombstoned: Vec<String> = Vec::new();
     if !to_prune.is_empty() {
-        for path in &to_prune {
-            if let Some(id) = resolve_worktree_id(Path::new(path)) {
-                gc_worktree_scoped_rows(&id, true).await;
+        let db = crate::internal::db::get_db_conn_instance().await;
+        // An entry with ACTIVE sequencer/bisect state is never pruned —
+        // its rows anchor the interrupted operation's objects.
+        let mut eligible: Vec<(String, Option<String>)> = Vec::new();
+        for (path, id) in to_prune {
+            if let Some(id_str) = id.as_deref()
+                && scoped_state_active(&db, id_str).await
+            {
+                continue;
+            }
+            eligible.push((path, id));
+        }
+        if !eligible.is_empty() {
+            let payload = serde_json::json!({
+                "paths": eligible.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            });
+            let journal_id = journal_append(&db, "prune", None, &payload)
+                .await
+                .map_err(WorktreeError::OperationBlocked)?;
+            let mut mirror_failed = false;
+            for (path, id) in &eligible {
+                // STRICT per-entry cleanup: a GC failure keeps the entry as
+                // a TOMBSTONE (the directory is proven missing) so the rows
+                // stay visible to repair and the down-migration guard —
+                // never silently orphaned.
+                let cleaned = if let Some(id_str) = id.as_deref() {
+                    match gc_worktree_scoped_rows_strict(&db, id_str, true).await {
+                        Ok(()) => {
+                            let _ = lifecycle_delete(&db, id_str).await;
+                            true
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                worktree_id = id_str,
+                                error,
+                                "prune cleanup failed; keeping a tombstone"
+                            );
+                            if let Err(mirror_error) = lifecycle_upsert(
+                                &db,
+                                id_str,
+                                WorktreeEntryState::Tombstone.as_str(),
+                                path,
+                            )
+                            .await
+                            {
+                                // Without the mirror row the down guard
+                                // cannot see this tombstone: keep the
+                                // journal row pending so repair retries.
+                                tracing::warn!(
+                                    worktree_id = id_str,
+                                    error = mirror_error,
+                                    "tombstone mirror write failed; journal kept for repair"
+                                );
+                                mirror_failed = true;
+                            }
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if cleaned {
+                    pruned.push(path.clone());
+                } else {
+                    tombstoned.push(path.clone());
+                }
+            }
+            let pruned_set: std::collections::HashSet<&String> = pruned.iter().collect();
+            for entry in &mut state.entries {
+                if tombstoned.contains(&entry.path) {
+                    entry.state = WorktreeEntryState::Tombstone;
+                }
+            }
+            state.entries.retain(|w| !pruned_set.contains(&w.path));
+            write_state(&state)?;
+            if mirror_failed {
+                tracing::warn!(
+                    "prune left a tombstone whose mirror write failed; the journal row \
+                     stays pending for `worktree repair`"
+                );
+            } else if let Err(error) = journal_resolve(&db, journal_id).await {
+                tracing::warn!(
+                    error,
+                    "prune journal entry not resolved; repair will reconcile"
+                );
             }
         }
-        state.entries.retain(|w| {
-            let path = Path::new(&w.path);
-            path.exists() || w.is_main || w.locked
-        });
-        write_state(&state)?;
     }
 
     Ok(WorktreePruneOutput {
-        pruned_count: to_prune.len(),
-        pruned: to_prune,
+        pruned_count: pruned.len(),
+        pruned,
+        tombstoned,
     })
 }
 
@@ -1866,84 +2424,375 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
             path: target.to_string_lossy().to_string(),
         });
     }
+    let entry_state = entry.state;
+    if entry_state == WorktreeEntryState::Tombstone {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{}' is a tombstone (directory already deleted, scoped cleanup pending); run \
+             `libra worktree repair` to retry the cleanup",
+            target.display()
+        )));
+    }
+    if !delete_dir && entry_state == WorktreeEntryState::DetachedFromRegistry {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{}' is already detached from the registry; re-add it or use --delete-dir",
+            target.display()
+        )));
+    }
 
-    // Resolve the instance id BEFORE any directory removal so its private
-    // HEAD/reflog rows can be GC'd (lore.md 2.1).
-    let worktree_id_for_gc = resolve_worktree_id(&target);
+    // The registry's PERSISTED id is authoritative (v2); the gitdir probe is
+    // only a fallback for pre-v2 rows the loader could not backfill.
+    let worktree_id_for_gc = state.entries[index]
+        .worktree_id
+        .clone()
+        .or_else(|| resolve_worktree_id(&target));
+
+    // Resolve the pooled connection ONCE, while the cwd-based path lookup
+    // is still valid — later steps may write the detached marker, after
+    // which any cwd-based storage resolution inside the target would fail.
+    let db = crate::internal::db::get_db_conn_instance().await;
+
+    // §C.7: a worktree with ACTIVE sequencer/rebase/bisect state refuses
+    // both remove modes — detaching would strand a half-finished operation
+    // behind the fail-closed gate, deleting would destroy it.
+    if let Some(id) = worktree_id_for_gc.as_deref()
+        && scoped_state_active(&db, id).await
+    {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{}' has an in-progress rebase/cherry-pick/bisect; finish or abort it there \
+             first",
+            target.display()
+        )));
+    }
 
     if delete_dir {
-        // Dirty-check: refuse on staged or unstaged changes. The check runs
-        // inside the target worktree so the ignore policy and storage path
-        // resolution match what the user would see if they ran `libra status`
-        // there.
-        let _guard = DirGuard::change_to(&target).map_err(|e| {
-            WorktreeError::IoRead(format!("cannot enter worktree '{}': {e}", target.display()))
-        })?;
-        // W1 §C.4.1.1: applied layer overlays are excluded from status by
-        // design, so they alone are not "uncommitted changes". This is a
-        // DESTRUCTIVE gate (`remove_dir_all` follows), so it must NOT consult
-        // the process-global advisory exclusion snapshot — another scope's
-        // refresh could hide REAL uncommitted files behind same-named overlay
-        // paths. The target scope's overlay set is read straight from the DB
-        // (fail-closed on error) and subtracted explicitly from the UNSTAGED
-        // side only; anything staged always refuses.
-        let overlay: std::collections::HashSet<String> =
-            crate::internal::layer::LayerStore::materialized_paths(
-                &crate::internal::worktree_scope::WorktreeScope::for_workdir(&target),
-            )
-            .await
-            .map_err(|e| {
-                WorktreeError::IoRead(format!(
-                    "cannot verify layer-owned paths before the dirty check: {e}"
-                ))
-            })?
-            .into_iter()
-            .map(|p| p.path)
-            .collect();
-        let staged = crate::command::status::changes_to_be_committed_safe()
-            .await
-            .map_err(|e| {
-                WorktreeError::IoRead(format!("failed to inspect worktree status: {e}"))
-            })?;
-        let unstaged = crate::command::status::changes_to_be_staged().map_err(|e| {
-            WorktreeError::IoRead(format!("failed to inspect worktree status: {e}"))
-        })?;
-        let is_real_change = |path: &std::path::PathBuf| {
-            crate::internal::layer::normalize_key(path).is_none_or(|key| !overlay.contains(&key))
-        };
-        let unstaged_dirty = unstaged
-            .new
-            .iter()
-            .chain(unstaged.modified.iter())
-            .chain(unstaged.deleted.iter())
-            .any(is_real_change)
-            || !unstaged.renamed.is_empty();
-        if !staged.is_empty() || unstaged_dirty {
+        remove_worktree_delete_dir(
+            &db,
+            &mut state,
+            index,
+            &target,
+            worktree_id_for_gc,
+            entry_state,
+        )
+        .await
+    } else {
+        remove_worktree_detach(&db, &mut state, index, &target, worktree_id_for_gc).await
+    }
+}
+
+/// Keep-dir remove (W3-s1b, §C.7): the directory and its scoped DB rows are
+/// PRESERVED — the entry moves to `detached_from_registry` and the gitdir
+/// gains a marker that fail-closes every command run inside the directory
+/// until re-add or `--delete-dir`. Deleting the scoped rows here would leave
+/// a directory that still operates as a repository but lost its HEAD.
+async fn remove_worktree_detach(
+    db: &sea_orm::DatabaseConnection,
+    state: &mut WorktreeState,
+    index: usize,
+    target: &Path,
+    worktree_id: Option<String>,
+) -> WorktreeResult<WorktreeRemoveOutput> {
+    let Some(worktree_id) = worktree_id else {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "cannot detach '{}': its stable worktree id is unknown; run `libra worktree \
+             repair` first",
+            target.display()
+        )));
+    };
+    let payload = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "delete_dir": false,
+    });
+    let journal_id = journal_append(db, "remove", Some(&worktree_id), &payload)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
+
+    // Recovery-ordered: lifecycle mirror → registry state → journal → the
+    // gitdir marker LAST. The marker fail-closes every storage resolution
+    // inside the target directory, so all cwd-sensitive work (DB access,
+    // registry writes — `remove .` runs with cwd IN the target) must finish
+    // before it appears. A crash before the marker leaves the journal row
+    // (or the detached entry) for `worktree repair`, whose reconcile pass
+    // rewrites missing markers from the registry.
+    lifecycle_upsert(
+        db,
+        &worktree_id,
+        WorktreeEntryState::DetachedFromRegistry.as_str(),
+        &target.to_string_lossy(),
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
+    state.entries[index].state = WorktreeEntryState::DetachedFromRegistry;
+    write_state(state)?;
+    // Marker BEFORE resolving the journal: if the marker write fails, the
+    // pending row makes `worktree repair` re-freeze the directory. The DB
+    // handle was resolved before the marker exists, so the resolve below
+    // cannot trip the gate even when cwd is inside the target.
+    write_detached_marker(target, &worktree_id)?;
+    if let Err(error) = journal_resolve(db, journal_id).await {
+        tracing::warn!(
+            error,
+            "detach journal entry not resolved; repair will reconcile"
+        );
+    }
+
+    Ok(WorktreeRemoveOutput {
+        path: target.to_string_lossy().into_owned(),
+        registry_removed: false,
+        disk_directory_deleted: false,
+        detached: true,
+        tombstone: false,
+    })
+}
+
+/// `--delete-dir` (W3-s1b, §C.7): dirty-check → delete + fsync parent →
+/// ONLY THEN clean scoped rows. A cleanup failure keeps the entry as a
+/// TOMBSTONE for `worktree repair` to retry — the rows are reachability
+/// roots until proven cleaned.
+async fn remove_worktree_delete_dir(
+    db: &sea_orm::DatabaseConnection,
+    state: &mut WorktreeState,
+    index: usize,
+    target: &Path,
+    worktree_id: Option<String>,
+    entry_state: WorktreeEntryState,
+) -> WorktreeResult<WorktreeRemoveOutput> {
+    let payload = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "delete_dir": true,
+    });
+    let journal_id = journal_append(db, "remove", worktree_id.as_deref(), &payload)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
+
+    // A DETACHED worktree's marker fail-closes the in-worktree dirty check;
+    // lift it for the check and restore it on refusal. Under the registry
+    // lock, and journaled, so a crash mid-window is rolled forward by
+    // repair (the registry entry still says detached).
+    let _marker_lifted = if entry_state == WorktreeEntryState::DetachedFromRegistry {
+        let marker = target.join(util::ROOT_DIR).join(DETACHED_MARKER);
+        match fs::remove_file(&marker) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                let _ = journal_resolve(db, journal_id).await;
+                return Err(WorktreeError::IoWrite(format!(
+                    "cannot lift the detached marker for the dirty check: {error}"
+                )));
+            }
+        }
+    } else {
+        false
+    };
+
+    let dirty = worktree_is_dirty(target).await;
+    match dirty {
+        Ok(false) => {}
+        Ok(true) => {
+            let restored = restore_marker_on_refusal(
+                entry_state == WorktreeEntryState::DetachedFromRegistry,
+                target,
+                worktree_id.as_deref(),
+            );
+            if restored {
+                let _ = journal_resolve(db, journal_id).await;
+            }
             return Err(WorktreeError::DirtyWorktree {
                 path: target.to_string_lossy().to_string(),
             });
         }
-        // Drop the guard so the cwd is restored before we rm -rf the target.
-        drop(_guard);
-        fs::remove_dir_all(&target).map_err(|e| {
-            WorktreeError::IoWrite(format!(
-                "failed to delete worktree directory '{}': {e}",
-                target.display()
-            ))
-        })?;
+        Err(error) => {
+            let restored = restore_marker_on_refusal(
+                entry_state == WorktreeEntryState::DetachedFromRegistry,
+                target,
+                worktree_id.as_deref(),
+            );
+            if restored {
+                let _ = journal_resolve(db, journal_id).await;
+            }
+            return Err(error);
+        }
     }
 
-    if let Some(id) = worktree_id_for_gc {
-        gc_worktree_scoped_rows(&id, delete_dir || !target.exists()).await;
+    // `remove --delete-dir .` runs with cwd INSIDE the target: move out
+    // before deleting it, or every later cwd-based lookup (and the user's
+    // shell) sits in a deleted directory.
+    if let Ok(cwd) = env::current_dir()
+        && cwd.starts_with(target)
+        && let Some(parent) = target.parent()
+    {
+        let _ = env::set_current_dir(parent);
     }
-    state.entries.remove(index);
-    write_state(&state)?;
+    if let Err(e) = fs::remove_dir_all(target) {
+        // Re-freeze a detached entry before surfacing the error — the
+        // journal row stays pending either way (no resolve on this path),
+        // so repair re-establishes whatever this restore could not.
+        let _ = restore_marker_on_refusal(
+            entry_state == WorktreeEntryState::DetachedFromRegistry,
+            target,
+            worktree_id.as_deref(),
+        );
+        return Err(WorktreeError::IoWrite(format!(
+            "failed to delete worktree directory '{}': {e}",
+            target.display()
+        )));
+    }
+    fsync_parent_best_effort(target);
+
+    let cleanup_failed = if let Some(id) = worktree_id.as_deref() {
+        match gc_worktree_scoped_rows_strict(db, id, true).await {
+            Ok(()) => {
+                let _ = lifecycle_delete(db, id).await;
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    worktree_id = id,
+                    error,
+                    "scoped-row cleanup failed after directory deletion; keeping a tombstone"
+                );
+                lifecycle_upsert(
+                    db,
+                    id,
+                    WorktreeEntryState::Tombstone.as_str(),
+                    &target.to_string_lossy(),
+                )
+                .await
+                .map_err(WorktreeError::OperationBlocked)?;
+                true
+            }
+        }
+    } else {
+        false
+    };
+
+    if cleanup_failed {
+        state.entries[index].state = WorktreeEntryState::Tombstone;
+    } else {
+        state.entries.remove(index);
+    }
+    write_state(state)?;
+    if let Err(error) = journal_resolve(db, journal_id).await {
+        tracing::warn!(
+            error,
+            "remove journal entry not resolved; repair will reconcile"
+        );
+    }
 
     Ok(WorktreeRemoveOutput {
         path: target.to_string_lossy().into_owned(),
-        registry_removed: true,
-        disk_directory_deleted: delete_dir,
+        registry_removed: !cleanup_failed,
+        disk_directory_deleted: true,
+        detached: false,
+        tombstone: cleanup_failed,
     })
+}
+
+/// Restore the detached marker after a refused `--delete-dir`. Returns
+/// whether the gate is intact again — when the restore FAILS, the caller
+/// keeps the journal row pending so `worktree repair` re-freezes the
+/// directory instead of leaving a detached entry unfrozen.
+fn restore_marker_on_refusal(
+    entry_is_detached: bool,
+    target: &Path,
+    worktree_id: Option<&str>,
+) -> bool {
+    // Restore UNCONDITIONALLY for detached entries: the marker may have
+    // been lifted for the dirty check, or may have been missing already
+    // (a crash between registry publication and marker creation) — either
+    // way, a refused delete must leave the directory frozen again.
+    if !entry_is_detached {
+        return true;
+    }
+    let Some(id) = worktree_id else {
+        return false;
+    };
+    match write_detached_marker(target, id) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not restore the detached marker after a refused delete; the \
+                 pending journal row lets `worktree repair` re-freeze the directory"
+            );
+            false
+        }
+    }
+}
+
+/// Write the fail-closed gitdir marker for a detached worktree.
+fn write_detached_marker(target: &Path, worktree_id: &str) -> WorktreeResult<()> {
+    let marker = target.join(util::ROOT_DIR).join(DETACHED_MARKER);
+    crate::utils::atomic_write::write_atomic(
+        &marker,
+        format!(
+            "{worktree_id}\nremoved from the worktree registry; re-add or delete this \
+             directory\n"
+        )
+        .as_bytes(),
+        true,
+    )
+    .map_err(|source| {
+        WorktreeError::IoWrite(format!(
+            "cannot write the detached marker '{}': {source}",
+            marker.display()
+        ))
+    })
+}
+
+/// Durably record the parent directory entry after a worktree deletion —
+/// the tombstone contract ("directory durably deleted") depends on it.
+/// Best-effort on platforms/filesystems that refuse directory fsync.
+fn fsync_parent_best_effort(target: &Path) {
+    if let Some(parent) = target.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+/// The in-worktree dirty check shared by `--delete-dir` (staged or real —
+/// non-overlay — unstaged changes refuse the destructive delete).
+async fn worktree_is_dirty(target: &Path) -> WorktreeResult<bool> {
+    let _guard = DirGuard::change_to(target).map_err(|e| {
+        WorktreeError::IoRead(format!("cannot enter worktree '{}': {e}", target.display()))
+    })?;
+    // W1 §C.4.1.1: applied layer overlays are excluded from status by
+    // design, so they alone are not "uncommitted changes". This is a
+    // DESTRUCTIVE gate (`remove_dir_all` follows), so it must NOT consult
+    // the process-global advisory exclusion snapshot — another scope's
+    // refresh could hide REAL uncommitted files behind same-named overlay
+    // paths. The target scope's overlay set is read straight from the DB
+    // (fail-closed on error) and subtracted explicitly from the UNSTAGED
+    // side only; anything staged always refuses.
+    let overlay: std::collections::HashSet<String> =
+        crate::internal::layer::LayerStore::materialized_paths(
+            &crate::internal::worktree_scope::WorktreeScope::for_workdir(target),
+        )
+        .await
+        .map_err(|e| {
+            WorktreeError::IoRead(format!(
+                "cannot verify layer-owned paths before the dirty check: {e}"
+            ))
+        })?
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    let staged = crate::command::status::changes_to_be_committed_safe()
+        .await
+        .map_err(|e| WorktreeError::IoRead(format!("failed to inspect worktree status: {e}")))?;
+    let unstaged = crate::command::status::changes_to_be_staged()
+        .map_err(|e| WorktreeError::IoRead(format!("failed to inspect worktree status: {e}")))?;
+    let is_real_change = |path: &std::path::PathBuf| {
+        crate::internal::layer::normalize_key(path).is_none_or(|key| !overlay.contains(&key))
+    };
+    let unstaged_dirty = unstaged
+        .new
+        .iter()
+        .chain(unstaged.modified.iter())
+        .chain(unstaged.deleted.iter())
+        .any(is_real_change)
+        || !unstaged.renamed.is_empty();
+    Ok(!staged.is_empty() || unstaged_dirty)
 }
 
 fn render_remove_worktree(result: &WorktreeRemoveOutput, output: &OutputConfig) -> CliResult<()> {
@@ -1953,14 +2802,22 @@ fn render_remove_worktree(result: &WorktreeRemoveOutput, output: &OutputConfig) 
     if output.quiet {
         return Ok(());
     }
-    if result.disk_directory_deleted {
+    if result.tombstone {
+        println!(
+            "Deleted worktree directory '{}', but the scoped-state cleanup failed — a \
+             tombstone entry remains; run `libra worktree repair` to retry.",
+            result.path
+        );
+    } else if result.disk_directory_deleted {
         println!(
             "Removed worktree '{}' from registry and deleted directory.",
             result.path
         );
     } else {
         println!(
-            "Removed worktree '{}' from registry. Directory kept on disk.",
+            "Detached worktree '{}' from the registry. Directory and its state kept on \
+             disk (frozen); re-add it with `libra worktree add` or delete it with \
+             `--delete-dir`.",
             result.path
         );
     }
@@ -2201,13 +3058,14 @@ fn render_repair_identity(
     Ok(())
 }
 
-fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
+async fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
     let _registry_lock = acquire_registry_lock()?;
     // The healing loader may itself rewrite the file (v1 upgrade, identity
     // invariants); report that as a change too.
     let bytes_before = fs::read(state_path()).ok();
     let mut state = load_state_for_repair()?;
     let mut changed = fs::read(state_path()).ok() != bytes_before;
+    let mut notes = Vec::new();
 
     let mut seen = HashSet::<PathBuf>::new();
     state.entries.retain(|w| {
@@ -2223,18 +3081,657 @@ fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
     if ensure_main_entry(&mut state).map_err(|source| WorktreeError::StateRepair { source })? {
         changed = true;
     }
+    if normalize_v2_ids(&mut state) {
+        changed = true;
+    }
+
+    // §C.7 W3-s1b recovery, in dependency order: stale intents first (they
+    // may settle an interrupted detach/move/re-attach), then tombstone
+    // retries, then marker + lifecycle-mirror reconciliation.
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let journal_recovered =
+        recover_pending_intents(&db, &mut state, &mut changed, &mut notes).await?;
+    let (tombstones_cleaned, tombstones_pending) =
+        retry_tombstones(&db, &mut state, &mut changed, &mut notes).await;
+    reconcile_lifecycle(&db, &mut state, &mut notes).await;
 
     if changed {
         let _ = normalize_v2_ids(&mut state);
         write_state(&state)?;
     }
 
-    Ok(WorktreeRepairOutput { changed })
+    Ok(WorktreeRepairOutput {
+        changed,
+        journal_recovered,
+        tombstones_cleaned,
+        tombstones_pending,
+        notes,
+    })
+}
+
+/// Roll every stale intent-journal row forward (or back) deterministically
+/// (§C.7). Recovery NEVER deletes directories, and it resolves a row ONLY
+/// from a proven state: any ambiguous observation (unreadable path, failed
+/// cleanup, unexpected directory combination) KEEPS the row pending with an
+/// explanatory note so the next repair retries instead of guessing.
+async fn recover_pending_intents(
+    db: &sea_orm::DatabaseConnection,
+    state: &mut WorktreeState,
+    changed: &mut bool,
+    notes: &mut Vec<String>,
+) -> WorktreeResult<usize> {
+    let pending = journal_pending(db)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
+    let mut recovered = 0usize;
+    for intent in pending {
+        let PendingIntent {
+            id,
+            op,
+            worktree_id,
+            payload,
+        } = intent;
+        let mut resolve_row = true;
+        match op.as_str() {
+            "remove" => {
+                let path = payload["path"].as_str().unwrap_or_default().to_string();
+                let delete_dir = payload["delete_dir"].as_bool().unwrap_or(false);
+                let entry_index = state
+                    .entries
+                    .iter()
+                    .position(|w| w.path == path && !w.is_main);
+                if delete_dir {
+                    let presence = probe_path(Path::new(&path));
+                    if let PathPresence::Unknown(error) = &presence {
+                        resolve_row = false;
+                        notes.push(format!(
+                            "cannot determine whether '{path}' still exists ({error}); \
+                             journal kept for the next repair"
+                        ));
+                    }
+                    if matches!(presence, PathPresence::Missing) {
+                        // Deletion happened; finish the cleanup.
+                        if let Some(idx) = entry_index {
+                            let entry_id = state.entries[idx].worktree_id.clone();
+                            if let Some(id_str) = entry_id.as_deref().or(worktree_id.as_deref()) {
+                                match gc_worktree_scoped_rows_strict(db, id_str, true).await {
+                                    Ok(()) => {
+                                        let _ = lifecycle_delete(db, id_str).await;
+                                        state.entries.remove(idx);
+                                        *changed = true;
+                                        notes.push(format!(
+                                            "completed interrupted remove of '{path}'"
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        state.entries[idx].state = WorktreeEntryState::Tombstone;
+                                        if let Err(mirror_error) = lifecycle_upsert(
+                                            db,
+                                            id_str,
+                                            WorktreeEntryState::Tombstone.as_str(),
+                                            &path,
+                                        )
+                                        .await
+                                        {
+                                            resolve_row = false;
+                                            notes.push(format!(
+                                                "tombstone mirror write for '{path}' failed \
+                                                 ({mirror_error}); journal kept for the \
+                                                 next repair"
+                                            ));
+                                        }
+                                        *changed = true;
+                                        notes.push(format!(
+                                            "remove of '{path}' left a tombstone (cleanup \
+                                             failed again: {error})"
+                                        ));
+                                    }
+                                }
+                            }
+                        } else if let Some(id_str) = worktree_id.as_deref() {
+                            match gc_worktree_scoped_rows_strict(db, id_str, true).await {
+                                Ok(()) => {
+                                    let _ = lifecycle_delete(db, id_str).await;
+                                }
+                                Err(error) => {
+                                    resolve_row = false;
+                                    notes.push(format!(
+                                        "scoped cleanup for the removed '{path}' failed \
+                                         ({error}); journal kept for the next repair"
+                                    ));
+                                }
+                            }
+                        }
+                    } else if matches!(presence, PathPresence::Present) {
+                        // Deletion never completed. NON-DESTRUCTIVE roll
+                        // back: restore the detached marker if this entry
+                        // was detached (the dirty-check window lifts it).
+                        if let Some(idx) = entry_index
+                            && state.entries[idx].state == WorktreeEntryState::DetachedFromRegistry
+                            && let Some(id_str) = state.entries[idx].worktree_id.clone().as_deref()
+                            && let Err(error) = write_detached_marker(Path::new(&path), id_str)
+                        {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "could not re-freeze detached '{path}' ({error}); journal \
+                                 kept for the next repair"
+                            ));
+                        }
+                        notes.push(format!(
+                            "interrupted `remove --delete-dir` of '{path}' rolled back \
+                             (directory still present; nothing was deleted by repair)"
+                        ));
+                    }
+                } else {
+                    // Keep-dir detach: roll FORWARD to the detached state.
+                    if let Some(idx) = entry_index {
+                        let entry_id = state.entries[idx].worktree_id.clone();
+                        if let Some(id_str) = entry_id.as_deref().or(worktree_id.as_deref()) {
+                            if let Err(error) = lifecycle_upsert(
+                                db,
+                                id_str,
+                                WorktreeEntryState::DetachedFromRegistry.as_str(),
+                                &path,
+                            )
+                            .await
+                            {
+                                resolve_row = false;
+                                notes.push(format!(
+                                    "lifecycle mirror write for '{path}' failed ({error}); \
+                                     journal kept for the next repair"
+                                ));
+                            }
+                            if let Err(error) = write_detached_marker(Path::new(&path), id_str) {
+                                resolve_row = false;
+                                notes.push(format!(
+                                    "could not freeze detached '{path}' ({error}); journal \
+                                     kept for the next repair"
+                                ));
+                            }
+                        }
+                        if state.entries[idx].state != WorktreeEntryState::DetachedFromRegistry {
+                            state.entries[idx].state = WorktreeEntryState::DetachedFromRegistry;
+                            *changed = true;
+                        }
+                        notes.push(format!("completed interrupted detach of '{path}'"));
+                    }
+                }
+            }
+            "add" => {
+                let path = payload["path"].as_str().unwrap_or_default().to_string();
+                if payload["reattach"].as_bool().unwrap_or(false) {
+                    // Finish a crashed re-attach ONLY for an entry already
+                    // PUBLISHED as Active (the crash sat between the
+                    // registry write and the marker removal). A still-
+                    // detached entry is NOT rolled forward: linked ids are
+                    // deterministic (path-derived), so this journal could
+                    // predate a delete/re-add/re-detach cycle at the same
+                    // path — unfreezing would betray that LATER detach. It
+                    // stays frozen (rerun `worktree add` to re-attach) and
+                    // the row resolves as rolled back.
+                    if let Some(idx) = state.entries.iter().position(|w| w.path == path) {
+                        match state.entries[idx].state {
+                            WorktreeEntryState::Active => {
+                                let marker =
+                                    Path::new(&path).join(util::ROOT_DIR).join(DETACHED_MARKER);
+                                match fs::remove_file(&marker) {
+                                    Ok(()) => {}
+                                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                    Err(error) => {
+                                        resolve_row = false;
+                                        notes.push(format!(
+                                            "could not lift the marker while completing \
+                                             the re-attach of '{path}' ({error}); journal \
+                                             kept for the next repair"
+                                        ));
+                                    }
+                                }
+                                if resolve_row {
+                                    if let Some(id_str) =
+                                        state.entries[idx].worktree_id.clone().as_deref()
+                                    {
+                                        let _ = lifecycle_delete(db, id_str).await;
+                                    }
+                                    notes.push(format!(
+                                        "completed interrupted re-attach of '{path}'"
+                                    ));
+                                }
+                            }
+                            WorktreeEntryState::DetachedFromRegistry => {
+                                notes.push(format!(
+                                    "stale re-attach intent for '{path}' rolled back — \
+                                     the entry is (still or again) detached and stays \
+                                     frozen; rerun `libra worktree add {path}` to \
+                                     re-attach it"
+                                ));
+                            }
+                            WorktreeEntryState::Tombstone => {
+                                notes.push(format!(
+                                    "stale re-attach intent for '{path}' resolved — the \
+                                     entry is now a tombstone"
+                                ));
+                            }
+                        }
+                    }
+                    if *changed {
+                        write_state(state)?;
+                    }
+                    if resolve_row {
+                        journal_resolve(db, id)
+                            .await
+                            .map_err(WorktreeError::OperationBlocked)?;
+                        recovered += 1;
+                    }
+                    continue;
+                }
+                let registered = state.entries.iter().any(|w| w.path == path);
+                if !registered && let Some(id_str) = worktree_id.as_deref() {
+                    // The add never published; sweep the scope it may have
+                    // seeded. The half-created directory (if any) is left
+                    // for the user — recovery never deletes directories.
+                    match gc_worktree_scoped_rows_strict(db, id_str, true).await {
+                        Ok(()) => {
+                            let _ = lifecycle_delete(db, id_str).await;
+                            notes.push(format!(
+                                "rolled back interrupted add of '{path}' (scoped rows \
+                                 swept; any partial directory was left in place)"
+                            ));
+                        }
+                        Err(error) => {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "sweep for the unpublished add of '{path}' failed \
+                                 ({error}); journal kept for the next repair"
+                            ));
+                        }
+                    }
+                }
+            }
+            "move" => {
+                let src = payload["src"].as_str().unwrap_or_default().to_string();
+                let dest = payload["dest"].as_str().unwrap_or_default().to_string();
+                let src_presence = probe_path(Path::new(&src));
+                let dest_presence = probe_path(Path::new(&dest));
+                if let PathPresence::Unknown(error) = &src_presence {
+                    resolve_row = false;
+                    notes.push(format!(
+                        "cannot determine whether '{src}' still exists ({error}); journal \
+                         kept for the next repair"
+                    ));
+                }
+                if let PathPresence::Unknown(error) = &dest_presence {
+                    resolve_row = false;
+                    notes.push(format!(
+                        "cannot determine whether '{dest}' exists ({error}); journal kept \
+                         for the next repair"
+                    ));
+                }
+                let src_exists = matches!(src_presence, PathPresence::Present);
+                let dest_missing = matches!(dest_presence, PathPresence::Missing);
+                let dest_exists = matches!(dest_presence, PathPresence::Present);
+                let src_missing = matches!(src_presence, PathPresence::Missing);
+                // Bind the intent to ITS worktree via the journal's persisted
+                // id — matching by path could adopt an unrelated entry that
+                // later came to occupy the source/destination (e.g. a
+                // tombstone), and rename a stranger's directory. Anything
+                // that does not line up EXACTLY is ambiguous: keep the row.
+                let expected_id = worktree_id.as_deref();
+                let entry_of_intent = expected_id.and_then(|journal_id| {
+                    state
+                        .entries
+                        .iter()
+                        .position(|w| w.worktree_id.as_deref() == Some(journal_id))
+                });
+                let dest_taken_by_other = state
+                    .entries
+                    .iter()
+                    .any(|w| w.path == dest && w.worktree_id.as_deref() != expected_id);
+                let src_taken_by_other = state
+                    .entries
+                    .iter()
+                    .any(|w| w.path == src && w.worktree_id.as_deref() != expected_id);
+                if resolve_row {
+                    match entry_of_intent {
+                        _ if expected_id.is_none() => {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "interrupted move '{src}' -> '{dest}' carries no worktree \
+                                 id; journal kept — investigate manually"
+                            ));
+                        }
+                        _ if dest_taken_by_other || src_taken_by_other => {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "interrupted move '{src}' -> '{dest}': another registry \
+                                 entry now occupies one of the paths; journal kept — \
+                                 resolve manually, then rerun repair"
+                            ));
+                        }
+                        Some(idx) if state.entries[idx].path == dest => {
+                            if src_exists && dest_missing {
+                                // Registry updated, rename never happened:
+                                // finish it (or roll the registry back).
+                                match fs::rename(&src, &dest) {
+                                    Ok(()) => {
+                                        notes.push(format!(
+                                            "completed interrupted move '{src}' -> '{dest}'"
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        state.entries[idx].path = src.clone();
+                                        *changed = true;
+                                        notes.push(format!(
+                                            "rolled back interrupted move '{src}' -> \
+                                             '{dest}' (rename failed: {error})"
+                                        ));
+                                    }
+                                }
+                            } else if src_missing && dest_exists {
+                                notes.push(format!(
+                                    "interrupted move '{src}' -> '{dest}' was already \
+                                     complete"
+                                ));
+                            } else {
+                                resolve_row = false;
+                                notes.push(format!(
+                                    "interrupted move '{src}' -> '{dest}' is ambiguous \
+                                     (src present: {src_exists}, dest present: \
+                                     {dest_exists}); journal kept — resolve the \
+                                     directories manually, then rerun repair"
+                                ));
+                            }
+                        }
+                        Some(idx) if state.entries[idx].path == src => {
+                            if src_missing && dest_exists {
+                                // Directory moved but the registry write was
+                                // lost: finish it.
+                                state.entries[idx].path = dest.clone();
+                                *changed = true;
+                                notes.push(format!(
+                                    "finished registry update for interrupted move \
+                                     '{src}' -> '{dest}'"
+                                ));
+                            } else if src_exists && dest_missing {
+                                notes.push(format!(
+                                    "interrupted move '{src}' -> '{dest}' never started; \
+                                     nothing to do"
+                                ));
+                            } else {
+                                resolve_row = false;
+                                notes.push(format!(
+                                    "interrupted move '{src}' -> '{dest}' is ambiguous \
+                                     (src present: {src_exists}, dest present: \
+                                     {dest_exists}); journal kept — resolve the \
+                                     directories manually, then rerun repair"
+                                ));
+                            }
+                        }
+                        Some(idx) => {
+                            resolve_row = false;
+                            let elsewhere = state.entries[idx].path.clone();
+                            notes.push(format!(
+                                "interrupted move '{src}' -> '{dest}': its worktree is \
+                                 now registered at '{elsewhere}'; journal kept — \
+                                 investigate manually"
+                            ));
+                        }
+                        None => {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "interrupted move '{src}' -> '{dest}': no registry entry \
+                                 carries its worktree id; journal kept — investigate \
+                                 manually, then rerun repair"
+                            ));
+                        }
+                    }
+                }
+            }
+            "prune" => {
+                if let Some(paths) = payload["paths"].as_array() {
+                    for value in paths {
+                        let path = value.as_str().unwrap_or_default().to_string();
+                        if state.entries.iter().any(|w| w.path == path && !w.is_main)
+                            && let PathPresence::Unknown(error) = probe_path(Path::new(&path))
+                        {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "cannot determine whether '{path}' still exists ({error}); \
+                                 journal kept for the next repair"
+                            ));
+                            continue;
+                        }
+                        if let Some(idx) = state.entries.iter().position(|w| {
+                            w.path == path
+                                && !w.is_main
+                                && matches!(probe_path(Path::new(&w.path)), PathPresence::Missing)
+                        }) {
+                            let entry_id = state.entries[idx].worktree_id.clone();
+                            let cleaned = if let Some(id_str) = entry_id.as_deref() {
+                                match gc_worktree_scoped_rows_strict(db, id_str, true).await {
+                                    Ok(()) => {
+                                        let _ = lifecycle_delete(db, id_str).await;
+                                        true
+                                    }
+                                    Err(error) => {
+                                        state.entries[idx].state = WorktreeEntryState::Tombstone;
+                                        if let Err(mirror_error) = lifecycle_upsert(
+                                            db,
+                                            id_str,
+                                            WorktreeEntryState::Tombstone.as_str(),
+                                            &path,
+                                        )
+                                        .await
+                                        {
+                                            resolve_row = false;
+                                            notes.push(format!(
+                                                "tombstone mirror write for '{path}' failed \
+                                                 ({mirror_error}); journal kept for the \
+                                                 next repair"
+                                            ));
+                                        }
+                                        *changed = true;
+                                        notes.push(format!(
+                                            "prune of '{path}' left a tombstone (cleanup \
+                                             failed: {error})"
+                                        ));
+                                        false
+                                    }
+                                }
+                            } else {
+                                true
+                            };
+                            if cleaned {
+                                state.entries.remove(idx);
+                                *changed = true;
+                                notes.push(format!("completed interrupted prune of '{path}'"));
+                            }
+                        }
+                    }
+                }
+            }
+            other => {
+                notes.push(format!("unknown intent op '{other}' (id {id}) resolved"));
+            }
+        }
+        // Persist the registry BEFORE resolving the intent: a crash after
+        // the resolve with only in-memory registry changes would silently
+        // lose the recovery (e.g. a reattach unfrozen with a still-detached
+        // persisted entry).
+        if *changed {
+            write_state(state)?;
+        }
+        if resolve_row {
+            journal_resolve(db, id)
+                .await
+                .map_err(WorktreeError::OperationBlocked)?;
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+
+/// Retry the scoped cleanup of every tombstone entry whose directory is
+/// still proven gone; a recreated directory is reported, never adopted.
+async fn retry_tombstones(
+    db: &sea_orm::DatabaseConnection,
+    state: &mut WorktreeState,
+    changed: &mut bool,
+    notes: &mut Vec<String>,
+) -> (usize, usize) {
+    let mut cleaned = 0usize;
+    let mut pending = 0usize;
+    let mut index = 0usize;
+    while index < state.entries.len() {
+        if state.entries[index].state != WorktreeEntryState::Tombstone {
+            index += 1;
+            continue;
+        }
+        let path = state.entries[index].path.clone();
+        let dir_missing = matches!(
+            fs::symlink_metadata(Path::new(&path)),
+            Err(ref error) if error.kind() == io::ErrorKind::NotFound
+        );
+        if !dir_missing {
+            pending += 1;
+            notes.push(format!(
+                "tombstone '{path}': a directory now exists at that path; not adopting it \
+                 — remove or rename it, then rerun repair"
+            ));
+            index += 1;
+            continue;
+        }
+        let Some(id) = state.entries[index].worktree_id.clone() else {
+            pending += 1;
+            index += 1;
+            continue;
+        };
+        match gc_worktree_scoped_rows_strict(db, &id, true).await {
+            Ok(()) => {
+                let _ = lifecycle_delete(db, &id).await;
+                state.entries.remove(index);
+                *changed = true;
+                cleaned += 1;
+                notes.push(format!("tombstone '{path}': scoped cleanup completed"));
+            }
+            Err(error) => {
+                pending += 1;
+                notes.push(format!(
+                    "tombstone '{path}': scoped cleanup failed again ({error}); will retry \
+                     on the next repair"
+                ));
+                index += 1;
+            }
+        }
+    }
+    (cleaned, pending)
+}
+
+/// Make every lifecycle artifact consistent with the registry (the
+/// authority): detached entries get their fail-closed marker and SQL
+/// mirror row rewritten; ACTIVE entries whose gitdir still carries a stale
+/// marker (a crashed re-attach) have it lifted when the identity matches;
+/// mirror rows whose entry is gone or active are deleted so they cannot
+/// block the down migration forever. Idempotent.
+async fn reconcile_lifecycle(
+    db: &sea_orm::DatabaseConnection,
+    state: &mut WorktreeState,
+    notes: &mut Vec<String>,
+) {
+    for entry in &state.entries {
+        let Some(id) = entry.worktree_id.as_deref() else {
+            continue;
+        };
+        let marker = Path::new(&entry.path)
+            .join(util::ROOT_DIR)
+            .join(DETACHED_MARKER);
+        match entry.state {
+            WorktreeEntryState::DetachedFromRegistry => {
+                if !marker.exists() && Path::new(&entry.path).is_dir() {
+                    match write_detached_marker(Path::new(&entry.path), id) {
+                        Ok(()) => {
+                            notes.push(format!("restored the detached marker for '{}'", entry.path))
+                        }
+                        Err(error) => notes.push(format!(
+                            "FAILED to restore the detached marker for '{}' ({error}); the \
+                             directory is NOT frozen — rerun repair after fixing the cause",
+                            entry.path
+                        )),
+                    }
+                }
+                let _ = lifecycle_upsert(
+                    db,
+                    id,
+                    WorktreeEntryState::DetachedFromRegistry.as_str(),
+                    &entry.path,
+                )
+                .await;
+            }
+            WorktreeEntryState::Tombstone => {
+                let _ =
+                    lifecycle_upsert(db, id, WorktreeEntryState::Tombstone.as_str(), &entry.path)
+                        .await;
+            }
+            WorktreeEntryState::Active => {
+                if marker.exists() {
+                    let gitdir_id = fs::read_to_string(
+                        Path::new(&entry.path)
+                            .join(util::ROOT_DIR)
+                            .join("worktree_id"),
+                    )
+                    .ok()
+                    .map(|value| value.trim().to_string());
+                    if gitdir_id.as_deref() == Some(id) {
+                        if fs::remove_file(&marker).is_ok() {
+                            notes.push(format!(
+                                "lifted a stale detached marker from active '{}'",
+                                entry.path
+                            ));
+                        }
+                    } else {
+                        notes.push(format!(
+                            "active '{}' carries a detached marker but its gitdir identity \
+                             does not match; leaving it frozen — investigate manually",
+                            entry.path
+                        ));
+                    }
+                }
+                let _ = lifecycle_delete(db, id).await;
+            }
+        }
+    }
+
+    // Sweep mirror rows with no matching non-active entry: they would block
+    // the down migration with nothing left to finish.
+    if let Ok(rows) = lifecycle_rows(db).await {
+        for (row_id, row_state) in rows {
+            let matching = state.entries.iter().find(|entry| {
+                entry.worktree_id.as_deref() == Some(row_id.as_str()) && !entry.state.is_active()
+            });
+            if matching.is_none() {
+                let _ = lifecycle_delete(db, &row_id).await;
+                notes.push(format!(
+                    "cleared an orphaned lifecycle row ({row_id}: {row_state})"
+                ));
+            }
+        }
+    }
 }
 
 fn render_repair_worktrees(result: &WorktreeRepairOutput, output: &OutputConfig) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.repair", result, output);
+    }
+    if !output.quiet {
+        for note in &result.notes {
+            println!("{note}");
+        }
+        if result.tombstones_pending > 0 {
+            println!(
+                "{} tombstone(s) still pending; rerun `libra worktree repair` after \
+                 addressing the notes above",
+                result.tombstones_pending
+            );
+        }
     }
     Ok(())
 }
@@ -2400,6 +3897,7 @@ mod tests {
                 locked: false,
                 lock_reason: None,
                 worktree_id: Some("abc123".to_string()),
+                state: WorktreeEntryState::Active,
             }],
         })
         .expect("serialize v2");

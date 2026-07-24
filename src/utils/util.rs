@@ -128,8 +128,12 @@ fn is_valid_storage_dir(path: &Path) -> bool {
     }
     // lore.md 2.1: a linked worktree's `.libra` holds only `commondir` +
     // `worktree_id` + `index` (db/objects live in the common storage), so
-    // recognize it by its commondir pointer.
-    if path.join("commondir").exists() {
+    // recognize it by its commondir pointer. A detached-from-registry
+    // marker also counts (W3-s1b): even if the commondir file was deleted,
+    // the walk must STOP here and fail closed on the marker — climbing to
+    // an ancestor repository would silently run commands in the WRONG
+    // scope.
+    if path.join("commondir").exists() || path.join("detached_from_registry").exists() {
         return true;
     }
 
@@ -298,6 +302,23 @@ pub fn find_git_repository(path: Option<&Path>) -> Option<GitRepositoryLocation>
 /// absent `commondir` (a main worktree) resolves to the gitdir itself.
 fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     let commondir_file = gitdir.join("commondir");
+    // W3-s1b (§C.7): a worktree removed from the registry with its directory
+    // kept carries a `detached_from_registry` marker — every command run
+    // inside it fails closed (its scoped state is preserved but frozen)
+    // until it is re-added or deleted. Checked only for LINKED worktrees
+    // (marker next to an existing commondir).
+    if gitdir.join("detached_from_registry").exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this worktree was removed from the registry (detached); from the main \
+                 worktree run `libra worktree add {}` to re-attach it, or `libra worktree \
+                 remove --delete-dir {}` to delete it",
+                gitdir.parent().unwrap_or(gitdir).display(),
+                gitdir.parent().unwrap_or(gitdir).display()
+            ),
+        ));
+    }
     match fs::read_to_string(&commondir_file) {
         Ok(contents) => {
             let raw = contents
