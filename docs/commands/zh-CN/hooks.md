@@ -39,6 +39,13 @@ Claude Code 与 Codex 暴露相同的七个 Claude-Code 风格生命周期事件
 | `stop` | 用户在 turn 中途按 Esc / 点击 Stop 按钮 |
 | `session-end` | 会话干净关闭 |
 
+对 Claude Code，`tool-use` verb 会**同时**为 `PreToolUse`（在工具运行前触发——
+提供更早的活跃信号）和 `PostToolUse`（在工具返回后触发）安装；两者都映射到 `ToolUse`
+生命周期事件——经 capture/traces 路径刷新活动会话的活跃（last-event）状态，但**不**
+物化 committed checkpoint（checkpoint 仅在 `stop` / `session-end` 落盘）。Claude 不注册
+任何 `Subagent*` 边界事件（只有 Codex 发出原生子 agent 边界），因此 Claude 磁盘上的子
+agent 内容被捕获为 `unresolved`。
+
 每个事件都会从 stdin 读取其提供商特定 JSON payload，运行脱敏流水线（secrets / tokens / 文件内容 >256 KiB），并将一条 `AgentTraceEvent` JSONL 记录追加到活动会话存储中。除非 payload 解析失败，否则 hook 返回退出码 0；提供商 hook 绝不能阻塞在 Libra 侧处理上。
 
 ## 选项

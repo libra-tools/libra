@@ -134,6 +134,18 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            ]
          }
        ],
+       "PreToolUse": [
+         {
+           "matcher": null,
+           "hooks": [
+             {
+               "type": "command",
+               "command": "<canonicalized-libra-abs-path> hooks claude tool-use",
+               "timeout": 10
+             }
+           ]
+         }
+       ],
        "PostToolUse": [
          {
            "matcher": null,
@@ -176,7 +188,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
    示例中 `<canonicalized-libra-abs-path>` 为占位符：实际写入值是 `resolve_hook_binary_path` 产出的 canonicalize 绝对路径。绝对路径是**必须形态**——schema/snapshot test 断言 command 以绝对路径开头、以 `hooks claude <verb>` 结尾，不允许裸 `libra` PATH 查找（与 plan.md §0.3.3/A6.5 安装断言互引）。
 
-   `ModelUpdate`、`Compaction`、`ToolUse` parser 能力可以存在，但当前 Claude Code 安装器只要求写入上表 5 个 forward events；若未来增加安装事件，必须同步本节、`docs/development/commands/hooks.md`、schema tests 和 uninstall 规则。
+   `ModelUpdate`、`Compaction` 等 parser 能力可以存在，但当前 Claude Code 安装器只写入上表 6 个 forward events（DR-00 起 `PreToolUse` 与 `PostToolUse` 一并转发到 `hooks claude tool-use`，二者都映射 `LifecycleEventKind::ToolUse`）；`ToolUse` 事件走 AgentTraces 采集路径，只更新 `agent_session` 活跃状态（`last_event_at` / `sync_revision`），**不**物化 checkpoint（committed checkpoint 仅在 `Stop`/`SessionEnd` 落盘）。若未来增删安装事件，必须同步本节、`docs/development/commands/hooks.md`、schema tests 和 uninstall 规则。
 
 4. **停用与移除**
 
@@ -1501,7 +1513,7 @@ pub fn hooks_for(kind: AgentKind) -> Option<&'static dyn HookProvider> {        
 }
 ```
 
-**SubagentStart/End 来源说明**：当前 boundary 事件仅由 Codex 原生 hook 产生（`SubagentStart` / `SubagentStop` → Libra `subagent-start` / `subagent-end`）；Claude 的 forward map 严格只有 SessionStart/UserPromptSubmit/PostToolUse/Stop/SessionEnd 五项，不会从 Task transcript 合成伪 boundary。Claude `Task` 只提示可能存在子代理活动；M5 通过 `<session>/subagents/*.jsonl` 发现真实 content，且没有稳定 hook ID 时保持 `unresolved`。`SubagentAwareExtractor` 的多源输入仅用于父 metadata 的文件并集与 usage 汇总，不制造 lifecycle 边界。
+**SubagentStart/End 来源说明**：当前 boundary 事件仅由 Codex 原生 hook 产生（`SubagentStart` / `SubagentStop` → Libra `subagent-start` / `subagent-end`）；Claude 的 forward map 为 SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/Stop/SessionEnd（DR-00 起 `PreToolUse` 与 `PostToolUse` 一并转发到 `tool-use`，二者都映射 `LifecycleEventKind::ToolUse`），其中**不含任何 subagent 边界事件**，不会从 Task transcript 合成伪 boundary。Claude `Task` 只提示可能存在子代理活动；M5 通过 `<session>/subagents/*.jsonl` 发现真实 content，且没有稳定 hook ID 时保持 `unresolved`。`SubagentAwareExtractor` 的多源输入仅用于父 metadata 的文件并集与 usage 汇总，不制造 lifecycle 边界。
 
 #### 1.1 Provider interface 详细设计
 

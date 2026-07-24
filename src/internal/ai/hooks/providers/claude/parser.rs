@@ -92,6 +92,7 @@ mod tests {
         let cases = [
             ("SessionStart", LifecycleEventKind::SessionStart),
             ("UserPromptSubmit", LifecycleEventKind::TurnStart),
+            ("PreToolUse", LifecycleEventKind::ToolUse),
             ("PostToolUse", LifecycleEventKind::ToolUse),
             ("Stop", LifecycleEventKind::TurnEnd),
             ("SessionEnd", LifecycleEventKind::SessionEnd),
@@ -101,6 +102,26 @@ mod tests {
             let event = parse_claude_hook_event(name, &envelope).expect("parse should succeed");
             assert_eq!(event.kind, kind);
         }
+    }
+
+    // Scenario (DR-00): a `PreToolUse` envelope carries no `tool_response` (the
+    // tool has not run yet). It must still parse to a `ToolUse` lifecycle event
+    // with `tool_response == None`, never a hard error.
+    #[test]
+    fn parser_maps_pretooluse_without_response() {
+        let mut envelope = canonical_envelope();
+        envelope.hook_event_name = "PreToolUse".to_string();
+        envelope
+            .extra
+            .insert("tool_name".to_string(), Value::String("Bash".to_string()));
+        // Deliberately no "tool_response" key in the pre-phase envelope.
+        let event =
+            parse_claude_hook_event("PreToolUse", &envelope).expect("PreToolUse must parse");
+        assert_eq!(event.kind, LifecycleEventKind::ToolUse);
+        assert!(
+            event.tool_response.is_none(),
+            "PreToolUse carries no tool result yet"
+        );
     }
 
     // Scenario: a hook name not in the known set returns an error.
