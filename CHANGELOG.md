@@ -4,6 +4,21 @@
 
 ### Changed
 
+- **Register the Claude Code `PreToolUse` hook (v0.19.60,
+  plan-20260713 DR-00)**: `libra agent enable --agent claude` now
+  installs a forward for `PreToolUse` in addition to `PostToolUse`, both
+  routed to `libra hooks claude tool-use`. This aligns the installer with
+  the config already documented in `docs/commands/hooks.md`; the parser
+  already mapped both events to `LifecycleEventKind::ToolUse`, so the
+  change is installer-only. A `ToolUse` event refreshes `agent_session`
+  liveness on the capture/traces path and writes **no** checkpoint
+  (checkpoints materialize only at `Stop`/`SessionEnd`), and it does not
+  touch the AiIntent `tool_use_count` stream (installed Claude hooks use
+  the AgentTraces path). No `Subagent*` boundary event is registered, so
+  Claude's on-disk sub-agent content stays `unresolved` (DR-06). Existing
+  five-event installs gain the PreToolUse forward on the next
+  `enable`/upsert; user-owned hooks are preserved.
+
 - **Canonical `worktree add` targets: branch, commit, `--detach`, `-b`
   (v0.19.59, plan-20260714 Part C §C.7, W3 slice 2)**: `worktree add
   <path> [<branch-or-commit>]` checks an existing branch out ATTACHED

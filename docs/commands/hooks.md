@@ -73,6 +73,15 @@ lifecycle events (Codex additionally forwards `subagent-start` /
 | `stop` | User pressed Esc / hit the Stop button mid-turn |
 | `session-end` | Session closed cleanly |
 
+For Claude Code the `tool-use` verb is installed for **both** `PreToolUse`
+(fired before a tool runs — an early liveness signal) and `PostToolUse`
+(fired after the tool returns); both map to the `ToolUse` lifecycle event,
+which refreshes the active session's liveness (last-event) state via the
+capture/traces path but does **not** write a committed checkpoint —
+checkpoints are materialized only at `stop` / `session-end`. No `Subagent*`
+boundary event is registered for Claude (only Codex emits native sub-agent
+boundaries), so Claude's on-disk sub-agent content is captured as `unresolved`.
+
 Each event reads its provider-specific JSON payload from stdin, runs
 the redaction pipeline (secrets / tokens / file content >256 KiB), and
 appends an `AgentTraceEvent` JSONL record into the active session
