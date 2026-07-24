@@ -307,6 +307,20 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     // inside it fails closed (its scoped state is preserved but frozen)
     // until it is re-added or deleted. Checked only for LINKED worktrees
     // (marker next to an existing commondir).
+    // W3-s3 (§C.6.2): a mid-migration worktree (journal-stamped
+    // `migrate-marker` still present) is FROZEN for every other process —
+    // work created there could be overwritten by the recovery re-seed. The
+    // migrating/repairing process itself holds a process-local bypass.
+    if gitdir.join("migrate-marker").exists() && !migration_gate_bypassed() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this worktree has an unfinished layout migration; run `libra worktree \
+                 repair` from the main worktree ('{}')",
+                gitdir.display()
+            ),
+        ));
+    }
     if gitdir.join("detached_from_registry").exists() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -505,6 +519,45 @@ pub fn storage_path() -> PathBuf {
 /// Deterministic fault injection for cold recovery/guard paths (R0-8
 /// style): active only when `LIBRA_TEST_FAULT` names the site. Never set in
 /// production.
+/// W3-s3 (§C.6.1): true when the CURRENT worktree uses the pre-isolation
+/// LEGACY layout — its `.libra` is a symlink straight at the common storage,
+/// so HEAD/index are shared with main. Read-only commands may proceed (no
+/// regression), but worktree-state mutations must refuse and direct at
+/// `repair --migrate-layout` (committing here would silently move MAIN's
+/// HEAD).
+pub fn is_legacy_symlink_worktree() -> bool {
+    let Ok((_, workdir, _gitdir)) = try_get_paths_full(None) else {
+        return false;
+    };
+    fs::symlink_metadata(workdir.join(ROOT_DIR))
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+static MIGRATION_GATE_BYPASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII bypass for the mid-migration freeze: held ONLY by the migration
+/// engine / repair recovery in this process (single migration at a time
+/// under the registry lock), so its own seeding/verification can resolve
+/// storage while every other process stays frozen out.
+pub struct MigrationGateBypass;
+
+impl Drop for MigrationGateBypass {
+    fn drop(&mut self) {
+        MIGRATION_GATE_BYPASS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn bypass_migration_gate() -> MigrationGateBypass {
+    MIGRATION_GATE_BYPASS.store(true, std::sync::atomic::Ordering::SeqCst);
+    MigrationGateBypass
+}
+
+fn migration_gate_bypassed() -> bool {
+    MIGRATION_GATE_BYPASS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub fn fault_injected(site: &str) -> bool {
     std::env::var("LIBRA_TEST_FAULT").is_ok_and(|value| value == site)
 }

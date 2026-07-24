@@ -131,8 +131,17 @@ pub enum WorktreeSubcommand {
     /// (`.libra/worktree_id` + `commondir`) from the registry's persisted
     /// stable id (registry v2, W3 §C.7).
     Repair {
-        /// Linked worktree whose gitdir identity should be restored.
+        /// Linked worktree whose gitdir identity should be restored (or,
+        /// with --migrate-layout, the single legacy worktree to migrate).
         path: Option<String>,
+        /// Migrate legacy shared-`.libra` symlink worktrees to the isolated
+        /// layout (W3-s3 §C.6.2).
+        #[clap(long)]
+        migrate_layout: bool,
+        /// With --migrate-layout: report what would be migrated, write
+        /// nothing.
+        #[clap(long, requires = "migrate_layout")]
+        dry_run: bool,
     },
 }
 
@@ -380,13 +389,21 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             )
             .await
         }
-        WorktreeSubcommand::Repair { path } => {
+        WorktreeSubcommand::Repair {
+            path,
+            migrate_layout,
+            dry_run,
+        } => {
             // Core registry first: a corrupt/zero-byte core registry must
             // fail the command BEFORE any fuse metadata is mutated.
-            let run_fuse_repair = path.is_none();
+            let run_fuse_repair = path.is_none() && !migrate_layout;
             legacy::execute_safe(
                 legacy::WorktreeArgs {
-                    command: legacy::WorktreeSubcommand::Repair { path },
+                    command: legacy::WorktreeSubcommand::Repair {
+                        path,
+                        migrate_layout,
+                        dry_run,
+                    },
                 },
                 output,
             )
@@ -680,6 +697,7 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 lock_reason: entry.lock_reason.clone(),
                 exists: Path::new(&entry.path).exists(),
                 state: "active",
+                layout: "task-fuse",
             });
         }
         return emit_json_data("worktree.list", &result, output);
@@ -702,6 +720,7 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 lock_reason: entry.lock_reason.clone(),
                 exists: Path::new(&entry.path).exists(),
                 state: "active",
+                layout: "task-fuse",
             });
         }
         print!("{}", legacy::format_worktree_porcelain(&all).await);

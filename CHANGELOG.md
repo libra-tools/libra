@@ -4,6 +4,23 @@
 
 ### Changed
 
+- **Legacy-layout detection and `repair --migrate-layout` (v0.19.60,
+  plan-20260714 Part C §C.6, W3 slice 3)**: `worktree list` now reports a
+  per-entry `layout` (`main`/`linked-v2`/`legacy-symlink`/`missing`/
+  `corrupt`, JSON field + porcelain `layout` line). In a legacy
+  shared-`.libra` symlink worktree, read-only commands keep working but
+  the worktree-state mutation surface refuses with `LBR-REPO-003` and a
+  migrate hint (mutating there would move MAIN's HEAD/index).
+  `worktree repair --migrate-layout [--dry-run] [<path>]` migrates legacy
+  worktrees from the main worktree via a journaled, identity-checked
+  state machine (migration 2026072403): prepared journal-stamped gitdir,
+  atomic renames with the legacy link kept as a backup until
+  verification, detached HEAD at the shared snapshot, private index
+  rebuilt from that commit — working files untouched, shared staged
+  state never copied; unmerged shared index or an active main sequencer
+  refuses before any rename, and `worktree repair` recovers every crash
+  window by identity, keeping materials on any mismatch.
+
 - **Canonical `worktree add` targets: branch, commit, `--detach`, `-b`
   (v0.19.59, plan-20260714 Part C §C.7, W3 slice 2)**: `worktree add
   <path> [<branch-or-commit>]` checks an existing branch out ATTACHED

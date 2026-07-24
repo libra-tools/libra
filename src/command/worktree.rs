@@ -46,7 +46,11 @@ EXAMPLES:
                                                    (refused on a dirty worktree)
     libra worktree repair                          Fix stale or duplicate registry rows
     libra worktree repair ../feature-x             Restore that worktree's gitdir identity
-                                                   from the registry (registry v2)";
+                                                   from the registry (registry v2)
+    libra worktree repair --migrate-layout         Migrate every legacy shared-.libra
+                                                   symlink worktree to the isolated layout
+    libra worktree repair --migrate-layout --dry-run
+                                                   Report what would be migrated";
 
 /// Manage multiple working trees attached to this repository.
 //
@@ -143,8 +147,18 @@ pub enum WorktreeSubcommand {
     /// (`.libra/worktree_id` + `commondir`) from the registry's persisted
     /// stable id (registry v2, W3 §C.7).
     Repair {
-        /// Linked worktree whose gitdir identity should be restored.
+        /// Linked worktree whose gitdir identity should be restored (or,
+        /// with --migrate-layout, the single legacy worktree to migrate).
         path: Option<String>,
+        /// Migrate legacy shared-`.libra` symlink worktrees to the isolated
+        /// layout (W3-s3 §C.6.2). Runs from the MAIN worktree; without a
+        /// path every legacy-symlink entry is migrated.
+        #[clap(long)]
+        migrate_layout: bool,
+        /// With --migrate-layout: report what would be migrated, write
+        /// nothing.
+        #[clap(long, requires = "migrate_layout")]
+        dry_run: bool,
     },
 }
 
@@ -426,6 +440,10 @@ pub(crate) struct WorktreeListEntry {
     /// Lifecycle state (W3-s1b): `active`, `detached_from_registry`, or
     /// `tombstone`.
     pub(crate) state: &'static str,
+    /// On-disk layout (W3-s3 §C.6.1): `main`, `linked-v2`, `legacy-symlink`
+    /// (a pre-isolation `.libra` symlink sharing main's HEAD/index),
+    /// `missing`, `corrupt`, or `task-fuse` for FUSE task worktrees.
+    pub(crate) layout: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -772,7 +790,17 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             let result = umount_fuse_path(path, cleanup).map_err(WorktreeError::into_cli_error)?;
             render_umount_fuse_path(&result, output)
         }
-        WorktreeSubcommand::Repair { path } => {
+        WorktreeSubcommand::Repair {
+            path,
+            migrate_layout,
+            dry_run,
+        } => {
+            if migrate_layout {
+                let result = migrate_layout_run(path, dry_run)
+                    .await
+                    .map_err(WorktreeError::into_cli_error)?;
+                return render_migrate_layout(&result, output);
+            }
             if let Some(path) = path {
                 let result =
                     repair_worktree_identity(path).map_err(WorktreeError::into_cli_error)?;
@@ -2020,6 +2048,23 @@ async fn journal_append(
     Ok(result.last_insert_id() as i64)
 }
 
+/// Advance a 'migrate' intent's durable stage (§C.6.2 state machine).
+async fn journal_set_stage(
+    db: &sea_orm::DatabaseConnection,
+    id: i64,
+    stage: &str,
+) -> Result<(), String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE worktree_intent_journal SET stage = ? WHERE id = ?",
+        [stage.into(), id.into()],
+    ))
+    .await
+    .map_err(|error| format!("cannot record migration stage {stage}: {error}"))?;
+    Ok(())
+}
+
 /// Resolve (delete) a journal row after the mutation is fully published.
 async fn journal_resolve(db: &sea_orm::DatabaseConnection, id: i64) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
@@ -2203,11 +2248,13 @@ pub(crate) fn run_list_worktrees() -> WorktreeResult<WorktreeListOutput> {
                 .worktree_id
                 .clone()
                 .or_else(|| resolve_entry_worktree_id(&w.path, w.is_main));
+            let layout = detect_entry_layout(Path::new(&w.path), w.is_main);
             WorktreeListEntry {
                 kind: if w.is_main { "main" } else { "worktree" },
                 exists: Path::new(&w.path).exists(),
                 worktree_id,
                 state: w.state.as_str(),
+                layout,
                 path: w.path,
                 is_main: w.is_main,
                 locked: w.locked,
@@ -2216,6 +2263,55 @@ pub(crate) fn run_list_worktrees() -> WorktreeResult<WorktreeListOutput> {
         })
         .collect();
     Ok(WorktreeListOutput { worktrees })
+}
+
+/// Classify a registered worktree's ON-DISK layout (W3-s3 §C.6.1).
+/// Read-only: `legacy-symlink` (a pre-isolation `.libra` symlink pointing at
+/// the common storage — shares main's HEAD/index) is recognized here so
+/// `repair --migrate-layout` can target it and mutation commands can refuse
+/// it; anything unexplainable is `corrupt`, never guessed.
+pub(crate) fn detect_entry_layout(path: &Path, is_main: bool) -> &'static str {
+    if is_main {
+        return "main";
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return "missing",
+        Err(_) => return "corrupt",
+        Ok(_) => {}
+    }
+    let gitdir = path.join(util::ROOT_DIR);
+    match fs::symlink_metadata(&gitdir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "corrupt",
+        Err(_) => "corrupt",
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let storage = util::storage_path();
+            let resolved = fs::canonicalize(&gitdir).ok();
+            let canonical_storage = fs::canonicalize(&storage).unwrap_or(storage);
+            if resolved.as_deref() == Some(canonical_storage.as_path()) {
+                "legacy-symlink"
+            } else {
+                "corrupt"
+            }
+        }
+        Ok(meta) if meta.is_dir() => {
+            let storage = util::storage_path();
+            let canonical_storage = fs::canonicalize(&storage).unwrap_or(storage);
+            let commondir_ok = fs::read_to_string(gitdir.join("commondir"))
+                .ok()
+                .and_then(|raw| raw.lines().next().map(str::trim).map(PathBuf::from))
+                .map(|p| {
+                    let abs = if p.is_absolute() { p } else { gitdir.join(p) };
+                    fs::canonicalize(&abs).unwrap_or(abs)
+                })
+                .is_some_and(|p| p == canonical_storage);
+            if commondir_ok || gitdir.join(DETACHED_MARKER).exists() {
+                "linked-v2"
+            } else {
+                "corrupt"
+            }
+        }
+        Ok(_) => "corrupt",
+    }
 }
 
 /// Resolve a registered worktree's stable id from its path (Part C §C.3.3).
@@ -2280,6 +2376,9 @@ pub(crate) async fn format_worktree_porcelain(worktrees: &[WorktreeListEntry]) -
                 _ => out.push_str("locked\n"),
             }
         }
+        // W3-s3 (§C.6.1): versioned layout line — additive to the frozen
+        // porcelain attributes (declared in COMPATIBILITY/docs).
+        out.push_str(&format!("layout {}\n", w.layout));
         out.push('\n');
     }
     out
@@ -2459,6 +2558,27 @@ async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMove
         .worktree_id
         .clone()
         .or_else(|| resolve_worktree_id(&src_path));
+    // W3-s3: moving a worktree with an UNFINISHED layout migration would
+    // strand its journal at the old path and let reconciliation unfreeze
+    // the relocated (still-unmigrated) state — refuse until repair settles
+    // it.
+    {
+        let db = crate::internal::db::get_db_conn_instance().await;
+        let pending = journal_pending(&db)
+            .await
+            .map_err(WorktreeError::OperationBlocked)?;
+        if pending.iter().any(|intent| {
+            intent.op == "migrate"
+                && (intent.worktree_id.as_deref() == journal_worktree_id.as_deref()
+                    || intent.payload["path"].as_str() == Some(src_path.to_string_lossy().as_ref()))
+        }) {
+            return Err(WorktreeError::OperationBlocked(format!(
+                "'{}' has an unfinished layout migration; run `libra worktree repair` \
+                 first",
+                src_path.display()
+            )));
+        }
+    }
     let payload = serde_json::json!({
         "src": src_path.to_string_lossy(),
         "dest": dest_path.to_string_lossy(),
@@ -2697,6 +2817,17 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
             action: "remove",
             path: target.to_string_lossy().to_string(),
         });
+    }
+    // W3-s3: a LEGACY symlink target shares main's `.libra` — any lifecycle
+    // marker written into it would land in MAIN storage and freeze the main
+    // repository. Refuse until the layout migration settles it.
+    if detect_entry_layout(&target, false) == "legacy-symlink" {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{}' uses the legacy shared-.libra symlink layout; run `libra worktree \
+             repair --migrate-layout {}` first",
+            target.display(),
+            target.display()
+        )));
     }
     let entry_state = entry.state;
     if entry_state == WorktreeEntryState::Tombstone {
@@ -2993,6 +3124,495 @@ fn restore_marker_on_refusal(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct MigrateLayoutOutput {
+    dry_run: bool,
+    migrated: Vec<String>,
+    planned: Vec<String>,
+    skipped: Vec<String>,
+}
+
+/// `repair --migrate-layout [--dry-run] [<path>]` (W3-s3 §C.6.2): migrate
+/// legacy shared-`.libra` symlink worktrees to the isolated layout via the
+/// journaled state machine. Runs from the MAIN worktree only, under the
+/// registry lock. Tracked/untracked FILES are never touched — the new
+/// private index is built from the shared HEAD snapshot, so post-migration
+/// they simply show as dirty/untracked against it (staged state is NOT
+/// copied: the shared index cannot prove which worktree owns it).
+async fn migrate_layout_run(
+    filter: Option<String>,
+    dry_run: bool,
+) -> WorktreeResult<MigrateLayoutOutput> {
+    if util::current_worktree_id().is_some() || util::is_legacy_symlink_worktree() {
+        return Err(WorktreeError::OperationBlocked(
+            "run `worktree repair --migrate-layout` from the MAIN worktree".to_string(),
+        ));
+    }
+    // Dry run is READ-ONLY end to end: no lock file creation, no registry
+    // upgrade — the lockless reader is enough to enumerate layouts.
+    let (_registry_lock, state) = if dry_run {
+        (None, load_state_readonly()?)
+    } else {
+        let guard = acquire_registry_lock()?;
+        let state = load_state()?;
+        (Some(guard), state)
+    };
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let filter_path = match &filter {
+        Some(raw) => Some(resolve_path(raw, "worktree path")?),
+        None => None,
+    };
+
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    for (idx, entry) in state.entries.iter().enumerate() {
+        if entry.is_main {
+            continue;
+        }
+        if let Some(want) = &filter_path
+            && Path::new(&entry.path) != want
+        {
+            continue;
+        }
+        match detect_entry_layout(Path::new(&entry.path), false) {
+            "legacy-symlink" => targets.push(idx),
+            layout => {
+                if filter_path.is_some() {
+                    return Err(WorktreeError::InvalidTarget(format!(
+                        "'{}' is not a legacy-symlink worktree (layout: {layout})",
+                        entry.path
+                    )));
+                }
+                skipped.push(format!("{} ({layout})", entry.path));
+            }
+        }
+    }
+    if let Some(want) = &filter_path
+        && targets.is_empty()
+    {
+        return Err(WorktreeError::NoSuchWorktree {
+            path: want.to_string_lossy().to_string(),
+        });
+    }
+
+    if dry_run {
+        return Ok(MigrateLayoutOutput {
+            dry_run: true,
+            migrated: Vec::new(),
+            planned: targets
+                .into_iter()
+                .map(|idx| state.entries[idx].path.clone())
+                .collect(),
+            skipped,
+        });
+    }
+
+    // Preconditions shared by every target (§C.6.2 step 4): the SHARED
+    // index must be conflict-free, no repository-global (main-scope)
+    // sequencer may be active, and HEAD must be readable and born.
+    let shared_index = git_internal::internal::index::Index::load(crate::utils::path::index())
+        .map_err(|e| WorktreeError::IoRead(format!("cannot read the shared index: {e}")))?;
+    if !crate::command::unmerged::collect(&shared_index).is_empty() {
+        return Err(WorktreeError::OperationBlocked(
+            "the shared index has unmerged (conflict) entries; resolve or abort the \
+             conflict in the main worktree first"
+                .to_string(),
+        ));
+    }
+    if scoped_state_active(&db, "").await {
+        return Err(WorktreeError::OperationBlocked(
+            "an in-progress rebase/cherry-pick/bisect is active in the main worktree; \
+             finish or abort it first"
+                .to_string(),
+        ));
+    }
+    let head_commit = Head::current_commit_result()
+        .await
+        .map_err(|e| WorktreeError::IoRead(format!("cannot read the shared HEAD: {e}")))?
+        .ok_or_else(|| {
+            WorktreeError::OperationBlocked(
+                "the repository has no commits yet; nothing to migrate onto".to_string(),
+            )
+        })?;
+
+    let mut state = state;
+    let mut migrated = Vec::new();
+    for idx in targets {
+        let path = state.entries[idx].path.clone();
+        migrate_one_worktree(&db, &mut state, idx, head_commit).await?;
+        migrated.push(path);
+    }
+
+    Ok(MigrateLayoutOutput {
+        dry_run: false,
+        migrated,
+        planned: Vec::new(),
+        skipped,
+    })
+}
+
+/// One target's journaled migration (§C.6.2 steps 1-7). Every filesystem
+/// step verifies IDENTITY (no-follow symlink target, our own marker file),
+/// never bare existence; any mismatch keeps all materials and errors.
+async fn migrate_one_worktree(
+    db: &sea_orm::DatabaseConnection,
+    state: &mut WorktreeState,
+    index: usize,
+    head_commit: git_internal::hash::ObjectHash,
+) -> WorktreeResult<()> {
+    let target = PathBuf::from(&state.entries[index].path);
+    let gitdir = target.join(util::ROOT_DIR);
+    let storage = util::storage_path();
+    let canonical_storage = fs::canonicalize(&storage).unwrap_or_else(|_| storage.clone());
+
+    // Step 1: no-follow — `.libra` must BE a symlink resolving exactly to
+    // the common storage. Anything else is refused untouched.
+    let meta = fs::symlink_metadata(&gitdir)
+        .map_err(|e| WorktreeError::IoRead(format!("cannot stat '{}': {e}", gitdir.display())))?;
+    if !meta.file_type().is_symlink()
+        || fs::canonicalize(&gitdir).ok().as_deref() != Some(canonical_storage.as_path())
+    {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{}' is not a legacy symlink at this repository's storage; refusing",
+            gitdir.display()
+        )));
+    }
+
+    let worktree_id = state.entries[index].worktree_id.clone().ok_or_else(|| {
+        WorktreeError::OperationBlocked(format!(
+            "registry entry '{}' has no persisted worktree id; run `worktree repair` \
+                 first",
+            target.display()
+        ))
+    })?;
+    // A target with an UNRESOLVED earlier migrate intent must be settled by
+    // `worktree repair` first — starting a second migration would leave the
+    // first row permanently ambiguous (recovery adopts only its own
+    // journal-stamped marker).
+    let pending = journal_pending(db)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
+    if pending.iter().any(|intent| {
+        intent.op == "migrate"
+            && intent.payload["path"].as_str() == Some(target.to_string_lossy().as_ref())
+    }) {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{}' has an unresolved earlier migration journal; run `libra worktree \
+             repair` to settle it, then retry",
+            target.display()
+        )));
+    }
+    let payload = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "head": head_commit.to_string(),
+    });
+    let journal_id = journal_append(db, "migrate", Some(&worktree_id), &payload)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
+    let set_stage = |stage: &'static str| {
+        let db = db.clone();
+        async move {
+            journal_set_stage(&db, journal_id, stage)
+                .await
+                .map_err(WorktreeError::OperationBlocked)
+        }
+    };
+
+    // Step 2: prepared gitdir with identity marker, fsynced.
+    let prepared = target.join(format!(".libra.migrate-{journal_id}"));
+    fs::create_dir_all(&prepared).map_err(|e| {
+        WorktreeError::IoWrite(format!("cannot create '{}': {e}", prepared.display()))
+    })?;
+    let write = |name: &str, contents: String| -> WorktreeResult<()> {
+        crate::utils::atomic_write::write_atomic(&prepared.join(name), contents.as_bytes(), true)
+            .map_err(|e| {
+                WorktreeError::IoWrite(format!("cannot write '{}/{name}': {e}", prepared.display()))
+            })
+    };
+    write("commondir", format!("{}\n", canonical_storage.display()))?;
+    write("worktree_id", format!("{worktree_id}\n"))?;
+    write("migrate-marker", format!("journal {journal_id}\n"))?;
+    fsync_parent_best_effort(&prepared.join("commondir"));
+    fsync_parent_best_effort(&prepared);
+    set_stage("PreparedLocalGitdir").await?;
+
+    // Step 5a: atomic rename of the symlink to a journal-identified backup.
+    let backup = target.join(format!(".libra.legacy-backup-{journal_id}"));
+    match fs::symlink_metadata(&backup) {
+        Ok(_) => {
+            return Err(WorktreeError::OperationBlocked(format!(
+                "'{}' already exists; remove it manually, then retry",
+                backup.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(WorktreeError::IoRead(format!(
+                "cannot inspect '{}': {error}",
+                backup.display()
+            )));
+        }
+    }
+    let _gate_bypass = util::bypass_migration_gate();
+    // Atomic NO-REPLACE backup on Unix: symlink(2) fails with EEXIST if a
+    // concurrent actor claimed the name after the check above, so user
+    // material can never be silently overwritten by a replace-capable
+    // rename. (A crash between the two steps leaves the legacy link intact
+    // — the pre-backup recovery branch removes this identity-named backup.)
+    #[cfg(unix)]
+    {
+        let dest = fs::read_link(&gitdir).map_err(|e| {
+            WorktreeError::IoRead(format!("cannot read the legacy link target: {e}"))
+        })?;
+        std::os::unix::fs::symlink(&dest, &backup).map_err(|e| {
+            WorktreeError::IoWrite(format!("cannot back up the legacy symlink: {e}"))
+        })?;
+        // Durability order: the backup's directory entry must be on disk
+        // BEFORE the original link disappears — a power loss in between
+        // must never leave neither. This sync is STRICT: if the filesystem
+        // cannot prove the entry durable, abort with the backup removed and
+        // the legacy link untouched.
+        if let Err(error) = fsync_parent_strict(&backup) {
+            let _ = fs::remove_file(&backup);
+            return Err(WorktreeError::IoWrite(format!(
+                "cannot durably record the backup link ({error}); migration aborted with \
+                 the legacy link untouched"
+            )));
+        }
+        fs::remove_file(&gitdir).map_err(|e| {
+            WorktreeError::IoWrite(format!("cannot retire the legacy symlink: {e}"))
+        })?;
+    }
+    #[cfg(not(unix))]
+    fs::rename(&gitdir, &backup)
+        .map_err(|e| WorktreeError::IoWrite(format!("cannot back up the legacy symlink: {e}")))?;
+    fsync_parent_best_effort(&backup);
+    set_stage("OldLinkBackedUp").await?;
+
+    // Step 5b: install the prepared gitdir.
+    fs::rename(&prepared, &gitdir).map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "cannot install the new gitdir (legacy backup kept at '{}'): {e}",
+            backup.display()
+        ))
+    })?;
+    fsync_parent_best_effort(&gitdir);
+    validate_installed_gitdir(&gitdir, journal_id, &worktree_id, &canonical_storage).map_err(
+        |error| {
+            WorktreeError::OperationBlocked(format!(
+                "installed gitdir failed identity validation ({error}); materials kept — \
+                 investigate, then rerun `worktree repair`"
+            ))
+        },
+    )?;
+    set_stage("NewGitdirInstalled").await?;
+
+    // Step 3: seed the scoped HEAD (detached at the shared snapshot) and
+    // build the private index from that commit — WITHOUT touching files.
+    seed_migrated_worktree(&target, head_commit).await?;
+    set_stage("HeadIndexSeeded").await?;
+
+    // Registry: the entry's layout is now derivable as linked-v2; persist
+    // the (possibly id-backfilled) state.
+    write_state(state)?;
+    set_stage("RegistryCommitted").await?;
+
+    // Step 6: verify from inside the worktree before any cleanup.
+    verify_migrated_worktree(&target, head_commit).await?;
+    set_stage("Verified").await?;
+
+    // Cleanup: drop the backup symlink and the marker, resolve the journal.
+    match fs::symlink_metadata(&backup) {
+        Ok(meta)
+            if meta.file_type().is_symlink()
+                && fs::canonicalize(&backup).ok().as_deref()
+                    == Some(canonical_storage.as_path()) =>
+        {
+            fs::remove_file(&backup).map_err(|error| {
+                WorktreeError::IoWrite(format!(
+                    "migrated, but the legacy backup '{}' could not be removed: {error}; \
+                     remove it and rerun `worktree repair`",
+                    backup.display()
+                ))
+            })?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        _ => {
+            return Err(WorktreeError::OperationBlocked(format!(
+                "'{}' is no longer the expected legacy symlink; not deleting it — \
+                 investigate, then rerun `worktree repair`",
+                backup.display()
+            )));
+        }
+    }
+    // Marker LAST: recovery adopts an install ONLY via this journal-stamped
+    // marker, so it must survive until the journal resolve below has landed
+    // (resolve-before-marker is what makes marker-only adoption safe).
+    journal_resolve(db, journal_id)
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
+    let _ = fs::remove_file(gitdir.join("migrate-marker"));
+    Ok(())
+}
+
+/// Seed a freshly installed isolated gitdir: detached HEAD at the shared
+/// snapshot, private index rebuilt from that commit's tree. Working files
+/// are left exactly as they were.
+async fn seed_migrated_worktree(
+    target: &Path,
+    head_commit: git_internal::hash::ObjectHash,
+) -> WorktreeResult<()> {
+    let _guard = DirGuard::change_to(target)
+        .map_err(|e| WorktreeError::IoRead(format!("cannot enter '{}': {e}", target.display())))?;
+    Head::update_result(Head::Detached(head_commit), None)
+        .await
+        .map_err(|e| {
+            WorktreeError::IoWrite(format!("cannot seed HEAD for '{}': {e}", target.display()))
+        })?;
+    restore::execute_checked(RestoreArgs {
+        overlay: false,
+        no_overlay: false,
+        ours: false,
+        theirs: false,
+        ignore_unmerged: false,
+        merge: false,
+        conflict: None,
+        pathspec: vec![util::working_dir_string()],
+        source: Some("HEAD".to_string()),
+        worktree: false,
+        staged: true,
+        pathspec_from_file: None,
+        pathspec_file_nul: false,
+        no_progress: false,
+    })
+    .await
+    .map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "cannot build the private index for '{}': {e}",
+            target.display()
+        ))
+    })
+}
+
+/// Post-install verification (§C.6.2 step 6): scoped HEAD resolves to the
+/// migrated snapshot, the private index exists, and the common object
+/// store is reachable through the new commondir.
+async fn verify_migrated_worktree(
+    target: &Path,
+    head_commit: git_internal::hash::ObjectHash,
+) -> WorktreeResult<()> {
+    let _guard = DirGuard::change_to(target)
+        .map_err(|e| WorktreeError::IoRead(format!("cannot enter '{}': {e}", target.display())))?;
+    let seen = Head::current_commit_result()
+        .await
+        .map_err(|e| WorktreeError::IoRead(format!("verification failed reading HEAD: {e}")))?;
+    if seen != Some(head_commit) {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "verification failed: '{}' resolves HEAD to {:?}, expected {head_commit}; \
+             materials kept — rerun `worktree repair`",
+            target.display(),
+            seen
+        )));
+    }
+    if !target.join(util::ROOT_DIR).join("index").exists() {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "verification failed: '{}' has no private index; materials kept — rerun \
+             `worktree repair`",
+            target.display()
+        )));
+    }
+    crate::command::load_object::<git_internal::internal::object::commit::Commit>(&head_commit)
+        .map_err(|e| {
+            WorktreeError::IoRead(format!(
+                "verification failed reading the HEAD commit through the new commondir: {e}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn render_migrate_layout(result: &MigrateLayoutOutput, output: &OutputConfig) -> CliResult<()> {
+    if output.is_json() {
+        return emit_json_data("worktree.repair", result, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    if result.dry_run {
+        if result.planned.is_empty() {
+            println!("No legacy-symlink worktrees to migrate.");
+        }
+        for path in &result.planned {
+            println!("would migrate {path}");
+        }
+    } else {
+        for path in &result.migrated {
+            println!("migrated {path}");
+        }
+        if result.migrated.is_empty() {
+            println!("No legacy-symlink worktrees to migrate.");
+        }
+    }
+    for entry in &result.skipped {
+        println!("skipped {entry}");
+    }
+    Ok(())
+}
+
+/// Full identity validation of an INSTALLED migration gitdir, run
+/// immediately before seeding (post-rename): no-follow real directory, the
+/// journal-stamped marker, a commondir canonicalizing to THIS storage, and
+/// the expected worktree id. Post-install validation binds what was
+/// actually installed, closing the check-then-rename window.
+fn validate_installed_gitdir(
+    gitdir: &Path,
+    journal_id: i64,
+    worktree_id: &str,
+    canonical_storage: &Path,
+) -> Result<(), String> {
+    if !no_follow_real_dir(gitdir) {
+        return Err(format!("'{}' is not a real directory", gitdir.display()));
+    }
+    let marker_ok = fs::read_to_string(gitdir.join("migrate-marker"))
+        .is_ok_and(|raw| raw.trim() == format!("journal {journal_id}"));
+    if !marker_ok {
+        return Err(format!(
+            "'{}' does not carry this migration's marker",
+            gitdir.display()
+        ));
+    }
+    let commondir_ok = fs::read_to_string(gitdir.join("commondir"))
+        .ok()
+        .and_then(|raw| raw.lines().next().map(str::trim).map(PathBuf::from))
+        .map(|p| {
+            let abs = if p.is_absolute() { p } else { gitdir.join(p) };
+            fs::canonicalize(&abs).unwrap_or(abs)
+        })
+        .is_some_and(|p| p == canonical_storage);
+    if !commondir_ok {
+        return Err(format!(
+            "'{}' commondir does not resolve to this repository's storage",
+            gitdir.display()
+        ));
+    }
+    let id_ok =
+        fs::read_to_string(gitdir.join("worktree_id")).is_ok_and(|raw| raw.trim() == worktree_id);
+    if !id_ok {
+        return Err(format!(
+            "'{}' worktree_id does not match the registry",
+            gitdir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// No-follow check: a REAL directory (symlink_metadata never follows, so a
+/// symlinked path reports the link itself).
+fn no_follow_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+}
+
 /// Write the fail-closed gitdir marker for a detached worktree.
 fn write_detached_marker(target: &Path, worktree_id: &str) -> WorktreeResult<()> {
     let marker = target.join(util::ROOT_DIR).join(DETACHED_MARKER);
@@ -3011,6 +3631,15 @@ fn write_detached_marker(target: &Path, worktree_id: &str) -> WorktreeResult<()>
             marker.display()
         ))
     })
+}
+
+/// Strict parent-directory fsync: returns the error instead of swallowing
+/// it (used where a lost directory entry would open a crash window).
+fn fsync_parent_strict(target: &Path) -> io::Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::other("path has no parent"))?;
+    fs::File::open(parent)?.sync_all()
 }
 
 /// Durably record the parent directory entry after a worktree deletion —
@@ -3214,9 +3843,20 @@ fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdenti
         )));
     };
     let gitdir = target.join(util::ROOT_DIR);
-    if !gitdir.is_dir() {
+    // No-follow: a LEGACY symlink gitdir resolves to MAIN storage — writing
+    // identity files through it would alter main metadata. Refuse with the
+    // migration hint; only a REAL directory is repairable.
+    if detect_entry_layout(&target, false) == "legacy-symlink" {
         return Err(WorktreeError::OperationBlocked(format!(
-            "'{}' has no .libra gitdir to repair; re-add the worktree instead",
+            "'{}' uses the legacy shared-.libra symlink layout; run `libra worktree \
+             repair --migrate-layout {}` first",
+            target.display(),
+            target.display()
+        )));
+    }
+    if !no_follow_real_dir(&gitdir) {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{}' has no real .libra gitdir to repair; re-add the worktree instead",
             target.display()
         )));
     }
@@ -3915,6 +4555,193 @@ async fn recover_pending_intents(
                     }
                 }
             }
+            "migrate" => {
+                // §C.6.2 step 5 recovery: decide by IDENTITY (no-follow
+                // symlink target, our own journal-stamped marker), never by
+                // bare existence. Ambiguity keeps the row.
+                let path = PathBuf::from(payload["path"].as_str().unwrap_or_default());
+                let head = payload["head"]
+                    .as_str()
+                    .and_then(|raw| raw.parse::<git_internal::hash::ObjectHash>().ok());
+                let gitdir = path.join(util::ROOT_DIR);
+                let prepared = path.join(format!(".libra.migrate-{id}"));
+                let backup = path.join(format!(".libra.legacy-backup-{id}"));
+                let storage = util::storage_path();
+                let canonical_storage =
+                    fs::canonicalize(&storage).unwrap_or_else(|_| storage.clone());
+                let is_our_marker = |dir: &Path| {
+                    fs::read_to_string(dir.join("migrate-marker"))
+                        .is_ok_and(|raw| raw.trim() == format!("journal {id}"))
+                };
+                let is_legacy_link = |candidate: &Path| {
+                    fs::symlink_metadata(candidate)
+                        .map(|meta| meta.file_type().is_symlink())
+                        .unwrap_or(false)
+                        && fs::canonicalize(candidate).ok().as_deref()
+                            == Some(canonical_storage.as_path())
+                };
+                let gitdir_meta = fs::symlink_metadata(&gitdir);
+                if is_legacy_link(&gitdir) {
+                    // Pre-backup crash: the legacy link is untouched. Roll
+                    // BACK — drop only OUR (marker-verified) prepared dir;
+                    // any unexpected artifact or a failed removal keeps the
+                    // journal (nothing is guessed or force-deleted).
+                    match fs::symlink_metadata(&prepared) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            if is_legacy_link(&backup) {
+                                let _ = fs::remove_file(&backup);
+                            }
+                            notes.push(format!(
+                                "rolled back interrupted layout migration of '{}' \
+                                 (legacy link untouched)",
+                                path.display()
+                            ));
+                        }
+                        Ok(meta) if meta.is_dir() && is_our_marker(&prepared) => {
+                            if is_legacy_link(&backup) {
+                                let _ = fs::remove_file(&backup);
+                            }
+                            if let Err(error) = fs::remove_dir_all(&prepared) {
+                                resolve_row = false;
+                                notes.push(format!(
+                                    "cannot remove the prepared dir '{}' ({error}); \
+                                     journal kept",
+                                    prepared.display()
+                                ));
+                            } else {
+                                notes.push(format!(
+                                    "rolled back interrupted layout migration of '{}' \
+                                     (legacy link untouched)",
+                                    path.display()
+                                ));
+                            }
+                        }
+                        _ => {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "prepared artifact '{}' does not carry this journal's \
+                                 marker; journal kept — investigate manually, nothing \
+                                 was deleted",
+                                prepared.display()
+                            ));
+                        }
+                    }
+                } else if matches!(&gitdir_meta, Err(e) if e.kind() == io::ErrorKind::NotFound)
+                    && is_legacy_link(&backup)
+                    && no_follow_real_dir(&prepared)
+                    && is_our_marker(&prepared)
+                {
+                    // Between 5a and 5b: install ours, then finish.
+                    if let Err(error) = fs::rename(&prepared, &gitdir) {
+                        resolve_row = false;
+                        notes.push(format!(
+                            "cannot finish installing the migrated gitdir for '{}' \
+                             ({error}); journal kept",
+                            path.display()
+                        ));
+                    } else {
+                        fsync_parent_best_effort(&gitdir);
+                        if let Err(error) = validate_installed_gitdir(
+                            &gitdir,
+                            id,
+                            worktree_id.as_deref().unwrap_or_default(),
+                            &canonical_storage,
+                        ) {
+                            // `continue` skips the shared tail, so the
+                            // journal row stays pending by construction.
+                            notes.push(format!(
+                                "installed gitdir for '{}' failed identity validation \
+                                 ({error}); journal kept — investigate manually",
+                                path.display()
+                            ));
+                            if *changed {
+                                write_state(state)?;
+                            }
+                            continue;
+                        }
+                        let _gate_bypass = util::bypass_migration_gate();
+                        match finish_migration_recovery(&path, &backup, head).await {
+                            Ok(()) => {
+                                if *changed {
+                                    write_state(state)?;
+                                }
+                                journal_resolve(db, id)
+                                    .await
+                                    .map_err(WorktreeError::OperationBlocked)?;
+                                let _ = fs::remove_file(
+                                    path.join(util::ROOT_DIR).join("migrate-marker"),
+                                );
+                                recovered += 1;
+                                notes.push(format!(
+                                    "completed interrupted layout migration of '{}'",
+                                    path.display()
+                                ));
+                                continue;
+                            }
+                            Err(error) => {
+                                resolve_row = false;
+                                notes.push(format!(
+                                    "layout migration of '{}' still incomplete ({error}); \
+                                     journal kept",
+                                    path.display()
+                                ));
+                            }
+                        }
+                    }
+                } else if validate_installed_gitdir(
+                    &gitdir,
+                    id,
+                    worktree_id.as_deref().unwrap_or_default(),
+                    &canonical_storage,
+                )
+                .is_ok()
+                {
+                    // ONLY the journal-stamped marker may adopt an install:
+                    // ids are path-derived, so a pruned/re-added worktree
+                    // at the same path would satisfy a commondir/id match
+                    // and be silently re-seeded from the stale snapshot.
+                    // (The resolve-before-marker ordering guarantees a
+                    // marker-less install never has a live journal.)
+                    // Installed; finish seed/verify/cleanup idempotently.
+                    // Journal resolves BEFORE the marker is lifted, so a
+                    // crash in between still leaves a recognizable install.
+                    let _gate_bypass = util::bypass_migration_gate();
+                    match finish_migration_recovery(&path, &backup, head).await {
+                        Ok(()) => {
+                            if *changed {
+                                write_state(state)?;
+                            }
+                            journal_resolve(db, id)
+                                .await
+                                .map_err(WorktreeError::OperationBlocked)?;
+                            let _ =
+                                fs::remove_file(path.join(util::ROOT_DIR).join("migrate-marker"));
+                            recovered += 1;
+                            notes.push(format!(
+                                "completed interrupted layout migration of '{}'",
+                                path.display()
+                            ));
+                            continue;
+                        }
+                        Err(error) => {
+                            resolve_row = false;
+                            notes.push(format!(
+                                "layout migration of '{}' still incomplete ({error}); \
+                                 journal kept",
+                                path.display()
+                            ));
+                        }
+                    }
+                } else {
+                    resolve_row = false;
+                    notes.push(format!(
+                        "interrupted layout migration of '{}': on-disk state matches no \
+                         known stage (identity check failed); journal kept — investigate \
+                         manually, nothing was deleted",
+                        path.display()
+                    ));
+                }
+            }
             other => {
                 notes.push(format!("unknown intent op '{other}' (id {id}) resolved"));
             }
@@ -3934,6 +4761,51 @@ async fn recover_pending_intents(
         }
     }
     Ok(recovered)
+}
+
+/// Finish an installed-but-unfinished layout migration: (re-)seed the
+/// scoped HEAD + private index at the journaled snapshot, verify, and drop
+/// the identity-checked backup link. Idempotent — every step overwrites or
+/// re-checks rather than assuming.
+async fn finish_migration_recovery(
+    target: &Path,
+    backup: &Path,
+    head: Option<git_internal::hash::ObjectHash>,
+) -> Result<(), String> {
+    let Some(head_commit) = head else {
+        return Err("journal carries no parsable HEAD snapshot".to_string());
+    };
+    seed_migrated_worktree(target, head_commit)
+        .await
+        .map_err(|e| e.into_cli_error().to_string())?;
+    verify_migrated_worktree(target, head_commit)
+        .await
+        .map_err(|e| e.into_cli_error().to_string())?;
+    let storage = util::storage_path();
+    let canonical_storage = fs::canonicalize(&storage).unwrap_or(storage);
+    match fs::symlink_metadata(backup) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // Only the EXPECTED legacy link (resolving to this repo's
+            // storage) may be deleted; a foreign symlink is kept.
+            if fs::canonicalize(backup).ok().as_deref() != Some(canonical_storage.as_path()) {
+                return Err(format!(
+                    "backup '{}' does not resolve to this repository's storage; not \
+                     touching it",
+                    backup.display()
+                ));
+            }
+            fs::remove_file(backup).map_err(|e| format!("cannot remove the backup: {e}"))?;
+        }
+        Ok(_) => {
+            return Err(format!(
+                "backup '{}' is not the expected symlink; not touching it",
+                backup.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect the backup: {error}")),
+    }
+    Ok(())
 }
 
 /// Retry the scoped cleanup of every tombstone entry whose directory is
@@ -4062,6 +4934,60 @@ async fn reconcile_lifecycle(
                     }
                 }
                 let _ = lifecycle_delete(db, id).await;
+            }
+        }
+    }
+
+    // Stray migrate-markers (§C.6.2 cleanup retry): a marker whose journal
+    // already RESOLVED (no pending migrate row for the path) only freezes a
+    // finished worktree — clear it once the install identity is verified
+    // (real dir + commondir at this storage). Unverifiable states are
+    // reported, never guessed.
+    if let Ok(pending) = journal_pending(db).await {
+        let storage = util::storage_path();
+        let canonical_storage = fs::canonicalize(&storage).unwrap_or(storage);
+        for entry in &state.entries {
+            let gitdir = Path::new(&entry.path).join(util::ROOT_DIR);
+            let marker = gitdir.join("migrate-marker");
+            if !marker.exists() {
+                continue;
+            }
+            let has_pending = pending.iter().any(|intent| {
+                intent.op == "migrate"
+                    && (intent.payload["path"].as_str() == Some(entry.path.as_str())
+                        || (intent.worktree_id.is_some()
+                            && intent.worktree_id.as_deref() == entry.worktree_id.as_deref()))
+            });
+            if has_pending {
+                continue;
+            }
+            let commondir_ok = fs::read_to_string(gitdir.join("commondir"))
+                .ok()
+                .and_then(|raw| raw.lines().next().map(str::trim).map(PathBuf::from))
+                .map(|p| {
+                    let abs = if p.is_absolute() { p } else { gitdir.join(p) };
+                    fs::canonicalize(&abs).unwrap_or(abs)
+                })
+                .is_some_and(|p| p == canonical_storage);
+            if no_follow_real_dir(&gitdir) && commondir_ok {
+                match fs::remove_file(&marker) {
+                    Ok(()) => notes.push(format!(
+                        "cleared a resolved migration marker from '{}'",
+                        entry.path
+                    )),
+                    Err(error) => notes.push(format!(
+                        "FAILED to clear the resolved migration marker from '{}' \
+                         ({error}); the worktree stays frozen — fix the cause and rerun \
+                         repair",
+                        entry.path
+                    )),
+                }
+            } else {
+                notes.push(format!(
+                    "'{}' carries a migration marker with no pending journal but its \
+                     install identity cannot be verified; leaving it frozen",
+                    entry.path
+                ));
             }
         }
     }

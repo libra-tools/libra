@@ -186,6 +186,8 @@ JSON / machine 输出信封：
 
 修复 worktree 元数据。不带参数时：移除重复条目（相同规范路径）、确保恰好存在一个主 worktree 条目，并运行 W3 lifecycle 恢复引擎——确定性回放中断的 add/move/remove/prune intent journal（恢复过程绝不删除目录）、重试 tombstone 条目的 scoped 清理、按 registry 重建 detached 标记与 SQL lifecycle 镜像；只有实际做出更改时才写入状态文件。
 
+带 `--migrate-layout` 时(自 v0.19.60,W3-s3 §C.6):从**主 worktree** 把 legacy 共享 `.libra` 符号链接布局迁移到隔离布局(`--dry-run` 只报告;不带 path 迁移全部 legacy 条目)。迁移以原子 rename 安装带 journal 标识的新 gitdir(legacy 链接保留为 backup 直至校验通过),以共享 HEAD 快照播种分离 HEAD 并据其重建 private index:工作区文件绝不改动(迁移后按新 index 显示为 dirty/untracked),共享 index 的 staged 状态绝不复制——请先在主 worktree commit/stash。共享 index 存在冲突或主 scope 有进行中 sequencer 时在任何 rename 前拒绝;中断的迁移由下一次普通 `worktree repair` 按身份恢复。面向目标的生命周期命令(两种模式的 `worktree remove <path>` 与 `worktree repair <path>`)对 legacy-symlink 目标同样拒绝——共享符号链接会把写入导向**主**存储——须先完成迁移。
+
 带路径参数时（registry v2，自 v0.19.57）：依据 registry 中持久化的 stable id 恢复该 **linked** worktree 的 gitdir 身份——重写缺失或损坏的 `.libra/worktree_id`，并恢复缺失或损坏（空/不可读）的 `commondir` 指针（指向本仓库共享存储）。身份永远来自 registry，绝不猜测；`commondir` 有效地指向**另一个**存储时会被拒绝（绝不悄悄改挂仓库），且拒绝时不产生任何写入。未注册路径与主 worktree 会被拒绝；registry 仍为 legacy v1 格式时（无持久化身份）同样拒绝——先运行一次不带参数的 `libra worktree repair` 完成升级后重试。
 
 ```bash

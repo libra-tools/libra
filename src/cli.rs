@@ -1511,6 +1511,60 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
     }
 }
 
+/// The worktree-STATE mutation surface (W3-s3 §C.6.1): commands that move
+/// HEAD, rewrite the index, or restructure the working tree of the CURRENT
+/// worktree. Repository-scoped writers (branch/tag/remote/config/fetch/push,
+/// object plumbing) stay allowed in a legacy-symlink worktree — they behave
+/// identically from any scope.
+fn command_mutates_worktree_state(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Add(_)
+            | Commands::Commit(_)
+            | Commands::Switch(_)
+            | Commands::Checkout(_)
+            | Commands::Restore(_)
+            | Commands::Reset(_)
+            | Commands::Merge(_)
+            | Commands::MergeFile(_)
+            | Commands::Rebase(_)
+            | Commands::CherryPick(_)
+            | Commands::Revert(_)
+            | Commands::Am(_)
+            | Commands::Bisect(_)
+            | Commands::Stash(_)
+            | Commands::Rm(_)
+            | Commands::Mv(_)
+            | Commands::Clean(_)
+            | Commands::Pull(_)
+            | Commands::Dirty(_)
+            | Commands::Hydrate(_)
+            | Commands::Rerere(_)
+            | Commands::ReadTree(_)
+            | Commands::UpdateIndex(_)
+    ) || match command {
+        // Scoped advisory stores: only their MUTATING subcommands touch
+        // worktree state; list/status stay readable in a legacy layout.
+        Commands::SparseView(args) => !matches!(
+            args.command,
+            command::sparse_view::SparseViewCommand::List
+                | command::sparse_view::SparseViewCommand::Status
+        ),
+        Commands::Layer(args) => !matches!(
+            args.command,
+            command::layer::LayerCommand::List | command::layer::LayerCommand::Status
+        ),
+        // The write form moves this worktree's HEAD directly.
+        Commands::SymbolicRef(args) => args.target.is_some(),
+        // Non-dry-run restore rewrites HEAD/index/worktree from a snapshot.
+        Commands::Op(args) => matches!(
+            &args.command,
+            command::op::OpCommand::Restore { dry_run: false, .. }
+        ),
+        _ => false,
+    }
+}
+
 fn command_requires_complete_object_index(command: &Commands) -> bool {
     matches!(command, Commands::Cloud(_))
         || matches!(
@@ -1921,6 +1975,22 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
         }
     } else if preflight.set_hash_kind {
         set_hash_kind(HashKind::Sha1);
+    }
+    // W3-s3 (§C.6.1): a legacy-symlink worktree shares main's HEAD/index —
+    // read commands keep working (no regression), but worktree-state
+    // mutations here would silently move MAIN's scope. Refuse them with the
+    // migrate hint before dispatch.
+    if command_mutates_worktree_state(&args.command) && utils::util::is_legacy_symlink_worktree() {
+        return Err(CliError::fatal(
+            "this worktree uses the legacy shared-`.libra` symlink layout; mutating it \
+             would move the MAIN worktree's HEAD/index"
+                .to_string(),
+        )
+        .with_stable_code(utils::error::StableErrorCode::RepoStateInvalid)
+        .with_hint(
+            "run `libra worktree repair --migrate-layout <this-path>` from the main \
+             worktree to migrate it to the isolated layout (read-only commands still work)",
+        ));
     }
     // Resolve global output flags into a single config before dispatching.
     let color = if args.no_color {

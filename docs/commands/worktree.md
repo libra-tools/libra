@@ -16,6 +16,7 @@ libra worktree prune
 libra worktree remove <path>
 libra worktree umount <path> [--cleanup]
 libra worktree repair [<path>]
+libra worktree repair --migrate-layout [--dry-run] [<path>]
 ```
 
 ## Description
@@ -81,7 +82,7 @@ libra --machine worktree list
 Structured output uses the `worktree.list` command envelope. Each entry reports
 `kind`, `path`, `is_main`, `locked`, `lock_reason`, whether the path currently
 exists on disk, the persisted `worktree_id`, and the lifecycle `state`
-(`active`, `detached_from_registry`, or `tombstone` — see `remove`).
+(`active`, `detached_from_registry`, or `tombstone` — see `remove`), and the on-disk `layout` (`main`, `linked-v2`, `legacy-symlink`, `missing`, `corrupt`; porcelain adds a matching `layout` line per entry). In a `legacy-symlink` worktree (pre-isolation shared `.libra`), read-only commands keep working but state-mutating commands refuse with `LBR-REPO-003` — run `libra worktree repair --migrate-layout <path>` from the main worktree. Target-oriented lifecycle commands (`worktree remove <path>` in both modes and `worktree repair <path>`) also refuse a legacy-symlink target — the shared symlink would route their writes into MAIN storage — until the migration completes.
 
 ### Subcommand: `lock`
 
@@ -228,6 +229,8 @@ JSON / machine output envelope:
 ### Subcommand: `repair`
 
 Repair worktree metadata. Without an argument, removes duplicate registry entries (same canonical path), ensures exactly one main worktree entry exists, and runs the W3 lifecycle recovery engine: stale intent-journal rows (from an interrupted add/move/remove/prune) are rolled forward or back deterministically (recovery never deletes directories), tombstone entries get their scoped cleanup retried, and detached markers plus the SQL lifecycle mirror are reconciled with the registry. The state file is only rewritten when something actually changed.
+
+With `--migrate-layout`, migrates legacy shared-`.libra` symlink worktrees to the isolated layout (run from the MAIN worktree; `--dry-run` reports without writing; without a path every legacy entry is migrated). The migration installs a fresh journaled gitdir by atomic renames (the legacy link is kept as a backup until verification passes), seeds a DETACHED HEAD at the shared snapshot, and rebuilds the private index from that commit: working files are never touched (they show as dirty/untracked afterwards) and shared STAGED state is never copied — commit or stash it in the main worktree first. An unmerged shared index or an in-progress main rebase/cherry-pick/bisect refuses before any rename; an interrupted migration is recovered by the next plain `worktree repair`.
 
 With a path, restores that **linked** worktree's gitdir identity from the registry (registry v2): rewrites a missing or corrupt `.libra/worktree_id` from the entry's persisted stable id and restores a missing or corrupt (empty/unreadable) `commondir` pointer to this repository's shared storage. The identity always comes from the registry — never from a guess — so the repaired worktree maps back to its own scoped state (HEAD, index, stash snapshots) instead of a fresh scope or the main worktree's. A `commondir` that validly points at a **different** storage is refused (repair never silently re-homes a worktree onto another repository), and the refusal is side-effect free — neither gitdir file is touched. Unregistered paths and the main worktree are refused, and so is a registry still in the legacy v1 format (it carries no persisted identities) — run the no-argument `libra worktree repair` once to upgrade it, then retry.
 

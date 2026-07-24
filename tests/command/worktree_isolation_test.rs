@@ -2533,7 +2533,7 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
             .rollback_to(&conn, 2026072304)
             .await
             .expect("roll back capability marker");
-        assert_eq!(rolled, vec![2026072402, 2026072401]);
+        assert_eq!(rolled, vec![2026072403, 2026072402, 2026072401]);
         conn.close().await.expect("close");
     }
 
@@ -4042,5 +4042,620 @@ fn injected_probe_fault_refuses_attach_and_switch() {
     assert_eq!(
         head, "HEAD",
         "worktree stays detached after the refused switch"
+    );
+}
+
+/// Build a LEGACY shared-`.libra` symlink worktree (pre-isolation layout)
+/// and register it, returning its canonical path.
+#[cfg(unix)]
+fn create_legacy_symlink_worktree(main: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let wt = main.join(name);
+    std::fs::create_dir_all(&wt).expect("mkdir legacy wt");
+    std::os::unix::fs::symlink(main.join(".libra"), wt.join(".libra")).expect("legacy symlink");
+    let canonical = wt.canonicalize().expect("canonical legacy wt");
+    // Register it (v2 entry with a persisted id, as the v1→v2 upgrade
+    // would have backfilled by canonical-path synthesis).
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "materialize registry",
+    );
+    let registry = main.join(".libra").join("worktrees.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry"))
+            .expect("registry json");
+    doc["entries"]
+        .as_array_mut()
+        .expect("entries")
+        .push(serde_json::json!({
+            "path": canonical.to_string_lossy(),
+            "is_main": false,
+            "locked": false,
+            "lock_reason": null,
+            "worktree_id": format!("legacy-{name}"),
+        }));
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&doc).expect("serialize"),
+    )
+    .expect("write registry");
+    canonical
+}
+
+/// §C.6.1: mutation commands refuse in a legacy-symlink worktree (they
+/// would move MAIN's HEAD/index); read-only commands keep working, and the
+/// list layout field reports `legacy-symlink`.
+#[cfg(unix)]
+#[test]
+fn legacy_symlink_mutation_fails_closed() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = create_legacy_symlink_worktree(main, "wt-legacy");
+
+    // Reads still work (shared scope, no regression).
+    assert_cli_success(&run_libra_command(&["status"], &wt), "read-only status");
+    assert_cli_success(
+        &run_libra_command(&["log", "--oneline"], &wt),
+        "read-only log",
+    );
+
+    // Mutations refuse with the stable code + migrate hint.
+    std::fs::write(wt.join("x.txt"), "x\n").unwrap();
+    for argv in [
+        vec!["add", "x.txt"],
+        vec!["commit", "-m", "nope", "--no-verify"],
+        vec!["switch", "feature"],
+        vec!["stash", "push"],
+        vec!["read-tree", "HEAD"],
+        vec!["update-index", "--add", "x.txt"],
+        vec!["sparse-view", "set", "src/**"],
+        vec!["layer", "add", "ov", "--source", "/tmp/ov"],
+        vec!["symbolic-ref", "HEAD", "refs/heads/feature"],
+    ] {
+        let out = run_libra_command(&argv, &wt);
+        assert!(
+            !out.status.success(),
+            "{argv:?} must refuse in a legacy-symlink worktree"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003")
+                && stderr.contains("--migrate-layout"),
+            "stable refusal with the migrate hint for {argv:?}: {stderr}"
+        );
+    }
+
+    // Read-only advisory subcommands stay usable.
+    assert_cli_success(
+        &run_libra_command(&["sparse-view", "status"], &wt),
+        "sparse-view status stays readable",
+    );
+    assert_cli_success(
+        &run_libra_command(&["layer", "list"], &wt),
+        "layer list stays readable",
+    );
+
+    // Lifecycle mutation of a LEGACY target refuses from main too — a
+    // detached marker or identity write through the shared symlink would
+    // land in MAIN storage and freeze the main repository.
+    let registry = main.join(".libra").join("worktrees.json");
+    let registry_before = std::fs::read(&registry).expect("registry bytes");
+    for argv in [
+        vec!["worktree", "remove", wt.to_str().unwrap()],
+        vec!["worktree", "repair", wt.to_str().unwrap()],
+    ] {
+        let out = run_libra_command(&argv, main);
+        assert!(
+            !out.status.success(),
+            "{argv:?} must refuse a legacy-symlink target"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--migrate-layout"),
+            "refusal directs at the migration for {argv:?}"
+        );
+    }
+    assert_cli_success(&run_libra_command(&["status"], main), "main stays usable");
+    assert!(
+        !main.join(".libra").join("detached_from_registry").exists(),
+        "no marker leaked into MAIN storage"
+    );
+    assert_eq!(
+        std::fs::read(&registry).expect("registry after"),
+        registry_before,
+        "registry unchanged by the refusals"
+    );
+
+    // Layout surfaces in JSON list and porcelain.
+    let list = run_libra_command(&["worktree", "list", "--json"], main);
+    assert_cli_success(&list, "list --json");
+    let payload = parse_json_stdout(&list);
+    let entry = payload["data"]["worktrees"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(wt.to_string_lossy().as_ref()))
+        .expect("legacy entry listed");
+    assert_eq!(entry["layout"].as_str(), Some("legacy-symlink"));
+    let porcelain = run_libra_command(&["worktree", "list", "--porcelain"], main);
+    assert_cli_success(&porcelain, "list --porcelain");
+    assert!(
+        String::from_utf8_lossy(&porcelain.stdout).contains("layout legacy-symlink"),
+        "porcelain layout line present"
+    );
+}
+
+/// §C.6.2: migration preserves dirty/untracked FILES byte-for-byte, does
+/// not copy staged state, seeds a detached HEAD at the shared snapshot,
+/// and flips the layout to linked-v2. `--dry-run` writes nothing.
+#[cfg(unix)]
+#[test]
+fn legacy_layout_migration_preserves_dirty_and_untracked() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = create_legacy_symlink_worktree(main, "wt-migrate");
+    let shared_head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+            .trim()
+            .to_string();
+
+    // Local files: a modified tracked file and an untracked one.
+    std::fs::write(wt.join("a.txt"), "locally modified\n").unwrap();
+    std::fs::write(wt.join("untracked.txt"), "keep me\n").unwrap();
+    // Staged state in the SHARED index (ownership unprovable — must NOT
+    // migrate into the private index).
+    std::fs::write(main.join("staged.txt"), "staged\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "staged.txt"], main),
+        "stage in main",
+    );
+
+    // Dry run: reports, writes nothing.
+    let dry = run_libra_command(
+        &[
+            "--json",
+            "worktree",
+            "repair",
+            "--migrate-layout",
+            "--dry-run",
+        ],
+        main,
+    );
+    assert_cli_success(&dry, "dry run");
+    let payload = parse_json_stdout(&dry);
+    assert_eq!(payload["data"]["dry_run"], true);
+    assert!(
+        payload["data"]["planned"]
+            .as_array()
+            .expect("planned")
+            .iter()
+            .any(|p| p.as_str() == Some(wt.to_string_lossy().as_ref())),
+        "dry run plans the legacy worktree"
+    );
+    assert!(
+        std::fs::symlink_metadata(wt.join(".libra"))
+            .expect("gitdir meta")
+            .file_type()
+            .is_symlink(),
+        "dry run leaves the symlink untouched"
+    );
+    let registry_bytes =
+        std::fs::read(main.join(".libra").join("worktrees.json")).expect("registry present");
+    let dry2 = run_libra_command(
+        &["worktree", "repair", "--migrate-layout", "--dry-run"],
+        main,
+    );
+    assert_cli_success(&dry2, "second dry run");
+    assert_eq!(
+        std::fs::read(main.join(".libra").join("worktrees.json")).expect("registry"),
+        registry_bytes,
+        "dry run never rewrites the registry"
+    );
+
+    // Real migration.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", "--migrate-layout"], main),
+        "migrate",
+    );
+    assert!(
+        std::fs::symlink_metadata(wt.join(".libra"))
+            .expect("gitdir meta")
+            .file_type()
+            .is_dir(),
+        "gitdir is now a real directory"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "locally modified\n",
+        "dirty file preserved byte-for-byte"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("untracked.txt")).unwrap(),
+        "keep me\n",
+        "untracked file preserved"
+    );
+
+    // Detached at the shared snapshot; staged state NOT copied.
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &wt).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(head, shared_head, "detached at the migration snapshot");
+    let abbrev = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(abbrev, "HEAD", "detached HEAD");
+    let status = run_libra_command(&["status", "--porcelain"], &wt);
+    assert_cli_success(&status, "status in migrated worktree");
+    let porcelain = String::from_utf8_lossy(&status.stdout).to_string();
+    assert!(
+        !porcelain.contains("staged.txt") || porcelain.contains("?? staged.txt"),
+        "shared staged state must not appear as staged here: {porcelain}"
+    );
+    assert!(
+        porcelain.contains(" M a.txt") || porcelain.contains("M a.txt"),
+        "modified file shows dirty against the new private index: {porcelain}"
+    );
+
+    // Layout flipped; mutations work now.
+    let list = run_libra_command(&["worktree", "list", "--json"], main);
+    let payload = parse_json_stdout(&list);
+    let entry = payload["data"]["worktrees"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(wt.to_string_lossy().as_ref()))
+        .expect("entry");
+    assert_eq!(entry["layout"].as_str(), Some("linked-v2"));
+    assert_cli_success(
+        &run_libra_command(&["add", "untracked.txt"], &wt),
+        "mutations unblocked after migration",
+    );
+    // No leftover journal/backup material.
+    assert!(!wt.join(".libra").join("migrate-marker").exists());
+}
+
+/// §C.6.2 step 4: an unmerged SHARED index refuses the migration before
+/// any rename.
+#[cfg(unix)]
+#[test]
+fn legacy_layout_unmerged_index_refused_before_rename() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = create_legacy_symlink_worktree(main, "wt-unmerged");
+
+    // Manufacture a conflict in MAIN's shared index.
+    std::fs::write(main.join("conflict.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "conflict.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main side", "--no-verify"], main),
+        "commit main side",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "feature"], main), "switch");
+    std::fs::write(main.join("conflict.txt"), "feature\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "conflict.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature side", "--no-verify"], main),
+        "commit feature side",
+    );
+    let merge = run_libra_command(&["merge", "main"], main);
+    assert!(!merge.status.success(), "merge conflicts");
+
+    let refused = run_libra_command(&["worktree", "repair", "--migrate-layout"], main);
+    assert!(
+        !refused.status.success(),
+        "unmerged shared index refuses migration"
+    );
+    assert!(
+        std::fs::symlink_metadata(wt.join(".libra"))
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "nothing renamed before the refusal"
+    );
+}
+
+/// §C.6.2 crash matrix: repair converges from each journaled crash window
+/// by IDENTITY (symlink target, journal-stamped marker) — pre-backup rolls
+/// back, between-renames rolls forward, installed finishes.
+#[cfg(unix)]
+#[tokio::test]
+async fn layout_migration_crash_matrix() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let shared_head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+            .trim()
+            .to_string();
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let plant = |wt_id: String, payload: String| {
+        let db_url = db_url.clone();
+        async move {
+            let conn = Database::connect(&db_url).await.expect("connect");
+            let backend = conn.get_database_backend();
+            conn.execute(Statement::from_string(
+                backend,
+                format!(
+                    "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
+                     created_at) VALUES ('migrate', '{wt_id}', '{payload}', 0);"
+                ),
+            ))
+            .await
+            .expect("plant journal");
+            let row = conn
+                .query_one(Statement::from_string(
+                    backend,
+                    "SELECT MAX(id) FROM worktree_intent_journal".to_string(),
+                ))
+                .await
+                .expect("query")
+                .expect("row");
+            let id: i64 = row.try_get_by_index(0).expect("id");
+            conn.close().await.expect("close");
+            id
+        }
+    };
+    let journal_count = || {
+        let db_url = db_url.clone();
+        async move {
+            let conn = Database::connect(&db_url).await.expect("connect");
+            let backend = conn.get_database_backend();
+            let row = conn
+                .query_one(Statement::from_string(
+                    backend,
+                    "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+                ))
+                .await
+                .expect("query")
+                .expect("row");
+            let count: i64 = row.try_get_by_index(0).expect("count");
+            conn.close().await.expect("close");
+            count
+        }
+    };
+
+    // Mid-migration freeze: a worktree whose gitdir still carries the
+    // journal-stamped marker refuses OTHER processes' commands.
+    let frozen = create_legacy_symlink_worktree(main, "wt-frozen");
+    std::fs::remove_file(frozen.join(".libra")).unwrap();
+    std::fs::create_dir_all(frozen.join(".libra")).unwrap();
+    std::fs::write(
+        frozen.join(".libra").join("commondir"),
+        format!(
+            "{}\n",
+            main.join(".libra").canonicalize().unwrap().display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        frozen.join(".libra").join("worktree_id"),
+        "legacy-wt-frozen\n",
+    )
+    .unwrap();
+    std::fs::write(
+        frozen.join(".libra").join("migrate-marker"),
+        "journal 9999\n",
+    )
+    .unwrap();
+    let out = run_libra_command(&["status"], &frozen);
+    assert!(
+        !out.status.success(),
+        "a mid-migration worktree is frozen for other processes"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unfinished layout migration"),
+        "freeze names the cause"
+    );
+    std::fs::remove_dir_all(&frozen).unwrap();
+
+    // Window 1: pre-backup — legacy link intact, prepared dir exists.
+    let wt1 = create_legacy_symlink_worktree(main, "wt-crash-pre");
+    let id1 = plant(
+        "legacy-wt-crash-pre".to_string(),
+        format!(
+            "{{\"path\":\"{}\",\"head\":\"{shared_head}\"}}",
+            wt1.to_string_lossy()
+        ),
+    )
+    .await;
+    let prepared1 = wt1.join(format!(".libra.migrate-{id1}"));
+    std::fs::create_dir_all(&prepared1).unwrap();
+    std::fs::write(prepared1.join("migrate-marker"), format!("journal {id1}\n")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair window 1",
+    );
+    assert!(
+        std::fs::symlink_metadata(wt1.join(".libra"))
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "window 1 rolls back: legacy link intact"
+    );
+    assert!(
+        !prepared1.exists(),
+        "window 1 removes only our prepared dir"
+    );
+
+    // Window 2: between renames — gitdir gone, backup holds the link,
+    // prepared carries the full identity.
+    let wt2 = create_legacy_symlink_worktree(main, "wt-crash-mid");
+    let id2 = plant(
+        "legacy-wt-crash-mid".to_string(),
+        format!(
+            "{{\"path\":\"{}\",\"head\":\"{shared_head}\"}}",
+            wt2.to_string_lossy()
+        ),
+    )
+    .await;
+    let prepared2 = wt2.join(format!(".libra.migrate-{id2}"));
+    std::fs::create_dir_all(&prepared2).unwrap();
+    std::fs::write(
+        prepared2.join("commondir"),
+        format!(
+            "{}\n",
+            main.join(".libra").canonicalize().unwrap().display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(prepared2.join("worktree_id"), "legacy-wt-crash-mid\n").unwrap();
+    std::fs::write(prepared2.join("migrate-marker"), format!("journal {id2}\n")).unwrap();
+    std::fs::rename(
+        wt2.join(".libra"),
+        wt2.join(format!(".libra.legacy-backup-{id2}")),
+    )
+    .unwrap();
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair window 2",
+    );
+    let head2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &wt2).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(
+        head2, shared_head,
+        "window 2 rolled forward to a working worktree"
+    );
+    assert!(
+        !wt2.join(format!(".libra.legacy-backup-{id2}")).exists(),
+        "window 2 backup cleaned"
+    );
+
+    assert_eq!(
+        journal_count().await,
+        0,
+        "both windows resolved their journals"
+    );
+
+    // Stale-journal adoption guard: a worktree freshly re-added at the same
+    // path (deterministic id, valid commondir, NO journal-stamped marker)
+    // must NOT be adopted and re-seeded from the old snapshot.
+    let wt3 = main.join("wt-crash-stale");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt3.to_str().unwrap(), "feature"], main),
+        "fresh worktree at the contested path",
+    );
+    let wt3_canonical = wt3.canonicalize().expect("canonical wt3");
+    let wt3_id = std::fs::read_to_string(wt3.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+    plant(
+        wt3_id,
+        format!(
+            "{{\"path\":\"{}\",\"head\":\"{shared_head}\"}}",
+            wt3_canonical.to_string_lossy()
+        ),
+    )
+    .await;
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with a stale migrate journal",
+    );
+    let head3 = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt3).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head3, "feature", "the fresh worktree was NOT re-seeded");
+    assert_eq!(journal_count().await, 1, "the stale journal row is kept");
+
+    // Retry guard: while that unresolved migrate journal exists for the
+    // path, a NEW migration attempt refuses instead of stacking a second
+    // intent.
+    std::fs::remove_dir_all(&wt3).expect("clear for legacy re-setup");
+    std::fs::create_dir_all(&wt3).unwrap();
+    std::os::unix::fs::symlink(main.join(".libra"), wt3.join(".libra")).unwrap();
+    let retry = run_libra_command(
+        &[
+            "worktree",
+            "repair",
+            "--migrate-layout",
+            wt3.to_str().unwrap(),
+        ],
+        main,
+    );
+    assert!(
+        !retry.status.success(),
+        "a pending migrate journal refuses a second migration"
+    );
+    assert!(
+        String::from_utf8_lossy(&retry.stderr).contains("unresolved earlier migration"),
+        "refusal names the pending journal"
+    );
+    assert_eq!(journal_count().await, 1, "no second intent was stacked");
+
+    // Stray RESOLVED marker (journal gone, e.g. an unlink failure after
+    // resolution): plain repair verifies the install identity and clears
+    // it, unfreezing the worktree.
+    let wt4 = main.join("wt-stray-marker");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt4.to_str().unwrap()], main),
+        "fresh worktree",
+    );
+    std::fs::write(
+        wt4.join(".libra").join("migrate-marker"),
+        "journal 424242\n",
+    )
+    .unwrap();
+    let frozen = run_libra_command(&["status"], &wt4);
+    assert!(!frozen.status.success(), "marker freezes the worktree");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair clears the resolved marker",
+    );
+    assert!(
+        !wt4.join(".libra").join("migrate-marker").exists(),
+        "marker cleared after identity verification"
+    );
+    assert_cli_success(
+        &run_libra_command(&["status"], &wt4),
+        "worktree unfrozen after repair",
+    );
+
+    // Interrupted-migration-then-move guard: an entry whose migrate journal
+    // is still pending refuses `worktree move` (a relocation would strand
+    // the journal at the old path and let reconciliation unfreeze the
+    // still-unmigrated state).
+    let wt5 = main.join("wt-move-pending");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt5.to_str().unwrap()], main),
+        "worktree for move guard",
+    );
+    let wt5_canonical = wt5.canonicalize().expect("canonical wt5");
+    let wt5_id = std::fs::read_to_string(wt5.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+    plant(
+        wt5_id,
+        format!(
+            "{{\"path\":\"{}\",\"head\":\"{shared_head}\"}}",
+            wt5_canonical.to_string_lossy()
+        ),
+    )
+    .await;
+    let blocked = run_libra_command(
+        &[
+            "worktree",
+            "move",
+            wt5.to_str().unwrap(),
+            main.join("wt-moved-away").to_str().unwrap(),
+        ],
+        main,
+    );
+    assert!(
+        !blocked.status.success(),
+        "move refuses while a migrate journal is pending"
+    );
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("unfinished layout migration"),
+        "refusal names the pending migration"
     );
 }
