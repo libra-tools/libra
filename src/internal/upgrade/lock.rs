@@ -66,6 +66,7 @@ pub enum EntryKind {
     Other,
 }
 
+#[cfg(unix)]
 fn validate_entry_name(name: &str) -> Result<(), InstallDirError> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(InstallDirError::BadEntryName(name.to_string()));
@@ -421,6 +422,50 @@ impl InstallDir {
     /// §A.5: Windows (and any non-Unix target) does not enter the upgrade
     /// file path in R0.
     pub fn open_validated(_path: &Path) -> Result<Self, InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    /// The canonical directory path (diagnostics only).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    // Keep the Unix-only upgrade callers type-checking on unsupported
+    // platforms while failing closed before any filesystem operation.
+    pub fn stat_entry(&self, _name: &str) -> Result<Option<EntryKind>, InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn read_file(&self, _name: &str) -> Result<Option<Vec<u8>>, InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn write_file_atomic(
+        &self,
+        _name: &str,
+        _bytes: &[u8],
+        _mode: u32,
+    ) -> Result<(), InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn rename_entry(&self, _from: &str, _to: &str) -> Result<(), InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn remove_file(&self, _name: &str) -> Result<bool, InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn fsync_dir(&self) -> Result<(), InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn try_lock(&self) -> Result<Option<UpgradeLock>, InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn lock_blocking(&self) -> Result<UpgradeLock, InstallDirError> {
         Err(InstallDirError::UnsupportedPlatform)
     }
 }

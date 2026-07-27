@@ -799,7 +799,7 @@ fn discover_codex(since: Option<i64>, deadline: Instant) -> Result<Vec<Candidate
     return discover_codex_unix(&root, &directory, since, deadline);
     #[cfg(not(unix))]
     {
-        let pinned_root = root;
+        let pinned_root = root.clone();
         let mut scanned = 0usize;
         let mut candidates = Vec::new();
         for year in read_codex_discovery_directory(&pinned_root, deadline, &mut scanned)? {
