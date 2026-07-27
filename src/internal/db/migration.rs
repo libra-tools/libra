@@ -1096,6 +1096,15 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072501_workspace_record.sql"),
             include_str!("../../../sql/migrations/2026072501_workspace_record_down.sql"),
         ),
+        // plan-20260714 Part C W4-s2 hardening: keyset pagination for
+        // `agent workspace list` must search by repository prefix in
+        // workspace_id order instead of scanning/sorting as the registry grows.
+        sql_migration(
+            2026072502,
+            "workspace_paging_index",
+            include_str!("../../../sql/migrations/2026072502_workspace_paging_index.sql"),
+            include_str!("../../../sql/migrations/2026072502_workspace_paging_index_down.sql"),
+        ),
     ]
 }
 
@@ -1341,9 +1350,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 42);
+        assert_eq!(runner.len(), 43);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072501));
+        assert_eq!(runner.max_registered_version(), Some(2026072502));
     }
 
     #[test]

@@ -1818,6 +1818,64 @@ async fn listing_pages_without_duplicates_or_loss() {
     assert!(unbounded_request.items.len() <= MAX_LIST_LIMIT as usize);
 }
 
+/// `agent workspace list` pages by `(repo_id, workspace_id)`, so the production
+/// migration must install a matching index. Otherwise the documented cap-500
+/// machine interface can still degrade into a table scan as other repository
+/// identities accumulate rows.
+#[tokio::test]
+async fn workspace_listing_hits_repo_paging_index() {
+    let db = open_db().await;
+    let root = db.path.parent().expect("db parent");
+    let first = WorkspaceStore::acquire(
+        &db.conn,
+        &AcquireRequest::linked("wt-1", workspace_dir(root, "ws-1"), "owner-1", TTL),
+        NOW,
+    )
+    .await
+    .expect("first workspace");
+    let _second = WorkspaceStore::acquire(
+        &db.conn,
+        &AcquireRequest::linked("wt-2", workspace_dir(root, "ws-2"), "owner-2", TTL),
+        NOW + 1,
+    )
+    .await
+    .expect("second workspace");
+
+    let rows = db
+        .conn
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "EXPLAIN QUERY PLAN \
+             SELECT workspace_id, repo_id, kind, worktree_id, path, owner_kind, owner_id, \
+                    task_id, session_id, base_commit, branch, state, lease_owner, lease_fence, \
+                    lease_expires_at, created_at, updated_at \
+             FROM workspace_record WHERE repo_id = ? AND workspace_id > ? \
+             ORDER BY workspace_id ASC LIMIT ?",
+            [REPO_ID.into(), first.workspace_id.into(), 51i64.into()],
+        ))
+        .await
+        .expect("explain workspace pagination");
+    let plan = rows
+        .iter()
+        .map(|row| row.try_get_by::<String, _>("detail").unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("idx_workspace_repo_paging"),
+        "workspace pagination must use idx_workspace_repo_paging, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("TEMP B-TREE"),
+        "workspace pagination must not sort via temp B-tree, got:\n{plan}"
+    );
+    for line in plan.lines() {
+        assert!(
+            !line.trim_start().starts_with("SCAN workspace_record") || line.contains("USING"),
+            "workspace pagination must not full-scan, got:\n{plan}"
+        );
+    }
+}
+
 /// The registry stores association IDs only — no prompts, transcripts, or tool
 /// payloads may ever leak into it (§C.8: "path、prompt、transcript、tool
 /// payload 不进入该表"). Pin the column set so a future column has to argue

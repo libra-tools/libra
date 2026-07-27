@@ -52,7 +52,8 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501
+            2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
+            2026072502
         ]
     );
     assert_eq!(
@@ -100,13 +101,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "worktree_lifecycle_journal",
             "worktree_migrate_intent",
             "workspace_record",
+            "workspace_paging_index",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 42);
-    assert_eq!(runner.max_registered_version(), Some(2026072501));
+    assert_eq!(runner.len(), 43);
+    assert_eq!(runner.max_registered_version(), Some(2026072502));
 }
 
 // ---------------------------------------------------------------------------
