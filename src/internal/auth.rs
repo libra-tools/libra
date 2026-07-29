@@ -59,7 +59,16 @@ impl HostScope {
 
     /// Scope of a request URL (returns None for non-token-eligible schemes).
     pub fn from_request_url(url: &url::Url) -> Option<HostScope> {
-        Self::from_url(url).ok()
+        // Request URLs necessarily contain repository and protocol paths, while
+        // stored credentials are scoped only to the origin host and port.
+        // Normalize the request to the origin before applying the strict host
+        // parser; otherwise every Git Smart HTTP request silently misses the
+        // stored token and push/fetch falls through to a 401 prompt.
+        let mut origin = url.clone();
+        origin.set_path("/");
+        origin.set_query(None);
+        origin.set_fragment(None);
+        Self::from_url(&origin).ok()
     }
 
     fn from_url(url: &url::Url) -> Result<HostScope> {
