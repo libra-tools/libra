@@ -8,6 +8,7 @@ use std::{
     collections::HashSet,
     env, fs, io,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 use clap::{Parser, Subcommand};
@@ -17,7 +18,17 @@ use serde::{Deserialize, Serialize};
 use crate::utils::fuse as fuse_utils;
 use crate::{
     command::restore::{self, RestoreArgs},
-    internal::head::Head,
+    internal::{
+        head::Head,
+        scorpiofs_backend::{
+            CAPABILITY_CHANGES_V1, CAPABILITY_MOUNT_V1, CAPABILITY_READY_V1, HttpScorpioFsClient,
+            MountRequest, MountResponse, ScorpioFsBackendRecord, ScorpioFsControl, ScorpioFsDriver,
+        },
+        worktree_backend::{
+            BackendKind as WorktreeBackendKind, BackendMountRequest as StorageMountRequest,
+            BackendMountSession as StorageMountSession, BackendMountSource, WorktreeBackendDriver,
+        },
+    },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -29,6 +40,9 @@ use crate::{
 pub const WORKTREE_EXAMPLES: &str = "\
 EXAMPLES:
     libra worktree add ../feature-x                Create a linked worktree
+    libra worktree scorpiofs attach --remote-path /project/crate --job-id dev-crate
+                                                   Attach a ScorpioFS remote worktree
+    libra worktree scorpiofs detach <mountpoint>   Detach the remote worktree
     libra worktree list                            List every registered worktree
     libra worktree list --porcelain                Machine-readable worktree list
     libra worktree lock ../feature-x --reason wip  Lock a worktree to prevent prune/remove
@@ -65,6 +79,11 @@ pub enum WorktreeSubcommand {
     Add {
         /// Filesystem path at which to create the new worktree.
         path: String,
+    },
+    /// Manage a linked worktree backed by a ScorpioFS Antares mount.
+    Scorpiofs {
+        #[clap(subcommand)]
+        command: ScorpioFsSubcommand,
     },
     /// List all known worktrees and their state.
     List {
@@ -120,6 +139,39 @@ pub enum WorktreeSubcommand {
     Repair,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum ScorpioFsSubcommand {
+    /// Mount a remote monorepo path and attach it as a persistent linked worktree.
+    Attach {
+        /// Antares API base URL.
+        ///
+        /// When omitted on Linux, Libra starts and owns an embedded ScorpioFS
+        /// worker. Supplying this option selects the compatibility HTTP mode.
+        #[clap(long)]
+        endpoint: Option<String>,
+        /// ScorpioFS configuration used by the Libra-owned worker.
+        #[clap(long, default_value = "scorpio.toml")]
+        config_path: PathBuf,
+        /// Absolute path inside the remote monorepo.
+        #[clap(long)]
+        remote_path: String,
+        /// Stable job identity used for idempotent mount creation and recovery.
+        #[clap(long)]
+        job_id: String,
+        /// Optional Mega changelist layer.
+        #[clap(long)]
+        cl: Option<String>,
+        /// Maximum number of seconds to wait for mount readiness.
+        #[clap(long, default_value_t = 120)]
+        ready_timeout_secs: u64,
+    },
+    /// Unmount and unregister a ScorpioFS-backed linked worktree.
+    Detach {
+        /// Mounted worktree path.
+        path: String,
+    },
+}
+
 /// A single worktree entry persisted in `worktrees.json`.
 ///
 /// `path` is always stored as a canonical absolute path.
@@ -162,6 +214,24 @@ pub(crate) struct WorktreeListEntry {
 struct WorktreeAddOutput {
     path: String,
     already_exists: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ScorpioFsAttachOutput {
+    path: String,
+    worktree_id: String,
+    mount_id: String,
+    job_id: String,
+    already_exists: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ScorpioFsDetachOutput {
+    path: String,
+    worktree_id: String,
+    job_id: String,
+    unmounted: bool,
+    registry_removed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -375,6 +445,34 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                 .map_err(WorktreeError::into_cli_error)?;
             render_add_worktree(&result, output)
         }
+        WorktreeSubcommand::Scorpiofs { command } => match command {
+            ScorpioFsSubcommand::Attach {
+                endpoint,
+                config_path,
+                remote_path,
+                job_id,
+                cl,
+                ready_timeout_secs,
+            } => {
+                let result = attach_scorpiofs_worktree(
+                    endpoint,
+                    config_path,
+                    remote_path,
+                    job_id,
+                    cl,
+                    ready_timeout_secs,
+                )
+                .await
+                .map_err(WorktreeError::into_cli_error)?;
+                render_scorpiofs_attach(&result, output)
+            }
+            ScorpioFsSubcommand::Detach { path } => {
+                let result = detach_scorpiofs_worktree(path)
+                    .await
+                    .map_err(WorktreeError::into_cli_error)?;
+                render_scorpiofs_detach(&result, output)
+            }
+        },
         WorktreeSubcommand::List { porcelain } => list_worktrees(output, porcelain).await,
         WorktreeSubcommand::Lock { path, reason } => {
             let result = lock_worktree(path, reason).map_err(WorktreeError::into_cli_error)?;
@@ -877,6 +975,878 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
     })
 }
 
+async fn attach_scorpiofs_worktree(
+    endpoint: Option<String>,
+    config_path: PathBuf,
+    remote_path: String,
+    job_id: String,
+    cl: Option<String>,
+    ready_timeout_secs: u64,
+) -> WorktreeResult<ScorpioFsAttachOutput> {
+    let storage = util::storage_path();
+    let _state_lock = crate::internal::scorpiofs_backend::ScorpioFsStateLock::acquire(&storage)
+        .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+    let (endpoint, transport) = match endpoint {
+        Some(endpoint) => (
+            endpoint,
+            crate::internal::scorpiofs_backend::BackendTransport::ExternalHttp,
+        ),
+        None => (
+            ensure_managed_scorpiofs_worker(
+                &storage,
+                &config_path,
+                Duration::from_secs(ready_timeout_secs),
+            )
+            .await?,
+            crate::internal::scorpiofs_backend::BackendTransport::ManagedCrate,
+        ),
+    };
+    let seed_commit = Head::current_commit_result().await.map_err(|error| {
+        WorktreeError::IoRead(format!(
+            "failed to read HEAD before attaching ScorpioFS worktree: {error}"
+        ))
+    })?;
+    let client = HttpScorpioFsClient::new(&endpoint)
+        .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+    let request = MountRequest {
+        job_id: job_id.clone(),
+        path: remote_path,
+        cl,
+        base_oid: None,
+    };
+    let mut desired_state = crate::internal::scorpiofs_backend::LibraScorpioFsState::load(&storage)
+        .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+    let previous_mountpoint = desired_state
+        .mounts
+        .get(&job_id)
+        .and_then(|desired| desired.mountpoint.clone());
+    desired_state
+        .begin_mount(request.clone(), transport, endpoint.clone())
+        .map_err(|error| WorktreeError::OperationBlocked(error.to_string()))?;
+    desired_state
+        .save(&storage)
+        .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+
+    let driver = ScorpioFsDriver::new(client.clone());
+    let backend_request = StorageMountRequest {
+        instance_id: job_id.clone(),
+        worktree_id: job_id.clone(),
+        source: BackendMountSource::RemoteProjection {
+            remote_path: request.path.clone(),
+            base_oid: request.base_oid.clone(),
+            change_layer: request.cl.clone(),
+        },
+        mountpoint_hint: None,
+        ready_timeout_secs,
+    };
+    let backend_session = match driver.mount(&backend_request).await {
+        Ok(session) => session,
+        Err(error) => {
+            record_scorpiofs_attach_error(&storage, &job_id, error.to_string());
+            return Err(WorktreeError::IoWrite(error.to_string()));
+        }
+    };
+    let mount = MountResponse {
+        mount_id: backend_session.session_id,
+        mountpoint: backend_session.mountpoint.to_string_lossy().into_owned(),
+        base_oid: backend_session.base_oid,
+        ready: Some(true),
+    };
+
+    let target = match resolve_path(&mount.mountpoint, "ScorpioFS mountpoint") {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = client.delete_by_job(&job_id).await;
+            record_scorpiofs_attach_error(&storage, &job_id, format!("{error:?}"));
+            return Err(error);
+        }
+    };
+    if !target.is_dir() {
+        let _ = client.delete_by_job(&job_id).await;
+        let error = WorktreeError::InvalidTarget(format!(
+            "ScorpioFS mountpoint is not a directory: {}",
+            target.display()
+        ));
+        record_scorpiofs_attach_error(&storage, &job_id, format!("{error:?}"));
+        return Err(error);
+    }
+    if util::is_sub_path(&target, &storage) {
+        let _ = client.delete_by_job(&job_id).await;
+        let error = WorktreeError::InvalidTarget(format!(
+            "ScorpioFS mountpoint cannot be inside .libra storage: {}",
+            target.display()
+        ));
+        record_scorpiofs_attach_error(&storage, &job_id, format!("{error:?}"));
+        return Err(error);
+    }
+
+    let mut state = load_state()?;
+    if let Some(previous_mountpoint) = previous_mountpoint.as_deref() {
+        if Path::new(previous_mountpoint) != target {
+            state
+                .worktrees
+                .retain(|entry| Path::new(&entry.path) != Path::new(previous_mountpoint));
+        }
+    }
+    if state
+        .worktrees
+        .iter()
+        .any(|entry| Path::new(&entry.path) == target)
+    {
+        let gitdir = util::try_get_worktree_gitdir(Some(target.clone())).map_err(|error| {
+            WorktreeError::IoRead(format!(
+                "registered ScorpioFS worktree '{}' has invalid metadata: {error}",
+                target.display()
+            ))
+        })?;
+        let record = ScorpioFsBackendRecord::load(&gitdir)
+            .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+        if record.job_id != job_id || record.remote_path != request.path {
+            return Err(WorktreeError::OperationBlocked(format!(
+                "worktree '{}' is already registered for ScorpioFS job '{}' and path '{}'",
+                target.display(),
+                record.job_id,
+                record.remote_path
+            )));
+        }
+        desired_state
+            .mark_ready(&job_id, &mount, &read_worktree_id(&gitdir)?)
+            .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+        desired_state
+            .save(&storage)
+            .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+        return Ok(ScorpioFsAttachOutput {
+            path: target.to_string_lossy().into_owned(),
+            worktree_id: read_worktree_id(&gitdir)?,
+            mount_id: mount.mount_id,
+            job_id,
+            already_exists: true,
+        });
+    }
+
+    let backend_identity = match transport {
+        crate::internal::scorpiofs_backend::BackendTransport::ManagedCrate => "managed-crate",
+        crate::internal::scorpiofs_backend::BackendTransport::ExternalHttp => {
+            client.endpoint().as_str()
+        }
+    };
+    let worktree_id = scorpiofs_worktree_id(backend_identity, &job_id, &request.path);
+    let gitdir = storage
+        .join("worktrees")
+        .join("scorpiofs")
+        .join(&worktree_id);
+    let pointer = target.join(util::ROOT_DIR);
+    let created_gitdir = !gitdir.exists();
+    if created_gitdir {
+        create_worktree_gitdir(&storage, &gitdir, &worktree_id).map_err(|source| {
+            WorktreeError::IoWrite(format!(
+                "failed to create persistent ScorpioFS worktree gitdir '{}': {source}",
+                gitdir.display()
+            ))
+        })?;
+    }
+
+    let record = match ScorpioFsBackendRecord::new_with_transport(
+        client.endpoint(),
+        &mount,
+        &request,
+        transport,
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            rollback_scorpiofs_attach(
+                &client,
+                &job_id,
+                &pointer,
+                false,
+                &gitdir,
+                created_gitdir,
+                &worktree_id,
+            )
+            .await;
+            return Err(WorktreeError::IoWrite(error.to_string()));
+        }
+    };
+
+    if !created_gitdir {
+        let existing = ScorpioFsBackendRecord::load(&gitdir).map_err(|error| {
+            WorktreeError::OperationBlocked(format!(
+                "persistent ScorpioFS worktree '{}' cannot be reused: {error}",
+                gitdir.display()
+            ))
+        })?;
+        if existing.job_id != job_id
+            || existing.remote_path != request.path
+            || existing.transport != record.transport
+            || (transport == crate::internal::scorpiofs_backend::BackendTransport::ExternalHttp
+                && existing.endpoint != record.endpoint)
+        {
+            let _ = client.delete_by_job(&job_id).await;
+            return Err(WorktreeError::OperationBlocked(format!(
+                "persistent ScorpioFS worktree id '{}' belongs to another backend attachment",
+                worktree_id
+            )));
+        }
+    }
+    if let Err(error) = record.save(&gitdir) {
+        rollback_scorpiofs_attach(
+            &client,
+            &job_id,
+            &pointer,
+            false,
+            &gitdir,
+            created_gitdir,
+            &worktree_id,
+        )
+        .await;
+        return Err(WorktreeError::IoWrite(error.to_string()));
+    }
+
+    let created_pointer = match attach_worktree_pointer(&pointer, &gitdir) {
+        Ok(created) => created,
+        Err(source) => {
+            rollback_scorpiofs_attach(
+                &client,
+                &job_id,
+                &pointer,
+                false,
+                &gitdir,
+                created_gitdir,
+                &worktree_id,
+            )
+            .await;
+            return Err(WorktreeError::IoWrite(format!(
+                "failed to attach persistent metadata at '{}': {source}",
+                pointer.display()
+            )));
+        }
+    };
+
+    if let Some(commit) = seed_commit {
+        let guard = match DirGuard::change_to(&target) {
+            Ok(guard) => guard,
+            Err(error) => {
+                rollback_scorpiofs_attach(
+                    &client,
+                    &job_id,
+                    &pointer,
+                    created_pointer,
+                    &gitdir,
+                    created_gitdir,
+                    &worktree_id,
+                )
+                .await;
+                return Err(WorktreeError::IoRead(format!(
+                    "failed to enter ScorpioFS worktree '{}': {error}",
+                    target.display()
+                )));
+            }
+        };
+        if let Err(error) = Head::update_result(Head::Detached(commit), None).await {
+            drop(guard);
+            rollback_scorpiofs_attach(
+                &client,
+                &job_id,
+                &pointer,
+                created_pointer,
+                &gitdir,
+                created_gitdir,
+                &worktree_id,
+            )
+            .await;
+            return Err(WorktreeError::IoWrite(format!(
+                "failed to seed ScorpioFS worktree HEAD: {error}"
+            )));
+        }
+        if let Err(error) = restore::execute_checked(RestoreArgs {
+            overlay: false,
+            no_overlay: false,
+            ours: false,
+            theirs: false,
+            ignore_unmerged: false,
+            merge: false,
+            conflict: None,
+            pathspec: vec![".".to_string()],
+            source: Some("HEAD".to_string()),
+            worktree: false,
+            staged: true,
+            pathspec_from_file: None,
+            pathspec_file_nul: false,
+            no_progress: false,
+        })
+        .await
+        {
+            drop(guard);
+            rollback_scorpiofs_attach(
+                &client,
+                &job_id,
+                &pointer,
+                created_pointer,
+                &gitdir,
+                created_gitdir,
+                &worktree_id,
+            )
+            .await;
+            return Err(WorktreeError::IoWrite(format!(
+                "failed to seed ScorpioFS worktree index: {error}"
+            )));
+        }
+    } else {
+        let guard = match DirGuard::change_to(&target) {
+            Ok(guard) => guard,
+            Err(error) => {
+                rollback_scorpiofs_attach(
+                    &client,
+                    &job_id,
+                    &pointer,
+                    created_pointer,
+                    &gitdir,
+                    created_gitdir,
+                    &worktree_id,
+                )
+                .await;
+                return Err(WorktreeError::IoRead(format!(
+                    "failed to enter ScorpioFS worktree '{}': {error}",
+                    target.display()
+                )));
+            }
+        };
+        let unborn_branch = format!("scorpiofs/{worktree_id}");
+        if let Err(error) = Head::update_result(Head::Branch(unborn_branch), None).await {
+            drop(guard);
+            rollback_scorpiofs_attach(
+                &client,
+                &job_id,
+                &pointer,
+                created_pointer,
+                &gitdir,
+                created_gitdir,
+                &worktree_id,
+            )
+            .await;
+            return Err(WorktreeError::IoWrite(format!(
+                "failed to seed unborn ScorpioFS worktree HEAD: {error}"
+            )));
+        }
+    }
+
+    state.worktrees.push(WorktreeEntry {
+        path: target.to_string_lossy().into_owned(),
+        is_main: false,
+        locked: false,
+        lock_reason: None,
+    });
+    if let Err(error) = write_state(&state) {
+        rollback_scorpiofs_attach(
+            &client,
+            &job_id,
+            &pointer,
+            created_pointer,
+            &gitdir,
+            created_gitdir,
+            &worktree_id,
+        )
+        .await;
+        return Err(error);
+    }
+
+    let mut desired_state = crate::internal::scorpiofs_backend::LibraScorpioFsState::load(&storage)
+        .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+    desired_state
+        .mark_ready(&job_id, &mount, &worktree_id)
+        .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+    if let Err(error) = desired_state.save(&storage) {
+        rollback_scorpiofs_attach(
+            &client,
+            &job_id,
+            &pointer,
+            created_pointer,
+            &gitdir,
+            created_gitdir,
+            &worktree_id,
+        )
+        .await;
+        return Err(WorktreeError::IoWrite(error.to_string()));
+    }
+
+    Ok(ScorpioFsAttachOutput {
+        path: target.to_string_lossy().into_owned(),
+        worktree_id,
+        mount_id: mount.mount_id,
+        job_id,
+        already_exists: false,
+    })
+}
+
+async fn detach_scorpiofs_worktree(path: String) -> WorktreeResult<ScorpioFsDetachOutput> {
+    let storage = util::storage_path();
+    let _state_lock = crate::internal::scorpiofs_backend::ScorpioFsStateLock::acquire(&storage)
+        .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+    let target = resolve_path(&path, "ScorpioFS worktree path")?;
+    let mut state = load_state()?;
+    let index = state
+        .worktrees
+        .iter()
+        .position(|entry| Path::new(&entry.path) == target)
+        .ok_or_else(|| WorktreeError::NoSuchWorktree { path: path.clone() })?;
+    let entry = state.worktrees[index].clone();
+    if entry.is_main {
+        return Err(WorktreeError::MainWorktree {
+            action: "detach",
+            path: target.to_string_lossy().into_owned(),
+        });
+    }
+    if entry.locked {
+        return Err(WorktreeError::LockedWorktree {
+            action: "detach",
+            path: target.to_string_lossy().into_owned(),
+        });
+    }
+
+    let gitdir = util::try_get_worktree_gitdir(Some(target.clone())).map_err(|error| {
+        WorktreeError::IoRead(format!(
+            "failed to resolve ScorpioFS worktree metadata for '{}': {error}",
+            target.display()
+        ))
+    })?;
+    let managed_root = storage.join("worktrees").join("scorpiofs");
+    if !util::is_sub_path(&gitdir, &managed_root) {
+        return Err(WorktreeError::InvalidTarget(format!(
+            "worktree '{}' is not managed by the ScorpioFS backend",
+            target.display()
+        )));
+    }
+    let record = ScorpioFsBackendRecord::load(&gitdir)
+        .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+    let worktree_id = read_worktree_id(&gitdir)?;
+
+    {
+        let guard = DirGuard::change_to(&target).map_err(|error| {
+            WorktreeError::IoRead(format!(
+                "cannot enter ScorpioFS worktree '{}': {error}",
+                target.display()
+            ))
+        })?;
+        let staged = crate::command::status::changes_to_be_committed_safe()
+            .await
+            .map_err(|error| {
+                WorktreeError::IoRead(format!("failed to inspect staged changes: {error}"))
+            })?;
+        let backend_changes = crate::internal::scorpiofs_backend::current_worktree_changes()
+            .await
+            .map_err(|error| {
+                WorktreeError::IoRead(format!(
+                    "failed to query ScorpioFS worktree changes before detach: {error}"
+                ))
+            })?;
+        let unstaged = if let Some(changes) = backend_changes {
+            let ignore_case = crate::utils::path_case::effective_ignore_case_for_dir_sync(&target)
+                .map_err(|error| {
+                    WorktreeError::IoRead(format!(
+                        "failed to resolve ScorpioFS worktree path case policy: {error}"
+                    ))
+                })?;
+            let (visible, _) =
+                crate::command::status::changes_to_be_staged_split_for_paths_with_ignore_case(
+                    ignore_case,
+                    &changes.candidate_paths(),
+                )
+                .map_err(|error| {
+                    WorktreeError::IoRead(format!("failed to inspect ScorpioFS changes: {error}"))
+                })?;
+            visible
+        } else {
+            crate::command::status::changes_to_be_staged().map_err(|error| {
+                WorktreeError::IoRead(format!("failed to inspect unstaged changes: {error}"))
+            })?
+        };
+        if !staged.is_empty() || !unstaged.is_empty() {
+            return Err(WorktreeError::DirtyWorktree {
+                path: target.to_string_lossy().into_owned(),
+            });
+        }
+        drop(guard);
+    }
+
+    let mut desired_state = crate::internal::scorpiofs_backend::LibraScorpioFsState::load(&storage)
+        .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+    if let Some(desired) = desired_state.mounts.get_mut(&record.job_id) {
+        desired.lifecycle = crate::internal::scorpiofs_backend::BackendLifecycle::Unmounting;
+        desired.last_error = None;
+    }
+    desired_state
+        .save(&storage)
+        .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+
+    state.worktrees.remove(index);
+    write_state(&state)?;
+
+    let client = HttpScorpioFsClient::new(&record.endpoint)
+        .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+    let driver = ScorpioFsDriver::new(client);
+    let backend_session = StorageMountSession {
+        backend: WorktreeBackendKind::ScorpioFs,
+        session_id: record.mount_id.clone(),
+        mountpoint: target.clone(),
+        cleanup_key: record.job_id.clone(),
+        base_oid: record.base_oid.clone(),
+    };
+    if let Err(error) = driver.unmount(&backend_session).await {
+        if let Some(desired) = desired_state.mounts.get_mut(&record.job_id) {
+            desired.lifecycle = crate::internal::scorpiofs_backend::BackendLifecycle::Ready;
+            desired.last_error = Some(error.to_string());
+        }
+        let _ = desired_state.save(&storage);
+        state.worktrees.insert(index, entry);
+        if let Err(restore_error) = write_state(&state) {
+            return Err(WorktreeError::StateWrite {
+                path: state_path(),
+                source: io::Error::other(format!(
+                    "ScorpioFS unmount failed ({error}); registry rollback also failed: \
+                     {restore_error:?}"
+                )),
+            });
+        }
+        return Err(WorktreeError::IoWrite(error.to_string()));
+    }
+
+    let pointer = target.join(util::ROOT_DIR);
+    match fs::remove_file(&pointer) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(WorktreeError::IoWrite(format!(
+                "ScorpioFS mount was removed but worktree pointer '{}' could not be deleted: \
+                 {source}; run `libra worktree repair`",
+                pointer.display()
+            )));
+        }
+    }
+
+    gc_worktree_scoped_rows(&worktree_id).await;
+    fs::remove_dir_all(&gitdir).map_err(|source| {
+        WorktreeError::IoWrite(format!(
+            "ScorpioFS mount was removed but persistent worktree metadata '{}' could not be \
+             deleted: {source}; run `libra worktree repair`",
+            gitdir.display()
+        ))
+    })?;
+
+    desired_state.mounts.remove(&record.job_id);
+    if desired_state.mounts.is_empty() {
+        stop_managed_scorpiofs_worker(&mut desired_state);
+    }
+    desired_state
+        .save(&storage)
+        .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+
+    Ok(ScorpioFsDetachOutput {
+        path: target.to_string_lossy().into_owned(),
+        worktree_id,
+        job_id: record.job_id,
+        unmounted: true,
+        registry_removed: true,
+    })
+}
+
+async fn rollback_scorpiofs_attach(
+    client: &HttpScorpioFsClient,
+    job_id: &str,
+    pointer: &Path,
+    created_pointer: bool,
+    gitdir: &Path,
+    created_gitdir: bool,
+    worktree_id: &str,
+) {
+    if let Some(storage) = gitdir.ancestors().nth(3) {
+        record_scorpiofs_attach_error(storage, job_id, "attach transaction rolled back");
+    }
+    if created_pointer {
+        let _ = fs::remove_file(pointer);
+    }
+    if created_gitdir {
+        let _ = fs::remove_dir_all(gitdir);
+    }
+    gc_worktree_scoped_rows(worktree_id).await;
+    if let Err(error) = client.delete_by_job(job_id).await {
+        tracing::warn!(job_id, error = %error, "failed to roll back ScorpioFS mount");
+    }
+}
+
+fn record_scorpiofs_attach_error(storage: &Path, job_id: &str, error: impl Into<String>) {
+    match crate::internal::scorpiofs_backend::LibraScorpioFsState::load(storage) {
+        Ok(mut state) => {
+            state.mark_error(job_id, error);
+            if let Err(save_error) = state.save(storage) {
+                tracing::warn!(job_id, error = %save_error, "failed to persist ScorpioFS error state");
+            }
+        }
+        Err(load_error) => {
+            tracing::warn!(job_id, error = %load_error, "failed to load Libra ScorpioFS state");
+        }
+    }
+}
+
+async fn ensure_managed_scorpiofs_worker(
+    storage: &Path,
+    config_path: &Path,
+    timeout: Duration,
+) -> WorktreeResult<String> {
+    #[cfg(not(all(target_os = "linux", feature = "scorpiofs-direct")))]
+    {
+        let _ = (storage, config_path, timeout);
+        return Err(WorktreeError::OperationBlocked(
+            "direct ScorpioFS requires Linux and the scorpiofs-direct feature; use --endpoint for compatibility mode"
+                .to_string(),
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "scorpiofs-direct"))]
+    {
+        use crate::internal::scorpiofs_backend::{
+            LibraScorpioFsState, ManagedWorkerRecord, ScorpioFsControl,
+        };
+
+        let mut state = LibraScorpioFsState::load(storage)
+            .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+        if let Some(worker) = state.worker.as_ref() {
+            if let Ok(client) = HttpScorpioFsClient::new(&worker.endpoint) {
+                if client.service_info().await.is_ok() {
+                    return Ok(worker.endpoint.clone());
+                }
+            }
+            for desired in state.mounts.values_mut() {
+                if desired.transport
+                    == crate::internal::scorpiofs_backend::BackendTransport::ManagedCrate
+                {
+                    desired.lifecycle =
+                        crate::internal::scorpiofs_backend::BackendLifecycle::RecoverableError;
+                    desired.last_error = Some(
+                        "Libra-owned ScorpioFS worker stopped; reattach this job to recover"
+                            .to_string(),
+                    );
+                }
+            }
+            state.worker = None;
+            state
+                .save(storage)
+                .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+        }
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|source| {
+            WorktreeError::IoWrite(format!("failed to reserve ScorpioFS worker port: {source}"))
+        })?;
+        let port = listener
+            .local_addr()
+            .map_err(|source| {
+                WorktreeError::IoRead(format!(
+                    "failed to inspect reserved ScorpioFS worker port: {source}"
+                ))
+            })?
+            .port();
+        drop(listener);
+
+        let runtime_key = {
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            storage.to_string_lossy().hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
+        let runtime_root = env::temp_dir().join("libra-scorpiofs").join(runtime_key);
+        fs::create_dir_all(&runtime_root).map_err(|source| {
+            WorktreeError::IoWrite(format!(
+                "failed to create ScorpioFS runtime directory '{}': {source}",
+                runtime_root.display()
+            ))
+        })?;
+        let config_path = if config_path.is_absolute() {
+            config_path.to_path_buf()
+        } else {
+            env::current_dir()
+                .map_err(|source| {
+                    WorktreeError::IoRead(format!(
+                        "failed to resolve ScorpioFS config path: {source}"
+                    ))
+                })?
+                .join(config_path)
+        };
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let log_root = storage.join("scorpiofs");
+        fs::create_dir_all(&log_root).map_err(|source| {
+            WorktreeError::IoWrite(format!(
+                "failed to create ScorpioFS log directory '{}': {source}",
+                log_root.display()
+            ))
+        })?;
+        let log_path = log_root.join("worker.log");
+        let stdout = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|source| {
+                WorktreeError::IoWrite(format!(
+                    "failed to open ScorpioFS worker log '{}': {source}",
+                    log_path.display()
+                ))
+            })?;
+        let stderr = stdout.try_clone().map_err(|source| {
+            WorktreeError::IoWrite(format!("failed to clone ScorpioFS worker log: {source}"))
+        })?;
+        let executable = env::current_exe().map_err(|source| {
+            WorktreeError::IoRead(format!("failed to locate the Libra executable: {source}"))
+        })?;
+        let child = std::process::Command::new(executable)
+            .arg("scorpiofs-worker")
+            .arg("--config-path")
+            .arg(&config_path)
+            .arg("--bind")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--upper-root")
+            .arg(runtime_root.join("upper"))
+            .arg("--cl-root")
+            .arg(runtime_root.join("cl"))
+            .arg("--mount-root")
+            .arg(runtime_root.join("mounts"))
+            .arg("--runtime-state-file")
+            .arg(log_root.join("ignored-runtime-state.toml"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr))
+            .spawn()
+            .map_err(|source| {
+                WorktreeError::IoWrite(format!(
+                    "failed to start Libra-owned ScorpioFS worker: {source}"
+                ))
+            })?;
+
+        state.worker = Some(ManagedWorkerRecord {
+            pid: child.id(),
+            endpoint: endpoint.clone(),
+            config_path: config_path.to_string_lossy().into_owned(),
+        });
+        state
+            .save(storage)
+            .map_err(|error| WorktreeError::IoWrite(error.to_string()))?;
+
+        let client = HttpScorpioFsClient::new(&endpoint)
+            .map_err(|error| WorktreeError::IoRead(error.to_string()))?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(service) = client.service_info().await {
+                for capability in [
+                    CAPABILITY_MOUNT_V1,
+                    CAPABILITY_READY_V1,
+                    CAPABILITY_CHANGES_V1,
+                ] {
+                    service
+                        .require(capability)
+                        .map_err(|error| WorktreeError::OperationBlocked(error.to_string()))?;
+                }
+                return Ok(endpoint);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                stop_managed_scorpiofs_worker(&mut state);
+                let _ = state.save(storage);
+                return Err(WorktreeError::IoRead(format!(
+                    "Libra-owned ScorpioFS worker did not become ready; inspect '{}'",
+                    log_path.display()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+fn stop_managed_scorpiofs_worker(
+    state: &mut crate::internal::scorpiofs_backend::LibraScorpioFsState,
+) {
+    let Some(worker) = state.worker.take() else {
+        return;
+    };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(worker.pid as i32, libc::SIGINT);
+    }
+}
+
+fn attach_worktree_pointer(pointer: &Path, gitdir: &Path) -> io::Result<bool> {
+    let expected = format!("gitdir: {}\n", gitdir.display());
+    match fs::read_to_string(pointer) {
+        Ok(existing) if existing == expected => Ok(false),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "worktree already contains a different .libra pointer at '{}'",
+                pointer.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::write(pointer, expected)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_worktree_id(gitdir: &Path) -> WorktreeResult<String> {
+    let path = gitdir.join("worktree_id");
+    let worktree_id = fs::read_to_string(&path).map_err(|source| {
+        WorktreeError::IoRead(format!(
+            "failed to read ScorpioFS worktree id '{}': {source}",
+            path.display()
+        ))
+    })?;
+    let worktree_id = worktree_id.trim();
+    if worktree_id.is_empty() {
+        return Err(WorktreeError::IoRead(format!(
+            "ScorpioFS worktree id '{}' is empty",
+            path.display()
+        )));
+    }
+    Ok(worktree_id.to_string())
+}
+
+fn scorpiofs_worktree_id(endpoint: &str, job_id: &str, remote_path: &str) -> String {
+    let key = format!("{endpoint}\0{job_id}\0{remote_path}");
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let label: String = job_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{label}-{hash:016x}")
+}
+
+fn render_scorpiofs_attach(result: &ScorpioFsAttachOutput, output: &OutputConfig) -> CliResult<()> {
+    if output.is_json() {
+        return emit_json_data("worktree.scorpiofs.attach", result, output);
+    }
+    if !output.quiet {
+        println!("{}", result.path);
+    }
+    Ok(())
+}
+
+fn render_scorpiofs_detach(result: &ScorpioFsDetachOutput, output: &OutputConfig) -> CliResult<()> {
+    if output.is_json() {
+        return emit_json_data("worktree.scorpiofs.detach", result, output);
+    }
+    if !output.quiet {
+        println!("Detached ScorpioFS worktree '{}'.", result.path);
+    }
+    Ok(())
+}
+
 fn render_add_worktree(result: &WorktreeAddOutput, output: &OutputConfig) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.add", result, output);
@@ -896,7 +1866,9 @@ fn render_add_worktree(result: &WorktreeAddOutput, output: &OutputConfig) -> Cli
 /// its `.libra/worktree_id` file if present, else recompute deterministically
 /// from the canonical path (lore.md 2.1).
 fn resolve_worktree_id(target: &Path) -> Option<String> {
-    if let Ok(id) = fs::read_to_string(target.join(util::ROOT_DIR).join("worktree_id")) {
+    if let Ok(gitdir) = util::try_get_worktree_gitdir(Some(target.to_path_buf()))
+        && let Ok(id) = fs::read_to_string(gitdir.join("worktree_id"))
+    {
         let id = id.trim();
         if !id.is_empty() {
             return Some(id.to_string());
@@ -1017,7 +1989,7 @@ pub(crate) fn resolve_entry_worktree_id(path: &str, is_main: bool) -> Option<Str
     if is_main {
         return None;
     }
-    let gitdir = Path::new(path).join(util::ROOT_DIR);
+    let gitdir = util::try_get_worktree_gitdir(Some(PathBuf::from(path))).ok()?;
     if let Ok(id) = fs::read_to_string(gitdir.join("worktree_id")) {
         let id = id.trim();
         if !id.is_empty() {

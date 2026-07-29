@@ -32,6 +32,29 @@ pub(crate) fn collect_status_worktree_changes(
     include_ignored: bool,
     ignore_case: bool,
 ) -> Result<StatusWorktreeChanges, StatusError> {
+    collect_status_worktree_changes_inner(untracked_mode, include_ignored, ignore_case, None)
+}
+
+pub(crate) fn collect_status_worktree_changes_for_paths(
+    untracked_mode: UntrackedFiles,
+    include_ignored: bool,
+    ignore_case: bool,
+    candidates: &[PathBuf],
+) -> Result<StatusWorktreeChanges, StatusError> {
+    collect_status_worktree_changes_inner(
+        untracked_mode,
+        include_ignored,
+        ignore_case,
+        Some(candidates),
+    )
+}
+
+fn collect_status_worktree_changes_inner(
+    untracked_mode: UntrackedFiles,
+    include_ignored: bool,
+    ignore_case: bool,
+    candidates: Option<&[PathBuf]>,
+) -> Result<StatusWorktreeChanges, StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
@@ -39,11 +62,26 @@ pub(crate) fn collect_status_worktree_changes(
         source,
     })?;
     let tracked = TrackedPaths::from_index(&index, ignore_case);
-    let mut unstaged = collect_tracked_worktree_changes(&workdir, &index, tracked.files())?;
+    let tracked_candidates;
+    let tracked_files = if let Some(candidates) = candidates {
+        tracked_candidates = candidates
+            .iter()
+            .filter(|path| path.to_str().is_some_and(|path| index.tracked(path, 0)))
+            .cloned()
+            .collect::<Vec<_>>();
+        tracked_candidates.as_slice()
+    } else {
+        tracked.files()
+    };
+    let mut unstaged = collect_tracked_worktree_changes(&workdir, &index, tracked_files)?;
     let mut ignored_files = Vec::new();
 
     if !matches!(untracked_mode, UntrackedFiles::No) {
-        let scan = scan_workdir(&workdir, &index, &tracked, untracked_mode, include_ignored)?;
+        let scan = if let Some(candidates) = candidates {
+            scan_candidate_paths(&workdir, &index, &tracked, candidates, include_ignored)?
+        } else {
+            scan_workdir(&workdir, &index, &tracked, untracked_mode, include_ignored)?
+        };
         unstaged.new = if matches!(untracked_mode, UntrackedFiles::Normal) {
             collapse_untracked_directories(scan.untracked, &tracked)
         } else {
@@ -61,6 +99,44 @@ pub(crate) fn collect_status_worktree_changes(
         ignored_files,
         index,
     })
+}
+
+fn scan_candidate_paths(
+    workdir: &Path,
+    index: &Index,
+    tracked: &TrackedPaths,
+    candidates: &[PathBuf],
+    include_ignored: bool,
+) -> Result<WorkdirScan, StatusError> {
+    let mut scan = WorkdirScan {
+        untracked: Vec::new(),
+        ignored: Vec::new(),
+    };
+    for relative in candidates {
+        let path = workdir.join(relative);
+        let file_type = match path.symlink_metadata() {
+            Ok(metadata) => metadata.file_type(),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(StatusError::WorktreeRead {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        if file_type.is_file() || file_type.is_symlink() {
+            scan_file(
+                &mut scan,
+                workdir,
+                index,
+                tracked,
+                &path,
+                relative,
+                include_ignored,
+            )?;
+        }
+    }
+    Ok(scan)
 }
 
 pub(crate) fn changes_to_current_directory(mut changes: Changes) -> Changes {

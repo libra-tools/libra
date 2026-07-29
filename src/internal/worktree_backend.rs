@@ -294,10 +294,10 @@ impl ChangeSet {
 pub enum WorktreeBackendError {
     #[error("invalid worktree backend request: {0}")]
     InvalidRequest(String),
-    #[error("backend '{backend}' does not support source type '{source}'")]
+    #[error("backend '{backend}' does not support source type '{detail}'")]
     UnsupportedSource {
         backend: BackendKind,
-        source: &'static str,
+        detail: &'static str,
     },
     #[error("worktree backend '{backend}' is unavailable: {reason}")]
     Unavailable {
@@ -350,17 +350,11 @@ pub trait WorktreeBackendDriver: Send + Sync {
         Ok(None)
     }
 
-    async fn flush(
-        &self,
-        _session: &BackendMountSession,
-    ) -> Result<(), WorktreeBackendError> {
+    async fn flush(&self, _session: &BackendMountSession) -> Result<(), WorktreeBackendError> {
         Ok(())
     }
 
-    async fn unmount(
-        &self,
-        session: &BackendMountSession,
-    ) -> Result<(), WorktreeBackendError>;
+    async fn unmount(&self, session: &BackendMountSession) -> Result<(), WorktreeBackendError>;
 
     async fn recover(
         &self,

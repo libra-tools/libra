@@ -534,13 +534,27 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         ignore_case,
     };
 
-    let (mut visible_changes, mut ignored_changes) = if args.force {
-        status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
-    } else {
-        status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
-    };
+    let backend_changes = crate::internal::scorpiofs_backend::current_worktree_changes()
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to query ScorpioFS worktree changes: {error}"
+            ))
+        })?;
+    let backend_candidates = backend_changes
+        .as_ref()
+        .map(|changes| changes.candidate_paths());
+    let (mut visible_changes, mut ignored_changes) =
+        if let Some(candidates) = backend_candidates.as_deref() {
+            status::changes_to_be_staged_split_for_paths_with_ignore_case(ignore_case, candidates)
+                .map_err(|source| AddError::Status { source })?
+        } else if args.force {
+            status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+                .map_err(|source| AddError::Status { source })?
+        } else {
+            status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
+                .map_err(|source| AddError::Status { source })?
+        };
     if args.force {
         visible_changes.extend(ignored_changes.clone());
         ignored_changes = Changes::default();

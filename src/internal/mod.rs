@@ -45,6 +45,7 @@ pub mod publish;
 pub mod reflog;
 pub mod repo_hooks;
 pub mod revision_ordinal;
+pub mod scorpiofs_backend;
 pub mod sequencer;
 pub mod sparse;
 pub mod tag;

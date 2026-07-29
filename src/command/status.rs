@@ -598,11 +598,30 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         .await
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
-    let worktree = status_untracked::collect_status_worktree_changes(
-        args.untracked_files.unwrap_or(UntrackedFiles::Normal),
-        args.ignored,
-        ignore_case,
-    )
+    let backend_changes = crate::internal::scorpiofs_backend::current_worktree_changes()
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to query ScorpioFS worktree changes: {error}"
+            ))
+        })?;
+    let backend_candidates = backend_changes
+        .as_ref()
+        .map(|changes| changes.candidate_paths());
+    let worktree = if let Some(candidates) = backend_candidates.as_deref() {
+        status_untracked::collect_status_worktree_changes_for_paths(
+            args.untracked_files.unwrap_or(UntrackedFiles::Normal),
+            args.ignored,
+            ignore_case,
+            candidates,
+        )
+    } else {
+        status_untracked::collect_status_worktree_changes(
+            args.untracked_files.unwrap_or(UntrackedFiles::Normal),
+            args.ignored,
+            ignore_case,
+        )
+    }
     .map_err(CliError::from)?;
     let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
     let unmerged = unmerged::collect(&worktree.index)
@@ -3545,6 +3564,21 @@ pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
         source,
     })?;
     changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)
+}
+
+pub(crate) fn changes_to_be_staged_split_for_paths_with_ignore_case(
+    ignore_case: bool,
+    candidates: &[PathBuf],
+) -> Result<(Changes, Changes), StatusError> {
+    let collected = status_untracked::collect_status_worktree_changes_for_paths(
+        UntrackedFiles::All,
+        true,
+        ignore_case,
+        candidates,
+    )?;
+    let mut ignored = Changes::default();
+    ignored.new = collected.ignored_files;
+    Ok((collected.unstaged, ignored))
 }
 
 /// List changes to be staged with --force semantics (recurse into ignored directories)

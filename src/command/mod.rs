@@ -105,6 +105,7 @@ pub mod rev_parse;
 pub mod revert;
 pub mod revision;
 pub mod sandbox;
+pub mod scorpiofs_worker;
 pub mod service;
 pub mod shortlog;
 pub mod show;

@@ -3,6 +3,12 @@
 Status: backend-neutral substrate implemented; ScorpioFS adapter implemented;
 BrewFS SDK runtime boundary implemented
 
+Implementation labels in this document:
+
+- **Implemented**: present in this Libra branch and covered by automated tests.
+- **Validated**: exercised against a deployed ScorpioFS and Mega service.
+- **Planned**: an architectural direction, not a currently available command.
+
 ## Purpose
 
 Libra supports worktrees whose POSIX files may come from different storage
@@ -104,6 +110,10 @@ process. Unix domain sockets should replace loopback HTTP as the default local
 control transport; the current ScorpioFS loopback protocol remains a
 compatibility transport during migration.
 
+Libra owns worker selection, desired state, and recovery. ScorpioFS owns only
+live mount state. The configured endpoint is a control-plane address, never a
+Git remote and never a credential container.
+
 ## Persistent layout
 
 Libra metadata remains on a host-local filesystem:
@@ -129,6 +139,14 @@ Backend caches and runtime state remain separate:
 `.libra` must not be stored in a ScorpioFS upper layer or a BrewFS volume. A
 mounted worktree contains only a reconstructable `.libra` pointer to its
 host-local per-worktree gitdir.
+
+### State reconciliation
+
+The persistent Libra record is authoritative. A live backend mount is an
+execution resource that may disappear after a process or machine restart.
+Recovery must read and validate host-local Libra state, query the backend by
+its durable cleanup key, recreate the pointer only after containment checks,
+and record failures as recoverable rather than silently dropping desired state.
 
 ## ScorpioFS adapter
 
@@ -212,3 +230,15 @@ in an unflushed client buffer.
 6. Implement a BrewFS SDK runtime and persistent-volume checkout/import flow.
 7. Migrate legacy `.libra/scorpiofs/state.json` into versioned backend-neutral
    desired state.
+
+## Current validation boundary
+
+The ScorpioFS implementation is validated for an attached remote projection:
+`attach`, `status`, `fetch`, `add`, `commit`, explicit-refspec
+`push --dry-run`, and `detach`. Validation uses the deployed Mega
+`project/aardvark-dns` repository inside an isolated Linux user and mount
+namespace.
+
+This does not claim every mutable Git operation or automatic base switch is
+production-ready. Transactional base switching, restart recovery, concurrent
+mount stress, and a direct embedded BrewFS SDK mount remain planned work.

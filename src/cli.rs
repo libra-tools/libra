@@ -737,6 +737,8 @@ enum Commands {
         hide = true
     )]
     Hooks(command::hooks::HooksArgs),
+    #[command(about = "Run a Libra-owned ScorpioFS worker", hide = true)]
+    ScorpiofsWorker(command::scorpiofs_worker::ScorpioFsWorkerArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -2183,6 +2185,9 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
                 command::agent::investigate::execute_safe(cmd_args, &output).await?
             }
             Commands::Hooks(cmd_args) => command::hooks::execute_safe(cmd_args, &output).await?,
+            Commands::ScorpiofsWorker(cmd_args) => {
+                command::scorpiofs_worker::execute_safe(cmd_args).await?
+            }
             Commands::Bisect(bisect_cmd) => {
                 command::bisect::execute_safe(bisect_cmd, &output).await?
             }
