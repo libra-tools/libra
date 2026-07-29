@@ -156,6 +156,75 @@ fn read_gitdir_file(path: &Path, worktree: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Resolve a Libra linked-worktree pointer file.
+///
+/// External worktree backends such as ScorpioFS cannot keep their private
+/// index and HEAD inside an ephemeral mount. They place a regular `.libra`
+/// file in the mounted worktree containing `gitdir: <path>`, while the real
+/// worktree gitdir remains under the main repository's persistent storage.
+///
+/// Unlike the best-effort Git repository discovery helper above, Libra
+/// repository discovery is fail-closed: a present but malformed pointer is a
+/// corrupt repository and must not be silently ignored.
+fn read_libra_gitdir_file(path: &Path, worktree: &Path) -> io::Result<PathBuf> {
+    let contents = fs::read_to_string(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read Libra worktree pointer '{}': {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let line = contents.lines().next().map(str::trim).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Libra worktree pointer '{}' is empty", path.display()),
+        )
+    })?;
+    let raw = line
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Libra worktree pointer '{}' must contain 'gitdir: <path>'",
+                    path.display()
+                ),
+            )
+        })?;
+
+    let configured = Path::new(raw);
+    let resolved = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        worktree.join(configured)
+    };
+    let resolved = fs::canonicalize(&resolved).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Libra worktree pointer '{}' targets unavailable gitdir '{}': {error}",
+                path.display(),
+                resolved.display()
+            ),
+        )
+    })?;
+    if !resolved.is_dir() || !is_valid_storage_dir(&resolved) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Libra worktree pointer '{}' targets invalid gitdir '{}'",
+                path.display(),
+                resolved.display()
+            ),
+        ));
+    }
+    Ok(resolved)
+}
+
 fn resolve_dot_git_dir(worktree: &Path) -> Option<PathBuf> {
     let dot_git = worktree.join(".git");
     let metadata = fs::metadata(&dot_git).ok()?;
@@ -352,6 +421,12 @@ fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBu
         if standard_repo.is_dir() && is_valid_storage_dir(&standard_repo) {
             // unwrap_or is safe here: if canonicalize fails, we use the original path
             let gitdir = fs::canonicalize(&standard_repo).unwrap_or(standard_repo);
+            let common = worktree_common_storage(&gitdir)?;
+            return Ok((common, path.clone(), gitdir));
+        }
+
+        if standard_repo.is_file() {
+            let gitdir = read_libra_gitdir_file(&standard_repo, &path)?;
             let common = worktree_common_storage(&gitdir)?;
             return Ok((common, path.clone(), gitdir));
         }
@@ -2845,6 +2920,68 @@ mod test {
 
         assert_eq!(location.root, repo.canonicalize().unwrap());
         assert!(!location.is_bare);
+    }
+
+    #[test]
+    #[serial]
+    fn test_libra_worktree_pointer_resolves_external_gitdir() {
+        let temp = tempdir().unwrap();
+        let main_storage = temp.path().join("main").join(".libra");
+        let external_gitdir = main_storage
+            .join("worktrees")
+            .join("scorpiofs")
+            .join("workspace-1");
+        let mounted_worktree = temp.path().join("mount");
+        fs::create_dir_all(main_storage.join("objects")).unwrap();
+        fs::create_dir_all(main_storage.join("hooks")).unwrap();
+        fs::create_dir_all(main_storage.join("info")).unwrap();
+        fs::write(main_storage.join(DATABASE), b"repo db").unwrap();
+        fs::create_dir_all(&external_gitdir).unwrap();
+        fs::write(
+            external_gitdir.join("commondir"),
+            format!("{}\n", main_storage.display()),
+        )
+        .unwrap();
+        fs::write(external_gitdir.join("worktree_id"), b"workspace-1\n").unwrap();
+        fs::create_dir_all(&mounted_worktree).unwrap();
+        fs::write(
+            mounted_worktree.join(ROOT_DIR),
+            format!("gitdir: {}\n", external_gitdir.display()),
+        )
+        .unwrap();
+
+        let _guard = test::ChangeDirGuard::new(&mounted_worktree);
+
+        assert_eq!(
+            try_get_storage_path(None).unwrap(),
+            main_storage.canonicalize().unwrap()
+        );
+        assert_eq!(
+            try_get_worktree_gitdir(None).unwrap(),
+            external_gitdir.canonicalize().unwrap()
+        );
+        assert_eq!(current_worktree_id().as_deref(), Some("workspace-1"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_libra_worktree_pointer_fails_closed_when_target_is_missing() {
+        let temp = tempdir().unwrap();
+        let mounted_worktree = temp.path().join("mount");
+        fs::create_dir_all(&mounted_worktree).unwrap();
+        fs::write(
+            mounted_worktree.join(ROOT_DIR),
+            "gitdir: /definitely/missing/libra-worktree\n",
+        )
+        .unwrap();
+
+        let _guard = test::ChangeDirGuard::new(&mounted_worktree);
+        let error = try_get_storage_path(None).expect_err("missing gitdir must fail");
+
+        assert!(
+            error.to_string().contains("targets unavailable gitdir"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
