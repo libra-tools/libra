@@ -62,6 +62,7 @@
 | [`credential`](credential.md) | `partial` | Vault-backed Git credential helper `fill`/`store`/`erase`; AES-256-GCM-encrypted, keyed by a digest of protocol/host/path; side-channel-free `fill` (hit/miss both exit 0); expiry (default 30d); secrets never logged/echoed. `credential-cache`, multi-username, and the consumer-side helper chain deferred |
 | [`describe`](describe.md) | `partial` | basic describe, `--tags`, `--always`, `--abbrev`, `--exact-match`, `--long`, `--dirty[=<mark>]`, `--first-parent`, `--match`, `--exclude`, `--candidates` (0 ⇒ exact-match), `--all` (any ref, prefixed), and `--contains` (git name-rev: nearest descendant tag, `<tag>~<n>^<m>` form) supported |
 | [`service`](service.md) | `intentionally-different` | 无头本地服务（lore.md 1.11）：notification v1 总线 + 令牌门 dirty 标记摄入；双重环回强制，绝不开对外端口 |
+| [`scorpiofs-worker`](scorpiofs-worker.md) | `intentionally-different` | 隐藏的 Libra 自有 ScorpioFS 常驻 worker，非 Git 命令：由 `worktree scorpiofs attach` 从 Libra 自身可执行文件拉起，直连 ScorpioFS crate（Linux + `scorpiofs-direct` feature），只暴露环回控制端点；内嵌服务不持久化、不自恢复状态，权威状态留在 Libra 侧 |
 | [`auth`](auth.md) | `intentionally-different` | 主机作用域 HTTP 令牌 v1（lore.md 1.6）：加密落盘、过期检测、免解密撤销、降级重定向拒绝 |
 | [`commit-tree`](commit-tree.md) | `partial` | 低层修订组合（lore.md 1.15）：tree+parents+message→commit 对象，零副作用；配合 --index-file scratch 索引 |
 | [`revision`](revision.md) | `intentionally-different` | 修订序号索引（lore.md 1.16）：逐 ref first-parent 链 1..N，tip+replace 指纹每读校验，快进追加/重写重建 |

@@ -8,6 +8,8 @@ Manage multiple working trees attached to this repository.
 
 ```
 libra worktree add <path>
+libra worktree scorpiofs attach --remote-path <mega-path> --job-id <id>
+libra worktree scorpiofs detach <mountpoint>
 libra worktree list
 libra worktree doctor
 libra worktree lock <path> [--reason <text>]
@@ -25,6 +27,12 @@ libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 ## Description
 
 `libra worktree` manages multiple working trees that share a single repository database and object store. This allows you to have several checkouts of the same repository simultaneously, which is useful for working on multiple branches at once, running builds while editing code, or testing changes in isolation.
+
+Mounted worktrees use the backend-neutral architecture documented in
+[`worktree-storage-backends.md`](../development/integration/worktree-storage-backends.md).
+ScorpioFS is a remote-revision projection backend; BrewFS is modeled as a
+persistent distributed-volume backend. Git objects, refs, index state, and
+authoritative backend lifecycle state remain owned by Libra.
 
 Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; `libra worktree doctor` reports it, and `libra worktree repair --migrate-layout --dry-run` previews the migration read-only.) The registry file `worktrees.json` is versioned (`schema_version: 3`; v2 since v0.19.57): each linked entry persists its stable `worktree_id`, a legacy v1 file is upgraded in place by the first mutating worktree command (ids backfilled from each worktree's gitdir; lockless readers like `worktree list` read a v1 file without rewriting it), and older binaries are refused at the database layer before they can misread or rewrite the file. v3 adds a durable registration GENERATION — `epoch_counter` on the registry and `epoch` on each entry, reported by `worktree list`. Instance ids are path-derived, so a worktree removed and re-added in the same place has the same id and path as its predecessor; the generation is what tells the two registrations apart, and the `libra service` dirty-mark endpoint requires it as a fence. A v2-era binary would parse a v3 file and drop the generations on rewrite, so the v3 capability marker refuses those binaries at connect time; for the same reason this migration does not roll back while any generation is live.
 
@@ -65,6 +73,36 @@ libra worktree add --detach ../probe v1.2.0
 
 # Create a new branch from a start point and check it out
 libra worktree add -b topic ../topic main
+```
+
+### Subcommand: `scorpiofs attach`
+
+Creates or recovers an idempotent Antares mount, waits for readiness, and
+attaches persistent Libra linked-worktree metadata to the returned mountpoint.
+By default on Linux, Libra starts a resident worker that links the ScorpioFS
+crate directly. Libra owns the worker and desired mount state in
+`.libra/scorpiofs/state.json`; ScorpioFS owns only live filesystem
+materialization. Libra also continues to own the index, objects, commits,
+refs, fetch, and push.
+
+```bash
+libra worktree scorpiofs attach \
+  --config-path scorpio.toml \
+  --remote-path /project/aardvark-dns \
+  --job-id dev-aardvark
+```
+
+Pass `--endpoint http://127.0.0.1:2725/antares` to use an externally managed
+ScorpioFS daemon as a compatibility transport instead.
+
+### Subcommand: `scorpiofs detach`
+
+Refuses to detach a dirty worktree, removes its persistent linked-worktree
+metadata, and asks Antares to delete the mount by job ID. Repeated remote
+cleanup is idempotent.
+
+```bash
+libra worktree scorpiofs detach /var/lib/antares/mounts/<mount-id>
 ```
 
 ### Subcommand: `list`

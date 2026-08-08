@@ -12,7 +12,8 @@ categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
 [features]
-default        = []
+default        = ["scorpiofs-direct"]
+scorpiofs-direct = ["dep:scorpiofs"]
 worktree-fuse  = []   # Unix FUSE-backed worktree commands (optional)
 test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
@@ -70,6 +71,7 @@ sea-orm = { version = "2.0.0", features = [
 ]}
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+fs2 = "0.4.3"
 sha1 = "0.11.0"
 sha2 = "0.10"
 thiserror = "2.0.18"
@@ -158,6 +160,7 @@ rfuse3 = { version = "0.0.8", features = ["tokio-runtime", "unprivileged"] }
 
 [target.'cfg(target_os = "linux")'.dependencies] # Linux-only seccomp BPF compiler
 seccompiler = { version = "0.5.0", features = ["json"] }
+scorpiofs = { version = "=0.4.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
