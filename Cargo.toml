@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.19.40"
+version = "0.19.104"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -27,7 +27,7 @@ keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release build
 
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
-git-internal = "0.8.3"
+git-internal = "0.8.6"
 anyhow = "1.0.102"
 byte-unit = "5.2.0"
 byteorder = "1.5.0"
@@ -63,7 +63,7 @@ reqwest = { version = "0.13.2", default-features = false, features = [
 ring = "0.17.14"
 rpassword = "7.4.0"
 scopeguard = "1.2.0"
-sea-orm = { version = "1.1.20", features = [
+sea-orm = { version = "2.0.0", features = [
     "sqlx-sqlite",
     "runtime-tokio-rustls",
     "macros",
@@ -185,7 +185,7 @@ gag = "1.0.0"
 portable-pty = "0.9.0"
 # AST-level use-tree/path walking for tests/compat/agent_architecture_guard.rs
 # (syn 2.x is already in the dependency graph via derive macros).
-syn = { version = "2.0", features = ["full", "visit"] }
+syn = { version = "2.0", features = ["full", "visit", "visit-mut"] }
 
 # Compatibility-surface integration tests live under tests/compat/. Cargo's
 # default test discovery only picks up *.rs directly under tests/, so each
@@ -271,8 +271,28 @@ name = "compat_error_codes_doc_sync"
 path = "tests/compat/error_codes_doc_sync.rs"
 
 [[test]]
+name = "compat_ledger_schema"
+path = "tests/compat/compat_ledger_schema.rs"
+
+[[test]]
+name = "compat_version_surface_sync"
+path = "tests/compat/version_surface_sync.rs"
+
+[[test]]
+name = "compat_r0_9_doc_closeout"
+path = "tests/compat/r0_9_doc_closeout.rs"
+
+[[test]]
 name = "compat_command_docs_examples_section"
 path = "tests/compat/command_docs_examples_section.rs"
+
+[[test]]
+name = "compat_worktree_docs_v2_layout"
+path = "tests/compat/worktree_docs_v2_layout.rs"
+
+[[test]]
+name = "compat_pseudo_ref_surface"
+path = "tests/compat/pseudo_ref_surface.rs"
 
 [[test]]
 name = "compat_help_flag_descriptions"
@@ -429,6 +449,14 @@ path = "tests/compat/libra_hooks_lifecycle_test.rs"
 [[test]]
 name = "compat_import_export_roundtrip"
 path = "tests/compat/import_export_roundtrip_test.rs"
+
+[[test]]
+name = "compat_status_args_parser_compile"
+path = "tests/compat/status_args_parser_compile.rs"
+
+[[test]]
+name = "compat_legacy_short_api_pre_r0_equivalence"
+path = "tests/compat/legacy_short_api_pre_r0_equivalence.rs"
 
 [[test]]
 name = "compat_status_wave0_register"

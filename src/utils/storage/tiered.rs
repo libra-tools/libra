@@ -216,28 +216,37 @@ impl Storage for TieredStorage {
             }
         }
 
-        // Local first (Auto and LocalOnly).
-        if self.local.exist(hash).await {
-            // If it's in LRU, access it to update recency. Recover from a
-            // poisoned lock rather than crashing a read (the LRU guards only
-            // bookkeeping, not the object bytes).
-            {
+        // Local first (Auto and LocalOnly). NO `exist()` pre-gate (W2
+        // §C.4.3): the bool probe folds pack/I-O errors into "absent", which
+        // would silently bypass the hard-error propagation below and let a
+        // remote miss masquerade as genuine absence. Attempt the read
+        // directly; only a real ObjectNotFound falls through.
+        match self.local.get(hash).await {
+            Ok(hit) => {
+                // Touch the LRU for recency. Recover from a poisoned lock
+                // rather than crashing a read (the LRU guards bookkeeping
+                // only, not the object bytes).
                 let mut lru = self
                     .lru
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let _ = lru.get(hash);
+                drop(lru);
+                return Ok(hit);
             }
-            match self.local.get(hash).await {
-                Ok(hit) => return Ok(hit),
-                // SELF-HEALING READ (lore.md 2.9): the file can vanish
-                // between exist() and get() — an evictor, an external
-                // cleaner, or a crash artifact. Under any policy that may
-                // reach the durable tier, fall through to the remote fetch
-                // (which re-verifies and re-caches) instead of failing.
-                Err(_) if policy != ReadPolicy::LocalOnly => {}
-                Err(error) => return Err(error),
+            // Genuinely absent locally (including the exist→get vanish race,
+            // whose end state is the same NotFound) — fall through to the
+            // durable tier under any policy that may reach it.
+            Err(GitError::ObjectNotFound(_)) if policy != ReadPolicy::LocalOnly => {}
+            Err(GitError::ObjectNotFound(_)) => {
+                // Under LocalOnly the actionable offline message below
+                // replaces the raw NotFound.
             }
+            // A local I/O or pack-decode error is CORRUPTION and must
+            // surface — folding it into a remote fallback would let
+            // destructive maintenance mistake an unreadable local root for
+            // a nonexistent one.
+            Err(error) => return Err(error),
         }
 
         // Not local. Under `--offline`/`--local`, never reach for the durable

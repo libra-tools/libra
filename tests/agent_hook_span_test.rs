@@ -16,9 +16,14 @@
 
 use std::sync::Mutex;
 
-use libra::internal::ai::hooks::{
-    LifecycleEventKind, ProviderHookCommand, claude_provider, runtime::ingest_agent_traces_payload,
+use libra::internal::{
+    ai::hooks::{
+        LifecycleEventKind, ProviderHookCommand, claude_provider,
+        runtime::ingest_agent_traces_payload,
+    },
+    config::ConfigKv,
 };
+use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serde_json::json;
 
 /// Shared in-memory sink handed to the fmt subscriber (identical to the
@@ -73,9 +78,13 @@ fn runtime() -> tokio::runtime::Runtime {
 /// `agent_session` table the ingest writes to exists.
 async fn fresh_conn(dir: &std::path::Path) -> sea_orm::DatabaseConnection {
     let db_path = dir.join("libra.db");
-    libra::internal::db::create_database(&db_path.display().to_string())
+    let conn = libra::internal::db::create_database(&db_path.display().to_string())
         .await
-        .expect("create fresh libra database")
+        .expect("create fresh libra database");
+    ConfigKv::set_with_conn(&conn, "libra.repoid", "agent-hook-span-test", false)
+        .await
+        .expect("seed repository identity");
+    conn
 }
 
 fn envelope(hook_event_name: &str, session_id: &str, extra: serde_json::Value) -> Vec<u8> {
@@ -268,4 +277,60 @@ fn invalid_envelope_records_validated_false() {
         !captured.contains("../../evil"),
         "the invalid session id must not be echoed into the span sink: {captured}"
     );
+}
+
+/// A provider id is a global external identity, not an adapter-local key. An
+/// export claim left by another scope must therefore prevent hook capture
+/// before it can create a second, cross-workspace `agent_session` claim.
+#[test]
+fn foreign_export_claim_blocks_hook_capture() {
+    let rt = runtime();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = rt.block_on(fresh_conn(dir.path()));
+    let provider_session_id = "sess-span-foreign-export";
+
+    rt.block_on(async {
+        conn.execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO agent_export_job (
+                job_id, agent_kind, provider_session_id, observed_generation,
+                processed_generation, state, created_at, updated_at, ttl_expires_at,
+                repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             ) VALUES (
+                'foreign-export-job', 'opencode', 'sess-span-foreign-export', 0,
+                0, 'idle', 1, 1, 9999999999999,
+                'other-repo', 'foreign-worktree', NULL, NULL, 'scoped'
+             )",
+        ))
+        .await
+        .expect("seed foreign export claim");
+
+        let error = ingest_agent_traces_payload(
+            &envelope("SessionStart", provider_session_id, json!({})),
+            ProviderHookCommand::SessionStart,
+            LifecycleEventKind::SessionStart,
+            claude_provider(),
+            &conn,
+            None,
+        )
+        .await
+        .expect_err("foreign provider claim must reject hook capture");
+        assert!(
+            format!("{error:#}").contains("already claimed by another"),
+            "unexpected ownership error: {error:#}"
+        );
+
+        let session = conn
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT 1 FROM agent_session
+                 WHERE provider_session_id = 'sess-span-foreign-export'",
+            ))
+            .await
+            .expect("query hook session after refused capture");
+        assert!(
+            session.is_none(),
+            "a rejected hook must not create a competing session claim"
+        );
+    });
 }

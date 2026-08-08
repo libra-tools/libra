@@ -23,7 +23,7 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
 }
 
 async fn seed_session(conn: &DatabaseConnection, session_id: &str) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -41,7 +41,7 @@ async fn seed_session(conn: &DatabaseConnection, session_id: &str) {
 /// DB-only checkpoint (empty traces ref) — erasure removes the catalog
 /// row via the prune engine's no-ref-rewrite path.
 async fn seed_checkpoint(conn: &DatabaseConnection, id: &str, session: &str, created_at: i64) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -63,7 +63,7 @@ async fn seed_checkpoint(conn: &DatabaseConnection, id: &str, session: &str, cre
 
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -79,7 +79,7 @@ async fn erase_legacy_generation_zero_session_advances_to_fresh_incarnation() {
     init_repo_via_cli(repo.path());
     let conn = connect_repo_db(repo.path()).await;
     seed_session(&conn, "sess-legacy-generation").await;
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE agent_session SET sync_revision = 0
          WHERE session_id = 'sess-legacy-generation'"
@@ -127,7 +127,7 @@ async fn erase_session_local_removes_rows_and_preserves_audit_log() {
     seed_checkpoint(&conn, "cp-keep", "sess-keep", 102).await;
 
     // An audit row that must outlive erasure.
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_audit_log (audit_id, timestamp, action, checkpoint_id, scope, granted) \
          VALUES ('aud-1', '2026-07-05T00:00:00Z', 'raw_export', 'cp-a', 'transcript', 1)",
@@ -136,7 +136,7 @@ async fn erase_session_local_removes_rows_and_preserves_audit_log() {
     .await
     .expect("seed audit");
     for session_id in ["sess-erase", "sess-keep"] {
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO metadata_kv (
                 scope, target, key, value, value_type, created_at, updated_at
@@ -242,12 +242,14 @@ async fn erase_session_local_removes_rows_and_preserves_audit_log() {
     );
 }
 
-/// A0-10 local tombstone contract: `erase_session_local` is a self-contained
-/// LOCAL tombstone. It succeeds with no D1/R2 cloud mirror configured (cloud
-/// tombstone propagation is an explicit, documented deferral — see
-/// `docs/development/tracing/agent.md` "还未实现的功能" row), and re-erasing a
-/// session that is already gone is idempotent (the tombstone is stable — a
-/// deleted session is never revived by a second erase).
+/// A0-10 local tombstone contract, upgraded for PD-03 propagation: the
+/// tombstone `erase_session_local` writes locally is exactly the row
+/// `libra cloud sync` later publishes to D1 (`agent_kind` +
+/// `provider_session_id` identity, `erased_session_id`, an `erased_at`
+/// timestamp), so this test pins those propagation-carrying fields. The
+/// erase itself still succeeds with no D1/R2 mirror configured, and
+/// re-erasing an already-gone session is idempotent (a deleted session
+/// is never revived by a second erase).
 #[tokio::test]
 async fn agent_erasure_local_tombstone() {
     let repo = tempfile::tempdir().expect("repo tempdir");
@@ -259,7 +261,7 @@ async fn agent_erasure_local_tombstone() {
     seed_checkpoint(&conn, "cp-t2", "sess-tomb", 201).await;
 
     // Audit row that must outlive the tombstone.
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_audit_log (audit_id, timestamp, action, checkpoint_id, scope, granted) \
          VALUES ('aud-tomb', '2026-07-09T00:00:00Z', 'raw_export', 'cp-t1', 'transcript', 1)",
@@ -309,6 +311,21 @@ async fn agent_erasure_local_tombstone() {
         .await,
         1,
         "local import tombstone must survive deletion of agent_session"
+    );
+    // PD-03: the tombstone row carries everything the cloud publication
+    // needs — the provider identity key and a positive erased_at.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_import_tombstone \
+             WHERE erased_session_id = 'sess-tomb' \
+               AND agent_kind = 'claude_code' \
+               AND provider_session_id = 'provider-sess-tomb' \
+               AND erased_at > 0"
+        )
+        .await,
+        1,
+        "the tombstone carries the propagation identity and timestamp"
     );
     assert_eq!(
         count(

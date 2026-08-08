@@ -22,7 +22,7 @@ async fn table_exists(db: &DatabaseConnection, table: &str) -> bool {
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [table.into()],
     );
-    db.query_one(stmt).await.unwrap().is_some()
+    db.query_one_raw(stmt).await.unwrap().is_some()
 }
 
 /// Returns `true` when SQLite reports an index with the exact `index` name. Used in
@@ -33,7 +33,7 @@ async fn index_exists(db: &DatabaseConnection, index: &str) -> bool {
         "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1",
         [index.into()],
     );
-    db.query_one(stmt).await.unwrap().is_some()
+    db.query_one_raw(stmt).await.unwrap().is_some()
 }
 
 /// Scenario: run the canonical bootstrap SQL against an empty SQLite and confirm
@@ -45,7 +45,7 @@ async fn index_exists(db: &DatabaseConnection, index: &str) -> bool {
 #[tokio::test]
 async fn fresh_bootstrap_contains_phase0_runtime_contract_tables() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         db.get_database_backend(),
         BOOTSTRAP_SQL,
     ))
@@ -77,7 +77,7 @@ async fn fresh_bootstrap_contains_phase0_runtime_contract_tables() {
 async fn deployed_db_runtime_contract_migration_is_idempotent() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let backend = db.get_database_backend();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         backend,
         r#"
 CREATE TABLE object_index (

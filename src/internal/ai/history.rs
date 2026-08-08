@@ -578,24 +578,23 @@ fn collect_rejected_cleanup_index_snapshot(
             registry_path.to_string_lossy().into_owned(),
             hex::encode(Sha256::digest(&bytes)),
         ));
-        let document: serde_json::Value = serde_json::from_slice(&bytes)
+        // Route through the DISCRIMINATING registry parser (§C.7): it
+        // accepts exactly one of the v2/v1 shapes and refuses hybrid or
+        // malformed documents — an ad-hoc key probe here could pick an
+        // empty `entries` over a populated legacy array and silently omit
+        // linked-worktree index roots from the cleanup snapshot.
+        let registry = crate::command::worktree::WorktreeState::parse(&bytes)
+            .map_err(|error| anyhow!("worktree registry rejected: {error}"))
             .context("parse worktree registry before rejected object cleanup")?;
-        let worktrees = document
-            .get("worktrees")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow!("worktree registry has no worktrees array"))?;
-        if worktrees.len() > REJECTED_CLEANUP_MAX_INDEX_FILES {
+        let worktree_paths = registry.entry_paths();
+        if worktree_paths.len() > REJECTED_CLEANUP_MAX_INDEX_FILES {
             bail!(
                 "worktree registry exceeds the {} index-file cleanup limit",
                 REJECTED_CLEANUP_MAX_INDEX_FILES
             );
         }
-        for worktree in worktrees {
-            let path = worktree
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("worktree registry entry has no path"))?;
-            index_paths.push(Path::new(path).join(".libra/index"));
+        for path in worktree_paths {
+            index_paths.push(Path::new(&path).join(".libra/index"));
         }
     }
     index_paths.sort();
@@ -1518,9 +1517,7 @@ impl HistoryManager {
                 bail!("checkpoint append exceeded the historical import execution deadline");
             }
             let result: Result<()> = async {
-                let txn = self
-                    .db_conn
-                    .begin()
+                let txn = crate::internal::db::begin_write_transaction(self.db_conn.as_ref())
                     .await
                     .context("begin checkpoint object ownership update")?;
                 let entry = crate::internal::metadata::MetadataKv::get_with_conn(
@@ -1609,9 +1606,7 @@ impl HistoryManager {
                 bail!("checkpoint append exceeded the historical import execution deadline");
             }
             let result: Result<()> = async {
-                let txn = self
-                    .db_conn
-                    .begin()
+                let txn = crate::internal::db::begin_write_transaction(self.db_conn.as_ref())
                     .await
                     .context("begin checkpoint object ownership finalization")?;
                 let entry = crate::internal::metadata::MetadataKv::get_with_conn(
@@ -1937,17 +1932,18 @@ impl HistoryManager {
 
     async fn update_ref(&self, ref_name: &str, hash: ObjectHash) -> Result<()> {
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-            let txn: DatabaseTransaction = match self.db_conn.begin().await {
-                Ok(txn) => txn,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => return Err(err).context("Failed to begin transaction"),
-            };
+            let txn: DatabaseTransaction =
+                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
+                    Ok(txn) => txn,
+                    Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
+                        sleep(Duration::from_millis(
+                            SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(err) => return Err(err).context("Failed to begin transaction"),
+                };
 
             let existing = match reference::Entity::find()
                 .filter(reference::Column::Name.eq(ref_name))
@@ -2051,17 +2047,18 @@ impl HistoryManager {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 bail!("checkpoint append exceeded the historical import execution deadline");
             }
-            let txn: DatabaseTransaction = match self.db_conn.begin().await {
-                Ok(txn) => txn,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => return Err(err).context("Failed to begin transaction"),
-            };
+            let txn: DatabaseTransaction =
+                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
+                    Ok(txn) => txn,
+                    Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
+                        sleep(Duration::from_millis(
+                            SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(err) => return Err(err).context("Failed to begin transaction"),
+                };
 
             // An expired ordinary marker may have been fenced and retired by
             // crash recovery while this writer was stalled. The marker check
@@ -2647,12 +2644,13 @@ impl HistoryManager {
         });
 
         let mut candidates = HashSet::new();
-        for marker in markers
-            .iter()
-            .filter(|marker| marker.cleanup_pending || !marker.is_live(now_ms))
-        {
+        for marker in markers.iter().filter(|marker| {
+            marker.cleanup_pending
+                || !marker.is_live(now_ms)
+                || !marker.time_fields_trustworthy(now_ms)
+        }) {
             let cataloged = conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     conn.get_database_backend(),
                     "SELECT 1 FROM agent_checkpoint WHERE checkpoint_id = ?",
                     [marker.attempt_id.clone().into()],
@@ -2665,7 +2663,7 @@ impl HistoryManager {
         }
 
         let mut root_rows = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT `commit` AS oid FROM reference WHERE `commit` IS NOT NULL LIMIT 250001"
                     .to_string(),
@@ -2673,7 +2671,7 @@ impl HistoryManager {
             .await
             .context("list reference roots for rejected object cleanup")?;
         let reflog_exists = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
                 ["reflog".into()],
@@ -2683,7 +2681,7 @@ impl HistoryManager {
             .is_some();
         if reflog_exists && root_rows.len() <= REJECTED_CLEANUP_MAX_VISITED_OBJECTS {
             root_rows.extend(
-                conn.query_all(Statement::from_string(
+                conn.query_all_raw(Statement::from_string(
                     conn.get_database_backend(),
                     "SELECT old_oid AS oid FROM reflog
                      UNION ALL SELECT new_oid AS oid FROM reflog
@@ -2716,7 +2714,7 @@ impl HistoryManager {
         let mut active_operations = Vec::new();
         for table in ["rebase_state", "sequence_state"] {
             let table_exists = conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     conn.get_database_backend(),
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
                     [table.into()],
@@ -2726,7 +2724,7 @@ impl HistoryManager {
                 .is_some();
             if table_exists
                 && conn
-                    .query_one(Statement::from_string(
+                    .query_one_raw(Statement::from_string(
                         conn.get_database_backend(),
                         format!("SELECT 1 FROM {table} LIMIT 1"),
                     ))
@@ -2995,9 +2993,7 @@ impl HistoryManager {
         // append to its caller. This happens before any optional background
         // queue wait, so a timeout can never erase the only durable record of
         // newly-created object ownership.
-        let txn = self
-            .db_conn
-            .begin()
+        let txn = crate::internal::db::begin_write_transaction(self.db_conn.as_ref())
             .await
             .context("begin rejected checkpoint cleanup registration")?;
         let existing = crate::internal::metadata::MetadataKv::get_with_conn(
@@ -3094,7 +3090,13 @@ impl HistoryManager {
         };
         let marker =
             decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)?;
-        if !marker.cleanup_pending && marker.is_live(now_ms) {
+        // A LIVE marker refuses retirement — but only when its time fields
+        // are trustworthy: a future-dated row would otherwise read as "live"
+        // forever and be unrepairable (W2 §C.4.3).
+        if !marker.cleanup_pending
+            && marker.time_fields_trustworthy(now_ms)
+            && marker.is_live(now_ms)
+        {
             return Ok(false);
         }
         self.drain_rejected_checkpoint_cleanup_jobs().await?;
@@ -3139,13 +3141,22 @@ impl HistoryManager {
             .db
             .markers
             .iter()
-            .filter(|marker| marker.cleanup_pending || !marker.is_live(now_ms))
+            .filter(|marker| {
+                marker.cleanup_pending
+                    || !marker.is_live(now_ms)
+                    // W2 §C.4.3: a future-dated (untrustworthy) row reads as
+                    // "live" under the absolute deadline forever — it must be
+                    // RETIRABLE here, or doctor can never unblock the
+                    // fail-closed listing.
+                    || !marker.time_fields_trustworthy(now_ms)
+            })
             .collect::<Vec<_>>();
         if pending.is_empty() {
             return Ok(());
         }
         if let Some(other) = initial.db.markers.iter().find(|marker| {
             !marker.cleanup_pending
+                && marker.time_fields_trustworthy(now_ms)
                 && marker.is_live(now_ms)
                 && ignored_attempt.is_none_or(|(session_id, attempt_id)| {
                     marker.session_id != session_id || marker.attempt_id != attempt_id
@@ -3201,7 +3212,7 @@ impl HistoryManager {
             .begin()
             .await
             .context("begin rejected checkpoint object cleanup")?;
-        txn.execute(Statement::from_string(
+        txn.execute_raw(Statement::from_string(
             txn.get_database_backend(),
             "UPDATE metadata_kv SET updated_at = updated_at
              WHERE scope = 'agent_traces_inflight'"
@@ -3251,7 +3262,11 @@ impl HistoryManager {
         let pending = locked_db
             .markers
             .iter()
-            .filter(|marker| marker.cleanup_pending || !marker.is_live(locked_now_ms))
+            .filter(|marker| {
+                marker.cleanup_pending
+                    || !marker.is_live(locked_now_ms)
+                    || !marker.time_fields_trustworthy(locked_now_ms)
+            })
             .collect::<Vec<_>>();
         if pending.is_empty() {
             txn.commit()
@@ -3261,6 +3276,7 @@ impl HistoryManager {
         }
         if let Some(other) = locked_db.markers.iter().find(|marker| {
             !marker.cleanup_pending
+                && marker.time_fields_trustworthy(locked_now_ms)
                 && marker.is_live(locked_now_ms)
                 && ignored_attempt.is_none_or(|(session_id, attempt_id)| {
                     marker.session_id != session_id || marker.attempt_id != attempt_id
@@ -3463,8 +3479,11 @@ impl HistoryManager {
     /// cascade its checkpoint rows away (FK `ON DELETE CASCADE`) and leave
     /// `refs/libra/traces` pointing at orphan commits.
     ///
-    /// D1/R2 cloud-mirror deletion propagation is explicitly out of scope
-    /// (documented deferral): this covers local consistency only.
+    /// Cloud propagation (PD-03): the `agent_import_tombstone` written
+    /// here is published to the D1 mirror by `libra cloud sync`, which
+    /// also drops the erased session's mirror rows, and `libra cloud
+    /// restore` is tombstone-first. Only R2 physical payload deletion
+    /// remains a documented deferral.
     pub async fn erase_session_local(&self, session_id: &str) -> Result<SessionEraseOutcome> {
         use sea_orm::{Statement, Value};
         let backend = self.db_conn.get_database_backend();
@@ -3477,7 +3496,7 @@ impl HistoryManager {
         // it in the meantime.
         let identity = self
             .db_conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT agent_kind, provider_session_id, metadata_json
                  FROM agent_session WHERE session_id = ?",
@@ -3507,7 +3526,7 @@ impl HistoryManager {
                 .context("begin agent erasure tombstone transaction")?;
             let incarnation_namespace = uuid::Uuid::new_v4().simple().to_string();
             let incarnation = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     backend,
                     "INSERT INTO agent_capture_incarnation (
                         agent_kind, provider_session_id, next_session_sync_revision,
@@ -3543,7 +3562,7 @@ impl HistoryManager {
                     "agent session disappeared while preserving its cloud replication incarnation; retry the erase"
                 );
             }
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_import_tombstone (
                     tombstone_id, agent_kind, provider_session_id,
@@ -3567,7 +3586,7 @@ impl HistoryManager {
             ))
             .await
             .context("write agent import anti-resurrection tombstone")?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "UPDATE agent_import_identity
                  SET state = 'failed', owner = NULL, lease_expires_at = NULL,
@@ -3582,7 +3601,7 @@ impl HistoryManager {
             ))
             .await
             .context("fence import identity holders during erasure")?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "UPDATE agent_coverage_claim
                  SET state = 'abandoned', owner = NULL, lease_expires_at = NULL,
@@ -3595,7 +3614,7 @@ impl HistoryManager {
             ))
             .await
             .context("fence coverage claim holders during erasure")?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "UPDATE agent_export_job
                  SET state = 'failed', owner = NULL, lease_expires_at = NULL,
@@ -3645,7 +3664,7 @@ impl HistoryManager {
         // Enumerate the session's checkpoints from the catalog.
         let rows = self
             .db_conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT checkpoint_id FROM agent_checkpoint WHERE session_id = ?",
                 [Value::from(session_id.to_string())],
@@ -3676,14 +3695,14 @@ impl HistoryManager {
             .await
             .context("begin agent session catalog erasure")?;
         let deleted = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM agent_session WHERE session_id = ?",
                 [Value::from(session_id.to_string())],
             ))
             .await
             .context("delete agent_session row for erasure")?;
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM metadata_kv WHERE scope = ? AND target = ?",
             [
@@ -3696,7 +3715,7 @@ impl HistoryManager {
         .await
         .context("delete import object-index repair marker for erased session")?;
         if let Some((agent_kind, provider_session_id)) = provider_identity {
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM agent_import_identity
                  WHERE agent_kind = ? AND provider_session_id = ?",
@@ -3707,7 +3726,7 @@ impl HistoryManager {
             ))
             .await
             .context("delete import identity rows for erased session")?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM agent_export_job
                  WHERE agent_kind = ? AND provider_session_id = ?",
@@ -3771,7 +3790,7 @@ impl HistoryManager {
         // closed on every unexpired reservation just as we do for markers.
         let reserved = self
             .db_conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 self.db_conn.get_database_backend(),
                 "SELECT parent_session_id, attempt_checkpoint_id, lease_expires_at
                  FROM agent_subagent_content_claim
@@ -3842,7 +3861,7 @@ impl HistoryManager {
         let backend = self.db_conn.get_database_backend();
         let rows = self
             .db_conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 backend,
                 "SELECT cp.checkpoint_id, cp.session_id, cp.scope, cp.parent_commit, \
                         cp.traces_commit, cp.tree_oid, cp.metadata_blob_oid, cp.created_at, \
@@ -4009,19 +4028,20 @@ impl HistoryManager {
             })?;
 
         'retry_sqlite: for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-            let txn: DatabaseTransaction = match self.db_conn.begin().await {
-                Ok(txn) => txn,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => {
-                    return Err(err).context("Failed to begin checkpoint prune transaction");
-                }
-            };
+            let txn: DatabaseTransaction =
+                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
+                    Ok(txn) => txn,
+                    Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
+                        sleep(Duration::from_millis(
+                            SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err).context("Failed to begin checkpoint prune transaction");
+                    }
+                };
 
             let existing = match reference::Entity::find()
                 .filter(reference::Column::Name.eq(&self.ref_name))
@@ -4082,7 +4102,7 @@ impl HistoryManager {
             let backend = txn.get_database_backend();
             for item in rewritten {
                 if let Err(err) = txn
-                    .execute(Statement::from_sql_and_values(
+                    .execute_raw(Statement::from_sql_and_values(
                         backend,
                         "UPDATE agent_checkpoint SET traces_commit = ?, tree_oid = ?, \
                             sync_revision = sync_revision + 1 \
@@ -4110,7 +4130,7 @@ impl HistoryManager {
             let mut removed = 0;
             for id in remove_ids {
                 if record_cloud_tombstones {
-                    txn.execute(Statement::from_sql_and_values(
+                    txn.execute_raw(Statement::from_sql_and_values(
                         backend,
                         "INSERT INTO agent_checkpoint_prune_tombstone (
                             checkpoint_id, session_id, pruned_at
@@ -4137,7 +4157,7 @@ impl HistoryManager {
                 // cascades its revision/link.  Keep an empty claim as the
                 // durable revision high-water mark so a later capture cannot
                 // reuse an audited revision number for different content.
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_subagent_content_revision
                      WHERE checkpoint_id = ?",
@@ -4145,7 +4165,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete subagent content revision for pruned checkpoint")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_subagent_content_claim
                      SET sync_revision = sync_revision + 1,
@@ -4188,7 +4208,7 @@ impl HistoryManager {
                 // attempt cursors are part of the same catalog fact as the
                 // checkpoint. Reconcile them before deleting the row so no
                 // committed claim can point at a pruned checkpoint.
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_conflict
                      WHERE incumbent_checkpoint_id = ?
@@ -4203,14 +4223,14 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete conflict evidence whose incumbent checkpoint is pruned")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_revision WHERE checkpoint_id = ?",
                     [Value::from(id.clone())],
                 ))
                 .await
                 .context("delete coverage revisions for pruned checkpoint")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_claim
                      WHERE checkpoint_id = ?
@@ -4224,7 +4244,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete coverage claims emptied by checkpoint prune")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_coverage_claim
                      SET revision = (
@@ -4281,7 +4301,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("repoint coverage claim after checkpoint prune")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_import_identity SET attempt_checkpoint_id = NULL
                      WHERE attempt_checkpoint_id = ?",
@@ -4290,7 +4310,7 @@ impl HistoryManager {
                 .await
                 .context("clear pruned import attempt checkpoint pointer")?;
                 match txn
-                    .execute(Statement::from_sql_and_values(
+                    .execute_raw(Statement::from_sql_and_values(
                         backend,
                         "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
                         [Value::from(id.clone())],
@@ -4311,7 +4331,7 @@ impl HistoryManager {
             }
 
             let deleted_import_identities = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_import_identity
                  WHERE state IN ('discovered','partial','committed','failed')
@@ -5251,10 +5271,44 @@ impl TracesInflightMarker {
     }
 
     /// Whether the marker is still live at `now_ms`.
+    ///
+    /// BOUNDED (W2 §C.4.3): a deterministic absolute deadline from the
+    /// persisted fields with `ttl_ms` capped at
+    /// [`TRACES_INFLIGHT_MAX_LIVE_MS`]. Future-dated rows are handled by
+    /// [`Self::time_fields_trustworthy`] (the listing fails closed on them
+    /// and doctor retires them) — this predicate never re-anchors to the
+    /// reading clock. Every liveness consumer inherits these definitions.
     pub fn is_live(&self, now_ms: i64) -> bool {
-        self.started_at_ms.saturating_add(self.ttl_ms) > now_ms
+        // DETERMINISTIC absolute deadline from the PERSISTED fields only —
+        // never re-anchored to the reading clock. TTL is capped so nothing
+        // counts as live more than 24h past its recorded start. Rows whose
+        // start lies beyond clock-skew tolerance in the FUTURE never reach
+        // this predicate through the listing: `time_fields_trustworthy`
+        // fails the listing CLOSED for them (they are corrupt, and silently
+        // dropping them would strip a possibly-writing session's only
+        // protection).
+        self.started_at_ms
+            .saturating_add(self.ttl_ms.clamp(0, TRACES_INFLIGHT_MAX_LIVE_MS))
+            > now_ms
+    }
+
+    /// Whether the persisted time fields are plausible at `now_ms`: a start
+    /// more than [`TRACES_INFLIGHT_FUTURE_SKEW_MS`] in the future cannot
+    /// come from a healthy writer — the row is corrupt and every
+    /// destructive consumer must stop (fail closed) rather than guess.
+    pub fn time_fields_trustworthy(&self, now_ms: i64) -> bool {
+        self.started_at_ms <= now_ms.saturating_add(TRACES_INFLIGHT_FUTURE_SKEW_MS)
     }
 }
+
+/// Upper bound on how long ANY ordinary in-flight marker may count as live,
+/// regardless of what its persisted `ttl_ms` claims (fail-safe clamp; the
+/// ordinary writer TTL is 10 minutes, so 24h is generous headroom).
+pub const TRACES_INFLIGHT_MAX_LIVE_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Clock-skew tolerance for `started_at_ms` (a healthy writer stamps "now";
+/// anything further in the future is a corrupt row, not a long-lived one).
+pub const TRACES_INFLIGHT_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
 fn validate_traces_inflight_marker(
     marker: &TracesInflightMarker,
@@ -5372,12 +5426,11 @@ pub async fn register_traces_write_attempt(
     marker: &TracesInflightMarker,
     coverage_fences: &[TracesCoverageFence<'_>],
 ) -> Result<()> {
-    let txn = conn
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin traces writer-attempt registration")?;
     let writable = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 AS writable
              FROM agent_session s
@@ -5397,7 +5450,7 @@ pub async fn register_traces_write_attempt(
     }
     for fence in coverage_fences {
         let owned = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT 1 AS owned FROM agent_coverage_claim
                  WHERE session_id = ? AND logical_turn_key = ?
@@ -5466,7 +5519,7 @@ pub async fn update_traces_inflight_marker_if_generation<C: ConnectionTrait>(
     let value =
         serde_json::to_string(marker).context("failed to serialize traces in-flight marker")?;
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "UPDATE metadata_kv
              SET value = ?, value_type = 'text', updated_at = ?
@@ -5511,7 +5564,7 @@ pub async fn clear_traces_inflight_marker_if_generation<C: ConnectionTrait>(
     generation: &str,
 ) -> Result<bool> {
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "DELETE FROM metadata_kv
              WHERE scope = 'agent_traces_inflight' AND target = ? AND key = ?
@@ -5533,7 +5586,7 @@ pub async fn clear_non_cleanup_traces_inflight_marker<C: ConnectionTrait>(
     generation: &str,
 ) -> Result<bool> {
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "DELETE FROM metadata_kv
              WHERE scope = 'agent_traces_inflight' AND target = ? AND key = ?
@@ -5570,6 +5623,21 @@ pub async fn list_live_traces_inflight_markers<C: ConnectionTrait>(
     for entry in entries {
         match decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key) {
             Ok(marker) => {
+                // A future-dated start beyond skew tolerance is a CORRUPT
+                // row, not an expired one: silently filtering it would strip
+                // a possibly-still-writing session's only protection, so the
+                // listing fails CLOSED and destructive consumers stop.
+                if !marker.time_fields_trustworthy(now_ms) {
+                    bail!(
+                        "traces in-flight marker for session {} attempt {} carries a \
+                         future-dated started_at_ms ({} vs now {now_ms}) — the row is \
+                         corrupt; inspect it with `libra agent doctor` before destructive \
+                         maintenance",
+                        marker.session_id,
+                        marker.attempt_id,
+                        marker.started_at_ms
+                    );
+                }
                 if marker.cleanup_pending || marker.is_live(now_ms) {
                     live.push(marker);
                 }
@@ -5609,7 +5677,7 @@ pub async fn agent_checkpoint_id_for_traces_commit<C: ConnectionTrait>(
 ) -> Result<Option<String>> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT checkpoint_id FROM agent_checkpoint WHERE traces_commit = ? LIMIT 1",
             [Value::from(commit_hash)],
@@ -5687,7 +5755,7 @@ pub(crate) async fn checkpoint_snapshot_durable_oids<C: ConnectionTrait>(
         return Ok(HashSet::new());
     }
     let catalog_rows = conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT traces_commit FROM agent_checkpoint ORDER BY traces_commit".to_string(),
         ))
@@ -5743,7 +5811,7 @@ async fn checkpoint_snapshot_durable_oids_with_catalog<C: ConnectionTrait>(
     deadline: Option<Instant>,
 ) -> Result<HashSet<String>> {
     let head_row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT `commit` FROM reference
              WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
@@ -6128,6 +6196,12 @@ fn collect_exclusive_unreachable_oids(
             .into_iter()
             .filter_map(|oid| oid.clone())
         {
+            // Legacy rows may spell "no traces commit" as an EMPTY string
+            // rather than NULL — an empty id is not an object to deindex,
+            // and passing it to the deletion fence aborts the whole prune.
+            if oid.is_empty() {
+                continue;
+            }
             if !still_referenced.contains(&oid) && seen.insert(oid.clone()) {
                 unreachable.push(oid);
             }
@@ -6289,6 +6363,146 @@ mod tests {
     }
 
     use super::*;
+
+    async fn drain_rejected_cleanup_in_invocation_scope(manager: &HistoryManager) -> Result<()> {
+        // Production cleanup runs under the CLI invocation-local object-index
+        // scope. Direct unit-test calls must model that boundary so unrelated
+        // tests using the process-wide fallback queue cannot consume this
+        // operation's finite drain budget.
+        crate::utils::client_storage::ClientStorage::with_background_index_failure_scope(
+            manager.drain_rejected_checkpoint_cleanup_jobs(),
+        )
+        .await
+    }
+
+    async fn repair_expired_marker_in_invocation_scope(
+        manager: &HistoryManager,
+        session_id: &str,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        crate::utils::client_storage::ClientStorage::with_background_index_failure_scope(
+            manager.repair_expired_traces_inflight_marker(session_id, attempt_id, now_ms),
+        )
+        .await
+    }
+
+    /// W2 §C.4.3 end-to-end unblock: an `i64::MAX`-dated marker row blocks
+    /// the listing fail-closed, and `agent doctor --repair`'s retirement
+    /// entry point RETIRES it (the drain classifies untrustworthy rows as
+    /// retirable), after which the listing succeeds again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn doctor_repair_retires_future_dated_marker_and_unblocks_listing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        let db = crate::internal::db::get_db_conn_instance().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut marker = TracesInflightMarker::new("sess-max", "attempt-max", now);
+        marker.started_at_ms = i64::MAX;
+        crate::internal::metadata::MetadataKv::set_with_conn(
+            &db,
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            "sess-max",
+            "attempt-max",
+            &serde_json::to_string(&marker).expect("encode"),
+            crate::internal::metadata::MetadataValueType::Text,
+        )
+        .await
+        .expect("seed i64::MAX marker");
+
+        list_live_traces_inflight_markers(&db, now)
+            .await
+            .expect_err("the corrupt row blocks the listing");
+
+        let storage: Arc<dyn crate::utils::storage::Storage + Send + Sync> =
+            Arc::new(crate::utils::storage::local::LocalStorage::new(
+                crate::utils::util::storage_path().join("objects"),
+            ));
+        let history = HistoryManager::new_with_ref(
+            storage,
+            crate::utils::util::storage_path(),
+            Arc::new(db.clone()),
+            "refs/libra/traces",
+        );
+        let retired =
+            repair_expired_marker_in_invocation_scope(&history, "sess-max", "attempt-max", now)
+                .await
+                .expect("doctor repair retires the untrustworthy marker");
+        assert!(retired, "the marker row was fully retired");
+
+        let live = list_live_traces_inflight_markers(&db, now)
+            .await
+            .expect("the listing is unblocked after retirement");
+        assert!(live.is_empty(), "no marker remains: {live:?}");
+    }
+
+    /// W2 §C.4.3: the LISTING fails closed on a future-dated marker row —
+    /// every destructive consumer (gc defer/roots, prune, erasure) stops
+    /// instead of silently losing or trusting the row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn listing_fails_closed_on_future_dated_marker_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        let db = crate::internal::db::get_db_conn_instance().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let marker = TracesInflightMarker::new("sess-f", "attempt-f", now + 48 * 60 * 60 * 1000);
+        crate::internal::metadata::MetadataKv::set_with_conn(
+            &db,
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            "sess-f",
+            "attempt-f",
+            &serde_json::to_string(&marker).expect("encode"),
+            crate::internal::metadata::MetadataValueType::Text,
+        )
+        .await
+        .expect("seed future-dated marker");
+
+        let err = list_live_traces_inflight_markers(&db, now)
+            .await
+            .expect_err("future-dated row must fail the listing closed");
+        assert!(
+            format!("{err:#}").contains("future-dated"),
+            "actionable corruption error: {err:#}"
+        );
+    }
+
+    /// W2 §C.4.3: marker liveness is a DETERMINISTIC absolute deadline from
+    /// the persisted fields (TTL capped at 24h, no per-read re-anchoring),
+    /// and a future-dated start beyond skew tolerance marks the ROW ITSELF
+    /// untrustworthy — the listing fails closed on it instead of silently
+    /// filtering or trusting it.
+    #[test]
+    fn inflight_marker_liveness_is_bounded_and_deterministic() {
+        let now = 1_700_000_000_000_i64;
+        let mut marker = TracesInflightMarker::new("s", "a", now - 60_000);
+        // Normal recent marker with its ordinary TTL: live and trustworthy.
+        assert!(marker.time_fields_trustworthy(now));
+        assert!(marker.is_live(now));
+        // Absurd TTL is capped: dead 24h past start no matter the claim.
+        marker.ttl_ms = i64::MAX;
+        assert!(marker.is_live(now));
+        assert!(!marker.is_live(marker.started_at_ms + TRACES_INFLIGHT_MAX_LIVE_MS + 1));
+        // Future-dated start beyond skew: UNTRUSTWORTHY at any read time
+        // before the claimed start — the listing bails rather than judging
+        // liveness; once real time catches up the row is trustworthy again
+        // and the ordinary capped deadline applies.
+        marker.started_at_ms = now + 48 * 60 * 60 * 1000;
+        marker.ttl_ms = 600_000;
+        assert!(!marker.time_fields_trustworthy(now));
+        assert!(!marker.time_fields_trustworthy(now + 60 * 60 * 1000));
+        assert!(marker.time_fields_trustworthy(marker.started_at_ms));
+        assert!(marker.is_live(marker.started_at_ms + 1));
+        assert!(!marker.is_live(marker.started_at_ms + 600_001));
+        // Small clock skew is tolerated deterministically.
+        marker.started_at_ms = now + 60_000;
+        assert!(marker.time_fields_trustworthy(now));
+        assert!(marker.is_live(now));
+        assert!(!marker.is_live(now + TRACES_INFLIGHT_MAX_LIVE_MS + 120_000));
+    }
     use crate::{internal::db, utils::storage::local::LocalStorage};
 
     #[cfg(unix)]
@@ -6394,7 +6608,18 @@ mod tests {
         let builder = db.get_database_backend();
         let schema = Schema::new(builder);
         let stmt = schema.create_table_from_entity(reference::Entity);
-        db.execute(builder.build(&stmt)).await.unwrap();
+        db.execute_raw(builder.build(&stmt)).await.unwrap();
+        // Present in every real repository (bootstrap schema). The write-lock
+        // primitive in `db::begin_write_transaction` issues a no-op write
+        // against it, so a fixture without it is not a repository database.
+        db.execute_raw(Statement::from_string(
+            builder,
+            "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,\
+             value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0)"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
         db
     }
 
@@ -6527,7 +6752,7 @@ mod tests {
         .expect("failed to open lock holder connection");
         let backend = locker.get_database_backend();
         locker
-            .execute(Statement::from_string(backend, "BEGIN EXCLUSIVE"))
+            .execute_raw(Statement::from_string(backend, "BEGIN EXCLUSIVE"))
             .await
             .expect("failed to acquire sqlite exclusive lock");
 
@@ -6537,7 +6762,7 @@ mod tests {
                 sleep(Duration::from_millis(250)).await;
                 let backend = locker.get_database_backend();
                 locker
-                    .execute(Statement::from_string(backend, "COMMIT"))
+                    .execute_raw(Statement::from_string(backend, "COMMIT"))
                     .await
                     .expect("failed to release sqlite exclusive lock");
             })
@@ -6596,13 +6821,13 @@ mod tests {
     }
 
     async fn prepare_checkpoint_test_schema(conn: &DatabaseConnection) {
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
         ))
         .await
         .expect("create checkpoint marker registry");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE IF NOT EXISTS agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)"
                 .to_string(),
@@ -7157,14 +7382,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
@@ -7216,8 +7441,7 @@ mod tests {
         write_traces_inflight_marker(&*db_conn, &expired)
             .await
             .expect("expire unrelated marker");
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("drain persisted cleanup after live peer exits");
         assert!(
@@ -7255,8 +7479,7 @@ mod tests {
             .await
             .expect("write unresolved preclaim marker");
 
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("retire unresolved preclaim without deleting payload");
         let oid_text = oid.to_string();
@@ -7282,7 +7505,7 @@ mod tests {
                 .expect("write reflog candidate");
         assert!(created);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE reflog (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7297,7 +7520,7 @@ mod tests {
             .await
             .expect("create reflog root table");
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db_conn.get_database_backend(),
                 "INSERT INTO reflog (
                     ref_name, old_oid, new_oid, timestamp, committer_name,
@@ -7321,8 +7544,7 @@ mod tests {
             )
             .await
             .expect("cleanup with reflog root");
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("drain reflog-root cleanup job");
         assert!(
@@ -7374,8 +7596,7 @@ mod tests {
             )
             .await
             .expect("cleanup with index root");
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("drain index-root cleanup job");
         assert!(
@@ -7402,21 +7623,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
             .await
             .expect("create cleanup catalog probe");
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db_conn.get_database_backend(),
                 "INSERT INTO metadata_kv (
                     scope, target, `key`, value, value_type, created_at, updated_at
@@ -7440,8 +7661,8 @@ mod tests {
             .await
             .expect("seed malformed durable cleanup marker");
 
-        let error = traces_manager(&dir, db_conn)
-            .drain_rejected_checkpoint_cleanup_jobs()
+        let manager = traces_manager(&dir, db_conn);
+        let error = drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect_err("malformed cleanup marker must fail closed");
         let message = format!("{error:#}");
@@ -7454,14 +7675,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
@@ -7474,14 +7695,14 @@ mod tests {
         let manager = traces_manager(&dir, db_conn.clone());
 
         assert!(
-            manager
-                .repair_expired_traces_inflight_marker(
-                    "expired-session",
-                    "expired-attempt",
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await
-                .expect("repair expired empty marker")
+            repair_expired_marker_in_invocation_scope(
+                &manager,
+                "expired-session",
+                "expired-attempt",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .expect("repair expired empty marker")
         );
         assert!(
             list_all_traces_inflight_markers(&*db_conn)
@@ -7498,14 +7719,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
@@ -7531,7 +7752,7 @@ mod tests {
         encoder.write_all(b"blob 15\0different bytes").unwrap();
         encoder.finish().unwrap();
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db_conn.get_database_backend(),
                 "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
                  VALUES ('broken-ref', 'Branch', ?, NULL, NULL)",
@@ -7566,8 +7787,7 @@ mod tests {
                 .exists(),
             "fail-closed cleanup deleted a candidate"
         );
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("non-destructive marker retirement must not read an unrelated corrupt ref");
         assert!(
@@ -7825,14 +8045,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
@@ -7852,7 +8072,7 @@ mod tests {
         let tag = write_git_object(&repo_path, "tag", tag_data.as_bytes())
             .expect("write annotated tag object");
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db_conn.get_database_backend(),
                 "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
                  VALUES ('keep-candidate', 'Tag', ?, NULL, NULL)",
@@ -7870,8 +8090,7 @@ mod tests {
             )
             .await
             .expect("annotated tag reachability should protect candidate");
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("drain annotated-tag cleanup job");
         assert!(

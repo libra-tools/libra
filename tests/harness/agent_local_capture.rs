@@ -126,6 +126,7 @@ pub const AGENTS: &[AgentSpec] = &[
 const CLAUDE_EVENT_VERBS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "tool-use"),
     ("PostToolUse", "tool-use"),
     ("Stop", "stop"),
     ("SessionEnd", "session-end"),

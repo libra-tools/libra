@@ -401,3 +401,175 @@ async fn test_fuse_worktree_add_with_branch_and_create_branch() {
     assert_eq!(state.worktrees.len(), 1);
     assert_eq!(state.worktrees[0].branch, "feature/fuse-wt");
 }
+
+/// Regression (W3 §C.7): the fuse build REPLACES the worktree subcommand
+/// surface, and its `Repair` variant must accept the same optional path as
+/// the legacy command — `libra worktree repair <path>` restores a linked
+/// worktree's gitdir identity in `--features worktree-fuse` builds too. No
+/// FUSE mount is involved; this guards the CLI surface only.
+#[test]
+fn repair_path_restores_identity_in_fuse_build() {
+    let dir = tempdir().expect("tempdir");
+    let main = dir.path();
+    assert_cli_success(&run_libra_command(&["init", "--vault=false"], main), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "t"], main),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t"], main),
+        "email",
+    );
+    fs::write(main.join("a.txt"), "a").expect("seed file");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], main),
+        "commit",
+    );
+
+    let wt = main.join("wt-fuse-repair");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add (non-fuse) in fuse build",
+    );
+    let id_file = wt.join(".libra").join("worktree_id");
+    let original_id = fs::read_to_string(&id_file)
+        .expect("gitdir id")
+        .trim()
+        .to_string();
+    fs::remove_file(&id_file).expect("drop id file");
+
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+            main,
+        ),
+        "worktree repair <path> in fuse build",
+    );
+    let restored = fs::read_to_string(&id_file)
+        .expect("restored id")
+        .trim()
+        .to_string();
+    assert_eq!(restored, original_id, "identity restored from the registry");
+}
+
+/// Read the `worktree repair` audit rows from a repository's operation log.
+#[cfg(unix)]
+async fn repair_audit_rows(repo: &Path) -> Vec<(String, String)> {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    let url = format!("sqlite://{}", repo.join(".libra/libra.db").display());
+    let mut opts = ConnectOptions::new(url);
+    opts.sqlx_logging(false);
+    let conn = Database::connect(opts).await.expect("open repo db");
+    conn.query_all_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "SELECT command_name, status FROM operation WHERE command_name = 'worktree repair' \
+         ORDER BY op_id",
+    ))
+    .await
+    .expect("read repair audit rows")
+    .iter()
+    .map(|row| {
+        (
+            row.try_get_by_index::<String>(0).expect("command_name"),
+            row.try_get_by_index::<String>(1).expect("status"),
+        )
+    })
+    .collect()
+}
+
+#[cfg(unix)]
+fn init_repo_with_commit(main: &Path) {
+    assert_cli_success(&run_libra_command(&["init", "--vault=false"], main), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "t"], main),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t"], main),
+        "email",
+    );
+    fs::write(main.join("a.txt"), "a").expect("seed file");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], main),
+        "commit",
+    );
+}
+
+/// W0 (§C.11, Codex R18): in a `--features worktree-fuse` build the no-arg
+/// `worktree repair` runs the core registry repair AND the FUSE state repair
+/// inside ONE operation-log audit boundary — exactly one row, closed with the
+/// combined outcome. No FUSE mount is involved; this guards the boundary
+/// composition only (the FUSE repair mutates `worktrees-fuse.json`).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn fuse_repair_shares_one_audit_boundary_with_core_repair() {
+    let dir = tempdir().expect("tempdir");
+    let main = dir.path();
+    init_repo_with_commit(main);
+
+    // A duplicated FUSE state entry for the repair to drop.
+    fs::write(
+        main.join(".libra/worktrees-fuse.json"),
+        r#"{"worktrees":[
+            {"path":"/wt-a","branch":"b","upper_dir":"/u","lower_dirs":[],"locked":false,"lock_reason":null,"privileged":false,"allow_other":false},
+            {"path":"/wt-a","branch":"b","upper_dir":"/u","lower_dirs":[],"locked":false,"lock_reason":null,"privileged":false,"allow_other":false}
+        ]}"#,
+    )
+    .expect("seed fuse state");
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
+        "worktree repair --confirm (fuse build)",
+    );
+
+    let data =
+        fs::read_to_string(main.join(".libra/worktrees-fuse.json")).expect("read fuse state");
+    let state: FuseState = serde_json::from_str(&data).expect("fuse state is valid json");
+    assert_eq!(state.worktrees.len(), 1, "fuse repair deduped the state");
+
+    let rows = repair_audit_rows(main).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one audit row covers the combined repair: {rows:?}"
+    );
+    assert_eq!(rows[0].1, "succeeded");
+}
+
+/// The same boundary, failing: a FUSE-state repair error must close the ONE
+/// audit row as `failed` and fail the command — the pre-fix shape closed the
+/// row as successful (core repair done) and THEN failed the command on the
+/// FUSE mutation, leaving the failure unrecorded.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn fuse_repair_failure_closes_the_shared_audit_row_failed() {
+    let dir = tempdir().expect("tempdir");
+    let main = dir.path();
+    init_repo_with_commit(main);
+
+    // Corrupt the FUSE state file so `repair_fuse_worktrees` fails to load it.
+    fs::write(main.join(".libra/worktrees-fuse.json"), "{ not json").expect("corrupt fuse state");
+
+    let out = run_libra_command(&["worktree", "repair", "--confirm"], main);
+    assert!(
+        !out.status.success(),
+        "a FUSE-state repair failure must fail the command: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let rows = repair_audit_rows(main).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one audit row covers the combined repair: {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1, "failed",
+        "the shared boundary closes with the combined failure"
+    );
+}

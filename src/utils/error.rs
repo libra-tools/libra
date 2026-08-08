@@ -306,6 +306,28 @@ pub enum StableErrorCode {
     /// `libra agent graph` was given a session id absent from both the live
     /// capture catalog and the local erasure tombstone catalog.
     AgentGraphSessionUnknown,
+    /// An Agent workspace lease could not be acquired: another live workspace
+    /// record already claims the linked worktree identity or the canonical
+    /// directory (plan-20260714 §C.8 W4). A lease conflict is an Agent-runtime
+    /// coordination refusal — deliberately NOT a branch-conflict code, so
+    /// agents can tell the two apart (§C.13).
+    AgentWorkspaceLeaseHeld,
+    /// A workspace lease mutation presented an owner/fence that no longer
+    /// matches the stored lease — a doctor/scavenger reclaim took it over with
+    /// a higher fence, or the record already settled (plan-20260714 §C.8 W4).
+    AgentWorkspaceLeaseLost,
+    /// A `worktree doctor` pagination cursor is malformed, was issued by a
+    /// different listing, or has expired (plan-20260714 §C.13 W4). Fail closed
+    /// rather than silently restarting at page one: a caller walking a keyset
+    /// page by page would otherwise re-read rows it already processed and
+    /// believe it had seen the whole registry.
+    WorktreeCursorInvalid,
+    /// A worktree/workspace scope's state is corrupt or unreadable, so the
+    /// diagnostic report would be incomplete (plan-20260714 §C.13 W4). The
+    /// doctor never degrades to an empty or partial diagnosis — an operator
+    /// acting on a silently-truncated report is worse off than one told the
+    /// scope cannot be read.
+    WorktreeScopeCorrupt,
     /// The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`)
     /// is unreadable, corrupt, or written by an unsupported schema version
     /// (plan-20260714 §A.3). Unsupported `config` spellings targeting the
@@ -376,6 +398,10 @@ impl StableErrorCode {
             Self::AgentImportErased => "LBR-AGENT-019",
             Self::AgentTranscriptAuthorizationMissing => "LBR-AGENT-020",
             Self::AgentGraphSessionUnknown => "LBR-AGENT-021",
+            Self::AgentWorkspaceLeaseHeld => "LBR-AGENT-022",
+            Self::AgentWorkspaceLeaseLost => "LBR-AGENT-023",
+            Self::WorktreeCursorInvalid => "LBR-WORKTREE-001",
+            Self::WorktreeScopeCorrupt => "LBR-WORKTREE-002",
             Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
         }
     }
@@ -387,9 +413,15 @@ impl StableErrorCode {
             Self::CliUnknownCommand | Self::CliInvalidArguments | Self::CliInvalidTarget => {
                 CliErrorCategory::Cli
             }
-            Self::RepoNotFound | Self::RepoCorrupt | Self::RepoStateInvalid => {
-                CliErrorCategory::Repo
-            }
+            // The two worktree-doctor codes deliberately reuse the existing
+            // `repo` category (§C.13): both describe repository-side state a
+            // caller must repair, and a new category would force every
+            // exit-code branch in downstream scripts to grow a case.
+            Self::RepoNotFound
+            | Self::RepoCorrupt
+            | Self::RepoStateInvalid
+            | Self::WorktreeCursorInvalid
+            | Self::WorktreeScopeCorrupt => CliErrorCategory::Repo,
             Self::ConfigSchemaFuture | Self::UpgradeSettingsInvalid => CliErrorCategory::Config,
             Self::ConflictUnresolved
             | Self::ConflictOperationBlocked
@@ -436,7 +468,9 @@ impl StableErrorCode {
             | Self::AgentImportPartialBatch
             | Self::AgentImportErased
             | Self::AgentTranscriptAuthorizationMissing
-            | Self::AgentGraphSessionUnknown => CliErrorCategory::Internal,
+            | Self::AgentGraphSessionUnknown
+            | Self::AgentWorkspaceLeaseHeld
+            | Self::AgentWorkspaceLeaseLost => CliErrorCategory::Internal,
         }
     }
 
@@ -503,7 +537,7 @@ impl StableErrorCode {
                 "Paths that differ only by case collide on a case-insensitive filesystem."
             }
             Self::LayerConflict => {
-                "A layer overlay path collided with tracked content; a layer may only add                  untracked paths."
+                "A layer overlay path collided with tracked content; a layer may only add untracked paths."
             }
             Self::ObliterateNotFound => "No payload was found for the object to obliterate.",
             Self::ObliteratePacked => {
@@ -605,6 +639,18 @@ impl StableErrorCode {
             Self::AgentGraphSessionUnknown => {
                 "The requested captured-agent session does not exist in this repository."
             }
+            Self::AgentWorkspaceLeaseHeld => {
+                "Another live workspace record already leases this linked worktree or directory."
+            }
+            Self::AgentWorkspaceLeaseLost => {
+                "The presented workspace lease owner/fence is stale; the lease was reclaimed or already released."
+            }
+            Self::WorktreeCursorInvalid => {
+                "The pagination cursor is malformed or expired; drop it and re-read the first page."
+            }
+            Self::WorktreeScopeCorrupt => {
+                "A worktree/workspace scope is corrupt or unreadable; repair it before trusting any diagnostic report."
+            }
             Self::UpgradeSettingsInvalid => {
                 "The reserved upgrade settings file ({LIBRA_HOME}/upgrade/settings.json) is unreadable or corrupt; rewrite it with libra config set --global upgrade.mode <auto|manual|off>."
             }
@@ -692,6 +738,11 @@ impl CliError {
             silent: false,
             report_issue_hint,
         }
+    }
+
+    /// Whether this error is a silent exit-code carrier (renders nothing).
+    pub fn is_silent(&self) -> bool {
+        self.silent
     }
 
     /// Create a silent exit error that only sets the process exit code
@@ -1275,8 +1326,18 @@ macro_rules! cli_error {
 /// global warning tracker is updated and the `--exit-code-on-warning` flag
 /// works correctly.
 pub fn emit_warning(message: impl std::fmt::Display) {
-    record_warning();
-    eprintln!("warning: {message}");
+    let message = message.to_string();
+    // Buffered as well as printed: a command rendering a structured
+    // envelope picks these up so `--json` never exits 9 with an empty
+    // `warnings[]` (§B.5 "no stderr-only bypass").
+    crate::utils::output::record_warning_message(message.clone());
+    // Under a structured envelope the message is delivered through
+    // `data.warnings[]`; printing it here too would reintroduce the
+    // stderr-only channel the contract forbids (and dirty the stream that
+    // JSON consumers are told stays clean on success).
+    if !crate::utils::output::structured_output_active() {
+        eprintln!("warning: {message}");
+    }
 }
 
 /// Emit an advisory warning to stderr WITHOUT tripping the
@@ -1493,6 +1554,13 @@ fn is_conflict_blocked_error(lower: &str) -> bool {
             "multiple root commits",
             "multiple sources moving to the same target path",
             "not under version control",
+            // plan-20260714 §C.13: a branch checked out in another worktree
+            // is a CONFLICT. The phrase is
+            // `internal::branch::CHECKED_OUT_ELSEWHERE_PHRASE`, produced by
+            // exactly one constructor; this arm is the fallback for paths
+            // that never set an explicit code, so no wrapping layer can
+            // silently downgrade the classification.
+            "is checked out at worktree",
         ],
     )
 }
@@ -2050,6 +2118,10 @@ mod tests {
                 "LBR-AGENT-020",
             ),
             (StableErrorCode::AgentGraphSessionUnknown, "LBR-AGENT-021"),
+            (StableErrorCode::AgentWorkspaceLeaseHeld, "LBR-AGENT-022"),
+            (StableErrorCode::AgentWorkspaceLeaseLost, "LBR-AGENT-023"),
+            (StableErrorCode::WorktreeCursorInvalid, "LBR-WORKTREE-001"),
+            (StableErrorCode::WorktreeScopeCorrupt, "LBR-WORKTREE-002"),
         ] {
             assert_eq!(variant.as_str(), code);
         }
@@ -2095,6 +2167,17 @@ mod tests {
         );
         assert_eq!(
             StableErrorCode::RepoStateInvalid.category(),
+            CliErrorCategory::Repo,
+        );
+        // The worktree-doctor pair reuses `repo` deliberately (§C.13) —
+        // re-bucketing either one would change `fine_exit_code()` for
+        // scripts that branch on the doctor's refusals.
+        assert_eq!(
+            StableErrorCode::WorktreeCursorInvalid.category(),
+            CliErrorCategory::Repo,
+        );
+        assert_eq!(
+            StableErrorCode::WorktreeScopeCorrupt.category(),
             CliErrorCategory::Repo,
         );
         assert_eq!(
@@ -2194,6 +2277,8 @@ mod tests {
             StableErrorCode::AgentImportErased,
             StableErrorCode::AgentTranscriptAuthorizationMissing,
             StableErrorCode::AgentGraphSessionUnknown,
+            StableErrorCode::AgentWorkspaceLeaseHeld,
+            StableErrorCode::AgentWorkspaceLeaseLost,
         ] {
             assert_eq!(variant.category(), CliErrorCategory::Internal);
         }

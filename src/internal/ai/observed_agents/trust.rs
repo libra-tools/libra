@@ -15,7 +15,10 @@
 //! before spawn, and quarantine on any mismatch. This narrows but does not
 //! eliminate the check-to-exec race; fd-derived exec is future work.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[cfg(unix)]
 use anyhow::anyhow;
@@ -229,6 +232,51 @@ pub async fn add_trusted_dir(path: &Path) -> Result<PathBuf> {
             .context("persist agent.external_agents.trusted_dirs")?;
     }
     Ok(canonical)
+}
+
+/// Trust-record slug for the OpenCode provider-exporter binary (DR-04b).
+pub const OPENCODE_EXPORTER_SLUG: &str = "opencode";
+
+/// Provider-exporter slugs: built-in providers whose OWN CLI binary may be
+/// trusted (under `agent.trust.<slug>`) to power a sandboxed export bridge.
+/// These are deliberately NOT `libra-agent-*` RPC binaries — `agent rpc
+/// trust <slug>` recognizes them and pins the provider binary found under a
+/// registered trusted directory instead of scanning `$PATH`, and the
+/// built-in-slug impersonation guard (`LBR-AGENT-006`) does not apply
+/// because the record is FOR the built-in provider itself.
+pub const PROVIDER_EXPORTER_TRUST_SLUGS: &[&str] = &[OPENCODE_EXPORTER_SLUG];
+
+/// Whether `slug` names a built-in provider exporter (see
+/// [`PROVIDER_EXPORTER_TRUST_SLUGS`]).
+pub fn is_provider_exporter_slug(slug: &str) -> bool {
+    PROVIDER_EXPORTER_TRUST_SLUGS.contains(&slug)
+}
+
+/// DR-04b: locate the provider-exporter binary named `slug` by probing the
+/// registered trusted directories — never `$PATH`, so exporter trust cannot
+/// widen the gated external-binary discovery surface. Returns the first
+/// `<trusted-dir>/<slug>` that resolves to an existing regular file;
+/// `record_trust` afterwards re-enforces canonicalization, world-writable
+/// refusal and trusted-directory containment on the final target.
+pub async fn resolve_exporter_binary(slug: &str) -> Result<PathBuf> {
+    let dirs = read_trusted_dirs().await?;
+    for dir in &dirs {
+        let candidate = dir.join(slug);
+        if fs::metadata(&candidate)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "no '{slug}' binary found under a trusted directory; register the directory containing \
+         the verified binary first with `libra agent rpc trust --dir <path>` (trusted dirs: {})",
+        dirs.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// A0-08: whether `canonical_binary` lives under one of the trusted `dirs`.

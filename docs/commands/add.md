@@ -328,12 +328,15 @@ content, only updates metadata. The mutual exclusivity prevents confusing combin
 
 ### Ignore Source Precedence
 
-Libra reads Git standard ignore files (`.gitignore`, `.git/info/exclude`, and
-`core.excludesFile`) plus Libra extension files (`.libraignore`). In the same
-directory, `.libraignore` has higher precedence than `.gitignore`; nearer
-directory sources override ancestors; `.git/info/exclude` and
-`core.excludesFile` are lower-precedence fallbacks. All sources use Git ignore
-pattern syntax.
+Libra reads Git standard ignore files (`.gitignore`, the worktree-local
+`info/exclude` — `.libra/info/exclude` in the current worktree's own gitdir,
+plus `.git/info/exclude` in a Git- or dual-layout tree — and `core.excludesFile`) plus
+Libra extension files (`.libraignore`). In the same directory, `.libraignore`
+has higher precedence than `.gitignore`; nearer directory sources override
+ancestors; `info/exclude` and `core.excludesFile` are lower-precedence
+fallbacks. `info/exclude` is per-worktree (never shared via `commondir`; see
+[check-ignore.md](check-ignore.md)). All sources use Git ignore pattern
+syntax.
 
 `libra init` still creates a root `.libraignore` in non-bare repositories for
 Libra-specific rules, and Git imports or non-bare clones may copy existing

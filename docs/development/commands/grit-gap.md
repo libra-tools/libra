@@ -1,4 +1,11 @@
-# Grit 差距补全执行计划
+# Grit 差距补全执行计划（**已过期 · 历史留档**）
+
+> **本文件已过期，请勿据此执行。** 当前事实源是 [`../gap/grit-gap.md`](../gap/grit-gap.md)。
+> 本副本的基线停留在 `v0.17.1609`，且与现行治理存在两处直接冲突：它规划的「阶段 5 — 交互式 rebase」
+> 已被 [`_compatibility.md`](_compatibility.md) 的 `D16` 拒绝；它关于 `gc`/`prune` 公开化的「supersede 该说明」
+> 结论也与新文档「不直接覆盖该说明」的口径相反。保留本文件仅为历史引用可解析，任何新工作都以 `../gap/grit-gap.md` 为准。
+> 退役登记：[`../plan/plan-20260729.md`](../plan/plan-20260729.md) 任务卡 CT0-03（2026-07-29）。
+
 
 本文件记录 Libra 相对 [Grit](https://github.com/gitbutlerapp/grit)（`grit-git` CLI + `grit-lib`）在 Git 兼容命令面上的差距、源码核对结论，以及**按实现顺序排列**的补全路线图。
 

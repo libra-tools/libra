@@ -1,0 +1,20 @@
+# Clean-room overlap allowlist (plan-20260729 CT2-03). Deliberately EMPTY.
+#
+# The clean-room gate fails a migrated test that shares ANY 8-token window with
+# an upstream GPLv2 source, after whitespace collapsing and lowercasing. The
+# threshold is zero, not a ratio: fragmented copying sits comfortably under any
+# ratio. This file is the only escape valve from that contract.
+#
+# Empty is the correct starting state. A migrated test describes Libra's
+# behaviour in Libra's own words and drives Libra's own helpers, so an
+# eight-word verbatim collision with a shell script does not happen by
+# accident. Pre-approving phrases before a single test has been migrated would
+# grant exceptions to a problem nobody has hit.
+#
+# CT2-03 freezes this file and its sha256 sidecar; CT3-02/CT3-04/CT3-06 consume
+# them read-only and their write sets exclude both, so "add the copied phrase to
+# the allowlist" is not a move available during migration. Per the clean-room
+# specification an unavoidable overlap requires amending the plan first.
+#
+# Format (enforced by `phrase_allowlist_sidecar_matches`): at most 20 lines, no
+# blank lines, every non-comment entry exactly 8 tokens after normalisation.

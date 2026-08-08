@@ -156,11 +156,34 @@ pub async fn execute_safe(args: HydrateArgs, output: &OutputConfig) -> CliResult
     // set to avoid materializing large out-of-view assets must not be bypassed
     // by a dependency edge. Gate on is_active() FIRST (a no-op view returns
     // contains()==true for everything).
-    let sparse = SparseView::load().await;
+    // W1 §C.4.1.1: hydrate MATERIALIZES files, so an unreadable view must
+    // fail closed instead of degrading to "everything in view" (which would
+    // bypass the sparse gate on a probe failure).
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+    let sparse = SparseView::try_load(&scope).await.map_err(|e| {
+        CliError::fatal(format!("cannot load the sparse view before hydrating: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
     let sparse_active = sparse.is_active() && !args.ignore_sparse;
 
     let workdir = util::working_dir();
     let storage = ClientStorage::init(path::objects());
+
+    // §C.4.3 AntiRoot: an obliterated object must never be re-materialized.
+    // `storage.get` resolves through alternates and the durable tier, either
+    // of which may still hold bytes this repository has deliberately erased —
+    // so the tombstone check has to happen HERE, before the fetch, the same
+    // way fsck --heal refuses to resurrect one. An unreadable tombstone table
+    // fails the command rather than defaulting to "nothing was obliterated".
+    crate::internal::obliteration::refresh_snapshot_result()
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "cannot verify obliteration tombstones before hydrating; refusing rather than \
+                 risk resurrecting an obliterated object: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
 
     let mut reports: Vec<PathReport> = Vec::new();
     let mut any_failed = false;
@@ -226,6 +249,22 @@ async fn hydrate_one(
             error: Some(format!(
                 "entry kind {mode:?} is not supported by hydrate v1"
             )),
+        };
+    }
+
+    // §C.4.3 AntiRoot: refuse BEFORE the fetch. The resolution chain below
+    // reaches alternates and the durable tier, so an object this repository
+    // obliterated can still be retrievable there — hydrating it would put
+    // erased content back on disk.
+    if crate::internal::obliteration::is_tombstoned_cached(oid) {
+        return PathReport {
+            path: target.to_string(),
+            oid: Some(oid_str),
+            status: "skipped-obliterated",
+            bytes: None,
+            error: Some(
+                "object is intentionally absent (obliterated); hydrate never resurrects one".into(),
+            ),
         };
     }
 

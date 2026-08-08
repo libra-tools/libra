@@ -91,8 +91,8 @@ unsupported 子面。
 |---|---|---|---|
 | 命令接入治理 | `gc`、`package`、`prune`、`stats` 的开发文档或源码文件存在，但用户可见 CLI 与 `COMPATIBILITY.md` 未公开。 | `for-each-ref`、`ls-files`、`ls-tree`、`archive` 和 `notes` 已在 `src/cli.rs::Commands`、`COMPATIBILITY.md` 和命令开发文档中公开，不能再列为未公开命令。其余命令仍需按当前 CLI surface 核对是否返回 `LBR-CLI-001` 或应降级为内部资料。 | 作为全局未收口项保留；后续必须二选一：接入 CLI 并同步 `COMPATIBILITY.md`、命令文档和集成场景，或把对应命令文档降级为内部/历史资料。 |
 | 兼容证据治理 | 参数级缺口不能只停留在文字说明；需要在命令开发文档、用户文档和 compat/integration 测试之间闭环。 | 删除独立参数 YAML 后，不再存在 `test_evidence`/`last_verified` 字段；证据必须落到具体测试、脚本或 D 编号说明中。 | 不允许把未验证参数当作完成承诺；新增兼容项时补测试证据，或把状态改为拒绝、延后、有意差异并给出 D 编号。 |
-| 拒绝/延后决策 | submodule family、本地 file remote push、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、clean pathspec、empty commit message、跨网/foreign-Git/push 侧 notes travel、依赖过滤克隆的工作树磁盘收窄。 | 对应 D1-D10、D15、D16、D17、D18、D-clean-pathspec、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
-| staging/worktree Git surface | `add --intent-to-add`、`clean -i`、`clean <pathspec>`、`checkout -p` 以及跨命令 patch mode。（`reset --merge/--keep` 与 `restore --overlay`/`--ours`/`--theirs`/`--merge`/`--conflict` 已实现；`restore --progress` 是全局 `--progress` 冲突，DEAD。） | `mv -k` / `--skip-errors` 已实现，`mv --sparse` 与 `rm --sparse` 均已作为 no-op 暴露；`add`、`clean` 的参数结构仍未暴露这些剩余 flag；patch mode 由 D15 拒绝；`switch --detach` 已实现，不能再把 detached HEAD 作为全局缺口。 | 作为命令级 Git 兼容缺口保留；实现时同步命令文档、`COMPATIBILITY.md` 和 integration scenarios。 |
+| 拒绝/延后决策 | submodule family、本地 file remote push、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、empty commit message、跨网/foreign-Git/push 侧 notes travel、依赖过滤克隆的工作树磁盘收窄。（clean pathspec 的共享 magic 已随 PD-07 落地，D-clean-pathspec 于 2026-08-08 收口，不再是活跃延后项。） | 对应 D1-D10、D15、D16、D17、D18、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
+| staging/worktree Git surface | `add --intent-to-add`、`clean -i`、`checkout -p` 以及跨命令 patch mode。（`clean <pathspec>` 已随 PD-07 经共享 `PathspecSet` 落地；`reset --merge/--keep` 与 `restore --overlay`/`--ours`/`--theirs`/`--merge`/`--conflict` 已实现；`restore --progress` 是全局 `--progress` 冲突，DEAD。） | `mv -k` / `--skip-errors` 已实现，`mv --sparse` 与 `rm --sparse` 均已作为 no-op 暴露；`add`、`clean` 的参数结构仍未暴露这些剩余 flag；patch mode 由 D15 拒绝；`switch --detach` 已实现，不能再把 detached HEAD 作为全局缺口。 | 作为命令级 Git 兼容缺口保留；实现时同步命令文档、`COMPATIBILITY.md` 和 integration scenarios。 |
 | commit/rewrite/sequencer | `commit --allow-empty-message`、`rebase -i/--edit-todo/--rebase-merges/--empty=stop|ask`、sequencer strategy 扩展。 | `CommitArgs` 已公开并实现 identity/date/message-source、fixup/squash/cleanup/editor/verbose/porcelain/status/template/trailer 等常用面；`--allow-empty-message` 仍由 D-empty-message 拒绝。`RebaseArgs` 已支持 `--onto`、autosquash、reapply-cherry-picks、empty controls，以及 P1-07a 的 `--autostash`、可重复且 required-sandbox 的 `--exec`、captured-tip/checked-out-safe 的 `--update-refs`、reflog `--fork-point`（均含负向 toggle）；这些不能再列为缺口。`cherry-pick` / `revert` 已有完整非交互 sequencer 基础。注意 `pull --rebase` 已实现。 | 仅保留 interactive/todo/rebase-merges/halt-on-empty 与其余 sequencer strategy 缺口；不能把已实现的 rebase non-interactive controls 或 commit 常用面当作缺失。 |
 | merge/pull strategy surface | octopus merge、`ours` 以外 strategy、`ours/theirs` 以外 strategy option。 | `MergeArgs` 已实现 P1-07b 的 `-s ours`、重复 last-wins `-X ours/theirs`、`--allow-unrelated-histories`、`--log[=<n>]`/`--no-log`，以及既有 merge flags；`PullArgs` 不暴露这些 merge-only controls。 | 仅 octopus 和其它 strategy/option 仍为缺口；不能再把已实现的 P1-07b controls 或既有 merge/pull flags 当作缺失。 |
 | object/plumbing surface | `cat-file --follow-symlinks` 等（`index-pack --fix-thin` 已作为接受式 no-op 实现——libra 要求自包含 pack、无外部 delta-base 解析器、从不产出 thin pack，故对其能建索引的 pack 无需补全；真正的 thin-pack 补全不支持，不再列为开放缺口）。 | `cat-file` 暴露 `-t/-s/-p/-e`，并共用支持 `@`、数字 reflog、typed/recursive peel、完整 tag ref 与 `REV:path` 的严格 resolver；batch 对 ref/对象库损坏 fail closed；AI modes、`--batch-check`/`--batch`/`--batch-command`（info/contents，带可选 `=<format>`）、`--batch-all-objects`（loose+packed，按 id 排序）；`verify-pack` 接受一个或多个 idx file、`--pack`（仅单 idx）、`-v` 和 `-s/--stat-only`；`index-pack` 是隐藏 plumbing，接受 pack file、`--stdin`、`-o`、`--keep[=<MSG>]`、Git-style `--progress` / `--no-progress`、`--fix-thin`（接受式 no-op）兼容入口和 test-only index version；`ls-tree` 已公开基础 tree inspection surface、子目录路径语义、`--full-name`、`--full-tree`、部分 `--format` atom 和 `REV:path` 子树导航，仅缺少完整 Git pathspec magic。 | 保留为 plumbing 兼容缺口；扩展参数时同步用户文档、命令文档、兼容矩阵和测试证据。 |
@@ -133,6 +133,12 @@ unsupported 子面。
   [`repository-hooks.md`](../../commands/repository-hooks.md)。
 - 重启条件：出现必须与 stock Git 在同一工作树共享 hook policy 的生产场景，
   且完成 opt-in `hooks.gitCompatibility=true` 的信任边界、路径竞态与 sandbox RFC。
+- 2026-07-22 决策（plan-20260714 Part D **PD-08** 决策门）：评估后**维持不桥接**——
+  无生产场景要求与 stock Git 共享 hook policy；`hooks.gitCompatibility` 保持未实现，
+  设置后为惰性普通 config 键。守卫
+  `compat_libra_hooks_lifecycle::git_hooks_bridge_stays_inert_with_gitcompatibility_config`
+  钉住 `.git/hooks`、`core.hooksPath` 与该键均不触发执行且 `.libra/hooks` 机制不受影响。
+  重启条件保持上一条不变。
 
 ### D4：`clone --recurse-submodules`
 
@@ -185,9 +191,9 @@ unsupported 子面。
 
 ### D-clean-pathspec：`clean <pathspec>`
 
-- 状态：部分可用、共享 magic 延后。当前 `clean` 已公开位置 pathspec，并按字面文件/目录前缀限制候选；但尚未接入 P1-01 的共享 pathspec magic（`:(exclude)` / `:(glob)` / `:(top)` 等）。
-- 原因：`clean` 会删除工作树文件，shared magic 接入必须同时验证 dry-run 与实际删除、ignore 叠加、目录递归和安全提示一致性，不能只复用只读命令的 matcher。
-- 重启条件：完成 `clean -n` 与 `clean -f` 的 shared pathspec 解析与删除保护测试，确保 dry-run 与实际删除结果一致。
+- 状态：已实现、已收口。`clean` 已公开位置 pathspec 并接入 P1-01 的共享 pathspec magic（`:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)`）。
+- 原因（历史）：`clean` 会删除工作树文件，shared magic 接入必须同时验证 dry-run 与实际删除、ignore 叠加、目录递归和安全提示一致性，不能只复用只读命令的 matcher。
+- 2026-08-08 收口：共享 magic 已随 PD-07 落地（clean 经 `PathspecSet` 编译，magic 错误给出支持列表提示；`compat_pathspec_magic` 18/18 含 6 项 clean 删除保护用例——`-n` 预览集 == `-f` 实删集、`:(exclude)` 仅收窄、子目录相对/`:(top)`、`:(icase)`、bracket literal fallback、tracked/ignored 不删），本决策关闭。
 
 ### D-empty-message：`commit --allow-empty-message`
 
@@ -213,6 +219,34 @@ unsupported 子面。
 - 原因：仅提供一个 `--dry-run` / `--validate-only` 壳会让用户误以为 Git 的 recipient/config/alias/credential/TLS/SMTP 语义已接入。P2-03 已证明 `libra format-patch` 产物可由 Git 消费，所以安全边界是让 Libra 只生成邮件，将校验和投递交给 stock `git send-email` 或其他专用 mailer。
 - 测试证据：`compat_matrix_alignment::send_email_policy_is_explicit_and_non_sending` 钉死 CLI 无此 variant、`LBR-CLI-001` 失败面、用户/开发/兼容文档一致性；P2-03 的 `compat_format_patch_mail_roundtrip` 继续守卫交接产物。
 - 重启条件：有明确的内建投递需求，并完成 SMTP/TLS 威胁模型、凭据存储与日志脱敏、Git `sendemail.*`/alias/recipient 语义、timeout/retry/idempotency 边界，以及可控邮件服务器端到端测试后，再以新 RFC 重启。
+
+### D20：本地 Libra remote 的 shallow 协商
+
+- 状态：2026-07-23 决策（plan-20260714 Part D **PD-06** 决策门）——**维持 fail-closed，不实现**。本地 Libra 源的 `fetch --depth` 无法像 Git upload-pack 一样应答 `shallow <oid>` 边界，历史实现会截断 commit walk 产出缺父提交且无 `.libra/shallow` 的 broken 仓库；P0-03（plan-20260708，v0.18.37）起在对象传输前拒绝（`FetchError::UnsupportedShallowLocalLibra` → `LBR-REPO-002`），`clone`/`pull` 继承且失败清理不留 initialized target。本地 Git / 网络 Git 的 shallow 协商路径不受影响；`rev-parse --is-shallow-repository` 可查询边界。
+- 原因：需求面小（本地 Libra 源通常整仓可直读，浅化收益趋近于零），而实现完整协商需要 shallow 边界生成、`.libra/shallow` 写入、deepen/unshallow 往返与 GC 边界（`shallow_repo_gc_stops_at_boundary`）联动，成本远超收益；fail-closed 已消除数据损坏风险。
+- 测试证据：`compat_clone_shallow_integrity` 钉死本地 Libra `--depth` 的 clone/fetch fail-closed 与 shallow 布尔查询。
+- 重启条件：出现真实的本地 Libra 浅克隆需求（如超大仓库 CI 本地缓存源），并完成 shallow 边界协议、deepen/unshallow 语义与 GC/fsck 联动设计后重启。
+
+### D21：上游测试语料中的外部 VCS / 服务桥接族
+
+- 状态：**out-of-scope**（2026-07-29，plan-20260729 CT0-02 裁定）。上游 Git 测试语料中依赖 `git svn`、`git p4`、CVS（`git cvsimport`/`cvsexportcommit`/`cvsserver`）、gitweb、`lib-httpd.sh` 与 `git daemon` 的测试文件不进入 Libra 的兼容证据账本；`tests/compat-ledger/` 中对应场景一律记 `category = "declined"`、`decision_id = "D21"`。
+- 原因：这些是 Perl/Python 编写的外部 VCS 与服务桥接，Libra 既无对应命令面，也无对应用户承诺（`src/cli.rs::Commands` 无 `svn`/`p4`/`cvs*`/`daemon`/`gitweb` variant）。为它们建立账本行只会产生大量永远无法转绿的 `blocked`，反而稀释真实缺口信号。以 pinned 语料复算，t9 族 137 个上游文件中 116 个（84.7%）落在本条。
+- 测试证据：无需新增守卫——`tests/compat-ledger/` 的 schema 守卫会强制每条 `declined` 绑定可解析的 `D` 编号；范围裁定与复算命令见 [`../gap/grit-suite-scope.md`](../gap/grit-suite-scope.md)。
+- 重启条件：Libra 出现任一外部 VCS 桥接的产品需求并完成其命令面与安全边界设计后，按族重新裁定并撤销本条。
+
+### D22：上游 `test-tool` C helper 依赖
+
+- 状态：**out-of-scope**（2026-07-29，plan-20260729 CT0-02 裁定）。凡直接调用上游 `test-tool` 的测试场景不进入迁移范围，账本记 `declined` + `D22`。
+- 原因：`test-tool` 是上游 Git 的 C 测试辅助程序（`git/t/helper/`，约 80 个子命令），其中 `ref-store` 等 verb 是对 Git refs 后端的直接 API shim。Libra 的 refs 存在 SQLite 中，复刻这类接口等于把内部存储结构固化成测试契约，与「机器接口先于交互外壳、但不暴露内部存储」的边界冲突。以 pinned 语料复算，162 个上游文件（15.6%）依赖它，并且是 t0/t1/t5 三族暂缓的主要原因。
+- 测试证据：同 `D21`，由账本 schema 守卫强制绑定；族级占比与复算命令见 [`../gap/grit-suite-scope.md`](../gap/grit-suite-scope.md)。
+- 重启条件：出现必须以 plumbing 级接口验证的兼容需求时，先设计 Libra 自有的等价可观测面（例如以既有 `update-ref`/`show-ref`/`for-each-ref` 覆盖 `ref-store` 的语义），再按 verb 逐条撤销本条，不整体引入 `test-tool`。
+
+### D23：上游 GPG keyring fixture 依赖
+
+- 状态：**out-of-scope**（2026-07-29，plan-20260729 CT0-02 裁定）。依赖上游 `lib-gpg.sh` 及其 keyring fixture 的签名测试场景不进入迁移范围，账本记 `declined` + `D23`。
+- 原因：上游这类测试依赖预置 keyring 与可启动的 `gpg-agent`；Libra 的签名模型走 vault（`vault.signing`、`~/.libra/vault-unseal-key`），与 Git 的外部 keyring 互操作本身已是独立议题（见 `plan-long.md`「不进入本长期 Top 10 的兼容增强」中的 GPG 外部 keyring 互操作项）。以 pinned 语料复算，23 个上游文件命中。
+- 测试证据：同 `D21`；Libra 侧的签名行为由既有 commit/tag 测试覆盖，不依赖上游 fixture。
+- 重启条件：Git GPG 外部 keyring 互操作从「兼容增强清单」升入排期后，连同本条一并重启。
 
 ## 维护要求
 

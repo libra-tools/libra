@@ -37,7 +37,13 @@ libra config --rename-section <old-name> <new-name>
 1. **子命令风格**（推荐）：`libra config set key value`、`libra config get key`
 2. **Git 兼容标志风格**（隐藏）：`libra config --get key`、`libra config key value`
 
-使用 `get` 读取值时，Libra 会按优先级从 local 到 global 级联查找。第一个匹配项胜出。
+使用 `get` 读取值时，Libra 会按优先级 local → global → system 级联查找。第一个匹配项胜出；system 库不可读时会被跳过。
+
+### 裸读 `libra config <key>`
+
+只给一个位置参数、不给值时是**读取**，与 `git config <key>` 一致：把已存储的值写 stdout 并以 0 退出；多值 key 返回**最后一个**值；级联顺序与 `get` 完全相同（local → global → system）；加密值渲染为 `<REDACTED>`（要明文用 `config get --reveal`）。key 未设置时以 **exit 1** + `LBR-CLI-002` 失败。`-z`/`--null` 与 `get` 上的行为一致：值以 NUL 而非换行结尾。
+
+**与 Git 的有意差异**：对**受保护 key**——即 Libra 判定为机密的 key（`vault.env.*`、`auth.token.*`、`*.privkey`，或末段包含 `secret`、`token`、`password`、`credential`、`apikey`、`accesskey`、`privatekey`、`secretkey`）——裸读形式保留 Libra 的交互式安全赋值路径：它会**无回显地提示输入新值**，而不是打印已存储的值。没有终端时报 `missing value for protected key '<key>' (non-interactive environment)` 并以 2 退出。要读取受保护 key 请用 `libra config get <key>`，它返回 `<REDACTED>`。该差异已登记在 `COMPATIBILITY.md`。
 
 ## 选项
 
@@ -76,7 +82,7 @@ libra config set vault.env.GEMINI_API_KEY
 
 #### `get <key>`
 
-获取配置值。从 local 到 global scope 级联，返回第一个匹配项。
+获取配置值。按 local → global → system scope 级联，返回第一个匹配项（system 库不可读时跳过）。
 
 | 标志 | 说明 |
 |------|------|
@@ -109,7 +115,7 @@ libra config get --regexp "user\\..*"
 | 标志 | 说明 |
 |------|------|
 | `--name-only` | 只显示 key 名，不显示值 |
-| `--show-origin` | 为每个条目加上 scope 前缀（`local` 或 `global`） |
+| `--show-origin` | 为每个条目加上 scope 前缀（`local`、`global` 或 `system`） |
 | `--vault` | 只显示 `vault.env.*` 条目 |
 | `--ssh-keys` | 显示 SSH key 条目 |
 | `--gpg-keys` | 显示 GPG key 条目 |

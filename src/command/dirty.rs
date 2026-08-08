@@ -98,15 +98,9 @@ pub async fn execute_safe(args: DirtyArgs, output: &OutputConfig) -> CliResult<(
     if util::require_repo().is_err() {
         return Err(CliError::repo_not_found());
     }
-    // Part C W0 (§C.11 transition guard, cache-semantic entry): `working_dirty`
-    // / `working_dirty_meta` are repository-global (id=1 meta), so a linked
-    // worktree with the same HEAD/index fingerprint could read or prune the main
-    // worktree's dirty state. `dirty` is cache-semantic, so it fails closed in a
-    // linked worktree until W1 scopes the DirtyCache call chain.
-    crate::command::ensure_main_worktree_because(
-        "dirty",
-        "the dirty cache is not yet worktree-scoped",
-    )?;
+    // Part C W1 (§C.4.1.1): the dirty cache is worktree-scoped (migration
+    // 2026072302 + per-scope DirtyCache predicates), so `dirty` runs in any
+    // worktree against its own rows.
     if args.list {
         let entries: Vec<DirtyListEntry> = DirtyCache::list()
             .await

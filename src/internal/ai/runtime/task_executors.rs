@@ -227,6 +227,12 @@ fn classify_codex_snapshot(
     let status = match snapshot.status {
         CodeUiSessionStatus::Error => TaskExecutionStatus::Failed,
         CodeUiSessionStatus::Completed => TaskExecutionStatus::Completed,
+        CodeUiSessionStatus::IndeterminateSideEffect => {
+            return Some(Err(TaskExecutionError::ToolPolicy(
+                "Codex task attempt reached an indeterminate side-effect boundary; reconcile before retrying"
+                    .to_string(),
+            )));
+        }
         CodeUiSessionStatus::Idle if has_error_entry => TaskExecutionStatus::Failed,
         CodeUiSessionStatus::Idle if has_cancelled_entry => TaskExecutionStatus::Cancelled,
         CodeUiSessionStatus::Idle if has_non_user_entry => TaskExecutionStatus::Completed,

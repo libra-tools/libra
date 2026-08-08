@@ -1,0 +1,23 @@
+# The worked example of the compatibility evidence ledger format. It is NOT
+# evidence: it lives under `_example/`, which the tree walk skips, and exists
+# so the schema has one file that demonstrates every field in a valid state.
+#
+# The field set is defined once, in ADR-CT-03 of
+# docs/development/plan/plan-20260729.md. Do not add fields here.
+
+[[scenario]]
+id = "t4001-diff-format::numstat-reports-added-and-deleted-line-counts"
+category = "direct"
+# Recomputed from COMPATIBILITY.md's top-level table by the guard, never
+# trusted as written.
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#description"
+reason = "Upstream asserts the two-column machine format; Libra exposes the same flag with the same column meaning."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4001-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--numstat"
+libra_tests = ["command::diff_test::test_diff_numstat_and_stat_flags_render_cli_output"]

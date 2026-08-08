@@ -323,6 +323,16 @@ impl ToolBoundaryPolicy {
         &self.policy_version
     }
 
+    /// Conservative mutability classification shared by runtime admission and
+    /// cooperative cancellation. Keep the known-tool set here so callers do
+    /// not grow parallel mutation lists.
+    pub fn operation_may_mutate(&self, operation: &ToolOperation) -> bool {
+        operation.mutates_state
+            || self.mutating_tools.contains(&operation.tool_name)
+            || operation.tool_name.starts_with("create_")
+            || operation.tool_name.starts_with("update_")
+    }
+
     pub fn decide(
         &self,
         principal: &PrincipalContext,
@@ -346,9 +356,7 @@ impl ToolBoundaryPolicy {
 
         let known_readonly = self.readonly_tools.contains(&operation.tool_name)
             || operation.tool_name.starts_with("list_");
-        let known_mutating = self.mutating_tools.contains(&operation.tool_name)
-            || operation.tool_name.starts_with("create_")
-            || operation.tool_name.starts_with("update_");
+        let known_mutating = self.operation_may_mutate(operation);
 
         if known_readonly && !operation.mutates_state {
             return BoundaryDecision {
@@ -566,6 +574,12 @@ impl ToolBoundaryRuntime {
 
     pub fn decide(&self, operation: &ToolOperation) -> BoundaryDecision {
         self.policy.decide(&self.principal, operation)
+    }
+
+    /// Return the policy's conservative mutability classification for this
+    /// operation without making an authorization decision.
+    pub fn operation_may_mutate(&self, operation: &ToolOperation) -> bool {
+        self.policy.operation_may_mutate(operation)
     }
 
     pub async fn append_audit(

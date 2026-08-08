@@ -608,6 +608,7 @@ mod tests {
                     network_access: NetworkAccess::Denied,
                     exclude_tmpdir_env_var: false,
                     exclude_slash_tmp: false,
+                    allow_metadata_writes: false,
                 },
                 permissions: SandboxPermissions::UseDefault,
             }),

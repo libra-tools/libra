@@ -85,6 +85,12 @@ struct AutomationRunOutput {
 }
 
 pub async fn execute_safe(args: AutomationArgs, output: &OutputConfig) -> CliResult<()> {
+    // W0 §C.4.1.1 preflight: `automations.toml` is read from the bare working
+    // directory, which in a linked worktree is the local gitdir where no
+    // repository configuration lives — every subcommand would silently see an
+    // EMPTY rule set instead of the repository's. Fail closed until the
+    // unified Code/Agent config resolver (W4) reads the repository layer.
+    crate::command::require_main_worktree_for_code_agent("libra automation", None)?;
     match args.command {
         AutomationSubcommand::List => list_rules(output).await,
         AutomationSubcommand::Run { rule, now, live } => run_rules(rule, now, live, output).await,

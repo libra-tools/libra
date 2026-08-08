@@ -128,11 +128,12 @@ pub(crate) fn is_top_level_path(path: &Path) -> bool {
 }
 
 pub(crate) fn directory_marker(path: &Path) -> PathBuf {
-    let mut display = path.display().to_string();
-    if !display.ends_with('/') {
-        display.push('/');
-    }
-    PathBuf::from(display)
+    // Marker form is `<dir>/` built on the RAW name: a non-UTF-8 directory
+    // keeps its exact bytes instead of a U+FFFD replacement character from
+    // `display()`.
+    let mut marker = path.as_os_str().to_os_string();
+    marker.push("/");
+    PathBuf::from(marker)
 }
 
 fn top_level_dir(path: &Path) -> Option<PathBuf> {

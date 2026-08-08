@@ -22,6 +22,8 @@ libra rebase --skip
 
 `--autostash` 会在重放前把 tracked index/worktree 变更保存为 held stash，并在成功或中止后分别恢复 staged index 层与 unstaged worktree 层。可重复的 `--exec <cmd>` 会在每个重放提交后通过 Libra 强制 workspace-write、禁网 sandbox 依次执行；失败会停止序列，`--continue` 重试失败命令。exec 失败后的 `--skip` 保留已重放提交并跳过该提交剩余命令。`--update-refs` 原子重定向重写区间中的其他本地分支，但排除任何 worktree 已检出的分支。`--fork-point` 从 upstream reflog 选择仍是 `HEAD` 祖先的最具体旧 tip，找不到时回退普通 merge base。
 
+重放出的提交**保留原作者**——rebase 改写的是历史形状而非署名——而 committer 记为执行本次 rebase 的人，时间戳为当次。折叠类动作（`fixup` / `squash` / `amend`）保留**目标提交**的 author，与 Git 的「折叠组中第一个提交的作者胜出」一致。若未配置 `user.name` / `user.email`，rebase 会以 `LBR-AUTH-001` fail closed，而不是写入占位身份。
+
 Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）持久化在 SQLite 数据库中。恢复关键的 autostash、exec 与 update-refs 元数据会原子且强制 fsync 到 `.libra/rebase-aux.json`，直到序列进入终态。旧 Libra 版本的 legacy file-based 状态会在首次访问时自动迁移到数据库。
 
 ## 选项

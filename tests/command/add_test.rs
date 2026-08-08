@@ -126,7 +126,7 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
     libra::utils::client_storage::ClientStorage::wait_for_background_tasks();
     let conn = get_db_conn_instance().await;
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS n FROM object_index WHERE o_type = 'blob' AND o_size = 7"
                 .to_string(),

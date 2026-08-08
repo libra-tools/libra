@@ -541,6 +541,14 @@ pub enum SandboxPolicy {
         exclude_tmpdir_env_var: bool,
         #[serde(default)]
         exclude_slash_tmp: bool,
+        /// When `false` (default), repository metadata directories inside
+        /// each writable root (`.git`, `.libra`, `.codex`, `.agents`) are
+        /// forced read-only so repo-content-controlled code (hooks) cannot
+        /// rewrite VCS metadata. Set to `true` only for user-supplied
+        /// commands that legitimately run nested VCS operations (for
+        /// example `rebase --exec` invoking `libra add`/`libra commit`).
+        #[serde(default)]
+        allow_metadata_writes: bool,
     },
 }
 
@@ -559,6 +567,7 @@ impl Default for SandboxPolicy {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         }
     }
 }
@@ -614,12 +623,14 @@ impl SandboxPolicy {
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
+                allow_metadata_writes,
                 ..
             } => Self::WorkspaceWrite {
                 writable_roots: vec![workspace_root.to_path_buf()],
                 network_access: network_access.clone(),
                 exclude_tmpdir_env_var: *exclude_tmpdir_env_var,
                 exclude_slash_tmp: *exclude_slash_tmp,
+                allow_metadata_writes: *allow_metadata_writes,
             },
             Self::ReadOnly => Self::ReadOnly,
             Self::DangerFullAccess | Self::ExternalSandbox { .. } => {
@@ -677,11 +688,13 @@ impl SandboxPolicy {
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
+                allow_metadata_writes,
             } => Self::WorkspaceWrite {
                 writable_roots: writable_roots.clone(),
                 network_access: network_access.restrict_with(config),
                 exclude_tmpdir_env_var: *exclude_tmpdir_env_var,
                 exclude_slash_tmp: *exclude_slash_tmp,
+                allow_metadata_writes: *allow_metadata_writes,
             },
             Self::DangerFullAccess | Self::ReadOnly => self.clone(),
         }
@@ -703,12 +716,14 @@ impl SandboxPolicy {
                 writable_roots,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
+                allow_metadata_writes,
                 network_access: _,
             } => Self::WorkspaceWrite {
                 writable_roots: writable_roots.clone(),
                 network_access: network_access.clone(),
                 exclude_tmpdir_env_var: *exclude_tmpdir_env_var,
                 exclude_slash_tmp: *exclude_slash_tmp,
+                allow_metadata_writes: *allow_metadata_writes,
             },
             Self::DangerFullAccess | Self::ReadOnly => self.clone(),
         }
@@ -723,8 +738,16 @@ impl SandboxPolicy {
 
     /// Returns writable roots resolved against the current working directory.
     /// Each writable root has protected subpaths (for example `.git`, `.libra`)
-    /// that remain read-only.
+    /// that remain read-only unless the policy sets `allow_metadata_writes`
+    /// (reserved for user-supplied commands running nested VCS operations).
     pub fn get_writable_roots_with_cwd(&self, cwd: &Path) -> Vec<WritableRoot> {
+        let protect_metadata = !matches!(
+            self,
+            Self::WorkspaceWrite {
+                allow_metadata_writes: true,
+                ..
+            }
+        );
         self.writable_root_paths_with_cwd(cwd)
             .into_iter()
             .map(|root| WritableRoot {
@@ -733,7 +756,7 @@ impl SandboxPolicy {
                 // `file/.git`-style pseudo-children makes bubblewrap fail with
                 // ENOTDIR and has no security value because a regular file has
                 // no descendants to protect.
-                read_only_subpaths: if root.is_file() {
+                read_only_subpaths: if root.is_file() || !protect_metadata {
                     Vec::new()
                 } else {
                     // Missing roots are conservatively treated as directories:
@@ -754,6 +777,7 @@ impl SandboxPolicy {
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
                 network_access: _,
+                allow_metadata_writes: _,
             } => {
                 let mut roots: Vec<PathBuf> = Vec::new();
 
@@ -893,6 +917,7 @@ mod tests {
             network_access: NetworkAccess::Full,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
         match policy.rebased_to_workspace(workspace) {
             SandboxPolicy::WorkspaceWrite {
@@ -900,6 +925,7 @@ mod tests {
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
+                allow_metadata_writes: _,
             } => {
                 assert_eq!(writable_roots, vec![workspace.to_path_buf()]);
                 assert_eq!(network_access, NetworkAccess::Full);
@@ -979,6 +1005,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let roots = policy.get_writable_roots_with_cwd(Path::new("/tmp/workspace"));
@@ -1005,6 +1032,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let roots = policy.get_writable_roots_with_cwd(temp.path());
@@ -1021,6 +1049,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let roots = policy.get_writable_roots_with_cwd(Path::new("/tmp/workspace"));
@@ -1039,6 +1068,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let error = policy
@@ -1055,6 +1085,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let error = policy
@@ -1072,6 +1103,7 @@ mod tests {
                 network_access: NetworkAccess::Denied,
                 exclude_tmpdir_env_var: true,
                 exclude_slash_tmp: true,
+                allow_metadata_writes: false,
             };
 
             assert!(
@@ -1090,6 +1122,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         policy
@@ -1643,6 +1676,7 @@ mod tests {
             network_access: NetworkAccess::Full,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         match workspace.with_network_restriction(&NetworkAccess::Denied) {
             SandboxPolicy::WorkspaceWrite {
@@ -1650,6 +1684,7 @@ mod tests {
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
+                allow_metadata_writes: _,
             } => {
                 assert_eq!(network_access, NetworkAccess::Denied);
                 // Non-network fields must be preserved verbatim.

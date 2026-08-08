@@ -24,7 +24,7 @@ use git_internal::internal::object::{
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    EntityTrait, QueryFilter, TransactionTrait,
+    EntityTrait, QueryFilter,
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -137,8 +137,7 @@ impl<'a> ProjectionRebuilder<'a> {
         db: &DatabaseConnection,
         rebuild: &MaterializedProjection,
     ) -> Result<()> {
-        let txn = db
-            .begin()
+        let txn = crate::internal::db::begin_write_transaction(db)
             .await
             .context("Failed to start projection materialization transaction")?;
 

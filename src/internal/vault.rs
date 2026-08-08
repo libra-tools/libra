@@ -35,7 +35,7 @@ use libvault::{
     errors::RvError,
     storage::{Backend, BackendEntry, sql::sqlite::SqliteBackend},
 };
-use sea_orm::sqlx::{SqlitePool, query_scalar, sqlite::SqliteConnectOptions};
+use sea_orm::sqlx::{AssertSqlSafe, SqlitePool, query_scalar, sqlite::SqliteConnectOptions};
 use serde_json::Value;
 
 use crate::utils::util::try_get_storage_path;
@@ -919,10 +919,14 @@ impl Backend for CompatSqliteBackend {
             .replace('\\', "\\\\")
             .replace('%', "\\%")
             .replace('_', "\\_");
-        let keys: Vec<Vec<u8>> = query_scalar(&sql)
+        // sqlx 0.9 requires an explicit assertion for interpolated SQL: the
+        // table name comes from our own vault configuration (never user input)
+        // and the LIKE prefix is bound as a parameter.
+        let keys: Vec<Vec<u8>> = query_scalar(AssertSqlSafe(sql))
             .bind(format!("{escaped_prefix}%").as_bytes())
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            .map_err(|e| RvError::from(anyhow!(e)))?;
 
         let mut result = HashSet::new();
         for key_bytes in keys {

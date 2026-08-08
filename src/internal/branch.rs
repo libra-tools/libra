@@ -122,9 +122,80 @@ pub enum BranchStoreError {
     /// Lookup or delete targeted a branch that does not exist.
     #[error("branch '{0}' not found")]
     NotFound(String),
+    /// An EXCLUSIVE create found the name already taken. Distinct from a
+    /// generic write failure because the caller's contract differs: `stash
+    /// branch` must refuse rather than move someone else's tip.
+    #[error("branch '{0}' already exists")]
+    AlreadyExists(String),
     /// Delete failed at the storage layer (FK violation, locked).
     #[error("failed to delete branch '{name}': {detail}")]
     Delete { name: String, detail: String },
+    /// §C.4.4: the branch is checked out in ANOTHER worktree, so attaching a
+    /// second HEAD to it (or deleting it) is refused.
+    ///
+    /// This is a distinct variant rather than a `Corrupt`/`Delete` with a
+    /// descriptive message because the stable error code depends on it:
+    /// §C.13 requires `LBR-CONFLICT-002` for a checkout collision, and every
+    /// writer boundary derives its code from the variant. Folding it into a
+    /// generic storage failure reported the repository as corrupt for what is
+    /// an ordinary, recoverable conflict.
+    ///
+    /// The message deliberately uses [`CHECKED_OUT_ELSEWHERE_PHRASE`] verbatim,
+    /// so a boundary that only ever sees the error as TEXT (after sea_orm or
+    /// an intermediate wrapper has erased the type) still classifies it
+    /// correctly.
+    #[error(
+        "branch '{name}' is checked out at worktree '{worktree}'; one branch is never checked \
+         out in two worktrees"
+    )]
+    CheckedOutElsewhere { name: String, worktree: String },
+}
+
+/// The one phrase by which a checkout collision survives sea_orm's transaction
+/// plumbing (plan-20260714 §C.13).
+///
+/// `Branch::update_branch_with_conn` is called from inside `with_reflog`
+/// closures, whose error type sea_orm fixes at [`DbErr`] — a typed enum
+/// cannot pass through it, and by the time the failure reaches a command it
+/// has been wrapped twice more. So the collision is encoded ONCE, by
+/// [`checked_out_elsewhere_db_err`], and recognised ONCE, by
+/// [`checked_out_elsewhere_cli_error`]: no call site formats this text and no
+/// call site matches on it. The phrase is deliberately the natural
+/// user-facing wording rather than an internal tag, so nothing has to be
+/// stripped before display, and it is the same wording the command-level
+/// preflight already uses for the same condition.
+pub const CHECKED_OUT_ELSEWHERE_PHRASE: &str = "is checked out at worktree";
+
+/// Build the [`DbErr`] carrier for a checkout collision.
+pub fn checked_out_elsewhere_db_err(branch_name: &str, worktree: &str) -> DbErr {
+    DbErr::Custom(format!(
+        "branch '{branch_name}' {CHECKED_OUT_ELSEWHERE_PHRASE} '{worktree}', so moving it here \
+         would silently diverge that worktree's working tree from its own branch; run `libra \
+         worktree list` to inspect, then switch one of them to another branch"
+    ))
+}
+
+/// Boundary helper (§C.13): if `error` — at any wrapping depth — is a
+/// checkout collision, produce the `LBR-CONFLICT-002` error it must be
+/// reported as. Returns `None` for every other failure, so a caller keeps its
+/// own mapping with `unwrap_or_else`.
+///
+/// A collision is not corruption and not an I/O fault: the repository is
+/// intact, and the user has a next step. Reporting it with a storage code
+/// sends them looking for damage that does not exist, and escalates in any
+/// tooling keyed on the code.
+pub fn checked_out_elsewhere_cli_error(
+    error: &impl std::fmt::Display,
+) -> Option<crate::utils::error::CliError> {
+    let text = error.to_string();
+    if !text.contains(CHECKED_OUT_ELSEWHERE_PHRASE) {
+        return None;
+    }
+    Some(
+        crate::utils::error::CliError::fatal(text)
+            .with_stable_code(crate::utils::error::StableErrorCode::ConflictOperationBlocked)
+            .with_hint("switch that worktree to another branch first, or run the command there"),
+    )
 }
 
 /// Decode a raw `reference::Model` row into a [`Branch`].
@@ -150,6 +221,20 @@ fn branch_from_model(model: reference::Model) -> Result<Option<Branch>, BranchSt
         name: name.clone(),
         detail: e.to_string(),
     })?;
+    // A well-formed id of the WRONG algorithm parses cleanly and only fails
+    // much later, inside object loading, as a panic. Fail closed at the read
+    // boundary instead.
+    let repo_kind = git_internal::hash::get_hash_kind();
+    if commit.kind() != repo_kind {
+        return Err(BranchStoreError::Corrupt {
+            name: name.clone(),
+            detail: format!(
+                "commit hash is {:?} but this repository uses {:?}",
+                commit.kind(),
+                repo_kind
+            ),
+        });
+    }
     Ok(Some(Branch {
         name,
         commit,
@@ -455,6 +540,32 @@ impl Branch {
     where
         C: ConnectionTrait,
     {
+        // plan-20260714 §C.4.4: THE cross-worktree guard, on the writer's own
+        // connection, immediately before the write.
+        //
+        // It lives here rather than in each caller because "each caller"
+        // turned out to mean `merge`, `rebase`, `cherry-pick`, `revert`,
+        // `am`, `reset`, `commit`, `pull`, `fetch`, `fast-import`,
+        // `update-ref`, `branch` and `op restore` — and six of them had no
+        // guard at all while the rest checked BEFORE opening their
+        // transaction, leaving a window for another worktree to attach in
+        // between. Every local branch ref write in the process funnels
+        // through this function, so guarding it closes both holes at once
+        // and makes a future writer safe by default.
+        //
+        // Remote-tracking refs are exempt: nothing checks them out, and
+        // `branch_checked_out_elsewhere_result_with_conn` filters
+        // `remote IS NULL` anyway.
+        if remote.is_none()
+            && let Some(other) =
+                crate::internal::head::Head::branch_checked_out_elsewhere_result_with_conn(
+                    db,
+                    branch_name,
+                )
+                .await?
+        {
+            return Err(checked_out_elsewhere_db_err(branch_name, &other));
+        }
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
             let branch = match query_reference_with_conn(db, branch_name, remote).await {
                 Ok(branch) => branch,
@@ -500,6 +611,189 @@ impl Branch {
         unreachable!("sqlite retry loop must return")
     }
 
+    /// Create a branch that must NOT already exist (W2 §C.4.3).
+    ///
+    /// [`Branch::update_branch`] is an UPSERT: it moves an existing tip. A
+    /// caller like `stash branch`, whose contract is "create this branch or
+    /// refuse", cannot use it — checking existence first leaves a window in
+    /// which another worktree creates the name and this call silently
+    /// overwrites its tip. The existence check and the insert therefore run in
+    /// ONE write-locked transaction, so a concurrent creator either loses the
+    /// lock (and this call refuses it) or wins it (and this call refuses).
+    pub async fn create_branch_exclusive(
+        branch_name: &str,
+        commit_hash: &str,
+        remote: Option<&str>,
+        provenance_key: Option<&str>,
+    ) -> Result<(), BranchStoreError> {
+        let db_conn = get_db_conn_instance().await;
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let existing = query_reference_with_conn(&txn, branch_name, remote)
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()));
+        let existing = match existing {
+            Ok(existing) => existing,
+            Err(error) => {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
+        };
+        if existing.is_some() {
+            let _ = txn.rollback().await;
+            return Err(BranchStoreError::AlreadyExists(branch_name.to_string()));
+        }
+        let insert = reference::ActiveModel {
+            name: Set(Some(branch_name.to_owned())),
+            kind: Set(reference::ConfigKind::Branch),
+            commit: Set(Some(commit_hash.to_owned())),
+            remote: Set(remote.map(|value| value.to_owned())),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await;
+        let inserted = match insert {
+            Ok(inserted) => inserted,
+            Err(error) => {
+                let _ = txn.rollback().await;
+                return Err(BranchStoreError::Query(error.to_string()));
+            }
+        };
+        // Provenance, committed ATOMICALLY with the creation (W2 r7 #1): the
+        // caller's crash-recovery must know whether THIS create ever
+        // committed, and a file written before or after the transaction
+        // cannot say that. The row also records the created reference's ID,
+        // so a later rollback deletes exactly the row this create made —
+        // never a same-name same-tip branch the user recreated (r7 #2).
+        if let Some(provenance_key) = provenance_key {
+            use sea_orm::{ConnectionTrait, Statement};
+            let recorded = txn
+                .execute_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "INSERT INTO metadata_kv \
+                     (scope, target, key, value, value_type, created_at, updated_at) \
+                     VALUES ('stash_branch_journal', ?, 'reference_id', ?, 'text', \
+                     datetime('now'), datetime('now'))",
+                    [provenance_key.into(), inserted.id.to_string().into()],
+                ))
+                .await;
+            if let Err(error) = recorded {
+                let _ = txn.rollback().await;
+                return Err(BranchStoreError::Query(error.to_string()));
+            }
+        }
+        txn.commit()
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))
+    }
+
+    /// The fate a journaled `stash branch` creation is concluded to, by
+    /// PROVENANCE rather than by name+tip (W2 r7 #1/#2).
+    ///
+    /// One write-locked transaction reads the provenance row and, when it
+    /// exists, deletes the branch BY ITS RECORDED ROW ID, conditional on the
+    /// tip still being the journaled base — then removes the provenance row.
+    /// A branch the user deleted and recreated at the same base has a
+    /// DIFFERENT row id, so it is kept: name and tip are reusable, a rowid is
+    /// not.
+    pub async fn conclude_journaled_branch(
+        provenance_key: &str,
+        base_tip: &str,
+    ) -> Result<JournaledBranchFate, BranchStoreError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db_conn = get_db_conn_instance().await;
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let row = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT value FROM metadata_kv WHERE scope = 'stash_branch_journal' \
+                 AND target = ? AND key = 'reference_id'",
+                [provenance_key.into()],
+            ))
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let Some(row) = row else {
+            // The create never COMMITTED: there is nothing of ours to remove.
+            let _ = txn.rollback().await;
+            return Ok(JournaledBranchFate::NeverCreated);
+        };
+        let reference_id: String = row
+            .try_get_by_index(0)
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let deleted = txn
+            .execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "DELETE FROM reference WHERE id = ? AND kind = 'Branch' AND `commit` = ?",
+                [reference_id.clone().into(), base_tip.into()],
+            ))
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let fate = if deleted.rows_affected() > 0 {
+            JournaledBranchFate::Deleted
+        } else {
+            // Row gone (user deleted it) or its tip moved (user committed):
+            // either way it is not ours to touch any more.
+            JournaledBranchFate::KeptOrGone
+        };
+        let cleared = txn
+            .execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
+                [provenance_key.into()],
+            ))
+            .await;
+        if let Err(error) = cleared {
+            let _ = txn.rollback().await;
+            return Err(BranchStoreError::Query(error.to_string()));
+        }
+        txn.commit()
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        Ok(fate)
+    }
+
+    /// Whether a journaled creation's provenance row EXISTS — the read-only
+    /// probe recovery runs before touching anything (W2 r8 #1): no row means
+    /// the create never committed, and recovery must then leave HEAD alone
+    /// too (the branch the user might be standing on is not ours).
+    pub async fn journaled_provenance_exists(
+        provenance_key: &str,
+    ) -> Result<bool, BranchStoreError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db_conn = get_db_conn_instance().await;
+        let row = db_conn
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT 1 FROM metadata_kv WHERE scope = 'stash_branch_journal' \
+                 AND target = ? AND key = 'reference_id'",
+                [provenance_key.into()],
+            ))
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        Ok(row.is_some())
+    }
+
+    /// Remove a journaled creation's provenance row WITHOUT touching the
+    /// branch — the success path's conclusion (the branch is the user's).
+    pub async fn clear_journaled_branch_provenance(
+        provenance_key: &str,
+    ) -> Result<(), BranchStoreError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db_conn = get_db_conn_instance().await;
+        db_conn
+            .execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
+                [provenance_key.into()],
+            ))
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        Ok(())
+    }
+
     /// Pool-acquiring counterpart of [`Branch::update_branch_with_conn`].
     /// Must NOT be called from within an active transaction (would deadlock —
     /// see the block comment near the top of `impl Branch`).
@@ -509,7 +803,18 @@ impl Branch {
         remote: Option<&str>,
     ) -> Result<(), DbErr> {
         let db_conn = get_db_conn_instance().await;
-        Self::update_branch_with_conn(&db_conn, branch_name, commit_hash, remote).await
+        // §C.4.4: run the checked-out probe and the write in ONE transaction.
+        // On a pool connection they are two implicit transactions, so another
+        // worktree can attach the branch in between — the probe says "free",
+        // the write moves the tip, and that worktree is left pointing at the
+        // old one. SQLite's rollback journal makes the read half of this
+        // transaction block a concurrent attach until we commit, so the pair
+        // is genuinely atomic against it.
+        // The update READS the existing row before writing it, so the write
+        // lock is taken up front (`db::begin_write_transaction`).
+        let txn = crate::internal::db::begin_write_transaction(&db_conn).await?;
+        Self::update_branch_with_conn(&txn, branch_name, commit_hash, remote).await?;
+        txn.commit().await
     }
 
     /// Result-returning branch delete.
@@ -527,6 +832,25 @@ impl Branch {
     where
         C: ConnectionTrait,
     {
+        // §C.4.4: deleting a branch another worktree has checked out leaves
+        // that worktree's HEAD dangling. `switch -C` reached here directly —
+        // deleting first and recreating after — so the guard on the UPDATE
+        // path alone let the delete through and then failed the recreate,
+        // which is the worst of both.
+        if remote.is_none()
+            && let Some(other) =
+                crate::internal::head::Head::branch_checked_out_elsewhere_result_with_conn(
+                    db,
+                    branch_name,
+                )
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            return Err(BranchStoreError::CheckedOutElsewhere {
+                name: branch_name.to_string(),
+                worktree: other,
+            });
+        }
         let branch = query_reference_with_conn(db, branch_name, remote)
             .await
             .map_err(|err| BranchStoreError::Query(err.to_string()))?;
@@ -564,13 +888,80 @@ impl Branch {
     }
 
     /// Pool-acquiring counterpart of [`Branch::delete_branch_result_with_conn`].
+    ///
+    /// Must NOT be called from within an active transaction (would deadlock —
+    /// see the block comment near the top of `impl Branch`).
     pub async fn delete_branch_result(
         branch_name: &str,
         remote: Option<&str>,
     ) -> Result<(), BranchStoreError> {
         let db_conn = get_db_conn_instance().await;
-        Self::delete_branch_result_with_conn(&db_conn, branch_name, remote).await
+        // §C.4.4: probe, delete and metadata cascade in ONE transaction. On a
+        // pool connection they are three implicit transactions, so a worktree
+        // that attaches to this branch after the probe — `switch -C` reaches
+        // this entry point directly — passes its own probe (the branch is
+        // still there), and then loses the branch under it. The same
+        // transaction also makes the metadata cascade atomic with the ref
+        // delete, which the `_with_conn` form could only document as a gap.
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        Self::delete_branch_result_with_conn(&txn, branch_name, remote).await?;
+        txn.commit()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))
     }
+
+    /// ATOMIC tip-conditional delete (W2 §C.4.3 `stash branch` rollback):
+    /// the tip check and the delete run in ONE transaction, so a branch a
+    /// concurrent writer moved between "looks unchanged" and "delete" can
+    /// never be destroyed — the whole check-then-delete either sees the
+    /// moved tip (and keeps the branch) or deletes the unmoved one.
+    pub async fn delete_branch_if_tip_result(
+        branch_name: &str,
+        expected_tip: &git_internal::hash::ObjectHash,
+    ) -> Result<ConditionalDeleteOutcome, BranchStoreError> {
+        let db_conn = get_db_conn_instance().await;
+        // Compare-and-swap on the tip: reads the row, then deletes it.
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        let found = Self::find_branch_result_with_conn(&txn, branch_name, None).await?;
+        let outcome = match found {
+            None => ConditionalDeleteOutcome::NotFound,
+            Some(branch) if branch.commit != *expected_tip => ConditionalDeleteOutcome::TipMoved,
+            Some(_) => {
+                Self::delete_branch_result_with_conn(&txn, branch_name, None).await?;
+                ConditionalDeleteOutcome::Deleted
+            }
+        };
+        txn.commit()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        Ok(outcome)
+    }
+}
+
+/// What [`Branch::conclude_journaled_branch`] found (W2 r7 #1/#2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournaledBranchFate {
+    /// No provenance row: the journaled create never committed.
+    NeverCreated,
+    /// The provenance-recorded row still sat at the journaled base — deleted.
+    Deleted,
+    /// The recorded row is gone or its tip moved: the user's now, untouched.
+    KeptOrGone,
+}
+
+/// Outcome of [`Branch::delete_branch_if_tip_result`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConditionalDeleteOutcome {
+    /// The branch still pointed at the expected tip and was deleted.
+    Deleted,
+    /// The branch tip moved concurrently — left in place.
+    TipMoved,
+    /// No branch of that name exists (already gone).
+    NotFound,
 }
 
 #[cfg(test)]
@@ -581,6 +972,111 @@ mod tests {
 
     use super::*;
     use crate::utils::test;
+
+    /// A ref mutation QUEUES behind a concurrent writer instead of failing.
+    ///
+    /// Both `Branch::update_branch` and `Head::update_result` read the current
+    /// row before replacing it. A deferred transaction that upgrades read→write
+    /// gets `SQLITE_BUSY` immediately — SQLite does not run the busy handler
+    /// for that case — so before `db::begin_write_transaction` a second writer
+    /// anywhere in the repository made these fail outright rather than wait.
+    #[tokio::test]
+    #[serial]
+    async fn a_ref_mutation_waits_for_a_concurrent_writer() {
+        use std::time::Duration;
+
+        let temp_path = tempdir().unwrap();
+        test::setup_with_new_libra_in(temp_path.path()).await;
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        // A SECOND connection to the same file, as another process would have.
+        let db_path = crate::utils::path::database();
+        let holder = crate::internal::db::establish_connection(db_path.to_str().expect("utf-8"))
+            .await
+            .expect("second connection");
+        let held = crate::internal::db::begin_write_transaction(&holder)
+            .await
+            .expect("hold the write lock");
+        held.execute_unprepared("INSERT INTO `config_kv` (`key`, `value`) VALUES ('holder', '1')")
+            .await
+            .expect("write under the held lock");
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            held.commit().await.expect("release the lock");
+        });
+
+        let tip = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let started = std::time::Instant::now();
+        Branch::update_branch("queued", &tip, None)
+            .await
+            .expect("the branch write waits for the other writer instead of failing");
+        crate::internal::head::Head::update_result(
+            crate::internal::head::Head::Branch("queued".to_string()),
+            None,
+        )
+        .await
+        .expect("and so does the HEAD write");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "it WAITED rather than racing past the holder"
+        );
+        release.await.expect("holder task");
+
+        assert!(
+            Branch::find_branch_result("queued", None)
+                .await
+                .expect("read back the branch")
+                .is_some(),
+            "and the write landed"
+        );
+    }
+
+    /// W2 §C.4.3: the tip-conditional delete is ATOMIC — a branch whose tip
+    /// moved is kept (TipMoved), an unmoved one is deleted, a missing one
+    /// reports NotFound; no query→delete window exists (single txn).
+    #[tokio::test]
+    #[serial]
+    async fn conditional_delete_only_removes_the_unmoved_tip() {
+        let temp_path = tempdir().unwrap();
+        test::setup_with_new_libra_in(temp_path.path()).await;
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        let base = ObjectHash::zero_str(get_hash_kind()).to_string();
+        Branch::update_branch("rb", &base, None)
+            .await
+            .expect("create branch");
+        let base_hash = ObjectHash::from_str(&base).unwrap();
+        let moved_hash = {
+            // Any different valid hash.
+            let mut hex = base.clone();
+            hex.replace_range(0..2, "aa");
+            ObjectHash::from_str(&hex).unwrap()
+        };
+
+        // Wrong expected tip → kept.
+        let outcome = Branch::delete_branch_if_tip_result("rb", &moved_hash)
+            .await
+            .expect("conditional delete");
+        assert_eq!(outcome, ConditionalDeleteOutcome::TipMoved);
+        assert!(
+            Branch::find_branch_result("rb", None)
+                .await
+                .expect("find")
+                .is_some(),
+            "moved-tip branch survives"
+        );
+
+        // Matching tip → deleted; second call reports NotFound.
+        let outcome = Branch::delete_branch_if_tip_result("rb", &base_hash)
+            .await
+            .expect("conditional delete");
+        assert_eq!(outcome, ConditionalDeleteOutcome::Deleted);
+        let outcome = Branch::delete_branch_if_tip_result("rb", &base_hash)
+            .await
+            .expect("conditional delete");
+        assert_eq!(outcome, ConditionalDeleteOutcome::NotFound);
+    }
 
     /// Scenario: a branch name like `"upstream/origin/master"` is ambiguous —
     /// it could be a local name, or any of three `(remote, branch)` splits.

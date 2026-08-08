@@ -18,6 +18,14 @@ By default, `run` uses a dry-run executor so shell actions are planned and
 recorded without spawning external commands. Pass `--live` only when the
 configured actions should actually run.
 
+**Linked worktrees**: every `libra automation` subcommand fails closed in a
+linked worktree until the unified Code/Agent configuration resolver lands —
+`automations.toml` would be read from the linked worktree's local gitdir,
+where no repository configuration lives, so the commands would silently see
+an empty rule set. VCS-event dispatch (commit/add/branch/switch/push triggers) is
+likewise disabled in linked worktrees, with one warning per command rather
+than a silent skip. Run from the main worktree instead.
+
 ## Subcommands
 
 | Subcommand | Description |

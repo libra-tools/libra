@@ -363,7 +363,7 @@ async fn list(args: SessionListArgs, output: &OutputConfig) -> CliResult<()> {
 
     let stmt = Statement::from_sql_and_values(backend, &sql, values);
     let rows = conn
-        .query_all(stmt)
+        .query_all_raw(stmt)
         .await
         .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
 
@@ -422,7 +422,7 @@ async fn show(args: SessionShowArgs, output: &OutputConfig) -> CliResult<()> {
         [args.session_id.clone().into()],
     );
     let row = conn
-        .query_one(stmt)
+        .query_one_raw(stmt)
         .await
         .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
     match row {
@@ -506,9 +506,9 @@ async fn mutate_session_state(
     }
 
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
-            "SELECT state, stopped_at, last_event_at \
+            "SELECT state, stopped_at, last_event_at, scope_state, worktree_id \
              FROM agent_session WHERE session_id = ? LIMIT 1",
             [session_id.into()],
         ))
@@ -572,12 +572,42 @@ async fn mutate_session_state(
         _ => {}
     }
 
+    // §C.4.1.1: lifecycle mutations carry the WRITER's scope. A row another
+    // worktree's scope owns is refused (a cross-scope stop would make the
+    // foreign session eligible for `agent clean --gc` retention and bump its
+    // replication revision), and `legacy_unknown` rows are excluded from
+    // every new write until explicitly adopted — the same rule the capture
+    // writers enforce.
+    let scope_state = row
+        .try_get_by::<Option<String>, _>("scope_state")
+        .unwrap_or(None);
+    if scope_state.as_deref() == Some("legacy_unknown") {
+        return Err(CliError::fatal(format!(
+            "session '{session_id}' predates workspace scoping and is excluded from new \
+             writes; adopt it first with `libra worktree doctor <workspace-id> \
+             --adopt-capture-session {session_id} --confirm`"
+        )));
+    }
+    if scope_state.as_deref() == Some("scoped") {
+        let row_worktree = row
+            .try_get_by::<Option<String>, _>("worktree_id")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+        let current_worktree = scope.worktree_id().unwrap_or_default().to_string();
+        if row_worktree != current_worktree {
+            return Err(CliError::fatal(format!(
+                "session '{session_id}' is owned by another worktree scope ('{row_worktree}'); \
+                 run this from that worktree, or inspect with `libra worktree doctor`"
+            )));
+        }
+    }
     let now = chrono::Utc::now().timestamp();
     let (new_state, new_stopped_at) = match kind {
         SessionMutationKind::Stop => ("stopped", Some(now)),
         SessionMutationKind::Resume => ("active", None),
     };
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "UPDATE agent_session \
          SET state = ?, last_event_at = ?, stopped_at = ?, \
@@ -743,7 +773,7 @@ async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> Cli
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
     );
-    conn.query_one(stmt)
+    conn.query_one_raw(stmt)
         .await
         .map(|row| row.is_some())
         .map_err(|e| CliError::fatal(format!("failed to query sqlite_master: {e}")))
@@ -771,7 +801,7 @@ async fn load_agent_session_snapshot(
 ) -> CliResult<AgentSessionSnapshot> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT session_id, agent_kind, provider_session_id, state, working_dir, \
                     COALESCE(metadata_json, '{}') AS metadata_json, \
@@ -1013,6 +1043,68 @@ mod tests {
         }
     }
 
+    /// §C.4.1.1 fail-closed witness (W4 review): lifecycle mutations refuse
+    /// (a) `legacy_unknown` rows — excluded from every new write until
+    /// explicitly adopted — and (b) rows another worktree scope owns. Both
+    /// name the way out.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_refuses_legacy_and_foreign_scope_rows() {
+        use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+        let db = Database::connect("sqlite::memory:").await.expect("connect");
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE TABLE agent_session (
+                session_id TEXT PRIMARY KEY,
+                agent_kind TEXT NOT NULL,
+                provider_session_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                working_dir TEXT NOT NULL,
+                worktree_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                started_at INTEGER NOT NULL DEFAULT 0,
+                last_event_at INTEGER NOT NULL DEFAULT 0,
+                stopped_at INTEGER,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                sync_revision INTEGER NOT NULL DEFAULT 0,
+                scope_state TEXT
+            )",
+        ))
+        .await
+        .expect("create table");
+        for (id, scope_state, worktree) in [
+            ("legacy-1", "legacy_unknown", ""),
+            ("foreign-1", "scoped", "wt-other"),
+        ] {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, \
+                 state, working_dir, worktree_id, scope_state) VALUES (?, 'claude_code', ?, \
+                 'active', '/tmp', ?, ?)",
+                [id.into(), id.into(), worktree.into(), scope_state.into()],
+            ))
+            .await
+            .expect("seed row");
+        }
+
+        let legacy = mutate_session_state(&db, "legacy-1", SessionMutationKind::Stop)
+            .await
+            .expect_err("legacy rows are excluded from new writes");
+        assert!(
+            legacy.to_string().contains("adopt"),
+            "the refusal names the adoption path: {legacy}"
+        );
+
+        let foreign = mutate_session_state(&db, "foreign-1", SessionMutationKind::Stop)
+            .await
+            .expect_err("another scope's row is not this worktree's to stop");
+        assert!(
+            foreign.to_string().contains("another worktree scope"),
+            "the refusal says whose it is: {foreign}"
+        );
+    }
+
     #[test]
     fn intent_spec_carries_agent_kind_and_provider_session_id() {
         let snapshot = snapshot_fixture();
@@ -1133,7 +1225,7 @@ mod tests {
                 continue;
             }
             let _: ExecResult = conn
-                .execute(Statement::from_string(backend, trimmed.to_string()))
+                .execute_raw(Statement::from_string(backend, trimmed.to_string()))
                 .await
                 .unwrap_or_else(|e| panic!("legacy bootstrap stmt failed: {trimmed}\n{e}"));
         }
@@ -1159,13 +1251,17 @@ mod tests {
         metadata_json: &str,
     ) {
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
+            // scope_state='scoped' + main worktree ('') models a MODERN
+            // capture: the lifecycle gate excludes legacy_unknown rows from
+            // every new write (its own test covers that refusal).
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
-                metadata_json, redaction_report, started_at, last_event_at, stopped_at
+                metadata_json, redaction_report, started_at, last_event_at, stopped_at,
+                scope_state, repo_id, worktree_id, workspace_id, workspace_fence
              ) VALUES (?, 'claude_code', ?, ?, '/tmp/repo', ?, '{}', 1700000000, \
-                       1700000100, ?)",
+                       1700000100, ?, 'scoped', 'test-repo', '', 'ws-test', 1)",
             vec![
                 session_id.to_string().into(),
                 format!("{session_id}-provider").into(),
@@ -1184,7 +1280,7 @@ mod tests {
     ) -> (String, Option<i64>, i64) {
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT state, stopped_at, last_event_at \
                  FROM agent_session WHERE session_id = ? LIMIT 1",
@@ -1304,7 +1400,7 @@ mod tests {
         let (_dir, conn, repo_path) = fresh_repo().await;
 
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1436,7 +1532,7 @@ mod tests {
         let (_dir, conn, repo_path) = fresh_repo().await;
 
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1502,7 +1598,7 @@ mod tests {
     async fn promote_honors_explicit_prompt_override() {
         let (_dir, conn, repo_path) = fresh_repo().await;
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,

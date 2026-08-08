@@ -37,8 +37,8 @@ use crate::{
         d1_client::{
             AgentCaptureGenerationManifest, AgentCaptureGenerationRow,
             AgentCaptureRestoreCatalogRows, AgentCheckpointPruneTombstoneRow, AgentCheckpointV2Row,
-            AgentSessionV2Row, AgentSubagentContentClaimRow, AgentSubagentContentRevisionRow,
-            AgentSubagentLinkRow, D1Client, ObjectIndexRow,
+            AgentImportTombstoneRow, AgentSessionV2Row, AgentSubagentContentClaimRow,
+            AgentSubagentContentRevisionRow, AgentSubagentLinkRow, D1Client, ObjectIndexRow,
         },
         error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{OutputConfig, ProgressMode, emit_json_data},
@@ -950,7 +950,7 @@ pub(crate) async fn run_cloud_sync(
         .if_not_exists()
         .to_owned();
 
-    let _ = db_conn.execute(builder.build(&stmt)).await;
+    let _ = db_conn.execute_raw(builder.build(&stmt)).await;
 
     let repo_id = ensure_repo_id().await;
 
@@ -1657,7 +1657,7 @@ async fn preflight_agent_capture_prune_fences(
 
     let backend = db_conn.get_database_backend();
     let tombstone_table_present = db_conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT 1 FROM sqlite_master
              WHERE type = 'table' AND name = 'agent_checkpoint_prune_tombstone' LIMIT 1"
@@ -1674,7 +1674,7 @@ async fn preflight_agent_capture_prune_fences(
         return Ok(());
     }
     let rows = db_conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             format!(
                 "SELECT checkpoint_id FROM agent_checkpoint_prune_tombstone
@@ -2209,7 +2209,7 @@ async fn load_local_agent_capture_cloud_base(
 
     let backend = db_conn.get_database_backend();
     let table_present = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master
              WHERE type = 'table' AND name = 'agent_capture_cloud_base' LIMIT 1",
@@ -2224,7 +2224,7 @@ async fn load_local_agent_capture_cloud_base(
         return Ok(None);
     }
     db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT remote_generation FROM agent_capture_cloud_base WHERE repo_id = ?",
             [repo_id.into()],
@@ -2249,7 +2249,7 @@ async fn store_local_agent_capture_cloud_base(
     use sea_orm::Statement;
 
     db_conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             db_conn.get_database_backend(),
             "INSERT INTO agent_capture_cloud_base (repo_id, remote_generation, updated_at)
              VALUES (?, ?, ?)
@@ -2278,8 +2278,43 @@ struct AgentCaptureSnapshot {
     revisions: Vec<AgentSubagentContentRevisionRow>,
     links: Vec<AgentSubagentLinkRow>,
     prune_tombstones: Vec<AgentCheckpointPruneTombstoneRow>,
+    /// PD-03 session-erasure tombstones from the local
+    /// `agent_import_tombstone` table.
+    import_tombstones: Vec<AgentImportTombstoneRow>,
     required_oids: HashSet<String>,
     traces_head: Option<String>,
+}
+
+/// PD-03: union local and remote session tombstones, keeping the newest
+/// `erased_at` (and any known fingerprint) per provider identity —
+/// delete/restore replays stay idempotent.
+fn merge_import_tombstones(
+    local: &[AgentImportTombstoneRow],
+    remote: &[AgentImportTombstoneRow],
+) -> Vec<AgentImportTombstoneRow> {
+    let mut merged: std::collections::BTreeMap<(String, String), AgentImportTombstoneRow> =
+        std::collections::BTreeMap::new();
+    for row in remote.iter().chain(local.iter()) {
+        let key = (row.agent_kind.clone(), row.provider_session_id.clone());
+        match merged.get_mut(&key) {
+            None => {
+                merged.insert(key, row.clone());
+            }
+            Some(existing) => {
+                if row.erased_at > existing.erased_at {
+                    let fingerprint = existing
+                        .source_fingerprint
+                        .clone()
+                        .or_else(|| row.source_fingerprint.clone());
+                    *existing = row.clone();
+                    existing.source_fingerprint = row.source_fingerprint.clone().or(fingerprint);
+                } else if existing.source_fingerprint.is_none() {
+                    existing.source_fingerprint = row.source_fingerprint.clone();
+                }
+            }
+        }
+    }
+    merged.into_values().collect()
 }
 
 fn agent_capture_catalog_row_count(snapshot: &AgentCaptureSnapshot) -> CloudResult<usize> {
@@ -2287,6 +2322,7 @@ fn agent_capture_catalog_row_count(snapshot: &AgentCaptureSnapshot) -> CloudResu
         snapshot.sessions.len(),
         snapshot.checkpoints.len(),
         snapshot.prune_tombstones.len(),
+        snapshot.import_tombstones.len(),
         snapshot.claims.len(),
         snapshot.revisions.len(),
         snapshot.links.len(),
@@ -2436,7 +2472,7 @@ async fn load_local_capture_pages<C: ConnectionTrait>(
                 .into(),
         ]);
         let page = conn
-            .query_all(sea_orm::Statement::from_sql_and_values(
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 format!("{sql} LIMIT ? OFFSET ?"),
                 page_values,
@@ -2480,7 +2516,7 @@ async fn load_synced_required_object_oids<C: ConnectionTrait>(
         values.push(repo_id.into());
         values.extend(page.iter().cloned().map(Into::into));
         let rows = conn
-            .query_all(sea_orm::Statement::from_sql_and_values(
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 format!(
                     "SELECT o_id FROM object_index
@@ -2548,7 +2584,7 @@ async fn load_agent_capture_catalog_snapshot(
         .map_err(|error| CloudError::Generic(format!("begin agent capture snapshot: {error}")))?;
     let backend = txn.get_database_backend();
     let unsynced = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT COUNT(*) AS n FROM object_index
              WHERE repo_id = ? AND COALESCE(is_synced, 0) = 0",
@@ -2664,7 +2700,7 @@ async fn load_agent_capture_catalog_snapshot(
         Vec::new()
     };
     let traces_head = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT `commit` FROM reference
              WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
@@ -2677,10 +2713,48 @@ async fn load_agent_capture_catalog_snapshot(
         .map_err(|error| CloudError::Generic(format!("decode traces snapshot head: {error}")))?
         .flatten();
 
+    let import_tombstone_present = txn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_import_tombstone' LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .map_err(|error| CloudError::Generic(format!("query import-tombstone schema: {error}")))?
+        .is_some();
+    let import_tombstones = if import_tombstone_present {
+        let tombstone_rows = load_local_capture_pages(
+            &txn,
+            "SELECT agent_kind, provider_session_id, erased_session_id,
+                    source_fingerprint, erased_at
+             FROM agent_import_tombstone ORDER BY agent_kind, provider_session_id",
+            Vec::new(),
+            "agent import tombstone",
+            &mut remaining_restore_rows,
+        )
+        .await?;
+        tombstone_rows
+            .into_iter()
+            .map(|row| {
+                Ok(AgentImportTombstoneRow {
+                    agent_kind: row.try_get_by("agent_kind")?,
+                    provider_session_id: row.try_get_by("provider_session_id")?,
+                    erased_session_id: row.try_get_by("erased_session_id")?,
+                    source_fingerprint: row.try_get_by("source_fingerprint")?,
+                    erased_at: row.try_get_by("erased_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sea_orm::DbErr>>()
+            .map_err(|error| CloudError::Generic(format!("decode import tombstones: {error}")))?
+    } else {
+        Vec::new()
+    };
     let mut snapshot = AgentCaptureSnapshot {
         sessions,
         checkpoints,
         prune_tombstones,
+        import_tombstones,
         traces_head,
         ..AgentCaptureSnapshot::default()
     };
@@ -3700,7 +3774,7 @@ async fn sync_agent_capture_tables_inner(
 
     let backend = db_conn.get_database_backend();
     let session_present = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_session' LIMIT 1",
             [],
@@ -3712,7 +3786,7 @@ async fn sync_agent_capture_tables_inner(
         return Ok(AgentCaptureSyncOutcome::SkippedLegacySchema);
     }
     let subagent_content_present = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master
              WHERE type = 'table' AND name = 'agent_subagent_content_claim' LIMIT 1",
@@ -3754,6 +3828,12 @@ async fn sync_agent_capture_tables_inner(
                 "ensure checkpoint prune tombstones: {}",
                 error.message
             ))
+        })?;
+    d1_client
+        .ensure_agent_import_tombstone_table()
+        .await
+        .map_err(|error| {
+            CloudError::D1(format!("ensure agent import tombstones: {}", error.message))
         })?;
     if subagent_content_present {
         d1_client
@@ -3806,11 +3886,49 @@ async fn sync_agent_capture_tables_inner(
         sessions: remote_sessions,
         checkpoints: remote_checkpoints,
         prune_tombstones: remote_prune_tombstones,
+        import_tombstones: remote_import_tombstones,
         claims: remote_claims,
         revisions: remote_revisions,
         links: remote_links,
         remaining_rows: _,
     } = remote_catalog;
+    // PD-03: the effective tombstone set is the UNION of local and remote
+    // (newest erased_at per provider identity), and every remote catalog
+    // row belonging to an erased session id is dropped BEFORE conflict/
+    // effective-set computation — the publish cascade deletes the same
+    // rows remotely, so the post-publish verification stays coherent.
+    let merged_import_tombstones =
+        merge_import_tombstones(&snapshot.import_tombstones, &remote_import_tombstones);
+    let erased_session_ids: HashSet<&str> = merged_import_tombstones
+        .iter()
+        .map(|row| row.erased_session_id.as_str())
+        .collect();
+    let remote_sessions: Vec<AgentSessionV2Row> = remote_sessions
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.session_id.as_str()))
+        .collect();
+    let erased_checkpoint_ids: HashSet<&str> = remote_checkpoints
+        .iter()
+        .filter(|row| erased_session_ids.contains(row.session_id.as_str()))
+        .map(|row| row.checkpoint_id.as_str())
+        .collect();
+    let remote_checkpoints: Vec<AgentCheckpointV2Row> = remote_checkpoints
+        .iter()
+        .filter(|row| !erased_session_ids.contains(row.session_id.as_str()))
+        .cloned()
+        .collect();
+    let remote_claims: Vec<AgentSubagentContentClaimRow> = remote_claims
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.parent_session_id.as_str()))
+        .collect();
+    let remote_revisions: Vec<AgentSubagentContentRevisionRow> = remote_revisions
+        .into_iter()
+        .filter(|row| !erased_checkpoint_ids.contains(row.checkpoint_id.as_str()))
+        .collect();
+    let remote_links: Vec<AgentSubagentLinkRow> = remote_links
+        .into_iter()
+        .filter(|row| !erased_checkpoint_ids.contains(row.content_checkpoint_id.as_str()))
+        .collect();
     validate_agent_capture_companions(
         &remote_checkpoints,
         &remote_claims,
@@ -4065,11 +4183,22 @@ async fn sync_agent_capture_tables_inner(
                 CloudError::D1(format!("sync subagent claim batch: {}", error.message))
             })?;
     }
+    // PD-03: the session tombstones publish LAST so their cascade delete
+    // is final regardless of what earlier batches upserted.
+    for rows in agent_capture_batches(&merged_import_tombstones) {
+        d1_client
+            .sync_agent_import_tombstones_batch(repo_id, &publish_token, rows)
+            .await
+            .map_err(|error| {
+                CloudError::D1(format!("sync agent import tombstones: {}", error.message))
+            })?;
+    }
 
     let AgentCaptureRestoreCatalogRows {
         sessions: completed_sessions,
         checkpoints: completed_checkpoints,
         prune_tombstones: _,
+        import_tombstones: _,
         claims: completed_claims,
         revisions: completed_revisions,
         links: completed_links,
@@ -4274,7 +4403,7 @@ async fn restore_agent_capture_from_d1_inner(
     // case so the user gets a single actionable hint.
     let backend = db_conn.get_database_backend();
     let session_present = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_session' LIMIT 1",
             [],
@@ -4283,7 +4412,7 @@ async fn restore_agent_capture_from_d1_inner(
         .map_err(|e| CloudError::Generic(format!("query sqlite_master: {e}")))?
         .is_some();
     let checkpoint_present = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_checkpoint' LIMIT 1",
             [],
@@ -4560,8 +4689,80 @@ async fn restore_agent_capture_from_d1_inner(
         render_human,
     )
     .await?;
+    // PD-03: propagate the remote session tombstones to THIS machine, so
+    // a later local import cannot resurrect a session erased elsewhere.
+    persist_local_import_tombstones(db_conn, &rows.import_tombstones).await?;
     store_local_agent_capture_cloud_base(db_conn, repo_id, remote_generation).await?;
     Ok(AgentCaptureRestoreOutcome::GenerationInstalled)
+}
+
+/// PD-03: UPSERT restored session tombstones into the local
+/// `agent_import_tombstone` table (same idempotent shape the local erase
+/// writes: newest `erased_at` wins, known fingerprints are kept). A
+/// legacy local schema without the table skips with a warning — the
+/// restore itself already filtered the erased rows.
+async fn persist_local_import_tombstones(
+    db_conn: &sea_orm::DatabaseConnection,
+    tombstones: &[AgentImportTombstoneRow],
+) -> CloudResult<()> {
+    use sea_orm::{ConnectionTrait, Statement, Value};
+
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+    let backend = db_conn.get_database_backend();
+    let table_present = db_conn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_import_tombstone' LIMIT 1",
+            [],
+        ))
+        .await
+        .map_err(|error| {
+            CloudError::Generic(format!("query local import-tombstone schema: {error}"))
+        })?
+        .is_some();
+    if !table_present {
+        emit_warning(
+            "local agent_import_tombstone table absent — restored erasure fences were \
+             not persisted locally; upgrade libra and rerun `libra cloud restore`",
+        );
+        return Ok(());
+    }
+    for row in tombstones {
+        db_conn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO agent_import_tombstone (
+                    tombstone_id, agent_kind, provider_session_id,
+                    erased_session_id, source_fingerprint, erased_at
+                 ) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(agent_kind, provider_session_id) DO UPDATE SET
+                    erased_session_id = excluded.erased_session_id,
+                    source_fingerprint = COALESCE(
+                        excluded.source_fingerprint,
+                        agent_import_tombstone.source_fingerprint
+                    ),
+                    erased_at = MAX(agent_import_tombstone.erased_at, excluded.erased_at)",
+                [
+                    uuid::Uuid::new_v4().to_string().into(),
+                    row.agent_kind.clone().into(),
+                    row.provider_session_id.clone().into(),
+                    row.erased_session_id.clone().into(),
+                    Value::from(row.source_fingerprint.clone()),
+                    row.erased_at.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| {
+                CloudError::Generic(format!(
+                    "persist restored session tombstone for {}/{}: {error}",
+                    row.agent_kind, row.provider_session_id
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 async fn load_remote_agent_capture_rows(
@@ -4573,6 +4774,7 @@ async fn load_remote_agent_capture_rows(
         sessions,
         checkpoints,
         prune_tombstones: _,
+        import_tombstones,
         claims,
         revisions,
         links,
@@ -4590,10 +4792,42 @@ async fn load_remote_agent_capture_rows(
                 error.message
             ))
         })?;
+    // PD-03 tombstone-first: an erased session never restores, even when
+    // a stale mirror still carries its rows.
+    let erased_session_ids: HashSet<&str> = import_tombstones
+        .iter()
+        .map(|row| row.erased_session_id.as_str())
+        .collect();
+    let erased_checkpoint_ids: HashSet<String> = checkpoints
+        .iter()
+        .filter(|row| erased_session_ids.contains(row.session_id.as_str()))
+        .map(|row| row.checkpoint_id.clone())
+        .collect();
+    let sessions: Vec<AgentSessionV2Row> = sessions
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.session_id.as_str()))
+        .collect();
+    let checkpoints: Vec<AgentCheckpointV2Row> = checkpoints
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.session_id.as_str()))
+        .collect();
+    let claims: Vec<AgentSubagentContentClaimRow> = claims
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.parent_session_id.as_str()))
+        .collect();
+    let revisions: Vec<AgentSubagentContentRevisionRow> = revisions
+        .into_iter()
+        .filter(|row| !erased_checkpoint_ids.contains(row.checkpoint_id.as_str()))
+        .collect();
+    let links: Vec<AgentSubagentLinkRow> = links
+        .into_iter()
+        .filter(|row| !erased_checkpoint_ids.contains(row.content_checkpoint_id.as_str()))
+        .collect();
     Ok((
         AgentCaptureSnapshot {
             sessions,
             checkpoints,
+            import_tombstones,
             claims,
             revisions,
             links,
@@ -4665,9 +4899,13 @@ async fn restore_agent_capture_from_rows_with_subagents(
         claim_rows,
         "restored remote",
     )?;
-    let txn = db_conn.begin().await.map_err(|error| {
-        CloudError::Generic(format!("begin atomic agent capture restore: {error}"))
-    })?;
+    // Reads the existing refs/rows before rewriting them (`restore fenced
+    // traces ref` below), so the write lock is taken up front.
+    let txn = crate::internal::db::begin_write_transaction(db_conn)
+        .await
+        .map_err(|error| {
+            CloudError::Generic(format!("begin atomic agent capture restore: {error}"))
+        })?;
     let backend = txn.get_database_backend();
 
     // An ordinary retention prune is a durable local deletion intent. The
@@ -4676,7 +4914,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
     // catalog instead of resurrecting a checkpoint and its companion rows.
     if !checkpoint_rows.is_empty() {
         let tombstone_rows = txn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 backend,
                 format!(
                     "SELECT checkpoint_id FROM agent_checkpoint_prune_tombstone \
@@ -4718,7 +4956,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
     }
 
     let existing_traces_ref = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT id, `commit` FROM reference
              WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
@@ -4734,7 +4972,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
         .flatten();
     if existing_head.as_deref() != traces_head {
         let local_checkpoint_count = txn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 backend,
                 "SELECT COUNT(*) AS n FROM agent_checkpoint".to_string(),
             ))
@@ -4758,7 +4996,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
         let ref_id: i64 = row
             .try_get_by("id")
             .map_err(|error| CloudError::Generic(format!("decode traces ref id: {error}")))?;
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "UPDATE reference SET `commit` = ? WHERE id = ?",
             [traces_head.map(str::to_string).into(), ref_id.into()],
@@ -4766,7 +5004,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
         .await
         .map_err(|error| CloudError::Generic(format!("restore fenced traces ref: {error}")))?;
     } else {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
              VALUES (?, 'Branch', ?, NULL, NULL)",
@@ -4779,13 +5017,74 @@ async fn restore_agent_capture_from_rows_with_subagents(
         .map_err(|error| CloudError::Generic(format!("create fenced traces ref: {error}")))?;
     }
 
+    // PD-03 tombstone-first, LOCAL side. The remote catalog is filtered by
+    // the tombstones the mirror knows about, but a session erased here and
+    // not yet propagated is invisible to that filter — restoring from a
+    // stale mirror would otherwise bring it back. The schema triggers would
+    // abort such a write, which is the right outcome but the wrong
+    // experience: the whole restore fails on an opaque RAISE(ABORT) instead
+    // of quietly declining the rows the user already erased. Read the local
+    // tombstones inside the SAME transaction and skip them.
+    let mut locally_erased_sessions: HashSet<(String, String)> = HashSet::new();
+    let mut locally_erased_session_ids: HashSet<String> = HashSet::new();
+    for row in txn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT agent_kind, provider_session_id, erased_session_id \
+             FROM agent_import_tombstone",
+        ))
+        .await
+        .map_err(|error| CloudError::Generic(format!("read local erasure tombstones: {error}")))?
+    {
+        let agent_kind: String = row
+            .try_get_by("agent_kind")
+            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
+        let provider_session_id: String = row
+            .try_get_by("provider_session_id")
+            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
+        let erased_session_id: String = row
+            .try_get_by("erased_session_id")
+            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
+        locally_erased_sessions.insert((agent_kind, provider_session_id));
+        locally_erased_session_ids.insert(erased_session_id);
+    }
+    // Collect the dropped sessions' REMOTE ids before filtering: a
+    // checkpoint references its session by id, and the mirror's id for an
+    // erased session need not match the local `erased_session_id`.
+    let dropped_session_ids: HashSet<String> = session_rows
+        .iter()
+        .filter(|row| {
+            locally_erased_sessions
+                .contains(&(row.agent_kind.clone(), row.provider_session_id.clone()))
+        })
+        .map(|row| row.session_id.clone())
+        .collect();
+    let session_rows: Vec<_> = session_rows
+        .iter()
+        .filter(|row| {
+            !locally_erased_sessions
+                .contains(&(row.agent_kind.clone(), row.provider_session_id.clone()))
+        })
+        .cloned()
+        .collect();
+    let session_rows = &session_rows[..];
+    let checkpoint_rows: Vec<_> = checkpoint_rows
+        .iter()
+        .filter(|row| {
+            !locally_erased_session_ids.contains(&row.session_id)
+                && !dropped_session_ids.contains(&row.session_id)
+        })
+        .cloned()
+        .collect();
+    let checkpoint_rows = &checkpoint_rows[..];
+
     // Validate every immutable/mutable companion conflict before applying any
     // row. The surrounding transaction guarantees a later SQL/FK failure also
     // rolls back sessions, checkpoints, skeleton claims, revisions, and links.
     let mut newer_local_sessions = HashSet::new();
     for row in session_rows {
         let existing = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT session_id, agent_kind, provider_session_id, state, working_dir,
                         worktree_id, parent_commit, parent_session_id, metadata_json,
@@ -4873,7 +5172,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
     }
     for row in checkpoint_rows {
         let existing = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT session_id, parent_checkpoint_id, scope, parent_commit, tree_oid,
                         metadata_blob_oid, traces_commit, tool_use_id, subagent_session_id,
@@ -4948,7 +5247,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
     let mut newer_local_claims = HashSet::new();
     for row in revision_rows {
         let existing = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT checkpoint_id, content_digest, source_channel, partial, created_at
                  FROM agent_subagent_content_revision
@@ -4997,7 +5296,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
     }
     for row in claim_rows {
         let existing = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT revision_cursor, sync_revision, current_revision, current_checkpoint_id,
                         current_digest, state
@@ -5073,7 +5372,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
     let mut newer_local_links = HashSet::new();
     for row in link_rows {
         let existing = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT parent_session_id, link_state, boundary_checkpoint_id,
                         stable_subagent_id, sync_revision, created_at, updated_at
@@ -5131,12 +5430,38 @@ async fn restore_agent_capture_from_rows_with_subagents(
         }
     }
 
+    let mut skipped_scoped_sessions = 0usize;
     for row in session_rows {
         if newer_local_sessions.contains(&(row.agent_kind.clone(), row.provider_session_id.clone()))
         {
             continue;
         }
-        txn.execute(Statement::from_sql_and_values(
+        // §C.4.1.1: a LOCALLY SCOPED session belongs to a live workspace
+        // owner; cloud content carries no scope columns, so overwriting the
+        // row would graft foreign material under an immutable owner claim.
+        // The UPSERT below skips such rows via its scope predicate — count
+        // them so the user learns the restore was partial.
+        let scoped_conflict = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT 1 AS hit FROM agent_session \
+                 WHERE agent_kind = ? AND provider_session_id = ? \
+                   AND scope_state IS 'scoped' AND sync_revision < ?",
+                [
+                    row.agent_kind.clone().into(),
+                    row.provider_session_id.clone().into(),
+                    row.sync_revision.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| {
+                CloudError::Generic(format!("probe scoped session conflict: {error}"))
+            })?
+            .is_some();
+        if scoped_conflict {
+            skipped_scoped_sessions += 1;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -5155,7 +5480,8 @@ async fn restore_agent_capture_from_rows_with_subagents(
                 stopped_at = excluded.stopped_at,
                 schema_version = excluded.schema_version,
                 sync_revision = excluded.sync_revision
-             WHERE excluded.sync_revision > agent_session.sync_revision",
+             WHERE excluded.sync_revision > agent_session.sync_revision
+               AND agent_session.scope_state IS NOT 'scoped'",
             [
                 row.session_id.clone().into(),
                 row.agent_kind.clone().into(),
@@ -5179,8 +5505,15 @@ async fn restore_agent_capture_from_rows_with_subagents(
             CloudError::Generic(format!("restore agent session {}: {error}", row.session_id))
         })?;
     }
+    if skipped_scoped_sessions > 0 {
+        emit_warning(format!(
+            "cloud restore left {skipped_scoped_sessions} locally SCOPED agent session(s) \
+             untouched: their rows are owned by a live workspace and cloud content carries \
+             no ownership; inspect with `libra worktree doctor`"
+        ));
+    }
     for row in checkpoint_rows {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
@@ -5221,7 +5554,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
     // Skeleton claims satisfy the revision FK but remain invisible outside the
     // transaction. Current leaves are advanced only after revisions and links.
     for row in claim_rows {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_subagent_content_claim (
                 parent_session_id, provider_kind, source_key, content_schema_version,
@@ -5246,7 +5579,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
         .map_err(|error| CloudError::Generic(format!("stage restored claim: {error}")))?;
     }
     for row in revision_rows {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_subagent_content_revision (
                 parent_session_id, provider_kind, source_key, content_schema_version,
@@ -5279,7 +5612,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
         if newer_local_links.contains(&row.content_checkpoint_id) {
             continue;
         }
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_subagent_link (
                 content_checkpoint_id, parent_session_id, link_state,
@@ -5318,7 +5651,7 @@ async fn restore_agent_capture_from_rows_with_subagents(
             continue;
         }
         let result = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "UPDATE agent_subagent_content_claim
                  SET revision_cursor = ?, sync_revision = ?, current_revision = ?, current_checkpoint_id = ?,
@@ -5550,6 +5883,34 @@ async fn restore_legacy_capture_refs_if_unowned(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merge_import_tombstones_keeps_newest_and_fingerprints() {
+        use crate::utils::d1_client::AgentImportTombstoneRow;
+
+        let row = |erased_at: i64, fp: Option<&str>| AgentImportTombstoneRow {
+            agent_kind: "claude_code".to_string(),
+            provider_session_id: "prov-1".to_string(),
+            erased_session_id: format!("sess-{erased_at}"),
+            source_fingerprint: fp.map(str::to_string),
+            erased_at,
+        };
+        // Newest erased_at wins; an older row's fingerprint survives when
+        // the newer one lacks it.
+        let merged = super::merge_import_tombstones(&[row(5, None)], &[row(3, Some("aa"))]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].erased_at, 5);
+        assert_eq!(merged[0].erased_session_id, "sess-5");
+        assert_eq!(merged[0].source_fingerprint.as_deref(), Some("aa"));
+        // Distinct provider identities stay distinct.
+        let mut other = row(7, None);
+        other.provider_session_id = "prov-2".to_string();
+        let merged = super::merge_import_tombstones(&[row(5, None)], &[other]);
+        assert_eq!(merged.len(), 2);
+        // Idempotent under replay: merging the merged set changes nothing.
+        let replay = super::merge_import_tombstones(&merged, &merged);
+        assert_eq!(replay, merged);
+    }
+
     use std::{env, ffi::OsString, fs, sync::Arc};
 
     use git_internal::internal::object::types::ObjectType;
@@ -5957,7 +6318,7 @@ mod tests {
             let local_commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
             let stale_remote_commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
             db_conn
-                .execute(sea_orm::Statement::from_sql_and_values(
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
                     db_conn.get_database_backend(),
                     "UPDATE reference SET `commit` = ?
                      WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
@@ -5990,7 +6351,7 @@ mod tests {
             .expect("validated capture generation owns the traces ref");
 
             let row = db_conn
-                .query_one(sea_orm::Statement::from_sql_and_values(
+                .query_one_raw(sea_orm::Statement::from_sql_and_values(
                     db_conn.get_database_backend(),
                     "SELECT `commit` FROM reference
                      WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
@@ -6040,7 +6401,7 @@ mod tests {
             .await
             .expect("legacy metadata owns traces when no generation exists");
             let restored = db_conn
-                .query_one(sea_orm::Statement::from_sql_and_values(
+                .query_one_raw(sea_orm::Statement::from_sql_and_values(
                     db_conn.get_database_backend(),
                     "SELECT `commit` FROM reference
                      WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
@@ -6633,6 +6994,114 @@ mod tests {
             .expect("an empty capture has no traces head");
     }
 
+    /// PD-03: a session erased HERE must not come back from a mirror that
+    /// has not yet seen the erasure.
+    ///
+    /// `restore` filtered only the tombstones the remote catalog carried,
+    /// so the window between a local `agent erase` and the next `cloud
+    /// sync` was a resurrection hole: restoring from the stale mirror
+    /// re-UPSERTed the session. The schema triggers would have aborted the
+    /// write — correct, but it takes the whole restore down with an opaque
+    /// `RAISE(ABORT)` instead of quietly declining rows the user already
+    /// erased. Both the session and its checkpoints must be dropped, and
+    /// everything else must still restore.
+    #[test]
+    #[serial]
+    fn restore_skips_locally_tombstoned_sessions_and_their_checkpoints() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let repo = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _home = ScopedEnvVar::set("HOME", home.path());
+        let _test_home = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
+        rt.block_on(setup_with_new_libra_in(repo.path()));
+        let _cwd = ChangeDirGuard::new(repo.path());
+
+        rt.block_on(async {
+            let db_conn = db::get_db_conn_instance().await;
+            let erased = fixture_session_row("sess-ERASED", "prov-ERASED");
+            let kept = fixture_session_row("sess-KEPT", "prov-KEPT");
+
+            // The local tombstone `agent erase` leaves behind. Note the
+            // mirror's session id need NOT equal `erased_session_id`, which
+            // is why checkpoints are dropped by the id the ROWS carry.
+            db_conn
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
+                    db_conn.get_database_backend(),
+                    "INSERT INTO agent_import_tombstone
+                       (agent_kind, provider_session_id, erased_session_id, erased_at)
+                     VALUES (?, ?, ?, ?)",
+                    [
+                        erased.agent_kind.clone().into(),
+                        erased.provider_session_id.clone().into(),
+                        "sess-LOCAL-ID".into(),
+                        1_i64.into(),
+                    ],
+                ))
+                .await
+                .expect("write the local erasure tombstone");
+
+            let sessions = vec![erased.clone(), kept.clone()];
+            let checkpoints = vec![
+                fixture_checkpoint_row("ckpt-ERASED", "sess-ERASED", Some("gone")),
+                fixture_checkpoint_row("ckpt-KEPT", "sess-KEPT", Some("stays")),
+            ];
+
+            restore_agent_capture_from_rows_with_subagents(
+                &db_conn,
+                AgentCaptureRestoreRows {
+                    sessions: &sessions,
+                    checkpoints: &checkpoints,
+                    claims: &[],
+                    revisions: &[],
+                    links: &[],
+                    traces_head: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    remote_is_known_ancestor: true,
+                },
+                true,
+            )
+            .await
+            .expect("restore must SUCCEED, declining the erased rows rather than aborting");
+
+            let restored_session = scalar_count(
+                &db_conn,
+                "SELECT COUNT(*) AS n FROM agent_session WHERE session_id = 'sess-ERASED'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                restored_session, 0,
+                "an erased session must not be resurrected by a stale mirror"
+            );
+            let restored_checkpoint = scalar_count(
+                &db_conn,
+                "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE checkpoint_id = 'ckpt-ERASED'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                restored_checkpoint, 0,
+                "nor may its checkpoints come back without it"
+            );
+
+            // Everything unrelated still restores: the filter is targeted,
+            // not a blanket refusal.
+            let kept_session = scalar_count(
+                &db_conn,
+                "SELECT COUNT(*) AS n FROM agent_session WHERE session_id = 'sess-KEPT'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(kept_session, 1, "an untombstoned session still restores");
+            let kept_checkpoint = scalar_count(
+                &db_conn,
+                "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE checkpoint_id = 'ckpt-KEPT'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(kept_checkpoint, 1, "and so do its checkpoints");
+        });
+    }
+
     /// Codex Q5 fixture: a fresh restore inserts both sessions and
     /// checkpoints into the local catalog. Smoke-tests the happy path
     /// without spinning up a D1 client.
@@ -6679,7 +7148,7 @@ mod tests {
             assert_eq!(session_count, 1);
             assert_eq!(checkpoint_count, 1);
             let restored_head = db_conn
-                .query_one(sea_orm::Statement::from_sql_and_values(
+                .query_one_raw(sea_orm::Statement::from_sql_and_values(
                     db_conn.get_database_backend(),
                     "SELECT `commit` FROM reference
                      WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
@@ -6728,7 +7197,7 @@ mod tests {
 
             let backend = db_conn.get_database_backend();
             db_conn
-                .execute(sea_orm::Statement::from_sql_and_values(
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
                     backend,
                     "INSERT INTO agent_checkpoint_prune_tombstone \
                      (checkpoint_id, session_id, pruned_at) VALUES (?, ?, ?)",
@@ -6737,14 +7206,14 @@ mod tests {
                 .await
                 .expect("record ordinary local prune fence");
             db_conn
-                .execute(sea_orm::Statement::from_string(
+                .execute_raw(sea_orm::Statement::from_string(
                     backend,
                     "DELETE FROM agent_checkpoint WHERE checkpoint_id = 'ckpt-A'".to_string(),
                 ))
                 .await
                 .expect("delete locally pruned checkpoint");
             db_conn
-                .execute(sea_orm::Statement::from_sql_and_values(
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
                     backend,
                     "UPDATE reference SET `commit` = NULL
                      WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
@@ -6780,7 +7249,7 @@ mod tests {
                 "restore must not resurrect the pruned catalog row"
             );
             let traces_head = db_conn
-                .query_one(sea_orm::Statement::from_sql_and_values(
+                .query_one_raw(sea_orm::Statement::from_sql_and_values(
                     backend,
                     "SELECT `commit` FROM reference
                      WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
@@ -7061,7 +7530,7 @@ mod tests {
         let conn = sea_orm::Database::connect("sqlite::memory:")
             .await
             .expect("open lineage test database");
-        conn.execute(sea_orm::Statement::from_string(
+        conn.execute_raw(sea_orm::Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE agent_capture_cloud_base (
                 repo_id TEXT PRIMARY KEY,
@@ -7304,7 +7773,7 @@ mod tests {
         let conn = sea_orm::Database::connect("sqlite::memory:")
             .await
             .expect("open object-index scale fixture");
-        conn.execute(sea_orm::Statement::from_string(
+        conn.execute_raw(sea_orm::Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE object_index (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7316,7 +7785,7 @@ mod tests {
         ))
         .await
         .expect("create object-index scale fixture");
-        conn.execute(sea_orm::Statement::from_string(
+        conn.execute_raw(sea_orm::Statement::from_string(
             conn.get_database_backend(),
             "WITH digits(d) AS (
                  VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
@@ -7333,7 +7802,7 @@ mod tests {
         .await
         .expect("seed more unrelated indexes than the capture history bound");
         let required_oid = "ffffffffffffffffffffffffffffffffffffffff".to_string();
-        conn.execute(sea_orm::Statement::from_sql_and_values(
+        conn.execute_raw(sea_orm::Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO object_index
                (o_id, o_type, o_size, repo_id, created_at, is_synced)
@@ -7383,13 +7852,13 @@ mod tests {
         let conn = sea_orm::Database::connect("sqlite::memory:")
             .await
             .expect("open aggregate budget fixture");
-        conn.execute(sea_orm::Statement::from_string(
+        conn.execute_raw(sea_orm::Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE capture_budget (kind TEXT NOT NULL, value INTEGER NOT NULL)".to_string(),
         ))
         .await
         .expect("create aggregate budget fixture");
-        conn.execute(sea_orm::Statement::from_string(
+        conn.execute_raw(sea_orm::Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO capture_budget VALUES
                 ('session', 1), ('session', 2),
@@ -7444,7 +7913,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
             let writer = tokio::spawn(async move {
                 let txn = writer_conn.begin().await.expect("begin concurrent capture");
-                txn.execute(sea_orm::Statement::from_string(
+                txn.execute_raw(sea_orm::Statement::from_string(
                     txn.get_database_backend(),
                     "INSERT INTO object_index (
                         o_id, o_type, o_size, repo_id, created_at, is_synced
@@ -7459,7 +7928,7 @@ mod tests {
                 ))
                 .await
                 .expect("insert concurrent objects");
-                txn.execute(sea_orm::Statement::from_string(
+                txn.execute_raw(sea_orm::Statement::from_string(
                     txn.get_database_backend(),
                     "INSERT INTO agent_session (
                         session_id, agent_kind, provider_session_id, state, working_dir,
@@ -7470,7 +7939,7 @@ mod tests {
                 ))
                 .await
                 .expect("insert concurrent session");
-                txn.execute(sea_orm::Statement::from_string(
+                txn.execute_raw(sea_orm::Statement::from_string(
                     txn.get_database_backend(),
                     "INSERT INTO agent_checkpoint (
                         checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
@@ -7612,7 +8081,7 @@ mod tests {
             use sea_orm::Statement;
             let backend = db_conn.get_database_backend();
             let row = db_conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     backend,
                     "SELECT description FROM agent_checkpoint WHERE checkpoint_id = ?",
                     ["ckpt-A".into()],
@@ -7670,7 +8139,7 @@ mod tests {
                 .expect("stale pre-prune row is skipped");
 
             let row = db_conn
-                .query_one(sea_orm::Statement::from_string(
+                .query_one_raw(sea_orm::Statement::from_string(
                     db_conn.get_database_backend(),
                     "SELECT traces_commit, sync_revision FROM agent_checkpoint
                      WHERE checkpoint_id = 'ckpt-A'"
@@ -7756,7 +8225,7 @@ mod tests {
             // exercise the local-presence guard, not the D1 list call —
             // the helper bails before either ensure_*_table fires.
             db_conn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DROP TABLE agent_checkpoint",
                     [],
@@ -7794,7 +8263,7 @@ mod tests {
         use sea_orm::Statement;
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(backend, sql, []))
+            .query_one_raw(Statement::from_sql_and_values(backend, sql, []))
             .await?
             .ok_or(sea_orm::DbErr::Custom("count returned no rows".to_string()))?;
         row.try_get_by::<i64, _>("n")

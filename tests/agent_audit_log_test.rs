@@ -46,7 +46,7 @@ fn sample_record(id: &str) -> AuditRecord {
 
 async fn count_rows(conn: &DatabaseConnection) -> i64 {
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS c FROM agent_audit_log".to_string(),
         ))
@@ -73,7 +73,7 @@ async fn audit_log_rejects_update_and_delete_but_allows_insert_select() {
 
     // UPDATE must be rejected by the trigger.
     let update = conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "UPDATE agent_audit_log SET justification = 'tampered' WHERE audit_id = 'a1'"
                 .to_string(),
@@ -90,7 +90,7 @@ async fn audit_log_rejects_update_and_delete_but_allows_insert_select() {
 
     // DELETE must be rejected by the trigger.
     let delete = conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "DELETE FROM agent_audit_log WHERE audit_id = 'a1'".to_string(),
         ))
@@ -109,7 +109,7 @@ async fn audit_log_rejects_update_and_delete_but_allows_insert_select() {
 
     // SELECT still works and returns the untampered value.
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT justification FROM agent_audit_log WHERE audit_id = 'a1'".to_string(),
         ))
@@ -135,7 +135,7 @@ async fn denied_access_is_recorded() {
         .await
         .expect("record denial");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT granted FROM agent_audit_log WHERE audit_id = 'd1'".to_string(),
         ))

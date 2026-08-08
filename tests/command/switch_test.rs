@@ -494,6 +494,7 @@ async fn test_switch_function() {
             detach: false,
             track: false,
             force: false,
+            ignore_other_worktrees: false,
             guess: false,
             no_guess: false,
         };
@@ -551,6 +552,7 @@ async fn test_switch_function() {
             detach: true,
             track: false,
             force: false,
+            ignore_other_worktrees: false,
             guess: false,
             no_guess: false,
         };
@@ -579,6 +581,7 @@ async fn test_switch_function() {
             detach: false,
             track: false,
             force: false,
+            ignore_other_worktrees: false,
             guess: false,
             no_guess: false,
         };
@@ -709,6 +712,7 @@ async fn test_switch_track_sets_upstream() {
         detach: false,
         track: true,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     };
@@ -1000,6 +1004,7 @@ async fn switch_to_detach(branch_test: String) -> String {
         detach: true,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     };
@@ -1023,6 +1028,7 @@ async fn switch_to_branch(branch_test: String) {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     };

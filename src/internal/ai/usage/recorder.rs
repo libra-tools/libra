@@ -131,7 +131,7 @@ impl UsageRecorder {
         let backend = self.conn.get_database_backend();
         let result = self
             .conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM agent_usage_stats \
                  WHERE COALESCE(started_at, created_at) < ?",
@@ -159,7 +159,7 @@ impl UsageRecorder {
         });
         let backend = self.conn.get_database_backend();
         self.conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_usage_stats \
                  (id, session_id, thread_id, agent_run_id, run_id, provider, model, agent_name, request_kind, intent, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, tool_call_count, wall_clock_ms, provider_latency_ms, cost_estimate_micro_dollars, cost_usd, usage_estimated, started_at, finished_at, success, error_kind, schema_version, created_at) \

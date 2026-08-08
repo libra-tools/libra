@@ -6,6 +6,12 @@
 //! them.
 
 const AGENT_DOC: &str = include_str!("../../docs/development/tracing/agent.md");
+/// The USER-facing pages. The tracing doc is not the only place the
+/// tombstone story is told, and a guard that reads one file cannot stop the
+/// other two from contradicting it — which is exactly how they came to say
+/// `restore` still resurrects erased sessions after it no longer did.
+const AGENT_CMD_DOC_EN: &str = include_str!("../../docs/commands/agent.md");
+const AGENT_CMD_DOC_ZH: &str = include_str!("../../docs/commands/zh-CN/agent.md");
 const CODE_COMMAND: &str = include_str!("../../src/command/code.rs");
 
 #[test]
@@ -73,33 +79,80 @@ fn agent_doc_tracks_schema_versioning_and_retention_policy() {
 
 #[test]
 fn agent_doc_declares_cloud_tombstone_deferred() {
-    // A0-10 doc-guard. Ground truth (verified against src/command/cloud.rs):
-    // the D1/R2 agent-capture MIRROR is live — `libra cloud sync` upserts
-    // agent_session/agent_checkpoint to D1 on every sync and `libra cloud
-    // restore` reads them back. Ordinary checkpoint retention now propagates
-    // a D1 prune fence and removes capture-catalog rows. What remains DEFERRED
-    // under the compatibility term "delete/tombstone propagation" is session
-    // erasure plus R2 physical deletion: a local `erase_session_local` does
-    // not delete the remote session, so restore can REVIVE it. The doc must
-    // preserve that distinction.
+    // A0-10 doc-guard, FLIPPED with plan-20260714 PD-03: session-erasure
+    // tombstones now PROPAGATE — `libra cloud sync` publishes
+    // `agent_import_tombstone` to D1 under the generation fence and
+    // cascade-deletes the erased session's mirror rows; `libra cloud
+    // restore` is tombstone-first (an erased session never restores) and
+    // persists the fences locally. The only remaining deferral is R2
+    // physical payload deletion. The doc must state the new facts and
+    // may no longer claim restore revives erased sessions.
     for required in [
         "cloud mirror tombstone propagation for agent capture data",
-        "delete/tombstone propagation",
-        "普通 checkpoint retention",
-        "复活已本地擦除的 session",
+        "session erasure tombstone 传播已随 plan-20260714 PD-03 落地",
+        "sync_agent_import_tombstones_batch",
+        "persist_local_import_tombstones",
+        "tombstone 优先",
+        "R2 物理删除",
         // Positive truth: the mirror IS live via cloud sync/restore.
         "libra cloud sync",
         "libra cloud restore",
     ] {
         assert!(
             AGENT_DOC.contains(required),
-            "agent.md must keep declaring the mirror live + delete/tombstone propagation deferred: {required}",
+            "agent.md must declare session-tombstone propagation live and R2 deletion deferred: {required}",
         );
     }
 
+    // Every page that describes erasure must agree, and must agree on the
+    // ONE remaining deferral.
+    for (label, doc) in [
+        ("docs/commands/agent.md", AGENT_CMD_DOC_EN),
+        ("docs/commands/zh-CN/agent.md", AGENT_CMD_DOC_ZH),
+    ] {
+        assert!(
+            doc.contains("R2"),
+            "{label} must still name R2 physical deletion as the remaining deferral",
+        );
+        // Scoped to the claim that actually went stale: RESTORE (or a
+        // cross-machine re-sync) bringing an erased session back. Matching
+        // "resurrect" alone catches unrelated prose — the `--restore-erased`
+        // flag description, a note about queue updates reviving a row — so
+        // a line only counts when it ties the two ideas together. The old
+        // guard pinned the exact string `复活已本地擦除` while the doc said
+        // `复活已擦除`, which is how the contradiction survived.
+        for line in doc.lines() {
+            let claims_revival = ["复活", "resurrect", "revive"]
+                .iter()
+                .any(|claim| line.contains(claim));
+            let about_restore = ["restore", "re-sync", "resync", "重新同步", "跨机"]
+                .iter()
+                .any(|word| line.contains(word));
+            if !(claims_revival && about_restore) {
+                continue;
+            }
+            let negated = [
+                "不",
+                "does not",
+                "not bring",
+                "no longer",
+                // Naming the MECHANISM that prevents revival is the opposite
+                // of claiming revival happens.
+                "anti-resurrection",
+                "防复活",
+                "反复活",
+            ]
+            .iter()
+            .any(|word| line.contains(word));
+            assert!(
+                negated,
+                "{label} says restore can bring erased capture back, which PD-03 fixed: {line}",
+            );
+        }
+    }
+
     for forbidden in [
-        // The old, factually wrong claims that the mirror does not exist /
-        // is not enabled / only lands after some future "introduction".
+        // The old, factually wrong claims that the mirror does not exist.
         "当前未启用 D1/R2 agent capture mirror",
         "未启用 D1/R2 mirror",
         "未启用 cloud mirror",
@@ -108,16 +161,24 @@ fn agent_doc_declares_cloud_tombstone_deferred() {
         "cloud mirror 启用后",
         "尚无 D1 mirror",
         "没有 D1 mirror",
-        // Overclaiming that the deferred propagation is done.
-        "delete/tombstone propagation 已实现",
+        // Post-PD-03: restore can no longer revive an erased session, so
+        // the old warning wording must not survive anywhere.
+        "复活已本地擦除",
+        "会复活已擦除",
+        // The phrasing the old list missed. `restore` is tombstone-first on
+        // both sides now, so no page may say otherwise in ANY spelling.
+        "复活已擦除",
+        "仍可复活",
+        "会复活 session",
+        "不传播 tombstone",
+        "tombstone 也不上传",
     ] {
         assert!(
             !AGENT_DOC.contains(forbidden),
-            "agent.md must not regress to a false/overclaimed cloud-mirror statement: {forbidden}",
+            "agent.md still carries a stale pre-PD-03 tombstone claim: {forbidden}",
         );
     }
 }
-
 #[test]
 fn agent_doc_tracks_code_agent_runtime_source_of_truth() {
     assert!(

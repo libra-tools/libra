@@ -268,7 +268,7 @@ async fn live_m4_historical_import_three_provider_acceptance() {
     for (sid, path) in &claude_candidates {
         let explicitly_gate_owned = gate_owned_claude.as_deref() == Some(sid.as_str());
         let existing = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 db.get_database_backend(),
                 "SELECT 1 AS one FROM agent_session \
                  WHERE agent_kind = 'claude_code' AND provider_session_id = ?",
@@ -294,7 +294,7 @@ async fn live_m4_historical_import_three_provider_acceptance() {
 
     if gate_owned_claude.is_some() {
         let tombstone_exists = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 db.get_database_backend(),
                 "SELECT 1 AS one FROM agent_import_tombstone \
                  WHERE agent_kind = 'claude_code' AND provider_session_id = ?",
@@ -546,7 +546,7 @@ async fn live_m5_subagent_boundary_content_attribution() {
     .expect("open M5 live capture database");
     let parent_session_id = format!("claude__{claude_sid}");
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             "SELECT c.current_revision, c.source_key, cp.parent_checkpoint_id,
                     l.link_state, l.boundary_checkpoint_id
@@ -601,7 +601,7 @@ async fn live_m5_subagent_boundary_content_attribution() {
     );
 
     let codex_boundaries = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT COUNT(*) AS n
              FROM agent_checkpoint cp
@@ -650,7 +650,7 @@ async fn live_m6_agent_graph_real_capture_is_private_and_readonly() {
     .await
     .expect("open M6 live capture database");
     let session_id = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT s.session_id
              FROM agent_session s
@@ -721,7 +721,7 @@ async fn live_m6_agent_graph_real_capture_is_private_and_readonly() {
     assert!(String::from_utf8_lossy(&non_tty.stderr).contains("LBR-CLI-002"));
 
     let erased_session_id = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT erased_session_id
              FROM agent_import_tombstone
@@ -777,7 +777,7 @@ async fn live_capture_snapshot(
     let mut snapshot = BTreeMap::new();
     for table in tables {
         let columns = connection
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 connection.get_database_backend(),
                 format!("PRAGMA table_info({table})"),
             ))
@@ -792,7 +792,7 @@ async fn live_capture_snapshot(
             .collect::<Vec<_>>()
             .join(" || char(31) || ");
         let row = connection
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 connection.get_database_backend(),
                 format!(
                     "SELECT COALESCE(group_concat(row_signature, char(30)), '') AS snapshot
@@ -813,7 +813,7 @@ async fn live_capture_snapshot(
 async fn subagent_revision_count(conn: &sea_orm::DatabaseConnection, session_id: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
 
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT COUNT(*) AS n FROM agent_subagent_content_revision
          WHERE parent_session_id = ?",

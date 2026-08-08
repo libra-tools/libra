@@ -1114,6 +1114,7 @@ async fn test_rename_current_branch() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1506,6 +1507,7 @@ async fn test_branch_delete_safe() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1537,6 +1539,7 @@ async fn test_branch_delete_safe() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1591,6 +1594,7 @@ async fn test_branch_delete_safe() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1605,6 +1609,7 @@ async fn test_branch_delete_safe() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1759,6 +1764,7 @@ async fn test_branch_contains_commit_filter() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1780,6 +1786,7 @@ async fn test_branch_contains_commit_filter() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })

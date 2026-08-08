@@ -115,7 +115,7 @@ impl AgentSpecRegistry for StaticRegistry {
 async fn count_rows(conn: &sea_orm::DatabaseConnection, table: &str) -> i64 {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             format!("SELECT COUNT(*) AS n FROM {table}"),
         ))

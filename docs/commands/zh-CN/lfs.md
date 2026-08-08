@@ -17,7 +17,7 @@ libra lfs ls-files [--long] [--size] [--name-only]
 
 `libra lfs` 提供内置 Large File Storage，用于管理二进制文件、媒体资产和其他不适合 diff 或 merge 的大型对象。LFS 不在仓库中存储完整文件内容，而是用轻量指针文件替换大文件，并将实际内容存储在专用 LFS 服务器上。
 
-`add` 和 `lfs ls-files` 判断路径是否带有 `filter=lfs` 时，会读取 Git/Libra attributes 来源（`core.attributesFile`、逐目录 `.gitattributes`、`.libra_attributes` 和 `.git/info/attributes`）。`track` 和 `untrack` 子命令仍管理根 `.libra_attributes` 文件，作为 Libra 的可写便捷层。文件锁定可防止无法合并的二进制文件被并发编辑，并通过 LFS lock API 在服务端强制执行。
+`add` 和 `lfs ls-files` 判断路径是否带有 `filter=lfs` 时，会读取 Git/Libra attributes 来源（`core.attributesFile`、逐目录 `.gitattributes`、`.libra_attributes`，以及 worktree 本地 `info/attributes`——`.libra/info/attributes`，Git 或双布局树还包括 `.git/info/attributes`）。`track` 和 `untrack` 子命令仍管理根 `.libra_attributes` 文件，作为 Libra 的可写便捷层。文件锁定可防止无法合并的二进制文件被并发编辑，并通过 LFS lock API 在服务端强制执行。
 
 与需要单独安装 `git-lfs` 扩展作为 smudge/clean 过滤器的 Git 不同，Libra 原生集成 LFS。LFS 客户端、指针文件解析和 attributes 管理都内置于 `libra` 二进制文件中。不需要额外安装或过滤器配置。
 

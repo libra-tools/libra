@@ -2627,6 +2627,7 @@ fn runtime_context_for_task(
         network_access,
         exclude_tmpdir_env_var: false,
         exclude_slash_tmp: false,
+        allow_metadata_writes: false,
     };
     ToolRuntimeContext {
         sandbox: Some(ToolSandboxContext {
@@ -2655,6 +2656,7 @@ fn runtime_context_for_gate_task(
                 )),
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
+                allow_metadata_writes: false,
             },
             permissions: SandboxPermissions::UseDefault,
         }),

@@ -459,3 +459,181 @@ fn ignore_if_in_upstream_suppresses_patch_equivalent_commits() {
         "equivalent patch was not suppressed"
     );
 }
+
+/// PD-09 ① gate: real `git format-patch --stdout` mbox piped into
+/// `libra am -`. Skips (never fails) when git is not installed.
+#[test]
+fn git_format_patch_stdout_mbox_applies_with_libra_am_stdin() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| !out.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped (install git to run the format-patch mbox round-trip gate)");
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.init_git("git-mbox-source");
+    fixture.git_commit(&source, "base\n", "base");
+    fixture.git_commit(&source, "base\none\n", "mbox change one");
+    fixture.git_commit(&source, "base\none\ntwo\n", "mbox change two");
+    let mbox = fixture.git_success(&source, &["format-patch", "--stdout", "HEAD~2..HEAD"]);
+
+    let target = fixture.init_libra("libra-mbox-target");
+    fixture.libra_commit(&target, "base\n", "base");
+
+    use std::{io::Write, process::Stdio};
+    let mut command = Command::new(env!("CARGO_BIN_EXE_libra"));
+    command
+        .args(["am", "-"])
+        .current_dir(&target)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &fixture.home)
+        .env("USERPROFILE", &fixture.home)
+        .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+        .env(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            fixture.home.join(".libra").join("config.db"),
+        )
+        .env("LIBRA_TEST", "1")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn libra am -");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(&mbox.stdout)
+        .expect("write mbox to stdin");
+    let out = child.wait_with_output().expect("wait for libra am");
+    assert_success("libra", &["am", "-"], &out);
+
+    assert_eq!(
+        fs::read_to_string(target.join("file.txt")).expect("read result"),
+        "base\none\ntwo\n"
+    );
+    let log = String::from_utf8_lossy(&fixture.libra_success(&target, &["log", "-2"]).stdout)
+        .into_owned();
+    assert!(log.contains("mbox change one"), "{log}");
+    assert!(log.contains("mbox change two"), "{log}");
+}
+
+/// PD-09 ② gate: real `git format-patch --binary` output — binary add,
+/// rename, and a mode flip — applies with `libra am`. Skips when git is
+/// not installed.
+#[test]
+fn git_binary_rename_mode_patches_apply_with_libra_am() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| !out.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped (install git to run the extended-patch round-trip gate)");
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.init_git("git-ext-source");
+    fixture.git_commit(&source, "base\n", "base");
+
+    // Commit 1: add a binary blob (NUL bytes force binary detection).
+    let payload: Vec<u8> = (0u8..=255).cycle().take(600).collect();
+    fs::write(source.join("blob.bin"), &payload).expect("write binary blob");
+    fixture.git_success(&source, &["add", "blob.bin"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "add binary"]);
+    // Commit 2: rename the text file.
+    fixture.git_success(&source, &["mv", "file.txt", "renamed.txt"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "rename text"]);
+    // Commit 3: chmod-only.
+    let sh = source.join("run.sh");
+    fs::write(&sh, "#!/bin/sh\n").expect("write script");
+    fixture.git_success(&source, &["add", "run.sh"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "add script"]);
+    fixture.git_success(&source, &["update-index", "--chmod=+x", "run.sh"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "make script executable"]);
+
+    let out_dir = fixture.root.join("ext-patches");
+    fixture.git_success(
+        &source,
+        &[
+            "format-patch",
+            "--binary",
+            "-o",
+            out_dir.to_str().expect("utf8 out dir"),
+            "HEAD~4..HEAD",
+        ],
+    );
+    let patches = sorted_files(&out_dir);
+    assert_eq!(patches.len(), 4, "four exported mails");
+
+    let target = fixture.init_libra("libra-ext-target");
+    fixture.libra_commit(&target, "base\n", "base");
+    let mut args: Vec<&str> = vec!["am"];
+    let paths: Vec<String> = patches
+        .iter()
+        .map(|path| path.to_str().expect("utf8 patch").to_string())
+        .collect();
+    args.extend(paths.iter().map(String::as_str));
+    fixture.libra_success(&target, &args);
+
+    assert_eq!(
+        fs::read(target.join("blob.bin")).expect("binary applied"),
+        payload
+    );
+    assert!(!target.join("file.txt").exists(), "rename removed source");
+    assert_eq!(
+        fs::read_to_string(target.join("renamed.txt")).expect("rename dest"),
+        "base\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(target.join("run.sh"))
+            .expect("script stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "mode-only patch applied: {mode:o}");
+    }
+}
+
+/// PD-09 ④ gate: real `git format-patch --attach` multipart output
+/// applies with `libra am`. Skips when git is not installed.
+#[test]
+fn git_format_patch_attach_applies_with_libra_am() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| !out.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped (install git to run the --attach round-trip gate)");
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.init_git("git-attach-source");
+    fixture.git_commit(&source, "base\n", "base");
+    fixture.git_commit(&source, "base\nattached from git\n", "git attach change");
+    let patch = fixture.git_success(&source, &["format-patch", "-1", "--attach", "--stdout"]);
+    let patch_path = fixture.root.join("git-attach.patch");
+    fs::write(&patch_path, &patch.stdout).expect("write git attach mail");
+
+    let target = fixture.init_libra("libra-attach-target");
+    fixture.libra_commit(&target, "base\n", "base");
+    fixture.libra_success(
+        &target,
+        &["am", patch_path.to_str().expect("utf8 mail path")],
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("file.txt")).expect("result"),
+        "base\nattached from git\n"
+    );
+    assert!(
+        String::from_utf8_lossy(&fixture.libra_success(&target, &["log", "-1"]).stdout)
+            .contains("git attach change")
+    );
+}

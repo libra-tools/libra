@@ -39,8 +39,14 @@ reviewer CLI（`claude-code`、`codex`、`opencode`），在隔离 workspace 中
   `clean [--run <id>|--all]`。全局 `--json` 输出结构化 envelope。
 - `target_scope` 推导（纯函数，单测钉死）：默认 `HEAD~1..HEAD`；
   `--since <rev>` → `<rev>..HEAD`；`--checkpoint <id>` → `checkpoint:<id>`
-  （checkpoint 物化未实现前 fail-closed 拒绝执行，避免在 checkpoint 标签下
-  静默 review 当前工作区——codex A7 R4 裁定）。
+  （PD-02 已落地：命令层先经 `checkpoint.rs::resolve_checkpoint_input_spec`
+  解析并验证 checkpoint——不存在/树非法/blob 不在本地对象库时在创建任何 run
+  之前 fail-closed；随后 runner 把 checkpoint 的整个 inner tree 以只读文件
+  物化到 `<run_dir>/checkpoint-input/`（`internal::ai::checkpoint_input`，
+  单文件 64 MiB / 总量 256 MiB 上限，路径组件消毒防逃逸），并把该目录作为
+  reviewer 的**全部** workspace——完全不物化 worktree 快照，scoped prompt
+  明确声明这是捕获的 transcript 而非仓库快照，transcript 内容按不可信数据
+  对待。物化产物在 run 目录内，与 run 共享 retention/orphan-release 面）。
   scope 只是记录在 state/manifest 中的人类可读标签；prompt 用 spotlighting
   定界把它作为数据（非指令）注入固定指令文本。
 - 输出与错误契约：全部经 `OutputConfig` / `emit_json_data` / `CliError`；
@@ -62,8 +68,12 @@ reviewer CLI（`claude-code`、`codex`、`opencode`），在隔离 workspace 中
   reviewers/<slug>.stderr.redacted.log
 ```
 
-`manual_attach` 是 E8 占位字段（恒为空）：AG-22 不提供 attach 命令面；要实现
-attach 入口必须先补 `agent.md` §5 规格。
+`manual_attach` 由 `libra review attach <run_id> <file>`（A0-06）填充：外部文件
+字节先经 `redact_untrusted` 脱敏，再内容寻址对象化（object_index `o_type =
+agent_findings`），manifest 追加 `{oid,name,provenance:"manual",size,attached_at}`
+条目（只存 basename，防路径泄露）。`findings_oid` 在 finalize 时由 findings.md
+内容寻址写入；`libra agent doctor` 覆盖 `missing_findings_object` /
+`missing_findings_object_index` 两类扫描与修复。
 
 ### Terminal states 与 cancel
 
@@ -142,7 +152,4 @@ stdout 为禁止字段。
 ## 还未实现的功能
 
 - `--fix`（内部 AgentRuntime fix bridge；Code 阶段 C7 源码锚点 + approval/
-  sandbox/tool gate 测试为前置）。
-- manual attach 命令面（E8 占位字段之外的入口需先补 `agent.md` §5 规格）。
-- findings 对象化（`findings_oid` 恒为 null；对象写入与 GC 由后续任务卡
-  承接）。
+  sandbox/tool gate 测试为前置；现由 plan-20260714 Part D PD-01 跟踪）。

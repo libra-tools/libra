@@ -238,17 +238,26 @@ fn core_ignorecase_value_sync(dir: &Path) -> Result<Option<String>> {
         .map_err(|error| anyhow!("failed to read core.ignorecase: {error}"))
 }
 
-/// Runtime probe (cached per process): does the working directory's
-/// filesystem resolve a case-swapped `.libra` spelling to the same entry?
+/// Runtime probe (UNCACHED, W0 §C.4.1.1 process-cache rules): does this
+/// invocation's worktree filesystem resolve a case-swapped `.libra` spelling
+/// to the same entry?
+///
+/// This used to latch a single process-global `OnceLock<bool>` — in a
+/// multi-worktree host process (service, code runtime) that handed worktree
+/// A's filesystem verdict to worktree B on a different mount. The probe is
+/// two `lstat` calls plus an identity check, far below any caller's own
+/// cost, so the sanctioned fix is no cache at all. The workdir comes from
+/// the request pin when one is installed (§C.4.2), falling back to the
+/// ambient cwd walk.
 pub fn probe_workdir_ignore_case() -> bool {
-    use std::sync::OnceLock;
-    static PROBE: OnceLock<bool> = OnceLock::new();
-    *PROBE.get_or_init(|| {
-        let Ok(workdir) = crate::utils::util::try_working_dir() else {
-            return false;
-        };
-        probe_dir_ignore_case(&workdir)
-    })
+    let workdir = match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.worktree_root.clone(),
+        None => match crate::utils::util::try_working_dir() {
+            Ok(dir) => dir,
+            Err(_) => return false,
+        },
+    };
+    probe_dir_ignore_case(&workdir)
 }
 
 /// Uncached probe for a specific directory (init-time use): stat the
@@ -383,6 +392,52 @@ mod tests {
                 "a genuine .LIBRA sibling is not case-insensitivity"
             );
         }
+    }
+
+    /// W0 §C.4.1.1: the workdir probe answers for THIS invocation's worktree,
+    /// not for whichever directory the process touched first. Two request
+    /// pins with different probe answers must both get their own — under the
+    /// retired `OnceLock<bool>` the second pin received the first pin's
+    /// latched verdict.
+    #[test]
+    #[serial_test::serial]
+    fn workdir_probe_is_not_latched_across_worktrees() {
+        use crate::internal::worktree_scope::WorktreeScope;
+
+        // A repo-shaped dir (probes true on a case-insensitive FS)...
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".libra")).unwrap();
+        std::fs::write(repo.path().join(".libra/libra.db"), b"").unwrap();
+        // ...and a bare dir with no `.libra` (always probes false).
+        let bare = tempfile::tempdir().unwrap();
+
+        let repo_expected = probe_dir_ignore_case(repo.path());
+        if !repo_expected {
+            eprintln!(
+                "skipped (case-sensitive filesystem: both probes answer false, \
+                 the latch would be indistinguishable)"
+            );
+            return;
+        }
+
+        // FIRST probe from a non-repo cwd: answers false (and would LATCH
+        // false under the retired OnceLock).
+        {
+            let _cd = crate::utils::test::ChangeDirGuard::new(bare.path());
+            assert!(
+                !probe_workdir_ignore_case(),
+                "no repository around the cwd probes false"
+            );
+        }
+        // SECOND probe, pinned to the repo worktree: must answer the repo's
+        // own filesystem (true here), not the first invocation's latched
+        // false — the exact staleness the OnceLock produced.
+        let _pin = WorktreeScope::pin_request_scope(repo.path().to_path_buf());
+        assert!(
+            probe_workdir_ignore_case(),
+            "a later invocation re-probes its OWN workdir instead of \
+             replaying the first invocation's cached verdict"
+        );
     }
 
     #[test]

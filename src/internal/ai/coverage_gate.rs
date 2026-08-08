@@ -27,9 +27,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement, TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement};
 
 use crate::internal::ai::{
     history::{TracesCommitCtx, TracesTxnExtra},
@@ -100,7 +98,7 @@ async fn read_claim(
     logical_turn_key: &str,
 ) -> Result<Option<ExistingClaim>> {
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT coverage_digest, completeness, revision, state,
                     lease_expires_at, fence_token, checkpoint_id
@@ -156,7 +154,7 @@ async fn try_insert_fresh_claim(
     let lease_expires_at = lease_deadline(now_ms)?;
     let reservation_state = reservation_state(source_channel)?;
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_coverage_claim (
                 session_id, logical_turn_key, coverage_schema_version,
@@ -219,7 +217,7 @@ async fn try_reown_claim(
     let expected_fence_value: sea_orm::Value = expected_fence.into();
     let reservation_state = reservation_state(source_channel)?;
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "UPDATE agent_coverage_claim
              SET state = ?, owner = ?, lease_expires_at = ?,
@@ -283,7 +281,7 @@ async fn try_mark_conflicted(
     let incoming_redaction_report_json = serde_json::to_string(&redaction_report)
         .context("serialize coverage conflict redaction report")?;
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "UPDATE agent_coverage_claim
          SET state = 'conflicted', updated_at = ?
@@ -303,7 +301,7 @@ async fn try_mark_conflicted(
     if result.rows_affected() != 1 {
         return Ok(ConflictMarkOutcome::LostRace);
     }
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_coverage_conflict (
             session_id, logical_turn_key, coverage_schema_version,
@@ -401,7 +399,7 @@ pub async fn abandon_reserved_turn_claims(
     now_ms: i64,
 ) -> Result<()> {
     let state = reservation_state(source_channel)?;
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "UPDATE agent_coverage_claim
          SET state = 'abandoned', owner = NULL, lease_expires_at = NULL,
@@ -473,12 +471,13 @@ async fn reserve_turn_claims_for_channel_inner(
     // ADR-DR-19: reserve the complete snapshot under one SQLite writer
     // transaction and establish the tombstone barrier before any claim
     // mutation. This closes both fresh-INSERT and re-own races with erasure.
-    let txn = conn
-        .begin()
+    // Reads the tombstone barrier before it writes the claim, so the write
+    // lock is taken up front (`db::begin_write_transaction`).
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin coverage reservation transaction")?;
     let writable = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 AS writable
              FROM agent_session s
@@ -773,7 +772,7 @@ pub(crate) async fn merge_import_session_lifecycle(
     session: &ImportSessionCommit,
 ) -> Result<()> {
     let updated = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_session
              SET working_dir = ?,
@@ -836,7 +835,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
         // the SAME transaction as the ref CAS; an erase that wins first makes
         // this transaction fail before the ref/catalog can advance.
         let writable = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT 1 AS writable
                  FROM agent_session s
@@ -888,7 +887,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
                 .into()
             };
             let advanced = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     txn.get_database_backend(),
                     "UPDATE agent_import_identity
                      SET state = ?, observed_digest = ?,
@@ -924,7 +923,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
         // Catalog row first (claim advance references checkpoint_id). The
         // `ON CONFLICT DO NOTHING` backstop keeps a crash-retry idempotent —
         // but within one transaction the row is always fresh.
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -946,7 +945,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
 
         for claim in &self.claims {
             // Append-only revision history (ADR-DR-16).
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "INSERT INTO agent_coverage_revision (
                     session_id, logical_turn_key, coverage_schema_version,
@@ -972,7 +971,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
             // means our reservation was fenced out; the WHOLE transaction
             // (ref update included) must roll back (ADR-DR-10).
             let advanced = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     txn.get_database_backend(),
                     "UPDATE agent_coverage_claim
                      SET state = 'catalog_committed', revision = ?,
@@ -1049,7 +1048,7 @@ mod tests {
         // The migration set assumes the bootstrap schema (ai_thread etc.)
         // exists; this unit fixture only needs the capture/coverage tables,
         // so relax FK enforcement instead of replaying the full bootstrap.
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "PRAGMA foreign_keys = OFF".to_string(),
         ))
@@ -1057,7 +1056,7 @@ mod tests {
         .expect("pragma");
         run_builtin_migrations(&conn).await.expect("migrations");
         // FK target for claims.
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1086,7 +1085,7 @@ mod tests {
 
     async fn claim_row(conn: &DatabaseConnection, key: &str) -> (String, i64, Option<i64>) {
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 "SELECT state, revision, fence_token FROM agent_coverage_claim \
                  WHERE logical_turn_key = ?",
@@ -1186,7 +1185,7 @@ mod tests {
             reserve_live_turn_claims(&conn, session, std::slice::from_ref(&t), "stale", 0)
                 .await
                 .expect("initial reservation");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO agent_import_tombstone (
                 tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
@@ -1205,7 +1204,7 @@ mod tests {
             .expect_err("new reservation must observe tombstone");
         assert!(error.to_string().contains("erased"));
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE checkpoint_id = 'cp-erased'"
                     .to_string(),
@@ -1264,7 +1263,7 @@ mod tests {
             let conn = conn.clone();
             async move {
                 let row = conn
-                    .query_one(Statement::from_string(
+                    .query_one_raw(Statement::from_string(
                         conn.get_database_backend(),
                         sql.to_string(),
                     ))
@@ -1353,7 +1352,7 @@ mod tests {
         assert_eq!(state, "conflicted");
         assert_eq!(revision, 1, "committed revision is preserved for doctor");
         let conflict = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT incumbent_revision, incumbent_digest, incoming_digest,
                         incoming_source_channel, incoming_canonical_json,
@@ -1453,7 +1452,7 @@ mod tests {
         // Both checkpoints remain in the catalog — no checkpoint-level
         // supersede (ADR-DR-16).
         let rows = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT checkpoint_id FROM agent_checkpoint".to_string(),
             ))

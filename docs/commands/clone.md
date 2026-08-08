@@ -202,8 +202,9 @@ Create a shallow clone with history truncated to the specified number of commits
 Only Git remotes support shallow transfer. Cloudflare restore rejects `--depth`
 because it must download the complete published object set. A local Libra source
 also rejects `--depth` with `LBR-REPO-002`: that transport cannot advertise
-shallow boundaries yet, so accepting the option would leave a clone with missing
-parents.
+shallow boundaries, so accepting the option would leave a clone with missing
+parents. This fail-closed behavior is the accepted end state (decision D20 in
+the development compatibility register), not a pending gap.
 
 ```bash
 libra clone --depth 1 git@github.com:user/repo.git
@@ -483,7 +484,7 @@ unnecessary. Libra supports `--depth N` for Git remotes that negotiate shallow
 boundaries: the history is truncated to the specified number of commits. The
 depth value is validated at parse time (must be a positive integer) and
 propagated to the fetch protocol layer. Local Libra sources fail closed with
-`LBR-REPO-002` until they can produce shallow boundary metadata. Libra bounds
+`LBR-REPO-002` — the accepted end state (decision D20), since they cannot produce shallow boundary metadata. Libra bounds
 shallow history **only** by `--depth`: the date/ref-based `--shallow-since` and
 `--shallow-exclude` flags are accepted but ignored with a warning (see their Options entry
 above) rather than rejected, so scripts that pass them still clone successfully.

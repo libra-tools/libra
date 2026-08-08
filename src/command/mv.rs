@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::Parser;
-use git_internal::internal::index::{Index, IndexEntry};
+use git_internal::internal::index::Index;
 use serde::Serialize;
 
 use crate::{
@@ -675,6 +675,9 @@ fn perform_moves(
         remove_index_entry_all_stages(index, &dst_rel);
 
         if index.remove(&src_rel, 0).is_some() {
+            // Stat BEFORE hashing the moved file — see verified_index_entry
+            // (2026-08-06 R0-8 review).
+            let pre_read = std::fs::symlink_metadata(dst).ok();
             let new_entry = calc_file_blob_hash(dst)
                 .map_err(|err| {
                     format!(
@@ -683,14 +686,18 @@ fn perform_moves(
                     )
                 })
                 .and_then(|hash| {
-                    IndexEntry::new_from_file(&dst_workdir, hash, &util::working_dir()).map_err(
-                        |err| {
-                            format!(
-                                "failed to build index entry for moved file, source={}, destination={}, error={}",
-                                src_rel, dst_rel, err
-                            )
-                        },
+                    crate::command::verified_index_entry(
+                        &dst_workdir,
+                        hash,
+                        &util::working_dir(),
+                        pre_read.as_ref(),
                     )
+                    .map_err(|err| {
+                        format!(
+                            "failed to build index entry for moved file, source={}, destination={}, error={}",
+                            src_rel, dst_rel, err
+                        )
+                    })
                 });
 
             match new_entry {

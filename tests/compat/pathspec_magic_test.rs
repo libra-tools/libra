@@ -553,3 +553,196 @@ fn checkout_path_mode_honors_shared_pathspec_magic() {
         "NEEDLE literal child\n"
     );
 }
+
+// ---- PD-07: `clean` joins the shared pathspec engine ---------------------
+
+/// Extract the workdir-relative paths from `clean -n` ("Would remove …") or
+/// `clean -f` ("Removing …") human output, order-insensitively.
+fn clean_reported_paths(stdout: &str) -> Vec<String> {
+    let mut paths: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("Would remove ")
+                .or_else(|| line.strip_prefix("Removing "))
+                .map(str::to_string)
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Extract the untracked (`?? `) paths from `status --porcelain` output.
+fn porcelain_untracked_paths(stdout: &str) -> Vec<String> {
+    let mut paths: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("?? ").map(str::to_string))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// PD-07: glob magic selects deletion candidates with the same matcher as
+/// ls-files/status, and the `-n` preview set is byte-identical to the `-f`
+/// deletion set. Tracked files never qualify.
+#[test]
+fn clean_honors_shared_pathspec_magic() {
+    let fixture = Fixture::new();
+    fixture.write("src/tmp.log", "untracked\n");
+    fixture.write("docs/tmp.log", "untracked\n");
+    fixture.write("src/scratch.txt", "untracked survivor\n");
+
+    // Cross-command parity: clean's candidate set for a spec is exactly the
+    // untracked set status reports for the same spec (same shared matcher).
+    let status = fixture.stdout(
+        &fixture.repo,
+        &["status", "--porcelain=v1", "--", ":(glob)**/*.log"],
+    );
+    let preview = fixture.stdout(&fixture.repo, &["clean", "-n", ":(glob)**/*.log"]);
+    let previewed = clean_reported_paths(&preview);
+    assert_eq!(
+        previewed,
+        porcelain_untracked_paths(&status),
+        "clean must select the same shared-engine set as status:\nstatus:\n{status}\nclean:\n{preview}"
+    );
+    assert_eq!(
+        previewed,
+        vec!["docs/tmp.log", "src/tmp.log"],
+        "glob magic must match the shared-engine set:\n{preview}"
+    );
+
+    let removal = fixture.stdout(&fixture.repo, &["clean", "-f", ":(glob)**/*.log"]);
+    assert_eq!(
+        clean_reported_paths(&removal),
+        previewed,
+        "-n preview set must equal the -f deletion set"
+    );
+    assert!(!fixture.repo.join("src/tmp.log").exists());
+    assert!(!fixture.repo.join("docs/tmp.log").exists());
+    assert!(fixture.repo.join("src/scratch.txt").exists());
+    // Tracked files are untouched even though the pattern shape could match.
+    assert_eq!(fixture.read("src/main.rs"), "NEEDLE main\n");
+}
+
+/// PD-07: `:(exclude)` magic can only NARROW the deletion set.
+#[test]
+fn clean_exclude_magic_narrows_only() {
+    let fixture = Fixture::new();
+    fixture.write("logs/a.log", "untracked\n");
+    fixture.write("logs/keep.log", "untracked keeper\n");
+
+    fixture.success(
+        &fixture.repo,
+        &["clean", "-f", "logs", ":(exclude)logs/keep.log"],
+    );
+    assert!(!fixture.repo.join("logs/a.log").exists());
+    assert!(
+        fixture.repo.join("logs/keep.log").exists(),
+        ":(exclude)-hit paths must never be deleted"
+    );
+}
+
+/// PD-07: pathspecs are subdirectory-relative like every other shared-engine
+/// consumer, and `:(top)` re-anchors at the repository root.
+#[test]
+fn clean_subdir_relative_and_top_magic() {
+    let fixture = Fixture::new();
+    fixture.write("root.log", "untracked\n");
+    fixture.write("src/sub.log", "untracked\n");
+    let subdir = fixture.repo.join("src");
+
+    let preview = fixture.stdout(&subdir, &["clean", "-n", "sub.log"]);
+    assert_eq!(
+        clean_reported_paths(&preview),
+        vec!["src/sub.log"],
+        "bare pathspec must resolve relative to the invocation subdirectory"
+    );
+
+    // Default (non-glob) fnmatch follows Git: `*` also crosses `/`, so a
+    // top-anchored `*.log` selects both files from anywhere in the tree.
+    let top = fixture.stdout(&subdir, &["clean", "-n", ":(top)*.log"]);
+    assert_eq!(
+        clean_reported_paths(&top),
+        vec!["root.log", "src/sub.log"],
+        ":(top) must re-anchor at the repository root with Git fnmatch semantics"
+    );
+}
+
+/// PD-07: `:(icase)` magic matches case-insensitively.
+#[test]
+fn clean_icase_magic() {
+    let fixture = Fixture::new();
+    fixture.write("src/UPPER.LOG", "untracked\n");
+
+    let preview = fixture.stdout(&fixture.repo, &["clean", "-n", ":(icase)src/upper.log"]);
+    assert_eq!(clean_reported_paths(&preview), vec!["src/UPPER.LOG"]);
+}
+
+/// PD-07: bracket filenames keep P1-01 write-command parity — a
+/// wildcard-looking `[abc].tmp` matches the character class AND retains the
+/// literal-path fallback (union), while `:(literal)` selects only the exact
+/// bracket file.
+#[test]
+fn clean_literal_bracket_fallback() {
+    let fixture = Fixture::new();
+    fixture.write("literal/[abc].tmp", "untracked bracket file\n");
+    fixture.write("literal/a.tmp", "untracked class member\n");
+    fixture.write("literal/z.tmp", "untracked non-member\n");
+
+    // Union semantics (shared-engine parity with add/rm): the class member
+    // and the literal bracket file both match; a non-member never does.
+    let preview = fixture.stdout(&fixture.repo, &["clean", "-n", "literal/[abc].tmp"]);
+    assert_eq!(
+        clean_reported_paths(&preview),
+        vec!["literal/[abc].tmp", "literal/a.tmp"],
+        "bracket pattern must keep the literal fallback alongside the class"
+    );
+
+    // The explicit :(literal) form protects class members: only the exact
+    // bracket file is deleted.
+    fixture.success(
+        &fixture.repo,
+        &["clean", "-f", ":(literal)literal/[abc].tmp"],
+    );
+    assert!(!fixture.repo.join("literal/[abc].tmp").exists());
+    assert!(
+        fixture.repo.join("literal/a.tmp").exists(),
+        ":(literal) must not expand the character class"
+    );
+    assert!(fixture.repo.join("literal/z.tmp").exists());
+}
+
+/// PD-07 mis-deletion guards: tracked and ignored paths stay protected even
+/// when a pathspec matches them, and the empty string stays rejected.
+#[test]
+fn clean_pathspec_protects_tracked_and_ignored() {
+    let fixture = Fixture::new();
+    fixture.write(".libraignore", "*.ign\n");
+    fixture.write("junk.ign", "ignored untracked\n");
+
+    // Ignored files are not candidates without -x.
+    fixture.success(&fixture.repo, &["clean", "-f", "junk.ign"]);
+    assert!(
+        fixture.repo.join("junk.ign").exists(),
+        "ignored files must survive clean without -x"
+    );
+
+    // Tracked files are never candidates.
+    fixture.success(&fixture.repo, &["clean", "-f", "README.md"]);
+    assert_eq!(fixture.read("README.md"), "root\n");
+
+    // The empty string must not silently widen the deletion set.
+    let empty = fixture.failure(&fixture.repo, &["clean", "-f", ""]);
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("empty string is not a valid pathspec"),
+        "empty pathspec must be rejected:\n{}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+
+    // Unsupported magic fails closed before any filesystem work.
+    let bogus = fixture.failure(&fixture.repo, &["clean", "-f", ":(bogus)x"]);
+    assert!(
+        String::from_utf8_lossy(&bogus.stderr).contains("pathspec magic"),
+        "unsupported magic must fail closed with the magic hint:\n{}",
+        String::from_utf8_lossy(&bogus.stderr)
+    );
+}

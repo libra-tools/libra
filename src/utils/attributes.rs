@@ -155,7 +155,7 @@ fn attribute_sources_for_path(workdir: &Path, absolute: &Path) -> Vec<AttributeS
         push_attribute_source(&mut sources, dir.join(GIT_ATTRIBUTES_FILE), dir.clone());
         push_attribute_source(&mut sources, dir.join(LIBRA_ATTRIBUTES_FILE), dir);
     }
-    if let Some(info_attributes) = util::git_info_file_path(workdir, "attributes") {
+    for info_attributes in util::worktree_info_file_paths(workdir, "attributes") {
         push_attribute_source(&mut sources, info_attributes, workdir.to_path_buf());
     }
     sources
@@ -214,6 +214,15 @@ fn cached_attribute_file(path: &Path, base: &Path) -> Arc<Vec<AttributeRule>> {
         },
     );
     rules
+}
+
+/// Does this attributes file contribute at least one rule the ENGINE would
+/// actually apply? Parser-backed on purpose (W0 §C.4.1.1 origin inventory):
+/// a hand-rolled "non-comment line" heuristic both over- and under-reports —
+/// `*.dat` with no assignment parses to nothing, while an indented `#…`
+/// line is a real pattern.
+pub fn file_defines_any_rule(path: &Path, base: &Path) -> bool {
+    !parse_attribute_file(path, base).is_empty()
 }
 
 fn parse_attribute_file(path: &Path, base: &Path) -> Vec<AttributeRule> {

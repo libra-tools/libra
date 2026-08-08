@@ -40,10 +40,11 @@ pub struct OrdinalMeta {
     pub built_at: String,
 }
 
-/// The replace-set signature from the SAME process-cached snapshot the
-/// chain walk resolves through (see `command::replace`) — deriving it from a
-/// fresh filesystem read could disagree with the cached map and stamp rows
-/// under a signature the walk never used.
+/// The replace-set signature of the AMBIENT snapshot (see
+/// `command::replace`). The builder paths below do NOT use this directly for
+/// stamping: they take ONE pinned snapshot and derive both the signature and
+/// the walk from it, so a concurrent replace mutation can never make the
+/// stamped signature describe a different map than the chain indexed.
 pub fn current_replace_signature() -> String {
     crate::command::replace::effective_replace_signature()
 }
@@ -99,7 +100,11 @@ impl RevisionOrdinalIndex {
         ref_name: &str,
         current_tip: &ObjectHash,
     ) -> Result<OrdinalMeta> {
-        let replace_sig = current_replace_signature();
+        // ONE pinned snapshot for the signature AND the walk (§C.4.1.1):
+        // with fresh per-call replace reads, a concurrent retarget between
+        // the two would stamp rows under a signature the walk never used.
+        let replace_snapshot = crate::command::replace::snapshot();
+        let replace_sig = crate::command::replace::signature_of(&replace_snapshot);
         let tip_text = current_tip.to_string();
         let existing = Self::meta_with_conn(db, ref_name).await?;
         if let Some(meta) = &existing
@@ -115,7 +120,10 @@ impl RevisionOrdinalIndex {
             && meta.replace_sig == replace_sig
         {
             let (suffix_tip_first, reached_old_tip) =
-                walk_first_parents(current_tip, Some(meta.tip_oid.as_str()))?;
+                crate::command::replace::with_pinned_snapshot_sync(
+                    replace_snapshot.clone(),
+                    || walk_first_parents(current_tip, Some(meta.tip_oid.as_str())),
+                )?;
             if reached_old_tip {
                 // Fast-forward: append suffix (root-most first).
                 let mut ordinal = meta.max_ordinal;
@@ -152,9 +160,15 @@ impl RevisionOrdinalIndex {
         ref_name: &str,
         current_tip: &ObjectHash,
     ) -> Result<OrdinalMeta> {
-        let replace_sig = current_replace_signature();
+        // Same pinning discipline as `ensure_fresh_with_conn`: signature and
+        // walk both come from ONE immutable snapshot.
+        let replace_snapshot = crate::command::replace::snapshot();
+        let replace_sig = crate::command::replace::signature_of(&replace_snapshot);
         let tip_text = current_tip.to_string();
-        let (chain_tip_first, _) = walk_first_parents(current_tip, None)?;
+        let (chain_tip_first, _) =
+            crate::command::replace::with_pinned_snapshot_sync(replace_snapshot, || {
+                walk_first_parents(current_tip, None)
+            })?;
         revision_ordinal::Entity::delete_many()
             .filter(revision_ordinal::Column::RefName.eq(ref_name))
             .exec(db)

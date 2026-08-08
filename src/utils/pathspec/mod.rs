@@ -97,6 +97,12 @@ impl PathspecSet {
         self.specs.is_empty()
     }
 
+    /// Whether the set contains at least one positive (non-exclude) spec.
+    /// An exclude-only set's positive half is equivalent to the whole tree.
+    pub fn has_positive(&self) -> bool {
+        self.has_positive
+    }
+
     /// Whether this set is exactly one positive repository-root prefix and
     /// therefore selects the whole tree, including a legitimately empty tree.
     pub fn is_full_tree_match(&self) -> bool {

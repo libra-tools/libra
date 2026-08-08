@@ -27,9 +27,10 @@ mode。普通文件、可执行文件和符号链接必须指向可加载的 blo
 | 选项 | 说明 | 示例 |
 |------|------|------|
 | `--index-file <path>` | 读取 scratch index 而不是 `.libra/index`；缺失的 scratch index 视为空。 | `libra write-tree --index-file scratch.idx` |
+| `--missing-ok` | 容忍 blob 对象缺失的 index 条目（对齐 Git）：tree 仍按记录的对象 id 写出。错类型对象、不可读对象与缺失的子树对象仍以 `LBR-REPO-002` fail-closed。 | `libra write-tree --missing-ok` |
 | `--json` / `--machine` | 结构化输出：`{ tree: "<id>" }`。 | `libra --json write-tree` |
 
-Git 的 `--prefix=<prefix>` 与 `--missing-ok` 未公开（延后）。
+Git 的 `--prefix=<prefix>` 未公开（延后）。`--missing-ok` 逃逸阀仅存在于本 plumbing 命令——`commit`、`merge`、`cherry-pick` 始终执行严格对象预检。
 
 ## 退出码
 

@@ -46,7 +46,7 @@ Pathspec 会相对于调用命令时的当前工作目录解析，而不是强�
 | `--others`、`-o` | 显示未跟踪的工作区文件。 |
 | `--cached`、`-c` | 显示索引中已暂存的文件。 |
 | `-i`、`--ignored` | 只显示被忽略的集合：`-i -o` 列出被忽略的未跟踪文件（`-o` 的反集），`-i -c` 列出匹配 exclude 模式的已跟踪文件。须配合 `-o`/`-c` 且需要 exclude 源——`--exclude-standard` 或显式 `-x`/`-X` pattern（否则退出码 128），与 git 一致。 |
-| `--exclude-standard` | 与 `--others` 一起使用时，遵循标准 Git/Libra ignore 来源（`.gitignore`、`.git/info/exclude`、`core.excludesFile` 和 `.libraignore`）。 |
+| `--exclude-standard` | 与 `--others` 一起使用时，遵循标准 Git/Libra ignore 来源（`.gitignore`、worktree 本地 `info/exclude`——`.libra/info/exclude`，Git 或双布局树还包括 `.git/info/exclude`——`core.excludesFile` 和 `.libraignore`）。 |
 | `-x`、`--exclude <pattern>` | 从 `--others` 列表中跳过匹配 `<pattern>`（gitignore 语法）的未跟踪文件。可重复；叠加 `--exclude-standard`。配合 `-i` 时该 pattern 改为定义 ignored 集。 |
 | `-X`、`--exclude-from <file>` | 从 `<file>` 读取额外 exclude 模式（每行一个；忽略 `#` 注释和空行）并按 `-x` 应用。可重复。 |
 | `--error-unmatch` | 只要任一显式 pathspec 在当前筛选结果中没有命中，就以退出码 1 和 `LBR-CLI-003` 退出。 |

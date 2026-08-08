@@ -222,7 +222,8 @@ fn walkdir_error(root: &Path, error: walkdir::Error) -> IgnoreFileError {
 /// `IncludeIgnored`, and get filtered when `OnlyIgnored` is requested.
 pub fn should_ignore(path: &Path, policy: IgnorePolicy, index: &Index) -> bool {
     let workdir = util::working_dir();
-    should_ignore_with_workdir(path, policy, index, &workdir)
+    let layers = crate::internal::layer::ExclusionSnapshot::for_request();
+    should_ignore_with_workdir(path, policy, index, &workdir, &layers)
 }
 
 /// Applies [`should_ignore`] over an iterator of workdir paths and returns the retained list.
@@ -231,9 +232,14 @@ where
     I: IntoIterator<Item = PathBuf>,
 {
     let workdir = util::working_dir();
+    // ONE snapshot for the whole walk (§C.4.1.1): captured here, immutable for
+    // the duration, so a concurrent task re-pinning the request scope cannot
+    // switch which worktree's exclusions this walk is applying halfway
+    // through — and the per-path consult below costs no lock and no allocation.
+    let layers = crate::internal::layer::ExclusionSnapshot::for_request();
     paths
         .into_iter()
-        .filter(|path| !should_ignore_with_workdir(path, policy, index, &workdir))
+        .filter(|path| !should_ignore_with_workdir(path, policy, index, &workdir, &layers))
         .collect()
 }
 
@@ -243,6 +249,7 @@ fn should_ignore_with_workdir(
     policy: IgnorePolicy,
     index: &Index,
     workdir: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
 ) -> bool {
     let is_tracked = path_is_tracked_or_unknown_encoding(path, index);
 
@@ -253,8 +260,9 @@ fn should_ignore_with_workdir(
     // `add` staging guard is the airtight backstop instead. Empty snapshot
     // (no layers) → no-op.
     if !matches!(policy, IgnorePolicy::IncludeIgnored)
+        && !layers.is_empty()
         && let Some(key) = crate::internal::layer::normalize_key(path)
-        && crate::internal::layer::is_layer_owned(&key)
+        && layers.is_owned(&key)
     {
         // Respect: the layer path is excluded from `status`/`add .` (un-negatable).
         // OnlyIgnored (the `clean -x` candidate scan): NOT a candidate — protect
@@ -268,14 +276,14 @@ fn should_ignore_with_workdir(
             if is_tracked {
                 return false;
             }
-            is_path_ignored(path, workdir)
+            is_path_ignored_with_layers(path, workdir, layers)
         }
         IgnorePolicy::IncludeIgnored => false,
         IgnorePolicy::OnlyIgnored => {
             if is_tracked {
                 return true;
             }
-            !is_path_ignored(path, workdir)
+            !is_path_ignored_with_layers(path, workdir, layers)
         }
     }
 }
@@ -298,12 +306,29 @@ pub fn path_matches_ignore_pattern(path: &Path, workdir: &Path) -> bool {
 }
 
 fn is_path_ignored(path: &Path, workdir: &Path) -> bool {
+    is_path_ignored_with_layers(
+        path,
+        workdir,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+    )
+}
+
+/// [`is_path_ignored`] against an ALREADY-CAPTURED layer snapshot.
+///
+/// The walk's snapshot has to reach the bottom of the call chain: recapturing
+/// here would re-read process-global state per path, which is exactly the
+/// re-pin hazard capturing once was meant to close.
+fn is_path_ignored_with_layers(
+    path: &Path,
+    workdir: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+) -> bool {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         workdir.join(path)
     };
-    util::check_gitignore(workdir, &absolute)
+    util::check_gitignore_with_layers(workdir, &absolute, layers)
 }
 
 #[cfg(test)]
@@ -413,11 +438,23 @@ mod tests {
         let index = Index::new();
 
         assert!(
-            !should_ignore_with_workdir(&non_utf8_path, IgnorePolicy::Respect, &index, &workdir),
+            !should_ignore_with_workdir(
+                &non_utf8_path,
+                IgnorePolicy::Respect,
+                &index,
+                &workdir,
+                &Default::default(),
+            ),
             "unknown-encoding paths should stay visible under Respect"
         );
         assert!(
-            should_ignore_with_workdir(&non_utf8_path, IgnorePolicy::OnlyIgnored, &index, &workdir),
+            should_ignore_with_workdir(
+                &non_utf8_path,
+                IgnorePolicy::OnlyIgnored,
+                &index,
+                &workdir,
+                &Default::default(),
+            ),
             "unknown-encoding paths should be excluded from OnlyIgnored like tracked entries"
         );
     }

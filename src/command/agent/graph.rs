@@ -260,7 +260,7 @@ async fn load_agent_graph_from_connection<C: ConnectionTrait>(
 
 async fn tombstone_exists<C: ConnectionTrait>(connection: &C, session_id: &str) -> CliResult<bool> {
     let row = connection
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "SELECT erased_session_id FROM agent_import_tombstone \
              WHERE erased_session_id = ? LIMIT 1",
@@ -276,7 +276,7 @@ async fn load_session<C: ConnectionTrait>(
     session_id: &str,
 ) -> CliResult<Option<SessionOutput>> {
     let row = connection
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "SELECT session_id, agent_kind, state, started_at AS created_at, \
                     last_event_at AS updated_at \
@@ -302,7 +302,7 @@ async fn load_checkpoints<C: ConnectionTrait>(
     session_id: &str,
 ) -> CliResult<BTreeMap<String, CheckpointStructure>> {
     let rows = connection
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "SELECT checkpoint_id, session_id, parent_checkpoint_id, scope, created_at \
              FROM agent_checkpoint WHERE session_id = ? \
@@ -329,7 +329,7 @@ async fn load_indexed_turns<C: ConnectionTrait>(
     session_id: &str,
 ) -> CliResult<Vec<TurnOutput>> {
     let claim_rows = connection
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "SELECT logical_turn_key, coverage_schema_version, state, completeness, revision, \
                     checkpoint_id, source_channel \
@@ -341,7 +341,7 @@ async fn load_indexed_turns<C: ConnectionTrait>(
         .await
         .map_err(|_| graph_store_error("read current turn coverage"))?;
     let revision_rows = connection
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "SELECT logical_turn_key, coverage_schema_version, revision, completeness, \
                     checkpoint_id, source_channel, created_at \
@@ -464,7 +464,7 @@ async fn load_subagents<C: ConnectionTrait>(
     checkpoints: &BTreeMap<String, CheckpointStructure>,
 ) -> CliResult<SubagentsOutput> {
     let rows = connection
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "SELECT l.content_checkpoint_id AS checkpoint_id, l.link_state, \
                     l.boundary_checkpoint_id, c.created_at \

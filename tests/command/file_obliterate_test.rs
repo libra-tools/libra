@@ -61,7 +61,7 @@ fn mark_obliteration_as_interrupted(repo: &Path) {
     runtime.block_on(async {
         let conn = connect_raw_repo_db(repo).await;
         let result = conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "UPDATE object_obliteration SET state='obliterating', payload_deleted_at=NULL",
             ))
@@ -206,4 +206,135 @@ fn obliterate_recover_finishes_interrupted() {
     let fsck = run_libra_command(&["fsck"], p);
     assert_eq!(fsck.status.code(), Some(0), "still exit 0 after recovery");
     assert!(String::from_utf8_lossy(&fsck.stdout).contains("intentionally absent"));
+}
+
+/// Kills and reaps the lock holder on drop, including on an assertion unwind.
+struct LockHolder(std::process::Child);
+
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Hold the repository maintenance lock EXCLUSIVELY from another process —
+/// what a `gc` deletion phase does.
+fn hold_exclusive_maintenance_lock(repo: &Path) -> LockHolder {
+    use std::io::{BufRead, BufReader};
+    let lock_path = repo.join(".libra").join("maintenance.lock");
+    let script = format!(
+        "import fcntl, sys, time\n\
+         f = open({path:?}, 'a+')\n\
+         fcntl.flock(f, fcntl.LOCK_EX)\n\
+         sys.stdout.write('locked\\n')\n\
+         sys.stdout.flush()\n\
+         time.sleep(600)\n",
+        path = lock_path.to_string_lossy().to_string()
+    );
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", &script])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the exclusive lock holder");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("holder ready");
+    assert_eq!(line.trim(), "locked");
+    LockHolder(child)
+}
+
+/// plan-20260714 §C.4.3: the maintenance lock is taken BEFORE anything else
+/// an obliteration does — before the borrower gate, before crash recovery,
+/// before the tombstone and the audit record.
+///
+/// The order is the whole safety property, and it is invisible to a test that
+/// only checks outcomes: with the gate first and the lock second, an
+/// interrupted obliteration is COMPLETED by the recovery pass — payload
+/// unlinked, `payload_deleted` audit line written — and only then does the
+/// command discover it cannot have the lock and refuse. The user is told the
+/// operation was refused about an object that is already gone.
+///
+/// So this drives the ordering directly: a real deletion phase holds the lock
+/// while an interrupted obliteration is pending, and the payload must still
+/// be there when the refusal comes back.
+#[test]
+fn obliterate_takes_the_maintenance_lock_before_recovering() {
+    let (repo, oid) = repo_with_secret();
+    let p = repo.path();
+
+    assert_cli_success(
+        &run_libra_command(&["file", "obliterate", &oid, "--yes"], p),
+        "obliterate",
+    );
+    fs::write(p.join("secret.txt"), "top secret payload\n").expect("rewrite");
+    assert_cli_success(
+        &run_libra_command(&["hash-object", "-w", "secret.txt"], p),
+        "re-hash payload",
+    );
+    assert!(
+        loose_path(p, &oid).exists(),
+        "payload restored for the test"
+    );
+    mark_obliteration_as_interrupted(p);
+
+    let audit = p.join(".libra").join("obliteration-audit.jsonl");
+    let audit_before = fs::read(&audit).unwrap_or_default();
+
+    // A deletion phase is running. Recovery must not proceed underneath it.
+    let holder = hold_exclusive_maintenance_lock(p);
+    let refused = run_libra_command(&["--json", "file", "obliterate", "--recover"], p);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !refused.status.success(),
+        "recovery must be refused while a deletion phase holds the lock: {combined}"
+    );
+    assert!(
+        combined.contains("LBR-CONFLICT-002"),
+        "and reported as a conflict: {combined}"
+    );
+    assert!(
+        loose_path(p, &oid).exists(),
+        "the payload must NOT have been deleted by a recovery that then refused"
+    );
+    assert_eq!(
+        fs::read(&audit).unwrap_or_default(),
+        audit_before,
+        "and no audit record may claim a deletion that did not happen"
+    );
+
+    // The same refusal, and the same non-effect, for a fresh obliteration —
+    // which also runs the recovery pass before doing its own work.
+    let refused = run_libra_command(&["--json", "file", "obliterate", &oid, "--yes"], p);
+    assert!(
+        !refused.status.success(),
+        "a fresh obliteration is refused too: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(loose_path(p, &oid).exists(), "payload still present");
+    // The SAME audit assertion as the recover branch, and it is not
+    // redundant: if only the outer lock moved below the recovery pass, the
+    // payload would still be there (the inner delete lock refuses) and the
+    // command would still fail — but `recover_incomplete` would already have
+    // appended a `payload_deleted` record for a deletion that never
+    // happened. The bytes are the only witness to that.
+    assert_eq!(
+        fs::read(&audit).unwrap_or_default(),
+        audit_before,
+        "a fresh obliteration must not let recovery write an audit record either"
+    );
+
+    // Once the deletion phase is gone, recovery completes normally.
+    drop(holder);
+    let recovered = run_libra_command(&["file", "obliterate", "--recover"], p);
+    assert_cli_success(&recovered, "recover after the lock is released");
+    assert!(
+        !loose_path(p, &oid).exists(),
+        "the interrupted obliteration finishes once nothing else is deleting"
+    );
 }

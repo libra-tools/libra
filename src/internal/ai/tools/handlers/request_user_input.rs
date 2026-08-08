@@ -1,5 +1,7 @@
 //! Handler for the `request_user_input` tool.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -60,6 +62,21 @@ impl ToolHandler for RequestUserInputHandler {
         if args.questions.is_empty() {
             return Err(ToolError::InvalidArguments(
                 "At least one question is required".into(),
+            ));
+        }
+        if args.questions.len() > 3 {
+            return Err(ToolError::InvalidArguments(
+                "At most three questions are allowed in one request".into(),
+            ));
+        }
+        let mut question_ids = HashSet::with_capacity(args.questions.len());
+        if args
+            .questions
+            .iter()
+            .any(|question| !question_ids.insert(question.id.as_str()))
+        {
+            return Err(ToolError::InvalidArguments(
+                "Question ids must be unique within one request".into(),
             ));
         }
 
@@ -173,6 +190,35 @@ mod tests {
         let text = output.as_text().unwrap();
         assert!(text.contains("JWT (Recommended)"));
         assert!(text.contains("user_note"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_question_ids_fail_before_the_interaction_is_queued() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<UserInputRequest>();
+        let handler = RequestUserInputHandler::new(tx);
+
+        let result = handler
+            .handle(make_invocation(
+                r#"{
+                    "questions": [
+                        {"id": "choice", "question": "First?"},
+                        {"id": "choice", "question": "Second?"}
+                    ]
+                }"#,
+            ))
+            .await
+            .expect_err("duplicate ids cannot be presented as a safe multi-question interaction");
+
+        assert!(
+            result
+                .to_string()
+                .contains("Question ids must be unique within one request"),
+            "error must tell the model how to correct the request, got {result}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an invalid request must not leave a pending UI interaction"
+        );
     }
 
     #[tokio::test]

@@ -9,20 +9,25 @@
 ```
 libra worktree add <path>
 libra worktree list
+libra worktree doctor
 libra worktree lock <path> [--reason <text>]
 libra worktree unlock <path>
 libra worktree move <src> <dest>
 libra worktree prune
 libra worktree remove <path>
 libra worktree umount <path> [--cleanup]
-libra worktree repair
+libra worktree repair --confirm [<path>]
+libra worktree repair --migrate-layout [--dry-run] [--confirm] [<path>]
+libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 ```
 
 ## 说明
 
 `libra worktree` 管理共享同一个仓库数据库和对象存储的多个工作树。这允许你同时拥有同一仓库的多个 checkout，适用于同时处理多个分支、编辑代码时运行构建，或隔离测试更改。
 
-每个 linked worktree 都是一个目录，其中包含它自己的真实 `.libra` gitdir——一个本地目录（不是符号链接），保存该 worktree 私有的 `HEAD`、index 和 `HEAD` reflog，以及指向共享存储的 `commondir` 指针和稳定的 `worktree_id`。主工作树是原始仓库目录。所有工作树共享同一个 SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但各自拥有独立的 checked-out 分支和暂存状态。（由更早版本 Libra 创建的 worktree 可能仍是旧的共享 `.libra` 符号链接布局；运行 `libra worktree repair` 检查。）
+每个 linked worktree 都是一个目录，其中包含它自己的真实 `.libra` gitdir——一个本地目录（不是符号链接），保存该 worktree 私有的 `HEAD`、index 和 `HEAD` reflog，以及指向共享存储的 `commondir` 指针和稳定的 `worktree_id`。主工作树是原始仓库目录。所有工作树共享同一个 SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但各自拥有独立的 checked-out 分支和暂存状态。（由更早版本 Libra 创建的 worktree 可能仍是旧的共享 `.libra` 符号链接布局；`libra worktree doctor` 会报告它，`libra worktree repair --migrate-layout --dry-run` 可只读预览迁移。）registry 文件 `worktrees.json` 带版本号（当前 `schema_version: 3`；v2 自 v0.19.57 起）：每个 linked 条目持久化其 stable `worktree_id`；旧 v1 文件在首个**变更类** worktree 命令时就地升级（id 从各 gitdir 回填，`worktree list` 等无锁读取不会重写文件）；旧版二进制在数据库层被拒绝，无法误读或重写该文件。v3 新增持久的**注册代次**——registry 上的 `epoch_counter` 与每个条目的 `epoch`（`worktree list` 输出）。instance id 由路径推导，因此原地 remove/re-add 后的 worktree 与前一次注册同 id、同路径；代次是区分两次注册的唯一依据，`libra service` 的 dirty-mark 端点将其作为 fence 强制要求。v2 时代的二进制会解析 v3 文件并在重写时丢弃代次，故 v3 capability marker 在 connect 时拒绝这些二进制；同理，只要仍有存活代次，该 migration 不允许回滚。
+
+**消解 registry 身份冲突。** 旧版二进制可能留下两个条目占用同一个由路径推导出的身份（`add A` → `move A B` → `add A`）。此时**所有**变更类 worktree 操作都被拒绝——包括本该用来修复的 `remove`，因为它走同一个 loader。`libra worktree doctor` 会指出冲突条目，而 `libra worktree repair <path> --resolve-identity --yes` 是唯一能在冲突 registry 上运行的动作：它把指定条目**detach**（文件与 scoped 状态保留，该目录内所有命令 fail closed），让剩下的那个重新独占身份。随后可用 `worktree remove --delete-dir <path>` 收尾，或 `worktree add <path>` 重新挂回。
 
 Worktree 元数据持久化在 `.libra` 存储目录内的 `worktrees.json` 文件中。每个条目记录文件系统路径、它是否是主工作树、锁定状态，以及可选锁定原因。状态文件通过临时文件重命名原子写入，以防损坏。
 
@@ -34,17 +39,27 @@ Worktree 元数据持久化在 `.libra` 存储目录内的 `worktrees.json` 文�
 
 在给定文件系统路径创建新的 linked worktree。
 
-| 参数 | 说明 |
-|------|------|
-| `<path>` | 新 worktree 的文件系统路径。可以是相对路径或绝对路径。目录不存在时会创建。不得位于 `.libra` 存储内部，不得已经注册，如果已存在则必须为空。 |
+| 参数 / 标志 | 说明 |
+|-------------|------|
+| `<path>` | 新 worktree 的文件系统路径,可相对可绝对;目录不存在时自动创建;不得位于 `.libra` 存储内、不得已注册、存在时必须为空。 |
+| `<branch-or-commit>` | 可选目标。已存在的 branch 会被**附着**检出(任一 worktree——包括当前——已检出该 branch 时在任何副作用前拒绝);其余按 commit-ish 解析并以**分离 HEAD** 播种、内容取自该 commit。branch 不存在时 fail-closed:Git 的 remote-branch DWIM、`worktree.guessRemote`、`--track`/`--no-track` 首期 deferred。 |
+| `--detach` | 即使目标是 branch 也分离 HEAD(branch 仍可被其它 worktree 检出)。 |
+| `-b, --create-branch <NEW_BRANCH>` | 在 `<branch-or-commit>`(默认:源 worktree HEAD)处创建新 branch 并检出;branch 已存在时拒绝(`-B`/`--force` deferred);后续任何失败会完整回滚——不留 branch-only 残留。 |
+
+不带目标时,新 worktree 以**源 commit 的分离 HEAD** 创建——与 Git 默认(以路径 basename 创建并检出新 branch)有意不同。`--lock`、`--orphan`、`--no-checkout` 首期 deferred;锁定请用独立的 `worktree lock` 子命令。
 
 ```bash
-# 为 feature 分支创建新 worktree
+# 源 commit 处分离(Libra 默认)
 libra worktree add ../my-feature
-libra --json worktree add ../my-feature
 
-# 使用绝对路径创建
-libra worktree add /tmp/libra-test
+# 检出既有 branch
+libra worktree add ../fix-1 hotfix
+
+# 在 commit-ish 处分离
+libra worktree add --detach ../probe v1.2.0
+
+# 从起点创建新 branch 并检出
+libra worktree add -b topic ../topic main
 ```
 
 ### 子命令：`list`
@@ -59,6 +74,92 @@ libra --machine worktree list
 ```
 
 结构化输出使用 `worktree.list` 命令信封。每个条目报告 `kind`、`path`、`is_main`、`locked`、`lock_reason`，以及该路径当前是否存在于磁盘上。
+
+### 子命令：`doctor`
+
+诊断 Agent **workspace** scope。普通调用**严格只读**（plan-20260714 Part C W0
+§C.11）：只报告、绝不修复——不会写入任何行、registry 条目、lease 或文件，
+调用前后 registry、数据库、lease 状态与文件系统逐字节不变。诊断命令必须能
+安全地在一个你尚未理解的仓库上运行——那正是你会用到它的时刻——所以裸
+`doctor` 绝不自行 adopt、reclaim 或修复，任何错误提示都不会承诺裸 `doctor`
+会修好什么；唯一的例外是下表中单独命名、需 `--confirm` 的变更操作。
+（Libra 专有；Git 无对应命令。）
+
+*workspace* 是 Agent runtime 接管某个 worktree 时建立的关联记录（见 `libra agent workspace list`）。人类使用 linked worktree 从不需要它，因此没有 Agent 活动的仓库不会报告任何内容。
+
+| 参数 / 选项 | 说明 |
+|-------------|------|
+| `<workspace-id>` | 只诊断一个 workspace，而不是分页遍历全部。不能与 `--limit`/`--cursor` 同时使用（单 scope 不是一页）——组合使用是用法错误 `LBR-CLI-002`。 |
+| `--limit <n>` | 每页最多返回的诊断条数。默认 50，上限 500。 |
+| `--cursor <cursor>` | 从上一页继续：原样回传 `next_cursor` 的值。cursor 是 opaque 的；非本命令签发的 cursor 会以 `LBR-WORKTREE-001` 拒绝，而不是悄悄从第一页重来。 |
+| `--adopt-capture-session <session-id>` | 明确归属一个 `legacy_unknown` 的历史 capture session。必须同时给出 `<workspace-id>` 和 `--confirm`，不能和 `--limit`/`--cursor` 组合。它是单独的变更操作；不带该选项的 doctor 始终只读。 |
+| `--adopt-info-to <worktree-path>` | W0 §C.4.1.1：把仓库共享存储（main 的 `.libra/info/*`）中的 `info/exclude`/`info/attributes` 显式复制进**一个** linked worktree 自己的 gitdir——绝不自动、绝不覆盖已存在的目标文件。需要 `--confirm`。 |
+| `--clear-common-info` | 删除共享存储中的 `.libra/info/exclude` 与 `info/attributes`（这些规则自 W0 起只作用于 main worktree；显式清除表示它们不应再作用于任何地方）。需要 `--confirm`。 |
+| `--confirm` | 确认一项 doctor 变更操作（capture 归属、info 文件 adopt/clear）。 |
+
+每条诊断报告该 workspace 的身份（`workspace_id`、`repo_id`、`path`、`worktree_id`）、`lease_state`（`none`/`held`/`expired`），以及 `scope_diagnostics` 发现列表。每项发现带稳定的 `code` 与 `severity`（`warning` 或 `error`）：
+
+| Code | Severity | 含义 |
+|------|----------|------|
+| `foreign_repository_identity` | error | 该记录写于此前的仓库身份下：常规列表看不到它，且它会阻塞新 workspace 注册。 |
+| `registry_path_mismatch` | error | worktree registry 与 workspace 记录对 scope 所在路径的说法不一致。 |
+| `scope_layout_corrupt` | error | 该路径的 gitdir 布局无法识别。 |
+| `workspace_orphaned` | warning | 拆除失败或 owner 消失；该 workspace 仍持有恢复状态。 |
+| `lease_expired` | warning | lease 期限已过。在被显式回收之前，lease 仍属于其 owner。 |
+| `workspace_path_missing` | warning | 声称的路径上没有目录。 |
+| `registry_entry_missing` | warning | 没有 worktree registry 条目拥有该 scope。 |
+| `registry_entry_detached` | warning | 该 worktree 已被 `worktree remove`（保留目录）注销。 |
+| `registry_entry_tombstoned` | warning | 目录已删除但其 scoped 行仍待清理；`libra worktree repair --confirm` 会重试。 |
+| `scope_layout_legacy_symlink` | warning | 该 worktree 仍是隔离布局之前的共享 `.libra` 符号链接布局；用 `libra worktree repair --migrate-layout --confirm` 迁移。 |
+
+完全无法读取的 scope——无法解析的 registry、不可读的记录、缺失的仓库身份——一律以 `LBR-WORKTREE-002` fail-closed，而不是给出残缺诊断。
+
+```bash
+libra worktree doctor
+libra --json worktree doctor
+libra --json worktree doctor --limit 20
+libra --json worktree doctor --cursor "$cursor"
+libra worktree doctor 9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13
+```
+
+迁移 `2026080401` 会把旧版未保存 scope 的 capture 行标成
+`legacy_unknown`，而不是猜测它们属于主 worktree；因此 hook 和历史导入会
+fail-closed。确认原始 session 与目标 workspace 后，唯一的归属路径是：
+
+```bash
+libra worktree doctor <workspace-id> \
+  --adopt-capture-session <session-id> --confirm
+```
+
+目标 workspace 必须持有当前 live lease fence。该命令会把同一 provider
+session 的全部 legacy capture 行（session、export job、import identity）归入
+该仓库/worktree/workspace fence；若该 provider session 已有任何 scoped 行则
+拒绝，随后写入一条不可变 audit 记录。操作不可撤销。其 JSON 使用独立的
+`worktree.doctor.adopt_capture` envelope；只读 `worktree.doctor` 的分页 schema
+不变。通常传入 catalog session id；若 export/import 行在 catalog session 已
+清理后仍保留，则传入 provider session id 以恢复该 orphan 行。
+
+**Legacy 共享 info 文件**（W0 §C.4.1.1）：`info/exclude` 与 `info/attributes`
+改为 worktree 本地后，共享存储（main 的 `.libra/info/*`）中的文件只作用于
+main worktree。存在 linked worktree 时，只读报告会在 main 条目上说明这一点，
+并给出两个显式、需确认的操作（绝不自动复制）：
+
+```bash
+# 把 main 的 info/exclude + info/attributes 复制进一个 linked worktree
+# 自己的 gitdir（已存在的目标文件保留、绝不覆盖）：
+libra worktree doctor --adopt-info-to <worktree-path> --confirm
+
+# 从共享存储删除它们（这些规则不再作用于任何地方）：
+libra worktree doctor --clear-common-info --confirm
+```
+
+两者在任何副作用之前都要求 `--confirm`，并与其它 mutating repair 操作一样
+运行在同一条 operation-log audit 边界内。`--json`/`--machine` 模式下各自使用
+独立 envelope——`worktree.doctor.adopt_info`（`data.target` + `data.report`）
+与 `worktree.doctor.clear_common_info`（`data.report`）——只读
+`worktree.doctor` 分页 schema 保持不变。只读报告的文本条目还会列出每个
+worktree 实际生效的本地 info 来源（如 `.libra/info/exclude`，双布局树还包括
+`.git/info/exclude`）。
 
 ### 子命令：`lock`
 
@@ -107,7 +208,7 @@ libra --json worktree move ../my-feature ../my-feature-v2
 
 ### 子命令：`prune`
 
-从注册表中移除磁盘目录已不存在的 worktrees。主 worktree 和已锁定 worktree 永远不会被 prune。
+从注册表移除磁盘目录已不存在的 worktree。只有 stat 返回 NotFound 的路径才算缺失——权限错误或未挂载卷绝不会把 worktree 判为缺失。主 worktree、已锁定 worktree、tombstone 条目（由 repair 处理）以及存在进行中 rebase/cherry-pick/bisect 的 scope 绝不会被 prune。被 prune 条目的 scoped 状态清理失败时,条目保留为 `tombstone`(输出 `tombstoned` 字段)由 `libra worktree repair --confirm` 重试。
 
 ```bash
 libra worktree prune
@@ -116,7 +217,7 @@ libra --machine worktree prune
 
 ### 子命令：`remove`
 
-从状态文件注销 worktree。默认情况下，磁盘目录会被有意保留，以避免破坏性行为。传入 `--delete-dir` 可获得 Git 风格行为：只有脏状态检查通过后，目录才会被删除。不能移除主 worktree 或已锁定 worktree。
+移除 worktree。默认（保留目录）自 v0.19.58 起为**分离（detach）**：registry 条目转入 `detached_from_registry` 状态，其 scoped 数据库状态（HEAD、reflog、layer/sparse/dirty 行）全部保留，gitdir 中的标记使该目录内的一切命令 fail-closed 并给出 re-add/删除提示；用 `libra worktree add <path>` 重新挂接（按 registry 持久化 id 校验目录身份），或用 `--delete-dir` 完成删除。传入 `--delete-dir` 为 Git 风格行为：脏状态检查通过后删除目录并 fsync 父目录，然后才清理 scoped 数据库状态；清理失败会保留 `tombstone` 条目由 `libra worktree repair --confirm` 重试。不能移除主 worktree、已锁定 worktree,或存在进行中 rebase/cherry-pick/bisect 的 worktree。
 
 | 参数 / 标志 | 说明 |
 |-------------|------|
@@ -174,11 +275,17 @@ JSON / machine 输出信封：
 
 ### 子命令：`repair`
 
-修复 worktree 元数据：移除重复条目（相同规范路径），并确保恰好存在一个主 worktree 条目。只有实际做出更改时才写入状态文件。
+修复 worktree 元数据。每个会变更状态的 repair 都必须带 `--confirm`；否则命令会在取得 registry 锁或写入数据库/文件系统前拒绝。不带参数时，已确认的操作会移除重复条目（相同规范路径）、确保恰好存在一个主 worktree 条目，并运行 W3 lifecycle 恢复引擎——确定性回放中断的 add/move/remove/prune intent journal（恢复过程绝不删除目录）、重试 tombstone 条目的 scoped 清理、按 registry 重建 detached 标记与 SQL lifecycle 镜像；只有实际做出更改时才写入状态文件。只有 `--migrate-layout --dry-run` 是无需确认的只读预览。
+
+带 `--migrate-layout` 时(自 v0.19.60,W3-s3 §C.6):从**主 worktree** 把 legacy 共享 `.libra` 符号链接布局迁移到隔离布局(`--dry-run` 只报告;不带 path 迁移全部 legacy 条目)。迁移以原子 rename 安装带 journal 标识的新 gitdir(legacy 链接保留为 backup 直至校验通过),以共享 HEAD 快照播种分离 HEAD 并据其重建 private index:工作区文件绝不改动(迁移后按新 index 显示为 dirty/untracked),共享 index 的 staged 状态绝不复制——请先在主 worktree commit/stash。共享 index 存在冲突或主 scope 有进行中 sequencer 时在任何 rename 前拒绝;中断的迁移由下一次 `worktree repair --confirm` 按身份恢复。面向目标的生命周期命令(两种模式的 `worktree remove <path>` 与 `worktree repair <path>`)对 legacy-symlink 目标同样拒绝——共享符号链接会把写入导向**主**存储——须先完成迁移。
+
+带路径参数时（registry v2，自 v0.19.57）：依据 registry 中持久化的 stable id 恢复该 **linked** worktree 的 gitdir 身份——重写缺失或损坏的 `.libra/worktree_id`，并恢复缺失或损坏（空/不可读）的 `commondir` 指针（指向本仓库共享存储）。身份永远来自 registry，绝不猜测；`commondir` 有效地指向**另一个**存储时会被拒绝（绝不悄悄改挂仓库），且拒绝时不产生任何写入。未注册路径与主 worktree 会被拒绝；registry 仍为 legacy v1 格式时（无持久化身份）同样拒绝——先运行一次不带参数的 `libra worktree repair --confirm` 完成升级后重试。
 
 ```bash
-libra worktree repair
-libra --json worktree repair
+libra worktree repair --confirm
+libra --json worktree repair --confirm
+libra worktree repair --confirm ../experiment
+libra --json worktree repair --confirm ../experiment
 ```
 
 ## 常用命令
@@ -207,6 +314,9 @@ libra wt remove ../experiment-v2
 
 # 修复不一致的 worktree 元数据
 libra wt repair
+
+# 只读诊断全部 Agent workspace scope
+libra wt doctor
 ```
 
 ## 人工输出
@@ -363,7 +473,87 @@ No worktrees to prune
   "ok": true,
   "command": "worktree.repair",
   "data": {
-    "changed": true
+    "changed": true,
+    "journal_recovered": 1,
+    "tombstones_cleaned": 1,
+    "tombstones_pending": 0,
+    "notes": ["completed interrupted remove of '/abs/path/wt'"]
+  }
+}
+```
+
+**带路径的 `worktree.repair`**：
+
+```json
+{
+  "ok": true,
+  "command": "worktree.repair",
+  "data": {
+    "path": "/abs/path/to/experiment",
+    "worktree_id": "1f0c…",
+    "worktree_id_restored": true,
+    "commondir_restored": true
+  }
+}
+```
+
+**`worktree.doctor`**（分页视图——`data.diagnostics[]` 加 `data.next_cursor`，
+最后一页为 `null`）：
+
+```json
+{
+  "ok": true,
+  "command": "worktree.doctor",
+  "data": {
+    "schema_version": 1,
+    "diagnostics": [
+      {
+        "workspace_id": "9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13",
+        "repo_id": "8f5b…",
+        "kind": "linked",
+        "state": "active",
+        "path": "/Users/alice/projects/my-feature",
+        "worktree_id": "1f0c…",
+        "lease_state": "expired",
+        "lease_owner": "agent-review-3",
+        "lease_fence": 2,
+        "lease_expires_at": 1785304730095,
+        "scope_diagnostics": [
+          {
+            "code": "lease_expired",
+            "severity": "warning",
+            "detail": "the lease deadline passed (expires_at 1785304730095, now 1785305330095); the lease still belongs to its owner until it is explicitly reclaimed"
+          }
+        ]
+      }
+    ],
+    "next_cursor": null
+  }
+}
+```
+
+**`worktree.doctor <workspace-id>`**（单 scope 视图——单数 `data.diagnostic`，
+无分页字段）：
+
+```json
+{
+  "ok": true,
+  "command": "worktree.doctor",
+  "data": {
+    "schema_version": 1,
+    "diagnostic": {
+      "workspace_id": "9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13",
+      "repo_id": "8f5b…",
+      "kind": "linked",
+      "state": "active",
+      "path": "/Users/alice/projects/my-feature",
+      "worktree_id": "1f0c…",
+      "lease_state": "held",
+      "lease_owner": "agent-review-3",
+      "lease_fence": 2,
+      "lease_expires_at": 1785305930095,
+      "scope_diagnostics": []
+    }
   }
 }
 ```
@@ -374,7 +564,7 @@ No worktrees to prune
 
 Git 通过一组文件系统结构跟踪 worktree：主 `.git/worktrees/` 目录包含每个 worktree 的目录，里面有 `gitdir`、`HEAD` 和 `commondir` 文件，每个 linked worktree 又有一个指回去的 `.git` 文件（不是目录）。这种方式与 Git 基于文件的架构强耦合，并要求在多个位置之间仔细交叉引用。
 
-Libra 在共享存储目录中使用单个 `worktrees.json` 文件。这有几个优势：所有 worktree 元数据位于一个可查询位置；状态通过临时文件重命名原子写入；格式也便于人类和 AI agent 检查。每个 linked worktree 的 `.libra` 符号链接回共享存储，比 Git 的双向指针系统更简单。代价是 JSON 文件成为单一事实来源，必须保持一致，因此存在 `repair`。
+Libra 在共享存储目录中使用单个 `worktrees.json` 文件。这有几个优势：所有 worktree 元数据位于一个可查询位置；状态通过临时文件重命名原子写入；格式也便于人类和 AI agent 检查。每个 linked worktree 拥有自己真实的 `.libra` gitdir（内含指回共享存储的 `commondir` 指针与稳定 `worktree_id`，不是符号链接），比 Git 的双向指针系统更简单。代价是 JSON 文件成为单一事实来源，必须保持一致，因此存在 `repair`。
 
 ### 为什么 lock 上有 `--reason`？
 
@@ -382,7 +572,7 @@ Git 的 `git worktree lock` 也支持 `--reason`，Libra 保留了这一点。�
 
 ### 为什么 `remove` 不删除磁盘目录？
 
-删除文件是不可撤销的破坏性操作。Libra 的 `remove` 只从 JSON 状态文件注销 worktree，保留目录本身。这是有意的安全选择：用户可以在确认不再需要后检查并手动删除目录。如果 worktree 包含未提交工作，这也能防止意外数据丢失。Git 的 `git worktree remove` 默认会删除目录，这曾导致工作丢失。
+删除文件是不可撤销的破坏性操作。Libra 默认的 `remove` 改为**分离**：目录、其 scoped 数据库状态与身份全部保留,条目转入 `detached_from_registry` 状态,目录被冻结(其中一切命令 fail-closed 并提示 re-add/删除)。这是有意的安全选择:用户可用 `worktree add` 重新挂接,或确认后用 `--delete-dir` 完成删除。如果 worktree 包含未提交工作,这也能防止意外数据丢失。Git 的 `git worktree remove` 默认会删除目录,这曾导致工作丢失。
 
 ### 为什么 `move` 拒绝已锁定 worktree？
 
@@ -396,20 +586,20 @@ Git 的 `git worktree lock` 也支持 `--reason`，Libra 保留了这一点。�
 
 | 操作 | Libra | Git | jj |
 |------|-------|-----|----|
-| 创建 worktree | `worktree add <path>` | `worktree add <path> [<branch>]` | `workspace add <path>` |
-| 在分支上创建 | 不支持 | `worktree add <path> <branch>` | `workspace add <path>`（然后 `jj edit`） |
-| 创建 detached | 不支持 | `worktree add --detach <path> <commit>` | N/A |
+| 创建 worktree | `worktree add <path> [<branch-or-commit>]`（无目标：源 commit 分离） | `worktree add <path> [<branch>]` | `workspace add <path>` |
+| 在分支上创建 | `worktree add <path> <branch>`（附着；任一处已检出即拒；无 DWIM） | `worktree add <path> <branch>` | `workspace add <path>`（然后 `jj edit`） |
+| 创建 detached | `worktree add --detach <path> [<commit>]`（`add <path> <commit>` 亦可） | `worktree add --detach <path> <commit>` | N/A |
 | 列出 worktrees | `worktree list` | `worktree list [--porcelain]` | `workspace list` |
 | 锁定 | `worktree lock <path> [--reason]` | `worktree lock [--reason] <worktree>` | N/A |
 | 解锁 | `worktree unlock <path>` | `worktree unlock <worktree>` | N/A |
 | 移动 | `worktree move <src> <dest>` | `worktree move <worktree> <new-path>` | N/A |
 | Prune | `worktree prune` | `worktree prune [--dry-run]` | N/A（自动） |
-| Remove | `worktree remove <path>`（仅注册表） | `worktree remove [--force] <worktree>`（删除目录） | `workspace forget <name>` |
-| Repair | `worktree repair` | `worktree repair [<path>...]` | N/A |
+| Remove | `worktree remove <path>`（分离——目录与状态保留、冻结） | `worktree remove [--force] <worktree>`（删除目录） | `workspace forget <name>` |
+| Repair | `worktree repair --confirm [<path>]` | `worktree repair [<path>...]` | N/A |
 | 别名 | `wt` | N/A | N/A |
-| 每个 worktree 一个分支 | 不支持 | 自动（新分支或已有分支） | 自动（新 working copy commit） |
+| 每个 worktree 一个分支 | `-b <new> [<start>]` 显式创建（全回滚；无 basename 默认） | 自动（新分支或已有分支） | 自动（新 working copy commit） |
 | 存储 | JSON 文件（`worktrees.json`） | 文件系统结构（`.git/worktrees/`） | Operation log |
-| Worktree 链接 | 指向共享 `.libra` 的符号链接 | 指向 `gitdir` 的 `.git` 文件 | 指向共享 `.jj` 的符号链接 |
+| Worktree 链接 | 真实本地 `.libra` gitdir，内含指向共享存储的 `commondir` 指针（legacy 布局为符号链接） | 指向 `gitdir` 的 `.git` 文件 | 指向共享 `.jj` 的符号链接 |
 
 注意：jj 使用术语 "workspace" 而不是 "worktree"。每个 workspace 会自动获得自己的 working copy commit，并且 workspaces 记录在 operation log 中。jj workspaces 比 Git worktrees 更简单，因为 jj 基于变更的模型不需要为每个 workspace 单独管理分支。
 
@@ -433,3 +623,7 @@ Git 的 `git worktree lock` 也支持 `--reason`，Libra 保留了这一点。�
 | `LBR-IO-001` | 读取或检查 worktree 路径/状态/status 失败 |
 | `LBR-IO-002` | 写入 worktrees.json 失败 |
 | `LBR-IO-002` | 从 HEAD 填充 worktree 失败 |
+| `LBR-CLI-002` | `worktree doctor <workspace-id>` 与 `--limit`/`--cursor` 同时使用 |
+| `LBR-CLI-003` | `worktree doctor <workspace-id>` 指向不存在的 workspace |
+| `LBR-WORKTREE-001` | `worktree doctor --cursor` 收到非本命令签发（或已过期）的 cursor |
+| `LBR-WORKTREE-002` | `worktree doctor` 无法读取某个 scope（registry 无法解析、记录不可读、仓库身份缺失），拒绝给出残缺诊断 |

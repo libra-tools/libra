@@ -3,17 +3,20 @@
 //! `--web-only --provider <X>` (X != codex) used to fall back to a read-only
 //! placeholder snapshot, leaving the browser unable to drive the agent. This
 //! module provides the minimum-viable replacement: a [`HeadlessCodeRuntime`]
-//! that owns a [`CodeUiSession`], spawns a tokio task per submitted message
-//! that runs the agent's tool loop, and streams the model's output back into
-//! the session transcript.
+//! that owns a [`CodeUiSession`], submits each browser turn to the shared
+//! [`crate::internal::ai::runtime::AgentRuntimeWorker`], and streams the
+//! model's output back into the session transcript through that worker's
+//! executor boundary.
 //!
 //! # v0 scope (Phase 3 minimum)
 //!
-//! - `submitMessage` queues a user message and starts a turn — the agent runs
-//!   the standard `run_tool_loop_with_history_and_observer` and the assistant
-//!   reply lands in the live snapshot, streamed delta-by-delta.
-//! - `cancelTurn` aborts the in-flight turn and marks the assistant entry as
-//!   cancelled.
+//! - `submitMessage` queues a user message through `AgentRuntimeHandle` — the
+//!   worker's executor runs the standard `run_tool_loop_with_history_and_observer`
+//!   and the assistant reply lands in the live snapshot, streamed delta-by-delta.
+//! - `cancelTurn` cooperatively stops model or read-only work and marks the
+//!   assistant entry as cancelled. A started mutation is never hard-aborted:
+//!   cancellation returns an actionable error until its determinate result is
+//!   available.
 //! - The runtime reuses the caller-provided [`ToolRegistry`] and
 //!   [`ToolLoopConfig`], so the same allow-list / hooks / sandbox boundaries
 //!   that protect the TUI agent also apply here.
@@ -33,19 +36,23 @@
 use std::{
     collections::HashMap,
     io,
+    marker::PhantomData,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::code_ui::{
     CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
@@ -55,13 +62,22 @@ use super::code_ui::{
     CodeUiSessionStatus, CodeUiToolCallSnapshot, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
 };
 use crate::internal::ai::{
-    agent::runtime::run_tool_loop_with_history_and_observer,
+    agent::runtime::{ToolLoopCancellation, run_tool_loop_with_history_and_observer},
     completion::{
         CompletionError, CompletionModel, CompletionStreamEvent, CompletionUsage,
         CompletionUsageSummary, Message,
     },
+    runtime::{
+        AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig, AgentSnapshot,
+        InteractionState, RuntimeCommandDurability, RuntimeCommandDurabilityError,
+        RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
+        RuntimeTurnExecutor, RuntimeWorkerError, TurnRequest,
+    },
     sandbox::{ExecApprovalRequest, NetworkAccess, ReviewDecision},
-    session::{SessionState, SessionStore},
+    session::{
+        CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandStatus,
+        CodeWorkflowEventKind, SessionJsonlStore, SessionState, SessionStore,
+    },
     tools::{
         ToolOutput, ToolRegistry,
         context::{
@@ -89,17 +105,49 @@ pub fn headless_capabilities() -> CodeUiCapabilities {
     }
 }
 
+/// Bound graceful shutdown waits so a stuck provider cannot leave the CLI
+/// indefinitely unresponsive. The timeout error is deliberately actionable;
+/// the caller must surface it rather than silently treating shutdown as clean.
+const HEADLESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct HeadlessSessionPersistence {
     store: Arc<SessionStore>,
     state: Arc<Mutex<SessionState>>,
+    projection_store: SessionJsonlStore,
+    projection_checkpoint: Arc<Mutex<HeadlessProjectionCheckpoint>>,
+}
+
+struct HeadlessProjectionCheckpoint {
+    snapshot: CodeUiSessionSnapshot,
+    sequence: u64,
 }
 
 impl HeadlessSessionPersistence {
+    /// Construct persistence for callers that do not yet have a restored
+    /// projection checkpoint. The first persisted snapshot becomes the
+    /// checkpoint through normal fine-grained delta emission.
     pub fn new(store: Arc<SessionStore>, state: SessionState) -> Self {
+        Self::with_projection_checkpoint(store, state, CodeUiSessionSnapshot::default(), 0)
+    }
+
+    /// Construct persistence from the durable legacy snapshot and its last
+    /// workflow cursor. This is the resume path used by `libra code`.
+    pub fn with_projection_checkpoint(
+        store: Arc<SessionStore>,
+        state: SessionState,
+        initial_projection_snapshot: CodeUiSessionSnapshot,
+        initial_projection_sequence: u64,
+    ) -> Self {
+        let projection_store = SessionJsonlStore::new(store.session_root(&state.id));
         Self {
             store,
             state: Arc::new(Mutex::new(state)),
+            projection_store,
+            projection_checkpoint: Arc::new(Mutex::new(HeadlessProjectionCheckpoint {
+                snapshot: initial_projection_snapshot,
+                sequence: initial_projection_sequence,
+            })),
         }
     }
 
@@ -108,9 +156,10 @@ impl HeadlessSessionPersistence {
         snapshot: CodeUiSessionSnapshot,
         content: &str,
     ) -> io::Result<()> {
+        let sequence = self.persist_projection_deltas(&snapshot).await?;
         let mut state = self.state.lock().await;
         state.add_user_message(content);
-        sync_session_metadata_from_snapshot(&mut state, snapshot);
+        sync_session_metadata_from_snapshot(&mut state, snapshot, sequence)?;
         self.store.save(&state)
     }
 
@@ -119,17 +168,241 @@ impl HeadlessSessionPersistence {
         snapshot: CodeUiSessionSnapshot,
         content: &str,
     ) -> io::Result<()> {
+        let sequence = self.persist_projection_deltas(&snapshot).await?;
         let mut state = self.state.lock().await;
         state.add_assistant_message(content);
-        sync_session_metadata_from_snapshot(&mut state, snapshot);
+        sync_session_metadata_from_snapshot(&mut state, snapshot, sequence)?;
         self.store.save(&state)
     }
 
     async fn persist_snapshot(&self, snapshot: CodeUiSessionSnapshot) -> io::Result<()> {
+        let sequence = self.persist_projection_deltas(&snapshot).await?;
         let mut state = self.state.lock().await;
-        sync_session_metadata_from_snapshot(&mut state, snapshot);
+        sync_session_metadata_from_snapshot(&mut state, snapshot, sequence)?;
         self.store.save(&state)
     }
+
+    /// Admit a browser direct-turn command before opening the runtime
+    /// executor's gate. Browser wire v1 has no caller-supplied command id, so
+    /// this uses the worker turn id as the current process-local identity;
+    /// W3's versioned control wire must replace it with a stable caller id for
+    /// retry de-duplication across requests.
+    async fn admit_browser_turn(
+        &self,
+        command_id: &str,
+        request_text: &str,
+    ) -> Result<CodeCommandAdmission, RuntimeCommandDurabilityError> {
+        let state = self.state.lock().await;
+        let request_hash = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(request_text.as_bytes()))
+        );
+        let intent = CodeCommandIntent::new(
+            CodeCommandIdentity::new(
+                state.working_dir.clone(),
+                state.id.clone(),
+                "web-headless-browser",
+                command_id,
+            ),
+            "headless_direct_turn",
+            request_hash,
+            true,
+        );
+        RuntimeCommandDurability::new(self.projection_store.clone()).admit(intent)
+    }
+
+    fn complete_browser_turn_success(
+        &self,
+        intent: &CodeCommandIntent,
+        summary: &str,
+    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
+        RuntimeCommandDurability::new(self.projection_store.clone())
+            .complete_success(intent, summary)
+    }
+
+    fn complete_browser_turn_failure(
+        &self,
+        intent: &CodeCommandIntent,
+        reason: &str,
+    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
+        RuntimeCommandDurability::new(self.projection_store.clone())
+            .complete_failure(intent, reason)
+    }
+
+    fn mark_browser_turn_indeterminate(
+        &self,
+        intent: &CodeCommandIntent,
+        effect: &str,
+        reason: &str,
+    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
+        RuntimeCommandDurability::new(self.projection_store.clone())
+            .mark_indeterminate(intent, effect, reason)
+    }
+
+    /// Record the non-sensitive fact that a browser interaction was resolved
+    /// before its continuation is released. Projection deltas make the UI
+    /// resumable, while this durable workflow event is the audit fact used to
+    /// distinguish a response from a merely rendered interaction state.
+    fn record_interaction_resolution(
+        &self,
+        interaction_id: &str,
+        resolution: &str,
+    ) -> io::Result<()> {
+        self.projection_store.append_code_workflow_durable(
+            CodeWorkflowEventKind::InteractionResolved {
+                interaction_id: interaction_id.to_string(),
+                resolution: resolution.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Persist only the projection fields that changed since the last durable
+    /// headless checkpoint.  `SessionSnapshot` remains the compatibility
+    /// record, while these ordered deltas are the authoritative Code UI suffix
+    /// replayed on resume.
+    async fn persist_projection_deltas(&self, snapshot: &CodeUiSessionSnapshot) -> io::Result<u64> {
+        let mut checkpoint = self.projection_checkpoint.lock().await;
+        let deltas = code_ui_projection_deltas(&checkpoint.snapshot, snapshot)?;
+        for delta in deltas {
+            let event = self.projection_store.append_code_workflow(delta)?;
+            checkpoint.sequence = event.sequence;
+        }
+        checkpoint.snapshot = snapshot.clone();
+        Ok(checkpoint.sequence)
+    }
+}
+
+fn code_ui_projection_deltas(
+    previous: &CodeUiSessionSnapshot,
+    current: &CodeUiSessionSnapshot,
+) -> io::Result<Vec<CodeWorkflowEventKind>> {
+    let mut deltas = Vec::new();
+    if previous.status != current.status {
+        deltas.push(projection_delta(
+            "status",
+            "session status changed",
+            &current.status,
+        )?);
+    }
+    if previous.controller != current.controller {
+        deltas.push(projection_delta(
+            "controller",
+            "controller state changed",
+            &current.controller,
+        )?);
+    }
+    append_changed_projection_items(
+        &mut deltas,
+        "transcript_upsert",
+        "transcript entry changed",
+        &previous.transcript,
+        &current.transcript,
+        |entry| entry.id.as_str(),
+    )?;
+    append_changed_projection_items(
+        &mut deltas,
+        "interaction_upsert",
+        "interaction changed",
+        &previous.interactions,
+        &current.interactions,
+        |interaction| interaction.id.as_str(),
+    )?;
+    for interaction in &previous.interactions {
+        if !current
+            .interactions
+            .iter()
+            .any(|candidate| candidate.id == interaction.id)
+        {
+            deltas.push(projection_delta(
+                "interaction_cleared",
+                "interaction cleared",
+                &serde_json::json!({ "interactionId": interaction.id }),
+            )?);
+        }
+    }
+    append_changed_projection_items(
+        &mut deltas,
+        "plan_upsert",
+        "plan changed",
+        &previous.plans,
+        &current.plans,
+        |plan| plan.id.as_str(),
+    )?;
+    append_changed_projection_items(
+        &mut deltas,
+        "task_upsert",
+        "task changed",
+        &previous.tasks,
+        &current.tasks,
+        |task| task.id.as_str(),
+    )?;
+    append_changed_projection_items(
+        &mut deltas,
+        "tool_call_upsert",
+        "tool call changed",
+        &previous.tool_calls,
+        &current.tool_calls,
+        |tool_call| tool_call.id.as_str(),
+    )?;
+    append_changed_projection_items(
+        &mut deltas,
+        "patchset_upsert",
+        "patchset changed",
+        &previous.patchsets,
+        &current.patchsets,
+        |patchset| patchset.id.as_str(),
+    )?;
+    Ok(deltas)
+}
+
+fn append_changed_projection_items<T, F>(
+    deltas: &mut Vec<CodeWorkflowEventKind>,
+    projection: &str,
+    summary: &str,
+    previous: &[T],
+    current: &[T],
+    id: F,
+) -> io::Result<()>
+where
+    T: serde::Serialize,
+    F: Fn(&T) -> &str,
+{
+    let previous_by_id = previous
+        .iter()
+        .map(|item| Ok((id(item).to_string(), serde_json::to_value(item)?)))
+        .collect::<Result<HashMap<_, _>, serde_json::Error>>()
+        .map_err(json_projection_error)?;
+    for item in current {
+        let payload = serde_json::to_value(item).map_err(json_projection_error)?;
+        if previous_by_id.get(id(item)) != Some(&payload) {
+            deltas.push(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: projection.to_string(),
+                summary: summary.to_string(),
+                payload,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn projection_delta<T: serde::Serialize>(
+    projection: &str,
+    summary: &str,
+    payload: &T,
+) -> io::Result<CodeWorkflowEventKind> {
+    Ok(CodeWorkflowEventKind::CodeUiProjectionDelta {
+        projection: projection.to_string(),
+        summary: summary.to_string(),
+        payload: serde_json::to_value(payload).map_err(json_projection_error)?,
+    })
+}
+
+fn json_projection_error(error: serde_json::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("failed to serialize Code UI projection event: {error}"),
+    )
 }
 
 struct PendingHeadlessUserInput {
@@ -141,42 +414,184 @@ struct PendingHeadlessExecApproval {
     request: ExecApprovalRequest,
 }
 
+/// A live tool-loop continuation held by `AgentRuntimeWorker` while the Web
+/// session is awaiting an interaction response.  The legacy pending maps below
+/// are retained only for standalone, no-active-turn adapter calls; browser
+/// turns must register one of these so validation, durable audit, and one-shot
+/// release have a single owner.
+enum HeadlessInteractionDelivery {
+    UserInput {
+        session: Arc<CodeUiSession>,
+        interaction_persistence_failed: Arc<AtomicBool>,
+        persistence: Option<HeadlessSessionPersistence>,
+        interaction_id: String,
+        questions: Vec<UserInputQuestion>,
+        response_tx: oneshot::Sender<UserInputResponse>,
+    },
+    ExecApproval {
+        session: Arc<CodeUiSession>,
+        interaction_persistence_failed: Arc<AtomicBool>,
+        persistence: Option<HeadlessSessionPersistence>,
+        interaction_id: String,
+        request: ExecApprovalRequest,
+    },
+}
+
+#[async_trait]
+impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
+    fn validate(
+        &self,
+        interaction: &crate::internal::ai::runtime::InteractionResponse,
+    ) -> Result<(), RuntimeWorkerError> {
+        let response = decode_headless_interaction_response(interaction)?;
+        match self {
+            Self::UserInput { questions, .. } => {
+                user_input_response_from_code_ui_request(questions, response)
+                    .map(|_| ())
+                    .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))
+            }
+            Self::ExecApproval { .. } => review_decision_from_interaction_response(response)
+                .map(|_| ())
+                .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string())),
+        }
+    }
+
+    async fn deliver(
+        self: Box<Self>,
+        _request: TurnRequest,
+        interaction: crate::internal::ai::runtime::InteractionResponse,
+        context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        if context.cancellation().is_cancelled() {
+            return Err(RuntimeWorkerError::Cancelled);
+        }
+        let response = decode_headless_interaction_response(&interaction)?;
+        match *self {
+            Self::UserInput {
+                session,
+                interaction_persistence_failed,
+                persistence,
+                interaction_id,
+                questions,
+                response_tx,
+            } => {
+                deliver_headless_user_input_response(
+                    &session,
+                    &interaction_persistence_failed,
+                    persistence.as_ref(),
+                    &interaction_id,
+                    questions,
+                    response_tx,
+                    response,
+                )
+                .await
+            }
+            Self::ExecApproval {
+                session,
+                interaction_persistence_failed,
+                persistence,
+                interaction_id,
+                request,
+            } => {
+                deliver_headless_exec_approval_response(
+                    &session,
+                    &interaction_persistence_failed,
+                    persistence.as_ref(),
+                    &interaction_id,
+                    request,
+                    response,
+                )
+                .await
+            }
+        }
+    }
+}
+
 /// Adapter that runs an agent tool loop in response to browser-driven messages.
 ///
 /// Generic over a [`CompletionModel`] so each provider (Ollama, OpenAI, Gemini,
 /// …) can plug in its own client. The model is held inside an `Arc<Mutex<…>>`
 /// so the spawned turn task can take exclusive access while the next submit
 /// waits in the queue.
-/// Bookkeeping for the active turn so the runtime can finalize its
-/// transcript entry on cancel and so the spawned task can avoid clobbering
-/// a successor turn's slot when it eventually clears itself out.
+/// Bookkeeping for a browser turn accepted by the serialized worker.
+///
+/// The gate keeps the worker executor from running a tool before the browser
+/// turn's durable initial projection has been written. This preserves the
+/// retry-safe persistence precondition even though worker admission itself is
+/// intentionally asynchronous.
 struct InFlightTurn {
-    /// Stable id assigned per-turn; the spawned task uses it as a generation
-    /// counter when releasing its slot at the end of the turn.
-    id: u64,
-    /// Transcript entry that needs `streaming -> false` + `status` finalized
-    /// when the turn ends (success, error, or cancellation).
+    runtime_turn_id: String,
     assistant_entry_id: String,
-    handle: JoinHandle<()>,
+    durable_command: Option<CodeCommandIntent>,
+    start_gate: Arc<tokio::sync::Notify>,
+    start_open: Arc<AtomicBool>,
+    /// Signals once terminal UI state and the worker's active-turn slot have
+    /// settled, including admission rollback after a durability failure.
+    completion: Arc<tokio::sync::Notify>,
 }
 
-pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
+/// Adapter from the UI-neutral serialized runtime to the existing headless
+/// provider/tool-loop stack. It deliberately owns no queueing state: ordering,
+/// cancellation and shutdown belong to `AgentRuntimeWorker`.
+struct HeadlessDirectTurnExecutor<M: CompletionModel + 'static> {
     session: Arc<CodeUiSession>,
-    capabilities: CodeUiCapabilities,
-    /// Conversation history accumulated across turns.
     history: Arc<Mutex<Vec<Message>>>,
     model: Arc<M>,
     registry: Arc<ToolRegistry>,
     config_factory:
         Arc<dyn Fn() -> super::super::agent::runtime::tool_loop::ToolLoopConfig + Send + Sync>,
+    in_flight: Arc<Mutex<Option<InFlightTurn>>>,
+    active_turn_mutations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    shutdown_timed_out: Arc<AtomicBool>,
+    /// A browser interaction response or request could not be durably
+    /// projected. The original tool-loop may still be unwinding, so its later
+    /// terminal result must not overwrite the reconciliation requirement.
+    interaction_persistence_failed: Arc<AtomicBool>,
+    pending_user_inputs: Arc<Mutex<HashMap<String, PendingHeadlessUserInput>>>,
+    pending_exec_approvals: Arc<Mutex<HashMap<String, PendingHeadlessExecApproval>>>,
+    persistence: Option<HeadlessSessionPersistence>,
+}
+
+pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
+    // The provider model lives in the runtime executor; keep the public
+    // adapter generic so callers cannot accidentally pair an executor built
+    // for one provider type with a differently typed headless handle.
+    model_type: PhantomData<M>,
+    session: Arc<CodeUiSession>,
+    capabilities: CodeUiCapabilities,
     /// Active turn slot. `submit_message` holds the lock while it spawns and
-    /// stores the new turn so two concurrent submits can never both see an
-    /// empty slot. `cancel_turn` and the spawned task itself acquire the
-    /// lock to release / finalize the slot.
+    /// stores the worker request so two concurrent submits can never both see
+    /// an empty slot. `cancel_turn` and the runtime executor acquire the lock
+    /// to release / finalize the slot.
     in_flight: Arc<Mutex<Option<InFlightTurn>>>,
     /// Monotonic turn id; used by spawned tasks to detect that a successor
     /// turn has claimed the slot before they cleared their own entry.
     next_turn_id: Arc<AtomicU64>,
+    /// Session identity for the in-memory worker. It is intentionally opaque
+    /// to the browser and never contains request text.
+    runtime_session_id: String,
+    /// The only path browser turns use to enter the serialized runtime.
+    runtime: AgentRuntimeHandle,
+    /// Retained so explicit shutdown can join the worker and report a panic
+    /// rather than silently detaching the lifecycle owner.
+    runtime_worker_task: Mutex<Option<JoinHandle<()>>>,
+    /// Worker-owned mutation markers registered by the executor. The browser
+    /// adapter reads these only to preserve its actionable "cannot safely
+    /// abort" response after it has asked the runtime to reconcile a turn.
+    active_turn_mutations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Once shutdown begins, no adapter command may start a replacement turn
+    /// while the previous in-flight turn is being reconciled.
+    shutting_down: AtomicBool,
+    /// A bounded shutdown timed out before its active turn reported a
+    /// determinate result. The turn task must not later overwrite the durable
+    /// indeterminate state if it happens to finish before process exit.
+    shutdown_timed_out: Arc<AtomicBool>,
+    /// Shared with the executor so a persistence failure in the interaction
+    /// listener remains authoritative through the original turn's completion.
+    interaction_persistence_failed: Arc<AtomicBool>,
+    /// Every repeated shutdown caller observes this same terminal result,
+    /// rather than racing to independently cancel or detach the active turn.
+    shutdown_result_tx: watch::Sender<Option<Result<(), String>>>,
     /// Pending `request_user_input` flows keyed by tool call id.
     pending_user_inputs: Arc<Mutex<HashMap<String, PendingHeadlessUserInput>>>,
     /// Pending exec approval flows keyed by tool call id.
@@ -206,7 +621,7 @@ where
         config_factory: Arc<
             dyn Fn() -> super::super::agent::runtime::tool_loop::ToolLoopConfig + Send + Sync,
         >,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         Self::new_with_persistence(
             session,
             capabilities,
@@ -235,18 +650,88 @@ where
         >,
         initial_history: Vec<Message>,
         persistence: Option<HeadlessSessionPersistence>,
-    ) -> Arc<Self> {
-        let runtime = Arc::new(Self {
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_persistence_and_shutdown_timeout(
             session,
             capabilities,
-            history: Arc::new(Mutex::new(initial_history)),
+            model,
+            registry,
+            user_input_rx,
+            exec_approval_rx,
+            config_factory,
+            initial_history,
+            persistence,
+            HEADLESS_SHUTDOWN_TIMEOUT,
+        )
+    }
+
+    /// Build a headless runtime with an explicit graceful-shutdown bound.
+    ///
+    /// Production callers use [`Self::new_with_persistence`]'s fixed default;
+    /// this constructor exists for runtime integrations and deterministic
+    /// timeout-injection tests that need to verify the indeterminate recovery
+    /// path without waiting for the production deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_persistence_and_shutdown_timeout(
+        session: Arc<CodeUiSession>,
+        capabilities: CodeUiCapabilities,
+        model: M,
+        registry: Arc<ToolRegistry>,
+        user_input_rx: mpsc::UnboundedReceiver<UserInputRequest>,
+        exec_approval_rx: mpsc::UnboundedReceiver<ExecApprovalRequest>,
+        config_factory: Arc<
+            dyn Fn() -> super::super::agent::runtime::tool_loop::ToolLoopConfig + Send + Sync,
+        >,
+        initial_history: Vec<Message>,
+        persistence: Option<HeadlessSessionPersistence>,
+        shutdown_timeout: Duration,
+    ) -> anyhow::Result<Arc<Self>> {
+        let (shutdown_result_tx, _) = watch::channel(None);
+        let in_flight = Arc::new(Mutex::new(None));
+        let history = Arc::new(Mutex::new(initial_history));
+        let shutdown_timed_out = Arc::new(AtomicBool::new(false));
+        let interaction_persistence_failed = Arc::new(AtomicBool::new(false));
+        let active_turn_mutations = Arc::new(Mutex::new(HashMap::new()));
+        let pending_user_inputs = Arc::new(Mutex::new(HashMap::new()));
+        let pending_exec_approvals = Arc::new(Mutex::new(HashMap::new()));
+        let tool_boundary = registry.hardening().cloned().ok_or_else(|| {
+            anyhow!(
+                "Headless Code runtime requires the registry's shared tool-boundary policy; rebuild CodeAgentServices before starting a browser turn"
+            )
+        })?;
+        let executor = Arc::new(HeadlessDirectTurnExecutor {
+            session: session.clone(),
+            history: history.clone(),
             model: Arc::new(model),
             registry,
             config_factory,
-            in_flight: Arc::new(Mutex::new(None)),
+            in_flight: in_flight.clone(),
+            active_turn_mutations: active_turn_mutations.clone(),
+            shutdown_timed_out: shutdown_timed_out.clone(),
+            interaction_persistence_failed: interaction_persistence_failed.clone(),
+            pending_user_inputs: pending_user_inputs.clone(),
+            pending_exec_approvals: pending_exec_approvals.clone(),
+            persistence: persistence.clone(),
+        });
+        let mut worker_config = AgentRuntimeWorkerConfig::new(executor, tool_boundary);
+        worker_config.shutdown_timeout = shutdown_timeout;
+        let (runtime_handle, runtime_worker_task) = AgentRuntimeWorker::spawn(worker_config);
+        let runtime = Arc::new(Self {
+            model_type: PhantomData,
+            session,
+            capabilities,
+            in_flight,
             next_turn_id: Arc::new(AtomicU64::new(1)),
-            pending_user_inputs: Arc::new(Mutex::new(HashMap::new())),
-            pending_exec_approvals: Arc::new(Mutex::new(HashMap::new())),
+            runtime_session_id: uuid::Uuid::new_v4().to_string(),
+            runtime: runtime_handle,
+            runtime_worker_task: Mutex::new(Some(runtime_worker_task)),
+            active_turn_mutations,
+            shutting_down: AtomicBool::new(false),
+            shutdown_timed_out,
+            interaction_persistence_failed,
+            shutdown_result_tx,
+            pending_user_inputs,
+            pending_exec_approvals,
             persistence,
         });
 
@@ -262,8 +747,596 @@ where
             .await;
         });
 
-        runtime
+        Ok(runtime)
     }
+}
+
+#[async_trait]
+impl<M> RuntimeTurnExecutor for HeadlessDirectTurnExecutor<M>
+where
+    M: CompletionModel + Clone + Send + Sync + 'static,
+    M::Response: CompletionUsage,
+{
+    async fn execute(
+        &self,
+        request: TurnRequest,
+        context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        let (assistant_entry_id, start_gate, start_open) = {
+            let slot = self.in_flight.lock().await;
+            let turn = slot
+                .as_ref()
+                .filter(|turn| turn.runtime_turn_id == request.turn_id)
+                .ok_or_else(|| {
+                    RuntimeWorkerError::ExecutionFailed(
+                        "browser turn admission was released before runtime execution began"
+                            .to_string(),
+                    )
+                })?;
+            (
+                turn.assistant_entry_id.clone(),
+                turn.start_gate.clone(),
+                turn.start_open.clone(),
+            )
+        };
+
+        if !wait_for_headless_turn_start(&start_gate, &start_open, context.cancellation()).await {
+            release_headless_turn(&self.in_flight, &request.turn_id).await;
+            return Err(RuntimeWorkerError::Cancelled);
+        }
+
+        let durable_command = {
+            let slot = self.in_flight.lock().await;
+            slot.as_ref()
+                .filter(|turn| turn.runtime_turn_id == request.turn_id)
+                .and_then(|turn| turn.durable_command.clone())
+        };
+
+        let mutation_started = context.mutation_started_marker();
+        {
+            let mut active_turn_mutations = self.active_turn_mutations.lock().await;
+            active_turn_mutations.insert(request.turn_id.clone(), mutation_started.clone());
+        }
+
+        let mut observer = HeadlessTurnObserver {
+            session: self.session.clone(),
+            assistant_entry_id: assistant_entry_id.clone(),
+            tool_arguments: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            start_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            completion_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let prior_history = self.history.lock().await.clone();
+        let mut config = (self.config_factory)();
+        config.cancellation = Some(ToolLoopCancellation::new(
+            context.cancellation(),
+            mutation_started,
+        ));
+        let cancellation = context.cancellation();
+        let result = run_tool_loop_with_history_and_observer(
+            self.model.as_ref(),
+            prior_history,
+            request.input,
+            self.registry.as_ref(),
+            config,
+            &mut observer,
+        )
+        .await;
+
+        // Tool-call projections mutate the same Code UI status as turn
+        // finalization. Drain them first so a late "tool completed" task
+        // cannot regress the terminal Idle/Error/Cancelled status back to
+        // Thinking after this executor has made the result visible.
+        observer.flush_projection_tasks().await;
+
+        let reconciliation_required = if self.shutdown_timed_out.load(Ordering::Acquire) {
+            Some((
+                "runtime_shutdown_timeout",
+                "runtime shutdown timed out before the active turn reached a determinate result",
+                "headless turn finished after runtime shutdown had already timed out; preserving indeterminate session state",
+            ))
+        } else if self.interaction_persistence_failed.load(Ordering::Acquire) {
+            Some((
+                "interaction_persistence_failure",
+                "interaction persistence failed before the active turn reached a determinate result",
+                "headless turn finished after interaction persistence failed; preserving indeterminate session state",
+            ))
+        } else {
+            None
+        };
+        let terminal = if let Some((effect, reason, log_message)) = reconciliation_required {
+            tracing::error!("{log_message}");
+            if let Err(error) = mark_headless_command_indeterminate(
+                self.persistence.as_ref(),
+                durable_command.as_ref(),
+                effect,
+                reason,
+            ) {
+                tracing::error!(
+                    error = %error,
+                    "failed to durably record indeterminate browser command after a reconciliation-required runtime failure"
+                );
+            }
+            self.session
+                .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                .await;
+            Err(RuntimeWorkerError::ExecutionFailed(format!(
+                "{reason}; session requires reconciliation"
+            )))
+        } else {
+            match result {
+                Ok(turn) => {
+                    if let Err(error) = finish_headless_command(
+                        self.persistence.as_ref(),
+                        durable_command.as_ref(),
+                        Ok(turn.final_text.as_str()),
+                    ) {
+                        self.session
+                            .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                            .await;
+                        Err(RuntimeWorkerError::ExecutionFailed(format!(
+                            "headless turn completed but its durable terminal result could not be recorded; reconciliation is required: {error}"
+                        )))
+                    } else {
+                        {
+                            let mut history = self.history.lock().await;
+                            *history = turn.history;
+                        }
+                        finalize_assistant_entry(
+                            &self.session,
+                            &assistant_entry_id,
+                            &turn.final_text,
+                            "completed",
+                        )
+                        .await;
+                        self.session.set_status(CodeUiSessionStatus::Idle).await;
+                        if let Some(persistence) = self.persistence.as_ref()
+                            && let Err(error) = persistence
+                                .record_assistant_message(
+                                    self.session.snapshot().await,
+                                    turn.final_text.as_str(),
+                                )
+                                .await
+                        {
+                            mark_persistence_failure(
+                                &self.session,
+                                "failed to persist headless web assistant message",
+                                error,
+                            )
+                            .await;
+                        }
+                        Ok(RuntimeTurnExecution::Completed {
+                            summary: "headless direct turn completed".to_string(),
+                        })
+                    }
+                }
+                Err(_error) if cancellation.is_cancelled() => {
+                    if let Err(error) = finish_headless_command(
+                        self.persistence.as_ref(),
+                        durable_command.as_ref(),
+                        Err("cancelled before the browser turn reached its terminal result"),
+                    ) {
+                        self.session
+                            .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                            .await;
+                        Err(RuntimeWorkerError::ExecutionFailed(format!(
+                            "cancelled headless turn could not record its durable terminal result; reconciliation is required: {error}"
+                        )))
+                    } else {
+                        finalize_assistant_entry(
+                            &self.session,
+                            &assistant_entry_id,
+                            "(turn cancelled by user)",
+                            "cancelled",
+                        )
+                        .await;
+                        self.session.set_status(CodeUiSessionStatus::Idle).await;
+                        if let Some(persistence) = self.persistence.as_ref()
+                            && let Err(error) = persistence
+                                .persist_snapshot(self.session.snapshot().await)
+                                .await
+                        {
+                            mark_persistence_failure(
+                                &self.session,
+                                "failed to persist cancelled headless web turn",
+                                error,
+                            )
+                            .await;
+                        }
+                        Err(RuntimeWorkerError::Cancelled)
+                    }
+                }
+                Err(error) => {
+                    let message = format_completion_error(&error);
+                    if let Err(durability_error) = finish_headless_command(
+                        self.persistence.as_ref(),
+                        durable_command.as_ref(),
+                        Err(message.as_str()),
+                    ) {
+                        self.session
+                            .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                            .await;
+                        Err(RuntimeWorkerError::ExecutionFailed(format!(
+                            "failed headless turn could not record its durable terminal result; reconciliation is required: {durability_error}"
+                        )))
+                    } else {
+                        finalize_assistant_entry(
+                            &self.session,
+                            &assistant_entry_id,
+                            &message,
+                            "error",
+                        )
+                        .await;
+                        self.session.set_status(CodeUiSessionStatus::Error).await;
+                        if let Some(persistence) = self.persistence.as_ref()
+                            && let Err(error) = persistence
+                                .persist_snapshot(self.session.snapshot().await)
+                                .await
+                        {
+                            mark_persistence_failure(
+                                &self.session,
+                                "failed to persist headless web failed turn snapshot",
+                                error,
+                            )
+                            .await;
+                        }
+                        Err(RuntimeWorkerError::ExecutionFailed(message))
+                    }
+                }
+            }
+        };
+
+        self.active_turn_mutations
+            .lock()
+            .await
+            .remove(&request.turn_id);
+        release_headless_turn(&self.in_flight, &request.turn_id).await;
+        terminal
+    }
+
+    async fn respond(
+        &self,
+        _request: TurnRequest,
+        interaction: crate::internal::ai::runtime::InteractionResponse,
+        context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        if context.cancellation().is_cancelled() {
+            return Err(RuntimeWorkerError::Cancelled);
+        }
+        let response = decode_headless_interaction_response(&interaction)?;
+        deliver_headless_interaction_response(
+            &self.session,
+            &self.interaction_persistence_failed,
+            &self.pending_user_inputs,
+            &self.pending_exec_approvals,
+            self.persistence.as_ref(),
+            &interaction.interaction_id,
+            response,
+        )
+        .await
+    }
+}
+
+/// Deliver a validated browser response only from the worker-dispatched
+/// executor path. Keeping removal, durable projection, and oneshot delivery
+/// together prevents the Web adapter from racing the original tool-loop
+/// continuation.
+async fn deliver_headless_interaction_response(
+    session: &Arc<CodeUiSession>,
+    interaction_persistence_failed: &Arc<AtomicBool>,
+    pending_user_inputs: &Arc<Mutex<HashMap<String, PendingHeadlessUserInput>>>,
+    pending_exec_approvals: &Arc<Mutex<HashMap<String, PendingHeadlessExecApproval>>>,
+    persistence: Option<&HeadlessSessionPersistence>,
+    interaction_id: &str,
+    response: CodeUiInteractionResponse,
+) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+    let exec_response = {
+        let pending = pending_exec_approvals.lock().await;
+        pending
+            .contains_key(interaction_id)
+            .then(|| review_decision_from_interaction_response(response.clone()))
+            .transpose()
+            .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?
+    };
+    if exec_response.is_some() {
+        let pending = {
+            let mut pending = pending_exec_approvals.lock().await;
+            pending.remove(interaction_id).ok_or_else(|| {
+                RuntimeWorkerError::ExecutionFailed(
+                    "the pending execution approval closed before the response was delivered"
+                        .to_string(),
+                )
+            })?
+        };
+        return deliver_headless_exec_approval_response(
+            session,
+            interaction_persistence_failed,
+            persistence,
+            interaction_id,
+            pending.request,
+            response,
+        )
+        .await;
+    }
+
+    {
+        let pending = pending_user_inputs.lock().await;
+        let pending = pending.get(interaction_id).ok_or_else(|| {
+            RuntimeWorkerError::ExecutionFailed(format!(
+                "unknown pending interaction: {interaction_id}"
+            ))
+        })?;
+        let _ = user_input_response_from_code_ui_request(&pending.questions, response.clone())
+            .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?;
+    }
+    let pending = {
+        let mut pending = pending_user_inputs.lock().await;
+        pending.remove(interaction_id).ok_or_else(|| {
+            RuntimeWorkerError::ExecutionFailed(
+                "the pending user-input request closed before the response was delivered"
+                    .to_string(),
+            )
+        })?
+    };
+    deliver_headless_user_input_response(
+        session,
+        interaction_persistence_failed,
+        persistence,
+        interaction_id,
+        pending.questions,
+        pending.response_tx,
+        response,
+    )
+    .await
+}
+
+fn decode_headless_interaction_response(
+    interaction: &crate::internal::ai::runtime::InteractionResponse,
+) -> Result<CodeUiInteractionResponse, RuntimeWorkerError> {
+    serde_json::from_str(&interaction.response).map_err(|error| {
+        RuntimeWorkerError::ExecutionFailed(format!(
+            "headless interaction response could not be decoded: {error}"
+        ))
+    })
+}
+
+async fn deliver_headless_exec_approval_response(
+    session: &Arc<CodeUiSession>,
+    interaction_persistence_failed: &Arc<AtomicBool>,
+    persistence: Option<&HeadlessSessionPersistence>,
+    interaction_id: &str,
+    request: ExecApprovalRequest,
+    response: CodeUiInteractionResponse,
+) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+    let decision = review_decision_from_interaction_response(response)
+        .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?;
+    session.resolve_interaction(interaction_id).await;
+    session.set_status(CodeUiSessionStatus::ExecutingTool).await;
+    if let Err(error) = persist_headless_interaction_snapshot(persistence, session).await {
+        interaction_persistence_failed.store(true, Ordering::Release);
+        mark_persistence_failure(
+            session,
+            "failed to persist resolved exec approval interaction",
+            error,
+        )
+        .await;
+        return Err(RuntimeWorkerError::ExecutionFailed(
+            "unable to persist the approval response; no tool action was started".to_string(),
+        ));
+    }
+    if let Err(error) = persist_headless_interaction_resolution(
+        persistence,
+        interaction_id,
+        review_decision_resolution(decision),
+    ) {
+        interaction_persistence_failed.store(true, Ordering::Release);
+        mark_persistence_failure(
+            session,
+            "failed to persist resolved exec approval audit event",
+            error,
+        )
+        .await;
+        return Err(RuntimeWorkerError::ExecutionFailed(
+            "unable to persist the approval audit event; no tool action was started".to_string(),
+        ));
+    }
+    if request.response_tx.send(decision).is_err() {
+        session.set_status(CodeUiSessionStatus::Error).await;
+        if let Err(error) = persist_headless_interaction_snapshot(persistence, session).await {
+            interaction_persistence_failed.store(true, Ordering::Release);
+            mark_persistence_failure(
+                session,
+                "failed to persist closed execution approval request",
+                error,
+            )
+            .await;
+        }
+        return Err(RuntimeWorkerError::ExecutionFailed(
+            "the pending execution approval request closed before the response was delivered; no tool action was started"
+                .to_string(),
+        ));
+    }
+    Ok(RuntimeTurnExecution::InteractionResponseDelivered)
+}
+
+async fn deliver_headless_user_input_response(
+    session: &Arc<CodeUiSession>,
+    interaction_persistence_failed: &Arc<AtomicBool>,
+    persistence: Option<&HeadlessSessionPersistence>,
+    interaction_id: &str,
+    questions: Vec<UserInputQuestion>,
+    response_tx: oneshot::Sender<UserInputResponse>,
+    response: CodeUiInteractionResponse,
+) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+    let user_input_response = user_input_response_from_code_ui_request(&questions, response)
+        .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?;
+    session.resolve_interaction(interaction_id).await;
+    session.set_status(CodeUiSessionStatus::ExecutingTool).await;
+    if let Err(error) = persist_headless_interaction_snapshot(persistence, session).await {
+        interaction_persistence_failed.store(true, Ordering::Release);
+        mark_persistence_failure(
+            session,
+            "failed to persist resolved user input interaction",
+            error,
+        )
+        .await;
+        return Err(RuntimeWorkerError::ExecutionFailed(
+            "unable to persist the user-input response; no tool action was started".to_string(),
+        ));
+    }
+    if let Err(error) =
+        persist_headless_interaction_resolution(persistence, interaction_id, "answered")
+    {
+        interaction_persistence_failed.store(true, Ordering::Release);
+        mark_persistence_failure(
+            session,
+            "failed to persist resolved user-input audit event",
+            error,
+        )
+        .await;
+        return Err(RuntimeWorkerError::ExecutionFailed(
+            "unable to persist the user-input audit event; no tool action was started".to_string(),
+        ));
+    }
+    if response_tx.send(user_input_response).is_err() {
+        session.set_status(CodeUiSessionStatus::Error).await;
+        if let Err(error) = persist_headless_interaction_snapshot(persistence, session).await {
+            interaction_persistence_failed.store(true, Ordering::Release);
+            mark_persistence_failure(
+                session,
+                "failed to persist closed user-input request",
+                error,
+            )
+            .await;
+        }
+        return Err(RuntimeWorkerError::ExecutionFailed(
+            "the pending user-input request closed before the response was delivered; no tool action was started"
+                .to_string(),
+        ));
+    }
+    Ok(RuntimeTurnExecution::InteractionResponseDelivered)
+}
+
+async fn persist_headless_interaction_snapshot(
+    persistence: Option<&HeadlessSessionPersistence>,
+    session: &Arc<CodeUiSession>,
+) -> io::Result<()> {
+    if let Some(persistence) = persistence {
+        persistence
+            .persist_snapshot(session.snapshot().await)
+            .await?;
+    }
+    Ok(())
+}
+
+fn persist_headless_interaction_resolution(
+    persistence: Option<&HeadlessSessionPersistence>,
+    interaction_id: &str,
+    resolution: &str,
+) -> io::Result<()> {
+    if let Some(persistence) = persistence {
+        persistence.record_interaction_resolution(interaction_id, resolution)?;
+    }
+    Ok(())
+}
+
+fn review_decision_resolution(decision: ReviewDecision) -> &'static str {
+    match decision {
+        ReviewDecision::Approved => "approved",
+        ReviewDecision::ApprovedForSession => "approved_for_session",
+        ReviewDecision::ApprovedForTtl => "approved_for_ttl",
+        ReviewDecision::ApprovedForDirectoryTtl => "approved_for_directory_ttl",
+        ReviewDecision::ApprovedForPatternTtl => "approved_for_pattern_ttl",
+        ReviewDecision::ApprovedForAllCommands => "approved_for_all_commands",
+        ReviewDecision::Denied => "denied",
+        ReviewDecision::Abort => "aborted",
+    }
+}
+
+fn headless_interaction_id(state: &InteractionState) -> Option<&str> {
+    match state {
+        InteractionState::AwaitingIntentReview { interaction_id }
+        | InteractionState::AwaitingPlanReview { interaction_id }
+        | InteractionState::AwaitingNetworkPolicy { interaction_id }
+        | InteractionState::AwaitingUserInput { interaction_id }
+        | InteractionState::AwaitingToolApproval { interaction_id, .. } => Some(interaction_id),
+        InteractionState::Idle
+        | InteractionState::Queued
+        | InteractionState::Running
+        | InteractionState::Cancelling
+        | InteractionState::Completed
+        | InteractionState::Failed { .. }
+        | InteractionState::Cancelled
+        | InteractionState::IndeterminateSideEffect { .. } => None,
+    }
+}
+
+async fn wait_for_headless_turn_start(
+    start_gate: &tokio::sync::Notify,
+    start_open: &AtomicBool,
+    cancellation: CancellationToken,
+) -> bool {
+    loop {
+        if start_open.load(Ordering::Acquire) {
+            return true;
+        }
+        let notified = start_gate.notified();
+        if start_open.load(Ordering::Acquire) {
+            return true;
+        }
+        tokio::select! {
+            _ = notified => {}
+            _ = cancellation.cancelled() => return false,
+        }
+    }
+}
+
+async fn release_headless_turn(in_flight: &Mutex<Option<InFlightTurn>>, runtime_turn_id: &str) {
+    let completion = {
+        let mut slot = in_flight.lock().await;
+        if slot
+            .as_ref()
+            .is_some_and(|turn| turn.runtime_turn_id == runtime_turn_id)
+        {
+            slot.take().map(|turn| turn.completion)
+        } else {
+            None
+        }
+    };
+    if let Some(completion) = completion {
+        completion.notify_waiters();
+    }
+}
+
+fn finish_headless_command(
+    persistence: Option<&HeadlessSessionPersistence>,
+    intent: Option<&CodeCommandIntent>,
+    terminal: Result<&str, &str>,
+) -> Result<(), RuntimeCommandDurabilityError> {
+    let (Some(persistence), Some(intent)) = (persistence, intent) else {
+        return Ok(());
+    };
+    match terminal {
+        Ok(summary) => persistence
+            .complete_browser_turn_success(intent, summary)
+            .map(|_| ()),
+        Err(reason) => persistence
+            .complete_browser_turn_failure(intent, reason)
+            .map(|_| ()),
+    }
+}
+
+fn mark_headless_command_indeterminate(
+    persistence: Option<&HeadlessSessionPersistence>,
+    intent: Option<&CodeCommandIntent>,
+    effect: &str,
+    reason: &str,
+) -> Result<(), RuntimeCommandDurabilityError> {
+    let (Some(persistence), Some(intent)) = (persistence, intent) else {
+        return Ok(());
+    };
+    persistence
+        .mark_browser_turn_indeterminate(intent, effect, reason)
+        .map(|_| ())
 }
 
 #[async_trait]
@@ -291,13 +1364,16 @@ where
         if text.trim().is_empty() {
             return Err(anyhow!("Empty messages are not accepted by libra code"));
         }
+        self.ensure_not_shutting_down()?;
+        self.ensure_session_is_recoverable().await?;
 
-        // Hold the in_flight lock continuously across the check + spawn + slot
-        // assignment. Two concurrent submits cannot both observe an empty slot
-        // because the second waiter blocks on `lock().await` until the first
-        // finishes installing its task.
+        // Hold the in_flight lock continuously across the check + runtime
+        // admission + slot assignment. Two concurrent submits cannot both
+        // observe an empty slot because the second waiter blocks until the
+        // first has installed its worker request.
         let mut slot = self.in_flight.lock().await;
-        if slot.as_ref().is_some_and(|turn| !turn.handle.is_finished()) {
+        self.ensure_not_shutting_down()?;
+        if slot.is_some() {
             return Err(anyhow!(
                 "A turn is already running; cancel it or wait for the assistant to finish before sending another message"
             ));
@@ -328,106 +1404,127 @@ where
             created_at: now,
             updated_at: now,
         };
+        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
+        let runtime_turn_id = format!("headless-{turn_id}");
+        let start_gate = Arc::new(tokio::sync::Notify::new());
+        let start_open = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(tokio::sync::Notify::new());
+        let completion_for_rollback = completion.clone();
+        *slot = Some(InFlightTurn {
+            runtime_turn_id: runtime_turn_id.clone(),
+            assistant_entry_id: assistant_entry_id.clone(),
+            durable_command: None,
+            start_gate: start_gate.clone(),
+            start_open: start_open.clone(),
+            completion,
+        });
+
+        // Admission occurs before the browser-visible mutation, but the
+        // executor cannot pass its gate until the durable projection and live
+        // transcript below are both ready. This makes the worker the sole
+        // execution owner without weakening the no-untracked-side-effect
+        // persistence precondition above.
+        if let Err(error) = self
+            .runtime
+            .submit(TurnRequest::new(
+                self.runtime_session_id.clone(),
+                runtime_turn_id.clone(),
+                text.clone(),
+                true,
+            ))
+            .await
+        {
+            *slot = None;
+            return Err(anyhow!(
+                "Unable to admit the browser turn to the AgentRuntime queue; no tool was started: {error}"
+            ));
+        }
+
+        // The executor is gated, so release the local slot lock before the
+        // durable admission checks. A failure below can then cancel the
+        // waiting executor and let it release the slot without any tool call.
+        drop(slot);
+        let durable_command = if let Some(persistence) = self.persistence.as_ref() {
+            match persistence
+                .admit_browser_turn(&runtime_turn_id, &text)
+                .await
+            {
+                Ok(CodeCommandAdmission::Execute { intent }) => Some(intent),
+                Ok(CodeCommandAdmission::Existing { status }) => {
+                    self.cancel_gated_runtime_turn(
+                        &runtime_turn_id,
+                        completion_for_rollback.clone(),
+                    )
+                    .await?;
+                    return Err(anyhow!(
+                        "The browser command was already durably admitted with state {status:?}; it was not dispatched again"
+                    ));
+                }
+                Err(error) => {
+                    self.cancel_gated_runtime_turn(
+                        &runtime_turn_id,
+                        completion_for_rollback.clone(),
+                    )
+                    .await?;
+                    return Err(anyhow!(
+                        "Unable to durably admit the browser command; no turn was started. Verify session storage and retry: {error}"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        // The worker has accepted the turn, but its executor is blocked on
+        // `start_gate`. Persist the complete initial projection before opening
+        // that gate or exposing the live transcript. This ordering prevents
+        // both a durable ghost message on rejected admission and an
+        // untracked tool dispatch when SessionStore is unavailable.
+        if let Some(persistence) = self.persistence.as_ref() {
+            let mut durable_snapshot = self.session.snapshot().await;
+            durable_snapshot.transcript.push(user_entry.clone());
+            durable_snapshot.transcript.push(assistant_entry.clone());
+            durable_snapshot.status = CodeUiSessionStatus::Thinking;
+            durable_snapshot.updated_at = now;
+            if let Err(error) = persistence
+                .record_user_message(durable_snapshot, &text)
+                .await
+            {
+                if let Some(intent) = durable_command.as_ref()
+                    && let Err(terminal_error) = persistence.complete_browser_turn_failure(
+                        intent,
+                        "initial_headless_projection_persistence_failed",
+                    )
+                {
+                    tracing::error!(
+                        error = %terminal_error,
+                        "failed to record durable terminal failure for a gated browser command"
+                    );
+                }
+                self.cancel_gated_runtime_turn(&runtime_turn_id, completion_for_rollback.clone())
+                    .await?;
+                return Err(anyhow!(
+                    "Unable to persist the headless web message; no turn was started. Verify session storage and retry: {error}"
+                ));
+            }
+        }
+        {
+            let mut slot = self.in_flight.lock().await;
+            let turn = slot
+                .as_mut()
+                .filter(|turn| turn.runtime_turn_id == runtime_turn_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "AgentRuntime released the browser turn before its durable projection could be opened"
+                    )
+                })?;
+            turn.durable_command = durable_command;
+        }
         self.session.upsert_transcript_entry(user_entry).await;
         self.session.upsert_transcript_entry(assistant_entry).await;
         self.session.set_status(CodeUiSessionStatus::Thinking).await;
-        if let Some(persistence) = self.persistence.as_ref() {
-            persist_or_warn(
-                persistence
-                    .record_user_message(self.session.snapshot().await, &text)
-                    .await,
-                "failed to persist headless web user message",
-            );
-        }
-
-        let session = self.session.clone();
-        let history = self.history.clone();
-        let model = self.model.clone();
-        let registry = self.registry.clone();
-        let config = (self.config_factory)();
-        let persistence = self.persistence.clone();
-        let in_flight_for_task = self.in_flight.clone();
-        let user_text = text;
-        let task_assistant_entry_id = assistant_entry_id.clone();
-        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
-
-        let task = tokio::spawn(async move {
-            let mut observer = HeadlessTurnObserver {
-                session: session.clone(),
-                assistant_entry_id: task_assistant_entry_id.clone(),
-                tool_arguments: Arc::new(std::sync::Mutex::new(HashMap::new())),
-                start_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            };
-
-            let prior_history = {
-                let guard = history.lock().await;
-                guard.clone()
-            };
-
-            let result = run_tool_loop_with_history_and_observer(
-                model.as_ref(),
-                prior_history,
-                user_text,
-                registry.as_ref(),
-                config,
-                &mut observer,
-            )
-            .await;
-
-            match result {
-                Ok(turn) => {
-                    {
-                        let mut guard = history.lock().await;
-                        *guard = turn.history;
-                    }
-                    finalize_assistant_entry(
-                        &session,
-                        &task_assistant_entry_id,
-                        &turn.final_text,
-                        "completed",
-                    )
-                    .await;
-                    session.set_status(CodeUiSessionStatus::Idle).await;
-                    if let Some(persistence) = persistence.as_ref() {
-                        persist_or_warn(
-                            persistence
-                                .record_assistant_message(
-                                    session.snapshot().await,
-                                    turn.final_text.as_str(),
-                                )
-                                .await,
-                            "failed to persist headless web assistant message",
-                        );
-                    }
-                }
-                Err(error) => {
-                    let message = format_completion_error(&error);
-                    finalize_assistant_entry(&session, &task_assistant_entry_id, &message, "error")
-                        .await;
-                    session.set_status(CodeUiSessionStatus::Error).await;
-                    if let Some(persistence) = persistence.as_ref() {
-                        persist_or_warn(
-                            persistence.persist_snapshot(session.snapshot().await).await,
-                            "failed to persist headless web failed turn snapshot",
-                        );
-                    }
-                }
-            }
-
-            // Only clear the slot if it still holds *our* turn — a successor
-            // submit may have already claimed the slot via cancel + resubmit
-            // and we would otherwise wipe its handle out from under it.
-            let mut slot = in_flight_for_task.lock().await;
-            if slot.as_ref().is_some_and(|t| t.id == turn_id) {
-                *slot = None;
-            }
-        });
-
-        *slot = Some(InFlightTurn {
-            id: turn_id,
-            assistant_entry_id,
-            handle: task,
-        });
+        start_open.store(true, Ordering::Release);
+        start_gate.notify_waiters();
         Ok(())
     }
 
@@ -436,91 +1533,331 @@ where
         interaction_id: &str,
         response: CodeUiInteractionResponse,
     ) -> anyhow::Result<()> {
-        if let Some(pending) = {
-            let mut pending = self.pending_exec_approvals.lock().await;
-            pending.remove(interaction_id)
-        } {
-            let decision = review_decision_from_interaction_response(response)?;
-            pending.request.response_tx.send(decision).map_err(|_| {
-                anyhow!("The pending execution approval request is no longer awaiting a response")
+        self.ensure_not_shutting_down()?;
+        self.ensure_session_is_recoverable().await?;
+        let runtime_turn_id = {
+            let slot = self.in_flight.lock().await;
+            slot.as_ref().map(|turn| turn.runtime_turn_id.clone())
+        };
+        if let Some(runtime_turn_id) = runtime_turn_id {
+            let response_payload = serde_json::to_string(&response).map_err(|error| {
+                anyhow!(
+                    "Unable to encode the interaction response for AgentRuntime delivery: {error}"
+                )
             })?;
+            self.runtime
+                .respond(
+                    self.runtime_session_id.clone(),
+                    runtime_turn_id,
+                    crate::internal::ai::runtime::InteractionResponse::new(
+                        interaction_id,
+                        response_payload,
+                    ),
+                )
+                .await
+                .map_err(|error| {
+                    anyhow!("Unable to deliver the interaction response to AgentRuntime: {error}")
+                })?;
+            return Ok(());
+        }
 
+        let exec_decision = {
+            let pending = self.pending_exec_approvals.lock().await;
+            pending
+                .contains_key(interaction_id)
+                .then(|| review_decision_from_interaction_response(response.clone()))
+                .transpose()?
+        };
+        if let Some(decision) = exec_decision {
+            let pending = {
+                let mut pending = self.pending_exec_approvals.lock().await;
+                pending.remove(interaction_id).ok_or_else(|| {
+                    anyhow!(
+                        "The pending execution approval closed before the response was delivered"
+                    )
+                })?
+            };
             self.session.resolve_interaction(interaction_id).await;
             self.session
                 .set_status(CodeUiSessionStatus::ExecutingTool)
                 .await;
-            self.persist_current_snapshot("failed to persist resolved exec approval interaction")
+            if let Err(error) = self.persist_current_snapshot().await {
+                self.interaction_persistence_failed
+                    .store(true, Ordering::Release);
+                mark_persistence_failure(
+                    &self.session,
+                    "failed to persist resolved exec approval interaction",
+                    error,
+                )
                 .await;
+                return Err(anyhow!(
+                    "Unable to persist the approval response; no tool action was started. Verify session storage before retrying"
+                ));
+            }
+            if let Err(error) = self.persist_interaction_resolution(
+                interaction_id,
+                review_decision_resolution(decision),
+            ) {
+                self.interaction_persistence_failed
+                    .store(true, Ordering::Release);
+                mark_persistence_failure(
+                    &self.session,
+                    "failed to persist resolved exec approval audit event",
+                    error,
+                )
+                .await;
+                return Err(anyhow!(
+                    "Unable to persist the approval audit event; no tool action was started. Verify session storage before retrying"
+                ));
+            }
+            if pending.request.response_tx.send(decision).is_err() {
+                self.session.set_status(CodeUiSessionStatus::Error).await;
+                if let Err(error) = self.persist_current_snapshot().await {
+                    self.interaction_persistence_failed
+                        .store(true, Ordering::Release);
+                    mark_persistence_failure(
+                        &self.session,
+                        "failed to persist closed execution approval request",
+                        error,
+                    )
+                    .await;
+                }
+                return Err(anyhow!(
+                    "The pending execution approval request closed before the response was delivered; no tool action was started"
+                ));
+            }
             return Ok(());
         }
 
+        let user_input_response = {
+            let pending = self.pending_user_inputs.lock().await;
+            let pending = pending
+                .get(interaction_id)
+                .ok_or_else(|| anyhow!("Unknown pending interaction: {interaction_id}"))?;
+            user_input_response_from_code_ui_request(&pending.questions, response)?
+        };
         let pending = {
             let mut pending = self.pending_user_inputs.lock().await;
-            pending
-                .remove(interaction_id)
-                .ok_or_else(|| anyhow!("Unknown pending interaction: {interaction_id}"))?
+            pending.remove(interaction_id).ok_or_else(|| {
+                anyhow!("The pending user-input request closed before the response was delivered")
+            })?
         };
-
-        let user_input_response =
-            user_input_response_from_code_ui_request(&pending.questions, response)?;
-        pending.response_tx.send(user_input_response).map_err(|_| {
-            anyhow!("The pending user input request is no longer awaiting a response")
-        })?;
-
         self.session.resolve_interaction(interaction_id).await;
         self.session
             .set_status(CodeUiSessionStatus::ExecutingTool)
             .await;
-        self.persist_current_snapshot("failed to persist resolved user input interaction")
+        if let Err(error) = self.persist_current_snapshot().await {
+            self.interaction_persistence_failed
+                .store(true, Ordering::Release);
+            mark_persistence_failure(
+                &self.session,
+                "failed to persist resolved user input interaction",
+                error,
+            )
             .await;
+            return Err(anyhow!(
+                "Unable to persist the user-input response; no tool action was started. Verify session storage before retrying"
+            ));
+        }
+        if let Err(error) = self.persist_interaction_resolution(interaction_id, "answered") {
+            self.interaction_persistence_failed
+                .store(true, Ordering::Release);
+            mark_persistence_failure(
+                &self.session,
+                "failed to persist resolved user-input audit event",
+                error,
+            )
+            .await;
+            return Err(anyhow!(
+                "Unable to persist the user-input audit event; no tool action was started. Verify session storage before retrying"
+            ));
+        }
+        if pending.response_tx.send(user_input_response).is_err() {
+            self.session.set_status(CodeUiSessionStatus::Error).await;
+            if let Err(error) = self.persist_current_snapshot().await {
+                self.interaction_persistence_failed
+                    .store(true, Ordering::Release);
+                mark_persistence_failure(
+                    &self.session,
+                    "failed to persist closed user-input request",
+                    error,
+                )
+                .await;
+            }
+            return Err(anyhow!(
+                "The pending user-input request closed before the response was delivered; no tool action was started"
+            ));
+        }
         Ok(())
     }
 
     async fn cancel_turn(&self) -> anyhow::Result<()> {
-        let active = {
-            let mut slot = self.in_flight.lock().await;
-            slot.take()
+        self.ensure_not_shutting_down()?;
+        let runtime_turn_id = {
+            let slot = self.in_flight.lock().await;
+            slot.as_ref().map(|turn| turn.runtime_turn_id.clone())
         };
-        if let Some(turn) = active {
-            if !turn.handle.is_finished() {
-                turn.handle.abort();
+        let Some(runtime_turn_id) = runtime_turn_id else {
+            self.clear_pending_user_inputs().await;
+            return Ok(());
+        };
+        let runtime_interaction_id = self
+            .runtime
+            .snapshot(self.runtime_session_id.clone())
+            .await
+            .ok()
+            .and_then(|snapshot| {
+                headless_interaction_id(&snapshot.interaction).map(ToOwned::to_owned)
+            });
+
+        let mutation_in_progress = self
+            .active_turn_mutations
+            .lock()
+            .await
+            .get(&runtime_turn_id)
+            .is_some_and(|marker| marker.load(Ordering::Acquire));
+        match self
+            .runtime
+            .cancel(self.runtime_session_id.clone(), runtime_turn_id)
+            .await
+        {
+            Ok(()) | Err(RuntimeWorkerError::UnknownTurn { .. }) => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "Unable to request cancellation from the AgentRuntime: {error}"
+                ));
             }
-            // Finalize the streaming assistant entry so the browser sees a
-            // terminal state instead of a perpetually streaming row.
-            finalize_assistant_entry(
-                &self.session,
-                &turn.assistant_entry_id,
-                "(turn cancelled by user)",
-                "cancelled",
-            )
-            .await;
         }
-        self.session.set_status(CodeUiSessionStatus::Idle).await;
+        if let Some(interaction_id) = runtime_interaction_id {
+            self.session.clear_interaction(&interaction_id).await;
+        }
         self.clear_pending_user_inputs().await;
-        self.persist_current_snapshot("failed to persist cancelled headless web turn")
-            .await;
+        if mutation_in_progress {
+            return Err(anyhow!(
+                "A mutating tool is already running; cancellation waits for its determinate result and cannot safely abort it"
+            ));
+        }
         Ok(())
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
-        let active = {
-            let mut slot = self.in_flight.lock().await;
-            slot.take()
-        };
-        if let Some(turn) = active {
-            turn.handle.abort();
-            finalize_assistant_entry(
-                &self.session,
-                &turn.assistant_entry_id,
-                "(libra code shutting down)",
-                "cancelled",
-            )
-            .await;
+        if self
+            .shutting_down
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return self.wait_for_shutdown_result().await;
         }
-        self.clear_pending_user_inputs().await;
-        self.persist_current_snapshot("failed to persist headless web shutdown snapshot")
-            .await;
+
+        let result = self
+            .shutdown_once()
+            .await
+            .map_err(|error| error.to_string());
+        self.shutdown_result_tx.send_replace(Some(result.clone()));
+        result.map_err(anyhow::Error::msg)
+    }
+}
+
+impl<M> HeadlessCodeRuntime<M>
+where
+    M: CompletionModel + Clone + Send + Sync + 'static,
+    M::Response: CompletionUsage,
+{
+    /// Read the serialized runtime's session snapshot. Web adapters continue
+    /// to consume [`CodeUiSession`] for their rich projection, while this
+    /// narrow accessor provides lifecycle integrations and regressions a way
+    /// to verify that browser turns are owned by `AgentRuntimeWorker`.
+    pub async fn runtime_snapshot(&self) -> Result<AgentSnapshot, RuntimeWorkerError> {
+        self.runtime.snapshot(self.runtime_session_id.clone()).await
+    }
+
+    /// Cancel an accepted turn whose executor is still blocked on its durable
+    /// admission gate. The cancellation token wakes that executor before the
+    /// tool loop can run, then the executor releases the local slot.
+    async fn cancel_gated_runtime_turn(
+        &self,
+        runtime_turn_id: &str,
+        completion: Arc<tokio::sync::Notify>,
+    ) -> anyhow::Result<()> {
+        let cancellation_finished = completion.notified();
+        match self
+            .runtime
+            .cancel(self.runtime_session_id.clone(), runtime_turn_id.to_string())
+            .await
+        {
+            Ok(()) => cancellation_finished.await,
+            Err(RuntimeWorkerError::UnknownTurn { .. }) => {
+                // The worker cannot have crossed the closed gate. If it has
+                // already discarded this request, remove the adapter-side
+                // reservation as well so a storage repair can be retried.
+                release_headless_turn(&self.in_flight, runtime_turn_id).await;
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "The gated AgentRuntime turn could not be cancelled; no tool gate was opened. Verify runtime/session storage before retrying: {error}"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    async fn shutdown_once(&self) -> anyhow::Result<()> {
+        let durable_command = {
+            let slot = self.in_flight.lock().await;
+            slot.as_ref().and_then(|turn| turn.durable_command.clone())
+        };
+        self.clear_pending_user_inputs().await;
+        let shutdown_result = self.runtime.shutdown().await;
+        if shutdown_result.is_err() {
+            self.shutdown_timed_out.store(true, Ordering::Release);
+            if let Err(error) = mark_headless_command_indeterminate(
+                self.persistence.as_ref(),
+                durable_command.as_ref(),
+                "runtime_shutdown_timeout",
+                "runtime shutdown did not complete before its deadline",
+            ) {
+                tracing::error!(
+                    error = %error,
+                    "failed to durably record indeterminate browser command during shutdown"
+                );
+            }
+            self.session
+                .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                .await;
+            if let Err(error) = self.persist_current_snapshot().await {
+                tracing::error!(
+                    error = %error,
+                    "failed to persist indeterminate headless session after runtime shutdown failure"
+                );
+            }
+        }
+
+        let worker_task = self.runtime_worker_task.lock().await.take();
+        if let Some(worker_task) = worker_task {
+            worker_task.await.map_err(|error| {
+                anyhow!(
+                    "AgentRuntime worker terminated unexpectedly during headless shutdown: {error}"
+                )
+            })?;
+        }
+
+        shutdown_result.map_err(|error| {
+            anyhow!(
+                "Headless web runtime shutdown did not complete cleanly: {error}. The session is indeterminate; inspect and reconcile it before restarting"
+            )
+        })
+    }
+
+    async fn wait_for_shutdown_result(&self) -> anyhow::Result<()> {
+        let mut result_rx = self.shutdown_result_tx.subscribe();
+        loop {
+            if let Some(result) = result_rx.borrow().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            result_rx.changed().await.map_err(|_| {
+                anyhow!("The headless web runtime stopped before it published the shutdown result")
+            })?;
+        }
     }
 }
 
@@ -573,19 +1910,8 @@ where
             .map(request_user_input_question_to_metadata)
             .collect::<Vec<_>>();
 
-        {
-            let mut pending = self.pending_user_inputs.lock().await;
-            pending.insert(
-                interaction_id.clone(),
-                PendingHeadlessUserInput {
-                    questions: request.questions,
-                    response_tx: request.response_tx,
-                },
-            );
-        }
-
         let interaction = CodeUiInteractionRequest {
-            id: interaction_id,
+            id: interaction_id.clone(),
             kind: crate::internal::ai::web::code_ui::CodeUiInteractionKind::RequestUserInput,
             title: Some("User input required".to_string()),
             description: None,
@@ -601,8 +1927,46 @@ where
         self.session
             .set_status(CodeUiSessionStatus::AwaitingInteraction)
             .await;
-        self.persist_current_snapshot("failed to persist pending user input interaction")
+        if let Err(error) = self.persist_current_snapshot().await {
+            self.interaction_persistence_failed
+                .store(true, Ordering::Release);
+            mark_persistence_failure(
+                &self.session,
+                "failed to persist pending user input interaction",
+                error,
+            )
             .await;
+            self.clear_pending_user_inputs().await;
+            return;
+        }
+        let interaction_state = InteractionState::AwaitingUserInput {
+            interaction_id: interaction_id.clone(),
+        };
+        if let Some(runtime_turn_id) = self.active_runtime_turn_id().await {
+            self.register_live_runtime_interaction(
+                runtime_turn_id,
+                &interaction_id,
+                interaction_state,
+                Box::new(HeadlessInteractionDelivery::UserInput {
+                    session: self.session.clone(),
+                    interaction_persistence_failed: self.interaction_persistence_failed.clone(),
+                    persistence: self.persistence.clone(),
+                    interaction_id: interaction_id.clone(),
+                    questions: request.questions,
+                    response_tx: request.response_tx,
+                }),
+            )
+            .await;
+            return;
+        }
+
+        self.pending_user_inputs.lock().await.insert(
+            interaction_id,
+            PendingHeadlessUserInput {
+                questions: request.questions,
+                response_tx: request.response_tx,
+            },
+        );
     }
 
     async fn handle_exec_approval_request(&self, request: ExecApprovalRequest) {
@@ -619,20 +1983,83 @@ where
             &request,
         );
 
-        {
-            let mut pending = self.pending_exec_approvals.lock().await;
-            pending.insert(
-                interaction_id.clone(),
-                PendingHeadlessExecApproval { request },
-            );
-        }
-
         self.session.upsert_interaction(interaction).await;
         self.session
             .set_status(CodeUiSessionStatus::AwaitingInteraction)
             .await;
-        self.persist_current_snapshot("failed to persist pending exec approval interaction")
+        if let Err(error) = self.persist_current_snapshot().await {
+            self.interaction_persistence_failed
+                .store(true, Ordering::Release);
+            mark_persistence_failure(
+                &self.session,
+                "failed to persist pending exec approval interaction",
+                error,
+            )
             .await;
+            self.clear_pending_user_inputs().await;
+            return;
+        }
+        let interaction_state = InteractionState::AwaitingToolApproval {
+            interaction_id: interaction_id.clone(),
+            tool_name: "shell".to_string(),
+        };
+        if let Some(runtime_turn_id) = self.active_runtime_turn_id().await {
+            self.register_live_runtime_interaction(
+                runtime_turn_id,
+                &interaction_id,
+                interaction_state,
+                Box::new(HeadlessInteractionDelivery::ExecApproval {
+                    session: self.session.clone(),
+                    interaction_persistence_failed: self.interaction_persistence_failed.clone(),
+                    persistence: self.persistence.clone(),
+                    interaction_id: interaction_id.clone(),
+                    request,
+                }),
+            )
+            .await;
+            return;
+        }
+
+        self.pending_exec_approvals
+            .lock()
+            .await
+            .insert(interaction_id, PendingHeadlessExecApproval { request });
+    }
+
+    async fn active_runtime_turn_id(&self) -> Option<String> {
+        let slot = self.in_flight.lock().await;
+        slot.as_ref().map(|turn| turn.runtime_turn_id.clone())
+    }
+
+    /// Transfer a live tool-loop continuation into the serialized worker.
+    /// Standalone adapter calls have no active runtime turn and deliberately
+    /// use the narrow compatibility map above instead.
+    async fn register_live_runtime_interaction(
+        &self,
+        runtime_turn_id: String,
+        interaction_id: &str,
+        interaction: InteractionState,
+        delivery: Box<dyn RuntimeInteractionDelivery>,
+    ) {
+        if let Err(error) = self
+            .runtime
+            .register_interaction_with_delivery(
+                self.runtime_session_id.clone(),
+                runtime_turn_id,
+                interaction,
+                delivery,
+            )
+            .await
+        {
+            tracing::error!(
+                interaction_id,
+                error = %error,
+                "failed to register a live headless interaction with AgentRuntime; closing the interaction fail-closed"
+            );
+            self.clear_pending_user_inputs().await;
+            self.session.clear_interaction(interaction_id).await;
+            self.session.set_status(CodeUiSessionStatus::Error).await;
+        }
     }
 
     async fn clear_pending_user_inputs(&self) {
@@ -659,15 +2086,43 @@ where
         }
     }
 
-    async fn persist_current_snapshot(&self, warning: &'static str) {
-        if let Some(persistence) = self.persistence.as_ref() {
-            persist_or_warn(
-                persistence
-                    .persist_snapshot(self.session.snapshot().await)
-                    .await,
-                warning,
-            );
+    async fn ensure_session_is_recoverable(&self) -> anyhow::Result<()> {
+        if self.session.snapshot().await.status == CodeUiSessionStatus::IndeterminateSideEffect {
+            return Err(anyhow!(
+                "This headless web session has an indeterminate persistence state; restart and inspect its durable session data before sending another request"
+            ));
         }
+        Ok(())
+    }
+
+    fn ensure_not_shutting_down(&self) -> anyhow::Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(anyhow!(
+                "This headless web runtime is shutting down and cannot accept new commands"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn persist_current_snapshot(&self) -> io::Result<()> {
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence
+                .persist_snapshot(self.session.snapshot().await)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn persist_interaction_resolution(
+        &self,
+        interaction_id: &str,
+        resolution: &str,
+    ) -> io::Result<()> {
+        persist_headless_interaction_resolution(
+            self.persistence.as_ref(),
+            interaction_id,
+            resolution,
+        )
     }
 }
 
@@ -704,16 +2159,22 @@ fn format_completion_error(error: &CompletionError) -> String {
     format!("Agent turn failed: {error}")
 }
 
-fn persist_or_warn(result: io::Result<()>, message: &'static str) {
-    if let Err(error) = result {
-        tracing::warn!(error = %error, "{message}");
-    }
+async fn mark_persistence_failure(
+    session: &Arc<CodeUiSession>,
+    message: &'static str,
+    error: io::Error,
+) {
+    tracing::error!(error = %error, "{message}");
+    session
+        .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+        .await;
 }
 
 fn sync_session_metadata_from_snapshot(
     state: &mut SessionState,
     mut snapshot: CodeUiSessionSnapshot,
-) {
+    projection_sequence: u64,
+) -> io::Result<()> {
     let thread_id = snapshot
         .thread_id
         .clone()
@@ -724,9 +2185,14 @@ fn sync_session_metadata_from_snapshot(
         .insert("thread_id".to_string(), serde_json::json!(thread_id));
     state.metadata.insert(
         "code_ui_snapshot".to_string(),
-        serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({})),
+        serde_json::to_value(snapshot).map_err(json_projection_error)?,
+    );
+    state.metadata.insert(
+        "code_ui_projection_cursor".to_string(),
+        serde_json::json!(projection_sequence),
     );
     state.updated_at = Utc::now();
+    Ok(())
 }
 
 fn request_user_input_question_to_metadata(question: &UserInputQuestion) -> serde_json::Value {
@@ -866,21 +2332,73 @@ fn user_input_response_from_code_ui_request(
     questions: &[UserInputQuestion],
     response: CodeUiInteractionResponse,
 ) -> anyhow::Result<UserInputResponse> {
-    if let Some((question_id, answers)) = response
-        .answers
-        .into_iter()
-        .find(|(_, answers)| !answers.is_empty())
-    {
-        return Ok(UserInputResponse {
-            answers: [(question_id, UserInputAnswer { answers })]
-                .into_iter()
-                .collect::<HashMap<_, _>>(),
-        });
+    if questions.is_empty() {
+        return Err(anyhow!("User input request contains no questions"));
     }
 
-    let question = questions
-        .first()
-        .ok_or_else(|| anyhow!("User input request contains no questions"))?;
+    if questions
+        .iter()
+        .any(|question| question.id.trim().is_empty())
+    {
+        return Err(anyhow!(
+            "User input request contains a question without a stable id"
+        ));
+    }
+    let question_ids = questions
+        .iter()
+        .map(|question| question.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if question_ids.len() != questions.len() {
+        return Err(anyhow!(
+            "User input request contains duplicate question ids and cannot be answered safely"
+        ));
+    }
+
+    if !response.answers.is_empty() {
+        let unknown_question_ids = response
+            .answers
+            .keys()
+            .filter(|question_id| !question_ids.contains(question_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown_question_ids.is_empty() {
+            return Err(anyhow!(
+                "User input response contains answers for unknown question ids: {}",
+                unknown_question_ids.join(", ")
+            ));
+        }
+
+        let mut answers = HashMap::with_capacity(questions.len());
+        for question in questions {
+            let values = response.answers.get(&question.id).ok_or_else(|| {
+                anyhow!(
+                    "User input response is missing an answer for question '{}'",
+                    question.id
+                )
+            })?;
+            if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+                return Err(anyhow!(
+                    "User input response must include a non-empty answer for question '{}'",
+                    question.id
+                ));
+            }
+            answers.insert(
+                question.id.clone(),
+                UserInputAnswer {
+                    answers: values.clone(),
+                },
+            );
+        }
+        return Ok(UserInputResponse { answers });
+    }
+
+    if questions.len() != 1 {
+        return Err(anyhow!(
+            "User input response must answer each of the {} requested questions",
+            questions.len()
+        ));
+    }
+    let question = &questions[0];
 
     let mut values = Vec::new();
     if let Some(selected) = response.selected_option
@@ -929,6 +2447,38 @@ struct HeadlessTurnObserver {
     /// "start" task can never clobber the "completed" tool_call / transcript /
     /// plan rows or regress the session status back to `ExecutingTool`.
     start_tasks: Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Terminal projection tasks. They must finish before the enclosing turn
+    /// writes its terminal session status, or their final `Thinking` update
+    /// can race with `Idle`/`Error`/`Cancelled`.
+    completion_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl HeadlessTurnObserver {
+    /// Wait for all projection tasks belonging to the current turn. Callback
+    /// invocation is single-threaded inside the tool loop, so by the time the
+    /// loop returns no new handles can be added; the loop only handles the
+    /// handoff where an end task has taken a start task between the two drains.
+    async fn flush_projection_tasks(&self) {
+        loop {
+            let mut handles = self
+                .start_tasks
+                .lock()
+                .map(|mut tasks| tasks.drain().map(|(_, task)| task).collect::<Vec<_>>())
+                .unwrap_or_default();
+            handles.extend(
+                self.completion_tasks
+                    .lock()
+                    .map(|mut tasks| std::mem::take(&mut *tasks))
+                    .unwrap_or_default(),
+            );
+            if handles.is_empty() {
+                return;
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+        }
+    }
 }
 
 impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnObserver {
@@ -1035,7 +2585,7 @@ impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnO
         let call_id = call_id.to_string();
         let tool_name = tool_name.to_string();
         let result = result.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Some(handle) = start_handle {
                 let _ = handle.await;
             }
@@ -1096,6 +2646,9 @@ impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnO
             }
             session.set_status(CodeUiSessionStatus::Thinking).await;
         });
+        if let Ok(mut tasks) = self.completion_tasks.lock() {
+            tasks.push(handle);
+        }
     }
 }
 

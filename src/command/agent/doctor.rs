@@ -871,7 +871,7 @@ async fn scan_checkpoint_store(
 
     if table_exists(conn, "agent_coverage_claim").await? {
         let conflicts = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT c.session_id, c.logical_turn_key, c.coverage_schema_version,
                         c.coverage_digest, c.completeness, c.revision,
@@ -971,7 +971,7 @@ async fn scan_checkpoint_store(
 
     if table_exists(conn, "agent_subagent_link").await? {
         let inconsistent = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT c.parent_session_id, c.provider_kind, c.source_key,
                         c.content_schema_version, c.current_revision,
@@ -1060,7 +1060,7 @@ async fn scan_checkpoint_store(
         }
 
         let unresolved = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT l.content_checkpoint_id
                  FROM agent_subagent_link l
@@ -1123,6 +1123,32 @@ async fn scan_checkpoint_store(
             &entry.target,
             &entry.key,
         ) {
+            Ok(marker) if !marker.time_fields_trustworthy(now_ms) => {
+                // W2 §C.4.3: a future-dated start beyond skew tolerance is a
+                // CORRUPT row — the prune-side listing fails closed on it,
+                // blocking GC/prune/erasure until it is retired. Doctor must
+                // therefore surface it as repairable (the same serialized
+                // root-fenced retirement drains its listed OIDs safely),
+                // never classify it as live.
+                findings.push(CheckpointFinding {
+                    inconsistency_type: CLASS_EXPIRED_INFLIGHT_MARKER.to_string(),
+                    checkpoint_id: marker.attempt_id.clone(),
+                    detail: format!(
+                        "future-dated traces marker for session '{}' (started_at_ms {} is \
+                         beyond clock-skew tolerance) blocks destructive maintenance \
+                         fail-closed; `libra agent doctor --repair` will run serialized \
+                         root-fenced ownership retirement",
+                        marker.session_id, marker.started_at_ms
+                    ),
+                    repaired: false,
+                    manual_required: false,
+                });
+                plans.push(RepairPlan::RepairExpiredInflightMarker {
+                    session_id: marker.session_id,
+                    attempt_id: marker.attempt_id,
+                    observed_at_ms: now_ms,
+                });
+            }
             Ok(marker) if marker.is_live(now_ms) && !marker.cleanup_pending => markers.push(marker),
             Ok(marker) => {
                 findings.push(CheckpointFinding {
@@ -1645,7 +1671,7 @@ async fn execute_repair(
         } => {
             let backend = conn.get_database_backend();
             let result = conn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_checkpoint \
                      SET tree_oid = ?, metadata_blob_oid = ?, traces_commit = ?, \
@@ -2017,7 +2043,7 @@ fn missing_objects_detail(missing: &[String]) -> String {
 async fn load_catalog_rows(conn: &DatabaseConnection) -> CliResult<Vec<CatalogRow>> {
     let backend = conn.get_database_backend();
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             backend,
             "SELECT checkpoint_id, tree_oid, metadata_blob_oid, traces_commit \
              FROM agent_checkpoint ORDER BY created_at ASC, checkpoint_id ASC",
@@ -2038,7 +2064,7 @@ async fn load_catalog_rows(conn: &DatabaseConnection) -> CliResult<Vec<CatalogRo
 
 async fn session_exists(conn: &DatabaseConnection, session_id: &str) -> CliResult<bool> {
     let backend = conn.get_database_backend();
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         backend,
         "SELECT 1 FROM agent_session WHERE session_id = ? LIMIT 1",
         [session_id.into()],
@@ -2157,6 +2183,14 @@ async fn scan_agent_findings(
                 .filter(|bytes| blob_oid_hex(bytes) == findings_oid);
             if let Some(bytes) = recoverable {
                 let (repaired, detail) = if repair {
+                    // §C.4.3 writer-vs-deleter: rewriting the blob and
+                    // re-inserting its `object_index` row is a PUBLICATION,
+                    // and `agent` is excluded from the command-level shared
+                    // hold (its runs are long). Without this the repair could
+                    // land inside a deletion phase and be pruned right back
+                    // out — repairing the same run forever.
+                    let _publication =
+                        crate::internal::maintenance_lock::MaintenanceLock::shared(&repo_path)?;
                     crate::utils::object::write_git_object(&repo_path, "blob", bytes).map_err(
                         |e| {
                             CliError::fatal(format!(
@@ -2298,7 +2332,7 @@ async fn object_index_row_shape<C: ConnectionTrait>(
 ) -> CliResult<Option<(String, i64)>> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT o_type, o_size FROM object_index WHERE o_id = ? AND repo_id = ? LIMIT 1",
             [o_id.into(), repo_id.into()],
@@ -2327,7 +2361,7 @@ async fn update_object_index_row_shape<C: ConnectionTrait>(
     repo_id: &str,
 ) -> Result<(), sea_orm::DbErr> {
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "UPDATE object_index
          SET o_type = ?, o_size = ?, is_synced = 0
@@ -2350,7 +2384,7 @@ async fn insert_object_index_row<C: ConnectionTrait>(
     repo_id: &str,
 ) -> Result<(), sea_orm::DbErr> {
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced) \
          SELECT ?, ?, ?, ?, ?, 0 \
@@ -2391,7 +2425,7 @@ pub(crate) async fn repair_session_object_index(
     // session. Erasure uses the same database writer serialization, so it
     // cannot prune the catalog and then race these index inserts back in.
     let locked = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE metadata_kv SET updated_at = updated_at
              WHERE scope = 'agent_import_index_repair'
@@ -2404,7 +2438,7 @@ pub(crate) async fn repair_session_object_index(
         bail!("import object-index repair marker disappeared or is no longer owned");
     }
     let marker = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT value FROM metadata_kv
              WHERE scope = 'agent_import_index_repair'
@@ -2436,7 +2470,7 @@ pub(crate) async fn repair_session_object_index(
         bail!("import object-index repair marker ownership changed");
     }
     let tombstone = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -2448,7 +2482,7 @@ pub(crate) async fn repair_session_object_index(
         bail!("session was erased while its import object-index repair was pending");
     }
     let session = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT agent_kind, provider_session_id FROM agent_session WHERE session_id = ?",
             [session_id.into()],
@@ -2468,7 +2502,7 @@ pub(crate) async fn repair_session_object_index(
     }
     import_index_repair_test_pause_after_lock()?;
     let rows = txn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT checkpoint_id, tree_oid, traces_commit
              FROM agent_checkpoint
@@ -2769,7 +2803,7 @@ fn emit_report(report: &DoctorReport, output: &OutputConfig) -> CliResult<()> {
 
 async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> CliResult<bool> {
     let backend = conn.get_database_backend();
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         backend,
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
@@ -2782,7 +2816,7 @@ async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> Cli
 async fn scalar_count(conn: &(impl ConnectionTrait + ?Sized), sql: &str) -> CliResult<i64> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(backend, sql, []))
+        .query_one_raw(Statement::from_sql_and_values(backend, sql, []))
         .await
         .map_err(|e| CliError::fatal(format!("doctor query failed: {e}")))?
         .ok_or_else(|| CliError::fatal("doctor count returned no rows".to_string()))?;

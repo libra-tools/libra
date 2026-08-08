@@ -60,7 +60,7 @@ DROP TABLE `sequence_state__old_2026071901`;
 -- (v0.19.36): `normalize_rebase_state_shape` in the migration runner
 -- normalizes the variable lazy-DDL column set on every connection open, and
 -- the 2026072101 static rebuild then re-keys `rebase_state` by `worktree_id`.
--- The lazily-created `bisect_state` is scoped IN PLACE instead (v0.19.34):
--- `src/command/bisect.rs` lazily ADDs a `worktree_id TEXT NOT NULL DEFAULT ''`
--- column (safe regardless of the table's current column set) and keys every
--- query by it, so bisect runs per-worktree without a static rebuild here.
+-- `bisect_state` was scoped IN PLACE at the time (v0.19.34): lazy ADD COLUMN
+-- of `worktree_id TEXT NOT NULL DEFAULT ''` with every query keyed by it.
+-- That lazy path was later retired — 2026072301 re-keys `bisect_state` by
+-- `worktree_id` with a static rebuild, same as `rebase_state` in 2026072101.

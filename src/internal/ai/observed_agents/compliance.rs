@@ -202,7 +202,7 @@ impl AuditRecord {
 /// `INSERT` — the table's triggers reject `UPDATE`/`DELETE`.
 pub async fn write_audit_record<C: ConnectionTrait>(conn: &C, record: &AuditRecord) -> Result<()> {
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_audit_log \
          (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) \

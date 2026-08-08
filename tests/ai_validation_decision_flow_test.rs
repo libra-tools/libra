@@ -37,7 +37,7 @@ const BOOTSTRAP_SQL: &str = include_str!("../sql/sqlite_20260309_init.sql");
 /// connection ready for tests that only need schema (no on-disk Libra repo).
 async fn setup_db() -> sea_orm::DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         db.get_database_backend(),
         BOOTSTRAP_SQL,
     ))

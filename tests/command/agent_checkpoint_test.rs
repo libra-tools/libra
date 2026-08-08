@@ -21,7 +21,7 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
 }
 
 async fn seed_checkpoint_for_parent(conn: &DatabaseConnection, checkpoint_id: &str, parent: &str) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -33,7 +33,7 @@ async fn seed_checkpoint_for_parent(conn: &DatabaseConnection, checkpoint_id: &s
     .await
     .expect("insert agent_session");
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -145,7 +145,7 @@ async fn agent_checkpoint_subagent_scope_listed_and_linked() {
 
     // A committed parent + a subagent child linked back to it.
     seed_checkpoint_for_parent(&conn, "cp-committed", "deadbeef").await;
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
@@ -179,7 +179,7 @@ async fn agent_checkpoint_subagent_scope_listed_and_linked() {
 
     // Parent linkage persisted on the subagent row.
     let link = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT parent_checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = 'cp-subagent'",
             [],

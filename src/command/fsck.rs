@@ -487,6 +487,25 @@ async fn run_fsck(args: &FsckArgs) -> CliResult<FsckResult> {
     // `--heal` repairs FIRST, so the checks below (and therefore the exit code)
     // observe the post-repair state. The repair itself is reported separately.
     let heal_report = if args.heal {
+        // plan-20260714 W0 hard gate: `--heal` discovery walks only
+        // refs/reflogs/index roots — it does NOT cover every worktree's
+        // private index, sequencer rows, sidecars and notes. Until it
+        // consumes the full `GcObjectSource` inventory, healing a repo that
+        // ever had linked worktrees could miss (and mis-report) another
+        // scope's objects, so it fails closed, exactly like the W0 GC gate.
+        if crate::command::maintenance::repository_had_linked_worktrees() {
+            return Err(CliError::fatal(
+                "fsck --heal does not yet cover the per-worktree object inventory; \
+                 it is refused on repositories that have (or had) linked worktrees",
+            )
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint(
+                "run `libra maintenance run` for the inventory-complete reachability walk; \
+                 removing the linked worktrees does NOT re-enable `--heal` (the repository's \
+                 worktree history is retained), so it stays unsupported until the heal \
+                 inventory is worktree-complete",
+            ));
+        }
         // A well-formed `--heal <OBJECT>` seeds that OID so it is healed even if
         // unreachable; a malformed one is left to the single-object check below
         // to report as invalid.
@@ -655,7 +674,7 @@ async fn run_heal_pass(explicit: Option<ObjectHash>) -> CliResult<HealReport> {
                 Ok(None) => {}
                 Err(e) => {
                     return Err(CliError::fatal(format!(
-                        "cannot verify obliteration tombstones during heal; aborting to avoid                          resurrecting an obliterated object: {e}"
+                        "cannot verify obliteration tombstones during heal; aborting to avoid resurrecting an obliterated object: {e}"
                     ))
                     .with_stable_code(StableErrorCode::IoReadFailed));
                 }
@@ -1546,7 +1565,9 @@ async fn collect_reachability_context(storage: &ClientStorage) -> CliResult<Reac
     // does not delete, but a false "unreachable" invites a manual delete. All
     // stages (0..=3) count: a blob referenced only by an unmerged conflict
     // stage is not garbage either.
-    for index_path in crate::command::maintenance::worktree_index_roots() {
+    for index_path in crate::command::maintenance::worktree_index_roots(
+        &crate::utils::util::request_storage_path(),
+    )? {
         if index_path.exists()
             && let Ok(index) = Index::load(&index_path)
         {

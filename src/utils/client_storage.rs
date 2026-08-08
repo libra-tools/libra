@@ -1586,6 +1586,14 @@ impl ClientStorage {
                     ObjectReadFailure::Corrupt
                 }
             }
+            // A filesystem/transport failure reading the object STORE is an
+            // availability fault, not an unknown one: the object may well
+            // exist and be intact, we just cannot read it right now
+            // (EACCES on a loose file, a dropped tier connection). Routing
+            // it through `Other` would report an object-store problem under
+            // the worktree warning family and send readers to inspect the
+            // wrong subsystem.
+            GitError::IOError(_) | GitError::NetworkError(_) => ObjectReadFailure::Unavailable,
             _ => ObjectReadFailure::Other,
         }
     }
@@ -2089,7 +2097,7 @@ pub(crate) async fn remove_object_index_rows_with_conn<C: ConnectionTrait>(
     }
     let backend = conn.get_database_backend();
     let table_exists = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'object_index' LIMIT 1"
                 .to_string(),
@@ -2105,7 +2113,7 @@ pub(crate) async fn remove_object_index_rows_with_conn<C: ConnectionTrait>(
     // `unknown-repo` sentinel would report success while leaving stale cloud
     // catalogue rows behind.
     let repo_id = match conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
                 .to_string(),
@@ -2135,11 +2143,73 @@ pub(crate) async fn remove_object_index_rows_with_conn<C: ConnectionTrait>(
         values.push(Value::from(repo_id.clone()));
         values.extend(chunk.iter().map(|oid| Value::from(oid.clone())));
         let result = conn
-            .execute(Statement::from_sql_and_values(backend, sql, values))
+            .execute_raw(Statement::from_sql_and_values(backend, sql, values))
             .await?;
         deleted += result.rows_affected();
     }
     Ok(deleted)
+}
+
+/// Count the `object_index` rows [`remove_object_index_rows_with_conn`]
+/// WOULD delete for `oids` — the `--dry-run` preview counterpart (PD-04).
+/// Mirrors the delete predicate exactly (same repo-id resolution, same
+/// chunking) and shares its boundary behavior: empty input or a missing
+/// `object_index` table count as zero.
+pub(crate) async fn count_object_index_rows_with_conn<C: ConnectionTrait>(
+    conn: &C,
+    oids: &[String],
+) -> Result<u64, DbErr> {
+    if oids.is_empty() {
+        return Ok(0);
+    }
+    let backend = conn.get_database_backend();
+    let table_exists = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'object_index' LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+        .is_some();
+    if !table_exists {
+        return Ok(0);
+    }
+    let repo_id = match conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+    {
+        Some(row) => {
+            let value = row.try_get_by::<String, _>("value")?;
+            if value.trim().is_empty() {
+                "unknown-repo".to_string()
+            } else {
+                value
+            }
+        }
+        None => "unknown-repo".to_string(),
+    };
+    const COUNT_CHUNK: usize = 200;
+    let mut total = 0_u64;
+    for chunk in oids.chunks(COUNT_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM object_index WHERE repo_id = ? AND o_id IN ({placeholders})"
+        );
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
+        values.push(Value::from(repo_id.clone()));
+        values.extend(chunk.iter().map(|oid| Value::from(oid.clone())));
+        if let Some(row) = conn
+            .query_one_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await?
+        {
+            total += row.try_get_by::<i64, _>("n")? as u64;
+        }
+    }
+    Ok(total)
 }
 
 #[async_trait]
@@ -2793,7 +2863,7 @@ async fn update_object_index_batch(
             sql.clone(),
             values.clone(),
         );
-        match db_conn.execute(statement).await {
+        match db_conn.execute_raw(statement).await {
             Ok(_) if db_path.is_file() => return Ok(()),
             Ok(_) => {
                 return Err(format!(
@@ -4338,7 +4408,7 @@ mod tests {
         )
         .await
         .expect("create test database");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "DROP TABLE config_kv".to_string(),
         ))
@@ -4384,7 +4454,7 @@ mod tests {
         // queries while preserving the full current schema contract.
         const OID: &str = "abcdef1234567890abcdef1234567890abcdef12";
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced) \
              VALUES (?, 'blob', 42, 'unknown-repo', 0, 1)",
@@ -4400,7 +4470,7 @@ mod tests {
             .expect("upgrade ok");
 
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT o_type, is_synced FROM object_index WHERE o_id = ? LIMIT 1",
                 [OID.into()],
@@ -4426,7 +4496,7 @@ mod tests {
             .await
             .expect("no-op ok");
         let row_again = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT o_type FROM object_index WHERE o_id = ? LIMIT 1",
                 [OID.into()],
@@ -4446,7 +4516,7 @@ mod tests {
             .expect("idempotent ok");
 
         let count_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT COUNT(*) AS n FROM object_index WHERE o_id = ?",
                 [OID.into()],

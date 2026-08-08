@@ -21,6 +21,8 @@ libra stash clear [--force]
 
 Stash 条目以特殊结构的提交对象存储在 `.libra/refs/stash` 下，并通过一个扁平文件列表跟踪 stash 栈。每个 stash 都捕获创建时的索引状态和工作树状态。
 
+**Worktree（自 W2 起）**：stash *栈* 有意在所有 worktree 间共享——一个 worktree 推入的条目可在任何其他 worktree 中 list/apply/pop；而 `push`/`apply`/`pop` 只快照与修改你运行命令的那个 worktree。栈突变经锁串行化，`pop`/`stash branch` 只删除自己刚 apply 的那个条目（若栈被并发修改则保留条目并报告，绝不误删他人条目，也不回滚已成功的 apply）。
+
 ## 选项
 
 ### 子命令

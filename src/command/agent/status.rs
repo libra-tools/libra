@@ -64,7 +64,7 @@ pub async fn execute_safe(_args: StatusArgs, output: &OutputConfig) -> CliResult
             "SELECT MAX(created_at) AS last FROM agent_checkpoint",
             [],
         );
-        match conn.query_one(stmt).await {
+        match conn.query_one_raw(stmt).await {
             Ok(Some(row)) => row.try_get_by::<Option<i64>, _>("last").ok().flatten(),
             Ok(None) => None,
             Err(e) => {
@@ -112,7 +112,7 @@ async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> Cli
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
     );
-    conn.query_one(stmt)
+    conn.query_one_raw(stmt)
         .await
         .map(|row| row.is_some())
         .map_err(|e| CliError::fatal(format!("failed to query sqlite_master: {e}")))
@@ -125,7 +125,7 @@ async fn scalar_count(
 ) -> CliResult<i64> {
     let stmt = Statement::from_sql_and_values(backend, sql, []);
     let row = conn
-        .query_one(stmt)
+        .query_one_raw(stmt)
         .await
         .map_err(|e| CliError::fatal(format!("failed to read agent_session count: {e}")))?
         .ok_or_else(|| {

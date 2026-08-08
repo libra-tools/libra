@@ -463,3 +463,110 @@ fn agent_rpc_trust_dir() {
         String::from_utf8_lossy(&ww_reg.stderr)
     );
 }
+
+/// DR-04b: provider-exporter trust (`rpc trust opencode`) pins the provider's
+/// OWN CLI binary for the sandboxed export bridge without opening the
+/// external-RPC surface: it works while `agent.external_agents.enabled` is
+/// off, resolves the binary only from registered trusted directories (never
+/// `$PATH`), refuses with `LBR-AGENT-005` when no trusted directory holds
+/// the binary, stays un-invokable as an RPC agent (`LBR-AGENT-006`), and is
+/// revocable through the ordinary `untrust` path.
+#[test]
+fn provider_exporter_trust_is_ungated_and_trusted_dir_bound() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    init_repo_via_cli(&repo);
+    let fixtures = temp.path().join("bin");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    // The provider's own CLI binary (NOT libra-agent-* prefixed).
+    let exporter = fixtures.join("opencode");
+    std::fs::write(&exporter, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&exporter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Gate deliberately left OFF for the whole registration flow.
+
+    // (a) No trusted directory holds the binary yet: refusal carries the
+    // provenance code and the actionable --dir hint, NOT the RPC gate code.
+    let missing = run_with_path(&["agent", "rpc", "trust", "opencode"], &repo, &fixtures);
+    assert!(!missing.status.success(), "must refuse without trusted dir");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-005") && stderr.contains("trust --dir"),
+        "refusal is a provenance rejection with the --dir hint: {stderr}"
+    );
+    assert!(
+        !stderr.contains("LBR-AGENT-002"),
+        "exporter trust must not be gated behind the external-RPC opt-in: {stderr}"
+    );
+
+    // (b) Registering the trusted directory is also un-gated preparation.
+    let trust_dir = run_with_path(
+        &["agent", "rpc", "trust", "--dir", fixtures.to_str().unwrap()],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        trust_dir.status.success(),
+        "trust --dir works while gated: {}",
+        String::from_utf8_lossy(&trust_dir.stderr)
+    );
+
+    // (c) Exporter trust now succeeds and names the provider-exporter role.
+    let trusted = run_with_path(&["agent", "rpc", "trust", "opencode"], &repo, &fixtures);
+    assert!(
+        trusted.status.success(),
+        "exporter trust succeeds: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&trusted.stdout);
+    assert!(
+        stdout.contains("provider exporter 'opencode'") && stdout.contains("sha256"),
+        "trust output names the exporter role and provenance: {stdout}"
+    );
+
+    // (d) The exporter slug never becomes an invokable RPC agent: while the
+    // surface is gated the gate answers; once enabled, impersonation does.
+    let gated_invoke = run_with_path(
+        &["agent", "rpc", "invoke", "opencode", "provider_kind"],
+        &repo,
+        &fixtures,
+    );
+    assert!(!gated_invoke.status.success());
+    assert!(
+        String::from_utf8_lossy(&gated_invoke.stderr).contains("LBR-AGENT-002"),
+        "invoke stays gated regardless of exporter trust"
+    );
+    let set = run_with_path(
+        &["config", "set", "agent.external_agents.enabled", "true"],
+        &repo,
+        &fixtures,
+    );
+    assert!(set.status.success());
+    let enabled_invoke = run_with_path(
+        &["agent", "rpc", "invoke", "opencode", "provider_kind"],
+        &repo,
+        &fixtures,
+    );
+    assert!(!enabled_invoke.status.success());
+    assert!(
+        String::from_utf8_lossy(&enabled_invoke.stderr).contains("LBR-AGENT-006"),
+        "an exporter slug is never invokable as an external RPC binary: {}",
+        String::from_utf8_lossy(&enabled_invoke.stderr)
+    );
+
+    // (e) Revocation goes through the ordinary untrust path with the
+    // exporter label.
+    let untrust = run_with_path(&["agent", "rpc", "untrust", "opencode"], &repo, &fixtures);
+    assert!(
+        untrust.status.success(),
+        "untrust works: {}",
+        String::from_utf8_lossy(&untrust.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&untrust.stdout).contains("provider exporter 'opencode'"),
+        "untrust names the exporter role: {}",
+        String::from_utf8_lossy(&untrust.stdout)
+    );
+}

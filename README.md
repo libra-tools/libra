@@ -44,7 +44,8 @@ Libra is built to fit into existing developer workflows. It is Git-compatible an
 ### Install
 
 ```bash
-# macOS / Linux (recommended)
+# macOS (Apple Silicon) / Linux (amd64, arm64) — recommended
+# Intel macOS has no prebuilt binary; build from source with `cargo build --release`.
 curl -fsSL https://download.libra.tools/install.sh | sh
 
 # Homebrew (macOS)

@@ -124,6 +124,18 @@ fn fully_populated_snapshot() -> CodeUiSessionSnapshot {
     }
 }
 
+#[test]
+fn indeterminate_side_effect_status_uses_a_stable_wire_value() {
+    let mut snapshot = fully_populated_snapshot();
+    snapshot.status = CodeUiSessionStatus::IndeterminateSideEffect;
+
+    let serialized = serde_json::to_value(snapshot).expect("snapshot must serialize");
+    assert_eq!(
+        serialized.get("status"),
+        Some(&Value::String("indeterminate_side_effect".into()))
+    );
+}
+
 /// Round-trip serialization must preserve every observable wire field
 /// (`sessionId`, `capabilities`, `controller.loopbackOnly`, transcript kinds,
 /// patchset diffs, interaction options) so the browser type contract stays in

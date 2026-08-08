@@ -48,7 +48,7 @@ async fn seed_session(
     last_event_at: i64,
     stopped_at: i64,
 ) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -80,7 +80,7 @@ async fn seed_checkpoint(
     let metadata_blob_oid = format!("{:040x}", created_at + 2);
     let traces_commit = format!("{:040x}", created_at + 3);
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -158,7 +158,7 @@ async fn seed_checkpoint_commit(
     .await
     .expect("clear seeded checkpoint writer marker");
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -201,7 +201,7 @@ async fn seed_checkpoint_commit(
 
 async fn checkpoint_exists(conn: &DatabaseConnection, checkpoint_id: &str) -> bool {
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE checkpoint_id = ?",
             [Value::from(checkpoint_id)],
@@ -214,7 +214,7 @@ async fn checkpoint_exists(conn: &DatabaseConnection, checkpoint_id: &str) -> bo
 }
 
 async fn scalar_count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    conn.query_one(Statement::from_string(
+    conn.query_one_raw(Statement::from_string(
         conn.get_database_backend(),
         sql.to_string(),
     ))
@@ -229,7 +229,7 @@ async fn checkpoint_traces_commit(
     conn: &DatabaseConnection,
     checkpoint_id: &str,
 ) -> Option<String> {
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT traces_commit FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
         [Value::from(checkpoint_id)],
@@ -243,7 +243,7 @@ async fn checkpoint_traces_commit(
 }
 
 async fn agent_traces_head(conn: &DatabaseConnection) -> Option<String> {
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT `commit` FROM reference WHERE name = ? AND kind = 'Branch' LIMIT 1",
         [Value::from(TRACES_BRANCH)],
@@ -330,7 +330,7 @@ async fn agent_clean_claims_gc_reconciles_companion_import_state() {
         old,
     )
     .await;
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_coverage_claim (
             session_id, logical_turn_key, coverage_schema_version,
@@ -348,7 +348,7 @@ async fn agent_clean_claims_gc_reconciles_companion_import_state() {
     ))
     .await
     .expect("seed coverage claim");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_coverage_revision (
             session_id, logical_turn_key, coverage_schema_version, revision,
@@ -358,7 +358,7 @@ async fn agent_clean_claims_gc_reconciles_companion_import_state() {
     ))
     .await
     .expect("seed coverage revision");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_coverage_conflict (
             session_id, logical_turn_key, coverage_schema_version,
@@ -371,7 +371,7 @@ async fn agent_clean_claims_gc_reconciles_companion_import_state() {
     ))
     .await
     .expect("seed conflict evidence for final claim");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_import_identity (
             identity_id, agent_kind, provider_session_id, source_kind, source_id,
@@ -480,7 +480,7 @@ async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger(
         20,
     )
     .await;
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_coverage_claim (
             session_id, logical_turn_key, coverage_schema_version,
@@ -497,7 +497,7 @@ async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger(
         (1_i64, "cp-conflict-first", "digest-first", 10_i64),
         (2_i64, "cp-conflict-second", "digest-second", 20_i64),
     ] {
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_coverage_revision (
                 session_id, logical_turn_key, coverage_schema_version, revision,
@@ -514,7 +514,7 @@ async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger(
         .await
         .expect("seed coverage revision");
     }
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_coverage_conflict (
             session_id, logical_turn_key, coverage_schema_version,
@@ -552,7 +552,7 @@ async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger(
         "ordinary prune must leave a durable cloud anti-resurrection fence"
     );
     let claim = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT state, revision, checkpoint_id, coverage_digest, traces_commit
              FROM agent_coverage_claim WHERE session_id = 'gc-conflict-rewind'"
@@ -575,7 +575,7 @@ async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger(
         "digest-first"
     );
     let retained_checkpoint_row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT traces_commit, sync_revision FROM agent_checkpoint
              WHERE checkpoint_id = 'cp-conflict-first'"
@@ -620,7 +620,7 @@ async fn agent_clean_gc_deletes_zero_checkpoint_import_identity() {
     init_repo_via_cli(repo.path());
     let conn = connect_repo_db(repo.path()).await;
     let now = chrono::Utc::now().timestamp_millis();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_import_identity (
             identity_id, agent_kind, provider_session_id, source_kind, source_id,
@@ -782,7 +782,7 @@ async fn agent_clean_refuses_when_traces_ref_reaches_uncataloged_commits() {
     .await;
     // Simulate window-B residue: the committed checkpoint's commit stays
     // reachable from the ref, but its catalog row vanishes.
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
         [Value::from("ee000000-0000-4000-8000-000000000002")],
@@ -822,7 +822,7 @@ async fn agent_clean_refuses_when_traces_ref_reaches_uncataloged_commits() {
 async fn object_index_row_count(conn: &DatabaseConnection, oids: &[String]) -> i64 {
     let placeholders = vec!["?"; oids.len()].join(", ");
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             format!("SELECT COUNT(*) AS n FROM object_index WHERE o_id IN ({placeholders})"),
             oids.iter().map(|oid| Value::from(oid.clone())),
@@ -835,7 +835,7 @@ async fn object_index_row_count(conn: &DatabaseConnection, oids: &[String]) -> i
 
 async fn checkpoint_catalog_oids(conn: &DatabaseConnection, checkpoint_id: &str) -> Vec<String> {
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT traces_commit, tree_oid, metadata_blob_oid FROM agent_checkpoint \
              WHERE checkpoint_id = ? LIMIT 1",
@@ -1096,7 +1096,7 @@ async fn checkpoint_prune_preserves_leased_import_identity_before_claim_registra
         302,
     )
     .await;
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_import_identity (
             identity_id, agent_kind, provider_session_id, source_kind, source_id,
@@ -1181,7 +1181,7 @@ async fn agent_clean_gc_drops_expired_all_scopes_and_keeps_audit_log() {
     )
     .await;
     // An audit row that GC must never delete.
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_audit_log \
          (audit_id, timestamp, action, checkpoint_id, scope, granted) \
@@ -1217,7 +1217,7 @@ async fn agent_clean_gc_drops_expired_all_scopes_and_keeps_audit_log() {
     );
     // The audit log survives GC untouched.
     let audit = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS n FROM agent_audit_log WHERE audit_id = ?",
             [Value::from("audit-1")],
@@ -1441,13 +1441,15 @@ async fn agent_clean_findings_retention_gc() {
     );
     assert_eq!(json["data"]["dry_run"], false);
 
-    // Aged terminal run DIR: gone. The objectized blob is deliberately KEPT
-    // (content-addressed; reclaimed by a future repo-wide object GC, never by
-    // per-run retention, so a shared/reachable object can't be corrupted).
+    // Aged terminal run DIR: gone — and since PD-04 so is the findings blob
+    // it owned. Leaving it meant the retention window expired while the
+    // bytes stayed in the repository forever. Reclamation is still
+    // conservative: an oid a surviving run names, or one history reaches,
+    // is never deleted (see the unit test in `agent::clean`).
     assert!(!runs_root.join("aged-run").exists(), "aged run dir removed");
     assert!(
-        loose(&aged_oid).exists(),
-        "the objectized blob is left for a repo-wide GC, not deleted here"
+        !loose(&aged_oid).exists(),
+        "the aged run's findings blob is reclaimed with it, not leaked"
     );
     // Recent terminal + aged in-flight runs: KEPT.
     assert!(runs_root.join("recent-run").exists(), "recent run kept");

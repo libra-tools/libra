@@ -23,6 +23,8 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 当 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph <thread_id>` 命令，以便在独立 TUI 中检查该线程的 Intent/Plan/Task/Run/PatchSet 版本图。检查非当前目录仓库时，使用 `libra graph <thread_id> --repo <path>`。
 
+**Linked worktree**：在统一的 Code/Agent 配置 resolver 落地前，`libra code`（所有模式）在 linked worktree 中一律拒绝启动——会话配置（agents、hooks、sandbox、审批）在该场景尚未按 worktree 解析，linked 会话可能在仓库 sandbox 策略下运行却缺失其安全 hooks。请改在 main worktree 运行；拒绝信息会给出该提示。同理，linked worktree 中 automation 的 VCS dispatch 被禁用（带 warning），`libra automation` 亦 fail-closed——见 [automation.md](automation.md)。
+
 ## 选项
 
 | 标志 | 短参数 | 长参数 | 默认值 | 说明 |
@@ -118,7 +120,7 @@ Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 
 
 请求 `--browser-control loopback` 且浏览器持有 active lease 时，TUI 初始 controller 是 `LocalTui`（可见 owner，可 reclaim），而不是 `Fixed { Tui }`（永久阻塞）。如果 TUI 也想驱动写入，必须同时提供 `--control write` 和 `--browser-control loopback`；两个 writer 通过同一个 `TuiControlCommand` channel 串行化。
 
-对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 Phase 3 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs)，直接运行 agent 的 tool loop，使浏览器可以驱动真实会话，无需终端。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--resume <thread_id>` 按设计仅限 TUI：headless runtime 内保留了 session 层的 resume 实现，但 `--resume` CLI flag 只在交互式 TUI 路径被接受，在 `--web-only`（和 `--stdio`）模式下被拒绝。持久化的 headless resume 只能通过 TUI 抵达——这是有意的契约，而非延后的工作。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。
+对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs)，浏览器 submit 会先进入串行的 `AgentRuntimeWorker`，再由其 executor 运行标准 agent tool loop，使浏览器可以驱动真实会话，无需终端。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--web-only --resume <thread_id>` 会在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。`--resume` 在 `--stdio` 模式及 `--provider codex` 下仍不可用；managed app-server 使用独立的 session protocol。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
 
 ### Code UI Wire Contract
 
@@ -134,7 +136,7 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | `provider` | object | `{ provider, model?, mode?, managed }`。 |
 | `capabilities` | object | 八个 booleans：`messageInput`、`streamingText`、`planUpdates`、`toolCalls`、`patchsets`、`interactiveApprovals`、`structuredQuestions`、`providerSessionResume`。 |
 | `controller` | object | `{ kind, ownerLabel?, canWrite, leaseExpiresAt?, reason?, loopbackOnly }`；`kind` 是 `none`、`browser`、`automation`、`tui` 或 `cli`。 |
-| `status` | string | `idle`、`thinking`、`executing_tool`、`awaiting_interaction`、`completed` 或 `error`。 |
+| `status` | string | `idle`、`thinking`、`executing_tool`、`awaiting_interaction`、`completed`、`error` 或 `indeterminate_side_effect`。最后一种表示变异命令可能已生效；再次尝试前必须先完成 reconciliation。 |
 | `transcript` | array | 带 `id`、`kind`、可选 `title` / `content` / `status`、`streaming`、`metadata`、`createdAt`、`updatedAt` 的条目。 |
 | `plans` / `tasks` / `toolCalls` / `patchsets` | arrays | Workflow、Summary、Diff 和 Terminal panes 使用的 runtime projections。 |
 | `interactions` | array | 待处理/已解决的 UI prompts。`kind` 是 `approval`、`sandbox_approval`、`request_user_input`、`intent_review_choice` 或 `post_plan_choice`。 |
@@ -234,8 +236,9 @@ LIBRA_LOG='libra::internal::ai=debug,libra::internal::tui=debug' \
 LIBRA_LOG_FILE=/tmp/libra-code.log \
 libra code --repo=/Volumes/Data/linked --provider ollama --model gemma4:31b
 
-# 恢复规范 Libra 线程（按设计仅限 TUI：`--resume` 不接受与 --web-only 或 --stdio 同用）
+# 在 TUI 或非 Codex headless Web server 中恢复规范 Libra 线程
 libra code --resume 11111111-1111-4111-8111-111111111111
+libra code --web-only --provider ollama --resume 11111111-1111-4111-8111-111111111111
 
 # 检查同一线程的版本图
 libra graph 11111111-1111-4111-8111-111111111111
@@ -303,6 +306,10 @@ AI agents 在开发者机器上执行 shell 命令存在真实安全风险。五
 
 嵌入式 Code UI 在其 session snapshot 中以 `threadId` 暴露相同规范标识。较旧的 `session_id` 字段仍保留以维持兼容，但新集成应使用 `threadId` 作为 resume、Web、MCP 和 diagnostics 流程的 key。
 
+对于持久化的非 Codex Web session，初始 session 写入是启动 turn 的前提：写入失败时 Libra 不会启动 turn，浏览器可修复存储后重试。若后续持久化失败，live session 会变为 `indeterminate_side_effect`，并阻止新的 submit 或 interaction reply；重启或 reconciliation 前必须检查 durable session data。
+
+收到 `Ctrl-C` 时，非 Codex headless runtime 会先关闭浏览器命令 admission，再最多等待 30 秒让 active turn 得到可判定结果。read-only/model 工作会 cooperative cancel；已经开始的 mutating tool 被允许完成。若超过期限，`libra code` 会以明确的 shutdown failure 退出，重启前必须检查 session 并完成 reconciliation。
+
 ## 参数对比：Libra vs Git vs jj
 
 | 参数 | Libra | Git | jj |
@@ -312,7 +319,7 @@ AI agents 在开发者机器上执行 shell 命令存在真实安全风险。五
 | Web 模式 | `--web-only` | 不可用 | 不可用 |
 | MCP/stdio 模式 | `--stdio` | 不可用 | 不可用 |
 | AI provider 选择 | `--provider` | 不可用 | 不可用 |
-| 会话恢复 | `--resume <thread_id>` | 不可用 | 不可用 |
+| 会话恢复 | `--resume <thread_id>`（TUI 及非 Codex `--web-only`） | 不可用 | 不可用 |
 | 工具 approval policy | `--approval-policy` | 不可用 | 不可用 |
 
 注意：Git 和 jj 都没有 `libra code` 的等价物。该命令体现了 Libra 作为 AI-agent-native 版本控制系统的核心差异。Git 生态中最接近的类似物是 GitHub Copilot CLI 或 aider 等第三方工具，它们是独立应用，而不是集成 VCS 命令。

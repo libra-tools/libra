@@ -236,38 +236,46 @@ fn resolve_rename_threshold(args: &DiffArgs) -> Result<Option<u32>, DiffError> {
 }
 
 /// Parse Git's `-M` score syntax onto the 0..60000 similarity scale.
-pub(super) fn parse_rename_score(raw: &str) -> Result<u32, DiffError> {
+pub(crate) fn parse_rename_score(raw: &str) -> Result<u32, DiffError> {
     let invalid = || DiffError::InvalidRenameScore(raw.to_string());
-    let parse_decimal = |s: &str| -> Option<(u128, u128)> {
-        let mut num = 0u128;
-        let mut denom = 1u128;
-        let mut seen_dot = false;
-        let mut any_digit = false;
-        const CAP: u128 = 1_000_000_000_000;
-        for byte in s.bytes() {
-            match byte {
-                b'.' if !seen_dot => seen_dot = true,
-                b'0'..=b'9' => {
-                    any_digit = true;
-                    if num < CAP && denom < CAP {
-                        num = num * 10 + u128::from(byte - b'0');
-                        if seen_dot {
-                            denom *= 10;
-                        }
-                    }
-                }
-                _ => return None,
-            }
-        }
-        any_digit.then_some((num, denom))
+    // Faithful port of Git diff.c `parse_num`: the scale grows once per
+    // digit and STOPS at 100000 (five significant digits) — later digits
+    // are dropped from `num` as well, so `0.000019` is 1/100000 (score 0,
+    // which the callers map to the 50% default) exactly as in Git, never
+    // a near-zero-but-nonzero threshold that would pair almost anything
+    // (2026-08-05 R0-4 review). A `.` resets the scale, and a bare
+    // integer therefore reads as `0.<digits>` without reinterpretation.
+    let (body, is_percent) = match raw.strip_suffix('%') {
+        Some(body) => (body, true),
+        None => (raw, false),
     };
-    let (num, denom) = if let Some(body) = raw.strip_suffix('%') {
-        let (number, divisor) = parse_decimal(body).ok_or_else(invalid)?;
-        (number, divisor * 100)
-    } else if raw.contains('.') {
-        parse_decimal(raw).ok_or_else(invalid)?
+    let mut num = 0u128;
+    let mut scale = 1u128;
+    let mut seen_dot = false;
+    for byte in body.bytes() {
+        match byte {
+            b'.' if !seen_dot => {
+                seen_dot = true;
+                scale = 1;
+            }
+            b'0'..=b'9' => {
+                if scale < 100_000 {
+                    scale *= 10;
+                    num = num * 10 + u128::from(byte - b'0');
+                }
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    // Digitless forms (``, `%`, `.`, `.%`) are score 0 in Git — the callers
+    // map 0 to the 50% default — while any NON-digit tail stays a usage
+    // error. No `any_digit` rejection here.
+    let denom = if is_percent {
+        // Git: `scale = dot ? scale*100 : 100` — a whole-number percent
+        // is N/100 regardless of how many digits N has.
+        if seen_dot { scale * 100 } else { 100 }
     } else {
-        parse_decimal(&format!("0.{raw}")).ok_or_else(invalid)?
+        scale
     };
     const MAX_SCORE: u128 = 60000;
     let score = if num >= denom {
@@ -276,4 +284,43 @@ pub(super) fn parse_rename_score(raw: &str) -> Result<u32, DiffError> {
         MAX_SCORE * num / denom
     };
     u32::try_from(score).map_err(|_| invalid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rename_score;
+
+    /// Git `diff.c parse_num` parity pins, including the five-significant-
+    /// digit scale cutoff (2026-08-05 R0-4 review): digits past the fifth
+    /// are dropped from BOTH the numerator and the scale, so `0.000019`
+    /// is 1/100000 = score 0 (the callers map 0 to the 50% default),
+    /// never a near-zero threshold that would pair almost anything.
+    #[test]
+    fn rename_score_matches_git_parse_num() {
+        assert_eq!(parse_rename_score("50").unwrap(), 30000);
+        assert_eq!(parse_rename_score("505").unwrap(), 30300);
+        assert_eq!(parse_rename_score("50%").unwrap(), 30000);
+        assert_eq!(parse_rename_score("12.5%").unwrap(), 7500);
+        assert_eq!(parse_rename_score("0.505").unwrap(), 30300);
+        assert_eq!(parse_rename_score("50000").unwrap(), 30000);
+        assert_eq!(parse_rename_score("100%").unwrap(), 60000);
+        assert_eq!(parse_rename_score("101%").unwrap(), 60000);
+        assert_eq!(parse_rename_score("0.000019").unwrap(), 0);
+        assert_eq!(parse_rename_score("0.00002").unwrap(), 1);
+        assert_eq!(
+            parse_rename_score("123456").unwrap(),
+            parse_rename_score("12345").unwrap(),
+            "the sixth significant digit is dropped, like Git"
+        );
+        // Git's digitless zero forms: score 0, which callers map to the
+        // 50% default — never a usage error.
+        assert_eq!(parse_rename_score("").unwrap(), 0);
+        assert_eq!(parse_rename_score("%").unwrap(), 0);
+        assert_eq!(parse_rename_score(".").unwrap(), 0);
+        assert_eq!(parse_rename_score(".%").unwrap(), 0);
+        // Malformed tails stay errors.
+        assert!(parse_rename_score("1.2.3").is_err());
+        assert!(parse_rename_score("abc").is_err());
+        assert!(parse_rename_score("9x").is_err());
+    }
 }

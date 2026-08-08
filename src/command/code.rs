@@ -91,9 +91,10 @@ use crate::internal::ai::providers::fake::FAKE_DEFAULT_MODEL;
 use crate::{
     cli_error,
     command::code_control_files::{
-        ControlInfo, ControlLockError, ControlLockGuard, ControlPaths, acquire_control_lock,
-        cleanup_control_files, ensure_control_token_file, resolve_control_paths,
-        write_control_info,
+        CONTROL_INFO_VERSION, ControlInfo, ControlLockError, ControlLockGuard, ControlPaths,
+        ControlScope, ControlScopePolicy, acquire_control_lock, cleanup_control_files,
+        ensure_control_token_file, ensure_scope_takeover_allowed, repo_has_linked_evidence,
+        resolve_control_paths, resolve_control_scope, write_control_info,
     },
     internal::{
         ai::{
@@ -117,25 +118,18 @@ use crate::{
                 anthropic::CLAUDE_3_5_SONNET, gemini::GEMINI_2_5_FLASH, kimi::KIMI_K2_6,
                 openai::GPT_4O_MINI, zhipu::GLM_5,
             },
-            runtime::{ToolBoundaryRuntime, TracingAuditSink},
-            sandbox::{
-                ApprovalCachePolicy, ApprovalStore, AskForApproval, DEFAULT_APPROVAL_TTL,
-                ExecApprovalRequest, NetworkAccess, SandboxPermissions, SandboxPolicy,
-                ToolApprovalContext, ToolRuntimeContext, ToolSandboxContext,
+            runtime::{
+                CodeAgentApprovalConfig, CodeAgentSandboxProfile, CodeAgentServicesBuilder,
+                tool_runtime_context,
             },
-            session::{SessionState, SessionStore},
+            sandbox::{
+                ApprovalCachePolicy, AskForApproval, DEFAULT_APPROVAL_TTL, ExecApprovalRequest,
+                ToolRuntimeContext,
+            },
+            session::{SessionJsonlStore, SessionState, SessionStore},
             skills::{SkillDispatcher, load_skills},
             sources::{SourcePool, register_builtin_mcp_source_from_project_config},
-            tools::{
-                ToolRegistry, ToolRegistryBuilder,
-                context::UserInputRequest,
-                handlers::{
-                    ApplyPatchHandler, GrepFilesHandler, ListDirHandler, McpBridgeHandler,
-                    PlanHandler, ReadFileHandler, RequestUserInputHandler, SearchFilesHandler,
-                    ShellHandler, SubmitIntentDraftHandler, SubmitPlanDraftHandler,
-                    SubmitTaskCompleteHandler, WebSearchHandler, register_semantic_handlers,
-                },
-            },
+            tools::{ToolRegistry, context::UserInputRequest},
             usage::{UsageContext, UsagePriceTable, UsageRecorder},
             web::{
                 WebServerHandle, WebServerOptions,
@@ -146,6 +140,10 @@ use crate::{
                     CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTranscriptEntry,
                     CodeUiTranscriptEntryKind, ReadOnlyCodeUiAdapter, initial_snapshot,
                     snapshot_from_thread_bundle,
+                },
+                code_ui_projection::{
+                    MAX_CODE_UI_PROJECTION_EVENTS, MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+                    fold_code_ui_snapshot,
                 },
                 headless::{
                     HeadlessCodeRuntime, HeadlessSessionPersistence, headless_capabilities,
@@ -694,6 +692,12 @@ pub(crate) fn effective_plan_mode(args: &CodeArgs) -> bool {
 /// terminal/session initialization failures. Error classification follows
 /// `docs/development/cli-error-contract-design.md`.
 pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
+    // W0 §C.4.1.1 preflight: gate on the SESSION's working directory — which
+    // `--cwd`/`--repo` may point at a different worktree than the process cwd
+    // — and BEFORE mode validation, so nothing starts a split-brained session
+    // from a linked worktree.
+    let session_workdir = resolve_code_preflight_working_dir(&args)?;
+    crate::command::require_main_worktree_for_code_agent("libra code", Some(&session_workdir))?;
     validate_mode_args(&args, output).map_err(CliError::command_usage)?;
     if args.stdio {
         execute_stdio(&args).await
@@ -721,17 +725,49 @@ struct McpServerHandle {
     connection_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
+const MCP_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+enum McpServerShutdownError {
+    #[error("mcp_server did not stop before the shutdown deadline")]
+    TimedOut,
+    #[error("mcp_server task exited unexpectedly during shutdown: {reason}")]
+    TaskFailed { reason: String },
+}
+
 impl McpServerHandle {
-    async fn shutdown(self) {
+    async fn shutdown(self) -> Result<(), McpServerShutdownError> {
+        self.shutdown_with_timeout(MCP_SERVER_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_with_timeout(
+        self,
+        shutdown_timeout: Duration,
+    ) -> Result<(), McpServerShutdownError> {
         let _ = self.shutdown_tx.send(());
-        let _ = self.join.await;
         let pending = match self.connection_tasks.lock() {
             Ok(mut handles) => std::mem::take(&mut *handles),
             Err(_) => Vec::new(),
         };
         for handle in pending {
             handle.abort();
-            let _ = handle.await;
+        }
+
+        let mut join = self.join;
+        match tokio::time::timeout(shutdown_timeout, &mut join).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(McpServerShutdownError::TaskFailed {
+                reason: error.to_string(),
+            }),
+            Ok(Err(error)) => Err(McpServerShutdownError::TaskFailed {
+                reason: error.to_string(),
+            }),
+            Err(_) => {
+                join.abort();
+                let _ = join.await;
+                Err(McpServerShutdownError::TimedOut)
+            }
         }
     }
 }
@@ -778,7 +814,7 @@ fn web_only_runtime_kind(provider: CodeProvider) -> WebOnlyRuntimeKind {
 
 /// Runs the web server and MCP server without a terminal UI.
 ///
-/// Blocks on `Ctrl-C`, then performs graceful shutdown of both servers.
+/// Blocks on SIGINT or SIGTERM, then performs graceful shutdown of both servers.
 /// This mode is useful for remote/headless environments where the user
 /// interacts through a browser or external MCP client.
 ///
@@ -786,7 +822,7 @@ fn web_only_runtime_kind(provider: CodeProvider) -> WebOnlyRuntimeKind {
 /// - Starts the embedded web server and Streamable HTTP MCP server.
 /// - For the Codex provider, starts and later shuts down a managed Codex
 ///   app-server child process.
-/// - Prints connection details to stdout and listens for `Ctrl-C`.
+/// - Prints connection details to stdout and listens for SIGINT/SIGTERM.
 ///
 /// # Errors
 /// Returns [`CliError`] when the working directory cannot be resolved, the web
@@ -794,6 +830,10 @@ fn web_only_runtime_kind(provider: CodeProvider) -> WebOnlyRuntimeKind {
 /// selected host would expose loopback-only browser control.
 async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     let working_dir = resolve_code_working_dir(args)?;
+    // Keep provider bootstrap on the same env-file → process → Vault lookup
+    // chain as the TUI path.  The current Web-only flag policy may reject a
+    // non-default file, but that policy no longer creates a second factory.
+    let env_file = load_code_env_file(args.env_file.as_deref())?;
     let browser_control = resolve_browser_control_mode(args)?;
     let control_runtime = prepare_control_runtime(args, &working_dir).await?;
     let mcp_server = init_mcp_server(&working_dir).await;
@@ -824,7 +864,8 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             )
             .await?
         } else {
-            let storage_root = resolve_storage_root(&working_dir);
+            // §C.4.1: refuse rather than mint a phantom `<working_dir>/.libra`.
+            let storage_root = require_storage_root(&working_dir)?;
             let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
             let session_state =
                 load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
@@ -838,6 +879,7 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             match build_non_codex_headless_runtime(
                 args,
                 &working_dir,
+                &env_file,
                 session_store,
                 session_state,
                 browser_control == BrowserControlMode::Loopback,
@@ -872,7 +914,7 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
         Err(err) => {
             let _ = code_ui_runtime.shutdown().await;
             if let Some(server) = managed_codex_server.as_mut() {
-                server.shutdown().await;
+                let _ = server.shutdown().await;
             }
             return Err(
                 CliError::network(format!("failed to start web server: {err}"))
@@ -887,9 +929,9 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     {
         let _ = code_ui_runtime.shutdown().await;
         if let Some(server) = managed_codex_server.as_mut() {
-            server.shutdown().await;
+            let _ = server.shutdown().await;
         }
-        web_handle.shutdown().await;
+        let _ = web_handle.shutdown().await;
         return Err(error);
     }
     println!("Libra Code server running at {base_url}");
@@ -906,10 +948,10 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             ) {
                 let _ = code_ui_runtime.shutdown().await;
                 if let Some(server) = managed_codex_server.as_mut() {
-                    server.shutdown().await;
+                    let _ = server.shutdown().await;
                 }
-                web_handle.shutdown().await;
-                handle.shutdown().await;
+                let _ = web_handle.shutdown().await;
+                let _ = handle.shutdown().await;
                 return Err(error);
             }
             println!("MCP: {mcp_url}");
@@ -918,9 +960,9 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
         Err(err) => {
             let _ = code_ui_runtime.shutdown().await;
             if let Some(server) = managed_codex_server.as_mut() {
-                server.shutdown().await;
+                let _ = server.shutdown().await;
             }
-            web_handle.shutdown().await;
+            let _ = web_handle.shutdown().await;
             return Err(
                 CliError::network(format!("failed to start MCP server: {err}"))
                     .with_detail("component", "mcp_server"),
@@ -928,14 +970,64 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
         }
     };
 
-    let _ = tokio::signal::ctrl_c().await;
-    let _ = code_ui_runtime.shutdown().await;
-    web_handle.shutdown().await;
-    mcp_handle.shutdown().await;
-    if let Some(server) = managed_codex_server.as_mut() {
-        server.shutdown().await;
+    let shutdown_signal_result = wait_for_web_only_shutdown_signal().await;
+    let web_shutdown_result = web_handle.shutdown().await;
+    let mcp_shutdown_result = mcp_handle.shutdown().await;
+    let runtime_shutdown_result = code_ui_runtime.shutdown().await;
+    let managed_codex_shutdown_result = match managed_codex_server.as_mut() {
+        Some(server) => Some(server.shutdown().await),
+        None => None,
+    };
+    if let Err(error) = runtime_shutdown_result {
+        return Err(CliError::failure(format!(
+            "Libra Code runtime did not shut down cleanly: {error}"
+        )));
+    }
+    if let Err(error) = web_shutdown_result {
+        return Err(CliError::failure(format!(
+            "Libra Code web server did not shut down cleanly: {error}"
+        )));
+    }
+    if let Err(error) = mcp_shutdown_result {
+        return Err(CliError::failure(format!(
+            "Libra Code MCP server did not shut down cleanly: {error}"
+        )));
+    }
+    if let Some(Err(error)) = managed_codex_shutdown_result {
+        return Err(CliError::failure(format!(
+            "Libra Code managed Codex server did not shut down cleanly: {error}"
+        )));
+    }
+    if let Err(error) = shutdown_signal_result {
+        return Err(CliError::failure(format!(
+            "Libra Code could not listen for a shutdown signal: {error}"
+        )));
     }
     Ok(())
+}
+
+/// Wait for the termination signals relevant to a web-only process.  Unix
+/// supervisors normally use SIGTERM, while Ctrl-C provides SIGINT on every
+/// supported platform.
+async fn wait_for_web_only_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = web_only_sigterm_listener()?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = sigterm.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+#[cfg(unix)]
+fn web_only_sigterm_listener() -> std::io::Result<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
 }
 
 // ---------------------------------------------------------------------------
@@ -1519,43 +1611,16 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
     let (exec_approval_tx, exec_approval_rx) =
         tokio::sync::mpsc::unbounded_channel::<ExecApprovalRequest>();
 
-    // Build registry: basic file tools + MCP workflow tools.
-    //
-    // AI user story: let a coding agent inspect files, search context, make
-    // bounded edits, run verification commands, ask the human for missing
-    // choices, and record structured planning artifacts without leaving the
-    // sandbox/approval model.
-    let mut builder = ToolRegistryBuilder::with_working_dir(working_dir.clone())
-        .hardening(ToolBoundaryRuntime::system(
-            trace_id,
-            Arc::new(TracingAuditSink),
-        ))
-        .register("read_file", Arc::new(ReadFileHandler))
-        .register("list_dir", Arc::new(ListDirHandler))
-        .register("grep_files", Arc::new(GrepFilesHandler))
-        .register("search_files", Arc::new(SearchFilesHandler))
-        .register("web_search", Arc::new(WebSearchHandler))
-        .register("apply_patch", Arc::new(ApplyPatchHandler))
-        .register("shell", Arc::new(ShellHandler))
-        .register("update_plan", Arc::new(PlanHandler))
-        .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
-        .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
-        .register("submit_task_complete", Arc::new(SubmitTaskCompleteHandler))
-        .register(
-            "request_user_input",
-            Arc::new(RequestUserInputHandler::new(user_input_tx.clone())),
-        );
-    builder = register_semantic_handlers(builder);
-
-    // AI user story: MCP bridge tools let the agent persist intent/task/run,
-    // evidence, provenance, and Libra VCS operations in the same workflow graph
-    // that external MCP clients use. Keep these names aligned with
-    // `docs/ai/intentspec_typical.yaml` and `docs/ai/workflow.md`.
-    for (name, handler) in McpBridgeHandler::all_handlers(mcp_server.clone()) {
-        builder = builder.register(name, handler);
-    }
-
-    let registry = Arc::new(builder.build());
+    // Runtime-owned services build the single hardened registry for both
+    // launch profiles.  The TUI merely selects the baseline capability set.
+    let registry = CodeAgentServicesBuilder::tui_baseline(
+        working_dir.clone(),
+        trace_id,
+        user_input_tx.clone(),
+        mcp_server.clone(),
+    )
+    .build()
+    .registry();
     let allowed_tools = registry.filter_by_intent(task_intent);
 
     // Single source of truth for the args -> approval-context mapping
@@ -1628,7 +1693,11 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    server.shutdown().await;
+                    if let Err(cleanup_error) = server.shutdown().await {
+                        return Err(CliError::failure(format!(
+                            "failed to initialize the managed Codex runtime: {error}; managed Codex cleanup failed: {cleanup_error}"
+                        )));
+                    }
                     return Err(error);
                 }
             };
@@ -1640,8 +1709,13 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
                 provider_name,
             )
             .await;
-            server.shutdown().await;
+            let shutdown_result = server.shutdown().await;
             result?;
+            shutdown_result.map_err(|error| {
+                CliError::failure(format!(
+                    "Libra Code managed Codex server did not shut down cleanly: {error}"
+                ))
+            })?;
         }
         _ => {
             // OC-Phase 2 P2.4: the helper returns the *effective* provider
@@ -1716,10 +1790,21 @@ fn preserve_reasoning_content_for_provider(provider: CodeProvider) -> bool {
 /// Represents a managed Codex app-server child process and its WebSocket URL.
 ///
 /// The server is spawned as a child process and communicated with over WebSocket.
-/// [`ManagedCodexServer::shutdown`] sends SIGKILL and waits up to 5 seconds.
+/// [`ManagedCodexServer::shutdown`] sends SIGKILL and waits within a bounded
+/// deadline; `kill_on_drop` is also set at spawn time as a final fallback.
 struct ManagedCodexServer {
     ws_url: String,
     child: Child,
+}
+
+const MANAGED_CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+enum ManagedCodexShutdownError {
+    #[error("managed_codex_child did not stop before the shutdown deadline")]
+    TimedOut,
+    #[error("managed_codex_child could not be terminated: {reason}")]
+    TerminationFailed { reason: String },
 }
 
 impl ManagedCodexServer {
@@ -1727,14 +1812,39 @@ impl ManagedCodexServer {
     ///
     /// If the child process has already exited (`id()` returns `None`), this is
     /// a no-op. Otherwise it sends a kill signal via `start_kill()` and waits up
-    /// to 5 seconds for the process to terminate. If the timeout expires the
-    /// process is abandoned (the OS will reap it when the handle is dropped).
-    async fn shutdown(&mut self) {
+    /// to a bounded deadline for the process to terminate. A deadline failure
+    /// is returned to the lifecycle owner rather than silently abandoning a
+    /// possibly unreaped child.
+    async fn shutdown(&mut self) -> Result<(), ManagedCodexShutdownError> {
+        self.shutdown_with_timeout(MANAGED_CODEX_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_with_timeout(
+        &mut self,
+        shutdown_timeout: Duration,
+    ) -> Result<(), ManagedCodexShutdownError> {
         if self.child.id().is_none() {
-            return;
+            return Ok(());
         }
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        if let Err(error) = self.child.start_kill() {
+            return match self.child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(ManagedCodexShutdownError::TerminationFailed {
+                    reason: error.to_string(),
+                }),
+                Err(wait_error) => Err(ManagedCodexShutdownError::TerminationFailed {
+                    reason: format!("{error}; failed to inspect child state: {wait_error}"),
+                }),
+            };
+        }
+        match tokio::time::timeout(shutdown_timeout, self.child.wait()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(ManagedCodexShutdownError::TerminationFailed {
+                reason: error.to_string(),
+            }),
+            Err(_) => Err(ManagedCodexShutdownError::TimedOut),
+        }
     }
 }
 
@@ -1747,6 +1857,11 @@ struct ControlRuntimeConfig {
     cleanup_token: bool,
     info_written: AtomicBool,
     started_at: chrono::DateTime<Utc>,
+    /// This process's control scope (§C.8 W4), stamped into `control.json`
+    /// and re-checked before any overwrite of an existing info file.
+    scope: ControlScope,
+    /// Linked-worktree evidence snapshot for the legacy-ambiguity rule.
+    linked_evidence: bool,
 }
 
 impl ControlRuntimeConfig {
@@ -1780,8 +1895,24 @@ impl ControlRuntimeConfig {
             return Ok(());
         }
 
+        // §C.8 W4: never overwrite another scope's control file. Observe mode
+        // holds no lock, so this pre-write check is its only takeover gate;
+        // for write mode it re-validates under the already-held lock.
+        ensure_scope_takeover_allowed(
+            &self.paths.info,
+            &self.scope,
+            ControlScopePolicy::Worktree,
+            self.linked_evidence,
+            &crate::utils::util::try_get_storage_path(Some(working_dir.to_path_buf()))
+                .unwrap_or_default(),
+        )
+        .map_err(|error| {
+            CliError::conflict(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        })?;
+
         let info = ControlInfo {
-            version: 1,
+            version: CONTROL_INFO_VERSION,
             mode: self.mode_name().to_string(),
             pid: std::process::id(),
             base_url,
@@ -1789,6 +1920,10 @@ impl ControlRuntimeConfig {
             working_dir: working_dir.to_path_buf(),
             thread_id,
             started_at: self.started_at,
+            repo_id: Some(self.scope.repo_id.clone()),
+            worktree_id: self.scope.worktree_id.clone(),
+            workspace_id: self.scope.workspace_id.clone(),
+            lease_fence: self.scope.lease_fence,
         };
         write_control_info(&self.paths.info, &info).map_err(|error| {
             CliError::fatal(format!(
@@ -1819,6 +1954,26 @@ async fn prepare_control_runtime(
     );
     let started_at = Utc::now();
 
+    // §C.8 W4: resolve this process's control scope once, up front, so both
+    // modes stamp `control.json` identically and the pre-write takeover gate
+    // has its inputs. `libra code` holds no workspace lease at startup, so
+    // the workspace association stays empty until a leased runtime threads
+    // one through.
+    let scope = resolve_control_scope(working_dir, None)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to resolve the control scope for '{}': {error:#}",
+                working_dir.display()
+            ))
+        })?;
+    // §C.4.1: an unresolvable storage root is itself evidence something is
+    // wrong with this worktree's linkage — treat it as linked (fail closed)
+    // rather than probing a path we would have had to invent.
+    let linked_evidence = resolve_storage_root(working_dir)
+        .as_deref()
+        .is_none_or(repo_has_linked_evidence);
+
     match args.control {
         ControlMode::Observe => Ok(ControlRuntimeConfig {
             mode: ControlMode::Observe,
@@ -1829,6 +1984,8 @@ async fn prepare_control_runtime(
             cleanup_token: false,
             info_written: AtomicBool::new(false),
             started_at,
+            scope,
+            linked_evidence,
         }),
         ControlMode::Write => {
             let lock_guard = acquire_control_lock(&paths.lock).map_err(|error| match error {
@@ -1857,6 +2014,8 @@ async fn prepare_control_runtime(
                 cleanup_token: true,
                 info_written: AtomicBool::new(false),
                 started_at,
+                scope,
+                linked_evidence,
             })
         }
     }
@@ -1932,28 +2091,17 @@ struct HeadlessApprovalChannels {
 
 /// Bootstraps the `SessionState` for a `--web-only` non-Codex headless run.
 ///
-/// The `create` path (`SessionState::new`) is the only one reachable through
-/// the CLI: `validate_mode_args`/`reject_non_tui_flags` reject `--resume` in
-/// every non-TUI mode, so `args.resume` is always `None` here. `--resume` is
-/// TUI-only by design (see `docs/development/tracing/code.md` §"Session /
-/// graph" and `docs/commands/code.md`), not deferred work — persisted headless
-/// resume is reachable only through the TUI path.
-///
-/// The session-layer `load_for_thread_id` branch below is therefore retained
-/// only as defense-in-depth so this helper keeps a single, correct
-/// load-or-create shape (identical to the TUI resume bootstrap): if a future
-/// caller ever supplies a resume id, it loads the right session instead of
-/// silently discarding it. It is intentionally not reachable via `libra code
-/// --web-only --resume`.
+/// `--web-only --resume <thread_id>` reaches this same load-or-create path for
+/// non-Codex providers. The restored state is then folded with the bounded
+/// Code UI workflow suffix before the browser server starts. Managed Codex
+/// keeps its separate app-server session protocol and remains rejected by the
+/// mode validator rather than silently starting a fresh session.
 fn load_or_create_headless_web_session_state(
     args: &CodeArgs,
     working_dir: &Path,
     session_store: &Arc<SessionStore>,
 ) -> CliResult<SessionState> {
     let working_dir_str = working_dir.to_string_lossy().to_string();
-    // NOTE: unreachable via the CLI today — `--resume` is rejected before we
-    // get here in web-only mode (TUI-only by design). Kept for a uniform
-    // load-or-create shape; see this function's doc comment.
     let mut session = if let Some(thread_id) = args.resume.as_deref() {
         if thread_id.trim().is_empty() {
             return Err(CliError::command_usage(
@@ -2027,7 +2175,14 @@ fn build_headless_web_code_ui_snapshot(
         .interactions
         .iter()
         .any(|interaction| interaction.status == CodeUiInteractionStatus::Pending);
-    snapshot.status = if has_pending_interaction {
+    // An indeterminate mutation is a durable safety fence.  The projection
+    // cursor can already be checkpointed at the end of the event stream, so a
+    // resume may have no events left to replay that would restore this state.
+    // Do not turn that fence into an idle, writable session while rebuilding
+    // the browser snapshot.
+    snapshot.status = if snapshot.status == CodeUiSessionStatus::IndeterminateSideEffect {
+        CodeUiSessionStatus::IndeterminateSideEffect
+    } else if has_pending_interaction {
         CodeUiSessionStatus::AwaitingInteraction
     } else {
         CodeUiSessionStatus::Idle
@@ -2080,14 +2235,46 @@ where
     };
     let capabilities = headless_capabilities();
     let initial_history = session_state.to_history();
-    let snapshot = build_headless_web_code_ui_snapshot(
+    let bootstrap_snapshot = build_headless_web_code_ui_snapshot(
         working_dir,
         provider,
         capabilities.clone(),
         &session_state,
     );
-    let session = CodeUiSession::new(snapshot);
-    let persistence = HeadlessSessionPersistence::new(session_store, session_state);
+    let projection_store = SessionJsonlStore::new(session_store.session_root(&session_state.id));
+    let projection_cursor = session_state
+        .metadata
+        .get("code_ui_projection_cursor")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let projection_replay = projection_store
+        .load_code_workflow_replay_since(
+            projection_cursor,
+            MAX_CODE_UI_PROJECTION_EVENTS,
+            MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+        )
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to load the Code UI workflow projection for session '{}': {error}",
+                session_state.id
+            ))
+        })?;
+    let folded_projection =
+        fold_code_ui_snapshot(bootstrap_snapshot, &projection_replay).map_err(|error| {
+            CliError::fatal(format!(
+                "cannot safely resume the Code UI workflow projection for session '{}': {error}",
+                session_state.id
+            ))
+        })?;
+    let projection_sequence = folded_projection.last_sequence.unwrap_or(projection_cursor);
+    let snapshot = folded_projection.snapshot;
+    let session = CodeUiSession::new(snapshot.clone());
+    let persistence = HeadlessSessionPersistence::with_projection_checkpoint(
+        session_store,
+        session_state,
+        snapshot,
+        projection_sequence,
+    );
 
     let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
     let runtime_context = Some(default_tui_runtime_context(
@@ -2128,7 +2315,12 @@ where
         config_factory,
         initial_history,
         Some(persistence),
-    );
+    )
+    .map_err(|error| {
+        CliError::fatal(format!(
+            "failed to construct the headless AgentRuntime adapter: {error}"
+        ))
+    })?;
 
     let mut runtime_options = CodeUiRuntimeOptions::new(
         browser_write_enabled,
@@ -2143,32 +2335,9 @@ fn build_headless_tool_registry(
     working_dir: &Path,
     user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
 ) -> Arc<ToolRegistry> {
-    // Headless web mode now reuses the same ToolRuntimeContext path as TUI:
-    // shell/apply_patch route through sandbox + exec approval, web_search sees
-    // the CLI network policy, and pending approvals surface through
-    // CodeUiInteractionRequest. `submit_plan_draft` is exposed because
-    // headless projects it into plans[]; workflow tools that require a
-    // session driver (`task`, `submit_intent_draft`) remain gated.
-    let trace_id = uuid::Uuid::new_v4();
-    let builder = ToolRegistryBuilder::with_working_dir(working_dir.to_path_buf())
-        .hardening(ToolBoundaryRuntime::system(
-            trace_id,
-            Arc::new(TracingAuditSink),
-        ))
-        .register("read_file", Arc::new(ReadFileHandler))
-        .register("list_dir", Arc::new(ListDirHandler))
-        .register("grep_files", Arc::new(GrepFilesHandler))
-        .register("search_files", Arc::new(SearchFilesHandler))
-        .register("web_search", Arc::new(WebSearchHandler))
-        .register("apply_patch", Arc::new(ApplyPatchHandler))
-        .register("shell", Arc::new(ShellHandler))
-        .register("update_plan", Arc::new(PlanHandler))
-        .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
-        .register(
-            "request_user_input",
-            Arc::new(RequestUserInputHandler::new(user_input_tx)),
-        );
-    Arc::new(register_semantic_handlers(builder).build())
+    CodeAgentServicesBuilder::web_headless(working_dir, Uuid::new_v4(), user_input_tx)
+        .build()
+        .registry()
 }
 
 /// Construct the appropriate provider client and wrap it in
@@ -2185,6 +2354,7 @@ fn build_headless_tool_registry(
 async fn build_non_codex_headless_runtime(
     args: &CodeArgs,
     working_dir: &Path,
+    env_file: &CodeEnvFile,
     session_store: Arc<SessionStore>,
     session_state: SessionState,
     browser_write_enabled: bool,
@@ -2201,7 +2371,7 @@ async fn build_non_codex_headless_runtime(
         | CodeProvider::Zhipu
         | CodeProvider::Ollama => {
             let (model, model_name, _) =
-                build_any_completion_model_for_args(args, &CodeEnvFile::default(), working_dir)?;
+                build_any_completion_model_for_args(args, env_file, working_dir)?;
             Ok(Some(
                 build_headless_web_code_ui_runtime(
                     args,
@@ -2227,7 +2397,7 @@ async fn build_non_codex_headless_runtime(
         #[cfg(feature = "test-provider")]
         CodeProvider::Fake => {
             let (model, model_name, _) =
-                build_any_completion_model_for_args(args, &CodeEnvFile::default(), working_dir)?;
+                build_any_completion_model_for_args(args, env_file, working_dir)?;
             Ok(Some(
                 build_headless_web_code_ui_runtime(
                     args,
@@ -2394,15 +2564,22 @@ async fn start_managed_codex_server(
     working_dir: &Path,
 ) -> CliResult<ManagedCodexServer> {
     let ws_url = resolve_codex_ws_url(requested_port)?;
-    let mut child = spawn_codex_app_server(codex_bin, &ws_url, working_dir)?;
+    let child = spawn_codex_app_server(codex_bin, &ws_url, working_dir)?;
+    let mut server = ManagedCodexServer {
+        ws_url: ws_url.clone(),
+        child,
+    };
 
     if let Err(err) = wait_for_codex_ready(&ws_url).await {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        if let Err(cleanup_error) = server.shutdown().await {
+            return Err(CliError::failure(format!(
+                "Codex app-server did not become ready at {ws_url}: {err}; cleanup failed: {cleanup_error}"
+            )));
+        }
         return Err(err);
     }
 
-    Ok(ManagedCodexServer { ws_url, child })
+    Ok(server)
 }
 
 /// Builds a `tokio::process::Command` for the Codex app-server.
@@ -2417,7 +2594,8 @@ fn build_codex_command(program: &str, ws_url: &str, working_dir: &Path) -> Comma
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     command
 }
 
@@ -2435,7 +2613,8 @@ fn build_windows_shell_codex_command(codex_bin: &str, ws_url: &str, working_dir:
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     command
 }
 
@@ -2760,7 +2939,13 @@ async fn load_code_ui_projection_bundle(
     working_dir: &Path,
     thread_id: Uuid,
 ) -> anyhow::Result<Option<ThreadBundle>> {
-    let storage_root = resolve_storage_root(working_dir);
+    let storage_root = resolve_storage_root(working_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resolve the repository storage root for '{}' — if this is a linked \
+             worktree, run `libra worktree repair --confirm <worktree-path>`",
+            working_dir.display()
+        )
+    })?;
     let db_path = storage_root.join("libra.db");
     let db_path = db_path
         .to_str()
@@ -2950,7 +3135,7 @@ where
     // moved into `App::new`; the post-exit graph handoff hint needs it to
     // decide whether to surface a `--repo <path>` suffix for a non-cwd repo.
     let session_working_dir = registry.working_dir().to_path_buf();
-    let storage_root = resolve_storage_root(registry.working_dir());
+    let storage_root = require_storage_root(registry.working_dir())?;
     let session_store = SessionStore::from_storage_path(&storage_root);
     let session = if let Some(thread_id) = params.resume_thread_id.as_deref() {
         // The resume identifier may be either a canonical UUID (planning-bound
@@ -3092,7 +3277,7 @@ where
                 None,
                 control_thread_id.clone(),
             ) {
-                handle.shutdown().await;
+                let _ = handle.shutdown().await;
                 if let Some(runtime) = managed_code_ui_runtime.as_ref() {
                     let _ = runtime.shutdown().await;
                 }
@@ -3133,9 +3318,9 @@ where
                     )
                 {
                     if let Some(handle) = web_handle.take() {
-                        handle.shutdown().await;
+                        let _ = handle.shutdown().await;
                     }
-                    handle.shutdown().await;
+                    let _ = handle.shutdown().await;
                     if let Some(runtime) = managed_code_ui_runtime.as_ref() {
                         let _ = runtime.shutdown().await;
                     }
@@ -3146,7 +3331,7 @@ where
             }
             Err(err) if control_runtime.is_write() => {
                 if let Some(handle) = web_handle.take() {
-                    handle.shutdown().await;
+                    let _ = handle.shutdown().await;
                 }
                 if let Some(runtime) = managed_code_ui_runtime.as_ref() {
                     let _ = runtime.shutdown().await;
@@ -3358,10 +3543,10 @@ where
     };
 
     if let Some(handle) = web_handle {
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
     }
     if let Some(handle) = mcp_handle {
-        handle.shutdown().await;
+        let _ = handle.shutdown().await;
     }
     if let Some(runtime) = managed_runtime_for_shutdown {
         let _ = runtime.shutdown().await;
@@ -3549,38 +3734,21 @@ fn default_tui_runtime_context(
     network_access: bool,
     exec_approval_tx: tokio::sync::mpsc::UnboundedSender<ExecApprovalRequest>,
 ) -> ToolRuntimeContext {
-    let policy = match context {
-        Some(CodeContext::Review | CodeContext::Research) => SandboxPolicy::ReadOnly,
-        Some(CodeContext::Dev) | None => SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![working_dir.to_path_buf()],
-            network_access: NetworkAccess::from_legacy_bool(network_access),
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
-        },
+    let sandbox_profile = match context {
+        Some(CodeContext::Review | CodeContext::Research) => CodeAgentSandboxProfile::ReadOnly,
+        Some(CodeContext::Dev) | None => CodeAgentSandboxProfile::WorkspaceWrite { network_access },
     };
-
-    let mut approval_store = ApprovalStore::default();
-    if approval.allow_all_commands {
-        approval_store.approve_all_commands();
-    }
-
-    ToolRuntimeContext {
-        sandbox: Some(ToolSandboxContext {
-            policy,
-            permissions: SandboxPermissions::UseDefault,
-        }),
-        sandbox_runtime: None,
-        approval: Some(ToolApprovalContext {
+    tool_runtime_context(
+        working_dir,
+        sandbox_profile,
+        CodeAgentApprovalConfig {
             policy: approval.policy,
-            request_tx: exec_approval_tx,
-            store: Arc::new(tokio::sync::Mutex::new(approval_store)),
-            scope_key_prefix: None,
-            approval_ttl: approval.ttl,
+            allow_all_commands: approval.allow_all_commands,
+            ttl: approval.ttl,
             cache_policy: approval.cache_policy,
-        }),
-        file_history: None,
-        max_output_bytes: None,
-    }
+        },
+        exec_approval_tx,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -3705,7 +3873,23 @@ fn approval_cache_policy_from_project_config(working_dir: &Path) -> ApprovalCach
 /// setup failures into a read-only MCP server so AI clients can still inspect
 /// files and continue a degraded session.
 async fn init_mcp_server(working_dir: &std::path::Path) -> Arc<LibraMcpServer> {
-    let storage_dir = resolve_storage_root(working_dir);
+    // §C.4.1: an unresolvable storage root degrades to the SAME read-only,
+    // history-disabled server this function already falls back to when the
+    // directory or database cannot be opened — never to a phantom
+    // `<working_dir>/.libra` that would start accumulating real history.
+    let Some(storage_dir) = resolve_storage_root(working_dir) else {
+        eprintln!(
+            "Warning: cannot resolve the repository storage root for {}. Running in read-only \
+             mode (history/context disabled). If this is a linked worktree, run `libra worktree \
+             repair <worktree-path> --confirm`.",
+            working_dir.display()
+        );
+        return Arc::new(LibraMcpServer::new_with_working_dir(
+            None,
+            None,
+            working_dir.to_path_buf(),
+        ));
+    };
     let objects_dir = storage_dir.join("objects");
     let dot_libra = storage_dir;
 
@@ -3766,24 +3950,52 @@ async fn init_mcp_server(working_dir: &std::path::Path) -> Arc<LibraMcpServer> {
     ))
 }
 
-/// Resolves the `.libra/` storage root for the given working directory.
-///
-/// Supports linked worktrees by delegating to `try_get_storage_path`, which
-/// follows `.libra` symlinks to the main repository's storage. Falls back to
-/// `<working_dir>/.libra` if resolution fails.
-pub(crate) fn resolve_storage_root(working_dir: &std::path::Path) -> std::path::PathBuf {
-    try_get_storage_path(Some(working_dir.to_path_buf())).unwrap_or_else(|error| {
-        // Part C §C.4.1: the code runtime degrades rather than aborting, but the
-        // degradation must NOT be silent — a `<working_dir>/.libra` fallback on a
-        // linked worktree with a broken `commondir` would route at a phantom
-        // storage root. Annotate loudly so the split-brain is diagnosable.
-        tracing::warn!(
-            working_dir = %working_dir.display(),
-            %error,
-            "storage-root resolution failed; falling back to <working_dir>/.libra — if this is a linked worktree, run `libra worktree repair`"
-        );
-        working_dir.join(".libra")
+/// [`resolve_storage_root`], but for the paths that genuinely cannot proceed
+/// without a storage root. `libra code`'s own CLI preflight already resolved
+/// one, so a failure here means the repository changed underneath the process
+/// — an actionable refusal, not a new repository beside the old one.
+pub(crate) fn require_storage_root(working_dir: &std::path::Path) -> CliResult<std::path::PathBuf> {
+    resolve_storage_root(working_dir).ok_or_else(|| {
+        CliError::fatal(format!(
+            "cannot resolve the repository storage root for '{}'",
+            working_dir.display()
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)
+        .with_hint(
+            "if this is a linked worktree, run `libra worktree repair --confirm \
+             <worktree-path>` from the main worktree",
+        )
     })
+}
+
+/// The repository storage root for `working_dir`, or `None` when it cannot be
+/// resolved.
+///
+/// Part C §C.4.1 forbids the caller-side fallback this used to perform. On a
+/// linked worktree with a corrupt or empty `commondir`, minting
+/// `<working_dir>/.libra` does not degrade the session — it CREATES a second,
+/// phantom repository: a fresh `libra.db` and `objects/` beside the real ones,
+/// which then accumulate history, approvals and captured sessions that the
+/// actual repository never sees. A warning does not make that safe, because
+/// the damage is silent and the writes are real.
+///
+/// Callers degrade instead: no storage root means no history and no object
+/// store, which is the same read-only mode they already fall back to when the
+/// directory or database cannot be opened.
+pub(crate) fn resolve_storage_root(working_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    match try_get_storage_path(Some(working_dir.to_path_buf())) {
+        Ok(root) => Some(root),
+        Err(error) => {
+            tracing::warn!(
+                working_dir = %working_dir.display(),
+                %error,
+                "storage-root resolution failed; continuing WITHOUT a storage root rather than \
+                 minting a phantom one — if this is a linked worktree, run `libra worktree \
+                 repair <worktree-path> --confirm`"
+            );
+            None
+        }
+    }
 }
 
 /// CEX-S2-12 "single sub-agent behind flag" concurrency cap.
@@ -4133,11 +4345,11 @@ async fn execute_stdio(args: &CodeArgs) -> CliResult<()> {
 /// - Web and MCP ports must differ (except in stdio mode).
 /// - `--stdio` (MCP transport) rejects provider/model/api-base/temperature and
 ///   the provider-specific tuning flags — it has no provider surface.
-/// - `--web`/`--web-only` relaxes provider/model/api-base/temperature and the
-///   provider-specific tuning flags (they feed the headless web runtime) but
-///   still rejects `--resume`, `--env-file`, `--network-access allow`,
-///   `--context`, `--approval-policy`, and `--approval-ttl` (see
-///   [`reject_non_tui_flags`]).
+/// - `--web`/`--web-only` relaxes provider/model/api-base/temperature, the
+///   provider-specific tuning flags, and `--resume` for non-Codex providers;
+///   they feed the headless web runtime. It still rejects `--env-file`,
+///   `--network-access allow`, `--context`, `--approval-policy`, and
+///   `--approval-ttl` (see [`reject_non_tui_flags`]).
 /// - Provider-specific flags are only accepted for their respective providers.
 fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), String> {
     if !args.stdio && args.port == args.mcp_port && args.port != 0 {
@@ -4176,6 +4388,12 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         // provider-specific tuning flags (they feed the headless web runtime and
         // still pass through the cross-provider match gate below).
         reject_non_tui_flags(args, "--web", true)?;
+        if args.provider == CodeProvider::Codex && args.resume.is_some() {
+            return Err(
+                "--resume is not supported with --web and --provider=codex; remove --resume or use a non-Codex headless provider"
+                    .to_string(),
+            );
+        }
     }
 
     if args.stdio {
@@ -4343,13 +4561,13 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 ///   selected provider and still rejects `--api-base` under `--provider=codex`.
 ///
 /// Flags that stay rejected in BOTH non-TUI modes (design / safety / deferred
-/// work): `--resume` (TUI-only by design — resume is accepted only on the TUI
-/// path per `docs/development/tracing/code.md`; the session-layer headless
-/// resume implementation is never wired to the CLI), `--env-file` (the
-/// headless runtime still boots with `CodeEnvFile::default()`, so honoring a
-/// user `--env-file` web-only needs additional plumbing — deferred),
+/// work): `--env-file` (its bootstrap source is shared with TUI, but accepting
+/// the public Web-only flag remains a later compatibility decision),
 /// `--network-access allow` (safety gate), plus `--context`,
 /// `--approval-policy`, and `--approval-ttl`.
+/// `--resume` is accepted only for the non-Codex Web headless path; it remains
+/// rejected for MCP stdio and managed Codex, which do not share that session
+/// protocol.
 fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(), String> {
     // Provider / model / api-base / temperature and the provider-specific tuning
     // flags feed the headless web runtime, so they are relaxed under web-only and
@@ -4380,20 +4598,15 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
     }
 
     // Rejected in BOTH non-TUI modes.
-    // NOTE (C2): web-only `--env-file` support is deferred. The headless runtime
-    // currently boots with `CodeEnvFile::default()` (see
-    // `build_non_codex_headless_runtime`), so honoring a user-supplied
-    // `--env-file` web-only needs additional plumbing; keep it rejected until
-    // that lands.
+    // NOTE (C2): Web-only uses the same env-file → process → Vault provider
+    // bootstrap as TUI, but accepting a user-supplied `--env-file` remains a
+    // later public-compatibility decision. Keep the flag rejected until that
+    // compatibility work lands.
     reject_mode_flag(args.env_file.is_some(), "--env-file", mode)?;
     reject_mode_flag(args.context.is_some(), "--context", mode)?;
-    // `--resume` is TUI-only by design (C5): although the session layer
-    // (`load_or_create_headless_web_session_state`) carries a headless resume
-    // implementation, resume is accepted only on the TUI path
-    // (`docs/development/tracing/code.md` §"Session / graph"). This is a
-    // deliberate contract, not deferred work — keep it rejected in every
-    // non-TUI mode.
-    reject_mode_flag(args.resume.is_some(), "--resume", mode)?;
+    if !web_only {
+        reject_mode_flag(args.resume.is_some(), "--resume", mode)?;
+    }
     reject_mode_flag(
         args.approval_policy != CodeApprovalPolicy::OnRequest,
         "--approval-policy",
@@ -4415,6 +4628,7 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use std::{
+        future,
         path::{Path, PathBuf},
         sync::Arc,
     };
@@ -4427,6 +4641,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::internal::ai::sandbox::SandboxPolicy;
 
     /// CEX-S2-12 "single sub-agent behind flag": the dispatcher
     /// concurrency cap is forced to 1 for every configured value —
@@ -4443,6 +4658,50 @@ mod tests {
                 "CEX-S2-12 must cap concurrency to 1, not {configured}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_shutdown_reports_a_bounded_timeout_and_aborts_the_task() {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let handle = McpServerHandle {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            shutdown_tx,
+            join: tokio::spawn(async { future::pending::<anyhow::Result<()>>().await }),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+
+        let result = handle
+            .shutdown_with_timeout(Duration::from_millis(10))
+            .await;
+
+        assert_eq!(result, Err(McpServerShutdownError::TimedOut));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_only_shutdown_registers_a_sigterm_listener() {
+        let _listener = web_only_sigterm_listener()
+            .expect("web-only mode must be able to subscribe to SIGTERM on Unix");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_codex_shutdown_kills_and_reaps_the_child_within_deadline() {
+        let child = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn temporary managed Codex child");
+        let mut server = ManagedCodexServer {
+            ws_url: "ws://127.0.0.1:0".to_string(),
+            child,
+        };
+
+        server
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .await
+            .expect("managed child must be reaped before its shutdown deadline");
+        assert!(server.child.id().is_none(), "managed child must be reaped");
     }
 
     fn base_args() -> CodeArgs {
@@ -4574,20 +4833,26 @@ mod tests {
         assert!(err.contains("exceeds the"));
     }
 
-    /// C5: `--resume` is TUI-only by design and stays rejected under
-    /// `--web-only`. This is a deliberate contract (resume is accepted only on
-    /// the TUI path, `docs/development/tracing/code.md`), not deferred work.
-    /// `--model` used to be rejected here too, but C2 relaxed it web-only — see
-    /// `accepts_model_api_base_and_temperature_in_web_only_mode`.
+    /// W1-06: the non-Codex headless runtime has a durable JSONL projection
+    /// fold, so its CLI surface must make `--web-only --resume` reachable.
+    /// Managed Codex uses a separate app-server session protocol and remains
+    /// explicitly rejected below.
     #[test]
-    fn rejects_tui_flags_in_web_mode() {
+    fn accepts_resume_in_non_codex_web_mode_and_rejects_managed_codex() {
         let mut args = base_args();
         args.web_only = true;
+        args.provider = CodeProvider::Ollama;
         args.resume = Some("thread-id".to_string());
+        assert!(
+            validate_mode_args(&args, &OutputConfig::default()).is_ok(),
+            "the generic headless Web runtime must make its resume implementation reachable"
+        );
+
+        args.provider = CodeProvider::Codex;
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
-            err.contains("--resume") && err.contains("--web") && err.contains("remove"),
-            "web-only --resume rejection must name the flag, the mode, and an action; got: {err}"
+            err.contains("--resume") && err.contains("--web") && err.contains("codex"),
+            "managed Codex resume rejection must name the flag, mode, and provider; got: {err}"
         );
     }
 
@@ -4604,6 +4869,77 @@ mod tests {
         assert!(
             err.contains("--resume") && err.contains("--stdio") && err.contains("remove"),
             "stdio --resume rejection must name the flag, the mode, and an action; got: {err}"
+        );
+    }
+
+    #[test]
+    fn headless_web_resume_loads_the_requested_persisted_session() {
+        let temp = tempfile::TempDir::new().expect("temporary headless session root");
+        let working_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&working_dir).expect("create working directory");
+        let session_store = Arc::new(SessionStore::from_storage_path(&working_dir.join(".libra")));
+        let mut original = SessionState::new(&working_dir.to_string_lossy());
+        original.metadata.insert(
+            "thread_id".to_string(),
+            serde_json::json!("headless-thread"),
+        );
+        let session_id = original.id.clone();
+        session_store
+            .save(&original)
+            .expect("persist headless session");
+
+        let mut args = base_args();
+        args.web_only = true;
+        args.provider = CodeProvider::Ollama;
+        args.resume = Some("headless-thread".to_string());
+        let restored =
+            load_or_create_headless_web_session_state(&args, &working_dir, &session_store)
+                .expect("resume persisted headless session");
+
+        assert_eq!(restored.id, session_id);
+        assert_eq!(
+            restored
+                .metadata
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str),
+            Some("headless-thread")
+        );
+    }
+
+    #[test]
+    fn headless_web_resume_preserves_indeterminate_side_effect_fence() {
+        let working_dir = tempfile::tempdir().expect("create temporary workspace");
+        let provider = CodeUiProviderInfo {
+            provider: "test".to_string(),
+            model: Some("test-model".to_string()),
+            mode: Some("web-headless".to_string()),
+            managed: false,
+        };
+        let capabilities = headless_capabilities();
+        let mut persisted = initial_snapshot(
+            working_dir.path().to_string_lossy().to_string(),
+            provider.clone(),
+            capabilities.clone(),
+        );
+        persisted.status = CodeUiSessionStatus::IndeterminateSideEffect;
+
+        let mut session = SessionState::new(&working_dir.path().to_string_lossy());
+        session.metadata.insert(
+            HEADLESS_CODE_UI_SNAPSHOT_METADATA_KEY.to_string(),
+            serde_json::to_value(persisted).expect("serialize persisted Code UI snapshot"),
+        );
+
+        let restored = build_headless_web_code_ui_snapshot(
+            working_dir.path(),
+            provider,
+            capabilities,
+            &session,
+        );
+
+        assert_eq!(
+            restored.status,
+            CodeUiSessionStatus::IndeterminateSideEffect,
+            "resume must retain the reconciliation fence even when projection replay is empty"
         );
     }
 
@@ -6127,6 +6463,7 @@ no_cache_unknown_network = true
         let runtime = build_non_codex_headless_runtime(
             &args,
             tmp.path(),
+            &CodeEnvFile::default(),
             session_store,
             session_state,
             false,
@@ -6139,6 +6476,36 @@ no_cache_unknown_network = true
         assert_eq!(snapshot.provider.provider, "ollama");
         assert_eq!(snapshot.provider.mode.as_deref(), Some("web-headless"));
         assert_eq!(snapshot.provider.model.as_deref(), Some("llama3.2"));
+    }
+
+    #[tokio::test]
+    async fn headless_provider_boot_uses_the_shared_env_file_lookup() {
+        let tmp = tempfile::TempDir::new().expect("temporary workspace");
+        let mut args = base_args();
+        args.provider = CodeProvider::Openai;
+        args.model = Some("gpt-test".to_string());
+        let mut env_file = CodeEnvFile::default();
+        env_file
+            .values
+            .insert("OPENAI_API_KEY".to_string(), "from-env-file".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&tmp.path().join(".libra")));
+        let session_state = SessionState::new(&tmp.path().to_string_lossy());
+
+        let runtime = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &env_file,
+            session_store,
+            session_state,
+            false,
+        )
+        .await
+        .expect("headless OpenAI should use the shared provider factory")
+        .expect("OpenAI is a supported non-Codex headless provider");
+        let snapshot = runtime.snapshot().await;
+
+        assert_eq!(snapshot.provider.provider, "openai");
+        assert_eq!(snapshot.provider.model.as_deref(), Some("gpt-test"));
     }
 
     #[cfg(feature = "test-provider")]
@@ -6162,6 +6529,7 @@ no_cache_unknown_network = true
         let runtime = build_non_codex_headless_runtime(
             &args,
             tmp.path(),
+            &CodeEnvFile::default(),
             session_store,
             session_state,
             false,
@@ -6229,6 +6597,7 @@ no_cache_unknown_network = true
         let runtime = build_non_codex_headless_runtime(
             &args,
             tmp.path(),
+            &CodeEnvFile::default(),
             session_store,
             session_state,
             false,

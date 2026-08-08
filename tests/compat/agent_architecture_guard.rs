@@ -326,3 +326,176 @@ fn agent_kind_enum_sql_check_and_doc_roster_stay_in_sync() {
         "tracing/agent.md must keep the frozen first-batch roster statement"
     );
 }
+
+/// W0-03: TUI removal is forbidden until the Web-only completion checklist is
+/// both complete and still tied to the runtime source seam.  While TUI remains
+/// compiled, this test freezes the complete checklist so later phases cannot
+/// silently omit a parity or security dimension.
+#[test]
+fn code_web_only_completion_gate() {
+    let code_doc = fs::read_to_string(repo_root().join("docs/development/tracing/code.md"))
+        .expect("read tracing/code.md");
+    assert!(
+        code_doc.contains("## Web-only completion gate（W0-03）"),
+        "tracing/code.md must retain the W0-03 Web-only completion gate"
+    );
+
+    let gates = [
+        "GATE-WEB-PLAN",
+        "GATE-WEB-GOAL",
+        "GATE-WEB-RESUME",
+        "GATE-WEB-APPROVAL",
+        "GATE-WEB-SSE",
+        "GATE-WEB-CODEX",
+        "GATE-WEB-MCP",
+        "GATE-WEB-DOCS",
+    ];
+    for gate in gates {
+        assert!(
+            code_doc.contains(&format!("| [ ] {gate}"))
+                || code_doc.contains(&format!("| [x] {gate}")),
+            "Web-only completion gate is missing {gate}"
+        );
+    }
+    for decision in [
+        "GATE-WEB-DECISION-WEB-ONLY",
+        "GATE-WEB-DECISION-BAKE",
+        "GATE-WEB-DECISION-STDIO",
+        "GATE-WEB-DECISION-SSH",
+        "GATE-WEB-DECISION-GRAPH",
+    ] {
+        assert!(
+            code_doc.contains(decision),
+            "Web-only completion gate is missing product decision {decision}"
+        );
+    }
+
+    let internal_mod =
+        fs::read_to_string(repo_root().join("src/internal/mod.rs")).expect("read internal/mod.rs");
+    let tui_still_compiled = internal_mod.contains("pub mod tui;");
+    if !tui_still_compiled {
+        let incomplete = gates
+            .iter()
+            .filter(|gate| code_doc.contains(&format!("| [ ] {gate}")))
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            incomplete.is_empty(),
+            "TUI was removed before Web-only completion gates passed: {}",
+            incomplete.join(", ")
+        );
+        let runtime_mod = fs::read_to_string(repo_root().join("src/internal/ai/runtime/mod.rs"))
+            .expect("read runtime/mod.rs");
+        assert!(
+            runtime_mod.contains("pub mod worker;"),
+            "TUI removal requires the UI-neutral AgentRuntime worker seam"
+        );
+    }
+}
+
+/// W0-01: retain the source-grounded conflict and A0-consumption records
+/// needed to prevent a future Code migration from silently recreating an
+/// Agent-side queue, trust policy, or artifact store.
+#[test]
+fn code_runtime_anchor_audit_is_documented() {
+    let code_doc = fs::read_to_string(repo_root().join("docs/development/tracing/code.md"))
+        .expect("read tracing/code.md");
+    for heading in [
+        "### C1–C10 契约冲突表（W0-01）",
+        "### A0 接口漂移登记表（W0-01）",
+    ] {
+        assert!(
+            code_doc.contains(heading),
+            "tracing/code.md must retain {heading}"
+        );
+    }
+    for contract in 1..=10 {
+        assert!(
+            code_doc.contains(&format!("| C{contract} |")),
+            "runtime contract audit is missing C{contract}"
+        );
+    }
+    for artifact in [
+        "A0-02 subagent checkpoint",
+        "A0-03 stable error emit",
+        "A0-04 run admission",
+        "A0-05 fix bridge",
+        "A0-06 findings artifacts",
+        "A0-07 skill projection",
+        "A0-08 trust",
+        "A0-09 retention",
+        "A0-10 cloud tombstone",
+        "A0-11 deferred parity",
+        "src/command/agent/graph.rs",
+    ] {
+        assert!(
+            code_doc.contains(artifact),
+            "runtime anchor audit is missing {artifact}"
+        );
+    }
+}
+
+/// W1-03: Code workflow JSONL stays additive to the existing session stream
+/// and must not silently absorb agent-owned checkpoint/finding/capture data.
+#[test]
+fn code_session_event_boundary_is_documented() {
+    let code_doc = fs::read_to_string(repo_root().join("docs/development/tracing/code.md"))
+        .expect("read tracing/code.md");
+    for required in [
+        "### W1-03 Code 会话事件边界",
+        ".libra/sessions/{session_id}/events.jsonl",
+        "code_workflow",
+        "event_id",
+        "sequence: u64",
+        "IndeterminateSideEffect",
+        "A0-02 subagent checkpoint",
+        "A0-06 review/investigate findings",
+        "external-agent capture retention",
+        "A0-10\ncloud tombstone",
+        "W1-05",
+        "W1-06",
+        "### W1-05 Runtime command durability boundary",
+        "RuntimeCommandDurability",
+        "command_indeterminate_side_effect",
+        "sync_data",
+    ] {
+        assert!(
+            code_doc.contains(required),
+            "W1-03 session boundary documentation is missing {required:?}"
+        );
+    }
+
+    let jsonl = fs::read_to_string(repo_root().join("src/internal/ai/session/jsonl.rs"))
+        .expect("read session JSONL implementation");
+    for required in [
+        "CodeWorkflowEventKind",
+        "CommandAccepted",
+        "TerminalSuccess",
+        "TerminalFailure",
+        "IndeterminateSideEffect",
+        "append_code_workflow",
+        "load_code_workflow_replay",
+        "admit_code_command",
+        "recover_code_command",
+    ] {
+        assert!(
+            jsonl.contains(required),
+            "W1-03 JSONL schema is missing {required}"
+        );
+    }
+
+    let durability = fs::read_to_string(repo_root().join("src/internal/ai/runtime/durability.rs"))
+        .expect("read runtime command durability implementation");
+    for required in [
+        "BeforeIntentFsync",
+        "AfterIntentFsyncBeforeDispatch",
+        "AfterDispatchBeforeTerminalFsync",
+        "AfterTerminalFsync",
+        "retry_recovered_read_only",
+    ] {
+        assert!(
+            durability.contains(required),
+            "W1-05 runtime durability boundary is missing {required}"
+        );
+    }
+}

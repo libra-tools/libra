@@ -64,23 +64,32 @@ struct CacheInfo {
     cache_size_bytes: usize,
 }
 
-async fn evict(
+/// The deletion-safety preflight every cache-eviction entry point must pass.
+///
+/// It lives here, in ONE place, because it was previously inlined in
+/// `libra cache evict` only — `libra maintenance run --task cache-evict`
+/// called the eviction engine directly and so skipped both checks entirely.
+/// A safety contract with two entry points and one implementation is a
+/// contract with a hole in it.
+pub(crate) fn evict_preflight(
     dry_run: bool,
-    max_size: Option<u64>,
-    min_age: u64,
-    output: &OutputConfig,
-) -> CliResult<()> {
-    use crate::utils::{error::StableErrorCode, storage::EvictRequest};
-    crate::utils::util::require_repo()
-        .map_err(|_| crate::utils::error::CliError::repo_not_found())?;
+) -> CliResult<Option<crate::internal::maintenance_lock::MaintenanceLock>> {
+    use crate::utils::error::StableErrorCode;
+
     // lore.md 2.3 deletion safety: a shared base (repos borrow FROM it) must
     // not evict a large object a borrower still needs — refuse while any live
-    // borrower exists (only for a real run; a dry run just previews).
-    if !dry_run && crate::internal::alternates::has_live_borrowers(&crate::utils::path::objects()) {
-        return Err(crate::utils::error::CliError::failure(
-            "cache eviction skipped: this store is shared (other repos borrow from it via              alternates); have borrowers run 'libra alternates remove' first",
-        )
-        .with_stable_code(StableErrorCode::ConflictOperationBlocked));
+    // borrower exists (only for a real run; a dry run just previews). The
+    // predicate lives in ONE helper (§C.11 release gate) so no deletion entry
+    // point can drift away from it.
+    // Validation first, so what a user is told is about their repository
+    // rather than about lock contention: a borrowed store and an offline read
+    // policy are refusals this command owes regardless of who else is
+    // running. The lock, and the re-check under it, come after.
+    if !dry_run {
+        crate::internal::alternates::ensure_no_live_borrowers(
+            "evict cached objects",
+            StableErrorCode::ConflictOperationBlocked,
+        )?;
     }
     // Offline read policy forbids the durability probes the safety contract
     // requires — refuse rather than delete unverified.
@@ -92,6 +101,42 @@ async fn evict(
         .with_stable_code(StableErrorCode::RepoStateInvalid)
         .with_hint("drop --offline / LIBRA_READ_POLICY=local and retry"));
     }
+    if dry_run {
+        return Ok(None);
+    }
+    // §C.4.3: eviction unlinks payloads, so it holds the maintenance lock
+    // EXCLUSIVELY. The guard is RETURNED rather than dropped here — a lock
+    // released at the end of the preflight would protect nothing.
+    let storage = crate::utils::util::try_get_storage_path(None).map_err(|error| {
+        crate::utils::error::CliError::fatal(format!(
+            "cannot resolve the repository storage path for cache eviction: {error}"
+        ))
+        .with_stable_code(StableErrorCode::RepoNotFound)
+    })?;
+    let deletion_lock = crate::internal::maintenance_lock::MaintenanceLock::exclusive_or_refuse(
+        &storage,
+        "evict cached objects",
+    )?;
+    // Re-checked UNDER the hold: the gate above ran before the lock existed,
+    // and registering a borrower is itself a publication, so one that
+    // appeared in between is caught here (§C.4.3).
+    crate::internal::alternates::ensure_no_live_borrowers(
+        "evict cached objects",
+        StableErrorCode::ConflictOperationBlocked,
+    )?;
+    Ok(Some(deletion_lock))
+}
+
+async fn evict(
+    dry_run: bool,
+    max_size: Option<u64>,
+    min_age: u64,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    use crate::utils::{error::StableErrorCode, storage::EvictRequest};
+    crate::utils::util::require_repo()
+        .map_err(|_| crate::utils::error::CliError::repo_not_found())?;
+    let _deletion_lock = evict_preflight(dry_run)?;
     let budget = match max_size {
         Some(budget) => budget,
         None => {

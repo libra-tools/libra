@@ -62,7 +62,7 @@ flowchart TD
 |---|---|---|
 | ✅ 已实现 | `-f` / `--force`（别名 `--discard-changes`） | 已公开：带本地改动也切换、切到不同提交时丢弃它们（会被覆盖的未跟踪文件仍受保护）；字段 `force`，clap `visible_alias = "discard-changes"`。 |
 | Orphan start-point | `switch --orphan <branch> <start-point>` 不公开；额外 positional 会 usage error fail-closed。 | Git `switch --orphan` 也不是 checkout 的 start-point 兼容入口；Libra 保持单参数 orphan，避免静默忽略 start-point 或破坏 P0-05 root 语义。 |
-| Git 兼容参数 | `--merge`、`--conflict=<style>`、`--recurse-submodules`、`--ignore-other-worktrees` 等切换策略参数。 | 当前未公开；后续需要先补工作树冲突模型和多工作树隔离契约。 |
+| Git 兼容参数 | `--merge`、`--conflict=<style>`、`--recurse-submodules` 等切换策略参数。 | 当前未公开；后续需要先补工作树冲突模型和多工作树隔离契约。`--ignore-other-worktrees` 已单独公开（Part C W0，有意与 Git 不同）：仅为 Git 兼容而接受，绝不绕过同分支互斥守卫——存在真实冲突时 switch 照样拒绝，且拒绝 hint 指向 `libra worktree doctor` / `libra worktree repair --confirm`；单 worktree 仓库中为静默 no-op。 |
 
 ## 维护要求
 

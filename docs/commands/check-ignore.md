@@ -3,12 +3,20 @@
 Report which pathnames are excluded by Git/Libra ignore rules — the equivalent
 of `git check-ignore`, with Libra extension files preserved.
 
-Libra reads standard Git ignore sources (`.gitignore`, `.git/info/exclude`, and
-`core.excludesFile`) as well as Libra extension files (`.libraignore`). Within
-the same directory, `.libraignore` has higher precedence than `.gitignore`; a
-nearer directory source overrides an ancestor; `.git/info/exclude` and
-`core.excludesFile` are lower-precedence fallbacks. Pattern syntax is Git
-ignore syntax.
+Libra reads standard Git ignore sources (`.gitignore`, the worktree-local
+`info/exclude`, and `core.excludesFile`) as well as Libra extension files
+(`.libraignore`). The worktree-local `info/exclude` lives in the CURRENT
+worktree's own gitdir — `.libra/info/exclude`, plus `.git/info/exclude` in a
+Git-layout or dual-layout tree (a repo converted from Git keeps both
+consulted) — and is per-worktree: each isolated linked worktree reads its
+own file, never another worktree's via `commondir` (intentionally different
+from Git, which shares `info/exclude` repository-wide; share rules with a
+root `.libraignore`/`.gitignore` instead). A pre-isolation legacy-symlink
+worktree still shares main's `info/*` until migrated with
+`libra worktree repair --migrate-layout`. Within the same directory,
+`.libraignore` has higher precedence than `.gitignore`; a nearer directory
+source overrides an ancestor; `info/exclude` and `core.excludesFile` are
+lower-precedence fallbacks. Pattern syntax is Git ignore syntax.
 
 ## Synopsis
 

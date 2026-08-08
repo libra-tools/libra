@@ -780,7 +780,7 @@ async fn reserve_source(
         .context("begin subagent content reservation")?;
     let lease_expires_at = now_ms.saturating_add(SUBAGENT_CONTENT_LEASE_MS);
     let inserted = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "INSERT INTO agent_subagent_content_claim (
                 parent_session_id, provider_kind, source_key, content_schema_version,
@@ -816,7 +816,7 @@ async fn reserve_source(
     }
 
     let row = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT revision_cursor, current_revision, current_checkpoint_id, current_digest, state,
                     attempt_digest, lease_expires_at, fence_token
@@ -854,7 +854,7 @@ async fn reserve_source(
     }
     if state == "reserved" && current_digest.as_deref() == Some(content_digest) {
         let cleared = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "UPDATE agent_subagent_content_claim
                  SET state = 'idle', attempt_digest = NULL, attempt_checkpoint_id = NULL,
@@ -889,7 +889,7 @@ async fn reserve_source(
             "subagent content claim has a digest but no current checkpoint; run `libra agent doctor`",
         )?;
         let intact = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT c.traces_commit, c.tree_oid, c.metadata_blob_oid
                  FROM agent_checkpoint c
@@ -943,7 +943,7 @@ async fn reserve_source(
             return Ok(ReservationOutcome::DurabilityProofStale);
         }
         let current_head = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT `commit` FROM reference
                  WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
@@ -968,7 +968,7 @@ async fn reserve_source(
         });
     }
     let updated = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_subagent_content_claim
              SET state = 'reserved', attempt_digest = ?, attempt_checkpoint_id = ?,
@@ -1001,7 +1001,7 @@ async fn reserve_source(
         });
     }
     let fence_row = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT fence_token FROM agent_subagent_content_claim
              WHERE parent_session_id = ? AND provider_kind = ? AND source_key = ?
@@ -1036,7 +1036,7 @@ async fn release_reservation(
 ) -> Result<()> {
     subagent_content_test_failpoint("before_release_reservation")?;
     let released = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "UPDATE agent_subagent_content_claim
              SET state = 'idle', attempt_digest = NULL, attempt_checkpoint_id = NULL,
@@ -1087,7 +1087,7 @@ async fn unique_boundary_checkpoint<C: ConnectionTrait>(
         return Ok(None);
     };
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT checkpoint_id FROM agent_checkpoint
              WHERE session_id = ? AND scope = 'subagent'
@@ -1115,9 +1115,11 @@ async fn refresh_current_link(
     let Some(stable_id) = source.stable_subagent_id.as_deref() else {
         return Ok(());
     };
-    let txn = conn.begin().await.context("begin subagent link refresh")?;
+    let txn = crate::internal::db::begin_write_transaction(conn)
+        .await
+        .context("begin subagent link refresh")?;
     let current = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT current_checkpoint_id FROM agent_subagent_content_claim
              WHERE parent_session_id = ? AND provider_kind = ? AND source_key = ?
@@ -1151,7 +1153,7 @@ async fn refresh_current_link(
             .context("commit unresolved subagent link refresh")?;
         return Ok(());
     };
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
         "UPDATE agent_subagent_link
          SET link_state = 'resolved', boundary_checkpoint_id = ?,
@@ -1194,7 +1196,7 @@ impl TracesTxnExtra for ContentCommitPlan {
     async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()> {
         subagent_content_test_failpoint("before_final_sql")?;
         let writable = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT 1 FROM agent_session s
                  WHERE s.session_id = ?
@@ -1212,7 +1214,7 @@ impl TracesTxnExtra for ContentCommitPlan {
         }
 
         let reservation = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT revision_cursor FROM agent_subagent_content_claim
                  WHERE parent_session_id = ? AND provider_kind = ? AND source_key = ?
@@ -1238,7 +1240,7 @@ impl TracesTxnExtra for ContentCommitPlan {
             bail!("subagent content revision changed while writer was in flight");
         }
 
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
@@ -1263,7 +1265,7 @@ impl TracesTxnExtra for ContentCommitPlan {
         .await
         .context("insert subagent content checkpoint catalog row")?;
 
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "INSERT INTO agent_subagent_content_revision (
                 parent_session_id, provider_kind, source_key, content_schema_version,
@@ -1297,7 +1299,7 @@ impl TracesTxnExtra for ContentCommitPlan {
             "unresolved"
         };
         let link_timestamp_ms = Utc::now().timestamp_millis();
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "INSERT INTO agent_subagent_link (
                 content_checkpoint_id, parent_session_id, link_state,
@@ -1318,7 +1320,7 @@ impl TracesTxnExtra for ContentCommitPlan {
         .context("insert subagent content boundary association")?;
 
         let advanced = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "UPDATE agent_subagent_content_claim
                  SET revision_cursor = ?, sync_revision = sync_revision + 1,
@@ -1419,7 +1421,7 @@ struct PreparedSubagentContent<'a> {
 }
 
 async fn traces_head<C: ConnectionTrait>(conn: &C) -> Result<Option<String>> {
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT `commit` FROM reference
          WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
@@ -1449,7 +1451,7 @@ async fn build_unchanged_durability_proof(
     for item in prepared {
         let source = item.source;
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 "SELECT c.current_checkpoint_id, cp.traces_commit, cp.tree_oid,
                         cp.metadata_blob_oid
@@ -1584,7 +1586,7 @@ async fn capture_discovered_subagent_contents_inner(
         bail!("invalid subagent content source channel");
     }
     let parent = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT agent_kind,
                     json_extract(metadata_json, '$.capture_incarnation') AS capture_incarnation
@@ -1975,13 +1977,13 @@ mod tests {
             .await
             .expect("memory database");
         run_builtin_migrations(&conn).await.expect("migrations");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
         ))
         .await
         .expect("minimal ai_thread FK target");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -2017,7 +2019,7 @@ mod tests {
     }
 
     async fn scalar(conn: &DatabaseConnection, sql: &str) -> i64 {
-        conn.query_one(Statement::from_string(
+        conn.query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -2033,7 +2035,7 @@ mod tests {
         checkpoint_id: &str,
         stable_id: Option<&str>,
     ) {
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
@@ -2486,7 +2488,7 @@ mod tests {
         )
         .await
         .expect("initial capture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             format!(
                 "UPDATE agent_subagent_content_claim
@@ -2510,7 +2512,7 @@ mod tests {
         .expect("unchanged replay");
         assert_eq!(replay.skipped_unchanged, 1);
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT state, attempt_digest, owner, fence_token
                  FROM agent_subagent_content_claim"
@@ -2559,7 +2561,7 @@ mod tests {
             .await
             .expect("initial capture");
             if damaged_field == "traces_ref" {
-                conn.execute(Statement::from_string(
+                conn.execute_raw(Statement::from_string(
                     conn.get_database_backend(),
                     "UPDATE reference SET `commit` = NULL
                      WHERE name = 'traces' AND kind = 'Branch'"
@@ -2569,7 +2571,7 @@ mod tests {
                 .expect("clear traces ref");
             } else if damaged_field == "descendant_object" {
                 let row = conn
-                    .query_one(Statement::from_string(
+                    .query_one_raw(Statement::from_string(
                         conn.get_database_backend(),
                         "SELECT checkpoint_id, traces_commit, tree_oid, metadata_blob_oid
                          FROM agent_checkpoint"
@@ -2600,7 +2602,7 @@ mod tests {
                     .expect("remove descendant object");
             } else {
                 let row = conn
-                    .query_one(Statement::from_string(
+                    .query_one_raw(Statement::from_string(
                         conn.get_database_backend(),
                         format!("SELECT {damaged_field} AS oid FROM agent_checkpoint"),
                     ))
@@ -2649,7 +2651,7 @@ mod tests {
         .await
         .expect("capture cloud-restore durability fixture");
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT checkpoint_id, traces_commit, tree_oid, metadata_blob_oid
                  FROM agent_checkpoint"
@@ -2715,7 +2717,7 @@ mod tests {
         .await
         .expect("first capture");
         let checkpoint_id: String = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT current_checkpoint_id FROM agent_subagent_content_claim".to_string(),
             ))
@@ -2724,7 +2726,7 @@ mod tests {
             .expect("current row")
             .try_get_by("current_checkpoint_id")
             .expect("current checkpoint");
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
             [checkpoint_id.into()],
@@ -2910,7 +2912,7 @@ mod tests {
         .await
         .expect("seed crashed reservation");
         assert!(matches!(stale, ReservationOutcome::Reserved { .. }));
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             format!(
                 "UPDATE agent_subagent_content_claim SET lease_expires_at = {}",
@@ -2992,7 +2994,7 @@ mod tests {
         let (projected, _, _, _) = safe_content_projection(&source).expect("safe projection");
         let digest = hex::encode(Sha256::digest(projected.as_ref()));
         let now_ms = Utc::now().timestamp_millis();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_subagent_content_claim (
                 parent_session_id, provider_kind, source_key, content_schema_version,
@@ -3124,7 +3126,7 @@ mod tests {
             .expect("content revision");
         }
         let current_id: String = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT current_checkpoint_id FROM agent_subagent_content_claim".to_string(),
             ))
@@ -3230,7 +3232,7 @@ mod tests {
         )
         .await
         .expect("current content");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             format!(
                 "UPDATE agent_subagent_content_claim
@@ -3244,7 +3246,7 @@ mod tests {
         .await
         .expect("seed reservation-before-marker window");
         let current_id: String = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT current_checkpoint_id FROM agent_subagent_content_claim".to_string(),
             ))
@@ -3491,7 +3493,7 @@ mod tests {
         .await
         .expect("initial unresolved content");
         let original_traces: String = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT cp.traces_commit FROM agent_checkpoint cp
                  JOIN agent_subagent_content_claim c
@@ -3525,7 +3527,7 @@ mod tests {
             "link refresh must not append content history"
         );
         let linked = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT l.link_state, l.boundary_checkpoint_id, cp.traces_commit
                  FROM agent_subagent_link l
@@ -3575,7 +3577,7 @@ mod tests {
         .await
         .expect("resolved content capture");
 
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
             ["boundary-stable".into()],

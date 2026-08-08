@@ -34,12 +34,30 @@ pub struct ProbeRequest {
 /// `__upgrade-probe --kind <k> --expected-version <v>` (order-independent,
 /// each flag once). Anything else returns a rejection so a malformed probe
 /// invocation fails closed rather than silently self-checking.
-pub fn parse_probe_argv(argv: &[String]) -> Option<Result<ProbeRequest, ProbeArgError>> {
-    let rest = argv.get(1)?;
-    if rest != UPGRADE_PROBE_TOKEN {
+pub fn parse_probe_argv(
+    argv: &[std::ffi::OsString],
+) -> Option<Result<ProbeRequest, ProbeArgError>> {
+    // Positions are taken from the RAW argv, never from a filtered view: the
+    // probe token must be argv[1] exactly. Filtering non-UTF-8 tokens out
+    // first would shift indices, so `libra <non-utf8> __upgrade-probe …`
+    // would be accepted as a probe — a command line that is not one.
+    if argv.get(1)?.to_str() != Some(UPGRADE_PROBE_TOKEN) {
         return None;
     }
-    Some(parse_probe_tail(&argv[2..]))
+    // The tail is a fixed set of ASCII flags and values; a non-UTF-8 token in
+    // it is a malformed probe, reported as such rather than dropped.
+    let mut tail = Vec::with_capacity(argv.len().saturating_sub(2));
+    for arg in &argv[2..] {
+        match arg.to_str() {
+            Some(text) => tail.push(text.to_string()),
+            None => {
+                return Some(Err(ProbeArgError::Unexpected(
+                    arg.to_string_lossy().into_owned(),
+                )));
+            }
+        }
+    }
+    Some(parse_probe_tail(&tail))
 }
 
 /// Malformed probe argv (still consumed by the front entry — never forwarded).
@@ -124,16 +142,53 @@ pub fn run_probe(request: Result<ProbeRequest, ProbeArgError>) -> CliResult<()> 
 
 /// Whether `argv` selects the probe entry (used by the CLI front scan to
 /// decide before doing anything else).
-pub fn is_probe_invocation(argv: &[String]) -> bool {
-    argv.get(1).map(String::as_str) == Some(UPGRADE_PROBE_TOKEN)
+pub fn is_probe_invocation(argv: &[std::ffi::OsString]) -> bool {
+    argv.get(1).and_then(|arg| arg.to_str()) == Some(UPGRADE_PROBE_TOKEN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+    fn argv(parts: &[&str]) -> Vec<std::ffi::OsString> {
+        parts.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    /// A non-UTF-8 token BEFORE the probe token must not be filtered away:
+    /// the probe is recognised by position, so dropping it would turn a
+    /// command line that is not a probe into one.
+    #[cfg(unix)]
+    #[test]
+    fn a_token_before_the_probe_token_is_not_skipped() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let argv = vec![
+            OsString::from("libra"),
+            OsString::from_vec(vec![0xff]),
+            OsString::from(UPGRADE_PROBE_TOKEN),
+            OsString::from("--kind"),
+            OsString::from("version"),
+        ];
+        assert!(
+            parse_probe_argv(&argv).is_none(),
+            "the probe token must be argv[1] exactly"
+        );
+    }
+
+    /// A non-UTF-8 token INSIDE the probe tail is a malformed probe, not a
+    /// silently dropped argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_probe_tail_token_is_rejected() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let argv = vec![
+            OsString::from("libra"),
+            OsString::from(UPGRADE_PROBE_TOKEN),
+            OsString::from_vec(vec![0xff]),
+        ];
+        assert!(matches!(
+            parse_probe_argv(&argv),
+            Some(Err(ProbeArgError::Unexpected(_)))
+        ));
     }
 
     #[test]

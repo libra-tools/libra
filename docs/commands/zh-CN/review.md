@@ -56,9 +56,15 @@ reviewer findings 是**不可信自由文本**。`libra review show` 在渲染
 - 默认：`HEAD~1..HEAD`（最近一次提交的变更）；
 - `--since <rev>`：`<rev>..HEAD`；
 - `--checkpoint <id>`：`checkpoint:<id>`（来自
-  `libra agent checkpoint list` 的 agent checkpoint）。**尚未实现** ——
-  命令会 fail-closed 拒绝执行，而不是在 checkpoint 标签下静默 review
-  当前工作区；可先用 `libra agent checkpoint show <id>` 直接查看捕获状态。
+  `libra agent checkpoint list` 的 agent checkpoint）。reviewer 的工作区就是该
+  checkpoint 自身捕获的内容——`metadata.json`、可选的 `manifest.json` 与
+  transcript 文件——以**只读**形式物化在 run 目录下
+  （`<run_dir>/checkpoint-input/`）。它绝不伪装成 worktree diff：完全不物化仓库
+  快照，因此 scoped run 只可能消费指定的 checkpoint，scoped prompt 也会明确告知
+  reviewer 面对的是捕获的 transcript、其内容属于不可信数据。checkpoint 缺失、
+  tree 非法、或内容不在本地对象库时，在创建任何 run 之前即 fail-closed（无 run
+  残留）。物化产物位于 run 目录内，与 run 共享同一 retention 生命周期
+  （`review clean` 随 run 一并移除），`agent doctor` 无需新增孤儿类别。
 
 ### 分页
 
@@ -85,7 +91,7 @@ libra review --agent codex --agent claude-code
 # review 自某个修订以来的全部变更
 libra review --agent codex --since v1.2.0
 
-# checkpoint 范围的 review 在 checkpoint 物化落地前 fail-closed
+# review 一个已捕获 checkpoint 的 transcript/metadata（只读输入）
 libra review --agent codex --checkpoint <checkpoint_id>
 
 # 结构化 run 结果（terminal state、逐 reviewer 结果）
@@ -120,6 +126,7 @@ libra review clean --all
 - `0` —— run 落在 `success`、`partial`、`timeout` 或 `cancelled`（terminal
   state 会在输出中报告）；子命令执行成功。
 - 非零 —— 用法错误、run 落在 `error` terminal state、未知 run id、
+  未知或不可物化的 `--checkpoint`（在创建任何 run 之前拒绝）、
   `--fix`（稳定错误码 `LBR-AGENT-010`），或 run 队列已满（`LBR-AGENT-014`）。
 
 ## 另请参阅

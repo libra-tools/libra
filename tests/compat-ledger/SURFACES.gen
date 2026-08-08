@@ -1,0 +1,195 @@
+#!/bin/sh
+# plan-20260729 CT2-02 — generate the surface lock from the surface registry.
+#
+# POSIX sh wrapper around the python implementation below. The wrapper exists
+# because every caller in the plan invokes this file as `sh SURFACES.gen`; a
+# bare `#!/usr/bin/env python3` script only works when executed directly, and
+# `sh` would then try to run python as shell. The wrapper also computes the
+# repository root from $0, since python reading from stdin has no __file__.
+set -eu
+LIBRA_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+export LIBRA_ROOT
+exec python3 - "$@" <<'SURFACES_GEN_PY'
+"""plan-20260729 CT2-02 — generate the surface lock from the surface registry.
+
+The registry (GC-13) is the authoritative, human-maintained table of what
+Libra's per-surface compatibility actually is:
+
+    <command>\t<surface>\t<status>\t<evidence_anchor>
+
+This generator does exactly two mechanical things with it, and nothing else:
+
+  (i)  reads the status out of the authoritative table, and
+  (ii) proves every `evidence_anchor` resolves to real text that mentions BOTH
+       the command and the surface literally.
+
+(ii) is the point of the whole exercise. Command documentation is free text —
+the same line of `docs/commands/format-patch.md` says `--base` is supported and
+`--base=auto` is not — so a status can never be scraped out of prose. It has to
+be asserted by a person and then *anchored* to the sentence that backs it. An
+anchor that does not mention the surface is not evidence, and this generator
+refuses to mint a lock line for it.
+
+The output is the lock: the same four columns, sorted by (command, surface),
+one line each, LF-terminated. Sorting is what makes it byte-for-byte
+reproducible, so the committed lock can be regenerated and `diff`ed in CI. The
+input's row order is deliberately not preserved — it is not information.
+
+Usage:
+    SURFACE_REGISTRY=<path> tests/compat-ledger/SURFACES.gen > SURFACES.lock
+
+`SURFACE_REGISTRY` defaults to `docs/development/gap/surface-registry.tsv`
+(CT3-05's deliverable). A missing or unreadable registry is an error, never an
+empty lock: silently emitting nothing would let a downstream `diff` "pass"
+against a lock that documents nothing.
+"""
+
+import os
+import re
+import sys
+
+STATUSES = {"git-compatible", "intentionally-different", "absent", "deferred"}
+DEFAULT_REGISTRY = "docs/development/gap/surface-registry.tsv"
+
+# The sh wrapper computes the repository root and exports it; python read from
+# stdin has no __file__ to derive it from.
+REPO_ROOT = os.environ["LIBRA_ROOT"]
+
+
+def fail(message):
+    print(f"SURFACES.gen: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def slugify(title):
+    out = []
+    for ch in title:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch.lower())
+        elif ch in " -_":
+            out.append("-")
+    return "".join(out)
+
+
+def read_repo_file(relative):
+    path = os.path.join(REPO_ROOT, relative)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as error:
+        return None if error.errno else None
+
+
+def heading_names_decision(title, decision_id):
+    """Whether a heading names exactly this decision.
+
+    A bare prefix test would let `D1` match `### D10`. The real headings are
+    `D1：<title>`, so requiring a non-alphanumeric next character is both
+    correct and satisfied by the real data.
+    """
+    if not title.startswith(decision_id):
+        return False
+    tail = title[len(decision_id):]
+    return not tail or not (tail[0].isascii() and tail[0].isalnum())
+
+
+def section_text(text, matches):
+    """The section whose heading satisfies `matches`, up to the next heading at
+    the same or a shallower level."""
+    depth = 0
+    body = None
+    for line in text.split("\n"):
+        hashes = len(line) - len(line.lstrip("#"))
+        is_heading = hashes > 0 and line[hashes:hashes + 1] == " "
+        if is_heading:
+            title = line[hashes + 1:].strip()
+            if body is not None and hashes <= depth:
+                break
+            if body is None and matches(title):
+                depth = hashes
+                body = [line]
+                continue
+        if body is not None:
+            body.append(line)
+    return "\n".join(body) if body is not None else None
+
+
+def resolve_anchor(anchor):
+    """The text an `evidence_anchor` points at, or None."""
+    if anchor.startswith("COMPATIBILITY.md:"):
+        rest = anchor[len("COMPATIBILITY.md:"):]
+        if not re.fullmatch(r"[0-9]+", rest) or rest == "0":
+            return None
+        text = read_repo_file("COMPATIBILITY.md")
+        if text is None:
+            return None
+        lines = text.split("\n")
+        index = int(rest) - 1
+        return lines[index] if index < len(lines) else None
+
+    if anchor.startswith("_compatibility.md#"):
+        decision = anchor[len("_compatibility.md#"):]
+        text = read_repo_file("docs/development/commands/_compatibility.md")
+        if text is None:
+            return None
+        return section_text(text, lambda title: heading_names_decision(title, decision))
+
+    if "#" in anchor:
+        path, _, fragment = anchor.partition("#")
+        if path.startswith("docs/commands/") and path.endswith(".md"):
+            text = read_repo_file(path)
+            if text is None:
+                return None
+            return section_text(text, lambda title: slugify(title) == slugify(fragment))
+
+    return None
+
+
+def main():
+    registry = os.environ.get("SURFACE_REGISTRY", DEFAULT_REGISTRY)
+    path = registry if os.path.isabs(registry) else os.path.join(REPO_ROOT, registry)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as error:
+        fail(f"cannot read the surface registry '{registry}': {error.strerror}")
+
+    rows = {}
+    for number, line in enumerate(raw.split("\n"), start=1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 4:
+            fail(f"line {number}: expected 4 tab-separated fields, found {len(fields)}")
+        command, surface, status, anchor = (f.strip() for f in fields)
+        if not command or not surface or not status or not anchor:
+            fail(f"line {number}: no field may be blank")
+        if status not in STATUSES:
+            fail(f"line {number}: status '{status}' is not one of {sorted(STATUSES)}")
+        key = (command, surface)
+        if key in rows:
+            fail(
+                f"line {number}: duplicate key ({command}, {surface}); it is already "
+                f"declared on line {rows[key][0]}"
+            )
+        body = resolve_anchor(anchor)
+        if body is None:
+            fail(f"line {number}: evidence_anchor '{anchor}' does not resolve")
+        for needle in (command, surface):
+            if needle not in body:
+                fail(
+                    f"line {number}: evidence_anchor '{anchor}' does not mention "
+                    f"'{needle}', so it does not back this row"
+                )
+        rows[key] = (number, status, anchor)
+
+    out = []
+    for (command, surface) in sorted(rows):
+        _, status, anchor = rows[(command, surface)]
+        out.append(f"{command}\t{surface}\t{status}\t{anchor}")
+    sys.stdout.write("".join(f"{line}\n" for line in out))
+
+
+if __name__ == "__main__":
+    main()
+SURFACES_GEN_PY

@@ -15,6 +15,8 @@
 
 两个已启用 layer 之间发生同一目标冲突时的优先级：更高 `priority` 获胜，平局按 name 打破（stack 顺序中的 last-writer-wins）。
 
+**自 W1 起按 worktree 隔离**（plan-20260714 §C.4.1.1，迁移 `2026072303`）：注册表与路径 ownership 以 `worktree_id` 为 scope——同名 layer（以及同一目标路径）可在不同 worktree 中独立存在，所有子命令只作用于当前 worktree 的行；仅当 worktree 目录随之删除时移除才清理其 layer 行（保留的目录继续持有 ownership 行，overlay 文件保持不可暂存）。旧的仓库全局行仅在不存在 linked worktree 时归属 main worktree；否则 schema 迁移 fail-closed，要求先在拥有者 worktree 显式执行 `layer unapply`/`layer remove`。
+
 ## 示例
 
 ```bash

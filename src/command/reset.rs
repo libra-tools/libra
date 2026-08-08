@@ -1573,7 +1573,13 @@ async fn update_reset_reference(
                     }
                     Head::Detached(_) => {
                         let new_head = Head::Detached(target_commit_id);
-                        Head::update_with_conn(txn, new_head, None).await;
+                        // Propagated, not logged-and-dropped: a HEAD write
+                        // that fails while the surrounding work commits
+                        // leaves the repository pointing at the wrong commit
+                        // and reports success.
+                        Head::update_result_with_conn(txn, new_head, None)
+                            .await
+                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
                     }
                 }
                 Ok(())

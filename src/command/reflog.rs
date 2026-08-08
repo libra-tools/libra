@@ -10,8 +10,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 use sea_orm::{
-    ConnectionTrait, DbBackend, DbErr, Statement, TransactionError, TransactionTrait,
-    sqlx::types::chrono,
+    ConnectionTrait, DbBackend, DbErr, Statement, TransactionError, sqlx::types::chrono,
 };
 use serde::Serialize;
 
@@ -584,7 +583,7 @@ async fn resolve_expire_refs<C: ConnectionTrait>(
 ) -> CliResult<Vec<String>> {
     if options.all {
         let rows = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT DISTINCT ref_name FROM reflog;".to_string(),
             ))
@@ -669,17 +668,27 @@ async fn handle_expire(options: ExpireCliOptions, output: &OutputConfig) -> CliR
     // trims reflog entries and is unaffected.
     if options.updateref && !options.dry_run {
         for ref_name in &refs {
-            if let Some(branch) = ref_name.strip_prefix("refs/heads/")
-                && let Some(other) =
-                    crate::internal::head::Head::branch_checked_out_elsewhere(branch).await
-            {
-                return Err(CliError::fatal(format!(
-                    "cannot expire --updateref: branch '{branch}' is checked out at worktree '{other}'"
-                ))
-                .with_stable_code(StableErrorCode::Unsupported)
-                .with_hint(
-                    "switch that worktree to another branch first, or run the command there",
-                ));
+            if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                let checked_out_elsewhere =
+                    crate::internal::head::Head::branch_checked_out_elsewhere_result(branch)
+                        .await
+                        .map_err(|error| {
+                            CliError::fatal(format!(
+                                "cannot verify whether '{branch}' is checked out in another \
+                                 worktree: {error}"
+                            ))
+                            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                            .with_hint("repair the repository database, then retry")
+                        })?;
+                if let Some(other) = checked_out_elsewhere {
+                    return Err(CliError::fatal(format!(
+                        "cannot expire --updateref: branch '{branch}' is checked out at worktree '{other}'"
+                    ))
+                    .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                    .with_hint(
+                        "switch that worktree to another branch first, or run the command there",
+                    ));
+                }
             }
         }
     }
@@ -775,7 +784,7 @@ async fn delete_single_group(group: &[(String, usize)]) -> CliResult<usize> {
     // clone this to move it into async block to make compiler happy :(
     let group = group.to_vec();
 
-    db.transaction(|txn| {
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let ref_name = &group[0].0;
             let logs = Reflog::find_all(txn, ref_name)
@@ -786,7 +795,7 @@ async fn delete_single_group(group: &[(String, usize)]) -> CliResult<usize> {
             for (_, index) in &group {
                 if let Some(entry) = logs.get(*index) {
                     let id = entry.id;
-                    txn.execute(Statement::from_sql_and_values(
+                    txn.execute_raw(Statement::from_sql_and_values(
                         DbBackend::Sqlite,
                         "DELETE FROM reflog WHERE id = ?;",
                         [id.into()],

@@ -145,11 +145,21 @@ async fn set_head_target(target: &str) -> CliResult<()> {
     // checked out in ANOTHER worktree would create a forbidden duplicate
     // checkout. `branch_checked_out_elsewhere` excludes the current worktree, so
     // re-pointing at this worktree's own current branch is still allowed.
-    if let Some(other) = Head::branch_checked_out_elsewhere(branch_name).await {
+    let checked_out = Head::branch_checked_out_elsewhere_result(branch_name)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "cannot determine whether branch '{branch_name}' is checked out in another \
+                 worktree: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+    if let Some(other) = checked_out {
         return Err(CliError::fatal(format!(
             "cannot point HEAD at '{branch_name}': it is already checked out at worktree '{other}'"
         ))
-        .with_stable_code(StableErrorCode::Unsupported)
+        // §C.13: branch checked out in another worktree → LBR-CONFLICT-002.
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
         .with_hint("check out a different branch, or run the command in that worktree"));
     }
     Head::update_result(Head::Branch(branch_name.to_string()), None)

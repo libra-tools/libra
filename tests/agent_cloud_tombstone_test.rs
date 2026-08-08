@@ -4,20 +4,19 @@
 //! MIRROR is live — `libra cloud sync` publishes fenced `agent_session` /
 //! `agent_checkpoint` to D1 on every sync (`sync_agent_capture_tables`) and
 //! `libra cloud restore` reads them back (`restore_agent_capture_from_d1`).
-//! Ordinary checkpoint retention now propagates a durable D1 prune fence.
-//! What remains DEFERRED is session-erasure propagation:
-//! [`HistoryManager::erase_session_local`] rewrites `refs/libra/traces`
-//! and deletes the LOCAL `agent_session` / `agent_checkpoint` rows +
-//! `object_index`, but does **not** delete the D1 mirror rows or write a
-//! tombstone. A subsequent `libra cloud restore` can therefore REVIVE erased
-//! capture.
+//! Ordinary checkpoint retention propagates a durable D1 prune fence, and —
+//! since plan-20260714 PD-03 — SESSION erasure propagates too:
+//! [`HistoryManager::erase_session_local`] writes the local
+//! `agent_import_tombstone`, `libra cloud sync` publishes it to D1 under the
+//! generation fence (`sync_agent_import_tombstones_batch`) and cascade-deletes
+//! the erased session's mirror rows, and `libra cloud restore` is
+//! tombstone-first. Only R2 physical payload deletion stays deferred.
 //!
-//! This test characterizes that deferred contract against a real D1 endpoint:
-//! it mirrors a session row to D1 (as a sync would), performs a real local
-//! erase of the SAME session, and asserts the D1 mirror row still exists (no
-//! tombstone was propagated). When propagation lands, this assertion must be
-//! flipped and the doc row in `docs/development/tracing/agent.md` updated in the
-//! same change.
+//! This test proves the propagation contract against a real D1 endpoint: it
+//! mirrors a session + checkpoint to D1 (as a sync would), performs a real
+//! local erase of the SAME session, publishes the resulting tombstone exactly
+//! as `cloud sync` does, and asserts the D1 mirror rows are gone, the restore
+//! catalog carries the tombstone, and a republish is idempotent.
 //!
 //! **Layer:** L3 — runs only with `--features test-live-cloud` AND `LIBRA_D1_*`
 //! credentials; otherwise it prints `skipped` and returns without failing. The
@@ -30,7 +29,8 @@ use libra::{
     utils::{
         client_storage::ClientStorage,
         d1_client::{
-            AgentCheckpointPruneTombstoneRow, AgentCheckpointV2Row, AgentSessionV2Row, D1Client,
+            AgentCheckpointPruneTombstoneRow, AgentCheckpointV2Row, AgentImportTombstoneRow,
+            AgentSessionV2Row, D1Client,
         },
     },
 };
@@ -72,7 +72,7 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
 /// Pin the local repo id so the local repo and the D1 mirror row share it — a
 /// future erase keyed by `repo_id` would then target this exact D1 row.
 async fn set_repo_id(conn: &DatabaseConnection, repo_id: &str) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', ?, 0)",
         vec![Value::from(repo_id)],
@@ -82,7 +82,7 @@ async fn set_repo_id(conn: &DatabaseConnection, repo_id: &str) {
 }
 
 async fn seed_local_session(conn: &DatabaseConnection, session_id: &str) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -103,7 +103,7 @@ async fn seed_local_checkpoint(
     session: &str,
     created_at: i64,
 ) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -125,7 +125,7 @@ async fn seed_local_checkpoint(
 
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -173,13 +173,15 @@ fn sample_checkpoint_row(checkpoint_id: &str, session_id: &str) -> AgentCheckpoi
     }
 }
 
-/// The deferred contract: a real local `erase_session_local` deletes the LOCAL
-/// rows but leaves the D1 mirror row intact, because Libra propagates no cloud
-/// tombstone. Runs against a throwaway `repo_id` so it never touches real
-/// capture data, and cleans up the D1 row before any value assertion can panic.
+/// PD-03 propagation contract: a real local `erase_session_local` writes the
+/// tombstone, the sync-shaped publication removes the D1 mirror rows and
+/// records the tombstone remotely (idempotently), and the restore catalog is
+/// tombstone-first. Runs against a throwaway `repo_id` so it never touches
+/// real capture data, and cleans up the D1 rows before any value assertion
+/// can panic.
 #[tokio::test]
 #[serial(cloud_live)]
-async fn cloud_tombstone_propagation_is_deferred_for_agent_capture() {
+async fn cloud_tombstone_propagates_for_agent_capture() {
     if !live_d1_tests_enabled() {
         eprintln!(
             "skipped (set --features test-live-cloud and LIBRA_D1_ACCOUNT_ID/\
@@ -223,6 +225,10 @@ async fn cloud_tombstone_propagation_is_deferred_for_agent_capture() {
         .ensure_agent_checkpoint_prune_tombstone_table()
         .await
         .expect("ensure checkpoint prune fences on D1");
+    client
+        .ensure_agent_import_tombstone_table()
+        .await
+        .expect("ensure session erasure tombstones on D1");
     client
         .ensure_agent_subagent_content_tables()
         .await
@@ -295,6 +301,85 @@ async fn cloud_tombstone_propagation_is_deferred_for_agent_capture() {
         .await
         .expect("re-list checkpoints after local erase")
         .len();
+
+    // PD-03: publish the local session tombstone exactly as `cloud sync`
+    // does — fenced UPSERT + cascade delete of the erased session's rows.
+    let tombstone_row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT agent_kind, provider_session_id, erased_session_id,
+                    source_fingerprint, erased_at
+             FROM agent_import_tombstone WHERE erased_session_id = ?",
+            [Value::from(session_id.clone())],
+        ))
+        .await
+        .expect("read local tombstone")
+        .expect("local erase wrote the tombstone");
+    let published = AgentImportTombstoneRow {
+        agent_kind: tombstone_row.try_get_by("agent_kind").expect("agent_kind"),
+        provider_session_id: tombstone_row
+            .try_get_by("provider_session_id")
+            .expect("provider_session_id"),
+        erased_session_id: tombstone_row
+            .try_get_by("erased_session_id")
+            .expect("erased_session_id"),
+        source_fingerprint: tombstone_row
+            .try_get_by("source_fingerprint")
+            .expect("source_fingerprint"),
+        erased_at: tombstone_row.try_get_by("erased_at").expect("erased_at"),
+    };
+    let tombstone_token = Uuid::new_v4().to_string();
+    client
+        .begin_agent_capture_generation(
+            &repo_id,
+            &tombstone_token,
+            libra::utils::d1_client::AgentCaptureGenerationManifest {
+                object_index_digest: "live-tombstone-propagation-no-objects",
+                object_index_count: 0,
+                object_index_scope: "checkpoint_projection",
+                object_index_generation: 0,
+                traces_head: None,
+            },
+        )
+        .await
+        .expect("begin tombstone publication generation");
+    client
+        .sync_agent_import_tombstones_batch(
+            &repo_id,
+            &tombstone_token,
+            std::slice::from_ref(&published),
+        )
+        .await
+        .expect("publish session tombstone to D1");
+    // Idempotent republish inside the same generation.
+    client
+        .sync_agent_import_tombstones_batch(
+            &repo_id,
+            &tombstone_token,
+            std::slice::from_ref(&published),
+        )
+        .await
+        .expect("republish session tombstone (idempotent)");
+    client
+        .complete_agent_capture_generation(&repo_id, &tombstone_token, 0)
+        .await
+        .expect("complete tombstone publication generation");
+    let sessions_after_propagation = client
+        .list_agent_sessions(&repo_id)
+        .await
+        .expect("list sessions after tombstone publication")
+        .len();
+    let checkpoints_after_propagation = client
+        .list_agent_checkpoints(&repo_id)
+        .await
+        .expect("list checkpoints after tombstone publication")
+        .len();
+    let restore_catalog = client
+        .list_agent_capture_restore_catalog_rows(&repo_id, false, 10_000)
+        .await
+        .expect("read restore catalog after tombstone publication");
+    let catalog_tombstones = restore_catalog.import_tombstones.clone();
+    let catalog_sessions = restore_catalog.sessions.len();
 
     // Ordinary retention is intentionally different from session erasure:
     // its durable D1 fence removes the checkpoint and rejects a stale clone.
@@ -382,6 +467,13 @@ async fn cloud_tombstone_propagation_is_deferred_for_agent_capture() {
         .expect("cleanup throwaway checkpoint prune fences");
     client
         .execute(
+            "DELETE FROM agent_import_tombstone WHERE repo_id = ?1",
+            Some(vec![serde_json::json!(repo_id)]),
+        )
+        .await
+        .expect("cleanup throwaway session tombstones");
+    client
+        .execute(
             "DELETE FROM agent_capture_generation WHERE repo_id = ?1",
             Some(vec![serde_json::json!(repo_id)]),
         )
@@ -413,13 +505,37 @@ async fn cloud_tombstone_propagation_is_deferred_for_agent_capture() {
     );
     assert_eq!(
         sessions_after, 1,
-        "cloud tombstone propagation is deferred: a local erase does not delete \
-         the D1 session mirror row (see agent.md 还未实现的功能; cloud restore would revive it)",
+        "a local erase alone does not touch D1 (propagation happens on the \
+         next cloud sync)",
     );
     assert_eq!(
         checkpoints_after, 1,
-        "cloud tombstone propagation is deferred: a local erase does not delete \
-         the D1 checkpoint mirror row either",
+        "a local erase alone does not touch the D1 checkpoint mirror either",
+    );
+    assert_eq!(
+        sessions_after_propagation, 0,
+        "PD-03: publishing the tombstone cascade-deletes the session mirror row"
+    );
+    assert_eq!(
+        checkpoints_after_propagation, 0,
+        "PD-03: publishing the tombstone cascade-deletes the checkpoint mirror row"
+    );
+    assert_eq!(
+        catalog_tombstones.len(),
+        1,
+        "the restore catalog carries the session tombstone (tombstone-first restore)"
+    );
+    assert_eq!(
+        catalog_tombstones[0].erased_session_id, session_id,
+        "the catalog tombstone names the erased session"
+    );
+    assert_eq!(
+        catalog_tombstones[0].erased_at, published.erased_at,
+        "the idempotent republish kept the original erased_at"
+    );
+    assert_eq!(
+        catalog_sessions, 0,
+        "no erased session survives into the restore catalog"
     );
     assert_eq!(
         checkpoints_after_ordinary_prune, 0,

@@ -38,7 +38,13 @@ The command supports two invocation styles:
 1. **Subcommand style** (preferred): `libra config set key value`, `libra config get key`
 2. **Git-compatible flag style** (hidden): `libra config --get key`, `libra config key value`
 
-When reading a value with `get`, Libra cascades through scopes in precedence order: local, then global. The first match wins.
+When reading a value with `get`, Libra cascades through scopes in precedence order: local, then global, then system. The first match wins; an unreadable system database is skipped.
+
+### Bare `libra config <key>`
+
+A single positional argument with no value is a **read**, matching `git config <key>`. It prints the stored value and exits 0, returns the **last** value of a multi-valued key, cascades local → global → system exactly as `get` does, and renders an encrypted value as `<REDACTED>` (use `config get --reveal` for the plaintext). A key that is not set exits **1** with `LBR-CLI-002`. `-z`/`--null` applies here exactly as it does to `get`, terminating the value with NUL instead of a newline.
+
+**Intentional difference from Git:** for a *protected* key — one Libra classifies as a secret (`vault.env.*`, `auth.token.*`, `*.privkey`, or a last segment containing `secret`, `token`, `password`, `credential`, `apikey`, `accesskey`, `privatekey` or `secretkey`) — the bare form keeps Libra's interactive secure-assignment path: it prompts for a **new** value with echo off instead of printing the stored one. With no terminal available it reports `missing value for protected key '<key>' (non-interactive environment)` and exits 2. Read a protected key with `libra config get <key>`, which returns `<REDACTED>`. This divergence is registered in `COMPATIBILITY.md`.
 
 ## Options
 
@@ -77,7 +83,7 @@ libra config set vault.env.GEMINI_API_KEY
 
 #### `get <key>`
 
-Retrieve a configuration value. Cascades from local to global scope, returning the first match.
+Retrieve a configuration value. Cascades local → global → system scope, returning the first match (an unreadable system database is skipped).
 
 | Flag | Description |
 |------|-------------|
@@ -110,7 +116,7 @@ List all configuration entries in the active scope.
 | Flag | Description |
 |------|-------------|
 | `--name-only` | Show only key names, not values |
-| `--show-origin` | Prefix each entry with its scope (`local` or `global`) |
+| `--show-origin` | Prefix each entry with its scope (`local`, `global`, or `system`) |
 | `--vault` | Show only `vault.env.*` entries |
 | `--ssh-keys` | Show SSH key entries |
 | `--gpg-keys` | Show GPG key entries |

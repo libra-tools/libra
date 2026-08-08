@@ -137,7 +137,7 @@ scenarios:
   - id: cli.config-git-compat-mode
     wave: 1
     group: config
-    purpose: "Concentrated coverage of non-import Git-compat hidden flags and positional translation on ConfigArgs; --import happy path lives in cli.config-import-path-edit because it requires system git."
+    purpose: "Concentrated coverage of non-import Git-compat hidden flags and positional translation on ConfigArgs, including the bare `config <key>` read (last value wins, -z parity with get, <REDACTED> for an encrypted ordinary key, exit 1 + LBR-CLI-002 when unset, and the protected-key interactive divergence); --import happy path lives in cli.config-import-path-edit because it requires system git."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, negative_exit]

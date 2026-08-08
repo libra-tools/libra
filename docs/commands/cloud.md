@@ -399,12 +399,15 @@ head atomically with the catalog rather than trusting separately uploaded generi
 reference metadata. Existing local objects are
 decoded and hash-checked; corrupt paths are re-downloaded atomically, and the
 complete traces chain plus every checkpoint tree/blob is validated before the
-catalog transaction starts. Local erase tombstones are still not propagated to
-D1/R2: a later restore can resurrect a remotely mirrored capture until
-cross-device deletion propagation is implemented. An explicit local
-`--restore-erased` import does preserve a new replication incarnation, so its
-session generation and child-source namespace cannot collide with the old rows
-that D1 still retains; it does not delete those retained rows.
+catalog transaction starts. Session-erasure tombstones now propagate: `cloud sync`
+publishes the local `agent_import_tombstone` rows to D1 under the same
+generation fence and cascade-deletes the erased session's mirror rows, and
+restore is tombstone-first — an erased session never restores, its fences are
+persisted locally on the restoring machine, and repeated deletes/restores are
+idempotent. R2 payload bytes are not physically deleted yet (the only remaining
+deferral). An explicit local `--restore-erased` import still preserves a new
+replication incarnation, so its session generation and child-source namespace
+cannot collide with older retained rows.
 
 `cloud sync` default mode still uses the legacy human progress output.
 `cloud restore` and `cloud sync` failures continue through Libra's standard CLI

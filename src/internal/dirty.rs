@@ -32,10 +32,7 @@ use sea_orm::{
     QueryOrder, sea_query::OnConflict,
 };
 
-use crate::internal::{
-    db::get_db_conn_instance,
-    model::{working_dirty, working_dirty_meta},
-};
+use crate::internal::model::{working_dirty, working_dirty_meta};
 
 /// Row kinds for the unstaged dirty set.
 pub const KIND_NEW: &str = "new";
@@ -213,9 +210,23 @@ pub fn validate_mark_paths(
 pub struct DirtyCache;
 
 impl DirtyCache {
+    /// This worktree's scope key for the dirty-cache tables (`""` = main
+    /// worktree; plan-20260714 §C.4.1.1).
+    fn scope_key() -> String {
+        // The invocation's scope (§C.4.2), so a cwd that moves mid-command
+        // cannot mark another worktree's paths — and so a caller acting
+        // deliberately on another scope (the service's scope-carrying
+        // dirty-mark) can say so with `WorktreeScope::override_scope`.
+        crate::internal::worktree_scope::WorktreeScope::for_request()
+            .storage_key()
+            .to_string()
+    }
     /// The meta row, when the cache has ever been touched.
     pub async fn meta_with_conn<C: ConnectionTrait>(db: &C) -> Result<Option<DirtyMeta>> {
-        let row = working_dirty_meta::Entity::find()
+        // Resolve the worktree scope ONCE per request (worktree_scope.rs
+        // contract): every statement below uses this same value.
+        let scope = Self::scope_key();
+        let row = working_dirty_meta::Entity::find_by_id(scope.clone())
             .one(db)
             .await
             .context("failed to read working_dirty_meta")?;
@@ -230,7 +241,9 @@ impl DirtyCache {
     }
 
     pub async fn meta() -> Result<Option<DirtyMeta>> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         Self::meta_with_conn(&db).await
     }
 
@@ -256,7 +269,11 @@ impl DirtyCache {
 
     /// All cached rows, path-ordered.
     pub async fn list_with_conn<C: ConnectionTrait>(db: &C) -> Result<Vec<DirtyEntry>> {
+        // Resolve the worktree scope ONCE per request (worktree_scope.rs
+        // contract): every statement below uses this same value.
+        let scope = Self::scope_key();
         let rows = working_dirty::Entity::find()
+            .filter(working_dirty::Column::WorktreeId.eq(scope.clone()))
             .order_by_asc(working_dirty::Column::Path)
             .order_by_asc(working_dirty::Column::Kind)
             .all(db)
@@ -275,7 +292,9 @@ impl DirtyCache {
     }
 
     pub async fn list() -> Result<Vec<DirtyEntry>> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         Self::list_with_conn(&db).await
     }
 
@@ -300,8 +319,43 @@ impl DirtyCache {
     pub async fn mark_paths(
         workdir_relative: &[std::path::PathBuf],
     ) -> std::result::Result<Vec<String>, MarkError> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
         Self::mark_paths_with_conn(&db, workdir_relative).await
+    }
+
+    /// Mark paths in an EXPLICIT scope, for a caller acting on behalf of
+    /// another worktree (§C.4.1.1: the service's scope-carrying dirty-mark).
+    ///
+    /// The scope is a parameter rather than process state on purpose: the
+    /// service handles requests concurrently, and a process-global scope
+    /// installed across an `await` can be overwritten by another request in
+    /// flight — putting one caller's mark in another caller's worktree.
+    pub async fn mark_paths_in_scope(
+        scope_key: &str,
+        workdir_relative: &[std::path::PathBuf],
+    ) -> std::result::Result<Vec<String>, MarkError> {
+        use sea_orm::TransactionTrait;
+
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+        let stored_paths = validate_mark_paths(workdir_relative).map_err(MarkError::Escaping)?;
+        // ONE transaction for the whole batch. The caller holds the registry
+        // lock across this call to fence the scope, so the work under that
+        // lock has to be bounded — a per-path awaited upsert is not.
+        let txn = db
+            .begin()
+            .await
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+        Self::mark_stored_paths_in_scope_with_conn(&txn, scope_key, &stored_paths)
+            .await
+            .map_err(MarkError::Store)?;
+        txn.commit()
+            .await
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+        Ok(stored_paths)
     }
 
     /// Raw insertion for PRE-VALIDATED stored paths (private: every public
@@ -310,9 +364,21 @@ impl DirtyCache {
         db: &C,
         stored_paths: &[String],
     ) -> Result<()> {
+        let scope = Self::scope_key();
+        Self::mark_stored_paths_in_scope_with_conn(db, &scope, stored_paths).await
+    }
+
+    /// [`Self::mark_stored_paths_with_conn`] against an explicit scope.
+    async fn mark_stored_paths_in_scope_with_conn<C: ConnectionTrait>(
+        db: &C,
+        scope: &str,
+        stored_paths: &[String],
+    ) -> Result<()> {
+        let scope = scope.to_string();
         let now = now_timestamp();
         for path in stored_paths {
             let active = working_dirty::ActiveModel {
+                worktree_id: Set(scope.clone()),
                 path: Set(path.clone()),
                 kind: Set(KIND_UNKNOWN.to_string()),
                 source: Set(SOURCE_MANUAL.to_string()),
@@ -322,12 +388,16 @@ impl DirtyCache {
             };
             working_dirty::Entity::insert(active)
                 .on_conflict(
-                    OnConflict::columns([working_dirty::Column::Path, working_dirty::Column::Kind])
-                        .update_columns([
-                            working_dirty::Column::Source,
-                            working_dirty::Column::MarkedAt,
-                        ])
-                        .to_owned(),
+                    OnConflict::columns([
+                        working_dirty::Column::WorktreeId,
+                        working_dirty::Column::Path,
+                        working_dirty::Column::Kind,
+                    ])
+                    .update_columns([
+                        working_dirty::Column::Source,
+                        working_dirty::Column::MarkedAt,
+                    ])
+                    .to_owned(),
                 )
                 .exec(db)
                 .await
@@ -351,8 +421,12 @@ impl DirtyCache {
         head_oid: Option<&str>,
         scan_started_at: &str,
     ) -> Result<()> {
+        // Resolve the worktree scope ONCE per request (worktree_scope.rs
+        // contract): every statement below uses this same value.
+        let scope = Self::scope_key();
         let now = now_timestamp();
         working_dirty::Entity::delete_many()
+            .filter(working_dirty::Column::WorktreeId.eq(scope.clone()))
             .filter(
                 sea_orm::Condition::any()
                     .add(working_dirty::Column::Source.eq(SOURCE_SCAN))
@@ -367,6 +441,7 @@ impl DirtyCache {
             .context("failed to clear working_dirty for the scan snapshot")?;
         for (path, kind) in entries {
             let active = working_dirty::ActiveModel {
+                worktree_id: Set(scope.clone()),
                 path: Set(path.clone()),
                 kind: Set((*kind).to_string()),
                 source: Set(SOURCE_SCAN.to_string()),
@@ -378,24 +453,34 @@ impl DirtyCache {
             // upgrade it to the scan row (same fact, now verified).
             working_dirty::Entity::insert(active)
                 .on_conflict(
-                    OnConflict::columns([working_dirty::Column::Path, working_dirty::Column::Kind])
-                        .update_columns([
-                            working_dirty::Column::Source,
-                            working_dirty::Column::MarkedAt,
-                            working_dirty::Column::VerifiedAt,
-                        ])
-                        .to_owned(),
+                    OnConflict::columns([
+                        working_dirty::Column::WorktreeId,
+                        working_dirty::Column::Path,
+                        working_dirty::Column::Kind,
+                    ])
+                    .update_columns([
+                        working_dirty::Column::Source,
+                        working_dirty::Column::MarkedAt,
+                        working_dirty::Column::VerifiedAt,
+                    ])
+                    .to_owned(),
                 )
                 .exec(db)
                 .await
                 .context("failed to insert a scan snapshot row")?;
         }
-        Self::upsert_meta_with_conn(db, "fresh", Some(fingerprint), head_oid, Some(&now)).await
+        Self::upsert_meta_with_conn(db, &scope, "fresh", Some(fingerprint), head_oid, Some(&now))
+            .await
     }
 
     /// Mark the cache stale (kept for future per-command carry-over hooks).
     pub async fn mark_stale_with_conn<C: ConnectionTrait>(db: &C) -> Result<()> {
-        if let Some(row) = working_dirty_meta::Entity::find()
+        // Resolve the worktree scope ONCE per request (worktree_scope.rs
+        // contract). This deliberately does NOT route through
+        // `upsert_meta_with_conn`: staleness only FLIPS an existing row —
+        // creating a meta row here would fabricate freshness metadata.
+        let scope = Self::scope_key();
+        if let Some(row) = working_dirty_meta::Entity::find_by_id(scope.clone())
             .one(db)
             .await
             .context("failed to read working_dirty_meta")?
@@ -412,12 +497,13 @@ impl DirtyCache {
 
     async fn upsert_meta_with_conn<C: ConnectionTrait>(
         db: &C,
+        scope: &str,
         state: &str,
         fingerprint: Option<&str>,
         head_oid: Option<&str>,
         scanned_at: Option<&str>,
     ) -> Result<()> {
-        let existing = working_dirty_meta::Entity::find()
+        let existing = working_dirty_meta::Entity::find_by_id(scope.to_string())
             .one(db)
             .await
             .context("failed to read working_dirty_meta")?;
@@ -435,7 +521,7 @@ impl DirtyCache {
             }
             None => {
                 let active = working_dirty_meta::ActiveModel {
-                    id: Set(1),
+                    worktree_id: Set(scope.to_string()),
                     state: Set(state.to_string()),
                     index_fingerprint: Set(fingerprint.map(str::to_string)),
                     head_oid: Set(head_oid.map(str::to_string)),
@@ -461,6 +547,9 @@ impl DirtyCache {
         db: &C,
         pid: i64,
     ) -> Result<ScanLockOutcome> {
+        // Resolve the worktree scope ONCE per request (worktree_scope.rs
+        // contract): every statement below uses this same value.
+        let scope = Self::scope_key();
         use sea_orm::sea_query::Expr;
         let now = Utc::now();
         let now_text = now.to_rfc3339();
@@ -470,7 +559,7 @@ impl DirtyCache {
         // timestamps are UTC RFC3339, so lexicographic comparison is
         // chronological.
         let seed = working_dirty_meta::ActiveModel {
-            id: Set(1),
+            worktree_id: Set(scope.clone()),
             state: Set("stale".to_string()),
             index_fingerprint: Set(None),
             head_oid: Set(None),
@@ -480,18 +569,18 @@ impl DirtyCache {
         };
         working_dirty_meta::Entity::insert(seed)
             .on_conflict(
-                OnConflict::column(working_dirty_meta::Column::Id)
+                OnConflict::column(working_dirty_meta::Column::WorktreeId)
                     .do_nothing()
                     .to_owned(),
             )
-            .do_nothing()
+            .try_insert()
             .exec(db)
             .await
             .context("failed to seed working_dirty_meta")?;
         let cutoff = (now - chrono::Duration::seconds(SCAN_LOCK_STEAL_SECS)).to_rfc3339();
         // Detect (best-effort, pre-CAS) whether we would be stealing, purely
         // for the warning; the CAS itself is authoritative.
-        let held_before = working_dirty_meta::Entity::find()
+        let held_before = working_dirty_meta::Entity::find_by_id(scope.clone())
             .one(db)
             .await
             .context("failed to read working_dirty_meta")?
@@ -502,7 +591,7 @@ impl DirtyCache {
                 working_dirty_meta::Column::ScanLockAt,
                 Expr::value(now_text),
             )
-            .filter(working_dirty_meta::Column::Id.eq(1))
+            .filter(working_dirty_meta::Column::WorktreeId.eq(scope.clone()))
             .filter(
                 sea_orm::Condition::any()
                     .add(working_dirty_meta::Column::ScanLockPid.is_null())
@@ -518,7 +607,7 @@ impl DirtyCache {
             });
         }
         // Lost the CAS: report the current holder.
-        let row = working_dirty_meta::Entity::find()
+        let row = working_dirty_meta::Entity::find_by_id(scope.clone())
             .one(db)
             .await
             .context("failed to read working_dirty_meta")?;
@@ -536,7 +625,10 @@ impl DirtyCache {
 
     /// Release the scan lock (best-effort; only clears our own pid).
     pub async fn release_scan_lock_with_conn<C: ConnectionTrait>(db: &C, pid: i64) -> Result<()> {
-        if let Some(row) = working_dirty_meta::Entity::find()
+        // Resolve the worktree scope ONCE per request (worktree_scope.rs
+        // contract): every statement below uses this same value.
+        let scope = Self::scope_key();
+        if let Some(row) = working_dirty_meta::Entity::find_by_id(scope.clone())
             .one(db)
             .await
             .context("failed to read working_dirty_meta")?
@@ -559,9 +651,13 @@ impl DirtyCache {
         pruned: &[(String, String)],
         confirmed: &[(String, String)],
     ) -> Result<()> {
+        // Resolve the worktree scope ONCE per request (worktree_scope.rs
+        // contract): every statement below uses this same value.
+        let scope = Self::scope_key();
         let now = now_timestamp();
         for (path, kind) in pruned {
             working_dirty::Entity::delete_many()
+                .filter(working_dirty::Column::WorktreeId.eq(scope.clone()))
                 .filter(working_dirty::Column::Path.eq(path.as_str()))
                 .filter(working_dirty::Column::Kind.eq(kind.as_str()))
                 .exec(db)
@@ -570,6 +666,7 @@ impl DirtyCache {
         }
         for (path, kind) in confirmed {
             working_dirty::Entity::update_many()
+                .filter(working_dirty::Column::WorktreeId.eq(scope.clone()))
                 .col_expr(
                     working_dirty::Column::VerifiedAt,
                     sea_orm::sea_query::Expr::value(Some(now.clone())),

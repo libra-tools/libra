@@ -4,7 +4,9 @@
 //! to one stable surface before scheduler and provider cutover starts.
 
 pub mod contracts;
+pub mod controller;
 mod derived_records;
+pub mod durability;
 pub mod environment;
 pub mod event;
 pub mod hardening;
@@ -15,10 +17,20 @@ pub mod phase3;
 pub mod phase4;
 pub mod prompt_builders;
 pub mod revision;
+pub mod services;
 pub mod snapshot;
 pub mod task_executors;
+pub mod worker;
 
 pub use contracts::{PromptPackage, WorkflowPhase};
+pub use controller::{
+    ControllerInitial, ControllerKind, ControllerLease, ControllerService, ControllerServiceError,
+    ControllerServiceOptions, ControllerSnapshot, ControllerWritePermit,
+    DEFAULT_CONTROLLER_LEASE_SECS,
+};
+pub use durability::{
+    DurableCommandCrashPoint, RuntimeCommandDurability, RuntimeCommandDurabilityError,
+};
 pub use event::{Event, audit_action_for};
 pub use hardening::{
     AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext, PrincipalRole,
@@ -35,7 +47,18 @@ pub use phase4::{
     build_decision_proposal,
 };
 pub use prompt_builders::{IntentPromptBuilder, PlanningPromptBuilder, TaskPromptBuilder};
+pub use services::{
+    CodeAgentApprovalConfig, CodeAgentLaunchProfile, CodeAgentSandboxProfile, CodeAgentServices,
+    CodeAgentServicesBuilder, tool_runtime_context,
+};
 pub use snapshot::Snapshot;
+pub use worker::{
+    AgentEvent, AgentEventKind, AgentEventStream, AgentRuntimeHandle, AgentRuntimeWorker,
+    AgentRuntimeWorkerConfig, AgentSnapshot, EventCursor, InteractionResponse, InteractionState,
+    RuntimeCommand, RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeObserveError,
+    RuntimeShutdownError, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
+    TurnReceipt, TurnRequest, TurnStateMachine,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {

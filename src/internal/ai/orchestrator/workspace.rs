@@ -1045,7 +1045,9 @@ pub(crate) fn sync_task_worktree_back(
     touch_files: &[String],
     in_scope: &[String],
     out_of_scope: &[String],
+    lease: &dyn LeaseFence,
 ) -> Result<SyncBackReport, WorkspaceSyncError> {
+    lease.check("start the sync-back")?;
     let task_snapshot = snapshot_workspace(task_worktree_dir)
         .map_err(|err| workspace_sync_io_error("snapshot task worktree", task_worktree_dir, err))?;
     let changed_paths = changed_paths_since_baseline(baseline, &task_snapshot);
@@ -1061,6 +1063,19 @@ pub(crate) fn sync_task_worktree_back(
 
     let mut report = SyncBackReport::default();
     for rel_path in changed_paths {
+        // Fenced per applied path (plan-20260714 §C.8): a workspace lease that
+        // lapses part-way through a long sync must stop the remaining writes,
+        // not merely be noticed afterwards — another owner may already be
+        // acting on this repository.
+        //
+        // Stopping here can leave main PARTIALLY updated — as any mid-loop
+        // failure already can, since the replay is not staged (§C.9 keeps
+        // transactional worktree recovery out of this Part). What must not
+        // happen is losing the record of it, so the refusal carries the paths
+        // already written.
+        if let Err(error) = lease.check("apply a change") {
+            return Err(annotate_partial_apply(error, &report));
+        }
         let baseline_entry = baseline.entries.get(&rel_path).cloned();
         let task_entry = task_snapshot.entries.get(&rel_path).cloned();
         let main_path = main_working_dir.join(&rel_path);
@@ -1136,6 +1151,61 @@ pub(crate) struct SyncBackReport {
 pub(crate) struct SkippedSyncPath {
     pub(crate) path: PathBuf,
     pub(crate) reason: String,
+}
+
+/// Fold what a sync-back already wrote into a failure, so an interrupted
+/// replay reports the partial state instead of discarding it. Without this the
+/// caller sees "the sync failed" and cannot tell whether main was touched.
+fn annotate_partial_apply(
+    error: WorkspaceSyncError,
+    report: &SyncBackReport,
+) -> WorkspaceSyncError {
+    // Every kind of write into main counts, not just the direct copies: a
+    // three-way merge writes merged content to main just as surely, and
+    // reporting only `applied` would tell the operator nothing landed when a
+    // merged file did.
+    let written: Vec<String> = report
+        .applied
+        .iter()
+        .chain(report.merged.iter())
+        .map(|path| path.display().to_string())
+        .collect();
+    if written.is_empty() {
+        return error;
+    }
+    match error {
+        WorkspaceSyncError::HardConflict { path, reason } => WorkspaceSyncError::HardConflict {
+            path,
+            reason: format!(
+                "{reason}; the replay had already written {} path(s) to the main workspace ({}) \
+                 — reconcile them before retrying",
+                written.len(),
+                written.join(", ")
+            ),
+        },
+        other => other,
+    }
+}
+
+/// The lease guard a sync-back is fenced by.
+///
+/// The sync worker runs on a blocking thread and cannot await the workspace
+/// store, so ownership is expressed as a cheap, synchronous check the runtime
+/// keeps up to date (its heartbeat pushes the deadline forward). Implementors
+/// return an error the moment the run can no longer prove it owns the
+/// workspace.
+pub(crate) trait LeaseFence: Send + Sync {
+    fn check(&self, stage: &'static str) -> Result<(), WorkspaceSyncError>;
+}
+
+/// A sync-back with no lease to enforce — a task worktree outside a repository,
+/// and the fence used by the sync tests.
+pub(crate) struct UnfencedLease;
+
+impl LeaseFence for UnfencedLease {
+    fn check(&self, _stage: &'static str) -> Result<(), WorkspaceSyncError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1582,10 +1652,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        FuseAttemptOutcome, FuseProvisionState, SubAgentWorkspaceError, WorkspaceSyncError,
-        cleanup_task_worktree, clone_or_copy_file, detect_contract_violations,
-        materialize_sub_agent_workspace, materialize_workspace, prepare_copy_task_worktree,
-        prepare_task_worktree, prepare_task_worktree_copy_fallback, prepare_task_worktree_root,
+        FuseAttemptOutcome, FuseProvisionState, LeaseFence, SubAgentWorkspaceError, SyncBackReport,
+        UnfencedLease, WorkspaceSyncError, annotate_partial_apply, cleanup_task_worktree,
+        clone_or_copy_file, detect_contract_violations, materialize_sub_agent_workspace,
+        materialize_workspace, prepare_copy_task_worktree, prepare_task_worktree,
+        prepare_task_worktree_copy_fallback, prepare_task_worktree_root,
         remove_partial_workspace_on_error, sync_task_worktree_back, task_worktree_paths,
     };
     use crate::{
@@ -1752,7 +1823,7 @@ mod tests {
         std::fs::remove_file(task.join("link.txt")).unwrap();
         symlink_path(std::path::Path::new("updated.txt"), &task.join("link.txt")).unwrap();
 
-        sync_task_worktree_back(&main, &task, &baseline, &[], &[], &[]).unwrap();
+        sync_task_worktree_back(&main, &task, &baseline, &[], &[], &[], &UnfencedLease).unwrap();
 
         assert!(
             std::fs::symlink_metadata(main.join("link.txt"))
@@ -1764,6 +1835,115 @@ mod tests {
             std::fs::read_link(main.join("link.txt")).unwrap(),
             PathBuf::from("updated.txt")
         );
+    }
+
+    /// A lease that lapses mid-replay stops the remaining writes AND reports
+    /// what already landed in main — an interrupted sync that hid its partial
+    /// state would leave the operator with nothing to reconcile.
+    #[test]
+    fn expired_lease_stops_the_replay_and_reports_partial_application() {
+        struct ExpireAfter(std::sync::atomic::AtomicUsize, usize);
+        impl LeaseFence for ExpireAfter {
+            fn check(&self, _stage: &'static str) -> Result<(), WorkspaceSyncError> {
+                let seen = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if seen < self.1 {
+                    return Ok(());
+                }
+                Err(WorkspaceSyncError::HardConflict {
+                    path: None,
+                    reason: "workspace lease expired".to_string(),
+                })
+            }
+        }
+
+        // Direct copy: a.txt crosses, then the fence trips before b.txt.
+        let main_dir = tempdir().unwrap();
+        let task_dir = tempdir().unwrap();
+        let main = main_dir.path();
+        let task = task_dir.path();
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(main.join(name), "base").unwrap();
+            std::fs::write(task.join(name), "changed").unwrap();
+        }
+        let baseline = snapshot_workspace(main).unwrap();
+
+        let error = sync_task_worktree_back(
+            main,
+            task,
+            &baseline,
+            &[],
+            &[],
+            &[],
+            &ExpireAfter(std::sync::atomic::AtomicUsize::new(0), 2),
+        )
+        .expect_err("an expired lease must stop the replay");
+        let message = error.to_string();
+        assert!(
+            message.contains("already written") && message.contains("a.txt"),
+            "the refusal must report the partial application: {message}"
+        );
+        let applied = ["a.txt", "b.txt"]
+            .iter()
+            .filter(|name| std::fs::read_to_string(main.join(name)).unwrap() == "changed")
+            .count();
+        assert_eq!(
+            applied, 1,
+            "the replay stopped part-way, as the report says"
+        );
+    }
+
+    /// Every way a path reaches main must show up in an interrupted replay's
+    /// report — a three-way MERGE writes main just as surely as a copy, so
+    /// counting only `applied` would tell the operator nothing landed when a
+    /// merged file did.
+    #[test]
+    fn partial_apply_report_counts_merged_paths_too() {
+        let expired = || WorkspaceSyncError::HardConflict {
+            path: None,
+            reason: "workspace lease expired".to_string(),
+        };
+
+        // Nothing written yet: the error is passed through untouched.
+        let untouched = annotate_partial_apply(expired(), &SyncBackReport::default());
+        assert!(!untouched.to_string().contains("already written"));
+
+        // Merged only — the case the first version of this annotation missed.
+        let merged_only = SyncBackReport {
+            merged: vec![PathBuf::from("a.txt")],
+            ..SyncBackReport::default()
+        };
+        let message = annotate_partial_apply(expired(), &merged_only).to_string();
+        assert!(
+            message.contains("already written 1 path(s)") && message.contains("a.txt"),
+            "a merged path must be reported: {message}"
+        );
+
+        // Both kinds are counted together.
+        let both = SyncBackReport {
+            applied: vec![PathBuf::from("b.txt")],
+            merged: vec![PathBuf::from("a.txt")],
+            ..SyncBackReport::default()
+        };
+        let message = annotate_partial_apply(expired(), &both).to_string();
+        assert!(
+            message.contains("already written 2 path(s)")
+                && message.contains("a.txt")
+                && message.contains("b.txt"),
+            "copies and merges are both writes into main: {message}"
+        );
+
+        // A non-hard-conflict failure keeps its own shape.
+        let retryable = annotate_partial_apply(
+            WorkspaceSyncError::RetryableConflict {
+                path: PathBuf::from("a.txt"),
+                reason: "busy".to_string(),
+            },
+            &both,
+        );
+        assert!(matches!(
+            retryable,
+            WorkspaceSyncError::RetryableConflict { .. }
+        ));
     }
 
     #[test]
@@ -1787,6 +1967,7 @@ mod tests {
             &["src/allowed.rs".to_string()],
             &["src/".to_string()],
             &[],
+            &UnfencedLease,
         )
         .unwrap_err();
 
@@ -1827,6 +2008,7 @@ mod tests {
             ],
             &["libra/".to_string()],
             &[],
+            &UnfencedLease,
         )
         .unwrap();
 
@@ -1866,6 +2048,7 @@ mod tests {
             &["libra/Cargo.toml".to_string()],
             &["libra/".to_string()],
             &[],
+            &UnfencedLease,
         )
         .unwrap();
 
@@ -1911,6 +2094,7 @@ mod tests {
             &["crates/app/Cargo.toml".to_string()],
             &[],
             &[],
+            &UnfencedLease,
         )
         .unwrap();
 
@@ -1942,6 +2126,7 @@ mod tests {
             &["src/lib.rs".to_string()],
             &[],
             &[],
+            &UnfencedLease,
         )
         .unwrap();
 
@@ -1970,6 +2155,7 @@ mod tests {
             &["src/lib.rs".to_string()],
             &[],
             &[],
+            &UnfencedLease,
         )
         .unwrap();
 
@@ -2001,6 +2187,7 @@ mod tests {
             &["src/lib.rs".to_string()],
             &[],
             &[],
+            &UnfencedLease,
         )
         .unwrap_err();
 
@@ -2034,6 +2221,7 @@ mod tests {
             &["Cargo.toml".to_string()],
             &[],
             &[],
+            &UnfencedLease,
         )
         .unwrap_err();
 
@@ -2126,8 +2314,16 @@ mod tests {
         materialize_workspace(&main, &task, &baseline).unwrap();
         std::fs::write(task.join("docs/readme.md"), "changed\n").unwrap();
 
-        let err = sync_task_worktree_back(&main, &task, &baseline, &[], &["src/".to_string()], &[])
-            .unwrap_err();
+        let err = sync_task_worktree_back(
+            &main,
+            &task,
+            &baseline,
+            &[],
+            &["src/".to_string()],
+            &[],
+            &UnfencedLease,
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string()

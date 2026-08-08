@@ -1,6 +1,6 @@
 ### `cli.stash-bisect-worktree`
 
-目的：覆盖兼容性差异较大的 `stash`、`bisect`、`worktree` 命令面，重点验证状态保存/恢复、`stash push -u` / `-a` / `--all` / `--keep-index`、二分会话状态，以及 Libra worktree 的 shared-HEAD 差异语义、常用 Git 兼容 flags 和 remove 默认保留目录的安全边界。
+目的：覆盖兼容性差异较大的 `stash`、`bisect`、`worktree` 命令面，重点验证状态保存/恢复、`stash push -u` / `-a` / `--all` / `--keep-index`、二分会话状态，以及 Libra worktree 的 per-worktree HEAD 隔离语义（同一 branch 不得被两个 worktree 同时 checkout）、常用 Git 兼容 flags 和 remove 默认保留目录的安全边界。
 
 最小步骤：
 
@@ -163,11 +163,11 @@ cd "$RUN_DIR/workflow-repo"
 ! libra worktree remove "$RUN_ROOT/repos/no-such-worktree"
 ```
 
-断言：`stash push` 保存 tracked 修改并清理工作区；`stash list` / `stash show` 能观察 stash 条目，`stash show --name-status stash@{0}` 输出 `<status>\t<path>` 记录；`stash apply`（含 `apply stash@{0}` 位置引用）保留 stash，`stash pop` 应用并删除 stash，越界引用 `stash pop stash@{999}` 必须失败；`stash drop stash@{0}` 删除指定条目并在列表中消失；`stash branch <branch> stash@{0}` 创建并切换新分支、应用且丢弃该 stash；`stash push -u` 保存/移除/恢复可见 untracked 文件；`stash push --all` 保存/移除/恢复可见 untracked 与 ignored 文件；`stash push --keep-index` 保留 staged 内容并移除 unstaged delta；`stash clear --force` 清空列表；`bisect start <bad> --good <good>` 建立会话，`bisect start <bad> <good1> <good2>...` 多 good 位置参数（git 表面），`view` / `log` 能观察状态，`bad`（裸式与 `bad <rev>`，非法 revision 失败）/ `good <rev>` 推进会话，`skip` / `skip <rev>` 跳过候选，`reset` 恢复原始 HEAD，`reset <rev>` 使 HEAD 落在指定 commit（detached，需 `reset --hard` 后再 `switch` 回原分支）；`worktree add -b` 注册 linked worktree 并创建 shared branch，`list --verbose` 显示共享 HEAD 短 hash，`list --porcelain` 输出 `worktree` / `HEAD` / `locked` 记录且不输出 Git per-worktree `branch` / `detached` 行，`lock --reason` / `unlock` 更新锁状态，`move` 更新路径，`remove` 默认只注销登记且保留目录，`prune --dry-run` 不写 registry，`prune --expire now` 清理目录缺失条目，`add --no-checkout` 不恢复 tracked 文件，locked worktree 需要 `-f -f` 注销，`remove --delete-dir --force` 可删除 dirty linked worktree；非法 stash ref、非法 revision 和缺失 worktree 必须失败且不破坏已有仓库状态。
+断言：`stash push` 保存 tracked 修改并清理工作区；`stash list` / `stash show` 能观察 stash 条目，`stash show --name-status stash@{0}` 输出 `<status>\t<path>` 记录；`stash apply`（含 `apply stash@{0}` 位置引用）保留 stash，`stash pop` 应用并删除 stash，越界引用 `stash pop stash@{999}` 必须失败；`stash drop stash@{0}` 删除指定条目并在列表中消失；`stash branch <branch> stash@{0}` 创建并切换新分支、应用且丢弃该 stash；`stash push -u` 保存/移除/恢复可见 untracked 文件；`stash push --all` 保存/移除/恢复可见 untracked 与 ignored 文件；`stash push --keep-index` 保留 staged 内容并移除 unstaged delta；`stash clear --force` 清空列表；`bisect start <bad> --good <good>` 建立会话，`bisect start <bad> <good1> <good2>...` 多 good 位置参数（git 表面），`view` / `log` 能观察状态，`bad`（裸式与 `bad <rev>`，非法 revision 失败）/ `good <rev>` 推进会话，`skip` / `skip <rev>` 跳过候选，`reset` 恢复原始 HEAD，`reset <rev>` 使 HEAD 落在指定 commit（detached，需 `reset --hard` 后再 `switch` 回原分支）；`worktree add -b` 注册 linked worktree 并创建 shared branch，`list --verbose` 显示该 worktree 自己的 HEAD 短 hash，`list --porcelain` 按各工作树自身 HEAD 输出 `worktree` / `HEAD` / `branch`（或 `detached`）/ `locked` / `layout` 记录（per-worktree HEAD，§C.3.3），`lock --reason` / `unlock` 更新锁状态，`move` 更新路径，`remove` 默认只注销登记且保留目录，`prune --dry-run` 不写 registry，`prune --expire now` 清理目录缺失条目，`add --no-checkout` 不恢复 tracked 文件，locked worktree 需要 `-f -f` 注销，`remove --delete-dir --force` 可删除 dirty linked worktree；非法 stash ref、非法 revision 和缺失 worktree 必须失败且不破坏已有仓库状态。
 
 补充可执行断言（故意差异重点场景）：
 - `libra worktree remove <path>` 后 `test -d <path>` 必须仍存在（Libra 故意保留目录，不像 Git 默认删除）。
-- `libra worktree list --porcelain` 必须包含 `worktree <path>` 和共享 `HEAD <hash>`，且不得包含 `branch` / `detached`（Libra 无 per-worktree HEAD）。
+- `libra worktree list --porcelain` 必须包含 `worktree <path>` 和该工作树自己的 `HEAD <hash>`；per-worktree HEAD 已存在（§C.3.3），每个条目按自身 HEAD 输出 `branch <ref>` 或 `detached` 行（另有 `layout` 行），无 HEAD 行的 scope（如 legacy-symlink）则不输出这两行。
 - `libra worktree add --no-checkout <path>` 后 tracked fixture 不应被恢复。
 - `libra --json stash list` 验证 `ok:true` 且 `data.entries[]` 或 `data.stashes[]` 可解析。
 - 每次 stash/bisect/worktree 操作后 `libra fsck --connectivity-only` 必须 0 退出。

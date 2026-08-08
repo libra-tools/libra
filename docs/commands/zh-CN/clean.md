@@ -13,9 +13,9 @@ libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [
 
 `libra clean` 从工作树移除未跟踪文件。与 Git 不同，Libra 要求显式模式标志：`-n` 用于 dry-run 预览，`-f` 用于实际删除。不带任一标志运行 `libra clean` 是错误。这通过强制用户明确意图来防止意外数据丢失。
 
-默认情况下，只移除文件，并遵守 Git/Libra ignore 来源（忽略文件会被跳过）。`-d` 标志选择同时移除未跟踪目录；`-x` 选择移除原本会受 ignore 规则保护的文件；`-X` 会反转规则，使得*只有*被忽略文件会被移除。每个候选路径都会被规范化并验证位于工作树根目录内，然后才删除，从而防止 symlink-escape 攻击。
+默认情况下，只移除文件，并遵守共享 Git/Libra ignore 来源（忽略文件会被跳过）：`.gitignore`、worktree 本地 `info/exclude`（`.libra/info/exclude`，Git 或双布局树还包括 `.git/info/exclude`）、`core.excludesFile` 与 `.libraignore`——就近目录优先，同目录 `.libraignore` 高于 `.gitignore`；完整优先级见 [check-ignore.md](check-ignore.md)。`-d` 标志选择同时移除未跟踪目录；`-x` 选择移除原本会受 ignore 规则保护的文件；`-X` 会反转规则，使得*只有*被忽略文件会被移除。每个候选路径都会被规范化并验证位于工作树根目录内，然后才删除，从而防止 symlink-escape 攻击。
 
-可选 pathspec 会将 clean 候选限制为匹配的未跟踪文件或目录前缀。这是 `clean` 当前使用的字面前缀匹配器；`:(exclude)` / `:(glob)` 等共享 pathspec magic 尚未对删除路径启用。
+可选 pathspec 通过共享 pathspec 引擎限制 clean 候选——与 `ls-files`/`status` 及写命令（`add`/`rm`/`restore`）同一 matcher：glob、`:(exclude)`、`:(top)`、`:(icase)`、`:(literal)`、`:(glob)` 与子目录相对语义。删除面按构造保持安全：候选恒为 untracked-only，exclusion magic 只能收窄集合，`-n` 预览集与 `-f` 实删集完全相同，空字符串 pathspec 被拒绝而不会扩大为全树。
 
 ## 选项
 
@@ -27,7 +27,7 @@ libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [
 | Include ignored | `-x` | | 移除未跟踪文件，**包括**被 ignore 规则匹配的文件。 |
 | Only ignored | `-X` | | **仅**移除被 ignore 规则匹配的未跟踪文件。 |
 | Exclude | `-e` | `--exclude <pattern>` | 添加额外排除模式；可重复。 |
-| Pathspec | | 位置参数 | 将候选限制为匹配文件或目录前缀。`clean` 尚未启用共享 pathspec magic。 |
+| Pathspec | | 位置参数 | 通过共享 pathspec 引擎限制候选（glob、`:(exclude)`、`:(top)`、`:(icase)`、`:(literal)`、`:(glob)`、子目录相对语义）。exclusion 只会收窄删除集。 |
 | JSON | | `--json` | 输出结构化 JSON（见下方）。 |
 | Quiet | | `--quiet` | 抑制所有人类可读 stdout。 |
 
@@ -62,6 +62,8 @@ Removing notes.txt
 **`-x`**
 
 覆盖配置的 ignore 来源。没有此标志时，被忽略文件（构建产物、缓存等）会被跳过。使用 `-x` 后，它们会像任何其他未跟踪文件一样被移除。
+
+**唯一例外，且在所有模式下成立**（含 `-x` 与 `-X`）：由活动 `libra layer` overlay 物化出的文件永不被删除。它们天然未跟踪，`clean` 否则可以随意删除——而其内容位于仓库之外，只有 `libra layer apply` 能恢复。同理，只要目录**任意层级**之下存在 overlay 文件，该目录也会被保留（`-d` 删除整棵子树）。移除 overlay 文件请用 `libra layer unapply`。若 `clean` 无法确定 overlay 拥有哪些路径（layer 存储被锁或不可读），它会**拒绝执行**而不是删除。
 
 **`-X`**
 
@@ -162,7 +164,7 @@ Git 的交互式 clean 模式会显示菜单来选择文件。Libra 面向 AI �
 | 交互模式 | 不支持 | `-i` | N/A |
 | Quiet 模式 | `--quiet` | `-q` / `--quiet` | N/A |
 | JSON 输出 | `--json` | 不支持 | N/A |
-| Pathspec 过滤 | 字面文件/目录前缀 pathspec | `<pathspec>...` | N/A |
+| Pathspec 过滤 | 共享 pathspec 引擎（glob、`:(exclude)`、`:(top)`、`:(icase)`、`:(literal)`、`:(glob)`） | `<pathspec>...` | N/A |
 | Require force 配置 | 始终要求 | `clean.requireForce`（默认 true） | N/A |
 
 注意：jj 没有 `clean` 命令，因为其工作副本模型会自动跟踪所有文件，未跟踪文件不是 jj 数据模型中的概念。

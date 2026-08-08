@@ -272,7 +272,7 @@ async fn malformed_latest_navigation_record_fails_closed() {
         fixture.repo.join(".libra/libra.db").display()
     );
     let db = Database::connect(db_url).await.expect("open repository DB");
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "UPDATE reflog SET message = 'malformed movement' \
          WHERE id = (SELECT id FROM reflog WHERE ref_name = 'HEAD' \

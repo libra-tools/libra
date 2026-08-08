@@ -455,7 +455,7 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
     // Part C W0 (§C.11): refuse to reset a branch checked out in ANOTHER
     // worktree — moving its tip would silently diverge that worktree's working
     // tree from its branch. The current worktree's branch is caught above.
-    if let Some(other) = Head::branch_checked_out_elsewhere(&branch).await {
+    if let Some(other) = checked_out_elsewhere_or_refuse(&branch).await? {
         return Err(CliError::from(BranchError::CheckedOutElsewhere(
             "reset", branch, other,
         )));
@@ -516,60 +516,80 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
     let branch_for_txn = branch.clone();
     let target_for_txn = args.target.clone();
     let new_for_txn = target_commit;
-    let result = with_operation_log(meta, OperationScope::default(), move |txn| {
-        Box::pin(async move {
-            // Authoritative, fail-closed policy gate (the 1.5 contract).
-            let protected =
-                crate::internal::metadata::MetadataKv::is_protected_with_conn(txn, &branch_for_txn)
-                    .await
-                    .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
-            if protected {
-                return Err(DbErr::Custom(format!(
-                    "{SENTINEL_PROTECTED}{branch_for_txn}"
-                )));
-            }
-            let archived =
-                crate::internal::metadata::MetadataKv::is_archived_with_conn(txn, &branch_for_txn)
-                    .await
-                    .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
-            if archived {
-                return Err(DbErr::Custom(format!(
-                    "{SENTINEL_ARCHIVED}{branch_for_txn}"
-                )));
-            }
-            // Re-check the checked-out branch in-txn: a concurrent `switch`
-            // between preflight and here must not produce phantom staged
-            // diffs on a silently-moved current branch.
-            if let Head::Branch(current) = Head::current_with_conn(txn).await
-                && current == branch_for_txn
-            {
-                return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
-            }
-            let live = Branch::find_branch_result_with_conn(txn, &branch_for_txn, None)
+    let result = with_operation_log(
+        meta,
+        // §C.9: recorded with the INVOKING worktree's scope, not `repository`.
+        // A branch ref is shared, but `op restore` is documented to restore
+        // HEAD/branches — and the protection §C.9 actually asks for is
+        // enforced by the checked-out-elsewhere guard, which refuses the whole
+        // restore before any ref moves. `repository` is reserved for operations
+        // with no worktree scope at all, and restore fails closed on it
+        // (Codex R24).
+        OperationScope::default(),
+        move |txn| {
+            Box::pin(async move {
+                // Authoritative, fail-closed policy gate (the 1.5 contract).
+                let protected = crate::internal::metadata::MetadataKv::is_protected_with_conn(
+                    txn,
+                    &branch_for_txn,
+                )
                 .await
-                .map_err(|e| DbErr::Custom(e.to_string()))?
-                .ok_or_else(|| {
-                    DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
-                })?;
-            Branch::update_branch_with_conn(txn, &branch_for_txn, &new_for_txn.to_string(), None)
+                .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+                if protected {
+                    return Err(DbErr::Custom(format!(
+                        "{SENTINEL_PROTECTED}{branch_for_txn}"
+                    )));
+                }
+                let archived = crate::internal::metadata::MetadataKv::is_archived_with_conn(
+                    txn,
+                    &branch_for_txn,
+                )
+                .await
+                .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+                if archived {
+                    return Err(DbErr::Custom(format!(
+                        "{SENTINEL_ARCHIVED}{branch_for_txn}"
+                    )));
+                }
+                // Re-check the checked-out branch in-txn: a concurrent `switch`
+                // between preflight and here must not produce phantom staged
+                // diffs on a silently-moved current branch.
+                if let Head::Branch(current) = Head::current_with_conn(txn).await
+                    && current == branch_for_txn
+                {
+                    return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
+                }
+                let live = Branch::find_branch_result_with_conn(txn, &branch_for_txn, None)
+                    .await
+                    .map_err(|e| DbErr::Custom(e.to_string()))?
+                    .ok_or_else(|| {
+                        DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
+                    })?;
+                Branch::update_branch_with_conn(
+                    txn,
+                    &branch_for_txn,
+                    &new_for_txn.to_string(),
+                    None,
+                )
                 .await?;
-            let context = crate::internal::reflog::ReflogContext {
-                old_oid: live.commit.to_string(),
-                new_oid: new_for_txn.to_string(),
-                action: crate::internal::reflog::ReflogAction::Reset {
-                    target: target_for_txn.clone(),
-                },
-            };
-            crate::internal::reflog::Reflog::insert_single_entry(
-                txn,
-                &context,
-                &format!("refs/heads/{branch_for_txn}"),
-            )
-            .await
-            .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
-            Ok::<String, DbErr>(live.commit.to_string())
-        })
-    })
+                let context = crate::internal::reflog::ReflogContext {
+                    old_oid: live.commit.to_string(),
+                    new_oid: new_for_txn.to_string(),
+                    action: crate::internal::reflog::ReflogAction::Reset {
+                        target: target_for_txn.clone(),
+                    },
+                };
+                crate::internal::reflog::Reflog::insert_single_entry(
+                    txn,
+                    &context,
+                    &format!("refs/heads/{branch_for_txn}"),
+                )
+                .await
+                .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
+                Ok::<String, DbErr>(live.commit.to_string())
+            })
+        },
+    )
     .await;
     let old_commit = match result {
         Ok(op) => op.payload,
@@ -928,10 +948,14 @@ impl From<BranchError> for CliError {
             ))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("switch to another branch first."),
+            // §C.13: "branch checked out in another worktree" is a
+            // CONFLICT, carrying the occupying worktree's id — not a
+            // generic "unsupported", which tells the user nothing about
+            // what to do next.
             BranchError::CheckedOutElsewhere(verb, name, other) => CliError::fatal(format!(
                 "Cannot {verb} branch '{name}': it is checked out at worktree '{other}'"
             ))
-            .with_stable_code(StableErrorCode::Unsupported)
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint(
                 "switch that worktree to another branch first, or run the command there",
             ),
@@ -1041,6 +1065,25 @@ fn detached_head_branch_error() -> BranchError {
     BranchError::DetachedHead
 }
 
+/// plan-20260714 §C.4.4: the ONE cross-worktree checkout probe every branch
+/// writer in this module uses.
+///
+/// The infallible `Head::branch_checked_out_elsewhere` folded a database error
+/// into `None` — indistinguishable from "no other worktree has it". Every
+/// destructive caller then read a transient query failure as permission to
+/// move or delete a branch another worktree was sitting on. This variant makes
+/// the failure a refusal.
+async fn checked_out_elsewhere_or_refuse(branch: &str) -> Result<Option<String>, BranchError> {
+    Head::branch_checked_out_elsewhere_result(branch)
+        .await
+        .map_err(|error| {
+            BranchError::StorageQueryFailed(format!(
+                "cannot determine whether branch '{branch}' is checked out in another worktree: \
+                 {error}"
+            ))
+        })
+}
+
 /// Translate an internal storage error into the user-facing [`BranchError`].
 ///
 /// Boundary conditions:
@@ -1049,6 +1092,7 @@ fn detached_head_branch_error() -> BranchError {
 fn map_branch_store_error(error: branch::BranchStoreError) -> BranchError {
     match error {
         branch::BranchStoreError::Query(detail) => BranchError::StorageQueryFailed(detail),
+        branch::BranchStoreError::AlreadyExists(name) => BranchError::AlreadyExists(name),
         branch::BranchStoreError::Corrupt { name, detail } => BranchError::StoredReferenceCorrupt(
             format!("stored branch reference '{name}' is corrupt: {detail}"),
         ),
@@ -1060,6 +1104,14 @@ fn map_branch_store_error(error: branch::BranchStoreError) -> BranchError {
             branch: name,
             detail,
         },
+        // §C.13 LBR-CONFLICT-002 — the SAME variant the preflight raises, so
+        // a collision detected at the storage seam (after the preflight, in
+        // the window this card closed) is reported identically to one caught
+        // before it. Routing it through `DeleteFailed` instead would report a
+        // storage failure for a branch that is perfectly healthy and in use.
+        branch::BranchStoreError::CheckedOutElsewhere { name, worktree } => {
+            BranchError::CheckedOutElsewhere("modify", name, worktree)
+        }
     }
 }
 
@@ -1298,7 +1350,8 @@ async fn edit_description_impl(branch: &str) -> Result<bool, BranchError> {
     // Part C §C.4.3: transient per-worktree editor scratch — on shared storage
     // two worktrees composing a message concurrently would truncate each other's
     // buffer. Identical path for the main worktree (local == common storage).
-    let path = crate::utils::util::worktree_gitdir().join("BRANCH_DESCRIPTION_EDITMSG");
+    let path =
+        crate::utils::util::request_worktree_gitdir_strict().join("BRANCH_DESCRIPTION_EDITMSG");
     let raw = crate::command::editor::edit_message(&path, &template, &editor_cmd, true)
         .await
         .map_err(|e| BranchError::EditorFailed(e.to_string()))?;
@@ -1465,27 +1518,33 @@ async fn create_branch_impl(
 
         let branch_for_operation = new_branch.clone();
         let commit_for_operation = commit_id_display.clone();
-        with_operation_log(meta, OperationScope::default(), move |txn| {
-            Box::pin(async move {
-                let exists = Branch::exists_result_with_conn(txn, &branch_for_operation, None)
-                    .await
-                    .map_err(|error| DbErr::Custom(error.to_string()))?;
-                if exists {
-                    return Err(DbErr::Custom(format!(
-                        "a branch named '{}' already exists",
-                        branch_for_operation
-                    )));
-                }
-                Branch::update_branch_with_conn(
-                    txn,
-                    &branch_for_operation,
-                    &commit_for_operation,
-                    None,
-                )
-                .await?;
-                Ok::<(), DbErr>(())
-            })
-        })
+        with_operation_log(
+            meta,
+            // Same as the reset path above: the invoking worktree's scope, so
+            // branch restore keeps working (Codex R24).
+            OperationScope::default(),
+            move |txn| {
+                Box::pin(async move {
+                    let exists = Branch::exists_result_with_conn(txn, &branch_for_operation, None)
+                        .await
+                        .map_err(|error| DbErr::Custom(error.to_string()))?;
+                    if exists {
+                        return Err(DbErr::Custom(format!(
+                            "a branch named '{}' already exists",
+                            branch_for_operation
+                        )));
+                    }
+                    Branch::update_branch_with_conn(
+                        txn,
+                        &branch_for_operation,
+                        &commit_for_operation,
+                        None,
+                    )
+                    .await?;
+                    Ok::<(), DbErr>(())
+                })
+            },
+        )
         .await
         .map_err(|error| BranchError::CreateFailed {
             branch: new_branch.clone(),
@@ -1532,7 +1591,7 @@ async fn delete_branch_impl(branch_name: String, force: bool) -> Result<BranchOu
     // Part C W0 (§C.11): refuse to delete a branch checked out in ANOTHER
     // worktree — that worktree's HEAD would be left dangling (Git parity). The
     // current worktree's own branch is caught by DeleteCurrent above.
-    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+    if let Some(other) = checked_out_elsewhere_or_refuse(&branch_name).await? {
         return Err(BranchError::CheckedOutElsewhere(
             "delete",
             branch_name,
@@ -1611,7 +1670,7 @@ async fn rename_branch_impl(args: &[String]) -> Result<BranchOutput, BranchError
     // Part C W0 (§C.11): refuse to rename a branch checked out in ANOTHER
     // worktree — that worktree's HEAD would be left pointing at the deleted old
     // name. The current worktree's own HEAD is re-pointed to the new name below.
-    if let Some(other) = Head::branch_checked_out_elsewhere(&old_name).await {
+    if let Some(other) = checked_out_elsewhere_or_refuse(&old_name).await? {
         return Err(BranchError::CheckedOutElsewhere("rename", old_name, other));
     }
     if Branch::find_branch_result(&new_name, None)

@@ -75,7 +75,7 @@ async fn seed_temporary_checkpoint(
     repo_path: &std::path::Path,
     checkpoint_id: &str,
 ) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -126,7 +126,7 @@ async fn seed_temporary_checkpoint(
         .await
         .expect("append temporary checkpoint commit");
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,

@@ -5,9 +5,15 @@
 //!
 //! - The whole external-agent surface is gated behind
 //!   `agent.external_agents.enabled` (default **false**); `list`
-//!   discovery, `trust` and `invoke` all refuse with `LBR-AGENT-002`
-//!   until the operator opts in. Only `untrust` stays available while
-//!   gated (revoking trust strictly tightens security).
+//!   discovery, `libra-agent-*` `trust` and `invoke` all refuse with
+//!   `LBR-AGENT-002` until the operator opts in. `untrust` stays
+//!   available while gated (revoking trust strictly tightens security),
+//!   and two preparation-only flows are exempt because they never scan
+//!   `$PATH` and arm nothing by themselves: `trust --dir <path>`
+//!   (registers an operator-named trusted directory) and provider-exporter
+//!   trust (DR-04b, e.g. `trust opencode`), which pins the built-in
+//!   provider's OWN CLI binary — resolved only from registered trusted
+//!   directories — for the sandboxed export bridge, not for RPC.
 //! - Discovered binaries are **quarantined** by default — `list` shows
 //!   them (once enabled) but they are not callable until
 //!   `rpc trust <slug>` records their provenance (path + sha256 +
@@ -58,8 +64,10 @@ pub struct AgentRpcListArgs {}
 
 #[derive(Args, Debug)]
 pub struct AgentRpcTrustArgs {
-    /// Slug after `libra-agent-`. The binary must be on `$PATH` and live under
-    /// a trusted directory (register one with `--dir` first).
+    /// Slug after `libra-agent-`; the binary must be on `$PATH` and live under
+    /// a trusted directory (register one with `--dir` first). Provider-exporter
+    /// slugs (`opencode`) instead pin the provider's own CLI binary found under
+    /// a trusted directory for the sandboxed export bridge.
     #[arg(required_unless_present = "dir", conflicts_with = "dir")]
     pub slug: Option<String>,
     /// Register a trusted directory: external agent binaries are only
@@ -208,10 +216,12 @@ async fn list(_args: AgentRpcListArgs, output: &OutputConfig) -> CliResult<()> {
 }
 
 async fn trust(args: AgentRpcTrustArgs, output: &OutputConfig) -> CliResult<()> {
-    require_external_agents_enabled().await?;
-
     // A0-08: `--dir <path>` registers a trusted directory (canonicalized +
-    // must be an existing, non-world-writable directory).
+    // must be an existing, non-world-writable directory). This touches only
+    // the operator-named path — no `$PATH` scan, nothing is executed, and a
+    // registered directory grants nothing by itself — and it is the
+    // prerequisite for BOTH `libra-agent-*` trust and provider-exporter
+    // trust (DR-04b), so it is not gated behind the external-RPC opt-in.
     if let Some(dir) = &args.dir {
         let canonical = crate::internal::ai::observed_agents::add_trusted_dir(dir)
             .await
@@ -235,6 +245,17 @@ async fn trust(args: AgentRpcTrustArgs, output: &OutputConfig) -> CliResult<()> 
             "pass a slug to trust a binary, or --dir <path> to trust a directory",
         )
     })?;
+    // DR-04b: provider-exporter slugs pin the built-in provider's OWN CLI
+    // binary for the sandboxed export bridge. This arms built-in capture,
+    // not the external-RPC surface, so the `LBR-AGENT-002` opt-in does not
+    // apply; the binary is resolved ONLY from registered trusted
+    // directories (never `$PATH`), and the built-in-slug impersonation
+    // guard (`LBR-AGENT-006`) deliberately does not fire — the record IS
+    // for the built-in provider, not for a `libra-agent-*` impersonator.
+    if crate::internal::ai::observed_agents::is_provider_exporter_slug(slug) {
+        return trust_exporter(slug, output).await;
+    }
+    require_external_agents_enabled().await?;
     reject_builtin_impersonation(slug)?;
     let binary = discover_rpc_agents()
         .into_iter()
@@ -282,25 +303,60 @@ async fn trust(args: AgentRpcTrustArgs, output: &OutputConfig) -> CliResult<()> 
     Ok(())
 }
 
+/// DR-04b operator path: pin the provider-exporter binary (e.g. the real
+/// `opencode` CLI) for the sandboxed export bridge. Resolution probes only
+/// registered trusted directories; `record_trust` re-enforces
+/// canonicalization, world-writable refusal and trusted-directory
+/// containment on the final target (`LBR-AGENT-005` on refusal).
+async fn trust_exporter(slug: &str, output: &OutputConfig) -> CliResult<()> {
+    let binary = crate::internal::ai::observed_agents::resolve_exporter_binary(slug)
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("cannot trust provider exporter '{slug}': {e}"))
+                .with_stable_code(StableErrorCode::AgentProvenanceRejected)
+        })?;
+    let record = record_trust(slug, &binary).await.map_err(|e| {
+        CliError::fatal(format!("record trust for provider exporter '{slug}': {e}"))
+            .with_stable_code(StableErrorCode::AgentProvenanceRejected)
+    })?;
+    if output.is_json() {
+        let payload = serde_json::json!({
+            "slug": slug,
+            "kind": "provider-exporter",
+            "path": record.path.display().to_string(),
+            "sha256": record.sha256,
+        });
+        return emit_json_data("agent_rpc_trust", &payload, output);
+    }
+    if !output.quiet {
+        println!(
+            "trusted provider exporter '{slug}' at {} (sha256 {}); the sandboxed export \
+             bridge can now use it",
+            record.path.display(),
+            record.sha256
+        );
+    }
+    Ok(())
+}
+
 async fn untrust(args: AgentRpcUntrustArgs, output: &OutputConfig) -> CliResult<()> {
     let removed = revoke_trust(&args.slug)
         .await
         .map_err(|e| CliError::fatal(format!("revoke trust for '{}': {e}", args.slug)))?;
+    let label = if crate::internal::ai::observed_agents::is_provider_exporter_slug(&args.slug) {
+        format!("provider exporter '{}'", args.slug)
+    } else {
+        format!("libra-agent-{}", args.slug)
+    };
     if output.is_json() {
         let payload = serde_json::json!({ "slug": args.slug, "removed": removed });
         return emit_json_data("agent_rpc_untrust", &payload, output);
     }
     if !output.quiet {
         if removed {
-            println!(
-                "revoked trust for libra-agent-{} (back to quarantine)",
-                args.slug
-            );
+            println!("revoked trust for {label} (back to quarantine)");
         } else {
-            println!(
-                "libra-agent-{} was not trusted; nothing to revoke",
-                args.slug
-            );
+            println!("{label} was not trusted; nothing to revoke");
         }
     }
     Ok(())

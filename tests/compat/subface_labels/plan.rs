@@ -70,23 +70,77 @@ fn is_d_number(s: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// Extract the task id from an H3 heading. Both historical shapes are
+/// recognized: `### P0-01 …` (pre-2026-07-25 plans) and the restructured
+/// task-card form `### Task P0-01: …` / `### Task CG-01: …`.
 fn heading_id(line: &str) -> Option<&str> {
     let rest = line.trim_start().strip_prefix("### ")?;
-    Some(
-        rest.split([' ', '：', ':', '\t'])
-            .next()
-            .unwrap_or("")
-            .trim(),
-    )
+    let mut tokens = rest
+        .split([' ', '：', ':', '\t'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let first = tokens.next()?;
+    if first == "Task" {
+        return Some(tokens.next().unwrap_or(""));
+    }
+    Some(first)
 }
 
+/// Expand inline task-id ranges (`P0-01..P0-12`, `A0-02..A0-11`, or the
+/// shorthand `P0-01..12`) found in plan prose. The 2026-07-25 restructure of
+/// plan-20260708 collapsed the per-subtask H3 headings into aggregate task
+/// cards (`### Task P0: …`) whose bodies enumerate the governed subtask ids
+/// as ranges, so the governing-number registry must recover them from text.
+fn expand_id_ranges(text: &str, ids: &mut BTreeSet<String>) {
+    const MAX_RANGE_END: u32 = 99;
+    for fragment in text.split(|c: char| !(c.is_ascii_alphanumeric() || "-.".contains(c))) {
+        let Some((start, end)) = fragment.split_once("..") else {
+            continue;
+        };
+        if !is_task_id(start) {
+            continue;
+        }
+        // INVARIANT: is_task_id guarantees exactly one usable split point.
+        let Some((head, start_tail)) = start.split_once('-') else {
+            continue;
+        };
+        let end_tail = match end.split_once('-') {
+            // Full end id (`P0-01..P0-12`): heads must agree.
+            Some((end_head, tail)) if end_head == head => tail,
+            Some(_) => continue,
+            // Bare numeric shorthand (`P0-01..12`).
+            None => end,
+        };
+        let (Ok(lo), Ok(hi)) = (start_tail.parse::<u32>(), end_tail.parse::<u32>()) else {
+            continue;
+        };
+        if lo > hi || hi > MAX_RANGE_END {
+            continue;
+        }
+        let width = start_tail.len();
+        for n in lo..=hi {
+            ids.insert(format!("{head}-{n:0width$}"));
+        }
+    }
+}
+
+/// Commands the plan's P0/P1 task text still names. With the restructured
+/// (condensed) plan this recovers only the commands the aggregate cards keep
+/// in backticks — the authoritative graded-command registry is the
+/// `GRADED_COMMANDS` pin, which the grading matrix is checked against
+/// bidirectionally; this derivation only guards against the matrix dropping a
+/// command the plan text explicitly names.
 pub fn plan_p0_p1_touched_commands(cli: &BTreeSet<String>) -> BTreeSet<String> {
     let plan = read_repo_file("docs/development/plan/plan-20260708.md");
     let mut touched = BTreeSet::new();
     let mut in_p0_p1_task = false;
     for line in plan.lines() {
         if let Some(id) = heading_id(line) {
-            in_p0_p1_task = (id.starts_with("P0-") || id.starts_with("P1-")) && is_task_id(id);
+            // Pre-restructure per-subtask cards (### P0-01 …) and the
+            // restructured aggregate cards (### Task P0: …) both count.
+            in_p0_p1_task = ((id.starts_with("P0-") || id.starts_with("P1-")) && is_task_id(id))
+                || id == "P0"
+                || id == "P1";
             continue;
         }
         if !in_p0_p1_task {
@@ -94,7 +148,8 @@ pub fn plan_p0_p1_touched_commands(cli: &BTreeSet<String>) -> BTreeSet<String> {
         }
         if !(line.contains("**范围**")
             || line.contains("**覆盖**")
-            || line.contains("**覆盖命令**"))
+            || line.contains("**覆盖命令**")
+            || line.contains("**Description:**"))
         {
             continue;
         }
@@ -116,7 +171,20 @@ pub fn plan_p0_p1_touched_commands(cli: &BTreeSet<String>) -> BTreeSet<String> {
 
 pub fn valid_governing_numbers() -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
-    for line in read_repo_file("docs/development/plan/plan-20260708.md").lines() {
+    // plan-20260708: task-card headings plus the subtask-id ranges its
+    // restructured aggregate cards (### Task P0: …) enumerate inline.
+    let plan_20260708 = read_repo_file("docs/development/plan/plan-20260708.md");
+    for line in plan_20260708.lines() {
+        if let Some(id) = heading_id(line)
+            && is_task_id(id)
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    expand_id_ranges(&plan_20260708, &mut ids);
+    // plan-20260714 Part D inherited plan-20260708's deferred residuals
+    // (PD-00..PD-10), so its task cards are valid governing targets too.
+    for line in read_repo_file("docs/development/plan/plan-20260714.md").lines() {
         if let Some(id) = heading_id(line)
             && is_task_id(id)
         {

@@ -344,6 +344,26 @@ impl ToolRegistry {
         })
     }
 
+    /// Return the handler's conservative mutability classification without
+    /// dispatching it. Runtime owners use this immediately before invocation
+    /// to decide whether a cancellation token may interrupt the call.
+    pub async fn invocation_may_mutate(&self, invocation: &ToolInvocation) -> ToolResult<bool> {
+        let tool_name = invocation.tool_name.clone();
+        let handler = self
+            .handler(&tool_name)
+            .ok_or_else(|| ToolError::ToolNotFound(tool_name.clone()))?;
+        if !handler.matches_kind(&invocation.payload) {
+            return Err(ToolError::IncompatiblePayload(format!(
+                "Tool {tool_name} received incompatible payload type"
+            )));
+        }
+        let handler_mutates = handler.is_mutating(invocation).await;
+        let boundary_mutates = self.hardening.as_ref().is_some_and(|hardening| {
+            hardening.operation_may_mutate(&ToolOperation::tool(tool_name, handler_mutates, false))
+        });
+        Ok(handler_mutates || boundary_mutates)
+    }
+
     /// Get the current working directory.
     pub fn working_dir(&self) -> &std::path::Path {
         &self.working_dir

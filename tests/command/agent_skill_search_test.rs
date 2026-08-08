@@ -60,7 +60,7 @@ async fn seed_skill_checkpoint(
     // CHECK constraint rejects the hyphenated slug, and INSERT OR IGNORE would
     // then silently drop the row and break the checkpoint FK.
     let agent_kind_db = provider.replace('-', "_");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT OR IGNORE INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -75,7 +75,7 @@ async fn seed_skill_checkpoint(
     .await
     .expect("insert agent_session");
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,

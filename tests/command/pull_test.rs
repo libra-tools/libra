@@ -1172,3 +1172,280 @@ fn pull_no_progress_flag_is_accepted() {
         "--no-progress is accepted by the parser: {err}"
     );
 }
+
+/// W2 §C.4.3: `pull --rebase --autostash` runs in a LINKED worktree — the
+/// autostash wrap pushes onto the shared stack, rebases, then pops EXACTLY
+/// its own entry by id: the linked worktree's dirty change survives the
+/// pull, and a pre-existing foreign entry on the shared stack is untouched.
+#[tokio::test]
+#[serial]
+async fn test_pull_rebase_autostash_in_linked_worktree_pops_only_its_own_entry() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "seed pull",
+    );
+
+    // A linked worktree on its own branch tracking the same remote branch.
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("autostash-wt");
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "add", wt.to_str().unwrap()],
+            local_repo.path(),
+        ),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "wt-line"], &wt),
+        "wt branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "branch.wt-line.remote", "origin"], &wt),
+        "wt branch remote",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "branch.wt-line.merge",
+                &format!("refs/heads/{branch}"),
+            ],
+            &wt,
+        ),
+        "wt branch merge",
+    );
+
+    // A FOREIGN stash pushed from the main worktree sits on the shared stack.
+    fs::write(local_repo.path().join("README.md"), "main dirty\n").expect("dirty main");
+    assert_cli_success(
+        &run_libra_command(&["stash", "push", "-m", "foreign-entry"], local_repo.path()),
+        "foreign stash push",
+    );
+
+    // The remote moves ahead; the linked worktree has a dirty tracked file.
+    push_remote_commit(
+        &work_dir,
+        &branch,
+        "upstream.txt",
+        "up\n",
+        "upstream change",
+    );
+    fs::write(wt.join("README.md"), "wt dirty\n").expect("dirty wt");
+
+    let pulled = run_libra_command(&["pull", "--rebase", "--autostash"], &wt);
+    assert_cli_success(&pulled, "pull --rebase --autostash in linked worktree");
+
+    // The linked worktree got the upstream commit AND kept its dirty change.
+    assert!(wt.join("upstream.txt").exists(), "rebased onto upstream");
+    assert_eq!(
+        fs::read_to_string(wt.join("README.md")).expect("read wt file"),
+        "wt dirty\n",
+        "the autostash was popped back into the LINKED worktree"
+    );
+    // The foreign entry survives untouched as the only stack entry, and the
+    // main worktree's file was never touched by the linked pull.
+    let listed = run_libra_command(&["stash", "list"], local_repo.path());
+    assert_cli_success(&listed, "stash list");
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listing.contains("foreign-entry") && listing.lines().count() == 1,
+        "exactly the foreign entry remains: {listing}"
+    );
+    // "never touched": the foreign stash restored main's README.md to its
+    // COMMITTED content — if the linked pull had popped the foreign entry,
+    // "main dirty" would be back in main's tree.
+    assert_ne!(
+        fs::read_to_string(local_repo.path().join("README.md")).expect("read main file"),
+        "main dirty\n",
+        "the linked pull must not pop the foreign entry into main's worktree"
+    );
+}
+
+/// W2 §C.4.3 packed-HEAD regression: a HEAD that arrived via `pull` lives in
+/// a PACK — `stash push` must still see the dirty tracked file and stash it
+/// (the pre-W2 loose-only object reads made it silently no-op with
+/// "No local changes to save").
+#[tokio::test]
+#[serial]
+async fn test_stash_push_works_on_a_packed_head_from_pull() {
+    let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "seed pull",
+    );
+
+    fs::write(local_repo.path().join("README.md"), "dirty after pull\n").expect("dirty file");
+    let pushed = run_libra_command(&["stash", "push", "-m", "packed-head"], local_repo.path());
+    assert_cli_success(&pushed, "stash push on packed HEAD");
+    assert!(
+        String::from_utf8_lossy(&pushed.stdout).contains("Saved working directory"),
+        "the push actually saved (not a silent no-op): {}",
+        String::from_utf8_lossy(&pushed.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(local_repo.path().join("README.md")).expect("read"),
+        "hello libra\n",
+        "the working tree was restored to HEAD"
+    );
+    let popped = run_libra_command(&["stash", "pop"], local_repo.path());
+    assert_cli_success(&popped, "stash pop on packed HEAD");
+    assert_eq!(
+        fs::read_to_string(local_repo.path().join("README.md")).expect("read"),
+        "dirty after pull\n",
+        "pop restored the stashed change"
+    );
+}
+
+/// W2 §C.4.3: `incremental-repack` actually CONSOLIDATES in a multi-worktree
+/// repository — the five fetch packs collapse into one (old packs deleted),
+/// while history and a blob staged only in a linked worktree stay readable.
+#[tokio::test]
+#[serial]
+async fn test_incremental_repack_consolidates_with_linked_worktree_roots() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(&run_libra_command(&["pull"], local_repo.path()), "pull 1");
+    for i in 0..4 {
+        push_remote_commit(
+            &work_dir,
+            &branch,
+            &format!("packfill-{i}.txt"),
+            "x\n",
+            &format!("packfill {i}"),
+        );
+        assert_cli_success(&run_libra_command(&["pull"], local_repo.path()), "pull n");
+    }
+    let pack_dir = local_repo.path().join(".libra/objects/pack");
+    let count_packs = |dir: &std::path::Path| {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert!(
+        count_packs(&pack_dir) >= 5,
+        "fixture produced enough packs to trigger consolidation"
+    );
+
+    // A linked worktree with a staged-only blob (an index root).
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("repack-wt");
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "add", wt.to_str().unwrap()],
+            local_repo.path(),
+        ),
+        "worktree add",
+    );
+    fs::write(wt.join("staged-only.txt"), "packed root\n").expect("stage file");
+    assert_cli_success(
+        &run_libra_command(&["add", "staged-only.txt"], &wt),
+        "wt add",
+    );
+    let oid = String::from_utf8_lossy(
+        &run_libra_command(&["hash-object", "staged-only.txt"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+
+    // Age the fetch packs past the deletion grace window (a just-written
+    // pack is deliberately RETAINED so an in-flight fetch's ref update can
+    // land — here we prove the aged-out deletion path).
+    let stamp = (chrono::Utc::now() - chrono::Duration::hours(2))
+        .format("%Y%m%d%H%M")
+        .to_string();
+    for entry in std::fs::read_dir(&pack_dir).expect("read pack dir") {
+        let entry = entry.expect("pack entry");
+        let status = std::process::Command::new("touch")
+            .arg("-t")
+            .arg(&stamp)
+            .arg(entry.path())
+            .status()
+            .expect("spawn touch");
+        assert!(status.success(), "backdating pack must succeed");
+    }
+    let repack = run_libra_command(
+        &["maintenance", "run", "--task", "incremental-repack"],
+        local_repo.path(),
+    );
+    assert_cli_success(&repack, "incremental-repack");
+    let text = String::from_utf8_lossy(&repack.stdout) + String::from_utf8_lossy(&repack.stderr);
+    assert!(
+        !text.contains("skipped repack"),
+        "no skip in a multi-worktree repository: {text}"
+    );
+    assert_eq!(
+        count_packs(&pack_dir),
+        1,
+        "aged-out old packs were deleted and consolidated into one"
+    );
+    // History from the deleted packs and the linked worktree's staged blob
+    // are both still readable.
+    assert_cli_success(
+        &run_libra_command(&["log", "--oneline", "-n", "3"], local_repo.path()),
+        "history readable after consolidation",
+    );
+    let cat = run_libra_command(&["cat-file", "-p", &oid], local_repo.path());
+    assert_cli_success(&cat, "staged-only blob readable after repack");
+    assert!(String::from_utf8_lossy(&cat.stdout).contains("packed root"));
+}
+
+/// W2 §C.4.3: `maintenance run --task prefetch` goes through
+/// `fetch_repository_safe`, which must RELEASE each pack's `.keep` pin on
+/// success — a leaked pin would exempt every prefetched pack from repack
+/// forever.
+#[tokio::test]
+#[serial]
+async fn test_prefetch_releases_pack_keep_pins() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    // New remote content so the prefetch transfers a pack.
+    push_remote_commit(&work_dir, &branch, "prefetched.txt", "p\n", "prefetch me");
+
+    let prefetch = run_libra_command(
+        &["maintenance", "run", "--task", "prefetch"],
+        local_repo.path(),
+    );
+    assert_cli_success(&prefetch, "maintenance prefetch");
+
+    // The prefetch actually transferred: the new remote commit is readable
+    // locally and at least one pack exists (rules out a no-op pass).
+    let remote_tip = git_stdout(&["rev-parse", "HEAD"], &work_dir);
+    let cat = run_libra_command(&["cat-file", "-t", &remote_tip], local_repo.path());
+    assert_cli_success(&cat, "prefetched commit readable");
+    let pack_dir = local_repo.path().join(".libra/objects/pack");
+    let mut packs = 0usize;
+    let mut leftover_keeps: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&pack_dir).expect("read pack dir") {
+        let path = entry.expect("pack dir entry").path();
+        match path.extension().and_then(|x| x.to_str()) {
+            Some("pack") => packs += 1,
+            Some("keep") => leftover_keeps.push(path),
+            _ => {}
+        }
+    }
+    assert!(packs >= 1, "the prefetch wrote at least one pack");
+    assert!(
+        leftover_keeps.is_empty(),
+        "prefetch released every pack .keep pin: {leftover_keeps:?}"
+    );
+}

@@ -20,7 +20,13 @@ async fn create_operation_schema(db: &DatabaseConnection) {
             args_digest TEXT,\
             start_ts INTEGER NOT NULL,\
             end_ts INTEGER,\
-            status TEXT NOT NULL\
+            status TEXT NOT NULL,\
+            worktree_id TEXT NOT NULL DEFAULT '',
+            scope_provenance TEXT NOT NULL DEFAULT 'declared',
+            restorable INTEGER NOT NULL DEFAULT 1,
+            control_slot TEXT,
+            claim_owner TEXT,
+            scope_kind TEXT NOT NULL DEFAULT 'main'\
         );",
         "CREATE TABLE IF NOT EXISTS operation_parent(\
             op_id TEXT NOT NULL,\
@@ -54,7 +60,7 @@ async fn create_operation_schema(db: &DatabaseConnection) {
     ];
 
     for sql in ddl {
-        db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .unwrap();
     }
@@ -73,6 +79,12 @@ fn sample_operation(op_id: &str, repo_id: &str, view_id: &str, end_ts: i64) -> O
         start_ts: end_ts - 10,
         end_ts: Some(end_ts),
         status: OperationStatus::Succeeded,
+        worktree_id: String::new(),
+        scope_provenance: "declared".to_string(),
+        restorable: true,
+        control_slot: None,
+        claim_owner: None,
+        scope_kind: "main".to_string(),
     }
 }
 
@@ -94,6 +106,12 @@ async fn invalid_arguments_are_rejected() {
             start_ts: 10,
             end_ts: Some(20),
             status: OperationStatus::Succeeded,
+            worktree_id: String::new(),
+            scope_provenance: "declared".to_string(),
+            restorable: true,
+            control_slot: None,
+            claim_owner: None,
+            scope_kind: "main".to_string(),
         },
     )
     .await
@@ -131,23 +149,23 @@ async fn duplicate_constraints_are_enforced_for_view_refs_and_workspace() {
         DbBackend::Sqlite,
         "INSERT INTO operation_view_ref(view_id, ref_kind, ref_name, ref_remote, target_oid) VALUES ('view_dup', 'branch', 'main', '', 'oid-1');",
     );
-    db.execute(ref_insert).await.unwrap();
+    db.execute_raw(ref_insert).await.unwrap();
     let duplicate_ref = Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO operation_view_ref(view_id, ref_kind, ref_name, ref_remote, target_oid) VALUES ('view_dup', 'branch', 'main', '', 'oid-2');",
     );
-    assert!(db.execute(duplicate_ref).await.is_err());
+    assert!(db.execute_raw(duplicate_ref).await.is_err());
 
     let workspace_insert = Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO operation_view_workspace(view_id, pointer_kind, pointer_value) VALUES ('view_dup', 'index', 'oid-1');",
     );
-    db.execute(workspace_insert).await.unwrap();
+    db.execute_raw(workspace_insert).await.unwrap();
     let duplicate_workspace = Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO operation_view_workspace(view_id, pointer_kind, pointer_value) VALUES ('view_dup', 'index', 'oid-2');",
     );
-    assert!(db.execute(duplicate_workspace).await.is_err());
+    assert!(db.execute_raw(duplicate_workspace).await.is_err());
 }
 
 #[tokio::test]
@@ -536,6 +554,12 @@ async fn graph_roundtrip_and_duplicate_constraint_failure() {
             start_ts: 500,
             end_ts: Some(510),
             status: OperationStatus::Succeeded,
+            worktree_id: String::new(),
+            scope_provenance: "declared".to_string(),
+            restorable: true,
+            control_slot: None,
+            claim_owner: None,
+            scope_kind: "main".to_string(),
         },
         parents: vec![OperationParentRecord {
             op_id: "op_graph".to_string(),

@@ -156,14 +156,14 @@ impl CliFixture {
                 .await
                 .expect("create global config db");
             let backend = conn.get_database_backend();
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM schema_versions",
                 [],
             ))
             .await
             .expect("clear schema versions");
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
                 [
@@ -174,7 +174,7 @@ impl CliFixture {
             ))
             .await
             .expect("insert future schema version");
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO config_kv (`key`, `value`, `encrypted`) VALUES (?, ?, 0)",
                 [

@@ -44,6 +44,7 @@ OID, new OID, and branch flag `1`. Already-on no-ops do not invoke it. Set
 | | `--track` | | Create a local branch tracking the given remote branch and switch to it |
 | | `--guess` | | Auto-create a tracking branch when `<branch>` uniquely matches one remote (default; DWIM) |
 | | `--no-guess` | | Disable the remote-tracking guess; require a local branch or explicit `--track` |
+| | `--ignore-other-worktrees` | | Accepted for CLI compatibility, but **does NOT** bypass Libra's other-worktree safety guard (intentionally-different from Git): Libra never allows the same shared branch checked out in two worktrees. It is a silent no-op in a single-worktree repo; against a real collision the switch is still refused, and the refusal points at `libra worktree doctor` / `libra worktree repair --confirm` for settling a stale recorded owner. |
 | | `--no-progress` | | Do not show a progress meter. Accepted no-op for Git parity: Libra's switch never renders a progress meter. |
 
 ### Flag details

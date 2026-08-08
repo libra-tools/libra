@@ -89,7 +89,7 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | External diff | | `--ext-diff` | Allow the configured external diff driver (`diff.external`) to generate each file's patch (it is used by default when configured; this flag is the explicit opposite of `--no-ext-diff`). |
 | Color moved lines | | `--color-moved[=<mode>]` | In colored output, color lines that were deleted in one place and added in another with a distinct color (removed → bold magenta, added → bold cyan). Bare `--color-moved` and the block modes (`default`/`zebra`/`blocks`/`dimmed-zebra`) are accepted but approximated by `plain` — every moved line is colored; Libra does not implement Git's conservative moved-block significance/zebra striping. `--color-moved=no` / `--no-color-moved` turns it off. Only affects colored output (a terminal or `--color=always`). |
 | No moved-line color | | `--no-color-moved` | Do not color moved lines differently (the default; countermands an earlier `--color-moved`). |
-| Find renames | `-M[<n>]` | `--find-renames[=<n>]` | Detect renames: a deleted + added pair whose content is similar enough is reported as one rename (`similarity index N%` / `rename from`/`rename to`, and `R<score>` / `old => new` in the name-status/numstat/summary surfaces). Detection is enabled at 50% by default, matching Git. Bare `-M` uses 50%; `-M<n>` / `-M<n>%` / `--find-renames=<n>` set it (a bare integer is read like Git as `0.<digits>`, so `-M5` is 50% and `-M100%` is exact-only). Exact matches are indexed by blob id; when either remaining side exceeds 1000 files, Libra preserves exact renames, skips the quadratic inexact pass, and warns. The similarity index matches Git for typical content (a different chunk hash means contrived hash-collision inputs can differ); when several files are renamed at once the chosen old/new pairings can differ from Git's. `diff.renames=true|false|copies` is honored through the strict local → global → system cascade; truthy/unset values enable 50%, `copies`/`copy` degrades to plain rename detection since Libra has no `-C`, and `--no-renames`/`-M` always win. Invalid values fail closed with `LBR-CLI-002` before progress or diff output. The porcelain-only config is ignored by `diff-tree`, `diff-index`, and `diff-files`. A pathspec cannot directly follow a bare `-M`/`--find-renames` — place it before the flag or after `--`. |
+| Find renames | `-M[<n>]` | `--find-renames[=<n>]` | Detect renames: a deleted + added pair whose content is similar enough is reported as one rename (`similarity index N%` / `rename from`/`rename to`, and `R<score>` / `old => new` in the name-status/numstat/summary surfaces). Detection is enabled at 50% by default, matching Git. Bare `-M` uses 50%; `-M<n>` / `-M<n>%` / `--find-renames=<n>` set it (a bare integer is read like Git as `0.<digits>`, so `-M5` is 50% and `-M100%` is exact-only). Exact matches are indexed by blob id; when either remaining side exceeds 1000 files, Libra preserves exact **and scored unique-basename** renames, skips only the quadratic exhaustive pass, and warns (see *Rename detection budgets*). The similarity index matches Git for typical content (a different chunk hash means contrived hash-collision inputs can differ); when several files are renamed at once the chosen old/new pairings can differ from Git's. `diff.renames=true|false|copies` is honored through the strict local → global → system cascade; truthy/unset values enable 50%, `copies`/`copy` degrades to plain rename detection since Libra has no `-C`, and `--no-renames`/`-M` always win. Invalid values fail closed with `LBR-CLI-002` before progress or diff output. The porcelain-only config is ignored by `diff-tree`, `diff-index`, and `diff-files`. A pathspec cannot directly follow a bare `-M`/`--find-renames` — place it before the flag or after `--`. |
 | No renames | | `--no-renames` | Turn off rename detection, overriding the default, `diff.renames`, and an earlier `-M`/`--find-renames`. |
 | Relative | | `--relative[=<path>]` | Restrict the diff to a directory and show paths relative to it: with a value, `<path>` is resolved from the current directory; bare `--relative` uses the current directory. Files outside the directory are excluded and the prefix is stripped from displayed paths (also in `--stat` and JSON). With an external `diff.external` driver, the file-set restriction still applies but the prefix is NOT stripped from the driver's verbatim output. |
 | No relative | | `--no-relative` | Show full repo-root-relative paths. This is Libra's default; accepted for Git parity and takes precedence over `--relative`. |
@@ -255,14 +255,22 @@ irrelevant prefix defaults are not read. `-R` swaps the resulting pair.
 ### Rename detection budgets
 
 `diff.renameLimit` (like Git) bounds the quadratic inexact-rename pass: when the
-number of rename sources *or* destinations exceeds the limit, exact renames are
-still reported but the inexact pass is skipped and a warning is emitted. The
+number of rename sources *or* destinations exceeds the limit, the exhaustive
+inexact pass is skipped and a warning is emitted, but the cheap stages that run
+before the gate still report — exact (blob-id) renames **and** scored
+unique-basename pairs (a lone `foo.rs` on each side, pairing only when its
+similarity still meets the threshold). The
 value is a non-negative integer through the strict local → global → system
 cascade; `0` means "no per-side limit"; the default is 1000. `diff.renameComparisonBudget`
-caps the total number of similarity comparisons in the inexact pass: a
-non-negative integer where `0` means "unlimited" (the default). When the budget
-is exhausted, the exhaustive-pass results are discarded and only exact plus
-unique-basename renames survive, with a warning. Both values fail closed with
+caps the total number of similarity comparisons, charged per comparison across
+BOTH the unique-basename and the exhaustive stages: a non-negative integer
+where `0` means "unlimited" (the default). When the budget is spent, the stage
+then running stops and no further comparisons happen — pairs already scored
+(exact, plus the unique-basename pairs already paired by then) survive, the
+exhaustive pass's results are discarded wholesale (a partial result would be
+order-dependent), and a warning is emitted. Note the distinction: the limit
+always keeps every scored unique-basename pair; the budget only keeps the ones
+already scored. Both values fail closed with
 `LBR-CLI-002` on an invalid (non-integer/negative) setting before any diff
 output.
 

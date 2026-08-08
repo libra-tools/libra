@@ -683,6 +683,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         for enforcement in SandboxEnforcement::all() {
             let (mode, allowlist, proxy_backend, warning) =
@@ -756,6 +757,7 @@ mod tests {
             },
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
 
         for enforcement in SandboxEnforcement::all() {

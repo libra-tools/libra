@@ -338,11 +338,13 @@ restore 只读探测远端 capture schema，不安装写屏障也不收养行，
 投影已不匹配 manifest digest 的 catalog 状态；后续无关 object-index 新增不会使未变化的
 checkpoint 投影失效。它从 manifest 绑定的 traces head
 验证可达性，并把该 head 与 catalog 原子恢复，不信任独立上传的通用 ref metadata。已有本地对象会被解码并校验 hash；损坏路径会原子重下，并在
-catalog transaction 开始前验证完整 traces 链及每个 checkpoint tree/blob。本地 erase
-tombstone 仍不会传播到 D1/R2：在跨设备删除
-传播实现前，后续 restore 仍可能复活已远端镜像的 capture。显式本地
-`--restore-erased` import 会保留新的复制 incarnation，使 session generation 与 child source
-namespace 不会和 D1 保留的旧行冲突；但它不会删除那些旧行。
+catalog transaction 开始前验证完整 traces 链及每个 checkpoint tree/blob。session 擦除 tombstone
+现已传播：`cloud sync` 在同一 generation fence 下把本地 `agent_import_tombstone`
+行发布到 D1 并级联删除被擦除 session 的 mirror 行；restore 则 tombstone 优先——
+被擦除的 session 绝不回灌，其 fence 会持久化到恢复方本机，重复删除/恢复幂等。
+R2 payload 字节尚未物理删除（唯一剩余 deferral）。显式本地
+`--restore-erased` import 仍会保留新的复制 incarnation，使 session generation 与
+child source namespace 不会和旧保留行冲突。
 
 `cloud sync` 默认模式仍使用旧的人类进度输出。`cloud restore` 和 `cloud sync` 的失败继续通过 Libra 的标准 CLI 错误机制处理。
 

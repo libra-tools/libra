@@ -64,10 +64,19 @@ review:
 - default: `HEAD~1..HEAD` (the last commit's changes);
 - `--since <rev>`: `<rev>..HEAD`;
 - `--checkpoint <id>`: `checkpoint:<id>` (an agent checkpoint from
-  `libra agent checkpoint list`). **Not implemented yet** — the command
-  fails closed instead of silently reviewing the current worktree under
-  a checkpoint label; use `libra agent checkpoint show <id>` to inspect
-  the captured state directly.
+  `libra agent checkpoint list`). The reviewers' workspace is the
+  checkpoint's own captured content — `metadata.json`, an optional
+  `manifest.json`, and the transcript files — materialized READ-ONLY
+  under the run directory (`<run_dir>/checkpoint-input/`). It is never
+  disguised as a worktree diff: no repository snapshot is materialized
+  at all, so a scoped run can only consume the named checkpoint, and the
+  scoped prompt tells reviewers they are looking at a captured
+  transcript whose content is untrusted data. A missing checkpoint, a
+  malformed checkpoint tree, or content that is not present in the local
+  object store fails closed BEFORE any run is created (no run residue).
+  The materialization lives inside the run directory, so it shares the
+  run's retention exactly (`review clean` removes it with the run) and
+  `agent doctor` needs no new orphan class.
 
 ### Pagination
 
@@ -95,8 +104,7 @@ libra review --agent codex --agent claude-code
 # Review everything since a revision
 libra review --agent codex --since v1.2.0
 
-# Checkpoint-scoped review fails closed until checkpoint
-# materialization lands (see --checkpoint above)
+# Review a captured checkpoint's transcript/metadata (read-only input)
 libra review --agent codex --checkpoint <checkpoint_id>
 
 # Structured run result (terminal state, per-reviewer outcomes)
@@ -134,8 +142,10 @@ overrunning the budget. Raise the limit with
 - `0` — the run reached `success`, `partial`, `timeout`, or `cancelled`
   (the terminal state is reported in the output); subcommands succeeded.
 - non-zero — usage errors, a run that ended in the `error` terminal
-  state, unknown run ids, `--fix` (stable code `LBR-AGENT-010`), or a full
-  run queue (stable code `LBR-AGENT-014`).
+  state, unknown run ids, an unknown or non-materializable
+  `--checkpoint` (refused before any run is created), `--fix` (stable
+  code `LBR-AGENT-010`), or a full run queue (stable code
+  `LBR-AGENT-014`).
 
 ## See Also
 

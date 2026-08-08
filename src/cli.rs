@@ -169,7 +169,7 @@ async fn read_schema_free_object_format(
     db_path: &Path,
 ) -> CliResult<String> {
     let has_config_kv = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             db_conn.get_database_backend(),
             "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1",
             ["table".into(), "config_kv".into()],
@@ -189,7 +189,7 @@ async fn read_schema_free_object_format(
     }
 
     let row = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             db_conn.get_database_backend(),
             "SELECT value FROM config_kv WHERE key = ? ORDER BY id DESC LIMIT 1",
             ["core.objectformat".into()],
@@ -237,7 +237,7 @@ fn set_hash_kind_from_object_format(object_format: String) -> CliResult<()> {
     after_help = ROOT_AFTER_HELP,
     arg_required_else_help = true,
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Emit machine-readable JSON to stdout.
     /// Use `--json` alone for pretty output, or `--json=compact` / `--json=ndjson`
     /// to select an alternative layout.  The `=` is required when specifying a format
@@ -926,19 +926,16 @@ pub fn parse(args: Option<&[&str]>) -> CliResult<()> {
 /// through clap's own metadata (aliases like `br` canonicalize to `branch`).
 /// Never derived from user argv content beyond the subcommand token itself.
 fn canonical_command_name(args: Option<&[&str]>) -> Option<String> {
-    let argv: Vec<String> = match args {
-        Some(args) => args.iter().map(|s| s.to_string()).collect(),
-        None => env::args().collect(),
+    let argv: Vec<std::ffi::OsString> = match args {
+        Some(args) => args.iter().map(std::ffi::OsString::from).collect(),
+        None => env::args_os().collect(),
     };
     let (index, _) = find_subcommand_index(&argv)?;
-    let token = argv.get(index)?;
+    let token = argv.get(index)?.to_str()?;
     let cli = <Cli as clap::CommandFactory>::command();
     cli.get_subcommands()
         .find(|candidate| {
-            candidate.get_name() == token.as_str()
-                || candidate
-                    .get_all_aliases()
-                    .any(|alias| alias == token.as_str())
+            candidate.get_name() == token || candidate.get_all_aliases().any(|alias| alias == token)
         })
         .map(|candidate| candidate.get_name().to_string())
 }
@@ -960,7 +957,7 @@ fn canonical_command_name(args: Option<&[&str]>) -> Option<String> {
 /// See: [`tests::clap_alias_br_resolves_to_branch`] and friends for related parser
 /// behaviour. The exact rewrite is exercised end-to-end by the integration tests in
 /// `tests/command/log_test.rs`.
-fn rewrite_log_short_number_args(args: Vec<String>) -> Vec<String> {
+fn rewrite_log_short_number_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     // Detect the real subcommand position to avoid rewriting positional args for other commands.
     let subcommand = find_subcommand_index(&args);
     let Some((log_index, from_double_dash)) = subcommand else {
@@ -970,7 +967,7 @@ fn rewrite_log_short_number_args(args: Vec<String>) -> Vec<String> {
         return args;
     }
 
-    let mut out: Vec<String> = Vec::with_capacity(args.len() + 2);
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len() + 2);
     if from_double_dash {
         // Drop the `--` that was used to separate global args from the subcommand.
         for (idx, arg) in args.iter().enumerate().take(log_index + 1) {
@@ -997,18 +994,21 @@ fn rewrite_log_short_number_args(args: Vec<String>) -> Vec<String> {
             continue;
         }
 
-        if is_short_number_flag(&arg) {
-            out.push("-n".to_string());
-            out.push(arg[1..].to_string());
-        } else {
-            out.push(arg);
+        // A non-UTF-8 argument is never one of these ASCII shortcuts, so it
+        // passes through untouched rather than being lossily inspected.
+        match arg.to_str() {
+            Some(text) if is_short_number_flag(text) => {
+                out.push(std::ffi::OsString::from("-n"));
+                out.push(std::ffi::OsString::from(&text[1..]));
+            }
+            _ => out.push(arg),
         }
     }
 
     out
 }
 
-fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
+fn rewrite_index_pack_progress_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let subcommand = find_subcommand_index(&args);
     let Some((index_pack_index, from_double_dash)) = subcommand else {
         return args;
@@ -1017,7 +1017,7 @@ fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
         return args;
     }
 
-    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
     if from_double_dash {
         for (idx, arg) in args.iter().enumerate().take(index_pack_index + 1) {
             if idx + 1 == index_pack_index && arg == "--" {
@@ -1040,9 +1040,9 @@ fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
             out.push(arg);
             continue;
         }
-        match arg.as_str() {
-            "--progress" => out.push("--progress=text".to_string()),
-            "--no-progress" => out.push("--progress=none".to_string()),
+        match arg.to_str() {
+            Some("--progress") => out.push(std::ffi::OsString::from("--progress=text")),
+            Some("--no-progress") => out.push(std::ffi::OsString::from("--progress=none")),
             _ => out.push(arg),
         }
     }
@@ -1050,7 +1050,7 @@ fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
     out
 }
 
-fn rewrite_reset_pathspec_separator_args(args: Vec<String>) -> Vec<String> {
+fn rewrite_reset_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let subcommand = find_subcommand_index(&args);
     let Some((reset_index, from_double_dash)) = subcommand else {
         return args;
@@ -1085,26 +1085,32 @@ fn rewrite_reset_pathspec_separator_args(args: Vec<String>) -> Vec<String> {
     for arg in args.iter().take(separator_index).skip(reset_index + 1) {
         out.push(arg.clone());
     }
-    out.push(format!(
+    out.push(std::ffi::OsString::from(format!(
         "--{}",
         command::reset::RESET_PATHSPEC_SEPARATOR_FLAG
-    ));
+    )));
     if !has_target_before_separator && args.get(separator_index + 1).is_some() {
-        out.push(command::reset::DEFAULT_RESET_TARGET.to_string());
+        out.push(std::ffi::OsString::from(
+            command::reset::DEFAULT_RESET_TARGET,
+        ));
     }
-    out.push("--".to_string());
+    out.push(std::ffi::OsString::from("--"));
     out.extend(args.iter().skip(separator_index + 1).cloned());
     out
 }
 
 fn reset_has_positional_target_before_separator(
-    args: &[String],
+    args: &[std::ffi::OsString],
     start: usize,
     separator_index: usize,
 ) -> bool {
     let mut index = start;
     while index < separator_index {
-        let arg = &args[index];
+        // A non-UTF-8 token is never one of these ASCII flags, so it is the
+        // positional target this is looking for.
+        let Some(arg) = args[index].to_str() else {
+            return true;
+        };
         if reset_flag_takes_separate_value(arg) {
             index += 2;
             continue;
@@ -1136,10 +1142,14 @@ fn reset_flag_takes_separate_value(arg: &str) -> bool {
 ///   `None` if `--` is the last token.
 /// - Returns `None` when no non-flag token exists (e.g. argv is `["libra"]` or
 ///   `["libra", "--help"]`).
-fn find_subcommand_index(args: &[String]) -> Option<(usize, bool)> {
+fn find_subcommand_index(args: &[std::ffi::OsString]) -> Option<(usize, bool)> {
     let mut i = 1;
     while i < args.len() {
-        let arg = &args[i];
+        // A token that is not valid UTF-8 cannot be an ASCII flag, so it is
+        // the first non-flag token — the subcommand position.
+        let Some(arg) = args[i].to_str() else {
+            return Some((i, false));
+        };
         if arg == "--" {
             return if i + 1 < args.len() {
                 Some((i + 1, true))
@@ -1147,7 +1157,7 @@ fn find_subcommand_index(args: &[String]) -> Option<(usize, bool)> {
                 None
             };
         }
-        if matches!(arg.as_str(), "--color" | "--progress") {
+        if matches!(arg, "--color" | "--progress") {
             i = (i + 2).min(args.len());
             continue;
         }
@@ -1252,11 +1262,14 @@ const REMOVED_CODE_CLAUDECODE_FLAGS: &[&str] = &[
     "--permission-mode",
 ];
 
-fn removed_code_claudecode_hints(argv: &[String]) -> Vec<String> {
+fn removed_code_claudecode_hints(argv: &[std::ffi::OsString]) -> Vec<String> {
     let Some((subcommand_index, _)) = find_subcommand_index(argv) else {
         return Vec::new();
     };
-    if !matches!(argv.get(subcommand_index).map(String::as_str), Some("code")) {
+    if !matches!(
+        argv.get(subcommand_index).and_then(|arg| arg.to_str()),
+        Some("code")
+    ) {
         return Vec::new();
     }
 
@@ -1272,9 +1285,10 @@ fn removed_code_claudecode_hints(argv: &[String]) -> Vec<String> {
     }
 
     let has_removed_flag = argv.iter().any(|arg| {
-        REMOVED_CODE_CLAUDECODE_FLAGS
-            .iter()
-            .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+        REMOVED_CODE_CLAUDECODE_FLAGS.iter().any(|flag| {
+            arg.to_str()
+                .is_some_and(|text| text == *flag || text.starts_with(&format!("{flag}=")))
+        })
     });
     if has_removed_flag {
         hints.push(
@@ -1366,6 +1380,18 @@ fn repo_not_found_error(path: Option<&Path>) -> CliError {
     error
 }
 
+/// Map a repository-resolution failure without masking actionable states:
+/// only a genuine NotFound renders the classic "not a libra repository"
+/// message — a detached-from-registry marker or a corrupt commondir carries
+/// its own remedy (re-add/repair) and must reach the user verbatim.
+fn repo_resolution_error(error: std::io::Error, path: Option<&Path>) -> CliError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return repo_not_found_error(path);
+    }
+    CliError::fatal(error.to_string())
+        .with_stable_code(utils::error::StableErrorCode::RepoStateInvalid)
+}
+
 struct CommandPreflight {
     storage: Option<std::path::PathBuf>,
     /// When `true`, the repository database is opened through the pooled,
@@ -1409,6 +1435,38 @@ impl CommandPreflight {
             set_hash_kind: true,
         }
     }
+}
+
+/// plan-20260714 Part C W0 (§C.11, Codex R19 follow-up): an unconfirmed
+/// mutating repair is refused before any side effect, so it must not take
+/// the migration-applying preflight. Mirrors
+/// `command::worktree::legacy::repair_invocation_refused_without_confirmation`;
+/// the FUSE surface never exposes `--resolve-identity`, so that arm exists
+/// only when compilation routes straight to the legacy module.
+fn repair_invocation_refused_without_confirmation(
+    command: &command::worktree::WorktreeSubcommand,
+) -> bool {
+    use command::worktree::WorktreeSubcommand;
+    let WorktreeSubcommand::Repair {
+        migrate_layout,
+        dry_run,
+        confirm,
+        ..
+    } = command
+    else {
+        return false;
+    };
+    #[cfg(not(all(unix, feature = "worktree-fuse")))]
+    if matches!(
+        command,
+        WorktreeSubcommand::Repair {
+            resolve_identity: true,
+            ..
+        }
+    ) {
+        return !matches!(command, WorktreeSubcommand::Repair { yes: true, .. });
+    }
+    !(*migrate_layout && *dry_run) && !*confirm
 }
 
 fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
@@ -1470,32 +1528,404 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         Commands::Worktree(command::worktree::WorktreeArgs {
             command: command::worktree::WorktreeSubcommand::Umount { .. },
         }) => Ok(CommandPreflight::none()),
+        // W0 §C.11: `worktree doctor` is STRICTLY read-only, and applying
+        // pending migrations is a WRITE. A diagnostic that silently upgrades
+        // the schema of the repository you are diagnosing changes the thing
+        // you were trying to observe — and on a repository behind schema, it
+        // is the one command you most want to be able to run without
+        // committing to an upgrade first.
+        Commands::Worktree(command::worktree::WorktreeArgs {
+            command: command::worktree::WorktreeSubcommand::Doctor { .. },
+        }) => {
+            let storage =
+                utils::util::try_get_storage_path(None).map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
+                storage,
+            ))
+        }
+        // W0 §C.11 (Codex R20 follow-up): the `repair --migrate-layout
+        // --dry-run` preview is documented as read-only end to end — and
+        // applying pending migrations is a WRITE. It takes the same
+        // no-migration preflight as `doctor`; the dispatch layers in
+        // `worktree.rs`/`worktree-fuse.rs` re-state the same exclusion, and
+        // the preview itself never resolves a database connection.
+        Commands::Worktree(command::worktree::WorktreeArgs {
+            command:
+                command::worktree::WorktreeSubcommand::Repair {
+                    migrate_layout: true,
+                    dry_run: true,
+                    ..
+                },
+        }) => {
+            let storage =
+                utils::util::try_get_storage_path(None).map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
+                storage,
+            ))
+        }
+        // W0 §C.11 (Codex R19 follow-up): an UNCONFIRMED mutating repair is
+        // refused as byte-for-byte side-effect free — and applying pending
+        // migrations is a write. Route the would-be-refused invocation
+        // through the same no-migration preflight as `doctor` so the refusal
+        // cannot irreversibly upgrade an older repository's schema on the
+        // way to saying no. Confirmed actions keep the standard preflight:
+        // their audit boundary writes by design.
+        Commands::Worktree(args)
+            if repair_invocation_refused_without_confirmation(&args.command) =>
+        {
+            let storage =
+                utils::util::try_get_storage_path(None).map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
+                storage,
+            ))
+        }
         // Config global/system scopes don't require a repository.
         Commands::Config(cfg) if cfg.global || cfg.system => Ok(CommandPreflight::none()),
         Commands::Code(code_args) => {
             let working_dir = command::code::resolve_code_preflight_working_dir(code_args)?;
             let storage = utils::util::try_get_storage_path(Some(working_dir.clone()))
-                .map_err(|_| repo_not_found_error(Some(&working_dir)))?;
+                .map_err(|error| repo_resolution_error(error, Some(&working_dir)))?;
             Ok(CommandPreflight::repo(storage))
         }
         Commands::Graph(graph_args) => {
             let storage = utils::util::try_get_storage_path(graph_args.repo.clone())
-                .map_err(|_| repo_not_found_error(graph_args.repo.as_deref()))?;
+                .map_err(|error| repo_resolution_error(error, graph_args.repo.as_deref()))?;
             Ok(CommandPreflight::repo(storage))
         }
         Commands::Agent(command::agent::AgentArgs {
             command: command::agent::AgentSubcommand::Graph(graph_args),
         }) => {
             let storage = utils::util::try_get_storage_path(graph_args.repo.clone())
-                .map_err(|_| repo_not_found_error(graph_args.repo.as_deref()))?;
+                .map_err(|error| repo_resolution_error(error, graph_args.repo.as_deref()))?;
             Ok(CommandPreflight::repo(storage))
         }
         _ => {
             let storage =
-                utils::util::try_get_storage_path(None).map_err(|_| repo_not_found_error(None))?;
+                utils::util::try_get_storage_path(None)
+                    .map_err(|error| repo_resolution_error(error, None))?;
             Ok(CommandPreflight::repo(storage))
         }
     }
+}
+
+/// plan-20260714 Part C W0 (§C.11): which mutable state a command owns.
+///
+/// Every command declares one. The declaration is the *inventory guard* the
+/// card requires, and it is enforced by the compiler rather than by a test:
+/// [`command_scope`] matches exhaustively with no wildcard arm, so adding a
+/// `Commands` variant without classifying it does not build. A test that
+/// merely fails is weaker — it can be skipped, filtered out, or land on a
+/// branch where the suite is not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandScope {
+    /// Mutates repository-wide state only: refs, config, the object store,
+    /// the worktree registry. Identical from any worktree, so a damaged
+    /// worktree does not make it unsafe.
+    Repository,
+    /// Mutates THIS worktree's HEAD, index, or working files.
+    Worktree,
+    /// Both — the reason `pull`, `fetch` and `stash` cannot be classified as
+    /// either one alone (§C.11).
+    Composite,
+    /// Reads only. Must stay available in a damaged worktree, because
+    /// diagnosing the damage is what these commands are for.
+    ReadOnly,
+}
+
+impl CommandScope {
+    /// Does this scope write the CURRENT worktree's HEAD / index / files?
+    fn mutates_worktree_state(self) -> bool {
+        matches!(self, Self::Worktree | Self::Composite)
+    }
+
+    /// Can this scope publish a reference to an object — a ref row, an index
+    /// entry, a sidecar, an agent-run manifest?
+    ///
+    /// Everything that is not read-only can. That is deliberately coarse:
+    /// under-claiming here is what lets a deletion phase run concurrently
+    /// with a publisher (§C.4.3 writer-vs-deleter), so the safe default for
+    /// a new command is "yes".
+    fn publishes_object_references(self) -> bool {
+        !matches!(self, Self::ReadOnly)
+    }
+}
+
+/// The scope inventory. See [`CommandScope`] — this match is deliberately
+/// exhaustive, so a new command must declare its scope to compile.
+fn command_scope(command: &Commands) -> CommandScope {
+    use CommandScope::{Composite, ReadOnly, Repository, Worktree};
+    match command {
+        // ── Worktree: HEAD / index / working files of THIS worktree ───────
+        Commands::Add(_)
+        | Commands::Rm(_)
+        | Commands::Mv(_)
+        | Commands::Restore(_)
+        | Commands::Clean(_)
+        | Commands::Reset(_)
+        | Commands::ReadTree(_)
+        | Commands::UpdateIndex(_)
+        | Commands::Hydrate(_)
+        | Commands::Dirty(_)
+        | Commands::Checkout(_)
+        | Commands::Switch(_)
+        | Commands::MergeFile(_)
+        | Commands::Apply(_)
+        // rerere's MERGE_RR is worktree-local (the rr-cache stays shared).
+        | Commands::Rerere(_) => Worktree,
+
+        // ── Composite: repository refs AND this worktree's state ──────────
+        Commands::Commit(_)
+        | Commands::Merge(_)
+        | Commands::Rebase(_)
+        | Commands::CherryPick(_)
+        | Commands::Revert(_)
+        | Commands::Am(_)
+        | Commands::Bisect(_)
+        // §C.11 pins these three explicitly. `fetch` earns Composite because
+        // FETCH_HEAD is worktree-local: run from a legacy shared-`.libra`
+        // worktree it lands in MAIN's gitdir.
+        | Commands::Pull(_)
+        | Commands::Fetch(_)
+        | Commands::Stash(_)
+        // These run tools that edit the working tree.
+        | Commands::Code(_)
+        | Commands::Automation(_)
+        | Commands::Sandbox(_) => Composite,
+
+        // ── Advisory stores: only their MUTATING subcommands ──────────────
+        Commands::SparseView(args) => {
+            if matches!(
+                args.command,
+                command::sparse_view::SparseViewCommand::List
+                    | command::sparse_view::SparseViewCommand::Status
+            ) {
+                ReadOnly
+            } else {
+                Worktree
+            }
+        }
+        Commands::Layer(args) => {
+            if matches!(
+                args.command,
+                command::layer::LayerCommand::List | command::layer::LayerCommand::Status
+            ) {
+                ReadOnly
+            } else {
+                Worktree
+            }
+        }
+        // The write form moves this worktree's HEAD directly.
+        Commands::SymbolicRef(args) => {
+            if args.target.is_some() {
+                Worktree
+            } else {
+                ReadOnly
+            }
+        }
+        // Non-dry-run restore rewrites HEAD/index/worktree from a snapshot.
+        Commands::Op(args) => {
+            if matches!(
+                &args.command,
+                command::op::OpCommand::Restore { dry_run: false, .. }
+            ) {
+                Composite
+            } else {
+                ReadOnly
+            }
+        }
+        // `worktree` manages the REGISTRY, not this worktree's HEAD/index —
+        // and `repair` is the documented recovery route out of a damaged
+        // identity, so it must never be gated behind a healthy one.
+        Commands::Worktree(args) => match &args.command {
+            command::worktree::WorktreeSubcommand::List { .. } => ReadOnly,
+            // `doctor` without a mutating flag is STRICTLY read-only (§C.11
+            // W0, Codex R15/R16): the repository — database, registry, lease
+            // state and FILESYSTEM — must be unchanged across a default
+            // invocation. Classifying it as a writer made the generic shared
+            // hold create `.libra/maintenance.lock`, which is a filesystem
+            // change, in the one command whose contract forbids any.
+            command::worktree::WorktreeSubcommand::Doctor {
+                adopt_capture_session: None,
+                adopt_info_to: None,
+                clear_common_info: false,
+                ..
+            } => ReadOnly,
+            // An UNCONFIRMED mutating doctor action is refused before any
+            // side effect (same contract as unconfirmed repair below).
+            command::worktree::WorktreeSubcommand::Doctor { confirm: false, .. } => ReadOnly,
+            // A CONFIRMED doctor mutation (capture-scope adoption, info-file
+            // adoption/clearing) writes — it takes the writer path like any
+            // other mutating repair action.
+            command::worktree::WorktreeSubcommand::Doctor { .. } => Repository,
+            // The `--migrate-layout --dry-run` preview publishes nothing
+            // (§C.11 W0, Codex R21): it is documented as read-only end to
+            // end, so it must not take the shared maintenance hold either —
+            // the hold CREATES `.libra/maintenance.lock` when absent, which
+            // is a filesystem write on the repository being previewed.
+            command::worktree::WorktreeSubcommand::Repair {
+                migrate_layout: true,
+                dry_run: true,
+                ..
+            } => ReadOnly,
+            // An UNCONFIRMED mutating repair is refused before any side
+            // effect (Codex R21): the refusal is documented as byte-for-byte
+            // side-effect free, and the lock-file creation the shared hold
+            // performs is a side effect.
+            command::worktree::WorktreeSubcommand::Repair { .. }
+                if repair_invocation_refused_without_confirmation(&args.command) =>
+            {
+                ReadOnly
+            }
+            _ => Repository,
+        },
+
+        // ── Repository: refs, config, object store, registries ────────────
+        Commands::Init(_)
+        | Commands::Clone(_)
+        | Commands::Config(_)
+        | Commands::Branch(_)
+        | Commands::Tag(_)
+        | Commands::UpdateRef(_)
+        | Commands::Reflog(_)
+        | Commands::Notes(_)
+        | Commands::Replace(_)
+        | Commands::Remote(_)
+        | Commands::Push(_)
+        | Commands::Repack(_)
+        | Commands::Maintenance(_)
+        | Commands::Fsck(_)
+        | Commands::Cache(_)
+        | Commands::File(_)
+        | Commands::Alternates(_)
+        | Commands::Metadata(_)
+        | Commands::Revision(_)
+        | Commands::Hooks(_)
+        | Commands::Service(_)
+        | Commands::Lfs(_)
+        | Commands::Deps(_)
+        | Commands::Auth(_)
+        | Commands::Login(_)
+        | Commands::Logout(_)
+        | Commands::Credential(_)
+        | Commands::HashObject(_)
+        | Commands::WriteTree(_)
+        | Commands::CommitTree(_)
+        | Commands::FastImport(_)
+        | Commands::IndexPack(_)
+        | Commands::PackObjects(_)
+        | Commands::Bundle(_)
+        | Commands::Cloud(_)
+        | Commands::Publish(_)
+        // The agent surface keeps its state in the repository database. The
+        // parts that DO edit files go through `code` / task worktrees, which
+        // take a workspace lease of their own; `agent`, `review`,
+        // `investigate` and `code-control` must stay usable for diagnosis in
+        // a damaged worktree.
+        | Commands::Agent(_)
+        | Commands::Review(_)
+        | Commands::Investigate(_)
+        | Commands::CodeControl(_) => Repository,
+        #[cfg(feature = "fastcdc")]
+        Commands::Media(_) => Repository,
+
+        // ── ReadOnly ──────────────────────────────────────────────────────
+        Commands::Status(_)
+        | Commands::Log(_)
+        | Commands::Logfile(_)
+        | Commands::LsFiles(_)
+        | Commands::LsTree(_)
+        | Commands::LsRemote(_)
+        | Commands::ShowRef(_)
+        | Commands::ForEachRef(_)
+        | Commands::RevParse(_)
+        | Commands::RevList(_)
+        | Commands::Diff(_)
+        | Commands::DiffTree(_)
+        | Commands::DiffIndex(_)
+        | Commands::DiffFiles(_)
+        | Commands::MergeBase(_)
+        | Commands::Grep(_)
+        | Commands::Blame(_)
+        | Commands::Describe(_)
+        | Commands::Show(_)
+        | Commands::Shortlog(_)
+        | Commands::CatFile(_)
+        | Commands::CheckIgnore(_)
+        | Commands::CheckAttr(_)
+        | Commands::CheckMailmap(_)
+        | Commands::FastExport(_)
+        | Commands::Archive(_)
+        | Commands::FormatPatch(_)
+        | Commands::Mailinfo(_)
+        | Commands::VerifyPack(_)
+        | Commands::Completions(_)
+        | Commands::Usage(_)
+        | Commands::Graph(_)
+        | Commands::Open(_)
+        | Commands::Whoami(_) => ReadOnly,
+    }
+}
+
+/// The worktree-STATE mutation surface (W3-s3 §C.6.1): commands that move
+/// HEAD, rewrite the index, or restructure the working tree of the CURRENT
+/// worktree. Repository-scoped writers (branch/tag/remote/config/push, object
+/// plumbing) stay allowed in a legacy-symlink worktree — they behave
+/// identically from any scope.
+fn command_mutates_worktree_state(command: &Commands) -> bool {
+    command_scope(command).mutates_worktree_state()
+}
+
+/// Does this command hold the SHARED maintenance lock for its whole run
+/// (plan-20260714 §C.4.3 writer-vs-deleter)?
+///
+/// Every non-read-only command does, EXCEPT the deletion family itself:
+/// `gc`/`prune`, `repack -d`, `cache evict` and `file obliterate` take the
+/// same lock EXCLUSIVELY around the phase that unlinks payloads, so taking
+/// it shared here first would only make them wait on themselves.
+fn command_holds_shared_maintenance_lock(command: &Commands) -> bool {
+    // The deletion family takes the lock itself, in the mode each phase
+    // needs — `maintenance` per task, `repack` shared for its pack write and
+    // exclusive for `-d`, `cache evict` / `file obliterate` / `agent clean`
+    // exclusive. A command-level shared hold here would be a hold they could
+    // not upgrade, so they would defer against themselves forever.
+    if matches!(
+        command,
+        Commands::Maintenance(_) | Commands::Repack(_) | Commands::Cache(_) | Commands::File(_)
+    ) {
+        return false;
+    }
+    // Long-running commands and sessions are excluded on purpose (§C.10: no
+    // ordinary command holds a maintenance lock for its lifetime). A `libra
+    // code` session runs for hours; holding the lock across it would starve
+    // every deletion phase, and — worse — a shell command the user approves
+    // INSIDE that session cannot satisfy "wait for the other command to
+    // finish", because the other command is its own parent.
+    //
+    // Excluding them opens no hole, because their in-process publications
+    // are already covered by mechanisms that predate this lock:
+    //
+    // * VCS mutations from an agent go through `run_libra_vcs`, which spawns
+    //   `libra` as a SUBPROCESS (`internal/ai/mcp/resource.rs`) — the child
+    //   takes the shared hold like any other command;
+    // * an agent-run directory without a manifest fails the GC root walk
+    //   closed at any age, so the objectize → finalize window of a review or
+    //   investigate run cannot be pruned through;
+    // * capture checkpoint writes publish under a traces-inflight marker,
+    //   which defers destructive pruning for its (clamped) TTL.
+    if matches!(
+        command,
+        Commands::Code(_)
+            | Commands::Automation(_)
+            | Commands::Sandbox(_)
+            | Commands::Service(_)
+            | Commands::Agent(_)
+            | Commands::Review(_)
+            | Commands::Investigate(_)
+            | Commands::CodeControl(_)
+    ) {
+        return false;
+    }
+    command_scope(command).publishes_object_references()
 }
 
 fn command_requires_complete_object_index(command: &Commands) -> bool {
@@ -1542,15 +1972,15 @@ async fn repair_pending_object_index_updates_before_command(
     }
 }
 
-fn is_error_codes_help_topic(argv: &[String]) -> bool {
+fn is_error_codes_help_topic(argv: &[std::ffi::OsString]) -> bool {
     let Some((index, _)) = find_subcommand_index(argv) else {
         return false;
     };
-    if !matches!(argv.get(index).map(String::as_str), Some("help")) {
+    if !matches!(argv.get(index).and_then(|arg| arg.to_str()), Some("help")) {
         return false;
     }
     if !matches!(
-        argv.get(index + 1).map(String::as_str),
+        argv.get(index + 1).and_then(|arg| arg.to_str()),
         Some("error-codes" | "errors")
     ) {
         return false;
@@ -1708,6 +2138,133 @@ fn global_config_schema_future_error(
     )
 }
 
+/// Map a parsed command to the sequencer control action it performs, if any
+/// (§C.9's enumeration). `None` for everything else, including a `cherry-pick`
+/// or `rebase` invocation that is not a control action in this sense — a fresh
+/// `cherry-pick <commit>` IS one (`Start`), because it can leave a sequence
+/// behind.
+async fn sequencer_control_for(
+    command: &Commands,
+) -> Option<crate::internal::sequencer::SequencerControl> {
+    use crate::internal::sequencer::{SequenceKind, SequencerControl};
+
+    match command {
+        Commands::CherryPick(args) => Some(if args.continue_pick {
+            SequencerControl::Continue(SequenceKind::CherryPick)
+        } else if args.skip {
+            SequencerControl::Skip(SequenceKind::CherryPick)
+        } else if args.abort {
+            SequencerControl::Abort(SequenceKind::CherryPick)
+        } else if args.quit {
+            SequencerControl::Quit(SequenceKind::CherryPick)
+        } else {
+            SequencerControl::Start(SequenceKind::CherryPick)
+        }),
+        Commands::Revert(args) => Some(if args.continue_revert {
+            SequencerControl::Continue(SequenceKind::Revert)
+        } else if args.skip {
+            SequencerControl::Skip(SequenceKind::Revert)
+        } else if args.abort {
+            SequencerControl::Abort(SequenceKind::Revert)
+        } else {
+            SequencerControl::Start(SequenceKind::Revert)
+        }),
+        Commands::Rebase(args) => Some(if args.continue_rebase {
+            SequencerControl::Continue(SequenceKind::Rebase)
+        } else if args.skip {
+            SequencerControl::Skip(SequenceKind::Rebase)
+        } else if args.abort {
+            SequencerControl::Abort(SequenceKind::Rebase)
+        } else {
+            SequencerControl::Start(SequenceKind::Rebase)
+        }),
+        Commands::Am(args) => Some(if args.continue_am {
+            SequencerControl::AmContinue
+        } else if args.skip {
+            SequencerControl::AmSkip
+        } else if args.abort {
+            SequencerControl::AmAbort
+        } else {
+            SequencerControl::AmStart
+        }),
+        // §C.9: a pull that REBASES runs a rebase in this worktree, so it must
+        // hold the control slot for the whole command — the fetch and a
+        // possible autostash happen before the rebase begins, and starting
+        // them while another control owns the sequencer is how a pull ends up
+        // rebasing on top of someone else's half-finished sequence. The mode
+        // is resolved the way `pull` resolves it (flags, then
+        // `branch.<name>.rebase`, then `pull.rebase`), because a configured
+        // `pull.rebase = true` makes a bare `libra pull` one of these.
+        Commands::Pull(args) => {
+            // A MERGE-mode pull claims the slot too (W2 r7 #3): it fetches
+            // and then drives the internal merge, and starting that while a
+            // same-worktree merge/rebase control is active races its
+            // state/index/worktree exactly as a bare `merge` would. A pull
+            // that cannot RESOLVE a mode (detached HEAD, unreadable config)
+            // claims nothing — the handler is about to refuse it, and a
+            // claimed slot would persist a failed control operation for a
+            // command that never touched the sequencer (r8 #4).
+            return match command::pull::resolved_pull_mode(args).await {
+                Some(true) => Some(SequencerControl::Start(SequenceKind::Rebase)),
+                Some(false) => Some(SequencerControl::Start(SequenceKind::Merge)),
+                None => None,
+            };
+        }
+        // §C.9: merge's control actions enter the boundary too — `--continue`
+        // and `--restart` reset this worktree and rewrite its sequencer state,
+        // so they need the control slot, the declared scope and the operation
+        // record for the same reasons every other control does.
+        Commands::Merge(args) => {
+            // `--dry-run` promises no writes, and the boundary PERSISTS an
+            // operation row — so it must not take one.
+            if args.dry_run {
+                return None;
+            }
+            if args.continue_merge {
+                Some(SequencerControl::Continue(SequenceKind::Merge))
+            } else if args.restart {
+                Some(SequencerControl::Restart(SequenceKind::Merge))
+            } else if args.abort {
+                Some(SequencerControl::Abort(SequenceKind::Merge))
+            } else {
+                Some(SequencerControl::Start(SequenceKind::Merge))
+            }
+        }
+        Commands::Bisect(bisect) => Some(match bisect {
+            Bisect::Start { .. } => SequencerControl::BisectStart,
+            Bisect::Bad { .. } | Bisect::Good { .. } => SequencerControl::BisectMark,
+            Bisect::Skip { .. } => SequencerControl::BisectSkip,
+            Bisect::Reset { .. } => SequencerControl::BisectReset,
+            Bisect::Run { .. } => SequencerControl::BisectRun,
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+/// §C.4.2 resolve-once: pin THIS invocation's worktree scope and workdir
+/// before any handler runs, and RESTORE the previous pin when the returned
+/// guard drops.
+///
+/// The cwd is not a scope carrier — `ChangeDirGuard` and anything that calls
+/// `set_current_dir` move it mid-command — so a sequencer control that read
+/// its state in worktree A could otherwise save it into whichever worktree the
+/// cwd had become, erasing A's sequence. The guard matters for in-process
+/// hosts: without it, one dispatch's pin would answer for every later library
+/// call in the process.
+/// Outside a repository there is NOTHING to pin: `clone` and `init` are the
+/// commands that run there, and they create their target and step into it, so
+/// a pin taken here would name a directory that is not a repository. There is
+/// no probe here — `pin_request_scope` installs a pin only when every path
+/// resolved, so an unpinnable invocation simply stays ambient, with the
+/// pre-§C.4.2 behaviour and diagnostics. Probing first and pinning second
+/// would be a TOCTOU: a `.libra` removed in between would install a pin whose
+/// paths nothing could resolve.
+fn pin_invocation_scope() -> crate::internal::worktree_scope::ScopeOverrideGuard {
+    use crate::internal::worktree_scope::WorktreeScope;
+    WorktreeScope::pin_request_scope(utils::util::cur_dir())
+}
+
 fn prepare_cli_invocation_state() {
     utils::output::reset_warning_tracker();
     utils::client_storage::reset_global_config_schema_future_warning_for_invocation();
@@ -1716,21 +2273,24 @@ fn prepare_cli_invocation_state() {
     utils::atomic_write::init_sync_data_from_env();
 }
 
-fn is_top_level_unknown_command(argv: &[String], err: &clap::Error) -> Option<String> {
+fn is_top_level_unknown_command(argv: &[std::ffi::OsString], err: &clap::Error) -> Option<String> {
     let invalid = match err.get(ContextKind::InvalidSubcommand) {
         Some(ContextValue::String(cmd)) => cmd,
         _ => return None,
     };
 
     let (index, _) = find_subcommand_index(argv)?;
-    if argv.get(index).is_some_and(|arg| arg == invalid) {
+    if argv
+        .get(index)
+        .is_some_and(|arg| arg.to_str() == Some(invalid.as_str()))
+    {
         return Some(invalid.to_string());
     }
 
     None
 }
 
-fn classify_parse_error(argv: &[String], err: &clap::Error) -> CliError {
+fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliError {
     if let Some(cmd) = is_top_level_unknown_command(argv, err) {
         let hints = top_level_unknown_command_hints(err);
         let mut cli_error = CliError::unknown_command(format!(
@@ -1826,15 +2386,23 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
 ///   function returns a `CliError::failure` with stable code `WarningEmitted` even
 ///   though the underlying command succeeded.
 pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
-    let argv = match args {
-        Some(args) => args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        None => env::args().collect::<Vec<_>>(),
+    // `args_os`, not `args`: `env::args()` PANICS on an argument that is not
+    // valid UTF-8, and a pathspec naming a file whose name is not UTF-8 is an
+    // ordinary thing to type on Unix. The argv pipeline therefore carries
+    // `OsString` all the way to clap (§B.4.3), and only the places that must
+    // interpret a value as text ask for UTF-8 — failing with a usage error
+    // there, on that one argument, instead of aborting the process.
+    let argv: Vec<std::ffi::OsString> = match args {
+        Some(args) => args.iter().map(std::ffi::OsString::from).collect(),
+        None => env::args_os().collect(),
     };
     // Auto-upgrade candidate self-check (§A.7): recognized at the very front,
     // before any argv rewrite, warning-tracker/env side effect, clap parse,
     // repo preflight, schema migration or background task. It runs ONLY a
     // side-effect-free identity self-check and exits; it never forwards to a
     // real user command.
+    // The RAW argv, not a filtered view: the probe is recognised by POSITION
+    // (argv[1]), and dropping a token before it would shift that position.
     if let Some(probe) = command::upgrade::parse_probe_argv(&argv) {
         return command::upgrade::run_probe(probe);
     }
@@ -1845,10 +2413,32 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     .await
 }
 
-async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
+/// A UTF-8 view of argv for consumers that only match ASCII flags.
+///
+/// Tokens that are not valid UTF-8 are dropped rather than transcoded: they
+/// are pathspecs as far as these consumers are concerned, and a lossy `?`
+/// substitution would make one look like a different path.
+fn utf8_argv_view(argv: &[std::ffi::OsString]) -> Vec<String> {
+    argv.iter()
+        .filter_map(|arg| arg.to_str().map(str::to_string))
+        .collect()
+}
+
+async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);
+    // §B.4.3 (R0-4): rewrite the status/st argument slice so Git's raw
+    // `--find-renames` grammar survives clap and the three rename spellings
+    // obey true last-one-wins via the occurrence list.
+    let status_resolution = command::status::normalize_status_argv(
+        argv.clone(),
+        &<Cli as clap::CommandFactory>::command(),
+    );
+    let argv = status_resolution.argv.clone();
+    // Same reasoning as above, for the consumers below that inspect argv.
+    let utf8_argv = utf8_argv_view(&argv);
+    let _invocation_scope = pin_invocation_scope();
     prepare_cli_invocation_state();
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
@@ -1868,9 +2458,24 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
         },
     };
     if let Commands::Diff(diff_args) = &mut args.command {
-        command::diff::record_algorithm_selector_events(diff_args, &argv);
+        command::diff::record_algorithm_selector_events(diff_args, &utf8_argv);
     }
     apply_global_runtime_flags(&args)?;
+    // Declare the output mode BEFORE anything that can raise a warning. The
+    // repository preflight below runs ahead of `OutputConfig::resolve`, so
+    // setting the flag there would let a preflight warning reach stderr
+    // milliseconds before the JSON envelope that is supposed to carry it —
+    // the stderr-only channel §B.5 forbids.
+    utils::output::set_structured_output(args.json.is_some() || args.machine);
+    // Debug-only seam: the delivery matrix for PREFLIGHT warnings (raised
+    // before any command runs) is otherwise only reachable by corrupting a
+    // repository, so tests inject one here instead.
+    #[cfg(debug_assertions)]
+    if let Ok(message) = std::env::var("LIBRA_TEST_PREFLIGHT_WARNING")
+        && !message.is_empty()
+    {
+        utils::error::emit_warning(message);
+    }
     // Auto-upgrade transaction recovery gate (§A.7/§A.10): a crashed install
     // must be resolved before any repo preflight or user command runs. Inert
     // (no I/O) until release keys are provisioned; a fatal, unrecoverable
@@ -1901,6 +2506,80 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
     } else if preflight.set_hash_kind {
         set_hash_kind(HashKind::Sha1);
     }
+    // W3-s3 (§C.6.1): a legacy-symlink worktree shares main's HEAD/index —
+    // read commands keep working (no regression), but worktree-state
+    // mutations here would silently move MAIN's scope. Refuse them with the
+    // migrate hint before dispatch.
+    if command_mutates_worktree_state(&args.command) && utils::util::is_legacy_symlink_worktree() {
+        return Err(CliError::fatal(
+            "this worktree uses the legacy shared-`.libra` symlink layout; mutating it \
+             would move the MAIN worktree's HEAD/index"
+                .to_string(),
+        )
+        // §C.13 offers "a new worktree-layout stable code OR LBR-REPO-002
+        // with a dedicated detail" — LBR-REPO-003 is that dedicated layout
+        // code. What it must never be is a generic "unsupported".
+        .with_stable_code(utils::error::StableErrorCode::RepoStateInvalid)
+        .with_hint(
+            "run `libra worktree repair --migrate-layout --confirm <this-path>` from the \
+             main worktree to migrate it to the isolated layout (read-only commands still \
+             work; `--dry-run` previews it without confirmation)",
+        ));
+    }
+    // W0 §C.4.1: a linked worktree whose `worktree_id` is missing, empty, or
+    // unreadable gets a SYNTHESIZED id so it never aliases to main. That
+    // fallback keeps reads honest, but it is a guess — mutating under it
+    // writes HEAD/index/sequencer rows that no other process associates with
+    // this worktree, and the damage is silent. Refuse the mutation once,
+    // here, with a repair route. Reads and `worktree repair` still work.
+    if command_mutates_worktree_state(&args.command)
+        && let Some(worktree_id) = utils::util::current_worktree_id()
+    {
+        // UNKNOWN is not OK. `registry_knows_linked_worktree` returns `None`
+        // when the registry itself cannot be read, and treating that as
+        // permission to proceed is the same fail-open the rest of this card
+        // spent its time removing: with a corrupt `worktrees.json` and a
+        // missing `worktree_id`, a mutation writes a scoped HEAD row under a
+        // synthesized identity that nothing will ever look up again.
+        let detail = match command::worktree::registry_knows_linked_worktree(&worktree_id) {
+            Some(true) => None,
+            Some(false) => Some(format!(
+                "this linked worktree's identity '{worktree_id}' is not in the worktree \
+                 registry; its `worktree_id` file is missing or corrupt, so mutating state \
+                 here would write rows nothing else can find"
+            )),
+            None => Some(
+                "the worktree registry cannot be read, so this worktree's identity cannot be \
+                 confirmed; mutating state here risks writing rows nothing else can find"
+                    .to_string(),
+            ),
+        };
+        if let Some(detail) = detail {
+            return Err(CliError::fatal(detail)
+                // §C.13: corrupt/missing linked worktree identity →
+                // LBR-REPO-002.
+                .with_stable_code(utils::error::StableErrorCode::RepoCorrupt)
+                .with_hint(
+                    "run `libra worktree repair <this-worktree-path> --confirm` from the main \
+                     worktree to restore this worktree's identity from the registry \
+                     (read-only commands still work)",
+                ));
+        }
+    }
+    // §C.4.3 writer-vs-deleter: hold the repository maintenance lock SHARED
+    // for the whole command. A publisher and a deletion phase can then never
+    // overlap, so a reference can never appear for bytes a concurrent `gc`,
+    // `repack -d`, `cache evict` or `file obliterate` has already unlinked —
+    // including the publications that never touch SQLite (an index entry, a
+    // worktree sidecar, an agent-run manifest) and are therefore invisible to
+    // a database transaction. Publishers never block each other; the cost is
+    // one `flock` per command.
+    let _maintenance_lock = match preflight.storage.as_deref() {
+        Some(storage) if command_holds_shared_maintenance_lock(&args.command) => Some(
+            crate::internal::maintenance_lock::MaintenanceLock::shared(storage)?,
+        ),
+        _ => None,
+    };
     // Resolve global output flags into a single config before dispatching.
     let color = if args.no_color {
         "never"
@@ -1917,6 +2596,10 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
         &args.progress,
     );
     output.apply_color_override();
+    // Warnings raised from here on (including repository preflight, which
+    // runs before the command itself) are delivered through the structured
+    // envelope when one is being rendered, instead of onto stderr.
+    utils::output::set_structured_output(output.is_json());
 
     // Most object-writing commands enqueue recoverable cloud-index work and
     // report terminal failures as a durable-pending warning. Import has its own
@@ -1946,6 +2629,21 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
         command_handles_background_index_failures,
         background_index_scope,
     );
+
+    // §C.9 / §C.11 W1: sequencer control actions enter the operation log
+    // through BOUNDARY recording. The claim is taken here, once, before the
+    // handler runs — and released after it returns — because the wrapper's
+    // closure form holds a write transaction for the whole body, and every
+    // control action writes HEAD/refs through the POOLED entry points, which
+    // `internal/head.rs:41` and `internal/branch.rs:298` document as a
+    // deadlock. Doing it at dispatch also means one site covers every control
+    // rather than twenty call sites drifting apart.
+    let control_boundary = match sequencer_control_for(&args.command).await {
+        Some(control) => {
+            crate::internal::sequencer::begin_control_operation(control, &utf8_argv).await?
+        }
+        None => None,
+    };
 
     let command_result: CliResult<()> = async {
         match args.command {
@@ -1990,7 +2688,14 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
             Commands::Restore(cmd_args) => {
                 command::restore::execute_safe(cmd_args, &output).await?
             }
-            Commands::Status(cmd_args) => command::status::execute_safe(cmd_args, &output).await?,
+            Commands::Status(cmd_args) => {
+                command::status::execute_safe_with_resolution(
+                    cmd_args,
+                    &output,
+                    Some(&status_resolution),
+                )
+                .await?
+            }
             Commands::Clean(cmd_args) => command::clean::execute_safe(cmd_args, &output).await?,
             Commands::Stash(cmd) => command::stash::execute_safe(cmd, &output).await?,
             Commands::Lfs(cmd) => command::lfs::execute_safe(cmd, &output).await?,
@@ -2090,7 +2795,7 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
                 command::describe::execute_safe(cmd_args, &output).await?
             }
             Commands::Notes(cmd_args) => {
-                command::notes::execute_safe(cmd_args, &output, &argv).await?
+                command::notes::execute_safe(cmd_args, &output, &utf8_argv).await?
             }
             Commands::CherryPick(cmd_args) => {
                 command::cherry_pick::execute_safe(cmd_args, &output).await?
@@ -2192,6 +2897,24 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
     .await;
 
     background_index_guard.finish().await;
+
+    // Close the control-action claim BEFORE propagating the command's own
+    // error, so a failed control still records an operation with its outcome
+    // instead of leaving a `running` row behind. A failure to close is
+    // reported as a warning: the command already happened, and turning a
+    // bookkeeping error into a command failure would misreport it.
+    if let Some(boundary) = control_boundary {
+        let outcome = if command_result.is_ok() {
+            crate::internal::operation_wrapper::BoundaryOutcome::Succeeded
+        } else {
+            crate::internal::operation_wrapper::BoundaryOutcome::Failed
+        };
+        if let Err(err) = boundary.finish(outcome).await {
+            crate::utils::error::emit_warning(format!(
+                "the command finished, but its operation-log record could not be closed: {err}"
+            ));
+        }
+    }
     command_result?;
 
     // Check only after the queue outcome has been recorded, so
@@ -2264,6 +2987,73 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    /// §C.9: what the CLI actually maps, asserted by CALLING the mapper.
+    ///
+    /// The declaration-side test in `internal::sequencer` compares a hand-written
+    /// list against `SequencerControl::ALL` — which cannot see a change to
+    /// `sequencer_control_for` itself. This one parses each real argv and calls
+    /// the real function, so removing an arm, or reintroducing one that should
+    /// not exist, fails here.
+    #[tokio::test]
+    async fn sequencer_control_mapping_matches_the_cli_grammar() {
+        use crate::internal::sequencer::{SequenceKind, SequencerControl};
+
+        let cases: &[(&[&str], Option<SequencerControl>)] = &[
+            // A dry run promises no writes, and the boundary PERSISTS a row.
+            (&["libra", "merge", "--dry-run", "topic"], None),
+            (
+                &["libra", "merge", "topic"],
+                Some(SequencerControl::Start(SequenceKind::Merge)),
+            ),
+            (
+                &["libra", "merge", "--continue"],
+                Some(SequencerControl::Continue(SequenceKind::Merge)),
+            ),
+            (
+                &["libra", "merge", "--restart"],
+                Some(SequencerControl::Restart(SequenceKind::Merge)),
+            ),
+            (
+                &["libra", "merge", "--abort"],
+                Some(SequencerControl::Abort(SequenceKind::Merge)),
+            ),
+            (
+                &["libra", "revert", "--skip"],
+                Some(SequencerControl::Skip(SequenceKind::Revert)),
+            ),
+            (
+                &["libra", "cherry-pick", "--quit"],
+                Some(SequencerControl::Quit(SequenceKind::CherryPick)),
+            ),
+            (
+                &["libra", "rebase", "--continue"],
+                Some(SequencerControl::Continue(SequenceKind::Rebase)),
+            ),
+            (&["libra", "am", "--abort"], Some(SequencerControl::AmAbort)),
+            (
+                &["libra", "bisect", "reset"],
+                Some(SequencerControl::BisectReset),
+            ),
+            (
+                &["libra", "bisect", "run", "true"],
+                Some(SequencerControl::BisectRun),
+            ),
+            // Not a sequencer control at all.
+            (&["libra", "status"], None),
+            (&["libra", "log"], None),
+        ];
+
+        for (argv, expected) in cases {
+            let parsed = Cli::try_parse_from(argv.iter().map(std::ffi::OsString::from))
+                .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
+            let actual = sequencer_control_for(&parsed.command).await;
+            assert_eq!(
+                actual, *expected,
+                "{argv:?} maps to {actual:?}, expected {expected:?}"
+            );
+        }
+    }
 
     #[test]
     #[serial]
@@ -2343,7 +3133,7 @@ mod tests {
     /// natural-but-wrong word are pointed at the real flag.
     #[tokio::test]
     async fn parse_error_shows_import_hint() {
-        let argv = vec!["libra".to_string(), "import".to_string()];
+        let argv: Vec<std::ffi::OsString> = vec!["libra".into(), "import".into()];
         let clap_err = Cli::try_parse_from(argv.clone()).unwrap_err();
         let err = classify_parse_error(&argv, &clap_err);
         let msg = err.render();
@@ -2380,10 +3170,10 @@ mod tests {
     #[test]
     fn index_pack_progress_rewrite_keeps_pack_positional() {
         let rewritten = rewrite_index_pack_progress_args(vec![
-            "libra".to_string(),
-            "index-pack".to_string(),
-            "--progress".to_string(),
-            "fixture.pack".to_string(),
+            "libra".into(),
+            "index-pack".into(),
+            "--progress".into(),
+            "fixture.pack".into(),
         ]);
 
         assert_eq!(
@@ -2395,12 +3185,12 @@ mod tests {
     #[test]
     fn index_pack_no_progress_rewrite_uses_global_none_mode() {
         let rewritten = rewrite_index_pack_progress_args(vec![
-            "libra".to_string(),
-            "--progress".to_string(),
-            "none".to_string(),
-            "index-pack".to_string(),
-            "--no-progress".to_string(),
-            "fixture.pack".to_string(),
+            "libra".into(),
+            "--progress".into(),
+            "none".into(),
+            "index-pack".into(),
+            "--no-progress".into(),
+            "fixture.pack".into(),
         ]);
 
         assert_eq!(
@@ -2483,7 +3273,7 @@ mod tests {
     #[tokio::test]
     async fn clap_fuzzy_suggests_similar_command() {
         // "initt" is close enough to "init" for clap's built-in fuzzy match.
-        let argv = vec!["libra".to_string(), "initt".to_string()];
+        let argv: Vec<std::ffi::OsString> = vec!["libra".into(), "initt".into()];
         let clap_err = Cli::try_parse_from(argv.clone()).unwrap_err();
         let err = classify_parse_error(&argv, &clap_err);
         let msg = err.render();
@@ -2705,23 +3495,23 @@ mod tests {
     #[test]
     fn detects_help_error_codes_topic() {
         assert!(is_error_codes_help_topic(&[
-            "libra".to_string(),
-            "help".to_string(),
-            "error-codes".to_string(),
+            "libra".into(),
+            "help".into(),
+            "error-codes".into(),
         ]));
         assert!(is_error_codes_help_topic(&[
-            "libra".to_string(),
-            "help".to_string(),
-            "errors".to_string(),
+            "libra".into(),
+            "help".into(),
+            "errors".into(),
         ]));
         assert!(!is_error_codes_help_topic(&[
-            "libra".to_string(),
-            "help".to_string(),
-            "status".to_string(),
+            "libra".into(),
+            "help".into(),
+            "status".into(),
         ]));
         assert!(!is_error_codes_help_topic(&[
-            "libra".to_string(),
-            "--help".to_string(),
+            "libra".into(),
+            "--help".into(),
         ]));
     }
 

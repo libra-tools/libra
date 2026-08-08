@@ -1642,8 +1642,10 @@ fn investigate_artifacts_objectized() {
 
 /// A real finalized investigate run's manifest carries the retention fields;
 /// once backdated past the `agent.retention.findings_days` window,
-/// `libra agent clean --gc` removes the run dir (the objectized blob is
-/// content-addressed and kept for a future repo-wide object GC).
+/// `libra agent clean --gc` removes the run dir and, since PD-04, reclaims
+/// the objectized findings blob with it — unless a surviving run still names
+/// that oid or a ref reaches it (content addressing lets a findings blob
+/// collide with one history needs).
 #[test]
 fn findings_retention_manifest() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1699,10 +1701,240 @@ fn findings_retention_manifest() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!run_dir.exists(), "the expired terminal run dir is GC'd");
-    // The objectized blob is content-addressed and left for a future repo-wide
-    // object GC — per-run retention never deletes it.
+    // PD-04: the findings blob is reclaimed with the run. Nothing else names
+    // this oid and no ref reaches it, so it is genuinely garbage — the two
+    // conservative exceptions (a surviving run's oid, a ref-reachable oid)
+    // are covered by the unit test in `command::agent::clean`.
     assert!(
-        blob.exists(),
-        "the objectized findings blob is not deleted here"
+        !blob.exists(),
+        "the expired run's findings blob is reclaimed with it, not leaked"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PD-02: checkpoint-scoped investigation (`start --checkpoint <id>`)
+// ---------------------------------------------------------------------------
+
+/// Write one raw git tree object; entries are `(mode, name, oid)`.
+fn write_tree_object(libra_dir: &Path, entries: &[(&str, &str, &str)]) -> String {
+    let mut body = Vec::new();
+    for (mode, name, oid) in entries {
+        body.extend_from_slice(mode.as_bytes());
+        body.push(b' ');
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&hex::decode(oid).expect("valid oid hex"));
+    }
+    libra::utils::object::write_git_object(libra_dir, "tree", &body)
+        .expect("write tree object")
+        .to_string()
+}
+
+/// Fabricate a real legacy-v1 checkpoint (blobs + v1 tree chain + catalog
+/// rows). Returns `(metadata_oid, transcript_oid)`.
+async fn seed_v1_checkpoint(
+    repo: &Path,
+    checkpoint_id: &str,
+    metadata: &[u8],
+    transcript: &[u8],
+) -> (String, String) {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+
+    let libra_dir = repo.join(".libra");
+    let metadata_oid = libra::utils::object::write_git_object(&libra_dir, "blob", metadata)
+        .expect("write metadata blob")
+        .to_string();
+    let transcript_oid = libra::utils::object::write_git_object(&libra_dir, "blob", transcript)
+        .expect("write transcript blob")
+        .to_string();
+    let transcript_tree =
+        write_tree_object(&libra_dir, &[("100644", "claude_code", &transcript_oid)]);
+    let inner_tree = write_tree_object(
+        &libra_dir,
+        &[
+            ("100644", "metadata.json", &metadata_oid),
+            ("40000", "transcript", &transcript_tree),
+        ],
+    );
+    let prefix_tree = write_tree_object(&libra_dir, &[("40000", &checkpoint_id[2..], &inner_tree)]);
+    let checkpoint_tree =
+        write_tree_object(&libra_dir, &[("40000", &checkpoint_id[..2], &prefix_tree)]);
+    let root_tree = write_tree_object(&libra_dir, &[("40000", "checkpoint", &checkpoint_tree)]);
+
+    let url = format!("sqlite://{}", libra_dir.join("libra.db").display());
+    let mut opts = ConnectOptions::new(url);
+    opts.sqlx_logging(false);
+    let conn = Database::connect(opts).await.expect("open repo db");
+    let backend = conn.get_database_backend();
+    conn.execute_raw(Statement::from_sql_and_values(
+        backend,
+        "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, state, \
+         working_dir, started_at, last_event_at) \
+         VALUES ('sess-pd02-inv', 'claude_code', 'sess-pd02-inv-provider', 'stopped', \
+                 '/tmp/repo', 1, 1)",
+        [],
+    ))
+    .await
+    .expect("seed agent_session");
+    conn.execute_raw(Statement::from_sql_and_values(
+        backend,
+        "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, \
+         tree_oid, metadata_blob_oid, traces_commit, created_at) \
+         VALUES (?, 'sess-pd02-inv', 'committed', NULL, ?, ?, \
+                 '64c851d2df4228ecd86e0d7aa54d1ba8c4fa4efc', 1783206712)",
+        [
+            checkpoint_id.into(),
+            root_tree.into(),
+            metadata_oid.clone().into(),
+        ],
+    ))
+    .await
+    .expect("seed agent_checkpoint");
+    (metadata_oid, transcript_oid)
+}
+
+/// PD-02 acceptance for `investigate`: a checkpoint-scoped run consumes
+/// ONLY the named checkpoint — the investigators' workspace is the
+/// materialized checkpoint content, the scope is persisted in the run
+/// state (so a resume can never fall back to the worktree), and a
+/// missing checkpoint fails closed with no run residue.
+#[tokio::test]
+async fn investigate_checkpoint_scoped() {
+    use libra::internal::ai::checkpoint_input::{CheckpointInputFile, CheckpointInputSpec};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    let checkpoint_id = "cafe75d2-4c53-465a-b890-a9f861a50cc7";
+    let metadata = br#"{"schema_version":1,"agent_kind":"claude_code"}"#;
+    let transcript = b"{\"role\":\"user\",\"text\":\"captured turn\"}\n";
+    let (metadata_oid, transcript_oid) =
+        seed_v1_checkpoint(&repo, checkpoint_id, metadata, transcript).await;
+
+    // ---- Engine-level consumption proof: the investigator lists its
+    // workspace and concludes; the stance shows exactly the checkpoint
+    // files and never the repo's tracked content. ----
+    let store = store_for(&repo);
+    let mut request = InvestigateRunRequest::new(
+        repo.clone(),
+        "review the captured transcript",
+        "0000000000000000000000000000000000000000",
+        vec![fake_investigator(
+            "lister",
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "ls {workspace} {workspace}/transcript && echo concluding: inventory done",
+            ],
+            Duration::from_secs(30),
+        )],
+        2,
+        1,
+    );
+    request.checkpoint_input = Some(CheckpointInputSpec {
+        checkpoint_id: checkpoint_id.to_string(),
+        files: vec![
+            CheckpointInputFile {
+                rel_path: "metadata.json".to_string(),
+                oid: metadata_oid.clone(),
+            },
+            CheckpointInputFile {
+                rel_path: "transcript/claude_code".to_string(),
+                oid: transcript_oid.clone(),
+            },
+        ],
+    });
+    let outcome = run_bounded(&store, request, InvestigateCancelHandle::new(), 60).await;
+    assert_eq!(
+        outcome.terminal_state,
+        Some(InvestigateTerminalState::Quorum),
+        "the concluding lister reaches quorum: {outcome:?}"
+    );
+    let run_dir = outcome.run_dir.clone();
+    let input_root = run_dir.join("checkpoint-input");
+    assert_eq!(
+        std::fs::read(input_root.join("metadata.json")).expect("materialized metadata"),
+        metadata.to_vec(),
+    );
+    assert_eq!(
+        std::fs::read(input_root.join("transcript/claude_code")).expect("materialized transcript"),
+        transcript.to_vec(),
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("state.json")).expect("state.json"))
+            .expect("state json");
+    // The scope is persisted with the run: a resume re-materializes the
+    // SAME checkpoint and can never fall back to the current worktree.
+    assert_eq!(
+        state["checkpoint_input"]["checkpoint_id"], checkpoint_id,
+        "{state}"
+    );
+    let ws = state["workspace_root"].as_str().expect("workspace_root");
+    assert!(
+        ws.ends_with("checkpoint-input"),
+        "the run's workspace IS the checkpoint input: {ws}"
+    );
+    let summary = state["stances"][0]["summary"]
+        .as_str()
+        .expect("stance summary");
+    assert!(summary.contains("metadata.json"), "{summary}");
+    assert!(summary.contains("claude_code"), "{summary}");
+    assert!(
+        !summary.contains("tracked.txt"),
+        "no repo content leaks into a scoped workspace: {summary}"
+    );
+    assert_no_leaked_workspace(&repo);
+
+    // ---- CLI: a missing checkpoint fails closed with no run residue. ----
+    let runs_root = repo.join(".libra/sessions/agent-runs");
+    let runs_before: usize = std::fs::read_dir(&runs_root)
+        .map(|d| d.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    let missing = run_libra(
+        &[
+            "investigate",
+            "start",
+            "--topic",
+            "scoped",
+            "--agent",
+            "codex",
+            "--checkpoint",
+            "no-such-checkpoint",
+        ],
+        &repo,
+        &[],
+    );
+    assert!(!missing.status.success(), "missing checkpoint fails closed");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("no checkpoint matches id 'no-such-checkpoint'"),
+        "actionable refusal: {stderr}"
+    );
+    let runs_after: usize = std::fs::read_dir(&runs_root)
+        .map(|d| d.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    assert_eq!(
+        runs_before, runs_after,
+        "no run residue for a missing checkpoint"
+    );
+
+    // ---- Doctor: scoped runs introduce no orphan/warning class. ----
+    let doctor = run_libra(&["--json", "agent", "doctor"], &repo, &[]);
+    assert!(
+        doctor.status.success(),
+        "agent doctor: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&doctor.stdout).trim()).expect("doctor json");
+    assert_eq!(doc["data"]["orphan_checkpoints"], 0, "{doc}");
+    assert_eq!(
+        doc["data"]["checkpoint_store"]["findings"],
+        serde_json::json!([]),
+        "{doc}"
+    );
+    assert_eq!(
+        doc["data"]["findings_store"]["findings"],
+        serde_json::json!([]),
+        "{doc}"
     );
 }

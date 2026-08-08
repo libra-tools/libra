@@ -1,6 +1,6 @@
 # `libra apply`
 
-Check whether a unified-diff patch applies cleanly — an MVP of
+Check whether a patch applies cleanly — an MVP of
 `git apply --check`. This version validates only: it parses the patch,
 safety-checks every target path, and test-applies each file's hunks against the
 current working tree **without writing anything**.
@@ -13,7 +13,7 @@ libra apply --check [-p<n>] [<patch>...]
 
 ## Description
 
-`apply --check` reads one or more unified-diff patches (from the named files, or
+`apply --check` reads one or more patches (from the named files, or
 from stdin when none are given), splits them into per-file sections, and for
 each file:
 

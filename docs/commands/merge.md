@@ -6,7 +6,7 @@ Merge one target into the current branch.
 
 ```text
 libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>
-libra merge --continue
+libra merge --continue [-m <msg>] [--no-verify]
 libra merge --abort
 libra merge --restart
 ```
@@ -54,7 +54,7 @@ Libra still does not implement octopus merges, merge strategies other than `ours
 | Option | Description |
 |--------|-------------|
 | `<branch>` | Target branch, commit, or remote-tracking ref to merge. |
-| `-m, --message <MSG>` | Override the merge commit message (default `Merge <branch> into <head>`). |
+| `-m, --message <MSG>` | Override the merge commit message (default `Merge <branch> into <head>`). Also accepted with `--continue`, where it overrides the message recorded when the conflicted merge started — a Libra extension, since Git's `--continue` takes no arguments and Libra never opens an editor for merge. |
 | `--ff` | Allow fast-forwarding when possible, overriding `merge.ff=false|only`. |
 | `--ff-only` | Refuse to merge unless the current branch can be fast-forwarded. |
 | `--no-ff` | Always create a two-parent merge commit, even when a fast-forward is possible. |
@@ -72,7 +72,7 @@ Libra still does not implement octopus merges, merge strategies other than `ours
 | `--no-progress` | Do not show a progress meter. No-op accepted for Git parity: Libra's merge never renders a progress meter. |
 | `--verify-signatures` | Verify the PGP signature on the tip commit and abort if it is unsigned or bad. Overrides `merge.verifySignatures`; only signatures made by this repository's vault PGP key can be validated. |
 | `--no-verify-signatures` | Do not verify the merged commit's signature, overriding `merge.verifySignatures=true`. The inverse of `--verify-signatures`; the last one wins. |
-| `--no-rerere-autoupdate` | Do not update the rerere index after the merge. No-op accepted for Git parity: Libra has no rerere. (Git's `--rerere-autoupdate` is not exposed.) |
+| `--no-rerere-autoupdate` | Accepted for Git parity. Rerere IS integrated: with `rerere.enabled`, a conflicted merge records each conflict's preimage and replays a recorded resolution when one matches; auto-staging of replayed files follows the `rerere.autoUpdate` config. The per-invocation override is not implemented — staging follows the config either way. (Git's positive `--rerere-autoupdate` is not exposed.) |
 | `--no-gpg-sign` | Do not GPG-sign the merge commit. No-op accepted for Git parity: Libra's merge never signs. (Git's `-S`/`--gpg-sign` is not implemented.) |
 | `--continue` | Finish an in-progress merge after conflicts have been resolved and staged. |
 | `--abort` | Restore the pre-merge HEAD, index, and working tree (re-applies a held autostash). |
@@ -105,6 +105,7 @@ libra merge --allow-unrelated-histories imported-root
 libra merge --log=10 feature-x
 libra merge refs/remotes/origin/main
 libra merge --continue
+libra merge --continue -m "merge: reconcile release notes"
 libra merge --abort
 libra merge --dry-run feature-x
 libra merge --restart
@@ -220,7 +221,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Post-merge diffstat | `--stat` (prints it); `-n` / `--no-stat` (default: omit) | `--stat` (default) / `-n` / `--no-stat` | N/A |
 | No progress meter | `--no-progress` (no-op; never renders one) | `--no-progress` | N/A |
 | Disable signature verification | `--no-verify-signatures` (default; disables `--verify-signatures`) | `--no-verify-signatures` | N/A |
-| No rerere autoupdate | `--no-rerere-autoupdate` (no-op; no rerere) | `--no-rerere-autoupdate` | N/A |
+| No rerere autoupdate | `--no-rerere-autoupdate` (accepted; staging follows `rerere.autoUpdate`) | `--no-rerere-autoupdate` | N/A |
 | No GPG sign | `--no-gpg-sign` (no-op; never signs) | `--no-gpg-sign` | N/A |
 | Ours strategy | `-s ours` | `-s ours` | N/A |
 | Conflict-side preference | `-X ours/theirs` | `-X ours/theirs` | N/A |

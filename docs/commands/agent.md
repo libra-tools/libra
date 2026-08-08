@@ -18,6 +18,8 @@ libra agent checkpoint <subcommand>
 libra agent skill <subcommand>
 libra agent clean [--all]
 libra agent doctor [--repair]
+libra agent workspace list [--limit <n>] [--cursor <token>] [--state <state>]...
+libra agent workspace show <workspace-id>
 libra agent push [--remote <name>] [--force-rewrite]
 libra agent rpc <subcommand>
 ```
@@ -27,6 +29,17 @@ libra agent rpc <subcommand>
 `libra agent` manages Libra's external-agent capture surface. It installs and
 removes provider hooks, reports captured session/checkpoint state, exposes
 read-only diagnostics, and can push `refs/libra/traces` to a remote.
+
+`libra agent workspace list|show` is the read-only machine interface over
+the workspace registry (`workspace_record`): every linked worktree, task
+worktree, or remote workspace an agent runtime has associated, with its
+lifecycle state (`provisioning`/`active`/`releasing`/`released`/
+`orphaned`), owner, lease fence/expiry, and canonical path. `list` uses
+keyset pagination (`workspace_id` ascending; default `--limit 50`, capped
+at 500; round-trip `next_cursor` verbatim) and accepts repeatable
+`--state` filters; `show <workspace-id>` returns one frozen
+schema-v1 record. Lease mutation is never exposed here — it stays inside
+the agent runtime's internal services.
 
 The supported roster is `claude-code`, `codex` and `opencode` (first batch),
 and all three are hook-installable: `claude-code` writes `.claude/settings.json`,
@@ -69,7 +82,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies |
 | `push` | Push `refs/libra/traces` to a remote (`--force-rewrite` for the non-fast-forward push after a `clean` prune, using force-with-lease) |
 | `rpc list` | List discovered `libra-agent-*` binaries on `PATH` (with trusted/quarantined state); requires the external-agents opt-in |
-| `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable, or when the binary is not under a trusted directory — `LBR-AGENT-005`) |
+| `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable, or when the binary is not under a trusted directory — `LBR-AGENT-005`). The provider-exporter slug `opencode` instead pins the provider's own CLI binary — resolved only from registered trusted directories, never `$PATH` — for the sandboxed export bridge; this form needs no external-agents opt-in |
 | `rpc trust --dir <path>` | Register a trusted directory (`agent.external_agents.trusted_dirs`, default `~/.libra/agents`): external binaries are only trustable when their canonical path lives under one. The path is canonicalized and must be an existing, non-world-writable directory |
 | `rpc untrust <slug>` | Revoke trust; the binary returns to quarantine (always available, even while external agents are disabled) |
 | `rpc invoke` | Invoke one JSON-RPC method on a trusted `libra-agent-*` binary |
@@ -95,7 +108,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `--dry-run` | `checkpoint rewind` | Show the impact without modifying files; this is the default |
 | `--allow-raw` / `--raw` | `checkpoint export` | Authorize + request a raw (un-redacted) export; without `--allow-raw` a `--raw` request is refused (`LBR-AGENT-013`) and audited |
 | `--justification <text>` / `-o <path>` | `checkpoint export` | Audit justification and output file for a raw export |
-| `--gc` / `--retention-days <n>` / `--dry-run` | `clean` | Retention GC across three windows: (1) drop checkpoints from stopped sessions older than `agent.retention.transcript_days` (default 90; override with `--retention-days`); (2) prune reviewer stderr diagnostic logs of terminal review/investigate runs older than `agent.retention.stderr_days` (default 30) while keeping each run's aggregate record; (3) **A0-09** remove whole terminal review/investigate run directories (`findings.md`, `manifest.json`, `state.json`, reviewer logs) older than `agent.retention.findings_days` (default 90). The objectized findings blob is content-addressed and left for a future repo-wide object GC (per-run retention never deletes a shared object). Non-terminal/undated runs are skipped fail-safe; `agent_audit_log` is never touched. `--dry-run` reports what each window and companion cleanup *would* remove (including JSON `findings_runs_pruned` and `import_identities_pruned`) without deleting anything |
+| `--gc` / `--retention-days <n>` / `--dry-run` | `clean` | Retention GC across three windows: (1) drop checkpoints from stopped sessions older than `agent.retention.transcript_days` (default 90; override with `--retention-days`); (2) prune reviewer stderr diagnostic logs of terminal review/investigate runs older than `agent.retention.stderr_days` (default 30) while keeping each run's aggregate record; (3) **A0-09** remove whole terminal review/investigate run directories (`findings.md`, `manifest.json`, `state.json`, reviewer logs) older than `agent.retention.findings_days` (default 90). The objectized findings blob is content-addressed and reclaimed by the repo-level `libra maintenance run --task gc` reachability pass (PD-04), which prunes orphaned findings blobs together with their `object_index` rows while live-run manifests keep their OIDs alive (per-run retention never deletes a shared object). Non-terminal/undated runs are skipped fail-safe; `agent_audit_log` is never touched. `--dry-run` reports what each window and companion cleanup *would* remove (including JSON `findings_runs_pruned` and `import_identities_pruned`) without deleting anything |
 | `--apply` | `checkpoint rewind` | Restore the working tree for the selected checkpoint |
 
 ## JSON Output
@@ -133,6 +146,11 @@ the default version 1 payload remains shape-compatible and never gains those
 fields implicitly. OpenCode reports `transcript_discoverable` unsupported
 because batch discovery is unavailable; explicit-ID `importable` and
 `export_bridge` availability depend on its trusted offline exporter/sandbox.
+To enable the exporter, register the directory containing the verified
+`opencode` binary and then pin it: `libra agent rpc trust --dir <path>`
+followed by `libra agent rpc trust opencode`. Neither step opens the
+external-RPC surface (`agent.external_agents.enabled` stays untouched); the
+binary is resolved only from registered trusted directories, never `$PATH`.
 Claude/Codex discovery and import are reported unavailable when the platform
 cannot provide Libra's secure provider-root file-open primitive.
 Unsupported schema versions fail as a usage error (exit 129, category `cli`)
@@ -323,11 +341,18 @@ checkpoint-history rebuild/prune rewinds the current claim to an older
 surviving revision, stale challenger evidence is deleted and the claim returns
 to its non-conflicted committed state.
 
-The tombstone is local only. Agent capture rows already mirrored to D1/R2 are
-not deleted and the tombstone is not propagated; `libra cloud restore` or a
-cross-machine re-sync can therefore resurrect locally erased capture until
-cloud delete/tombstone propagation is implemented. Do not use this local
-control as the sole cross-device erasure mechanism.
+The tombstone is propagated. `libra cloud sync` publishes it to D1 under the
+generation fence and removes the erased session's mirrored catalog rows, and
+`libra cloud restore` is tombstone-first in BOTH directions: it filters rows
+carrying a remote tombstone AND rows matching this repository's own
+`agent_import_tombstone`, inside the restore transaction. Erasing locally and
+then restoring from a mirror that has not yet seen the tombstone therefore
+does not bring the session back.
+
+What is still deferred is R2 physical payload deletion: the erased content's
+objects remain in R2, so another machine that has never seen the tombstone can
+still fetch them. Treat `agent erase` as irreversible for THIS repository, not
+as a cross-machine guarantee that every copy is gone.
 
 `agent session list --json` and `agent checkpoint list --json` return one
 page per call: `data` carries a `schema_version`, the rows under `sessions`
@@ -512,8 +537,11 @@ on them:
 
 - External `libra-agent-*` agents are **disabled by default**. Opt in with
   `libra config set agent.external_agents.enabled true` (repo-local); until
-  then `rpc list`/`rpc trust`/`rpc invoke` refuse with `LBR-AGENT-002`
-  (`rpc untrust` stays available — revoking trust only tightens security).
+  then `rpc list`/`libra-agent-*` `rpc trust`/`rpc invoke` refuse with
+  `LBR-AGENT-002` (`rpc untrust` stays available — revoking trust only
+  tightens security; `rpc trust --dir <path>` and provider-exporter trust,
+  e.g. `rpc trust opencode`, are preparation-only — they never scan `$PATH`
+  and arm nothing by themselves, so they work while gated).
   Discovered binaries stay quarantined until `rpc trust <slug>` records
   their provenance (trust is refused for a binary in a world-writable
   directory), every invoke revalidates it (drift revokes trust,

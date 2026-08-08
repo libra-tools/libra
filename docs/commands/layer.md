@@ -30,6 +30,17 @@ invariants:
 Precedence on a same-destination collision between two enabled layers:
 higher `priority` wins, ties broken by name (last-writer-wins in stack order).
 
+**Per-worktree since W1** (plan-20260714 §C.4.1.1, migration `2026072303`):
+the registry and path ownership are scoped by `worktree_id` — the same layer
+name (and the same destination path) can exist independently in different
+worktrees, every subcommand acts only on the current worktree's rows, and
+removing a worktree purges its layer rows only when its directory is deleted
+too (a retained directory keeps them, so its overlay files stay
+un-stageable). Legacy repository-global rows are
+adopted by the main worktree only when no linked worktree exists; otherwise
+the schema migration fails closed and asks for an explicit
+`layer unapply`/`layer remove` from the owning worktree first.
+
 ## Examples
 
 ```bash

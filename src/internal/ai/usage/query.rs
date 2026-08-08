@@ -50,7 +50,7 @@ impl UsageQuery {
         let select_prefix = grouping.select_prefix();
         let rows = self
             .conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 format!(
                     "SELECT {select_prefix}, COUNT(*), \

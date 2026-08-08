@@ -110,17 +110,17 @@ fn mv_case_only_rename_rekeys_index() {
     assert_eq!(fs::read_to_string(p.join("foo.txt")).unwrap(), "content\n");
     let status = run_libra_command(&["--json", "status"], p);
     let json = parse_json_stdout(&status);
-    let staged_new: Vec<String> = json["data"]["staged"]["new"]
+    // Rename detection is on by default (50%, matching Git), so the staged
+    // delete+add pair folds into a rename record keyed by the NEW casing.
+    let renamed = json["data"]["staged"]["renamed"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
+        .cloned()
         .unwrap_or_default();
     assert!(
-        staged_new.contains(&"foo.txt".to_string()),
-        "rekeyed: {json}"
+        renamed
+            .iter()
+            .any(|r| r["from"] == "Foo.txt" && r["to"] == "foo.txt"),
+        "rekeyed as a rename record: {json}"
     );
     // Self-move still refused.
     let same = run_libra_command(&["mv", "foo.txt", "foo.txt"], p);

@@ -92,7 +92,7 @@ Additional workflows: `codeql.yml` (security analysis), `model-generation-nightl
 
 ## Test Layers
 
-Libra tests are organised into three layers — `cargo test --all` runs L1 only; L2/L3 are silently skipped when their env vars are unset. See `docs/tests.md` for the canonical guide.
+Libra tests are organised into three layers — `cargo test --all` runs L1 only; L2/L3 are silently skipped when their env vars are unset. See [`docs/development/integration/integration-test-plan.md`](docs/development/integration/integration-test-plan.md) for the canonical guide.
 
 | Layer | Dependencies | Trigger |
 |-------|--------------|---------|
@@ -138,7 +138,7 @@ Gate L2 / L3 tests with the small `env_var_is_set(name) -> bool` helper (see e.g
 ## Testing Guidelines
 
 - **Integration tests** in `tests/command/` mirror real Git workflows; prefer these for new commands
-- **Compatibility-surface tests** in `tests/compat/` guard against regressions in CLI flag/help wording, declined-feature drift, and the production `unwrap()` audit. Each `*.rs` under `tests/compat/` must be registered as a `[[test]]` entry in `Cargo.toml` (Cargo's default discovery only picks up files directly under `tests/`). New compat guards must also add a row to the inventory table in [`tests/compat/README.md`](tests/compat/README.md). See [`docs/tests.md`](docs/tests.md) `Compatibility-surface tests` section for the full convention.
+- **Compatibility-surface tests** in `tests/compat/` guard against regressions in CLI flag/help wording, declined-feature drift, and the production `unwrap()` audit. Each `*.rs` under `tests/compat/` must be registered as a `[[test]]` entry in `Cargo.toml` (Cargo's default discovery only picks up files directly under `tests/`). New compat guards must also add a row to the inventory table in [`tests/compat/README.md`](tests/compat/README.md). See [`docs/development/integration/integration-test-plan.md`](docs/development/integration/integration-test-plan.md) for the full convention.
 - **Cross-cutting `--help` EXAMPLES contract**: every visible command in `src/cli.rs::Commands` ships with a `pub const <CMD>_EXAMPLES` constant wired via `#[command(after_help = …)]` (or `after_help = command::<name>::<CMD>_EXAMPLES` on the parent subcommand binding in `cli.rs` for `Subcommand`-style commands). Three compat guards protect this contract: `compat_help_examples_banner` (every `<cmd> --help` renders an EXAMPLES section), `cli::tests::root_after_help_lists_every_visible_command` (every non-hidden command appears in a Command Groups row), and `compat_command_docs_examples_section` (every `docs/commands/<name>.md` page carries an Examples / Common Commands heading). New commands must satisfy all three.
 - **Isolation**: Use `tempfile::tempdir()` and `utils::test::ChangeDirGuard` to isolate state
 - **Serial execution**: Mark tests `#[serial]` (from `serial_test` crate) if they mutate shared state
@@ -184,7 +184,7 @@ SQLite database at `.libra/libra.db` — inspect the concrete table set in the b
 
 Bootstrap files: `sql/sqlite_20260309_init.sql` (core + AI baseline) and `sql/sqlite_20260415_ai_runtime_contract.sql` (runtime-contract extension).
 
-**Versioned migrations** live under `sql/migrations/` and are applied by `internal::db::migration::MigrationRunner`. Filenames follow `YYYYMMDDNN_<snake_case_name>.sql` (forward) with optional matching `*_down.sql` (rollback). Forward DDL must be idempotent (`CREATE TABLE IF NOT EXISTS …`). See `sql/migrations/README.md`.
+**Versioned migrations** live under `sql/migrations/` and are applied by `internal::db::migration::MigrationRunner`. Filenames follow `YYYYMMDDNN_<snake_case_name>.sql` (forward) with optional matching `*_down.sql` (rollback). Forward DDL should be idempotent (`CREATE TABLE IF NOT EXISTS …`); RENAME-based rebuilds are the exception — the runner's claim-first transaction guarantees single application. See `sql/migrations/README.md`.
 
 The publish Worker uses its own D1 schema in `sql/publish/` (`0001_publish.sql`, `0002_publish_digest_check.sql`, `0003_publish_max_preview_trigger_replace.sql`, `0004_publish_refs_index.sql`).
 

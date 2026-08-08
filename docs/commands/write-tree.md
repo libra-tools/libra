@@ -36,9 +36,12 @@ submodule commits that may live outside this object database.
 | Option | Description | Example |
 |--------|-------------|---------|
 | `--index-file <path>` | Read a scratch index instead of `.libra/index`; a missing scratch index is treated as empty. | `libra write-tree --index-file scratch.idx` |
+| `--missing-ok` | Tolerate index entries whose blob objects are absent (Git parity): the tree is written with the recorded ids. Mistyped objects, unreadable objects, and missing subtree objects still fail closed with `LBR-REPO-002`. | `libra write-tree --missing-ok` |
 | `--json` / `--machine` | Structured output: `{ tree: "<id>" }`. | `libra --json write-tree` |
 
-Git's `--prefix=<prefix>` and `--missing-ok` are not exposed (deferred).
+Git's `--prefix=<prefix>` is not exposed (deferred). The `--missing-ok`
+escape valve exists only on this plumbing command — `commit`, `merge`, and
+`cherry-pick` always run the strict object preflight.
 
 ## Exit codes
 

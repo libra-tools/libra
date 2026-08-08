@@ -528,6 +528,11 @@ async fn run_init_internal(
     args: InitArgs,
     progress: &InitProgress,
 ) -> Result<InitOutput, InitError> {
+    // §C.4.2: `init` BUILDS the repository it then steps into, so it acts on
+    // no pre-existing worktree. Run unpinned — a pin taken in an enclosing
+    // repository would make the pinned resolvers write the ENCLOSING
+    // repository's index/HEAD while this command is inside the new one.
+    let _scope = crate::internal::worktree_scope::WorktreeScope::unpinned();
     let current_dir = cur_dir();
     let target_dir = resolve_cli_path(&current_dir, &args.repo_directory);
     let root_dir = storage_root(&target_dir, args.bare);
@@ -770,7 +775,7 @@ async fn reinitialize_existing(
         .unwrap_or_default();
     let bare = read_config_string(&conn, "core.bare")
         .await?
-        .map(|value| value == "true")
+        .and_then(|value| crate::internal::config::parse_git_bool(&value))
         .unwrap_or(args.bare);
     let vault_signing = read_config_string(&conn, "vault.signing")
         .await?
@@ -1350,7 +1355,7 @@ async fn init_config(
     ignore_case: bool,
     shared_mode: Option<&SharedMode>,
 ) -> Result<String, DbErr> {
-    let txn = conn.begin().await?;
+    let txn = crate::internal::db::begin_write_transaction(conn).await?;
 
     // `core.ignorecase` is PROBED, not platform-hard-coded (lore.md 1.14):
     // Linux records false, macOS records what the volume actually is, and a

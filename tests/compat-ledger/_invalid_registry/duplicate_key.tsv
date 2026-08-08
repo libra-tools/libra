@@ -1,0 +1,2 @@
+diff	--numstat	git-compatible	docs/commands/diff.md#description
+diff	--numstat	absent	docs/commands/diff.md#description

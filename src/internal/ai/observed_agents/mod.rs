@@ -99,11 +99,12 @@ pub(crate) use transcript_source::{
     pinned_provider_directory_path, resolve_import_transcript_source_until,
 };
 pub use trust::{
-    DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY, Provenance,
-    TRUSTED_DIRS_KEY, TrustRecord, add_trusted_dir, compute_provenance,
-    ensure_dir_not_world_writable, ensure_parent_not_world_writable, env_allowlist_extra,
-    env_name_is_forbidden, external_agents_enabled, path_within_trusted_dirs, read_trust,
-    read_trusted_dirs, record_trust, revalidate_trust, revoke_trust,
+    DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY,
+    PROVIDER_EXPORTER_TRUST_SLUGS, Provenance, TRUSTED_DIRS_KEY, TrustRecord, add_trusted_dir,
+    compute_provenance, ensure_dir_not_world_writable, ensure_parent_not_world_writable,
+    env_allowlist_extra, env_name_is_forbidden, external_agents_enabled, is_provider_exporter_slug,
+    path_within_trusted_dirs, read_trust, read_trusted_dirs, record_trust, resolve_exporter_binary,
+    revalidate_trust, revoke_trust,
 };
 
 /// Borrow the static [`ObservedAgent`] for the supplied [`AgentKind`].

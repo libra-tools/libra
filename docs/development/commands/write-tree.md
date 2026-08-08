@@ -7,8 +7,8 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：无参数或 `--index-file <path>` 把 index 写成嵌套 tree（保留 mode 与 hash kind），`--json`/`--machine`。空 index → 规范空 tree。写入前校验 stage-0 index 条目中的 blob/tree 对象存在且类型匹配，缺失/错类型 fail-closed 为 `LBR-REPO-002`；gitlink 不校验。
-- 未公开：Git 的 `--prefix=<prefix>`、`--missing-ok`（延后）。
+- 已支持：无参数或 `--index-file <path>` 把 index 写成嵌套 tree（保留 mode 与 hash kind），`--json`/`--machine`。空 index → 规范空 tree。写入前校验 stage-0 index 条目中的 blob/tree 对象存在且类型匹配，缺失/错类型 fail-closed 为 `LBR-REPO-002`；gitlink 不校验。`--missing-ok`（PD-05）仅跳过 blob 存在性校验（对齐 Git）：错类型、不可读对象与缺失子树仍 fail-closed；该逃逸阀不进入 `commit`/`merge`/`cherry-pick` 路径。
+- 未公开：Git 的 `--prefix=<prefix>`（延后）。
 
 ## 设计方案
 
@@ -36,7 +36,7 @@
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容差异项 | `--prefix` / `--missing-ok` | 延后；按需补齐。 |
+| 兼容差异项 | `--prefix` | 延后；按需补齐（`--missing-ok` 已随 PD-05 落地）。 |
 | 去重收口 | `rebase.rs`/`stash.rs` 树构造、`ai/history.rs::write_tree` 未并入 tree_plumbing | rebase items-based 可后续委托 `write_tree_from_leaves`；stash 为 FS 遍历、history 为不同 API，记为后续/有意独立。 |
 
 ## 维护要求

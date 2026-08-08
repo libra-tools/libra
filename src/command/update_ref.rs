@@ -9,11 +9,13 @@
 //! (use `symbolic-ref` / `switch` / `tag`), since they are not directly
 //! representable here.
 
-use std::str::FromStr;
-
 use clap::Parser;
-use git_internal::hash::{ObjectHash, get_hash_kind};
-use sea_orm::{TransactionError, TransactionTrait};
+use git_internal::{
+    errors::GitError,
+    hash::{ObjectHash, get_hash_kind},
+    internal::object::types::ObjectType,
+};
+use sea_orm::TransactionError;
 use serde::Serialize;
 
 use crate::{
@@ -25,7 +27,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
-        util,
+        util::{self, CommitBaseError},
     },
 };
 
@@ -123,13 +125,26 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
     // ANOTHER worktree — its HEAD would be left dangling or its working tree
     // would silently diverge. `branch_checked_out_elsewhere` excludes the
     // current worktree, so updating this worktree's own branch is still allowed.
-    if let Some(other) = crate::internal::head::Head::branch_checked_out_elsewhere(branch).await {
+    // Fail CLOSED: a probe failure must refuse, never silently allow the
+    // cross-worktree move (§C.4.4).
+    let checked_out_elsewhere =
+        crate::internal::head::Head::branch_checked_out_elsewhere_result(branch)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "cannot verify whether '{branch}' is checked out in another worktree: {error}"
+                ))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("repair the repository database, then retry")
+            })?;
+    if let Some(other) = checked_out_elsewhere {
         return Err(CliError::fatal(format!(
             "cannot update '{}': branch '{branch}' is checked out at worktree '{other}'",
             args.ref_name
         ))
         .with_exit_code(128)
-        .with_stable_code(StableErrorCode::Unsupported)
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
         .with_hint("switch that worktree to another branch first, or run the command there"));
     }
 
@@ -152,23 +167,13 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
                 args.ref_name
             )));
         };
-        let new_hash = parse_object_id(&new_value, &zero).map_err(fatal)?;
-        // Git's update-ref refuses to point a ref at an object that is not in
-        // the store; do the same so we never create a dangling ref.
-        if util::objects_storage().get(&new_hash).is_err() {
-            return Err(CliError::fatal(format!(
-                "cannot update '{}': object {new_value} does not exist in the repository",
-                args.ref_name
-            ))
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::CliInvalidTarget));
-        }
+        let new_hash = resolve_new_value(&new_value, &zero, &args.ref_name).await?;
         (Some(new_hash.to_string()), args.old_value.clone())
     };
 
     // Parse the optional compare-and-swap operand.
     let old_spec = match old_spec {
-        Some(value) => Some(parse_old_value(&value, &zero).map_err(fatal)?),
+        Some(value) => Some(resolve_old_value(&value, &zero, &args.ref_name).await?),
         None => None,
     };
 
@@ -178,128 +183,125 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
     let delete = args.delete;
 
     let db = get_db_conn_instance().await;
-    let outcome = db
-        .transaction(move |txn| {
-            Box::pin(async move {
-                // Branch policy (lore.md 1.13): protect/archive metadata is
-                // enforced INSIDE the authoritative txn for every local-head
-                // writer — update-ref would otherwise be a silent bypass of
-                // `branch reset`'s policy layer. Fail-closed: metadata read
-                // errors refuse the update. (update-ref stays plumbing-sharp
-                // otherwise — it may still move the checked-out branch, like
-                // git update-ref.)
-                let protected = crate::internal::metadata::MetadataKv::is_protected_with_conn(
-                    txn,
-                    &branch_name,
-                )
-                .await
-                .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
-                if protected {
-                    return Err(UpdateRefTxError::PolicyBlocked {
-                        branch: branch_name.clone(),
-                        policy: "protected".to_string(),
-                    });
-                }
-                let archived =
-                    crate::internal::metadata::MetadataKv::is_archived_with_conn(txn, &branch_name)
-                        .await
-                        .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
-                if archived {
-                    return Err(UpdateRefTxError::PolicyBlocked {
-                        branch: branch_name.clone(),
-                        policy: "archived".to_string(),
-                    });
-                }
-                let current = Branch::find_branch_result_with_conn(txn, &branch_name, None)
+    // A compare-and-swap on a ref: it READS the current value and the branch
+    // policy before it writes, so it must take the write lock up front or a
+    // concurrent writer makes it fail instead of wait (see
+    // `db::begin_write_transaction`).
+    let outcome = crate::internal::db::write_transaction(&db, move |txn| {
+        Box::pin(async move {
+            // Branch policy (lore.md 1.13): protect/archive metadata is
+            // enforced INSIDE the authoritative txn for every local-head
+            // writer — update-ref would otherwise be a silent bypass of
+            // `branch reset`'s policy layer. Fail-closed: metadata read
+            // errors refuse the update. (update-ref stays plumbing-sharp
+            // otherwise — it may still move the checked-out branch, like
+            // git update-ref.)
+            let protected =
+                crate::internal::metadata::MetadataKv::is_protected_with_conn(txn, &branch_name)
                     .await
-                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?
-                    .map(|b| b.commit.to_string());
-
-                // Compare-and-swap precondition.
-                if let Some(expected) = &old_spec {
-                    match (expected, &current) {
-                        // `0{40}` => the ref must not exist.
-                        (OldValue::MustNotExist, Some(actual)) => {
-                            return Err(UpdateRefTxError::MustNotExist {
-                                ref_name: full_ref.clone(),
-                                actual: actual.clone(),
-                            });
-                        }
-                        (OldValue::MustNotExist, None) => {}
-                        (OldValue::Exact(want), actual)
-                            if actual.as_deref() != Some(want.as_str()) =>
-                        {
-                            return Err(UpdateRefTxError::CasMismatch {
-                                ref_name: full_ref.clone(),
-                                expected: want.clone(),
-                                actual: actual.clone().unwrap_or_else(|| zero.clone()),
-                            });
-                        }
-                        (OldValue::Exact(_), _) => {}
-                    }
-                }
-
-                if delete {
-                    let Some(old) = current.clone() else {
-                        return Err(UpdateRefTxError::DoesNotExist {
-                            ref_name: full_ref.clone(),
-                        });
-                    };
-                    Branch::delete_branch_result_with_conn(txn, &branch_name, None)
-                        .await
-                        .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
-                    write_reflog(txn, &full_ref, &old, &zero, &reflog_reason).await?;
-                    Ok(UpdateRefOutcome {
-                        old: Some(old),
-                        new: None,
-                    })
-                } else {
-                    // INVARIANT: in the non-delete branch the positional
-                    // disambiguation above always set `new_oid` to `Some`.
-                    let new = new_oid.expect("new value validated for non-delete");
-                    Branch::update_branch_with_conn(txn, &branch_name, &new, None)
-                        .await
-                        .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
-                    let old = current.clone().unwrap_or_else(|| zero.clone());
-                    write_reflog(txn, &full_ref, &old, &new, &reflog_reason).await?;
-                    Ok::<_, UpdateRefTxError>(UpdateRefOutcome {
-                        old: current,
-                        new: Some(new),
-                    })
-                }
-            })
-        })
-        .await
-        .map_err(|error| {
-            // Preserve the policy refusal's dedicated stable code.
-            if let TransactionError::Transaction(UpdateRefTxError::PolicyBlocked {
-                branch,
-                policy,
-            }) = &error
-            {
-                let policy_key = if policy == "protected" {
-                    "protect"
-                } else {
-                    "archive"
-                };
-                CliError::fatal(format!(
-                    "branch '{branch}' is {policy}; refusing to update its ref"
-                ))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
-                .with_hint(format!(
-                    "clear it first: 'libra metadata unset --branch {branch} {policy_key}'"
-                ))
-            } else {
-                let message = match error {
-                    TransactionError::Connection(error) => error.to_string(),
-                    TransactionError::Transaction(error) => error.to_string(),
-                };
-                CliError::fatal(message)
-                    .with_exit_code(128)
-                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+            if protected {
+                return Err(UpdateRefTxError::PolicyBlocked {
+                    branch: branch_name.clone(),
+                    policy: "protected".to_string(),
+                });
             }
-        })?;
+            let archived =
+                crate::internal::metadata::MetadataKv::is_archived_with_conn(txn, &branch_name)
+                    .await
+                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+            if archived {
+                return Err(UpdateRefTxError::PolicyBlocked {
+                    branch: branch_name.clone(),
+                    policy: "archived".to_string(),
+                });
+            }
+            let current = Branch::find_branch_result_with_conn(txn, &branch_name, None)
+                .await
+                .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?
+                .map(|b| b.commit.to_string());
+
+            // Compare-and-swap precondition.
+            if let Some(expected) = &old_spec {
+                match (expected, &current) {
+                    // `0{40}` => the ref must not exist.
+                    (OldValue::MustNotExist, Some(actual)) => {
+                        return Err(UpdateRefTxError::MustNotExist {
+                            ref_name: full_ref.clone(),
+                            actual: actual.clone(),
+                        });
+                    }
+                    (OldValue::MustNotExist, None) => {}
+                    (OldValue::Exact(want), actual) if actual.as_deref() != Some(want.as_str()) => {
+                        return Err(UpdateRefTxError::CasMismatch {
+                            ref_name: full_ref.clone(),
+                            expected: want.clone(),
+                            actual: actual.clone().unwrap_or_else(|| zero.clone()),
+                        });
+                    }
+                    (OldValue::Exact(_), _) => {}
+                }
+            }
+
+            if delete {
+                let Some(old) = current.clone() else {
+                    return Err(UpdateRefTxError::DoesNotExist {
+                        ref_name: full_ref.clone(),
+                    });
+                };
+                Branch::delete_branch_result_with_conn(txn, &branch_name, None)
+                    .await
+                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+                write_reflog(txn, &full_ref, &old, &zero, &reflog_reason).await?;
+                Ok(UpdateRefOutcome {
+                    old: Some(old),
+                    new: None,
+                })
+            } else {
+                // INVARIANT: in the non-delete branch the positional
+                // disambiguation above always set `new_oid` to `Some`.
+                let new = new_oid.expect("new value validated for non-delete");
+                Branch::update_branch_with_conn(txn, &branch_name, &new, None)
+                    .await
+                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+                let old = current.clone().unwrap_or_else(|| zero.clone());
+                write_reflog(txn, &full_ref, &old, &new, &reflog_reason).await?;
+                Ok::<_, UpdateRefTxError>(UpdateRefOutcome {
+                    old: current,
+                    new: Some(new),
+                })
+            }
+        })
+    })
+    .await
+    .map_err(|error| {
+        // Preserve the policy refusal's dedicated stable code.
+        if let TransactionError::Transaction(UpdateRefTxError::PolicyBlocked { branch, policy }) =
+            &error
+        {
+            let policy_key = if policy == "protected" {
+                "protect"
+            } else {
+                "archive"
+            };
+            CliError::fatal(format!(
+                "branch '{branch}' is {policy}; refusing to update its ref"
+            ))
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
+            .with_hint(format!(
+                "clear it first: 'libra metadata unset --branch {branch} {policy_key}'"
+            ))
+        } else {
+            let message = match error {
+                TransactionError::Connection(error) => error.to_string(),
+                TransactionError::Transaction(error) => error.to_string(),
+            };
+            CliError::fatal(message)
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        }
+    })?;
 
     if output.is_json() {
         emit_json_data(
@@ -370,40 +372,119 @@ fn parse_heads_ref(ref_name: &str) -> Result<&str, String> {
     ))
 }
 
-/// Parse a new-value object id, rejecting symbolic-ref syntax, the null id, and
-/// hash-format mismatches. Returns the parsed [`ObjectHash`] so the caller can
-/// check that the object exists.
-fn parse_object_id(value: &str, zero: &str) -> Result<ObjectHash, String> {
+/// Resolve the `<newvalue>` operand to the commit the ref will point at.
+///
+/// Two syntax-layer spellings are refused before any lookup and keep the
+/// usage class (`LBR-CLI-002`): `ref:` (that is `symbolic-ref`'s job) and the
+/// null id (that is `-d`'s job). Everything else goes through the shared
+/// revision engine, so branch names, tags, `HEAD`, `~`/`^` navigation and
+/// abbreviated ids all work.
+///
+/// There is deliberately **no implicit peel**: whatever the expression names
+/// must itself be a commit. That is Git's rule — a lightweight tag points at
+/// the commit and is accepted, a bare annotated tag names a tag object and is
+/// refused, and `<tag>^{commit}` peels explicitly and is accepted. Peeling
+/// silently would let `update-ref refs/heads/x v1.0` write a branch the user
+/// never named.
+async fn resolve_new_value(value: &str, zero: &str, ref_name: &str) -> CliResult<ObjectHash> {
     if value.starts_with("ref:") {
-        return Err(
+        return Err(usage_fatal(
             "symbolic refs are not supported by update-ref; use `symbolic-ref`".to_string(),
-        );
+        ));
     }
     if value == zero {
-        return Err("refusing to point a ref at the null object id; use -d to delete".to_string());
+        return Err(usage_fatal(
+            "refusing to point a ref at the null object id; use -d to delete".to_string(),
+        ));
     }
-    validate_oid(value)
+
+    let object_id = util::resolve_object_spec_typed(value)
+        .await
+        .map_err(|error| resolver_error(error, value, ref_name))?;
+
+    // Git's update-ref refuses to point a ref at an object that is not in the
+    // store; do the same so we never create a dangling ref. Reading the type
+    // proves existence and answers the commit question in one lookup.
+    let object_type = util::objects_storage()
+        .get_object_type(&object_id)
+        .map_err(|error| match error {
+            GitError::ObjectNotFound(_) => invalid_target_fatal(format!(
+                "cannot update '{ref_name}': object {value} does not exist in the repository"
+            )),
+            other => CliError::fatal(format!(
+                "cannot update '{ref_name}': could not read object {object_id}: {other}"
+            ))
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::RepoCorrupt),
+        })?;
+
+    if object_type != ObjectType::Commit {
+        return Err(invalid_target_fatal(format!(
+            "cannot update '{ref_name}': '{value}' resolves to a {object_type}              ({object_id}), not a commit; use '{value}^{{commit}}' to peel it"
+        )));
+    }
+
+    Ok(object_id)
 }
 
-/// Parse a compare-and-swap operand (`0{40}` => must-not-exist).
-fn parse_old_value(value: &str, zero: &str) -> Result<OldValue, String> {
+/// A syntax-layer refusal of an operand: the user's command line is wrong.
+fn usage_fatal(message: String) -> CliError {
+    CliError::fatal(message)
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+}
+
+/// The operand parsed, but does not name something this command can use.
+fn invalid_target_fatal(message: String) -> CliError {
+    CliError::fatal(message)
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+}
+
+/// Resolve a compare-and-swap operand (`0{40}` => must-not-exist).
+///
+/// Same revision entry point as `<newvalue>`, and deliberately **no commit
+/// type check**: `<oldvalue>` states what the ref is expected to point at
+/// right now, so the resolved id is compared verbatim. Naming an annotated tag
+/// here therefore produces an ordinary CAS mismatch — Git behaves the same
+/// way, because a ref that points at a tag object is a state you are allowed
+/// to assert and be wrong about, not a malformed request.
+async fn resolve_old_value(value: &str, zero: &str, ref_name: &str) -> CliResult<OldValue> {
     if value == zero {
         return Ok(OldValue::MustNotExist);
     }
-    validate_oid(value)?;
-    Ok(OldValue::Exact(value.to_string()))
-}
-
-/// Validate that `value` is a full object id matching the repository hash kind,
-/// returning the parsed hash.
-fn validate_oid(value: &str) -> Result<ObjectHash, String> {
-    let expected_len = get_hash_kind().hex_len();
-    if value.len() != expected_len {
-        return Err(format!(
-            "'{value}' is not a valid object id for this repository (expected {expected_len} hex chars)"
+    if value.starts_with("ref:") {
+        return Err(usage_fatal(
+            "symbolic refs are not supported by update-ref; use `symbolic-ref`".to_string(),
         ));
     }
-    ObjectHash::from_str(value).map_err(|_| {
-        format!("'{value}' is not a valid object id for this repository (expected {expected_len} hex chars)")
-    })
+    let object_id = util::resolve_object_spec_typed(value)
+        .await
+        .map_err(|error| resolver_error(error, value, ref_name))?;
+    Ok(OldValue::Exact(object_id.to_string()))
+}
+
+/// Map a resolver failure onto this command's error classes.
+///
+/// A resolver failure caused by the repository itself must keep its own class
+/// — reporting it as bad user input would send the operator looking at their
+/// command line instead of at their objects.
+fn resolver_error(error: CommitBaseError, value: &str, ref_name: &str) -> CliError {
+    match error {
+        CommitBaseError::HeadUnborn | CommitBaseError::InvalidReference(_) => {
+            invalid_target_fatal(format!(
+                "cannot update '{ref_name}': '{value}' is not a valid revision in this repository"
+            ))
+        }
+        CommitBaseError::ReadFailure(detail) => {
+            CliError::fatal(format!("cannot update '{ref_name}': {detail}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        }
+        CommitBaseError::CorruptReference(detail) => {
+            CliError::fatal(format!("cannot update '{ref_name}': {detail}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+        }
+    }
 }

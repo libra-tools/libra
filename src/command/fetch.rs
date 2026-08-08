@@ -19,8 +19,7 @@ use git_internal::{
 };
 use indicatif::ProgressBar;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set,
-    TransactionError, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionError,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -38,7 +37,6 @@ use crate::{
     internal::{
         branch::Branch,
         config::{ConfigKv, ConfigKvEntry, RemoteConfig},
-        db::get_db_conn_instance,
         head::Head,
         model::reference as ref_model,
         protocol::{
@@ -717,6 +715,12 @@ pub struct FetchRefUpdate {
 pub struct FetchRepositoryResult {
     pub remote: String,
     pub url: String,
+    /// `.keep` sentinel pinning this fetch's pack until the caller records
+    /// FETCH_HEAD (internal plumbing, never serialized). Release via
+    /// [`FetchRepositoryResult::release_pack_pin`] AFTER the last root
+    /// record for this fetch has landed.
+    #[serde(skip)]
+    pub pack_keep_sentinel: Option<std::path::PathBuf>,
     pub refs_updated: Vec<FetchRefUpdate>,
     pub objects_fetched: usize,
     /// Bytes received in the fetch pack stream (the `.pack` payload size). Zero
@@ -732,6 +736,17 @@ pub struct FetchRepositoryResult {
     /// Git records these in FETCH_HEAD even when no local destination moved.
     #[serde(skip)]
     fetch_head_records: Vec<FetchHeadRecord>,
+}
+
+impl FetchRepositoryResult {
+    /// Release the fetch pack's `.keep` pin — call ONLY after the caller has
+    /// recorded every root for this fetch (refs/tags inside `run_fetch`,
+    /// plus FETCH_HEAD where the surface writes one). Idempotent.
+    pub fn release_pack_pin(&self) {
+        if let Some(keep) = &self.pack_keep_sentinel {
+            let _ = std::fs::remove_file(keep);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -835,7 +850,7 @@ pub enum FetchError {
     #[error("fetch destination update rejected: {message}")]
     RefUpdateRejected { message: String },
     #[error(
-        "local Libra remotes do not support --depth yet because they cannot advertise shallow boundaries"
+        "local Libra remotes do not support --depth: they cannot advertise shallow boundaries (declined by design, register D20)"
     )]
     UnsupportedShallowLocalLibra,
     #[error("failed to inspect local repository state: {message}")]
@@ -1002,6 +1017,11 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     // FETCH_HEAD records the fetched refs; `--dry-run` writes nothing.
     if !dry_run {
         write_fetch_head(&result, append).map_err(CliError::from)?;
+    }
+    // FETCH_HEAD (the fetch's last root record) has landed — release each
+    // pack's `.keep` pin so a later repack may consolidate it.
+    for remote in &result.remotes {
+        remote.release_pack_pin();
     }
     if porcelain {
         render_fetch_porcelain(&result, output)
@@ -1747,7 +1767,13 @@ pub async fn fetch_repository_safe(
         output,
     )
     .await
-    .map(|_| ())
+    .map(|result| {
+        // This surface records no FETCH_HEAD and the fetch's ref updates
+        // completed inside — release the pack's `.keep` pin before the
+        // result is discarded (leaking it would exempt every prefetch /
+        // `remote update` pack from repack forever).
+        result.release_pack_pin();
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1796,6 +1822,7 @@ pub(crate) async fn fetch_repository_with_result(
         // (a transient/broken advertisement) so a single empty response cannot
         // wipe every remote-tracking ref.
         return Ok(FetchRepositoryResult {
+            pack_keep_sentinel: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated: Vec::new(),
@@ -1903,6 +1930,7 @@ pub(crate) async fn fetch_repository_with_result(
             Vec::new()
         };
         return Ok(FetchRepositoryResult {
+            pack_keep_sentinel: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated,
@@ -1930,6 +1958,7 @@ pub(crate) async fn fetch_repository_with_result(
             Vec::new()
         };
         return Ok(FetchRepositoryResult {
+            pack_keep_sentinel: None,
             remote: remote_config.name,
             url: normalized_url,
             refs_updated,
@@ -1962,6 +1991,14 @@ pub(crate) async fn fetch_repository_with_result(
     let objects_fetched = pack_object_count(&fetch_data.pack_data);
     let bytes_received = fetch_data.pack_data.len();
     let pack_file = write_pack_and_index(&fetch_data.pack_data)?;
+    // W2 §C.4.3: the `.keep` sentinel was created INSIDE
+    // `write_pack_and_index`, before the pack's final name became visible.
+    // It is carried out in the result and released by the caller only after
+    // FETCH_HEAD lands (the last root record of a fetch); a crash leaves it
+    // behind, which fails SAFE — repack retains the pack and reports it.
+    let keep_sentinel = pack_file
+        .as_ref()
+        .map(|pack| std::path::PathBuf::from(pack.replace(".pack", ".keep")));
     if let Some(pack_file) = pack_file {
         let index_version = match get_hash_kind() {
             HashKind::Sha1 => None,
@@ -2051,6 +2088,7 @@ pub(crate) async fn fetch_repository_with_result(
     };
 
     Ok(FetchRepositoryResult {
+        pack_keep_sentinel: keep_sentinel,
         remote: remote_config.name,
         url: normalized_url,
         refs_updated,
@@ -2614,6 +2652,17 @@ fn write_pack_and_index(pack_data: &[u8]) -> Result<Option<String>, FetchError> 
 
     let checksum = checksum.to_string();
     let pack_file = pack_dir.join(format!("pack-{checksum}.pack"));
+    // W2 §C.4.3: pin the pack BEFORE it becomes visible at its final name —
+    // the `.keep` sentinel must exist for every instant a repack could list
+    // this pack, so the pack-written→refs-recorded window has no gap at
+    // either end (the caller releases the pin only after FETCH_HEAD lands).
+    let keep_file = pack_dir.join(format!("pack-{checksum}.keep"));
+    fs::write(&keep_file, b"libra fetch in progress\n").map_err(|source| {
+        FetchError::PackWrite {
+            path: keep_file.clone(),
+            source,
+        }
+    })?;
     let mut file = fs::File::create(&pack_file).map_err(|source| FetchError::PackWrite {
         path: pack_file.clone(),
         source,
@@ -2635,8 +2684,22 @@ fn shallow_file_path() -> Result<PathBuf, FetchError> {
         })
 }
 
-fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> {
-    let path = shallow_file_path()?;
+/// The repository's shallow boundary commits, or an empty set when the clone
+/// is complete. `pub(crate)` because GC must treat the same OIDs as traversal
+/// boundaries (§C.4.3 `Boundary`) — a second parser would be free to disagree
+/// with this one about what counts as a boundary, which is precisely the
+/// disagreement that turns a shallow clone's GC into a corruption report.
+pub(crate) fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> {
+    read_shallow_boundaries_at(&shallow_file_path()?)
+}
+
+/// [`read_shallow_boundaries`] against an EXPLICIT shallow file (§C.4.2) —
+/// the GC collection binds every file-backed source to one pinned storage
+/// root rather than re-resolving ambiently per source.
+pub(crate) fn read_shallow_boundaries_at(
+    path: &std::path::Path,
+) -> Result<BTreeSet<String>, FetchError> {
+    let path = path.to_path_buf();
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
@@ -2729,7 +2792,9 @@ async fn compute_fetch_ref_preview(
     force_override: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let mut updates = Vec::new();
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let checked_out_branches = checked_out_local_branches_with_conn(&db).await?;
     for plan in plans {
         let (storage_name, remote_scope) =
@@ -2838,7 +2903,10 @@ fn fetch_head_path() -> Result<PathBuf, FetchError> {
     // now lives in this worktree's own local gitdir (identical path for the main
     // worktree, where local and common storage coincide), so a linked worktree's
     // fetch no longer touches the main worktree's `FETCH_HEAD`.
-    util::try_get_worktree_gitdir(None)
+    // Resolved from the INVOCATION's workdir (§C.4.2), not the process cwd: a
+    // `set_current_dir` between the fetch and this write would otherwise pair
+    // one worktree's refs with another worktree's `FETCH_HEAD`.
+    util::request_worktree_gitdir()
         .map(|gitdir| gitdir.join("FETCH_HEAD"))
         .map_err(|source| FetchError::LocalState {
             message: format!("failed to locate this worktree's gitdir for FETCH_HEAD: {source}"),
@@ -3003,11 +3071,15 @@ async fn prune_stale_remote_refs(
         return Ok(pruned);
     }
 
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let remote_owned = remote_name.to_string();
     let to_delete = pruned.clone();
     let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
-    db.transaction(|txn| {
+    // Reads the refs it is about to move/delete before writing them, so the
+    // write lock is taken up front (`db::begin_write_transaction`).
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             for entry in &to_delete {
                 // Record a non-lossy audit entry before deleting the ref. The
@@ -3059,11 +3131,13 @@ async fn update_references(
     capabilities: Vec<String>,
     force_override: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let remote_config = remote_config.clone();
     let plans = plans.to_vec();
     let ref_heads = ref_heads.to_vec();
-    db.transaction(|txn| {
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
             let checked_out_branches = checked_out_local_branches_with_conn(txn).await?;
@@ -3327,9 +3401,11 @@ async fn persist_fetched_tags(
     if tags.is_empty() {
         return Ok(Vec::new());
     }
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let tags = tags.to_vec();
-    db.transaction(|txn| {
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
             for tag in &tags {
@@ -3491,7 +3567,9 @@ async fn current_have_safe() -> Result<Vec<String>, FetchError> {
     // the tag objects and their history on every run (the bug that previously
     // forced tag fetching to be backed out). This is unconditional: the client
     // genuinely has these objects, so advertising them is always correct.
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let tag_rows = ref_model::Entity::find()
         .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
         .all(&db)
@@ -3740,6 +3818,7 @@ mod tests {
             requested_remote: Some("origin".to_string()),
             refspec: None,
             remotes: vec![FetchRepositoryResult {
+                pack_keep_sentinel: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 2,
@@ -3792,6 +3871,7 @@ mod tests {
             requested_remote: Some("origin".to_string()),
             refspec: None,
             remotes: vec![FetchRepositoryResult {
+                pack_keep_sentinel: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 1,
@@ -3832,6 +3912,7 @@ mod tests {
             requested_remote: Some("origin".to_string()),
             refspec: None,
             remotes: vec![FetchRepositoryResult {
+                pack_keep_sentinel: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 0,
@@ -3884,6 +3965,7 @@ mod tests {
             requested_remote: Some("origin".to_string()),
             refspec: None,
             remotes: vec![FetchRepositoryResult {
+                pack_keep_sentinel: None,
                 remote: "origin".to_string(),
                 url: "https://example.com/x.git".to_string(),
                 objects_fetched: 0,

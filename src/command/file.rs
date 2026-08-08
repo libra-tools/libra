@@ -82,6 +82,31 @@ pub async fn execute_safe(args: FileArgs, output: &OutputConfig) -> CliResult<()
 }
 
 async fn run_recover(output: &OutputConfig) -> CliResult<()> {
+    util::require_repo().map_err(|_| CliError::repo_not_found())?;
+    // W0 §C.11 release gate: recovery DELETES payloads, so it is a deletion
+    // entry point and passes the same borrower gate as a fresh obliteration.
+    // `delete_payload` re-checks, but refusing up front means the audit
+    // record for a recovery we will not perform is never written.
+    // §C.4.3 writer-vs-deleter: held across the whole recovery, so no
+    // publisher can be mid-publication while payloads are unlinked. The
+    // re-check inside `delete_payload` re-enters this same hold.
+    //
+    // Taken BEFORE the borrower gate: registering a borrower is a
+    // publication, so a gate evaluated outside the hold can be overtaken —
+    // and recovery would then write a durable `payload_deleted` audit record
+    // for a deletion the under-lock recheck goes on to refuse.
+    let _obliteration_lock =
+        crate::internal::maintenance_lock::MaintenanceLock::exclusive_or_refuse(
+            &crate::utils::util::storage_path(),
+            "recover an interrupted obliteration",
+        )?;
+    crate::internal::alternates::ensure_no_live_borrowers(
+        "recover an interrupted obliteration",
+        // A borrowed store is a CONFLICT, not a missing confirmation:
+        // `LBR-OBLITERATE-003` documents "re-run with --yes", which the user
+        // may already have done.
+        StableErrorCode::ConflictOperationBlocked,
+    )?;
     let completed = obliteration::recover_incomplete().await?;
     if output.is_json() {
         return emit_json_data(
@@ -104,6 +129,33 @@ async fn run_obliterate(
     output: &OutputConfig,
 ) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
+    // W0 §C.11 release gate: the borrower gate must come BEFORE the recovery
+    // pass below, because recovery itself deletes payloads. It used to sit
+    // after it, so an interrupted obliteration was completed — objects
+    // unlinked — before anyone asked whether a borrower still needed them.
+    // §C.4.3 writer-vs-deleter: take the EXCLUSIVE maintenance lock HERE —
+    // before the borrower gate, before the recovery pass below (which
+    // deletes), and before the tombstone and audit record this command
+    // writes.
+    //
+    // Acquiring later would mean a contended lock is discovered only after a
+    // durable `obliterating` row and an append-only audit line already exist,
+    // and the next unrelated `file obliterate` would then run recovery and
+    // complete an erasure THIS invocation reported as refused. Acquiring
+    // first makes contention a clean no-op: nothing written, nothing to
+    // recover. The lock is re-entrant within the process, so the re-check
+    // inside `delete_payload` sees this hold rather than blocking on it.
+    let _obliteration_lock =
+        crate::internal::maintenance_lock::MaintenanceLock::exclusive_or_refuse(
+            &crate::utils::util::storage_path(),
+            "obliterate an object",
+        )?;
+    crate::internal::alternates::ensure_no_live_borrowers(
+        "obliterate an object",
+        // See `run_recover`: a borrowed store is a conflict, not a missing
+        // confirmation.
+        StableErrorCode::ConflictOperationBlocked,
+    )?;
     // Fail CLOSED (Codex P1): finish any interrupted obliteration BEFORE a new
     // one; a recovery failure aborts rather than proceeding over an unresolved
     // mid-state tombstone.
@@ -126,18 +178,6 @@ async fn run_obliterate(
             println!("{hash} is already obliterated (no-op)");
         }
         return Ok(());
-    }
-
-    // lore.md 2.3 deletion safety (Codex P1): if another repo borrows FROM
-    // this store, obliterating one of its objects could corrupt the borrower.
-    // Refuse while any live borrower exists.
-    if crate::internal::alternates::has_live_borrowers(&crate::utils::path::objects()) {
-        return Err(CliError::fatal(
-            "cannot obliterate: this store is shared (other repos borrow from it via \
-             alternates)",
-        )
-        .with_stable_code(StableErrorCode::ObliterateConfirm)
-        .with_hint("have borrowers run 'libra alternates remove' first, or dissociate them"));
     }
 
     // Phase A — evaluate (read-only).

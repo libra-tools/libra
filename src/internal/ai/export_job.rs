@@ -17,8 +17,10 @@
 //! - rows expire by TTL (clean --gc / retention / startup scavenging), never
 //!   by session cascade — the provider session may not exist locally.
 
-use anyhow::{Context, Result, anyhow};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
+use anyhow::{Context, Result, anyhow, bail};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+
+use super::capture_scope::CaptureScope;
 
 /// Lease length for one export run: must cover the export subprocess
 /// deadline (≤3s, GC-DR-04) plus parse/redact/claim with margin.
@@ -40,8 +42,70 @@ pub enum IdleOutcome {
     RecordedOnly,
 }
 
+/// The stable owner key for one export job. Keeping the provider identity and
+/// its capture scope together prevents callers from advancing a job under a
+/// mismatched scope, and keeps the mutation APIs from growing positional
+/// argument lists as ownership checks evolve.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportJobTarget<'a> {
+    agent_kind: &'a str,
+    provider_session_id: &'a str,
+    scope: &'a CaptureScope,
+}
+
+impl<'a> ExportJobTarget<'a> {
+    pub fn new(agent_kind: &'a str, provider_session_id: &'a str, scope: &'a CaptureScope) -> Self {
+        Self {
+            agent_kind,
+            provider_session_id,
+            scope,
+        }
+    }
+}
+
 fn now_or(now_ms: i64, delta: i64) -> i64 {
     now_ms.saturating_add(delta)
+}
+
+/// Reject a legacy or foreign job before it can receive another generation
+/// bump. The global provider-session unique key stays in place deliberately:
+/// this check turns a cross-workspace observation into an actionable refusal
+/// instead of a silent overwrite or a second export runner.
+async fn assert_export_job_scope<C: ConnectionTrait>(
+    conn: &C,
+    agent_kind: &str,
+    provider_session_id: &str,
+    scope: &CaptureScope,
+) -> Result<()> {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT scope_state, repo_id, worktree_id, workspace_id, workspace_fence \
+             FROM agent_export_job WHERE agent_kind = ? AND provider_session_id = ?",
+            [agent_kind.into(), provider_session_id.into()],
+        ))
+        .await
+        .context("read export-job workspace ownership")?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let scope_state: String = row.try_get_by("scope_state")?;
+    let repo_id: Option<String> = row.try_get_by("repo_id")?;
+    let worktree_id: Option<String> = row.try_get_by("worktree_id")?;
+    let workspace_id: Option<String> = row.try_get_by("workspace_id")?;
+    let workspace_fence: Option<i64> = row.try_get_by("workspace_fence")?;
+    if scope_state != "scoped"
+        || repo_id.as_deref() != Some(scope.repo_id.as_str())
+        || worktree_id.as_deref() != Some(scope.worktree_id.as_str())
+        || workspace_id != scope.workspace_id
+        || workspace_fence != scope.workspace_fence
+    {
+        bail!(
+            "OpenCode export job belongs to a legacy or different workspace scope; refusing to \
+             advance it — inspect it with `libra worktree doctor` before retrying"
+        );
+    }
+    Ok(())
 }
 
 /// Record one `session.idle` and try to become the runner (ADR-DR-11).
@@ -53,15 +117,22 @@ pub async fn observe_idle(
     conn: &DatabaseConnection,
     agent_kind: &str,
     provider_session_id: &str,
+    scope: &CaptureScope,
     owner: &str,
     now_ms: i64,
 ) -> Result<IdleOutcome> {
-    let txn = conn
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin export generation transaction")?;
+    // Check cross-table ownership only after acquiring SQLite's writer slot.
+    // Otherwise an import/hook writer in another scope can commit its claim
+    // between this preflight and the export-job insert below.
+    scope
+        .assert_provider_session_compatible(&txn, provider_session_id)
+        .await?;
+    assert_export_job_scope(&txn, agent_kind, provider_session_id, scope).await?;
     let tombstoned = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -74,12 +145,20 @@ pub async fn observe_idle(
         anyhow::bail!("erased agent session cannot create or advance an export job");
     }
     // Ensure the row exists (first idle creates it).
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
         "INSERT INTO agent_export_job (
             job_id, agent_kind, provider_session_id, observed_generation,
-            processed_generation, state, created_at, updated_at, ttl_expires_at
-         ) VALUES (?, ?, ?, 0, 0, 'idle', ?, ?, ?)
+            processed_generation, state, created_at, updated_at, ttl_expires_at,
+            repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+         ) SELECT ?, ?, ?, 0, 0, 'idle', ?, ?, ?, ?, ?, ?, ?, 'scoped'
+         WHERE (? IS NULL OR EXISTS (
+             SELECT 1 FROM workspace_record
+             WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+               AND state IN ('provisioning', 'active', 'releasing')
+               AND lease_owner IS NOT NULL
+               AND lease_expires_at > (unixepoch('now') * 1000)
+         ))
          ON CONFLICT(agent_kind, provider_session_id) DO NOTHING",
         [
             uuid::Uuid::new_v4().to_string().into(),
@@ -88,42 +167,81 @@ pub async fn observe_idle(
             now_ms.into(),
             now_ms.into(),
             now_or(now_ms, EXPORT_JOB_TTL_MS).into(),
+            scope.repo_id.clone().into(),
+            scope.worktree_id.clone().into(),
+            scope.workspace_id.clone().into(),
+            scope.workspace_fence.into(),
+            scope.workspace_id.clone().into(),
+            scope.workspace_id.clone().into(),
+            scope.repo_id.clone().into(),
+            scope.workspace_fence.into(),
         ],
     ))
     .await
     .context("insert agent_export_job row")?;
 
     // Unconditional observed bump — every idle counts exactly once.
-    txn.execute(Statement::from_sql_and_values(
-        txn.get_database_backend(),
-        "UPDATE agent_export_job
+    let bumped = txn
+        .execute_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "UPDATE agent_export_job
          SET observed_generation = observed_generation + 1, updated_at = ?,
              ttl_expires_at = ?
-         WHERE agent_kind = ? AND provider_session_id = ?",
-        [
-            now_ms.into(),
-            now_or(now_ms, EXPORT_JOB_TTL_MS).into(),
-            agent_kind.into(),
-            provider_session_id.into(),
-        ],
-    ))
-    .await
-    .context("bump observed_generation")?;
+         WHERE agent_kind = ? AND provider_session_id = ?
+           AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+           AND workspace_id IS ? AND workspace_fence IS ?
+           AND (? IS NULL OR EXISTS (
+               SELECT 1 FROM workspace_record
+               WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                 AND state IN ('provisioning', 'active', 'releasing')
+                 AND lease_owner IS NOT NULL
+                 AND lease_expires_at > (unixepoch('now') * 1000)
+           ))",
+            [
+                now_ms.into(),
+                now_or(now_ms, EXPORT_JOB_TTL_MS).into(),
+                agent_kind.into(),
+                provider_session_id.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .context("bump observed_generation")?;
+    if bumped.rows_affected() != 1 {
+        txn.rollback().await.ok();
+        bail!(
+            "export job could not be advanced because its workspace lease fence changed or another scope owns this provider session"
+        );
+    }
 
     // Lease attempt: only when no live lease exists (expired or absent) AND
     // pending work remains (processed < observed) — a delayed contender whose
     // bump was already processed by another runner must NOT re-export a
     // clean generation (Codex M3 R1 P1-4).
-    let new_fence_seed = now_ms; // any monotonic-ish base; real fence below
-    let _ = new_fence_seed;
     let acquired = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_export_job
              SET owner = ?, lease_expires_at = ?,
                  fence_token = COALESCE(fence_token, 0) + 1,
                  state = 'inflight', updated_at = ?
              WHERE agent_kind = ? AND provider_session_id = ?
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?
+               AND (? IS NULL OR EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               ))
                AND (owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
                AND processed_generation < observed_generation",
             [
@@ -132,6 +250,14 @@ pub async fn observe_idle(
                 now_ms.into(),
                 agent_kind.into(),
                 provider_session_id.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.workspace_fence.into(),
                 now_ms.into(),
             ],
         ))
@@ -145,11 +271,21 @@ pub async fn observe_idle(
     }
 
     let row = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT job_id, fence_token, observed_generation FROM agent_export_job
-             WHERE agent_kind = ? AND provider_session_id = ? AND owner = ?",
-            [agent_kind.into(), provider_session_id.into(), owner.into()],
+             WHERE agent_kind = ? AND provider_session_id = ? AND owner = ?
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?",
+            [
+                agent_kind.into(),
+                provider_session_id.into(),
+                owner.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+            ],
         ))
         .await
         .context("read acquired export job")?
@@ -158,7 +294,7 @@ pub async fn observe_idle(
         job_id: row.try_get_by("job_id")?,
         fence_token: row
             .try_get_by::<Option<i64>, _>("fence_token")?
-            .unwrap_or(0),
+            .context("acquired export job has no fence token")?,
         target_generation: row.try_get_by("observed_generation")?,
     };
     txn.commit()
@@ -173,21 +309,31 @@ pub async fn observe_idle(
 /// the stale runner must stop without touching anything else.
 pub async fn advance_processed(
     conn: &DatabaseConnection,
-    agent_kind: &str,
-    provider_session_id: &str,
+    job: &ExportJobTarget<'_>,
     owner: &str,
     fence_token: i64,
     target: i64,
     now_ms: i64,
 ) -> Result<AdvanceOutcome> {
     let advanced = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "UPDATE agent_export_job
              SET processed_generation = ?, updated_at = ?
          WHERE agent_kind = ? AND provider_session_id = ?
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?
                AND owner = ? AND fence_token = ?
                AND processed_generation < ?
+               AND (agent_export_job.workspace_id IS NULL OR EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = agent_export_job.workspace_id
+                     AND repo_id = agent_export_job.repo_id
+                     AND lease_fence = agent_export_job.workspace_fence
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               ))
                AND NOT EXISTS (
                  SELECT 1 FROM agent_import_tombstone t
                  WHERE t.agent_kind = agent_export_job.agent_kind
@@ -196,8 +342,12 @@ pub async fn advance_processed(
             [
                 target.into(),
                 now_ms.into(),
-                agent_kind.into(),
-                provider_session_id.into(),
+                job.agent_kind.into(),
+                job.provider_session_id.into(),
+                job.scope.repo_id.clone().into(),
+                job.scope.worktree_id.clone().into(),
+                job.scope.workspace_id.clone().into(),
+                job.scope.workspace_fence.into(),
                 owner.into(),
                 fence_token.into(),
                 target.into(),
@@ -209,11 +359,20 @@ pub async fn advance_processed(
         return Ok(AdvanceOutcome::FencedOut);
     }
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT observed_generation, processed_generation FROM agent_export_job
-             WHERE agent_kind = ? AND provider_session_id = ?",
-            [agent_kind.into(), provider_session_id.into()],
+             WHERE agent_kind = ? AND provider_session_id = ?
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?",
+            [
+                job.agent_kind.into(),
+                job.provider_session_id.into(),
+                job.scope.repo_id.clone().into(),
+                job.scope.worktree_id.clone().into(),
+                job.scope.workspace_id.clone().into(),
+                job.scope.workspace_fence.into(),
+            ],
         ))
         .await
         .context("re-read export job generations")?
@@ -247,40 +406,20 @@ pub enum AdvanceOutcome {
 /// must remain untouched.
 pub async fn advance_and_release(
     conn: &DatabaseConnection,
-    agent_kind: &str,
-    provider_session_id: &str,
+    job: &ExportJobTarget<'_>,
     owner: &str,
     fence_token: i64,
     target: i64,
     now_ms: i64,
 ) -> Result<AdvanceOutcome> {
-    let outcome = advance_processed(
-        conn,
-        agent_kind,
-        provider_session_id,
-        owner,
-        fence_token,
-        target,
-        now_ms,
-    )
-    .await?;
+    let outcome = advance_processed(conn, job, owner, fence_token, target, now_ms).await?;
     let state = match outcome {
         AdvanceOutcome::Clean => Some("idle"),
         AdvanceOutcome::MoreWork { .. } => Some("dirty"),
         AdvanceOutcome::FencedOut => None,
     };
     if let Some(state) = state {
-        release(
-            conn,
-            agent_kind,
-            provider_session_id,
-            owner,
-            fence_token,
-            state,
-            None,
-            now_ms,
-        )
-        .await?;
+        release(conn, job, owner, fence_token, state, None, now_ms).await?;
     }
     Ok(outcome)
 }
@@ -288,11 +427,9 @@ pub async fn advance_and_release(
 /// Release the lease under owner+fence, marking the terminal state honestly:
 /// `dirty` when work remains, `failed` with a stable code, else `idle`. A
 /// fenced-out release is a silent no-op (the new owner's state wins).
-#[allow(clippy::too_many_arguments)]
 pub async fn release(
     conn: &DatabaseConnection,
-    agent_kind: &str,
-    provider_session_id: &str,
+    job: &ExportJobTarget<'_>,
     owner: &str,
     fence_token: i64,
     state: &str,
@@ -300,13 +437,24 @@ pub async fn release(
     now_ms: i64,
 ) -> Result<()> {
     debug_assert!(matches!(state, "idle" | "dirty" | "failed"));
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "UPDATE agent_export_job
          SET owner = NULL, lease_expires_at = NULL, state = ?,
              last_error_code = ?, updated_at = ?
          WHERE agent_kind = ? AND provider_session_id = ?
+           AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+           AND workspace_id IS ? AND workspace_fence IS ?
            AND owner = ? AND fence_token = ?
+           AND (agent_export_job.workspace_id IS NULL OR EXISTS (
+               SELECT 1 FROM workspace_record
+               WHERE workspace_id = agent_export_job.workspace_id
+                 AND repo_id = agent_export_job.repo_id
+                 AND lease_fence = agent_export_job.workspace_fence
+                 AND state IN ('provisioning', 'active', 'releasing')
+                 AND lease_owner IS NOT NULL
+                 AND lease_expires_at > (unixepoch('now') * 1000)
+           ))
            AND NOT EXISTS (
              SELECT 1 FROM agent_import_tombstone t
              WHERE t.agent_kind = agent_export_job.agent_kind
@@ -316,8 +464,12 @@ pub async fn release(
             state.into(),
             last_error_code.into(),
             now_ms.into(),
-            agent_kind.into(),
-            provider_session_id.into(),
+            job.agent_kind.into(),
+            job.provider_session_id.into(),
+            job.scope.repo_id.clone().into(),
+            job.scope.worktree_id.clone().into(),
+            job.scope.workspace_id.clone().into(),
+            job.scope.workspace_fence.into(),
             owner.into(),
             fence_token.into(),
         ],
@@ -331,7 +483,7 @@ pub async fn release(
 /// startup). Bounded by the TTL index.
 pub async fn scavenge_expired(conn: &DatabaseConnection, now_ms: i64) -> Result<u64> {
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "DELETE FROM agent_export_job WHERE ttl_expires_at <= ?",
             [now_ms.into()],
@@ -350,7 +502,7 @@ mod tests {
 
     async fn job_db() -> DatabaseConnection {
         let conn = Database::connect("sqlite::memory:").await.expect("mem db");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "PRAGMA foreign_keys = OFF".to_string(),
         ))
@@ -360,6 +512,15 @@ mod tests {
         conn
     }
 
+    fn scope() -> CaptureScope {
+        CaptureScope {
+            repo_id: "export-job-test-repo".to_string(),
+            worktree_id: String::new(),
+            workspace_id: None,
+            workspace_fence: None,
+        }
+    }
+
     /// opencode_export_inflight_generation_merges_third_idle: idles landing
     /// while a runner is inflight merge into `observed_generation`; the
     /// runner's advance reports MoreWork with the merged target.
@@ -367,8 +528,12 @@ mod tests {
     async fn inflight_generation_merges_later_idles() {
         let conn = job_db().await;
         let (kind, sid) = ("opencode", "s1");
+        let scope = scope();
+        let job = ExportJobTarget::new(kind, sid, &scope);
 
-        let runner = observe_idle(&conn, kind, sid, "r1", 1_000).await.unwrap();
+        let runner = observe_idle(&conn, kind, sid, &scope, "r1", 1_000)
+            .await
+            .unwrap();
         let IdleOutcome::Runner {
             fence_token,
             target_generation,
@@ -381,16 +546,20 @@ mod tests {
 
         // Two more idles while inflight: recorded, not runners.
         assert_eq!(
-            observe_idle(&conn, kind, sid, "r2", 2_000).await.unwrap(),
+            observe_idle(&conn, kind, sid, &scope, "r2", 2_000)
+                .await
+                .unwrap(),
             IdleOutcome::RecordedOnly
         );
         assert_eq!(
-            observe_idle(&conn, kind, sid, "r3", 3_000).await.unwrap(),
+            observe_idle(&conn, kind, sid, &scope, "r3", 3_000)
+                .await
+                .unwrap(),
             IdleOutcome::RecordedOnly
         );
 
         // Runner finishes generation 1 → more work (target 3).
-        let outcome = advance_processed(&conn, kind, sid, "r1", fence_token, 1, 4_000)
+        let outcome = advance_processed(&conn, &job, "r1", fence_token, 1, 4_000)
             .await
             .unwrap();
         assert_eq!(
@@ -400,11 +569,11 @@ mod tests {
             }
         );
         // Processes the merged batch → clean.
-        let outcome = advance_processed(&conn, kind, sid, "r1", fence_token, 3, 5_000)
+        let outcome = advance_processed(&conn, &job, "r1", fence_token, 3, 5_000)
             .await
             .unwrap();
         assert_eq!(outcome, AdvanceOutcome::Clean);
-        release(&conn, kind, sid, "r1", fence_token, "idle", None, 6_000)
+        release(&conn, &job, "r1", fence_token, "idle", None, 6_000)
             .await
             .unwrap();
     }
@@ -412,7 +581,8 @@ mod tests {
     #[tokio::test]
     async fn tombstone_blocks_export_job_creation_and_generation_advance() {
         let conn = job_db().await;
-        conn.execute(Statement::from_string(
+        let scope = scope();
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO agent_import_tombstone (
                 tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
@@ -421,12 +591,12 @@ mod tests {
         ))
         .await
         .expect("seed tombstone");
-        let error = observe_idle(&conn, "opencode", "erased", "runner", 1)
+        let error = observe_idle(&conn, "opencode", "erased", &scope, "runner", 1)
             .await
             .expect_err("erased export job must be blocked");
         assert!(error.to_string().contains("erased"));
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT COUNT(*) AS n FROM agent_export_job".to_string(),
             ))
@@ -443,22 +613,26 @@ mod tests {
     async fn delayed_contender_cannot_reexport_clean_generation() {
         let conn = job_db().await;
         let (kind, sid) = ("opencode", "s1");
+        let scope = scope();
+        let job = ExportJobTarget::new(kind, sid, &scope);
 
         // A bumps (observed=1) but stalls before acquiring: simulate by
         // bumping WITHOUT holding the lease — B then bumps + runs + finishes.
         let IdleOutcome::Runner { fence_token, .. } =
-            observe_idle(&conn, kind, sid, "b", 0).await.unwrap()
+            observe_idle(&conn, kind, sid, &scope, "b", 0)
+                .await
+                .unwrap()
         else {
             panic!("B becomes the runner");
         };
         // B processes everything observed so far and releases idle.
         assert_eq!(
-            advance_processed(&conn, kind, sid, "b", fence_token, 1, 1_000)
+            advance_processed(&conn, &job, "b", fence_token, 1, 1_000)
                 .await
                 .unwrap(),
             AdvanceOutcome::Clean
         );
-        release(&conn, kind, sid, "b", fence_token, "idle", None, 1_500)
+        release(&conn, &job, "b", fence_token, "idle", None, 1_500)
             .await
             .unwrap();
 
@@ -468,7 +642,7 @@ mod tests {
         // directly: with processed == observed, the lease UPDATE matches no
         // row.
         let acquired = conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 "UPDATE agent_export_job
                  SET owner = 'a', lease_expires_at = 99999, state = 'inflight'
@@ -487,7 +661,9 @@ mod tests {
 
         // A fresh idle (new bump) re-enables acquisition normally.
         assert!(matches!(
-            observe_idle(&conn, kind, sid, "a", 3_000).await.unwrap(),
+            observe_idle(&conn, kind, sid, &scope, "a", 3_000)
+                .await
+                .unwrap(),
             IdleOutcome::Runner { .. }
         ));
     }
@@ -498,34 +674,29 @@ mod tests {
     async fn advance_and_release_keeps_later_generation_dirty() {
         let conn = job_db().await;
         let (kind, sid) = ("opencode", "settle-dirty");
+        let scope = scope();
+        let job = ExportJobTarget::new(kind, sid, &scope);
         let IdleOutcome::Runner {
             fence_token,
             target_generation,
             ..
-        } = observe_idle(&conn, kind, sid, "runner", 1_000)
+        } = observe_idle(&conn, kind, sid, &scope, "runner", 1_000)
             .await
             .unwrap()
         else {
             panic!("first idle must become the runner");
         };
         assert_eq!(
-            observe_idle(&conn, kind, sid, "later", 2_000)
+            observe_idle(&conn, kind, sid, &scope, "later", 2_000)
                 .await
                 .unwrap(),
             IdleOutcome::RecordedOnly
         );
 
-        let outcome = advance_and_release(
-            &conn,
-            kind,
-            sid,
-            "runner",
-            fence_token,
-            target_generation,
-            3_000,
-        )
-        .await
-        .unwrap();
+        let outcome =
+            advance_and_release(&conn, &job, "runner", fence_token, target_generation, 3_000)
+                .await
+                .unwrap();
         assert_eq!(
             outcome,
             AdvanceOutcome::MoreWork {
@@ -534,7 +705,7 @@ mod tests {
         );
 
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 "SELECT state, owner, observed_generation, processed_generation
                  FROM agent_export_job
@@ -557,11 +728,15 @@ mod tests {
     async fn stale_owner_is_fenced_out_after_takeover() {
         let conn = job_db().await;
         let (kind, sid) = ("opencode", "s1");
+        let scope = scope();
+        let job = ExportJobTarget::new(kind, sid, &scope);
 
         let IdleOutcome::Runner {
             fence_token: stale_fence,
             ..
-        } = observe_idle(&conn, kind, sid, "stale", 0).await.unwrap()
+        } = observe_idle(&conn, kind, sid, &scope, "stale", 0)
+            .await
+            .unwrap()
         else {
             panic!("runner expected");
         };
@@ -571,7 +746,7 @@ mod tests {
             fence_token: fresh_fence,
             target_generation,
             ..
-        } = observe_idle(&conn, kind, sid, "fresh", 60_000)
+        } = observe_idle(&conn, kind, sid, &scope, "fresh", 60_000)
             .await
             .unwrap()
         else {
@@ -582,16 +757,16 @@ mod tests {
 
         // Stale runner: advance and release are both fenced no-ops.
         assert_eq!(
-            advance_processed(&conn, kind, sid, "stale", stale_fence, 1, 61_000)
+            advance_processed(&conn, &job, "stale", stale_fence, 1, 61_000)
                 .await
                 .unwrap(),
             AdvanceOutcome::FencedOut
         );
-        release(&conn, kind, sid, "stale", stale_fence, "idle", None, 61_500)
+        release(&conn, &job, "stale", stale_fence, "idle", None, 61_500)
             .await
             .unwrap(); // silent no-op
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT owner, state FROM agent_export_job".to_string(),
             ))
@@ -609,7 +784,7 @@ mod tests {
 
         // Fresh runner completes normally.
         assert_eq!(
-            advance_processed(&conn, kind, sid, "fresh", fresh_fence, 2, 62_000)
+            advance_processed(&conn, &job, "fresh", fresh_fence, 2, 62_000)
                 .await
                 .unwrap(),
             AdvanceOutcome::Clean
@@ -623,27 +798,31 @@ mod tests {
     async fn max_loop_release_stays_dirty_and_ttl_scavenges() {
         let conn = job_db().await;
         let (kind, sid) = ("opencode", "s1");
+        let scope = scope();
+        let job = ExportJobTarget::new(kind, sid, &scope);
 
         let IdleOutcome::Runner { fence_token, .. } =
-            observe_idle(&conn, kind, sid, "r1", 0).await.unwrap()
+            observe_idle(&conn, kind, sid, &scope, "r1", 0)
+                .await
+                .unwrap()
         else {
             panic!("runner expected");
         };
         // A new idle arrives; runner hits its loop bound and releases dirty.
-        observe_idle(&conn, kind, sid, "other", 1_000)
+        observe_idle(&conn, kind, sid, &scope, "other", 1_000)
             .await
             .unwrap();
         assert!(matches!(
-            advance_processed(&conn, kind, sid, "r1", fence_token, 1, 2_000)
+            advance_processed(&conn, &job, "r1", fence_token, 1, 2_000)
                 .await
                 .unwrap(),
             AdvanceOutcome::MoreWork { .. }
         ));
-        release(&conn, kind, sid, "r1", fence_token, "dirty", None, 3_000)
+        release(&conn, &job, "r1", fence_token, "dirty", None, 3_000)
             .await
             .unwrap();
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT state FROM agent_export_job".to_string(),
             ))
@@ -657,5 +836,63 @@ mod tests {
         assert_eq!(scavenge_expired(&conn, 3_000).await.unwrap(), 0);
         let far_future = 3_000 + 24 * 60 * 60 * 1_000 + 1;
         assert_eq!(scavenge_expired(&conn, far_future).await.unwrap(), 1);
+    }
+
+    /// W4: the historical global provider-session key is intentionally kept
+    /// as a fail-closed collision boundary. A second workspace cannot bump or
+    /// take over the first workspace's export generation.
+    #[tokio::test]
+    async fn provider_session_in_another_workspace_scope_is_rejected() {
+        let conn = job_db().await;
+        let first = scope();
+        let second = CaptureScope {
+            repo_id: first.repo_id.clone(),
+            worktree_id: "linked-wt".to_string(),
+            workspace_id: Some("workspace-b".to_string()),
+            workspace_fence: Some(7),
+        };
+        assert!(matches!(
+            observe_idle(&conn, "opencode", "same-provider", &first, "a", 1)
+                .await
+                .unwrap(),
+            IdleOutcome::Runner { .. }
+        ));
+        let error = observe_idle(&conn, "opencode", "same-provider", &second, "b", 2)
+            .await
+            .expect_err("a second workspace must not reuse the provider session");
+        assert!(
+            error.to_string().contains("already claimed by another"),
+            "cross-scope refusal must explain the ownership conflict: {error:#}"
+        );
+    }
+
+    /// An export/import recovery row can survive after its catalog session is
+    /// gone. It remains a provider-session ownership claim and must block a
+    /// new capture from another scope just as a live session row would.
+    #[tokio::test]
+    async fn orphan_import_identity_in_another_scope_blocks_export_capture() {
+        let conn = job_db().await;
+        let scope = scope();
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "INSERT INTO agent_import_identity (
+                identity_id, agent_kind, provider_session_id, source_kind, source_id,
+                schema_version, next_ordinal, state, created_at, updated_at,
+                repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             ) VALUES ('foreign-import', 'opencode', 'orphan-provider', 'file', 'foreign',
+                       1, 0, 'discovered', 1, 1,
+                       'other-repo', 'linked-worktree', 'other-workspace', 9, 'scoped')"
+                .to_string(),
+        ))
+        .await
+        .expect("seed foreign scoped import identity");
+
+        let error = observe_idle(&conn, "opencode", "orphan-provider", &scope, "owner", 1)
+            .await
+            .expect_err("orphan import identity must retain its provider claim");
+        assert!(
+            error.to_string().contains("already claimed by another"),
+            "foreign orphan claim must be explained: {error:#}"
+        );
     }
 }

@@ -25,6 +25,8 @@ With `--autosquash`, commits whose subject starts with `fixup!`, `squash!`, or `
 
 `--autostash` preserves tracked index and worktree changes in a held stash object before replay and restores the staged index and unstaged worktree layers separately after success or abort. `--exec <cmd>` runs each repeatable command after every replayed commit through Libra's required workspace-write, network-denied sandbox; a failure stops the sequence and `--continue` retries the failed command. `--skip` after an exec failure keeps the already replayed commit and skips the remaining commands for that commit. `--update-refs` atomically retargets other local branches in the rewritten range, except branches checked out in any worktree. `--fork-point` uses the upstream reflog to recover the most specific old upstream tip that remains an ancestor of `HEAD`, then falls back to the ordinary merge base.
 
+Replayed commits preserve their original author — a rebase rewrites history's shape, not its authorship — while the committer becomes whoever ran the rebase, with a fresh timestamp. A fold (`fixup`, `squash`, `amend`) keeps the *target* commit's author, matching Git's rule that the author of the first commit in the group wins. If no `user.name` / `user.email` is configured, the rebase fails closed with `LBR-AUTH-001` instead of recording a placeholder identity.
+
 Rebase state (the list of remaining and completed commits, the original HEAD, and the target base) is persisted in the SQLite database. Recovery-critical autostash, exec, and update-refs metadata is fsynced atomically in `.libra/rebase-aux.json` until the sequence reaches a terminal state. Legacy file-based state from older Libra versions is automatically migrated to the database on first access.
 
 ## Options
