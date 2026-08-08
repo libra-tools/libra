@@ -276,6 +276,9 @@ fn stage_working_tree_path(
     fs::File::open(absolute)
         .map_err(|error| fatal(format!("cannot stage '{path_str}': {error}")))?;
 
+    // Stat BEFORE reading: the entry's stat must describe the hashed
+    // content, or it is smudged (2026-08-06 R0-8 review).
+    let pre_read = std::fs::symlink_metadata(absolute).ok();
     let blob = if lfs::is_lfs_tracked(absolute) {
         Blob::from_lfs_file(absolute)
     } else {
@@ -286,9 +289,10 @@ fn stage_working_tree_path(
             .with_exit_code(128)
             .with_stable_code(StableErrorCode::IoWriteFailed)
     })?;
-    IndexEntry::new_from_file(Path::new(path_str), blob.id, workdir).map_err(|error| {
-        CliError::fatal(format!("failed to stage '{path_str}': {error}"))
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::IoReadFailed)
-    })
+    crate::command::verified_index_entry(Path::new(path_str), blob.id, workdir, pre_read.as_ref())
+        .map_err(|error| {
+            CliError::fatal(format!("failed to stage '{path_str}': {error}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })
 }

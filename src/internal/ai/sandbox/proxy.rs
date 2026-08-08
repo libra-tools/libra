@@ -582,6 +582,7 @@ mod tests {
             },
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         assert!(
             allowlist_proxy_from_policy(&allowlist_policy)
@@ -607,6 +608,7 @@ mod tests {
             },
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         let error = allowlist_proxy_from_policy(&invalid_policy)
             .expect_err("invalid host should be rejected by service validation");

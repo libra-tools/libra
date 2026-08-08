@@ -24,7 +24,7 @@ libra service events
 |---|---|---|
 | `GET /api/health` | loopback | Liveness probe。 |
 | `GET /api/service/events` | token | SSE notification stream。 |
-| `POST /api/service/dirty/mark` | token | `{"paths":[...]}` — 通过已验证 owner API 的咨询式 dirty marks（只要任何路径逃出 repo，整个 batch 拒绝；仅 over-report）。 |
+| `POST /api/service/dirty/mark` | token | `{"paths":[...],"scope":{...}}` — 通过已验证 owner API 的咨询式 dirty marks（只要任何路径逃出 repo，整个 batch 拒绝；仅 over-report）。`scope` 是**带标签**的 worktree scope：`{"kind":"main"}`，或 `{"kind":"linked","worktree_id":"wt-…","workdir":"/abs/path","epoch":<n>}`——linked scope 下 `workdir` 与 `epoch` **必填**，二者在 registry 锁下与条目校验。instance id 由路径推导、路径本身会重复，因此原地 remove/re-add 后的 worktree 与前一次注册完全同形；`epoch`（`libra worktree list` 输出）是区分两次注册的 fence，携带旧值的请求会被拒绝。scope 会按 registry 校验：未知 id、registry 中 linked id 重复、或 linked 条目占用保留 id `main`，一律 **409**。**不带** `scope` 的请求仅在单 main 仓库中接受：多 worktree 仓库（或 registry 损坏/不可读——包括可解析但缺少唯一 main 条目的状态）下返回 **409**——dirty cache 按 worktree 隔离，请指明 scope，或在目标 worktree 内运行 `libra dirty <paths>`。 |
 | `POST /api/service/notify` | token | `{"type":"...","data":{...}}` — 发布自定义通知（automation triggers）。 |
 
 **Notification v1 语义**：事件为 `{seq,type,at,data}`，`seq` 在每次 service run 内单调递增。投递是 **at-most-once** — 落后的消费者会收到 `resync` 事件，并应重新读取权威状态（`libra dirty --list`、`libra status`）；服务重启时 `seq` 重置。持久事实（marks）保存在 SQLite 中且能跨 `kill -9` 存活；bus 上的一切都可派生。请求体上限 256 KiB。
@@ -49,7 +49,7 @@ libra service events                   # tail 通知
 TOKEN=$(cat .libra/service/service-token)
 URL=$(libra --json service status | jq -r .data.base_url)
 curl -H "X-Libra-Service-Token: $TOKEN" -X POST "$URL/api/service/dirty/mark" \
-     -H 'content-type: application/json' -d '{"paths":["src/main.rs"]}'
+     -H 'content-type: application/json' -d '{"paths":["src/main.rs"],"scope":{"kind":"main"}}'
 ```
 
 ## 与 Git 对比

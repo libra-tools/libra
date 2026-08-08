@@ -170,7 +170,7 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
 
 #[cfg(unix)]
 async fn seed_stopped_session(conn: &DatabaseConnection, session_id: &str) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -238,7 +238,7 @@ async fn seed_checkpoint_commit(
         .await
         .expect("append checkpoint commit");
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -270,7 +270,7 @@ async fn seed_checkpoint_commit(
 
 #[cfg(unix)]
 async fn local_traces_tip(conn: &DatabaseConnection) -> Option<String> {
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT `commit` FROM reference \
          WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",

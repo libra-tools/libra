@@ -275,10 +275,14 @@ Git 的 `--patch` 模式在终端内提供逐 hunk 的交互式暂存接口。Li
 
 ### Ignore 来源优先级
 
-Libra 会读取 Git 标准 ignore 文件（`.gitignore`、`.git/info/exclude` 和
-`core.excludesFile`）以及 Libra 扩展文件（`.libraignore`）。同一目录内
-`.libraignore` 比 `.gitignore` 优先；更近目录的来源优先于祖先目录；
-`.git/info/exclude` 和 `core.excludesFile` 是较低优先级 fallback。所有来源都使用 Git ignore 模式语法。
+Libra 会读取 Git 标准 ignore 文件（`.gitignore`、worktree 本地
+`info/exclude`——即当前 worktree 自己 gitdir 下的 `.libra/info/exclude`，
+Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）以及 Libra
+扩展文件（`.libraignore`）。同一目录内 `.libraignore` 比 `.gitignore`
+优先；更近目录的来源优先于祖先目录；`info/exclude` 和 `core.excludesFile`
+是较低优先级 fallback。`info/exclude` 按 worktree 独立（绝不经 `commondir`
+共享；见 [check-ignore.md](check-ignore.md)）。所有来源都使用 Git ignore
+模式语法。
 
 `libra init` 仍会在非 bare 仓库中创建根 `.libraignore`，以便保存 Libra 专用规则；Git 导入或非 bare clone 仍会把已有 `.gitignore` 文件复制为匹配的 `.libraignore` 文件，方便显式覆盖。
 

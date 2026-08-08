@@ -149,7 +149,7 @@ async fn edit_revert_message(initial: &str) -> Result<String, RevertError> {
     // Part C §C.4.3: transient per-worktree editor scratch — on shared storage
     // two worktrees composing a message concurrently would truncate each other's
     // buffer. Identical path for the main worktree (local == common storage).
-    let path = util::worktree_gitdir().join("REVERT_EDITMSG");
+    let path = util::request_worktree_gitdir_strict().join("REVERT_EDITMSG");
     let raw = editor::edit_message(&path, initial, &editor_cmd, true)
         .await
         .map_err(|e| RevertError::Editor(e.to_string()))?;
@@ -557,6 +557,7 @@ async fn revert_sequence(
 /// `revert --continue`: require every conflict resolved (no markers staged),
 /// then create the revert commit from the resolved index and clear the state.
 async fn run_revert_continue() -> Result<RevertOutput, RevertError> {
+    refuse_ambiguous_common_state()?;
     let state = RevertState::load_optional()?.ok_or(RevertError::NoRevertInProgress)?;
 
     // Refuse to finish while conflict markers remain in any *staged* file (the
@@ -635,6 +636,7 @@ async fn run_revert_continue() -> Result<RevertOutput, RevertError> {
 /// restoring the working tree/index to the commit's start point, then continue
 /// the sequence with the remaining commits.
 async fn run_revert_skip() -> Result<RevertOutput, RevertError> {
+    refuse_ambiguous_common_state()?;
     let state = RevertState::load_optional()?.ok_or(RevertError::NoRevertInProgress)?;
 
     // HEAD is already at `orig_head` (the conflict stopped before committing), so
@@ -708,9 +710,53 @@ async fn restore_to_orig_head(orig_head_str: &str) -> Result<(), RevertError> {
     update_head(orig_head_str).await
 }
 
+/// Refuse a control action on a COMMON-storage revert sidecar whose owner
+/// cannot be established (§C.4.3).
+///
+/// For a linked worktree the sidecar is in its own gitdir and is unambiguously
+/// its own. For MAIN the local gitdir IS common storage, so a sidecar there
+/// could have been written by a linked worktree that has since been removed —
+/// and `--continue`/`--abort` would reset main's HEAD, index and working tree
+/// from that state and then delete it. Refused BEFORE the load, so nothing is
+/// read and nothing is deleted.
+fn refuse_ambiguous_common_state() -> Result<(), RevertError> {
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+    if scope.is_linked() {
+        return Ok(());
+    }
+    if !crate::command::maintenance::repository_had_linked_worktrees() {
+        return Ok(());
+    }
+    let gitdir = util::request_worktree_gitdir().map_err(|error| {
+        RevertError::StateIo(format!(
+            "cannot resolve this worktree's gitdir to check for ambiguous shared state: {error}"
+        ))
+    })?;
+    let sidecar = gitdir.join("revert-state.json");
+    if !sidecar.exists() {
+        return Ok(());
+    }
+    // W2: a sidecar whose writer recorded main's scope is PROVEN main's and
+    // stays operable; only an unmarked (old-binary) file keeps W1's guess.
+    match crate::internal::sequencer::sidecar_recorded_owner(&sidecar) {
+        Ok(Some(owner)) if owner.is_empty() => return Ok(()),
+        Ok(_) => {}
+        Err(error) => return Err(RevertError::StateIo(error)),
+    }
+    Err(RevertError::StateIo(format!(
+        "a revert state file exists at '{}' in COMMON storage, and this repository has \
+         linked-worktree history, so it cannot be proven to be the main worktree's — \
+         continuing or aborting it would reset this worktree from another worktree's state. \
+         Inspect it with `libra worktree doctor`; remove it manually once you have confirmed \
+         it is stale.",
+        sidecar.display()
+    )))
+}
+
 /// `revert --abort`: reset HEAD/index/worktree to the pre-revert commit and clear
 /// the state.
 async fn run_revert_abort() -> Result<RevertOutput, RevertError> {
+    refuse_ambiguous_common_state()?;
     let state = RevertState::load_optional()?.ok_or(RevertError::NoRevertInProgress)?;
     restore_to_orig_head(&state.orig_head).await?;
     RevertState::cleanup()?;
@@ -758,6 +804,39 @@ const CONFLICT_MARKER: &str = "<<<<<<<";
 /// Persisted state for an in-progress conflicted revert (`.libra/revert-state.json`),
 /// mirroring merge's file-based state so `revert --continue`/`--abort` can finish
 /// or unwind the revert.
+/// This worktree's revert sidecar, for the §C.5 pseudo-ref projection:
+/// `(ORIG_HEAD, REVERT_HEAD)`. Read-only; the tuple keeps `RevertState`
+/// private, since the projection needs exactly these two fields.
+/// The SEMANTIC OID fields of this gitdir's `revert-state.json`, for GC root
+/// collection (plan-20260714 §C.4.3). Same contract as
+/// `merge::merge_state_gc_oids`: typed fields only, never text.
+pub(crate) fn revert_state_gc_oids(
+    gitdir: &std::path::Path,
+) -> Result<Option<Vec<(&'static str, String)>>, String> {
+    Ok(
+        revert_state_for_pseudo_refs(gitdir)?.map(|(orig_head, reverted_commit)| {
+            vec![
+                ("orig_head", orig_head),
+                ("reverted_commit", reverted_commit),
+            ]
+        }),
+    )
+}
+
+pub(crate) fn revert_state_for_pseudo_refs(
+    gitdir: &std::path::Path,
+) -> Result<Option<(String, String)>, String> {
+    let path = gitdir.join("revert-state.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let state: RevertState = serde_json::from_str(&data)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    Ok(Some((state.orig_head, state.reverted_commit)))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RevertState {
     /// HEAD at the time the revert started — the `--abort` reset target and the
@@ -793,7 +872,7 @@ impl RevertState {
         // where local and common storage coincide — so an in-progress revert
         // started by an older binary (which wrote common storage) is still found
         // there after upgrade.
-        util::worktree_gitdir().join("revert-state.json")
+        util::request_worktree_gitdir_strict().join("revert-state.json")
     }
 
     fn load_optional() -> Result<Option<Self>, RevertError> {
@@ -809,8 +888,21 @@ impl RevertState {
 
     fn save(&self) -> Result<(), RevertError> {
         let path = Self::path();
+        // Record the writer's scope (W2, ADR-0714-08) — see MergeState::save.
+        let mut value =
+            serde_json::to_value(self).map_err(|e| RevertError::StateIo(e.to_string()))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "owner_scope".to_string(),
+                serde_json::Value::String(
+                    crate::internal::worktree_scope::WorktreeScope::for_request()
+                        .storage_key()
+                        .to_string(),
+                ),
+            );
+        }
         let data =
-            serde_json::to_vec_pretty(self).map_err(|e| RevertError::StateIo(e.to_string()))?;
+            serde_json::to_vec_pretty(&value).map_err(|e| RevertError::StateIo(e.to_string()))?;
         // Atomic + fsynced write (lore.md §7.7): recovery-critical sequencer
         // state must never be left truncated by a crash.
         crate::utils::atomic_write::write_atomic(&path, &data, true)
@@ -819,10 +911,10 @@ impl RevertState {
 
     fn cleanup() -> Result<(), RevertError> {
         let path = Self::path();
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| RevertError::StateIo(e.to_string()))?;
-        }
-        Ok(())
+        // Durable (§C.10): a resurrected revert-state replays a revert the
+        // user already concluded.
+        crate::utils::atomic_write::remove_durably(&path)
+            .map_err(|e| RevertError::StateIo(format!("{}: {e}", path.display())))
     }
 }
 

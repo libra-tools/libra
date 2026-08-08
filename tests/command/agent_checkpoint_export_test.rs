@@ -37,7 +37,7 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
 /// embeds `SECRET`, and return the checkpoint id.
 async fn seed_checkpoint_with_secret(repo: &Path) -> String {
     let conn = connect_repo_db(repo).await;
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -85,7 +85,7 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
         .await
         .expect("append checkpoint");
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -115,7 +115,7 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
 async fn audit_rows(repo: &Path) -> Vec<(String, i64)> {
     let conn = connect_repo_db(repo).await;
     let rows = conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT checkpoint_id, granted FROM agent_audit_log ORDER BY timestamp".to_string(),
         ))

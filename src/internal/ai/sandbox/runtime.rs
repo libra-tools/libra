@@ -1314,6 +1314,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
 
         assert_eq!(
@@ -1343,6 +1344,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         assert_eq!(
             manager.select_initial(Some(&policy), SandboxPermissions::UseDefault),
@@ -1371,6 +1373,7 @@ mod tests {
                 network_access: NetworkAccess::Denied,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
+                allow_metadata_writes: false,
             }),
             sandbox_policy_cwd: &cwd,
             linux_sandbox_exe: None,
@@ -1409,6 +1412,7 @@ mod tests {
                 network_access: NetworkAccess::Denied,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
+                allow_metadata_writes: false,
             }),
             sandbox_policy_cwd: &cwd,
             linux_sandbox_exe: None,
@@ -1588,6 +1592,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let args = create_bwrap_command_args(
@@ -1625,6 +1630,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let args = create_bwrap_command_args(
@@ -1680,6 +1686,7 @@ mod tests {
             network_access: NetworkAccess::Full,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let args = create_bwrap_command_args(
@@ -1708,6 +1715,7 @@ mod tests {
             },
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let args = create_bwrap_command_args(
@@ -1757,6 +1765,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let args = create_bwrap_command_args(
@@ -1815,6 +1824,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let with_seccomp = create_bwrap_command_args_with_seccomp(
@@ -1895,6 +1905,7 @@ mod tests {
                 network_access: NetworkAccess::Denied,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
+                allow_metadata_writes: false,
             }),
             sandbox_policy_cwd: &cwd,
             linux_sandbox_exe: None,
@@ -2057,6 +2068,7 @@ mod tests {
                 network_access: NetworkAccess::Denied,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
+                allow_metadata_writes: false,
             }),
             sandbox_policy_cwd: &cwd,
             linux_sandbox_exe: None,
@@ -2152,6 +2164,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
         let request = SandboxTransformRequest {
             spec: CommandSpec::shell(
@@ -2189,6 +2202,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
         let request = SandboxTransformRequest {
             spec: CommandSpec::shell(

@@ -54,7 +54,7 @@ without printing panic/backtrace or `Broken pipe` diagnostics.
 | `--others`, `-o` | Show untracked working-tree files. |
 | `--cached`, `-c` | Show files staged in the index. |
 | `-i`, `--ignored` | Show only the ignored set: `-i -o` lists ignored untracked files (the inverse of `-o`), `-i -c` lists tracked files matching an exclude pattern. Must be combined with `-o`/`-c` and needs an exclude source — `--exclude-standard` or an explicit `-x`/`-X` pattern (exit 128 otherwise), matching Git. |
-| `--exclude-standard` | With `--others`, honor standard Git/Libra ignore sources (`.gitignore`, `.git/info/exclude`, `core.excludesFile`, and `.libraignore`). |
+| `--exclude-standard` | With `--others`, honor standard Git/Libra ignore sources (`.gitignore`, the worktree-local `info/exclude` — `.libra/info/exclude`, plus `.git/info/exclude` in Git- or dual-layout trees — `core.excludesFile`, and `.libraignore`). |
 | `-x`, `--exclude <pattern>` | Skip untracked files matching `<pattern>` (gitignore syntax) from the `--others` listing. Repeatable; supplements `--exclude-standard`. With `-i` the pattern instead defines the ignored set. |
 | `-X`, `--exclude-from <file>` | Read additional exclude patterns from `<file>` (one per line; `#` comments and blank lines skipped) and apply them like `-x`. Repeatable. |
 | `--error-unmatch` | Exit 1 with `LBR-CLI-003` if any explicit pathspec matches no files in the selected result set. |

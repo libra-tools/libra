@@ -17,15 +17,16 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
 use crate::internal::ai::{
     projection::{PlanHeadRef, ThreadBundle},
-    runtime::hardening::SecretRedactor,
+    runtime::{
+        ControllerLease, ControllerService, ControllerServiceError, ControllerServiceOptions,
+        ControllerSnapshot, hardening::SecretRedactor,
+    },
 };
-
-const DEFAULT_BROWSER_CONTROLLER_LEASE_SECS: i64 = 120;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +38,10 @@ pub enum CodeUiSessionStatus {
     AwaitingInteraction,
     Completed,
     Error,
+    /// A mutating command may have reached an unknown side-effect boundary.
+    /// This is intentionally distinct from ordinary errors/cancellation so a
+    /// resumed client cannot offer an unsafe automatic replay.
+    IndeterminateSideEffect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -64,20 +69,8 @@ pub struct CodeUiProviderInfo {
     pub managed: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeUiControllerKind {
-    #[default]
-    None,
-    Browser,
-    /// Local automation writer. Automation requires both the process-level
-    /// `X-Libra-Control-Token` and the lease-level `X-Code-Controller-Token`;
-    /// existing browser controllers keep using only the lease token for
-    /// backward compatibility.
-    Automation,
-    Tui,
-    Cli,
-}
+/// Wire-compatible name for the UI-neutral runtime controller kind.
+pub use crate::internal::ai::runtime::ControllerKind as CodeUiControllerKind;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -788,49 +781,14 @@ pub trait CodeUiProviderAdapter: CodeUiReadModel + CodeUiCommandAdapter {}
 
 impl<T> CodeUiProviderAdapter for T where T: CodeUiReadModel + CodeUiCommandAdapter {}
 
-#[derive(Debug, Clone)]
-pub enum CodeUiInitialController {
-    Unclaimed,
-    Fixed {
-        kind: CodeUiControllerKind,
-        owner_label: String,
-        reason: Option<String>,
-    },
-    LocalTui {
-        owner_label: String,
-        reason: Option<String>,
-    },
-}
-
-#[derive(Debug)]
-struct FixedController {
-    kind: CodeUiControllerKind,
-    owner_label: String,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ControllerLease {
-    pub kind: CodeUiControllerKind,
-    pub client_id: String,
-    pub token: String,
-    pub expires_at: DateTime<Utc>,
-}
-
-#[derive(Debug)]
-struct CodeUiControllerRuntimeState {
-    fixed: Option<FixedController>,
-    local_tui_owner: Option<FixedController>,
-    active_lease: Option<ControllerLease>,
-}
+/// Wire-compatible name for initial controller ownership.  Ownership is
+/// stored by the runtime service, not by a Web or TUI adapter.
+pub use crate::internal::ai::runtime::ControllerInitial as CodeUiInitialController;
 
 #[derive(Clone)]
 pub struct CodeUiRuntimeHandle {
     adapter: Arc<dyn CodeUiProviderAdapter>,
-    browser_write_enabled: bool,
-    automation_write_enabled: bool,
-    controller_state: Arc<Mutex<CodeUiControllerRuntimeState>>,
-    controller_lease_duration: Duration,
+    controller_service: ControllerService,
 }
 
 /// Bag of constructor options for [`CodeUiRuntimeHandle::build_with_options`].
@@ -845,7 +803,7 @@ pub struct CodeUiRuntimeOptions {
     pub automation_write_enabled: bool,
     pub initial_controller: CodeUiInitialController,
     /// Override for the controller-lease TTL. `None` keeps the production
-    /// default (`DEFAULT_BROWSER_CONTROLLER_LEASE_SECS` = 120 s). Only set
+    /// default (`DEFAULT_CONTROLLER_LEASE_SECS` = 120 s). Only set
     /// from `cfg(feature = "test-provider")` paths.
     pub lease_duration: Option<Duration>,
 }
@@ -936,45 +894,17 @@ impl CodeUiRuntimeHandle {
         adapter: Arc<dyn CodeUiProviderAdapter>,
         options: CodeUiRuntimeOptions,
     ) -> Arc<Self> {
-        let (fixed, local_tui_owner) = match options.initial_controller {
-            CodeUiInitialController::Unclaimed => (None, None),
-            CodeUiInitialController::Fixed {
-                kind,
-                owner_label,
-                reason,
-            } => (
-                Some(FixedController {
-                    kind,
-                    owner_label,
-                    reason,
-                }),
-                None,
-            ),
-            CodeUiInitialController::LocalTui {
-                owner_label,
-                reason,
-            } => (
-                None,
-                Some(FixedController {
-                    kind: CodeUiControllerKind::Tui,
-                    owner_label,
-                    reason,
-                }),
-            ),
-        };
-
+        let mut controller_options = ControllerServiceOptions::new(
+            options.browser_write_enabled,
+            options.automation_write_enabled,
+            options.initial_controller,
+        );
+        controller_options.lease_duration = options.lease_duration.unwrap_or_else(|| {
+            Duration::seconds(crate::internal::ai::runtime::DEFAULT_CONTROLLER_LEASE_SECS)
+        });
         let handle = Arc::new(Self {
             adapter,
-            browser_write_enabled: options.browser_write_enabled,
-            automation_write_enabled: options.automation_write_enabled,
-            controller_state: Arc::new(Mutex::new(CodeUiControllerRuntimeState {
-                fixed,
-                local_tui_owner,
-                active_lease: None,
-            })),
-            controller_lease_duration: options
-                .lease_duration
-                .unwrap_or_else(|| Duration::seconds(DEFAULT_BROWSER_CONTROLLER_LEASE_SECS)),
+            controller_service: ControllerService::new(controller_options),
         });
         handle.sync_controller_snapshot().await;
         handle
@@ -1035,86 +965,24 @@ impl CodeUiRuntimeHandle {
     /// - `CONTROLLER_CONFLICT` when another client already holds an active lease.
     /// - `INVALID_CONTROLLER_KIND` for `None`, `Tui`, or `Cli`.
     ///
-    /// The lease TTL defaults to `DEFAULT_BROWSER_CONTROLLER_LEASE_SECS` (120s).
+    /// The lease TTL defaults to `DEFAULT_CONTROLLER_LEASE_SECS` (120s).
     /// Renew by calling again with the same `client_id`.
     pub async fn attach_controller(
         &self,
         kind: CodeUiControllerKind,
         client_id: &str,
     ) -> Result<CodeUiControllerAttachResponse, CodeUiApiError> {
-        match kind {
-            CodeUiControllerKind::Browser if !self.browser_write_enabled => {
-                return Err(CodeUiApiError::forbidden(
-                    "BROWSER_CONTROL_DISABLED",
-                    "Browser control is disabled for this code session",
-                ));
-            }
-            CodeUiControllerKind::Automation if !self.automation_write_enabled => {
-                return Err(CodeUiApiError::forbidden(
-                    "CONTROL_DISABLED",
-                    "Local TUI automation write control is not enabled; start with --control write",
-                ));
-            }
-            CodeUiControllerKind::Browser | CodeUiControllerKind::Automation => {}
-            _ => {
-                return Err(CodeUiApiError::bad_request(
-                    "INVALID_CONTROLLER_KIND",
-                    format!("Controller kind '{}' cannot attach", kind.as_str()),
-                ));
-            }
-        }
-
-        let mut state = self.controller_state.lock().await;
-        if let Some(fixed) = state.fixed.as_ref() {
-            return Err(CodeUiApiError::conflict(
-                "CONTROLLER_CONFLICT",
-                format!(
-                    "The active controller is {} ({})",
-                    fixed.kind.as_str(),
-                    fixed.owner_label
-                ),
-            ));
-        }
-
-        let now = Utc::now();
-        if state
-            .active_lease
-            .as_ref()
-            .is_some_and(|lease| lease.expires_at <= now)
-        {
-            state.active_lease = None;
-        }
-
-        let lease = if let Some(existing) = state.active_lease.as_mut() {
-            if existing.client_id != client_id || existing.kind != kind {
-                return Err(CodeUiApiError::conflict(
-                    "CONTROLLER_CONFLICT",
-                    format!(
-                        "Another {} currently controls this session",
-                        existing.kind.as_str()
-                    ),
-                ));
-            }
-            existing.expires_at = now + self.controller_lease_duration;
-            existing.clone()
-        } else {
-            let lease = ControllerLease {
-                kind,
-                client_id: client_id.to_string(),
-                token: Uuid::new_v4().to_string(),
-                expires_at: now + self.controller_lease_duration,
-            };
-            state.active_lease = Some(lease.clone());
-            lease
-        };
-        drop(state);
-
+        let lease = self
+            .controller_service
+            .attach(kind, client_id)
+            .await
+            .map_err(CodeUiApiError::from_controller_service)?;
         self.sync_controller_snapshot().await;
 
         Ok(CodeUiControllerAttachResponse {
             controller_token: lease.token,
             lease_expires_at: lease.expires_at,
-            controller: self.current_controller_state().await,
+            controller: self.code_ui_controller_state().await,
         })
     }
 
@@ -1123,40 +991,28 @@ impl CodeUiRuntimeHandle {
         client_id: &str,
         token: &str,
     ) -> Result<(), CodeUiApiError> {
-        self.detach_controller(CodeUiControllerKind::Browser, client_id, token, false)
+        self.detach_controller(CodeUiControllerKind::Browser, client_id, token)
             .await
     }
 
     /// Release an active controller lease.
     ///
-    /// `force` is reserved for local TUI reclaim (e.g. `/control reclaim`).
-    /// When `force` is `false`, both `client_id` and `token` must match the
-    /// active lease. HTTP handlers should not expose `force` to remote clients.
+    /// Both `client_id` and `token` must match the active lease.  Local TUI
+    /// reclaim is a separately scoped runtime operation and is never exposed
+    /// through this remote detach API.
     ///
-    /// Thin wrappers (`detach_browser_controller`) hard-code `kind` and `force`
-    /// to preserve backward compatibility for existing browser callers.
+    /// The thin `detach_browser_controller` wrapper preserves compatibility for
+    /// existing browser callers.
     pub async fn detach_controller(
         &self,
         kind: CodeUiControllerKind,
         client_id: &str,
         token: &str,
-        force: bool,
     ) -> Result<(), CodeUiApiError> {
-        let mut state = self.controller_state.lock().await;
-        let Some(existing) = state.active_lease.as_ref() else {
-            return Ok(());
-        };
-        if existing.kind != kind {
-            return Ok(());
-        }
-        if !force && (existing.client_id != client_id || existing.token != token) {
-            return Err(CodeUiApiError::forbidden(
-                "INVALID_CONTROLLER_TOKEN",
-                "The controller token does not match the active controller",
-            ));
-        }
-        state.active_lease = None;
-        drop(state);
+        self.controller_service
+            .detach(kind, client_id, token)
+            .await
+            .map_err(CodeUiApiError::from_controller_service)?;
         self.sync_controller_snapshot().await;
         Ok(())
     }
@@ -1166,11 +1022,15 @@ impl CodeUiRuntimeHandle {
         token: Option<&str>,
         text: String,
     ) -> Result<(), CodeUiApiError> {
-        self.ensure_controller_write_access(token).await?;
-        self.adapter
+        let permit = self.acquire_controller_write_permit(token).await?;
+        let result = self
+            .adapter
             .submit_message(text)
             .await
-            .map_err(CodeUiApiError::unsupported_from_error)
+            .map_err(CodeUiApiError::unsupported_from_error);
+        drop(permit);
+        self.sync_controller_snapshot().await;
+        result
     }
 
     pub async fn respond_interaction(
@@ -1179,19 +1039,27 @@ impl CodeUiRuntimeHandle {
         interaction_id: &str,
         response: CodeUiInteractionResponse,
     ) -> Result<(), CodeUiApiError> {
-        self.ensure_controller_write_access(token).await?;
-        self.adapter
+        let permit = self.acquire_controller_write_permit(token).await?;
+        let result = self
+            .adapter
             .respond_interaction(interaction_id, response)
             .await
-            .map_err(CodeUiApiError::unsupported_from_error)
+            .map_err(CodeUiApiError::unsupported_from_error);
+        drop(permit);
+        self.sync_controller_snapshot().await;
+        result
     }
 
     pub async fn cancel_turn(&self, token: Option<&str>) -> Result<(), CodeUiApiError> {
-        self.ensure_controller_write_access(token).await?;
-        self.adapter
+        let permit = self.acquire_controller_write_permit(token).await?;
+        let result = self
+            .adapter
             .cancel_turn()
             .await
-            .map_err(CodeUiApiError::unsupported_from_error)
+            .map_err(CodeUiApiError::unsupported_from_error);
+        drop(permit);
+        self.sync_controller_snapshot().await;
+        result
     }
 
     /// `task.dispatch { agent, prompt }` — user-initiated sub-agent
@@ -1203,11 +1071,15 @@ impl CodeUiRuntimeHandle {
         agent: String,
         prompt: String,
     ) -> Result<String, CodeUiApiError> {
-        self.ensure_controller_write_access(token).await?;
-        self.adapter
+        let permit = self.acquire_controller_write_permit(token).await?;
+        let result = self
+            .adapter
             .task_dispatch(agent, prompt)
             .await
-            .map_err(CodeUiApiError::unsupported_from_error)
+            .map_err(CodeUiApiError::unsupported_from_error);
+        drop(permit);
+        self.sync_controller_snapshot().await;
+        result
     }
 
     /// `goal.start { objective }` — open an active Goal in this
@@ -1221,11 +1093,15 @@ impl CodeUiRuntimeHandle {
         token: Option<&str>,
         objective: String,
     ) -> Result<String, CodeUiApiError> {
-        self.ensure_controller_write_access(token).await?;
-        self.adapter
+        let permit = self.acquire_controller_write_permit(token).await?;
+        let result = self
+            .adapter
             .goal_start(objective)
             .await
-            .map_err(CodeUiApiError::unsupported_from_error)
+            .map_err(CodeUiApiError::unsupported_from_error);
+        drop(permit);
+        self.sync_controller_snapshot().await;
+        result
     }
 
     /// `goal.status` — return the active Goal's rendered snapshot.
@@ -1246,11 +1122,15 @@ impl CodeUiRuntimeHandle {
         token: Option<&str>,
         reason: String,
     ) -> Result<String, CodeUiApiError> {
-        self.ensure_controller_write_access(token).await?;
-        self.adapter
+        let permit = self.acquire_controller_write_permit(token).await?;
+        let result = self
+            .adapter
             .goal_cancel(reason)
             .await
-            .map_err(CodeUiApiError::unsupported_from_error)
+            .map_err(CodeUiApiError::unsupported_from_error);
+        drop(permit);
+        self.sync_controller_snapshot().await;
+        result
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -1273,127 +1153,63 @@ impl CodeUiRuntimeHandle {
         &self,
         token: Option<&str>,
     ) -> Result<ControllerLease, CodeUiApiError> {
-        let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
-            return Err(CodeUiApiError::forbidden(
-                "MISSING_CONTROLLER_TOKEN",
-                "A controller token is required for write operations",
-            ));
-        };
-
-        let mut should_sync_after_error = false;
-        let lease = {
-            let mut state = self.controller_state.lock().await;
-            let now = Utc::now();
-            if state
-                .active_lease
-                .as_ref()
-                .is_some_and(|lease| lease.expires_at <= now)
-            {
-                state.active_lease = None;
-                should_sync_after_error = true;
-            }
-
-            let Some(lease) = state.active_lease.as_mut() else {
-                drop(state);
-                if should_sync_after_error {
-                    self.sync_controller_snapshot().await;
-                }
-                return Err(CodeUiApiError::conflict(
-                    "CONTROLLER_CONFLICT",
-                    "No client currently controls this session",
-                ));
-            };
-            if lease.token != token {
-                return Err(CodeUiApiError::forbidden(
-                    "INVALID_CONTROLLER_TOKEN",
-                    "The controller token does not match the active controller",
-                ));
-            }
-            lease.expires_at = now + self.controller_lease_duration;
-            lease.clone()
-        };
+        let result = self
+            .controller_service
+            .authorize_write(token)
+            .await
+            .map_err(CodeUiApiError::from_controller_service);
         self.sync_controller_snapshot().await;
-        Ok(lease)
+        result
     }
 
     pub async fn reclaim_local_tui_controller(&self) -> Result<(), CodeUiApiError> {
-        let mut state = self.controller_state.lock().await;
-        if state.local_tui_owner.is_none() {
-            return Err(CodeUiApiError::conflict(
-                "CONTROLLER_CONFLICT",
-                "This session does not have a local TUI controller to reclaim",
-            ));
-        }
-        state.active_lease = None;
-        drop(state);
+        self.controller_service
+            .reclaim_local_tui()
+            .await
+            .map_err(CodeUiApiError::from_controller_service)?;
         self.sync_controller_snapshot().await;
         Ok(())
     }
 
-    async fn current_controller_state(&self) -> CodeUiControllerState {
-        let mut state = self.controller_state.lock().await;
-        let now = Utc::now();
-        if state
-            .active_lease
-            .as_ref()
-            .is_some_and(|lease| lease.expires_at <= now)
-        {
-            state.active_lease = None;
+    async fn acquire_controller_write_permit(
+        &self,
+        token: Option<&str>,
+    ) -> Result<crate::internal::ai::runtime::ControllerWritePermit, CodeUiApiError> {
+        let result = self
+            .controller_service
+            .acquire_write_permit(token)
+            .await
+            .map_err(CodeUiApiError::from_controller_service);
+        if result.is_err() {
+            self.sync_controller_snapshot().await;
         }
-
-        if let Some(lease) = state.active_lease.as_ref() {
-            return CodeUiControllerState {
-                kind: lease.kind,
-                owner_label: Some(lease.client_id.clone()),
-                can_write: true,
-                lease_expires_at: Some(lease.expires_at),
-                reason: None,
-                loopback_only: true,
-            };
-        }
-
-        if let Some(local) = state.local_tui_owner.as_ref() {
-            return CodeUiControllerState {
-                kind: local.kind,
-                owner_label: Some(local.owner_label.clone()),
-                can_write: false,
-                lease_expires_at: None,
-                reason: local.reason.clone(),
-                loopback_only: true,
-            };
-        }
-
-        if let Some(fixed) = state.fixed.as_ref() {
-            return CodeUiControllerState {
-                kind: fixed.kind,
-                owner_label: Some(fixed.owner_label.clone()),
-                can_write: false,
-                lease_expires_at: None,
-                reason: fixed.reason.clone(),
-                loopback_only: true,
-            };
-        }
-
-        CodeUiControllerState {
-            kind: CodeUiControllerKind::None,
-            owner_label: None,
-            can_write: false,
-            lease_expires_at: None,
-            reason: if self.browser_write_enabled {
-                Some("No controller attached".to_string())
-            } else {
-                Some("Browser control is disabled".to_string())
-            },
-            loopback_only: true,
-        }
+        result
     }
 
     async fn sync_controller_snapshot(&self) {
-        let controller = self.current_controller_state().await;
+        let controller = self.code_ui_controller_state().await;
         self.adapter
             .session()
             .set_controller_state(controller)
             .await;
+    }
+
+    async fn code_ui_controller_state(&self) -> CodeUiControllerState {
+        let ControllerSnapshot {
+            kind,
+            owner_label,
+            can_write,
+            lease_expires_at,
+            reason,
+        } = self.controller_service.snapshot().await;
+        CodeUiControllerState {
+            kind,
+            owner_label,
+            can_write,
+            lease_expires_at,
+            reason,
+            loopback_only: true,
+        }
     }
 }
 
@@ -1405,6 +1221,14 @@ pub struct CodeUiApiError {
 }
 
 impl CodeUiApiError {
+    fn from_controller_service(error: ControllerServiceError) -> Self {
+        Self {
+            status: error.http_status(),
+            code: error.code().to_string(),
+            message: error.message(),
+        }
+    }
+
     pub fn not_found(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status: 404,
@@ -1659,18 +1483,6 @@ pub fn snapshot_from_event(event: &CodeUiEventEnvelope) -> anyhow::Result<CodeUi
     Ok(event.data.clone())
 }
 
-impl CodeUiControllerKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Browser => "browser",
-            Self::Automation => "automation",
-            Self::Tui => "tui",
-            Self::Cli => "cli",
-        }
-    }
-}
-
 pub fn ensure_session_updated_event(
     snapshot: &CodeUiSessionSnapshot,
 ) -> anyhow::Result<CodeUiEventEnvelope> {
@@ -1684,6 +1496,8 @@ pub fn ensure_session_updated_event(
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::Mutex;
+
     use super::*;
 
     fn test_session() -> Arc<CodeUiSession> {
@@ -2088,10 +1902,12 @@ mod tests {
     #[tokio::test]
     async fn expired_browser_controller_lease_is_cleaned_before_attach() {
         let session = test_session();
-        let runtime = CodeUiRuntimeHandle::build(
+        let mut options =
+            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed);
+        options.lease_duration = Some(Duration::milliseconds(1));
+        let runtime = CodeUiRuntimeHandle::build_with_options(
             ReadOnlyCodeUiAdapter::new(session.clone(), CodeUiCapabilities::default()),
-            true,
-            CodeUiInitialController::Unclaimed,
+            options,
         )
         .await;
 
@@ -2099,14 +1915,7 @@ mod tests {
             .attach_browser_controller("browser-a")
             .await
             .expect("browser controller should attach");
-        {
-            let mut state = runtime.controller_state.lock().await;
-            let lease = state
-                .active_lease
-                .as_mut()
-                .expect("browser lease should be active");
-            lease.expires_at = Utc::now() - Duration::seconds(1);
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
         let replacement_attach = runtime
             .attach_browser_controller("browser-b")

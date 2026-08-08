@@ -138,6 +138,33 @@ pub(crate) fn fsync_parent_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Unlink `path` so the removal SURVIVES a power loss.
+///
+/// The parent directory entry is fsynced after the unlink: a removal that has
+/// not reached the disk leaves the file behind exactly as a lost write would,
+/// and for recovery-critical state (sequencer sidecars, the stash log) a
+/// resurrected file replays an operation the user already concluded. Both the
+/// directory open and the sync PROPAGATE — swallowing them would report a
+/// durable deletion that is not.
+pub fn remove_durably(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot fsync the parent of a path with none: {}",
+                path.display()
+            ),
+        )
+    })?;
+    let dir = fs::File::open(parent)?;
+    dir.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

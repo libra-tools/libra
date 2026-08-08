@@ -264,10 +264,9 @@ pub(crate) fn parse_mail(source: &str, raw: &str) -> CliResult<ParsedMail> {
         .ok_or_else(|| invalid_mail(source, "missing blank line after mail headers"))?;
     let headers = parse_headers(raw_headers).map_err(|detail| invalid_mail(source, &detail))?;
     let content_type = header(&headers, "content-type").unwrap_or("text/plain");
-    validate_content_type(content_type).map_err(|detail| invalid_mail(source, &detail))?;
     let transfer = header(&headers, "content-transfer-encoding").unwrap_or("8bit");
-    let body =
-        decode_transfer(encoded_body, transfer).map_err(|detail| invalid_mail(source, &detail))?;
+    let body = extract_text_body(content_type, transfer, encoded_body, 0)
+        .map_err(|detail| invalid_mail(source, &detail))?;
     if body.contains('\0') {
         return Err(invalid_mail(source, "decoded mail body contains NUL"));
     }
@@ -365,22 +364,215 @@ fn parse_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
     Ok(headers)
 }
 
+/// Cap on multipart nesting (PD-09 ④): real mails nest one or two
+/// levels; a hostile boundary bomb must not recurse unbounded.
+const MAX_MULTIPART_DEPTH: usize = 4;
+
+/// PD-09 ④: produce the mail's effective TEXT body. `text/plain`
+/// decodes directly (the historical behavior, byte-identical);
+/// `multipart/*` containers split on their boundary and concatenate
+/// every supported text part in order — `text/plain`, `text/x-patch`,
+/// and `text/x-diff` (the attachment types `format-patch --attach`
+/// produces) — recursing into nested multiparts (bounded) and skipping
+/// non-text parts such as HTML alternatives or binary attachments.
+fn extract_text_body(
+    content_type: &str,
+    transfer: &str,
+    encoded: &str,
+    depth: usize,
+) -> Result<String, String> {
+    if depth > MAX_MULTIPART_DEPTH {
+        return Err("multipart mail nests too deep".to_string());
+    }
+    let media = media_type_of(content_type);
+    if !media.starts_with("multipart/") {
+        validate_content_type(content_type)?;
+        return decode_transfer(encoded, transfer);
+    }
+    // RFC 2045: a multipart container itself must use an identity
+    // transfer encoding.
+    match transfer.trim().to_ascii_lowercase().as_str() {
+        "" | "7bit" | "8bit" | "binary" => {}
+        other => {
+            return Err(format!(
+                "unsupported Content-Transfer-Encoding '{other}' on a multipart container"
+            ));
+        }
+    }
+    let boundary = content_type_parameter(content_type, "boundary")
+        .ok_or_else(|| "multipart mail is missing its boundary parameter".to_string())?;
+    if boundary.is_empty() {
+        return Err("multipart mail has an empty boundary parameter".to_string());
+    }
+    let mut collected = String::new();
+    for part in split_multipart(encoded, &boundary)? {
+        // RFC 2046: a part may have an EMPTY header section — its content
+        // starts right after a leading blank line. Detect that before the
+        // generic headers/body split so a body paragraph break is never
+        // mis-read as the header separator.
+        let (raw_part_headers, part_body) = if let Some(body) = part.strip_prefix('\n') {
+            ("", body)
+        } else if let Some(body) = part.strip_prefix("\r\n") {
+            ("", body)
+        } else {
+            match part.split_once("\n\n") {
+                Some((headers, body)) => (headers, body),
+                // A headerless part is implicit text/plain.
+                None => ("", part.as_str()),
+            }
+        };
+        let part_headers = parse_headers(raw_part_headers)?;
+        let part_type = header(&part_headers, "content-type").unwrap_or("text/plain");
+        let part_transfer = header(&part_headers, "content-transfer-encoding").unwrap_or("8bit");
+        let part_media = media_type_of(part_type);
+        if part_media.starts_with("multipart/") {
+            let nested = extract_text_body(part_type, part_transfer, part_body, depth + 1)?;
+            push_text_part(&mut collected, &nested);
+            continue;
+        }
+        if !matches!(
+            part_media.as_str(),
+            "text/plain" | "text/x-patch" | "text/x-diff"
+        ) {
+            // HTML alternatives, binary attachments, signatures … are not
+            // patch carriers; skipping them mirrors `git mailinfo`.
+            continue;
+        }
+        validate_text_charset(part_type)?;
+        let decoded = decode_transfer(part_body, part_transfer)?;
+        push_text_part(&mut collected, &decoded);
+    }
+    if collected.trim().is_empty() {
+        return Err("multipart mail carries no supported text part".to_string());
+    }
+    Ok(collected)
+}
+
+/// Join text parts with a separating newline so a body part that does
+/// not end in one cannot glue onto the next part's first line.
+fn push_text_part(collected: &mut String, part: &str) {
+    if !collected.is_empty() && !collected.ends_with('\n') {
+        collected.push('\n');
+    }
+    collected.push_str(part);
+}
+
+/// Split a Content-Type header's `;`-separated parameters WITHOUT
+/// breaking inside quoted values (`name="a;b"`), per RFC 2045 §5.1.
+fn split_ct_params(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    for (index, byte) in value.bytes().enumerate() {
+        match byte {
+            b'"' => in_quotes = !in_quotes,
+            b';' if !in_quotes => {
+                parts.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+fn media_type_of(content_type: &str) -> String {
+    split_ct_params(content_type)
+        .first()
+        .copied()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Extract a `name=value` parameter from a Content-Type header,
+/// stripping optional quotes.
+fn content_type_parameter(value: &str, name: &str) -> Option<String> {
+    for parameter in split_ct_params(value).into_iter().skip(1) {
+        let Some((candidate, parameter_value)) = parameter.trim().split_once('=') else {
+            continue;
+        };
+        if candidate.trim().eq_ignore_ascii_case(name) {
+            return Some(parameter_value.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Split a multipart body on its boundary lines. The preamble (before
+/// the first boundary) is discarded; the closing `--boundary--` ends the
+/// scan; an unterminated final part is tolerated (matching mail
+/// tooling). Each part's trailing delimiter newline is removed.
+fn split_multipart(body: &str, boundary: &str) -> Result<Vec<String>, String> {
+    let open = format!("--{boundary}");
+    let close = format!("--{boundary}--");
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in body.split_inclusive('\n') {
+        // RFC 2046 §5.1.1: a boundary delimiter line may carry trailing
+        // transport padding (spaces/tabs) before the CRLF.
+        let bare = line
+            .trim_end_matches(['\n', '\r'])
+            .trim_end_matches([' ', '\t']);
+        if bare == close {
+            if let Some(part) = current.take() {
+                parts.push(trim_part_delimiter_newline(part));
+            }
+            break;
+        }
+        if bare == open {
+            if let Some(part) = current.take() {
+                parts.push(trim_part_delimiter_newline(part));
+            }
+            current = Some(String::new());
+            continue;
+        }
+        if let Some(part) = current.as_mut() {
+            part.push_str(line);
+        }
+    }
+    if let Some(part) = current.take() {
+        parts.push(trim_part_delimiter_newline(part));
+    }
+    if parts.is_empty() {
+        return Err("multipart mail has no parts for its declared boundary".to_string());
+    }
+    Ok(parts)
+}
+
+/// The newline immediately before a boundary belongs to the delimiter,
+/// not to the part content (RFC 2046 §5.1.1).
+fn trim_part_delimiter_newline(mut part: String) -> String {
+    if part.ends_with('\n') {
+        part.pop();
+        if part.ends_with('\r') {
+            part.pop();
+        }
+    }
+    part
+}
+
 fn validate_content_type(value: &str) -> Result<(), String> {
-    let mut parts = value.split(';');
-    let media_type = parts.next().unwrap_or_default().trim();
+    let binding = media_type_of(value);
+    let media_type = binding.as_str();
     if !media_type.eq_ignore_ascii_case("text/plain") {
         return Err(format!(
-            "unsupported Content-Type '{media_type}'; expected text/plain"
+            "unsupported Content-Type '{media_type}'; expected text/plain or a multipart container"
         ));
     }
-    for parameter in parts {
-        let Some((name, value)) = parameter.trim().split_once('=') else {
+    validate_text_charset(value)
+}
+
+fn validate_text_charset(value: &str) -> Result<(), String> {
+    for parameter in split_ct_params(value).into_iter().skip(1) {
+        let Some((name, parameter_value)) = parameter.trim().split_once('=') else {
             continue;
         };
         if name.trim().eq_ignore_ascii_case("charset") {
-            let charset = value.trim().trim_matches('"');
+            let charset = parameter_value.trim().trim_matches('"');
             if !matches!(charset.to_ascii_lowercase().as_str(), "utf-8" | "us-ascii") {
-                return Err(format!("unsupported text/plain charset '{charset}'"));
+                return Err(format!("unsupported text charset '{charset}'"));
             }
         }
     }

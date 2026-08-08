@@ -478,9 +478,6 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
 /// See: tests::test_add_all_flag in tests/command/add_test.rs:100;
 /// tests::test_add_force_tracks_ignored_file in tests/command/add_test.rs:319.
 pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
-    // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
-    // ignore resolver skips layer-owned paths (a no-op with no layers).
-    crate::internal::layer::refresh_exclusion_snapshot().await;
     let workdir = util::try_working_dir().map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AddError::NotInRepo
@@ -488,6 +485,13 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             AddError::Workdir { source }
         }
     })?;
+    // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
+    // ignore resolver skips layer-owned paths (a no-op with no layers).
+    // W1 §C.4.1.1: the scope is derived from the CAPTURED workdir (not the
+    // ambient cwd) so it stays bound to the tree this request stages into —
+    // resolved ONCE and reused by the staging guard below.
+    let layer_scope = crate::internal::worktree_scope::WorktreeScope::for_workdir(&workdir);
+    crate::internal::layer::refresh_exclusion_snapshot(&layer_scope).await;
     let index_path = path::try_index().map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AddError::NotInRepo
@@ -627,12 +631,21 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // Under Respect, layer paths are already ignore-excluded so `files` is
     // empty of them (this loop is a no-op — zero overhead with no layers).
     {
-        // Fail-CLOSED (Codex P1): a real DB read failure here must NOT allow
-        // staging (the invariant is never-enters-commit). `materialized_paths`
-        // is absence-tolerant for a missing table (fresh repo) but propagates
-        // any other error.
+        // W1 §C.4.1.1 scope↔workdir binding, last-moment re-verification:
+        // awaits ran since `layer_scope` was derived from the entry workdir.
+        // If the process cwd moved to ANOTHER worktree meanwhile, the index
+        // this request stages into would no longer belong to `layer_scope` —
+        // refuse rather than guard the wrong tree (fail closed).
+        crate::internal::layer::verify_staging_context(&workdir, &layer_scope)?;
+        // Fail-CLOSED (§C.4.1.1): a read failure here must NOT allow staging —
+        // the invariant is that a materialized overlay never enters a commit.
+        // The STRICT reader, because `materialized_paths` is absence-tolerant:
+        // it answers "no overlays" for a missing `layer_path` table so a fresh
+        // or pre-migration repository still works, and on a corrupt or partially
+        // migrated database that same answer would let `add --force` stage an
+        // overlay that is still on disk.
         let owned: std::collections::HashSet<String> =
-            crate::internal::layer::LayerStore::materialized_paths()
+            crate::internal::layer::LayerStore::owned_path_set_strict(&layer_scope)
                 .await
                 .map_err(|e| {
                     CliError::fatal(format!(
@@ -641,7 +654,6 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                     .with_stable_code(StableErrorCode::IoReadFailed)
                 })?
                 .into_iter()
-                .map(|p| p.path)
                 .collect();
         if !owned.is_empty() {
             let blocked: Vec<String> = files
@@ -863,9 +875,11 @@ fn apply_chmod(
         let file_str = file
             .to_str()
             .ok_or_else(|| AddError::InvalidPathEncoding { path: file.clone() })?;
-        // Read the current mode + blob id without holding the index borrow
-        // (`IndexEntry` is not `Clone`).
-        let Some((current_mode, hash)) = index.get(file_str, 0).map(|e| (e.mode, e.hash)) else {
+        // Read the current mode + blob id + size without holding the index
+        // borrow (`IndexEntry` is not `Clone`).
+        let Some((current_mode, hash, entry_size)) =
+            index.get(file_str, 0).map(|e| (e.mode, e.hash, e.size))
+        else {
             continue;
         };
         // Only regular blobs carry an executable bit; a path already at the
@@ -883,15 +897,14 @@ fn apply_chmod(
             continue;
         }
         if !dry_run {
-            // Rebuild the entry from the working-tree stat, keeping the existing
-            // blob (no content change) and forcing the requested mode.
-            let mut updated =
-                IndexEntry::new_from_file(file, hash, &workdir).map_err(|source| {
-                    AddError::CreateIndexEntry {
-                        path: file.to_path_buf(),
-                        source,
-                    }
-                })?;
+            // Keep the existing blob and force the requested mode, but do
+            // NOT record the CURRENT worktree stat: `new_from_file` here
+            // paired a possibly-modified file's fresh stat with the stale
+            // staged hash, making the modification invisible to status's
+            // stat shortcut over an unbounded window (2026-08-06 R0-8
+            // review). Zeroed stat fields (the `new_from_blob` shape)
+            // force the next status to content-compare this entry.
+            let mut updated = IndexEntry::new_from_blob(file_str.to_string(), hash, entry_size);
             updated.mode = target_mode;
             index.update(updated);
         }
@@ -931,6 +944,9 @@ fn renormalize_entry(
     if meta.is_dir() {
         return Ok(StagedAction::Unchanged);
     }
+    // Stat BEFORE reading — the entry's stat must describe the hashed
+    // content, or it is smudged (2026-08-06 R0-8 review).
+    let pre_read = file_abs.symlink_metadata().ok();
     let blob = gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
         path: file.to_path_buf(),
         source,
@@ -940,12 +956,12 @@ fn renormalize_entry(
         source,
     })?;
     index.update(
-        IndexEntry::new_from_file(file, blob.id, workdir).map_err(|source| {
-            AddError::CreateIndexEntry {
+        crate::command::verified_index_entry(file, blob.id, workdir, pre_read.as_ref()).map_err(
+            |source| AddError::CreateIndexEntry {
                 path: file.to_path_buf(),
                 source,
-            }
-        })?,
+            },
+        )?,
     );
     Ok(StagedAction::Modified)
 }
@@ -1374,6 +1390,9 @@ async fn stage_a_file(
     let file_status = check_file_status(file, index, workdir)?;
     match file_status {
         FileStatus::New => {
+            // Stat BEFORE reading: the entry's stat must describe the
+            // hashed content, or it is smudged (2026-08-06 R0-8 review).
+            let pre_read = file_abs.symlink_metadata().ok();
             let blob =
                 gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
                     path: file.to_path_buf(),
@@ -1384,17 +1403,18 @@ async fn stage_a_file(
                 source,
             })?;
             index.add(
-                IndexEntry::new_from_file(file, blob.id, workdir).map_err(|source| {
-                    AddError::CreateIndexEntry {
+                crate::command::verified_index_entry(file, blob.id, workdir, pre_read.as_ref())
+                    .map_err(|source| AddError::CreateIndexEntry {
                         path: file.to_path_buf(),
                         source,
-                    }
-                })?,
+                    })?,
             );
             Ok(StagedAction::Added)
         }
         FileStatus::Modified => {
             if index.is_modified(file_str, 0, workdir) {
+                // Stat BEFORE reading — see the `New` arm.
+                let pre_read = file_abs.symlink_metadata().ok();
                 let blob =
                     gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
                         path: file.to_path_buf(),
@@ -1405,12 +1425,18 @@ async fn stage_a_file(
                         path: file.to_path_buf(),
                         source,
                     })?;
-                    index.update(IndexEntry::new_from_file(file, blob.id, workdir).map_err(
-                        |source| AddError::CreateIndexEntry {
+                    index.update(
+                        crate::command::verified_index_entry(
+                            file,
+                            blob.id,
+                            workdir,
+                            pre_read.as_ref(),
+                        )
+                        .map_err(|source| AddError::CreateIndexEntry {
                             path: file.to_path_buf(),
                             source,
-                        },
-                    )?);
+                        })?,
+                    );
                     return Ok(StagedAction::Modified);
                 }
             }

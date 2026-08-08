@@ -50,13 +50,16 @@
 //!   `tool_name` plus boolean flags, not the raw envelope.
 //!
 //! Per-envelope vs per-logical-call:
-//! - Today both `PreToolUse` and `PostToolUse` Claude/Gemini hook
+//! - Both `PreToolUse` and `PostToolUse` Claude/Gemini hook
 //!   envelopes map to `LifecycleEventKind::ToolUse` (see
-//!   `hooks::providers::claude::parser::map_kind`). In production
-//!   only `PostToolUse` is registered as a hook
-//!   (`CLAUDE_HOOK_FORWARD_MAP` in `claude/settings.rs`), so each
-//!   logical tool call produces exactly one normalized `tool_use`
-//!   event with `has_tool_response=true`.
+//!   `hooks::providers::claude::parser::map_kind`). Since DR-00
+//!   (plan-20260713) `CLAUDE_HOOK_FORWARD_MAP` in `claude/settings.rs`
+//!   registers **both** `PreToolUse` and `PostToolUse`. Note that the
+//!   installed Claude hooks capture via the AgentTraces path
+//!   (`agent_session` liveness only — they do NOT populate this
+//!   normalized `tool_use` stream or `tool_use_count`); this derived
+//!   builder is exercised by the AiIntent/derived consumers, where a
+//!   pre/post pair yields one record per envelope (see below).
 //! - The schema does NOT carry a `tool_use_id`, so if a future
 //!   provider DOES register both pre- and post-hooks, this function
 //!   would emit two records per call. That outcome is documented in
@@ -250,11 +253,12 @@ mod tests {
         assert_eq!(records[1].action, "invoke_only");
     }
 
-    /// If a future provider DOES register both `PreToolUse` and
-    /// `PostToolUse` hooks (today only `PostToolUse` is wired in
-    /// `claude/settings.rs::CLAUDE_HOOK_FORWARD_MAP`), the runtime
-    /// would emit two `tool_use` normalized events for one logical
-    /// call — one with `has_tool_input=true` and one with
+    /// When both `PreToolUse` and `PostToolUse` envelopes reach this
+    /// builder — since DR-00, `claude/settings.rs::CLAUDE_HOOK_FORWARD_MAP`
+    /// registers both (installed Claude capture uses the AgentTraces path,
+    /// so this normalized stream is the AiIntent/derived consumer) — the
+    /// runtime emits two `tool_use` normalized events for one logical
+    /// call: one with `has_tool_input=true` and one with
     /// `has_tool_response=true`. This test pins the documented
     /// per-envelope behavior so a regression to silent merging or
     /// silent dropping fails loudly. v2 is expected to introduce

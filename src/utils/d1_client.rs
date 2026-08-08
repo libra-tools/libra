@@ -1513,6 +1513,34 @@ impl D1Client {
         Ok(())
     }
 
+    /// PD-03: session-erasure tombstones on D1 (delete/restore
+    /// idempotent, `erased_at` monotone under replays).
+    pub async fn ensure_agent_import_tombstone_table(&self) -> Result<(), D1Error> {
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_import_tombstone (
+                repo_id TEXT NOT NULL,
+                agent_kind TEXT NOT NULL,
+                provider_session_id TEXT NOT NULL,
+                erased_session_id TEXT NOT NULL,
+                source_fingerprint TEXT,
+                erased_at INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (repo_id, agent_kind, provider_session_id)
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_d1_agent_import_tombstone_session
+             ON agent_import_tombstone (repo_id, erased_session_id)",
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Generation fence for the multi-request agent-capture mirror. A writer
     /// publishes under a unique token; takeover advances the generation and
     /// fences every older request in the same SQL statement that applies rows.
@@ -1945,6 +1973,23 @@ impl D1Client {
         .await
     }
 
+    async fn list_agent_import_tombstones_with_budget(
+        &self,
+        repo_id: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<AgentImportTombstoneRow>, D1Error> {
+        self.collect_agent_capture_pages_with_budget(
+            "SELECT agent_kind, provider_session_id, erased_session_id,
+                    source_fingerprint, erased_at
+             FROM agent_import_tombstone WHERE repo_id = ?1
+             ORDER BY agent_kind, provider_session_id LIMIT ?2 OFFSET ?3",
+            repo_id,
+            "agent import tombstone",
+            remaining_rows,
+        )
+        .await
+    }
+
     async fn collect_agent_capture_pages<T: for<'de> Deserialize<'de>>(
         &self,
         sql: &str,
@@ -2012,6 +2057,14 @@ impl D1Client {
         let prune_tombstones = self
             .list_agent_checkpoint_prune_tombstones_with_budget(repo_id, &mut remaining_rows)
             .await?;
+        // Pre-PD-03 remotes have no tombstone table; restore is a
+        // read-only consumer and must not create it.
+        let import_tombstones = if self.agent_import_tombstone_table_exists().await? {
+            self.list_agent_import_tombstones_with_budget(repo_id, &mut remaining_rows)
+                .await?
+        } else {
+            Vec::new()
+        };
         let (claims, revisions, links) = if include_subagent_content {
             (
                 self.list_agent_subagent_content_claims_with_budget(repo_id, &mut remaining_rows)
@@ -2031,6 +2084,7 @@ impl D1Client {
             sessions,
             checkpoints,
             prune_tombstones,
+            import_tombstones,
             claims,
             revisions,
             links,
@@ -2086,6 +2140,12 @@ impl D1Client {
     /// legacy-writer barriers or adopts rows.
     pub async fn agent_capture_generation_table_exists(&self) -> Result<bool, D1Error> {
         self.remote_table_exists("agent_capture_generation").await
+    }
+
+    /// PD-03: whether the remote carries the session-erasure tombstone
+    /// table (absent on pre-PD-03 remotes; restore must stay read-only).
+    pub async fn agent_import_tombstone_table_exists(&self) -> Result<bool, D1Error> {
+        self.remote_table_exists("agent_import_tombstone").await
     }
 
     async fn agent_capture_v2_projection_is_ready(&self) -> Result<bool, D1Error> {
@@ -2540,10 +2600,126 @@ impl D1Client {
         Ok(())
     }
 
-    /// Create the durable M5 subagent-content companion tables in D1.
-    /// Transient reservation owner/lease/attempt fields are intentionally not
-    /// mirrored; restore always reconstructs an idle claim with the same
-    /// monotonic revision/fence high-water marks.
+    /// PD-03: publish session-erasure tombstones under the generation
+    /// fence, then cascade-delete every mirror row of each erased
+    /// session (claims -> revisions -> links -> checkpoints -> the
+    /// session itself). Idempotent: replays keep the newest `erased_at`.
+    pub async fn sync_agent_import_tombstones_batch(
+        &self,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[AgentImportTombstoneRow],
+    ) -> Result<(), D1Error> {
+        self.execute_agent_capture_json_batch(
+            r#"
+            WITH incoming(value) AS (SELECT value FROM json_each(?2))
+            INSERT INTO agent_import_tombstone (
+                repo_id, agent_kind, provider_session_id, erased_session_id,
+                source_fingerprint, erased_at, synced_at
+            )
+            SELECT ?1, json_extract(value, '$.agent_kind'),
+                   json_extract(value, '$.provider_session_id'),
+                   json_extract(value, '$.erased_session_id'),
+                   json_extract(value, '$.source_fingerprint'),
+                   CAST(json_extract(value, '$.erased_at') AS INTEGER),
+                   CAST(strftime('%s', 'now') AS INTEGER)
+            FROM incoming
+            WHERE EXISTS (
+                SELECT 1 FROM agent_capture_generation
+                WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+            )
+            ON CONFLICT(repo_id, agent_kind, provider_session_id) DO UPDATE SET
+                erased_session_id = excluded.erased_session_id,
+                source_fingerprint = COALESCE(
+                    excluded.source_fingerprint,
+                    agent_import_tombstone.source_fingerprint
+                ),
+                erased_at = MAX(agent_import_tombstone.erased_at, excluded.erased_at),
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            "#,
+            repo_id,
+            publish_token,
+            rows,
+            "agent import tombstone",
+        )
+        .await?;
+
+        // Cascade under the same fence. Every statement keeps the
+        // Publishing-mode graph valid so an interrupted generation can be
+        // taken over: mutable claims first, then immutable revisions and
+        // associations, then checkpoints, then the session row.
+        for sql in [
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_content_claim
+              WHERE repo_id = ?1
+                AND parent_session_id IN (
+                    SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_content_revision
+              WHERE repo_id = ?1
+                AND checkpoint_id IN (
+                    SELECT checkpoint_id FROM agent_capture_checkpoint_v2
+                    WHERE repo_id = ?1 AND session_id IN (
+                        SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                    )
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_link
+              WHERE repo_id = ?1
+                AND content_checkpoint_id IN (
+                    SELECT checkpoint_id FROM agent_capture_checkpoint_v2
+                    WHERE repo_id = ?1 AND session_id IN (
+                        SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                    )
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_capture_checkpoint_v2
+              WHERE repo_id = ?1
+                AND session_id IN (
+                    SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_capture_session_v2
+              WHERE repo_id = ?1
+                AND session_id IN (
+                    SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+        ] {
+            let statement = Self::agent_capture_json_batch_statement(
+                sql,
+                repo_id,
+                publish_token,
+                rows,
+                "agent import tombstone cascade",
+            )?;
+            // Cascade deletes remove however many mirror rows exist (often
+            // zero on a replay) — no per-row change-count expectation.
+            self.execute(&statement.sql, statement.params).await?;
+        }
+        Ok(())
+    }
+
     pub async fn ensure_agent_subagent_content_tables(&self) -> Result<(), D1Error> {
         self.execute(
             r#"
@@ -2630,6 +2806,10 @@ impl D1Client {
         Ok(())
     }
 
+    /// Create the durable M5 subagent-content companion tables in D1.
+    /// Transient reservation owner/lease/attempt fields are intentionally not
+    /// mirrored; restore always reconstructs an idle claim with the same
+    /// monotonic revision/fence high-water marks.
     pub async fn upsert_agent_subagent_content_claim(
         &self,
         repo_id: &str,
@@ -4005,6 +4185,18 @@ pub struct AgentCheckpointPruneTombstoneRow {
     pub pruned_at: i64,
 }
 
+/// PD-03: a SESSION-level erasure tombstone mirrored to D1. Keyed by the
+/// provider identity `(agent_kind, provider_session_id)` — the same
+/// anti-resurrection key `erase_session_local` writes locally.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentImportTombstoneRow {
+    pub agent_kind: String,
+    pub provider_session_id: String,
+    pub erased_session_id: String,
+    pub source_fingerprint: Option<String>,
+    pub erased_at: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct AgentCheckpointIdRow {
     checkpoint_id: String,
@@ -4076,6 +4268,8 @@ pub struct AgentCaptureRestoreCatalogRows {
     pub sessions: Vec<AgentSessionV2Row>,
     pub checkpoints: Vec<AgentCheckpointV2Row>,
     pub prune_tombstones: Vec<AgentCheckpointPruneTombstoneRow>,
+    /// PD-03 session-erasure tombstones (tombstone-first on restore).
+    pub import_tombstones: Vec<AgentImportTombstoneRow>,
     pub claims: Vec<AgentSubagentContentClaimRow>,
     pub revisions: Vec<AgentSubagentContentRevisionRow>,
     pub links: Vec<AgentSubagentLinkRow>,
@@ -4343,13 +4537,13 @@ mod tests {
         let conn = Database::connect("sqlite::memory:")
             .await
             .expect("open SQLite JSON fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE batch_values (value INTEGER NOT NULL)".to_string(),
         ))
         .await
         .expect("create batch target");
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             batch.sql,
             ["repo".into(), payload.into(), "writer-token".into()],
@@ -4357,7 +4551,7 @@ mod tests {
         .await
         .expect("execute JSON-text batch through SQLite json_each");
         let values = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT value FROM batch_values ORDER BY value".to_string(),
             ))
@@ -4376,7 +4570,7 @@ mod tests {
         let conn = Database::connect("sqlite::memory:")
             .await
             .expect("open claim high-water fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE agent_subagent_content_claim (
                 source_key TEXT PRIMARY KEY, revision_cursor INTEGER NOT NULL,
@@ -4387,7 +4581,7 @@ mod tests {
         ))
         .await
         .expect("create claim high-water fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO agent_subagent_content_claim VALUES
              ('source', 9, 3, 9, 'checkpoint-9', 'digest-9')"
@@ -4407,12 +4601,12 @@ mod tests {
              WHERE {AGENT_SUBAGENT_CLAIM_UPDATE_GUARD}"
         );
         let result = conn
-            .execute(Statement::from_string(conn.get_database_backend(), sql))
+            .execute_raw(Statement::from_string(conn.get_database_backend(), sql))
             .await
             .expect("apply guarded claim update");
         assert_eq!(result.rows_affected(), 0);
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT revision_cursor, sync_revision FROM agent_subagent_content_claim"
                     .to_string(),
@@ -4448,7 +4642,7 @@ mod tests {
             "INSERT INTO object_index_catalog_generation VALUES ('existing', 7)",
             OBJECT_INDEX_CATALOG_SEED_SQL,
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
@@ -4456,7 +4650,7 @@ mod tests {
             .expect("apply object-index generation seed SQL");
         }
         let generations = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT repo_id, generation FROM object_index_catalog_generation ORDER BY repo_id"
                     .to_string(),
@@ -4500,7 +4694,7 @@ mod tests {
             OBJECT_INDEX_CATALOG_SEED_SQL,
             "INSERT INTO object_index VALUES (1, 'before', 'blob', 1, 'repo', 1, 1)",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
@@ -4508,7 +4702,7 @@ mod tests {
             .expect("prepare object-index readiness fixture");
         }
         let ready_before = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT EXISTS(
                     SELECT 1 FROM object_index_catalog_generation_ready WHERE singleton = 1
@@ -4526,21 +4720,21 @@ mod tests {
             .into_iter()
             .chain(std::iter::once(OBJECT_INDEX_CATALOG_PUBLISH_READY_SQL))
         {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
             .await
             .expect("publish object-index readiness");
         }
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO object_index VALUES (2, 'after', 'blob', 1, 'repo', 1, 1)".to_string(),
         ))
         .await
         .expect("mutate catalog after readiness");
         let generation = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT generation FROM object_index_catalog_generation WHERE repo_id = 'repo'"
                     .to_string(),
@@ -4570,7 +4764,7 @@ mod tests {
                 repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -4578,7 +4772,7 @@ mod tests {
             .expect("create object-index generation fixture");
         }
         for trigger in OBJECT_INDEX_CATALOG_TRIGGERS {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 trigger.to_string(),
             ))
@@ -4591,7 +4785,7 @@ mod tests {
             "INSERT INTO object_index VALUES (2, 'a', 'blob', 1, 'repo', 1, 1)",
             "DELETE FROM object_index WHERE repo_id = 'repo' AND o_id = 'b'",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 mutation.to_string(),
             ))
@@ -4599,7 +4793,7 @@ mod tests {
             .expect("mutate object-index generation fixture");
         }
         let generation = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT generation FROM object_index_catalog_generation WHERE repo_id = 'repo'"
                     .to_string(),
@@ -4619,7 +4813,7 @@ mod tests {
         let conn = Database::connect("sqlite::memory:")
             .await
             .expect("open generation lease fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE agent_capture_generation (
                 repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL,
@@ -4632,7 +4826,7 @@ mod tests {
         ))
         .await
         .expect("create generation lease fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO agent_capture_generation VALUES (
                 'repo', 7, 'publishing', 'active', 'old', 1,
@@ -4657,7 +4851,7 @@ mod tests {
             ]
         };
         let active = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 AGENT_CAPTURE_BEGIN_GENERATION_FROM_SQL,
                 params(),
@@ -4669,14 +4863,14 @@ mod tests {
             "an active publisher must retain its fence"
         );
 
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "UPDATE agent_capture_generation SET started_at = 0 WHERE repo_id = 'repo'".to_string(),
         ))
         .await
         .expect("expire generation lease");
         let recovered = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 AGENT_CAPTURE_BEGIN_GENERATION_FROM_SQL,
                 params(),
@@ -4722,7 +4916,7 @@ mod tests {
                 'checkpoint_projection', 1, NULL, 1, NULL
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -4731,7 +4925,7 @@ mod tests {
         }
 
         let stale = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 AGENT_CAPTURE_COMPLETE_GENERATION_SQL,
                 ["repo".into(), "writer".into(), 1_i64.into()],
@@ -4743,7 +4937,7 @@ mod tests {
             "an object-index mutation after manifest read must fence completion"
         );
 
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "UPDATE object_index_catalog_generation SET generation = 1 WHERE repo_id = 'repo'"
                 .to_string(),
@@ -4751,7 +4945,7 @@ mod tests {
         .await
         .expect("restore matching object generation");
         let complete = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 AGENT_CAPTURE_COMPLETE_GENERATION_SQL,
                 ["repo".into(), "writer".into(), 1_i64.into()],
@@ -4772,7 +4966,7 @@ mod tests {
             "CREATE TABLE agent_session (session_id TEXT PRIMARY KEY)",
             "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -4780,7 +4974,7 @@ mod tests {
             .expect("create legacy capture table");
         }
         for ddl in AGENT_CAPTURE_LEGACY_WRITE_BARRIERS {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -4793,7 +4987,7 @@ mod tests {
             "INSERT INTO agent_checkpoint (checkpoint_id) VALUES ('legacy-checkpoint')",
         ] {
             let error = conn
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     conn.get_database_backend(),
                     sql.to_string(),
                 ))
@@ -4913,21 +5107,21 @@ mod tests {
                 NULL, NULL, NULL, '{}', '{}', 1, 2, NULL, 1, 3
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
             .await
             .expect("seed adoption fixture");
         }
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             AGENT_CAPTURE_LEGACY_SESSION_ADOPTION_SQL.to_string(),
         ))
         .await
         .expect("adopt legacy session");
         let adopted = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT sync_revision FROM agent_capture_session_v2 WHERE session_id = 'legacy-1'"
                     .to_string(),
@@ -4950,21 +5144,21 @@ mod tests {
                 NULL, NULL, NULL, '{}', '{}', 1, 2, NULL, 1, 3
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
             .await
             .expect("finish one-time adoption fixture");
         }
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             AGENT_CAPTURE_LEGACY_SESSION_ADOPTION_SQL.to_string(),
         ))
         .await
         .expect("re-run adoption after completion");
         let count = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT COUNT(*) AS n FROM agent_capture_session_v2".to_string(),
             ))
@@ -5016,7 +5210,7 @@ mod tests {
                 PRIMARY KEY (repo_id, checkpoint_id)
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -5027,7 +5221,7 @@ mod tests {
             AGENT_CAPTURE_LEGACY_CHECKPOINT_ADOPTION_SQL,
             AGENT_CAPTURE_LEGACY_ORPHAN_CLEANUP_SQL,
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
@@ -5035,7 +5229,7 @@ mod tests {
             .expect("adopt and reconcile legacy checkpoints");
         }
         let rows = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT checkpoint_id, sync_revision FROM agent_capture_checkpoint_v2".to_string(),
             ))

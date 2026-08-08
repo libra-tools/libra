@@ -242,7 +242,7 @@ async fn build_projection(session: Option<&str>) -> CliResult<SkillEventProjecti
         )
     };
     let rows = conn
-        .query_all(Statement::from_sql_and_values(backend, &sql, values))
+        .query_all_raw(Statement::from_sql_and_values(backend, &sql, values))
         .await
         .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
 

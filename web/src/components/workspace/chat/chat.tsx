@@ -272,6 +272,8 @@ function derivePhaseLabel(
       return "Completed";
     case "error":
       return "Error";
+    case "indeterminate_side_effect":
+      return "Reconciliation required";
     case "idle":
     default:
       return null;

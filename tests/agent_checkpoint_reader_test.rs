@@ -204,7 +204,7 @@ fn list_page(out: &Output, rows_key: &str) -> (Vec<Value>, Option<String>) {
 
 async fn seed_session(conn: &DatabaseConnection, session_id: &str, started_at: i64) {
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, state, \
          working_dir, started_at, last_event_at) \
@@ -240,7 +240,7 @@ async fn seed_checkpoints(conn: &DatabaseConnection, session_id: &str, rows: &[(
             values.push(format!("commit-{checkpoint_id}").into());
             values.push((*created_at).into());
         }
-        conn.execute(Statement::from_sql_and_values(backend, &sql, values))
+        conn.execute_raw(Statement::from_sql_and_values(backend, &sql, values))
             .await
             .expect("seed agent_checkpoint batch");
     }
@@ -509,7 +509,7 @@ async fn v1_fixture_show_classifies_legacy_layout() {
     let conn = repo.db().await;
     seed_session(&conn, "claude__fixture-v1-claude", 1).await;
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, \
          tree_oid, metadata_blob_oid, traces_commit, created_at) \
@@ -839,7 +839,7 @@ async fn explain_query_plan_hits_pagination_indexes_on_repo_db() {
     ];
     for (sql, index_name, table) in cases {
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 format!("EXPLAIN QUERY PLAN {sql}"),
                 [

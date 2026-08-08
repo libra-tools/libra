@@ -16,11 +16,17 @@ use libra::internal::ai::{
         ThreadProjection,
     },
     runtime::contracts::ProjectionFreshness,
-    web::code_ui::{
-        CodeUiCapabilities, CodeUiProviderInfo, CodeUiSessionStatus, snapshot_from_thread_bundle,
+    session::{CodeWorkflowEvent, CodeWorkflowEventKind, CodeWorkflowReplay},
+    web::{
+        code_ui::{
+            CodeUiCapabilities, CodeUiInteractionRequest, CodeUiInteractionStatus,
+            CodeUiPlanSnapshot, CodeUiProviderInfo, CodeUiSessionSnapshot, CodeUiSessionStatus,
+            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, snapshot_from_thread_bundle,
+        },
+        code_ui_projection::fold_code_ui_snapshot,
     },
 };
-use serde_json::json;
+use serde_json::{json, to_value};
 use uuid::Uuid;
 
 /// Parse a hard-coded UUID literal used in fixtures. Panics on malformed input — the
@@ -191,4 +197,149 @@ fn code_ui_plan_snapshot_updated_at_tracks_scheduler_revision_not_wall_clock() {
         "two renders of the same scheduler revision must produce \
          identical plan updated_at",
     );
+}
+
+/// W1-06 regression: rebuild the Code UI read model from the ordered
+/// fine-grained workflow suffix rather than the mutable in-memory session. A
+/// mutating command that reached an unknown side-effect boundary must remain
+/// visibly indeterminate after the rebuild.
+#[test]
+fn snapshot_rebuilt_from_event_fold() {
+    let bootstrap = CodeUiSessionSnapshot {
+        session_id: "session-projection-fold".to_string(),
+        working_dir: "/repo".to_string(),
+        ..CodeUiSessionSnapshot::default()
+    };
+
+    let user = CodeUiTranscriptEntry {
+        id: "user-1".to_string(),
+        kind: CodeUiTranscriptEntryKind::UserMessage,
+        content: Some("inspect the failing test".to_string()),
+        status: Some("submitted".to_string()),
+        created_at: ts(1_700_001_001),
+        updated_at: ts(1_700_001_001),
+        ..CodeUiTranscriptEntry::default()
+    };
+    let assistant = CodeUiTranscriptEntry {
+        id: "assistant-1".to_string(),
+        kind: CodeUiTranscriptEntryKind::AssistantMessage,
+        content: Some(String::new()),
+        status: Some("streaming".to_string()),
+        streaming: true,
+        created_at: ts(1_700_001_002),
+        updated_at: ts(1_700_001_002),
+        ..CodeUiTranscriptEntry::default()
+    };
+    let interaction = CodeUiInteractionRequest {
+        id: "approval-1".to_string(),
+        status: CodeUiInteractionStatus::Pending,
+        requested_at: ts(1_700_001_004),
+        ..CodeUiInteractionRequest::default()
+    };
+    let plan = CodeUiPlanSnapshot {
+        id: "plan-1".to_string(),
+        status: "running".to_string(),
+        updated_at: ts(1_700_001_006),
+        ..CodeUiPlanSnapshot::default()
+    };
+
+    let events = vec![
+        workflow_event(
+            1,
+            CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "transcript_upsert".to_string(),
+                summary: "user message".to_string(),
+                payload: to_value(&user).expect("test entry must serialize"),
+            },
+        ),
+        workflow_event(
+            2,
+            CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "transcript_upsert".to_string(),
+                summary: "assistant started".to_string(),
+                payload: to_value(&assistant).expect("test entry must serialize"),
+            },
+        ),
+        workflow_event(
+            3,
+            CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "assistant_delta".to_string(),
+                summary: "assistant text delta".to_string(),
+                payload: json!({
+                    "entryId": "assistant-1",
+                    "delta": "I found the issue.",
+                    "updatedAt": ts(1_700_001_003),
+                }),
+            },
+        ),
+        workflow_event(
+            4,
+            CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "interaction_upsert".to_string(),
+                summary: "approval requested".to_string(),
+                payload: to_value(&interaction).expect("test interaction must serialize"),
+            },
+        ),
+        workflow_event(
+            5,
+            CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "interaction_resolved".to_string(),
+                summary: "approval resolved".to_string(),
+                payload: json!({
+                    "interactionId": "approval-1",
+                    "resolvedAt": ts(1_700_001_005),
+                }),
+            },
+        ),
+        workflow_event(
+            6,
+            CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "plan_upsert".to_string(),
+                summary: "plan running".to_string(),
+                payload: to_value(&plan).expect("test plan must serialize"),
+            },
+        ),
+        workflow_event(
+            7,
+            CodeWorkflowEventKind::IndeterminateSideEffect {
+                command_id: "apply-1".to_string(),
+                effect: "apply_patch".to_string(),
+                reason: "process ended before result was persisted".to_string(),
+            },
+        ),
+    ];
+    let folded = fold_code_ui_snapshot(
+        bootstrap,
+        &CodeWorkflowReplay {
+            events,
+            gaps: Vec::new(),
+        },
+    )
+    .expect("ordered fine-grained events must rebuild a snapshot");
+
+    assert_eq!(folded.last_sequence, Some(7));
+    assert_eq!(folded.snapshot.transcript.len(), 2);
+    assert_eq!(
+        folded.snapshot.transcript[1].content.as_deref(),
+        Some("I found the issue.")
+    );
+    assert!(folded.snapshot.transcript[1].streaming);
+    assert_eq!(
+        folded.snapshot.interactions[0].status,
+        CodeUiInteractionStatus::Resolved
+    );
+    assert_eq!(folded.snapshot.plans[0].status, "running");
+    assert_eq!(
+        folded.snapshot.status,
+        CodeUiSessionStatus::IndeterminateSideEffect
+    );
+}
+
+fn workflow_event(sequence: u64, event: CodeWorkflowEventKind) -> CodeWorkflowEvent {
+    CodeWorkflowEvent {
+        event_id: Uuid::new_v4(),
+        sequence,
+        recorded_at: ts(1_700_001_000 + sequence as i64),
+        event,
+    }
 }

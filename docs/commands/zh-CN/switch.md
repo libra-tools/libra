@@ -43,6 +43,7 @@ libra switch [--guess | --no-guess] <branch>
 | | `--track` | | 创建跟踪给定远程分支的本地分支，并切换到它 |
 | | `--guess` | | 当 `<branch>` 唯一匹配某个远程跟踪分支时自动创建 tracking 分支（默认；DWIM） |
 | | `--no-guess` | | 禁用远程跟踪猜测；要求本地分支或显式 `--track` |
+| | `--ignore-other-worktrees` | | 为 CLI 兼容而接受，但**不会**绕过 Libra 的 other-worktree 安全保护（有意与 Git 不同）：Libra 绝不允许同一共享分支在两个 worktree 同时 checkout。单 worktree 仓库中为静默 no-op；存在真实冲突时 switch 仍被拒绝，且拒绝信息会指向 `libra worktree doctor` / `libra worktree repair --confirm` 以处置疑似过期的登记属主。 |
 | | `--no-progress` | | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 switch 从不渲染进度条。 |
 
 ### 标志细节

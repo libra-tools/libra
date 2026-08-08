@@ -83,7 +83,7 @@ Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改�
 | 外部 diff | | `--ext-diff` | 允许已配置的外部 diff 驱动（`diff.external`）生成每个文件的 patch（配置后默认即启用，此 flag 为 `--no-ext-diff` 的显式反面）。 |
 | 对移动行着色 | | `--color-moved[=<mode>]` | 在彩色输出中，对“一处删除、另一处新增”的行用独立颜色着色（删除→粗体洋红，新增→粗体青）。裸 `--color-moved` 与块模式（`default`/`zebra`/`blocks`/`dimmed-zebra`）被接受但以 `plain` 近似——所有移动行都着色；Libra 不实现 Git 保守的移动块显著性/zebra 条带。`--color-moved=no` / `--no-color-moved` 关闭。仅影响彩色输出（终端或 `--color=always`）。 |
 | 不对移动行着色 | | `--no-color-moved` | 不对移动行单独着色（默认行为；countermand 先前的 `--color-moved`）。 |
-| 检测重命名 | `-M[<n>]` | `--find-renames[=<n>]` | 检测重命名：内容足够相似的 删除+新增 文件对会合并为一条重命名（`similarity index N%` / `rename from`/`rename to`，name-status/numstat/summary 表面显示 `R<score>` / `old => new`）。与 Git 一致，默认按 50% 阈值开启。裸 `-M` 使用 50%；`-M<n>` / `-M<n>%` / `--find-renames=<n>` 设定阈值（裸整数与 Git 一样读作 `0.<digits>`，故 `-M5` 为 50%、`-M100%` 仅精确匹配）。精确阶段按 blob id 建索引；任一剩余侧超过 1000 个文件时保留精确重命名、跳过二次方非精确阶段并告警。相似度对真实内容与 Git 一致（分块哈希不同，故专门构造的哈希碰撞输入可能不同）；同时重命名多个文件时，所选的 old/new 配对可能与 Git 不同。`diff.renames=true|false|copies` 通过严格 local → global → system 级联生效；真值或未设置时使用 50%，`copies`/`copy` 退化为普通重命名检测（Libra 无 `-C`），`--no-renames`/`-M` 恒胜。无效值在进度或 diff 输出前以 `LBR-CLI-002` fail-closed；该 porcelain-only 配置被 `diff-tree`、`diff-index`、`diff-files` 忽略。裸 `-M`/`--find-renames` 后不能紧跟 pathspec——请置于该 flag 之前或 `--` 之后。 |
+| 检测重命名 | `-M[<n>]` | `--find-renames[=<n>]` | 检测重命名：内容足够相似的 删除+新增 文件对会合并为一条重命名（`similarity index N%` / `rename from`/`rename to`，name-status/numstat/summary 表面显示 `R<score>` / `old => new`）。与 Git 一致，默认按 50% 阈值开启。裸 `-M` 使用 50%；`-M<n>` / `-M<n>%` / `--find-renames=<n>` 设定阈值（裸整数与 Git 一样读作 `0.<digits>`，故 `-M5` 为 50%、`-M100%` 仅精确匹配）。精确阶段按 blob id 建索引；任一剩余侧超过 1000 个文件时保留精确**与已评分的唯一 basename** 重命名、仅跳过二次方穷举阶段并告警（见*重命名检测预算*）。相似度对真实内容与 Git 一致（分块哈希不同，故专门构造的哈希碰撞输入可能不同）；同时重命名多个文件时，所选的 old/new 配对可能与 Git 不同。`diff.renames=true|false|copies` 通过严格 local → global → system 级联生效；真值或未设置时使用 50%，`copies`/`copy` 退化为普通重命名检测（Libra 无 `-C`），`--no-renames`/`-M` 恒胜。无效值在进度或 diff 输出前以 `LBR-CLI-002` fail-closed；该 porcelain-only 配置被 `diff-tree`、`diff-index`、`diff-files` 忽略。裸 `-M`/`--find-renames` 后不能紧跟 pathspec——请置于该 flag 之前或 `--` 之后。 |
 | 不检测重命名 | | `--no-renames` | 关闭重命名检测，覆盖默认行为、`diff.renames` 与先前的 `-M`/`--find-renames`。 |
 | 相对路径 | | `--relative[=<path>]` | 将 diff 限定到某个目录并显示相对该目录的路径：带值时 `<path>` 相对当前目录解析，裸 `--relative` 用当前目录。该目录之外的文件被排除，显示路径剥离该前缀（`--stat` 与 JSON 同样如此）。配合外部 `diff.external` 驱动时，文件集仍按前缀过滤，但不对驱动的 verbatim 输出剥离前缀。 |
 | 不用相对路径 | | `--no-relative` | 显示完整的仓库根相对路径。这是 Libra 的默认行为；为 Git 兼容而接受，并优先于 `--relative`（两者同时给出时关闭相对输出）。 |
@@ -238,12 +238,17 @@ diff 驱动的 verbatim 输出。与 Git 一样，`commit -v` 始终使用内建
 ### 重命名检测预算
 
 `diff.renameLimit`（与 Git 一致）限制二次 inexact 重命名扫描：当 rename 源
-**或**目标数量超过该限制时，仍报告 exact 重命名，但跳过 inexact 扫描并发出
-警告。取值为非负整数，经严格 local → global → system 级联；`0` 表示“无 per-side
-限制”；默认 1000。`diff.renameComparisonBudget` 限制 inexact 扫描的相似度比较
-总数：非负整数，`0` 表示“无上限”（默认）。预算耗尽时丢弃穷举扫描结果，仅保留
-exact 与唯一 basename 的重命名，并发出警告。两者在非法（非整数/负数）设置时于
-任何 diff 输出前以 `LBR-CLI-002` fail-closed。
+**或**目标数量超过该限制时，跳过穷举 inexact 扫描并发出警告，但闸门之前的
+廉价阶段仍然生效——exact（blob id）重命名**以及**已评分的唯一 basename 配对
+（两侧各只有一个 `foo.rs`，且相似度仍达到阈值时才配对）。取值为非负整数，
+经严格 local → global → system 级联；`0` 表示“无 per-side
+限制”；默认 1000。`diff.renameComparisonBudget` 限制相似度比较总数，按次
+计费并同时作用于唯一 basename 与穷举两个阶段：非负整数，`0` 表示“无上限”
+（默认）。预算耗尽时正在执行的阶段停止，不再进行任何比较——已评分的配对
+（exact 及届时已配对的唯一 basename 配对）保留，穷举阶段结果被整体丢弃
+（部分结果顺序相关），并发出警告。注意区分：renameLimit 总是保留全部已评分
+唯一 basename 配对；comparisonBudget 只保留耗尽前已评分的部分。两者在非法
+（非整数/负数）设置时于任何 diff 输出前以 `LBR-CLI-002` fail-closed。
 
 ## 人类可读输出
 

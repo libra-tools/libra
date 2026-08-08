@@ -971,7 +971,8 @@ fn build_plan_text(explanation: Option<&String>, plan_steps: &[TurnPlanStep]) ->
 /// 为 Codex 代理初始化 MCP（Model Context Protocol）服务器实例。
 ///
 /// 初始化流程：
-/// 1. 通过 `try_get_storage_path` 定位 `.libra/` 目录（若失败则退回到 `{cwd}/.libra/`）；
+/// 1. 通过 `try_get_storage_path` 定位 `.libra/` 目录（失败时**不**退回
+///    `{cwd}/.libra/`——那会铸造第二个幻影仓库，见 Part C §C.4.1——而是以只读模式运行）；
 /// 2. 创建 `.libra/objects/` 目录（若创建失败则以只读模式运行）；
 /// 3. 建立 SQLite 数据库连接（`libra.db`）（若失败则以只读模式运行）；
 /// 4. 初始化 `LocalStorage`（content-addressable 对象存储）；
@@ -981,7 +982,9 @@ fn build_plan_text(explanation: Option<&String>, plan_steps: &[TurnPlanStep]) ->
 /// Initialises the `LibraMcpServer` used by the Codex agent for data persistence.
 ///
 /// The function:
-/// 1. Resolves the `.libra/` storage directory via `try_get_storage_path`.
+/// 1. Resolves the `.libra/` storage directory via `try_get_storage_path`
+///    (on failure it degrades to the read-only server — never to
+///    `{cwd}/.libra`, which would mint a phantom repository; Part C §C.4.1).
 /// 2. Creates the `objects/` sub-directory (falls back to read-only on failure).
 /// 3. Establishes a SQLite connection to `libra.db` (falls back to read-only).
 /// 4. Sets up `LocalStorage` (content-addressable object store).
@@ -991,17 +994,29 @@ fn build_plan_text(explanation: Option<&String>, plan_steps: &[TurnPlanStep]) ->
 /// # Arguments
 /// * `working_dir` — 代理的工作目录，用于定位 `.libra/` 存储路径。
 pub async fn init_mcp_server(working_dir: &Path) -> Arc<LibraMcpServer> {
-    let storage_dir = try_get_storage_path(Some(working_dir.to_path_buf())).unwrap_or_else(|error| {
-        // Part C §C.4.1: annotate the degrade fallback so a phantom storage root
-        // (a linked worktree with a broken `commondir`) is diagnosable rather
-        // than silently routing db/objects at `<working_dir>/.libra`.
-        tracing::warn!(
-            working_dir = %working_dir.display(),
-            %error,
-            "storage-root resolution failed for the MCP server; falling back to <working_dir>/.libra — run `libra worktree repair` for a linked worktree"
-        );
-        working_dir.join(".libra")
-    });
+    // Part C §C.4.1: a `<working_dir>/.libra` fallback does not degrade the
+    // session, it creates a SECOND repository — a fresh `libra.db` and
+    // `objects/` beside the real ones, which then collect history the actual
+    // repository never sees. Degrade to the read-only server instead, the
+    // same way this function already handles an unopenable directory or
+    // database.
+    let storage_dir = match try_get_storage_path(Some(working_dir.to_path_buf())) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                working_dir = %working_dir.display(),
+                %error,
+                "storage-root resolution failed for the MCP server; running read-only rather \
+                 than minting a phantom <working_dir>/.libra — run `libra worktree repair \
+                 --confirm <worktree-path>` for a linked worktree"
+            );
+            return Arc::new(LibraMcpServer::new_with_working_dir(
+                None,
+                None,
+                working_dir.to_path_buf(),
+            ));
+        }
+    };
     let (objects_dir, dot_libra) = (storage_dir.join("objects"), storage_dir);
 
     // Try to create the directory

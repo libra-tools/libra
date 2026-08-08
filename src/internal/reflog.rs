@@ -17,7 +17,6 @@ use tokio::time::sleep;
 
 use crate::internal::{
     config,
-    db::get_db_conn_instance,
     head::Head,
     model::{
         reflog,
@@ -47,14 +46,24 @@ pub enum ReflogError {
     TransactionError(TransactionError<DbErr>),
     /// A `gc.reflog*` config value could not be read or parsed.
     Config(String),
+    /// The repository database this invocation is scoped to could not be
+    /// opened — distinct from a query that failed against an open one.
+    Storage(String),
 }
 
 impl Display for ReflogError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DatabaseError(_) => write!(f, "failed to access reflog storage"),
-            Self::TransactionError(_) => write!(f, "failed to update reflog"),
+            // The CAUSE is part of the message, not just the category. It
+            // was dropped, and with it went every classification that lives
+            // in the underlying error's text — a branch refused because
+            // another worktree has it checked out reached the command as a
+            // bare "failed to update reflog" and was reported as an I/O
+            // fault (plan-20260714 §C.13).
+            Self::DatabaseError(error) => write!(f, "failed to access reflog storage: {error}"),
+            Self::TransactionError(error) => write!(f, "failed to update reflog: {error}"),
             Self::Config(detail) => write!(f, "invalid reflog expire config: {detail}"),
+            Self::Storage(detail) => write!(f, "failed to open reflog storage: {detail}"),
         }
     }
 }
@@ -404,19 +413,39 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), DbErr>> + Send + 'b>>,
     F: Send + 'static,
 {
-    let db = get_db_conn_instance().await;
-    db.transaction(|txn| {
-        Box::pin(async move {
-            operation(txn).await.map_err(ReflogError::from)?;
-            Reflog::insert(txn, context, insert_ref).await?;
-            Ok::<_, ReflogError>(())
-        })
-    })
-    .await
-    .map_err(|err| match err {
-        TransactionError::Connection(err) => ReflogError::from(err),
-        TransactionError::Transaction(err) => err,
-    })
+    // §C.4.2: the reflog entry and the ref move it describes must land in the
+    // database of the worktree this INVOCATION is acting on — the ambient
+    // connection follows the cwd, so a moved cwd would record the move in
+    // another repository's log (or fail to find the row it just wrote).
+    let db = crate::internal::worktree_scope::request_db()
+        .await
+        .map_err(|error| {
+            ReflogError::Storage(format!(
+                "cannot open the repository database for this reflog write: {error}"
+            ))
+        })?;
+    // The caller's `operation` almost always READS before it writes (resolve
+    // the branch, read HEAD, then move them), and a deferred transaction that
+    // upgrades read→write gets `SQLITE_BUSY` immediately, without the busy
+    // timeout — so a second worktree writing its own refs at the same moment
+    // failed this one outright instead of queueing. Take the write lock up
+    // front; see `db::begin_write_transaction`.
+    let txn = crate::internal::db::begin_write_transaction(&db)
+        .await
+        .map_err(ReflogError::from)?;
+    let result = async {
+        operation(&txn).await.map_err(ReflogError::from)?;
+        Reflog::insert(&txn, context, insert_ref).await?;
+        Ok::<_, ReflogError>(())
+    }
+    .await;
+    match result {
+        Ok(()) => txn.commit().await.map_err(ReflogError::from),
+        Err(err) => {
+            let _ = txn.rollback().await;
+            Err(err)
+        }
+    }
 }
 
 /// Check whether the current libra repo have a `reflog` table
@@ -431,7 +460,7 @@ async fn reflog_table_exists<C: ConnectionTrait>(db_conn: &C) -> Result<bool, Re
         ["reflog".into()],
     );
 
-    if let Some(result) = db_conn.query_one(stmt).await? {
+    if let Some(result) = db_conn.query_one_raw(stmt).await? {
         let count = result.try_get_by_index(0).unwrap_or(0);
         if count == 0 {
             return Ok(false);
@@ -468,7 +497,7 @@ async fn ensure_reflog_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), Re
     );
 
     for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-        match db.execute(create_table_stmt.clone()).await {
+        match db.execute_raw(create_table_stmt.clone()).await {
             Ok(_) => break,
             Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
                 sleep(Duration::from_millis(
@@ -489,7 +518,7 @@ async fn ensure_reflog_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), Re
     );
 
     for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-        match db.execute(create_index_stmt.clone()).await {
+        match db.execute_raw(create_index_stmt.clone()).await {
             Ok(_) => break,
             Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
                 sleep(Duration::from_millis(
@@ -762,7 +791,7 @@ where
         for window in survivors.windows(2) {
             let (newer, older) = (window[0], window[1]);
             if newer.old_oid != older.new_oid {
-                conn.execute(Statement::from_sql_and_values(
+                conn.execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
                     "UPDATE reflog SET old_oid = ? WHERE id = ?;",
                     [older.new_oid.clone().into(), newer.id.into()],
@@ -775,7 +804,7 @@ where
 
     for entry in &entries {
         if doomed_ids.contains(&entry.id) {
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "DELETE FROM reflog WHERE id = ?;",
                 [entry.id.into()],
@@ -815,21 +844,22 @@ pub async fn expire_reflog<C, LP, LC>(
     is_commit: LC,
 ) -> Result<ExpireResult, ReflogError>
 where
-    C: TransactionTrait,
+    C: TransactionTrait<Transaction = sea_orm::DatabaseTransaction>,
     LP: FnMut(&str) -> Option<Vec<String>> + Send + 'static,
     LC: Fn(&str) -> bool + Send + 'static,
 {
     let ref_name = ref_name.to_string();
     let options = options.clone();
-    let result = db
-        .transaction(move |txn| {
-            Box::pin(async move {
-                expire_reflog_with_conn(txn, &ref_name, &options, load_parents, is_commit)
-                    .await
-                    .map_err(|e| DbErr::Custom(e.to_string()))
-            })
+    // Expiry READS the ref's entries before it deletes any, so it takes the
+    // write lock up front (`db::begin_write_transaction`).
+    let result = crate::internal::db::write_transaction(db, move |txn| {
+        Box::pin(async move {
+            expire_reflog_with_conn(txn, &ref_name, &options, load_parents, is_commit)
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))
         })
-        .await?;
+    })
+    .await?;
     Ok(result)
 }
 
@@ -839,18 +869,25 @@ mod tests {
 
     use super::ReflogError;
 
+    /// The cause is part of the message.
+    ///
+    /// This used to pin the causeless text, which is what let a branch
+    /// refused because another worktree had it checked out arrive at the
+    /// command as a bare "failed to update reflog" — classified as an I/O
+    /// fault, because the only thing that identified it had been thrown away
+    /// (plan-20260714 §C.13).
     #[test]
-    fn reflog_error_display_pins_static_messages() {
+    fn reflog_error_display_carries_its_cause() {
         assert_eq!(
-            ReflogError::DatabaseError(DbErr::Custom("ignored".to_string())).to_string(),
-            "failed to access reflog storage",
+            ReflogError::DatabaseError(DbErr::Custom("underlying detail".to_string())).to_string(),
+            "failed to access reflog storage: Custom Error: underlying detail",
         );
         assert_eq!(
             ReflogError::TransactionError(TransactionError::Transaction(DbErr::Custom(
-                "ignored".to_string()
+                "underlying detail".to_string()
             )))
             .to_string(),
-            "failed to update reflog",
+            "failed to update reflog: Custom Error: underlying detail",
         );
     }
 

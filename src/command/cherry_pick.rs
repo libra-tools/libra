@@ -262,6 +262,14 @@ enum CherryPickSingleError {
 /// rebuild the same commit shape after a conflict.
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 struct CherryPickOpts {
+    /// §C.5 conflict-phase discriminator: `true` only when the sequence is
+    /// STOPPED ON A CONFLICT. `resume_picks` persists position BEFORE every
+    /// attempt, so the row alone cannot distinguish "stopped on conflict"
+    /// from "stopped on a hard error mid-resume" — and `CHERRY_PICK_HEAD`
+    /// is defined for the former only. Set on each conflict stop, stripped
+    /// on every resume, absent (= false) in rows from older binaries.
+    #[serde(default)]
+    stopped_on_conflict: bool,
     #[serde(default)]
     append_source: bool,
     #[serde(default)]
@@ -301,6 +309,7 @@ struct CherryPickOpts {
 impl CherryPickOpts {
     fn from_args(args: &CherryPickArgs) -> Self {
         Self {
+            stopped_on_conflict: false,
             append_source: args.append_source,
             signoff: args.signoff,
             edit: args.edit,
@@ -834,9 +843,18 @@ async fn run_cherry_pick(
                     head_orig,
                     current_oid: *commit_id,
                     todo: commit_ids[i + 1..].iter().copied().collect(),
-                    opts_json: opts_json.clone(),
+                    // This claim only happens on a conflict stop — say so
+                    // durably (§C.5 conflict-phase discriminator).
+                    opts_json: opts_json_with_conflict_flag(&opts_json, true),
                 };
-                state.save().await.map_err(CherryPickError::SaveFailed)?;
+                // The FIRST persistence of a fresh sequence: an atomic claim,
+                // not a replace (§C.4.4). `resume_picks` keeps the upsert —
+                // by then the caller owns the row and advancing it is the
+                // point.
+                state
+                    .claim_start()
+                    .await
+                    .map_err(CherryPickError::SaveFailed)?;
                 return Err(CherryPickError::Conflict {
                     commit: label,
                     reason: format!("conflicts in {} path(s)", paths.len()),
@@ -860,6 +878,19 @@ async fn run_cherry_pick(
 /// `current_oid`/`todo` to the commit that stopped the sequence, so a follow-up
 /// `--skip`/`--abort`/`--continue` operates on the correct position rather than
 /// the stale pre-resume one. On completion it clears the state row.
+/// `opts_json` with the §C.5 conflict-phase flag set or cleared. Falls back
+/// to the input on a parse failure — the option payload is validated where
+/// it is USED; the flag must never turn a working sequence into an error.
+fn opts_json_with_conflict_flag(opts_json: &str, stopped_on_conflict: bool) -> String {
+    match serde_json::from_str::<CherryPickOpts>(opts_json) {
+        Ok(mut opts) => {
+            opts.stopped_on_conflict = stopped_on_conflict;
+            serde_json::to_string(&opts).unwrap_or_else(|_| opts_json.to_string())
+        }
+        Err(_) => opts_json.to_string(),
+    }
+}
+
 async fn resume_picks(
     head_name: &str,
     head_orig: ObjectHash,
@@ -880,14 +911,27 @@ async fn resume_picks(
             head_orig,
             current_oid: commit_id,
             todo: todo.clone(),
-            opts_json: opts_json.to_string(),
+            // STRIPPED flag: this save happens before the attempt, so if the
+            // pick stops on a NON-conflict error the row must not carry a
+            // stale conflict claim from an earlier stop.
+            opts_json: opts_json_with_conflict_flag(opts_json, false),
         };
         pending.save().await.map_err(CherryPickError::SaveFailed)?;
 
         match cherry_pick_single_commit(&commit_id, opts_args, output).await {
             Ok(outcome) => record_outcome(outcome, &commit_id, acc),
             Err(CherryPickSingleError::Conflicted(paths)) => {
-                // State already points at this commit + the remaining todo.
+                // Re-persist WITH the conflict flag: `CHERRY_PICK_HEAD` is
+                // defined only for a conflict stop (§C.5), and this is the
+                // one place that knows which stop this is.
+                let conflicted = CherryPickState {
+                    opts_json: opts_json_with_conflict_flag(opts_json, true),
+                    ..pending
+                };
+                conflicted
+                    .save()
+                    .await
+                    .map_err(CherryPickError::SaveFailed)?;
                 return Err(CherryPickError::Conflict {
                     commit: commit_id.to_string(),
                     reason: format!("conflicts in {} path(s)", paths.len()),
@@ -911,6 +955,10 @@ async fn run_cherry_pick_continue(
     // The conflicted index must be fully resolved (no stage 1/2/3 left).
     let index = Index::load(path::index())
         .map_err(|e| CherryPickError::LoadObject(format!("failed to load index: {e}")))?;
+    // Same guard: `--continue` builds a commit from the current index.
+    crate::internal::layer::reject_layer_owned_entries(&index, "to continue the cherry-pick")
+        .await
+        .map_err(CherryPickError::LoadObject)?;
     if !merge::unresolved_conflicted_paths(&index, &[]).is_empty() {
         return Err(CherryPickError::Conflict {
             commit: short_display_hash(&state.current_oid.to_string()).to_string(),
@@ -1444,7 +1492,9 @@ async fn edit_cherry_pick_message(
     // lives in THIS worktree's gitdir. On shared storage two worktrees editing a
     // message concurrently would truncate each other's buffer. Unchanged for the
     // main worktree, where local and common storage are the same directory.
-    let path = util::worktree_gitdir().join("CHERRY_PICK_MSG");
+    let path = util::request_worktree_gitdir()
+        .map(|gitdir| gitdir.join("CHERRY_PICK_MSG"))
+        .map_err(|error| CherryPickSingleError::SaveFailed(error.to_string()))?;
     crate::command::editor::edit_message(&path, message, editor, false)
         .await
         .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))
@@ -1855,6 +1905,12 @@ impl CherryPickState {
     /// Persist via the unified sequencer (atomic DELETE+INSERT txn).
     pub async fn save(&self) -> Result<(), String> {
         sequencer::save(&self.to_sequence()).await
+    }
+
+    /// Persist the FIRST write of a starting sequence as an atomic claim, so
+    /// two starts racing in one worktree cannot both proceed (§C.4.4).
+    pub async fn claim_start(&self) -> Result<(), String> {
+        sequencer::claim_start(&self.to_sequence()).await
     }
 
     /// Load the active cherry-pick sequence, if the active sequence is a

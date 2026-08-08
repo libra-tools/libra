@@ -1,0 +1,17 @@
+# `surface_evidence` resolves, but the cited text never mentions the surface.
+#
+# One deliberate defect, so the guard's refusal can be attributed to it.
+
+[[scenario]]
+id = "t1400-update-ref::stdin-batch-updates"
+category = "adapted"
+command_status = "partial"
+surface_compatibility = "deferred"
+surface_evidence = "docs/commands/update-ref.md#synopsis"
+reason = "Fixture for the surface-lock half of the ledger guard."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t1400-update-ref.sh"
+libra_command = "update-ref"
+libra_surface = "--stdin"

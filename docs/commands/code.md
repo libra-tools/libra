@@ -23,6 +23,8 @@ A sandboxed tool-execution layer enforces approval policies that control when th
 
 When the TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command so the thread's Intent/Plan/Task/Run/PatchSet version graph can be inspected in a separate TUI. Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
 
+**Linked worktrees**: `libra code` (every mode) refuses to launch from a linked worktree until the unified Code/Agent configuration resolver lands — the session's configuration (agents, hooks, sandbox, approvals) is not yet worktree-aware there, and a linked session could run under the repository's sandbox policy without its security hooks. Run from the main worktree instead; the refusal names this remedy. For the same reason, automation VCS dispatch is disabled (with a warning) in linked worktrees and `libra automation` fails closed there — see [automation.md](automation.md).
+
 ## Options
 
 | Flag | Short | Long | Default | Description |
@@ -118,7 +120,7 @@ When the server is bound to a non-loopback host, non-loopback browsers receive a
 
 When `--browser-control loopback` is requested and the browser holds the active lease, the TUI initial controller is `LocalTui` (visible owner, can be reclaimed) instead of `Fixed { Tui }` (permanently blocking). If the TUI also wants to drive writes, `--control write` must be supplied alongside `--browser-control loopback`; the two writers serialize through the same `TuiControlCommand` channel.
 
-For `--web-only` non-Codex providers (`--provider ollama` is the canonical Phase 3 verification path), Libra builds a [`HeadlessCodeRuntime`](../../src/internal/ai/web/headless.rs) that runs the agent's tool loop directly so the browser can drive a real session -- no terminal required. Headless mode advertises `messageInput`, `streamingText`, `toolCalls`, `planUpdates`, `patchsets`, `interactiveApprovals`, `structuredQuestions`, and `providerSessionResume`. `--resume <thread_id>` is TUI-only by design: the headless runtime carries a session-layer resume implementation, but the `--resume` CLI flag is accepted only on the interactive TUI path and is rejected in `--web-only` (and `--stdio`) mode. Persisted headless resume is reachable only through the TUI — this is a deliberate contract, not deferred work. `update_plan` projects into `plans[]`, and `apply_patch` metadata projects into `patchsets[]`.
+For `--web-only` non-Codex providers (`--provider ollama` is the canonical headless verification path), Libra builds a [`HeadlessCodeRuntime`](../../src/internal/ai/web/headless.rs) whose browser submits enter the serialized `AgentRuntimeWorker`; its executor then runs the standard agent tool loop, so the browser can drive a real session -- no terminal required. Headless mode advertises `messageInput`, `streamingText`, `toolCalls`, `planUpdates`, `patchsets`, `interactiveApprovals`, `structuredQuestions`, and `providerSessionResume`. `--web-only --resume <thread_id>` reloads the matching session in the same working directory, then applies the bounded durable Code UI projection suffix before starting the browser server. `--resume` remains unavailable in `--stdio` mode and with `--provider codex`, whose managed app-server has a separate session protocol. `update_plan` projects into `plans[]`, and `apply_patch` metadata projects into `patchsets[]`. Cancellation is cooperative before a tool's mutation boundary. After a potentially mutating tool has begun, cancel returns an actionable error and the active turn remains in place until it reaches a determinate result; Libra never hard-aborts that side effect or relabels it as an ordinary cancelled turn.
 
 ### Code UI Wire Contract
 
@@ -134,7 +136,7 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 | `provider` | object | `{ provider, model?, mode?, managed }`. |
 | `capabilities` | object | Eight booleans: `messageInput`, `streamingText`, `planUpdates`, `toolCalls`, `patchsets`, `interactiveApprovals`, `structuredQuestions`, `providerSessionResume`. |
 | `controller` | object | `{ kind, ownerLabel?, canWrite, leaseExpiresAt?, reason?, loopbackOnly }`; `kind` is `none`, `browser`, `automation`, `tui`, or `cli`. |
-| `status` | string | `idle`, `thinking`, `executing_tool`, `awaiting_interaction`, `completed`, or `error`. |
+| `status` | string | `idle`, `thinking`, `executing_tool`, `awaiting_interaction`, `completed`, `error`, or `indeterminate_side_effect`. The final value means a mutating command may have taken effect and must be reconciled before any retry. |
 | `transcript` | array | Entries with `id`, `kind`, optional `title` / `content` / `status`, `streaming`, `metadata`, `createdAt`, `updatedAt`. |
 | `plans` / `tasks` / `toolCalls` / `patchsets` | arrays | Runtime projections used by Workflow, Summary, Diff, and Terminal panes. |
 | `interactions` | array | Pending/resolved UI prompts. `kind` is `approval`, `sandbox_approval`, `request_user_input`, `intent_review_choice`, or `post_plan_choice`. |
@@ -240,9 +242,9 @@ LIBRA_LOG='libra::internal::ai=debug,libra::internal::tui=debug' \
 LIBRA_LOG_FILE=/tmp/libra-code.log \
 libra code --repo=/Volumes/Data/linked --provider ollama --model gemma4:31b
 
-# Resume a canonical Libra thread (TUI-only: --resume is not accepted with
-# --web-only or --stdio, by design)
+# Resume a canonical Libra thread in the TUI or with a non-Codex headless Web server
 libra code --resume 11111111-1111-4111-8111-111111111111
+libra code --web-only --provider ollama --resume 11111111-1111-4111-8111-111111111111
 
 # Inspect the same thread's version graph
 libra graph 11111111-1111-4111-8111-111111111111
@@ -309,6 +311,10 @@ AI agents executing shell commands on a developer's machine present real safety 
 Long coding sessions accumulate significant context: file edits, conversation history, tool outputs. Losing this context on an accidental terminal close is painful. Session persistence stores the full conversation and tool state, and `--resume <thread_id>` restores a canonical Libra thread.
 
 The embedded Code UI exposes the same canonical identifier as `threadId` in its session snapshot. Older `session_id` fields remain present for compatibility, but new integrations should key resume, Web, MCP, and diagnostics flows by `threadId`.
+
+For a persistent non-Codex Web session, the initial session write is a prerequisite for starting a turn: if it fails, Libra starts no turn and the browser can repair storage and retry. A later persistence failure changes the live session to `indeterminate_side_effect` and blocks further submits or interaction replies; inspect the durable session data before restarting or reconciling it.
+
+On `Ctrl-C`, a non-Codex headless runtime first closes browser command admission, then waits up to 30 seconds for the active turn to reach a determinate result. Read-only/model work is cooperatively cancelled; a started mutating tool is allowed to finish. If the deadline expires, `libra code` exits with an explicit shutdown failure and requires session inspection and reconciliation before restart.
 
 ## Parameter Comparison: Libra vs Git vs jj
 

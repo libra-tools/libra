@@ -163,7 +163,7 @@ async fn assert_persisted_row_redacted(repo: &HookRepo, session_id: &str, token:
     let conn = Database::connect(opts).await.expect("open repo libra.db");
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT session_id, agent_kind, provider_session_id, state, working_dir, \
                     COALESCE(metadata_json, '') AS metadata_json, \

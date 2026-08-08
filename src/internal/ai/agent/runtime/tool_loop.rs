@@ -20,12 +20,16 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io,
+    future, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use super::sub_agent::{
     SubAgentToolLoopRuntime, TaskEntryKind, TaskFailure, TaskInvocation, TaskResult,
@@ -64,6 +68,43 @@ use crate::internal::ai::{
 pub struct ToolLoopTurn {
     pub final_text: String,
     pub history: Vec<Message>,
+}
+
+/// Cooperative cancellation supplied by a runtime owner. It separates the
+/// normal cancellation signal from the active mutation-dispatch marker:
+/// callers must request cancellation before the latter is set, while a loop
+/// that has started a mutating call waits for a determinate handler result.
+#[derive(Clone, Debug)]
+pub struct ToolLoopCancellation {
+    token: CancellationToken,
+    mutation_started: Arc<AtomicBool>,
+}
+
+impl ToolLoopCancellation {
+    pub fn new(token: CancellationToken, mutation_started: Arc<AtomicBool>) -> Self {
+        Self {
+            token,
+            mutation_started,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub fn mark_mutation_started(&self) {
+        self.mutation_started.store(true, Ordering::Release);
+    }
+
+    /// Clear the marker only after the handler has returned its determinate
+    /// result. A later model/read-only phase is safe to cancel cooperatively.
+    pub fn mark_mutation_finished(&self) {
+        self.mutation_started.store(false, Ordering::Release);
+    }
+
+    async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
 }
 
 /// Observer hooks for tool-loop execution.
@@ -148,6 +189,10 @@ pub struct ToolLoopConfig {
     pub allowed_tools: Option<Vec<String>>,
     /// Optional runtime constraints injected into every tool invocation.
     pub runtime_context: Option<ToolRuntimeContext>,
+    /// Optional runtime-owned cooperative cancellation contract. The loop
+    /// observes it before model work and immediately before dispatch; mutating
+    /// calls mark their side-effect boundary and are never force-cancelled.
+    pub cancellation: Option<ToolLoopCancellation>,
     /// Hard cap for model turns in one tool loop run.
     pub max_turns: Option<usize>,
     /// Number of recent executed tool calls used to detect repeated calls.
@@ -214,6 +259,7 @@ impl Default for ToolLoopConfig {
             hook_runner: None,
             allowed_tools: None,
             runtime_context: None,
+            cancellation: None,
             max_turns: None,
             repeat_detection_window: Some(DEFAULT_REPEAT_DETECTION_WINDOW),
             repeat_warning_threshold: Some(DEFAULT_REPEAT_WARNING_THRESHOLD),
@@ -250,6 +296,24 @@ const DEFAULT_REPEAT_ABORT_THRESHOLD: usize = 5;
 /// rejection). Exceeding this means the model is stuck retrying a forbidden call and
 /// the loop aborts to avoid wasted tokens.
 const MAX_IDENTICAL_BLOCKED_TOOL_CALLS: usize = 3;
+
+fn tool_loop_cancelled(config: &ToolLoopConfig) -> bool {
+    config
+        .cancellation
+        .as_ref()
+        .is_some_and(ToolLoopCancellation::is_cancelled)
+}
+
+async fn wait_for_tool_loop_cancellation(cancellation: Option<&ToolLoopCancellation>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => future::pending::<()>().await,
+    }
+}
+
+fn tool_loop_cancelled_error() -> CompletionError {
+    CompletionError::ResponseError("Tool loop cancelled before a new side effect began".to_string())
+}
 
 /// Run a prompt through a completion model, allowing iterative tool calls.
 ///
@@ -365,6 +429,9 @@ where
     }
 
     loop {
+        if tool_loop_cancelled(&config) {
+            return Err(tool_loop_cancelled_error());
+        }
         if turn_count >= max_turns {
             return Err(CompletionError::ResponseError(format!(
                 "Tool loop exceeded maximum turns ({max_turns})"
@@ -405,6 +472,9 @@ where
                     }
                     Some(event) = stream_rx.recv() => {
                         observer.on_model_stream_event(&event);
+                    }
+                    _ = wait_for_tool_loop_cancellation(config.cancellation.as_ref()) => {
+                        break Err(tool_loop_cancelled_error());
                     }
                 }
             }
@@ -491,6 +561,9 @@ where
             });
 
             for call in tool_calls {
+                if tool_loop_cancelled(&config) {
+                    return Err(tool_loop_cancelled_error());
+                }
                 observer.on_tool_call_begin(
                     &call.id,
                     &call.function.name,
@@ -609,6 +682,35 @@ where
                 }
 
                 let tool_name = call.function.name.clone();
+                let mutates_state = if tool_name == "task" {
+                    // A task may delegate an arbitrary child tool surface, so
+                    // treat it as mutating until the child contract is folded
+                    // into this runtime boundary.
+                    true
+                } else {
+                    registry
+                        .invocation_may_mutate(&invocation)
+                        .await
+                        .map_err(|error| {
+                            CompletionError::ResponseError(format!(
+                                "failed to classify tool '{tool_name}' for cancellation: {error}"
+                            ))
+                        })?
+                };
+                // Claim the mutation boundary before the final cancellation
+                // check. If cancellation won the race, clear the marker and
+                // exit without dispatching. If it arrives after this check,
+                // the runtime sees the marker and waits for the handler's
+                // determinate result instead of hard-aborting it.
+                if mutates_state && let Some(cancellation) = config.cancellation.as_ref() {
+                    cancellation.mark_mutation_started();
+                    if cancellation.is_cancelled() {
+                        cancellation.mark_mutation_finished();
+                        return Err(tool_loop_cancelled_error());
+                    }
+                } else if tool_loop_cancelled(&config) {
+                    return Err(tool_loop_cancelled_error());
+                }
                 let mut tool_result: Result<ToolOutput, String> = if tool_name == "task" {
                     dispatch_task_tool_call(
                         config.subagent_runtime.as_ref(),
@@ -625,12 +727,25 @@ where
                         observer,
                     )
                     .await
-                } else {
+                } else if mutates_state {
                     match registry.dispatch(invocation).await {
                         Ok(output) => Ok(output),
                         Err(err) => Err(format!("Tool '{}' failed: {}", tool_name, err)),
                     }
+                } else {
+                    tokio::select! {
+                        _ = wait_for_tool_loop_cancellation(config.cancellation.as_ref()) => {
+                            return Err(tool_loop_cancelled_error());
+                        }
+                        result = registry.dispatch(invocation) => match result {
+                            Ok(output) => Ok(output),
+                            Err(err) => Err(format!("Tool '{}' failed: {}", tool_name, err)),
+                        }
+                    }
                 };
+                if mutates_state && let Some(cancellation) = config.cancellation.as_ref() {
+                    cancellation.mark_mutation_finished();
+                }
                 blocked_signatures.clear();
                 let repeat_status = record_executed_tool_signature(
                     &mut executed_tool_signatures,
@@ -1570,6 +1685,160 @@ mod tests {
         }
     }
 
+    struct MutatingMockHandler;
+
+    #[async_trait]
+    impl ToolHandler for MutatingMockHandler {
+        fn kind(&self) -> ToolKind {
+            ToolKind::Function
+        }
+
+        async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
+            true
+        }
+
+        async fn handle(
+            &self,
+            _invocation: ToolInvocation,
+        ) -> crate::internal::ai::tools::ToolResult<ToolOutput> {
+            Ok(ToolOutput::success("mutated"))
+        }
+
+        fn schema(&self) -> ToolSpec {
+            ToolSpec::new("mock_tool", "mutating mock tool")
+        }
+    }
+
+    /// The mutation marker must describe only the dispatch boundary. Leaving
+    /// it set after the handler returns would make a following model/read-only
+    /// phase permanently reject safe cooperative cancellation.
+    #[tokio::test]
+    async fn tool_loop_clears_mutation_marker_after_determinate_handler_result() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ToolRegistry::with_working_dir(temp_dir.path().to_path_buf());
+        registry.register("mock_tool", Arc::new(MutatingMockHandler));
+        let token = CancellationToken::new();
+        let mutation_started = Arc::new(AtomicBool::new(false));
+        let config = ToolLoopConfig {
+            cancellation: Some(ToolLoopCancellation::new(
+                token,
+                Arc::clone(&mutation_started),
+            )),
+            ..ToolLoopConfig::default()
+        };
+
+        let turn = run_tool_loop_with_history_and_observer(
+            &MockModel,
+            Vec::new(),
+            "run mutation",
+            &registry,
+            config,
+            &mut NoopObserver,
+        )
+        .await
+        .expect("the mutating mock handler should reach a determinate result");
+
+        assert_eq!(turn.final_text, "done");
+        assert!(
+            !mutation_started.load(Ordering::Acquire),
+            "the marker must be cleared after the mutation handler returns",
+        );
+    }
+
+    struct ClassificationBlockingMutationHandler {
+        classification_started: Arc<tokio::sync::Notify>,
+        allow_classification: Arc<tokio::sync::Notify>,
+        dispatches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for ClassificationBlockingMutationHandler {
+        fn kind(&self) -> ToolKind {
+            ToolKind::Function
+        }
+
+        async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
+            self.classification_started.notify_one();
+            self.allow_classification.notified().await;
+            true
+        }
+
+        async fn handle(
+            &self,
+            _invocation: ToolInvocation,
+        ) -> crate::internal::ai::tools::ToolResult<ToolOutput> {
+            self.dispatches.fetch_add(1, Ordering::AcqRel);
+            Ok(ToolOutput::success("must not dispatch after cancellation"))
+        }
+
+        fn schema(&self) -> ToolSpec {
+            ToolSpec::new("mock_tool", "classification-blocking mutating mock tool")
+        }
+    }
+
+    /// Cancellation that lands after mutability classification begins but
+    /// before dispatch must win without executing the mutation. The loop first
+    /// claims the boundary, then rechecks the token, closing the former race
+    /// between a pre-dispatch check and marker publication.
+    #[tokio::test]
+    async fn cancellation_between_mutation_classification_and_dispatch_skips_tool() {
+        let temp_dir = TempDir::new().unwrap();
+        let classification_started = Arc::new(tokio::sync::Notify::new());
+        let allow_classification = Arc::new(tokio::sync::Notify::new());
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::with_working_dir(temp_dir.path().to_path_buf());
+        registry.register(
+            "mock_tool",
+            Arc::new(ClassificationBlockingMutationHandler {
+                classification_started: Arc::clone(&classification_started),
+                allow_classification: Arc::clone(&allow_classification),
+                dispatches: Arc::clone(&dispatches),
+            }),
+        );
+        let registry = Arc::new(registry);
+        let token = CancellationToken::new();
+        let mutation_started = Arc::new(AtomicBool::new(false));
+        let config = ToolLoopConfig {
+            cancellation: Some(ToolLoopCancellation::new(
+                token.clone(),
+                Arc::clone(&mutation_started),
+            )),
+            ..ToolLoopConfig::default()
+        };
+
+        let task_registry = Arc::clone(&registry);
+        let task = tokio::spawn(async move {
+            let mut observer = NoopObserver;
+            run_tool_loop_with_history_and_observer(
+                &MockModel,
+                Vec::new(),
+                "run mutation",
+                task_registry.as_ref(),
+                config,
+                &mut observer,
+            )
+            .await
+        });
+        classification_started.notified().await;
+        token.cancel();
+        allow_classification.notify_one();
+
+        let error = task
+            .await
+            .expect("tool loop task must not panic")
+            .expect_err("cancellation before dispatch must stop the loop");
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(
+            dispatches.load(Ordering::Acquire),
+            0,
+            "the handler must not run after cancellation wins before dispatch",
+        );
+        assert!(
+            !mutation_started.load(Ordering::Acquire),
+            "a cancellation before dispatch must release the mutation marker",
+        );
+    }
+
     #[derive(Clone)]
     struct LoopFakeSource {
         manifest: CapabilityManifest,
@@ -1859,6 +2128,7 @@ mod tests {
                 hook_runner: None,
                 allowed_tools: None,
                 runtime_context: None,
+                cancellation: None,
                 max_turns: None,
                 repeat_detection_window: Some(DEFAULT_REPEAT_DETECTION_WINDOW),
                 repeat_warning_threshold: Some(DEFAULT_REPEAT_WARNING_THRESHOLD),
@@ -2619,6 +2889,7 @@ mod tests {
                 hook_runner: None,
                 allowed_tools: None,
                 runtime_context: None,
+                cancellation: None,
                 max_turns: None,
                 repeat_detection_window: Some(DEFAULT_REPEAT_DETECTION_WINDOW),
                 repeat_warning_threshold: Some(DEFAULT_REPEAT_WARNING_THRESHOLD),
@@ -2755,6 +3026,7 @@ mod tests {
                 hook_runner: None,
                 allowed_tools: Some(vec!["other_tool".to_string()]),
                 runtime_context: None,
+                cancellation: None,
                 max_turns: None,
                 repeat_detection_window: Some(DEFAULT_REPEAT_DETECTION_WINDOW),
                 repeat_warning_threshold: Some(DEFAULT_REPEAT_WARNING_THRESHOLD),

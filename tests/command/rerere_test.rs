@@ -275,3 +275,131 @@ fn rerere_auto_replays_a_recurring_merge_conflict() {
         "rerere should have replayed the recorded merge resolution, got: {replayed:?}"
     );
 }
+
+/// W2 §C.4.3: MERGE_RR is per-worktree — each worktree tracks its own
+/// current conflicts in `<local_gitdir>/MERGE_RR`, one scope's clear never
+/// drops another's tracking, while the resolution CACHE stays shared (a
+/// resolution recorded in one worktree replays in another).
+#[test]
+fn merge_rr_is_worktree_scoped_and_cache_is_shared() {
+    let repo = repo_with_conflict();
+    let main = repo.path();
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("rr-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Main records its conflict; the canonical file is main's local gitdir
+    // (`.libra/MERGE_RR`), NOT the legacy shared cache location.
+    assert_cli_success(&run_libra_command(&["rerere"], main), "main record");
+    assert!(main.join(".libra/MERGE_RR").exists(), "canonical main file");
+    assert!(
+        !main.join(".libra/rerere/MERGE_RR").exists(),
+        "no legacy shared MERGE_RR is written"
+    );
+
+    // The linked worktree sees NO tracked conflicts (its own list is empty).
+    let wt_status = run_libra_command(&["rerere", "status"], &wt);
+    assert_cli_success(&wt_status, "wt status");
+    assert_eq!(out(&wt_status).trim(), "", "linked list starts empty");
+
+    // The linked worktree gets the same conflict; tracking lands in ITS
+    // local gitdir and clear-in-main must not drop it.
+    fs::write(wt.join("tracked.txt"), CONFLICT).unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], &wt), "wt record");
+    assert!(wt.join(".libra/MERGE_RR").exists(), "canonical wt file");
+    assert_cli_success(&run_libra_command(&["rerere", "clear"], main), "main clear");
+    let wt_status = run_libra_command(&["rerere", "status"], &wt);
+    assert!(
+        out(&wt_status).contains("tracked.txt"),
+        "main's clear does not drop the linked worktree's tracking: {}",
+        out(&wt_status)
+    );
+
+    // Shared cache: resolve in the LINKED worktree, then the same conflict
+    // in MAIN replays from the shared resolution cache.
+    fs::write(wt.join("tracked.txt"), RESOLVED).unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], &wt), "wt resolve");
+    fs::write(main.join("tracked.txt"), CONFLICT).unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], main), "main replay");
+    assert_eq!(
+        fs::read_to_string(main.join("tracked.txt")).unwrap(),
+        RESOLVED,
+        "the resolution cache is repository-shared across worktrees"
+    );
+}
+
+/// W2 §C.4.3 legacy migration: a single-worktree main READS a pre-W2
+/// `.libra/rerere/MERGE_RR` and migrates it to the canonical location on
+/// first write; with linked worktrees present the legacy file is ambiguous —
+/// ignored with a notice and left untouched, and a linked scope never reads
+/// it at all.
+#[test]
+fn legacy_merge_rr_migrates_for_single_main_and_stays_ambiguous_with_linked() {
+    // Single-worktree: legacy content is read and migrated on first write.
+    let repo = repo_with_conflict();
+    let main = repo.path();
+    assert_cli_success(&run_libra_command(&["rerere"], main), "record");
+    let canonical = main.join(".libra/MERGE_RR");
+    let legacy = main.join(".libra/rerere/MERGE_RR");
+    // Recreate the pre-W2 layout: move the tracking file to the legacy spot.
+    fs::rename(&canonical, &legacy).unwrap();
+    let status = run_libra_command(&["rerere", "status"], main);
+    assert!(
+        out(&status).contains("tracked.txt"),
+        "single-worktree main reads the legacy file: {}",
+        out(&status)
+    );
+    // A write pass migrates: canonical exists, legacy is gone.
+    assert_cli_success(&run_libra_command(&["rerere"], main), "migrating write");
+    assert!(canonical.exists(), "canonical file after migration");
+    assert!(!legacy.exists(), "legacy file removed after migration");
+
+    // With a linked worktree, a legacy file is ambiguous: ignored (with a
+    // notice) and left untouched; the linked scope never reads it either.
+    fs::rename(&canonical, &legacy).unwrap();
+    let legacy_bytes = fs::read(&legacy).unwrap();
+    let wt_root = tempdir().expect("wt root");
+    let wt = wt_root.path().join("legacy-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let status = run_libra_command(&["rerere", "status"], main);
+    assert_cli_success(&status, "ambiguous status still succeeds");
+    assert_eq!(
+        out(&status).trim(),
+        "",
+        "ambiguous legacy list is not consumed by main"
+    );
+    assert!(
+        String::from_utf8_lossy(&status.stderr).contains("ambiguous"),
+        "a one-line notice points at the ambiguity"
+    );
+    // `clear` in main surfaces the same notice and leaves the file too.
+    let cleared = run_libra_command(&["rerere", "clear"], main);
+    assert_cli_success(&cleared, "ambiguous clear still succeeds");
+    assert!(
+        String::from_utf8_lossy(&cleared.stderr).contains("ambiguous"),
+        "clear surfaces the ambiguity notice"
+    );
+    assert!(legacy.exists(), "clear leaves the ambiguous legacy file");
+    assert_eq!(
+        fs::read(&legacy).unwrap(),
+        legacy_bytes,
+        "the ambiguous legacy file is byte-for-byte untouched for the W3 doctor"
+    );
+    let wt_status = run_libra_command(&["rerere", "status"], &wt);
+    assert_cli_success(&wt_status, "wt status");
+    assert_eq!(
+        out(&wt_status).trim(),
+        "",
+        "a linked scope never reads the legacy common file"
+    );
+    assert!(
+        legacy.exists(),
+        "the ambiguous legacy file is left untouched"
+    );
+}

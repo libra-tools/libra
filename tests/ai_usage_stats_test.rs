@@ -301,7 +301,7 @@ async fn usage_recorder_prunes_rows_before_cutoff() {
         .await
         .expect("record usage");
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "UPDATE agent_usage_stats SET started_at = ?, created_at = ?",
         vec![

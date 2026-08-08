@@ -194,7 +194,7 @@ async fn list(args: CheckpointListArgs, output: &OutputConfig) -> CliResult<()> 
     values.push((limit as i64 + 1).into());
 
     let rows = conn
-        .query_all(Statement::from_sql_and_values(backend, &sql, values))
+        .query_all_raw(Statement::from_sql_and_values(backend, &sql, values))
         .await
         .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
     let mut out = Vec::with_capacity(rows.len());
@@ -237,7 +237,7 @@ async fn show(args: CheckpointShowArgs, output: &OutputConfig) -> CliResult<()> 
     }
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
                     metadata_blob_oid, traces_commit, created_at \
@@ -295,7 +295,7 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
     }
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT parent_commit, traces_commit FROM agent_checkpoint \
              WHERE checkpoint_id = ? LIMIT 1",
@@ -580,7 +580,7 @@ async fn lookup_truncation_support(
 ) -> Result<bool, sea_orm::DbErr> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT s.agent_kind AS agent_kind, \
                     COALESCE(s.metadata_json, '{}') AS metadata_json \
@@ -639,7 +639,7 @@ async fn truncate_agent_transcript_for_checkpoint_with_conn(
     //    (Codex round-1 P4 follow-up),
     //  - created_at on the checkpoint (the boundary).
     let row = match conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT s.agent_kind AS agent_kind, \
                     COALESCE(s.metadata_json, '{}') AS metadata_json, \
@@ -1272,6 +1272,145 @@ fn tree_entry<'t>(tree: &'t Tree, name: &str) -> Option<&'t TreeItem> {
     tree.tree_items.iter().find(|item| item.name == name)
 }
 
+/// PD-02: resolve `--checkpoint <id>` (review/investigate scoped input)
+/// into a validated materialization spec. Every failure — unknown id,
+/// malformed tree, non-local blob — fails closed HERE, before the caller
+/// creates any run state, so an invalid checkpoint never leaves run
+/// residue. The returned spec lists the checkpoint's ENTIRE inner tree
+/// (metadata, manifest, transcript parts), each blob verified locally
+/// present.
+pub(super) async fn resolve_checkpoint_input_spec(
+    checkpoint_id: &str,
+) -> CliResult<crate::internal::ai::checkpoint_input::CheckpointInputSpec> {
+    use crate::internal::ai::checkpoint_input::{CheckpointInputFile, CheckpointInputSpec};
+
+    let conn = get_db_conn_instance().await;
+    if !table_exists(&conn, "agent_checkpoint").await? {
+        return Err(CliError::fatal(format!(
+            "no checkpoint matches '{checkpoint_id}': agent_checkpoint table not yet present \
+             (run `libra init`?)"
+        )));
+    }
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
+                    metadata_blob_oid, traces_commit, created_at \
+             FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
+            [checkpoint_id.into()],
+        ))
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
+    let Some(row) = row else {
+        return Err(CliError::fatal(format!(
+            "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
+             `libra agent checkpoint list`"
+        )));
+    };
+    let tree_oid: String = row.try_get_by("tree_oid").unwrap_or_default();
+    let storage = util::try_get_storage_path(None)
+        .map_err(|e| CliError::fatal(format!("not in a libra repository: {e}")))?;
+    let scoped = |reason: String| {
+        CliError::fatal(format!(
+            "checkpoint '{checkpoint_id}' cannot be materialized as a scoped input: {reason}"
+        ))
+    };
+    let root = read_tree_object(&storage, &tree_oid).map_err(scoped)?;
+    let checkpoint_tree = subtree(&storage, &root, "checkpoint").map_err(scoped)?;
+    let prefix = checkpoint_id
+        .get(..2)
+        .ok_or_else(|| scoped(format!("checkpoint id '{checkpoint_id}' is too short")))?;
+    let prefix_tree = subtree(&storage, &checkpoint_tree, prefix).map_err(scoped)?;
+    let inner = subtree(&storage, &prefix_tree, &checkpoint_id[2..]).map_err(scoped)?;
+
+    // Walk the inner tree breadth-first, collecting every blob. Blob
+    // presence is verified with the same loose-object stat the layout
+    // summary uses — a checkpoint whose content is not locally present
+    // must fail before any run exists, not midway through a run.
+    let mut files: Vec<CheckpointInputFile> = Vec::new();
+    let mut pending: Vec<(String, Tree)> = vec![(String::new(), inner)];
+    while let Some((prefix, tree)) = pending.pop() {
+        for item in &tree.tree_items {
+            let rel_path = if prefix.is_empty() {
+                item.name.clone()
+            } else {
+                format!("{prefix}/{}", item.name)
+            };
+            if item.mode == TreeItemMode::Tree {
+                let child = read_tree_object(&storage, &item.id.to_string()).map_err(scoped)?;
+                pending.push((rel_path, child));
+            } else {
+                // A gitlink has no content to materialize; a checkpoint
+                // tree carrying one is malformed, not a submodule.
+                if item.mode == TreeItemMode::Commit {
+                    return Err(scoped(format!(
+                        "entry {rel_path} is a gitlink, which has no content to materialize"
+                    )));
+                }
+                // Re-validate the path HERE, not only in the materializer:
+                // the acceptance criterion is that a malformed checkpoint
+                // fails before any run exists, and a path the materializer
+                // would refuse must not first cost the caller an error run.
+                crate::internal::ai::checkpoint_input::sanitize_rel_path(&rel_path)
+                    .map_err(scoped)?;
+                let oid = item.id.to_string();
+                let object_path = storage.join("objects").join(&oid[..2]).join(&oid[2..]);
+                if !object_path.exists() {
+                    return Err(scoped(format!(
+                        "blob {oid} ({rel_path}) is not present in the local object store"
+                    )));
+                }
+                files.push(CheckpointInputFile { rel_path, oid });
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(scoped("the checkpoint tree carries no files".to_string()));
+    }
+    // Presence is not readability. Decode every blob under the SAME caps
+    // the materializer enforces, so a corrupt, wrong-typed, or oversized
+    // checkpoint is refused here — before a run row exists — instead of
+    // failing halfway through materialization and leaving an error run
+    // behind for the user to clean up.
+    let mut total: u64 = 0;
+    for file in &files {
+        let oid = ObjectHash::from_str(&file.oid)
+            .map_err(|e| scoped(format!("invalid blob oid '{}': {e}", file.oid)))?;
+        let (bytes, truncated) = read_git_object_bounded(
+            &storage,
+            &oid,
+            crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_FILE_BYTES,
+        )
+        .map_err(|e| {
+            scoped(format!(
+                "blob {} ({}) is not readable from the local object store: {e}",
+                file.oid, file.rel_path
+            ))
+        })?;
+        if truncated {
+            return Err(scoped(format!(
+                "blob {} ({}) exceeds the {}-byte per-file cap",
+                file.oid,
+                file.rel_path,
+                crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_FILE_BYTES
+            )));
+        }
+        total = total.saturating_add(bytes.len() as u64);
+        if total > crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_TOTAL_BYTES {
+            return Err(scoped(format!(
+                "the checkpoint's files exceed the {}-byte total cap",
+                crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_TOTAL_BYTES
+            )));
+        }
+    }
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(CheckpointInputSpec {
+        checkpoint_id: checkpoint_id.to_string(),
+        files,
+    })
+}
+
 fn subtree(storage: &Path, tree: &Tree, name: &str) -> Result<Tree, String> {
     let item = tree_entry(tree, name).ok_or_else(|| {
         format!("tree entry '{name}' missing while resolving the checkpoint tree")
@@ -1390,7 +1529,7 @@ async fn load_checkpoint_row(
     }
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
                     metadata_blob_oid, traces_commit, created_at \
@@ -1697,7 +1836,7 @@ pub(super) async fn table_exists(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
     );
-    conn.query_one(stmt)
+    conn.query_one_raw(stmt)
         .await
         .map(|row| row.is_some())
         .map_err(|e| CliError::fatal(format!("failed to query sqlite_master: {e}")))
@@ -1736,7 +1875,7 @@ mod tests {
                 continue;
             }
             let _: ExecResult = conn
-                .execute(Statement::from_string(backend, trimmed.to_string()))
+                .execute_raw(Statement::from_string(backend, trimmed.to_string()))
                 .await
                 .unwrap_or_else(|e| panic!("legacy bootstrap stmt failed: {trimmed}\n{e}"));
         }
@@ -1773,7 +1912,7 @@ mod tests {
             .timestamp();
 
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1783,7 +1922,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -1814,7 +1953,7 @@ mod tests {
     async fn rewind_truncate_skips_when_no_transcript_path_in_metadata() {
         let (_dir, conn) = fresh_db().await;
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1824,7 +1963,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -1872,7 +2011,7 @@ mod tests {
             let session_id = format!("s-{idx}");
             let provider_session_id = format!("p-{idx}");
             let checkpoint_id = format!("cp-{idx}");
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_session (
                     session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1887,7 +2026,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_checkpoint (
                     checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -1924,7 +2063,7 @@ mod tests {
         .to_string();
 
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1934,7 +2073,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -2047,7 +2186,7 @@ mod tests {
         ];
         for (sql, values, index_name, table) in cases {
             let rows = conn
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     backend,
                     format!("EXPLAIN QUERY PLAN {sql}"),
                     values,

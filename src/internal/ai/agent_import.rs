@@ -20,11 +20,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::observed_agents::{
-    AgentKind, CanonValue, Completeness, NormalizedTurn, RedactedBytes, Redactor,
-    TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource, normalize_claude_transcript_until,
-    normalize_codex_rollout_until, normalize_opencode_export_until, parse_canon_value,
-    redact_turns_with_report, safe_turn_projection,
+use super::{
+    capture_scope::CaptureScope,
+    observed_agents::{
+        AgentKind, CanonValue, Completeness, NormalizedTurn, RedactedBytes, Redactor,
+        TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource, normalize_claude_transcript_until,
+        normalize_codex_rollout_until, normalize_opencode_export_until, parse_canon_value,
+        redact_turns_with_report, safe_turn_projection,
+    },
 };
 use crate::{
     internal::{
@@ -94,6 +97,11 @@ pub struct ImportRequest {
     #[serde(with = "import_path_serde")]
     pub working_dir: PathBuf,
     pub repository_identity: String,
+    /// Canonical repository/worktree/workspace owner. The bounded parsing
+    /// helper cannot resolve this database-backed value, so the command path
+    /// attaches it before the first lease/identity write.
+    #[serde(default)]
+    pub capture_scope: Option<CaptureScope>,
     pub source_fingerprint: String,
     /// Exact non-secret fingerprint of the pre-helper existing-session row.
     /// Foreground lease acquisition re-queries and compares this value without
@@ -809,6 +817,7 @@ pub fn prepare_import_request(
         stopped_at: facts.terminal.then_some(ended_at),
         working_dir,
         repository_identity,
+        capture_scope: None,
         source_fingerprint,
         existing_session_fingerprint: None,
         redaction_report,
@@ -832,6 +841,19 @@ pub(crate) fn identity_id(request: &ImportRequest) -> String {
     format!("import-{}", hex::encode(digest.finalize()))
 }
 
+async fn capture_scope_for_request<C: ConnectionTrait>(
+    conn: &C,
+    request: &ImportRequest,
+) -> Result<CaptureScope> {
+    match &request.capture_scope {
+        Some(scope) => Ok(scope.clone()),
+        // Direct in-process callers predate W4's command-owned scope handoff.
+        // They are test/internal compatibility seams only; production command
+        // paths set `capture_scope` from the real worktree before parsing.
+        None => CaptureScope::main_for_connection(conn).await,
+    }
+}
+
 fn existing_session_snapshot_fingerprint(snapshot: &ExistingSessionOwnershipSnapshot) -> String {
     let mut digest = Sha256::new();
     for value in [
@@ -853,7 +875,7 @@ pub async fn load_existing_session_ownership<C: ConnectionTrait>(
     provider_session_id: &str,
 ) -> Result<Option<ExistingSessionOwnershipSnapshot>> {
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT session_id, agent_kind, provider_session_id, working_dir, metadata_json
              FROM agent_session WHERE agent_kind = ? AND provider_session_id = ?",
@@ -861,6 +883,50 @@ pub async fn load_existing_session_ownership<C: ConnectionTrait>(
         ))
         .await
         .context("query existing agent import ownership snapshot")?;
+    row.map(|row| {
+        Ok(ExistingSessionOwnershipSnapshot {
+            session_id: row.try_get_by("session_id")?,
+            agent_kind: row.try_get_by("agent_kind")?,
+            provider_session_id: row.try_get_by("provider_session_id")?,
+            working_dir: row.try_get_by("working_dir")?,
+            metadata_json: row.try_get_by("metadata_json")?,
+        })
+    })
+    .transpose()
+}
+
+/// Scope-aware import ownership lookup used by the command path. The legacy
+/// public helper remains for preparation tests, while every real import first
+/// rejects a foreign/unknown provider-session claim and then reads only the
+/// exact canonical scope.
+pub async fn load_existing_session_ownership_in_scope<C: ConnectionTrait>(
+    conn: &C,
+    kind: AgentKind,
+    provider_session_id: &str,
+    scope: &CaptureScope,
+) -> Result<Option<ExistingSessionOwnershipSnapshot>> {
+    scope
+        .assert_provider_session_compatible(conn, provider_session_id)
+        .await?;
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT session_id, agent_kind, provider_session_id, working_dir, metadata_json
+             FROM agent_session
+             WHERE agent_kind = ? AND provider_session_id = ?
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?",
+            [
+                kind.as_db_str().into(),
+                provider_session_id.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .context("query scoped agent import ownership snapshot")?;
     row.map(|row| {
         Ok(ExistingSessionOwnershipSnapshot {
             session_id: row.try_get_by("session_id")?,
@@ -946,9 +1012,14 @@ async fn validate_existing_session_ownership<C: ConnectionTrait>(
     conn: &C,
     request: &ImportRequest,
 ) -> Result<()> {
-    let observed =
-        load_existing_session_ownership(conn, request.agent_kind, &request.provider_session_id)
-            .await?;
+    let scope = capture_scope_for_request(conn, request).await?;
+    let observed = load_existing_session_ownership_in_scope(
+        conn,
+        request.agent_kind,
+        &request.provider_session_id,
+        &scope,
+    )
+    .await?;
     let observed_fingerprint = observed.as_ref().map(existing_session_snapshot_fingerprint);
     if observed_fingerprint != request.existing_session_fingerprint {
         return Err(ImportError::RepositoryConflict.into());
@@ -958,14 +1029,25 @@ async fn validate_existing_session_ownership<C: ConnectionTrait>(
 
 async fn ensure_session(conn: &impl ConnectionTrait, request: &ImportRequest) -> Result<()> {
     let backend = conn.get_database_backend();
+    let scope = capture_scope_for_request(conn, request).await?;
+    scope
+        .assert_provider_session_compatible(conn, &request.provider_session_id)
+        .await?;
+    scope.assert_workspace_fence_live(conn).await?;
     let existing = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT session_id, agent_kind, provider_session_id, working_dir, metadata_json
-             FROM agent_session WHERE agent_kind = ? AND provider_session_id = ?",
+             FROM agent_session WHERE agent_kind = ? AND provider_session_id = ?
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?",
             [
                 request.agent_kind.as_db_str().into(),
                 request.provider_session_id.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
             ],
         ))
         .await
@@ -1008,7 +1090,7 @@ async fn ensure_session(conn: &impl ConnectionTrait, request: &ImportRequest) ->
         return Err(ImportError::RepositoryConflict.into());
     }
     let incarnation = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT next_session_sync_revision, source_namespace
              FROM agent_capture_incarnation
@@ -1038,13 +1120,14 @@ async fn ensure_session(conn: &impl ConnectionTrait, request: &ImportRequest) ->
     if let Some(source_namespace) = source_namespace {
         metadata["capture_incarnation"] = serde_json::Value::String(source_namespace);
     }
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
             metadata_json, redaction_report, started_at, last_event_at,
-            stopped_at, schema_version, sync_revision
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            stopped_at, schema_version, sync_revision,
+            repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'scoped')",
         [
             request.session_id.clone().into(),
             request.agent_kind.as_db_str().into(),
@@ -1059,10 +1142,58 @@ async fn ensure_session(conn: &impl ConnectionTrait, request: &ImportRequest) ->
             request.started_at.into(),
             Value::from(None::<i64>),
             sync_revision.into(),
+            scope.repo_id.clone().into(),
+            scope.worktree_id.clone().into(),
+            scope.workspace_id.clone().into(),
+            scope.workspace_fence.into(),
         ],
     ))
     .await
     .context("create agent session for historical import")?;
+    Ok(())
+}
+
+async fn assert_import_identity_scope<C: ConnectionTrait>(
+    conn: &C,
+    request: &ImportRequest,
+    scope: &CaptureScope,
+) -> Result<()> {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT scope_state, repo_id, worktree_id, workspace_id, workspace_fence
+             FROM agent_import_identity
+             WHERE agent_kind = ? AND provider_session_id = ?
+               AND source_kind = ? AND source_id = ? AND schema_version = ?",
+            [
+                request.agent_kind.as_db_str().into(),
+                request.provider_session_id.clone().into(),
+                request.source_kind.clone().into(),
+                request.source_id.clone().into(),
+                IMPORT_IDENTITY_SCHEMA_VERSION.into(),
+            ],
+        ))
+        .await
+        .context("read import-identity workspace ownership")?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let scope_state: String = row.try_get_by("scope_state")?;
+    let repo_id: Option<String> = row.try_get_by("repo_id")?;
+    let worktree_id: Option<String> = row.try_get_by("worktree_id")?;
+    let workspace_id: Option<String> = row.try_get_by("workspace_id")?;
+    let workspace_fence: Option<i64> = row.try_get_by("workspace_fence")?;
+    if scope_state != "scoped"
+        || repo_id.as_deref() != Some(scope.repo_id.as_str())
+        || worktree_id.as_deref() != Some(scope.worktree_id.as_str())
+        || workspace_id != scope.workspace_id
+        || workspace_fence != scope.workspace_fence
+    {
+        bail!(
+            "import identity belongs to a legacy or different workspace scope; refusing to \
+             take over it — inspect it with `libra worktree doctor` before retrying"
+        );
+    }
     Ok(())
 }
 
@@ -1074,6 +1205,7 @@ async fn acquire_identity(
     deadline: Instant,
 ) -> Result<ImportLease> {
     let identity_id = identity_id(request);
+    let scope = capture_scope_for_request(conn, request).await?;
     let lease_expires_at = now_ms
         .checked_add(IMPORT_LEASE_MS)
         .context("import lease timestamp overflow")?;
@@ -1082,23 +1214,29 @@ async fn acquire_identity(
     // prepared session fingerprint. Otherwise erasure can commit between a
     // standalone ownership read and this transaction, turning a known erased
     // identity into a misleading repository-conflict result.
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
         // `working_dir` is deliberately outside the compatibility tombstone
         // trigger's UPDATE OF list. Updating a guarded lifecycle column here
         // would abort before the contextual tombstone check can return
         // ImportError::Erased when erase has committed its first phase.
         "UPDATE agent_session SET working_dir = working_dir
-         WHERE agent_kind = ? AND provider_session_id = ?",
+         WHERE agent_kind = ? AND provider_session_id = ?
+           AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+           AND workspace_id IS ? AND workspace_fence IS ?",
         [
             request.agent_kind.as_db_str().into(),
             request.provider_session_id.clone().into(),
+            scope.repo_id.clone().into(),
+            scope.worktree_id.clone().into(),
+            scope.workspace_id.clone().into(),
+            scope.workspace_fence.into(),
         ],
     ))
     .await
     .context("serialize import identity acquisition with session erasure")?;
     let tombstone = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -1119,14 +1257,16 @@ async fn acquire_identity(
     // and a standalone session insert, leaving a locally erased session
     // resurrected even though identity acquisition fails closed.
     ensure_session(&txn, request).await?;
+    assert_import_identity_scope(&txn, request, &scope).await?;
     let inserted = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "INSERT INTO agent_import_identity (
                 identity_id, agent_kind, provider_session_id, source_kind,
                 source_id, schema_version, observed_digest, next_ordinal,
-                state, owner, lease_expires_at, fence_token, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'leased', ?, ?, 1, ?, ?)
+                state, owner, lease_expires_at, fence_token, created_at, updated_at,
+                repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'leased', ?, ?, 1, ?, ?, ?, ?, ?, ?, 'scoped')
              ON CONFLICT(agent_kind, provider_session_id, source_kind, source_id, schema_version)
              DO NOTHING",
             [
@@ -1141,6 +1281,10 @@ async fn acquire_identity(
                 lease_expires_at.into(),
                 now_ms.into(),
                 now_ms.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
             ],
         ))
         .await
@@ -1149,19 +1293,25 @@ async fn acquire_identity(
         1
     } else {
         let row = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT identity_id, owner, lease_expires_at, fence_token,
                         attempt_checkpoint_id
                  FROM agent_import_identity
                  WHERE agent_kind = ? AND provider_session_id = ?
-                   AND source_kind = ? AND source_id = ? AND schema_version = ?",
+                   AND source_kind = ? AND source_id = ? AND schema_version = ?
+                   AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+                   AND workspace_id IS ? AND workspace_fence IS ?",
                 [
                     request.agent_kind.as_db_str().into(),
                     request.provider_session_id.clone().into(),
                     request.source_kind.clone().into(),
                     request.source_id.clone().into(),
                     IMPORT_IDENTITY_SCHEMA_VERSION.into(),
+                    scope.repo_id.clone().into(),
+                    scope.worktree_id.clone().into(),
+                    scope.workspace_id.clone().into(),
+                    scope.workspace_fence.into(),
                 ],
             ))
             .await
@@ -1184,14 +1334,25 @@ async fn acquire_identity(
             .checked_add(1)
             .context("import identity fence overflow")?;
         let updated = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "UPDATE agent_import_identity
                  SET state = 'leased', owner = ?, lease_expires_at = ?,
                      fence_token = ?, observed_digest = ?, last_error_code = NULL,
                      attempt_id = NULL, attempt_checkpoint_id = NULL,
                      updated_at = ?
-                 WHERE identity_id = ? AND fence_token IS ?",
+                 WHERE identity_id = ? AND fence_token IS ?
+                   AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+                   AND workspace_id IS ? AND workspace_fence IS ?
+                   AND (agent_import_identity.workspace_id IS NULL OR EXISTS (
+                       SELECT 1 FROM workspace_record
+                       WHERE workspace_id = agent_import_identity.workspace_id
+                         AND repo_id = agent_import_identity.repo_id
+                         AND lease_fence = agent_import_identity.workspace_fence
+                         AND state IN ('provisioning', 'active', 'releasing')
+                         AND lease_owner IS NOT NULL
+                         AND lease_expires_at > (unixepoch('now') * 1000)
+                   ))",
                 [
                     owner.into(),
                     lease_expires_at.into(),
@@ -1200,6 +1361,10 @@ async fn acquire_identity(
                     now_ms.into(),
                     row_identity_id.into(),
                     Value::from(existing_fence),
+                    scope.repo_id.clone().into(),
+                    scope.worktree_id.clone().into(),
+                    scope.workspace_id.clone().into(),
+                    scope.workspace_fence.into(),
                 ],
             ))
             .await
@@ -1209,7 +1374,7 @@ async fn acquire_identity(
             return Err(ImportError::LeaseBusy.into());
         }
         if let Some(stale_owner) = existing_owner.as_deref().filter(|stale| *stale != owner) {
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "UPDATE agent_coverage_claim
                  SET state = 'abandoned', owner = NULL, lease_expires_at = NULL,
@@ -1258,17 +1423,29 @@ async fn bind_attempt(
     deadline: Instant,
 ) -> Result<String> {
     ensure_before_deadline(deadline)?;
+    let scope = capture_scope_for_request(conn, request).await?;
     let txn = conn.begin().await.context("begin import attempt binding")?;
     let lease_expires_at = now_ms
         .checked_add(IMPORT_LEASE_MS)
         .context("import lease timestamp overflow during attempt binding")?;
     let identity = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_import_identity
              SET state = 'writing', attempt_id = ?, attempt_checkpoint_id = ?,
                  lease_expires_at = ?, updated_at = ?
              WHERE identity_id = ? AND owner = ? AND fence_token = ?
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?
+               AND (agent_import_identity.workspace_id IS NULL OR EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = agent_import_identity.workspace_id
+                     AND repo_id = agent_import_identity.repo_id
+                     AND lease_fence = agent_import_identity.workspace_fence
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               ))
                AND state IN ('leased','writing')",
             [
                 checkpoint_id.into(),
@@ -1278,6 +1455,10 @@ async fn bind_attempt(
                 lease.identity_id.clone().into(),
                 lease.owner.clone().into(),
                 lease.fence_token.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
             ],
         ))
         .await
@@ -1292,7 +1473,7 @@ async fn bind_attempt(
     // reservation was acquired more than one lease interval ago. A live
     // writer that already preempted a claim changed its owner/fence and is
     // intentionally untouched.
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
         "UPDATE agent_coverage_claim SET lease_expires_at = ?, updated_at = ?
          WHERE session_id = ? AND state = 'reserved_import' AND owner = ?",
@@ -1306,7 +1487,7 @@ async fn bind_attempt(
     .await
     .context("renew remaining import coverage reservations")?;
     let coverage = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_coverage_claim SET attempt_checkpoint_id = ?, updated_at = ?
              WHERE session_id = ? AND logical_turn_key = ?
@@ -1359,12 +1540,12 @@ async fn finalize_noop_identity(
     now_ms: i64,
     deadline: Instant,
 ) -> Result<()> {
-    let txn = conn
-        .begin()
+    let scope = capture_scope_for_request(conn, request).await?;
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin import identity finalization")?;
     let tombstone = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -1385,14 +1566,25 @@ async fn finalize_noop_identity(
         None::<String>.into()
     };
     let result = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_import_identity
              SET state = ?, committed_digest = COALESCE(?, committed_digest),
                  next_ordinal = CASE WHEN ? THEN ? ELSE next_ordinal END,
                  owner = NULL, lease_expires_at = NULL,
                  last_error_code = ?, updated_at = ?
-             WHERE identity_id = ? AND owner = ? AND fence_token = ?",
+             WHERE identity_id = ? AND owner = ? AND fence_token = ?
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?
+               AND (agent_import_identity.workspace_id IS NULL OR EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = agent_import_identity.workspace_id
+                     AND repo_id = agent_import_identity.repo_id
+                     AND lease_fence = agent_import_identity.workspace_fence
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               ))",
             [
                 state.into(),
                 committed_digest,
@@ -1405,6 +1597,10 @@ async fn finalize_noop_identity(
                 lease.identity_id.clone().into(),
                 lease.owner.clone().into(),
                 lease.fence_token.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
             ],
         ))
         .await
@@ -1455,11 +1651,12 @@ async fn abandon_import_attempt(
     last_error_code: &str,
     now_ms: i64,
 ) -> Result<()> {
+    let scope = capture_scope_for_request(conn, request).await?;
     let txn = conn
         .begin()
         .await
         .context("begin expired import attempt cleanup")?;
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
         "UPDATE agent_coverage_claim
          SET state = 'abandoned', owner = NULL, lease_expires_at = NULL,
@@ -1478,14 +1675,25 @@ async fn abandon_import_attempt(
     .await
     .context("abandon expired import coverage reservation")?;
     let released_identity = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_import_identity
          SET state = ?, owner = NULL, lease_expires_at = NULL,
              attempt_id = NULL, attempt_checkpoint_id = NULL,
              fence_token = COALESCE(fence_token, 0) + 1,
              last_error_code = ?, updated_at = ?
-         WHERE identity_id = ? AND owner = ? AND fence_token = ?",
+         WHERE identity_id = ? AND owner = ? AND fence_token = ?
+           AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+           AND workspace_id IS ? AND workspace_fence IS ?
+           AND (agent_import_identity.workspace_id IS NULL OR EXISTS (
+               SELECT 1 FROM workspace_record
+               WHERE workspace_id = agent_import_identity.workspace_id
+                 AND repo_id = agent_import_identity.repo_id
+                 AND lease_fence = agent_import_identity.workspace_fence
+                 AND state IN ('provisioning', 'active', 'releasing')
+                 AND lease_owner IS NOT NULL
+                 AND lease_expires_at > (unixepoch('now') * 1000)
+           ))",
             [
                 identity_state.into(),
                 last_error_code.into(),
@@ -1493,6 +1701,10 @@ async fn abandon_import_attempt(
                 lease.identity_id.clone().into(),
                 lease.owner.clone().into(),
                 lease.fence_token.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
             ],
         ))
         .await
@@ -1512,7 +1724,7 @@ async fn abandon_import_attempt(
         .context("clear uncommitted import attempt marker")?;
     }
     if released_identity {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "DELETE FROM agent_session
              WHERE session_id = ?
@@ -1661,7 +1873,7 @@ async fn committed_source_ordinals(
     request: &ImportRequest,
 ) -> Result<BTreeSet<usize>> {
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT logical_turn_key FROM agent_coverage_claim
              WHERE session_id = ? AND coverage_schema_version = ?
@@ -1687,7 +1899,7 @@ async fn committed_source_ordinals(
 
 async fn checkpoint_is_cataloged(conn: &DatabaseConnection, checkpoint_id: &str) -> Result<bool> {
     Ok(conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT 1 FROM agent_checkpoint WHERE checkpoint_id = ?",
             [checkpoint_id.into()],
@@ -2346,7 +2558,7 @@ pub async fn session_is_tombstoned(
     provider_session_id: &str,
 ) -> Result<bool> {
     Ok(conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT 1 FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -2363,9 +2575,11 @@ pub async fn restore_tombstone(
     kind: AgentKind,
     provider_session_id: &str,
 ) -> Result<bool> {
-    let txn = conn.begin().await.context("begin erased-session restore")?;
+    let txn = crate::internal::db::begin_write_transaction(conn)
+        .await
+        .context("begin erased-session restore")?;
     let row = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT erased_session_id FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -2379,7 +2593,7 @@ pub async fn restore_tombstone(
     };
     let erased_session_id: String = row.try_get_by("erased_session_id")?;
     let erasure_finished = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 FROM agent_session WHERE session_id = ?",
             [erased_session_id.clone().into()],
@@ -2393,7 +2607,7 @@ pub async fn restore_tombstone(
             "the erased session is still being pruned; wait for local erasure to finish before restoring it"
         );
     }
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
         "INSERT INTO agent_audit_log (
             audit_id, timestamp, action, checkpoint_id, scope, justification, granted
@@ -2408,7 +2622,7 @@ pub async fn restore_tombstone(
     .await
     .context("append erased-session restore audit")?;
     let deleted = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "DELETE FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -2444,13 +2658,14 @@ mod tests {
             .await
             .expect("create import finalizer database");
         let session_id = "claude__takeover";
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
                 metadata_json, redaction_report, started_at, last_event_at,
-                stopped_at, schema_version
-             ) VALUES (?, 'claude_code', 'takeover', 'active', ?, ?, '{}', 1, 1, NULL, 1)",
+                stopped_at, schema_version, repo_id, worktree_id, scope_state
+             ) VALUES (?, 'claude_code', 'takeover', 'active', ?, ?, '{}', 1, 1, NULL, 1,
+                       'test-repo', '', 'scoped')",
             [
                 session_id.into(),
                 dir.path().to_string_lossy().into_owned().into(),
@@ -2461,14 +2676,16 @@ mod tests {
         ))
         .await
         .expect("seed provisional session");
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_import_identity (
                 identity_id, agent_kind, provider_session_id, source_kind,
                 source_id, schema_version, next_ordinal, state, owner,
-                lease_expires_at, fence_token, created_at, updated_at
+                lease_expires_at, fence_token, created_at, updated_at,
+                repo_id, worktree_id, scope_state
              ) VALUES ('identity', 'claude_code', 'takeover', 'file', 'source',
-                       1, 0, 'leased', 'owner-b', 9999999999999, 2, 1, 1)",
+                       1, 0, 'leased', 'owner-b', 9999999999999, 2, 1, 1,
+                       'test-repo', '', 'scoped')",
             [],
         ))
         .await
@@ -2486,6 +2703,12 @@ mod tests {
             stopped_at: None,
             working_dir: dir.path().to_path_buf(),
             repository_identity: "repo".to_string(),
+            capture_scope: Some(CaptureScope {
+                repo_id: "test-repo".to_string(),
+                worktree_id: String::new(),
+                workspace_id: None,
+                workspace_fence: None,
+            }),
             source_fingerprint: "source".to_string(),
             existing_session_fingerprint: None,
             redaction_report: serde_json::json!({
@@ -2533,7 +2756,7 @@ mod tests {
         .expect("run stale finalizer");
 
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 "SELECT COUNT(*) AS n FROM agent_session WHERE session_id = ?",
                 [session_id.into()],
@@ -2558,7 +2781,7 @@ mod tests {
             Some(takeover_generation.as_str())
         );
 
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TRIGGER fail_import_abandon
              BEFORE UPDATE ON agent_import_identity

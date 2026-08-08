@@ -217,7 +217,11 @@ pub struct UnpublishArgs {
 }
 
 const WORKER_TEMPLATE_MANIFEST_SCHEMA_VERSION: u32 = 1;
-const WORKER_TEMPLATE_MANIFEST_PATH: &str = ".libra/publish/worker-template-manifest.json";
+/// The manifest location relative to COMMON STORAGE (the shared `.libra`).
+/// Resolution goes through the common-storage resolver
+/// ([`publish_manifest_path`]); output reporting derives from the resolved
+/// path ([`reported_manifest_path`]).
+const WORKER_TEMPLATE_MANIFEST_STORAGE_PATH: &str = "publish/worker-template-manifest.json";
 const PUBLISH_D1_DATABASE_ID_PLACEHOLDER: &str = "REPLACE_WITH_D1_DATABASE_ID";
 const PUBLISH_R2_BUCKET_NAME_PLACEHOLDER: &str = "REPLACE_WITH_R2_BUCKET_NAME";
 const PUBLISH_REDACTION_RULES_VERSION: &str = "2026.05.13-1";
@@ -268,6 +272,47 @@ pub async fn execute(args: PublishArgs) -> CliResult<()> {
     execute_safe(args, &OutputConfig::default()).await
 }
 
+/// The manifest path as REPORTED in machine/human output: relative when the
+/// resolved location sits under THIS invocation's worktree root (the main
+/// worktree — byte-identical to the pre-W0 output contract), absolute
+/// otherwise (a linked worktree, whose manifest lives in main's common
+/// storage; a relative string resolved against the linked root would name a
+/// file that does not exist — and a tool WRITING there would recreate the
+/// per-worktree manifest fork at the reporting layer).
+fn reported_manifest_path(repo_root: &Path, manifest_path: &Path) -> String {
+    if let Ok(relative) = manifest_path.strip_prefix(repo_root) {
+        return relative.display().to_string();
+    }
+    // The resolver canonicalizes; the walk's repo_root may be an alias
+    // (macOS /var -> /private/var). Compare canonical-to-canonical before
+    // concluding the manifest lives outside this worktree.
+    let canonical = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    manifest_path
+        .strip_prefix(&canonical)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| manifest_path.display().to_string())
+}
+
+/// The worker-template manifest lives in repository COMMON storage
+/// (`<shared .libra>/publish/worker-template-manifest.json`), resolved through
+/// the commondir chain — never derived from the invoking worktree's root.
+/// Every worktree of a repository must read and write the SAME manifest
+/// (plan-20260714 §C.4.1.1): deriving it from the worktree root would fork the
+/// deploy drift gate per worktree, letting a linked worktree init/deploy
+/// against a manifest the main worktree never sees. Fail-closed on a corrupt
+/// `commondir` pointer (§C.4.1) rather than minting a phantom location.
+fn publish_manifest_path(repo_root: &Path) -> CliResult<PathBuf> {
+    let storage_root =
+        util::try_get_storage_path(Some(repo_root.to_path_buf())).map_err(|source| {
+            CliError::fatal(format!(
+                "failed to resolve the repository storage root for '{}': {source}",
+                repo_root.display()
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+    Ok(storage_root.join(WORKER_TEMPLATE_MANIFEST_STORAGE_PATH))
+}
+
 pub async fn execute_safe(args: PublishArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
     match args.command {
@@ -276,7 +321,8 @@ pub async fn execute_safe(args: PublishArgs, output: &OutputConfig) -> CliResult
                 CliError::fatal(format!("failed to resolve Libra repository root: {source}"))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
             })?;
-            let result = run_publish_init_at_root(&repo_root, &init_args)?;
+            let manifest_path = publish_manifest_path(&repo_root)?;
+            let result = run_publish_init_at_root(&repo_root, &manifest_path, &init_args)?;
             output::emit(&result, output)
         }
         PublishCommand::Sync(sync_args) => {
@@ -292,7 +338,10 @@ pub async fn execute_safe(args: PublishArgs, output: &OutputConfig) -> CliResult
                 CliError::fatal(format!("failed to resolve Libra repository root: {source}"))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
             })?;
-            let result = run_publish_status_command_at_root(&repo_root, &status_args).await?;
+            let manifest_path = publish_manifest_path(&repo_root)?;
+            let result =
+                run_publish_status_command_at_root(&repo_root, &manifest_path, &status_args)
+                    .await?;
             output::emit(&result, output)
         }
         PublishCommand::Deploy(deploy_args) => {
@@ -300,8 +349,10 @@ pub async fn execute_safe(args: PublishArgs, output: &OutputConfig) -> CliResult
                 CliError::fatal(format!("failed to resolve Libra repository root: {source}"))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
             })?;
+            let manifest_path = publish_manifest_path(&repo_root)?;
             let mut runner = ProcessPublishWorkerCommandRunner;
-            let result = run_publish_deploy_at_root(&repo_root, &deploy_args, &mut runner)?;
+            let result =
+                run_publish_deploy_at_root(&repo_root, &manifest_path, &deploy_args, &mut runner)?;
             output::emit(&result, output)
         }
         PublishCommand::Unpublish(unpublish_args) => {
@@ -314,10 +365,16 @@ pub async fn execute_safe(args: PublishArgs, output: &OutputConfig) -> CliResult
                 CliError::fatal(format!("failed to resolve Libra repository root: {source}"))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
             })?;
+            let manifest_path = publish_manifest_path(&repo_root)?;
             let site_id = resolve_unpublish_site_id(&unpublish_args).await?;
             let mut runner = ProcessPublishWorkerCommandRunner;
-            let result =
-                run_publish_unpublish_at_root(&repo_root, &unpublish_args, &site_id, &mut runner)?;
+            let result = run_publish_unpublish_at_root(
+                &repo_root,
+                &manifest_path,
+                &unpublish_args,
+                &site_id,
+                &mut runner,
+            )?;
             output::emit(&result, output)
         }
     }
@@ -547,10 +604,11 @@ impl PublishWorkerCommandRunner for ProcessPublishWorkerCommandRunner {
 
 fn run_publish_deploy_at_root(
     repo_root: &Path,
+    manifest_path: &Path,
     args: &DeployArgs,
     runner: &mut dyn PublishWorkerCommandRunner,
 ) -> CliResult<PublishDeployOutput> {
-    let status = run_publish_status_at_root(repo_root)?;
+    let status = run_publish_status_at_root(repo_root, manifest_path)?;
     ensure_publish_deploy_template_ready(&status)?;
     let worker_dir = repo_root.join("worker");
     ensure_publish_deploy_files(&worker_dir)?;
@@ -693,6 +751,7 @@ fn publish_status_d1_error(operation: &str, source: D1Error) -> CliError {
 
 fn run_publish_unpublish_at_root(
     repo_root: &Path,
+    manifest_path: &Path,
     args: &UnpublishArgs,
     site_id: &str,
     runner: &mut dyn PublishWorkerCommandRunner,
@@ -703,7 +762,7 @@ fn run_publish_unpublish_at_root(
         ));
     }
 
-    let status = run_publish_status_at_root(repo_root)?;
+    let status = run_publish_status_at_root(repo_root, manifest_path)?;
     ensure_publish_deploy_template_ready(&status)?;
     let worker_dir = repo_root.join("worker");
     ensure_publish_deploy_files(&worker_dir)?;
@@ -2571,10 +2630,13 @@ impl CommandOutput for PublishStatusOutput {
     }
 }
 
-fn run_publish_init_at_root(repo_root: &Path, _args: &InitArgs) -> CliResult<PublishInitOutput> {
+fn run_publish_init_at_root(
+    repo_root: &Path,
+    manifest_path: &Path,
+    _args: &InitArgs,
+) -> CliResult<PublishInitOutput> {
     let files = collect_worker_template_files()?;
     let worker_dir = repo_root.join("worker");
-    let manifest_path = repo_root.join(WORKER_TEMPLATE_MANIFEST_PATH);
 
     let conflicts = find_worker_template_conflicts(&worker_dir, &files)?;
     if !conflicts.is_empty() {
@@ -2635,7 +2697,7 @@ fn run_publish_init_at_root(repo_root: &Path, _args: &InitArgs) -> CliResult<Pub
             .with_stable_code(StableErrorCode::IoWriteFailed)
         })?;
     }
-    fs::write(&manifest_path, manifest_bytes).map_err(|source| {
+    fs::write(manifest_path, manifest_bytes).map_err(|source| {
         CliError::fatal(format!(
             "failed to write Worker template manifest '{}': {source}",
             manifest_path.display()
@@ -2645,18 +2707,20 @@ fn run_publish_init_at_root(repo_root: &Path, _args: &InitArgs) -> CliResult<Pub
 
     Ok(PublishInitOutput {
         worker_dir: "worker".to_string(),
-        manifest_path: WORKER_TEMPLATE_MANIFEST_PATH.to_string(),
+        manifest_path: reported_manifest_path(repo_root, manifest_path),
         template_version: env!("CARGO_PKG_VERSION"),
         files_written,
         files_current,
     })
 }
 
-fn run_publish_status_at_root(repo_root: &Path) -> CliResult<PublishStatusOutput> {
+fn run_publish_status_at_root(
+    repo_root: &Path,
+    manifest_path: &Path,
+) -> CliResult<PublishStatusOutput> {
     let files = collect_worker_template_files()?;
     let worker_dir = repo_root.join("worker");
-    let manifest_path = repo_root.join(WORKER_TEMPLATE_MANIFEST_PATH);
-    let manifest = read_worker_template_manifest(&manifest_path)?;
+    let manifest = read_worker_template_manifest(manifest_path)?;
     let manifest_hashes: BTreeMap<&str, &str> = manifest
         .as_ref()
         .map(|manifest| {
@@ -2732,7 +2796,7 @@ fn run_publish_status_at_root(repo_root: &Path) -> CliResult<PublishStatusOutput
 
     Ok(PublishStatusOutput {
         worker_dir: "worker".to_string(),
-        manifest_path: WORKER_TEMPLATE_MANIFEST_PATH.to_string(),
+        manifest_path: reported_manifest_path(repo_root, manifest_path),
         template_version: env!("CARGO_PKG_VERSION"),
         status,
         files_total: files.len(),
@@ -2747,10 +2811,12 @@ fn run_publish_status_at_root(repo_root: &Path) -> CliResult<PublishStatusOutput
 
 async fn run_publish_status_command_at_root(
     repo_root: &Path,
+    manifest_path: &Path,
     args: &StatusArgs,
 ) -> CliResult<PublishStatusOutput> {
     run_publish_status_command_at_root_with_loaders(
         repo_root,
+        manifest_path,
         args,
         collect_publish_refs,
         |site_id| async move {
@@ -2783,6 +2849,7 @@ async fn run_publish_status_command_at_root_with_loaders<
     CloudRowsFuture,
 >(
     repo_root: &Path,
+    manifest_path: &Path,
     args: &StatusArgs,
     load_local_refs: LocalRefs,
     load_cloud_rows: CloudRows,
@@ -2793,7 +2860,7 @@ where
     CloudRows: FnOnce(String) -> CloudRowsFuture,
     CloudRowsFuture: Future<Output = CliResult<PublishCloudStatusRows>>,
 {
-    let mut output = run_publish_status_at_root(repo_root)?;
+    let mut output = run_publish_status_at_root(repo_root, manifest_path)?;
     let Some(site_id) = resolve_publish_status_site_id(args).await? else {
         return Ok(output);
     };
@@ -3166,6 +3233,61 @@ mod tests {
         }
     }
 
+    /// The main-worktree-relative manifest location — the REPORTED form for
+    /// main-worktree invocations, and the fixture expectation these tests
+    /// assert against.
+    const WORKER_TEMPLATE_MANIFEST_PATH: &str = ".libra/publish/worker-template-manifest.json";
+
+    /// The manifest path a MAIN worktree resolves (storage == `<root>/.libra`).
+    /// Unit tests exercise the `*_at_root` bodies hermetically; the
+    /// linked-worktree resolution itself is covered by
+    /// `publish_manifest_resolves_into_common_storage_for_linked_worktrees`.
+    fn manifest_at(root: &Path) -> PathBuf {
+        root.join(WORKER_TEMPLATE_MANIFEST_PATH)
+    }
+
+    /// W0 (§C.4.1.1): every worktree of a repository reads/writes ONE
+    /// worker-template manifest — the one in common storage. Deriving it from
+    /// the invoking worktree's root forked the deploy drift gate per worktree.
+    #[test]
+    fn publish_manifest_resolves_into_common_storage_for_linked_worktrees() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let main_gitdir = temp.path().join("main").join(".libra");
+        fs::create_dir_all(&main_gitdir).expect("main gitdir");
+        fs::write(main_gitdir.join("libra.db"), b"").expect("db marker");
+
+        let linked_root = temp.path().join("wt");
+        let linked_gitdir = linked_root.join(".libra");
+        fs::create_dir_all(&linked_gitdir).expect("linked gitdir");
+        fs::write(
+            linked_gitdir.join("commondir"),
+            main_gitdir.to_string_lossy().as_bytes(),
+        )
+        .expect("commondir pointer");
+
+        let resolved = publish_manifest_path(&linked_root).expect("linked root resolves");
+        let canonical_main = fs::canonicalize(&main_gitdir).unwrap_or(main_gitdir.clone());
+        assert_eq!(
+            resolved,
+            canonical_main.join(WORKER_TEMPLATE_MANIFEST_STORAGE_PATH),
+            "a linked worktree must resolve the manifest into COMMON storage, \
+             not its local gitdir"
+        );
+
+        let main_resolved =
+            publish_manifest_path(main_gitdir.parent().expect("main root")).expect("main root");
+        assert_eq!(
+            main_resolved, resolved,
+            "main and linked worktrees must agree on ONE manifest"
+        );
+
+        // A corrupt commondir pointer refuses — it must never mint a
+        // per-worktree manifest location (§C.4.1).
+        fs::write(linked_gitdir.join("commondir"), b"").expect("corrupt pointer");
+        let err = publish_manifest_path(&linked_root).expect_err("corrupt commondir refuses");
+        assert_eq!(err.stable_code(), StableErrorCode::RepoStateInvalid);
+    }
+
     fn publish_sync_site_context() -> PublishSyncSiteContext {
         PublishSyncSiteContext {
             repo_id: "repo-1".to_string(),
@@ -3439,7 +3561,7 @@ mod tests {
     }
 
     fn materialize_deployable_worker(repo_root: &Path) {
-        run_publish_init_at_root(repo_root, &default_init_args())
+        run_publish_init_at_root(repo_root, &manifest_at(repo_root), &default_init_args())
             .expect("publish init must materialize the template");
         let wrangler_path = repo_root.join("worker/wrangler.jsonc");
         let wrangler =
@@ -4086,8 +4208,9 @@ mod tests {
     fn publish_init_materializes_worker_template_and_manifest() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
 
-        let output = run_publish_init_at_root(temp.path(), &default_init_args())
-            .expect("publish init must materialize the embedded worker template");
+        let output =
+            run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
+                .expect("publish init must materialize the embedded worker template");
 
         assert!(output.files_written > 0);
         assert_eq!(output.files_current, 0);
@@ -4141,8 +4264,9 @@ mod tests {
             "manifest must record package.json with its template hash"
         );
 
-        let rerun = run_publish_init_at_root(temp.path(), &default_init_args())
-            .expect("publish init must be idempotent for byte-identical files");
+        let rerun =
+            run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
+                .expect("publish init must be idempotent for byte-identical files");
         assert_eq!(rerun.files_written, 0);
         assert_eq!(rerun.files_current, output.files_written);
     }
@@ -4151,7 +4275,7 @@ mod tests {
     fn publish_status_reports_missing_before_init() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
 
-        let output = run_publish_status_at_root(temp.path())
+        let output = run_publish_status_at_root(temp.path(), &manifest_at(temp.path()))
             .expect("status should inspect missing template");
 
         assert_eq!(output.status, WorkerTemplateStatus::Missing);
@@ -4166,11 +4290,11 @@ mod tests {
     #[test]
     fn publish_status_reports_current_after_init() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
-        run_publish_init_at_root(temp.path(), &default_init_args())
+        run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
             .expect("publish init must materialize the template");
 
-        let output =
-            run_publish_status_at_root(temp.path()).expect("status should inspect template");
+        let output = run_publish_status_at_root(temp.path(), &manifest_at(temp.path()))
+            .expect("status should inspect template");
 
         assert_eq!(output.status, WorkerTemplateStatus::Current);
         assert_eq!(output.files_missing, 0);
@@ -4304,6 +4428,7 @@ mod tests {
 
         let output = run_publish_status_command_at_root_with_loaders(
             temp.path(),
+            &manifest_at(temp.path()),
             &args,
             || async {
                 Ok::<Vec<RefInput>, CliError>(vec![
@@ -4383,6 +4508,7 @@ mod tests {
 
         let err = run_publish_status_command_at_root_with_loaders(
             temp.path(),
+            &manifest_at(temp.path()),
             &args,
             || async { Ok::<Vec<RefInput>, CliError>(Vec::new()) },
             |site_id| async move {
@@ -4415,8 +4541,9 @@ mod tests {
         let mut runner =
             FakePublishWorkerCommandRunner::with_outputs([successful_deploy_command_output()]);
 
-        let output = run_publish_deploy_at_root(temp.path(), &args, &mut runner)
-            .expect("deploy --skip-deploy should build and skip cloud mutations");
+        let output =
+            run_publish_deploy_at_root(temp.path(), &manifest_at(temp.path()), &args, &mut runner)
+                .expect("deploy --skip-deploy should build and skip cloud mutations");
 
         assert_eq!(runner.calls, vec![command_summary("pnpm", &["build"])]);
         assert_eq!(output.deploy_url, None);
@@ -4454,8 +4581,9 @@ mod tests {
             ),
         ]);
 
-        let output = run_publish_deploy_at_root(temp.path(), &args, &mut runner)
-            .expect("deploy should run build, migrations, and Worker deploy");
+        let output =
+            run_publish_deploy_at_root(temp.path(), &manifest_at(temp.path()), &args, &mut runner)
+                .expect("deploy should run build, migrations, and Worker deploy");
 
         assert_eq!(
             runner.calls,
@@ -4491,7 +4619,7 @@ mod tests {
     #[test]
     fn publish_deploy_requires_configured_d1_database_id_before_commands() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
-        run_publish_init_at_root(temp.path(), &default_init_args())
+        run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
             .expect("publish init must materialize the template");
         let wrangler_path = temp.path().join("worker/wrangler.jsonc");
         let wrangler =
@@ -4504,8 +4632,9 @@ mod tests {
         let args = DeployArgs { skip_deploy: true };
         let mut runner = FakePublishWorkerCommandRunner::default();
 
-        let err = run_publish_deploy_at_root(temp.path(), &args, &mut runner)
-            .expect_err("deploy must fail before running commands with placeholder D1 config");
+        let err =
+            run_publish_deploy_at_root(temp.path(), &manifest_at(temp.path()), &args, &mut runner)
+                .expect_err("deploy must fail before running commands with placeholder D1 config");
 
         assert_eq!(err.stable_code(), StableErrorCode::RepoStateInvalid);
         assert!(
@@ -4522,7 +4651,7 @@ mod tests {
     #[test]
     fn publish_deploy_requires_configured_r2_bucket_name_before_commands() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
-        run_publish_init_at_root(temp.path(), &default_init_args())
+        run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
             .expect("publish init must materialize the template");
         let wrangler_path = temp.path().join("worker/wrangler.jsonc");
         let wrangler =
@@ -4534,8 +4663,9 @@ mod tests {
         let args = DeployArgs { skip_deploy: true };
         let mut runner = FakePublishWorkerCommandRunner::default();
 
-        let err = run_publish_deploy_at_root(temp.path(), &args, &mut runner)
-            .expect_err("deploy must fail before running commands with placeholder R2 config");
+        let err =
+            run_publish_deploy_at_root(temp.path(), &manifest_at(temp.path()), &args, &mut runner)
+                .expect_err("deploy must fail before running commands with placeholder R2 config");
 
         assert_eq!(err.stable_code(), StableErrorCode::RepoStateInvalid);
         assert!(
@@ -4561,6 +4691,7 @@ mod tests {
 
         let err = run_publish_unpublish_at_root(
             temp.path(),
+            &manifest_at(temp.path()),
             &args,
             "00000000-0000-0000-0000-000000000001",
             &mut runner,
@@ -4587,6 +4718,7 @@ mod tests {
 
         let output = run_publish_unpublish_at_root(
             temp.path(),
+            &manifest_at(temp.path()),
             &args,
             "00000000-0000-0000-0000-000000000001",
             &mut runner,
@@ -4728,7 +4860,7 @@ mod tests {
     #[test]
     fn publish_status_reports_modified_template_file() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
-        run_publish_init_at_root(temp.path(), &default_init_args())
+        run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
             .expect("publish init must materialize the template");
         fs::write(
             temp.path().join("worker/package.json"),
@@ -4736,8 +4868,8 @@ mod tests {
         )
         .expect("custom package.json must be writable");
 
-        let output =
-            run_publish_status_at_root(temp.path()).expect("status should inspect template");
+        let output = run_publish_status_at_root(temp.path(), &manifest_at(temp.path()))
+            .expect("status should inspect template");
 
         assert_eq!(output.status, WorkerTemplateStatus::Modified);
         assert_eq!(output.files_modified, 1);
@@ -4746,7 +4878,7 @@ mod tests {
     #[test]
     fn publish_status_reports_outdated_template_file() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
-        run_publish_init_at_root(temp.path(), &default_init_args())
+        run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
             .expect("publish init must materialize the template");
         let old_package = b"{\"old\":true}\n";
         fs::write(temp.path().join("worker/package.json"), old_package)
@@ -4771,8 +4903,8 @@ mod tests {
         )
         .expect("manifest must be writable");
 
-        let output =
-            run_publish_status_at_root(temp.path()).expect("status should inspect template");
+        let output = run_publish_status_at_root(temp.path(), &manifest_at(temp.path()))
+            .expect("status should inspect template");
 
         assert_eq!(output.status, WorkerTemplateStatus::Outdated);
         assert_eq!(output.files_outdated, 1);
@@ -4786,8 +4918,9 @@ mod tests {
         fs::write(worker_dir.join("package.json"), b"{\"custom\":true}\n")
             .expect("custom package.json must be writable");
 
-        let err = run_publish_init_at_root(temp.path(), &default_init_args())
-            .expect_err("publish init must fail closed on modified template files");
+        let err =
+            run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
+                .expect_err("publish init must fail closed on modified template files");
 
         assert_eq!(err.stable_code(), StableErrorCode::ConflictOperationBlocked);
         assert!(
@@ -4816,8 +4949,9 @@ mod tests {
         fs::create_dir(&outside).expect("outside dir must be created");
         symlink(&outside, temp.path().join("worker")).expect("worker symlink must be created");
 
-        let err = run_publish_init_at_root(temp.path(), &default_init_args())
-            .expect_err("publish init must refuse symlinked worker roots");
+        let err =
+            run_publish_init_at_root(temp.path(), &manifest_at(temp.path()), &default_init_args())
+                .expect_err("publish init must refuse symlinked worker roots");
 
         assert_eq!(err.stable_code(), StableErrorCode::ConflictOperationBlocked);
         assert!(
@@ -4841,8 +4975,8 @@ mod tests {
         fs::create_dir(&outside).expect("outside dir must be created");
         symlink(&outside, temp.path().join("worker")).expect("worker symlink must be created");
 
-        let output =
-            run_publish_status_at_root(temp.path()).expect("status should inspect symlink");
+        let output = run_publish_status_at_root(temp.path(), &manifest_at(temp.path()))
+            .expect("status should inspect symlink");
 
         assert_eq!(output.status, WorkerTemplateStatus::Conflicted);
         assert!(output.files_conflicted > 0);

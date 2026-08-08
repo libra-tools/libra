@@ -1179,6 +1179,13 @@ fn test_stash_show_invalid_index_errors() {
 /// `stash branch <name>` creates a new branch, applies the stash, and
 /// drops it. `applied` and `dropped` are both `true` in the JSON output
 /// when the operation succeeds end-to-end.
+///
+/// §C.12 roster: this is `stash_branch_apply_success_only_then_cas_drop` —
+/// the drop is reported only because the apply completed, and the CAS is the
+/// only path that removes the entry. The CAS-MISS arm (stack changed between
+/// apply and drop → entry kept, never re-resolved by index) is pinned at the
+/// unit level by `do_drop_cas_misses_leave_the_stack_untouched` in
+/// `src/command/stash.rs`, which `stash branch` shares with pop.
 #[test]
 fn test_stash_branch_creates_branch_and_applies() {
     let repo = create_committed_repo_via_cli();
@@ -1702,4 +1709,52 @@ async fn test_stash_push_pathspec_rejects_options() {
         // The working tree is left untouched by the rejected push.
         assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), "A1\n");
     }
+}
+
+/// W2 §C.4.3: a failed `stash branch` apply rolls back the half-created
+/// state — the new branch is deleted (tip-conditionally), HEAD returns to
+/// the original branch, and the stash entry is kept.
+///
+/// §C.12 roster: this is `stash_branch_failure_has_zero_side_effects`; the
+/// crash-interrupted half of the same contract is
+/// `an_interrupted_stash_branch_rollback_completes_from_the_journal` in the
+/// worktree-isolation suite.
+#[test]
+fn stash_branch_failed_apply_rolls_back_branch_and_head() {
+    let repo = create_committed_repo_via_cli();
+    let path = repo.path();
+    // Stash a tracked change, then dirty the SAME file differently so the
+    // apply inside `stash branch` conflicts and fails.
+    std::fs::write(path.join("tracked.txt"), "stash me\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["stash", "push", "-m", "rollback-probe"], path),
+        "stash push",
+    );
+    std::fs::write(path.join("tracked.txt"), "conflicting local edit\n").unwrap();
+
+    let branched = run_libra_command(&["stash", "branch", "rollback-nb"], path);
+    assert_ne!(
+        branched.status.code(),
+        Some(0),
+        "conflicting apply fails the branch command"
+    );
+    let branches = run_libra_command(&["branch"], path);
+    assert_cli_success(&branches, "branch list");
+    assert!(
+        !String::from_utf8_lossy(&branches.stdout).contains("rollback-nb"),
+        "the half-created branch was rolled back: {}",
+        String::from_utf8_lossy(&branches.stdout)
+    );
+    let listed = run_libra_command(&["stash", "list"], path);
+    assert_cli_success(&listed, "stash list");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("rollback-probe"),
+        "the stash entry is kept after the failed branch"
+    );
+    let status = run_libra_command(&["status"], path);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("main"),
+        "HEAD returned to the original branch: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
 }

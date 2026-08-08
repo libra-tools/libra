@@ -28,6 +28,9 @@ EXAMPLES:
     libra alternates add /path/to/base/.libra/objects   Borrow objects from a shared store
     libra alternates list                                Show registered alternates
     libra alternates remove /path/to/base/.libra/objects Stop borrowing (unregisters borrower)
+    libra alternates prune --dry-run                     Show borrower registrations whose repo is gone
+    libra alternates prune                               Retire them (unblocks this store's gc)
+    libra alternates prune /gone/.libra/objects           Retire one that cannot be checked at all
 
 NOTE: reads borrow from the base on a local miss; the base is protected — while
 this repo borrows, the base's 'gc'/'cache evict' refuse to prune the borrowed
@@ -53,6 +56,23 @@ pub enum AlternatesCommand {
     List,
     /// Stop borrowing from an object directory.
     Remove { path: String },
+    /// Retire borrower registrations whose repository is gone.
+    ///
+    /// A borrower is registered in THIS store so its objects are protected
+    /// from `gc` / `repack -d` / `cache evict`. Nothing removes such a
+    /// registration automatically: an absent path is indistinguishable from
+    /// an unmounted one, and guessing wrong deletes objects a borrower still
+    /// needs. This command is where the user supplies that judgement.
+    Prune {
+        /// Retire this exact registration, whatever the filesystem says about
+        /// it. Use when a borrower is gone for good but its path cannot be
+        /// checked — an unreachable mount, a permission-denied parent — so
+        /// the automatic "absent" rule cannot see it.
+        path: Option<String>,
+        /// Report what would be retired and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Resolve a user-supplied path to an object directory: accept an objects dir
@@ -116,7 +136,7 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
         .map_err(|e| format!("cannot open the base repo's config database: {e}"))?;
     // objectformat (config table; default sha1).
     let fmt_row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT value FROM config WHERE name = 'objectformat' AND configuration = 'core' \
              LIMIT 1"
@@ -139,7 +159,7 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
     };
     // tiered? (config_kv LIBRA_STORAGE_TYPE = s3/r2).
     let tier_row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT value FROM config_kv WHERE key = 'LIBRA_STORAGE_TYPE' LIMIT 1".to_string(),
         ))
@@ -251,6 +271,72 @@ pub async fn execute_safe(args: AlternatesArgs, output: &OutputConfig) -> CliRes
             }
             Ok(())
         }
+        AlternatesCommand::Prune { path, dry_run } => {
+            // Taken verbatim. Canonicalizing the user's path would resolve a
+            // symlink onto a DIFFERENT, live borrower and retire that one
+            // instead — the registration list is matched against this value,
+            // not the other way round.
+            let named = path.as_deref().map(PathBuf::from);
+            let candidates = match named.as_deref() {
+                Some(target) => vec![target.to_path_buf()],
+                None => alternates::absent_borrowers(&objects_dir).map_err(|error| {
+                    CliError::fatal(format!(
+                        "cannot read this store's borrower registration \
+                         ('objects/info/borrowers'): {error}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?,
+            };
+            let removed = if dry_run {
+                Vec::new()
+            } else {
+                // Re-checked under the borrowers-file lock: a borrower that
+                // came back and re-registered between the listing and here
+                // keeps its fresh registration.
+                alternates::prune_borrowers(&objects_dir, named.as_deref()).map_err(|error| {
+                    CliError::fatal(format!(
+                        "failed to update this store's borrower registration: {error}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?
+            };
+            if output.is_json() {
+                return emit_json_data(
+                    "alternates",
+                    &serde_json::json!({
+                        "action": "prune",
+                        "dry_run": dry_run,
+                        "candidates": candidates
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>(),
+                        "removed": removed
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>(),
+                    }),
+                    output,
+                );
+            }
+            if !output.quiet {
+                if dry_run {
+                    if candidates.is_empty() {
+                        println!("no borrower registrations point at a missing repository");
+                    } else {
+                        for path in &candidates {
+                            println!("would retire borrower {}", path.display());
+                        }
+                    }
+                } else if removed.is_empty() {
+                    println!("no borrower registrations were retired");
+                } else {
+                    for path in &removed {
+                        println!("retired borrower {}", path.display());
+                    }
+                }
+            }
+            Ok(())
+        }
         AlternatesCommand::Remove { path: input } => {
             let alt = resolve_objects_dir(&input)?;
             let removed = alternates::remove(&objects_dir, &alt).map_err(|e| {
@@ -268,6 +354,47 @@ pub async fn execute_safe(args: AlternatesArgs, output: &OutputConfig) -> CliRes
                 println!("removed alternate {}", alt.display());
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Surface guard: every subcommand this command accepts is documented in
+    /// BOTH user manuals and in the development reference.
+    ///
+    /// A new subcommand is public surface, and public surface that only
+    /// exists in `--help` is surface nobody finds. This catches the omission
+    /// at the one moment it is cheap to fix — `prune` was added and three
+    /// documents kept describing `add|list|remove`.
+    #[test]
+    fn every_subcommand_is_documented() {
+        // Each entry is a form the manuals must SHOW, not merely mention:
+        // `prune` and `prune <path>` are different routes with different
+        // preconditions, and documenting only the first leaves the one that
+        // rescues an unreadable registration undiscoverable.
+        const SUBCOMMANDS: &[&str] = &["add", "list", "remove", "prune", "prune /"];
+        let docs: [(&str, &str); 3] = [
+            (
+                "docs/commands/alternates.md",
+                include_str!("../../docs/commands/alternates.md"),
+            ),
+            (
+                "docs/commands/zh-CN/alternates.md",
+                include_str!("../../docs/commands/zh-CN/alternates.md"),
+            ),
+            (
+                "docs/development/commands/alternates.md",
+                include_str!("../../docs/development/commands/alternates.md"),
+            ),
+        ];
+        for (name, body) in docs {
+            for subcommand in SUBCOMMANDS {
+                assert!(
+                    body.contains(&format!("libra alternates {subcommand}")),
+                    "{name} does not document `libra alternates {subcommand}`"
+                );
+            }
         }
     }
 }

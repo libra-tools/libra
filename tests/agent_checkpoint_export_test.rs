@@ -29,15 +29,18 @@
 
 use std::path::{Path, PathBuf};
 
-use libra::internal::ai::{
-    history::{self, TracesInflightMarker, checkpoint_content_hash, parse_content_hash},
-    hooks::{
-        LifecycleEventKind, ProviderHookCommand, claude_provider,
-        runtime::{
-            AgentCheckpointRow, SubagentCheckpointRow, ingest_agent_traces_payload,
-            insert_agent_checkpoint_row_idempotent, insert_subagent_checkpoint_row_idempotent,
+use libra::internal::{
+    ai::{
+        history::{self, TracesInflightMarker, checkpoint_content_hash, parse_content_hash},
+        hooks::{
+            LifecycleEventKind, ProviderHookCommand, claude_provider,
+            runtime::{
+                AgentCheckpointRow, SubagentCheckpointRow, ingest_agent_traces_payload,
+                insert_agent_checkpoint_row_idempotent, insert_subagent_checkpoint_row_idempotent,
+            },
         },
     },
+    config::ConfigKv,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::{Value, json};
@@ -68,6 +71,9 @@ impl ExportRepo {
         let conn = libra::internal::db::create_database(&db_path.display().to_string())
             .await
             .expect("create fresh libra database");
+        ConfigKv::set_with_conn(&conn, "libra.repoid", "agent-checkpoint-export-test", false)
+            .await
+            .expect("seed repository identity");
 
         let home = tempfile::tempdir().expect("fake home tempdir");
         let claude_dir = home.path().join(".claude");
@@ -147,7 +153,7 @@ impl ExportRepo {
         let backend = self.conn.get_database_backend();
         let row = self
             .conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT checkpoint_id, session_id, tree_oid, metadata_blob_oid, traces_commit \
                  FROM agent_checkpoint WHERE session_id = \
@@ -656,7 +662,7 @@ async fn catalog_insert_is_idempotent_across_crash_retries() {
         async move {
             let backend = conn.get_database_backend();
             let row = conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     backend,
                     "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE traces_commit = ?",
                     [commit.into()],
@@ -778,7 +784,7 @@ async fn subagent_scope_row_persists_linkage_and_is_idempotent() {
     // The row persisted with scope='subagent' and all four linkage columns.
     let row = repo
         .conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             repo.conn.get_database_backend(),
             "SELECT scope, parent_checkpoint_id, subagent_session_id, tool_use_id, description \
              FROM agent_checkpoint WHERE checkpoint_id = ?",
@@ -827,7 +833,7 @@ async fn subagent_scope_row_persists_linkage_and_is_idempotent() {
     // Committed parent and subagent child coexist, distinguishable by scope.
     let scopes = repo
         .conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             repo.conn.get_database_backend(),
             "SELECT scope FROM agent_checkpoint WHERE session_id = ? ORDER BY scope",
             [parent.session_id.clone().into()],
@@ -986,7 +992,7 @@ async fn v1_fixture_checkpoint_remains_readable_via_checkpoint_show() {
     let backend = conn.get_database_backend();
     let session_id = "claude__fixture-v1-claude";
     let checkpoint_id = "85ae75d2-4c53-465a-b890-a9f861a50cc7";
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, state, \
          working_dir, started_at, last_event_at) VALUES (?, 'claude_code', ?, 'stopped', ?, 1, 1)",
@@ -998,7 +1004,7 @@ async fn v1_fixture_checkpoint_remains_readable_via_checkpoint_show() {
     ))
     .await
     .expect("seed agent_session");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, \
          tree_oid, metadata_blob_oid, traces_commit, created_at) \
@@ -1053,7 +1059,7 @@ async fn successful_ingest_clears_its_inflight_marker() {
     let backend = repo.conn.get_database_backend();
     let leftover = repo
         .conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'"
                 .to_string(),

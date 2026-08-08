@@ -1,0 +1,12 @@
+t4000-diff-format.sh
+t4001-diff-rename.sh
+t4003-diff-rename-1.sh
+t4004-diff-rename-symlink.sh
+t4005-diff-rename-2.sh
+t4006-diff-mode.sh
+t4007-rename-3.sh
+t4009-diff-rename-4.sh
+t4010-diff-pathspec.sh
+t4015-format-patch-options.sh
+t4016-diff-quote.sh
+t4017-diff-retval.sh

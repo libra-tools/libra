@@ -758,14 +758,29 @@ fn fast_streams_interoperate_bidirectionally_with_real_git() {
     assert!(String::from_utf8_lossy(&imported_note.stdout).contains("note from Git"));
 }
 
+/// Hosts may enable `tag.gpgSign` / `commit.gpgSign` in the global
+/// gitconfig, which would turn fixture tags into signed tags and make
+/// `git fast-export --all` abort (default `--signed-tags=abort`). Inject
+/// env-scoped config overrides so the interop fixture is independent of
+/// the host's global Git configuration on every platform.
+fn neutralize_host_git_signing(command: &mut Command) {
+    command
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "tag.gpgSign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "commit.gpgSign")
+        .env("GIT_CONFIG_VALUE_1", "false");
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Output {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(cwd)
         .env("LANG", "C")
-        .env("LC_ALL", "C")
-        .output()
-        .expect("spawn system Git")
+        .env("LC_ALL", "C");
+    neutralize_host_git_signing(&mut command);
+    command.output().expect("spawn system Git")
 }
 
 fn run_git_stdin(cwd: Option<&Path>, args: &[&str], input: &[u8]) -> Output {
@@ -777,6 +792,7 @@ fn run_git_stdin(cwd: Option<&Path>, args: &[&str], input: &[u8]) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    neutralize_host_git_signing(&mut command);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }

@@ -441,7 +441,7 @@ async fn load_export_tags() -> CliResult<Vec<ExportTag>> {
 async fn load_export_notes() -> CliResult<Vec<ExportNote>> {
     let db = get_db_conn_instance().await;
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
             "SELECT notes_ref, object, blob FROM notes ORDER BY notes_ref, object".to_string(),
         ))

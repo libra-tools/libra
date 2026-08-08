@@ -64,7 +64,7 @@ async fn setup_test_db() -> sea_orm::DatabaseConnection {
     let builder = db.get_database_backend();
     let schema = Schema::new(builder);
     let stmt = schema.create_table_from_entity(reference::Entity);
-    db.execute(builder.build(&stmt)).await.unwrap();
+    db.execute_raw(builder.build(&stmt)).await.unwrap();
     db
 }
 

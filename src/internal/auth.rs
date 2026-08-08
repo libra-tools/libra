@@ -58,11 +58,35 @@ impl HostScope {
     }
 
     /// Scope of a request URL (returns None for non-token-eligible schemes).
+    ///
+    /// A REQUEST url always carries a path, and usually a query — a smart-HTTP
+    /// discovery is `https://host/owner/repo.git/info/refs?service=…`. Sharing
+    /// [`Self::from_url`] with [`Self::parse`] therefore rejected every real
+    /// request: the stored token was never attached, `libra push` over HTTPS
+    /// answered `LBR-AUTH-001` no matter what `libra auth login` had stored,
+    /// and the 401 hint that names the host printed the literal `<host>`. The
+    /// path/query/fragment refusals belong to the user-supplied HOST argument
+    /// only; the scope of a request is its host and port.
     pub fn from_request_url(url: &url::Url) -> Option<HostScope> {
-        Self::from_url(url).ok()
+        Self::scope_of(url).ok()
     }
 
     fn from_url(url: &url::Url) -> Result<HostScope> {
+        if url.path() != "/" && !url.path().is_empty() {
+            bail!("host must not carry a path");
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            bail!("host must not carry a query or fragment");
+        }
+        Self::scope_of(url)
+    }
+
+    /// The host and port a token is scoped to, with the checks that hold for
+    /// BOTH a host argument and a live request URL: https (or http to a
+    /// loopback host), and no credentials embedded in the URL — a URL that
+    /// carries its own userinfo is answering for itself, and must not have a
+    /// stored token attached on top.
+    fn scope_of(url: &url::Url) -> Result<HostScope> {
         let host = url
             .host_str()
             .ok_or_else(|| anyhow!("host is missing"))?
@@ -78,12 +102,6 @@ impl HostScope {
         }
         if !url.username().is_empty() || url.password().is_some() {
             bail!("host must not carry credentials");
-        }
-        if url.path() != "/" && !url.path().is_empty() {
-            bail!("host must not carry a path");
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            bail!("host must not carry a query or fragment");
         }
         let port = url
             .port_or_known_default()
@@ -806,6 +824,54 @@ mod tests {
         ] {
             assert!(HostScope::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A stored token is worthless if the scope of a live REQUEST cannot be
+    /// computed. Smart-HTTP discovery URLs carry a path and a query, which the
+    /// host-argument parser refuses by design — sharing that parser meant
+    /// `from_request_url` returned `None` for every real request, so
+    /// `libra push` over HTTPS failed with `LBR-AUTH-001` however good the
+    /// stored token was, and the 401 hint printed a literal `<host>`.
+    #[test]
+    fn request_url_scope_survives_paths_and_queries() {
+        let discovery = url::Url::parse(
+            "https://github.com/libra-tools/libra.git/info/refs?service=git-receive-pack",
+        )
+        .unwrap();
+        assert_eq!(
+            HostScope::from_request_url(&discovery),
+            Some(HostScope {
+                host: "github.com".to_string(),
+                port: 443,
+            })
+        );
+
+        // Non-default ports keep their identity: a token stored for
+        // `host:8443` must not be attached to `host:443`.
+        let alt = url::Url::parse("https://git.example.com:8443/o/r.git/git-upload-pack").unwrap();
+        assert_eq!(HostScope::from_request_url(&alt).unwrap().port, 8443);
+
+        // The checks that DO apply to a request survive: cleartext to a
+        // non-loopback host, and a URL that carries its own credentials, get
+        // no stored token attached.
+        for refused in [
+            "http://git.example.com/o/r.git/info/refs",
+            "https://user:pw@git.example.com/o/r.git/info/refs",
+            "ssh://git.example.com/o/r.git",
+        ] {
+            let url = url::Url::parse(refused).unwrap();
+            assert!(
+                HostScope::from_request_url(&url).is_none(),
+                "{refused} must not resolve to a token scope"
+            );
+        }
+
+        // Loopback http stays eligible, which is what local dev servers use.
+        let local = url::Url::parse("http://127.0.0.1:8000/o/r.git/info/refs").unwrap();
+        assert_eq!(HostScope::from_request_url(&local).unwrap().port, 8000);
+
+        // And the host-argument parser still refuses paths and queries.
+        assert!(HostScope::parse("https://host/path/repo").is_err());
     }
 
     #[test]

@@ -1,5 +1,11 @@
 //! Large-set regression for default rename detection.
 //!
+//! plan-20260714 §B.4.2.3 stage order: exact → unique-basename (ALWAYS
+//! runs) → bounded exhaustive. A tripped per-side `renameLimit`
+//! therefore skips only the exhaustive stage; the inexact fixture below
+//! deliberately uses DISTINCT basenames (`src-NNNN` → `dst-NNNN`) so the
+//! basename stage cannot pair it and the limit is genuinely exercised.
+//!
 //! Layer: L1 (deterministic; tempdir only, no network).
 
 use std::fs;
@@ -27,7 +33,7 @@ fn diff_large_set_warns_and_preserves_exact_renames() {
         )
         .expect("write exact source");
         fs::write(
-            inexact_old.join(format!("{index:04}.txt")),
+            inexact_old.join(format!("src-{index:04}.txt")),
             format!("old-{index}\n"),
         )
         .expect("write inexact source");
@@ -47,7 +53,7 @@ fn diff_large_set_warns_and_preserves_exact_renames() {
         )
         .expect("write exact destination");
         fs::write(
-            inexact_new.join(format!("{index:04}.txt")),
+            inexact_new.join(format!("dst-{index:04}.txt")),
             format!("new-{index}\n"),
         )
         .expect("write inexact destination");

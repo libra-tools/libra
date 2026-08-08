@@ -1,0 +1,3 @@
+docs/development/gap/grit-gap.md	../plan/plan-20260729.md
+docs/development/gap/grit-gap.md	../../../src/command/init.rs:263
+docs/development/gap/grit-gap.md	../../../src/command/init.rs:521

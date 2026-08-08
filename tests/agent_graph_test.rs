@@ -195,7 +195,7 @@ INSERT INTO agent_import_tombstone (
         let mut snapshot = BTreeMap::new();
         for table in tables {
             let columns = connection
-                .query_all(Statement::from_string(
+                .query_all_raw(Statement::from_string(
                     connection.get_database_backend(),
                     format!("PRAGMA table_info({table})"),
                 ))
@@ -217,7 +217,7 @@ INSERT INTO agent_import_tombstone (
                  FROM (SELECT {signature} AS row_signature FROM {table} ORDER BY row_signature)"
             );
             let row = connection
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     connection.get_database_backend(),
                     sql,
                 ))

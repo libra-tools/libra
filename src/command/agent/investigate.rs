@@ -62,6 +62,7 @@ EXAMPLES:
     libra investigate start --topic \"why is startup slow\" --agent codex        Start a round-robin investigation with one agent
     libra investigate start --topic \"auth bug\" --agent codex --agent claude-code  Round-robin across two agents (strict, one at a time)
     libra investigate start --topic \"leak\" --agent codex --max-turns 8 --quorum 2  Bound turns and require 2 concluding agents
+    libra investigate start --topic \"replay\" --agent codex --checkpoint <id>   Investigate a captured checkpoint's transcript (read-only input)
     libra investigate list                                     List investigate runs, newest first (default 50 per page)
     libra investigate list --limit 10 --cursor <token>        Next keyset page (token = previous page's next_cursor)
     libra investigate show <run_id>                           State, stances and sanitized findings
@@ -146,6 +147,14 @@ pub struct InvestigateStartArgs {
     /// the run to reach quorum (default: the number of agents).
     #[arg(long, value_name = "N")]
     pub quorum: Option<u32>,
+    /// Scope the investigation to the content captured by an agent
+    /// checkpoint (see `libra agent checkpoint list`): the investigators'
+    /// workspace is the checkpoint's materialized transcript/metadata
+    /// (read-only), never the current worktree. A missing or
+    /// non-materializable checkpoint fails closed before any run is
+    /// created.
+    #[arg(long, value_name = "ID")]
+    pub checkpoint: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -226,29 +235,33 @@ async fn attach(args: InvestigateAttachArgs, output: &OutputConfig) -> CliResult
     let raw = std::fs::read(&args.file)
         .map_err(|e| CliError::fatal(format!("failed to read attach file '{name}': {e}")))?;
     let (redacted, _report) = crate::internal::ai::review::redact_untrusted(&raw);
-    let oid = store
-        .objectize_bytes(redacted.as_bytes())
-        .map_err(|e| map_store_error("failed to objectize the attachment", e))?;
-
     let attached_at = crate::internal::ai::review::store::utc_timestamp();
-    let entry = serde_json::json!({
-        "oid": oid,
-        "name": name,
-        "provenance": "manual",
-        "size": redacted.len(),
-        "attached_at": attached_at,
-    });
-
     let mut manifest = store
         .load_manifest(&args.run_id)
         .map_err(|e| map_store_error("failed to read investigate run manifest", e))?
         .ok_or_else(|| run_not_found(&args.run_id))?;
-    manifest.manual_attach.push(entry);
-    manifest.updated_at = attached_at;
-    let attachments = manifest.manual_attach.len();
-    store
-        .write_manifest(&manifest)
-        .map_err(|e| map_store_error("failed to record the attachment in the manifest", e))?;
+
+    // §C.4.3: the objectized blob is rootless until the manifest naming it is
+    // written, and an attachment is content-addressed — its oid may be one a
+    // `gc` has already quarantined. `objectize_and_publish` is the only route
+    // to the object writer, and it holds the repository maintenance lock
+    // across both steps, so the pair cannot be split here.
+    let mut attachments = 0usize;
+    let redacted_len = redacted.len();
+    let oid = store
+        .objectize_and_publish(redacted.as_bytes(), |oid| {
+            manifest.manual_attach.push(serde_json::json!({
+                "oid": oid,
+                "name": name,
+                "provenance": "manual",
+                "size": redacted_len,
+                "attached_at": attached_at,
+            }));
+            manifest.updated_at = attached_at.clone();
+            attachments = manifest.manual_attach.len();
+            store.write_manifest(&manifest)
+        })
+        .map_err(|e| map_store_error("failed to attach the file", e))?;
 
     if output.is_json() {
         let payload = serde_json::json!({
@@ -470,11 +483,20 @@ async fn start(args: InvestigateStartArgs, output: &OutputConfig) -> CliResult<(
             )
         })?;
 
+    // PD-02 checkpoint scope: resolve and validate BEFORE any run side
+    // effect — an unknown or non-materializable checkpoint fails closed
+    // with no run residue. The validated spec makes the materialized
+    // checkpoint content the investigators' entire workspace.
+    let checkpoint_input = match args.checkpoint.as_deref() {
+        Some(id) => Some(super::checkpoint::resolve_checkpoint_input_spec(id).await?),
+        None => None,
+    };
+
     let sources: Vec<InvestigatorSource> = agents
         .iter()
         .map(|slug| InvestigatorSource::Builtin { slug: slug.clone() })
         .collect();
-    let request = InvestigateRunRequest::new(
+    let mut request = InvestigateRunRequest::new(
         repo_root,
         args.topic.clone(),
         starting_sha,
@@ -482,6 +504,7 @@ async fn start(args: InvestigateStartArgs, output: &OutputConfig) -> CliResult<(
         max_turns,
         quorum,
     );
+    request.checkpoint_input = checkpoint_input;
 
     // A0-04: acquire a shared run-level admission slot (the same queue
     // `libra review` uses). Over `agent.max_concurrent_runs` this blocks in

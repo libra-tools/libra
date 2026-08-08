@@ -3,7 +3,7 @@
 > **Out-of-scope of `tracing/plan.md`**（§0 范围声明）：AI-agent persistent memory 设计面（agent knowledge store）不属于 AG-16~AG-24 外部捕获改进计划。本文已按当前事实对齐两项历史冲突：`LifecycleEventKind` 现为 13 个变体；MCP transport 使用 `libra code --stdio`。Memory MCP 工具仍须等待 `tracing/code.md` 所列 C9 default-deny 生产授权闭环，不能因为 transport 已存在就提前暴露。
 
 > Status: draft
-> Last updated: 2026-07-18
+> Last updated: 2026-08-07
 > Scope: 规范 Memory 子系统——agent 跨 run / thread / branch 的持久化知识存储，及其在 Libra 三层对象模型（快照/事件/投影）、运行时生命周期与 MCP 边界上的落地约定。
 
 本文档规范 `Memory`——一个让 agent 能够跨 run、跨 thread、跨 branch 记住事物的 Libra 子系统，且不会像 `CLAUDE.md` 这样的扁平大块文件那样污染上下文。
@@ -170,6 +170,35 @@ Libra 采纳 diff / history / review、常驻小核心、按需档案与 scope-a
 
 最终定位：**Libra Memory = Libra-native 内容寻址与事件历史 + Statewave 式 compiler / receipt + ReMe 式可读投影 + Graphiti 式时间事实 + Letta 式 Git 审计 UX + LangGraph 式运行态分离 + PowerMem / MemOS 式受审查 Skill 晋升；图、向量与外部框架永远是可替换的候选层。**
 
+#### 0.0.4 本地竞品语料复核（2026-08-07，第六次审计）
+
+本节把第六次竞品审计的本地语料（`/Volumes/Data/competition/*/*`，Memory 类 11 个 + 相邻参考 3 个，revision 已引脚）固化为设计取舍；逐项目机制分析与验证入口见 [`../gap/memory-redesign.md`](../gap/memory-redesign.md) §2。vendor 自报数字只提供场景与目标参考，不进入验收（§16）。
+
+| 项目 | revision | 承重机制 | 取舍 |
+|---|---|---|---|
+| `rohitg00/agentmemory` | `d60652a` | 四层巩固（working→episodic→semantic→procedural）、BM25+vector+graph 三流 RRF(k=60)+会话去重（max 3/session）、隐私过滤、Git snapshot | 采纳机制：MEM-01/02/03 主证据；54 MCP tools 作规模反例 |
+| `MachineWisdomAI/fava-trails` | `6653f9f` | `drafts/` 隔离、Trust Gate（LLM 评审）、supersession 隐藏旧版、原子提交 | 采纳 Trust Gate 为显式 promotion 阶段（A4，§10 修订） |
+| `matrixorigin/Memoria` | `54c9114` | 记忆 snapshot/branch/merge/rollback、per-user DB 数据边界、vector+全文混合、LongMemEval+BEAM 6-bucket 能力分类 | 采纳数据边界教训与 6-bucket 评测视角（§16）；宣传口径不采纳 |
+| `sachinsharma9780/memweave` | `2ff82df` | Markdown+SQLite（FTS5 BM25 + sqlite-vec）、MMR 去重、核心路径零 LLM、无 embedding 降级 | 采纳「确定性基线常开 + 可选向量 + 降级」（§8.7） |
+| `sqliteai/sqlite-memory` | `0f0aede` | vector+FTS5 混合、llama.cpp 本地 embedding、CRDT offline-first 同步 | 参考团队同步（§5.4 未来项）；托管服务不采纳 |
+| `graphwisdom/perstate` | `95e27e3` | branch-as-identity、session 绑定、物化视图 | 已采纳（§3.4/§5.5），维持 |
+| `sl4m3/ledgermind` | `99220d1` | 自主知识生命周期、自愈衰减、无监督演化 | **反例**（见下） |
+| `ruvnet/agentic-flow` | `d3735a3` | 66 agents / 213 MCP tools / QuantumDAG（宣传口径） | 不作证据 |
+| `letta-ai/trajectory` | `59c0db5` | 多 runtime transcript 归一化 + diagnostics | 采纳为外部导入前置（A5 / AG-ATTR） |
+| `letta-ai/agent-file` | `78212eb` | `.af` 可移植格式（identity / memory blocks / skills / settings） | 采纳子集评估（A5） |
+| `letta-ai/letta-code` | `ac359eeb` | memory blocks、MemFS（git 跟踪）、`/sleeptime` dreaming、`/doctor` | 采纳记忆块投影与排期巩固（A3/A5）；自改 harness 哲学不采纳 |
+| `letta-ai/skills` | `16352df` | 社区 skill 知识库 + peer review | 参考 skill 投影（A5） |
+| `facebook/sapling`（相邻） | `119e6d1f75d` | Crewmate 私有目录授权钩子（默认 deny、有界授权扇出） | 参考团队 publication 授权（A6，§5.4 未来项） |
+
+**反例登记（不采纳）**：
+
+- **ledgermind 式无监督自主演化/自愈**：无审计的自主变异违反「先确定性、后智能化」与可审计原则；任何巩固、衰减与矛盾消解都必须可解释、可回滚。
+- **agentic-flow 宣传口径**（66 agents / 213 tools / QuantumDAG）：无源码承重证据，不作参考。
+- **agentmemory 54-tool 堆砌**：作为 MEM-04 的规模反例——Memory 工具面必须小而稳定。
+- **`.af` 完整云生态绑定**：只评估子集（identity / memory blocks / skills / settings 中与 Libra 兼容的部分）。
+
+注意事项：`agentmemory/DESIGN.md` 实为 Lamborghini 站点设计稿，与记忆无关——语料内部质量参差，机制引用必须按文件逐一验证；本节的取舍不因任何仓库的 README 宣传自动成立。
+
 ### 0.1 方案审查结论
 
 本方案总体合理且可行：它没有为 Memory 新增 git-internal typed object，而是把 Memory 作为普通 Git blob + refs + 可重建 SQLite 投影实现，符合 Libra 现有三层对象模型、外部 agent 捕获边界与 MCP 边界。路径键、namespace、scope、审查状态、trust / sensitivity 门禁也能解决 CLAUDE.md 式扁平长期记忆的上下文污染、不可审计与不可回滚问题。
@@ -196,7 +225,7 @@ Libra 采纳 diff / history / review、常驻小核心、按需档案与 scope-a
 
 ### 0.2 骨架选型决策（2026-07-13）
 
-基于 §0.0 的外部参考，曾对比五种互斥骨架：**A** 分类树导航型（memoir-ai 主导，即本文 §1–§17 的形态）、**B** 记忆编译器型（Statewave 主导，M0 唯一入口、一切皆编译产物）、**C** 双时间事实账本型（Graphiti 主导）、**D** 可读投影审查型（ReMe / Letta Code 主导）、**E** 运行态分离蒸馏型（LangGraph / PowerMem / MemOS 主导）。
+基于 §0.0 的外部参考，曾对比五种互斥骨架：**A** 分类树导航型（memoir-ai 主导，即本文 §1–§18 的形态）、**B** 记忆编译器型（Statewave 主导，M0 唯一入口、一切皆编译产物）、**C** 双时间事实账本型（Graphiti 主导）、**D** 可读投影审查型（ReMe / Letta Code 主导）、**E** 运行态分离蒸馏型（LangGraph / PowerMem / MemOS 主导）。
 
 **决策：骨架采用 A，同时把 B 的两个原语从「字段级补丁」升级为硬性退出门槛。** 这不是可选优化——骨架 A 的原始形态（直接 `remember` 即成为 confirmed 候选）对 §0.0.1 约束 2「先编译，再使用」满足最弱，以下两条是让 A 合规的必要修正：
 
@@ -450,7 +479,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 - `valid_from` / `valid_until` 是业务时间；`created_at` / event `at` 是 recorded time；`effective_*_commit` 是 Git DAG 有效性。召回必须先验证当前 code commit 与 anchor 的 ancestry，再考虑 wall-clock 时间。无法证明 ancestry 时标记 stale / not-applicable，不按时间戳猜测。
 - `SecretLike` 的 note 只能以已编辑（redacted）的正文加证据引用的形式存储；它们绝不会被注入 prompt。
 - `SecretLike` 原文及其未加盐普通哈希不得进入 `input_hashes`、事件 reason、receipt 或日志；需要去重时使用本地密钥派生的 HMAC，且 HMAC 不得进入团队 ref。`Confidential` 正文在加密-at-rest 与 publication policy 落地前也不得进入共享 ref 或远端 durable tier。
-- `body` 必须有硬大小上限。第一版建议默认拒绝超过 16 KiB 的正文；更大的内容应存为 `EvidenceRef` 或 onboarding artifact，并在 Memory 中只保留摘要与引用。召回侧的对应模式是「文件即上下文」：此类大体量证据以临时文件句柄交给 agent 按需 read / grep，而非整体注入 prompt（Cursor 的 A/B 实验自报该模式使 token 消耗下降 46.9%，见 §17 开放问题 4 所引分析文章）。
+- `body` 必须有硬大小上限。第一版建议默认拒绝超过 16 KiB 的正文；更大的内容应存为 `EvidenceRef` 或 onboarding artifact，并在 Memory 中只保留摘要与引用。召回侧的对应模式是「文件即上下文」：此类大体量证据以临时文件句柄交给 agent 按需 read / grep，而非整体注入 prompt（Cursor 的 A/B 实验自报该模式使 token 消耗下降 46.9%，见 §18 开放问题 4 所引分析文章）。
 - `compile_record` 缺失或不完整的 note 必须在写入事务第 1 步被拒绝（§4.1.1、§4.2.1）；编译记录随正文一同内容寻址，事后不可补写。
 
 #### 4.1.1 `CompileRecord` —— 编译记录（Phase A 硬性门槛）
@@ -860,6 +889,16 @@ CREATE TABLE memory_classifier_cache (
     expires_at            TEXT NOT NULL
 );
 
+-- 可选：向量通道缓存（§8.7）。按内容哈希缓存 embedding；
+-- 可整体丢弃，不参与 rebuild。
+CREATE TABLE memory_embedding_cache (
+    content_hash          TEXT PRIMARY KEY,
+    embedding_json        TEXT NOT NULL,
+    model_id              TEXT NOT NULL,
+    embedding_version     TEXT NOT NULL,
+    created_at            TEXT NOT NULL
+);
+
 -- 注入回执账本（§8.6）。注意：这是本地 append-only 审计账本，
 -- **不是**投影——它记录读取时刻的选择，无法也无须从 Git 历史重建；
 -- rebuild 不触碰它，保留策略负责有界修剪。
@@ -887,7 +926,7 @@ CREATE INDEX idx_memory_receipt_time
     ON memory_context_receipt(emitted_at);
 ```
 
-`memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 是可重建投影。`memory_classifier_cache` 是可丢弃 cache；`memory_access_stats` 与 `memory_context_receipt` 是本地有界账本，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
+`memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 是可重建投影。`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats` 与 `memory_context_receipt` 是本地有界账本，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
 
 查询实现必须始终带上 `scope_key` 与 `namespace`，禁止只按 `path` 做全局查询后在内存中过滤。跨 scope / namespace 的检索只能由显式 `--all-namespaces` 或策略允许的 scope fallback 触发，并且必须在结果中保留原始 `scope` 与 `namespace`，防止 prompt 注入时发生来源混淆。
 
@@ -1194,6 +1233,27 @@ memory.get(scope, namespace, path) -> Vec<MemoryRecord>
 - **单一 receipt 原语。** Rust 类型与 mainline ML-05 / ML-08 共用同一定义（§0.0.10）；本文与 mainline 各自的注入管线写同一张回执面，不得分叉出两种 schema。
 - `memory inspect-injection` 从回执读取并重放展示，而非从当前投影反推。被预算丢弃的项直接记录在 receipt 的 `dropped` 中，不再为每次读取追加 `PromptTrimmed` 权威事件。
 
+### 8.7 混合检索通道（Hybrid Retrieval Channels）
+
+§8.1–§8.4 的召回原语之上，检索面由**确定性基线 + 可选增强通道**组成（实现 MEM-02 的检索面）。向量与图永远是可替换的候选层（§0.0.11），不改变 §8.6 的确定性承诺。
+
+```text
+query
+  -> Channel 0: path prefix + BM25/FTS5（常开，确定性）
+  -> Channel 1: vector（可选；sqlite-vec 或等价本地实现 + 本地 embedding）
+  -> Channel 2: entity graph 1–2 hop（Phase E，§6.4 有界）
+  -> fusion: RRF 固定 k + MMR/会话去重上限
+  -> fail-closed: 无 embedding 配置或 provider 失败 -> 仅 Channel 0
+```
+
+- **Channel 0（常开）**：路径前缀（§6.2）+ BM25/FTS5 关键词检索；无任何 embedding 配置即可用、可测（memweave 的「零外部服务 + 纯关键词降级」与 agentmemory 的「BM25 always on」为同向证据）。
+- **Channel 1（可选）**：向量相似度。embedding 必须可本地运行（llama.cpp / Ollama 等）；embedding 按内容哈希缓存（`memory_embedding_cache`，§5.2，可整体丢弃）。provider 缺失、失败或超时 → 自动回退 Channel 0；**不得**把不可验证的向量结果注入 prompt。
+- **Channel 2（Phase E）**：§6.4 已定义的实体图有界一跳/两跳查询，只返回候选。
+- **融合与去重**：RRF 融合使用固定 k（起点 k=60，agentmemory 口径）；MMR 或等价去重 + 会话多样化上限（起点 max 3/session），避免同一事实多 chunk 重复注入。
+- **确定性边界**：融合排序、channel snapshot（哪些通道启用、各自版本与权重）必须冻结进 ContextReceipt（§8.6）；embedding 向量与索引**不**进入 canonical hash / `bundle_hash` / 回执。
+- **adaptive profile**：`memory_access_stats.use_count` / `last_used_at` 只能用于离线训练、诊断或显式 adaptive profile（冻结统计快照并写入 receipt），不得改写 canonical `MemoryHead.rank_hint`（§18 开放问题 4）。
+- **评测**：Channel 0 单独与 Channel 0+1 融合分别上报 recall/NDCG（§16.3），确保「无 embedding 配置仍可用」始终可验证。
+
 ## 9. 分支与版本
 
 ### 9.1 按分支隔离的记忆
@@ -1412,7 +1472,7 @@ Libra 应当照做：
   使非 git 目录获得与 warm refresh 同级的增量粒度。对 Libra / git
   仓库这一能力是免费的：commit tree 本身就是 Merkle 树，warm
   refresh 的 tree diff 即为此算法（Cursor 的代码库索引采用同款
-  增量同步，见 §17 开放问题 4 所引分析文章）。
+  增量同步，见 §18 开放问题 4 所引分析文章）。
 
 ### 11.5 SessionEnd / TurnEnd
 
@@ -1591,10 +1651,11 @@ agent 捕获使用的 `2026050303_agent_capture.sql` 迁移属于同一模式，
 - `memory_taxonomy_node`（§5.2）
 - `memory_projection_state`（§5.2）
 - `memory_classifier_cache`（§5.2，可选，带 TTL）
+- `memory_embedding_cache`（§8.7，可选向量通道缓存，可丢弃）
 - `memory_access_stats`（§5.2，本地账本，不参与 rebuild）
 - `memory_context_receipt`（§8.6，账本类：append-only、豁免 rebuild、按保留策略有界修剪）
 
-只有 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 可由 `libra memory rebuild` 从 `refs/libra/memory/...` 重建。classifier cache 可直接丢弃；access stats 与 receipt 是本地账本，不参与 rebuild。
+只有 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 可由 `libra memory rebuild` 从 `refs/libra/memory/...` 重建。classifier cache 与 embedding cache 可直接丢弃；access stats 与 receipt 是本地账本，不参与 rebuild。
 
 值得一提的是模式选择上的对比：Memory 的投影表用 SeaORM entity 建模（与同样可
 重建的 `ai_index_*` 投影同模式），而外部捕获的 `agent_session` /
@@ -1689,7 +1750,55 @@ source 在 dry-run 后移动必须使 fork fail-closed，重复 fork 幂等。
 写入 `innerHTML`；恶意 HTML、`javascript:` URL、事件属性、超长图和越权节点 fixture
 均被净化、截断或拒绝，CSP 与本地资源完整性测试通过。
 
-## 16. 验证计划
+## 16. 评测与验收（Evaluation & Acceptance）
+
+本设计的所有长期完成判据都必须有可度量口径（对齐 `plan-long.md` MEM-01..05）。vendor 自报数字（agentmemory R@5 95.2%、memweave LongMemEval-S R@5 97.24%±0.12% 等）只提供场景与目标参考，**不**进入验收。
+
+### 16.1 原则
+
+1. **两层评测**：确定性探针（离线、无 LLM、CI 必跑）与 LLM 场景（nightly，`--features test-live-ai`）。
+2. **评测只读**：使用独立 seed corpus 与冻结 view 快照；不修改权威 ref，不写 receipt 之外的本地账本。
+3. **双口径**：官方 benchmark 标签为主（LongMemEval-S / BEAM），能力桶为辅助视角（Memoria `memory-ability-taxonomy.md` 的 6-bucket）。
+
+### 16.2 能力桶与场景集
+
+| 桶 | 覆盖能力 | Libra 场景示例 |
+|---|---|---|
+| Single-Session Grounding | 单会话事实/上下文提取 | `codebase:onboard` 摘要命中 |
+| Preference Understanding | 用户偏好（非关键词命中） | `default` 用户约束 recall |
+| Multi-Session Synthesis | 跨会话整合 | 巩固后 semantic note 覆盖多 session 事实 |
+| Temporal State Tracking | 时间/顺序/状态演化 | `valid_from` / `valid_until` + commit anchor 过滤 |
+| Knowledge Update & Conflict | 新旧知识、矛盾消解 | supersede / quarantine 后的 recall 结果 |
+| Abstention & Constraint | 无证据拒答、遵守约束 | 无命中时不注入、不编造 |
+
+Libra 专属场景（官方 benchmark 不覆盖）：branch/commit anchor 切换后 recall 变化；supersession 隐藏旧版；`forget` 后默认读取不可见；actor 隐私隔离；跨 worktree 边界；无 embedding 配置降级。
+
+### 16.3 指标定义
+
+| 指标 | 定义 | 门槛 |
+|---|---|---|
+| recall@k / NDCG@k | k=5、10；Channel 0 与 Channel 0+1 分别上报（§8.7） | Phase C 基线冻结后定目标 |
+| 注入预算合规 | 注入 tokens ≤ `LIBRA_MEMORY_PROMPT_BUDGET_TOKENS` | 100% |
+| 重放一致性 | 同 view 快照 → 同 selected IDs / 顺序 / `bundle_hash` | 100%（硬门槛） |
+| 隐私泄漏 | `SecretLike` / `Confidential` 进入 prompt / 日志 / receipt 次数 | 0（硬门槛） |
+| 召回延迟 | 引擎内召回 P99 | 有界 |
+
+### 16.4 评测资产与 CI
+
+- 资产：`tests/data/memory/`（seed corpus、scenario、期望结果 JSON）；确定性探针 target 建议 `tests/memory_eval.rs` 并按 `tests/INDEX.md` 登记。
+- 确定性探针 offline CI 必跑；LLM 场景 nightly。
+- 输出固定 JSON 报告（`--json`），与版本化基线对比，回归即失败。
+
+### 16.5 验收门槛（对应 MEM）
+
+| MEM | 门槛 |
+|---|---|
+| MEM-01 | 本地单仓记录/列出/删除 round-trip；秘密探针零泄漏；schema forward + 迁移测试；损坏数据 fail loud |
+| MEM-02 | 无 embedding 配置召回可用且可测；注入不超预算；citation 可人工核验；与 LR-07 preflight 共享同一检索服务 |
+| MEM-03 | 巩固/遗忘单测 + 集成测；晋升失败不泄漏私有原文；doctor 可报告记忆健康 |
+| MEM-05 | 导出→清空→导入→召回命中；兼容范围文档化 |
+
+## 17. 验证计划
 
 Memory 只有在配齐有针对性的回归覆盖后才发布：
 
@@ -1747,7 +1856,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 - 资源上限：构造大量 namespace / path / note / entity / relation，断言 `recall`、`summarize`、`list_prefix`、`related`、`onboard`、`consolidate`、`fork`、`materialize` 与 prompt injection 均受各自适用的条目数、批大小、分页、字节数、timeout、LLM 调用预算与 token 预算限制。
 - forget 合规语义：执行 `forget` 后，prompt 注入、MCP 默认读取与 `memory get` 默认读取只显示 redacted body；审计命令仍能解释 tombstone 与无法物理删除的历史边界。
 
-## 17. 开放问题
+## 18. 开放问题
 
 1. **跨 worktree 可见性。** `libra worktree` 衍生出的关联 worktree 如今
    共享 `.libra/`。它们是否也应共享 memory？当前提议是：`Repo`
@@ -1762,18 +1871,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
    复盘草稿）可能超出合理的内联大小。当某条 memory 正文超过
    `LIBRA_STORAGE_THRESHOLD` 时，复用 Libra 既有的 LFS 管道
    （`lfs_structs.rs`、`protocol/lfs_client.rs`）。
-4. **embedding 索引扩展。** memoir-ai 在其核心中刻意回避向量；本设计沿用
-   这一取舍。后续可选的 `memory.embed` 扩展可以在路径键检索**之上**叠加
-   ANN 搜索，而绝不取而代之。若实现该扩展，检索的优化目标应当是
-   「哪条记忆帮助 agent 达成目标」，而非通用文本相似度——Cursor 的
-   代码库索引实践用 agent session traces 训练自有 embedding 模型：
-   统计成功任务中被反复访问的内容，再由 LLM 反推「什么本该更早浮现」
-   （见 [How Does Cursor Index Your Codebase?](https://manthanguptaa.in/posts/how_cursor_index_your_codebase/)，
-   逆向分析博文，数字为 Cursor 自报口径）。Libra 已系统性捕获同类
-   训练信号（`traces` checkpoint、`metrics.turn` / `metrics.code`
-   命名空间、`ai_*` run 记录）。`memory_access_stats.use_count` /
-   `last_used_at` 可用于离线训练、诊断或显式 adaptive profile，但不得改写
-   canonical `MemoryHead.rank_hint`；adaptive 选择必须冻结统计快照并写入 receipt。
+4. **adaptive profile（向量通道已由 §8.7 收敛）。** 混合检索的「可选向量 + 确定性回退」已定为一等设计；本条目只保留未解决的开放部分：基于 `memory_access_stats.use_count` / `last_used_at` 的**离线训练 / 显式 adaptive profile**（Cursor 实践：统计成功任务中被反复访问的内容，再由 LLM 反推「什么本该更早浮现」，见 [How Does Cursor Index Your Codebase?](https://manthanguptaa.in/posts/how_cursor_index_your_codebase/)，逆向分析博文，数字为 Cursor 自报口径）。Libra 已系统性捕获同类训练信号（`traces` checkpoint、`metrics.turn` / `metrics.code` 命名空间、`ai_*` run 记录）；adaptive 选择必须冻结统计快照并写入 receipt，不得改写 canonical `MemoryHead.rank_hint`。
 5. **跨仓库的 memory 联邦（federation）。** 当前不在范围内。一个在多个
    仓库间工作的用户，仍然是每个仓库一份独立的 memory 存储。
 6. **prompt 注入可观测性。** Phase C 应当同时发布一个

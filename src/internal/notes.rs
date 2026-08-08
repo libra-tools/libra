@@ -7,7 +7,7 @@
 use std::str::FromStr;
 
 use git_internal::{errors::GitError, hash::ObjectHash, internal::object::ObjectTrait};
-use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbErr, Statement};
 
 use crate::{internal::db::get_db_conn_instance, utils::util};
 
@@ -202,7 +202,7 @@ pub async fn add(
 
     if force {
         // INSERT … ON CONFLICT DO UPDATE: atomic upsert — no check-then-act gap.
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Sqlite,
             "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
              ON CONFLICT(notes_ref, object) DO UPDATE SET blob = excluded.blob",
@@ -219,7 +219,7 @@ pub async fn add(
         // without a separate query that could land on a different pooled
         // connection.
         let result = db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "INSERT OR IGNORE INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)",
                 [
@@ -257,7 +257,7 @@ pub async fn list(notes_ref: &str, object: Option<&str>) -> Result<Vec<NoteEntry
         let resolved = resolve_object(Some(obj)).await?;
         let obj_str = resolved.to_string();
         let rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "SELECT blob, object FROM notes WHERE notes_ref = ? AND object = ?",
                 [notes_ref.into(), obj_str.clone().into()],
@@ -278,7 +278,7 @@ pub async fn list(notes_ref: &str, object: Option<&str>) -> Result<Vec<NoteEntry
             .collect())
     } else {
         let rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "SELECT blob, object FROM notes WHERE notes_ref = ?",
                 [notes_ref.into()],
@@ -356,10 +356,10 @@ pub async fn remove(
     // Include `blob = ?` so that a concurrent `add -f` cannot overwrite
     // the blob between Phase 1 and Phase 2 — if the blob hash changed,
     // rows_affected() is 0 and we roll back the whole transaction.
-    let txn = db.begin().await?;
+    let txn = crate::internal::db::begin_write_transaction(&db).await?;
     for (obj_str, blob_hash) in &to_delete {
         let result = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "DELETE FROM notes WHERE notes_ref = ? AND object = ? AND blob = ?",
                 [
@@ -434,12 +434,12 @@ pub async fn prune(notes_ref: &str, dry_run: bool) -> Result<Vec<String>, NotesE
     }
 
     let db = get_db_conn_instance().await;
-    let txn = db.begin().await?;
+    let txn = crate::internal::db::begin_write_transaction(&db).await?;
     let mut pruned = Vec::new();
     for (object, blob) in stale {
         let result = match &blob {
             Some(blob) => {
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Sqlite,
                     "DELETE FROM notes WHERE notes_ref = ? AND object = ? AND blob = ?",
                     [notes_ref.into(), object.clone().into(), blob.clone().into()],
@@ -447,7 +447,7 @@ pub async fn prune(notes_ref: &str, dry_run: bool) -> Result<Vec<String>, NotesE
                 .await?
             }
             None => {
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Sqlite,
                     "DELETE FROM notes WHERE notes_ref = ? AND object = ?",
                     [notes_ref.into(), object.clone().into()],
@@ -485,7 +485,7 @@ pub async fn merge(
     let db = get_db_conn_instance().await;
 
     let other_rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Sqlite,
             "SELECT object, blob FROM notes WHERE notes_ref = ?",
             [other_ref.into()],
@@ -552,10 +552,10 @@ pub async fn merge(
     // current blob (`AND blob = <expected>`). Any mismatch means another writer
     // changed the notes between classification and apply, so the whole merge
     // rolls back rather than clobbering concurrent work or applying partially.
-    let txn = db.begin().await?;
+    let txn = crate::internal::db::begin_write_transaction(&db).await?;
     for (object, blob) in &to_copy {
         let result = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
                  ON CONFLICT(notes_ref, object) DO NOTHING",
@@ -572,7 +572,7 @@ pub async fn merge(
     for (object, new_blob, expected_current) in &conflict_updates {
         if let Some(blob) = new_blob {
             let result = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Sqlite,
                     "UPDATE notes SET blob = ? WHERE notes_ref = ? AND object = ? AND blob = ?",
                     [
@@ -635,7 +635,7 @@ async fn find_note_blob(
     object: &str,
 ) -> Result<Option<String>, DbErr> {
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Sqlite,
             "SELECT blob FROM notes WHERE notes_ref = ? AND object = ?",
             [notes_ref.into(), object.into()],

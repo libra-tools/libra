@@ -505,7 +505,7 @@ async fn compose_tag_message(name: &str, base: Option<&str>) -> Result<String, T
     // worktrees composing a tag message at the same time would truncate each
     // other's `TAG_EDITMSG`. The buffer is transient scratch, so it lives in
     // THIS worktree's gitdir (identical path for the main worktree).
-    let path = crate::utils::util::worktree_gitdir().join("TAG_EDITMSG");
+    let path = crate::utils::util::request_worktree_gitdir_strict().join("TAG_EDITMSG");
     let raw = crate::command::editor::edit_message(&path, &template, &editor_cmd, true)
         .await
         .map_err(|e| TagError::EditorFailed(e.to_string()))?;

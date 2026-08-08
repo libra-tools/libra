@@ -47,6 +47,8 @@ mod log_default_errors;
 mod log_defaults;
 #[path = "config_defaults_log_follow.rs"]
 mod log_follow_defaults;
+#[path = "config_defaults_status_renames.rs"]
+mod status_renames_defaults;
 
 const PATH_ENV: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
@@ -1102,6 +1104,22 @@ fn status_show_stash_config_adds_hint_and_cli_negation_wins() {
 
     let suppressed = fixture.success(&repo, &["status", "--no-show-stash"]);
     assert!(!stdout_trim(&suppressed).contains("stash currently has"));
+}
+
+/// 2026-08-05 R0-1 review: a stored integer config value with whitespace
+/// padding must resolve identically in `libra diff` (which trims before
+/// parsing) and `libra status` (which used to hand the untrimmed value to
+/// the pre-trimmed-only parser and fail closed with a usage error on the
+/// exact same key).
+#[test]
+fn padded_rename_limit_value_parses_in_both_commands() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("padded-rename-limit");
+    fixture.init_repo(&repo);
+    fixture.commit_file(&repo, "a.txt", "content\n", "base");
+    fixture.success(&repo, &["config", "diff.renameLimit", " 5 "]);
+    fixture.success(&repo, &["status"]);
+    fixture.success(&repo, &["diff"]);
 }
 
 #[test]

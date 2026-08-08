@@ -34,7 +34,7 @@ async fn stale_repo_at_approved_permission() -> tempfile::TempDir {
 
 async fn max_schema_version(conn: &DatabaseConnection) -> Option<i64> {
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT MAX(version) FROM schema_versions",
         ))
@@ -45,7 +45,7 @@ async fn max_schema_version(conn: &DatabaseConnection) -> Option<i64> {
 }
 
 async fn index_exists(conn: &DatabaseConnection, name: &str) -> bool {
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1",
         ["index".into(), name.into()],
@@ -58,7 +58,7 @@ async fn index_exists(conn: &DatabaseConnection, name: &str) -> bool {
 async fn column_exists(conn: &DatabaseConnection, table: &str, column: &str) -> bool {
     let escaped_table = table.replace('`', "``");
     let rows = conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             format!("PRAGMA table_info(`{escaped_table}`)"),
         ))
@@ -127,7 +127,7 @@ async fn hash_object_read_only_defaults_sha1_when_config_kv_is_missing() {
     std::fs::write(repo.path().join("hello.txt"), b"hello world\n").expect("write fixture");
 
     let conn = connect_raw_repo_db(repo.path()).await;
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "DROP TABLE config_kv",
     ))

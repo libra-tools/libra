@@ -109,6 +109,640 @@ async fn generic_provider_can_execute_through_task_executor_contract() {
     assert_eq!(result.summary.as_deref(), Some("attempt complete"));
 }
 
+/// W1-01: the runtime worker, rather than a UI adapter, owns per-session
+/// serialized turn execution.  The executor deliberately waits so the test
+/// can prove the second mutating turn cannot begin until the first exits.
+#[tokio::test]
+async fn agent_runtime_state_machine() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, PrincipalContext,
+        PrincipalRole, RuntimeExecutionContext, RuntimeTurnExecution, RuntimeTurnExecutor,
+        RuntimeWorkerError, SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+    };
+    use tokio::{
+        sync::{Mutex, Notify},
+        time::{Duration, timeout},
+    };
+
+    struct BlockingExecutor {
+        starts: Arc<Mutex<Vec<String>>>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for BlockingExecutor {
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.starts.lock().await.push(request.turn_id);
+            self.started.notify_one();
+            let cancellation = context.cancellation();
+            tokio::select! {
+                _ = self.release.notified() => Ok(RuntimeTurnExecution::Completed { summary: "done".to_string() }),
+                _ = cancellation.cancelled() => Err(RuntimeWorkerError::Cancelled),
+            }
+        }
+    }
+
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let executor = Arc::new(BlockingExecutor {
+        starts: starts.clone(),
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let tool_boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "runtime-contract-test".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, tool_boundary));
+
+    handle
+        .submit(TurnRequest::new("session", "first", "first input", true))
+        .await
+        .expect("first turn accepted");
+    handle
+        .submit(TurnRequest::new("session", "second", "second input", true))
+        .await
+        .expect("second turn accepted");
+    timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("first turn started");
+    assert_eq!(starts.lock().await.as_slice(), ["first"]);
+    let snapshot = handle.snapshot("session").await.expect("runtime snapshot");
+    assert_eq!(snapshot.active_turn_id.as_deref(), Some("first"));
+    assert_eq!(snapshot.queued_turns, 1);
+
+    release.notify_one();
+    timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("second turn started after first completed");
+    assert_eq!(starts.lock().await.as_slice(), ["first", "second"]);
+    release.notify_one();
+    worker.abort();
+}
+
+#[test]
+fn durable_intent_precedes_mutation_in_four_crash_windows() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::{
+        runtime::{
+            DurableCommandCrashPoint, RuntimeCommandDurability, RuntimeCommandDurabilityError,
+        },
+        session::{
+            CodeCommandIdentity, CodeCommandIntent, CodeCommandRecovery, CodeCommandStatus,
+            CodeCommandStoreError, SessionJsonlStore,
+        },
+    };
+
+    fn intent(command_id: &str, mutating: bool) -> CodeCommandIntent {
+        CodeCommandIntent::new(
+            CodeCommandIdentity::new("repo", "session", "contract-test", command_id),
+            if mutating {
+                "apply_patch"
+            } else {
+                "search_files"
+            },
+            format!("sha256:{command_id}"),
+            mutating,
+        )
+    }
+
+    for crash_point in [
+        DurableCommandCrashPoint::BeforeIntentFsync,
+        DurableCommandCrashPoint::AfterIntentFsyncBeforeDispatch,
+        DurableCommandCrashPoint::AfterDispatchBeforeTerminalFsync,
+        DurableCommandCrashPoint::AfterTerminalFsync,
+    ] {
+        let temp = tempfile::TempDir::new().expect("temporary session root");
+        let durability =
+            RuntimeCommandDurability::new(SessionJsonlStore::new(temp.path().join("session")));
+        let command = intent("mutating", true);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_call = Arc::clone(&dispatches);
+
+        let error = durability
+            .execute(command.clone(), Some(crash_point), move || {
+                dispatches_for_call.fetch_add(1, Ordering::SeqCst);
+                Ok("mutation applied".to_string())
+            })
+            .expect_err("each injected crash must stop the caller");
+        assert!(matches!(
+            error,
+            RuntimeCommandDurabilityError::InjectedCrash(point) if point == crash_point
+        ));
+
+        match crash_point {
+            DurableCommandCrashPoint::BeforeIntentFsync => {
+                assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+                assert!(matches!(
+                    durability.recover(&command),
+                    Err(RuntimeCommandDurabilityError::Store(
+                        CodeCommandStoreError::MissingIntent { .. }
+                    ))
+                ));
+            }
+            DurableCommandCrashPoint::AfterIntentFsyncBeforeDispatch => {
+                assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+                assert!(matches!(
+                    durability
+                        .recover(&command)
+                        .expect("recover persisted intent"),
+                    CodeCommandRecovery::Existing {
+                        status: CodeCommandStatus::Indeterminate { .. }
+                    }
+                ));
+            }
+            DurableCommandCrashPoint::AfterDispatchBeforeTerminalFsync => {
+                assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+                assert!(matches!(
+                    durability
+                        .recover(&command)
+                        .expect("recover dispatched mutation"),
+                    CodeCommandRecovery::Existing {
+                        status: CodeCommandStatus::Indeterminate { .. }
+                    }
+                ));
+            }
+            DurableCommandCrashPoint::AfterTerminalFsync => {
+                assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+                assert!(matches!(
+                    durability
+                        .recover(&command)
+                        .expect("recover durable terminal result"),
+                    CodeCommandRecovery::Existing {
+                        status: CodeCommandStatus::Succeeded { .. }
+                    }
+                ));
+            }
+        }
+    }
+
+    let temp = tempfile::TempDir::new().expect("temporary read-only session root");
+    let durability =
+        RuntimeCommandDurability::new(SessionJsonlStore::new(temp.path().join("session")));
+    let read_only = intent("read-only", false);
+    let error = durability
+        .execute(
+            read_only.clone(),
+            Some(DurableCommandCrashPoint::AfterDispatchBeforeTerminalFsync),
+            || Ok("three matches".to_string()),
+        )
+        .expect_err("injected crash");
+    assert!(matches!(
+        error,
+        RuntimeCommandDurabilityError::InjectedCrash(
+            DurableCommandCrashPoint::AfterDispatchBeforeTerminalFsync
+        )
+    ));
+    assert!(matches!(
+        durability
+            .recover(&read_only)
+            .expect("recover read-only command"),
+        CodeCommandRecovery::RetryReadOnly { .. }
+    ));
+    assert!(matches!(
+        durability
+            .retry_recovered_read_only(read_only, || Ok("three matches".to_string()))
+            .expect("retry recovered read-only command"),
+        CodeCommandStatus::Succeeded { .. }
+    ));
+}
+
+#[tokio::test]
+async fn cancel_during_mutation_requires_reconciliation() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionState,
+        PrincipalContext, PrincipalRole, RuntimeExecutionContext, RuntimeTurnExecution,
+        RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor, ToolBoundaryPolicy,
+        ToolBoundaryRuntime, TurnRequest,
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+
+    struct MutationExecutor {
+        mutation_started: Arc<Notify>,
+        release_first: Arc<Notify>,
+        second_started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutationExecutor {
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            if request.turn_id == "first" {
+                context.mark_mutation_started();
+                self.mutation_started.notify_one();
+                self.release_first.notified().await;
+                // A real adapter must report an actual terminal tool result.
+                // This intentionally ambiguous result exercises the worker's
+                // fail-closed reconciliation branch.
+                return Err(RuntimeWorkerError::Cancelled);
+            }
+            self.second_started.notify_one();
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "second completed".to_string(),
+            })
+        }
+    }
+
+    let mutation_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let second_started = Arc::new(Notify::new());
+    let executor = Arc::new(MutationExecutor {
+        mutation_started: Arc::clone(&mutation_started),
+        release_first: Arc::clone(&release_first),
+        second_started: Arc::clone(&second_started),
+    });
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "runtime-cancel-test".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+    handle
+        .submit(TurnRequest::new("session", "first", "apply patch", true))
+        .await
+        .expect("first turn accepted");
+    timeout(Duration::from_secs(1), mutation_started.notified())
+        .await
+        .expect("mutation began");
+    handle
+        .submit(TurnRequest::new("session", "second", "next patch", true))
+        .await
+        .expect("second turn queued");
+
+    handle
+        .cancel("session", "first")
+        .await
+        .expect("cancel request accepted");
+    assert_eq!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("cancelling snapshot")
+            .interaction,
+        InteractionState::Cancelling,
+        "a cancellation after mutation start must wait for executor reconciliation",
+    );
+
+    release_first.notify_one();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = handle.snapshot("session").await.expect("snapshot");
+            if matches!(
+                snapshot.interaction,
+                InteractionState::IndeterminateSideEffect { .. }
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ambiguous mutation result becomes indeterminate");
+    assert!(
+        timeout(Duration::from_millis(100), second_started.notified())
+            .await
+            .is_err(),
+        "the queued mutation must not begin while reconciliation is required"
+    );
+    assert!(matches!(
+        handle
+            .submit(TurnRequest::new("session", "third", "another patch", true))
+            .await,
+        Err(RuntimeWorkerError::ReconciliationRequired { .. })
+    ));
+    worker.abort();
+}
+
+/// W1-08: runtime shutdown is a structured, idempotent lifecycle operation.
+/// It stops admission before cancelling a read-only turn, drains queued work,
+/// and makes concurrent callers observe one terminal outcome. A non-cooperative
+/// executor must return an actionable timeout rather than leaving shutdown
+/// indefinitely pending.
+#[tokio::test]
+async fn runtime_shutdown_releases_resources() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, PrincipalContext,
+        PrincipalRole, RuntimeExecutionContext, RuntimeShutdownError, RuntimeTurnExecution,
+        RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor, ToolBoundaryPolicy,
+        ToolBoundaryRuntime, TurnRequest,
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+
+    fn boundary() -> ToolBoundaryRuntime {
+        ToolBoundaryRuntime::new(
+            Uuid::new_v4(),
+            PrincipalContext {
+                principal_id: "runtime-shutdown-test".to_string(),
+                role: PrincipalRole::Contributor,
+            },
+            ToolBoundaryPolicy::default_runtime(),
+            SecretRedactor::default_runtime(),
+            Arc::new(InMemoryAuditSink::default()),
+        )
+    }
+
+    struct CooperativeExecutor {
+        started: Arc<Notify>,
+        cancellation_seen: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for CooperativeExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.notify_one();
+            context.cancellation().cancelled().await;
+            self.cancellation_seen.notify_one();
+            self.release.notified().await;
+            Err(RuntimeWorkerError::Cancelled)
+        }
+    }
+
+    let started = Arc::new(Notify::new());
+    let cancellation_seen = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let executor = Arc::new(CooperativeExecutor {
+        started: Arc::clone(&started),
+        cancellation_seen: Arc::clone(&cancellation_seen),
+        release: Arc::clone(&release),
+    });
+    let mut config = AgentRuntimeWorkerConfig::new(executor, boundary());
+    config.shutdown_timeout = Duration::from_secs(1);
+    let (handle, worker) = AgentRuntimeWorker::spawn(config);
+
+    handle
+        .submit(TurnRequest::new("session", "active", "read", false))
+        .await
+        .expect("active turn accepted");
+    handle
+        .submit(TurnRequest::new("session", "queued", "later", false))
+        .await
+        .expect("queued turn accepted");
+    timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("active turn started");
+
+    let first_shutdown = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.shutdown().await })
+    };
+    timeout(Duration::from_secs(1), cancellation_seen.notified())
+        .await
+        .expect("shutdown cooperatively cancels the active turn");
+    assert!(matches!(
+        handle
+            .submit(TurnRequest::new(
+                "session",
+                "rejected",
+                "after shutdown",
+                false
+            ))
+            .await,
+        Err(RuntimeWorkerError::ShuttingDown)
+    ));
+
+    let second_shutdown = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.shutdown().await })
+    };
+    tokio::task::yield_now().await;
+    release.notify_one();
+    assert!(first_shutdown.await.expect("first shutdown task").is_ok());
+    assert!(second_shutdown.await.expect("second shutdown task").is_ok());
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("worker exits after shutdown")
+        .expect("worker task does not panic");
+    assert!(
+        handle.shutdown().await.is_ok(),
+        "a completed shutdown must stay idempotent after the worker task exits"
+    );
+
+    let drop_started = Arc::new(Notify::new());
+    let drop_cancellation_seen = Arc::new(Notify::new());
+    let drop_release = Arc::new(Notify::new());
+    let drop_executor = Arc::new(CooperativeExecutor {
+        started: Arc::clone(&drop_started),
+        cancellation_seen: Arc::clone(&drop_cancellation_seen),
+        release: Arc::clone(&drop_release),
+    });
+    let (drop_handle, drop_worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(drop_executor, boundary()));
+    drop_handle
+        .submit(TurnRequest::new("dropped", "active", "read", false))
+        .await
+        .expect("last-handle-drop turn accepted");
+    timeout(Duration::from_secs(1), drop_started.notified())
+        .await
+        .expect("last-handle-drop turn started");
+    drop(drop_handle);
+    timeout(Duration::from_secs(1), drop_cancellation_seen.notified())
+        .await
+        .expect("dropping the last runtime handle starts the same shutdown path");
+    drop_release.notify_one();
+    timeout(Duration::from_secs(1), drop_worker)
+        .await
+        .expect("worker exits after last handle drop")
+        .expect("last-handle-drop worker task does not panic");
+
+    struct MutatingExecutor {
+        started: Arc<Notify>,
+        cancellation_seen: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            context.mark_mutation_started();
+            self.started.notify_one();
+            let cancellation = context.cancellation();
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    self.cancellation_seen.notify_one();
+                    Err(RuntimeWorkerError::Cancelled)
+                }
+                _ = self.release.notified() => Ok(RuntimeTurnExecution::Completed {
+                    summary: "mutation completed determinately".to_string(),
+                }),
+            }
+        }
+    }
+
+    let mutation_started = Arc::new(Notify::new());
+    let mutation_cancellation_seen = Arc::new(Notify::new());
+    let mutation_release = Arc::new(Notify::new());
+    let mutating_executor = Arc::new(MutatingExecutor {
+        started: Arc::clone(&mutation_started),
+        cancellation_seen: Arc::clone(&mutation_cancellation_seen),
+        release: Arc::clone(&mutation_release),
+    });
+    let (mutating_handle, mutating_worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(mutating_executor, boundary()));
+    mutating_handle
+        .submit(TurnRequest::new("mutating", "active", "write", true))
+        .await
+        .expect("mutating turn accepted");
+    timeout(Duration::from_secs(1), mutation_started.notified())
+        .await
+        .expect("mutating turn started");
+    let mutating_shutdown = {
+        let handle = mutating_handle.clone();
+        tokio::spawn(async move { handle.shutdown().await })
+    };
+    assert!(
+        timeout(
+            Duration::from_millis(100),
+            mutation_cancellation_seen.notified()
+        )
+        .await
+        .is_err(),
+        "shutdown must not cancel a mutation after its side effect begins"
+    );
+    mutation_release.notify_one();
+    assert!(
+        mutating_shutdown
+            .await
+            .expect("mutating shutdown task")
+            .is_ok(),
+        "a determinate mutation completion releases shutdown"
+    );
+    timeout(Duration::from_secs(1), mutating_worker)
+        .await
+        .expect("worker exits after determinate mutation")
+        .expect("mutating worker task does not panic");
+
+    struct StuckExecutor;
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for StuckExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            std::future::pending().await
+        }
+    }
+
+    let mut stuck_config = AgentRuntimeWorkerConfig::new(Arc::new(StuckExecutor), boundary());
+    stuck_config.shutdown_timeout = Duration::from_millis(20);
+    let (stuck_handle, stuck_worker) = AgentRuntimeWorker::spawn(stuck_config);
+    stuck_handle
+        .submit(TurnRequest::new("stuck", "active", "read", false))
+        .await
+        .expect("stuck turn accepted");
+    let timeout_error = stuck_handle
+        .shutdown()
+        .await
+        .expect_err("non-cooperative executor must hit the shutdown deadline");
+    assert!(matches!(
+        &timeout_error,
+        RuntimeShutdownError::TimedOut { unreleased_resources }
+            if unreleased_resources == &vec!["runtime_turn".to_string()]
+    ));
+    timeout(Duration::from_secs(1), stuck_worker)
+        .await
+        .expect("timed-out worker exits")
+        .expect("timed-out worker task does not panic");
+    assert_eq!(
+        stuck_handle.shutdown().await,
+        Err(timeout_error),
+        "a completed failed shutdown must preserve its diagnostic for repeat callers"
+    );
+
+    struct StuckMutatingExecutor {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for StuckMutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            context.mark_mutation_started();
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    let stuck_mutation_started = Arc::new(Notify::new());
+    let mutating_stuck_executor = Arc::new(StuckMutatingExecutor {
+        started: Arc::clone(&stuck_mutation_started),
+    });
+    let mutating_stuck_config = AgentRuntimeWorkerConfig::new(mutating_stuck_executor, boundary());
+    let (mutating_stuck_handle, mutating_stuck_worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig {
+            shutdown_timeout: Duration::from_millis(20),
+            ..mutating_stuck_config
+        });
+    mutating_stuck_handle
+        .submit(TurnRequest::new("stuck-mutation", "active", "write", true))
+        .await
+        .expect("stuck mutating turn accepted");
+    timeout(Duration::from_secs(1), stuck_mutation_started.notified())
+        .await
+        .expect("stuck mutation reached dispatch boundary");
+    assert!(matches!(
+        mutating_stuck_handle.shutdown().await,
+        Err(RuntimeShutdownError::TimedOut { unreleased_resources })
+            if unreleased_resources == vec!["mutating_runtime_turn_reconciliation".to_string()]
+    ));
+    timeout(Duration::from_secs(1), mutating_stuck_worker)
+        .await
+        .expect("timed-out mutating worker exits")
+        .expect("timed-out mutating worker task does not panic");
+}
+
 // ---------------------------------------------------------------------------
 // CEX-00.5: top-level Event / Snapshot trait contract
 // ---------------------------------------------------------------------------

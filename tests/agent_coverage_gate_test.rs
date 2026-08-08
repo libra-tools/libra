@@ -157,7 +157,7 @@ impl HookRepo {
 
     async fn query_rows(&self, sql: &str) -> Vec<sea_orm::QueryResult> {
         let conn = self.db().await;
-        conn.query_all(Statement::from_string(
+        conn.query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -381,7 +381,7 @@ async fn coverage_gate_inflight_only_fails_visibly() {
     );
     let conn = Database::connect(url).await.expect("open rw");
     let inserted = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_coverage_claim (
                 session_id, logical_turn_key, coverage_schema_version,
@@ -443,7 +443,7 @@ async fn live_writer_preempts_reserved_import_and_fences_stale_owner() {
     );
     let conn = Database::connect(url).await.expect("open rw");
     let inserted = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_coverage_claim (
                 session_id, logical_turn_key, coverage_schema_version,
@@ -504,7 +504,7 @@ async fn coverage_gate_db_error_does_not_append() {
             repo.repo.join(".libra").join("libra.db").display()
         );
         let conn = Database::connect(url).await.expect("open rw");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "DROP TABLE agent_coverage_claim".to_string(),
         ))

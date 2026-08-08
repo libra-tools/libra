@@ -152,6 +152,8 @@ function deriveCurrentPhase(snapshot: CodeUiSessionSnapshot): number {
       return 4;
     case "error":
       return 3;
+    case "indeterminate_side_effect":
+      return 3;
     default:
       break;
   }

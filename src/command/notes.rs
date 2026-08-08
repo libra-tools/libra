@@ -233,7 +233,12 @@ pub struct NotesRemovedEntry {
 }
 
 pub async fn execute(args: NotesArgs) {
-    let argv: Vec<String> = std::env::args().collect();
+    // `args_os`: `env::args()` panics on a non-UTF-8 argument, and a
+    // pathspec that is not UTF-8 is ordinary on Unix. Only ASCII flags are
+    // matched here, so non-UTF-8 tokens are skipped.
+    let argv: Vec<String> = std::env::args_os()
+        .filter_map(|arg| arg.into_string().ok())
+        .collect();
     if let Err(err) = execute_safe(args, &OutputConfig::default(), &argv).await {
         err.print_stderr();
     }
@@ -588,7 +593,7 @@ async fn compose_note_via_editor(initial: &str, object: &str) -> CliResult<Strin
     // Part C §C.4.3: transient per-worktree editor scratch — on shared storage
     // two worktrees composing a message concurrently would truncate each other's
     // buffer. Identical path for the main worktree (local == common storage).
-    let path = crate::utils::util::worktree_gitdir().join("NOTES_EDITMSG");
+    let path = crate::utils::util::request_worktree_gitdir_strict().join("NOTES_EDITMSG");
     let raw = crate::command::editor::edit_message(&path, initial, &editor_cmd, true)
         .await
         .map_err(|e| {

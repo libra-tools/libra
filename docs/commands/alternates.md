@@ -41,7 +41,30 @@ cannot reach the base's remote tier).
 libra alternates add /path/to/base/.libra/objects   # borrow from a shared store
 libra alternates list
 libra alternates remove /path/to/base/.libra/objects # stop borrowing
+libra alternates prune --dry-run                     # show borrowers whose repo is gone
+libra alternates prune                               # retire them (unblocks this store's gc)
 ```
+
+## Retiring a borrower whose repository is gone
+
+Registering an alternate records this repository as a BORROWER in the base, and
+while that registration exists the base's `gc`, `repack -d`, `cache evict`,
+`agent clean` and `file obliterate` all refuse to delete objects.
+
+The only registration retired automatically is one whose path exists and is
+not a directory — an object directory never is. Absence is deliberately NOT
+enough: an absent borrower path is indistinguishable from an unmounted one, and
+guessing wrong deletes objects a borrower still needs the moment its mount
+comes back.
+Run `libra alternates prune` IN THE BASE to retire registrations whose path does
+not exist — the flag `--dry-run` lists them first. When a registration cannot be
+checked at all (an unreachable mount, a permission-denied parent), name it:
+`libra alternates prune /path/to/gone/.libra/objects` retires that one exact
+registration whatever the filesystem says, because there the user is the only
+available evidence. The path is matched verbatim against the registration, so a
+symlink pointing at a different borrower cannot retire it by accident. The
+normal route is still `libra alternates remove` from the borrower, which
+unregisters both sides.
 
 ## Deferred (not v1)
 

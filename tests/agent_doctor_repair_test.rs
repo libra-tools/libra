@@ -190,7 +190,7 @@ impl DoctorRepo {
     async fn exec_sql(&self, sql: &str, values: Vec<sea_orm::Value>) {
         let conn = self.db().await;
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(backend, sql, values))
+        conn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
             .await
             .expect("execute test SQL");
     }
@@ -200,7 +200,7 @@ impl DoctorRepo {
         let conn = self.db().await;
         let backend = conn.get_database_backend();
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
                         metadata_blob_oid, traces_commit, created_at \
@@ -235,7 +235,7 @@ impl DoctorRepo {
         );
         let values: Vec<sea_orm::Value> = oids.iter().map(|oid| (*oid).into()).collect();
         let rows = conn
-            .query_all(Statement::from_sql_and_values(backend, sql, values))
+            .query_all_raw(Statement::from_sql_and_values(backend, sql, values))
             .await
             .expect("query object_index");
         rows.into_iter()
@@ -696,7 +696,7 @@ async fn class1_stale_row_repaired_from_ref() {
     );
     let conn = repo.db().await;
     let generation = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT sync_revision FROM agent_checkpoint WHERE checkpoint_id = ?",
             [repaired.checkpoint_id.clone().into()],
@@ -1579,7 +1579,7 @@ async fn class3_drifted_object_index_row_updated_in_place() {
     let synced: i64 = repo
         .db()
         .await
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Sqlite,
             "SELECT is_synced FROM object_index WHERE o_id = ?",
             [transcript_oid.clone().into()],
@@ -1605,7 +1605,7 @@ async fn subagent_parent_link(repo: &DoctorRepo, checkpoint_id: &str) -> Option<
     let conn = repo.db().await;
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT parent_checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = ?",
             vec![checkpoint_id.into()],
@@ -1905,6 +1905,265 @@ async fn checkpoint_store_missing_nested_tree_emits_lbr_agent_009() {
 // A0-06 — findings-object repair (review/investigate objectized findings)
 // ---------------------------------------------------------------------------
 
+/// Kills and reaps a helper process on drop, including on an assertion
+/// unwind — a leaked holder would keep an exclusive lock (and a 600-second
+/// sleep) alive for every later test in the process.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// §C.4.3 writer-vs-deleter: `agent doctor --repair` REPUBLISHES a findings
+/// blob, so it must hold the repository maintenance lock across the rewrite
+/// and the `object_index` insert.
+///
+/// `agent` is excluded from the command-level shared hold (its runs are
+/// long), so this seam is where the exclusion happens for the repair path.
+/// The test drives it from the outside: a second PROCESS holds the lock
+/// exclusively, and the repair must not get through the publication while
+/// that hold lasts.
+///
+/// The synchronisation is a PROOF, not a sleep: `doctor` writes its marker
+/// only after observing that a shared acquisition would block, so the marker
+/// existing IS the evidence that it waited. On a loaded machine a sleep would
+/// prove nothing — a descheduled process looks exactly like a blocked one —
+/// and removing the acquisition would make the marker never appear.
+#[tokio::test]
+async fn findings_object_repair_waits_for_the_maintenance_lock() {
+    use std::io::{BufRead, BufReader};
+
+    use libra::internal::ai::review::{
+        ReviewRunStore, ReviewTerminalState, store::RedactionReportSummary,
+    };
+
+    let repo = DoctorRepo::init();
+    let store = ReviewRunStore::new(repo.repo.join(".libra").join("sessions"));
+    store
+        .create_run("lock-run", &["codex".to_string()], "sha", "HEAD~1..HEAD")
+        .expect("create run");
+    store
+        .write_findings("lock-run", "review finding body line\n")
+        .expect("write findings");
+    store
+        .finalize_run(
+            "lock-run",
+            ReviewTerminalState::Success,
+            &[],
+            RedactionReportSummary::default(),
+        )
+        .expect("finalize objectizes findings");
+    let findings_oid = store
+        .load_manifest("lock-run")
+        .expect("load manifest")
+        .expect("manifest")
+        .findings_oid
+        .expect("findings_oid");
+    let obj_path = repo
+        .repo
+        .join(".libra")
+        .join("objects")
+        .join(&findings_oid[..2])
+        .join(&findings_oid[2..]);
+    std::fs::remove_file(&obj_path).expect("delete findings object");
+
+    // A deletion phase, in another process, holding the lock exclusively.
+    let lock_path = repo.repo.join(".libra").join("maintenance.lock");
+    let script = format!(
+        "import fcntl, sys, time\n\
+         f = open({path:?}, 'a+')\n\
+         fcntl.flock(f, fcntl.LOCK_EX)\n\
+         sys.stdout.write('locked\\n')\n\
+         sys.stdout.flush()\n\
+         time.sleep(600)\n",
+        path = lock_path.to_string_lossy().to_string()
+    );
+    let mut deleter = ChildGuard(
+        std::process::Command::new("python3")
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the deleter holding the lock"),
+    );
+    let mut ready = String::new();
+    BufReader::new(deleter.0.stdout.take().expect("stdout"))
+        .read_line(&mut ready)
+        .expect("deleter ready");
+    assert_eq!(ready.trim(), "locked");
+
+    // The repair must reach its lock attempt and then WAIT there.
+    let barrier = repo.repo.join(".libra").join("publication-barrier");
+    let mut repair = ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+            .args(["agent", "doctor", "--repair", "--json"])
+            .current_dir(&repo.repo)
+            .env("LIBRA_TEST", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn doctor --repair"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !barrier.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "doctor never reached the publication barrier"
+        );
+        assert!(
+            repair.0.try_wait().expect("poll").is_none(),
+            "doctor exited before reaching the publication"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The marker is written only AFTER the repair observed that a shared
+    // acquisition would block, so its existence already proves the wait —
+    // there is no sleep here to be wrong about.
+    assert!(
+        repair.0.try_wait().expect("poll").is_none(),
+        "the repair must wait for the deletion phase to finish, not republish underneath it"
+    );
+    assert!(
+        !obj_path.exists(),
+        "and it must not have rewritten the blob while the deleter holds the lock"
+    );
+
+    // Released: the repair completes and the blob is back.
+    drop(deleter);
+    let status = repair
+        .0
+        .wait()
+        .expect("repair finishes once the lock is free");
+    assert!(status.success(), "doctor --repair failed after the wait");
+    assert!(
+        obj_path.exists(),
+        "the findings object must be restored once the lock is released"
+    );
+}
+
+/// The contention marker is created NO-FOLLOW.
+///
+/// The marker path is fixed and inside `.libra`, but a planted symlink there
+/// would redirect a following write anywhere the process can reach. `O_EXCL`
+/// refuses a symlink outright; this pins that, because a regression to
+/// `fs::write` would follow it and the contention test alone would not
+/// notice.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_contention_marker_never_follows_a_planted_symlink() {
+    use std::io::{BufRead, BufReader};
+
+    use libra::internal::ai::review::{
+        ReviewRunStore, ReviewTerminalState, store::RedactionReportSummary,
+    };
+
+    let repo = DoctorRepo::init();
+    let store = ReviewRunStore::new(repo.repo.join(".libra").join("sessions"));
+    store
+        .create_run("symlink-run", &["codex".to_string()], "sha", "HEAD~1..HEAD")
+        .expect("create run");
+    store
+        .write_findings("symlink-run", "review finding body line\n")
+        .expect("write findings");
+    store
+        .finalize_run(
+            "symlink-run",
+            ReviewTerminalState::Success,
+            &[],
+            RedactionReportSummary::default(),
+        )
+        .expect("finalize");
+    let findings_oid = store
+        .load_manifest("symlink-run")
+        .expect("load")
+        .expect("manifest")
+        .findings_oid
+        .expect("findings_oid");
+    let obj_path = repo
+        .repo
+        .join(".libra")
+        .join("objects")
+        .join(&findings_oid[..2])
+        .join(&findings_oid[2..]);
+    std::fs::remove_file(&obj_path).expect("delete findings object");
+
+    // A sentinel OUTSIDE the repository, and a symlink at the marker path
+    // pointing at it.
+    let outside = tempfile::tempdir().expect("outside");
+    let sentinel = outside.path().join("sentinel");
+    std::fs::write(&sentinel, b"untouched").expect("write sentinel");
+    let marker = repo.repo.join(".libra").join("publication-barrier");
+    std::os::unix::fs::symlink(&sentinel, &marker).expect("plant the symlink");
+
+    // Force contention so the marker path is exercised.
+    let lock_path = repo.repo.join(".libra").join("maintenance.lock");
+    let script = format!(
+        "import fcntl, sys, time\n\
+         f = open({path:?}, 'a+')\n\
+         fcntl.flock(f, fcntl.LOCK_EX)\n\
+         sys.stdout.write('locked\\n')\n\
+         sys.stdout.flush()\n\
+         time.sleep(600)\n",
+        path = lock_path.to_string_lossy().to_string()
+    );
+    let mut deleter = ChildGuard(
+        std::process::Command::new("python3")
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the deleter"),
+    );
+    let mut ready = String::new();
+    BufReader::new(deleter.0.stdout.take().expect("stdout"))
+        .read_line(&mut ready)
+        .expect("deleter ready");
+    assert_eq!(ready.trim(), "locked");
+
+    let mut repair = ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+            .args(["agent", "doctor", "--repair", "--json"])
+            .current_dir(&repo.repo)
+            .env("LIBRA_TEST", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn doctor --repair"),
+    );
+    // Wait for PROOF that the contention branch ran — the `.attempted`
+    // signal, which is written on the same path as the marker attempt and
+    // has no symlink planted on it. Without this the sentinel could be
+    // untouched merely because the child had not got there yet.
+    let attempted = repo
+        .repo
+        .join(".libra")
+        .join("publication-barrier.attempted");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !attempted.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "doctor never reached the contention branch"
+        );
+        assert!(
+            repair.0.try_wait().expect("poll").is_none(),
+            "doctor exited before reaching the contention branch"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        std::fs::read(&sentinel).expect("sentinel readable"),
+        b"untouched",
+        "the marker must never be written through a symlink"
+    );
+    assert!(
+        marker.symlink_metadata().expect("marker path").is_symlink(),
+        "the planted symlink itself must be left alone"
+    );
+    drop(deleter);
+    let _ = repair.0.wait();
+}
+
 /// A0-06: a review run's objectized findings blob that goes missing while
 /// `findings.md` remains is detected as `missing_findings_object` and
 /// auto-repaired by `doctor --repair` (content-addressed rewrite from
@@ -2039,7 +2298,7 @@ async fn findings_object_index_tolerates_agent_transcript_tag() {
     let repo_id = {
         let conn = repo.db().await;
         let backend = conn.get_database_backend();
-        conn.query_one(Statement::from_string(
+        conn.query_one_raw(Statement::from_string(
             backend,
             "SELECT value FROM config_kv WHERE key='libra.repoid'",
         ))

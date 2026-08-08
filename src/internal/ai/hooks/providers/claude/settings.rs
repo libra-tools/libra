@@ -23,9 +23,20 @@ use super::super::super::{
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 10;
 const CLAUDE_SETTINGS_DIR: &str = ".claude";
 const CLAUDE_SETTINGS_FILE: &str = "settings.json";
+// Every event forwarded here must be a name the Claude parser recognizes — this is
+// a deliberate *subset* of `parser::CLAUDE_HOOK_EVENT_NAMES` (the installer forwards
+// these 6; the parser understands more). `PreToolUse` and `PostToolUse` both forward
+// to the `tool-use` verb (parser maps both to `LifecycleEventKind::ToolUse`), giving
+// an earlier liveness signal at the start of a tool call in addition to the
+// completed-call event; a `ToolUse` event refreshes `agent_session` liveness on the
+// AgentTraces path and does not write a checkpoint (only Stop/SessionEnd do). No
+// `Subagent*` boundary event is registered here: Claude does not emit stable
+// sub-agent boundaries, so its on-disk sub-agent content stays `unresolved` (DR-06
+// premise). Keep in sync with the installed config in `docs/commands/hooks.md`.
 const CLAUDE_HOOK_FORWARD_MAP: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "tool-use"),
     ("PostToolUse", "tool-use"),
     ("Stop", "stop"),
     ("SessionEnd", "session-end"),
@@ -278,12 +289,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_hook_forward_map_is_exactly_five_and_has_no_subagent_boundary() {
+    fn claude_hook_forward_map_pins_events_and_has_no_subagent_boundary() {
+        // DR-00: `PreToolUse` is registered alongside `PostToolUse`, both routed to
+        // the `tool-use` verb. DR-06 premise preserved: no `Subagent*` boundary event
+        // is forwarded for Claude, so its on-disk sub-agent content stays `unresolved`.
         assert_eq!(
             CLAUDE_HOOK_FORWARD_MAP,
             [
                 ("SessionStart", "session-start"),
                 ("UserPromptSubmit", "prompt"),
+                ("PreToolUse", "tool-use"),
                 ("PostToolUse", "tool-use"),
                 ("Stop", "stop"),
                 ("SessionEnd", "session-end"),
@@ -302,6 +317,93 @@ mod tests {
         assert!(upsert_claude_hooks(&mut settings, "/tmp/libra", 10));
         assert!(!upsert_claude_hooks(&mut settings, "/tmp/libra", 10));
         assert!(all_claude_specs_installed(&settings, "/tmp/libra"));
+    }
+
+    /// Builds one `matcher: null` Libra command matcher for `event → verb`.
+    fn libra_matcher(verb: &str) -> ClaudeHookMatcher {
+        ClaudeHookMatcher {
+            matcher: None,
+            hooks: vec![ClaudeHookEntry {
+                entry_type: "command".to_string(),
+                command: format!("/tmp/libra hooks claude {verb}"),
+                timeout: Some(10),
+                extra: BTreeMap::new(),
+            }],
+            extra: BTreeMap::new(),
+        }
+    }
+
+    // DR-00 upgrade path: a config installed by a pre-DR-00 binary (the five
+    // legacy events, no PreToolUse) must gain the Libra PreToolUse forward on
+    // the next upsert, stay idempotent on a rerun, preserve a user-owned
+    // PreToolUse hook, and drop only Libra-managed hooks on uninstall.
+    #[test]
+    fn upsert_upgrades_legacy_five_event_config_and_preserves_user_hooks() {
+        let mut settings = ClaudeSettings::default();
+        for (event, verb) in [
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt"),
+            ("PostToolUse", "tool-use"),
+            ("Stop", "stop"),
+            ("SessionEnd", "session-end"),
+        ] {
+            settings
+                .hooks
+                .insert(event.to_string(), vec![libra_matcher(verb)]);
+        }
+        // A user-owned PreToolUse hook that Libra must never clobber.
+        settings.hooks.insert(
+            "PreToolUse".to_string(),
+            vec![ClaudeHookMatcher {
+                matcher: Some("Bash".to_string()),
+                hooks: vec![ClaudeHookEntry {
+                    entry_type: "command".to_string(),
+                    command: "echo user-pre".to_string(),
+                    timeout: Some(5),
+                    extra: BTreeMap::new(),
+                }],
+                extra: BTreeMap::new(),
+            }],
+        );
+
+        // Upgrade: the missing Libra PreToolUse forward is added (change == true).
+        assert!(upsert_claude_hooks(&mut settings, "/tmp/libra", 10));
+        assert!(all_claude_specs_installed(&settings, "/tmp/libra"));
+        let pre = settings.hooks.get("PreToolUse").expect("PreToolUse");
+        assert!(
+            pre.iter().any(|m| m.matcher.as_deref() == Some("Bash")
+                && m.hooks.iter().any(|h| h.command == "echo user-pre")),
+            "user PreToolUse hook must survive upgrade: {settings:?}"
+        );
+        assert!(
+            pre.iter().any(|m| m.matcher.is_none()
+                && m.hooks
+                    .iter()
+                    .any(|h| h.command == "/tmp/libra hooks claude tool-use")),
+            "Libra PreToolUse forward must be installed: {settings:?}"
+        );
+
+        // Idempotent: a second upsert reports no change.
+        assert!(!upsert_claude_hooks(&mut settings, "/tmp/libra", 10));
+
+        // Uninstall drops only Libra-managed hooks; the user hook survives.
+        assert!(remove_libra_claude_hooks(&mut settings));
+        let pre = settings
+            .hooks
+            .get("PreToolUse")
+            .expect("PreToolUse remains");
+        assert!(
+            pre.iter()
+                .any(|m| m.hooks.iter().any(|h| h.command == "echo user-pre")),
+            "user PreToolUse hook must survive uninstall: {settings:?}"
+        );
+        assert!(
+            !pre.iter().any(|m| m
+                .hooks
+                .iter()
+                .any(|h| h.command.contains("hooks claude tool-use"))),
+            "Libra PreToolUse forward must be removed on uninstall: {settings:?}"
+        );
     }
 
     #[test]

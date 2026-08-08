@@ -5,7 +5,7 @@
 ## 概要
 
 ```bash
-libra investigate start --topic <text> --agent <slug>... [--max-turns <n>] [--quorum <n>]
+libra investigate start --topic <text> --agent <slug>... [--max-turns <n>] [--quorum <n>] [--checkpoint <id>]
 libra investigate list [--json] [--limit <n>] [--cursor <token>]
 libra investigate show <run_id> [--json]
 libra investigate continue <run_id>
@@ -33,6 +33,16 @@ manifest 的 `manual_attach` 列表；永不修改 findings 或 run 状态。
 每个 investigator 都在**隔离 workspace** 中运行——按 ignore 规则物化的仓库镜像
 （`.env.test` 等被 gitignore 的 secret 文件不会进入镜像），使用最小权限只读的
 CLI 形态，环境变量只注入 allowlist。investigator 永远不会在仓库工作树本身运行。
+
+使用 `start --checkpoint <id>` 时，调查范围改为一个已捕获的 agent checkpoint：
+investigator 的工作区就是该 checkpoint 自身的内容——`metadata.json`、可选的
+`manifest.json` 与 transcript 文件——以**只读**形式物化在 run 目录下
+（`<run_dir>/checkpoint-input/`）。完全不物化仓库快照，因此 scoped run 只可能
+消费指定的 checkpoint；该 scope 持久化在 run 状态里，`investigate continue`
+恢复时会重新物化**同一个** checkpoint，绝不会回落到当前工作树。checkpoint
+缺失、tree 非法、或内容不在本地对象库时，在创建任何 run 之前即 fail-closed
+（无 run 残留）。物化产物与 run 共享 retention 生命周期（`investigate clean`
+随 run 一并移除），`agent doctor` 无需新增孤儿类别。
 
 每一轮从 investigator 的 stdout 收集其 stance（经 redaction），追加到 run 的
 `stances` 列表与单写 `findings.md`，并推进轮询位置
@@ -106,6 +116,9 @@ libra investigate start --topic "auth bug" --agent codex --agent claude-code
 
 # 限制 turn 数并要求两个 concluding agent
 libra investigate start --topic "memory leak" --agent codex --max-turns 8 --quorum 2
+
+# investigate 一个已捕获 checkpoint 的 transcript（只读输入）
+libra investigate start --topic "replay" --agent codex --checkpoint <checkpoint_id>
 
 # 列出 run，再取下一页
 libra investigate list

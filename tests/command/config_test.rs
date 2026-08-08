@@ -2755,3 +2755,560 @@ async fn test_config_upgrade_mode_isolated_by_global_db_override() {
         serde_json::from_str(&std::fs::read_to_string(&isolated).unwrap()).unwrap();
     assert_eq!(doc["mode"], "manual");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CT1-01 (plan-20260729): bare `libra config <key>` reads for ordinary keys.
+//
+// Git's `git config <key>` is a read. Libra previously routed a single-positional
+// call with no value into set mode, which reported "missing value for key" with
+// LBR-INTERNAL-001 / exit 2. Ordinary keys now read; PROTECTED keys deliberately
+// keep Libra's interactive secure-assignment path (intentional divergence, see
+// COMPATIBILITY.md and docs/development/commands/config.md).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[serial]
+fn config_bare_read_single_value() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "A U Thor"], p),
+        "seed user.name",
+    );
+
+    let bare = run_libra_command(&["config", "user.name"], p);
+    assert_cli_success(&bare, "bare read");
+    let via_get = run_libra_command(&["config", "get", "user.name"], p);
+    assert_cli_success(&via_get, "config get");
+    assert_eq!(
+        bare.stdout, via_get.stdout,
+        "bare read must be byte-identical to `config get`"
+    );
+    assert_eq!(String::from_utf8_lossy(&bare.stdout).trim(), "A U Thor");
+}
+
+#[test]
+#[serial]
+fn config_bare_read_multi_value_last_wins() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "--add", "multi.key", "one"], p),
+        "add first",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--add", "multi.key", "two"], p),
+        "add second",
+    );
+
+    let bare = run_libra_command(&["config", "multi.key"], p);
+    assert_cli_success(&bare, "bare read of multi-valued key");
+    assert_eq!(
+        String::from_utf8_lossy(&bare.stdout).trim(),
+        "two",
+        "Git returns the LAST value for a multi-valued key"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_missing_key_exit1() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    let bare = run_libra_command(&["config", "nosuch.key"], p);
+    assert_eq!(
+        bare.status.code(),
+        Some(1),
+        "missing key exits 1, not the old 2: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_missing_key_error_code() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    let bare = run_libra_command(&["config", "nosuch.key"], p);
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        stderr.contains("LBR-CLI-002"),
+        "missing key must be a CLI error, not LBR-INTERNAL-001: {stderr}"
+    );
+    assert!(
+        !stderr.contains("LBR-INTERNAL-001"),
+        "user input must never surface as an internal error: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_sensitive_key_keeps_interactive_set() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    // Protected keys keep the interactive secure-assignment path. Under the test
+    // harness that path is non-interactive, so it reports the protected-key error
+    // rather than reading. This is the pre-existing behaviour and must not change.
+    let bare = run_libra_command(&["config", "user.password"], p);
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        stderr.contains("missing value for protected key"),
+        "sensitive key must stay on the interactive-assignment path: {stderr}"
+    );
+    assert_eq!(
+        bare.status.code(),
+        Some(2),
+        "protected-key path keeps exit 2"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_upgrade_namespace_fail_closed() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    let bare = run_libra_command(&["config", "upgrade.mode"], p);
+    assert!(
+        !bare.status.success(),
+        "reserved upgrade.* namespace must stay fail-closed on a bare read"
+    );
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        stderr.contains("upgrade.*"),
+        "error must name the reserved namespace: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_scope_cascade() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "--global", "cascade.key", "from-global"], p),
+        "seed global",
+    );
+    let global_only = run_libra_command(&["config", "cascade.key"], p);
+    assert_cli_success(&global_only, "cascade read (global only)");
+    assert_eq!(
+        String::from_utf8_lossy(&global_only.stdout).trim(),
+        "from-global"
+    );
+
+    // Local must win over global, matching `config get`.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "cascade.key", "from-local"], p),
+        "seed local",
+    );
+    let bare = run_libra_command(&["config", "cascade.key"], p);
+    assert_cli_success(&bare, "cascade read (local wins)");
+    let via_get = run_libra_command(&["config", "get", "cascade.key"], p);
+    assert_eq!(
+        bare.stdout, via_get.stdout,
+        "bare read cascade must match `config get` cascade"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_output_shape_human() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "shape.key", "v"], p),
+        "seed shape.key",
+    );
+
+    let ok = run_libra_command(&["config", "shape.key"], p);
+    assert_cli_success(&ok, "human success");
+    assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "v");
+
+    let err = run_libra_command(&["config", "shape.missing"], p);
+    assert_eq!(err.status.code(), Some(1), "human failure exit code");
+    assert!(
+        String::from_utf8_lossy(&err.stdout).trim().is_empty(),
+        "human failure must not print a value on stdout"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_output_shape_json() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "shape.key", "v"], p),
+        "seed shape.key",
+    );
+
+    let ok = run_libra_command(&["--json", "config", "shape.key"], p);
+    assert_cli_success(&ok, "json success");
+    let body = String::from_utf8_lossy(&ok.stdout);
+    // `--json` pretty-prints, so match on the fields rather than a compact spelling.
+    assert!(
+        body.contains("\"ok\": true") && body.contains("\"value\": \"v\""),
+        "json success payload: {body}"
+    );
+
+    let err = run_libra_command(&["--json", "config", "shape.missing"], p);
+    assert_eq!(err.status.code(), Some(1), "json failure exit code");
+    let ebody = String::from_utf8_lossy(&err.stderr);
+    assert!(
+        ebody.contains("\"ok\": false") && ebody.contains("LBR-CLI-002"),
+        "json failure payload: {ebody}"
+    );
+    assert!(
+        ebody.contains("\"exit_code\": 1"),
+        "json failure must carry exit_code 1: {ebody}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_output_shape_machine() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "shape.key", "v"], p),
+        "seed shape.key",
+    );
+
+    let ok = run_libra_command(&["--machine", "config", "shape.key"], p);
+    assert_cli_success(&ok, "machine success");
+    // `--machine` emits a compact single-line JSON envelope (not a bare value).
+    let body = String::from_utf8_lossy(&ok.stdout);
+    assert!(
+        body.contains("\"ok\":true") && body.contains("\"value\":\"v\""),
+        "machine success payload: {body}"
+    );
+    assert_eq!(
+        body.lines().count(),
+        1,
+        "machine output is single-line: {body}"
+    );
+
+    let err = run_libra_command(&["--machine", "config", "shape.missing"], p);
+    assert_eq!(err.status.code(), Some(1), "machine failure exit code");
+}
+
+/// CT1-01 AC 9–11: an ORDINARY key whose stored value happens to be encrypted
+/// still bare-reads, and it reads through `config get`'s `reveal=false`
+/// rendering path — `<REDACTED>`, never the plaintext, never the ciphertext.
+///
+/// Before this card the stored `encrypted` flag was folded into the
+/// protected-input decision, so `libra config ordinary.blob` reported
+/// "missing value for protected key" with exit 2 instead of reading. Only an
+/// explicit assignment (`config set <key>` / `--add`) may draw that inference
+/// now; see `handle_set`.
+#[test]
+#[serial]
+fn config_bare_read_encrypted_is_redacted() {
+    const SENTINEL: &str = "ct101-plaintext-sentinel-must-never-print";
+
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "--local",
+                "--encrypt",
+                "ordinary.blob",
+                SENTINEL,
+            ],
+            p,
+        ),
+        "seed an encrypted value under an ordinary (non-protected) key",
+    );
+    // `is_sensitive_key` classifies by the key's LAST segment, so the key here
+    // must not spell secret/token/password/... — otherwise the test would be
+    // exercising the protected path it is meant to stay clear of.
+
+    let bare = run_libra_command(&["config", "ordinary.blob"], p);
+    assert_cli_success(&bare, "bare read of an encrypted ordinary key");
+    let stdout = String::from_utf8_lossy(&bare.stdout);
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+
+    // Redacted, and byte-identical to the explicit read: same rendering path.
+    assert_eq!(stdout.trim(), "<REDACTED>", "bare read stdout: {stdout}");
+    let via_get = run_libra_command(&["config", "get", "ordinary.blob"], p);
+    assert_cli_success(&via_get, "config get of the same key");
+    assert_eq!(
+        bare.stdout, via_get.stdout,
+        "bare read must reuse `config get`'s reveal=false rendering"
+    );
+
+    // Does not decrypt.
+    assert!(
+        !stdout.contains(SENTINEL) && !stderr.contains(SENTINEL),
+        "bare read must not decrypt the value: stdout={stdout} stderr={stderr}"
+    );
+
+    // Does not echo the ciphertext. Compare against the row as actually stored,
+    // so this cannot pass by the value merely being spelled differently.
+    let ciphertext = stored_config_value(p, "ordinary.blob");
+    assert!(
+        !ciphertext.is_empty() && ciphertext != SENTINEL,
+        "the seeded row should hold ciphertext, not the plaintext: {ciphertext}"
+    );
+    assert!(
+        !stdout.contains(&ciphertext) && !stderr.contains(&ciphertext),
+        "bare read must not echo the stored ciphertext: stdout={stdout} stderr={stderr}"
+    );
+}
+
+/// CT1-01 AC 1, with `-z` in play: "byte-identical to `config get`" has to
+/// hold for the documented read flags too. The bare form used to hardcode
+/// newline termination, so `config -z <key>` emitted `v\n` where
+/// `config -z get <key>` emitted `v\0`.
+#[test]
+#[serial]
+fn config_bare_read_null_terminated_matches_get() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "zed.key", "v"], p),
+        "seed zed.key",
+    );
+
+    let bare = run_libra_command(&["config", "-z", "zed.key"], p);
+    assert_cli_success(&bare, "bare read with -z");
+    let via_get = run_libra_command(&["config", "-z", "get", "zed.key"], p);
+    assert_cli_success(&via_get, "config get with -z");
+    assert_eq!(
+        bare.stdout, via_get.stdout,
+        "-z bare read must be byte-identical to -z `config get`"
+    );
+    assert_eq!(bare.stdout, b"v\0", "-z terminates with NUL, not newline");
+}
+
+/// CT1-01 AC 7: the protected-key divergence must not become a disclosure
+/// channel. The pinned `config_bare_read_sensitive_key_keeps_interactive_set`
+/// asserts the error and exit code but seeds no secret, so nothing there would
+/// notice a value leaking into the message. Seed one and check all three
+/// output shapes, on both streams.
+#[test]
+#[serial]
+fn config_bare_read_sensitive_key_never_leaks_value() {
+    const SENTINEL: &str = "ct101-protected-sentinel-must-never-print";
+
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "user.password", SENTINEL], p),
+        "seed a protected key",
+    );
+
+    for shape in [
+        vec!["config", "user.password"],
+        vec!["--json", "config", "user.password"],
+        vec!["--machine", "config", "user.password"],
+    ] {
+        let out = run_libra_command(&shape, p);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stdout.contains(SENTINEL),
+            "{shape:?} leaked the stored secret on stdout: {stdout}"
+        );
+        assert!(
+            !stderr.contains(SENTINEL),
+            "{shape:?} leaked the stored secret on stderr: {stderr}"
+        );
+        // Pin the failure class too: a shape that started SUCCEEDING would
+        // also satisfy the two assertions above while having quietly turned
+        // the protected key into a readable one.
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{shape:?} must stay on the protected-key path: {stderr}"
+        );
+        assert!(
+            stderr.contains("missing value for protected key"),
+            "{shape:?} must report the protected-key error: {stderr}"
+        );
+    }
+}
+
+/// CT1-01: the interactive secure-assignment branch a protected key keeps
+/// (`src/command/config.rs`, the `rpassword` prompt) is unreachable from the
+/// ordinary harness — `base_libra_command` always sets `LIBRA_TEST=1` and the
+/// pipe is not a terminal, both of which short-circuit to the protected-key
+/// error. Drive it on a real pty instead, which is what the plan's manual
+/// evidence item called for.
+#[test]
+#[serial]
+fn config_bare_read_protected_key_interactive_pty() {
+    const SENTINEL: &str = "ct101-typed-sentinel-must-not-echo";
+
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    let (ok, transcript) =
+        run_config_in_pty(&["config", "user.password"], p, &format!("{SENTINEL}\n"));
+    assert!(ok, "interactive assignment should succeed: {transcript}");
+    assert!(
+        transcript.contains("Enter value for user.password:"),
+        "the no-echo prompt must appear: {transcript}"
+    );
+    assert!(
+        !transcript.contains(SENTINEL),
+        "the typed value must not be echoed by the terminal: {transcript}"
+    );
+
+    // The value did land, and reading it back stays redacted.
+    let via_get = run_libra_command(&["config", "get", "user.password"], p);
+    assert_cli_success(&via_get, "read back the interactively assigned value");
+    let stdout = String::from_utf8_lossy(&via_get.stdout);
+    assert_eq!(stdout.trim(), "<REDACTED>", "read back: {stdout}");
+    assert!(
+        !stdout.contains(SENTINEL),
+        "read back must not reveal the value: {stdout}"
+    );
+}
+
+/// The raw `config_kv` row as stored on disk, so a test can assert on the
+/// ciphertext itself rather than on a re-rendering of it. Uses python3's
+/// bundled sqlite3 — `sqlite3(1)` is not installed on every dev machine.
+fn stored_config_value(repo: &std::path::Path, key: &str) -> String {
+    let db = repo.join(".libra/libra.db");
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import sqlite3\nc = sqlite3.connect({db:?})\nr = c.execute('SELECT value FROM \
+             config_kv WHERE key = ?', ({key:?},)).fetchone()\nprint(r[0] if r else '')\n"
+        ))
+        .output()
+        .expect("read config_kv through python3 sqlite3");
+    assert!(
+        out.status.success(),
+        "sqlite read failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Run a libra command on a pty and feed it `input`, so branches gated on
+/// `stdin().is_terminal()` are reachable. `LIBRA_TEST` is deliberately NOT set:
+/// it is the other half of the interactive short-circuit. Returns whether the
+/// child exited successfully plus everything the pty saw.
+fn run_config_in_pty(args: &[&str], cwd: &std::path::Path, input: &str) -> (bool, String) {
+    use std::io::{Read, Write};
+
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let home = cwd.join(".libra-test-home");
+    let config_home = home.join(".config");
+    std::fs::create_dir_all(&config_home).expect("isolated config dir");
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_libra"));
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.cwd(cwd);
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    cmd.env("HOME", &home);
+    cmd.env("USERPROFILE", &home);
+    cmd.env("XDG_CONFIG_HOME", &config_home);
+    cmd.env(
+        "LIBRA_CONFIG_GLOBAL_DB",
+        home.join(".libra").join("config.db"),
+    );
+    cmd.env("LANG", "C");
+    cmd.env("LC_ALL", "C");
+    cmd.env("TERM", "dumb");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn under pty");
+    drop(pair.slave);
+
+    // Drain the master, or the child blocks once the pty buffer fills. The sink
+    // is shared so the main thread can wait for the prompt before typing.
+    let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let drain_sink = std::sync::Arc::clone(&sink);
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        while let Ok(read) = reader.read(&mut buf) {
+            if read == 0 {
+                break;
+            }
+            drain_sink
+                .lock()
+                .expect("pty sink")
+                .extend_from_slice(&buf[..read]);
+        }
+    });
+
+    // Type only once the prompt is on screen. A fixed sleep would race the
+    // child's switch out of echo mode, and typing into a still-echoing pty
+    // would look exactly like the leak this test exists to catch.
+    let prompt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let seen = String::from_utf8_lossy(&sink.lock().expect("pty sink")).into_owned();
+        if seen.contains("Enter value for") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < prompt_deadline,
+            "no interactive prompt within 30s on a pty; saw: {seen}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    {
+        let mut writer = pair.master.take_writer().expect("pty writer");
+        writer.write_all(input.as_bytes()).expect("type into pty");
+        writer.flush().expect("flush pty");
+    }
+
+    // Watchdog: a regression that never reads stdin would otherwise hang CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait().expect("poll the pty child") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!(
+                    "`libra {}` did not exit within 60s on a pty",
+                    args.join(" ")
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    drop(pair.master);
+    let _ = drain.join();
+    let output = sink.lock().expect("pty sink").clone();
+    (
+        status.success(),
+        String::from_utf8_lossy(&output).into_owned(),
+    )
+}

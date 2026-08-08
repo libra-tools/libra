@@ -111,6 +111,30 @@ jobs:
             exit 1
           fi
 
+  owner-liveness-macos:
+    # plan-20260714 W1 (§C.9): the operation claim decides whether a control
+    # action's owner is dead by proving it — boot id + PID namespace on Linux,
+    # host UUID + boot time on macOS. The macOS branch has no other coverage,
+    # and a failure there does not make claims unsafe, it makes them
+    # unreclaimable: a killed command would hold its worktree's control slot
+    # until the row is cleared by hand. These five tests are the proof that the
+    # platform-specific reads work where they run.
+    name: compat-owner-liveness-macos
+    runs-on: macos-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+      LIBRA_SKIP_WEB_BUILD: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Run the claim-owner liveness tests
+        run: cargo test --lib -- claim_owner_tests --test-threads=1
+
   redundancy:
     name: compat-redundancy
     runs-on: [self-hosted]

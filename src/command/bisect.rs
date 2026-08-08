@@ -5,9 +5,9 @@
 //! ancestor and a known "bad" descendant.
 //!
 //! Persistent state lives in a dedicated `bisect_state` table inside the
-//! repository's SQLite store; the schema is created lazily by
-//! [`BisectState::ensure_bisect_state_table_exists`] and migrated in place
-//! when the `completed` column is missing on older databases.
+//! repository's SQLite store; the schema is owned by the versioned migration
+//! `2026072301_bisect_state_worktree_scope` (one row per worktree,
+//! `worktree_id` primary key — lazy DDL was retired with it).
 //!
 //! Non-obvious responsibilities:
 //! - Detached vs. branch HEAD recovery: `start` records the original branch
@@ -29,7 +29,7 @@ use std::{
 };
 
 use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait, Value};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 use serde::Serialize;
 
 use crate::{
@@ -41,7 +41,6 @@ use crate::{
     internal::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
-        db::get_db_conn_instance,
         head::Head,
     },
     utils::{
@@ -85,29 +84,85 @@ impl BisectState {
     /// Returns true when a non-completed bisect session row exists. Used by
     /// the bare-repo guard and by `start` to refuse re-entry.
     pub async fn is_in_progress() -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::has_active_state_in_db(&db).await
     }
 
     /// Returns true when any row exists, including converged sessions whose
     /// state was preserved for `bisect reset`.
     pub async fn has_state() -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::has_any_state_in_db(&db).await
     }
 
-    /// Persist `self` as the single row in `bisect_state`.
+    /// Persist `self` as THIS worktree's single row in `bisect_state`.
     ///
     /// Boundary conditions:
-    /// - Wipes any pre-existing row first (the table is always single-row),
-    ///   so concurrent writers race for last-writer-wins semantics.
+    /// - Upserts on the `worktree_id` primary key in one statement, so
+    ///   concurrent writers in the same worktree get last-writer-wins
+    ///   semantics instead of one of them hitting a UNIQUE violation.
+    ///   Last-writer-wins is right for an OWNER advancing its own session; a
+    ///   STARTING session must use [`BisectState::claim_start`] instead.
     pub async fn save(&self) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
-        Self::clear_state_in_db(&db).await?;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::save_with_conn(&db, self).await
+    }
+
+    /// Claim this worktree's bisect slot for a STARTING session (§C.4.4).
+    ///
+    /// `ensure_none_for_bisect` is a check, and a check followed by an upsert
+    /// is a TOCTOU window: two `bisect start` runs in one worktree both see no
+    /// row, both check out a candidate, and the loser's upsert overwrites the
+    /// winner's `orig_head` — so `bisect reset` afterwards returns HEAD to the
+    /// wrong place, which is the one thing a bisect must not get wrong. A bare
+    /// `INSERT` against `worktree_id PRIMARY KEY` lets exactly one starter
+    /// win; the loser gets the ordinary "already in progress" refusal.
+    pub async fn claim_start(&self) -> Result<(), String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        let good_json = serde_json::to_string(&self.good)
+            .map_err(|e| format!("failed to serialize good commits: {e}"))?;
+        let skipped_json = serde_json::to_string(&self.skipped)
+            .map_err(|e| format!("failed to serialize skipped commits: {e}"))?;
+        let scope_key = crate::internal::worktree_scope::WorktreeScope::for_request()
+            .storage_key()
+            .to_string();
+        let result = db
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, \
+                 skipped, steps, completed, first_parent, worktree_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    self.orig_head.to_string().into(),
+                    self.orig_head_name
+                        .clone()
+                        .map(|name| name.into())
+                        .unwrap_or(Value::String(None)),
+                    self.bad
+                        .map(|h| h.to_string().into())
+                        .unwrap_or(Value::String(None)),
+                    good_json.into(),
+                    self.current
+                        .map(|h| h.to_string().into())
+                        .unwrap_or(Value::String(None)),
+                    skipped_json.into(),
+                    self.steps
+                        .map(|s| s as i64)
+                        .map(|v| v.into())
+                        .unwrap_or(Value::BigInt(None)),
+                    (self.completed as i64).into(),
+                    (self.first_parent as i64).into(),
+                    scope_key.into(),
+                ],
+            ))
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if crate::internal::sequencer::is_unique_violation(&err) => {
+                Err("a bisect is already in progress in this worktree".to_string())
+            }
+            Err(err) => Err(format!("failed to claim bisect_state: {err}")),
+        }
     }
 
     /// Load the persisted bisect state.
@@ -116,8 +171,7 @@ impl BisectState {
     /// - Returns `Err("No bisect in progress")` if the row is missing — this
     ///   propagates as a fatal CLI error in every caller.
     pub async fn load() -> Result<Self, String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::load_from_db(&db)
             .await?
             .ok_or_else(|| "No bisect in progress".to_string())
@@ -125,168 +179,13 @@ impl BisectState {
 
     /// Drop the bisect state row. Idempotent on an empty table.
     pub async fn cleanup() -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_bisect_state_table_exists(&db).await?;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::clear_state_in_db(&db).await
-    }
-
-    /// Lazy DDL: ensure the `bisect_state` table exists and has the
-    /// `completed` column.
-    ///
-    /// Functional scope:
-    /// - Creates the table with `CREATE TABLE IF NOT EXISTS`.
-    /// - Inspects `pragma_table_info` to detect older schemas missing the
-    ///   `completed` column and adds it via `ALTER TABLE`.
-    ///
-    /// Boundary conditions:
-    /// - Concurrent migrations are tolerated: if `ALTER TABLE` fails with
-    ///   `"duplicate column name"` because another process won the race, the
-    ///   error is swallowed and the function returns `Ok(())`.
-    /// - Any other DDL failure is bubbled up as a `String` error.
-    async fn ensure_bisect_state_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        // Use IF NOT EXISTS for idempotency (handles concurrent creation)
-        let create_table_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                CREATE TABLE IF NOT EXISTS bisect_state (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    orig_head    TEXT NOT NULL,
-                    orig_head_name TEXT,
-                    bad          TEXT,
-                    good         TEXT NOT NULL,
-                    current      TEXT,
-                    skipped      TEXT,
-                    steps        INTEGER,
-                    completed    INTEGER NOT NULL DEFAULT 0,
-                    first_parent INTEGER NOT NULL DEFAULT 0
-                );
-            "#
-            .to_string(),
-        );
-
-        db.execute(create_table_stmt)
-            .await
-            .map_err(|e| format!("failed to create bisect_state table: {e}"))?;
-
-        // Check if completed column exists (migration for older tables without it)
-        let check_column_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                SELECT COUNT(*)
-                FROM pragma_table_info('bisect_state')
-                WHERE name='completed';
-            "#
-            .to_string(),
-        );
-
-        if let Some(result) = db
-            .query_one(check_column_stmt)
-            .await
-            .map_err(|e| format!("failed to check bisect_state columns: {e}"))?
-        {
-            let count: i64 = result.try_get_by_index(0).unwrap_or(0);
-            if count == 0 {
-                // completed column doesn't exist - add it
-                let alter_stmt = Statement::from_string(
-                    DbBackend::Sqlite,
-                    "ALTER TABLE bisect_state ADD COLUMN completed INTEGER NOT NULL DEFAULT 0;"
-                        .to_string(),
-                );
-
-                // Handle concurrent migration: if another process already added the column,
-                // SQLite returns "duplicate column name" error which we should treat as success
-                match db.execute(alter_stmt).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("duplicate column name") {
-                            return Err(format!("failed to add completed column: {e}"));
-                        }
-                        // Column already exists (added by concurrent process) - continue
-                    }
-                }
-            }
-        }
-
-        // Check if first_parent column exists (migration for older tables without it)
-        let check_first_parent_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                SELECT COUNT(*)
-                FROM pragma_table_info('bisect_state')
-                WHERE name='first_parent';
-            "#
-            .to_string(),
-        );
-
-        if let Some(result) = db
-            .query_one(check_first_parent_stmt)
-            .await
-            .map_err(|e| format!("failed to check bisect_state columns: {e}"))?
-        {
-            let count: i64 = result.try_get_by_index(0).unwrap_or(0);
-            if count == 0 {
-                let alter_stmt = Statement::from_string(
-                    DbBackend::Sqlite,
-                    "ALTER TABLE bisect_state ADD COLUMN first_parent INTEGER NOT NULL DEFAULT 0;"
-                        .to_string(),
-                );
-                match db.execute(alter_stmt).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("duplicate column name") {
-                            return Err(format!("failed to add first_parent column: {e}"));
-                        }
-                        // Column already exists (added by concurrent process) - continue
-                    }
-                }
-            }
-        }
-
-        // Part C W1 (§C.4.2): `worktree_id` scopes the bisect to the worktree
-        // that started it (empty string = main). Added by plain `ADD COLUMN`
-        // (not a table rebuild) so it works regardless of which of the lazily
-        // added columns above already exist. Existing rows belong to main
-        // (`''`), and each worktree keeps its own single bisect row.
-        let check_worktree_id_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                SELECT COUNT(*)
-                FROM pragma_table_info('bisect_state')
-                WHERE name='worktree_id';
-            "#
-            .to_string(),
-        );
-        if let Some(result) = db
-            .query_one(check_worktree_id_stmt)
-            .await
-            .map_err(|e| format!("failed to check bisect_state columns: {e}"))?
-        {
-            let count: i64 = result.try_get_by_index(0).unwrap_or(0);
-            if count == 0 {
-                let alter_stmt = Statement::from_string(
-                    DbBackend::Sqlite,
-                    "ALTER TABLE bisect_state ADD COLUMN worktree_id TEXT NOT NULL DEFAULT '';"
-                        .to_string(),
-                );
-                match db.execute(alter_stmt).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if !e.to_string().contains("duplicate column name") {
-                            return Err(format!("failed to add worktree_id column: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// This worktree's scope key for `bisect_state` (`""` = main worktree).
     fn scope_key() -> String {
-        crate::internal::worktree_scope::WorktreeScope::current()
+        crate::internal::worktree_scope::WorktreeScope::for_request()
             .storage_key()
             .to_string()
     }
@@ -302,7 +201,7 @@ impl BisectState {
         );
 
         if let Some(result) = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to query bisect_state: {e}"))?
         {
@@ -324,7 +223,7 @@ impl BisectState {
         );
 
         if let Some(result) = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to query bisect_state: {e}"))?
         {
@@ -335,8 +234,8 @@ impl BisectState {
         Ok(false)
     }
 
-    /// Insert `state` into `bisect_state`. Vector fields are JSON-encoded.
-    /// Caller is responsible for clearing any existing row first.
+    /// Upsert `state` as this scope's `bisect_state` row (conflict target:
+    /// the `worktree_id` primary key). Vector fields are JSON-encoded.
     async fn save_with_conn<C: ConnectionTrait>(db: &C, state: &BisectState) -> Result<(), String> {
         let good_json = serde_json::to_string(&state.good)
             .map_err(|e| format!("failed to serialize good commits: {e}"))?;
@@ -347,7 +246,17 @@ impl BisectState {
             DbBackend::Sqlite,
             r#"
                 INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent, worktree_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(worktree_id) DO UPDATE SET
+                    orig_head = excluded.orig_head,
+                    orig_head_name = excluded.orig_head_name,
+                    bad = excluded.bad,
+                    good = excluded.good,
+                    current = excluded.current,
+                    skipped = excluded.skipped,
+                    steps = excluded.steps,
+                    completed = excluded.completed,
+                    first_parent = excluded.first_parent;
             "#,
             [
                 state.orig_head.to_string().into(),
@@ -377,7 +286,7 @@ impl BisectState {
             ],
         );
 
-        db.execute(stmt)
+        db.execute_raw(stmt)
             .await
             .map_err(|e| format!("failed to save bisect state: {e}"))?;
 
@@ -387,15 +296,31 @@ impl BisectState {
     /// Read the single bisect-state row, decoding the JSON-encoded
     /// `good`/`skipped` vectors and re-parsing each `ObjectHash`. Returns
     /// `Ok(None)` when no row exists.
+    /// The row of an EXPLICITLY resolved scope (§C.4.2) — the `ORIG_HEAD`
+    /// projection of §C.5 reads it for the scope its caller resolved.
+    pub(crate) async fn load_for_scope(
+        scope: &crate::internal::worktree_scope::WorktreeScope,
+    ) -> Result<Option<BisectState>, String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        Self::load_from_db_in_scope(&db, scope.storage_key()).await
+    }
+
     async fn load_from_db<C: ConnectionTrait>(db: &C) -> Result<Option<BisectState>, String> {
+        Self::load_from_db_in_scope(db, &Self::scope_key()).await
+    }
+
+    async fn load_from_db_in_scope<C: ConnectionTrait>(
+        db: &C,
+        scope_key: &str,
+    ) -> Result<Option<BisectState>, String> {
         let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent FROM bisect_state WHERE worktree_id = ? LIMIT 1;",
-            [Self::scope_key().into()],
+            [scope_key.into()],
         );
 
         if let Some(result) = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to load bisect state: {e}"))?
         {
@@ -444,7 +369,7 @@ impl BisectState {
     }
 
     /// Truncate THIS worktree's bisect-state row (Part C W1 §C.4.2). Used by
-    /// both `save` (before insert) and `cleanup` (after a session ends). Never
+    /// `cleanup` after a session ends (`save` upserts in place instead). Never
     /// an unconditional `DELETE`, which would wipe another worktree's bisect.
     async fn clear_state_in_db<C: ConnectionTrait>(db: &C) -> Result<(), String> {
         let stmt = Statement::from_sql_and_values(
@@ -453,7 +378,7 @@ impl BisectState {
             [Self::scope_key().into()],
         );
 
-        db.execute(stmt)
+        db.execute_raw(stmt)
             .await
             .map_err(|e| format!("failed to clear bisect state: {e}"))?;
 
@@ -841,25 +766,7 @@ fn hashes_to_strings(hashes: &[ObjectHash]) -> Vec<String> {
 ///   safely if we cannot tell whether a worktree exists.
 /// - Underlying DB read failure -> fatal `CliError`.
 async fn is_bare_repository() -> CliResult<bool> {
-    fn parse_git_bool(value: &str) -> Option<bool> {
-        match value.trim() {
-            v if v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-                || v == "1" =>
-            {
-                Some(true)
-            }
-            v if v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-                || v.eq_ignore_ascii_case("off")
-                || v == "0" =>
-            {
-                Some(false)
-            }
-            _ => None,
-        }
-    }
+    use crate::internal::config::parse_git_bool;
 
     match ConfigKv::get("core.bare").await {
         Ok(Some(entry)) => parse_git_bool(&entry.value).ok_or_else(|| {
@@ -907,6 +814,18 @@ async fn run_bisect_start(
         return Err(CliError::fatal("bisect cannot be run in a bare repository")
             .with_hint("bisect requires a working tree to check out commits for testing"));
     }
+
+    // §C.4.4 bisect/sequencer mutual exclusion: a rebase, cherry-pick, revert,
+    // merge or am owning THIS worktree's scope blocks a new bisect, exactly as
+    // an active bisect now blocks them. Bisect was outside the symmetric mutex
+    // entirely, so a `bisect start` could begin beside an in-progress sequence
+    // and then check out candidates underneath it.
+    //
+    // Checked BEFORE the clean-tree requirement: an in-progress sequence is
+    // the more fundamental blocker, and it is usually what made the tree
+    // dirty — "working tree contains uncommitted changes" would send the user
+    // to commit conflict markers.
+    crate::internal::sequencer::ensure_none_for_bisect().await?;
 
     // Require a clean working tree to prevent data loss: each bisect checkout
     // resets tracked paths in the index and working tree to the candidate
@@ -978,7 +897,9 @@ async fn run_bisect_start(
         }
     }
 
-    state.save().await.map_err(CliError::fatal)?;
+    // The first write of a STARTING session is a claim, not an upsert
+    // (§C.4.4) — see `BisectState::claim_start`.
+    state.claim_start().await.map_err(CliError::fatal)?;
 
     if bad_hash.is_some() && good_hash.is_none() {
         return Ok(BisectOutput::Start {
@@ -1348,15 +1269,28 @@ async fn run_bisect_reset(rev: Option<String>) -> CliResult<BisectOutput> {
     // Warn and end the session detached at the target commit instead.
     let target_branch = match target_branch {
         Some(branch_name) => {
-            if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
-                crate::utils::error::emit_warning(format!(
-                    "not re-attaching branch '{branch_name}': it is now checked out at \
-                     worktree '{other}'; bisect ends detached at {target_hash} \
-                     (use 'libra switch' to pick a branch)"
-                ));
-                None
-            } else {
-                Some(branch_name)
+            // §C.4.4: fail CLOSED on the DANGEROUS action. If the probe
+            // cannot answer, do not re-attach — ending detached is
+            // recoverable with one `switch`; two worktrees on one branch is
+            // not.
+            match Head::branch_checked_out_elsewhere_result(&branch_name).await {
+                Ok(Some(other)) => {
+                    crate::utils::error::emit_warning(format!(
+                        "not re-attaching branch '{branch_name}': it is now checked out at \
+                         worktree '{other}'; bisect ends detached at {target_hash} \
+                         (use 'libra switch' to pick a branch)"
+                    ));
+                    None
+                }
+                Ok(None) => Some(branch_name),
+                Err(error) => {
+                    crate::utils::error::emit_warning(format!(
+                        "not re-attaching branch '{branch_name}': cannot determine whether it \
+                         is checked out in another worktree ({error}); bisect ends detached at \
+                         {target_hash} (use 'libra switch' to pick a branch)"
+                    ));
+                    None
+                }
             }
         }
         None => None,
@@ -1386,6 +1320,10 @@ fn map_bisect_branch_store_error(branch_name: &str, error: BranchStoreError) -> 
         ))
         .with_stable_code(StableErrorCode::IoReadFailed)
         .with_hint("repair branch storage or reset to an explicit revision with 'libra bisect reset <rev>'."),
+        BranchStoreError::AlreadyExists(name) => CliError::fatal(format!(
+            "branch '{name}' already exists"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget),
         BranchStoreError::Corrupt { .. } => CliError::fatal(format!(
             "failed to restore original branch '{branch_name}': {error}"
         ))
@@ -1399,6 +1337,16 @@ fn map_bisect_branch_store_error(branch_name: &str, error: BranchStoreError) -> 
             "failed to restore original branch '{branch_name}': {error}"
         ))
         .with_stable_code(StableErrorCode::IoWriteFailed),
+        // §C.13: a checkout collision is a CONFLICT, not corruption or an
+        // I/O fault — the repository is intact and the user has a next step.
+        BranchStoreError::CheckedOutElsewhere { .. } => CliError::fatal(format!(
+            "failed to restore original branch '{branch_name}': {error}"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "the other worktree must switch away first; `libra worktree list` shows which one \
+             holds it",
+        ),
     }
 }
 
@@ -1415,16 +1363,19 @@ fn map_bisect_branch_store_error(branch_name: &str, error: BranchStoreError) -> 
 /// - Transaction begin/commit failures and HEAD-mismatch detection both
 ///   return fatal `CliError`s with diagnostic messages.
 async fn restore_to_branch(branch_name: String, commit_hash: ObjectHash) -> CliResult<()> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
 
-    let txn = db
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(&db)
         .await
         .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
 
     // Update HEAD to point to the branch
     let new_head = Head::Branch(branch_name.clone());
-    Head::update_with_conn(&txn, new_head.clone(), None).await;
+    Head::update_result_with_conn(&txn, new_head.clone(), None)
+        .await
+        .map_err(|error| map_bisect_branch_store_error(&branch_name, error))?;
 
     txn.commit()
         .await
@@ -1677,15 +1628,21 @@ async fn resolve_ref(ref_str: &str) -> CliResult<ObjectHash> {
 ///   restore runs after commit, so a partial failure between them leaves the
 ///   worktree out of sync until `bisect reset`.
 async fn checkout_to_commit(commit_hash: ObjectHash) -> CliResult<()> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
 
-    let txn = db
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(&db)
         .await
         .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
 
     let new_head = Head::Detached(commit_hash);
-    Head::update_with_conn(&txn, new_head, None).await;
+    Head::update_result_with_conn(&txn, new_head, None)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to move HEAD to {commit_hash}: {error}"))
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
 
     txn.commit()
         .await
@@ -1948,4 +1905,14 @@ async fn count_commits_to_test(state: &BisectState) -> Result<usize, String> {
     let testable =
         get_testable_commits(&bad, &state.good, &state.skipped, state.first_parent).await?;
     Ok(testable.len())
+}
+
+/// `ORIG_HEAD` for an explicitly resolved scope — the §C.5 projection. `None`
+/// when that worktree has no bisect session; an unreadable row is an ERROR.
+pub(crate) async fn orig_head_for_scope(
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<String>, String> {
+    Ok(BisectState::load_for_scope(scope)
+        .await?
+        .map(|state| state.orig_head.to_string()))
 }

@@ -287,6 +287,13 @@ pub struct InvestigateRunState {
     /// investigators spawn so an orphaned run can be cleaned up).
     #[serde(default)]
     pub workspace_root: Option<String>,
+    /// PD-02 checkpoint scope: when set, every drive pass (including
+    /// `investigate continue` resumes) materializes THIS checkpoint's
+    /// content as the investigators' whole workspace instead of a
+    /// worktree snapshot. Persisted so a resume can never silently fall
+    /// back to reviewing the current worktree.
+    #[serde(default)]
+    pub checkpoint_input: Option<crate::internal::ai::checkpoint_input::CheckpointInputSpec>,
 }
 
 impl InvestigateRunState {
@@ -501,6 +508,7 @@ impl InvestigateRunStore {
             terminal_state: None,
             cancel_requested: false,
             workspace_root: None,
+            checkpoint_input: None,
         };
         let manifest = InvestigateManifest {
             schema_version: INVESTIGATE_MANIFEST_SCHEMA_VERSION,
@@ -629,29 +637,40 @@ impl InvestigateRunStore {
             })
     }
 
-    /// A0-06: write `bytes` as a content-addressed git blob and enqueue it
-    /// into `object_index` (tag [`AGENT_FINDINGS_OTYPE`]), returning the OID.
-    /// Idempotent by content-addressing.
-    pub fn objectize_bytes(&self, bytes: &[u8]) -> io::Result<String> {
+    /// §C.4.3 writer-vs-deleter: objectize `bytes` and publish the manifest
+    /// that roots the resulting oid, as ONE sequence under the repository
+    /// maintenance lock.
+    ///
+    /// The two halves cannot be separated by a caller, which is the point.
+    /// Findings and attachments are content-addressed, so objectizing can
+    /// resolve to an oid that already exists — including one a `gc` has
+    /// already quarantined. In the window between the objectize and the
+    /// manifest write the blob has no root in this run, and the other
+    /// protections do not cover it: the manifest EXISTS (so the
+    /// missing-manifest fail-closed does not fire) and does not yet name the
+    /// oid. A concurrent deletion phase would take the bytes and leave the
+    /// manifest pointing at nothing.
+    ///
+    /// `libra review` / `libra investigate` deliberately do NOT take the
+    /// command-level shared hold — an AI run lasts minutes and holding it
+    /// would starve every deleter (§C.10) — so the hold lives here, around
+    /// the publication itself, which is the only part that needs it.
+    /// `publish` receives the oid and must be the call that writes the
+    /// manifest naming it.
+    pub(crate) fn objectize_and_publish<F>(&self, bytes: &[u8], publish: F) -> io::Result<String>
+    where
+        F: FnOnce(&str) -> io::Result<()>,
+    {
         let libra_dir = self.libra_dir()?;
-        let oid = crate::utils::object::write_git_object(&libra_dir, "blob", bytes)
-            .map_err(|e| io::Error::other(format!("failed to write findings object: {e}")))?;
-        crate::utils::client_storage::enqueue_agent_blob_object_index_update(
-            &libra_dir,
-            &oid.to_string(),
-            AGENT_FINDINGS_OTYPE,
-            bytes.len() as i64,
-        )?;
-        Ok(oid.to_string())
-    }
-
-    /// A0-06: objectize the run's current `findings.md`. `None` when empty.
-    pub fn objectize_findings(&self, run_id: &str) -> io::Result<Option<String>> {
-        let content = self.read_findings(run_id)?.unwrap_or_default();
-        if content.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(self.objectize_bytes(content.as_bytes())?))
+        let publication = crate::internal::maintenance_lock::MaintenanceLock::shared(&libra_dir)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to take the repository maintenance lock before publishing: {error}"
+                ))
+            })?;
+        let oid = raw_object::write(&publication, &libra_dir, bytes)?;
+        publish(&oid)?;
+        Ok(oid)
     }
 
     pub fn write_manifest_terminal(
@@ -670,11 +689,19 @@ impl InvestigateRunStore {
         manifest.redaction_report = redaction;
         manifest.updated_at = utc_timestamp();
         // A0-06: objectize the final findings.md so `findings_oid` points at a
-        // real, object_index-visible, doctor-repairable blob.
-        if let Some(oid) = self.objectize_findings(run_id)? {
-            manifest.findings_oid = Some(oid);
+        // real, object_index-visible, doctor-repairable blob. The objectize
+        // and the manifest write that roots it are ONE sequence under the
+        // maintenance lock — `objectize_and_publish` is the only way to reach
+        // the object writer, so this cannot be split by accident (§C.4.3).
+        let findings = self.read_findings(run_id)?.unwrap_or_default();
+        if findings.is_empty() {
+            return self.write_manifest(&manifest);
         }
-        self.write_manifest(&manifest)
+        self.objectize_and_publish(findings.as_bytes(), |oid| {
+            manifest.findings_oid = Some(oid.to_string());
+            self.write_manifest(&manifest)
+        })?;
+        Ok(())
     }
 
     /// Cross-process cancel request: drop a marker file the owning driver
@@ -865,6 +892,41 @@ fn acquire_flock(_file: &File, _run_id: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Raw object publication — the object writer, behind a lock the caller must
+/// already hold.
+///
+/// The boundary is enforced by the module system and the signature, not by
+/// convention: [`write`] is private to this file, and it cannot be called
+/// without a [`MaintenanceLock`] guard, which only
+/// `investigate` run publication takes. A future site that wanted to objectize
+/// bytes without publishing them would have to acquire the lock to do it,
+/// which is the invariant (plan-20260714 §C.4.3).
+mod raw_object {
+    use std::{io, path::Path};
+
+    use super::AGENT_FINDINGS_OTYPE;
+    use crate::internal::maintenance_lock::MaintenanceLock;
+
+    /// Write `bytes` as a content-addressed git blob and enqueue it into
+    /// `object_index`. Content-addressed, so re-writing identical bytes is
+    /// idempotent.
+    pub(super) fn write(
+        _held: &MaintenanceLock,
+        libra_dir: &Path,
+        bytes: &[u8],
+    ) -> io::Result<String> {
+        let oid = crate::utils::object::write_git_object(libra_dir, "blob", bytes)
+            .map_err(|e| io::Error::other(format!("failed to write findings object: {e}")))?;
+        crate::utils::client_storage::enqueue_agent_blob_object_index_update(
+            libra_dir,
+            &oid.to_string(),
+            AGENT_FINDINGS_OTYPE,
+            bytes.len() as i64,
+        )?;
+        Ok(oid.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -875,6 +937,59 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = InvestigateRunStore::new(dir.path().join(".libra").join("sessions"));
         (dir, store)
+    }
+
+    /// §C.4.3: publishing an objectized blob holds the repository
+    /// maintenance lock across the manifest write that roots it — the
+    /// investigate store's own copy of the invariant, not the review one's.
+    #[test]
+    fn publication_holds_the_lock_across_the_manifest_write() {
+        let (dir, store) = store();
+        let libra_dir = dir.path().join(".libra");
+        let mut observed_lock_held = false;
+        let oid = store
+            .objectize_and_publish(b"findings body", |_oid| {
+                // Inside the publication window an outside acquirer must be
+                // refused. This process holds it shared, and a shared hold is
+                // never upgradable, so the refusal here is the one another
+                // process would get.
+                observed_lock_held =
+                    crate::internal::maintenance_lock::MaintenanceLock::try_exclusive(
+                        &libra_dir,
+                        std::time::Duration::from_millis(50),
+                    )
+                    .expect("probe")
+                    .is_none();
+                Ok(())
+            })
+            .expect("publish");
+        assert!(!oid.is_empty());
+        assert!(
+            observed_lock_held,
+            "the lock must be held while the manifest is being written"
+        );
+        assert!(libra_dir.join("maintenance.lock").exists());
+    }
+
+    /// Tripwire for the structural boundary.
+    ///
+    /// The boundary itself is the module system: the object writer lives in
+    /// the private `raw_object` module and its signature demands a held
+    /// `MaintenanceLock`, so no site can objectize bytes without taking the
+    /// lock — that is not something a test enforces. This only catches the
+    /// cheaper regression of someone adding a second call inside the one
+    /// function that already holds a guard and then publishing later.
+    #[test]
+    fn the_object_writer_has_exactly_one_caller() {
+        let source = include_str!("store.rs");
+        // Split so this test's own text is not a match.
+        let needle = concat!("raw_object::", "write(");
+        let calls = source.matches(needle).count();
+        assert_eq!(
+            calls, 1,
+            "the object writer must be called only from objectize_and_publish, which holds the \
+             maintenance lock across the publication"
+        );
     }
 
     /// E8-libra manifest contract: exactly the 12 keys, no more, no less,

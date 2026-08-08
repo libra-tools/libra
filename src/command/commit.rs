@@ -12,7 +12,7 @@ use clap::Parser;
 use git_internal::{
     hash::{ObjectHash, get_hash_kind},
     internal::{
-        index::{Index, IndexEntry},
+        index::Index,
         object::{
             ObjectTrait,
             blob::Blob,
@@ -444,8 +444,19 @@ impl From<CommitError> for CliError {
             CommitError::ParentCommitLoad { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("the parent commit is missing or corrupted"),
+            // §C.13: the same failure variant carries two very different
+            // conditions. A branch another worktree has checked out is a
+            // CONFLICT (`LBR-CONFLICT-002`) — the repository is intact and
+            // the user has a next step; everything else here is a write
+            // fault. The predicate belongs to the storage layer, so this
+            // boundary asks it rather than matching on the message itself.
             CommitError::HeadUpdate(..) => {
-                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+                crate::internal::branch::checked_out_elsewhere_cli_error(&error).unwrap_or_else(
+                    || {
+                        CliError::fatal(error.to_string())
+                            .with_stable_code(StableErrorCode::IoWriteFailed)
+                    },
+                )
             }
             CommitError::PreCommitHook(..) | CommitError::RepositoryHook { .. } => {
                 CliError::failure(error.to_string())
@@ -1036,6 +1047,15 @@ async fn run_commit_with_index(
 
         let index =
             Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        // lore.md 2.4 / §C.11 W1: the LAST gate before a commit is published.
+        // `add` has its own guard, but plumbing does not — `update-index --add`
+        // stages a path directly — so a materialized layer overlay could reach
+        // history and be pushed, and its content lives outside the repository.
+        // Checked here because this is the choke point every path goes through,
+        // and fail-closed: a lookup failure refuses rather than publishes.
+        crate::internal::layer::reject_layer_owned_entries(&index, "to commit")
+            .await
+            .map_err(CommitError::IndexLoad)?;
         let storage = ClientStorage::init(path::objects());
         let tracked_entries = index.tracked_entries(0);
 
@@ -1760,7 +1780,7 @@ fn append_status_section(mut buffer: String, status_section: Option<&str>) -> St
 /// empty; collection/config/rendering failures abort with their original stable
 /// CLI error rather than silently omitting the section.
 async fn build_status_section(
-    status_args: status::StatusArgs,
+    status_args: status::ResolvedStatusArgs,
 ) -> Result<Option<String>, CommitError> {
     let mut raw: Vec<u8> = Vec::new();
     status::execute_to_resolved(status_args, &mut raw)
@@ -2602,7 +2622,10 @@ fn auto_stage_tracked_changes(
                 });
             }
         }
-        // Refresh blob IDs for modified tracked files before updating the index
+        // Refresh blob IDs for modified tracked files before updating the index.
+        // Stat BEFORE reading: the entry's stat must describe the hashed
+        // content, or it is smudged (2026-08-06 R0-8 review).
+        let pre_read = std::fs::symlink_metadata(&abs).ok();
         let blob = if cache_preview_objects {
             read_and_cache_preview_blob(&abs)?
         } else {
@@ -2618,9 +2641,10 @@ fn auto_stage_tracked_changes(
             })?;
         }
         index.update(
-            IndexEntry::new_from_file(&file, blob.id, &workdir).map_err(|e| {
-                CommitError::AutoStage(format!("failed to create index entry: {}", e))
-            })?,
+            crate::command::verified_index_entry(&file, blob.id, &workdir, pre_read.as_ref())
+                .map_err(|e| {
+                    CommitError::AutoStage(format!("failed to create index entry: {}", e))
+                })?,
         );
         touched = true;
     }
@@ -2945,6 +2969,31 @@ async fn get_parents_ids() -> Vec<ObjectHash> {
 async fn update_head<C: ConnectionTrait>(db: &C, commit_id: &str) -> Result<(), CommitError> {
     match Head::current_with_conn(db).await {
         Head::Branch(name) => {
+            // plan-20260714 §C.4.4: `commit` and `amend` are current-branch ref
+            // writers, and they were the ones NOT wired to the checked-out
+            // guard. Normally this worktree is the only one on `name` and the
+            // probe returns None. It matters for a repository that already
+            // holds a duplicate checkout — created before the guard existed,
+            // or by a registry edit — where committing moves a branch a
+            // second worktree's HEAD is also on, silently diverging that
+            // worktree's working tree from its own branch. Fail closed before
+            // writing the ref, and say where the other checkout is.
+            if let Some(other) = Head::branch_checked_out_elsewhere_result_with_conn(db, &name)
+                .await
+                .map_err(|error| {
+                    CommitError::HeadUpdate(format!(
+                        "cannot determine whether branch '{name}' is checked out in another \
+                         worktree: {error}"
+                    ))
+                })?
+            {
+                return Err(CommitError::HeadUpdate(format!(
+                    "branch '{name}' is also checked out at worktree '{other}', so committing \
+                     here would move a pointer that worktree is using; run `libra worktree \
+                     list` to inspect, then `libra worktree repair --confirm` or switch one \
+                     of them to another branch"
+                )));
+            }
             Branch::update_branch_with_conn(db, &name, commit_id, None)
                 .await
                 .map_err(|e| {
@@ -2956,7 +3005,11 @@ async fn update_head<C: ConnectionTrait>(db: &C, commit_id: &str) -> Result<(), 
                 ObjectHash::from_str(commit_id)
                     .map_err(|e| CommitError::HeadUpdate(format!("invalid commit id: {e}")))?,
             );
-            Head::update_with_conn(db, head, None).await;
+            // Propagated: a swallowed HEAD write left `commit` reporting
+            // success with HEAD unmoved.
+            Head::update_result_with_conn(db, head, None)
+                .await
+                .map_err(|e| CommitError::HeadUpdate(format!("failed to update HEAD: {e}")))?;
         }
     }
     Ok(())

@@ -26,6 +26,70 @@ use super::*;
 
 #[test]
 #[serial]
+/// plan-20260714 W0 hard gate: `fsck --heal` discovery walks only
+/// refs/reflogs/index roots — it does not cover every worktree's private
+/// index, sequencer rows or sidecars, so it fails closed on a repository
+/// with linked worktrees rather than mis-report their objects.
+fn test_fsck_heal_refused_with_linked_worktrees() {
+    let main = tempdir().unwrap();
+    let linked = tempdir().unwrap();
+    init_repo_via_cli(main.path());
+    configure_identity_via_cli(main.path());
+    fs::write(main.path().join("base.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "base.txt"], main.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], main.path()),
+        "commit",
+    );
+
+    // Main-only: the heal path runs (nothing to repair is a valid outcome).
+    let out = run_libra_command(&["fsck", "--heal"], main.path());
+    assert_cli_success(&out, "fsck --heal runs on a single-worktree repo");
+
+    // With a linked worktree: fail closed with the W0 refusal.
+    let add = run_libra_command(
+        &["worktree", "add", linked.path().to_str().unwrap()],
+        main.path(),
+    );
+    assert_cli_success(&add, "add a linked worktree");
+    let out = run_libra_command(&["fsck", "--heal"], main.path());
+    assert!(
+        !out.status.success(),
+        "fsck --heal must refuse a linked-worktree repo: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("per-worktree object inventory"),
+        "the refusal names the reason: {stderr}"
+    );
+
+    // Removing the directory does not make the historical per-worktree
+    // inventory disappear. `--heal` must remain fail-closed until its object
+    // discovery is actually worktree-complete.
+    let remove = run_libra_command(
+        &[
+            "worktree",
+            "remove",
+            "--delete-dir",
+            linked.path().to_str().unwrap(),
+        ],
+        main.path(),
+    );
+    assert_cli_success(&remove, "remove the linked worktree directory");
+    let out = run_libra_command(&["fsck", "--heal"], main.path());
+    assert!(
+        !out.status.success(),
+        "fsck --heal must remain refused after linked-worktree removal"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("worktree history is retained"),
+        "the retained-history refusal must stay actionable"
+    );
+}
+
+#[test]
+#[serial]
 /// Tests fsck on an empty repository passes successfully.
 /// Verifies the basic happy path for newly initialized repositories.
 fn test_fsck_empty_repo_passes() {

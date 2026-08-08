@@ -239,6 +239,7 @@ impl<M: CompletionModel> ToolLoopAction<M> {
                 hook_runner: None,
                 allowed_tools: None,
                 runtime_context: None,
+                cancellation: None,
                 max_turns: None,
                 repeat_detection_window: None,
                 repeat_warning_threshold: None,

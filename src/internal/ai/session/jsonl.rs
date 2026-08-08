@@ -1,9 +1,12 @@
 //! Append-only JSONL session event storage.
 
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -20,6 +23,9 @@ use crate::internal::ai::{
 };
 
 pub const SESSION_EVENTS_FILE: &str = "events.jsonl";
+const CODE_WORKFLOW_APPEND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const CODE_WORKFLOW_APPEND_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const STALE_CODE_WORKFLOW_APPEND_LOCK_AGE: Duration = Duration::from_secs(30);
 
 /// Event persisted in a session JSONL stream.
 ///
@@ -68,6 +74,255 @@ pub enum SessionEvent {
     /// `payload.payload: serde_json::Value` so a future kind
     /// extension does not break older readers.
     AiArtifact(AiArtifactEvent),
+    /// Code runtime workflow event. This is deliberately one additive top-
+    /// level kind: binaries released before W1-03 see `code_workflow` as an
+    /// unknown event and safely skip the whole row. The typed payload holds
+    /// the cursor/deduplication identity needed by later resume and SSE
+    /// projections without changing the wire shape of legacy session rows.
+    CodeWorkflow(CodeWorkflowEvent),
+}
+
+/// A cursor into one session's Code workflow stream.
+///
+/// The session id scopes `sequence`; consumers must never compare sequence
+/// values from different sessions. Runtime adapters use this cursor for SSE
+/// and resume, while W1-06 will add the projection that consumes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeWorkflowCursor {
+    pub session_id: String,
+    pub sequence: u64,
+}
+
+impl CodeWorkflowCursor {
+    pub fn new(session_id: impl Into<String>, sequence: u64) -> Self {
+        Self {
+            session_id: session_id.into(),
+            sequence,
+        }
+    }
+}
+
+/// One additive Code workflow event in a session JSONL stream.
+///
+/// `event_id` is the de-duplication identity and `sequence` is the ordered
+/// per-session cursor. UUID ordering is explicitly not an event-ordering
+/// mechanism. This card serializes allocation plus append; W1-05 owns the
+/// fsync/mutation replay contract that must surround it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeWorkflowEvent {
+    pub event_id: Uuid,
+    pub sequence: u64,
+    pub recorded_at: DateTime<Utc>,
+    #[serde(flatten)]
+    pub event: CodeWorkflowEventKind,
+}
+
+impl CodeWorkflowEvent {
+    pub fn new(sequence: u64, event: CodeWorkflowEventKind) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            sequence,
+            recorded_at: Utc::now(),
+            event,
+        }
+    }
+}
+
+/// Code-specific payload variants frozen by W1-03.
+///
+/// All strings are identifiers or redacted summaries. Raw user prompts,
+/// approval responses, tool arguments and environment values belong to their
+/// existing redacted stores and must not be copied into this event stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "event")]
+pub enum CodeWorkflowEventKind {
+    CommandAccepted {
+        command_id: String,
+        workflow: String,
+    },
+    IntentReviewRequested {
+        interaction_id: String,
+        intent_id: String,
+    },
+    PlanReviewRequested {
+        interaction_id: String,
+        plan_id: String,
+    },
+    InteractionResolved {
+        interaction_id: String,
+        resolution: String,
+    },
+    CodeUiProjectionDelta {
+        projection: String,
+        summary: String,
+        /// Typed projection payload.  W1-06 consumers deserialize this only
+        /// for projection names they understand; older rows that predate this
+        /// additive field decode as `Null`, and future projection names remain
+        /// skippable without changing the top-level session-event envelope.
+        #[serde(default)]
+        payload: serde_json::Value,
+    },
+    TerminalSuccess {
+        command_id: String,
+        summary: String,
+    },
+    TerminalFailure {
+        command_id: String,
+        reason: String,
+    },
+    IndeterminateSideEffect {
+        command_id: String,
+        effect: String,
+        reason: String,
+    },
+    /// Recovery-critical intent. This is written and fsynced by W1-05 before
+    /// the runtime dispatches any mutating command.
+    CommandIntentPersisted {
+        command: CodeCommandIntent,
+    },
+    CommandTerminalSuccess {
+        command: CodeCommandIdentity,
+        summary: String,
+    },
+    CommandTerminalFailure {
+        command: CodeCommandIdentity,
+        reason: String,
+    },
+    CommandIndeterminateSideEffect {
+        command: CodeCommandIdentity,
+        effect: String,
+        reason: String,
+    },
+}
+
+/// Stable runtime-command de-duplication key. The session id remains in the
+/// key even though the file path is session-scoped so a copied or misrouted
+/// JSONL row cannot silently match a command from another session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CodeCommandIdentity {
+    pub repo_id: String,
+    pub session_id: String,
+    pub principal_id: String,
+    pub command_id: String,
+}
+
+impl CodeCommandIdentity {
+    pub fn new(
+        repo_id: impl Into<String>,
+        session_id: impl Into<String>,
+        principal_id: impl Into<String>,
+        command_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            repo_id: repo_id.into(),
+            session_id: session_id.into(),
+            principal_id: principal_id.into(),
+            command_id: command_id.into(),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.repo_id.is_empty()
+            && !self.session_id.is_empty()
+            && !self.principal_id.is_empty()
+            && !self.command_id.is_empty()
+    }
+}
+
+/// Canonical request metadata persisted before runtime execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeCommandIntent {
+    pub identity: CodeCommandIdentity,
+    pub command_kind: String,
+    pub canonical_request_hash: String,
+    pub mutating: bool,
+}
+
+impl CodeCommandIntent {
+    pub fn new(
+        identity: CodeCommandIdentity,
+        command_kind: impl Into<String>,
+        canonical_request_hash: impl Into<String>,
+        mutating: bool,
+    ) -> Self {
+        Self {
+            identity,
+            command_kind: command_kind.into(),
+            canonical_request_hash: canonical_request_hash.into(),
+            mutating,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.identity.is_complete()
+            && !self.command_kind.is_empty()
+            && !self.canonical_request_hash.is_empty()
+    }
+}
+
+/// Current durable state for one runtime command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeCommandStatus {
+    Pending,
+    Succeeded { summary: String },
+    Failed { reason: String },
+    Indeterminate { effect: String, reason: String },
+}
+
+/// Result of attempting to admit a command. A duplicate with the same
+/// canonical payload never executes a second time; the caller receives the
+/// previously durable state instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeCommandAdmission {
+    Execute { intent: CodeCommandIntent },
+    Existing { status: CodeCommandStatus },
+}
+
+/// Recovery decision for a command found in the JSONL log after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeCommandRecovery {
+    RetryReadOnly { intent: CodeCommandIntent },
+    Existing { status: CodeCommandStatus },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CodeCommandStoreError {
+    #[error("Code command identity and canonical request metadata must be non-empty")]
+    InvalidIntent,
+    #[error(
+        "Code command '{command_id}' for repo '{repo_id}', session '{session_id}', principal '{principal_id}' was reused with a different canonical payload"
+    )]
+    PayloadConflict {
+        repo_id: String,
+        session_id: String,
+        principal_id: String,
+        command_id: String,
+    },
+    #[error("Code command '{command_id}' has a terminal event without a durable intent")]
+    TerminalWithoutIntent { command_id: String },
+    #[error("Code command '{command_id}' has conflicting terminal results")]
+    TerminalConflict { command_id: String },
+    #[error("Code command '{command_id}' has no durable intent in this session")]
+    MissingIntent { command_id: String },
+    #[error("failed to access the Code command session log: {0}")]
+    Storage(#[from] io::Error),
+}
+
+/// Gap observed while replaying Code workflow event cursors.
+///
+/// A gap is data, rather than a silently repaired sequence: a resume/SSE
+/// adapter can request a snapshot or surface the loss to its caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeWorkflowSequenceGap {
+    pub after: u64,
+    pub before: u64,
+}
+
+/// De-duplicated, ordered view of Code workflow rows in one session.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CodeWorkflowReplay {
+    pub events: Vec<CodeWorkflowEvent>,
+    pub gaps: Vec<CodeWorkflowSequenceGap>,
 }
 
 /// OC-Phase 4 ArtifactLedger JSONL projection envelope (v0.17.810).
@@ -184,6 +439,10 @@ impl SessionEvent {
         Self::AiArtifact(event)
     }
 
+    pub fn code_workflow(event: CodeWorkflowEvent) -> Self {
+        Self::CodeWorkflow(event)
+    }
+
     pub fn apply_to(&self, current: &mut Option<SessionState>) {
         match self {
             Self::SessionSnapshot(event) => {
@@ -207,7 +466,8 @@ impl SessionEvent {
             | Self::ToolCall(_)
             | Self::ToolResult(_)
             | Self::Goal(_)
-            | Self::AiArtifact(_) => {}
+            | Self::AiArtifact(_)
+            | Self::CodeWorkflow(_) => {}
         }
     }
 }
@@ -224,6 +484,7 @@ impl Event for SessionEvent {
             Self::ToolResult(_) => "tool_result",
             Self::Goal(event) => event.event_kind(),
             Self::AiArtifact(_) => "ai_artifact",
+            Self::CodeWorkflow(_) => "code_workflow",
         }
     }
 
@@ -241,6 +502,7 @@ impl Event for SessionEvent {
             Self::ToolResult(event) => event.event_id,
             Self::Goal(event) => event.event_id(),
             Self::AiArtifact(event) => event.event_id,
+            Self::CodeWorkflow(event) => event.event_id,
         }
     }
 
@@ -273,7 +535,100 @@ impl Event for SessionEvent {
                 event.thread_id,
                 event.artifact_id.as_deref().unwrap_or("-")
             ),
+            Self::CodeWorkflow(event) => format!(
+                "code_workflow sequence={} {}",
+                event.sequence,
+                code_workflow_event_summary(&event.event)
+            ),
         }
+    }
+}
+
+fn code_workflow_event_summary(event: &CodeWorkflowEventKind) -> String {
+    match event {
+        CodeWorkflowEventKind::CommandAccepted {
+            command_id,
+            workflow,
+        } => format!("command accepted {command_id} ({workflow})"),
+        CodeWorkflowEventKind::IntentReviewRequested {
+            interaction_id,
+            intent_id,
+        } => format!("intent review {interaction_id} ({intent_id})"),
+        CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id,
+            plan_id,
+        } => format!("plan review {interaction_id} ({plan_id})"),
+        CodeWorkflowEventKind::InteractionResolved {
+            interaction_id,
+            resolution,
+        } => format!("interaction {interaction_id} resolved ({resolution})"),
+        CodeWorkflowEventKind::CodeUiProjectionDelta {
+            projection,
+            summary,
+            ..
+        } => format!("projection {projection}: {summary}"),
+        CodeWorkflowEventKind::TerminalSuccess {
+            command_id,
+            summary,
+        } => format!("command {command_id} succeeded: {summary}"),
+        CodeWorkflowEventKind::TerminalFailure { command_id, reason } => {
+            format!("command {command_id} failed: {reason}")
+        }
+        CodeWorkflowEventKind::IndeterminateSideEffect {
+            command_id,
+            effect,
+            reason,
+        } => format!("command {command_id} indeterminate {effect}: {reason}"),
+        CodeWorkflowEventKind::CommandIntentPersisted { command } => format!(
+            "durable command intent {} ({})",
+            command.identity.command_id, command.command_kind
+        ),
+        CodeWorkflowEventKind::CommandTerminalSuccess { command, summary } => {
+            format!(
+                "durable command {} succeeded: {summary}",
+                command.command_id
+            )
+        }
+        CodeWorkflowEventKind::CommandTerminalFailure { command, reason } => {
+            format!("durable command {} failed: {reason}", command.command_id)
+        }
+        CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+            command,
+            effect,
+            reason,
+        } => format!(
+            "durable command {} indeterminate {effect}: {reason}",
+            command.command_id
+        ),
+    }
+}
+
+fn payload_conflict(identity: &CodeCommandIdentity) -> CodeCommandStoreError {
+    CodeCommandStoreError::PayloadConflict {
+        repo_id: identity.repo_id.clone(),
+        session_id: identity.session_id.clone(),
+        principal_id: identity.principal_id.clone(),
+        command_id: identity.command_id.clone(),
+    }
+}
+
+fn update_code_command_terminal(
+    status: &mut Option<CodeCommandStatus>,
+    target: CodeCommandStatus,
+    identity: &CodeCommandIdentity,
+) -> Result<(), CodeCommandStoreError> {
+    match status {
+        None => Err(CodeCommandStoreError::TerminalWithoutIntent {
+            command_id: identity.command_id.clone(),
+        }),
+        Some(CodeCommandStatus::Pending) => {
+            *status = Some(target);
+            Ok(())
+        }
+        Some(existing) if *existing == target => Ok(()),
+        Some(_) => Err(CodeCommandStoreError::TerminalConflict {
+            command_id: identity.command_id.clone(),
+        }),
     }
 }
 
@@ -286,6 +641,29 @@ pub struct SessionContextReplay {
 #[derive(Debug, Clone)]
 pub struct SessionJsonlStore {
     session_root: PathBuf,
+}
+
+/// A narrow cross-process lock for sequence allocation plus one Code workflow
+/// JSONL append. The lock deliberately covers neither tool execution nor
+/// projection work. W1-05 will reuse this append boundary to add the required
+/// mutation durability/fsync protocol.
+#[derive(Debug)]
+struct CodeWorkflowAppendLock {
+    path: PathBuf,
+}
+
+impl Drop for CodeWorkflowAppendLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "failed to release Code workflow append lock"
+            );
+        }
+    }
 }
 
 impl SessionJsonlStore {
@@ -309,7 +687,88 @@ impl SessionJsonlStore {
         self.session_root.join(SESSION_EVENTS_FILE)
     }
 
+    /// Append the next ordered Code workflow event for this session.
+    ///
+    /// This takes the session-local append lock around sequence allocation and
+    /// the JSONL write. W1-05 will add the recovery-critical fsync/mutation
+    /// ordering around the same boundary; callers must not use this method as
+    /// a substitute for that durability contract.
+    pub fn append_code_workflow(
+        &self,
+        event: CodeWorkflowEventKind,
+    ) -> io::Result<CodeWorkflowEvent> {
+        self.append_code_workflow_with_durability(event, false)
+    }
+
+    /// Append and fsync a Code workflow row while holding the same
+    /// session-local sequence lock as [`Self::append_code_workflow`]. This is
+    /// the recovery-critical write primitive used by durable command intent
+    /// and terminal-result transitions.
+    pub fn append_code_workflow_durable(
+        &self,
+        event: CodeWorkflowEventKind,
+    ) -> io::Result<CodeWorkflowEvent> {
+        self.append_code_workflow_with_durability(event, true)
+    }
+
+    fn append_code_workflow_with_durability(
+        &self,
+        event: CodeWorkflowEventKind,
+        durable: bool,
+    ) -> io::Result<CodeWorkflowEvent> {
+        fs::create_dir_all(&self.session_root).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to create session directory '{}': {error}",
+                    self.session_root.display()
+                ),
+            )
+        })?;
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        self.append_code_workflow_while_locked(event, durable)
+    }
+
     pub fn append(&self, event: &SessionEvent) -> io::Result<()> {
+        if matches!(event, SessionEvent::CodeWorkflow(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "append Code workflow events through append_code_workflow so sequence allocation stays serialized",
+            ));
+        }
+        // SessionState compatibility snapshots and Code workflow rows share
+        // one JSONL file.  Taking the same lock prevents a legacy snapshot
+        // writer from interleaving bytes with a projection/durability append.
+        // Code workflow callers already hold this lock and use
+        // `append_code_workflow_while_locked` directly.
+        fs::create_dir_all(&self.session_root).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to create session directory '{}': {error}",
+                    self.session_root.display()
+                ),
+            )
+        })?;
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        self.append_unchecked(event, false)
+    }
+
+    fn append_code_workflow_while_locked(
+        &self,
+        event: CodeWorkflowEventKind,
+        durable: bool,
+    ) -> io::Result<CodeWorkflowEvent> {
+        let sequence = self.next_code_workflow_sequence()?;
+        let workflow_event = CodeWorkflowEvent::new(sequence, event);
+        self.append_unchecked(
+            &SessionEvent::code_workflow(workflow_event.clone()),
+            durable,
+        )?;
+        Ok(workflow_event)
+    }
+
+    fn append_unchecked(&self, event: &SessionEvent, durable: bool) -> io::Result<()> {
         fs::create_dir_all(&self.session_root).map_err(|err| {
             io::Error::new(
                 err.kind(),
@@ -321,6 +780,7 @@ impl SessionJsonlStore {
         })?;
 
         let path = self.events_path();
+        let needs_separator = recover_truncated_tail_for_append(&path)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -335,6 +795,17 @@ impl SessionJsonlStore {
                 )
             })?;
 
+        if needs_separator {
+            file.write_all(b"\n").map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to restore JSONL line boundary in '{}': {err}",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
         serde_json::to_writer(&mut file, event)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         file.write_all(b"\n").map_err(|err| {
@@ -345,7 +816,406 @@ impl SessionJsonlStore {
                     path.display()
                 ),
             )
-        })
+        })?;
+        if durable {
+            file.sync_data().map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to fsync durable session event log '{}': {err}",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Load Code workflow rows with duplicate event ids removed and sequence
+    /// gaps surfaced explicitly. Resume/SSE consumers should use this view
+    /// rather than assuming a UUID or line number is an ordering cursor.
+    pub fn load_code_workflow_replay(&self) -> io::Result<CodeWorkflowReplay> {
+        code_workflow_replay_from_events(self.load_events()?, 0)
+    }
+
+    /// Read the bounded workflow suffix after a durable projection cursor.
+    ///
+    /// `max_bytes` puts an upper bound on disk access and `max_events` bounds
+    /// projection work.  If the requested suffix begins before the retained
+    /// tail window, the returned replay reports a sequence gap so callers fail
+    /// closed rather than rebuilding a plausible partial UI snapshot.
+    pub fn load_code_workflow_replay_since(
+        &self,
+        after_sequence: u64,
+        max_events: usize,
+        max_bytes: u64,
+    ) -> io::Result<CodeWorkflowReplay> {
+        if max_events == 0 || max_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Code workflow replay bounds must both be greater than zero",
+            ));
+        }
+        let path = self.events_path();
+        let mut file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(CodeWorkflowReplay::default());
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to open session event log '{}' for bounded replay: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+        let file_len = file.metadata()?.len();
+        let start = file_len.saturating_sub(max_bytes);
+        file.seek(SeekFrom::Start(start))?;
+        let tail_capacity = usize::try_from(file_len - start).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "bounded Code workflow replay window for '{}' is too large for this platform",
+                    path.display()
+                ),
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(tail_capacity);
+        file.read_to_end(&mut bytes)?;
+        let mut content = String::from_utf8_lossy(&bytes).into_owned();
+        if start > 0 {
+            let Some(first_newline) = content.find('\n') else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "bounded Code workflow replay window for '{}' contains no complete JSONL record",
+                        path.display()
+                    ),
+                ));
+            };
+            content.drain(..=first_newline);
+        }
+
+        let replay = code_workflow_replay_from_events(
+            parse_session_events_content(&path, &content)?,
+            after_sequence,
+        )?;
+        if start > 0 && replay.events.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bounded Code workflow replay after sequence {after_sequence} cannot prove the retained tail of '{}' contains no omitted workflow events; create a projection checkpoint before resuming",
+                    path.display()
+                ),
+            ));
+        }
+        if replay.events.len() > max_events {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Code workflow replay after sequence {after_sequence} has {} events, exceeding the bounded limit of {max_events}; create a projection checkpoint before resuming",
+                    replay.events.len()
+                ),
+            ));
+        }
+        Ok(replay)
+    }
+
+    pub fn next_code_workflow_sequence(&self) -> io::Result<u64> {
+        let replay = self.load_code_workflow_replay()?;
+        match replay.events.last() {
+            Some(event) => event.sequence.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot append Code workflow event: sequence reached u64::MAX",
+                )
+            }),
+            None => Ok(1),
+        }
+    }
+
+    /// Durably admit a runtime command before it is dispatched. Reusing the
+    /// same `(repo, session, principal, command)` identity with another kind
+    /// or canonical request hash fails closed instead of risking a replay of
+    /// an unintended mutation.
+    pub fn admit_code_command(
+        &self,
+        intent: CodeCommandIntent,
+    ) -> Result<CodeCommandAdmission, CodeCommandStoreError> {
+        if !intent.is_valid() {
+            return Err(CodeCommandStoreError::InvalidIntent);
+        }
+        fs::create_dir_all(&self.session_root)?;
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        if let Some((existing_intent, status)) = self.code_command_status(&intent.identity)? {
+            if existing_intent != intent {
+                return Err(payload_conflict(&intent.identity));
+            }
+            return Ok(CodeCommandAdmission::Existing { status });
+        }
+
+        self.append_code_workflow_while_locked(
+            CodeWorkflowEventKind::CommandIntentPersisted {
+                command: intent.clone(),
+            },
+            true,
+        )?;
+        Ok(CodeCommandAdmission::Execute { intent })
+    }
+
+    /// Recover a command after an interrupted runtime. Read-only pending
+    /// commands are explicitly eligible for a caller-controlled retry;
+    /// mutating pending commands become durable `Indeterminate` state and are
+    /// never replayed automatically.
+    pub fn recover_code_command(
+        &self,
+        identity: &CodeCommandIdentity,
+    ) -> Result<CodeCommandRecovery, CodeCommandStoreError> {
+        if !identity.is_complete() {
+            return Err(CodeCommandStoreError::InvalidIntent);
+        }
+        fs::create_dir_all(&self.session_root)?;
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        let Some((intent, status)) = self.code_command_status(identity)? else {
+            return Err(CodeCommandStoreError::MissingIntent {
+                command_id: identity.command_id.clone(),
+            });
+        };
+
+        match status {
+            CodeCommandStatus::Pending if intent.mutating => {
+                let status = CodeCommandStatus::Indeterminate {
+                    effect: "unknown_mutating_dispatch".to_string(),
+                    reason:
+                        "runtime stopped after durable intent; manual reconciliation is required"
+                            .to_string(),
+                };
+                self.append_code_workflow_while_locked(
+                    CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                        command: identity.clone(),
+                        effect: "unknown_mutating_dispatch".to_string(),
+                        reason: "runtime stopped after durable intent; manual reconciliation is required"
+                            .to_string(),
+                    },
+                    true,
+                )?;
+                Ok(CodeCommandRecovery::Existing { status })
+            }
+            CodeCommandStatus::Pending => Ok(CodeCommandRecovery::RetryReadOnly { intent }),
+            status => Ok(CodeCommandRecovery::Existing { status }),
+        }
+    }
+
+    pub fn complete_code_command_success(
+        &self,
+        identity: &CodeCommandIdentity,
+        summary: impl Into<String>,
+    ) -> Result<CodeCommandStatus, CodeCommandStoreError> {
+        let summary = summary.into();
+        self.finish_code_command(
+            identity,
+            CodeCommandStatus::Succeeded {
+                summary: summary.clone(),
+            },
+            CodeWorkflowEventKind::CommandTerminalSuccess {
+                command: identity.clone(),
+                summary,
+            },
+        )
+    }
+
+    pub fn complete_code_command_failure(
+        &self,
+        identity: &CodeCommandIdentity,
+        reason: impl Into<String>,
+    ) -> Result<CodeCommandStatus, CodeCommandStoreError> {
+        let reason = reason.into();
+        self.finish_code_command(
+            identity,
+            CodeCommandStatus::Failed {
+                reason: reason.clone(),
+            },
+            CodeWorkflowEventKind::CommandTerminalFailure {
+                command: identity.clone(),
+                reason,
+            },
+        )
+    }
+
+    pub fn mark_code_command_indeterminate(
+        &self,
+        identity: &CodeCommandIdentity,
+        effect: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<CodeCommandStatus, CodeCommandStoreError> {
+        let effect = effect.into();
+        let reason = reason.into();
+        self.finish_code_command(
+            identity,
+            CodeCommandStatus::Indeterminate {
+                effect: effect.clone(),
+                reason: reason.clone(),
+            },
+            CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                command: identity.clone(),
+                effect,
+                reason,
+            },
+        )
+    }
+
+    fn finish_code_command(
+        &self,
+        identity: &CodeCommandIdentity,
+        target: CodeCommandStatus,
+        event: CodeWorkflowEventKind,
+    ) -> Result<CodeCommandStatus, CodeCommandStoreError> {
+        if !identity.is_complete() {
+            return Err(CodeCommandStoreError::InvalidIntent);
+        }
+        fs::create_dir_all(&self.session_root)?;
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        let Some((_intent, status)) = self.code_command_status(identity)? else {
+            return Err(CodeCommandStoreError::MissingIntent {
+                command_id: identity.command_id.clone(),
+            });
+        };
+        match status {
+            CodeCommandStatus::Pending => {
+                self.append_code_workflow_while_locked(event, true)?;
+                Ok(target)
+            }
+            existing if existing == target => Ok(existing),
+            _ => Err(CodeCommandStoreError::TerminalConflict {
+                command_id: identity.command_id.clone(),
+            }),
+        }
+    }
+
+    fn code_command_status(
+        &self,
+        identity: &CodeCommandIdentity,
+    ) -> Result<Option<(CodeCommandIntent, CodeCommandStatus)>, CodeCommandStoreError> {
+        let mut intent = None;
+        let mut status = None;
+        for event in self.load_code_workflow_replay()?.events {
+            match event.event {
+                CodeWorkflowEventKind::CommandIntentPersisted { command }
+                    if command.identity == *identity =>
+                {
+                    if let Some(existing) = intent.as_ref()
+                        && existing != &command
+                    {
+                        return Err(payload_conflict(identity));
+                    }
+                    intent = Some(command);
+                    status.get_or_insert(CodeCommandStatus::Pending);
+                }
+                CodeWorkflowEventKind::CommandTerminalSuccess { command, summary }
+                    if command == *identity =>
+                {
+                    update_code_command_terminal(
+                        &mut status,
+                        CodeCommandStatus::Succeeded { summary },
+                        identity,
+                    )?;
+                }
+                CodeWorkflowEventKind::CommandTerminalFailure { command, reason }
+                    if command == *identity =>
+                {
+                    update_code_command_terminal(
+                        &mut status,
+                        CodeCommandStatus::Failed { reason },
+                        identity,
+                    )?;
+                }
+                CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                    command,
+                    effect,
+                    reason,
+                } if command == *identity => {
+                    update_code_command_terminal(
+                        &mut status,
+                        CodeCommandStatus::Indeterminate { effect, reason },
+                        identity,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+
+        match (intent, status) {
+            (Some(intent), Some(status)) => Ok(Some((intent, status))),
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(CodeCommandStoreError::TerminalWithoutIntent {
+                command_id: identity.command_id.clone(),
+            }),
+            (Some(_), None) => Err(CodeCommandStoreError::TerminalWithoutIntent {
+                command_id: identity.command_id.clone(),
+            }),
+        }
+    }
+
+    fn acquire_code_workflow_append_lock(&self) -> io::Result<CodeWorkflowAppendLock> {
+        let path = self.session_root.join("events.code-workflow.append.lock");
+        let started = Instant::now();
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(format!("pid={}\n", std::process::id()).as_bytes())
+                        .map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "failed to initialize Code workflow append lock '{}': {error}",
+                                    path.display()
+                                ),
+                            )
+                        })?;
+                    return Ok(CodeWorkflowAppendLock { path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if code_workflow_append_lock_is_stale(&path) {
+                        match fs::remove_file(&path) {
+                            Ok(()) => continue,
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                            Err(error) => {
+                                return Err(io::Error::new(
+                                    error.kind(),
+                                    format!(
+                                        "failed to clear stale Code workflow append lock '{}': {error}",
+                                        path.display()
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if started.elapsed() >= CODE_WORKFLOW_APPEND_LOCK_TIMEOUT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "timed out waiting for Code workflow append lock '{}'",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    thread::sleep(CODE_WORKFLOW_APPEND_LOCK_POLL_INTERVAL);
+                }
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to acquire Code workflow append lock '{}': {error}",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     pub fn load_state(&self) -> io::Result<Option<SessionState>> {
@@ -372,52 +1242,7 @@ impl SessionJsonlStore {
             }
         };
 
-        let lines: Vec<&str> = content.lines().collect();
-        let ends_with_newline = content.ends_with('\n');
-        let mut events = Vec::new();
-        for (line_index, line) in lines.iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let value = match serde_json::from_str::<Value>(line) {
-                Ok(value) => value,
-                Err(err) if line_index + 1 == lines.len() && !ends_with_newline => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        line = line_number,
-                        error = %err,
-                        "stopping session JSONL replay at malformed trailing line"
-                    );
-                    break;
-                }
-                Err(err) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "malformed complete line in session event log '{}' line {line_number}: {err}",
-                            path.display()
-                        ),
-                    ));
-                }
-            };
-
-            match parse_session_event_value(value) {
-                Ok(Some(event)) => events.push(event),
-                Ok(None) => {}
-                Err(err) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "failed to decode session event log '{}' line {line_number}: {err}",
-                            path.display()
-                        ),
-                    ));
-                }
-            }
-        }
-        Ok(events)
+        parse_session_events_content(&path, &content)
     }
 
     pub fn load_context_replay(&self) -> io::Result<SessionContextReplay> {
@@ -445,6 +1270,7 @@ impl SessionJsonlStore {
                 // a future artefact-ledger replay reads through a
                 // separate projection.
                 SessionEvent::AiArtifact(_) => {}
+                SessionEvent::CodeWorkflow(_) => {}
             }
         }
         Ok(replay)
@@ -486,6 +1312,121 @@ impl SessionJsonlStore {
     }
 }
 
+fn code_workflow_replay_from_events(
+    events: impl IntoIterator<Item = SessionEvent>,
+    after_sequence: u64,
+) -> io::Result<CodeWorkflowReplay> {
+    let mut replay = CodeWorkflowReplay::default();
+    let mut seen_event_ids = HashSet::new();
+    let mut previous_sequence = (after_sequence > 0).then_some(after_sequence);
+
+    for event in events {
+        let SessionEvent::CodeWorkflow(workflow_event) = event else {
+            continue;
+        };
+        if workflow_event.sequence <= after_sequence {
+            continue;
+        }
+        if !seen_event_ids.insert(workflow_event.event_id) {
+            tracing::warn!(
+                event_id = %workflow_event.event_id,
+                sequence = workflow_event.sequence,
+                "skipping duplicate Code workflow event id"
+            );
+            continue;
+        }
+        if workflow_event.sequence == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Code workflow event '{}' has invalid zero sequence",
+                    workflow_event.event_id
+                ),
+            ));
+        }
+
+        if let Some(previous) = previous_sequence {
+            let expected = previous.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Code workflow sequence overflowed u64",
+                )
+            })?;
+            if workflow_event.sequence < expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Code workflow event '{}' sequence {} is not after prior sequence {}",
+                        workflow_event.event_id, workflow_event.sequence, previous
+                    ),
+                ));
+            }
+            if workflow_event.sequence > expected {
+                replay.gaps.push(CodeWorkflowSequenceGap {
+                    after: previous,
+                    before: workflow_event.sequence,
+                });
+            }
+        } else if workflow_event.sequence > 1 {
+            replay.gaps.push(CodeWorkflowSequenceGap {
+                after: 0,
+                before: workflow_event.sequence,
+            });
+        }
+
+        previous_sequence = Some(workflow_event.sequence);
+        replay.events.push(workflow_event);
+    }
+    Ok(replay)
+}
+
+fn parse_session_events_content(path: &Path, content: &str) -> io::Result<Vec<SessionEvent>> {
+    let lines: Vec<&str> = content.lines().collect();
+    let ends_with_newline = content.ends_with('\n');
+    let mut events = Vec::new();
+    for (line_index, line) in lines.iter().enumerate() {
+        let line_number = line_index + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(error) if line_index + 1 == lines.len() && !ends_with_newline => {
+                tracing::warn!(
+                    path = %path.display(),
+                    line = line_number,
+                    error = %error,
+                    "stopping session JSONL replay at malformed trailing line"
+                );
+                break;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "malformed complete line in session event log '{}' line {line_number}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+        match parse_session_event_value(value) {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "failed to decode session event log '{}' line {line_number}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(events)
+}
+
 fn child_dir_name(child_id: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, child_id.as_bytes());
     format!("task-{}", hex::encode(digest.as_ref()))
@@ -513,11 +1454,126 @@ fn parse_session_event_value(value: Value) -> Result<Option<SessionEvent>, serde
         // forward-compat shape as `goal` — older binaries skip
         // the row via the unknown branch.
         "ai_artifact" => serde_json::from_value(value).map(Some),
+        "code_workflow" => parse_code_workflow_event_value(value),
         unknown => {
             tracing::warn!(event_kind = unknown, "skipping unknown session event");
             Ok(None)
         }
     }
+}
+
+/// Decode a Code workflow envelope while preserving additive nested variants.
+/// A binary that predates the whole `code_workflow` top-level kind skips it in
+/// `parse_session_event_value`; a binary that knows the envelope but not a
+/// future nested event likewise skips only that row instead of rejecting the
+/// complete session log.
+fn parse_code_workflow_event_value(
+    value: Value,
+) -> Result<Option<SessionEvent>, serde_json::Error> {
+    let nested_event = value
+        .get("payload")
+        .and_then(Value::as_object)
+        .and_then(|payload| payload.get("event"))
+        .and_then(Value::as_str);
+    let Some(nested_event) = nested_event else {
+        return serde_json::from_value(value).map(Some);
+    };
+
+    match nested_event {
+        "command_accepted"
+        | "intent_review_requested"
+        | "plan_review_requested"
+        | "interaction_resolved"
+        | "code_ui_projection_delta"
+        | "terminal_success"
+        | "terminal_failure"
+        | "indeterminate_side_effect"
+        | "command_intent_persisted"
+        | "command_terminal_success"
+        | "command_terminal_failure"
+        | "command_indeterminate_side_effect" => serde_json::from_value(value).map(Some),
+        unknown => {
+            tracing::warn!(
+                event_kind = "code_workflow",
+                nested_event = unknown,
+                "skipping unknown Code workflow event"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Repair the only recoverable JSONL corruption before an append.
+///
+/// A malformed final non-newline line is an interrupted write. Replay already
+/// ignores it, but writing directly after it would concatenate two JSON values
+/// and turn a recoverable tail into a malformed complete line. Drop only that
+/// incomplete suffix, preserving every newline-terminated record. A complete
+/// last JSON value lacking a newline remains valid and gets a separator before
+/// the next append.
+fn recover_truncated_tail_for_append(path: &Path) -> io::Result<bool> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect session event log '{}' before append: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return Ok(false);
+    }
+
+    let last_line_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let tail = &bytes[last_line_start..];
+    if serde_json::from_slice::<Value>(tail).is_ok() {
+        return Ok(true);
+    }
+
+    let file = OpenOptions::new().write(true).open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to open session event log '{}' for tail recovery: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    file.set_len(last_line_start as u64).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to discard malformed trailing JSONL data in '{}': {error}",
+                path.display()
+            ),
+        )
+    })?;
+    tracing::warn!(
+        path = %path.display(),
+        "discarded malformed trailing session JSONL data before append"
+    );
+    Ok(false)
+}
+
+fn code_workflow_append_lock_is_stale(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+    let Ok(elapsed) = modified_at.elapsed() else {
+        return false;
+    };
+    elapsed >= STALE_CODE_WORKFLOW_APPEND_LOCK_AGE
 }
 
 pub fn session_events_path(session_root: &Path) -> PathBuf {

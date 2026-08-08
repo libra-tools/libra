@@ -128,8 +128,32 @@ fn is_valid_storage_dir(path: &Path) -> bool {
     }
     // lore.md 2.1: a linked worktree's `.libra` holds only `commondir` +
     // `worktree_id` + `index` (db/objects live in the common storage), so
-    // recognize it by its commondir pointer.
-    if path.join("commondir").exists() {
+    // recognize it by its commondir pointer. A detached-from-registry
+    // marker also counts (W3-s1b): even if the commondir file was deleted,
+    // the walk must STOP here and fail closed on the marker — climbing to
+    // an ancestor repository would silently run commands in the WRONG
+    // scope.
+    // `symlink_metadata`, not `exists()`, and inspection ERRORS count as
+    // marker-present too: a dangling symlink (or an EPERM/EIO on the
+    // marker) still MARKS this directory as a linked gitdir — reporting it
+    // absent would let repository discovery climb past a (corrupt) linked
+    // worktree into the main worktree's scope. The walk STOPS here and the
+    // resolution layer produces the actionable refusal.
+    let marker_blocks = |name: &str| {
+        !matches!(
+            fs::symlink_metadata(path.join(name)),
+            Err(ref err) if err.kind() == io::ErrorKind::NotFound
+        )
+    };
+    // `worktree_id` counts too: a linked gitdir whose `commondir` was
+    // DELETED still carries its identity, and the walk must stop here so
+    // the resolver can refuse. Climbing past it would resolve commands in
+    // an ancestor repository's scope (or answer "no repository" and let a
+    // caller trust the local `.libra` contents).
+    if marker_blocks("commondir")
+        || marker_blocks("detached_from_registry")
+        || marker_blocks("worktree_id")
+    {
         return true;
     }
 
@@ -237,15 +261,46 @@ fn resolve_dot_git_dir(worktree: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a Git-standard `.git/info/<name>` file for a worktree, including
-/// linked-worktree `.git` files. Returns `None` when the worktree has no Git
-/// metadata directory.
-pub fn git_info_file_path(worktree: &Path, name: &str) -> Option<PathBuf> {
-    let git_dir = resolve_dot_git_dir(worktree)?;
-    let common_dir = git_common_dir(&git_dir).unwrap_or(git_dir);
-    Some(common_dir.join("info").join(name))
+/// Resolve the CURRENT worktree's `info/<name>` candidates (W0 §C.4.1.1,
+/// plan line 2262): `<local_gitdir>/info/<name>`, never through the
+/// common-storage pointer.
+///
+/// `info/exclude` and `info/attributes` are part of the WORKTREE VIEW in
+/// Libra — each worktree carries its own, and repository-wide sharing is
+/// expressed by root `.libraignore`/`.gitignore`/attributes files instead.
+/// (Intentionally different from Git, which routes `info/*` through
+/// `commondir`; recorded in `COMPATIBILITY.md`.) BOTH local layouts are
+/// consulted when present, `.libra` first:
+///
+/// - `.libra` (primary): the worktree's own local gitdir — main's equals the
+///   common storage, a linked worktree's is its private `.libra`. Before W0
+///   this candidate DID NOT EXIST: only a literal `.git` marker was
+///   recognized, so the `.libra/info/exclude` that `libra init` itself
+///   creates was never read at all.
+/// - Git-compat: a literal `.git` directory or gitdir-file. Kept alongside
+///   the `.libra` candidate so dual-layout repositories (converted from Git
+///   with `.git` left in place) do not silently lose their existing
+///   `.git/info/*` rules. The gitdir-file target is used as-is (the LOCAL
+///   gitdir); its `commondir` is not followed.
+///
+/// Returns an empty vec when the worktree has no recognizable metadata
+/// directory.
+pub fn worktree_info_file_paths(worktree: &Path, name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let libra_gitdir = worktree.join(ROOT_DIR);
+    if libra_gitdir.is_dir() && is_valid_storage_dir(&libra_gitdir) {
+        candidates.push(libra_gitdir.join("info").join(name));
+    }
+    if let Some(git_dir) = resolve_dot_git_dir(worktree) {
+        candidates.push(git_dir.join("info").join(name));
+    }
+    candidates
 }
 
+/// The `commondir` target of a Git-layout gitdir. Used ONLY for gitdir
+/// validity probing (`config`/`objects` markers may live in either place) —
+/// info-file resolution deliberately does NOT follow it (see
+/// [`worktree_info_file_path`]).
 fn git_common_dir(git_dir: &Path) -> Option<PathBuf> {
     let contents = fs::read_to_string(git_dir.join("commondir")).ok()?;
     let raw = contents.lines().next()?.trim();
@@ -363,10 +418,144 @@ pub fn find_git_repository(path: Option<&Path>) -> Option<GitRepositoryLocation>
 /// empty first line, the pointer is CORRUPT — we must NOT silently fall back to
 /// treating the library-less local gitdir as common storage, which would route
 /// every db/objects lookup at a phantom repository. Return an error so mutation
-/// paths refuse and point the user at `libra worktree repair`. Only a genuinely
+/// paths refuse and point the user at `libra worktree repair --confirm`. Only a genuinely
 /// absent `commondir` (a main worktree) resolves to the gitdir itself.
+/// Terminal COMMON-storage validity — stricter than [`is_valid_storage_dir`],
+/// which also accepts linked LOCAL gitdirs by their `commondir` /
+/// `detached_from_registry` markers. The target of a commondir pointer must
+/// itself BE the shared storage: it holds the repository database (or the
+/// git-import marker set) and carries no `commondir` pointer of its own.
+/// A pointer chain — including a self-pointer or a pointer at another
+/// linked worktree's gitdir — is corruption to refuse, not indirection to
+/// follow: following it would route db/objects/policy lookups into a
+/// database-less local gitdir where "not found" masquerades as "no
+/// configuration".
+fn is_terminal_common_storage(path: &Path) -> bool {
+    // `symlink_metadata`, not `exists()`: a DANGLING `commondir` symlink is
+    // still a commondir marker — `exists()` follows the link and reports the
+    // marker absent, which would bless a non-terminal (corrupt) target. And
+    // fail CLOSED on inspection errors: only a definitive NotFound counts
+    // as "no marker" — an uninspectable target must be refused, not
+    // accepted as terminal.
+    if !matches!(
+        fs::symlink_metadata(path.join("commondir")),
+        Err(ref err) if err.kind() == io::ErrorKind::NotFound
+    ) {
+        return false;
+    }
+    if path.join(DATABASE).exists() {
+        return true;
+    }
+    ["objects", "info/exclude", "hooks"]
+        .iter()
+        .filter(|marker| path.join(marker).exists())
+        .count()
+        >= 2
+}
+
 fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     let commondir_file = gitdir.join("commondir");
+    // W3-s1b (§C.7): a worktree removed from the registry with its directory
+    // kept carries a `detached_from_registry` marker — every command run
+    // inside it fails closed (its scoped state is preserved but frozen)
+    // until it is re-added or deleted. Checked only for LINKED worktrees
+    // (marker next to an existing commondir).
+    // W3-s3 (§C.6.2): a mid-migration worktree (journal-stamped
+    // `migrate-marker` still present) is FROZEN for every other process —
+    // work created there could be overwritten by the recovery re-seed. The
+    // migrating/repairing process itself holds a process-local bypass.
+    // Lifecycle markers are judged WITHOUT following symlinks (a dangling
+    // symlink still marks the state) and WITHOUT treating inspection
+    // failures as absence: only a definitive NotFound clears a marker —
+    // an EPERM/EIO on the marker must freeze, not silently unfreeze.
+    let marker_present = |name: &str| -> io::Result<bool> {
+        match fs::symlink_metadata(gitdir.join(name)) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot inspect worktree lifecycle marker '{}/{name}': {err}; treat the \
+                     worktree as frozen — run `libra worktree repair --confirm \
+                     <worktree-path>` from the main worktree",
+                    gitdir.display()
+                ),
+            )),
+        }
+    };
+    if marker_present("migrate-marker")? && !migration_gate_bypassed() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this worktree has an unfinished layout migration; run `libra worktree \
+                 repair --migrate-layout --confirm` from the main worktree ('{}')",
+                gitdir.display()
+            ),
+        ));
+    }
+    if marker_present("detached_from_registry")? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this worktree was removed from the registry (detached); from the main \
+                 worktree run `libra worktree add {}` to re-attach it, or `libra worktree \
+                 remove --delete-dir {}` to delete it",
+                gitdir.parent().unwrap_or(gitdir).display(),
+                gitdir.parent().unwrap_or(gitdir).display()
+            ),
+        ));
+    }
+    // The marker's EXISTENCE is judged without following symlinks: a
+    // dangling `commondir` symlink is a present-but-unreadable marker
+    // (corruption to refuse), NOT an absent one — `read_to_string` alone
+    // would report NotFound and silently treat this linked worktree as
+    // MAIN. A marker that exists but is not a regular file is equally
+    // corrupt.
+    match fs::symlink_metadata(&commondir_file) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // No pointer. That spells MAIN — unless this gitdir still
+            // carries a `worktree_id`, which only a LINKED worktree has: a
+            // linked worktree that lost its pointer is corrupt, and
+            // answering "main" here would route its db/objects lookups at
+            // its own pointer-less gitdir (a phantom repository) and let
+            // callers trust its local configuration as the repository's.
+            if marker_present("worktree_id")? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "worktree gitdir '{}' carries a `worktree_id` but no `commondir` \
+                         pointer; the linked worktree is corrupt — run `libra worktree \
+                         repair --confirm <worktree-path>` from the main worktree",
+                        gitdir.display()
+                    ),
+                ));
+            }
+            return Ok(gitdir.to_path_buf());
+        }
+        Err(err) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot inspect worktree commondir marker at '{}': {err}; the linked \
+                     worktree is corrupt — run `libra worktree repair --confirm \
+                     <worktree-path>` from the main worktree",
+                    commondir_file.display()
+                ),
+            ));
+        }
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "worktree commondir marker at '{}' is not a regular file; the linked \
+                     worktree is corrupt — run `libra worktree repair --confirm \
+                     <worktree-path>` from the main worktree",
+                    commondir_file.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+    }
     match fs::read_to_string(&commondir_file) {
         Ok(contents) => {
             let raw = contents
@@ -379,7 +568,8 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
                     io::ErrorKind::InvalidData,
                     format!(
                         "worktree commondir pointer at '{}' is empty; the linked worktree is \
-                         corrupt — run `libra worktree repair`",
+                         corrupt — run `libra worktree repair --confirm <worktree-path>` from the main \
+                         worktree",
                         commondir_file.display()
                     ),
                 ));
@@ -390,17 +580,61 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
             } else {
                 gitdir.join(common)
             };
-            Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
+            // FAIL-CLOSED on the TARGET too (W0 codex finding): a pointer
+            // whose target is missing, unreadable, or not a storage
+            // directory is just as corrupt as an empty pointer — silently
+            // returning the dangling path routes every downstream lookup
+            // (db, objects, sandbox policy, publish manifest) at a location
+            // where "file not found" masquerades as "no configuration".
+            let canonical = fs::canonicalize(&resolved).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "worktree commondir pointer at '{}' targets '{}', which cannot be \
+                         resolved: {err}; the linked worktree is corrupt — run `libra worktree \
+                         repair --confirm <worktree-path>` from the main worktree",
+                        commondir_file.display(),
+                        resolved.display()
+                    ),
+                )
+            })?;
+            if !is_terminal_common_storage(&canonical) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "worktree commondir pointer at '{}' targets '{}', which is not the \
+                         repository's TERMINAL common storage (it is missing the repository \
+                         database, or carries a commondir pointer of its own — chains, \
+                         self-pointers, and pointers at another worktree's gitdir are \
+                         corruption, not indirection); run `libra worktree repair --confirm \
+                         <worktree-path>` from the main worktree",
+                        commondir_file.display(),
+                        canonical.display()
+                    ),
+                ));
+            }
+            Ok(canonical)
         }
-        // No `commondir` marker at all → this IS the main worktree; its own
-        // gitdir holds the shared db/objects.
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(gitdir.to_path_buf()),
+        // The marker VANISHED between the no-follow existence check above
+        // and this read: something is mutating this gitdir underneath us —
+        // that is corruption to refuse, not a license to reclassify the
+        // worktree as main mid-observation.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "worktree commondir marker at '{}' disappeared while being read; the \
+                 linked worktree is corrupt or being mutated — run `libra worktree \
+                 repair --confirm <worktree-path>` from the main worktree",
+                commondir_file.display()
+            ),
+        )),
         // The marker exists but cannot be read → linked-worktree corruption.
         Err(err) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "cannot read worktree commondir pointer at '{}': {err}; the linked worktree is \
-                 corrupt — run `libra worktree repair`",
+                "cannot read worktree commondir pointer at '{}': {err}; the linked worktree \
+                 is corrupt — run `libra worktree repair --confirm <worktree-path>` from the main \
+                 worktree",
                 commondir_file.display()
             ),
         )),
@@ -450,6 +684,14 @@ fn try_get_paths(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf), io::Error>
     Ok((common, workdir))
 }
 
+/// `(common_storage, worktree_root, gitdir)` from ONE walk — what a request
+/// pin resolves at entry so its three paths cannot later disagree (§C.4.2).
+pub(crate) fn try_get_request_paths(
+    path: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+    try_get_paths_full(path)
+}
+
 /// The LOCAL `.libra` gitdir for this working tree (lore.md 2.1): where the
 /// per-worktree `index` + `worktree_id` live. Equals the common storage for the
 /// main worktree; the linked worktree's own `.libra` otherwise.
@@ -461,6 +703,75 @@ pub fn try_get_worktree_gitdir(path: Option<PathBuf>) -> Result<PathBuf, io::Err
 /// The current worktree's gitdir (panics outside a repo — mirrors `storage_path`).
 pub fn worktree_gitdir() -> PathBuf {
     try_get_worktree_gitdir(None).expect("worktree_gitdir() called outside a libra repository")
+}
+
+/// The gitdir of the worktree THIS INVOCATION is acting on (§C.4.2
+/// resolve-once).
+///
+/// Worktree-local files — `FETCH_HEAD`, `rebase-aux.json`, `CHERRY_PICK_MSG` —
+/// must land in the same worktree whose database rows the command is reading.
+/// [`worktree_gitdir`] resolves from the process cwd, so a `set_current_dir`
+/// between the row read and the file write would pair scope A's state with
+/// scope B's sidecar. When dispatch pinned a request workdir, resolve from
+/// THAT; otherwise resolve from the cwd, which is what an unpinned in-process
+/// caller means. A pinned workdir that cannot be resolved is an error rather
+/// than a fallback.
+pub fn request_worktree_gitdir() -> Result<PathBuf, io::Error> {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        // The gitdir RESOLVED at pin time, so a later discovery failure cannot
+        // produce a different worktree's path — or a path that is not a gitdir
+        // at all, which is what deriving `<workdir>/.libra` from a
+        // subdirectory-invoked command would do. A pin only exists when all of
+        // its paths resolved, so there is no half-resolved case to report.
+        Some(pinned) => Ok(pinned.gitdir.clone()),
+        None => try_get_worktree_gitdir(None),
+    }
+}
+
+/// [`request_worktree_gitdir`] for callers whose path helper cannot fail.
+///
+/// Uses the gitdir resolved AT PIN TIME. It never re-resolves the cwd (the
+/// accident the pin exists to prevent) and never derives a path from the
+/// workdir (which is wrong whenever the command was invoked from a
+/// subdirectory). If the pin has no resolved gitdir the repository was
+/// unreadable when the command started, and there is nothing to be strict
+/// about — the same panic-on-missing-repo contract as [`worktree_gitdir`]
+/// applies, which is what every caller here already assumed.
+pub fn request_worktree_gitdir_strict() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.gitdir.clone(),
+        None => worktree_gitdir(),
+    }
+}
+
+/// The COMMON storage of the repository THIS INVOCATION is acting on (§C.4.2).
+///
+/// [`storage_path`] re-reads the cwd, so a command that steps into another
+/// repository mid-flight — or one whose library caller moved the cwd — would
+/// resolve a DIFFERENT repository's storage than the one whose rows it has
+/// been reading. The legacy sequencer sidecars (`rebase-merge`,
+/// `rebase-apply`) live there, so the pair has to hold: state read from
+/// repository A's database must never be finished against repository B's
+/// sidecar directory.
+///
+/// Unpinned callers resolve from the cwd, which is what they mean.
+pub fn request_storage_path() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.storage.clone(),
+        None => storage_path(),
+    }
+}
+
+/// The working-tree ROOT this invocation is acting on (§C.4.2).
+///
+/// [`working_dir`] re-reads the cwd; a rebase that resolved its plan against
+/// worktree A must not then reset worktree B's files because something moved
+/// the process cwd in between.
+pub fn request_working_dir() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.worktree_root.clone(),
+        None => working_dir(),
+    }
 }
 
 /// The current worktree's stable instance id (lore.md 2.1), read ambiently from
@@ -479,7 +790,26 @@ pub fn is_linked_worktree() -> bool {
 }
 
 pub fn current_worktree_id() -> Option<String> {
-    let gitdir = try_get_worktree_gitdir(None).ok()?;
+    worktree_id_for_base(None)
+}
+
+/// [`current_worktree_id`] resolved from an EXPLICIT base directory instead
+/// of the process cwd (W1 §C.4.1.1 scope↔workdir binding): a command that
+/// captured its working directory once can derive the matching scope from
+/// that same value, immune to a concurrent cwd switch in the process.
+pub fn worktree_id_for_base(base: Option<PathBuf>) -> Option<String> {
+    let gitdir = try_get_worktree_gitdir(base).ok()?;
+    worktree_id_for_gitdir(&gitdir)
+}
+
+/// [`worktree_id_for_base`] for a caller that has ALREADY resolved the gitdir.
+///
+/// §C.4.2: a pin derives its scope from the same walk that produced its paths.
+/// Resolving the scope from the cwd and the paths from a workdir is two
+/// observations, and a `set_current_dir` between them yields worktree A's
+/// scope key paired with worktree B's gitdir — the exact mismatch the pin
+/// exists to prevent.
+pub fn worktree_id_for_gitdir(gitdir: &Path) -> Option<String> {
     if let Ok(id) = fs::read_to_string(gitdir.join("worktree_id")) {
         let id = id.trim();
         if !id.is_empty() {
@@ -493,7 +823,7 @@ pub fn current_worktree_id() -> Option<String> {
     // canonical workdir (matching creation's derivation) so a recovered
     // worktree stays isolated from main and keeps its rows.
     if gitdir.join("commondir").exists() {
-        let workdir = gitdir.parent().unwrap_or(&gitdir);
+        let workdir = gitdir.parent().unwrap_or(gitdir);
         let canonical = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
         return Some(worktree_instance_id(&canonical));
     }
@@ -538,6 +868,109 @@ pub fn storage_path() -> PathBuf {
 }
 
 /// Return an error instead of printing when the current directory is not a repository.
+/// RAII guard for the repository-wide BRANCH-ATTACH lock (W3-s2 §C.7).
+///
+/// `switch`/`checkout` and `worktree add <branch>` all publish "branch X is
+/// checked out in scope Y" state, but only worktree mutators hold the
+/// registry lock — so the checked-out-elsewhere check and the HEAD
+/// publication must share THIS lock or two processes can attach the same
+/// branch in two scopes. (The full writer inventory joins in the dedicated
+/// shared-helper slice; see plan-20260714 W-branch item.)
+/// Deterministic fault injection for cold recovery/guard paths (R0-8
+/// style): active only when `LIBRA_TEST_FAULT` names the site. Never set in
+/// production.
+/// W3-s3 (§C.6.1): true when the CURRENT worktree uses the pre-isolation
+/// LEGACY layout — its `.libra` is a symlink straight at the common storage,
+/// so HEAD/index are shared with main. Read-only commands may proceed (no
+/// regression), but worktree-state mutations must refuse and direct at
+/// `repair --migrate-layout` (committing here would silently move MAIN's
+/// HEAD).
+pub fn is_legacy_symlink_worktree() -> bool {
+    let Ok((_, workdir, _gitdir)) = try_get_paths_full(None) else {
+        return false;
+    };
+    fs::symlink_metadata(workdir.join(ROOT_DIR))
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+static MIGRATION_GATE_BYPASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII bypass for the mid-migration freeze: held ONLY by the migration
+/// engine / repair recovery in this process (single migration at a time
+/// under the registry lock), so its own seeding/verification can resolve
+/// storage while every other process stays frozen out.
+pub struct MigrationGateBypass;
+
+impl Drop for MigrationGateBypass {
+    fn drop(&mut self) {
+        MIGRATION_GATE_BYPASS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn bypass_migration_gate() -> MigrationGateBypass {
+    MIGRATION_GATE_BYPASS.store(true, std::sync::atomic::Ordering::SeqCst);
+    MigrationGateBypass
+}
+
+fn migration_gate_bypassed() -> bool {
+    MIGRATION_GATE_BYPASS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn fault_injected(site: &str) -> bool {
+    std::env::var("LIBRA_TEST_FAULT").is_ok_and(|value| value == site)
+}
+
+/// Test-only rendezvous seam: when `LIBRA_TEST_RENDEZVOUS` is set to
+/// `<site>=<path>`, append one line to `<path>` on reaching `site`.
+///
+/// It changes NO behaviour — it exists so a test can start a timing window
+/// at the moment the SERVER reaches a point. A client-side barrier can only
+/// observe when a request was SENT; a concurrency test that starts its
+/// window there proves nothing when the handler arrives late, because the
+/// wall-clock assertion is then satisfied by the handler's own slowness
+/// instead of by contention.
+pub fn test_rendezvous(site: &str) {
+    use std::io::Write as _;
+
+    let Ok(value) = std::env::var("LIBRA_TEST_RENDEZVOUS") else {
+        return;
+    };
+    let Some((configured, path)) = value.split_once('=') else {
+        return;
+    };
+    if configured != site {
+        return;
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{site}");
+    }
+}
+
+pub struct BranchAttachLockGuard {
+    file: fs::File,
+}
+
+impl Drop for BranchAttachLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Acquire the branch-attach lock (blocking). The lock file lives in the
+/// COMMON storage, so every worktree of the repository serializes on it.
+pub fn acquire_branch_attach_lock() -> io::Result<BranchAttachLockGuard> {
+    let path = storage_path().join("branch-attach.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    file.lock()?;
+    Ok(BranchAttachLockGuard { file })
+}
+
 pub fn require_repo() -> io::Result<()> {
     try_get_storage_path(None).map(|_| ())
 }
@@ -696,6 +1129,91 @@ pub fn try_workdir_to_absolute(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     Ok(try_working_dir()?.join(path.as_ref()))
 }
 
+/// Collapse `.` / `..` components lexically, without touching the filesystem.
+///
+/// `..` never escapes above the filesystem root or a Windows prefix, so the
+/// result stays inside the same volume. Symlinks are NOT resolved — pair this
+/// with [`canonicalize_deepest_existing`] when two spellings of the same
+/// directory must compare equal.
+pub fn normalize_abs_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Path::new(comp.as_os_str())),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Never allow `..` to escape above filesystem root/prefix.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// Canonical, absolute spelling of `path` for the worktree registry
+/// (plan-20260714 Part C §C.7). Path aliases (`a/../b`, a symlinked parent, a
+/// trailing slash) must collapse onto one string, or the registry would treat
+/// one directory as two entries.
+///
+/// Relative inputs resolve against the process cwd. An EXISTING path goes
+/// through [`fs::canonicalize`], so symlinks and `..` are applied in the
+/// kernel's order; only for a path that does not exist yet does it fall back to
+/// canonicalizing the deepest existing ancestor and appending the remaining
+/// lexical components, keeping a persisted path stable across the directory's
+/// creation.
+///
+/// The workspace/lease store (§C.8) needs the same answer but cannot accept the
+/// lexical fallback — a not-yet-created leaf behind a dangling symlink has no
+/// provable identity — so it uses its own stricter resolver. The two agree
+/// exactly for every path that exists, which is what keeps a registered
+/// worktree and its workspace record pointing at one directory.
+pub fn canonicalize_deepest_existing(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cur_dir().join(path)
+    };
+    // Ask the KERNEL first, and keep asking it about shorter and shorter
+    // prefixes of the ORIGINAL path — never a lexically collapsed copy.
+    // Collapsing `..` before resolution is wrong wherever a symlink precedes
+    // it: with `/r/a/link -> /r/b/sub`, `/r/a/link/../new` really lives at
+    // `/r/b/new`, but popping `link` lexically yields `/r/a/new` — a different
+    // directory that a `worktree add` would then create.
+    let mut current = joined.as_path();
+    let mut remainder = PathBuf::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(current) {
+            let mut resolved = canonical;
+            if !remainder.as_os_str().is_empty() {
+                resolved.push(&remainder);
+            }
+            return Ok(resolved);
+        }
+
+        // `file_name()` is None for a component that is `..` or a bare root:
+        // there is nothing to peel off, so no true resolution exists.
+        let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
+            break;
+        };
+        remainder = if remainder.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            PathBuf::from(name).join(remainder)
+        };
+        current = parent;
+    }
+
+    // Nothing along the path resolves (a fully missing tree, or a `..` at the
+    // boundary). Fall back to the lexical reading — the best available answer
+    // when the filesystem has no opinion.
+    Ok(normalize_abs_path(&joined))
+}
+
 /// Judge if the path is a sub path of the parent path
 /// - Not check existence
 /// - `true` if path == parent
@@ -704,27 +1222,6 @@ where
     P: AsRef<Path>,
     B: AsRef<Path>,
 {
-    fn normalize_abs_path(path: &Path) -> PathBuf {
-        use std::path::Component;
-
-        let mut out = PathBuf::new();
-        for comp in path.components() {
-            match comp {
-                Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-                Component::RootDir => out.push(Path::new(comp.as_os_str())),
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    // Never allow `..` to escape above filesystem root/prefix.
-                    if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                        out.pop();
-                    }
-                }
-                Component::Normal(part) => out.push(part),
-            }
-        }
-        out
-    }
-
     // Avoid panics and avoid depending on a valid current directory when inputs are absolute.
     let path_abs = if path.as_ref().is_absolute() {
         normalize_abs_path(path.as_ref())
@@ -1020,8 +1517,18 @@ impl CommitBaseError {
             BranchStoreError::Query(_) | BranchStoreError::Delete { .. } => {
                 Self::ReadFailure(message)
             }
+            BranchStoreError::AlreadyExists(_) => Self::InvalidReference(message),
             BranchStoreError::Corrupt { .. } => Self::CorruptReference(message),
             BranchStoreError::NotFound(_) => Self::InvalidReference(message),
+            // §C.4.4's checkout-collision refusal is raised only by the WRITE
+            // seams (`Head::update_result_with_conn`,
+            // `Branch::delete_branch_result_with_conn`); the read functions
+            // this classifier wraps cannot produce it. Classified as an
+            // unusable reference rather than corruption so that if a future
+            // refactor ever routes a write error through here, the user is
+            // told the ref cannot be used — not that their repository is
+            // damaged.
+            BranchStoreError::CheckedOutElsewhere { .. } => Self::InvalidReference(message),
         }
     }
 
@@ -1361,6 +1868,11 @@ fn peel_object_to_type_typed(
     let storage = objects_storage();
     let mut current = ensure_hash_kind(object_id, display_name, false)?;
     let mut seen = HashSet::new();
+    // Whether the peel walked through at least one annotated tag: a type
+    // mismatch is then the TAG's fault, and the error names it so users see
+    // which object to fix (e.g. `rev-list <tag>` where the tag targets a
+    // tree).
+    let mut peeled_through_tag = false;
 
     loop {
         if !seen.insert(current) {
@@ -1390,11 +1902,18 @@ fn peel_object_to_type_typed(
                 );
             }
             _ if current_type == ObjectType::Tag => {
+                peeled_through_tag = true;
                 current = peel_tag_target_typed(&storage, current, display_name)?;
             }
             Some(expected_type) => {
+                let tag_detail = if peeled_through_tag {
+                    format!(" (tag points to {current_type})")
+                } else {
+                    String::new()
+                };
                 return Err(CommitBaseError::InvalidReference(format!(
-                    "reference '{display_name}' cannot be peeled from {current_type} to {expected_type}"
+                    "reference '{display_name}' cannot be peeled from {current_type} to \
+                     {expected_type}{tag_detail}"
                 )));
             }
             None => return Ok(current),
@@ -1742,7 +2261,57 @@ fn path_has_git_dir_component(work_dir: &Path, target_file: &Path) -> bool {
 /// parsing.
 ///
 /// Assume `target_file` is in `work_dir`.
+/// [`check_gitignore`] under the status I/O deadline.
+///
+/// Ignore resolution reads `.gitignore` / `.libraignore` files, so on a hung
+/// mount it can block like any other filesystem read. `None` means the
+/// lookup was reclaimed: callers treat that as "cannot decide" and report
+/// the path blocked rather than silently choosing an answer.
+pub fn check_gitignore_bounded(workdir: &Path, path: &Path) -> Option<bool> {
+    prewarm_ignore_config(workdir);
+    let workdir_owned = workdir.to_path_buf();
+    let path_owned = path.to_path_buf();
+    let answer = crate::command::status_probe::with_io_deadline(move || {
+        check_gitignore(&workdir_owned, &path_owned)
+    })
+    .ok()?;
+    // An unreadable ignore file yields an EMPTY matcher, so `false` here
+    // would mean "not ignored" when the truth is "unknown".
+    if ignore_read_failed() {
+        return None;
+    }
+    Some(answer)
+}
+
+/// Resolve the DATABASE-backed part of the ignore configuration on the
+/// CALLING thread.
+///
+/// `check_gitignore` consults `core.excludesFile`, which is a SQLite read of
+/// the repository config — not a filesystem operation. Running it on a
+/// pooled I/O worker means contention on the repository database is charged
+/// against the worktree I/O deadline and surfaces as a bogus `io_timeout`
+/// for a path that was perfectly readable. Callers that are about to hand
+/// `check_gitignore` to `with_io_deadline` warm the process-wide config
+/// cache here first, so the worker only ever touches the filesystem.
+pub fn prewarm_ignore_config(workdir: &Path) {
+    let _ = optional_cascaded_config_path(CORE_EXCLUDES_FILE_KEY, workdir);
+}
+
 pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {
+    check_gitignore_with_layers(
+        work_dir,
+        target_file,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+    )
+}
+
+/// [`check_gitignore`] against an ALREADY-CAPTURED layer snapshot, for a walk
+/// that captured once and must not re-read process-global state per path.
+pub fn check_gitignore_with_layers(
+    work_dir: &Path,
+    target_file: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+) -> bool {
     assert!(target_file.starts_with(work_dir));
 
     // Git hardcodes ignoring `.git`. Mirror that here, before consulting any
@@ -1758,9 +2327,15 @@ pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {
     // swept into `status`/`add`. Zero overhead with no layers (empty
     // snapshot). The `add` staging guard is the airtight backstop for
     // `--force` (which extends ignored files back into the staged set).
-    if let Ok(relative) = target_file.strip_prefix(work_dir)
+    //
+    // The snapshot is a PARAMETER (§C.4.1.1): a walk captures once and threads
+    // it down, so a concurrent re-pin cannot change which worktree's exclusions
+    // the walk is applying halfway through. `check_gitignore` captures for
+    // callers that have no walk.
+    if !layers.is_empty()
+        && let Ok(relative) = target_file.strip_prefix(work_dir)
         && let Some(key) = crate::internal::layer::normalize_key(relative)
-        && crate::internal::layer::is_layer_owned(&key)
+        && layers.is_owned(&key)
     {
         return true;
     }
@@ -1838,7 +2413,7 @@ fn ignore_sources_for_target(work_dir: &Path, target_file: &Path) -> Vec<IgnoreS
         dir.pop();
     }
 
-    if let Some(info_exclude) = git_info_file_path(work_dir, "exclude") {
+    for info_exclude in worktree_info_file_paths(work_dir, "exclude") {
         push_ignore_source(&mut sources, info_exclude, work_dir.to_path_buf());
     }
     if let Some(configured) = optional_cascaded_config_path(CORE_EXCLUDES_FILE_KEY, work_dir) {
@@ -2020,6 +2595,42 @@ pub fn exclude_matcher_verdict(
     }
 }
 
+/// Set when an ignore file existed but could not be read during this
+/// invocation. `check_gitignore_bounded` turns it into an undecidable
+/// answer, which callers report as `io_blocked` rather than guessing.
+static IGNORE_READ_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any ignore file failed to read since the last reset.
+pub fn ignore_read_failed() -> bool {
+    IGNORE_READ_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Does this ignore file contribute at least one pattern the ENGINE would
+/// actually apply? Parser-backed on purpose (W0 §C.4.1.1 origin inventory):
+/// a hand-rolled "non-comment line" heuristic disagrees with gitignore
+/// semantics — an INDENTED `#…` line is a real pattern, and a line the
+/// builder rejects contributes nothing.
+pub fn ignore_file_defines_any_pattern(ignore_path: &Path, base: &Path) -> bool {
+    let mut builder = GitignoreBuilder::new(base);
+    let Ok(contents) = fs::read_to_string(ignore_path) else {
+        return false;
+    };
+    let mut added = false;
+    for line in contents.lines() {
+        if builder
+            .add_line(Some(ignore_path.to_path_buf()), line)
+            .is_ok()
+        {
+            added = true;
+        }
+    }
+    if !added {
+        return false;
+    }
+    builder.build().map(|set| !set.is_empty()).unwrap_or(false)
+}
+
 fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
     let mut builder = GitignoreBuilder::new(base);
     match fs::read_to_string(ignore_path) {
@@ -2033,11 +2644,18 @@ fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
                 }
             }
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            eprintln!(
-                "warning: failed to read ignore file {}: {error}",
+            // An ignore file we cannot READ leaves an empty matcher, which
+            // silently reclassifies everything under it as NOT ignored. Mark
+            // the invocation so callers that must fail closed (the status
+            // probe and worktree scan) can refuse to answer instead of
+            // inventing a classification.
+            IGNORE_READ_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::utils::error::emit_warning(format!(
+                "failed to read ignore file {}: {error}",
                 ignore_path.display()
-            );
+            ));
         }
     }
     match builder.build() {
@@ -2244,6 +2862,38 @@ mod test {
         internal::{db::get_db_conn_instance, head::Head, model::reference, tag as internal_tag},
         utils::test,
     };
+
+    /// `..` after a symlink must be resolved by the kernel, for an existing
+    /// path AND for a leaf that does not exist yet: with `a/link -> b/sub`,
+    /// `a/link/../new` is `b/new`, not `a/new`. Getting this wrong makes
+    /// `worktree add` create a directory somewhere the user never named.
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_resolves_parent_traversal_through_symlinks() {
+        let dir = tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        std::fs::create_dir_all(root.join("a")).expect("mkdir a");
+        std::fs::create_dir_all(root.join("b").join("sub")).expect("mkdir b/sub");
+        std::fs::create_dir(root.join("b").join("existing")).expect("mkdir b/existing");
+        std::os::unix::fs::symlink(root.join("b").join("sub"), root.join("a").join("link"))
+            .expect("symlink");
+
+        // Existing target.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../existing")).expect("canonical"),
+            root.join("b").join("existing")
+        );
+        // Leaf that does not exist yet — the parent still resolves.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../new")).expect("canonical"),
+            root.join("b").join("new")
+        );
+        // Two levels of missing leaf below the resolvable parent.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../new/deeper")).expect("canonical"),
+            root.join("b").join("new").join("deeper")
+        );
+    }
 
     #[test]
     fn is_valid_refname_matches_git_check_ref_format() {
@@ -2984,8 +3634,13 @@ mod test {
         );
     }
 
+    /// W0 §C.4.1.1 (plan line 2262): info files belong to the WORKTREE VIEW.
+    /// A Git-layout linked worktree resolves its OWN gitdir's `info/<name>`,
+    /// not the commondir target's — the pre-W0 behavior (follow `commondir`)
+    /// gave a linked worktree main's exclude view while its own file was
+    /// silently ignored.
     #[test]
-    fn test_git_info_file_path_uses_common_dir_for_linked_worktree() {
+    fn test_worktree_info_file_path_is_local_for_git_layout_linked_worktree() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("linked-worktree");
         let common = temp.path().join("main.git");
@@ -3000,9 +3655,306 @@ mod test {
         .unwrap();
         fs::write(worktree_git.join("commondir"), b"../..\n").unwrap();
 
-        let info_path = git_info_file_path(&repo, "exclude").expect("resolve info path");
+        let info_paths = worktree_info_file_paths(&repo, "exclude");
 
-        assert_eq!(info_path, common.join("info").join("exclude"));
+        assert_eq!(
+            info_paths,
+            vec![worktree_git.join("info").join("exclude")],
+            "the LOCAL gitdir's info file, not the commondir target's"
+        );
+    }
+
+    /// The `.libra` layout — the primary product — must resolve at all: the
+    /// `.libra/info/exclude` that `libra init` creates was dead code before
+    /// W0 (only a literal `.git` marker was recognized). A dual-layout tree
+    /// (converted from Git, `.git` kept beside `.libra`) keeps BOTH local
+    /// candidates so existing `.git/info/*` rules do not silently vanish.
+    #[test]
+    fn test_worktree_info_file_paths_resolve_dot_libra_layouts() {
+        let temp = tempdir().unwrap();
+
+        // Main worktree: local gitdir == common storage.
+        let main_root = temp.path().join("main");
+        let main_gitdir = main_root.join(ROOT_DIR);
+        fs::create_dir_all(&main_gitdir).unwrap();
+        fs::write(main_gitdir.join(DATABASE), b"").unwrap();
+        assert_eq!(
+            worktree_info_file_paths(&main_root, "exclude"),
+            vec![main_gitdir.join("info").join("exclude")],
+        );
+
+        // Linked worktree: its OWN `.libra`, never the commondir target.
+        let linked_root = temp.path().join("wt");
+        let linked_gitdir = linked_root.join(ROOT_DIR);
+        fs::create_dir_all(&linked_gitdir).unwrap();
+        fs::write(
+            linked_gitdir.join("commondir"),
+            main_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            worktree_info_file_paths(&linked_root, "attributes"),
+            vec![linked_gitdir.join("info").join("attributes")],
+            "linked worktrees carry their own info view (plan line 2262)"
+        );
+
+        // Dual layout: a literal `.git` beside `.libra` contributes its own
+        // LOCAL info candidate after the `.libra` one.
+        let dual_git = main_root.join(".git");
+        fs::create_dir_all(&dual_git).unwrap();
+        assert_eq!(
+            worktree_info_file_paths(&main_root, "exclude"),
+            vec![
+                main_gitdir.join("info").join("exclude"),
+                dual_git.join("info").join("exclude"),
+            ],
+            "a converted repo keeps its .git/info rules alongside .libra's"
+        );
+    }
+
+    /// §C.4.1 fail-closed covers the pointer's TARGET too: a `commondir`
+    /// whose target is missing or is not a storage directory must refuse —
+    /// returning the dangling path would route every db/objects/policy
+    /// lookup at a location where "not found" masquerades as "no
+    /// configuration".
+    #[test]
+    fn test_commondir_pointer_with_bad_target_fails_closed() {
+        let temp = tempdir().unwrap();
+
+        // Dangling target.
+        let dangling_root = temp.path().join("wt-dangling");
+        let dangling_gitdir = dangling_root.join(ROOT_DIR);
+        fs::create_dir_all(&dangling_gitdir).unwrap();
+        fs::write(
+            dangling_gitdir.join("commondir"),
+            temp.path().join("no-such-dir").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(dangling_root)).expect_err("dangling target refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("worktree repair"),
+            "the refusal must point at the remedy: {err}"
+        );
+
+        // Existing target that is NOT a storage directory.
+        let bogus_target = temp.path().join("plain-dir");
+        fs::create_dir_all(&bogus_target).unwrap();
+        let bogus_root = temp.path().join("wt-bogus");
+        let bogus_gitdir = bogus_root.join(ROOT_DIR);
+        fs::create_dir_all(&bogus_gitdir).unwrap();
+        fs::write(
+            bogus_gitdir.join("commondir"),
+            bogus_target.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(bogus_root)).expect_err("non-storage target refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("TERMINAL common storage"),
+            "the refusal must say WHY the target is rejected: {err}"
+        );
+
+        // A SELF-pointer (the gitdir's commondir names itself): the target
+        // carries a commondir marker, so it is not terminal — refused, not
+        // followed into a database-less local gitdir.
+        let selfish_root = temp.path().join("wt-self");
+        let selfish_gitdir = selfish_root.join(ROOT_DIR);
+        fs::create_dir_all(&selfish_gitdir).unwrap();
+        fs::write(
+            selfish_gitdir.join("commondir"),
+            selfish_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(selfish_root)).expect_err("self-pointer refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // A pointer at ANOTHER linked worktree's gitdir (a chain): equally
+        // refused — chains are corruption, not indirection.
+        let main_gitdir = temp.path().join("main").join(ROOT_DIR);
+        fs::create_dir_all(&main_gitdir).unwrap();
+        fs::write(main_gitdir.join(DATABASE), b"").unwrap();
+        let hop_gitdir = temp.path().join("wt-hop").join(ROOT_DIR);
+        fs::create_dir_all(&hop_gitdir).unwrap();
+        fs::write(
+            hop_gitdir.join("commondir"),
+            main_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let chain_root = temp.path().join("wt-chain");
+        let chain_gitdir = chain_root.join(ROOT_DIR);
+        fs::create_dir_all(&chain_gitdir).unwrap();
+        fs::write(
+            chain_gitdir.join("commondir"),
+            hop_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(chain_root)).expect_err("pointer chain refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A gitdir carrying a `worktree_id` but NO `commondir` is a linked
+    /// worktree that LOST its pointer — corruption to refuse. Answering
+    /// "main" (the pre-fix behavior) would route its db/objects lookups at
+    /// its own pointer-less gitdir, a phantom repository, and let callers
+    /// trust its local configuration as the repository's. Discovery must
+    /// also STOP there rather than climbing into an ancestor repository.
+    #[test]
+    fn test_pointerless_linked_gitdir_fails_closed() {
+        let temp = tempdir().unwrap();
+        // An ancestor repository the walk must NOT climb into.
+        let ancestor_gitdir = temp.path().join(ROOT_DIR);
+        fs::create_dir_all(&ancestor_gitdir).unwrap();
+        fs::write(ancestor_gitdir.join(DATABASE), b"").unwrap();
+
+        let root = temp.path().join("nested-wt");
+        let gitdir = root.join(ROOT_DIR);
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("worktree_id"), b"wt-orphan-1234\n").unwrap();
+
+        assert!(
+            is_valid_storage_dir(&gitdir),
+            "a worktree_id marks a linked gitdir even with no commondir, so \
+             discovery STOPS here instead of climbing to the ancestor repo"
+        );
+        let err = try_get_storage_path(Some(root)).expect_err("pointer-less linked gitdir refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("worktree repair"),
+            "the refusal must point at the remedy: {err}"
+        );
+        assert!(
+            !err.to_string().contains("not a libra repository"),
+            "it must be a CORRUPTION refusal, not a 'no repository' answer: {err}"
+        );
+    }
+
+    /// A DANGLING `commondir` symlink is a present-but-corrupt marker, not
+    /// an absent one: `exists()` follows the link and would silently treat
+    /// the linked worktree as MAIN (routing every write at the wrong scope),
+    /// and would bless a pointer target that still carries a (dangling)
+    /// commondir marker as terminal.
+    #[cfg(unix)]
+    #[test]
+    fn test_dangling_commondir_symlink_fails_closed() {
+        let temp = tempdir().unwrap();
+
+        // Linked gitdir whose commondir marker is a dangling symlink.
+        let root = temp.path().join("wt");
+        let gitdir = root.join(ROOT_DIR);
+        fs::create_dir_all(&gitdir).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("gone"), gitdir.join("commondir")).unwrap();
+        // The gitdir must still be RECOGNIZED as a linked gitdir...
+        assert!(
+            is_valid_storage_dir(&gitdir),
+            "a dangling commondir symlink still marks a linked gitdir"
+        );
+        // ...and resolution must refuse, never silently answer "main".
+        let err = try_get_storage_path(Some(root)).expect_err("dangling marker refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("worktree repair"),
+            "the refusal must point at the remedy: {err}"
+        );
+
+        // A pointer TARGET carrying a dangling commondir symlink is not
+        // terminal either.
+        let target = temp.path().join("bad-target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join(DATABASE), b"").unwrap();
+        std::os::unix::fs::symlink(temp.path().join("gone2"), target.join("commondir")).unwrap();
+        assert!(
+            !is_terminal_common_storage(&target),
+            "a database-bearing dir with a dangling commondir marker is not terminal"
+        );
+
+        // A DANGLING detached_from_registry symlink still freezes the
+        // worktree — `exists()` would follow it and silently unfreeze.
+        let detached_main_gitdir = temp.path().join("detached-main").join(ROOT_DIR);
+        fs::create_dir_all(&detached_main_gitdir).unwrap();
+        fs::write(detached_main_gitdir.join(DATABASE), b"").unwrap();
+        let detached_root = temp.path().join("wt-detached");
+        let detached_gitdir = detached_root.join(ROOT_DIR);
+        fs::create_dir_all(&detached_gitdir).unwrap();
+        fs::write(
+            detached_gitdir.join("commondir"),
+            detached_main_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            temp.path().join("gone3"),
+            detached_gitdir.join("detached_from_registry"),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(detached_root)).expect_err("dangling detached refuses");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// An UNINSPECTABLE marker (EPERM on lstat) is treated as present, not
+    /// absent: discovery still stops at the gitdir and resolution refuses
+    /// via the lifecycle-marker arm — never silently unfreezing or climbing
+    /// into main's scope.
+    #[cfg(unix)]
+    #[test]
+    fn test_uninspectable_markers_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("wt");
+        let gitdir = root.join(ROOT_DIR);
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), b"target").unwrap();
+        let writable = fs::metadata(&gitdir).unwrap().permissions();
+        fs::set_permissions(&gitdir, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::symlink_metadata(gitdir.join("commondir")).is_ok() {
+            fs::set_permissions(&gitdir, writable).unwrap();
+            eprintln!("skipped (running as root: permission bits cannot stage EPERM)");
+            return;
+        }
+
+        assert!(
+            is_valid_storage_dir(&gitdir),
+            "an uninspectable gitdir still STOPS repository discovery"
+        );
+        let err = try_get_storage_path(Some(root)).expect_err("uninspectable markers refuse");
+        fs::set_permissions(&gitdir, writable).unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("lifecycle marker"),
+            "the LIFECYCLE-marker arm must fire first (uninspectable = frozen, \
+             not absent): {err}"
+        );
+
+        // And the TERMINAL-target branch, reached only when the LOCAL gitdir
+        // is perfectly readable: a database-bearing target whose own
+        // `commondir` cannot be inspected must be refused, never blessed as
+        // terminal (the pre-fix behavior accepted it).
+        let opaque_target = temp.path().join("opaque-target");
+        fs::create_dir_all(&opaque_target).unwrap();
+        fs::write(opaque_target.join(DATABASE), b"").unwrap();
+        let pointing_root = temp.path().join("wt-pointing");
+        let pointing_gitdir = pointing_root.join(ROOT_DIR);
+        fs::create_dir_all(&pointing_gitdir).unwrap();
+        fs::write(
+            pointing_gitdir.join("commondir"),
+            opaque_target.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let target_writable = fs::metadata(&opaque_target).unwrap().permissions();
+        fs::set_permissions(&opaque_target, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::symlink_metadata(opaque_target.join("commondir")).is_ok() {
+            fs::set_permissions(&opaque_target, target_writable).unwrap();
+            eprintln!("skipped (running as root: permission bits cannot stage EPERM)");
+            return;
+        }
+        let err =
+            try_get_storage_path(Some(pointing_root)).expect_err("uninspectable target refuses");
+        fs::set_permissions(&opaque_target, target_writable).unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("TERMINAL common storage"),
+            "the TERMINAL-target branch must refuse an uninspectable target: {err}"
+        );
     }
 
     #[test]

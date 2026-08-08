@@ -24,6 +24,11 @@ pub enum OperationStatus {
 }
 
 impl OperationStatus {
+    /// The status as it appears in messages and storage.
+    pub fn as_str(self) -> &'static str {
+        self.as_db_value()
+    }
+
     fn as_db_value(self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -59,6 +64,30 @@ pub struct OperationRecord {
     pub start_ts: i64,
     pub end_ts: Option<i64>,
     pub status: OperationStatus,
+    /// Worktree scope the operation ran in (Part C W1 §C.9): main = `""`,
+    /// linked = its stable instance id.
+    pub worktree_id: String,
+    /// W0 §C.11: how `worktree_id` came to hold its value. Every operation
+    /// this binary records is `"declared"`; `"unknown"` exists only for rows
+    /// migration 2026072902 could not attribute (see that file).
+    pub scope_provenance: String,
+    /// Whether `op restore` may replay this operation (W1 §C.9). `false` for
+    /// every operation whose effects the HEAD/refs-only snapshot cannot
+    /// restore — all sequencer control actions.
+    pub restorable: bool,
+    /// Set while this row holds its worktree's single control slot (W1 §C.9):
+    /// the partial unique index admits at most one running control per
+    /// (repository, worktree). `None` for every ordinary operation.
+    pub control_slot: Option<String>,
+    /// `<host>/<pid>` of the process holding a `running` claim, so a claim
+    /// left by a killed process can be proven dead rather than guessed from
+    /// age.
+    pub claim_owner: Option<String>,
+    /// The typed scope kind (W1 §C.9): `main` / `linked` / `repository` /
+    /// `unknown`. `worktree_id` alone cannot express it — a repository-scope
+    /// operation recorded from main carries the same empty id as a main-scope
+    /// one, and `op restore` must refuse the former while allowing the latter.
+    pub scope_kind: String,
 }
 
 /// Parent edge for operation lineage.
@@ -215,6 +244,12 @@ impl OperationService {
             start_ts: model.start_ts,
             end_ts: model.end_ts,
             status,
+            worktree_id: model.worktree_id,
+            scope_provenance: model.scope_provenance,
+            restorable: model.restorable != 0,
+            control_slot: model.control_slot,
+            claim_owner: model.claim_owner,
+            scope_kind: model.scope_kind,
         })
     }
 
@@ -236,6 +271,12 @@ impl OperationService {
             start_ts: Set(record.start_ts),
             end_ts: Set(record.end_ts),
             status: Set(record.status.as_db_value().to_string()),
+            worktree_id: Set(record.worktree_id.clone()),
+            scope_provenance: Set(record.scope_provenance.clone()),
+            restorable: Set(i32::from(record.restorable)),
+            control_slot: Set(record.control_slot.clone()),
+            claim_owner: Set(record.claim_owner.clone()),
+            scope_kind: Set(record.scope_kind.clone()),
         };
 
         let inserted = model.insert(db).await.map_err(|err| {
@@ -246,6 +287,81 @@ impl OperationService {
         })?;
 
         Self::record_from_model(inserted)
+    }
+
+    /// Delete one operation row by id.
+    ///
+    /// Used by boundary recording to replace a `running` claim with the
+    /// finished record inside one transaction — which also releases the
+    /// partial unique index on running claims, so the next control action in
+    /// this worktree is not blocked by an operation that already ended.
+    pub async fn delete_operation_with_conn<C: ConnectionTrait>(
+        db: &C,
+        op_id: &str,
+    ) -> Result<bool, OperationServiceError> {
+        let deleted = operation::Entity::delete_many()
+            .filter(operation::Column::OpId.eq(op_id))
+            .exec(db)
+            .await
+            .map_err(|err| {
+                OperationServiceError::Storage(format!(
+                    "failed to delete operation '{op_id}': {err}"
+                ))
+            })?;
+        Ok(deleted.rows_affected > 0)
+    }
+
+    /// The running control claim on one worktree's slot, if any:
+    /// `(op_id, command_name, start_ts, claim_owner)`.
+    pub async fn running_control_claim_with_conn<C: ConnectionTrait>(
+        db: &C,
+        repo_id: &str,
+        worktree_id: &str,
+    ) -> Result<Option<(String, String, i64, Option<String>)>, OperationServiceError> {
+        let holder = operation::Entity::find()
+            .filter(operation::Column::RepoId.eq(repo_id))
+            .filter(operation::Column::WorktreeId.eq(worktree_id))
+            .filter(operation::Column::Status.eq(OperationStatus::Running.as_db_value()))
+            .filter(operation::Column::ControlSlot.is_not_null())
+            .one(db)
+            .await
+            .map_err(|err| {
+                OperationServiceError::Storage(format!("failed to read the control claim: {err}"))
+            })?;
+        Ok(holder.map(|row| (row.op_id, row.command_name, row.start_ts, row.claim_owner)))
+    }
+
+    /// Close an ABANDONED claim by marking it failed, which both releases the
+    /// worktree's control slot and keeps the row as evidence that a control
+    /// action died mid-flight. Returns false when the row was already gone.
+    pub async fn abandon_claim_with_conn<C: ConnectionTrait>(
+        db: &C,
+        op_id: &str,
+        end_ts: i64,
+    ) -> Result<bool, OperationServiceError> {
+        let updated = operation::Entity::update_many()
+            .col_expr(
+                operation::Column::Status,
+                sea_orm::sea_query::Expr::value(OperationStatus::Failed.as_db_value()),
+            )
+            .col_expr(
+                operation::Column::EndTs,
+                sea_orm::sea_query::Expr::value(end_ts),
+            )
+            .col_expr(
+                operation::Column::ControlSlot,
+                sea_orm::sea_query::Expr::value(Option::<String>::None),
+            )
+            .filter(operation::Column::OpId.eq(op_id))
+            .filter(operation::Column::Status.eq(OperationStatus::Running.as_db_value()))
+            .exec(db)
+            .await
+            .map_err(|err| {
+                OperationServiceError::Storage(format!(
+                    "failed to close the abandoned claim '{op_id}': {err}"
+                ))
+            })?;
+        Ok(updated.rows_affected > 0)
     }
 
     /// Find one operation main record by operation id.
@@ -273,6 +389,64 @@ impl OperationService {
     }
 
     /// List latest operation main records for a repository.
+    /// Recent SUCCEEDED operations for one `(repo, worktree, command, digest)`
+    /// within `window_secs` — the duplicate-suppression point query
+    /// (plan-20260714 §C.9).
+    ///
+    /// This exists because filtering in memory does not work: the caller used
+    /// to take the newest 50 rows for the whole REPOSITORY and then keep the
+    /// ones matching its scope, so fifty newer operations in other worktrees
+    /// pushed a same-scope operation out of the window and the duplicate it
+    /// should have refused went through. Every predicate belongs in the
+    /// query, and `limit` then bounds a set that is already the right one.
+    pub async fn recent_duplicate_candidates_with_conn<C: ConnectionTrait>(
+        db: &C,
+        repo_id: &str,
+        // `None` = REPOSITORY-wide: an operation whose effects belong to the
+        // repository must deduplicate across worktrees, so the scope filter is
+        // omitted rather than matched against a scope key no row carries.
+        worktree_id: Option<&str>,
+        command_name: &str,
+        args_digest: &str,
+        earliest_end_ts: i64,
+        limit: u64,
+    ) -> Result<Vec<OperationRecord>, OperationServiceError> {
+        if repo_id.trim().is_empty() {
+            return Err(OperationServiceError::InvalidArgument(
+                "repo_id must not be empty".to_string(),
+            ));
+        }
+        if limit == 0 {
+            return Err(OperationServiceError::InvalidArgument(
+                "limit must be greater than 0".to_string(),
+            ));
+        }
+        let mut query = operation::Entity::find().filter(operation::Column::RepoId.eq(repo_id));
+        if let Some(worktree_id) = worktree_id {
+            query = query.filter(operation::Column::WorktreeId.eq(worktree_id));
+        }
+        let models = Self::apply_repo_operation_order(
+            query
+                .filter(operation::Column::CommandName.eq(command_name))
+                .filter(operation::Column::ArgsDigest.eq(args_digest))
+                .filter(operation::Column::Status.eq(OperationStatus::Succeeded.as_db_value()))
+                .filter(operation::Column::EndTs.gte(earliest_end_ts)),
+        )
+        .limit(limit)
+        .all(db)
+        .await
+        .map_err(|err| {
+            OperationServiceError::Storage(format!(
+                "failed to query duplicate candidates for repository '{repo_id}': {err}"
+            ))
+        })?;
+
+        models
+            .into_iter()
+            .map(Self::record_from_model)
+            .collect::<Result<Vec<_>, _>>()
+    }
+
     pub async fn list_operations_by_repo_with_conn<C: ConnectionTrait>(
         db: &C,
         repo_id: &str,
@@ -971,6 +1145,8 @@ mod tests {
             start_ts: 100,
             end_ts: Some(120),
             status: OperationStatus::Succeeded,
+            worktree_id: String::new(),
+            scope_provenance: "declared".to_string(),
         }
     }
 
@@ -1298,7 +1474,7 @@ mod tests {
     async fn commit7_persist_and_find_operation_graph_roundtrip() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let ddl = concat!(
-            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'unknown');",
             "CREATE TABLE IF NOT EXISTS operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
             "CREATE TABLE IF NOT EXISTS operation_view(view_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,head_kind TEXT NOT NULL,head_target TEXT NOT NULL,created_at INTEGER NOT NULL);",
             "CREATE TABLE IF NOT EXISTS operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
@@ -1320,6 +1496,8 @@ mod tests {
                 start_ts: 200,
                 end_ts: Some(205),
                 status: OperationStatus::Succeeded,
+                worktree_id: String::new(),
+                scope_provenance: "declared".to_string(),
             },
             parents: vec![OperationParentRecord {
                 op_id: "op_7".to_string(),
@@ -1380,7 +1558,7 @@ mod tests {
 
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'unknown');",
         ))
         .await
         .unwrap();
@@ -1397,6 +1575,8 @@ mod tests {
                 start_ts: end_ts - 10,
                 end_ts: Some(end_ts),
                 status: OperationStatus::Succeeded,
+                worktree_id: String::new(),
+                scope_provenance: "declared".to_string(),
             };
             OperationService::insert_operation_with_conn(&db, &record)
                 .await

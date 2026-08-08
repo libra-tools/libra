@@ -4670,10 +4670,17 @@ where
                 }
 
                 if saw_activity && managed_snapshot_is_terminal(&snapshot) {
-                    let event = if snapshot.status == CodeUiSessionStatus::Error {
+                    let event = if matches!(
+                        snapshot.status,
+                        CodeUiSessionStatus::Error | CodeUiSessionStatus::IndeterminateSideEffect
+                    ) {
                         AgentEvent::Error {
                             message: if previous_text.trim().is_empty() {
-                                "managed provider turn failed".to_string()
+                                if snapshot.status == CodeUiSessionStatus::IndeterminateSideEffect {
+                                    "managed provider turn reached an indeterminate side-effect boundary; reconcile before retrying".to_string()
+                                } else {
+                                    "managed provider turn failed".to_string()
+                                }
                             } else {
                                 previous_text.clone()
                             },
@@ -10541,7 +10548,10 @@ fn managed_snapshot_is_terminal(snapshot: &CodeUiSessionSnapshot) -> bool {
     !has_pending_interaction
         && matches!(
             snapshot.status,
-            CodeUiSessionStatus::Idle | CodeUiSessionStatus::Completed | CodeUiSessionStatus::Error
+            CodeUiSessionStatus::Idle
+                | CodeUiSessionStatus::Completed
+                | CodeUiSessionStatus::Error
+                | CodeUiSessionStatus::IndeterminateSideEffect
         )
 }
 
@@ -10550,9 +10560,10 @@ fn managed_agent_status(status: CodeUiSessionStatus) -> AgentStatus {
         CodeUiSessionStatus::Thinking => AgentStatus::Thinking,
         CodeUiSessionStatus::ExecutingTool => AgentStatus::ExecutingTool,
         CodeUiSessionStatus::AwaitingInteraction => AgentStatus::AwaitingApproval,
-        CodeUiSessionStatus::Idle | CodeUiSessionStatus::Completed | CodeUiSessionStatus::Error => {
-            AgentStatus::Idle
-        }
+        CodeUiSessionStatus::Idle
+        | CodeUiSessionStatus::Completed
+        | CodeUiSessionStatus::Error
+        | CodeUiSessionStatus::IndeterminateSideEffect => AgentStatus::Idle,
     }
 }
 

@@ -1,0 +1,17 @@
+-- 2026073005_worktree_registry_v3_capability
+--
+-- plan-20260714 Part C W1 (§C.4.1.1 service fence): repository capability
+-- marker for `worktrees.json` schema_version 3 — the registry that carries a
+-- durable registration-generation counter.
+--
+-- `#[serde(default)]` is the right way to READ a pre-epoch file. It is the
+-- wrong compatibility barrier for a generation ISSUER: a v2-era binary parses
+-- a v3 registry happily, does not know `epoch_counter` or an entry's `epoch`,
+-- and drops both when it rewrites the file. The next registration then reissues
+-- a generation a live client is still fenced on, and the fence silently stops
+-- fencing — the failure mode it exists to prevent, arrived at by upgrade.
+--
+-- The marker makes every older binary refuse the repository at connect time
+-- (future-schema fail-closed) BEFORE it can rewrite the registry, exactly as
+-- the v2 marker did for persisted worktree ids.
+INSERT OR IGNORE INTO `worktree_registry_capability` (`version`) VALUES (3);

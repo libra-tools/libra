@@ -1,0 +1,18 @@
+# `upstream_revision` is not a 40-hex pinned SHA.
+#
+# One deliberate defect, so the guard's refusal can be attributed to it.
+
+[[scenario]]
+id = "t4001-diff-format::numstat-reports-added-and-deleted-line-counts"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#description"
+reason = "Upstream asserts the two-column machine format; Libra exposes the same flag."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "deadbeef"
+upstream_file = "t4001-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--numstat"
+

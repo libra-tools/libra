@@ -79,7 +79,21 @@ impl From<GitError> for TreePlumbingError {
 /// (SHA-1 / SHA-256) follows the process hash kind, since the tree id is derived
 /// from the serialized tree bytes.
 pub fn write_tree_from_index(index: &Index) -> Result<ObjectHash, TreePlumbingError> {
-    validate_index_objects(index)?;
+    write_tree_from_index_with(index, false)
+}
+
+/// [`write_tree_from_index`] with the `write-tree --missing-ok` escape valve
+/// (plan-20260714 PD-05, Git parity): `missing_ok` skips ONLY the
+/// blob-existence half of the preflight — the tree is still written with the
+/// recorded object ids. Mistyped objects, unreadable (corrupt) objects, and
+/// missing subtree objects keep failing closed. The `commit` / `merge` /
+/// `cherry-pick` paths deliberately stay on the strict entry point and never
+/// expose this valve.
+pub fn write_tree_from_index_with(
+    index: &Index,
+    missing_ok: bool,
+) -> Result<ObjectHash, TreePlumbingError> {
+    validate_index_objects_with(index, missing_ok)?;
 
     let mut leaves = Vec::new();
     for path in index.tracked_files() {
@@ -100,6 +114,19 @@ pub fn write_tree_from_index(index: &Index) -> Result<ObjectHash, TreePlumbingEr
 /// checked: their ids belong to the submodule repository, not necessarily this
 /// object database.
 pub fn validate_index_objects(index: &Index) -> Result<(), TreePlumbingError> {
+    validate_index_objects_with(index, false)
+}
+
+/// [`validate_index_objects`] with the PD-05 `--missing-ok` escape valve:
+/// when `missing_ok` is set, an ABSENT object behind a blob-typed entry
+/// (regular / executable / symlink) is tolerated — Git's
+/// `write-tree --missing-ok` semantics. Everything else keeps failing
+/// closed: unreadable/corrupt objects, missing subtree objects, and objects
+/// whose type does not match the entry mode.
+pub fn validate_index_objects_with(
+    index: &Index,
+    missing_ok: bool,
+) -> Result<(), TreePlumbingError> {
     let storage = util::objects_storage();
 
     for entry in index.tracked_entries(0) {
@@ -107,14 +134,23 @@ pub fn validate_index_objects(index: &Index) -> Result<(), TreePlumbingError> {
         let Some(expected) = expected_object_type(mode) else {
             continue;
         };
-        let actual = storage.get_object_type(&entry.hash).map_err(|error| {
-            TreePlumbingError::MissingOrUnreadableObject {
-                path: entry.name.clone(),
-                object: entry.hash,
-                expected,
-                detail: error.to_string(),
+        let actual = match storage.get_object_type(&entry.hash) {
+            Ok(actual) => actual,
+            // PD-05: only "the object does not exist" is excusable, and only
+            // for blob-typed entries; read/corruption failures stay fatal so
+            // the valve never masks a damaged object store.
+            Err(GitError::ObjectNotFound(_)) if missing_ok && expected == ObjectType::Blob => {
+                continue;
             }
-        })?;
+            Err(error) => {
+                return Err(TreePlumbingError::MissingOrUnreadableObject {
+                    path: entry.name.clone(),
+                    object: entry.hash,
+                    expected,
+                    detail: error.to_string(),
+                });
+            }
+        };
         if actual != expected {
             return Err(TreePlumbingError::WrongObjectType {
                 path: entry.name.clone(),

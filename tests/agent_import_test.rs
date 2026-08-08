@@ -176,7 +176,7 @@ impl ImportRepo {
             self.repo.join(".libra/libra.db").display()
         );
         let conn = Database::connect(url).await.expect("open repo db");
-        conn.query_one(Statement::from_string(
+        conn.query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -193,7 +193,7 @@ impl ImportRepo {
             self.repo.join(".libra/libra.db").display()
         );
         let conn = Database::connect(url).await.expect("open repo db");
-        conn.query_all(Statement::from_string(
+        conn.query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -202,6 +202,17 @@ impl ImportRepo {
         .into_iter()
         .map(|row| row.try_get_by(column).expect("text result"))
         .collect()
+    }
+
+    async fn repo_id(&self) -> String {
+        self.text_rows(
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1",
+            "value",
+        )
+        .await
+        .into_iter()
+        .next()
+        .expect("initialized repository identity")
     }
 }
 
@@ -697,7 +708,7 @@ async fn agent_import_same_digest_terminal_upgrade_writes_complete_schema_valid_
     .await
     .expect("open result db");
     let lifecycle = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT state, last_event_at, stopped_at FROM agent_session
              WHERE provider_session_id = 'terminalupgrade'"
@@ -719,7 +730,7 @@ async fn agent_import_same_digest_terminal_upgrade_writes_complete_schema_valid_
         1_784_077_202
     );
     let checkpoint = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT r.checkpoint_id, c.tree_oid
              FROM agent_coverage_revision r
@@ -896,7 +907,7 @@ async fn agent_import_preserves_three_turn_checkpoint_and_lifecycle_chronology()
     .await
     .expect("open chronology db");
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT checkpoint_id, tree_oid, created_at FROM agent_checkpoint
              WHERE session_id = 'claude__chronology123'
@@ -1023,7 +1034,7 @@ async fn agent_import_normalizes_same_second_turns_in_public_checkpoint_order() 
     .await
     .expect("open same-second chronology db");
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT checkpoint_id, created_at FROM agent_checkpoint
              WHERE session_id = 'claude__same-second-chronology'
@@ -1043,7 +1054,7 @@ async fn agent_import_normalizes_same_second_turns_in_public_checkpoint_order() 
         expected_public_ids.push(row.try_get_by::<String, _>("checkpoint_id").unwrap());
     }
     let lifecycle = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT last_event_at, stopped_at FROM agent_session
              WHERE session_id = 'claude__same-second-chronology'"
@@ -1465,7 +1476,7 @@ async fn agent_import_codex_malformed_arguments_upgrade_without_conflict() {
     .await
     .expect("open result db");
     let row = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT state, completeness FROM agent_coverage_claim".to_string(),
         ))
@@ -1494,19 +1505,21 @@ async fn agent_import_reuses_same_repository_live_session_from_subdirectory() {
     let subdir = fixture.repo.join("nested/work");
     std::fs::create_dir_all(&subdir).expect("create repo subdir");
     let transcript = fixture.write_transcript("subdir123", &subdir, true);
+    let repo_id = fixture.repo_id().await;
     let db_url = format!(
         "sqlite://{}",
         fixture.repo.join(".libra/libra.db").display()
     );
     let conn = Database::connect(db_url).await.expect("open repo db");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
-            metadata_json, redaction_report, started_at, last_event_at, schema_version
+            metadata_json, redaction_report, started_at, last_event_at, schema_version,
+            repo_id, worktree_id, workspace_id, workspace_fence, scope_state
          ) VALUES ('claude__subdir123', 'claude_code', 'subdir123', 'active', ?,
-                   '{}', '{}', 1, 1, 1)",
-        [subdir.to_string_lossy().into_owned().into()],
+                   '{}', '{}', 1, 1, 1, ?, '', NULL, NULL, 'scoped')",
+        [subdir.to_string_lossy().into_owned().into(), repo_id.into()],
     ))
     .await
     .expect("seed live session");
@@ -1575,25 +1588,28 @@ async fn agent_import_preserves_newer_stopped_live_session_lifecycle() {
 
     let newer_event_at = 9_999_999_999_000_i64;
     let newer_stopped_at = 9_999_999_999_500_i64;
+    let repo_id = fixture.repo_id().await;
     let db_url = format!(
         "sqlite://{}",
         fixture.repo.join(".libra/libra.db").display()
     );
     let conn = Database::connect(db_url).await.expect("open repo db");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
             metadata_json, redaction_report, started_at, last_event_at,
-            stopped_at, schema_version
+            stopped_at, schema_version, repo_id, worktree_id, workspace_id,
+            workspace_fence, scope_state
          ) VALUES ('claude__stoppednewer', 'claude_code', ?, 'stopped', ?,
-                   '{}', '{}', ?, ?, ?, 1)",
+                   '{}', '{}', ?, ?, ?, 1, ?, '', NULL, NULL, 'scoped')",
         [
             session_id.into(),
             fixture.repo.to_string_lossy().into_owned().into(),
             newer_event_at.into(),
             newer_event_at.into(),
             newer_stopped_at.into(),
+            repo_id.into(),
         ],
     ))
     .await
@@ -1630,7 +1646,7 @@ async fn agent_import_preserves_newer_stopped_live_session_lifecycle() {
     .await
     .expect("open result db");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT state, started_at, last_event_at, stopped_at FROM agent_session
              WHERE session_id = 'claude__stoppednewer'"
@@ -1870,7 +1886,7 @@ async fn agent_import_restore_refuses_while_erasure_is_unfinished() {
         fixture.repo.join(".libra/libra.db").display()
     );
     let conn = Database::connect(db_url).await.expect("open repo db");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1881,7 +1897,7 @@ async fn agent_import_restore_refuses_while_erasure_is_unfinished() {
     ))
     .await
     .expect("seed erasing session");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_import_tombstone (
             tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
@@ -1896,7 +1912,7 @@ async fn agent_import_restore_refuses_while_erasure_is_unfinished() {
         .expect_err("restore must wait for catalog deletion");
     assert!(error.to_string().contains("still being pruned"));
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS n FROM agent_import_tombstone".to_string(),
         ))
@@ -1953,7 +1969,7 @@ async fn import_intermediate_erasure_tombstone_reaches_exact_fence_when_recheck_
         fixture.repo.join(".libra/libra.db").display()
     );
     let conn = Database::connect(db_url).await.expect("open repo db");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_import_tombstone (
             tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
@@ -2029,13 +2045,13 @@ async fn agent_import_crash_recovery_never_double_appends() {
     let conn = Database::connect(db_url)
         .await
         .expect("open writable repo db");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE agent_import_identity SET lease_expires_at = 0".to_string(),
     ))
     .await
     .expect("expire crashed identity lease");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE agent_coverage_claim SET lease_expires_at = 0".to_string(),
     ))
@@ -2155,7 +2171,7 @@ async fn agent_import_concurrent_recovery_appends_exactly_once() {
          SET value = json_set(value, '$.lease_expires_at', 0)
          WHERE scope = 'agent_import_index_repair'",
     ] {
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -2313,19 +2329,19 @@ async fn crashed_provisional_session_is_reaped_after_takeover_fails_without_prog
     let conn = Database::connect(db_url)
         .await
         .expect("open writable repo db");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE agent_import_identity SET lease_expires_at = 0".to_string(),
     ))
     .await
     .expect("expire crashed identity lease");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE agent_coverage_claim SET lease_expires_at = 0".to_string(),
     ))
     .await
     .expect("expire crashed coverage lease");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "CREATE TRIGGER reject_recovered_marker
          BEFORE UPDATE OF value ON metadata_kv
@@ -2439,7 +2455,7 @@ async fn crashed_import_takeover_abandons_claims_missing_from_shrunk_source() {
          SET value = json_set(value, '$.lease_expires_at', 0)
          WHERE scope = 'agent_import_index_repair'",
     ] {
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -2526,7 +2542,7 @@ async fn crash_after_first_object_is_recovered_from_durable_attempt_ownership() 
     let conn = Database::connect(db_url)
         .await
         .expect("open writable repo db");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE metadata_kv
          SET value = json_set(value, '$.started_at_ms', 0, '$.ttl_ms', 0)
@@ -2622,7 +2638,7 @@ async fn expired_object_crash_takeover_retires_marker_and_resumes_import() {
          SET value = json_set(value, '$.lease_expires_at', 0)
          WHERE scope = 'agent_import_index_repair'",
     ] {
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -2835,7 +2851,7 @@ async fn agent_erase_between_reservation_and_objects_blocks_all_later_import_win
         format!("{blocked:#}").contains("in-flight"),
         "unexpected erasure refusal: {blocked:#}"
     );
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE metadata_kv
              SET value = json_set(value, '$.started_at_ms', 0, '$.ttl_ms', 0)
@@ -2988,7 +3004,7 @@ async fn concurrent_erase_blocks_marked_writer_and_leaves_rejected_objects_for_g
         format!("{still_blocked:#}").contains("in-flight"),
         "unexpected cleanup-pending erasure refusal: {still_blocked:#}"
     );
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE metadata_kv
          SET value = json_set(value, '$.started_at_ms', 0, '$.ttl_ms', 0)
@@ -3006,7 +3022,7 @@ async fn concurrent_erase_blocks_marked_writer_and_leaves_rejected_objects_for_g
         format!("{expired_still_blocked:#}").contains("in-flight"),
         "unexpected expired-cleanup erasure refusal: {expired_still_blocked:#}"
     );
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "UPDATE metadata_kv
          SET value = json_set(value, '$.started_at_ms', ?, '$.ttl_ms', 120000)
@@ -3089,7 +3105,7 @@ async fn agent_doctor_retires_marker_without_reading_fifo_cleanup_root() {
     // repository.
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
          VALUES ('fifo-cleanup-root', 'Branch', ?, NULL, NULL)",
@@ -5367,7 +5383,7 @@ async fn agent_import_marker_failure_is_fail_closed_and_preserves_existing_sessi
     let conn = Database::connect(db_url)
         .await
         .expect("open writable repo db");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "CREATE TRIGGER reject_import_marker
          BEFORE INSERT ON metadata_kv
@@ -5406,7 +5422,7 @@ async fn agent_import_marker_failure_is_fail_closed_and_preserves_existing_sessi
         "marker failure must happen before object construction"
     );
 
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -5435,7 +5451,7 @@ async fn agent_import_marker_failure_is_fail_closed_and_preserves_existing_sessi
     ]);
     assert!(!existing_output.status.success(), "marker failure passed");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT state, working_dir, metadata_json, last_event_at, stopped_at
              FROM agent_session WHERE session_id = 'claude__markerfail-existing'"

@@ -194,7 +194,11 @@ pub async fn execute(args: RevParseArgs) -> Result<(), String> {
 /// never contains that token) can never spuriously report a separator — this is
 /// only consulted when `spec` is empty and `after_dashdash` is empty.
 fn leading_bare_dashdash_in_argv() -> bool {
-    let argv: Vec<String> = std::env::args().collect();
+    // `args_os`: see `notes` — `env::args()` panics on a non-UTF-8
+    // argument, and only ASCII flags are matched here.
+    let argv: Vec<String> = std::env::args_os()
+        .filter_map(|arg| arg.into_string().ok())
+        .collect();
     match argv.iter().position(|a| a == "rev-parse") {
         Some(idx) => argv[idx + 1..].iter().any(|a| a == "--"),
         None => false,
@@ -887,25 +891,7 @@ async fn resolve_short_commit(
 }
 
 async fn is_bare_repository() -> CliResult<bool> {
-    fn parse_git_bool(value: &str) -> Option<bool> {
-        match value.trim() {
-            v if v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-                || v == "1" =>
-            {
-                Some(true)
-            }
-            v if v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-                || v.eq_ignore_ascii_case("off")
-                || v == "0" =>
-            {
-                Some(false)
-            }
-            _ => None,
-        }
-    }
+    use crate::internal::config::parse_git_bool;
 
     match ConfigKv::get("core.bare").await {
         Ok(Some(entry)) => parse_git_bool(&entry.value).ok_or_else(|| {
@@ -977,6 +963,10 @@ fn map_head_resolution_error(error: BranchStoreError) -> CliError {
 
 fn map_symbolic_ref_resolution_error(spec: &str, error: BranchStoreError) -> CliError {
     match error {
+        BranchStoreError::AlreadyExists(name) => {
+            CliError::fatal(format!("branch '{name}' already exists"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
         BranchStoreError::Corrupt { detail, .. } => {
             CliError::fatal(format!("failed to resolve symbolic ref '{spec}': {detail}"))
                 .with_stable_code(StableErrorCode::RepoCorrupt)
@@ -986,6 +976,13 @@ fn map_symbolic_ref_resolution_error(spec: &str, error: BranchStoreError) -> Cli
         | BranchStoreError::Delete { detail, .. } => {
             CliError::fatal(format!("failed to resolve symbolic ref '{spec}': {detail}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)
+        }
+        // §C.13 LBR-CONFLICT-002: `rev-parse` resolves rather than writes, so
+        // this arm is defensive — but a resolution that DID collide must not
+        // be reported as an I/O failure.
+        error @ BranchStoreError::CheckedOutElsewhere { .. } => {
+            CliError::fatal(format!("failed to resolve symbolic ref '{spec}': {error}"))
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
         }
     }
 }

@@ -74,6 +74,10 @@ pub mod subagent_content;
 // skills / commands / sources / sub-agent definitions plus the per-repo
 // installed-package store the session bootstrap reads.
 pub mod capability_package;
+// Canonical repo/worktree/workspace ownership for capture/import/export rows.
+pub mod capture_scope;
+// PD-02 checkpoint-scoped review/investigate input materialization.
+pub mod checkpoint_input;
 // Generic LLM client helpers shared across providers.
 pub mod client;
 // Adapter for the managed Codex provider runtime.

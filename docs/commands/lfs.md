@@ -18,8 +18,9 @@ libra lfs ls-files [--long] [--size] [--name-only]
 `libra lfs` provides built-in Large File Storage for managing binary files, media assets, and other large objects that do not diff or merge well. Instead of storing the full file content in the repository, LFS replaces large files with lightweight pointer files and stores the actual content on a dedicated LFS server.
 
 LFS tracking is read from Git/Libra attribute sources (`core.attributesFile`,
-per-directory `.gitattributes`, `.libra_attributes`, and
-`.git/info/attributes`) when `add` and `lfs ls-files` decide whether a path has
+per-directory `.gitattributes`, `.libra_attributes`, and the worktree-local
+`info/attributes` — `.libra/info/attributes`, plus `.git/info/attributes` in
+Git- or dual-layout trees) when `add` and `lfs ls-files` decide whether a path has
 `filter=lfs`. The `track` and `untrack` subcommands still manage the root
 `.libra_attributes` file as Libra's writable convenience layer. File locking prevents concurrent edits to
 binary files that cannot be merged, with server-side enforcement via the LFS

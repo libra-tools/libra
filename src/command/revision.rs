@@ -11,7 +11,6 @@
 //! remote under tiered storage); subsequent queries are index hits.
 
 use clap::{Parser, Subcommand};
-use sea_orm::TransactionTrait;
 use serde::Serialize;
 
 use crate::{
@@ -156,7 +155,9 @@ pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResul
             })?;
             let db = get_db_conn_instance().await;
             // Freshness + lookup in ONE transaction (never-lie).
-            let txn = db.begin().await.map_err(map_db)?;
+            let txn = crate::internal::db::begin_write_transaction(&db)
+                .await
+                .map_err(map_db)?;
             let meta = RevisionOrdinalIndex::ensure_fresh_with_conn(&txn, &ref_name, &tip_oid)
                 .await
                 .map_err(map_index)?;
@@ -199,7 +200,9 @@ pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResul
                     .with_stable_code(StableErrorCode::RepoCorrupt)
             })?;
             let db = get_db_conn_instance().await;
-            let txn = db.begin().await.map_err(map_db)?;
+            let txn = crate::internal::db::begin_write_transaction(&db)
+                .await
+                .map_err(map_db)?;
             let meta = RevisionOrdinalIndex::ensure_fresh_with_conn(&txn, &ref_name, &tip_oid)
                 .await
                 .map_err(map_index)?;
@@ -254,7 +257,9 @@ pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResul
                 Vec::new()
             };
             let db = get_db_conn_instance().await;
-            let txn = db.begin().await.map_err(map_db)?;
+            let txn = crate::internal::db::begin_write_transaction(&db)
+                .await
+                .map_err(map_db)?;
             let mut pruned_refs = 0usize;
             let meta = if rebuild {
                 // Prune rows for refs that no longer exist (the sweep's

@@ -26,7 +26,14 @@ pub fn index() -> PathBuf {
     }
     // lore.md 2.1: the index is PER-WORKTREE — it lives in the local gitdir,
     // not the shared/common storage (db/objects stay shared).
-    util::worktree_gitdir().join("index")
+    //
+    // §C.4.2: from the gitdir the INVOCATION pinned, not the cwd. The database
+    // half of this pairing is already pinned; leaving the index ambient would
+    // let a cwd that moved mid-command read scope A's rows and then rewrite
+    // worktree B's index — the two halves disagreeing is worse than either
+    // being wrong alone. `request_worktree_gitdir_strict` falls back to the cwd
+    // only for a caller that never pinned.
+    util::request_worktree_gitdir_strict().join("index")
 }
 
 pub fn try_index() -> io::Result<PathBuf> {

@@ -46,7 +46,7 @@ const BOOTSTRAP_SQL: &str = include_str!("../sql/sqlite_20260309_init.sql");
 /// disk).
 async fn setup_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         db.get_database_backend(),
         BOOTSTRAP_SQL,
     ))

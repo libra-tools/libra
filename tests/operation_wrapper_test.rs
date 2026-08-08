@@ -41,20 +41,30 @@ fn sample_record(op_id: &str, status: OperationStatus, end_ts: i64) -> Operation
         start_ts: end_ts - 5,
         end_ts: Some(end_ts),
         status,
+        worktree_id: String::new(),
+        scope_provenance: "declared".to_string(),
+        restorable: true,
+        control_slot: None,
+        claim_owner: None,
+        scope_kind: "main".to_string(),
     }
 }
 
 /// Create the full operation-layer schema required by wrapper tests.
 async fn create_operation_schema(db: &DatabaseConnection) {
     let ddl = [
-        "CREATE TABLE operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL);",
+        "CREATE TABLE operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
         "CREATE TABLE operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
+        // Present in every real repository (bootstrap schema); the write-lock
+        // primitive in `db::begin_write_transaction` writes a no-op row filter
+        // against it, and a fixture without it is not a repository database.
+        "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0);",
         "CREATE TABLE operation_view(view_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,head_kind TEXT NOT NULL,head_target TEXT NOT NULL,created_at INTEGER NOT NULL);",
         "CREATE TABLE operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
         "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
     ];
     for sql in ddl {
-        db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .unwrap();
     }
@@ -63,13 +73,17 @@ async fn create_operation_schema(db: &DatabaseConnection) {
 /// Create a schema that is missing `operation_view` so persist failure paths can be exercised.
 async fn create_operation_schema_missing_view(db: &DatabaseConnection) {
     let ddl = [
-        "CREATE TABLE operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL);",
+        "CREATE TABLE operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
         "CREATE TABLE operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
+        // Present in every real repository (bootstrap schema); the write-lock
+        // primitive in `db::begin_write_transaction` writes a no-op row filter
+        // against it, and a fixture without it is not a repository database.
+        "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0);",
         "CREATE TABLE operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
         "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
     ];
     for sql in ddl {
-        db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .unwrap();
     }
@@ -77,20 +91,27 @@ async fn create_operation_schema_missing_view(db: &DatabaseConnection) {
 
 /// Create the reference table with both HEAD and main branch rows.
 async fn create_reference_table_with_head(db: &DatabaseConnection) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)".to_string(),
     ))
     .await
     .unwrap();
-    db.execute(Statement::from_string(
+    // HEAD resolution is scoped to `WorktreeScope::current()` (cwd-derived):
+    // seed the row for the scope this process actually runs in, so the suite
+    // also passes when invoked from inside a linked worktree (where main's
+    // NULL-worktree_id row is invisible to the scoped query).
+    let scope_worktree_id = libra::internal::worktree_scope::WorktreeScope::current()
+        .worktree_id()
+        .map(str::to_string);
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO reference(name, kind, \"commit\", remote) VALUES('main', 'Head', NULL, NULL)"
-            .to_string(),
+        "INSERT INTO reference(name, kind, \"commit\", remote, worktree_id) VALUES('main', 'Head', NULL, NULL, ?)",
+        [scope_worktree_id.into()],
     ))
     .await
     .unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO reference(name, kind, \"commit\", remote) VALUES('main', 'Branch', '1111111111111111111111111111111111111111', NULL)".to_string(),
     ))
@@ -100,7 +121,7 @@ async fn create_reference_table_with_head(db: &DatabaseConnection) {
 
 /// Create the reference table without a HEAD row to force snapshot failure.
 async fn create_reference_table_without_head(db: &DatabaseConnection) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)".to_string(),
     ))
@@ -110,7 +131,7 @@ async fn create_reference_table_without_head(db: &DatabaseConnection) {
 
 /// Create a probe table used to assert rollback behavior.
 async fn create_tx_probe_table(db: &DatabaseConnection) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "CREATE TABLE tx_probe (id INTEGER PRIMARY KEY)".to_string(),
     ))
@@ -294,7 +315,7 @@ async fn business_failure_rolls_back_all_writes() {
 
     let error = with_operation_log_with_conn(&db, valid_meta(), OperationScope::default(), |txn| {
         Box::pin(async move {
-            txn.execute(Statement::from_string(
+            txn.execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "INSERT INTO tx_probe(id) VALUES(1)".to_string(),
             ))
@@ -308,7 +329,7 @@ async fn business_failure_rolls_back_all_writes() {
     assert!(matches!(error, OperationError::Business(_)));
 
     let tx_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM tx_probe".to_string(),
         ))
@@ -318,7 +339,7 @@ async fn business_failure_rolls_back_all_writes() {
         .try_get_by_index::<i64>(0)
         .unwrap_or_default();
     let op_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM operation".to_string(),
         ))
@@ -341,7 +362,7 @@ async fn snapshot_failure_rolls_back_and_persists_nothing() {
 
     let error = with_operation_log_with_conn(&db, valid_meta(), OperationScope::default(), |txn| {
         Box::pin(async move {
-            txn.execute(Statement::from_string(
+            txn.execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "INSERT INTO tx_probe(id) VALUES(3)".to_string(),
             ))
@@ -355,7 +376,7 @@ async fn snapshot_failure_rolls_back_and_persists_nothing() {
     assert!(matches!(error, OperationError::Snapshot(_)));
 
     let tx_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM tx_probe WHERE id = 3".to_string(),
         ))
@@ -365,7 +386,7 @@ async fn snapshot_failure_rolls_back_and_persists_nothing() {
         .try_get_by_index::<i64>(0)
         .unwrap_or_default();
     let op_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM operation".to_string(),
         ))
@@ -388,7 +409,7 @@ async fn persist_failure_rolls_back_business_writes() {
 
     let error = with_operation_log_with_conn(&db, valid_meta(), OperationScope::default(), |txn| {
         Box::pin(async move {
-            txn.execute(Statement::from_string(
+            txn.execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "INSERT INTO tx_probe(id) VALUES(2)".to_string(),
             ))
@@ -405,7 +426,7 @@ async fn persist_failure_rolls_back_business_writes() {
     ));
 
     let tx_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM tx_probe WHERE id = 2".to_string(),
         ))
@@ -415,7 +436,7 @@ async fn persist_failure_rolls_back_business_writes() {
         .try_get_by_index::<i64>(0)
         .unwrap_or_default();
     let op_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM operation".to_string(),
         ))
@@ -580,4 +601,315 @@ async fn parent_chain_restore_view_consistency() {
     assert_eq!(second_graph.parents.len(), 1);
     assert_eq!(second_graph.parents[0].parent_op_id, first.op_id);
     assert_eq!(second_graph.view.repo_id, "repo_1");
+}
+
+/// Part C W1 (§C.9): the duplicate window is a SCOPE point query, so
+/// operations in OTHER worktrees cannot push a same-scope operation out of it.
+///
+/// The old implementation took the newest 50 rows for the whole repository and
+/// then filtered by worktree in memory. Fifty newer operations elsewhere were
+/// therefore enough to hide the duplicate — the check silently stopped
+/// working on exactly the repositories the scoping was added for.
+#[tokio::test]
+async fn cross_scope_interference_cannot_hide_a_duplicate() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    create_operation_schema(&db).await;
+    create_reference_table_with_head(&db).await;
+
+    // One same-scope success, which the next identical submission must be
+    // refused against.
+    let meta = valid_meta_with_digest("sha256:dedup-interference");
+    with_operation_log_with_conn(&db, meta.clone(), OperationScope::default(), |_txn| {
+        Box::pin(async move { Ok::<_, DbErr>("first".to_string()) })
+    })
+    .await
+    .unwrap();
+
+    // Fifty NEWER operations in other worktrees — more than the old page.
+    let now = chrono::Utc::now().timestamp();
+    for i in 0..50 {
+        db.execute_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
+             args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+             VALUES (?, 'repo_1', ?, 'commit', 'other worktree', 'bob', 'sha256:other', ?, ?, \
+             'succeeded', ?, 'declared')",
+            [
+                format!("op-other-{i}").into(),
+                format!("view-other-{i}").into(),
+                (now + 1).into(),
+                (now + 1).into(),
+                format!("wt-other-{i}").into(),
+            ],
+        ))
+        .await
+        .expect("seed a cross-scope operation");
+    }
+
+    let second = with_operation_log_with_conn(&db, meta, OperationScope::default(), |_txn| {
+        Box::pin(async move { Ok::<_, DbErr>("second".to_string()) })
+    })
+    .await;
+    assert!(
+        matches!(second, Err(OperationError::Business(_))),
+        "the duplicate must still be refused with 50 newer cross-scope rows present"
+    );
+}
+
+/// The converse: the same command and digest in a DIFFERENT worktree is not a
+/// duplicate. Two linked worktrees running the same control action within the
+/// window must both proceed (§C.11 W1 acceptance).
+#[tokio::test]
+async fn the_same_action_in_another_worktree_is_not_a_duplicate() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    create_operation_schema(&db).await;
+    create_reference_table_with_head(&db).await;
+
+    // A success recorded by ANOTHER worktree, one second ago.
+    let now = chrono::Utc::now().timestamp();
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
+         args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+         VALUES ('op-linked', 'repo_1', 'view-linked', 'commit', 'linked worktree', 'bob', \
+         'sha256:same-action', ?, ?, 'succeeded', 'wt-linked-1', 'declared')",
+        [(now - 1).into(), (now - 1).into()],
+    ))
+    .await
+    .expect("seed the other worktree's operation");
+
+    // This worktree (main, scope key "") runs the identical action.
+    let accepted = with_operation_log_with_conn(
+        &db,
+        valid_meta_with_digest("sha256:same-action"),
+        OperationScope::default(),
+        |_txn| Box::pin(async move { Ok::<_, DbErr>("mine".to_string()) }),
+    )
+    .await;
+    assert!(
+        accepted.is_ok(),
+        "another worktree's identical action must not dedupe mine: {accepted:?}"
+    );
+}
+
+/// §C.12 named regression `op_restore_dedup_key_is_scope_aware`: `op restore`
+/// is a WRAPPED command, so its dedup identity is the one users can actually
+/// hit. Restoring the same operation id from two worktrees inside the window
+/// must not read as a repeat of itself.
+///
+/// This is asserted at the wrapper seam rather than through the CLI on
+/// purpose: end to end, the cross-scope restore guard (`op.rs`, ADR-0714-08)
+/// refuses a linked worktree BEFORE the wrapper is reached, so a command-level
+/// test would pass with a repo-wide key and prove nothing about the key.
+#[tokio::test]
+async fn op_restore_dedup_key_is_scope_aware() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    create_operation_schema(&db).await;
+    create_reference_table_with_head(&db).await;
+
+    let target_op_id = "0191f0de-0000-7000-8000-00000000cafe";
+    let restore_meta = || OperationMeta {
+        command_name: "op restore".to_string(),
+        description: format!("restore to {}", &target_op_id[..8]),
+        actor: "alice".to_string(),
+        repo_id: "repo_1".to_string(),
+        args_digest: Some(target_op_id.to_string()),
+    };
+
+    // Another worktree restored this very operation one second ago.
+    let now = chrono::Utc::now().timestamp();
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
+         args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+         VALUES ('op-linked-restore', 'repo_1', 'view-linked-restore', 'op restore', \
+         'restore to 0191f0de', 'bob', ?, ?, ?, 'succeeded', 'wt-linked-1', 'declared')",
+        [target_op_id.into(), (now - 1).into(), (now - 1).into()],
+    ))
+    .await
+    .expect("seed the other worktree's restore");
+
+    // This scope's identical restore is a different operation, and proceeds.
+    let mine =
+        with_operation_log_with_conn(&db, restore_meta(), OperationScope::default(), |_txn| {
+            Box::pin(async move { Ok::<_, DbErr>("mine".to_string()) })
+        })
+        .await;
+    assert!(
+        mine.is_ok(),
+        "another worktree's restore of the same operation must not dedupe mine: {mine:?}"
+    );
+
+    // ...and the key still has teeth WITHIN the scope: repeating it here is a
+    // duplicate. Without this half the test would pass with dedup disabled.
+    let repeat =
+        with_operation_log_with_conn(&db, restore_meta(), OperationScope::default(), |_txn| {
+            Box::pin(async move { Ok::<_, DbErr>("repeat".to_string()) })
+        })
+        .await;
+    assert!(
+        matches!(repeat, Err(OperationError::Business(_))),
+        "the same restore repeated in THIS scope is still a duplicate: {repeat:?}"
+    );
+}
+
+/// A row written BEFORE digests were canonicalized (padded with whitespace)
+/// must still be found by the duplicate check.
+///
+/// The window is a SQL equality now, so a stored `" digest "` is invisible to
+/// a `"digest"` submission — and the duplicate it should refuse goes through
+/// once. Migration `2026073001` canonicalizes such rows; this pins the
+/// behaviour the migration exists for.
+#[tokio::test]
+async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    create_operation_schema(&db).await;
+    create_reference_table_with_head(&db).await;
+
+    // A pre-canonicalization row: same scope, same command, PADDED digest.
+    // The dedup window is a scope point query keyed by `storage_key()` — seed
+    // the rows for the scope this process actually runs in ('' for main, the
+    // id inside a linked worktree) so the suite passes from either cwd.
+    let scope_storage_key = libra::internal::worktree_scope::WorktreeScope::current()
+        .storage_key()
+        .to_string();
+    let now = chrono::Utc::now().timestamp();
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
+         args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+         VALUES ('op-legacy', 'repo_1', 'view-legacy', 'commit', 'legacy row', 'alice', \
+         '  sha256:legacy-pad  ', ?, ?, 'succeeded', ?, 'declared')",
+        [
+            (now - 1).into(),
+            (now - 1).into(),
+            scope_storage_key.clone().into(),
+        ],
+    ))
+    .await
+    .expect("seed a legacy padded row");
+
+    // Rows padded with a TAB and a NEWLINE, and one that is whitespace only —
+    // SQLite's one-argument TRIM would leave all three untouched.
+    for (op_id, digest) in [("op-tab", "\tsha256:legacy-tab\n"), ("op-ws", "   ")] {
+        db.execute_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
+             args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+             VALUES (?, 'repo_1', ?, 'commit', 'legacy row', 'alice', ?, ?, ?, 'succeeded', ?, \
+             'declared')",
+            [
+                op_id.into(),
+                format!("view-{op_id}").into(),
+                digest.into(),
+                (now - 1).into(),
+                (now - 1).into(),
+                scope_storage_key.clone().into(),
+            ],
+        ))
+        .await
+        .expect("seed a legacy row");
+    }
+
+    // Run the SHIPPED migration SQL, not a hand-written approximation: the
+    // point is that THAT predicate and THAT trim set canonicalize these rows.
+    db.execute_raw(Statement::from_string(
+        db.get_database_backend(),
+        include_str!("../sql/migrations/2026073001_operation_args_digest_canonical.sql")
+            .to_string(),
+    ))
+    .await
+    .expect("canonicalize");
+
+    // Whitespace-only becomes NULL (no digest), and the tab/newline row is
+    // trimmed to its token.
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT op_id, args_digest FROM operation WHERE op_id IN ('op-tab', 'op-ws') \
+             ORDER BY op_id"
+                .to_string(),
+        ))
+        .await
+        .expect("read back");
+    let canonical: Vec<(String, Option<String>)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get_by_index::<String>(0).expect("op_id"),
+                row.try_get_by_index::<Option<String>>(1).expect("digest"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        canonical,
+        vec![
+            ("op-tab".to_string(), Some("sha256:legacy-tab".to_string())),
+            ("op-ws".to_string(), None),
+        ],
+        "the shipped migration must trim ASCII whitespace and NULL an empty result"
+    );
+
+    // And the tab-padded row now blocks its duplicate.
+    let tab_blocked = with_operation_log_with_conn(
+        &db,
+        valid_meta_with_digest("sha256:legacy-tab"),
+        OperationScope::default(),
+        |_txn| Box::pin(async move { Ok::<_, DbErr>("dup".to_string()) }),
+    )
+    .await;
+    assert!(
+        matches!(tab_blocked, Err(OperationError::Business(_))),
+        "a tab/newline-padded legacy row must refuse its duplicate too: {tab_blocked:?}"
+    );
+
+    let blocked = with_operation_log_with_conn(
+        &db,
+        valid_meta_with_digest("sha256:legacy-pad"),
+        OperationScope::default(),
+        |_txn| Box::pin(async move { Ok::<_, DbErr>("dup".to_string()) }),
+    )
+    .await;
+    assert!(
+        matches!(blocked, Err(OperationError::Business(_))),
+        "a canonicalized legacy row must still refuse the duplicate: {blocked:?}"
+    );
+}
+
+/// A submission whose digest carries whitespace is stored canonically, so the
+/// NEXT identical submission matches it.
+#[tokio::test]
+async fn a_padded_digest_is_stored_canonically() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    create_operation_schema(&db).await;
+    create_reference_table_with_head(&db).await;
+
+    with_operation_log_with_conn(
+        &db,
+        valid_meta_with_digest("  sha256:pad-on-write  "),
+        OperationScope::default(),
+        |_txn| Box::pin(async move { Ok::<_, DbErr>("first".to_string()) }),
+    )
+    .await
+    .expect("first submission");
+
+    let second = with_operation_log_with_conn(
+        &db,
+        valid_meta_with_digest("sha256:pad-on-write"),
+        OperationScope::default(),
+        |_txn| Box::pin(async move { Ok::<_, DbErr>("second".to_string()) }),
+    )
+    .await;
+    assert!(
+        matches!(second, Err(OperationError::Business(_))),
+        "the trimmed form must match what was stored: {second:?}"
+    );
 }

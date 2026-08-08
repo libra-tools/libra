@@ -33,6 +33,14 @@ flowchart TD
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 
+## Worktree 语义（W2 §C.4.3）
+
+- stash **stack**（`refs/stash` + reflog 平面文件）有意 repository 共享：任一 worktree 推入的条目可在其它 worktree list/apply/pop；`push`/`apply`/`pop` 的 index/workdir 快照与改写只作用于**当前** worktree（经 `path::index()` 与 `util::working_dir()` 的 cwd-scoped 解析——修复了此前直读 common storage `index`/其父目录、在 linked 中误判 "No local changes" 的缺陷）。
+- 全部栈突变（push/store、drop、pop 的删除阶段、clear、branch 的删除阶段）经 `stash-stack.lock`（common storage,std `File::lock` 跨平台阻塞锁）串行。
+- 删除路径统一为单一 `do_drop(stash, expected_id)`：pop/branch 传入 apply 成功条目的 **id**,在锁内按 id 定位（并发 push 会移位索引,按索引重删会删错）；id 不在栈上 → `StackChanged`,条目保留并报告,已成功的本地 apply 不回滚（C.10 两阶段协议）。普通 drop 在锁内按索引原子读改写。
+- `stash branch`：分支名冲突在任何改动前 preflight 拒绝;HEAD 切换走 `Head::update_result`（吞错版本会把 stash apply 到错误分支尖）;apply 成功后经同一 CAS do_drop 删除,CAS 失败输出 warning 且 `dropped=false`。
+- W0 linked 守卫（stash 全子命令与 `pull --rebase --autostash`）随本切片解除。
+
 ## 实现历史
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。

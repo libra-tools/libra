@@ -88,6 +88,15 @@ pub struct SwitchArgs {
     #[clap(short = 'f', long = "force", visible_alias = "discard-changes")]
     pub force: bool,
 
+    /// Switch to a branch even if it is already checked out in another worktree.
+    /// Accepted for Git parity, but NOT honored against a real collision: each
+    /// worktree owns its HEAD, and one branch may be checked out by at most one
+    /// live worktree (ADR-0714-09), so switching to a branch held by another
+    /// worktree is refused with or without this flag. It is a silent no-op in a
+    /// single-worktree repository.
+    #[clap(long = "ignore-other-worktrees")]
+    pub ignore_other_worktrees: bool,
+
     /// When <branch> is not a local branch but matches exactly one
     /// remote-tracking branch, create a local branch tracking it and switch
     /// (Git's DWIM). Enabled by default; overrides `checkout.guess`.
@@ -259,9 +268,18 @@ impl From<SwitchError> for CliError {
                     "use 'libra switch {}' if you meant the existing local branch, or 'libra switch -C {0}' to reset it.",
                     name
                 )),
-            SwitchError::BranchDelete { ref branch, ref detail } => CliError::fatal(error.to_string())
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-                .with_hint(format!("branch '{branch}' could not be deleted before force-create: {detail}")),
+            // §C.13: `switch -C` deletes and recreates, so a branch another
+            // worktree holds surfaces HERE. It is a conflict, not an I/O
+            // fault — the delete did not fail, it was refused.
+            SwitchError::BranchDelete { ref branch, ref detail } => {
+                crate::internal::branch::checked_out_elsewhere_cli_error(&error).unwrap_or_else(|| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                        .with_hint(format!(
+                            "branch '{branch}' could not be deleted before force-create: {detail}"
+                        ))
+                })
+            }
             SwitchError::InternalBranchBlocked(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
             SwitchError::DirtyUnstaged => CliError::fatal(error.to_string())
@@ -282,8 +300,16 @@ impl From<SwitchError> for CliError {
             SwitchError::BranchCreate { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            // §C.13: a HEAD/branch write refused because another worktree
+            // has the branch checked out is a CONFLICT, not a write fault —
+            // `switch -C` reaches the seam directly.
             SwitchError::HeadUpdate(..) => {
-                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+                crate::internal::branch::checked_out_elsewhere_cli_error(&error).unwrap_or_else(
+                    || {
+                        CliError::fatal(error.to_string())
+                            .with_stable_code(StableErrorCode::IoWriteFailed)
+                    },
+                )
             }
             SwitchError::DelegatedCli(cli_err) => cli_err,
         }
@@ -292,6 +318,10 @@ impl From<SwitchError> for CliError {
 
 fn map_branch_store_error(error: repo_branch::BranchStoreError) -> SwitchError {
     match error {
+        repo_branch::BranchStoreError::AlreadyExists(name) => SwitchError::DelegatedCli(
+            CliError::fatal(format!("branch '{name}' already exists"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget),
+        ),
         repo_branch::BranchStoreError::Query(detail) => SwitchError::DelegatedCli(
             CliError::fatal(format!("failed to read branch storage: {detail}"))
                 .with_stable_code(StableErrorCode::IoReadFailed),
@@ -306,6 +336,16 @@ fn map_branch_store_error(error: repo_branch::BranchStoreError) -> SwitchError {
         repo_branch::BranchStoreError::Delete { name, detail } => SwitchError::DelegatedCli(
             CliError::fatal(format!("failed to delete branch '{name}': {detail}"))
                 .with_stable_code(StableErrorCode::IoWriteFailed),
+        ),
+        // §C.13 LBR-CONFLICT-002. `switch -C` reaches the delete seam
+        // directly, so this is the arm a real collision takes.
+        repo_branch::BranchStoreError::CheckedOutElsewhere { .. } => SwitchError::DelegatedCli(
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint(
+                    "the other worktree must switch away first; `libra worktree list` shows \
+                     which one holds it",
+                ),
         ),
     }
 }
@@ -870,6 +910,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
         detach,
         track,
         force,
+        ignore_other_worktrees,
         guess,
         no_guess,
     } = args;
@@ -908,7 +949,8 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
 
         branch::create_branch_safe(new_branch_name.clone(), branch).await?;
         let created_branch = resolve_created_branch(&new_branch_name).await?;
-        let commit = switch_to_resolved_branch(created_branch, output).await?;
+        // A freshly created branch cannot be checked out in another worktree.
+        let commit = switch_to_resolved_branch(created_branch, output, false).await?;
         return Ok(SwitchOutput {
             previous_branch,
             previous_commit,
@@ -952,7 +994,8 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
         }
         branch::create_branch_safe(new_branch_name.clone(), branch).await?;
         let created_branch = resolve_created_branch(&new_branch_name).await?;
-        let commit = switch_to_resolved_branch(created_branch, output).await?;
+        // A freshly (re)created branch cannot be checked out in another worktree.
+        let commit = switch_to_resolved_branch(created_branch, output, false).await?;
         return Ok(SwitchOutput {
             previous_branch,
             previous_commit,
@@ -1058,7 +1101,8 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
             ensure_switch_clean_or_force(force, target_branch.commit, output).await?;
 
             let branch = target_branch.name.clone();
-            let commit = switch_to_resolved_branch(target_branch, output).await?;
+            let commit =
+                switch_to_resolved_branch(target_branch, output, ignore_other_worktrees).await?;
             Ok(SwitchOutput {
                 previous_branch,
                 previous_commit,
@@ -1182,6 +1226,8 @@ async fn switch_to_tracked_remote_branch(
             commit: target.commit,
         },
         output,
+        // A freshly created tracking branch cannot be checked out elsewhere.
+        false,
     )
     .await?;
     Ok(TrackedSwitchResult {
@@ -1209,7 +1255,18 @@ pub(crate) async fn switch_to_orphan_branch(
             .with_stable_code(StableErrorCode::ConflictOperationBlocked),
         ));
     }
-    if let Some(other) = Head::branch_checked_out_elsewhere(&new_branch_name).await {
+    let checked_out = Head::branch_checked_out_elsewhere_result(&new_branch_name)
+        .await
+        .map_err(|error| {
+            SwitchError::WorktreeConflict(
+                CliError::fatal(format!(
+                    "cannot determine whether branch '{new_branch_name}' is checked out in \
+                     another worktree: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt),
+            )
+        })?;
+    if let Some(other) = checked_out {
         return Err(SwitchError::WorktreeConflict(
             CliError::fatal(format!(
                 "branch '{new_branch_name}' is already checked out at worktree '{other}'"
@@ -1367,8 +1424,15 @@ async fn move_to_commit(
 async fn switch_to_resolved_branch(
     target_branch: ResolvedSwitchBranch,
     output: &OutputConfig,
+    ignore_other_worktrees: bool,
 ) -> Result<ObjectHash, SwitchError> {
-    move_to_resolved_branch(target_branch, NavigationCommand::Switch, output, false).await
+    move_to_resolved_branch(
+        target_branch,
+        NavigationCommand::Switch,
+        output,
+        ignore_other_worktrees,
+    )
+    .await
 }
 
 pub(crate) async fn checkout_to_branch(
@@ -1415,11 +1479,30 @@ async fn move_to_resolved_branch(
     // bypass this in a multi-worktree repo (intentionally-different): Libra
     // never allows the same branch checked out twice. Detach instead to share
     // the tip read-only. Single-worktree repos never hit this (no collision).
-    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+    // W3-s2 (§C.7): the check and the HEAD publication below hold the
+    // repository-wide branch-attach lock, closing the race with a
+    // concurrent `worktree add <path> <branch>` (which holds it across ITS
+    // final check + seed).
+    let _attach_lock = crate::utils::util::acquire_branch_attach_lock().map_err(|error| {
+        SwitchError::HeadUpdate(format!("cannot acquire the branch-attach lock: {error}"))
+    })?;
+    // Fail-closed probe (W3-s2): a query failure refuses the switch — it
+    // must never read as "the branch is free". Covers every scope; the
+    // current scope cannot appear here (the already-on case returned
+    // earlier).
+    let other_scope = Head::branch_checked_out_anywhere_result(&branch_name)
+        .await
+        .map_err(|error| {
+            SwitchError::HeadUpdate(format!(
+                "cannot verify whether branch '{branch_name}' is checked out: {error}"
+            ))
+        })?;
+    if let Some(other) = other_scope {
         let hint = if ignore_other_worktrees {
             "Libra does not honor --ignore-other-worktrees (it never allows the same branch \
              checked out in two worktrees): switch to a different branch, or use --detach to \
-             share its tip"
+             share its tip; if the recorded owner looks stale, inspect it with `libra \
+             worktree doctor` and settle the registry with `libra worktree repair --confirm`"
         } else {
             "switch to a different branch, or use --detach to share its tip"
         };
@@ -1460,6 +1543,7 @@ async fn move_to_resolved_branch(
     {
         return Err(SwitchError::HeadUpdate(e.to_string()));
     }
+    drop(_attach_lock);
 
     restore_to_commit(target_commit_id, output).await?;
     Ok(target_commit_id)

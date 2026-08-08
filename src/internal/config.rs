@@ -99,6 +99,31 @@ fn rewrite_fetch_refspec_destination(value: &str, old: &str, new: &str) -> Strin
 /// Marker struct; all methods are associated functions. Calling a method
 /// without `_with_conn` acquires its own connection — do **not** call those
 /// from inside a `db.transaction(|txn| { ... })` block (deadlock).
+/// Parse Git's boolean config spellings (`git_parse_maybe_bool_text`):
+/// `true`/`yes`/`on`/`1` → `Some(true)`, `false`/`no`/`off`/`0` →
+/// `Some(false)` (trimmed, case-insensitive), anything else → `None`.
+/// SHARED by every `core.bare` reader so a valid non-literal spelling can
+/// never classify differently across commands.
+pub fn parse_git_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        v if v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("yes")
+            || v.eq_ignore_ascii_case("on")
+            || v == "1" =>
+        {
+            Some(true)
+        }
+        v if v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("no")
+            || v.eq_ignore_ascii_case("off")
+            || v == "0" =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
 pub struct ConfigKv;
 
 impl ConfigKv {
@@ -2450,14 +2475,14 @@ mod tests {
             .await
             .expect("create config db");
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM schema_versions",
             [],
         ))
         .await
         .expect("clear schema versions");
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
             [

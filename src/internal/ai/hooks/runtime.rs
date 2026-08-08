@@ -36,6 +36,7 @@ use crate::{
     internal::{
         ai::{
             automation::dispatch_repo_hook_lifecycle_event_to_history,
+            capture_scope::CaptureScope,
             history::{AI_REF, HistoryManager},
             session::{SessionState, SessionStore},
         },
@@ -462,14 +463,18 @@ async fn ingest_agent_traces(
     let conn = db::get_db_conn_instance_for_path(&storage_path.join(util::DATABASE))
         .await
         .map_err(|err| anyhow!("failed to open libra database: {err}"))?;
+    let repo_root =
+        util::try_working_dir().context("failed to resolve hook capture worktree root")?;
+    let scope = CaptureScope::resolve(&conn, &repo_root).await?;
 
-    ingest_agent_traces_payload(
+    ingest_agent_traces_payload_with_scope(
         &stdin_bytes,
         command,
         expected_kind,
         provider,
         &conn,
         Some(&storage_path),
+        &scope,
     )
     .await
 }
@@ -495,6 +500,31 @@ pub async fn ingest_agent_traces_payload(
     provider: &dyn HookProvider,
     conn: &sea_orm::DatabaseConnection,
     repo_path: Option<&std::path::Path>,
+) -> Result<()> {
+    // This in-process helper is used by tests that supply a database but not
+    // a real worktree. Production hook entrypoints resolve the worktree above;
+    // never derive it from the untrusted envelope cwd.
+    let scope = CaptureScope::main_for_connection(conn).await?;
+    ingest_agent_traces_payload_with_scope(
+        payload,
+        command,
+        expected_kind,
+        provider,
+        conn,
+        repo_path,
+        &scope,
+    )
+    .await
+}
+
+async fn ingest_agent_traces_payload_with_scope(
+    payload: &[u8],
+    command: super::provider::ProviderHookCommand,
+    expected_kind: LifecycleEventKind,
+    provider: &dyn HookProvider,
+    conn: &sea_orm::DatabaseConnection,
+    repo_path: Option<&std::path::Path>,
+    scope: &CaptureScope,
 ) -> Result<()> {
     use sea_orm::{ConnectionTrait, Statement};
 
@@ -630,7 +660,7 @@ pub async fn ingest_agent_traces_payload(
 
     // If the migration has not run yet, fail loud rather than silently.
     let table_check = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_session' LIMIT 1",
             [],
@@ -642,6 +672,10 @@ pub async fn ingest_agent_traces_payload(
             "agent_session table does not exist; run `libra init` against this repository to apply migrations",
         );
     }
+    scope
+        .assert_provider_session_compatible(conn, &envelope.session_id)
+        .await
+        .context("validate provider-session workspace ownership")?;
 
     let now = Utc::now().timestamp();
     let session_id = build_ai_session_id(provider.provider_name(), &envelope.session_id);
@@ -676,11 +710,19 @@ pub async fn ingest_agent_traces_payload(
         LifecycleEventKind::SessionStart | LifecycleEventKind::TurnStart
     ) {
         let owner_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT agent_kind FROM agent_session WHERE provider_session_id = ? \
+                 AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ? \
+                 AND workspace_id IS ? AND workspace_fence IS ? \
                  ORDER BY rowid ASC LIMIT 1",
-                [envelope.session_id.clone().into()],
+                [
+                    envelope.session_id.clone().into(),
+                    scope.repo_id.clone().into(),
+                    scope.worktree_id.clone().into(),
+                    scope.workspace_id.clone().into(),
+                    scope.workspace_fence.into(),
+                ],
             ))
             .await
             .context("failed to query agent_session owner claim")?;
@@ -722,7 +764,8 @@ pub async fn ingest_agent_traces_payload(
     // can resolve the on-disk transcript file without re-running the
     // adapter's path-discovery heuristics.
     let concurrent_active =
-        session_concurrent_active(conn, backend, event.kind, &session_id, &envelope.cwd).await?;
+        session_concurrent_active(conn, backend, event.kind, &session_id, &envelope.cwd, scope)
+            .await?;
     let metadata_json = build_agent_session_metadata_json(&envelope, concurrent_active);
     // ADR-DR-19: make the tombstone check and the session UPSERT one SQLite
     // statement.  A separate preflight query would leave a check/write race
@@ -733,7 +776,7 @@ pub async fn ingest_agent_traces_payload(
         INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
             metadata_json, redaction_report, started_at, last_event_at, stopped_at,
-            sync_revision
+            sync_revision, repo_id, worktree_id, workspace_id, workspace_fence, scope_state
         )
         SELECT ?, ?, ?, ?, ?,
                json_patch(
@@ -749,10 +792,43 @@ pub async fn ingest_agent_traces_payload(
                    SELECT next_session_sync_revision
                    FROM agent_capture_incarnation
                    WHERE agent_kind = ? AND provider_session_id = ?
-               ), 1)
+               ), 1), ?, ?, ?, ?, 'scoped'
         WHERE NOT EXISTS (
             SELECT 1 FROM agent_import_tombstone
             WHERE agent_kind = ? AND provider_session_id = ?
+        )
+        AND (
+            ? IS NULL OR EXISTS (
+                SELECT 1 FROM workspace_record
+                WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                  AND state IN ('provisioning', 'active', 'releasing')
+                  AND lease_owner IS NOT NULL
+                  AND lease_expires_at > (unixepoch('now') * 1000)
+            )
+        )
+        -- This lives in the same mutating statement as the session
+        -- INSERT/UPSERT. A standalone preflight is useful for an actionable
+        -- error, but it can race an import/export writer in another scope;
+        -- SQLite serializes this predicate with the write so a second scope
+        -- cannot split one provider id across the three capture tables.
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_session
+             WHERE provider_session_id = ?
+               AND (scope_state <> 'scoped' OR repo_id IS NOT ?
+                    OR worktree_id IS NOT ? OR workspace_id IS NOT ?
+                    OR workspace_fence IS NOT ?)
+            UNION ALL
+            SELECT 1 FROM agent_export_job
+             WHERE provider_session_id = ?
+               AND (scope_state <> 'scoped' OR repo_id IS NOT ?
+                    OR worktree_id IS NOT ? OR workspace_id IS NOT ?
+                    OR workspace_fence IS NOT ?)
+            UNION ALL
+            SELECT 1 FROM agent_import_identity
+             WHERE provider_session_id = ?
+               AND (scope_state <> 'scoped' OR repo_id IS NOT ?
+                    OR worktree_id IS NOT ? OR workspace_id IS NOT ?
+                    OR workspace_fence IS NOT ?)
         )
         ON CONFLICT(agent_kind, provider_session_id) DO UPDATE SET
             state = excluded.state,
@@ -766,11 +842,27 @@ pub async fn ingest_agent_traces_payload(
                     THEN json_patch(agent_session.metadata_json, excluded.metadata_json)
                 ELSE agent_session.metadata_json
             END
+        WHERE agent_session.scope_state = 'scoped'
+          AND agent_session.repo_id = excluded.repo_id
+          AND agent_session.worktree_id = excluded.worktree_id
+          AND agent_session.workspace_id IS excluded.workspace_id
+          AND agent_session.workspace_fence IS excluded.workspace_fence
+          AND (
+              excluded.workspace_id IS NULL OR EXISTS (
+                  SELECT 1 FROM workspace_record
+                  WHERE workspace_id = excluded.workspace_id
+                    AND repo_id = excluded.repo_id
+                    AND lease_fence = excluded.workspace_fence
+                    AND state IN ('provisioning', 'active', 'releasing')
+                    AND lease_owner IS NOT NULL
+                    AND lease_expires_at > (unixepoch('now') * 1000)
+              )
+          )
     ";
     let stopped_at: Option<i64> =
         matches!(event.kind, LifecycleEventKind::SessionEnd).then_some(now);
     let upsert = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             backend,
             upsert_sql,
             [
@@ -788,16 +880,40 @@ pub async fn ingest_agent_traces_payload(
                 stopped_at.into(),
                 agent_kind.into(),
                 envelope.session_id.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
                 agent_kind.into(),
                 envelope.session_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.workspace_fence.into(),
+                envelope.session_id.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+                envelope.session_id.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+                envelope.session_id.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
             ],
         ))
         .await
         .with_context(|| format!("failed to upsert agent_session for command '{command}'"))?;
     if upsert.rows_affected() == 0 {
         bail!(
-            "agent session was erased and is protected by an anti-resurrection tombstone; \
-             restore it explicitly before accepting new hook events"
+            "agent session could not be claimed in this workspace scope: it was erased, its \
+             workspace lease fence changed, or another scope owns this provider session; inspect \
+             it with `libra worktree doctor` before retrying"
         );
     }
 
@@ -827,11 +943,19 @@ pub async fn ingest_agent_traces_payload(
         // the racers writes the checkpoint. The loser keeps its metadata
         // row but is skipped fail-closed here.
         let confirmed_owner: String = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT agent_kind FROM agent_session WHERE provider_session_id = ? \
+                 AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ? \
+                 AND workspace_id IS ? AND workspace_fence IS ? \
                  ORDER BY rowid ASC LIMIT 1",
-                [envelope.session_id.clone().into()],
+                [
+                    envelope.session_id.clone().into(),
+                    scope.repo_id.clone().into(),
+                    scope.worktree_id.clone().into(),
+                    scope.workspace_id.clone().into(),
+                    scope.workspace_fence.into(),
+                ],
             ))
             .await
             .context("failed to re-confirm agent_session owner claim")?
@@ -947,6 +1071,7 @@ pub async fn ingest_agent_traces_payload(
                 &redaction_report_json,
                 &all_matches,
                 now,
+                scope,
                 &subagent_discovery.sources,
                 subagent_discovery.warning.as_deref(),
             )
@@ -1008,6 +1133,7 @@ async fn session_concurrent_active(
     event_kind: LifecycleEventKind,
     libra_session_id: &str,
     working_dir: &str,
+    scope: &CaptureScope,
 ) -> Result<bool> {
     use sea_orm::{ConnectionTrait, Statement};
 
@@ -1018,11 +1144,20 @@ async fn session_concurrent_active(
 
     // Count *other* active sessions sharing this working_dir.
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT COUNT(*) AS peers FROM agent_session \
-             WHERE state = 'active' AND working_dir = ? AND session_id <> ?",
-            [working_dir.into(), libra_session_id.into()],
+             WHERE state = 'active' AND working_dir = ? AND session_id <> ? \
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ? \
+               AND workspace_id IS ? AND workspace_fence IS ?",
+            [
+                working_dir.into(),
+                libra_session_id.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+            ],
         ))
         .await
         .context("failed to count concurrent active sessions")?;
@@ -1056,6 +1191,7 @@ async fn cleanup_failed_registered_checkpoint(
     conn: &sea_orm::DatabaseConnection,
     marker: &crate::internal::ai::history::TracesInflightMarker,
     provider_session_id: &str,
+    scope: &CaptureScope,
     claim_channel: &'static str,
     claim_owner: Option<&str>,
     export_lease: Option<(&str, i64)>,
@@ -1079,8 +1215,11 @@ async fn cleanup_failed_registered_checkpoint(
     if let Some((owner, fence_token)) = export_lease
         && let Err(error) = crate::internal::ai::export_job::release(
             conn,
-            "opencode",
-            provider_session_id,
+            &crate::internal::ai::export_job::ExportJobTarget::new(
+                "opencode",
+                provider_session_id,
+                scope,
+            ),
             owner,
             fence_token,
             "dirty",
@@ -1123,6 +1262,7 @@ async fn write_committed_checkpoint(
     redaction_report_json: &str,
     redaction_matches: &[crate::internal::ai::observed_agents::RedactionMatch],
     now: i64,
+    scope: &CaptureScope,
     subagent_sources: &[crate::internal::ai::subagent_content::DiscoveredSubagentContent],
     subagent_discovery_warning: Option<&str>,
 ) -> Result<()> {
@@ -1297,7 +1437,15 @@ async fn write_committed_checkpoint(
         };
         let owner = format!("export:{}:{}", std::process::id(), uuid::Uuid::new_v4());
         let now_ms = Utc::now().timestamp_millis();
-        match export_job::observe_idle(conn, "opencode", &envelope.session_id, &owner, now_ms).await
+        match export_job::observe_idle(
+            conn,
+            "opencode",
+            &envelope.session_id,
+            scope,
+            &owner,
+            now_ms,
+        )
+        .await
         {
             Err(err) => {
                 // ADR-DR-10 fail-closed: a job/DB/schema failure is a GATE
@@ -1320,6 +1468,7 @@ async fn write_committed_checkpoint(
                 target_generation,
                 ..
             }) => {
+                let job = export_job::ExportJobTarget::new("opencode", &envelope.session_id, scope);
                 let bridge = async {
                     let binary = trusted_opencode_binary().await?;
                     authorized_sandboxed_export(
@@ -1339,8 +1488,7 @@ async fn write_committed_checkpoint(
                         );
                         if let Err(release_err) = export_job::release(
                             conn,
-                            "opencode",
-                            &envelope.session_id,
+                            &job,
                             &owner,
                             fence_token,
                             "failed",
@@ -1369,8 +1517,7 @@ async fn write_committed_checkpoint(
                         if !auth.matches("opencode", libra_session_id, &bytes) {
                             let _ = export_job::release(
                                 conn,
-                                "opencode",
-                                &envelope.session_id,
+                                &job,
                                 &owner,
                                 fence_token,
                                 "failed",
@@ -1400,8 +1547,7 @@ async fn write_committed_checkpoint(
                                 // dirty so the next idle retries.
                                 if let Err(release_err) = export_job::release(
                                     conn,
-                                    "opencode",
-                                    &envelope.session_id,
+                                    &job,
                                     &owner,
                                     fence_token,
                                     "dirty",
@@ -1440,8 +1586,7 @@ async fn write_committed_checkpoint(
                             let done_ms = Utc::now().timestamp_millis();
                             if let Err(job_err) = export_job::release(
                                 conn,
-                                "opencode",
-                                &envelope.session_id,
+                                &job,
                                 &owner,
                                 fence_token,
                                 "dirty",
@@ -1472,8 +1617,7 @@ async fn write_committed_checkpoint(
                             let done_ms = Utc::now().timestamp_millis();
                             if let Err(job_err) = export_job::advance_and_release(
                                 conn,
-                                "opencode",
-                                &envelope.session_id,
+                                &job,
                                 &owner,
                                 fence_token,
                                 target_generation,
@@ -1628,6 +1772,7 @@ async fn write_committed_checkpoint(
             conn,
             &marker,
             &envelope.session_id,
+            scope,
             claim_channel,
             failure_claim_owner.as_deref(),
             failure_export_lease
@@ -1644,6 +1789,7 @@ async fn write_committed_checkpoint(
             conn,
             &marker,
             &envelope.session_id,
+            scope,
             claim_channel,
             failure_claim_owner.as_deref(),
             failure_export_lease
@@ -1662,6 +1808,7 @@ async fn write_committed_checkpoint(
             conn,
             &marker,
             &envelope.session_id,
+            scope,
             claim_channel,
             failure_claim_owner.as_deref(),
             failure_export_lease
@@ -1709,6 +1856,7 @@ async fn write_committed_checkpoint(
                     conn,
                     &marker,
                     &envelope.session_id,
+                    scope,
                     claim_channel,
                     failure_claim_owner.as_deref(),
                     failure_export_lease
@@ -1776,6 +1924,7 @@ async fn write_committed_checkpoint(
                 conn,
                 &marker,
                 &envelope.session_id,
+                scope,
                 claim_channel,
                 failure_claim_owner.as_deref(),
                 failure_export_lease
@@ -1842,10 +1991,14 @@ async fn write_committed_checkpoint(
     // path), `idle` when clean; a fenced-out runner touches nothing.
     if let Some((owner, fence_token, target_generation)) = export_release {
         let done_ms = Utc::now().timestamp_millis();
-        if let Err(job_err) = crate::internal::ai::export_job::advance_and_release(
-            conn,
+        let job = crate::internal::ai::export_job::ExportJobTarget::new(
             "opencode",
             &envelope.session_id,
+            scope,
+        );
+        if let Err(job_err) = crate::internal::ai::export_job::advance_and_release(
+            conn,
+            &job,
             &owner,
             fence_token,
             target_generation,
@@ -1888,7 +2041,7 @@ impl crate::internal::ai::history::TracesTxnExtra for SubagentCommitPlan {
         use sea_orm::{ConnectionTrait, Statement};
 
         let writable = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT 1 AS writable
                  FROM agent_session s
@@ -1907,7 +2060,7 @@ impl crate::internal::ai::history::TracesTxnExtra for SubagentCommitPlan {
                 "agent session was erased or tombstoned while the subagent checkpoint was in flight"
             );
         }
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
@@ -2214,7 +2367,7 @@ async fn latest_committed_checkpoint_id(
     use sea_orm::{ConnectionTrait, Statement};
 
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT checkpoint_id FROM agent_checkpoint \
              WHERE session_id = ? AND scope = 'committed' \
@@ -2278,7 +2431,7 @@ pub async fn insert_subagent_checkpoint_row_idempotent(
     let tool_use_value: sea_orm::Value = row.tool_use_id.map(str::to_string).into();
     let description_value: sea_orm::Value = row.description.map(str::to_string).into();
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
@@ -2350,7 +2503,7 @@ pub async fn insert_agent_checkpoint_row_idempotent(
     }
     let parent_commit_value: sea_orm::Value = row.parent_commit.map(str::to_string).into();
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -3341,7 +3494,7 @@ mod tests {
                 continue;
             }
             let _: ExecResult = conn
-                .execute(Statement::from_string(backend, trimmed.to_string()))
+                .execute_raw(Statement::from_string(backend, trimmed.to_string()))
                 .await
                 .unwrap_or_else(|e| panic!("legacy bootstrap stmt failed: {trimmed}\n{e}"));
         }
@@ -3393,7 +3546,7 @@ mod tests {
 
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT agent_kind, state, working_dir, provider_session_id, stopped_at \
                  FROM agent_session WHERE provider_session_id = ?",
@@ -3427,7 +3580,7 @@ mod tests {
     async fn ingest_tombstone_blocks_stale_hook_session_resurrection() {
         let (_dir, conn) = ingest_fresh_conn().await;
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_import_tombstone (
                 tombstone_id, agent_kind, provider_session_id,
@@ -3460,7 +3613,7 @@ mod tests {
         );
 
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT COUNT(*) AS n FROM agent_session WHERE provider_session_id = ?",
                 ["S-erased".into()],
@@ -3476,7 +3629,7 @@ mod tests {
         let (_dir, conn) = ingest_fresh_conn().await;
         let backend = conn.get_database_backend();
         let namespace = "0123456789abcdef0123456789abcdef";
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_capture_incarnation (
                 agent_kind, provider_session_id, next_session_sync_revision,
@@ -3499,7 +3652,7 @@ mod tests {
         .expect("fresh live hook consumes the saved incarnation");
 
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT sync_revision,
                         json_extract(metadata_json, '$.capture_incarnation') AS incarnation
@@ -3546,7 +3699,7 @@ mod tests {
 
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT state, stopped_at, sync_revision FROM agent_session
                  WHERE provider_session_id = ?",
@@ -3570,7 +3723,7 @@ mod tests {
 
         // Repeat-ingest is idempotent: still exactly one row for that session.
         let count_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT COUNT(*) AS n FROM agent_session WHERE provider_session_id = ?",
                 ["S-002".into()],
@@ -3609,7 +3762,7 @@ mod tests {
 
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT state, redaction_report FROM agent_session WHERE provider_session_id = ?",
                 ["S-redact".into()],
@@ -3655,7 +3808,7 @@ mod tests {
     ) -> serde_json::Value {
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT metadata_json FROM agent_session WHERE provider_session_id = ?",
                 [provider_session_id.into()],
@@ -3864,7 +4017,7 @@ mod tests {
         // No row should have been written.
         let backend = conn.get_database_backend();
         let count_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT COUNT(*) AS n FROM agent_session WHERE provider_session_id = ?",
                 ["S-mismatch".into()],
@@ -3939,7 +4092,7 @@ mod tests {
 
         let backend = conn.get_database_backend();
         let state_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT state FROM agent_session WHERE provider_session_id = 'S-turn-cp'",
                 [],
@@ -3954,7 +4107,7 @@ mod tests {
         );
 
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT scope, traces_commit FROM agent_checkpoint \
                  WHERE session_id = (SELECT session_id FROM agent_session \
@@ -4014,7 +4167,7 @@ mod tests {
 
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT checkpoint_id, scope, traces_commit, tree_oid, metadata_blob_oid \
                  FROM agent_checkpoint WHERE session_id = (SELECT session_id FROM agent_session \
@@ -4046,7 +4199,7 @@ mod tests {
         // The traces ref row must point at the checkpoint commit hash.
         let backend = conn.get_database_backend();
         let ref_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT `commit` FROM reference WHERE name = ? AND kind = 'Branch' LIMIT 1",
                 [crate::internal::branch::TRACES_BRANCH.into()],
@@ -4077,7 +4230,7 @@ mod tests {
         // `agent_checkpoint.metadata_blob_oid` column should join cleanly
         // to `object_index`).
         let metadata_count_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT COUNT(*) AS n FROM object_index WHERE o_id = ?",
                 [metadata_blob_oid.clone().into()],
@@ -4091,7 +4244,7 @@ mod tests {
         // Spot check the distinctive `agent_transcript` tag — at least
         // one row carries it (the transcript blob), per the spec.
         let transcript_count_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT COUNT(*) AS n FROM object_index WHERE o_type = 'agent_transcript'",
                 [],
@@ -4157,7 +4310,7 @@ mod tests {
         // read + zlib-decode it and strip the `blob <len>\0` header.
         let backend = conn.get_database_backend();
         let blob_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT o_id FROM object_index WHERE o_type = 'agent_transcript' LIMIT 1",
                 [],
@@ -4333,7 +4486,7 @@ mod tests {
 
         let backend = conn.get_database_backend();
         let blob_row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT o_id FROM object_index WHERE o_type = 'agent_transcript' LIMIT 1",
                 [],
@@ -4434,7 +4587,7 @@ mod tests {
     async fn assert_object_index_has(conn: &DatabaseConnection, oid: &str, expected_o_type: &str) {
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT o_type FROM object_index WHERE o_id = ? LIMIT 1",
                 [oid.into()],

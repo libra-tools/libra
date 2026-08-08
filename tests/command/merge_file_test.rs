@@ -6,7 +6,9 @@ use std::{fs, path::Path, process::Output};
 
 use tempfile::{TempDir, tempdir};
 
-use super::{parse_json_stdout, run_libra_command};
+use super::{
+    assert_cli_success, create_committed_repo_via_cli, parse_json_stdout, run_libra_command,
+};
 
 fn stdout_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
@@ -196,4 +198,63 @@ fn json_reports_conflict_and_written() {
     let json = parse_json_stdout(&out);
     assert_eq!(json["data"]["conflict"].as_bool(), Some(true));
     assert_eq!(json["data"]["written"].as_bool(), Some(false));
+}
+
+/// W2 §C.4.3: the in-place backup lives in the ACTING worktree's local
+/// gitdir — a linked worktree's conflicted merge backs up under its own
+/// `.libra/merge-file-backup/`, and same-named files in two worktrees never
+/// share (or clean up) each other's backups.
+#[test]
+fn backup_is_worktree_local() {
+    let repo = create_committed_repo_via_cli();
+    let main = repo.path();
+    let wt_root = tempfile::tempdir().expect("wt root");
+    let wt = wt_root.path().join("mf-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Identical conflicting three-way inputs in BOTH worktrees.
+    for dir in [main, wt.as_path()] {
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        std::fs::write(dir.join("ours.txt"), "ours\n").unwrap();
+        std::fs::write(dir.join("theirs.txt"), "theirs\n").unwrap();
+    }
+    let wt_merge = run_libra_command(&["merge-file", "ours.txt", "base.txt", "theirs.txt"], &wt);
+    assert_eq!(wt_merge.status.code(), Some(1), "conflict exits 1");
+    assert!(
+        wt.join(".libra/merge-file-backup/ours.txt").exists(),
+        "the linked worktree's backup lives in ITS local gitdir"
+    );
+    assert!(
+        !main.join(".libra/merge-file-backup/ours.txt").exists(),
+        "nothing leaked into the shared/common storage"
+    );
+
+    // Main's own conflicted merge lands in main's gitdir; both coexist.
+    let main_merge = run_libra_command(&["merge-file", "ours.txt", "base.txt", "theirs.txt"], main);
+    assert_eq!(main_merge.status.code(), Some(1), "conflict exits 1");
+    assert!(main.join(".libra/merge-file-backup/ours.txt").exists());
+    assert!(
+        wt.join(".libra/merge-file-backup/ours.txt").exists(),
+        "main's merge did not clean up the linked worktree's backup"
+    );
+
+    // A CLEAN merge in main removes MAIN's own backup (the cleanup branch)
+    // while the linked worktree's backup for the same filename survives.
+    std::fs::write(main.join("base.txt"), "b\n").unwrap();
+    std::fs::write(main.join("ours.txt"), "x\n").unwrap();
+    std::fs::write(main.join("theirs.txt"), "b\n").unwrap();
+    let clean_merge =
+        run_libra_command(&["merge-file", "ours.txt", "base.txt", "theirs.txt"], main);
+    assert_eq!(clean_merge.status.code(), Some(0), "clean merge exits 0");
+    assert!(
+        !main.join(".libra/merge-file-backup/ours.txt").exists(),
+        "main's clean merge removed its OWN backup"
+    );
+    assert!(
+        wt.join(".libra/merge-file-backup/ours.txt").exists(),
+        "the linked worktree's same-named backup survives main's cleanup"
+    );
 }

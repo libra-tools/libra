@@ -110,7 +110,7 @@ impl ApprovedRulesetStore {
         let backend = conn.get_database_backend();
         let now_micros = Utc::now().timestamp_micros();
         let exec = conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT OR IGNORE INTO approved_permission \
                  (project_id, permission, pattern, created_at) \
@@ -136,7 +136,7 @@ impl ApprovedRulesetStore {
     ) -> Result<u64, DbErr> {
         let backend = conn.get_database_backend();
         let exec = conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM approved_permission \
                  WHERE project_id = ? AND permission = ? AND pattern = ?",
@@ -151,7 +151,7 @@ impl ApprovedRulesetStore {
     pub async fn clear(conn: &DatabaseConnection, project_id: &str) -> Result<u64, DbErr> {
         let backend = conn.get_database_backend();
         let exec = conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM approved_permission WHERE project_id = ?",
                 [project_id.into()],

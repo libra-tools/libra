@@ -301,8 +301,7 @@ impl ThreadProjection {
     /// # }
     /// ```
     pub async fn update(&self, db: &DatabaseConnection) -> Result<()> {
-        let txn = db
-            .begin()
+        let txn = crate::internal::db::begin_write_transaction(db)
             .await
             .context("Failed to start transaction for thread projection update")?;
 
@@ -1036,7 +1035,7 @@ mod tests {
     async fn setup_test_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let backend = db.get_database_backend();
-        db.execute(Statement::from_string(backend, BOOTSTRAP_SQL))
+        db.execute_raw(Statement::from_string(backend, BOOTSTRAP_SQL))
             .await
             .unwrap();
         db
@@ -1253,7 +1252,7 @@ mod tests {
         first.create(&db).await.unwrap();
 
         let backend = db.get_database_backend();
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             backend,
             "DROP INDEX uq_ai_thread_intent_intent".to_string(),
         ))

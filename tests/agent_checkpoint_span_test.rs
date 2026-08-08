@@ -15,8 +15,12 @@
 
 use std::sync::Mutex;
 
-use libra::internal::ai::hooks::{
-    LifecycleEventKind, ProviderHookCommand, claude_provider, runtime::ingest_agent_traces_payload,
+use libra::internal::{
+    ai::hooks::{
+        LifecycleEventKind, ProviderHookCommand, claude_provider,
+        runtime::ingest_agent_traces_payload,
+    },
+    config::ConfigKv,
 };
 use serde_json::json;
 
@@ -89,9 +93,13 @@ fn checkpoint_write_span_carries_required_fields_without_transcript_body() {
     let repo_path = dir.path().to_path_buf();
     let db_path = repo_path.join("libra.db");
     let conn = rt.block_on(async {
-        libra::internal::db::create_database(&db_path.display().to_string())
+        let conn = libra::internal::db::create_database(&db_path.display().to_string())
             .await
-            .expect("create fresh libra database")
+            .expect("create fresh libra database");
+        ConfigKv::set_with_conn(&conn, "libra.repoid", "agent-checkpoint-span-test", false)
+            .await
+            .expect("seed repository identity");
+        conn
     });
 
     // Unique marker: with no trusted transcript path, the writer falls

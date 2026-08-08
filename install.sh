@@ -18,7 +18,7 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # user opts in with LIBRA_ALLOW_FALLBACK=1. Default behaviour is fail-fast so
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
-DEFAULT_VERSION="v0.18.91"
+DEFAULT_VERSION="v0.19.104"
 
 # ─── theme (Dusk) ────────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${LIBRA_NO_TUI:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
@@ -355,7 +355,7 @@ detect_os() {
     case "$OS_RAW" in
         Linux)  OS=linux  ;;
         Darwin) OS=darwin ;;
-        *) error_exit "unsupported operating system: $OS_RAW" "detect" "libra ships builds for linux & darwin" ;;
+        *) error_exit "unsupported operating system: $OS_RAW" "detect" "libra ships builds for linux (amd64, arm64) & macOS (arm64 only)" ;;
     esac
 }
 
@@ -366,6 +366,14 @@ detect_arch() {
         aarch64|arm64) ARCH=arm64 ;;
         *) error_exit "unsupported architecture: $ARCH_RAW" "detect" "libra builds amd64 and arm64" ;;
     esac
+
+    # The release matrix does not build an Intel-macOS artifact, so darwin/amd64 has no
+    # downloadable binary. Fail here with an actionable message instead of letting the
+    # download step 404 on ${BASE_URL}/${VERSION}/libra-darwin-amd64.
+    if [ "$OS" = darwin ] && [ "$ARCH" = amd64 ]; then
+        error_exit "unsupported platform: macOS on Intel (darwin/amd64)" "detect" \
+            "libra ships macOS builds for Apple Silicon (arm64) only; on an Intel Mac build from source with 'cargo build --release', or run the linux/amd64 build under a Linux VM or container"
+    fi
 }
 
 check_dependencies() {

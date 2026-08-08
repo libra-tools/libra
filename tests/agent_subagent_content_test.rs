@@ -195,7 +195,7 @@ async fn claude_hook_captures_partial_subagent_content_once_as_unresolved() {
         .await
         .expect("connect repository database");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT c.current_revision, c.current_checkpoint_id, c.source_key,
                     cp.metadata_blob_oid, r.partial, l.link_state,
@@ -249,7 +249,7 @@ async fn claude_hook_captures_partial_subagent_content_once_as_unresolved() {
     let content_checkpoint_id = row
         .try_get_by::<String, _>("current_checkpoint_id")
         .expect("content checkpoint id");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
         [content_checkpoint_id.clone().into()],
@@ -354,7 +354,7 @@ async fn unchanged_replay_rejects_an_uncataloged_traces_ancestor() {
         .await
         .expect("connect repository database");
     let deleted = conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "DELETE FROM agent_checkpoint WHERE scope = 'committed'".to_string(),
         ))

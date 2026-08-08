@@ -27,6 +27,7 @@ mod hooks;
 mod import;
 mod list;
 mod push;
+mod workspace;
 // `libra review` is a TOP-LEVEL command (AG-22; `Commands::Review` in
 // `src/cli.rs`); its implementation lives here so it can reuse the
 // AG-20 `pub(super)` pagination helpers in `checkpoint.rs`.
@@ -100,6 +101,8 @@ EXAMPLES:
     libra agent clean                               Drop temporary checkpoints from the most recent stopped session
     libra agent clean --all                         Drop temporary checkpoints from every stopped session
     libra agent doctor                              Diagnose hook installation and capture state
+    libra agent workspace list                      List workspace records (keyset pagination)
+    libra agent workspace show <workspace-id>       Show one workspace record (lease, owner, path, state)
     libra agent push                                Push refs/libra/traces to the default remote
     libra agent push --remote origin                Push refs/libra/traces to a named remote
     libra agent rpc list                            Discover libra-agent-<name> RPC binaries on PATH
@@ -175,6 +178,10 @@ pub enum AgentSubcommand {
     /// Push `refs/libra/traces` to a remote.
     #[command(about = "Push refs/libra/traces to a remote")]
     Push(PushArgs),
+
+    /// Inspect the workspace registry (§C.8, read-only).
+    #[command(subcommand, about = "Inspect workspace records (read-only)")]
+    Workspace(workspace::WorkspaceSubcommand),
 
     /// Internal hook entry point (called by hook configs installed by `enable`).
     #[command(subcommand, about = "Hook entry point", hide = true)]
@@ -365,6 +372,7 @@ pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<(
         AgentSubcommand::Clean(cmd) => clean::execute_safe(cmd, output).await,
         AgentSubcommand::Doctor(cmd) => doctor::execute_safe(cmd, output).await,
         AgentSubcommand::Push(cmd) => push::execute_safe(cmd, output).await,
+        AgentSubcommand::Workspace(cmd) => workspace::execute_safe(cmd, output).await,
         AgentSubcommand::Hooks(cmd) => hooks::execute_safe(cmd, output).await,
         AgentSubcommand::Rpc(cmd) => rpc::execute_safe(cmd, output).await,
     }

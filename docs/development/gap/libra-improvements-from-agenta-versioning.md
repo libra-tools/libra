@@ -748,11 +748,13 @@ LIBRA_SKIP_WEB_BUILD=1 cargo test --test command_test merge_commits
 
 - **`libra fork`（原子隔离 agent 分支+worktree）** — *infeasible*。“O(1) 在 commit X 建分支、对象共享、headless/JSON” 即今天的 `libra branch <name> <rev> --json`（`branch.rs:111-118`，内部单 ref 行 INSERT 无拷贝），Agenta “修 O(n)→O(1)” 框架描述的正是 Libra 现状；其定义性价值（带独立 HEAD 的隔离 worktree）依赖不存在的 per-worktree HEAD；分支在 SQLite、worktree 在 worktrees.json，无法单事务原子；无 ephemeral/created_by 列可标记/回收。
 
-- **checkout 互斥守卫（branch already checked out elsewhere）** — *infeasible*。所有 worktree 共享一个 HEAD（单 reference 行 + `.libra` symlink），`checkout --ignore-other-worktrees` 已**故意**是 no-op，无 per-worktree HEAD 可数。**唯一残值**：把并发 branch-create 竞争失败的裸 sea-orm integrity error 也映射到 `LBR-CONFLICT-002`（呼应 Agenta“传播冲突而非吞掉”）——小而真，无需新码/新机制；丢弃 `SELECT..FOR UPDATE` 类比（SQLite 无行锁，busy 重试已是等价物）。
+- **checkout 互斥守卫（branch already checked out elsewhere）** — *已实现*（本条的 2026-07 评估基线「所有 worktree 共享一个 HEAD」已被 plan-20260714 Part C W0 推翻：`reference` 表带 `worktree_id` 列，每个 worktree 解析自己的 HEAD 行）。守卫由 `Head::branch_checked_out_elsewhere_result` 单一 fail-closed 探针提供，接入全部 shared-branch mutator 与 current-branch ref writer；`checkout --ignore-other-worktrees` 不再绕过该守卫（intentionally-different，见 ADR-0714-09），冲突返回 `LBR-CONFLICT-002`。**唯一残值**：把并发 branch-create 竞争失败的裸 sea-orm integrity error 也映射到 `LBR-CONFLICT-002`（呼应 Agenta“传播冲突而非吞掉”）——小而真，无需新码/新机制；丢弃 `SELECT..FOR UPDATE` 类比（SQLite 无行锁，busy 重试已是等价物）。
 
 - **受保护（guarded）环境** — *infeasible*（且依赖同样不存在的 env 子系统）。`promote.rs`/`env.rs`/`deployment` 表/`guarded` 标志全不存在；权限模型无强弱层级，无 "DEPLOY > EDIT" 表示；引用的 `compat_error_codes_doc_sync` 测试名也不存在。**唯一残值**：AI 发起的晋升走现有 `approved_permission` 流（新字符串键 `promote`）——已并入 P2-11 注意事项。
 
-- **per-worktree HEAD/index 隔离** — *conflicts-with-principles*。技术可建且不破坏 git on-disk 兼容，但与 COMPATIBILITY.md:77/88、`docs/commands/worktree.md`、libra-workflow skill 明文的“共享 HEAD/index/refs 是 intentionally-different，branch-isolated worktree 是反模式、官方替代是独立 clone”直接冲突；且其核心动机是误诊（被引“并发暂存竞争”是同目录共享工作树竞争，per-worktree 作用域修不了）。**不作为改进建议**，仅作为“若维护者主动反转产品方向”时的前置能力（见路线图），届时须按“从规范 worktree 路径确定性派生 worktree_id、保 `path::index()` 为纯同步函数、保持 Branch/Tag 行共享、丢弃 worktrees.json→SQLite 正规化”收窄实现，并预算 ~124 `Head::current*` + 36 `Head::update*` + 64 `path::index()` 站点的真实爆炸半径与文档反转。
+- **per-worktree HEAD/index 隔离** — *已实现*（本条按 2026-07 基线写成 conflicts-with-principles；plan-20260714 Part C 反转了该产品方向并交付了 per-worktree HEAD/index 作用域，下述反对意见与「共享 HEAD/index 是 intentionally-different」的引用均为历史记录，不再描述当前行为）。原评估：
+
+  技术可建且不破坏 git on-disk 兼容，但与 COMPATIBILITY.md:77/88、`docs/commands/worktree.md`、libra-workflow skill 明文的“共享 HEAD/index/refs 是 intentionally-different，branch-isolated worktree 是反模式、官方替代是独立 clone”直接冲突；且其核心动机是误诊（被引“并发暂存竞争”是同目录共享工作树竞争，per-worktree 作用域修不了）。**不作为改进建议**，仅作为“若维护者主动反转产品方向”时的前置能力（见路线图），届时须按“从规范 worktree 路径确定性派生 worktree_id、保 `path::index()` 为纯同步函数、保持 Branch/Tag 行共享、丢弃 worktrees.json→SQLite 正规化”收窄实现，并预算 ~124 `Head::current*` + 36 `Head::update*` + 64 `path::index()` 站点的真实爆炸半径与文档反转。
 
 ---
 

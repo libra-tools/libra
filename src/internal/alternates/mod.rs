@@ -36,9 +36,26 @@ fn borrowers_file(objects_dir: &Path) -> PathBuf {
 /// relative entry is joined to `objects_dir`). Missing file → empty. Comment
 /// (`#`) and blank lines are skipped.
 fn read_list(path: &Path, objects_dir: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+    read_list_result(path, objects_dir).unwrap_or_default()
+}
+
+/// [`read_list`], but distinguishing "no such file" (an empty list — the
+/// normal case) from "cannot be read" (unknown contents).
+///
+/// The difference is the whole deletion gate: an unreadable `borrowers` file
+/// collapsed into "no borrowers", which is permission to delete objects a
+/// borrowing repository may still need. Callers that DELETE use this form and
+/// fail closed; decorative readers keep the lenient one.
+fn read_list_result(path: &Path, objects_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
+    Ok(parse_list(&text, objects_dir))
+}
+
+fn parse_list(text: &str, objects_dir: &Path) -> Vec<PathBuf> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -111,7 +128,11 @@ fn update_list(
     mutate: impl FnOnce(&mut Vec<PathBuf>),
 ) -> std::io::Result<bool> {
     let _lock = FileLock::acquire(list_file)?;
-    let mut entries = read_list(list_file, base_dir);
+    // STRICT re-read. The lenient form turns an unreadable list into an empty
+    // one, and this is a read-modify-WRITE: an empty read here would rewrite
+    // the file as empty — deleting registrations nobody could see — and hand
+    // a deletion gate "no borrowers" for a list it never actually read.
+    let mut entries = read_list_result(list_file, base_dir)?;
     let before = entries.len();
     let before_snapshot = entries.clone();
     mutate(&mut entries);
@@ -169,6 +190,23 @@ pub fn add(objects_dir: &Path, alternate_objects_dir: &Path) -> std::io::Result<
     let alternate = std::fs::canonicalize(alternate_objects_dir)
         .unwrap_or_else(|_| alternate_objects_dir.to_path_buf());
     let me = std::fs::canonicalize(objects_dir).unwrap_or_else(|_| objects_dir.to_path_buf());
+    // §C.4.3 writer-vs-deleter, from the OTHER side: registering a borrower
+    // is a publication into the BASE repository — it is the fact that makes
+    // the base's `gc`, `repack -d` and `cache evict` refuse. Registering it
+    // without the base's maintenance lock lets it land after that refusal has
+    // already been evaluated and before the base unlinks, so the new borrower
+    // starts out depending on objects that are about to disappear.
+    //
+    // The base's `.libra` is the alternate's `objects/` parent.
+    let _base_publication = alternate
+        .parent()
+        .map(crate::internal::maintenance_lock::MaintenanceLock::shared)
+        .transpose()
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "failed to take the base repository's maintenance lock before registering as a                  borrower: {error}"
+            ))
+        })?;
     // 1) register THIS store as a BORROWER of the alternate FIRST (Codex P1):
     // if step 2 then fails, an extra borrower pin (base over-protected) is
     // safer than an unprotected borrow (base could prune what we read).
@@ -213,23 +251,197 @@ pub fn remove(objects_dir: &Path, alternate_objects_dir: &Path) -> std::io::Resu
 /// PRUNED from the file (self-healing), so a stale registration never pins a
 /// base forever.
 pub fn live_borrowers(objects_dir: &Path) -> Vec<PathBuf> {
-    let bfile = borrowers_file(objects_dir);
-    let live: Vec<PathBuf> = read_list(&bfile, objects_dir)
+    // Unknown contents: report nothing. The DELETION gate uses the fallible
+    // form and fails closed; this lenient form exists for decoration, where
+    // an empty answer costs a less precise message and never a decision.
+    live_borrowers_result(objects_dir).unwrap_or_default()
+}
+
+/// Is this borrower registration PROVABLY dead — as opposed to merely
+/// unreadable right now?
+///
+/// The distinction is the whole gate. `is_dir()` was the rule, and it maps
+/// EACCES and a stale mount to "not a directory", so a borrower this process
+/// merely could not stat was deleted from the registration and the next
+/// deletion gate saw no borrower at all. Only an entry that is gone, or that
+/// is definitely something other than a directory (an object directory never
+/// is), counts as dead.
+fn borrower_is_provably_dead(entry: &Path) -> bool {
+    // ABSENCE IS NOT PROOF, and this is the whole judgement.
+    //
+    // An automounted or temporarily unavailable borrower answers ENOENT for a
+    // path that exists again the moment it is mounted, and there is no way to
+    // tell that apart from a deleted repository by looking — the mount point
+    // and the deleted directory are both "not there". Pruning on ENOENT would
+    // therefore let the next `gc` delete objects a borrower still needs, for
+    // the sake of tidying a text file.
+    //
+    // So the automatic rule removes only what CANNOT be an object directory:
+    // a path that exists and is a regular file. Everything else — absent,
+    // unreadable, EIO — is treated as live, and the way to retire it is
+    // `libra alternates prune`, where the USER asserts the borrower is gone.
+    match std::fs::metadata(entry) {
+        Ok(meta) => !meta.is_dir(),
+        Err(_) => false,
+    }
+}
+
+/// Registrations that are ABSENT (as opposed to unreadable), for the explicit
+/// `libra alternates prune`.
+///
+/// Absence is not proof of death for the automatic gate — see
+/// [`borrower_is_provably_dead`] — but under an explicit prune the user is
+/// the proof: they are asserting these borrowers are gone for good. The
+/// command reports each path before removing anything.
+pub fn absent_borrowers(objects_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let registered = read_list_result(&borrowers_file(objects_dir), objects_dir)?;
+    Ok(registered
         .into_iter()
-        .filter(|p| p.is_dir())
-        .collect();
-    // Self-heal dead entries under the lock (best-effort — a read must never
-    // fail just because the prune could not acquire the lock).
-    let _ = update_list(&bfile, objects_dir, |all| {
-        all.retain(|p| p.is_dir());
-    });
-    live
+        .filter(|entry| {
+            matches!(
+                std::fs::metadata(entry),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+        .collect())
+}
+
+/// Retire borrower registrations under the borrowers-file LOCK, re-checking
+/// each one at the moment of removal. Returns the paths actually removed.
+///
+/// The re-check is the point. Deciding from a snapshot taken earlier lets a
+/// borrower that came back — and successfully re-registered in the meantime —
+/// have its FRESH registration deleted, after which the base is free to prune
+/// objects it is now borrowing. Under the lock, `alternates add` cannot
+/// interleave, and an entry that exists again is left alone.
+///
+/// `named` retires one specific registration whatever the filesystem says
+/// about it (the user is asserting it is gone); `None` retires every
+/// registration whose path is ABSENT.
+pub fn prune_borrowers(objects_dir: &Path, named: Option<&Path>) -> std::io::Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    update_list(&borrowers_file(objects_dir), objects_dir, |all| {
+        all.retain(|entry| {
+            let retire = match named {
+                // The TARGET is used exactly as given — never canonicalized.
+                // Resolving it first lets `prune /alias`, where `/alias` is a
+                // symlink to a live borrower, retire that borrower's
+                // registration even though `/alias` was never registered.
+                // A registration may still be canonicalized to meet the raw
+                // target, which is the direction that cannot invent a match.
+                Some(target) => {
+                    entry == target
+                        || std::fs::canonicalize(entry).is_ok_and(|resolved| resolved == target)
+                }
+                None => matches!(
+                    std::fs::metadata(entry),
+                    Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                ),
+            };
+            if retire {
+                removed.push(entry.clone());
+            }
+            !retire
+        });
+    })?;
+    Ok(removed)
 }
 
 /// Whether `objects_dir` is a SHARED BASE that some live borrower depends on.
 /// gc / cache-evict consult this and refuse to prune loose objects when true.
 pub fn has_live_borrowers(objects_dir: &Path) -> bool {
     !live_borrowers(objects_dir).is_empty()
+}
+
+/// [`has_live_borrowers`] for DELETION gates: an unreadable `borrowers` file
+/// is an error, not "no borrowers".
+///
+/// A missing file legitimately means nobody borrows from this store. A file
+/// that exists and cannot be read means the answer is UNKNOWN, and the
+/// difference decides whether objects a borrowing repository still needs get
+/// unlinked. Only an absent file may be read as empty.
+fn live_borrowers_result(objects_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let bfile = borrowers_file(objects_dir);
+    // Read strictly first: an unreadable registration is a fault the caller
+    // must see, and it must not be rewritten.
+    let registered = read_list_result(&bfile, objects_dir)?;
+    if registered.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // The answer is decided INSIDE the lock, from the list as it stands
+    // there — and it is the same pass that prunes. Deciding first and
+    // pruning after leaves a window in which a registration re-appears: it
+    // survives the prune (correctly) but is missing from the answer, and the
+    // caller then deletes objects it is borrowing.
+    let mut live = Vec::new();
+    let locked = update_list(&bfile, objects_dir, |all| {
+        all.retain(|entry| {
+            if borrower_is_provably_dead(entry) {
+                false
+            } else {
+                live.push(entry.clone());
+                true
+            }
+        });
+    });
+    match locked {
+        Ok(_) => Ok(live),
+        // The prune could not take the list lock (or could not write). That
+        // must not turn into "no borrowers": fall back to the strict read,
+        // which over-reports rather than under-reports.
+        Err(_) => Ok(registered
+            .into_iter()
+            .filter(|entry| !borrower_is_provably_dead(entry))
+            .collect()),
+    }
+}
+
+/// plan-20260714 Part C W0 (§C.11 release gate): THE deletion-safety gate.
+///
+/// Every entry point that physically removes an object payload from this
+/// store must pass through here — `gc`, `repack`, `prune`, `cache evict`
+/// (direct and via scheduled maintenance), `file obliterate` and its crash
+/// recovery. This store's reachability set does not include a borrower's
+/// refs, so deleting while a borrower is live can leave that borrower
+/// referencing bytes that no longer exist.
+///
+/// It exists as ONE function because the alternative — the same two-line
+/// check copied into each caller — is how `maintenance run --task
+/// cache-evict` and `file obliterate --recover` came to skip it entirely.
+/// `action` names the refused operation in the message; `code` lets a caller
+/// keep the stable error code its surface already documents.
+pub fn ensure_no_live_borrowers(
+    action: &str,
+    code: crate::utils::error::StableErrorCode,
+) -> crate::utils::error::CliResult<()> {
+    let objects = crate::utils::path::objects();
+    let live = live_borrowers_result(&objects).map_err(|error| {
+        crate::utils::error::CliError::fatal(format!(
+            "cannot {action}: this object store's borrower registration \
+             ('objects/info/borrowers') cannot be read, so whether another repository depends \
+             on these objects is unknown: {error}"
+        ))
+        // Deliberately NOT `code`. A live borrower is a known state a caller
+        // may legitimately report as "skipped"; an unreadable registration is
+        // a FAULT, and scheduled maintenance must not fold it into a
+        // successful run. The code is what lets callers tell them apart.
+        .with_stable_code(crate::utils::error::StableErrorCode::IoReadFailed)
+        .with_hint("repair or remove that file once you know which repositories borrow from here")
+    })?;
+    if live.is_empty() {
+        return Ok(());
+    }
+    Err(crate::utils::error::CliError::fatal(format!(
+        "cannot {action}: this object store is shared (other repositories borrow from it via \
+         alternates), and deleting an object one of them still needs would corrupt it"
+    ))
+    .with_stable_code(code)
+    .with_hint(
+        "have the borrowers run 'libra alternates remove' (or dissociate) first; if a borrower \
+         repository is gone for good, run 'libra alternates prune' here to retire its \
+         registration",
+    ))
 }
 
 /// Append a raw comment/line to a store's info dir (used by tests / diagnostics).

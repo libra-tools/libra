@@ -94,7 +94,10 @@ pub mod rebase;
 pub mod reflog;
 pub mod remote;
 pub mod remove;
-pub(crate) mod rename_detect;
+// The shared diffcore rename engine (§B.4). Public so the wave-0
+// integration suite can pin engine-level contracts (evidence allow-list,
+// budget independence) that no CLI path can construct today.
+pub mod rename_detect;
 pub mod repack;
 pub mod replace;
 pub mod rerere;
@@ -137,6 +140,7 @@ pub mod worktree;
 
 pub mod stash;
 pub mod status;
+pub(crate) mod status_probe;
 pub(crate) mod status_untracked;
 pub(crate) mod status_untracked_paths;
 pub mod switch;
@@ -165,30 +169,41 @@ use crate::{
 };
 
 // impl load for all objects
-/// lore.md 2.1: refuse an in-progress sequencer operation inside a LINKED
-/// worktree. Only `rebase` still needs this (Part C W1): its `rebase_state`
-/// row and sidecar files are still repository-global, so running it in a
-/// linked worktree could collide with the main worktree's operation.
-/// Merge/cherry-pick/am/revert/bisect state is worktree-scoped (per-scope
-/// `sequence_state`/`bisect_state` rows + local-gitdir sidecars) and those
-/// commands run in any worktree. Allowed in the main worktree.
-pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
-    ensure_main_worktree_because(op, "in-progress operation state is shared across worktrees")
-}
+// NOTE (Part C ledger): the W0 `ensure_main_worktree`/`ensure_main_worktree_because`
+// transition guards were RETIRED with the W2 stash slice — every formerly
+// repository-global store (sequencers, dirty cache, layer, sparse view, the
+// stash stack protocol) is worktree-aware now, and no command refuses to run
+// in a linked worktree on those grounds.
 
-/// plan-20260714 Part C W0 transition guard: refuse `op` inside a LINKED
-/// worktree with a caller-supplied reason. Used for the states whose stores are
-/// still repository-global (stash stack, dirty cache, layer/sparse tables,
-/// composite fetch/pull) until the W1/W2 slices make them worktree-scoped — a
-/// linked invocation could read or clobber the wrong (or the main worktree's)
-/// state, so it fails closed. Always allowed in the main worktree.
-pub fn ensure_main_worktree_because(op: &str, reason: &str) -> crate::utils::error::CliResult<()> {
-    if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
+/// W0 §C.4.1.1 (plan-20260714): the one transition guard that REMAINS — a
+/// different hazard from the retired store guards above.
+///
+/// Until the unified Code/Agent config resolver lands (transferred to
+/// plan-20260715 W4-06..W4-08, not yet delivered), Code/Agent configuration
+/// reads are split-brained in a linked worktree: agents/approval/MCP/profile/
+/// hooks read the LOCAL gitdir while sandbox reads COMMON storage, so a
+/// linked session could run under main's sandbox policy WITHOUT main's
+/// `PreToolUse` Block hooks. Launching the runtime surfaces there fails
+/// closed instead of running silently permissive. Diagnosis surfaces
+/// (`agent`, `review`, `investigate`, `code-control`) stay usable in a
+/// damaged or linked worktree — see the CommandScope note in `cli.rs`.
+/// `base`: the directory the guarded surface will actually OPERATE ON —
+/// `None` means the process cwd. `libra code` accepts `--cwd`/`--repo`, so
+/// gating on the ambient cwd alone would let `libra code --cwd <linked-wt>`
+/// start the exact split-brained session the guard exists to prevent.
+pub(crate) fn require_main_worktree_for_code_agent(
+    surface: &str,
+    base: Option<&std::path::Path>,
+) -> Result<(), crate::utils::error::CliError> {
+    if util::worktree_id_for_base(base.map(std::path::Path::to_path_buf)).is_some() {
         return Err(crate::utils::error::CliError::fatal(format!(
-            "'{op}' is not yet supported inside a linked worktree (lore.md 2.1: {reason}) \
-             \u{2014} run it in the main worktree"
+            "{surface} cannot run in a linked worktree yet: Code/Agent \
+             configuration (agents/hooks/sandbox/approvals) is not \
+             worktree-aware until the unified config resolver lands \
+             (plan-20260714 W0 preflight)"
         ))
-        .with_stable_code(crate::utils::error::StableErrorCode::Unsupported));
+        .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)
+        .with_hint("run this command from the MAIN worktree"));
     }
     Ok(())
 }
@@ -204,6 +219,20 @@ where
     let storage = util::objects_storage();
     let data = storage.get(&hash)?;
     T::from_bytes(&data.to_vec(), hash)
+}
+
+/// RAW load: NO `refs/replace` substitution (plan-20260714 §C.4.1.1 process
+/// cache rules — the GC/repack reachability walk must traverse the ORIGINAL
+/// graph byte-for-byte; resolving replacements would leave the replaced
+/// object's own tree/parents unrooted and expose a corrupt history the
+/// moment the replace ref is deleted).
+pub fn load_object_raw<T>(hash: &ObjectHash) -> Result<T, GitError>
+where
+    T: ObjectTrait,
+{
+    let storage = util::objects_storage();
+    let data = storage.get(hash)?;
+    T::from_bytes(&data.to_vec(), *hash)
 }
 
 // impl save for all objects
@@ -314,6 +343,91 @@ pub(crate) fn read_symlink_blob_bytes(path: &Path) -> io::Result<Vec<u8>> {
     Ok(symlink_target_blob_bytes(&fs::read_link(path)?))
 }
 
+/// Build an index entry whose recorded stat PROVABLY describes the hashed
+/// content. The caller stats the file BEFORE reading/hashing it; this
+/// helper re-stats after (via `new_from_file`) and, when the two disagree
+/// — the racy window where an edit landed between the content read and
+/// the stat — zeroes the volatile stat fields so every later `status`
+/// content-compares the entry instead of trusting a post-edit stat paired
+/// with a pre-edit hash. The index writers previously statted only AFTER
+/// hashing, which produced exactly that poisoned pairing (2026-08-06
+/// R0-8 review: plain status hid a concurrently-edited file, and a
+/// non-`-a` commit would have built a stale tree from it).
+pub(crate) fn verified_index_entry(
+    name: &Path,
+    hash: ObjectHash,
+    workdir: &Path,
+    pre_read: Option<&fs::Metadata>,
+) -> io::Result<git_internal::internal::index::IndexEntry> {
+    use git_internal::internal::index::Time;
+
+    let mut entry = git_internal::internal::index::IndexEntry::new_from_file(name, hash, workdir)?;
+    // No pre-read stat means no proof — smudge.
+    if !pre_read.is_some_and(|pre_read| entry_stat_matches_metadata(&entry, pre_read)) {
+        entry.ctime = Time::from_system_time(std::time::UNIX_EPOCH);
+        entry.mtime = Time::from_system_time(std::time::UNIX_EPOCH);
+        entry.dev = 0;
+        entry.ino = 0;
+        entry.uid = 0;
+        entry.gid = 0;
+    }
+    Ok(entry)
+}
+
+/// Whether an entry's volatile stat triple equals `metadata`'s. Mirrors
+/// the comparison `status` performs (`index_stat_differs`), so a pairing
+/// this returns `true` for is exactly one status would trust.
+fn entry_stat_matches_metadata(
+    entry: &git_internal::internal::index::IndexEntry,
+    metadata: &fs::Metadata,
+) -> bool {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use git_internal::internal::index::Time;
+
+    #[cfg(unix)]
+    fn stat_times(metadata: &fs::Metadata) -> (SystemTime, SystemTime) {
+        use std::os::unix::fs::MetadataExt;
+
+        fn at(seconds: i64, nanos: i64) -> SystemTime {
+            if seconds < 0 {
+                return UNIX_EPOCH;
+            }
+            let nanos = u32::try_from(nanos)
+                .ok()
+                .filter(|nanos| *nanos < 1_000_000_000)
+                .unwrap_or(0);
+            UNIX_EPOCH + Duration::new(seconds as u64, nanos)
+        }
+        (
+            at(metadata.ctime(), metadata.ctime_nsec()),
+            at(metadata.mtime(), metadata.mtime_nsec()),
+        )
+    }
+    #[cfg(not(unix))]
+    fn stat_times(metadata: &fs::Metadata) -> (SystemTime, SystemTime) {
+        let _ = Duration::from_secs(0);
+        (
+            metadata
+                .created()
+                .or_else(|_| metadata.modified())
+                .unwrap_or(UNIX_EPOCH),
+            metadata
+                .modified()
+                .or_else(|_| metadata.created())
+                .unwrap_or(UNIX_EPOCH),
+        )
+    }
+
+    let Ok(size) = u32::try_from(metadata.len()) else {
+        return false;
+    };
+    let (ctime, mtime) = stat_times(metadata);
+    entry.size == size
+        && entry.ctime == Time::from_system_time(ctime)
+        && entry.mtime == Time::from_system_time(mtime)
+}
+
 #[cfg(unix)]
 pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -324,6 +438,64 @@ pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
 #[cfg(not(unix))]
 pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
     target.to_string_lossy().as_bytes().to_vec()
+}
+
+/// Hash a worktree file as a Git blob under a hard byte cap.
+///
+/// Returns `Ok(None)` when the file exceeds `cap`, or when its size changes
+/// under the read. The second case matters for correctness as much as for
+/// budget: the blob header commits to a length before the body is read, so
+/// a file that grows or shrinks mid-read would otherwise yield a WRONG
+/// object id that silently claims to be the file's content. Callers that
+/// enforce a read budget must use this instead of [`stream_file_blob_hash`],
+/// whose size check can be defeated by a file that grows after the stat.
+/// Returns `(oid, bytes_read)`. `bytes_read` is what was actually pulled off
+/// the file, NOT the caller's pre-read `stat` length, and is reported on the
+/// refusal paths too: a file that grows between the caller's stat and this
+/// read must be charged for the bytes it really cost, or a growth race buys
+/// unmetered I/O against the budget this function exists to enforce.
+pub(crate) fn stream_file_blob_hash_bounded(
+    path: impl AsRef<Path>,
+    cap: u64,
+) -> io::Result<(Option<ObjectHash>, u64)> {
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > cap {
+        return Ok((None, 0));
+    }
+    // Read AT MOST `len` (<= cap) bytes: the cap is a hard ceiling, so growth
+    // is detected by re-stating AFTER the read rather than by reading one
+    // byte past it. Reading cap+1 would overrun the very bound this function
+    // exists to enforce, exactly when the caller is at its limit.
+    let mut reader = io::BufReader::new(file).take(len);
+    let mut hasher = HashAlgorithm::new();
+
+    hasher.update(b"blob ");
+    hasher.update(len.to_string().as_bytes());
+    hasher.update(b"\0");
+
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    if total != len {
+        return Ok((None, total)); // shrank under the read
+    }
+    // Post-read length check: a file that grew would otherwise hash a prefix
+    // and pass it off as the whole file.
+    if reader.into_inner().into_inner().metadata()?.len() != len {
+        return Ok((None, total)); // grew under the read
+    }
+    ObjectHash::from_bytes(&hasher.finalize())
+        .map(|oid| (Some(oid), total))
+        .map_err(io::Error::other)
 }
 
 fn stream_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {
@@ -360,6 +532,32 @@ pub async fn get_target_commit(
 
 #[cfg(test)]
 mod tests {
+    use super::stream_file_blob_hash_bounded;
+
+    /// §B.3.4: `cap` is a HARD ceiling. The bounded hasher used to read
+    /// `cap + 1` bytes to detect a growing file, which meant a caller sitting
+    /// exactly at its 2 MiB / 64 MiB limit could still be made to read one
+    /// byte past it. Growth is now caught by re-stating AFTER the read, so
+    /// nothing beyond the cap is ever consumed.
+    #[test]
+    fn bounded_hash_never_reads_past_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("exactly-at-cap.bin");
+        let cap = 4096_u64;
+        std::fs::write(&path, vec![b'z'; cap as usize]).expect("write");
+
+        // Exactly at the cap: accepted, and charged exactly the cap.
+        let (oid, read) = stream_file_blob_hash_bounded(&path, cap).expect("read at the cap");
+        assert!(oid.is_some(), "a file exactly at the cap is readable");
+        assert_eq!(read, cap, "and costs exactly the cap, never cap + 1");
+
+        // One byte over: refused before anything is read.
+        std::fs::write(&path, vec![b'z'; cap as usize + 1]).expect("grow past the cap");
+        let (oid, read) = stream_file_blob_hash_bounded(&path, cap).expect("read past the cap");
+        assert!(oid.is_none(), "a file over the cap is refused");
+        assert_eq!(read, 0, "and no byte past the cap is consumed to find out");
+    }
+
     use git_internal::internal::object::commit::Commit;
     use serial_test::serial;
     use tempfile::tempdir;
@@ -415,5 +613,50 @@ mod tests {
             let (msg_, _) = parse_commit_msg(&msg_gpg);
             assert_eq!(msg, msg_);
         }
+    }
+}
+
+#[cfg(test)]
+mod verified_entry_tests {
+    use std::path::Path;
+
+    use git_internal::internal::index::Time;
+
+    use super::verified_index_entry;
+
+    /// 2026-08-06 R0-8 review: an edit landing between the pre-read stat
+    /// and the post-hash stat smudges the entry (zeroed volatile stats →
+    /// every later status content-compares it); an un-raced entry keeps
+    /// its verified stat; no pre-read stat never earns trust.
+    #[test]
+    fn racy_edit_between_read_and_stat_smudges_the_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let zero = Time::from_system_time(std::time::UNIX_EPOCH);
+
+        let file = dir.path().join("racy.txt");
+        std::fs::write(&file, "original").unwrap();
+        let pre = std::fs::symlink_metadata(&file).unwrap();
+        // (the content would be hashed here) — then the racy edit lands:
+        std::fs::write(&file, "edited, longer than before").unwrap();
+        let hash = git_internal::internal::object::blob::Blob::from_content("original").id;
+        let entry = verified_index_entry(Path::new("racy.txt"), hash, dir.path(), Some(&pre))
+            .expect("entry");
+        assert_eq!(
+            entry.mtime, zero,
+            "smudged: the stat must not describe content the hash is not"
+        );
+        assert_eq!(entry.ctime, zero);
+
+        let calm = dir.path().join("calm.txt");
+        std::fs::write(&calm, "steady").unwrap();
+        let pre = std::fs::symlink_metadata(&calm).unwrap();
+        let hash = git_internal::internal::object::blob::Blob::from_content("steady").id;
+        let entry = verified_index_entry(Path::new("calm.txt"), hash, dir.path(), Some(&pre))
+            .expect("entry");
+        assert_ne!(entry.mtime, zero, "an un-raced entry keeps its real stat");
+
+        let entry =
+            verified_index_entry(Path::new("calm.txt"), hash, dir.path(), None).expect("entry");
+        assert_eq!(entry.mtime, zero, "no pre-read stat never earns trust");
     }
 }

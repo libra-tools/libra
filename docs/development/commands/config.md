@@ -8,6 +8,8 @@
 
 - 兼容级别：`partial`。vault-backed local/global config 已支持；section 操作 `--remove-section <name>` / `--rename-section <old> <new>`（事务化，采用 Git 的 section/subsection 身份而非裸前缀——`--remove-section branch` 删除 `branch.<key>` 但不动 `branch.feature.*` 子节）已支持；`-z`/`--null` NUL 分隔输出（get/get-all 输出 `value\0`，`--get-regexp`/`--list` 输出 `key\nvalue\0`，`--name-only` 输出 `key\0`，`--show-origin` 前缀 `origin\0`）已支持；读取与设置时的类型规范化 `--type=<bool|int|path>` 及 `--bool`/`--int`/`--path` 快捷方式（bool 变体→true/false、int 的 k/m/g 1024 倍率、path 的 `~`/`~/` 展开；set 时在存储前校验+规范化，非法值报错不写入）已支持；`--system` 作用域（`/etc/libra/config.db`，可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖，级联优先级最低；vault 加密密钥与 `import` 在该作用域被拒绝）已支持；editor round-trip 和 includeIf 尚未完整支持。
 
+- 裸读 `libra config <key>`（单个位置参数、无值）是**读取**，与 `git config <key>` 一致：`resolve_command_typed` 的兜底分支解析为 `ResolvedCommand::Set { value: None, explicit_set: false }`，`handle_set` 在「无值」分支把普通 key 转 `handle_get`（`reveal=false`），因此多值取末值、级联与 `config get` 同序、加密值渲染 `<REDACTED>`、未设置 key 为 exit 1 + `LBR-CLI-002`；`-z`/`--null` 也经 `ResolvedCommand::Set.null` 透传给 `handle_get`，使 `config -z <key>` 与 `config -z get <key>` 逐字节相同（此前裸读硬编码换行结尾）。**有意差异**：受保护 key（`is_sensitive_key`）保留交互式安全赋值路径而非读取，非交互环境报 protected-key 错误 + exit 2，已登记进 `COMPATIBILITY.md` 的 config 行。`has_encrypted`（该 key 已存有密文）**只在显式赋值**（`config set <key>` / `--add`，即 `explicit_set=true`）时才推断为赋值意图——否则一个普通 key 一旦存了密文就再也读不出来，只会报「missing value for protected key」。回归：`tests/command/config_test.rs` 的 13 个 `config_bare_read_*`（含 `config_bare_read_encrypted_is_redacted`、`config_bare_read_sensitive_key_never_leaks_value`、pty 驱动的 `config_bare_read_protected_key_interactive_pty`）。
+
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
 

@@ -1,7 +1,9 @@
 //! Local TUI automation control file lifecycle.
 //!
-//! `libra code --control write` uses three files under the repository storage
-//! root by default:
+//! `libra code --control write` uses three files under the ACTING worktree's
+//! local gitdir by default (plan-20260714 §C.8 W4 — for the main worktree the
+//! local gitdir IS the repository storage root, so the historical paths are
+//! unchanged there):
 //!
 //! - `.libra/code/control-token` stores the per-process bearer token.
 //! - `.libra/code/control.json` stores non-secret endpoint discovery metadata.
@@ -13,6 +15,26 @@
 //! ignored when their PID is not live. On Unix the token file must be a regular
 //! non-symlink file with exact `0600` permissions; Windows currently treats the
 //! permission check as a no-op because ACL semantics need a separate design.
+//!
+//! ## Scope contract (plan-20260714 §C.8 W4)
+//!
+//! A version-2 [`ControlInfo`] carries the WRITER's scope — `repo_id`,
+//! `worktree_id`, and (when the writer holds a workspace lease) `workspace_id`
+//! plus `lease_fence`. Every consumer that trusts, replaces, or removes an
+//! existing control file must first classify it against its OWN scope via
+//! [`classify_control_scope`]:
+//!
+//! - a scope mismatch is refused even when the recorded PID is dead — stale
+//!   cleanup must never delete another worktree's/workspace's control files or
+//!   release a newer owner;
+//! - a legacy (pre-v2) file with no scope fields is adoptable only while the
+//!   repository has no linked-worktree evidence; with such evidence it is
+//!   AMBIGUOUS and never auto-adopted (remove it manually after confirming the
+//!   owning process is gone). ONE exception keeps upgrades survivable: a
+//!   [`ControlScopePolicy::Repository`] surface adopts a legacy record whose
+//!   `working_dir` still resolves to this repository's storage — that proves
+//!   the repository, which is the only thing the repository policy asks
+//!   (see `legacy_record_names_this_repository`).
 
 #[cfg(unix)]
 use std::os::unix::{fs::OpenOptionsExt, fs::PermissionsExt, io::AsRawFd};
@@ -30,6 +52,16 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use super::code::resolve_storage_root;
+use crate::{
+    internal::{db, workspace::RepoIdentity},
+    utils::util,
+};
+
+/// The control-info schema version this binary writes. Version 2 added the
+/// writer-scope fields (`repoId`/`worktreeId`/`workspaceId`/`leaseFence`);
+/// files at version 1 (or missing a `repoId`) follow the legacy-ambiguity
+/// rules in [`classify_control_scope`].
+pub const CONTROL_INFO_VERSION: u8 = 2;
 
 /// Discovery metadata written to `control.json`.
 ///
@@ -48,6 +80,366 @@ pub struct ControlInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub started_at: DateTime<Utc>,
+    /// Stable repository identity (`libra.repoid`) of the writer. Always
+    /// `Some` in version-2 files; `None` marks a legacy file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    /// The writer's worktree scope: `None` = the main worktree (authoritative
+    /// in version-2 files; indistinguishable from "unknown" in legacy files —
+    /// the `version`/`repo_id` pair discriminates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    /// Workspace lease association, present only when the writer holds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_fence: Option<i64>,
+}
+
+impl ControlInfo {
+    /// True when this file carries an authoritative writer scope.
+    pub fn has_scope(&self) -> bool {
+        self.version >= 2 && self.repo_id.is_some()
+    }
+}
+
+/// The scope a control-file writer or consumer is acting from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlScope {
+    /// Stable repository identity (`libra.repoid`).
+    pub repo_id: String,
+    /// `None` = the main worktree.
+    pub worktree_id: Option<String>,
+    /// Workspace lease held by this process, when any.
+    pub workspace_id: Option<String>,
+    pub lease_fence: Option<i64>,
+}
+
+/// How strictly a sidecar is bound to one worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlScopePolicy {
+    /// Per-worktree sidecar (`libra code`): repository AND worktree must
+    /// match; workspace/fence must match when both sides carry one.
+    Worktree,
+    /// Repository-level sidecar (`libra service`): only the repository must
+    /// match — any worktree of the same repository may reclaim a stale
+    /// instance (the advisory lock still arbitrates liveness).
+    Repository,
+}
+
+/// Field-level mismatch between an existing control file and the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlScopeMismatch {
+    RepoId {
+        found: String,
+        expected: String,
+    },
+    WorktreeId {
+        found: Option<String>,
+        expected: Option<String>,
+    },
+    WorkspaceId {
+        found: String,
+        expected: String,
+    },
+    LeaseFence {
+        found: i64,
+        expected: i64,
+    },
+}
+
+impl fmt::Display for ControlScopeMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let describe = |id: &Option<String>| match id {
+            Some(id) => format!("linked worktree '{id}'"),
+            None => "the main worktree".to_string(),
+        };
+        match self {
+            Self::RepoId { found, expected } => write!(
+                f,
+                "it belongs to repository '{found}' (this repository is '{expected}')"
+            ),
+            Self::WorktreeId { found, expected } => write!(
+                f,
+                "it belongs to {} (this scope is {})",
+                describe(found),
+                describe(expected)
+            ),
+            Self::WorkspaceId { found, expected } => write!(
+                f,
+                "it belongs to workspace '{found}' (this scope is workspace '{expected}')"
+            ),
+            Self::LeaseFence { found, expected } => write!(
+                f,
+                "it was written at lease fence {found} (this scope holds fence {expected})"
+            ),
+        }
+    }
+}
+
+/// Classification of an existing control file against the caller's scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlScopeCheck {
+    /// Version-2 file written from this same scope.
+    Match,
+    /// Legacy file and the repository has no linked-worktree evidence: treat
+    /// as this repository's main scope (pre-W4 behavior).
+    LegacyAdoptable,
+    /// Legacy file but linked worktrees exist(ed): the owner scope cannot be
+    /// attributed — never auto-adopt, never auto-delete.
+    LegacyAmbiguous,
+    /// Version-2 file written from a DIFFERENT scope: refuse to trust,
+    /// replace, or remove it, even when its PID is dead.
+    Foreign(ControlScopeMismatch),
+}
+
+/// Classify an existing control-info file against the caller's scope
+/// (plan-20260714 §C.8 W4). Pure — filesystem/PID liveness is deliberately
+/// out of scope so the matrix stays unit-testable.
+pub fn classify_control_scope(
+    info: &ControlInfo,
+    expected: &ControlScope,
+    policy: ControlScopePolicy,
+    linked_evidence: bool,
+) -> ControlScopeCheck {
+    let Some(found_repo) = info.repo_id.as_deref().filter(|_| info.version >= 2) else {
+        return if linked_evidence {
+            ControlScopeCheck::LegacyAmbiguous
+        } else {
+            ControlScopeCheck::LegacyAdoptable
+        };
+    };
+
+    if found_repo != expected.repo_id {
+        return ControlScopeCheck::Foreign(ControlScopeMismatch::RepoId {
+            found: found_repo.to_string(),
+            expected: expected.repo_id.clone(),
+        });
+    }
+    if policy == ControlScopePolicy::Worktree && info.worktree_id != expected.worktree_id {
+        return ControlScopeCheck::Foreign(ControlScopeMismatch::WorktreeId {
+            found: info.worktree_id.clone(),
+            expected: expected.worktree_id.clone(),
+        });
+    }
+    if let (Some(found), Some(expected_ws)) = (
+        info.workspace_id.as_deref(),
+        expected.workspace_id.as_deref(),
+    ) && found != expected_ws
+    {
+        return ControlScopeCheck::Foreign(ControlScopeMismatch::WorkspaceId {
+            found: found.to_string(),
+            expected: expected_ws.to_string(),
+        });
+    }
+    if let (Some(found), Some(expected_fence)) = (info.lease_fence, expected.lease_fence)
+        && found != expected_fence
+    {
+        return ControlScopeCheck::Foreign(ControlScopeMismatch::LeaseFence {
+            found,
+            expected: expected_fence,
+        });
+    }
+    ControlScopeCheck::Match
+}
+
+/// Whether the repository at `storage_path` has linked-worktree evidence
+/// (§C.8 W4 legacy-ambiguity input). An unreadable or corrupt registry counts
+/// as evidence — never guess "single worktree" from a registry that cannot
+/// prove it.
+pub fn repo_has_linked_evidence(storage_path: &Path) -> bool {
+    let registry = storage_path.join("worktrees.json");
+    match fs::read_to_string(&registry) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(raw) => !crate::command::worktree::WorktreeState::parse(raw.as_bytes())
+            .is_ok_and(|state| state.is_single_main()),
+        Err(_) => true,
+    }
+}
+
+/// Resolve the caller's [`ControlScope`] for `working_dir`: the repository
+/// identity comes from `libra.repoid` (minted lazily for legacy repositories,
+/// same fact source as the workspace store), the worktree id from the
+/// workdir's local gitdir. `workspace` carries a held lease, when any.
+pub async fn resolve_control_scope(
+    working_dir: &Path,
+    workspace: Option<(String, i64)>,
+) -> Result<ControlScope> {
+    let storage_path =
+        util::try_get_storage_path(Some(working_dir.to_path_buf())).with_context(|| {
+            format!(
+                "cannot resolve the repository storage root for '{}'",
+                working_dir.display()
+            )
+        })?;
+    let conn = db::get_db_conn_instance_for_path(&storage_path.join(util::DATABASE))
+        .await
+        .with_context(|| {
+            format!(
+                "cannot open the repository database under '{}'",
+                storage_path.display()
+            )
+        })?;
+    let repo_id = RepoIdentity::resolve_or_init(&conn)
+        .await
+        .context("cannot resolve the repository identity for the control scope")?;
+    let (workspace_id, lease_fence) = match workspace {
+        Some((id, fence)) => (Some(id), Some(fence)),
+        None => (None, None),
+    };
+    Ok(ControlScope {
+        repo_id: repo_id.as_str().to_string(),
+        worktree_id: util::worktree_id_for_base(Some(working_dir.to_path_buf())),
+        workspace_id,
+        lease_fence,
+    })
+}
+
+/// Scope refusals raised before trusting/replacing/removing a control file.
+#[derive(Debug)]
+pub enum ControlScopeError {
+    Foreign {
+        path: PathBuf,
+        mismatch: ControlScopeMismatch,
+    },
+    LegacyAmbiguous {
+        path: PathBuf,
+    },
+    Unreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for ControlScopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Foreign { path, mismatch } => write!(
+                f,
+                "CONTROL_SCOPE_CONFLICT: control file '{}' was not written from this scope: \
+                 {mismatch}. Refusing to reuse or remove another scope's control sidecar — run \
+                 from the owning worktree, or remove the file manually after confirming its \
+                 process is gone.",
+                path.display()
+            ),
+            Self::LegacyAmbiguous { path } => write!(
+                f,
+                "CONTROL_SCOPE_CONFLICT: control file '{}' predates scope stamping and this \
+                 repository has linked worktrees, so its owner cannot be attributed. Remove the \
+                 file manually after confirming the owning process is gone.",
+                path.display()
+            ),
+            Self::Unreadable { path, source } => write!(
+                f,
+                "cannot read control file '{}' to verify its scope: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ControlScopeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unreadable { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Gate a takeover/overwrite of `info_path` on scope compatibility
+/// (§C.8 W4): a missing file is fine, a same-scope or adoptable-legacy file
+/// may be replaced (the advisory lock arbitrates liveness), anything else is
+/// refused — INCLUDING dead-PID files from a foreign scope, whose cleanup
+/// belongs to their own scope's owner or an explicit human action.
+/// Repository-policy adoption of a LEGACY (pre-scope-stamping) record.
+///
+/// A version-1 file cannot name its writer's repository — but it does name
+/// the writer's `working_dir`. Under [`ControlScopePolicy::Repository`] the
+/// only question is whether the record belongs to THIS repository (which
+/// worktree wrote it is irrelevant by policy), so a `working_dir` that
+/// still resolves to this repository's common storage settles ownership
+/// even when linked worktrees exist.
+///
+/// This is what keeps an UPGRADE survivable: a service killed before the
+/// scope stamping shipped leaves a v1 record, and in any repository that
+/// has ever had a linked worktree that record would otherwise be
+/// permanently un-takeoverable — the next `libra service run` would refuse
+/// to start and demand a manual file deletion.
+///
+/// Absent proof — a moved or deleted working directory, a path in another
+/// repository, an unresolvable resolve — the record stays ambiguous and the
+/// gate fails closed.
+fn legacy_record_names_this_repository(info: &ControlInfo, common_storage: &Path) -> bool {
+    let Ok(record_storage) = util::try_get_storage_path(Some(info.working_dir.clone())) else {
+        return false;
+    };
+    // Both sides go through the same canonicalization: a record written via
+    // `/var/...` must still match a common storage discovered as
+    // `/private/var/...` (macOS), and vice versa.
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(&record_storage) == canonical(common_storage)
+}
+
+pub fn ensure_scope_takeover_allowed(
+    info_path: &Path,
+    expected: &ControlScope,
+    policy: ControlScopePolicy,
+    linked_evidence: bool,
+    common_storage: &Path,
+) -> std::result::Result<(), ControlScopeError> {
+    let content = match fs::read_to_string(info_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ControlScopeError::Unreadable {
+                path: info_path.to_path_buf(),
+                source,
+            });
+        }
+        Ok(content) => content,
+    };
+    let info: ControlInfo = match serde_json::from_str(&content) {
+        Ok(info) => info,
+        Err(error) => {
+            // A malformed file cannot prove its scope. Without linked
+            // evidence keep the historical "stale garbage is replaceable"
+            // behavior; with linked evidence fail closed like a legacy file.
+            if linked_evidence {
+                return Err(ControlScopeError::LegacyAmbiguous {
+                    path: info_path.to_path_buf(),
+                });
+            }
+            tracing::debug!(
+                path = %info_path.display(),
+                error = %error,
+                "replacing malformed control info file"
+            );
+            return Ok(());
+        }
+    };
+    match classify_control_scope(&info, expected, policy, linked_evidence) {
+        ControlScopeCheck::Match | ControlScopeCheck::LegacyAdoptable => Ok(()),
+        // A repository-level surface may still adopt a legacy record that
+        // PROVES it belongs here (see the helper: this is the upgrade path).
+        ControlScopeCheck::LegacyAmbiguous
+            if policy == ControlScopePolicy::Repository
+                && legacy_record_names_this_repository(&info, common_storage) =>
+        {
+            tracing::debug!(
+                path = %info_path.display(),
+                working_dir = %info.working_dir.display(),
+                "adopting a legacy control record whose working dir resolves to this repository"
+            );
+            Ok(())
+        }
+        ControlScopeCheck::LegacyAmbiguous => Err(ControlScopeError::LegacyAmbiguous {
+            path: info_path.to_path_buf(),
+        }),
+        ControlScopeCheck::Foreign(mismatch) => Err(ControlScopeError::Foreign {
+            path: info_path.to_path_buf(),
+            mismatch,
+        }),
+    }
 }
 
 /// Resolved token, info, and lock paths for a control-enabled session.
@@ -149,12 +541,36 @@ impl std::error::Error for ControlLockError {
 }
 
 /// Resolve default or overridden local-control paths.
+///
+/// The default directory is the ACTING worktree's local gitdir `code/`
+/// subdirectory (§C.8 W4): for the main worktree that is the historical
+/// common `.libra/code/`, for a linked worktree its own private gitdir — so
+/// two worktrees can never share a token/info/lock by default.
 pub fn resolve_control_paths(
     working_dir: &Path,
     token_override: Option<&Path>,
     info_override: Option<&Path>,
 ) -> ControlPaths {
-    let control_dir = resolve_storage_root(working_dir).join("code");
+    let control_dir = match util::try_get_worktree_gitdir(Some(working_dir.to_path_buf())) {
+        Ok(gitdir) => gitdir.join("code"),
+        Err(error) => {
+            // Same non-silent degradation contract as `resolve_storage_root`:
+            // a broken linked worktree must be diagnosable, not phantom-routed.
+            tracing::warn!(
+                working_dir = %working_dir.display(),
+                %error,
+                "worktree gitdir resolution failed; control files fall back to the storage root — \
+                 if this is a linked worktree, run `libra worktree repair --confirm <worktree-path>`"
+            );
+            // §C.4.1: with no gitdir AND no storage root there is nowhere
+            // legitimate to put control files — use the working directory
+            // explicitly rather than minting a `.libra` that looks like a
+            // repository root to everything downstream.
+            resolve_storage_root(working_dir)
+                .unwrap_or_else(|| working_dir.to_path_buf())
+                .join("code")
+        }
+    };
     let token = token_override
         .map(Path::to_path_buf)
         .unwrap_or_else(|| control_dir.join("control-token"));
@@ -381,12 +797,24 @@ pub fn write_control_info(path: &Path, info: &ControlInfo) -> Result<()> {
 
 /// Best-effort cleanup for token/info files on normal shutdown or startup
 /// failure. Lock file cleanup is owned by [`ControlLockGuard::drop`].
+///
+/// The info file is removed only when it still records THIS process's PID
+/// (§C.8 W4): an observe-mode writer holds no lock, and after a crash-reclaim
+/// race the file may already belong to a successor — shutdown cleanup must
+/// never delete a control file it no longer owns.
 pub fn cleanup_control_files(paths: &ControlPaths, remove_token: bool, remove_info: bool) {
     let cleanup_paths = [
         remove_token.then_some(&paths.token),
         remove_info.then_some(&paths.info),
     ];
     for path in cleanup_paths.into_iter().flatten() {
+        if *path == paths.info && !info_file_is_owned_by_this_process(path) {
+            tracing::debug!(
+                path = %path.display(),
+                "skipping control info cleanup: the file no longer records this process"
+            );
+            continue;
+        }
         if let Err(error) = fs::remove_file(path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -396,6 +824,19 @@ pub fn cleanup_control_files(paths: &ControlPaths, remove_token: bool, remove_in
                 "failed to remove local TUI control file"
             );
         }
+    }
+}
+
+/// True when the info file parses and records this process's PID. A missing
+/// file counts as owned (the remove below is a no-op); a malformed or
+/// foreign-PID file does not — leave it for its actual owner.
+fn info_file_is_owned_by_this_process(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(content) => serde_json::from_str::<ControlInfo>(&content)
+            .map(|info| info.pid == std::process::id())
+            .unwrap_or(false),
     }
 }
 
@@ -479,6 +920,36 @@ mod tests {
             working_dir: PathBuf::from("/tmp/repo"),
             thread_id: None,
             started_at: Utc::now(),
+            repo_id: None,
+            worktree_id: None,
+            workspace_id: None,
+            lease_fence: None,
+        }
+    }
+
+    fn scoped_control_info(pid: u32, scope: &ControlScope) -> ControlInfo {
+        ControlInfo {
+            version: CONTROL_INFO_VERSION,
+            mode: "write".to_string(),
+            pid,
+            base_url: "http://127.0.0.1:3000".to_string(),
+            mcp_url: None,
+            working_dir: PathBuf::from("/tmp/repo"),
+            thread_id: None,
+            started_at: Utc::now(),
+            repo_id: Some(scope.repo_id.clone()),
+            worktree_id: scope.worktree_id.clone(),
+            workspace_id: scope.workspace_id.clone(),
+            lease_fence: scope.lease_fence,
+        }
+    }
+
+    fn scope(repo: &str, worktree: Option<&str>) -> ControlScope {
+        ControlScope {
+            repo_id: repo.to_string(),
+            worktree_id: worktree.map(str::to_string),
+            workspace_id: None,
+            lease_fence: None,
         }
     }
 
@@ -614,6 +1085,325 @@ mod tests {
     fn code_control_files_pid_liveness_rejects_invalid_pid_values() {
         assert!(!pid_is_live(0));
         assert!(!pid_is_live(u32::MAX));
+    }
+
+    /// §C.12 named regression (plan-20260714 line 2759), UNIT half. `libra
+    /// service` is a REPOSITORY-level sidecar, so its stale-file reclamation
+    /// must be fenced by repository identity: a dead-PID control file
+    /// belonging to ANOTHER repository is not this service's garbage to
+    /// collect — its cleanup belongs to its own scope's owner. The
+    /// same-repository / other-worktree case is deliberately NOT foreign for
+    /// this policy (one service serves the whole repository), and that half
+    /// is asserted too so the fence cannot be "tightened" into refusing
+    /// legitimate reuse. The END-TO-END half — that `libra service run`
+    /// actually consults this gate and stamps its own record — is
+    /// `service_startup_refuses_a_foreign_stale_control_file` in
+    /// tests/command/service_test.rs.
+    #[test]
+    fn service_stale_cleanup_does_not_touch_other_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info_path = dir.path().join("service.json");
+
+        // A DEAD-pid file written by a different repository's service.
+        let foreign = scope("repo-other", None);
+        let stale_foreign = scoped_control_info(u32::MAX, &foreign);
+        std::fs::write(
+            &info_path,
+            serde_json::to_string(&stale_foreign).expect("serialize"),
+        )
+        .expect("write foreign control info");
+        assert!(!pid_is_live(stale_foreign.pid), "the fixture pid is dead");
+
+        let me = scope("repo-a", None);
+        let error = ensure_scope_takeover_allowed(
+            &info_path,
+            &me,
+            ControlScopePolicy::Repository,
+            true,
+            Path::new("/nonexistent-storage-for-this-unit-test"),
+        )
+        .expect_err("a foreign repository's stale control file is not ours to reclaim");
+        assert!(
+            matches!(error, ControlScopeError::Foreign { .. }),
+            "the refusal names the scope mismatch: {error:?}"
+        );
+        assert!(
+            info_path.exists(),
+            "the refusal must leave the foreign file in place"
+        );
+
+        // ...while a stale file from ANOTHER WORKTREE of the SAME repository
+        // is reclaimable: the service is repository-level by design.
+        let sibling = scope("repo-a", Some("wt-sibling"));
+        std::fs::write(
+            &info_path,
+            serde_json::to_string(&scoped_control_info(u32::MAX, &sibling)).expect("serialize"),
+        )
+        .expect("write sibling control info");
+        ensure_scope_takeover_allowed(
+            &info_path,
+            &me,
+            ControlScopePolicy::Repository,
+            true,
+            Path::new("/nonexistent-storage-for-this-unit-test"),
+        )
+        .expect("same repository, different worktree is the service's own scope");
+    }
+
+    #[test]
+    fn scope_classification_v2_same_scope_matches() {
+        let me = scope("repo-a", Some("wt-1"));
+        let info = scoped_control_info(4242, &me);
+        for policy in [ControlScopePolicy::Worktree, ControlScopePolicy::Repository] {
+            assert_eq!(
+                classify_control_scope(&info, &me, policy, true),
+                ControlScopeCheck::Match
+            );
+        }
+    }
+
+    #[test]
+    fn scope_classification_other_worktree_is_foreign_even_with_dead_pid_semantics() {
+        // Classification is liveness-agnostic by design: a dead foreign
+        // instance is just as untouchable as a live one.
+        let owner = scope("repo-a", Some("wt-1"));
+        let me = scope("repo-a", Some("wt-2"));
+        let info = scoped_control_info(u32::MAX, &owner);
+        assert_eq!(
+            classify_control_scope(&info, &me, ControlScopePolicy::Worktree, true),
+            ControlScopeCheck::Foreign(ControlScopeMismatch::WorktreeId {
+                found: Some("wt-1".to_string()),
+                expected: Some("wt-2".to_string()),
+            })
+        );
+        // A repository-level sidecar tolerates a different worktree of the
+        // SAME repository (the advisory lock arbitrates liveness).
+        assert_eq!(
+            classify_control_scope(&info, &me, ControlScopePolicy::Repository, true),
+            ControlScopeCheck::Match
+        );
+    }
+
+    #[test]
+    fn scope_classification_main_vs_linked_never_aliases() {
+        let main = scope("repo-a", None);
+        let linked = scope("repo-a", Some("wt-1"));
+        let main_info = scoped_control_info(1, &main);
+        assert!(matches!(
+            classify_control_scope(&main_info, &linked, ControlScopePolicy::Worktree, true),
+            ControlScopeCheck::Foreign(ControlScopeMismatch::WorktreeId { .. })
+        ));
+        let linked_info = scoped_control_info(1, &linked);
+        assert!(matches!(
+            classify_control_scope(&linked_info, &main, ControlScopePolicy::Worktree, true),
+            ControlScopeCheck::Foreign(ControlScopeMismatch::WorktreeId { .. })
+        ));
+    }
+
+    #[test]
+    fn scope_classification_other_repository_is_foreign_under_both_policies() {
+        let me = scope("repo-a", None);
+        let info = scoped_control_info(1, &scope("repo-b", None));
+        for policy in [ControlScopePolicy::Worktree, ControlScopePolicy::Repository] {
+            assert_eq!(
+                classify_control_scope(&info, &me, policy, false),
+                ControlScopeCheck::Foreign(ControlScopeMismatch::RepoId {
+                    found: "repo-b".to_string(),
+                    expected: "repo-a".to_string(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn scope_classification_workspace_and_fence_mismatch_are_foreign() {
+        let mut owner = scope("repo-a", Some("wt-1"));
+        owner.workspace_id = Some("ws-1".to_string());
+        owner.lease_fence = Some(3);
+        let info = scoped_control_info(1, &owner);
+
+        let mut me = owner.clone();
+        me.workspace_id = Some("ws-2".to_string());
+        assert!(matches!(
+            classify_control_scope(&info, &me, ControlScopePolicy::Worktree, true),
+            ControlScopeCheck::Foreign(ControlScopeMismatch::WorkspaceId { .. })
+        ));
+
+        let mut me = owner.clone();
+        me.lease_fence = Some(4);
+        assert!(matches!(
+            classify_control_scope(&info, &me, ControlScopePolicy::Worktree, true),
+            ControlScopeCheck::Foreign(ControlScopeMismatch::LeaseFence { .. })
+        ));
+
+        // A side with NO workspace association is compatible with one that
+        // has one — the mismatch rule only fires when both sides claim one.
+        let me = scope("repo-a", Some("wt-1"));
+        assert_eq!(
+            classify_control_scope(&info, &me, ControlScopePolicy::Worktree, true),
+            ControlScopeCheck::Match
+        );
+    }
+
+    #[test]
+    fn scope_classification_legacy_follows_linked_evidence() {
+        let me = scope("repo-a", None);
+        let legacy = test_control_info(1, "http://127.0.0.1:3000");
+        assert_eq!(
+            classify_control_scope(&legacy, &me, ControlScopePolicy::Worktree, false),
+            ControlScopeCheck::LegacyAdoptable
+        );
+        assert_eq!(
+            classify_control_scope(&legacy, &me, ControlScopePolicy::Worktree, true),
+            ControlScopeCheck::LegacyAmbiguous
+        );
+        // A "version 2" file that lost its repoId is legacy, not trusted.
+        let mut clipped = scoped_control_info(1, &me);
+        clipped.repo_id = None;
+        assert_eq!(
+            classify_control_scope(&clipped, &me, ControlScopePolicy::Worktree, true),
+            ControlScopeCheck::LegacyAmbiguous
+        );
+    }
+
+    #[test]
+    fn takeover_guard_matrix_on_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let info_path = temp.path().join("control.json");
+        let me = scope("repo-a", Some("wt-2"));
+
+        // Missing file: allowed.
+        assert!(
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                true,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_ok()
+        );
+
+        // Foreign worktree, dead pid: refused, and the file must survive.
+        let owner = scope("repo-a", Some("wt-1"));
+        write_control_info(&info_path, &scoped_control_info(u32::MAX, &owner)).unwrap();
+        let error = ensure_scope_takeover_allowed(
+            &info_path,
+            &me,
+            ControlScopePolicy::Worktree,
+            true,
+            Path::new("/nonexistent-storage-for-this-unit-test"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("CONTROL_SCOPE_CONFLICT"));
+        assert!(info_path.exists());
+
+        // Same scope: allowed.
+        write_control_info(&info_path, &scoped_control_info(u32::MAX, &me)).unwrap();
+        assert!(
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                true,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_ok()
+        );
+
+        // Legacy + linked evidence: refused; without evidence: allowed.
+        fs::write(
+            &info_path,
+            serde_json::to_string(&test_control_info(1, "http://127.0.0.1:3000")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                true,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                false,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_ok()
+        );
+
+        // Malformed + linked evidence: refused; without evidence: replaceable.
+        fs::write(&info_path, "{not json").unwrap();
+        assert!(
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                true,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                false,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cleanup_skips_info_file_recorded_by_another_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ControlPaths {
+            token: temp.path().join("control-token"),
+            info: temp.path().join("control.json"),
+            lock: temp.path().join("control.lock"),
+        };
+        // Another process's pid in the info file: cleanup must leave it.
+        write_control_info(
+            &paths.info,
+            &test_control_info(std::process::id() + 1, "http://127.0.0.1:3000"),
+        )
+        .unwrap();
+        cleanup_control_files(&paths, false, true);
+        assert!(paths.info.exists());
+
+        // Our own pid: cleanup removes it.
+        write_control_info(
+            &paths.info,
+            &test_control_info(std::process::id(), "http://127.0.0.1:3000"),
+        )
+        .unwrap();
+        cleanup_control_files(&paths, false, true);
+        assert!(!paths.info.exists());
+    }
+
+    #[test]
+    fn v1_control_info_json_still_deserializes() {
+        // A pre-W4 file has none of the scope keys; parsing must not break.
+        let json = r#"{
+            "version": 1,
+            "mode": "write",
+            "pid": 4242,
+            "baseUrl": "http://127.0.0.1:3000",
+            "workingDir": "/tmp/repo",
+            "startedAt": "2026-07-01T00:00:00Z"
+        }"#;
+        let info: ControlInfo = serde_json::from_str(json).unwrap();
+        assert!(!info.has_scope());
+        assert_eq!(info.repo_id, None);
+        assert_eq!(info.worktree_id, None);
     }
 
     #[test]

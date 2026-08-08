@@ -71,7 +71,12 @@ fix bridge 落地前稳定 unsupported（`LBR-AGENT-010`），绝不伪装成功
 ```
 
 `list`/`clean` 仅作用于 `kind="investigate"` 的目录，与 review run 共享目录但
-互不干扰。`manual_attach` 是 E8 占位字段（恒为空）：AG-23 不提供 attach 命令面。
+互不干扰。`manual_attach` 由 `libra investigate attach <run_id> <file>`（A0-06）
+填充：外部文件字节先经 `redact_untrusted` 脱敏，再内容寻址对象化（object_index
+`o_type = agent_findings`），manifest 追加 `{oid,name,provenance:"manual",size,
+attached_at}` 条目（只存 basename，防路径泄露）。`findings_oid` 在 terminal
+manifest 落盘时由 findings.md 内容寻址写入；`libra agent doctor` 覆盖
+`missing_findings_object` / `missing_findings_object_index` 两类扫描与修复。
 
 ### Terminal / pause 语义与 cancel
 
@@ -158,6 +163,4 @@ libra investigate clean --all
 ## 还未实现的功能
 
 - `investigate fix`（内部 AgentRuntime fix bridge；Code 阶段源码锚点 +
-  approval/sandbox/tool gate 测试为前置）。
-- manual attach 命令面（E8 占位字段之外的入口需先补 `agent.md` §5 规格）。
-- findings 对象化（`findings_oid` 恒为 null；对象写入与 GC 由后续任务卡承接）。
+  approval/sandbox/tool gate 测试为前置；现由 plan-20260714 Part D PD-01 跟踪）。

@@ -1666,6 +1666,7 @@ fn test_merge_dry_run_fast_forward_writes_nothing() {
     assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
 
     let head_before = head_commit(p);
+    let operations_before = operation_count(p);
     let out = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
     assert_cli_success(&out, "dry-run ff");
     let json = parse_json_stdout(&out);
@@ -1679,6 +1680,24 @@ fn test_merge_dry_run_fast_forward_writes_nothing() {
         "worktree must not receive the feature file"
     );
     assert!(!p.join(".libra").join("merge-state.json").exists());
+    // And no OPERATION row (§C.9): the sequencer boundary persists one before
+    // the handler runs, so mapping a dry run to a control action would write to
+    // the operation log for a command documented to write nothing.
+    assert_eq!(
+        operation_count(p),
+        operations_before,
+        "a dry run must not record an operation"
+    );
+}
+
+/// How many operations the log holds — the assertion a dry run needs, since
+/// the control boundary writes its row before the handler is reached.
+fn operation_count(repo: &Path) -> u64 {
+    let out = run_libra_command(&["--json", "op", "log", "-n", "100"], repo);
+    assert_cli_success(&out, "op log");
+    parse_json_stdout(&out)["data"]["total"]
+        .as_u64()
+        .expect("op log total")
 }
 
 #[test]
@@ -2156,4 +2175,133 @@ fn test_merge_autostash_config_and_validation() {
     assert_eq!(out.status.code(), Some(129));
     let out = run_libra_command(&["merge", "feature", "--dry-run", "--autostash"], p);
     assert_eq!(out.status.code(), Some(129));
+}
+
+/// Regression: `Commit::from_tree_id` hardcodes `mega <admin@mega.org>` as both
+/// author and committer. Every merge-commit path used it, so merge commits
+/// silently discarded `user.name` / `user.email`. All three paths must now carry
+/// the configured identity.
+#[tokio::test]
+#[serial]
+async fn test_merge_commit_carries_configured_identity() {
+    for (label, extra_args) in [
+        ("three-way", Vec::new()),
+        ("no-ff", vec!["--no-ff"]),
+        ("ours-strategy", vec!["-s", "ours"]),
+    ] {
+        let temp_repo = create_committed_repo_via_cli();
+        let temp_path = temp_repo.path();
+
+        assert_cli_success(
+            &run_libra_command(&["branch", "feature"], temp_path),
+            "create feature",
+        );
+        assert_cli_success(
+            &run_libra_command(&["checkout", "feature"], temp_path),
+            "checkout feature",
+        );
+        commit_file(temp_path, "feature.txt", "feature\n", "feature commit");
+        assert_cli_success(
+            &run_libra_command(&["checkout", "main"], temp_path),
+            "checkout main",
+        );
+        commit_file(temp_path, "main.txt", "main\n", "main commit");
+
+        let mut args = vec!["merge", "feature"];
+        args.extend_from_slice(&extra_args);
+        assert_cli_success(&run_libra_command(&args, temp_path), label);
+
+        let _guard = ChangeDirGuard::new(temp_path);
+        let head = Head::current_commit().await.expect("merge moved HEAD");
+        let commit: Commit = load_object(&head).expect("load merge commit");
+        assert_eq!(
+            commit.parent_commit_ids.len(),
+            2,
+            "{label} should record two parents"
+        );
+        assert_eq!(
+            (
+                commit.author.name.as_str(),
+                commit.author.email.as_str(),
+                commit.committer.name.as_str(),
+                commit.committer.email.as_str(),
+            ),
+            (
+                "Test User",
+                "test@example.com",
+                "Test User",
+                "test@example.com",
+            ),
+            "{label} merge commit must use the configured identity, not the hardcoded default"
+        );
+    }
+}
+
+/// `--continue` finalizes without an editor, so `-m` is the only way to set the
+/// message of a conflicted merge. It must also carry the configured identity.
+#[tokio::test]
+#[serial]
+async fn test_merge_continue_accepts_message_override_and_configured_identity() {
+    let temp_repo = create_committed_repo_via_cli();
+    let temp_path = temp_repo.path();
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], temp_path),
+        "create feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], temp_path),
+        "checkout feature",
+    );
+    commit_file(temp_path, "tracked.txt", "feature change\n", "feature");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], temp_path),
+        "checkout main",
+    );
+    commit_file(temp_path, "tracked.txt", "main change\n", "main");
+
+    // Conflict, then resolve.
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], temp_path)
+            .status
+            .code(),
+        Some(128)
+    );
+    std::fs::write(temp_path.join("tracked.txt"), "resolved\n").expect("write resolution");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], temp_path),
+        "stage resolution",
+    );
+
+    assert_cli_success(
+        &run_libra_command(
+            &["merge", "--continue", "-m", "custom merge subject"],
+            temp_path,
+        ),
+        "merge continue with -m",
+    );
+
+    let _guard = ChangeDirGuard::new(temp_path);
+    let head = Head::current_commit().await.expect("continue moved HEAD");
+    let commit: Commit = load_object(&head).expect("load continued merge commit");
+    assert_eq!(commit.parent_commit_ids.len(), 2);
+    // Commit messages are stored with a leading newline (`format_commit_msg`).
+    assert!(
+        commit
+            .message
+            .trim_start()
+            .starts_with("custom merge subject"),
+        "-m must override the message stored at merge start, got: {}",
+        commit.message
+    );
+    assert!(
+        !commit.message.contains("Merge feature into main"),
+        "the stored default must not survive the override, got: {}",
+        commit.message
+    );
+    assert_eq!(
+        (commit.author.name.as_str(), commit.author.email.as_str()),
+        ("Test User", "test@example.com"),
+        "continued merge commit must use the configured identity"
+    );
 }

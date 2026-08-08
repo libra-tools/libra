@@ -1,0 +1,20 @@
+{
+  "responses": [
+    {
+      "match": { "contains": "blocking mutation" },
+      "type": "tool_call",
+      "id": "blocking-mutation-1",
+      "name": "blocking_mutation",
+      "arguments": {}
+    },
+    {
+      "match": { "equals": "" },
+      "type": "text",
+      "text": "fake assistant: mutation completed"
+    }
+  ],
+  "fallback": {
+    "type": "text",
+    "text": "fake assistant: mutation fallback"
+  }
+}

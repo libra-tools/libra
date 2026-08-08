@@ -125,7 +125,13 @@ fn commit_hooks_run_in_order_modify_the_message_and_honor_escape_valves() {
     );
 
     fixture.success(&repo, &["commit", "--no-gpg-sign", "-m", "subject"]);
-    let message_path = repo.join(".libra/COMMIT_EDITMSG");
+    // Hooks receive the canonicalized message-file path (the sandbox runner
+    // resolves `/var` -> `/private/var` on macOS), so expectations must be
+    // built from the canonical repo path to stay portable across platforms.
+    let message_path = repo
+        .canonicalize()
+        .expect("canonicalize repo path")
+        .join(".libra/COMMIT_EDITMSG");
     let expected_log = format!(
         "pre-commit\nprepare:{}:message:\ncommit-msg:{}\npost-commit\n",
         message_path.display(),
@@ -297,10 +303,14 @@ fn hooks_fail_closed_on_unsafe_files_and_cannot_escape_or_rewrite_metadata() {
 
     fs::remove_file(&canonical).expect("remove non-executable canonical hook");
     fs::remove_file(repo.join(".libra/hooks/pre-commit.sh")).expect("remove legacy hook");
+    // Keep the environment-allowlist probe platform-neutral: the escape-write
+    // outcome differs between bubblewrap (contained-and-discarded) and
+    // seatbelt (EPERM -> hook fails), so it lives in the platform-gated
+    // `hooks_sandbox_escape_*` tests below instead.
     write_hook(
         &repo,
         "pre-commit",
-        "#!/bin/sh\ntest -z \"${LIBRA_HOOK_SECRET_TEST+x}\" || exit 41\ntest -n \"$PATH\" || exit 42\ntouch \"$LIBRA_WORK_TREE/inside\"\ntouch \"$LIBRA_WORK_TREE/../outside\"\n",
+        "#!/bin/sh\ntest -z \"${LIBRA_HOOK_SECRET_TEST+x}\" || exit 41\ntest -n \"$PATH\" || exit 42\ntouch \"$LIBRA_WORK_TREE/inside\"\n",
     );
     let sandboxed = fixture
         .command(&repo, &["commit", "--no-gpg-sign", "-m", "sandboxed"])
@@ -313,10 +323,6 @@ fn hooks_fail_closed_on_unsafe_files_and_cannot_escape_or_rewrite_metadata() {
         String::from_utf8_lossy(&sandboxed.stderr)
     );
     assert!(repo.join("inside").exists());
-    assert!(
-        !fixture.root.join("outside").exists(),
-        "the hook sandbox must not mutate the host outside its worktree"
-    );
     for absent_metadata in [".git", ".codex", ".agents"] {
         assert!(
             !repo.join(absent_metadata).exists(),
@@ -355,6 +361,77 @@ fn hooks_fail_closed_on_unsafe_files_and_cannot_escape_or_rewrite_metadata() {
         String::from_utf8_lossy(&rejected.stderr)
     );
     assert_eq!(fixture.oid(&repo, "HEAD"), head_before);
+}
+
+/// Shared setup for the platform-gated escape tests: a staged repo whose
+/// pre-commit hook tries to write outside the worktree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn setup_escape_attempt(fixture: &Fixture, name: &str) -> (PathBuf, String) {
+    let repo = fixture.init_repo(name);
+    fixture.stage(&repo, "base.txt", "base\n");
+    fixture.success(
+        &repo,
+        &["commit", "--no-gpg-sign", "--no-verify", "-m", "base"],
+    );
+    write_hook(
+        &repo,
+        "pre-commit",
+        "#!/bin/sh\ntouch \"$LIBRA_WORK_TREE/../outside\"\n",
+    );
+    let head_before = fixture.oid(&repo, "HEAD");
+    (repo, head_before)
+}
+
+/// Linux/bubblewrap: the worktree's parent directory exists only as
+/// sandbox-private mount scaffolding, so the escape write is contained
+/// inside the namespace and discarded — the hook succeeds while the host
+/// stays untouched. When the system sandbox cannot start (restricted
+/// containers), required enforcement fails the hook closed instead. Both
+/// outcomes satisfy the security invariant.
+#[test]
+#[cfg(target_os = "linux")]
+fn hooks_sandbox_escape_write_is_contained_or_fails_closed() {
+    let fixture = Fixture::new();
+    let (repo, head_before) = setup_escape_attempt(&fixture, "hook-escape-linux");
+
+    let outcome = fixture.run(&repo, &["commit", "--no-gpg-sign", "-m", "escape"]);
+    assert!(
+        !fixture.root.join("outside").exists(),
+        "the hook sandbox must not mutate the host outside its worktree"
+    );
+    if !outcome.status.success() {
+        assert_eq!(
+            fixture.oid(&repo, "HEAD"),
+            head_before,
+            "a blocked hook must not let the commit through"
+        );
+    }
+}
+
+/// macOS/seatbelt: the escape write is denied with EPERM, so the hook exits
+/// non-zero and the commit is rejected fail-closed; the host stays
+/// untouched and HEAD does not move.
+#[test]
+#[cfg(target_os = "macos")]
+fn hooks_sandbox_escape_write_fails_closed() {
+    let fixture = Fixture::new();
+    let (repo, head_before) = setup_escape_attempt(&fixture, "hook-escape-macos");
+
+    let outcome = fixture.run(&repo, &["commit", "--no-gpg-sign", "-m", "escape"]);
+    assert!(
+        !outcome.status.success(),
+        "seatbelt must deny the escape write, failing the hook: {}",
+        String::from_utf8_lossy(&outcome.stdout)
+    );
+    assert!(
+        !fixture.root.join("outside").exists(),
+        "the hook sandbox must not mutate the host outside its worktree"
+    );
+    assert_eq!(
+        fixture.oid(&repo, "HEAD"),
+        head_before,
+        "a blocked hook must not let the commit through"
+    );
 }
 
 #[test]
@@ -646,5 +723,88 @@ fn rebase_hooks_receive_upstream_and_complete_rewrite_map() {
         bypassed.status.success(),
         "LIBRA_NO_HOOKS must bypass pre-rebase: {}",
         String::from_utf8_lossy(&bypassed.stderr)
+    );
+}
+
+#[test]
+fn git_hooks_bridge_stays_inert_with_gitcompatibility_config() {
+    // plan-20260714 PD-08 decision gate (2026-07-22): the opt-in Git hooks
+    // bridge (`hooks.gitCompatibility`, plan-20260708 P1-10 Option B) was
+    // evaluated and declined. `.git/hooks`, `core.hooksPath`, and the config
+    // key itself must never trigger hook execution, while the sandboxed
+    // `.libra/hooks` machinery stays active.
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("bridge-inert");
+
+    let git_sentinel = repo.join("git-hook-ran");
+    let git_hooks = repo.join(".git/hooks");
+    fs::create_dir_all(&git_hooks).expect("create .git/hooks");
+    let git_hook = git_hooks.join("pre-commit");
+    fs::write(
+        &git_hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", git_sentinel.display()),
+    )
+    .expect("write .git/hooks/pre-commit");
+    fs::set_permissions(&git_hook, fs::Permissions::from_mode(0o755))
+        .expect("make .git hook executable");
+
+    let custom_sentinel = repo.join("custom-hook-ran");
+    let custom_dir = repo.join("custom-hooks");
+    fs::create_dir_all(&custom_dir).expect("create core.hooksPath dir");
+    let custom_hook = custom_dir.join("pre-commit");
+    fs::write(
+        &custom_hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", custom_sentinel.display()),
+    )
+    .expect("write core.hooksPath pre-commit");
+    fs::set_permissions(&custom_hook, fs::Permissions::from_mode(0o755))
+        .expect("make core.hooksPath hook executable");
+
+    fixture.success(&repo, &["config", "set", "core.hooksPath", "custom-hooks"]);
+    fixture.success(&repo, &["config", "set", "hooks.gitCompatibility", "true"]);
+    // Read both keys back so the guard cannot pass vacuously if `config set`
+    // ever starts dropping unsupported keys as a silent no-op.
+    let hooks_path = String::from_utf8(
+        fixture
+            .success(&repo, &["config", "get", "core.hooksPath"])
+            .stdout,
+    )
+    .expect("core.hooksPath value is utf8");
+    assert_eq!(hooks_path.trim(), "custom-hooks");
+    let bridge = String::from_utf8(
+        fixture
+            .success(&repo, &["config", "get", "hooks.gitCompatibility"])
+            .stdout,
+    )
+    .expect("hooks.gitCompatibility value is utf8");
+    assert_eq!(bridge.trim(), "true");
+
+    fixture.stage(&repo, "bridge.txt", "bridge stays inert\n");
+    fixture.success(&repo, &["commit", "-m", "bridge inert commit"]);
+    assert!(
+        !git_sentinel.exists(),
+        ".git/hooks/pre-commit must never run"
+    );
+    assert!(
+        !custom_sentinel.exists(),
+        "core.hooksPath pre-commit must never run"
+    );
+
+    // Control: the sandboxed `.libra/hooks` machinery is still active — a
+    // blocking pre-commit there rejects the next commit.
+    write_hook(
+        &repo,
+        "pre-commit",
+        "#!/bin/sh\necho native hook blocks >&2\nexit 1\n",
+    );
+    fixture.stage(&repo, "blocked.txt", "native hook blocks\n");
+    let blocked = fixture.run(&repo, &["commit", "-m", "must be blocked"]);
+    assert!(
+        !blocked.status.success(),
+        ".libra/hooks pre-commit must still block commits"
+    );
+    assert!(
+        !git_sentinel.exists() && !custom_sentinel.exists(),
+        "bridge hooks must stay inert even when native hooks fire"
     );
 }

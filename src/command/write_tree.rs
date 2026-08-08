@@ -18,6 +18,7 @@ use crate::{
 pub const WRITE_TREE_EXAMPLES: &str = "\
 EXAMPLES:
     libra write-tree              Write the index as a tree and print its object id
+    libra write-tree --missing-ok Tolerate absent blob objects (Git parity)
     libra --json write-tree       Structured JSON output for agents";
 
 /// Write the current index out as a tree object and print its object id.
@@ -29,6 +30,12 @@ pub struct WriteTreeArgs {
     /// index (yielding the canonical empty tree).
     #[clap(long = "index-file", value_name = "PATH")]
     pub index_file: Option<String>,
+    /// Tolerate index entries whose blob objects are absent from the object
+    /// store (Git's `write-tree --missing-ok`): the tree is written with the
+    /// recorded ids. Mistyped objects, unreadable objects, and missing
+    /// subtree objects still fail closed.
+    #[clap(long = "missing-ok")]
+    pub missing_ok: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,7 +72,20 @@ pub async fn execute_safe(args: WriteTreeArgs, output: &OutputConfig) -> CliResu
         })?
     };
 
-    let tree = tree_plumbing::write_tree_from_index(&index).map_err(map_tree_plumbing_error)?;
+    // lore.md 2.4 / §C.11 W1: the plumbing route into history.
+    // `commit` has its own guard, but `write-tree` → `commit-tree` →
+    // `update-ref` reaches a published branch without ever passing through it —
+    // and a materialized layer overlay's content lives OUTSIDE the repository,
+    // so publishing it produces a commit the repository cannot reproduce. The
+    // tree is where the index stops being local, so the guard belongs here too.
+    crate::internal::layer::reject_layer_owned_entries(&index, "to write a tree")
+        .await
+        .map_err(|message| {
+            CliError::fatal(message).with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+
+    let tree = tree_plumbing::write_tree_from_index_with(&index, args.missing_ok)
+        .map_err(map_tree_plumbing_error)?;
 
     if output.is_json() {
         emit_json_data(

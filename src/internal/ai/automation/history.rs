@@ -12,7 +12,7 @@ impl AutomationHistory {
         result: &AutomationRunResult,
     ) -> Result<(), AutomationError> {
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO automation_log \
              (id, rule_id, trigger_kind, action_kind, status, message, started_at, finished_at, details_json) \
@@ -40,7 +40,7 @@ impl AutomationHistory {
     ) -> Result<Vec<AutomationRunResult>, AutomationError> {
         let backend = conn.get_database_backend();
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT id, rule_id, trigger_kind, action_kind, status, message, started_at, finished_at, details_json \
                  FROM automation_log ORDER BY finished_at DESC LIMIT ?",

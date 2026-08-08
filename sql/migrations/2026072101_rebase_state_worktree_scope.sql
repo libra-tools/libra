@@ -2,7 +2,8 @@
 --
 -- plan-20260714 Part C W1 (§C.4.2): make the rebase state store per-worktree,
 -- completing the sequencer family (`sequence_state` was re-keyed by
--- 2026071901; `bisect_state` is scoped in place by its own lazy ADD COLUMN).
+-- 2026071901; `bisect_state` was scoped in place by lazy ADD COLUMN at the
+-- time this shipped, and later re-keyed by 2026072301).
 --
 -- `rebase_state` was a repository-global single row (id AUTOINCREMENT +
 -- behavioral DELETE-all-then-INSERT). With linked worktrees that is wrong: a

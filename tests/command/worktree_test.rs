@@ -63,7 +63,7 @@ fn test_worktree_help_header_is_user_facing() {
     );
 }
 
-/// Mirror of the on-disk `WorktreeEntry` used only in tests.
+/// Mirror of the on-disk `WorktreeEntry` used only in tests (registry v2).
 ///
 /// This type allows tests to deserialize `worktrees.json` without depending
 /// on internal, non-public structs from the main crate.
@@ -73,12 +73,15 @@ struct TestWorktreeEntry {
     is_main: bool,
     locked: bool,
     lock_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree_id: Option<String>,
 }
 
-/// Mirror of the on-disk `WorktreeState` used only in tests.
+/// Mirror of the on-disk `WorktreeState` used only in tests (registry v2).
 #[derive(Deserialize, Serialize)]
 struct TestWorktreeState {
-    worktrees: Vec<TestWorktreeEntry>,
+    schema_version: u32,
+    entries: Vec<TestWorktreeEntry>,
 }
 
 /// Loads the current `worktrees.json` into a test-friendly `TestWorktreeState`.
@@ -91,7 +94,7 @@ fn read_worktree_state() -> TestWorktreeState {
 /// Returns all worktree paths from the persisted test state.
 fn worktree_paths() -> Vec<String> {
     read_worktree_state()
-        .worktrees
+        .entries
         .into_iter()
         .map(|w| w.path)
         .collect()
@@ -227,7 +230,7 @@ async fn test_scorpiofs_attach_is_persistent_idempotent_and_detachable() {
     assert!(gitdir.join("backend.json").is_file());
     assert_eq!(
         read_worktree_state()
-            .worktrees
+            .entries
             .iter()
             .filter(|entry| entry.path == mountpoint_json)
             .count(),
@@ -262,6 +265,60 @@ async fn test_scorpiofs_attach_is_persistent_idempotent_and_detachable() {
     assert!(!gitdir.exists());
 
     server.abort();
+}
+
+/// §C.8 (W4 review): the `worktree list` JSON data half carries its OWN
+/// `schema_version` (the global `--json` flag never selects a schema), the
+/// v2 fields are present, `--schema-version 2` is the explicit spelling of
+/// the default, and an unsupported version is refused with LBR-CLI-002 —
+/// never answered with a shape lie.
+#[tokio::test]
+#[serial]
+async fn test_worktree_list_schema_version_surface() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", "wt_sv"], repo_dir.path()),
+        "worktree add",
+    );
+
+    for args in [
+        vec!["--json", "worktree", "list"],
+        vec!["--json", "worktree", "list", "--schema-version", "2"],
+    ] {
+        let output = run_libra_command(&args, repo_dir.path());
+        assert_cli_success(&output, "json worktree list");
+        let parsed = parse_json_stdout(&output);
+        assert_eq!(
+            parsed["data"]["schema_version"], 2,
+            "the data half names its schema: {parsed}"
+        );
+        let entry = parsed["data"]["worktrees"]
+            .as_array()
+            .expect("worktrees array")
+            .iter()
+            .find(|entry| entry["is_main"] == false)
+            .expect("linked entry")
+            .clone();
+        assert!(
+            entry["worktree_id"].is_string() && entry["layout"].is_string(),
+            "v2 fields present: {entry}"
+        );
+    }
+
+    let refused = run_libra_command(
+        &["--json", "worktree", "list", "--schema-version", "1"],
+        repo_dir.path(),
+    );
+    assert!(
+        !refused.status.success(),
+        "an unavailable schema version is refused, not faked"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("LBR-CLI-002"),
+        "stable code: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
 }
 
 #[tokio::test]
@@ -515,19 +572,22 @@ async fn test_worktree_repair_json_reports_changed_state() {
 
     let mut state = read_worktree_state();
     let duplicate = state
-        .worktrees
+        .entries
         .iter()
         .find(|w| w.path.ends_with("wt_repair_json"))
         .cloned()
         .expect("expected worktree entry for wt_repair_json");
-    state.worktrees.push(duplicate);
+    state.entries.push(duplicate);
 
     let state_path = util::storage_path().join("worktrees.json");
     let data = serde_json::to_string_pretty(&state)
         .expect("failed to serialize duplicated worktree state");
     fs::write(&state_path, data).expect("failed to overwrite worktrees.json with duplicates");
 
-    let output = run_libra_command(&["--json", "worktree", "repair"], repo_dir.path());
+    let output = run_libra_command(
+        &["--json", "worktree", "repair", "--confirm"],
+        repo_dir.path(),
+    );
     assert_cli_success(&output, "json worktree repair");
     assert!(
         output.stderr.is_empty(),
@@ -595,9 +655,9 @@ async fn test_worktree_lock_json_no_such_worktree_reports_invalid_target() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["list"])
+    exec_worktree(&["repair", "--confirm"])
         .await
-        .expect("worktree list should initialize state");
+        .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
 
     let output = run_libra_command(
@@ -626,9 +686,9 @@ async fn test_worktree_remove_machine_rejects_main_with_stable_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["list"])
+    exec_worktree(&["repair", "--confirm"])
         .await
-        .expect("worktree list should initialize state");
+        .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
     let main_path = repo_dir.path().canonicalize().unwrap();
     let main_arg = main_path.to_string_lossy().to_string();
@@ -736,9 +796,9 @@ async fn test_worktree_add_json_rejects_storage_path_as_invalid_target() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["list"])
+    exec_worktree(&["repair", "--confirm"])
         .await
-        .expect("worktree list should initialize state");
+        .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
     let inside_storage = util::storage_path().join("wt_inside_storage");
     let inside_arg = inside_storage.to_string_lossy().to_string();
@@ -773,9 +833,9 @@ async fn test_worktree_list_json_corrupt_state_reports_repo_corrupt() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["list"])
+    exec_worktree(&["repair", "--confirm"])
         .await
-        .expect("worktree list should initialize state");
+        .expect("worktree repair should initialize state");
     let state_path = util::storage_path().join("worktrees.json");
     fs::write(&state_path, b"{ invalid json").expect("failed to corrupt state file");
     let before = fs::read_to_string(&state_path).unwrap();
@@ -837,7 +897,7 @@ async fn test_worktree_add_normalizes_missing_parent_with_dotdot() {
     let expected = repo_dir.path().join("wt_norm").canonicalize().unwrap();
     let state = read_worktree_state();
     let entry = state
-        .worktrees
+        .entries
         .iter()
         .find(|w| w.path.ends_with("wt_norm"))
         .expect("state should contain the added worktree");
@@ -856,6 +916,54 @@ async fn test_worktree_add_normalizes_missing_parent_with_dotdot() {
     exec_worktree(&["remove", "wt_norm"])
         .await
         .expect("worktree remove should succeed");
+}
+
+/// `..` after a SYMLINK must be resolved the way the kernel resolves it:
+/// with `a/link -> b/sub`, `worktree add a/link/../wt` belongs at `b/wt`.
+/// A lexical `..` pass would pop `link` and silently create the worktree at
+/// `a/wt` — a directory the user never named (plan-20260714 §C.7/§C.8: the
+/// registry and the workspace store must agree on what "the same directory"
+/// is, and both key on this resolution).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_worktree_add_resolves_dotdot_through_symlinked_parent() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+
+    fs::create_dir_all(repo_dir.path().join("a")).unwrap();
+    fs::create_dir_all(repo_dir.path().join("b/sub")).unwrap();
+    std::os::unix::fs::symlink(
+        repo_dir.path().join("b/sub"),
+        repo_dir.path().join("a/link"),
+    )
+    .unwrap();
+
+    exec_worktree(&["add", "a/link/../wt_symlink"])
+        .await
+        .expect("worktree add should succeed");
+
+    let expected = repo_dir
+        .path()
+        .join("b/wt_symlink")
+        .canonicalize()
+        .expect("the worktree must be created where the kernel resolves the path");
+    let state = read_worktree_state();
+    let entry = state
+        .entries
+        .iter()
+        .find(|w| w.path.ends_with("wt_symlink"))
+        .expect("state should contain the added worktree");
+    assert_eq!(
+        entry.path,
+        expected.to_string_lossy().as_ref(),
+        "the registry must record the kernel-resolved path, not a lexical one"
+    );
+    assert!(
+        !repo_dir.path().join("a/wt_symlink").exists(),
+        "a lexically collapsed path must never be created"
+    );
 }
 
 #[tokio::test]
@@ -1194,9 +1302,9 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
     let wt_path = repo_dir.path().join("wt_state_save_fail");
     fs::create_dir_all(&wt_path).expect("failed to create existing empty target");
 
-    exec_worktree(&["list"])
+    exec_worktree(&["repair", "--confirm"])
         .await
-        .expect("worktree list should initialize worktree state");
+        .expect("worktree repair should initialize worktree state");
     assert!(
         util::storage_path().join("worktrees.json").exists(),
         "worktrees.json should exist before forcing save_state failure"
@@ -1305,9 +1413,9 @@ async fn test_worktree_corrupted_state_file_is_handled_without_side_effects() {
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
 
-    exec_worktree(&["list"])
+    exec_worktree(&["repair", "--confirm"])
         .await
-        .expect("worktree list should initialize state first");
+        .expect("worktree repair should initialize state first");
 
     let state_path = util::storage_path().join("worktrees.json");
     fs::write(&state_path, b"{ invalid json").expect("failed to corrupt state file");
@@ -1574,9 +1682,9 @@ async fn test_worktree_move_main_is_rejected_without_side_effects() {
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
 
-    exec_worktree(&["list"])
+    exec_worktree(&["repair", "--confirm"])
         .await
-        .expect("worktree list should initialize worktree state");
+        .expect("worktree repair should initialize worktree state");
 
     let before_paths = worktree_paths();
     let main_path = repo_dir.path().canonicalize().unwrap();
@@ -1656,7 +1764,7 @@ async fn test_worktree_move_locked_is_rejected_without_side_effects() {
 
     let state = read_worktree_state();
     let locked_entry = state
-        .worktrees
+        .entries
         .into_iter()
         .find(|w| w.path == src_canonical.to_string_lossy())
         .expect("locked worktree entry should still exist");
@@ -1809,7 +1917,7 @@ async fn test_worktree_prune_keeps_locked_worktrees() {
 
     let state = read_worktree_state();
     let locked_entry = state
-        .worktrees
+        .entries
         .into_iter()
         .find(|w| w.path == canonical)
         .expect("locked worktree should remain registered");
@@ -1868,24 +1976,24 @@ async fn test_worktree_repair_deduplicates_entries() {
 
     let mut state = read_worktree_state();
     let duplicate = state
-        .worktrees
+        .entries
         .iter()
         .find(|w| w.path.ends_with("wt_repair"))
         .cloned()
         .expect("expected worktree entry for wt_repair");
-    state.worktrees.push(duplicate);
+    state.entries.push(duplicate);
 
     let state_path = util::storage_path().join("worktrees.json");
     let data = serde_json::to_string_pretty(&state)
         .expect("failed to serialize duplicated worktree state");
     fs::write(&state_path, data).expect("failed to overwrite worktrees.json with duplicates");
 
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should succeed");
 
     let repaired = read_worktree_state();
-    let paths: Vec<String> = repaired.worktrees.iter().map(|w| w.path.clone()).collect();
+    let paths: Vec<String> = repaired.entries.iter().map(|w| w.path.clone()).collect();
     let unique_paths = paths
         .iter()
         .cloned()
@@ -1910,7 +2018,7 @@ async fn test_worktree_repair_persists_main_flag_fix_without_duplicates() {
         .expect("worktree add should succeed");
 
     let mut state = read_worktree_state();
-    for w in &mut state.worktrees {
+    for w in &mut state.entries {
         w.is_main = false;
     }
 
@@ -1919,12 +2027,12 @@ async fn test_worktree_repair_persists_main_flag_fix_without_duplicates() {
         .expect("failed to serialize worktree state with broken main flags");
     fs::write(&state_path, data).expect("failed to overwrite worktrees.json");
 
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should succeed");
 
     let repaired = read_worktree_state();
-    let main_entries: Vec<_> = repaired.worktrees.iter().filter(|w| w.is_main).collect();
+    let main_entries: Vec<_> = repaired.entries.iter().filter(|w| w.is_main).collect();
     assert_eq!(
         main_entries.len(),
         1,
@@ -1958,7 +2066,7 @@ async fn test_worktree_main_flag_remains_single_and_stable() {
         .expect("worktree list from linked worktree should succeed");
 
     let state = read_worktree_state();
-    let main_entries: Vec<_> = state.worktrees.iter().filter(|w| w.is_main).collect();
+    let main_entries: Vec<_> = state.entries.iter().filter(|w| w.is_main).collect();
     assert_eq!(
         main_entries.len(),
         1,
@@ -1996,10 +2104,21 @@ async fn test_worktree_remove_default_keeps_disk_directory() {
         wt_path.is_dir(),
         "default remove must preserve the directory on disk"
     );
-    let paths = worktree_paths();
+    // W3-s1b: the entry is RETAINED in `detached_from_registry` state (its
+    // scoped rows and directory are preserved) rather than dropped.
+    let state = read_worktree_state();
+    let detached = state
+        .entries
+        .iter()
+        .find(|w| w.path.ends_with("wt_keep"))
+        .expect("detached entry retained");
+    assert!(!detached.is_main);
     assert!(
-        !paths.iter().any(|p| p.ends_with("wt_keep")),
-        "registry should no longer track wt_keep, paths: {paths:?}"
+        wt_path
+            .join(".libra")
+            .join("detached_from_registry")
+            .exists(),
+        "detach writes the fail-closed marker"
     );
 }
 
@@ -2034,8 +2153,9 @@ async fn test_worktree_remove_json_reports_kept_directory() {
     assert_eq!(parsed["ok"], true);
     assert_eq!(parsed["command"], "worktree.remove");
     assert_eq!(parsed["data"]["path"], canonical.to_string_lossy().as_ref());
-    assert_eq!(parsed["data"]["registry_removed"], true);
+    assert_eq!(parsed["data"]["registry_removed"], false);
     assert_eq!(parsed["data"]["disk_directory_deleted"], false);
+    assert_eq!(parsed["data"]["detached"], true, "keep-dir remove detaches");
     assert!(
         wt_path.is_dir(),
         "json remove without --delete-dir must keep directory"

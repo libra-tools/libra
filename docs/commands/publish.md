@@ -6,6 +6,13 @@ Current implementation status:
 
 - `libra publish init` materialises the embedded Worker template under
   `worker/` and records `.libra/publish/worker-template-manifest.json`.
+  The manifest lives in the repository's COMMON storage (the shared
+  `.libra`, resolved through the `commondir` chain), so `init`, `status`,
+  `deploy`, and `unpublish` read and write the same manifest from every
+  worktree; the `worker/` directory itself is tracked working-tree content
+  and stays per-worktree. The reported `manifest_path` is worktree-relative
+  when the manifest sits under the invoking worktree (the main worktree)
+  and an absolute path otherwise (a linked worktree).
 - `libra publish status` reports the local Worker template state as
   `missing`, `current`, `modified`, `outdated`, or `conflicted`, and
   can compare local branch/tag refs with D1 `publish_refs` when a site

@@ -28,5 +28,11 @@ pub mod migration;
 pub mod state;
 pub mod store;
 
+pub use jsonl::{
+    CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandRecovery,
+    CodeCommandStatus, CodeCommandStoreError, CodeWorkflowCursor, CodeWorkflowEvent,
+    CodeWorkflowEventKind, CodeWorkflowReplay, CodeWorkflowSequenceGap, SessionEvent,
+    SessionJsonlStore,
+};
 pub use state::{SessionId, SessionMessage, SessionState};
 pub use store::{SessionInfo, SessionStore};

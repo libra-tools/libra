@@ -1,6 +1,6 @@
 //! Provides diff command logic comparing commits, the index, and the working tree with algorithm selection, pathspec filtering, and optional file output.
 
-mod options;
+pub(crate) mod options;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -766,7 +766,9 @@ fn relative_prefix(args: &DiffArgs) -> Option<String> {
 /// lore.md 2.2: retain only in-view files in a working-tree diff and recompute
 /// the stat totals. A no-op when the view is inactive.
 async fn apply_sparse_view_filter(result: &mut DiffOutput) {
-    let view = crate::internal::sparse::SparseView::load().await;
+    // W1 §C.4.1.1: per-worktree view (read-only display filter).
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+    let view = crate::internal::sparse::SparseView::load(&scope).await;
     if !view.is_active() {
         return;
     }
@@ -1577,7 +1579,11 @@ fn strip_relative_prefix_in_line(line: &str, strip: &str, full: &str, stripped: 
 /// deterministic (same pattern as rev-parse). Caveat inherited from rev-parse:
 /// an earlier argv token literally equal to `diff` could confuse the scan.
 fn bare_dashdash_in_diff_argv() -> bool {
-    let argv: Vec<String> = std::env::args().collect();
+    // `args_os`: see `notes` — `env::args()` panics on a non-UTF-8
+    // argument, and only ASCII flags are matched here.
+    let argv: Vec<String> = std::env::args_os()
+        .filter_map(|arg| arg.into_string().ok())
+        .collect();
     match argv.iter().position(|a| a == "diff") {
         Some(idx) => argv[idx + 1..].iter().any(|a| a == "--"),
         None => false,
@@ -2378,13 +2384,13 @@ async fn run_diff(
         );
         if rename_skips.inexact_skipped_by_limit {
             crate::utils::error::emit_legacy_stderr(format!(
-                "warning: skipped inexact rename detection because more than {} sources or destinations changed (diff.renameLimit); exact renames were still detected",
+                "warning: skipped inexact rename detection because more than {} sources or destinations changed (diff.renameLimit); exact and unique-basename renames were still detected",
                 config.rename_limit,
             ));
         }
         if rename_skips.inexact_discarded_by_budget {
             crate::utils::error::emit_legacy_stderr(
-                "warning: inexact rename detection exceeded diff.renameComparisonBudget; scored candidates were discarded and only exact renames were detected",
+                "warning: inexact rename detection exceeded diff.renameComparisonBudget; the exhaustive pass was discarded and only exact and unique-basename renames were detected",
             );
         }
     }
@@ -2891,11 +2897,19 @@ fn get_files_blobs(
     index: &Index,
     policy: IgnorePolicy,
 ) -> Result<Vec<(PathBuf, ObjectHash)>, DiffError> {
+    // ONE index snapshot timestamp for the whole batch: per-candidate
+    // re-stats were O(files) syscalls and could evaluate one loaded Index
+    // against different mtimes during a concurrent rewrite (2026-08-06
+    // R0-8 review).
+    let index_file_mtime = crate::utils::path::try_index()
+        .ok()
+        .and_then(|index_path| std::fs::metadata(index_path).ok())
+        .and_then(|meta| meta.modified().ok());
     files
         .iter()
         .filter(|path| !ignore::should_ignore(path, policy, index))
         .map(|p| {
-            if let Some(hash) = index_hash_if_worktree_stat_matches(p, index) {
+            if let Some(hash) = index_hash_if_worktree_stat_matches(p, index, index_file_mtime) {
                 return Ok((p.to_owned(), hash));
             }
             let path = util::workdir_to_absolute(p);
@@ -2908,14 +2922,22 @@ fn get_files_blobs(
         .collect()
 }
 
-fn index_hash_if_worktree_stat_matches(path: &Path, index: &Index) -> Option<ObjectHash> {
+fn index_hash_if_worktree_stat_matches(
+    path: &Path,
+    index: &Index,
+    index_file_mtime: Option<std::time::SystemTime>,
+) -> Option<ObjectHash> {
     let entry = index.get(path.to_str()?, 0)?;
     let absolute = util::workdir_to_absolute(path);
     let metadata = std::fs::symlink_metadata(&absolute).ok()?;
-    index_entry_matches_worktree_stat(entry, &metadata).then_some(entry.hash)
+    index_entry_matches_worktree_stat(entry, &metadata, index_file_mtime).then_some(entry.hash)
 }
 
-fn index_entry_matches_worktree_stat(entry: &IndexEntry, metadata: &std::fs::Metadata) -> bool {
+fn index_entry_matches_worktree_stat(
+    entry: &IndexEntry,
+    metadata: &std::fs::Metadata,
+    index_file_mtime: Option<std::time::SystemTime>,
+) -> bool {
     let Ok(size) = u32::try_from(metadata.len()) else {
         return false;
     };
@@ -2930,6 +2952,12 @@ fn index_entry_matches_worktree_stat(entry: &IndexEntry, metadata: &std::fs::Met
         && entry.uid == index_uid_from_metadata(metadata)
         && entry.gid == index_gid_from_metadata(metadata)
         && entry.mode == index_mode_from_metadata(metadata)
+        // Racily-clean guard (Git parity): the shortcut is only earned by
+        // files strictly OLDER than the index snapshot — an entry written
+        // in the same instant the file changed can pair a post-edit stat
+        // with a pre-edit hash (2026-08-06 R0-8 review; same guard as
+        // status's index_stat_differs).
+        && index_file_mtime.is_some_and(|snapshot| index_mtime(metadata) < snapshot)
 }
 
 #[cfg(unix)]
@@ -3566,7 +3594,7 @@ fn color_moved_active(args: &DiffArgs) -> Result<bool, DiffError> {
 // Rename similarity scoring (spanhash + Git's 0..60000 score) lives in the
 // shared engine module (plan-20260714 §B.4.2) so `status` and `diff` cannot
 // drift apart.
-use super::rename_detect::similarity_score;
+use super::rename_detect;
 
 /// Detect renames among the deleted + added files and fold each matched pair into
 /// a single rename entry (`-M`). Exact (same blob id) pairs are matched first,
@@ -3589,20 +3617,10 @@ fn apply_rename_detection(
     ignore_blank: bool,
     diff_algorithm: &DiffAlgorithm,
 ) -> RenameDetectionSkips {
-    let same_file_type = |old_path: &str, new_path: &str| {
-        let old_type = first_modes
-            .get(&PathBuf::from(old_path))
-            .map(|mode| mode & 0o170000);
-        let new_type = second_modes
-            .get(&PathBuf::from(new_path))
-            .map(|mode| mode & 0o170000);
-        match (old_type, new_type) {
-            (Some(old), Some(new)) => old == new,
-            // Missing mode metadata should not disable otherwise valid rename
-            // detection; populated tree, index, and worktree sides have modes.
-            _ => true,
-        }
-    };
+    // NOTE: file-type eligibility (same kind for exact, non-empty regular
+    // files for inexact) now lives in the shared engine, which is the whole
+    // point of routing through it — these rules used to be duplicated here
+    // and drifted from `status`.
     let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Option<Vec<u8>> {
         let pb = PathBuf::from(path);
         let hash = map.get(&pb)?;
@@ -3624,144 +3642,135 @@ fn apply_rename_detection(
         return RenameDetectionSkips::default();
     }
 
-    let mut used_del = vec![false; files.len()];
-    let mut used_add = vec![false; files.len()];
-    // (old_idx, new_idx, score) for the chosen pairs.
-    let mut pairs: Vec<(usize, usize, u32)> = Vec::new();
+    // ── Pairing is delegated to the SHARED engine ────────────────────────
+    //
+    // `diff` used to carry its own exact/basename/limit/top-K/greedy
+    // implementation. Two matchers meant two sets of tie-breaks, two budget
+    // accountings and two eligibility rules, and they drifted: the same
+    // repository could report different renames depending on which command
+    // you asked. Everything below is translation — build the snapshot, run
+    // `match_pairs`, map the result back to `files` indices.
+    let path_index: HashMap<PathBuf, usize> = deleted
+        .iter()
+        .chain(added.iter())
+        .map(|&i| (PathBuf::from(&files[i].path), i))
+        .collect();
 
-    // Pass 1: exact renames (identical blob id). Index destinations by object id
-    // so the default-on path remains linear rather than deleted×added.
-    let mut added_by_hash: HashMap<String, VecDeque<usize>> = HashMap::new();
-    for &ai in &added {
-        if let Some(hash) = second_map.get(&PathBuf::from(&files[ai].path)) {
-            added_by_hash
-                .entry(hash.to_string())
-                .or_default()
-                .push_back(ai);
+    // The engine's inexact stage is restricted to NON-EMPTY regular files
+    // (`size != Some(0)`). Leaving every size `None` would let empty blobs
+    // reach content scoring here but not in `status`, so a small
+    // `diff.renameComparisonBudget` could be spent on them and a real
+    // rename discarded — the same input producing two different answers.
+    // Recorded ids are enough to recognise emptiness without a read.
+    let empty_oid = git_internal::internal::object::blob::Blob::from_content_bytes(Vec::new()).id;
+    let blob_for = |path: &str,
+                    map: &HashMap<PathBuf, ObjectHash>,
+                    modes: &HashMap<PathBuf, u32>|
+     -> Option<rename_detect::BlobRef> {
+        let pb = PathBuf::from(path);
+        let oid = *map.get(&pb)?;
+        let mode = modes.get(&pb).copied().unwrap_or(0o100644);
+        Some(rename_detect::BlobRef {
+            kind: rename_detect::BlobKind::from_mode(mode),
+            mode,
+            size: (oid == empty_oid).then_some(0),
+            // Both sides are recorded tree/index/worktree ids, so exact
+            // pairing is permitted (§B.4.1 allow-list).
+            evidence: rename_detect::BlobEvidence::KnownObjectId { oid },
+        })
+    };
+
+    let mut snapshot = rename_detect::RenameSnapshot::default();
+    for &di in &deleted {
+        if let Some(blob) = blob_for(&files[di].path, first_map, first_modes) {
+            snapshot
+                .old_map
+                .insert(PathBuf::from(&files[di].path), blob);
         }
     }
-    for &di in &deleted {
-        let Some(dh) = first_map.get(&PathBuf::from(&files[di].path)) else {
-            continue;
-        };
-        let Some(candidates) = added_by_hash.get_mut(&dh.to_string()) else {
-            continue;
-        };
-        let Some(position) = candidates
-            .iter()
-            .position(|&ai| same_file_type(&files[di].path, &files[ai].path))
+    for &ai in &added {
+        if let Some(blob) = blob_for(&files[ai].path, second_map, second_modes) {
+            snapshot
+                .new_map
+                .insert(PathBuf::from(&files[ai].path), blob);
+        }
+    }
+
+    /// Content provider over diff's own loaders. `diff` has no read budget
+    /// (§B.7: `max_blob_bytes: None`), so a failed load is simply a skipped
+    /// candidate.
+    struct DiffContentSource<'a> {
+        first_map: &'a HashMap<PathBuf, ObjectHash>,
+        second_map: &'a HashMap<PathBuf, ObjectHash>,
+        worktree_entries: &'a HashMap<PathBuf, ObjectHash>,
+    }
+
+    impl DiffContentSource<'_> {
+        fn read(
+            &self,
+            path: &Path,
+            map: &HashMap<PathBuf, ObjectHash>,
+        ) -> rename_detect::ContentOutcome {
+            let Some(hash) = map.get(path) else {
+                return rename_detect::ContentOutcome::Skipped(
+                    rename_detect::SkipReason::ObjectMissing,
+                );
+            };
+            let owned = path.to_path_buf();
+            let loaded = if self.worktree_entries.get(path) == Some(hash) {
+                read_worktree_blob_content(&owned).ok()
+            } else {
+                load_repo_blob_content(hash).ok()
+            };
+            match loaded {
+                Some(bytes) => rename_detect::ContentOutcome::Content(std::rc::Rc::new(bytes)),
+                None => rename_detect::ContentOutcome::Skipped(
+                    rename_detect::SkipReason::ObjectUnavailable,
+                ),
+            }
+        }
+    }
+
+    impl rename_detect::RenameContentSource for DiffContentSource<'_> {
+        fn old_content(
+            &mut self,
+            path: &Path,
+            _blob: &rename_detect::BlobRef,
+        ) -> rename_detect::ContentOutcome {
+            self.read(path, self.first_map)
+        }
+
+        fn new_content(
+            &mut self,
+            path: &Path,
+            _blob: &rename_detect::BlobRef,
+        ) -> rename_detect::ContentOutcome {
+            self.read(path, self.second_map)
+        }
+    }
+
+    let mut source = DiffContentSource {
+        first_map,
+        second_map,
+        worktree_entries,
+    };
+    let config = rename_detect::RenameDetectConfig {
+        threshold,
+        rename_limit,
+        comparison_budget,
+    };
+    let outcome = rename_detect::match_pairs(&snapshot, &config, &mut source);
+
+    let mut pairs: Vec<(usize, usize, u32)> = Vec::new();
+    for matched in &outcome.matches {
+        let (Some(&di), Some(&ai)) = (path_index.get(&matched.old), path_index.get(&matched.new))
         else {
             continue;
         };
-        let Some(ai) = candidates.remove(position) else {
-            continue;
-        };
-        pairs.push((di, ai, 60000));
-        used_del[di] = true;
-        used_add[ai] = true;
+        pairs.push((di, ai, matched.internal_score));
     }
-
-    let remaining_deleted = deleted.iter().filter(|&&di| !used_del[di]).count();
-    let remaining_added = added.iter().filter(|&&ai| !used_add[ai]).count();
-    const MAX_SCORE: u32 = 60000;
-    let inexact_skipped = threshold < MAX_SCORE
-        && inexact_rename_detection_exceeds_limit(remaining_deleted, remaining_added, rename_limit);
-
-    let mut old_contents: HashMap<usize, Vec<u8>> = HashMap::new();
-    let mut new_contents: HashMap<usize, Vec<u8>> = HashMap::new();
-    if threshold < MAX_SCORE && !inexact_skipped {
-        for &di in &deleted {
-            if !used_del[di]
-                && let Some(content) = load(&files[di].path, first_map)
-            {
-                old_contents.insert(di, content);
-            }
-        }
-        for &ai in &added {
-            if !used_add[ai]
-                && let Some(content) = load(&files[ai].path, second_map)
-            {
-                new_contents.insert(ai, content);
-            }
-        }
-    }
-
-    // Pass 2: inexact renames — score every remaining pair, then assign greedily
-    // by descending score (each side once), keeping only pairs >= threshold.
-    // Like Git, a matching basename breaks ties so an ambiguous equal-score set
-    // prefers same-name pairings. `-M100%` (threshold == MAX_SCORE) is exact-only:
-    // Git skips inexact detection entirely, so a 100%-similar but non-identical
-    // pair (e.g. reordered lines) must NOT be folded.
-    let basename = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
-    let mut budget_discarded = false;
-    if threshold < MAX_SCORE && !inexact_skipped {
-        // Per-destination top-K bounded edge set (K=4, plan-20260714 §B.4.2.5)
-        // keeps memory at O(K × destinations) even for `-l0`-style uncapped
-        // candidate sets. Edge order: score desc, same-basename first, then
-        // (deleted, added) index ascending — diff's historical tie-break.
-        const PER_DEST_TOP_K: usize = 4;
-        let mut comparisons: u64 = 0;
-        // per added-index: (score, same_basename, di, ai) best-first
-        let mut per_dest: HashMap<usize, Vec<(u32, bool, usize, usize)>> = HashMap::new();
-        'outer: for &ai in &added {
-            if used_add[ai] {
-                continue;
-            }
-            let Some(new) = new_contents.get(&ai) else {
-                continue;
-            };
-            for &di in &deleted {
-                if used_del[di] {
-                    continue;
-                }
-                if !same_file_type(&files[di].path, &files[ai].path) {
-                    continue;
-                }
-                let Some(old) = old_contents.get(&di) else {
-                    continue;
-                };
-                if let Some(budget) = comparison_budget
-                    && comparisons >= budget
-                {
-                    // 触顶规则：丢弃整个 inexact 阶段已评结果，仅保留 exact。
-                    budget_discarded = true;
-                    per_dest.clear();
-                    break 'outer;
-                }
-                comparisons += 1;
-                let score = similarity_score(old, new);
-                if score >= threshold {
-                    let same_base = basename(&files[di].path) == basename(&files[ai].path);
-                    let edges = per_dest.entry(ai).or_default();
-                    edges.push((score, same_base, di, ai));
-                    edges.sort_by(|a, b| {
-                        b.0.cmp(&a.0)
-                            .then(b.1.cmp(&a.1))
-                            .then(a.2.cmp(&b.2))
-                            .then(a.3.cmp(&b.3))
-                    });
-                    if edges.len() > PER_DEST_TOP_K {
-                        edges.truncate(PER_DEST_TOP_K);
-                    }
-                }
-            }
-        }
-        let mut candidates: Vec<(u32, bool, usize, usize)> =
-            per_dest.into_values().flatten().collect();
-        candidates.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then(b.1.cmp(&a.1))
-                .then(a.2.cmp(&b.2))
-                .then(a.3.cmp(&b.3))
-        });
-        for (score, _, di, ai) in candidates {
-            if !used_del[di] && !used_add[ai] {
-                used_del[di] = true;
-                used_add[ai] = true;
-                pairs.push((di, ai, score));
-            }
-        }
-    }
+    let inexact_skipped = outcome.stats.skipped_by_limit;
+    let budget_discarded = outcome.stats.exhaustive_discarded;
 
     let skips = RenameDetectionSkips {
         inexact_skipped_by_limit: inexact_skipped,
@@ -3777,14 +3786,10 @@ fn apply_rename_detection(
         let old_path = files[*di].path.clone();
         let new_path = files[*ai].path.clone();
         let percent = score / 600;
-        let old_content = old_contents
-            .remove(di)
-            .or_else(|| load(&old_path, first_map))
-            .unwrap_or_default();
-        let new_content = new_contents
-            .remove(ai)
-            .or_else(|| load(&new_path, second_map))
-            .unwrap_or_default();
+        // The engine owns its own content caching, so the rendering side
+        // loads what it needs directly.
+        let old_content = load(&old_path, first_map).unwrap_or_default();
+        let new_content = load(&new_path, second_map).unwrap_or_default();
         let entry = build_rename_entry(
             &old_path,
             &new_path,
@@ -3827,16 +3832,6 @@ struct RenameDetectionSkips {
 }
 
 pub(super) const DEFAULT_RENAME_LIMIT: usize = 1000;
-
-/// Per-side rename-limit gate (Git's `diff.renameLimit`); `limit == 0`
-/// disables the cap.
-fn inexact_rename_detection_exceeds_limit(
-    sources: usize,
-    destinations: usize,
-    limit: usize,
-) -> bool {
-    limit > 0 && (sources > limit || destinations > limit)
-}
 
 /// Render one rename entry (patch + metadata). A byte-identical rename emits only
 /// the rename headers; any rename whose blobs differ — even at 100% similarity
@@ -6868,26 +6863,77 @@ mod test {
 
     #[test]
     fn inexact_rename_detection_obeys_git_default_limit() {
-        assert!(!inexact_rename_detection_exceeds_limit(
-            1000,
-            1000,
-            DEFAULT_RENAME_LIMIT
-        ));
-        assert!(inexact_rename_detection_exceeds_limit(
-            1001,
-            1,
-            DEFAULT_RENAME_LIMIT
-        ));
-        assert!(inexact_rename_detection_exceeds_limit(
-            1,
-            1001,
-            DEFAULT_RENAME_LIMIT
-        ));
-        // `diff.renameLimit = 0` disables the per-side cap entirely.
-        assert!(!inexact_rename_detection_exceeds_limit(100_000, 100_000, 0));
-        // A tighter configured limit gates smaller candidate sets.
-        assert!(inexact_rename_detection_exceeds_limit(33, 1, 32));
-        assert!(!inexact_rename_detection_exceeds_limit(32, 32, 32));
+        use std::{path::PathBuf, rc::Rc};
+
+        use super::rename_detect::{
+            BlobEvidence, BlobKind, BlobRef, ContentOutcome, RenameContentSource,
+            RenameDetectConfig, RenameSnapshot, match_pairs,
+        };
+
+        // `diff` no longer owns a limit gate: it delegates to the shared
+        // engine, so the per-side OR semantics are asserted THERE — through
+        // the same call `diff` makes. Duplicating the rule in a local helper
+        // is exactly how the two commands drifted apart before.
+        struct Bodies;
+        impl RenameContentSource for Bodies {
+            fn old_content(&mut self, path: &Path, _blob: &BlobRef) -> ContentOutcome {
+                ContentOutcome::Content(Rc::new(
+                    format!("shared body\ncommon line\n{}\n", path.display()).into_bytes(),
+                ))
+            }
+            fn new_content(&mut self, path: &Path, _blob: &BlobRef) -> ContentOutcome {
+                ContentOutcome::Content(Rc::new(
+                    format!("shared body\ncommon line\n{}\n", path.display()).into_bytes(),
+                ))
+            }
+        }
+
+        let blob = |seed: u8| BlobRef {
+            kind: BlobKind::Regular,
+            mode: 0o100644,
+            size: Some(32),
+            evidence: BlobEvidence::KnownObjectId {
+                oid: git_internal::internal::object::blob::Blob::from_content(&format!(
+                    "distinct {seed}"
+                ))
+                .id,
+            },
+        };
+        let snapshot = || {
+            let mut snapshot = RenameSnapshot::default();
+            for i in 0..2u8 {
+                snapshot
+                    .old_map
+                    .insert(PathBuf::from(format!("old{i}.txt")), blob(i));
+                snapshot
+                    .new_map
+                    .insert(PathBuf::from(format!("new{i}.txt")), blob(i + 100));
+            }
+            snapshot
+        };
+        let config = |rename_limit| RenameDetectConfig {
+            threshold: 30_000,
+            rename_limit,
+            comparison_budget: None,
+        };
+
+        // Per-side limit 1 with 2 sources and 2 destinations: the exhaustive
+        // stage is gated.
+        let gated = match_pairs(&snapshot(), &config(1), &mut Bodies);
+        assert!(
+            gated.stats.skipped_by_limit,
+            "a side above the limit gates the exhaustive stage"
+        );
+        // The Git default comfortably admits this candidate set…
+        let allowed = match_pairs(&snapshot(), &config(DEFAULT_RENAME_LIMIT), &mut Bodies);
+        assert!(!allowed.stats.skipped_by_limit, "1000 admits 2 vs 2");
+        // …and `0` disables the cap entirely.
+        let uncapped = match_pairs(&snapshot(), &config(0), &mut Bodies);
+        assert!(
+            !uncapped.stats.skipped_by_limit,
+            "renameLimit = 0 means no per-side cap"
+        );
+        assert_eq!(DEFAULT_RENAME_LIMIT, 1000, "Git's default is 1000");
     }
 
     #[test]
@@ -7468,11 +7514,26 @@ mod test {
         let worktree_hash = calculate_object_hash(ObjectType::Blob, &worktree_content);
         assert_ne!(indexed_hash, worktree_hash);
 
+        // The racily-clean guard only trusts the shortcut for files
+        // strictly OLDER than the on-disk index snapshot (2026-08-06
+        // R0-8 review): rewind the file's mtime, build the entry from
+        // the rewound stat, THEN persist the index so its snapshot
+        // timestamp is later than the file.
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open("tracked.txt")
+            .unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(earlier))
+            .unwrap();
+        drop(file);
+
         let mut index = Index::new();
         index.add(
             IndexEntry::new_from_file(Path::new("tracked.txt"), indexed_hash, temp_path.path())
                 .unwrap(),
         );
+        index.save(crate::utils::path::index()).unwrap();
 
         let blobs = get_files_blobs(
             &[PathBuf::from("tracked.txt")],

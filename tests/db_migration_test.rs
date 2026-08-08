@@ -51,7 +51,10 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407, 2026071901, 2026072101
+            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
+            2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
+            2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
+            2026073005, 2026073101, 2026080401
         ]
     );
     assert_eq!(
@@ -90,13 +93,32 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_subagent_replication",
             "sequencer_worktree_scope",
             "rebase_state_worktree_scope",
+            "operation_worktree_scope",
+            "bisect_state_worktree_scope",
+            "working_dirty_worktree_scope",
+            "layer_worktree_scope",
+            "sparse_view_worktree_scope",
+            "worktree_registry_v2",
+            "worktree_lifecycle_journal",
+            "worktree_migrate_intent",
+            "workspace_record",
+            "workspace_paging_index",
+            "head_scope_unique",
+            "operation_scope_provenance",
+            "operation_args_digest_canonical",
+            "operation_dedup_index",
+            "operation_boundary_claim",
+            "operation_scope_kind",
+            "worktree_registry_v3_capability",
+            "stash_generation_fence",
+            "agent_capture_workspace_scope",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 33);
-    assert_eq!(runner.max_registered_version(), Some(2026072101));
+    assert_eq!(runner.len(), 52);
+    assert_eq!(runner.max_registered_version(), Some(2026080401));
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +267,7 @@ async fn run_pending_persists_name_and_parseable_applied_at() {
 
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT version, name, applied_at FROM schema_versions WHERE version = 7",
         ))
@@ -298,7 +320,7 @@ async fn run_pending_tolerates_pre_existing_tables_via_idempotent_ddl() {
     let conn = connect(&url).await;
     // Simulate a legacy database that already contains `legacy_widgets`,
     // pre-dating any version tracking.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "CREATE TABLE legacy_widgets (id INTEGER PRIMARY KEY, kind TEXT NOT NULL)",
     ))
@@ -853,14 +875,14 @@ async fn concurrent_run_pending_calls_converge_without_unique_violation() {
     // and neither one can short-circuit before the INSERT race for
     // version 1.
     conn_a
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             conn_a.get_database_backend(),
             "CREATE TABLE IF NOT EXISTS schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)",
         ))
         .await
         .unwrap();
     conn_a
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn_a.get_database_backend(),
             "INSERT INTO schema_versions (version, name, applied_at) VALUES (0, 'baseline', '2026-01-01T00:00:00Z')",
             [],
@@ -928,7 +950,7 @@ async fn connect_with_busy_timeout(url: &str) -> DatabaseConnection {
 async fn count_schema_versions(conn: &DatabaseConnection) -> i64 {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM schema_versions",
         ))
@@ -1054,7 +1076,7 @@ async fn describe_schema_versions(conn: &DatabaseConnection) -> Vec<String> {
     let backend = conn.get_database_backend();
     let mut rows = vec![];
     let stream = conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "PRAGMA table_info(schema_versions)",
         ))
@@ -1087,7 +1109,10 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407, 2026071901, 2026072101
+            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
+            2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
+            2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
+            2026073005, 2026073101, 2026080401
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1140,9 +1165,12 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     assert!(table_exists(&conn, "agent_export_job").await);
     assert!(index_exists(&conn, "idx_agent_export_job_session").await);
     assert!(index_exists(&conn, "idx_agent_export_job_ttl").await);
+    assert!(index_exists(&conn, "idx_agent_export_job_capture_provider").await);
     // plan-20260713 M4: historical import identity + local erase barrier.
     assert!(table_exists(&conn, "agent_import_identity").await);
     assert!(index_exists(&conn, "idx_agent_import_identity_key").await);
+    assert!(index_exists(&conn, "idx_agent_import_identity_capture_provider").await);
+    assert!(index_exists(&conn, "idx_agent_session_capture_provider").await);
     assert!(table_exists(&conn, "agent_import_tombstone").await);
     assert!(index_exists(&conn, "idx_agent_import_tombstone_provider").await);
     assert!(index_exists(&conn, "idx_agent_import_tombstone_erased_session").await);
@@ -1175,13 +1203,13 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
     assert!(table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
     assert!(column_exists(&conn, "agent_checkpoint", "sync_revision").await);
 
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
     ))
     .await
     .expect("seed minimal ai_thread FK target");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1192,7 +1220,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
     ))
     .await
     .expect("seed M5 parent session");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_subagent_content_claim (
             parent_session_id, provider_kind, source_key, content_schema_version,
@@ -1219,13 +1247,13 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             .expect("current M5 version"),
         Some(2026071407)
     );
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "DELETE FROM agent_subagent_content_claim".to_string(),
     ))
     .await
     .expect("clear M5 recovery state");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
@@ -1238,7 +1266,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
     ))
     .await
     .expect("seed link-only M5 checkpoint");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_subagent_link (
             content_checkpoint_id, parent_session_id, link_state,
@@ -1257,13 +1285,13 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
         format!("{error:#}").contains("cannot roll back subagent content attribution"),
         "unexpected link-only rollback error: {error:#}"
     );
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "DELETE FROM agent_subagent_link".to_string(),
     ))
     .await
     .expect("clear link-only M5 link");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "DELETE FROM agent_checkpoint WHERE checkpoint_id = 'm5-link-only-checkpoint'".to_string(),
     ))
@@ -1274,9 +1302,14 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             .run_pending(&conn)
             .await
             .expect("restore 1407 after the 1406 link-only rollback guard"),
-        vec![2026071407, 2026071901, 2026072101]
+        vec![
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
+            2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
+            2026080401
+        ]
     );
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint_prune_tombstone (checkpoint_id, session_id, pruned_at)
          VALUES ('m5-pruned', 'm5-down-session', 1)"
@@ -1292,13 +1325,13 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
         format!("{error:#}").contains("cannot roll back subagent replication"),
         "unexpected prune-fence rollback error: {error:#}"
     );
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "DELETE FROM agent_checkpoint_prune_tombstone".to_string(),
     ))
     .await
     .expect("clear ordinary prune tombstone");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE agent_session SET sync_revision = 2 WHERE session_id = 'm5-down-session'"
             .to_string(),
@@ -1313,7 +1346,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
         format!("{error:#}").contains("cannot roll back subagent replication"),
         "unexpected session-generation rollback error: {error:#}"
     );
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE agent_session SET sync_revision = 1 WHERE session_id = 'm5-down-session'"
             .to_string(),
@@ -1334,7 +1367,12 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
     assert!(!column_exists(&conn, "agent_checkpoint", "sync_revision").await);
     assert_eq!(
         runner.run_pending(&conn).await.expect("M5 up #2"),
-        vec![2026071406, 2026071407, 2026071901, 2026072101]
+        vec![
+            2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302,
+            2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502,
+            2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005,
+            2026073101, 2026080401
+        ]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
     assert!(table_exists(&conn, "agent_capture_incarnation").await);
@@ -1373,13 +1411,13 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
     assert!(!table_exists(&conn, "agent_capture_cloud_base").await);
     assert!(!table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
 
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
     ))
     .await
     .expect("seed immutable 1406 ai_thread FK target");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1390,7 +1428,7 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
     ))
     .await
     .expect("seed immutable 1406 parent session");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
@@ -1403,7 +1441,7 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
     ))
     .await
     .expect("seed immutable 1406 checkpoint");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_subagent_content_claim (
             parent_session_id, provider_kind, source_key, content_schema_version,
@@ -1415,7 +1453,7 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
     ))
     .await
     .expect("seed immutable 1406 current claim");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_subagent_content_revision (
             parent_session_id, provider_kind, source_key, content_schema_version,
@@ -1433,10 +1471,15 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             .run_pending(&conn)
             .await
             .expect("upgrade immutable 1406 schema"),
-        vec![2026071407, 2026071901, 2026072101]
+        vec![
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
+            2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
+            2026080401
+        ]
     );
     let claim = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT revision_cursor, sync_revision
              FROM agent_subagent_content_claim
@@ -1494,20 +1537,20 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
         "ALTER TABLE agent_subagent_content_claim ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE agent_subagent_link ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
     ] {
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             alter.to_string(),
         ))
         .await
         .expect("construct evolved 1406 column shape");
     }
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
     ))
     .await
     .expect("seed evolved 1406 ai_thread FK target");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1519,7 +1562,7 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
     ))
     .await
     .expect("seed evolved 1406 parent session");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
@@ -1532,7 +1575,7 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
     ))
     .await
     .expect("seed evolved 1406 checkpoint");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_subagent_content_claim (
             parent_session_id, provider_kind, source_key, content_schema_version,
@@ -1544,7 +1587,7 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
     ))
     .await
     .expect("seed evolved 1406 stale cursor");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_subagent_content_revision (
             parent_session_id, provider_kind, source_key, content_schema_version,
@@ -1562,10 +1605,15 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             .run_pending(&conn)
             .await
             .expect("upgrade evolved 1406 schema"),
-        vec![2026071407, 2026071901, 2026072101]
+        vec![
+            2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
+            2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
+            2026080401
+        ]
     );
     let cursor = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT revision_cursor FROM agent_subagent_content_claim
              WHERE parent_session_id = 'm5-evolved-session'"
@@ -1605,8 +1653,10 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
-            2026071402
+            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
+            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
+            2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1622,7 +1672,9 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         reapplied,
         vec![
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101
+            2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
+            2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
+            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1653,7 +1705,10 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404
+            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
+            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
+            2026071407, 2026071406, 2026071405, 2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1668,7 +1723,10 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         applied,
         vec![
-            2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101
+            2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201,
+            2026072301, 2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403,
+            2026072501, 2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003,
+            2026073004, 2026073005, 2026073101, 2026080401
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -1685,7 +1743,7 @@ async fn agent_import_tombstone_rollback_refuses_nonempty_barrier() {
         .run_pending(&conn)
         .await
         .expect("apply M4 migrations");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_import_tombstone (
             tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
@@ -1705,7 +1763,7 @@ async fn agent_import_tombstone_rollback_refuses_nonempty_barrier() {
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
     let count: i64 = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS n FROM agent_import_tombstone".to_string(),
         ))
@@ -1735,13 +1793,13 @@ async fn agent_coverage_conflict_rollback_refuses_nonempty_evidence() {
         .await
         .expect("apply M4 migrations");
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
     ))
     .await
     .expect("seed minimal ai_thread FK target");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1752,7 +1810,7 @@ async fn agent_coverage_conflict_rollback_refuses_nonempty_evidence() {
     ))
     .await
     .expect("seed conflict session");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "INSERT INTO agent_coverage_claim (
             session_id, logical_turn_key, coverage_schema_version,
@@ -1764,7 +1822,7 @@ async fn agent_coverage_conflict_rollback_refuses_nonempty_evidence() {
     ))
     .await
     .expect("seed conflicted claim");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "INSERT INTO agent_coverage_conflict (
             session_id, logical_turn_key, coverage_schema_version,
@@ -1789,7 +1847,7 @@ async fn agent_coverage_conflict_rollback_refuses_nonempty_evidence() {
     );
     assert!(table_exists(&conn, "agent_coverage_conflict").await);
     let count: i64 = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) AS n FROM agent_coverage_conflict".to_string(),
         ))
@@ -1818,7 +1876,7 @@ async fn agent_import_identity_rollback_refuses_nonempty_recovery_state() {
         .run_pending(&conn)
         .await
         .expect("apply M4 migrations");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "INSERT INTO agent_import_identity (
             identity_id, agent_kind, provider_session_id, source_kind, source_id,
@@ -1863,7 +1921,7 @@ async fn agent_import_schema_constraints_fail_closed() {
     // schema, while `agent_session.thread_id` carries a soft FK to ai_thread.
     // Supply the minimal FK target so the rollback-barrier assertions exercise
     // normal foreign-key enforcement instead of disabling it.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
     ))
@@ -1874,7 +1932,7 @@ async fn agent_import_schema_constraints_fail_closed() {
         identity_id, agent_kind, provider_session_id, source_kind, source_id,
         schema_version, next_ordinal, state, created_at, updated_at
      ) VALUES (?, 'claude_code', 'provider-1', 'file', 'relative/source', 1, 0, ?, 1, 1)";
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         identity_sql,
         ["identity-1".into(), "discovered".into()],
@@ -1882,7 +1940,7 @@ async fn agent_import_schema_constraints_fail_closed() {
     .await
     .expect("seed valid identity");
     assert!(
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             identity_sql,
             ["identity-2".into(), "discovered".into()],
@@ -1892,7 +1950,7 @@ async fn agent_import_schema_constraints_fail_closed() {
         "stable import identity key must be unique"
     );
     assert!(
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_import_identity (
                 identity_id, agent_kind, provider_session_id, source_kind, source_id,
@@ -1909,7 +1967,7 @@ async fn agent_import_schema_constraints_fail_closed() {
     let tombstone_sql = "INSERT INTO agent_import_tombstone (
         tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
      ) VALUES (?, 'claude_code', ?, ?, 1)";
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1920,7 +1978,7 @@ async fn agent_import_schema_constraints_fail_closed() {
     ))
     .await
     .expect("seed session that will be tombstoned");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         tombstone_sql,
         ["tomb-1".into(), "provider-a".into(), "session-a".into()],
@@ -1928,7 +1986,7 @@ async fn agent_import_schema_constraints_fail_closed() {
     .await
     .expect("seed tombstone");
     assert!(
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             tombstone_sql,
             ["tomb-2".into(), "provider-a".into(), "session-b".into()],
@@ -1938,7 +1996,7 @@ async fn agent_import_schema_constraints_fail_closed() {
         "provider tombstone key must be unique"
     );
     assert!(
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             tombstone_sql,
             ["tomb-3".into(), "provider-b".into(), "session-a".into()],
@@ -1948,7 +2006,7 @@ async fn agent_import_schema_constraints_fail_closed() {
         "erased session id must remain uniquely classifiable"
     );
     assert!(
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1962,7 +2020,7 @@ async fn agent_import_schema_constraints_fail_closed() {
         "an older writer must not recreate a tombstoned provider session"
     );
     assert!(
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             backend,
             "UPDATE agent_session SET last_event_at = 2 WHERE session_id = 'session-a'".to_string(),
         ))
@@ -1971,7 +2029,7 @@ async fn agent_import_schema_constraints_fail_closed() {
         "an older writer must not advance a session after its tombstone"
     );
     assert!(
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
@@ -2013,11 +2071,13 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
-            2026071402, 2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701,
-            2026070601, 2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301,
-            2026061401, 2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801,
-            2026050601
+            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
+            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
+            2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401,
+            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
+            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
+            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -2045,7 +2105,9 @@ async fn approved_permission_up_down_up_round_trip() {
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
-            2026072101
+            2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
+            2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
+            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -2069,7 +2131,7 @@ async fn rebase_state_migration_preserves_active_row_from_lazy_shape() {
     let (_dir, url, _path) = fresh_db_url();
     let conn = connect(&url).await;
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         r#"CREATE TABLE `rebase_state` (
             `id`           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2085,7 +2147,7 @@ async fn rebase_state_migration_preserves_active_row_from_lazy_shape() {
     ))
     .await
     .expect("legacy 8-column table");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "INSERT INTO rebase_state \
          (head_name, onto, orig_head, current_head, todo, done, stopped_sha) \
@@ -2103,7 +2165,7 @@ async fn rebase_state_migration_preserves_active_row_from_lazy_shape() {
         "the AUTOINCREMENT id is retired by the worktree_id re-key"
     );
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT worktree_id, head_name, todo_actions, autosquash, empty_mode \
              FROM rebase_state"
@@ -2138,7 +2200,7 @@ async fn rebase_down_migration_rejects_linked_rows() {
     let conn = connect(&url).await;
     let backend = conn.get_database_backend();
     run_builtin_migrations(&conn).await.expect("migrations");
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "INSERT INTO rebase_state \
          (worktree_id, head_name, onto, orig_head, current_head, todo, done) \
@@ -2162,7 +2224,7 @@ async fn rebase_down_migration_rejects_linked_rows() {
     // The scoped table survives the refused rollback (txn rolled back).
     assert!(column_exists(&conn, "rebase_state", "worktree_id").await);
 
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "DELETE FROM rebase_state WHERE worktree_id <> '';".to_string(),
     ))
@@ -2172,11 +2234,17 @@ async fn rebase_down_migration_rejects_linked_rows() {
         .rollback_to(&conn, 2026071901)
         .await
         .expect("rollback succeeds once only the main row remains");
-    assert_eq!(rolled, vec![2026072101]);
+    assert_eq!(
+        rolled,
+        vec![
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101
+        ]
+    );
     assert!(column_exists(&conn, "rebase_state", "id").await);
     assert!(!column_exists(&conn, "rebase_state", "worktree_id").await);
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT head_name FROM rebase_state".to_string(),
         ))
@@ -2187,13 +2255,898 @@ async fn rebase_down_migration_rejects_linked_rows() {
     assert_eq!(head_name, "refs/heads/main");
 }
 
+/// §C.12 named regression `sequence_migration_preserves_main_active_state`:
+/// the UPGRADE direction. A repository that was mid-cherry-pick when it was
+/// upgraded must find its sequence exactly where it left it, under the main
+/// scope — losing it would mean an interrupted sequence silently becomes "no
+/// sequence in progress", with a conflicted tree and nothing to continue.
+///
+/// The existing `sequence_down_migration_rejects_linked_rows` exercises the
+/// DOWN direction from an already-scoped table, which cannot catch this.
+#[tokio::test]
+async fn sequence_migration_preserves_main_active_state() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+
+    // Stop one migration BEFORE the scope rewrite, so the legacy single-row
+    // shape (`id INTEGER PRIMARY KEY CHECK (id = 1)`) is what exists.
+    runner
+        .run_pending_up_to(&conn, 2026071407)
+        .await
+        .expect("apply up to the pre-scope schema");
+    assert!(!column_exists(&conn, "sequence_state", "worktree_id").await);
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sequence_state (id, kind, head_name, head_orig, current_oid, todo, payload) \
+         VALUES (1, 'cherry_pick', 'refs/heads/main', \
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', \
+                 'cccccccccccccccccccccccccccccccccccccccc', '{\"signoff\":true}');"
+            .to_string(),
+    ))
+    .await
+    .expect("an in-progress cherry-pick in the legacy shape");
+
+    runner.run_pending(&conn).await.expect("upgrade");
+
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, kind, head_name, head_orig, current_oid, todo, payload \
+             FROM sequence_state"
+                .to_string(),
+        ))
+        .await
+        .expect("query the migrated row")
+        .expect("the active sequence survives the upgrade");
+    let worktree_id: String = row.try_get_by_index(0).expect("worktree_id");
+    let kind: String = row.try_get_by_index(1).expect("kind");
+    let head_name: String = row.try_get_by_index(2).expect("head_name");
+    let head_orig: String = row.try_get_by_index(3).expect("head_orig");
+    let current_oid: String = row.try_get_by_index(4).expect("current_oid");
+    let todo: String = row.try_get_by_index(5).expect("todo");
+    let payload: String = row.try_get_by_index(6).expect("payload");
+    assert_eq!(worktree_id, "", "a pre-scope row belongs to main");
+    assert_eq!(kind, "cherry_pick");
+    assert_eq!(head_name, "refs/heads/main");
+    assert_eq!(head_orig, "a".repeat(40));
+    assert_eq!(current_oid, "b".repeat(40), "the position is not reset");
+    assert_eq!(todo, "c".repeat(40), "the remaining todo is not dropped");
+    assert_eq!(payload, "{\"signoff\":true}", "options survive verbatim");
+}
+
+/// The 2026071901 down migration FAILS CLOSED while a linked worktree's
+/// sequence row exists (the legacy `CHECK(id = 1)` single-row schema cannot
+/// represent it, so rolling back would silently discard that worktree's
+/// cherry-pick/am/revert sequence). After the linked row is gone, the same
+/// rollback succeeds and restores the legacy shape with the main row intact.
+#[tokio::test]
+async fn sequence_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sequence_state \
+         (worktree_id, kind, head_name, head_orig, current_oid, todo) \
+         VALUES ('', 'cherry_pick', 'refs/heads/main', 'aa', 'bb', '[]'), \
+                ('wt1234', 'revert', 'refs/heads/feature', 'cc', 'dd', '[]');"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked sequence rows");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026071407)
+        .await
+        .expect_err("rollback with a linked sequence row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    // The scoped table survives the refused rollback (txn rolled back).
+    assert!(column_exists(&conn, "sequence_state", "worktree_id").await);
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM sequence_state WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("finish the linked sequence");
+    // The runner commits each down migration separately, so the refused
+    // attempt already rolled back 2026072301/2026072201/2026072101 before
+    // failing closed at 2026071901 — only the guarded one remains.
+    let rolled = runner
+        .rollback_to(&conn, 2026071407)
+        .await
+        .expect("rollback succeeds once only the main row remains");
+    assert_eq!(
+        rolled,
+        vec![
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101, 2026071901
+        ]
+    );
+    assert!(!column_exists(&conn, "sequence_state", "worktree_id").await);
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT kind, head_name FROM sequence_state".to_string(),
+        ))
+        .await
+        .expect("query restored row")
+        .expect("main row survives the rollback");
+    let kind: String = row.try_get_by_index(0).expect("kind");
+    let head_name: String = row.try_get_by_index(1).expect("head_name");
+    assert_eq!(kind, "cherry_pick");
+    assert_eq!(head_name, "refs/heads/main");
+}
+
+/// A database whose `bisect_state` still carries the OLDEST lazy shape
+/// (before `completed`/`first_parent`/`worktree_id` were ADD COLUMNed) is
+/// normalized on connection open and re-keyed by 2026072301: the newest row
+/// wins, lands in the main scope, and the lazy defaults are filled in.
+#[tokio::test]
+async fn bisect_state_migration_preserves_active_row_from_lazy_shape() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    conn.execute_raw(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `bisect_state` (
+            `id`             INTEGER PRIMARY KEY AUTOINCREMENT,
+            `orig_head`      TEXT NOT NULL,
+            `orig_head_name` TEXT,
+            `bad`            TEXT,
+            `good`           TEXT NOT NULL,
+            `current`        TEXT,
+            `skipped`        TEXT,
+            `steps`          INTEGER
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("oldest lazy 8-column table");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO bisect_state \
+         (orig_head, orig_head_name, bad, good, current, skipped, steps) \
+         VALUES ('aa11', 'refs/heads/main', 'bb22', '[\"cc33\"]', 'dd44', '[]', 3), \
+                ('ee55', NULL, 'ff66', '[\"aa77\"]', 'bb88', '[]', 2);"
+            .to_string(),
+    ))
+    .await
+    .expect("stale + newest lazy rows");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(column_exists(&conn, "bisect_state", "worktree_id").await);
+    assert!(
+        !column_exists(&conn, "bisect_state", "id").await,
+        "the AUTOINCREMENT id is retired by the worktree_id re-key"
+    );
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, orig_head, completed, first_parent FROM bisect_state".to_string(),
+        ))
+        .await
+        .expect("query migrated rows");
+    assert_eq!(rows.len(), 1, "newest id wins per scope");
+    let worktree_id: String = rows[0].try_get_by_index(0).expect("worktree_id");
+    let orig_head: String = rows[0].try_get_by_index(1).expect("orig_head");
+    let completed: i64 = rows[0].try_get_by_index(2).expect("completed");
+    let first_parent: i64 = rows[0].try_get_by_index(3).expect("first_parent");
+    assert_eq!(
+        worktree_id, "",
+        "pre-existing rows belong to the main scope"
+    );
+    assert_eq!(orig_head, "ee55", "newest lazy row survives");
+    assert_eq!(completed, 0, "lazy-column default filled in");
+    assert_eq!(first_parent, 0, "lazy-column default filled in");
+}
+
+/// A v0.19.34-era lazy shape (worktree_id already ADD COLUMNed, AUTOINCREMENT
+/// id, stale + newest rows in SEVERAL scopes) is re-keyed to exactly one row
+/// per scope — the newest id in each scope wins, linked rows included.
+#[tokio::test]
+async fn bisect_state_migration_keeps_newest_row_per_scope() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    conn.execute_raw(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `bisect_state` (
+            `id`             INTEGER PRIMARY KEY AUTOINCREMENT,
+            `orig_head`      TEXT NOT NULL,
+            `orig_head_name` TEXT,
+            `bad`            TEXT,
+            `good`           TEXT NOT NULL,
+            `current`        TEXT,
+            `skipped`        TEXT,
+            `steps`          INTEGER,
+            `completed`      INTEGER NOT NULL DEFAULT 0,
+            `first_parent`   INTEGER NOT NULL DEFAULT 0,
+            `worktree_id`    TEXT NOT NULL DEFAULT ''
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("v0.19.34-era lazy full shape");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO bisect_state \
+         (orig_head, good, completed, first_parent, worktree_id) \
+         VALUES ('main-old', '[]', 1, 0, ''), \
+                ('main-new', '[]', 0, 0, ''), \
+                ('wt1-old', '[]', 0, 1, 'wt1'), \
+                ('wt1-new', '[]', 0, 1, 'wt1'), \
+                ('wt2-only', '[]', 0, 0, 'wt2');"
+            .to_string(),
+    ))
+    .await
+    .expect("stale + newest rows across three scopes");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, orig_head FROM bisect_state ORDER BY worktree_id".to_string(),
+        ))
+        .await
+        .expect("query migrated rows");
+    let survivors: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get_by_index(0).expect("worktree_id"),
+                row.try_get_by_index(1).expect("orig_head"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        survivors,
+        vec![
+            ("".to_string(), "main-new".to_string()),
+            ("wt1".to_string(), "wt1-new".to_string()),
+            ("wt2".to_string(), "wt2-only".to_string()),
+        ],
+        "newest id per scope wins; no scope is dropped"
+    );
+}
+
+/// Two runners racing `run_pending` on the same fresh database: the version
+/// claim happens before the up DDL inside each migration's transaction, so
+/// every migration is applied exactly once (RENAME-based rebuilds like
+/// 2026072101/2026072301 are not idempotent and must never run twice) and
+/// both callers finish without error.
+///
+/// The race is FORCED deterministically: both racers rendezvous in the
+/// runner's post-read gate (`run_pending_with_post_read_gate`), i.e. AFTER
+/// each has read the same empty current-version and computed the full
+/// pending list, but BEFORE either has claimed anything. Every subsequent
+/// version claim is therefore contended by construction — under the old
+/// DDL-before-claim order the claim loser re-ran the RENAME rebuilds
+/// against already-rebuilt tables and errored deterministically. The
+/// path intentionally skips the normalize hooks (raw `builtin_runner` on a
+/// fresh database — the rebuild migrations self-provision their input
+/// shape), so nothing outside the gate can serialize the racers.
+/// Three rounds vary the interleaving of the claims themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_run_pending_applies_each_migration_exactly_once() {
+    for round in 0..3 {
+        let (_dir, url, _path) = fresh_db_url();
+        let conn_a = connect(&url).await;
+        let conn_b = connect(&url).await;
+        let runner_a = builtin_runner().expect("builtin runner A");
+        let runner_b = builtin_runner().expect("builtin runner B");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let barrier_a = barrier.clone();
+        let barrier_b = barrier;
+        let race_a = runner_a.run_pending_with_post_read_gate(&conn_a, || async move {
+            barrier_a.wait().await;
+        });
+        let race_b = runner_b.run_pending_with_post_read_gate(&conn_b, || async move {
+            barrier_b.wait().await;
+        });
+        let (applied_a, applied_b) = tokio::join!(race_a, race_b);
+        let applied_a = applied_a.expect("racer A succeeds");
+        let applied_b = applied_b.expect("racer B succeeds");
+
+        // Each version is owned by exactly one racer.
+        let mut all: Vec<i64> = applied_a.iter().chain(applied_b.iter()).copied().collect();
+        all.sort_unstable();
+        let mut deduped = all.clone();
+        deduped.dedup();
+        assert_eq!(all, deduped, "round {round}: no version applied twice");
+
+        // The union covers every registered migration, and the rebuilt
+        // table is in the re-keyed shape exactly once.
+        let runner = builtin_runner().expect("builtin runner");
+        assert_eq!(
+            all.len(),
+            runner.len(),
+            "round {round}: union covers the full registry"
+        );
+        assert!(column_exists(&conn_a, "bisect_state", "worktree_id").await);
+        assert!(!column_exists(&conn_a, "bisect_state", "id").await);
+        assert!(column_exists(&conn_a, "rebase_state", "worktree_id").await);
+    }
+}
+
+/// The 2026072301 down migration FAILS CLOSED while a linked worktree's
+/// bisect row exists; after the linked session is reset, the rollback
+/// succeeds and restores the lazy shape with the main row intact.
+#[tokio::test]
+async fn bisect_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO bisect_state \
+         (worktree_id, orig_head, good, completed, first_parent) \
+         VALUES ('', 'aa11', '[\"bb22\"]', 0, 0), \
+                ('wt1234', 'cc33', '[\"dd44\"]', 0, 1);"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked bisect rows");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026072201)
+        .await
+        .expect_err("rollback with a linked bisect row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    // The re-keyed table survives the refused rollback (txn rolled back).
+    assert!(!column_exists(&conn, "bisect_state", "id").await);
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM bisect_state WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("reset the linked bisect");
+    let rolled = runner
+        .rollback_to(&conn, 2026072201)
+        .await
+        .expect("rollback succeeds once only the main row remains");
+    assert_eq!(
+        rolled,
+        vec![
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301
+        ]
+    );
+    assert!(column_exists(&conn, "bisect_state", "id").await);
+    assert!(column_exists(&conn, "bisect_state", "worktree_id").await);
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT orig_head, worktree_id FROM bisect_state".to_string(),
+        ))
+        .await
+        .expect("query restored row")
+        .expect("main row survives the rollback");
+    let orig_head: String = row.try_get_by_index(0).expect("orig_head");
+    let worktree_id: String = row.try_get_by_index(1).expect("worktree_id");
+    assert_eq!(orig_head, "aa11");
+    assert_eq!(worktree_id, "");
+}
+
+/// 2026072302 clears legacy dirty-cache rows (rebuildable advisory state —
+/// §C.4.1.1 "clear and rescan, never guess the owner") and re-keys the meta
+/// singleton to worktree_id.
+#[tokio::test]
+async fn dirty_migration_clears_advisory_rows_and_rekeys_meta() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    conn.execute_raw(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `working_dirty` (
+            `id`          INTEGER PRIMARY KEY AUTOINCREMENT,
+            `path`        TEXT NOT NULL,
+            `kind`        TEXT NOT NULL DEFAULT 'unknown',
+            `source`      TEXT NOT NULL,
+            `marked_at`   TEXT NOT NULL,
+            `verified_at` TEXT,
+            UNIQUE(`path`, `kind`)
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("legacy rows table");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO working_dirty (path, kind, source, marked_at) \
+         VALUES ('f.txt', 'modified', 'scan', '2026-07-01T00:00:00Z');"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy row");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(column_exists(&conn, "working_dirty", "worktree_id").await);
+    assert!(column_exists(&conn, "working_dirty_meta", "worktree_id").await);
+    assert!(!column_exists(&conn, "working_dirty_meta", "id").await);
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT path FROM working_dirty".to_string(),
+        ))
+        .await
+        .expect("query");
+    assert!(rows.is_empty(), "advisory rows are cleared, not adopted");
+}
+
+/// §C.12 named regression. The sibling test above proves the CLEARING rule
+/// on a plain legacy database; this one adds the dimension the plan actually
+/// names: a repository that HAD a linked worktree. §C.4.1.1's migration rule
+/// for rebuildable advisory state is "mark the whole group stale and clear —
+/// never guess the owner", so the legacy rows must NOT be attributed to main
+/// (the tempting default) just because main is the only scope that can be
+/// named. The clearing must also be TARGETED: another worktree-scoped table's
+/// linked row is untouched.
+#[tokio::test]
+async fn legacy_dirty_cache_with_linked_is_invalidated_not_adopted() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    // Rewind to just BEFORE the dirty-cache scope migration, so
+    // `working_dirty` is back in its legacy repository-global shape while
+    // `sequence_state` (an earlier migration) is already scoped.
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .rollback_to(&conn, 2026072301)
+        .await
+        .expect("rollback to the pre-dirty-scope schema");
+    assert!(!column_exists(&conn, "working_dirty", "worktree_id").await);
+
+    // Legacy advisory rows + a meta row claiming the cache is authoritative.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO working_dirty (path, kind, source, marked_at) \
+         VALUES ('legacy.txt', 'modified', 'scan', '2026-07-01T00:00:00Z');"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy dirty row");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO working_dirty_meta (id, state) VALUES (1, 'fresh');".to_string(),
+    ))
+    .await
+    .expect("legacy meta row");
+    // LINKED EVIDENCE: a linked-scope row in another advisory table proves
+    // this repository had a linked worktree when the legacy cache was
+    // written — so main is NOT the only possible owner.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sequence_state \
+         (worktree_id, kind, head_name, head_orig, current_oid, todo) \
+         VALUES ('wt-linked', 'cherry-pick', 'main', 'aa11', 'bb22', '[]');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked evidence row");
+
+    run_builtin_migrations(&conn)
+        .await
+        .expect("re-apply forward");
+
+    // The whole advisory group is gone — attributed to NO scope, not main.
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, path FROM working_dirty".to_string(),
+        ))
+        .await
+        .expect("query rows");
+    assert!(
+        rows.is_empty(),
+        "legacy rows must be invalidated, never adopted into main scope"
+    );
+    let meta = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, state FROM working_dirty_meta".to_string(),
+        ))
+        .await
+        .expect("query meta");
+    assert!(
+        meta.is_empty(),
+        "the 'fresh' claim must not survive either — every worktree rescans"
+    );
+
+    // ...and the clearing was TARGETED: the linked row in the sibling
+    // advisory table is untouched.
+    let survivors = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id FROM sequence_state WHERE worktree_id = 'wt-linked'".to_string(),
+        ))
+        .await
+        .expect("query sequence_state");
+    assert_eq!(
+        survivors.len(),
+        1,
+        "clearing the dirty cache must not touch another scoped table's rows"
+    );
+}
+
+/// The 2026072302 down migration FAILS CLOSED while linked-scope dirty rows
+/// or meta exist; after clearing them the rollback restores the legacy
+/// single-row shapes with the main rows intact.
+#[tokio::test]
+async fn dirty_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO working_dirty (worktree_id, path, kind, source, marked_at) \
+         VALUES ('', 'main.txt', 'modified', 'scan', '2026-07-01T00:00:00Z'), \
+                ('wt1', 'linked.txt', 'modified', 'scan', '2026-07-01T00:00:00Z');"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked rows");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO working_dirty_meta (worktree_id, state) VALUES ('', 'fresh');".to_string(),
+    ))
+    .await
+    .expect("main meta");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026072301)
+        .await
+        .expect_err("rollback with a linked dirty row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    assert!(column_exists(&conn, "working_dirty", "worktree_id").await);
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM working_dirty WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked rows");
+
+    // Second guard branch: a linked META row alone must also fail closed.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO working_dirty_meta (worktree_id, state) VALUES ('wt1', 'fresh');".to_string(),
+    ))
+    .await
+    .expect("linked meta");
+    let err = runner
+        .rollback_to(&conn, 2026072301)
+        .await
+        .expect_err("rollback with a linked META row must fail closed");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "meta guard CHECK fires"
+    );
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM working_dirty_meta WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked meta");
+    let rolled = runner
+        .rollback_to(&conn, 2026072301)
+        .await
+        .expect("rollback succeeds once only main rows remain");
+    assert_eq!(rolled, vec![2026072302]);
+    assert!(!column_exists(&conn, "working_dirty", "worktree_id").await);
+    assert!(column_exists(&conn, "working_dirty_meta", "id").await);
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT path FROM working_dirty".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("main row survives");
+    let path: String = row.try_get_by_index(0).expect("path");
+    assert_eq!(path, "main.txt");
+}
+
+/// 2026072303 re-keys `layer`/`layer_path` per worktree. Layer ownership is
+/// NOT rebuildable (§C.4.1.1), so legacy global rows are ADOPTED to the main
+/// scope ('') — permitted because the guard proved no linked worktree exists.
+#[tokio::test]
+async fn layer_migration_adopts_main_rows_without_linked_evidence() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    // Pre-create the legacy shapes with rows: 2026070501's CREATE IF NOT
+    // EXISTS skips them, and 2026072303 must rebuild + adopt.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `layer` (
+            `id`         INTEGER PRIMARY KEY AUTOINCREMENT,
+            `name`       TEXT NOT NULL UNIQUE,
+            `source`     TEXT NOT NULL,
+            `priority`   INTEGER NOT NULL DEFAULT 0,
+            `enabled`    INTEGER NOT NULL DEFAULT 1,
+            `created_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("legacy layer table");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `layer_path` (
+            `id`              INTEGER PRIMARY KEY AUTOINCREMENT,
+            `layer_name`      TEXT NOT NULL,
+            `path`            TEXT NOT NULL UNIQUE,
+            `content_hash`    TEXT NOT NULL,
+            `materialized_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("legacy layer_path table");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO layer (name, source, priority, enabled) VALUES ('ov', '/src/ov', 3, 1);"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy layer row");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO layer_path (layer_name, path, content_hash) \
+         VALUES ('ov', 'dir/f.txt', 'hash1');"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy path row");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(column_exists(&conn, "layer", "worktree_id").await);
+    assert!(column_exists(&conn, "layer_path", "worktree_id").await);
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, name, source, priority FROM layer".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("adopted layer row");
+    let scope: String = row.try_get_by_index(0).expect("worktree_id");
+    let name: String = row.try_get_by_index(1).expect("name");
+    let source: String = row.try_get_by_index(2).expect("source");
+    let priority: i64 = row.try_get_by_index(3).expect("priority");
+    assert_eq!((scope.as_str(), name.as_str()), ("", "ov"));
+    assert_eq!((source.as_str(), priority), ("/src/ov", 3));
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, path, content_hash FROM layer_path".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("adopted path row");
+    let scope: String = row.try_get_by_index(0).expect("worktree_id");
+    let path: String = row.try_get_by_index(1).expect("path");
+    assert_eq!((scope.as_str(), path.as_str()), ("", "dir/f.txt"));
+}
+
+/// 2026072303 FAILS CLOSED when legacy global layer rows coexist with linked
+/// worktree evidence (a linked HEAD row): ownership must not be guessed —
+/// the user unapplies/removes from the owning worktree first (§C.4.1.1).
+#[tokio::test]
+async fn legacy_layer_rows_with_linked_fail_migration() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+    // Re-open the legacy window: roll back ONLY 2026072303 (its empty tables
+    // pass the down guard), then plant legacy rows + linked HEAD evidence.
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072302)
+            .await
+            .expect("rollback layer scope"),
+        vec![
+            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
+            2026072304, 2026072303
+        ]
+    );
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO layer (name, source) VALUES ('ov', '/src/ov');".to_string(),
+    ))
+    .await
+    .expect("legacy layer row");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO reference (name, kind, `commit`, worktree_id) \
+         VALUES (NULL, 'Head', 'aa11', 'wt1');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked HEAD evidence");
+
+    let err = runner
+        .run_pending(&conn)
+        .await
+        .expect_err("legacy rows + linked evidence must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the adopt guard CHECK: {rendered}"
+    );
+    // Nothing was claimed or rebuilt: the legacy shape and row survive.
+    assert!(!column_exists(&conn, "layer", "worktree_id").await);
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT name FROM layer".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("legacy row untouched");
+    let name: String = row.try_get_by_index(0).expect("name");
+    assert_eq!(name, "ov");
+
+    // After the user clears the ambiguity (here: the linked evidence goes
+    // away), the migration applies and adopts to main.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM reference WHERE worktree_id = 'wt1';".to_string(),
+    ))
+    .await
+    .expect("clear linked evidence");
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("retry succeeds"),
+        vec![
+            2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502,
+            2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005,
+            2026073101, 2026080401
+        ]
+    );
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id FROM layer WHERE name = 'ov'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("adopted row");
+    let scope: String = row.try_get_by_index(0).expect("worktree_id");
+    assert_eq!(scope, "");
+}
+
+/// The 2026072303 down migration FAILS CLOSED while linked-scope layer rows
+/// exist (dropping them would make overlay files committable); after the
+/// linked scopes are explicitly cleared it restores the legacy shapes with
+/// the main rows intact.
+#[tokio::test]
+async fn layer_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO layer (worktree_id, name, source) \
+         VALUES ('', 'ov', '/src/main'), ('wt1', 'ov', '/src/linked');"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked rows");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
+         VALUES ('', 'ov', 'main.txt', 'h1');"
+            .to_string(),
+    ))
+    .await
+    .expect("main path row");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026072302)
+        .await
+        .expect_err("rollback with a linked layer row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    assert!(column_exists(&conn, "layer", "worktree_id").await);
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM layer WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked layer row");
+
+    // Second guard branch: a linked PATH row alone must also fail closed.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
+         VALUES ('wt1', 'ov', 'linked.txt', 'h2');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked path row");
+    let err = runner
+        .rollback_to(&conn, 2026072302)
+        .await
+        .expect_err("rollback with a linked layer_path row must fail closed");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "path guard CHECK fires"
+    );
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM layer_path WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked path row");
+
+    let rolled = runner
+        .rollback_to(&conn, 2026072302)
+        .await
+        .expect("rollback succeeds once only main rows remain");
+    assert_eq!(rolled, vec![2026072303]);
+    assert!(!column_exists(&conn, "layer", "worktree_id").await);
+    assert!(!column_exists(&conn, "layer_path", "worktree_id").await);
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT name, source FROM layer".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("main row survives");
+    let name: String = row.try_get_by_index(0).expect("name");
+    let source: String = row.try_get_by_index(1).expect("source");
+    assert_eq!((name.as_str(), source.as_str()), ("ov", "/src/main"));
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 async fn table_exists(conn: &DatabaseConnection, name: &str) -> bool {
     let backend = conn.get_database_backend();
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         backend,
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
@@ -2205,7 +3158,7 @@ async fn table_exists(conn: &DatabaseConnection, name: &str) -> bool {
 
 async fn index_exists(conn: &DatabaseConnection, name: &str) -> bool {
     let backend = conn.get_database_backend();
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         backend,
         "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1",
         [name.into()],
@@ -2216,7 +3169,7 @@ async fn index_exists(conn: &DatabaseConnection, name: &str) -> bool {
 }
 
 async fn trigger_exists(conn: &DatabaseConnection, name: &str) -> bool {
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT 1 AS one FROM sqlite_master WHERE type = 'trigger' AND name = ?",
         [name.into()],
@@ -2230,7 +3183,7 @@ async fn column_exists(conn: &DatabaseConnection, table: &str, column: &str) -> 
     let backend = conn.get_database_backend();
     let escaped_table = table.replace('`', "``");
     let rows = conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             format!("PRAGMA table_info(`{escaped_table}`)"),
         ))
@@ -2240,4 +3193,1580 @@ async fn column_exists(conn: &DatabaseConnection, table: &str, column: &str) -> 
         let name: String = row.try_get_by_index(1).expect("column name");
         name == column
     })
+}
+
+/// 2026072304 re-keys `sparse_view` per worktree and projects the legacy
+/// `sparse.enabled` `config_kv` key into `sparse_view_meta` — legacy
+/// patterns/toggle adopt to the main scope ('') when no linked worktree
+/// exists, and the retired config key is removed.
+#[tokio::test]
+async fn sparse_migration_adopts_main_state_without_linked_evidence() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    // Pre-create the legacy shape with rows + the legacy config toggle:
+    // 2026070701's CREATE IF NOT EXISTS skips the table, and 2026072304
+    // must rebuild + adopt + project.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `sparse_view` (
+            `id`      INTEGER PRIMARY KEY AUTOINCREMENT,
+            `pattern` TEXT NOT NULL,
+            `ordinal` INTEGER NOT NULL
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("legacy sparse table");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sparse_view (pattern, ordinal) VALUES ('src/**', 0), ('!src/gen/**', 1);"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy patterns");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        r#"CREATE TABLE `config_kv` (
+            `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+            `key` TEXT NOT NULL,
+            `value` TEXT NOT NULL,
+            `encrypted` INTEGER NOT NULL DEFAULT 0
+        );"#
+        .to_string(),
+    ))
+    .await
+    .expect("config_kv table");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', 'true');".to_string(),
+    ))
+    .await
+    .expect("legacy toggle");
+
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
+    assert!(table_exists(&conn, "sparse_view_meta").await);
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, pattern FROM sparse_view ORDER BY ordinal".to_string(),
+        ))
+        .await
+        .expect("query");
+    let adopted: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get_by_index(0).expect("scope"),
+                row.try_get_by_index(1).expect("pattern"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        adopted,
+        vec![
+            ("".to_string(), "src/**".to_string()),
+            ("".to_string(), "!src/gen/**".to_string())
+        ]
+    );
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ''".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("projected toggle");
+    let enabled: i32 = row.try_get_by_index(0).expect("enabled");
+    assert_eq!(enabled, 1, "truthy legacy toggle projected as enabled");
+    let leftover = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM config_kv WHERE key = 'sparse.enabled'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let count: i64 = leftover.try_get_by_index(0).expect("count");
+    assert_eq!(count, 0, "the legacy config key is retired");
+}
+
+/// 2026072304 follows `ConfigKv::get` last-wins semantics for the legacy
+/// toggle: with duplicate `sparse.enabled` rows, only the HIGHEST-id value
+/// counts — a stale earlier `true` under a later `false` projects as
+/// DISABLED and does not count as legacy-enabled state for the guard, so
+/// the migration proceeds even alongside linked worktree evidence.
+#[tokio::test]
+async fn sparse_migration_projects_last_wins_toggle() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072303)
+            .await
+            .expect("rollback sparse scope"),
+        vec![
+            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
+            2026072304
+        ]
+    );
+    // Duplicate legacy rows: stale `true` (lower id) then effective `false`
+    // (higher id) — `ConfigKv::get` reads the LAST one. Plus linked HEAD
+    // evidence: since the effective toggle is falsy and there are no
+    // patterns, there is NO legacy-enabled state and the guard must pass.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', 'true');".to_string(),
+    ))
+    .await
+    .expect("stale truthy row");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', 'false');".to_string(),
+    ))
+    .await
+    .expect("effective falsy row");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO reference (name, kind, `commit`, worktree_id) \
+         VALUES (NULL, 'Head', 'aa11', 'wt1');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked HEAD evidence");
+
+    assert_eq!(
+        runner
+            .run_pending(&conn)
+            .await
+            .expect("falsy effective toggle does not trip the guard"),
+        vec![
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
+            2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
+            2026080401
+        ]
+    );
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ''".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("projected toggle");
+    let enabled: i32 = row.try_get_by_index(0).expect("enabled");
+    assert_eq!(enabled, 0, "last-wins falsy value projects as disabled");
+}
+
+/// 2026072304 FAILS CLOSED when legacy sparse state (patterns OR a truthy
+/// toggle) coexists with linked worktree evidence — ownership must not be
+/// guessed, and patterns are never copied to every worktree (§C.4.1.1).
+#[tokio::test]
+async fn legacy_sparse_state_with_linked_requires_adopt_or_clear() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+    // Re-open the legacy window: roll back ONLY 2026072304 (its empty
+    // tables pass the down guard), then plant a truthy legacy toggle plus
+    // linked HEAD evidence — the toggle ALONE (no patterns) must trip the
+    // guard too.
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072303)
+            .await
+            .expect("rollback sparse scope"),
+        vec![
+            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
+            2026072304
+        ]
+    );
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', 'true');".to_string(),
+    ))
+    .await
+    .expect("legacy toggle");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO reference (name, kind, `commit`, worktree_id) \
+         VALUES (NULL, 'Head', 'aa11', 'wt1');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked HEAD evidence");
+
+    let err = runner
+        .run_pending(&conn)
+        .await
+        .expect_err("legacy toggle + linked evidence must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the adopt guard CHECK: {rendered}"
+    );
+    assert!(!column_exists(&conn, "sparse_view", "worktree_id").await);
+
+    // Clearing the ambiguity (dropping the legacy toggle) lets the retry
+    // apply; no meta row is projected for a state-less repo... except the
+    // config row existed, so the main row records disabled-after-clear.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM config_kv WHERE key = 'sparse.enabled';".to_string(),
+    ))
+    .await
+    .expect("clear legacy toggle");
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("retry succeeds"),
+        vec![
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
+            2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
+            2026080401
+        ]
+    );
+    assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
+}
+
+/// The 2026072304 down migration FAILS CLOSED while linked-scope rows exist
+/// (patterns or a meta row); after clearing them it restores the legacy
+/// shape and re-projects the main toggle back into `config_kv`.
+#[tokio::test]
+async fn sparse_down_migration_rejects_linked_rows() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sparse_view (worktree_id, pattern, ordinal) \
+         VALUES ('', 'main/**', 0), ('wt1', 'linked/**', 0);"
+            .to_string(),
+    ))
+    .await
+    .expect("main + linked patterns");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES ('', 1);".to_string(),
+    ))
+    .await
+    .expect("main toggle");
+
+    let runner = builtin_runner().expect("builtin runner");
+    let err = runner
+        .rollback_to(&conn, 2026072303)
+        .await
+        .expect_err("rollback with a linked pattern row must fail closed");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "failure comes from the down-guard CHECK: {rendered}"
+    );
+    assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM sparse_view WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked pattern");
+
+    // Second guard branch: a linked META row alone must also fail closed.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES ('wt1', 0);".to_string(),
+    ))
+    .await
+    .expect("linked meta row");
+    let err = runner
+        .rollback_to(&conn, 2026072303)
+        .await
+        .expect_err("rollback with a linked meta row must fail closed");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "meta guard CHECK fires"
+    );
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM sparse_view_meta WHERE worktree_id <> '';".to_string(),
+    ))
+    .await
+    .expect("clear linked meta");
+
+    let rolled = runner
+        .rollback_to(&conn, 2026072303)
+        .await
+        .expect("rollback succeeds once only main rows remain");
+    assert_eq!(rolled, vec![2026072304]);
+    assert!(!column_exists(&conn, "sparse_view", "worktree_id").await);
+    assert!(!table_exists(&conn, "sparse_view_meta").await);
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'sparse.enabled'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("re-projected toggle");
+    let value: String = row.try_get_by_index(0).expect("value");
+    assert_eq!(value, "true", "main toggle re-projected into config_kv");
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT pattern FROM sparse_view".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("main pattern survives");
+    let pattern: String = row.try_get_by_index(0).expect("pattern");
+    assert_eq!(pattern, "main/**");
+}
+
+/// W2 §C.4.3 inventory guard: every OID-shaped column in the LIVE schema
+/// must be accounted for in `GC_OBJECT_SOURCE_INVENTORY` — either as a
+/// traced reachability root or as a documented non-root. A new store that
+/// adds an OID column without updating the inventory (and, when a root, the
+/// collector) fails here instead of silently shipping un-traced.
+#[tokio::test]
+async fn gc_object_source_inventory_covers_every_oid_column() {
+    use libra::command::maintenance::GC_OBJECT_SOURCE_INVENTORY;
+
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    let oid_keywords = ["oid", "commit", "blob", "tree", "sha", "hash"];
+    // Table-level exemptions: stores whose OID-shaped columns are not
+    // object-store OIDs at all (AI capture bookkeeping uses provider ids and
+    // sync hashes; `agent_checkpoint` itself IS inventoried).
+    let exempt_tables: [&str; 0] = [];
+
+    let tables = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND name NOT LIKE 'sqlite_%'"
+                .to_string(),
+        ))
+        .await
+        .expect("list tables");
+    let mut uncovered: Vec<String> = Vec::new();
+    for table_row in tables {
+        let table: String = table_row.try_get_by_index(0).expect("table name");
+        if exempt_tables.contains(&table.as_str()) {
+            continue;
+        }
+        let columns = conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                format!("PRAGMA table_info({table})"),
+            ))
+            .await
+            .expect("table info");
+        for column_row in columns {
+            let column: String = column_row.try_get_by_index(1).expect("column name");
+            let is_oid_shaped = column
+                .split('_')
+                .any(|segment| oid_keywords.contains(&segment));
+            if !is_oid_shaped {
+                continue;
+            }
+            let inventoried = GC_OBJECT_SOURCE_INVENTORY
+                .iter()
+                .any(|source| source.location == table && source.column == column);
+            if !inventoried {
+                uncovered.push(format!("{table}.{column}"));
+            }
+        }
+    }
+    // Semantic OID columns the name heuristic cannot flag — pinned by hand;
+    // each must be inventoried too.
+    for (table, column) in [
+        ("operation_view", "head_target"),
+        ("operation_view_workspace", "pointer_value"),
+        ("object_index", "o_id"),
+        ("metadata_kv", "value"),
+    ] {
+        let inventoried = GC_OBJECT_SOURCE_INVENTORY
+            .iter()
+            .any(|source| source.location == table && source.column == column);
+        if !inventoried {
+            uncovered.push(format!("{table}.{column} (semantic)"));
+        }
+    }
+    assert!(
+        uncovered.is_empty(),
+        "OID-shaped columns missing from GC_OBJECT_SOURCE_INVENTORY (add each as a traced \
+         root in collect_reachable_objects or a documented non-root): {uncovered:?}"
+    );
+}
+
+/// 2026072401 (plan-20260714 §C.7, registry v2): the capability marker makes
+/// OLD binaries refuse the repository at connect time (future-schema
+/// fail-closed) before they can parse or recreate `worktrees.json`. Its down
+/// drops only the marker — the v2 JSON layout itself still fails a v1 parser
+/// closed — and re-applying is idempotent.
+///
+/// §C.12 roster: together with
+/// `worktree_commands_apply_capability_marker_before_registry_io` (the
+/// marker precedes registry IO on every worktree command path) this
+/// discharges `registry_v2_old_binary_refuses_before_rewrite`: the refusal
+/// happens at schema-preflight time, BEFORE an old binary could parse or
+/// rewrite the registry, and the renamed v2 top-level key is the second
+/// belt for any reader that never connects.
+#[tokio::test]
+async fn worktree_registry_v2_capability_marker_round_trip() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(table_exists(&conn, "worktree_registry_capability").await);
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT version FROM worktree_registry_capability".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("capability row");
+    let version: i32 = row.try_get_by_index(0).expect("version");
+    assert_eq!(version, 2, "marker records registry schema v2");
+
+    // Down drops only the marker.
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072304)
+            .await
+            .expect("rollback capability marker"),
+        vec![
+            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
+        ]
+    );
+    assert!(!table_exists(&conn, "worktree_registry_capability").await);
+
+    // Re-apply, then a second full pass is a no-op (idempotent DDL).
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("re-apply"),
+        vec![
+            2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902,
+            2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401
+        ]
+    );
+    assert!(table_exists(&conn, "worktree_registry_capability").await);
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("idempotent"),
+        Vec::<i64>::new()
+    );
+}
+
+/// 2026072402 (§C.7 W3-s1b): the down migration REFUSES while any lifecycle
+/// (detached_from_registry / tombstone) or in-flight journal row exists —
+/// v2 lifecycle must never be folded into a v1 active entry or dropped.
+/// After the pending state is resolved, the rollback proceeds and re-apply
+/// is idempotent.
+#[tokio::test]
+async fn registry_v2_down_migration_rejects_nonterminal_state() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, updated_at) \
+         VALUES ('wt1', 'detached_from_registry', '/wt1', 0, 0);"
+            .to_string(),
+    ))
+    .await
+    .expect("lifecycle row");
+    let err = runner
+        .rollback_to(&conn, 2026072401)
+        .await
+        .expect_err("down must refuse while a detached row exists");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "refusal comes from the down-guard CHECK: {rendered}"
+    );
+    assert!(table_exists(&conn, "worktree_lifecycle").await);
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM worktree_lifecycle;".to_string(),
+    ))
+    .await
+    .expect("clear lifecycle");
+
+    // A pending journal row alone must refuse too.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+         VALUES ('remove', 'wt1', '{}', 0);"
+            .to_string(),
+    ))
+    .await
+    .expect("journal row");
+    let err = runner
+        .rollback_to(&conn, 2026072401)
+        .await
+        .expect_err("down must refuse while a journal row exists");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "journal guard CHECK fires"
+    );
+
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM worktree_intent_journal;".to_string(),
+    ))
+    .await
+    .expect("clear journal");
+
+    // Linked-scope sequencer state alone must refuse too (§C.7 line 1261);
+    // main-scope rows (empty worktree_id) do not block.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO rebase_state (worktree_id, head_name, onto, orig_head, current_head, \
+         todo, done) VALUES ('wt1', 'refs/heads/f', 'aa', 'bb', 'cc', '', '');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked rebase row");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sequence_state (worktree_id, kind, head_name, head_orig, current_oid, \
+         todo) VALUES ('', 'CherryPick', 'refs/heads/m', 'dd', 'ee', '');"
+            .to_string(),
+    ))
+    .await
+    .expect("main sequencer row (must not block)");
+    let err = runner
+        .rollback_to(&conn, 2026072401)
+        .await
+        .expect_err("down must refuse while linked sequencer state exists");
+    assert!(
+        format!("{err:?}").contains("CHECK")
+            || format!("{err:?}").to_lowercase().contains("constraint"),
+        "sequencer guard CHECK fires"
+    );
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM rebase_state WHERE worktree_id = 'wt1';".to_string(),
+    ))
+    .await
+    .expect("clear linked rebase row");
+
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072401)
+            .await
+            .expect("rollback proceeds once terminal"),
+        vec![2026072402]
+    );
+    assert!(!table_exists(&conn, "worktree_lifecycle").await);
+    assert!(!table_exists(&conn, "worktree_intent_journal").await);
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("re-apply"),
+        vec![
+            2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
+            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401
+        ]
+    );
+}
+
+/// §C.8 W4-s1: the workspace-lease rollback guard. `2026072501`'s down must
+/// refuse while ANY non-terminal workspace record exists — a live lease
+/// (provisioning/active/releasing) or an orphan still awaiting the
+/// scavenger/doctor. Dropping the table under either would strand the lease
+/// and destroy the only record of what has to be cleaned up.
+///
+/// The same guard is what protects every DEEPER rollback: a rollback that
+/// wants to reach the W3 lifecycle tables must pass through this migration
+/// first, so a live lease blocks it without `2026072402`'s own down having to
+/// know that `workspace_record` exists.
+#[tokio::test]
+async fn workspace_record_down_migration_rejects_nonterminal_state() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    let insert = |state: &str| {
+        Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO workspace_record (workspace_id, repo_id, kind, worktree_id, path, \
+             owner_kind, state, lease_owner, lease_fence, lease_expires_at, created_at, \
+             updated_at) VALUES ('ws1', 'repo1', 'linked', 'wt1', '/wt1', 'agent', ?, \
+             'agent-a', 1, 100, 0, 0)",
+            [state.into()],
+        )
+    };
+    let set_state = |state: &str| {
+        Statement::from_sql_and_values(
+            backend,
+            "UPDATE workspace_record SET state = ? WHERE workspace_id = 'ws1'",
+            [state.into()],
+        )
+    };
+
+    conn.execute_raw(insert("active"))
+        .await
+        .expect("live workspace");
+    for state in ["active", "provisioning", "releasing", "orphaned"] {
+        conn.execute_raw(set_state(state)).await.expect("set state");
+        let err = runner
+            .rollback_to(&conn, 2026072403)
+            .await
+            .expect_err("down must refuse while a non-terminal workspace exists");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+            "the {state} refusal must come from the down-guard CHECK: {rendered}"
+        );
+        assert!(
+            table_exists(&conn, "workspace_record").await,
+            "a refused rollback must leave the {state} record in place"
+        );
+    }
+
+    // A settled record no longer blocks the rollback.
+    conn.execute_raw(set_state("released"))
+        .await
+        .expect("settle");
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072403)
+            .await
+            .expect("rollback proceeds once every record is terminal"),
+        // 2026072901 (head_scope_unique) has no guard of its own, so each
+        // REFUSED attempt above already rolled it back before 2026072501's
+        // guard fired; only 2026072501 is left to undo here.
+        vec![2026072501]
+    );
+    assert!(!table_exists(&conn, "workspace_record").await);
+    assert!(!index_exists(&conn, "idx_workspace_linked_live").await);
+    assert!(!index_exists(&conn, "idx_workspace_active_path").await);
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("re-apply"),
+        vec![
+            2026072501, 2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003,
+            2026073004, 2026073005, 2026073101, 2026080401
+        ]
+    );
+
+    // Transitivity: a live lease blocks a DEEPER rollback too, and nothing
+    // below this migration is touched when it refuses.
+    conn.execute_raw(insert("active"))
+        .await
+        .expect("live workspace");
+    runner
+        .rollback_to(&conn, 2026072401)
+        .await
+        .expect_err("a live lease blocks the deeper W3 rollback as well");
+    assert!(table_exists(&conn, "workspace_record").await);
+    assert!(table_exists(&conn, "worktree_intent_journal").await);
+    assert!(table_exists(&conn, "worktree_lifecycle").await);
+}
+
+/// plan-20260714 W0 (§C.11 "HEAD schema hardening", ADR-0714-08): the
+/// single-HEAD-per-scope invariant is enforced by the DATABASE, and a
+/// repository that already violates it fails the migration CLOSED.
+///
+/// 2026070801 left the invariant to `Head`'s find-then-update, which two
+/// concurrent detached-HEAD updates in one scope can both miss. The reader
+/// then resolved the duplicate with `.one()` — an arbitrary row — so the
+/// worktree silently operated on whichever HEAD SQLite returned. Guessing
+/// which of two HEADs a worktree is on destroys the evidence needed to tell,
+/// so the migration refuses and leaves the rows for the operator.
+#[tokio::test]
+async fn head_scope_unique_migration_fails_closed_on_preexisting_duplicates() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("apply current migration registry");
+
+    // Both indexes exist on a clean database.
+    assert!(index_exists(&conn, "idx_reference_head_scope_unique").await);
+    assert!(index_exists(&conn, "idx_reference_head_main_unique").await);
+
+    // With them in place a duplicate is REJECTED rather than accepted.
+    let insert_head = |name: &str, worktree: Option<&str>| {
+        let (sql, values): (String, Vec<sea_orm::Value>) = match worktree {
+            Some(id) => (
+                "INSERT INTO `reference` (`name`, `kind`, `commit`, `worktree_id`) \
+                 VALUES (?, 'Head', NULL, ?)"
+                    .to_string(),
+                vec![name.into(), id.into()],
+            ),
+            None => (
+                "INSERT INTO `reference` (`name`, `kind`, `commit`, `worktree_id`) \
+                 VALUES (?, 'Head', NULL, NULL)"
+                    .to_string(),
+                vec![name.into()],
+            ),
+        };
+        Statement::from_sql_and_values(conn.get_database_backend(), &sql, values)
+    };
+
+    conn.execute_raw(insert_head("main", None))
+        .await
+        .expect("first main HEAD row");
+    conn.execute_raw(insert_head("other", None))
+        .await
+        .expect_err("a SECOND main HEAD row must be rejected by the unique index");
+
+    conn.execute_raw(insert_head("feature", Some("wt1")))
+        .await
+        .expect("first linked HEAD row");
+    conn.execute_raw(insert_head("feature2", Some("wt1")))
+        .await
+        .expect_err("a SECOND HEAD row for the same worktree must be rejected");
+    // A DIFFERENT worktree is unaffected.
+    conn.execute_raw(insert_head("feature3", Some("wt2")))
+        .await
+        .expect("a different worktree gets its own HEAD row");
+
+    // Now construct the pre-existing-duplicate case: roll the migration back,
+    // seed the duplicate the old schema permitted, and re-apply.
+    runner
+        .rollback_to(&conn, 2026072501)
+        .await
+        .expect("roll back the uniqueness constraints");
+    conn.execute_raw(insert_head("other", None))
+        .await
+        .expect("the pre-2026072901 schema accepted a duplicate main HEAD");
+
+    let error = runner
+        .run_pending(&conn)
+        .await
+        .expect_err("the migration must refuse a repository that already has duplicates");
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("CHECK") || rendered.to_lowercase().contains("constraint"),
+        "the refusal must come from the guard, not a later failure: {rendered}"
+    );
+    // And the evidence is untouched: both rows are still there to inspect.
+    assert!(!index_exists(&conn, "idx_reference_head_main_unique").await);
+}
+
+/// plan-20260714 W0 (§C.11): `2026072902` records HOW an operation's worktree
+/// scope came to hold its value, and the value is a closed domain.
+///
+/// The narrow backfill matters in both directions. Marking too little leaves
+/// `op restore` rewriting a worktree from an operation that may never have run
+/// in it; marking too much strands operations that were correctly scoped all
+/// along, with no repair route yet. So the rule is tested on both sides of its
+/// boundary: an operation from before the scope column existed becomes
+/// `unknown` in a repository with linked-worktree evidence, and one recorded
+/// after it does not.
+#[tokio::test]
+async fn operation_scope_provenance_backfills_narrowly_and_enforces_its_domain() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("apply current migration registry");
+    let backend = conn.get_database_backend();
+
+    // The domain is enforced by the database, not only by readers: a reader
+    // that tests for the literal "unknown" fails OPEN on a corrupted value.
+    let insert_op = |op_id: &str, start_ts: i64, provenance: &str| {
+        Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO `operation` (op_id, repo_id, view_id, command_name, description, \
+             actor, args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+             VALUES (?, 'repo1', 'view1', 'commit', 'd', 'a', NULL, ?, ?, 'succeeded', '', ?)",
+            [
+                op_id.into(),
+                start_ts.into(),
+                start_ts.into(),
+                provenance.into(),
+            ],
+        )
+    };
+    conn.execute_raw(insert_op("op-bogus", 100, "declraed"))
+        .await
+        .expect_err("a value outside the domain must be rejected by the database");
+    conn.execute_raw(insert_op("op-ok", 100, "declared"))
+        .await
+        .expect("the positive value is accepted");
+    conn.execute_raw(insert_op("op-unknown", 100, "unknown"))
+        .await
+        .expect("the unattributable value is accepted");
+
+    // The down migration refuses while an `unknown` row exists: dropping the
+    // column would promote it back to "main scope, trustworthy".
+    runner
+        .rollback_to(&conn, 2026072901)
+        .await
+        .expect_err("rollback must refuse while an unknown-provenance row exists");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "DELETE FROM `operation` WHERE op_id = 'op-unknown'".to_string(),
+    ))
+    .await
+    .expect("resolve the unknown row");
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026072901)
+            .await
+            .expect("rollback proceeds once nothing is unattributable"),
+        vec![2026072902]
+    );
+
+    // Now the backfill rule. Seed one operation from BEFORE 2026072201 was
+    // applied and one from after, plus linked-worktree evidence, then
+    // re-apply.
+    let applied_at: String = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT applied_at FROM schema_versions WHERE version = 2026072201".to_string(),
+        ))
+        .await
+        .expect("query applied_at")
+        .expect("2026072201 is applied")
+        .try_get_by_index(0)
+        .expect("applied_at column");
+    let boundary = chrono::DateTime::parse_from_rfc3339(&applied_at)
+        .expect("applied_at is rfc3339")
+        .timestamp();
+
+    let seed = |op_id: &str, start_ts: i64| {
+        Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO `operation` (op_id, repo_id, view_id, command_name, description, \
+             actor, args_digest, start_ts, end_ts, status, worktree_id) \
+             VALUES (?, 'repo1', 'view1', 'commit', 'd', 'a', NULL, ?, ?, 'succeeded', '')",
+            [op_id.into(), start_ts.into(), start_ts.into()],
+        )
+    };
+    conn.execute_raw(seed("op-before", boundary - 60))
+        .await
+        .expect("seed a pre-scope operation");
+    conn.execute_raw(seed("op-after", boundary + 60))
+        .await
+        .expect("seed a post-scope operation");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO `reference` (`name`, `kind`, `commit`, `worktree_id`) \
+         VALUES ('feature', 'Head', NULL, 'wt-linked')"
+            .to_string(),
+    ))
+    .await
+    .expect("seed linked-worktree evidence");
+
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("re-apply the provenance migration");
+
+    let provenance_of = |op_id: &'static str| {
+        let conn = &conn;
+        async move {
+            conn.query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT scope_provenance FROM `operation` WHERE op_id = ?",
+                [op_id.into()],
+            ))
+            .await
+            .expect("query provenance")
+            .expect("row exists")
+            .try_get_by_index::<String>(0)
+            .expect("column")
+        }
+    };
+    assert_eq!(
+        provenance_of("op-before").await,
+        "unknown",
+        "an operation predating the scope column, in a repo with linked evidence, is not \
+         attributable to main"
+    );
+    assert_eq!(
+        provenance_of("op-after").await,
+        "declared",
+        "an operation recorded AFTER the scope column carries a scope its process declared, \
+         and must not be stranded by the backfill"
+    );
+}
+
+/// plan-20260714 §C.4.3: the GC source inventory is TYPED, and all four
+/// semantic kinds are represented — not just "root / not a root".
+///
+/// The kinds are not decoration. `AntiRoot` means an absent payload is the
+/// intended state, so heal and hydrate must refuse to restore it. `Boundary`
+/// means the traversal stops rather than reporting the missing parent as
+/// corruption. `IndexOnly` means the entry keeps nothing alive and must be
+/// invalidated in step with the deletion it describes. Collapsing them into
+/// `NonRoot` loses exactly the distinctions the collectors act on.
+#[test]
+fn gc_object_source_inventory_is_typed_across_all_four_kinds() {
+    use libra::command::maintenance::{
+        GC_OBJECT_FILE_SOURCE_INVENTORY, GC_OBJECT_SOURCE_INVENTORY, GcSourceStatus,
+    };
+
+    let db_kinds: Vec<GcSourceStatus> = GC_OBJECT_SOURCE_INVENTORY
+        .iter()
+        .map(|source| source.status)
+        .collect();
+    let file_kinds: Vec<GcSourceStatus> = GC_OBJECT_FILE_SOURCE_INVENTORY
+        .iter()
+        .map(|source| source.status)
+        .collect();
+    let has = |kind: GcSourceStatus| db_kinds.contains(&kind) || file_kinds.contains(&kind);
+
+    for kind in [
+        GcSourceStatus::TracedRoot,
+        GcSourceStatus::AntiRoot,
+        GcSourceStatus::Boundary,
+        GcSourceStatus::IndexOnly,
+        GcSourceStatus::NonRoot,
+    ] {
+        assert!(has(kind), "no inventory entry is classified {kind:?}");
+    }
+
+    // The classifications §C.4.3 names explicitly.
+    let db_entry = |table: &str, column: &str| {
+        GC_OBJECT_SOURCE_INVENTORY
+            .iter()
+            .find(|source| source.location == table && source.column == column)
+            .map(|source| source.status)
+    };
+    assert_eq!(
+        db_entry("object_obliteration", "oid"),
+        Some(GcSourceStatus::AntiRoot),
+        "an obliteration tombstone is the OPPOSITE of a root"
+    );
+    assert_eq!(
+        db_entry("object_index", "o_id"),
+        Some(GcSourceStatus::IndexOnly),
+        "the object catalogue keeps nothing alive"
+    );
+
+    let file_entry = |needle: &str| {
+        GC_OBJECT_FILE_SOURCE_INVENTORY
+            .iter()
+            .find(|source| source.location.contains(needle))
+            .map(|source| source.status)
+    };
+    assert_eq!(
+        file_entry(".libra/shallow"),
+        Some(GcSourceStatus::Boundary),
+        "shallow grafts are traversal boundaries"
+    );
+    // §C.4.3 item 13 pins this one by name: fetch records already-up-to-date
+    // tips with no local destination, so rooting FETCH_HEAD would pin
+    // objects nothing references.
+    assert_eq!(
+        file_entry("FETCH_HEAD"),
+        Some(GcSourceStatus::NonRoot),
+        "FETCH_HEAD is explicitly NOT a reachability root"
+    );
+    assert_eq!(
+        file_entry("agent-runs"),
+        Some(GcSourceStatus::TracedRoot),
+        "agent-run findings manifests are mandatory roots"
+    );
+
+    // Every file source documents WHY, naming the collector or gate that
+    // implements its classification — an unexplained entry is unverifiable.
+    for source in GC_OBJECT_FILE_SOURCE_INVENTORY {
+        assert!(
+            source.note.len() > 40,
+            "{} has no substantive note",
+            source.location
+        );
+    }
+
+    // §C.4.3: every source declares storage kind, schema/version, read
+    // bound and corruption policy — and the policy must be CONSISTENT with
+    // the root type, or the declarations are decoration. A root that keeps
+    // objects alive (TracedRoot/AntiRoot/Boundary) must fail closed (or
+    // defer on undecidable liveness); an IndexOnly source keeps nothing
+    // alive so lenient is the only honest answer; a NonRoot contributes
+    // nothing so no policy applies.
+    use libra::command::maintenance::GcCorruptionPolicy;
+    for source in GC_OBJECT_SOURCE_INVENTORY
+        .iter()
+        .chain(GC_OBJECT_FILE_SOURCE_INVENTORY.iter())
+    {
+        assert!(
+            !source.schema.trim().is_empty() && !source.read_bound.trim().is_empty(),
+            "{}.{} declares no schema/read bound",
+            source.location,
+            source.column
+        );
+        let policy_fits = match source.status {
+            GcSourceStatus::TracedRoot | GcSourceStatus::AntiRoot | GcSourceStatus::Boundary => {
+                matches!(
+                    source.corruption,
+                    GcCorruptionPolicy::FailClosed | GcCorruptionPolicy::DeferLive
+                )
+            }
+            GcSourceStatus::IndexOnly => source.corruption == GcCorruptionPolicy::LenientSkip,
+            GcSourceStatus::NonRoot => source.corruption == GcCorruptionPolicy::NotApplicable,
+        };
+        assert!(
+            policy_fits,
+            "{}.{} declares {:?} with corruption policy {:?} — inconsistent \
+             (a keep-alive root must fail closed or defer; IndexOnly must be \
+             lenient; NonRoot has no policy)",
+            source.location, source.column, source.status, source.corruption
+        );
+    }
+}
+
+/// plan-20260714 §C.9: the scoped duplicate point query USES its index.
+///
+/// The predicate was moved into SQL so a busy repository cannot hide a
+/// duplicate — but without a matching index that same query scans every
+/// operation the repository recorded inside the window, on the hot path of
+/// every logged command. `EXPLAIN QUERY PLAN` is the only assertion that can
+/// tell the two apart.
+#[tokio::test]
+async fn operation_dedup_query_uses_its_index() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    let plan = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "EXPLAIN QUERY PLAN SELECT op_id FROM operation \
+             WHERE repo_id = 'r' AND worktree_id = '' AND command_name = 'commit' \
+               AND args_digest = 'd' AND status = 'succeeded' AND end_ts >= 0"
+                .to_string(),
+        ))
+        .await
+        .expect("explain");
+    let detail: String = plan
+        .iter()
+        .filter_map(|row| row.try_get_by::<String, _>("detail").ok())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        detail.contains("idx_operation_dedup_scope"),
+        "the duplicate query must use its composite index, not scan: {detail}"
+    );
+    assert!(
+        !detail.contains("SCAN operation"),
+        "and must not scan the operation table: {detail}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Registry v3 rollback guard (plan-20260714 W1 §C.4.1.1).
+//
+// The capability marker is what keeps a v2-era binary from rewriting
+// `worktrees.json` and dropping the service-fence generations. Rolling it away
+// while generations are live re-opens exactly that hole, and nothing can detect
+// it afterwards — the evidence is what gets dropped. The guard cannot be SQL
+// (the registry is a file), so it lives in `rollback_to`'s pre-validation
+// phase, and these tests are its coverage: a refusal must run NO down DDL.
+// ---------------------------------------------------------------------------
+
+/// Write a `worktrees.json` into a repository's storage and return its path.
+fn seed_registry(storage: &std::path::Path, body: serde_json::Value) {
+    std::fs::create_dir_all(storage).expect("storage dir");
+    std::fs::write(
+        storage.join("worktrees.json"),
+        serde_json::to_vec_pretty(&body).expect("serialize registry"),
+    )
+    .expect("write registry");
+}
+
+/// A repository whose registry carries a LIVE generation: the rollback is
+/// refused, and the v3 marker is still there afterwards — proving no down DDL
+/// ran rather than merely that the call returned an error.
+#[tokio::test]
+async fn registry_v3_rollback_refuses_live_generations() {
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    seed_registry(
+        &storage,
+        serde_json::json!({
+            "schema_version": 3,
+            "epoch_counter": 7,
+            "entries": [
+                {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+                {
+                    "path": repo.path().join("wt").to_string_lossy(),
+                    "is_main": false,
+                    "locked": false,
+                    "worktree_id": "wt-live",
+                    "epoch": 7,
+                },
+            ],
+        }),
+    );
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+    run_builtin_migrations(&conn).await.expect("migrations");
+    let runner = builtin_runner().expect("builtin runner");
+
+    let err = runner
+        .rollback_to(&conn, 2026073004)
+        .await
+        .expect_err("a live generation must refuse the rollback");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("live registration generations"),
+        "the refusal must say why: {rendered}"
+    );
+    // The runner applies its rollback plan atomically. Although the empty W4
+    // capture catalog would permit 2026080401's down SQL, the later v3 guard
+    // refusal rolls that attempt back too: no part of the schema may change.
+    assert!(
+        marker_has_version(&conn, 3).await,
+        "the v3 capability marker survives a refused rollback"
+    );
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026080401),
+        "and the schema is untouched"
+    );
+}
+
+/// The converse, so the refusal above is not vacuous: a registry with NO
+/// generations (every worktree registered before v3) rolls back, as do a
+/// missing registry and an unparseable one — a rollback is not the place to
+/// adjudicate an unrelated corruption.
+#[tokio::test]
+async fn registry_v3_rollback_allows_absent_generations() {
+    for (label, registry) in [
+        (
+            "no generations",
+            Some(serde_json::json!({
+                "schema_version": 3,
+                "entries": [
+                    {"path": "/tmp/main", "is_main": true, "locked": false},
+                    {
+                        "path": "/tmp/wt",
+                        "is_main": false,
+                        "locked": false,
+                        "worktree_id": "wt-old",
+                    },
+                ],
+            })),
+        ),
+        ("no registry at all", None),
+    ] {
+        let repo = tempfile::tempdir().expect("repo");
+        let storage = repo.path().join(".libra");
+        std::fs::create_dir_all(&storage).expect("storage dir");
+        if let Some(body) = registry {
+            seed_registry(&storage, body);
+        }
+        let db_path = storage.join("libra.db");
+        std::fs::File::create(&db_path).expect("touch sqlite file");
+        let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+        run_builtin_migrations(&conn).await.expect("migrations");
+        let runner = builtin_runner().expect("builtin runner");
+        let rolled = runner
+            .rollback_to(&conn, 2026073004)
+            .await
+            .unwrap_or_else(|error| panic!("{label} must roll back: {error:?}"));
+        assert_eq!(
+            rolled,
+            vec![2026080401, 2026073101, 2026073005],
+            "{label}: exactly v3 rolled back"
+        );
+        assert!(
+            !marker_has_version(&conn, 3).await,
+            "{label}: the marker is gone after a successful rollback"
+        );
+    }
+}
+
+/// An unparseable registry rolls back too, for the same reason.
+#[tokio::test]
+async fn registry_v3_rollback_allows_unreadable_registry() {
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    std::fs::create_dir_all(&storage).expect("storage dir");
+    std::fs::write(storage.join("worktrees.json"), b"{ not json").expect("write");
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+    run_builtin_migrations(&conn).await.expect("migrations");
+    let runner = builtin_runner().expect("builtin runner");
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026073004)
+            .await
+            .expect("an unparseable registry does not block the rollback"),
+        vec![2026080401, 2026073101, 2026073005]
+    );
+}
+
+async fn marker_has_version(conn: &DatabaseConnection, version: i64) -> bool {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    conn.query_one_raw(Statement::from_string(
+        conn.get_database_backend(),
+        format!("SELECT version FROM worktree_registry_capability WHERE version = {version}"),
+    ))
+    .await
+    .expect("query the capability marker")
+    .is_some()
+}
+
+/// Write a `worktrees.json` into a repository's storage.
+fn seed_registry_v2(storage: &std::path::Path, body: serde_json::Value) {
+    std::fs::create_dir_all(storage).expect("storage dir");
+    std::fs::write(
+        storage.join("worktrees.json"),
+        serde_json::to_vec_pretty(&body).expect("serialize registry"),
+    )
+    .expect("write registry");
+}
+
+/// §C.4.1.1/§C.4.3: a linked worktree REMOVED before the scope migration leaves
+/// no `reference` row, so the migration's own SQL guard sees a main-only
+/// repository and adopts its legacy layer state into main. The registry is the
+/// durable witness, and it is a file — so the guard is a Rust preflight whose
+/// row half runs inside the claim transaction.
+///
+/// Refusal must leave the migration UNAPPLIED: nothing adopted, nothing
+/// half-done.
+#[tokio::test]
+async fn layer_scope_migration_refuses_when_registry_shows_removed_linked_worktree() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    // v1 SHAPE: no history field at all, which the validated parser promotes to
+    // `Unknown` — a worktree removed before v3 left nothing else to read.
+    seed_registry_v2(
+        &storage,
+        serde_json::json!({
+            "worktrees": [
+                {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+            ],
+        }),
+    );
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026072302)
+        .await
+        .expect("apply up to the pre-layer-scope schema");
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO layer (name, source, priority, enabled) \
+         VALUES ('legacy', '/src/legacy', 0, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("plant a legacy global layer row");
+
+    let err = runner
+        .run_pending(&conn)
+        .await
+        .expect_err("a pre-v3 registry cannot rule out a removed linked worktree");
+    assert!(
+        format!("{err:?}").contains("cannot be read or parsed")
+            || format!("{err:?}").contains("linked worktree has existed"),
+        "the refusal must name the registry as the reason: {err:?}"
+    );
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026072302),
+        "unapplied: nothing was adopted"
+    );
+}
+
+/// The converse: a v3 registry that PROVES no linked worktree ever existed
+/// migrates the same legacy rows into main. Without this the refusal above could
+/// be passing for the wrong reason.
+#[tokio::test]
+async fn layer_scope_migration_adopts_when_registry_proves_main_only() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    seed_registry_v2(
+        &storage,
+        serde_json::json!({
+            "schema_version": 3,
+            "entries": [
+                {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+            ],
+        }),
+    );
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026072302)
+        .await
+        .expect("apply up to the pre-layer-scope schema");
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO layer (name, source, priority, enabled) \
+         VALUES ('legacy', '/src/legacy', 0, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("plant a legacy global layer row");
+
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("a proven main-only history adopts the legacy rows");
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT worktree_id FROM layer WHERE name = 'legacy'".to_string(),
+        ))
+        .await
+        .expect("query the migrated row")
+        .expect("the legacy row survives");
+    let scope: String = row.try_get_by_index(0).expect("worktree_id");
+    assert_eq!(scope, "", "and lands in the main scope");
+}
+
+/// §C.9: the operation provenance migration does NOT block — operations are
+/// history. With registry evidence of a linked worktree it marks every unscoped
+/// row `unknown` instead of trusting it as `main`, which is what makes
+/// `op restore` refuse to replay it.
+#[tokio::test]
+async fn operation_provenance_marks_unknown_on_removed_linked_worktree() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    seed_registry_v2(
+        &storage,
+        serde_json::json!({
+            "schema_version": 3,
+            "linked_history": "existed",
+            "entries": [
+                {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+            ],
+        }),
+    );
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026072901)
+        .await
+        .expect("apply up to the pre-provenance schema");
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
+         args_digest, start_ts, end_ts, status, worktree_id) \
+         VALUES ('op-old', 'repo_1', 'view-old', 'commit', 'old', 'alice', NULL, 1, 1, \
+         'succeeded', '')"
+            .to_string(),
+    ))
+    .await
+    .expect("plant an unscoped historic operation");
+
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("provenance marking must not block the upgrade");
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT scope_provenance FROM operation WHERE op_id = 'op-old'".to_string(),
+        ))
+        .await
+        .expect("query the marked row")
+        .expect("the operation survives");
+    let provenance: String = row.try_get_by_index(0).expect("scope_provenance");
+    assert_eq!(
+        provenance, "unknown",
+        "an unscoped historic operation in a repository with linked history is UNKNOWN, \
+         not trusted main"
+    );
+}
+
+/// The guard's predicate must agree with the MIGRATION's, character for
+/// character. Migration 2026072304 trims but does not case-fold, so `TRUE` is
+/// not truthy there — and a guard that case-folded would refuse an upgrade over
+/// a value the migration itself projects as disabled.
+///
+/// Both directions, under identical registry history, so the difference is the
+/// value and nothing else.
+#[tokio::test]
+async fn sparse_guard_matches_the_migration_case_sensitivity() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    for (value, should_refuse) in [(" TRUE ", false), (" true ", true)] {
+        let repo = tempfile::tempdir().expect("repo");
+        let storage = repo.path().join(".libra");
+        seed_registry_v2(
+            &storage,
+            serde_json::json!({
+                "schema_version": 3,
+                "linked_history": "existed",
+                "entries": [
+                    {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+                ],
+            }),
+        );
+        let db_path = storage.join("libra.db");
+        std::fs::File::create(&db_path).expect("touch sqlite file");
+        let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+
+        let runner = builtin_runner().expect("builtin runner");
+        runner
+            .run_pending_up_to(&conn, 2026072303)
+            .await
+            .expect("apply up to the pre-sparse-scope schema");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TABLE IF NOT EXISTS config_kv (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             configuration TEXT, name TEXT, key TEXT NOT NULL, value TEXT NOT NULL)"
+                .to_string(),
+        ))
+        .await
+        .expect("create config_kv");
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', ?)",
+            [value.into()],
+        ))
+        .await
+        .expect("plant the toggle");
+
+        let outcome = runner.run_pending(&conn).await;
+        if should_refuse {
+            assert!(
+                outcome.is_err(),
+                "'{value}' is truthy to the migration, so linked history must refuse it"
+            );
+        } else {
+            outcome.unwrap_or_else(|error| {
+                panic!(
+                    "'{value}' is NOT truthy to the migration (it does not case-fold), so the \
+                     guard must not refuse: {error:?}"
+                )
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W2 §C.10: the stash-generation fence's lifecycle (2026073101)
+// ---------------------------------------------------------------------------
+
+/// The marker is present after up, gone after down, and back after re-up —
+/// and its down migration removes ONLY the marker row.
+#[tokio::test]
+async fn stash_generation_fence_up_down_up_round_trip() {
+    async fn fence_marker_present(conn: &DatabaseConnection) -> bool {
+        use sea_orm::{ConnectionTrait, Statement};
+        conn.query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT value FROM metadata_kv WHERE scope = 'repository' AND target = '' \
+             AND key = 'stash.reflog.generation'"
+                .to_string(),
+        ))
+        .await
+        .expect("query the fence marker")
+        .is_some()
+    }
+
+    let conn = connect("sqlite::memory:").await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner.run_pending(&conn).await.expect("up");
+    assert!(
+        fence_marker_present(&conn).await,
+        "up writes the fence marker"
+    );
+    assert_eq!(
+        runner.current_version(&conn).await.expect("version"),
+        Some(2026080401),
+        "the capture-scope migration is the newest migration — retarget this test when a newer one lands"
+    );
+
+    let rolled = runner
+        .rollback_to(&conn, 2026073005)
+        .await
+        .expect("down to the previous version");
+    assert_eq!(
+        rolled,
+        vec![2026080401, 2026073101],
+        "the scope migration and fence roll back in order"
+    );
+    assert!(
+        !fence_marker_present(&conn).await,
+        "down removes the marker"
+    );
+
+    runner.run_pending(&conn).await.expect("re-up");
+    assert!(
+        fence_marker_present(&conn).await,
+        "re-up restores the marker"
+    );
+}
+
+/// The MECHANISM the fence rides on: a database whose recorded schema version
+/// exceeds what this binary registers is refused at open, with the
+/// install-a-newer-binary hint — that refusal is what keeps an old (ABA-prone
+/// generation-less) stash writer out of the repository entirely.
+#[tokio::test]
+async fn a_future_schema_version_refuses_the_connection() {
+    use sea_orm::ConnectionTrait;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("libra.db");
+    let conn = libra::internal::db::create_database(db_path.to_str().expect("utf-8"))
+        .await
+        .expect("create the database");
+    conn.execute_unprepared(
+        "INSERT INTO schema_versions (version, name, applied_at) \
+         VALUES (2126010101, 'from-the-future', datetime('now'))",
+    )
+    .await
+    .expect("plant a future version");
+    drop(conn);
+
+    let error = libra::internal::db::establish_connection(db_path.to_str().expect("utf-8"))
+        .await
+        .expect_err("a future schema must refuse the connection");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("newer than this Libra binary supports"),
+        "the refusal says WHY and implies the fix: {rendered}"
+    );
 }

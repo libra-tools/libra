@@ -6,7 +6,7 @@
 
 ```text
 libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
-libra merge --continue
+libra merge --continue [-m <msg>] [--no-verify]
 libra merge --abort
 libra merge --restart
 ```
@@ -46,7 +46,7 @@ Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`the
 | 选项 | 说明 |
 |--------|-------------|
 | `<branch>` | 要合并的目标分支、提交或远程跟踪引用。 |
-| `-m, --message <MSG>` | 覆盖合并提交消息（默认 `Merge <branch> into <head>`）。 |
+| `-m, --message <MSG>` | 覆盖合并提交消息（默认 `Merge <branch> into <head>`）。也可与 `--continue` 同用，覆盖冲突合并开始时记录的消息——这是 Libra 扩展：Git 的 `--continue` 不接受参数，而 Libra 的 merge 从不打开编辑器。 |
 | `--ff` | 允许可行的快进，覆盖 `merge.ff=false|only`。 |
 | `--ff-only` | 仅当当前分支可快进时才合并，否则失败。 |
 | `--no-ff` | 即使可以快进也强制生成双父合并提交。 |
@@ -64,7 +64,7 @@ Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`the
 | `--no-progress` | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 merge 从不渲染进度条。 |
 | `--verify-signatures` | 验证被合并分支 tip 的 PGP 签名，未签名或签名无效则中止；覆盖 `merge.verifySignatures`。仅能验证本仓库 vault PGP key 所签。 |
 | `--no-verify-signatures` | 不验证被合并提交的签名，覆盖 `merge.verifySignatures=true`；与正向标志 last-wins。 |
-| `--no-rerere-autoupdate` | 合并后不更新 rerere 索引。为对齐 Git 而接受的 no-op：Libra 无 rerere。（Git 的 `--rerere-autoupdate` 未公开。） |
+| `--no-rerere-autoupdate` | 为对齐 Git 而接受。rerere 已集成：`rerere.enabled` 开启时，冲突合并会记录每个冲突的 preimage 并在有匹配记录时回放已保存的解法；回放文件是否自动暂存跟随 `rerere.autoUpdate` 配置。逐次调用的覆盖未实现——暂存始终跟随配置。（Git 的正向 `--rerere-autoupdate` 未公开。） |
 | `--no-gpg-sign` | 不对合并提交 GPG 签名。为对齐 Git 而接受的 no-op：Libra 的 merge 从不签名。（Git 的 `-S`/`--gpg-sign` 未实现。） |
 | `--continue` | 在冲突已解决并暂存后完成进行中的合并。 |
 | `--abort` | 恢复合并前的 HEAD、索引和工作树。 |
@@ -97,6 +97,7 @@ libra merge --allow-unrelated-histories imported-root
 libra merge --log=10 feature-x
 libra merge refs/remotes/origin/main
 libra merge --continue
+libra merge --continue -m "merge: reconcile release notes"
 libra merge --abort
 libra merge --dry-run feature-x
 libra merge --restart
@@ -195,7 +196,7 @@ Merge aborted.
 | 合并后 diffstat | `--stat`（打印）；`-n` / `--no-stat`（默认：不打印） | `--stat`（默认） / `-n` / `--no-stat` | N/A |
 | 不显示进度条 | `--no-progress`（no-op；从不渲染） | `--no-progress` | N/A |
 | 禁用签名验证 | `--no-verify-signatures`（默认；关闭 `--verify-signatures`） | `--no-verify-signatures` | N/A |
-| 不更新 rerere | `--no-rerere-autoupdate`（no-op；无 rerere） | `--no-rerere-autoupdate` | N/A |
+| 不更新 rerere | `--no-rerere-autoupdate`（已接受；暂存跟随 `rerere.autoUpdate`） | `--no-rerere-autoupdate` | N/A |
 | 不 GPG 签名 | `--no-gpg-sign`（no-op；从不签名） | `--no-gpg-sign` | N/A |
 | Ours strategy | `-s ours` | `-s ours` | N/A |
 | 冲突侧偏好 | `-X ours/theirs` | `-X ours/theirs` | N/A |

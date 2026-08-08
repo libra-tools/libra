@@ -47,17 +47,31 @@ Agent 机制是更高层的架构。它把 worktree 当作由 Libra 调度器（
   本地目录（非 symlink），保存该 worktree 私有的 HEAD、index 和 HEAD
   reflog，并记录 `commondir` 指针（指回共享存储）与稳定 `worktree_id`。
   由更早版本创建的 worktree 可能仍是旧的 `.libra` symlink 共享布局。
-- `worktrees.json` 存储规范化路径、主 worktree 标记、锁
-  状态以及可选的锁定原因。
+- `worktrees.json` 自 v0.19.57 起为 registry v2：顶层为
+  `{schema_version: 2, entries: [...]}`（顶层键由 `worktrees` 更名为
+  `entries`，使 v1 解析器对 v2 文件 fail-closed），每个条目存储规范化
+  路径、主 worktree 标记、锁状态、可选锁定原因，linked 条目还持久化其
+  stable `worktree_id`。旧 v1 文件在首个变更类命令（registry 锁内）就
+  地升级并回填 id；无锁读取（`worktree list`）不重写文件。数据库迁移
+  2026072401 的 capability 标记使 pre-v2 二进制在连接时即被拒绝。
 - 状态写入是原子的：Libra 先写入一个临时 JSON 文件，再将其重命名
   到目标位置。
 - `libra worktree add` 会创建一个空的关联目录，并在 `HEAD`
   存在时，将已提交的 `HEAD` 内容恢复到该目录中。它不会
   复制仅暂存（staged-only）的 index 状态。
-- `libra worktree remove` 会注销该 worktree，但有意不
-  删除目录，以降低意外丢数据的风险。
-- `libra worktree repair` 会对注册表条目去重，并恢复
-  「恰有一个条目是主 worktree」这一不变量。
+- `libra worktree remove` 默认保留目录：自 v0.19.58 起为分离
+  （`detached_from_registry`——scoped 状态保留、目录内命令 fail-closed、
+  `worktree add` 按持久化 id 校验后重挂接）；`--delete-dir` 删除并
+  fsync 父目录后才清理 scoped 行，失败保留 tombstone 由 repair 重试；
+  add/move/remove/prune 均先写 durable intent journal。
+- `libra worktree repair --confirm` 会对注册表条目去重，并恢复
+  「恰有一个条目是主 worktree」这一不变量。`repair <path> --confirm`
+  则依据 registry 持久化的 stable id 恢复 linked worktree 缺失/损坏的
+  `.libra/worktree_id` 与 `commondir`（指向另一存储的有效指针会被
+  拒绝，且拒绝不产生写入）。每个 mutating repair 动作都要求
+  `--confirm`（`--resolve-identity` 用专属的 `--yes`，只读预览
+  `--migrate-layout --dry-run` 免确认）；未确认在任一写入前拒绝、
+  零副作用，确认后在 operation log 记录恰好一条审计行（W0 §C.11）。
 
 启用 `worktree-fuse` 特性后，Libra 还可以维护
 `worktrees-fuse.json`，以及位于 `.libra/worktrees-fuse/` 下的
@@ -201,7 +215,7 @@ linked checkout
 | 主要拥有者 | Git ref 与检出机制 | Libra 调度器（Scheduler）与执行环境 |
 | 主要隔离单元 | 分支、分离 commit，以及每个 worktree 各自的 index | 任务尝试、基线快照与写入合约 |
 | 元数据布局 | `.git/worktrees/<id>` 下分散的文件系统控制文件，外加 `.git` 指针文件 | 持久化 worktree 使用人类/Agent 可读的 JSON；Agent worktree 使用临时任务状态 |
-| 仓库存储链接 | `.git` 文件指向每个 worktree 各自的 Git 管理目录；`commondir` 指回公共存储 | `.libra` symlink 直接指向共享的 Libra 存储；任务的 FUSE backend 将存储链接进可写的 upper 层 |
+| 仓库存储链接 | `.git` 文件指向每个 worktree 各自的 Git 管理目录；`commondir` 指回公共存储 | 每个关联 worktree 拥有真实本地 `.libra` gitdir，内含 `commondir` 指针指回共享 Libra 存储（legacy 布局为 symlink）；任务的 FUSE backend 将存储链接进可写的 upper 层 |
 | 起始内容 | Git 从某个分支或 commit 检出到 worktree 与 index | CLI 关联 worktree 恢复 `HEAD`；Agent worktree 对当前工作区状态拍快照，包括未被忽略的未提交文件 |
 | 并行工作 | 多个持久化的分支检出 | 多次临时任务尝试可并行运行，而无需分配分支 |
 | 集成方式 | 用户运行 merge、rebase、cherry-pick 或手动复制 | Libra 在通过作用域与并发检查后，将成功的任务变更同步回去 |
@@ -272,6 +286,66 @@ worktree。
 这有意比 Git 那种会删除目录的
 `worktree remove` 行为更保守，也对那些关联检出中可能存在
 未提交工作的 AI 辅助工作流更友好。
+
+## Workspace 关联与 lease（plan-20260714 §C.8，W4）
+
+仓库关联 worktree 与 Agent 任务 worktree 之前没有统一的
+事实源：谁在写哪个工作区、某个目录是否已经有 owner，
+只能靠各自的运行时自己记账。W4-s1（v0.19.61）引入
+`workspace_record` 表（迁移 `2026072501`）与
+[`src/internal/workspace.rs`](../../src/internal/workspace.rs)
+的 `WorkspaceStore`，把 linked worktree、task copy/FUSE
+worktree 与未来的 remote workspace 收敛到一层可查询的
+关联记录，并在同一处协调它们的**写者**：
+
+- **仲裁者是数据库，不是应用层。** linked workspace 的
+  lease 身份是 `(repo_id, worktree_id)`，canonical 路径在
+  全部 live workspace（`provisioning`/`active`/`releasing`）
+  内唯一，两者都由 partial unique index 保证；`acquire`
+  是一条写语句，唯一冲突映射为稳定错误
+  `LBR-AGENT-022`。先查后写的选举存在竞态窗口，会让两个
+  acquire 同时为一个目录发布记录，因此不采用。
+- **每次 lease 变更都是 owner + 单调 fence 条件写。**
+  doctor 以更高 fence 回收后，旧 owner 的 renew/activate/
+  release/abandon 一律匹配零行并返回 `LBR-AGENT-023`，
+  不可能释放或覆盖新 owner 的 lease。
+- **过期不等于可抢占。** 只有 doctor/scavenger 的回收路径
+  能在超时后接管；收养 orphan 以 `releasing` 进入（表示
+  “我来拆除”），live 记录在接管后保持原有生命周期状态。
+- **人类不受影响。** 人类使用 linked worktree 不申请 lease，
+  也就不会被该表锁死；记录只在 Agent/automation 申请时产生。
+- **只存关联 ID。** 表中没有 prompt、transcript 或工具负载；
+  列表接口按 keyset 分页（默认 50、上限 500）。
+
+`repo_id` 只来自仓库自身的 `libra.repoid`（`RepoIdentity`
+token，带首尾空白或空值按 corrupt 元数据拒绝而非规范化），
+并在事务开启前解析——写事务必须 write-first，否则两个并发
+acquire 会在 SQLite 锁升级上互相拒绝（SQLITE_BUSY）而拿不到
+稳定的 lease-held 结果。identity 被改写且旧 identity 仍有
+未结算记录时，新注册 fail-closed，避免唯一索引的 `repo_id`
+前缀重开命名空间、让旧记录不可见也不可回收。
+
+工作区路径必须是绝对路径、完全交由内核解析（`link/../ws`
+这类符号链接穿越不会被词法折叠到别的目录），且父目录必须
+可解析（悬空符号链接拒绝）。需要注意其边界：存储的是注册
+时刻的 canonical **字符串**身份，因此 bind mount、同一设备的
+第二个挂载点、大小写不敏感卷的不同拼写，或注册后被重新指向
+的叶子目录，仍可能产生两条记录——这与 worktree registry 的
+口径一致，也符合 §C.8「lease 只协调 Agent/runtime owner，
+不取代 filesystem lock」的定位。
+
+W4-s2（v0.19.62）接上调度器的 task worktree 生命周期：物化成功
+后（绝不在此之前）发布 `active` 记录，owner 是「task + 进程」的
+lease；sync-back 先续租再回写，lease 已被回收就 fail-closed——
+把 task worktree 的改动重放进主工作区，恰恰是 lease 要阻止的
+双写；拆除先进 `releasing`（目录移除期间身份仍被占用），成功后
+`released`，清理失败则 `orphaned` 留给 scavenger。非仓库目录
+依然可以有 task worktree（没有可关联的仓库，就不产生记录），
+但仓库存在却无法登记时 provisioning 直接失败。
+
+后续 W4 切片：sub-agent workspace 记录、Code control sidecar
+（token/info/lock/socket/PID）按 scope 隔离、Code/Agent 配置统一
+resolver 与 `libra agent workspace list/show` 机器接口。
 
 ## 当前取舍
 

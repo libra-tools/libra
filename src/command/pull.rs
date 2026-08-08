@@ -57,7 +57,7 @@ pub struct PullArgs {
 
     /// Rebase the current branch onto the upstream after fetching instead of merging
     #[clap(long, short = 'r', overrides_with = "no_rebase")]
-    rebase: bool,
+    pub(crate) rebase: bool,
 
     /// Merge instead of rebasing, countermanding an earlier
     /// `--rebase`/`-r` (last one on the command line wins), matching `git pull
@@ -183,6 +183,15 @@ pub(crate) enum PullError {
     #[error("you are not currently on a branch")]
     NotOnBranch,
 
+    #[error(
+        "a merge is in progress in this worktree; conclude it first with \
+         `libra merge --continue` or `libra merge --abort`"
+    )]
+    MergeInProgress,
+
+    #[error("cannot inspect this worktree's merge state: {0}")]
+    LocalStateProbe(String),
+
     #[error("there is no tracking information for the current branch")]
     NoTrackingInfo {
         branch: String,
@@ -201,11 +210,6 @@ pub(crate) enum PullError {
 
     #[error("pull failed during rebase phase: {0}")]
     Rebase(#[source] rebase::RebaseError),
-
-    /// Part C W1: the rebase mode alone is refused in a linked worktree (its
-    /// state is still repository-global); carries the ready-made guard error.
-    #[error("'pull --rebase' is not yet supported inside a linked worktree")]
-    RebaseInLinkedWorktree(CliError),
 
     #[error("pull --autostash failed: {0}")]
     Autostash(String),
@@ -235,6 +239,16 @@ impl From<PullError> for CliError {
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("checkout a branch before pulling")
                 .with_hint("use 'libra switch <branch>' to switch"),
+            PullError::MergeInProgress => {
+                CliError::failure("a merge is in progress in this worktree; conclude it first")
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+                    .with_hint("finish it with 'libra merge --continue'")
+                    .with_hint("or discard it with 'libra merge --abort'")
+            }
+            PullError::LocalStateProbe(detail) => CliError::fatal(format!(
+                "cannot inspect this worktree's merge state: {detail}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed),
             PullError::NoTrackingInfo {
                 branch,
                 advice_remote,
@@ -253,7 +267,6 @@ impl From<PullError> for CliError {
             PullError::Fetch(error) => map_fetch_error_to_cli(&error).with_detail("phase", "fetch"),
             PullError::Merge(error) => map_merge_error_to_cli(&error).with_detail("phase", "merge"),
             PullError::Rebase(error) => CliError::from(error).with_detail("phase", "rebase"),
-            PullError::RebaseInLinkedWorktree(guard) => guard.with_detail("phase", "rebase"),
             PullError::Autostash(detail) => {
                 CliError::failure(format!("pull --autostash failed: {detail}"))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
@@ -347,14 +360,10 @@ pub async fn execute(args: PullArgs) {
 /// Returns [`CliError`] when the pull target cannot be resolved, fetch fails,
 /// histories cannot be merged safely, or refs/worktree updates fail.
 pub async fn execute_safe(args: PullArgs, output: &OutputConfig) -> CliResult<()> {
-    // Part C W1 (§C.4.4): pull's fetch phase writes only repository-scoped
-    // state (`refs/remotes/*` + objects; the pull-internal fetch writes no
-    // FETCH_HEAD) and its merge phase runs on fully worktree-scoped merge
-    // state (v0.19.33), so the merge/ff modes are safe in a linked worktree.
-    // Only the REBASE mode still rides the repository-global `rebase_state`
-    // (plus the legacy stash-stack autostash) — `run_pull` refuses that mode
-    // alone, after config resolution (so `pull.rebase = true` cannot sneak
-    // past a flag-only check).
+    // Part C W2 (§C.4.3/§C.4.4): every pull mode runs in any worktree —
+    // the fetch phase writes only repository-scoped state, merge/rebase run
+    // on worktree-scoped state, and the rebase-path `--autostash` wrap uses
+    // the shared stash stack through the stack-lock + by-id CAS protocol.
     let result = run_pull(args, output).await.map_err(CliError::from)?;
     render_pull_output(&result, output)
 }
@@ -365,18 +374,17 @@ pub(crate) async fn run_pull(
 ) -> Result<PullOutput, PullError> {
     let branch = current_branch_for_pull().await?;
     let effective = resolve_effective_pull_options(&args, &branch).await?;
-    // Part C W1 (§C.4.4): the rebase mode (whether from `--rebase` or from
-    // `pull.rebase`/`branch.<name>.rebase` config) still uses the
-    // repository-global `rebase_state` and the stash-stack autostash, so it
-    // alone stays refused in a linked worktree — before any fetch runs.
-    if effective.rebase
-        && let Err(guard) = crate::command::ensure_main_worktree_because(
-            "pull --rebase",
-            "pull's rebase state is not yet worktree-scoped; use the merge mode (--no-rebase)",
-        )
-    {
-        return Err(PullError::RebaseInLinkedWorktree(guard));
+    // W2 r8 #2: a persisted merge must refuse the pull BEFORE the fetch — the
+    // control slot only excludes concurrent control actions, and a fetch
+    // would move FETCH_HEAD and the remote refs for a pull that has nowhere
+    // to integrate.
+    if !effective.rebase && merge::merge_in_progress().map_err(PullError::LocalStateProbe)? {
+        return Err(PullError::MergeInProgress);
     }
+    // Part C W2 (§C.4.3): the `--rebase --autostash` combination is allowed
+    // in linked worktrees now — its wrap pushes/pops the shared stash stack
+    // through the W2 stack-lock + by-id CAS protocol, and the snapshot/apply
+    // side acts on this worktree's own index/workdir.
     let target = resolve_pull_target(&args, branch, effective.rebase).await?;
     // `--no-progress` forwards to the fetch: suppress its "Receiving objects"
     // meter just like `git pull --no-progress`.
@@ -400,6 +408,9 @@ pub(crate) async fn run_pull(
     )
     .await
     .map_err(PullError::Fetch)?;
+    // The pull-internal fetch writes no FETCH_HEAD and its ref updates
+    // completed inside — release the pack's `.keep` pin now.
+    fetch_result.release_pack_pin();
 
     let fetch_summary = PullFetchResult {
         remote: fetch_result.remote,
@@ -421,12 +432,12 @@ pub(crate) async fn run_pull(
     // has no autostash machinery of its own — see COMPATIBILITY.md rebase
     // row). The MERGE path uses the Git-faithful merge-owned autostash below
     // (held on conflict rather than popped back into a conflicted tree).
-    let stashed = if args.autostash && effective.rebase {
+    let autostash_entry = if args.autostash && effective.rebase {
         stash::autostash_push()
             .await
             .map_err(PullError::Autostash)?
     } else {
-        false
+        None
     };
 
     // Capture the integrate result so the autostash can be popped afterwards
@@ -511,8 +522,13 @@ pub(crate) async fn run_pull(
         }
     };
 
-    if stashed {
-        stash::autostash_pop().await.map_err(PullError::Autostash)?;
+    if let Some((id, raw_line)) = autostash_entry {
+        // Pop EXACTLY the entry this pull pushed — named by the push-time
+        // raw reflog line (immune even to a duplicate commit id another
+        // worktree pushed onto the shared stack meanwhile).
+        stash::autostash_pop_by_entry(&id, &raw_line)
+            .await
+            .map_err(PullError::Autostash)?;
     }
 
     integrate_result
@@ -523,6 +539,41 @@ async fn current_branch_for_pull() -> Result<String, PullError> {
         Head::Branch(name) => name,
         Head::Detached(_) => return Err(PullError::NotOnBranch),
     })
+}
+
+/// Whether this `pull` will REBASE, resolved exactly as the command itself
+/// resolves it — flags first, then `branch.<name>.rebase`, then `pull.rebase`.
+///
+/// Dispatch needs the answer BEFORE the handler runs, because a pull that
+/// rebases must hold the worktree's sequencer control slot across the whole
+/// command: the fetch and a possible autostash happen before the rebase
+/// begins, and starting them beside another worktree-local sequence is how a
+/// pull ends up rebasing on top of someone else's half-finished work. A
+/// configured `pull.rebase = true` makes a bare `libra pull` such a command,
+/// so keying the slot on the `--rebase` FLAG would miss it.
+///
+/// Errors are answered `false`: a pull that cannot resolve its own branch or
+/// config is about to fail in the handler with a better message, and taking a
+/// control slot for it would only change which error the user sees.
+/// The pull's RESOLVED integration mode, for dispatch (W2 r8 #4):
+/// `Some(true)` = rebase, `Some(false)` = merge, `None` = the pull cannot
+/// resolve a mode at all — a detached HEAD or unreadable config is about to
+/// be refused by the handler, and claiming a sequencer control slot for it
+/// would persist a failed control operation for a command that never touched
+/// the sequencer.
+pub(crate) async fn resolved_pull_mode(args: &PullArgs) -> Option<bool> {
+    // The branch is resolved FIRST, even for an explicit `--rebase`: on a
+    // detached HEAD the handler refuses the pull outright.
+    let Ok(branch) = current_branch_for_pull().await else {
+        return None;
+    };
+    if args.rebase {
+        return Some(true);
+    }
+    match resolve_effective_pull_options(args, &branch).await {
+        Ok(options) => Some(options.rebase),
+        Err(_) => None,
+    }
 }
 
 async fn resolve_effective_pull_options(
@@ -1037,6 +1088,12 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         | merge::PullMergeError::WorkdirReset(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
         }
+        // Mirrors `CommitError::IdentityMissing`: the merge commit `pull` creates
+        // needs the same identity as any other commit, and fails the same way.
+        merge::PullMergeError::IdentityMissing(..) => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::AuthMissingCredentials)
+            .with_hint("run 'libra config --global user.name \"Your Name\"' and 'libra config --global user.email \"you@example.com\"'")
+            .with_hint("omit '--global' to set the identity only in this repository."),
         merge::PullMergeError::HeadResolve(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }

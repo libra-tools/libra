@@ -4,7 +4,7 @@
 
 当前实现状态：
 
-- `libra publish init` 会将嵌入的 Worker 模板 materialise 到 `worker/` 下，并记录 `.libra/publish/worker-template-manifest.json`。
+- `libra publish init` 会将嵌入的 Worker 模板 materialise 到 `worker/` 下，并记录 `.libra/publish/worker-template-manifest.json`。该 manifest 位于仓库**共享存储**（经 `commondir` 链解析的共享 `.libra`），因此 `init`/`status`/`deploy`/`unpublish` 在任何 worktree 中读写的都是同一份 manifest；`worker/` 目录本身是被跟踪的工作树内容，按 worktree 独立。输出中报告的 `manifest_path`：当 manifest 位于调用 worktree 之下（main worktree）时为相对路径，否则（linked worktree）为绝对路径。
 - `libra publish status` 报告本地 Worker 模板状态：`missing`、`current`、`modified`、`outdated` 或 `conflicted`；配置 site id 时，还可以将本地 branch/tag refs 与 D1 `publish_refs` 比较。
 - `libra publish sync --dry-run` 扫描本地 branch/tag refs，校验 `--ref`，报告脏树警告，并在没有 Cloudflare 凭据的情况下输出本地发布计划。
 - `libra publish sync` 将代码快照和 AI artifacts 写入 R2，并在 D1 中 upsert `publish_sync_runs`、`publish_revisions`、`publish_files`、`publish_ai_objects`、`publish_ai_versions` 和 `publish_refs`；只有完整的 all-refs sync 才会推进 `publish_sites.latest_revision_oid`。内置 AI 导出 planner 读取本地 AI 历史，输出脱敏的 snapshot/event 对象，并为发布 AI index、graph 和 bundle 添加 projection 对象。

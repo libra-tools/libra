@@ -71,6 +71,14 @@ pub async fn execute_safe(args: RepackArgs, output: &OutputConfig) -> CliResult<
     let storage = ClientStorage::init(path::objects());
     let hash_kind = get_hash_kind();
 
+    // §C.4.3 writer-vs-deleter: `repack` PUBLISHES (a new pack becomes the
+    // only home of objects it consolidates) and, under `-d`, DELETES. It
+    // takes the maintenance lock shared for the publication half, exactly
+    // like every other publisher, so an obliteration cannot classify an
+    // object as loose-only and then find it re-published inside a pack it
+    // never looked at. `-d` upgrades to the exclusive hold below.
+    let publish_lock = crate::internal::maintenance_lock::MaintenanceLock::shared(&repo_path)?;
+
     let reachable = collect_reachable_objects(&storage).await?;
 
     // Loose objects on disk, as (hash, path). Used to pick the default packing
@@ -89,9 +97,9 @@ pub async fn execute_safe(args: RepackArgs, output: &OutputConfig) -> CliResult<
     };
 
     let pack_dir = path::objects().join("pack");
-    let pack_path =
+    let publication =
         match pack_writer::write_pack_with_index(&storage, &to_pack, &pack_dir, hash_kind).await {
-            Ok(Some(path)) => path,
+            Ok(Some(publication)) => publication,
             Ok(None) => {
                 if !output.quiet && !output.is_json() {
                     println!("Nothing new to pack.");
@@ -104,21 +112,85 @@ pub async fn execute_safe(args: RepackArgs, output: &OutputConfig) -> CliResult<
     // `-d`: drop loose objects that are now in the new pack. Only files whose
     // hash is in `to_pack` are removed, so nothing that was left out of the pack
     // is ever deleted.
+    let pack_path = publication.path.clone();
     let mut loose_removed = 0usize;
     if args.delete {
+        // The pack is about to become these objects' only home, so its NAME
+        // has to be durable, not just its bytes: a crash that loses the
+        // directory entry after the loose copies are gone loses the objects.
+        if !publication.durable {
+            return Err(CliError::fatal(
+                "refusing to delete loose objects: the new pack's directory entry could not be \
+                 made durable, so a crash could leave the objects with no copy at all"
+                    .to_string(),
+            )
+            .with_stable_code(crate::utils::error::StableErrorCode::IoWriteFailed)
+            .with_hint("re-run 'libra repack' without -d to keep the loose objects"));
+        }
+        // lore.md 2.3 / plan-20260714 W0 deletion hard gate: `-d` is a
+        // DELETION entry point, so it must refuse while another repository
+        // borrows from this object store — this store's reachability does
+        // not include the borrower's refs, so a loose object it still needs
+        // could be dropped. The borrower must `alternates remove` (or
+        // dissociate) first.
+        crate::internal::alternates::ensure_no_live_borrowers(
+            "delete loose objects after repacking",
+            crate::utils::error::StableErrorCode::ConflictOperationBlocked,
+        )
+        .map_err(|error| {
+            error.with_hint("or re-run 'libra repack' without -d to keep the loose objects")
+        })?;
+        // The publication is durable on disk now, so the shared hold is
+        // released and the deletion phase takes the EXCLUSIVE one: no
+        // publisher may be running while loose payloads are unlinked. A
+        // shared hold cannot be upgraded in place (another process may hold
+        // it too), which is why this is a release-then-acquire rather than a
+        // nested acquisition.
+        drop(publish_lock);
+        let _deletion_lock =
+            crate::internal::maintenance_lock::MaintenanceLock::exclusive_or_refuse(
+                &repo_path,
+                "delete loose objects after repacking",
+            )
+            .map_err(|error| {
+                error.with_hint("or re-run 'libra repack' without -d to keep the loose objects")
+            })?;
+        // Re-checked UNDER the exclusive hold: the gate above ran before this
+        // lock existed, and borrower registration is itself a publication, so
+        // one that appeared in between is caught here (§C.4.3).
+        crate::internal::alternates::ensure_no_live_borrowers(
+            "delete loose objects after repacking",
+            crate::utils::error::StableErrorCode::ConflictOperationBlocked,
+        )
+        .map_err(|error| {
+            error.with_hint("or re-run 'libra repack' without -d to keep the loose objects")
+        })?;
         let packed: HashSet<ObjectHash> = to_pack.iter().copied().collect();
         for (hash_str, obj_path) in &loose {
             if let Some(hash) = parse_object_hash(hash_str)
                 && packed.contains(&hash)
             {
-                std::fs::remove_file(obj_path).map_err(|e| {
-                    CliError::fatal(format!("failed to remove loose object {hash_str}: {e}"))
-                })?;
-                loose_removed += 1;
+                match std::fs::remove_file(obj_path) {
+                    Ok(()) => loose_removed += 1,
+                    // Already gone. Two `repack -d` runs can each snapshot the
+                    // same loose set under their shared holds; whichever
+                    // reaches the exclusive phase second finds the files
+                    // removed, and its own pack still contains every object,
+                    // so the goal state is reached. Treating that as fatal
+                    // failed a command that had done its job correctly.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(CliError::fatal(format!(
+                            "failed to remove loose object {hash_str}: {e}"
+                        )));
+                    }
+                }
             }
         }
     }
 
+    // Either the `-d` branch released it, or it is released when this
+    // function returns — the publication window ends with the pack on disk.
     let pack_name = pack_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

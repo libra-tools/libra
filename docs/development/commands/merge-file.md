@@ -7,7 +7,7 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：`merge-file [-p|--stdout] [--diff3] [-q|--quiet] <current> <base> <other>`、`--json`/`--machine`、二进制检测、空文件、就地写入 + `.libra/merge-file-backup/` 备份。
+- 已支持：`merge-file [-p|--stdout] [--diff3] [-q|--quiet] <current> <base> <other>`、`--json`/`--machine`、二进制检测、空文件、就地写入 + worktree-local gitdir 的 `merge-file-backup/` 备份（W2 §C.4.3）。
 - 退出码：0 干净 / 1 冲突（无论冲突数固定 1）/ 128 错误。
 - **差异**：冲突标记标签为 `ours`/`theirs`（与 `merge.rs` 的 diffy 输出一致），非文件名；冲突退出码固定 1（Git 报告冲突数量——本实现按 grit-gap 计划固定 1）。
 - 未公开（延后，`diffy` 0.4 不支持自定义标签/择边）：`-L <label>`、`--ours`/`--theirs`/`--union`、`--marker-size`。
@@ -19,9 +19,9 @@
 - 合并核心：`diffy::MergeOptions::new()`（`--diff3` → `set_conflict_style(ConflictStyle::Diff3)`）`.merge_bytes(&base, &current, &other)` → `Ok(clean)` / `Err(conflicted-with-markers)`。**注意 diffy 参数序为 (ancestor, ours, theirs)**，故 Git 的 `<current> <base> <other>` 映射为 `merge_bytes(base, current, other)`。
 - 二进制检测：三方任一含 NUL 字节 → 128 `cannot merge binary files: <file>`（`StableErrorCode::Unsupported`）。
 - 输出：`-p` 非 json → 原始字节写 stdout；`-p` + json → merged 文本放进 JSON `merged` 字段（避免与 envelope 混在 stdout）；无 `-p` → `write_with_backup` 覆盖 `<current>`。
-- 备份：仅在仓库内（`util::try_get_storage_path(None).ok()`）时，把原 `<current>` 备份到 `.libra/merge-file-backup/<sanitized-path>`；干净合并删备份，冲突保留 + （非 `-q`）提示。仓库外不备份（合并照常）。
+- 备份：仅在仓库内（`util::try_get_worktree_gitdir(None).ok()`）时，把原 `<current>` 备份到**当前 worktree local gitdir** 的 `merge-file-backup/<sanitized-path>`（W2 §C.4.3：备份对象属于本 worktree，两个 worktree 合并同名文件互不覆盖/清理对方备份；main 的 local gitdir 即 `.libra`，单 worktree 行为不变）；干净合并删备份，冲突保留 + （非 `-q`）提示。仓库外不备份（合并照常）。
 - 退出码：冲突 → `CliError::silent_exit(1)`（标记已写出，冲突非错误）；错误 → 128。
-- 底层操作对象：三个磁盘文件 + （写模式）`.libra/merge-file-backup/`。无对象库/refs/网络写入；不校验内容对应 blob。
+- 底层操作对象：三个磁盘文件 + （写模式）worktree-local `merge-file-backup/`。无对象库/refs/网络写入；不校验内容对应 blob。
 
 ## 实现历史
 

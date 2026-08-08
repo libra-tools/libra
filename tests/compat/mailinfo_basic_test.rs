@@ -243,13 +243,16 @@ fn invalid_mail_and_invalid_second_destination_preserve_existing_outputs() {
 #[test]
 fn unsupported_multipart_and_non_utf8_input_fail_closed() {
     let temp = tempdir().expect("create tempdir");
+    // PD-09 ④: well-formed multipart is now SUPPORTED; a mail that
+    // declares a boundary but carries no parts for it still fails
+    // closed rather than silently parsing garbage.
     let multipart = MAIL.replace(
         "Content-Type: text/plain; charset=UTF-8",
         "Content-Type: multipart/mixed; boundary=x",
     );
     assert_failure(
         &run_mailinfo(temp.path(), &["mailinfo", "a", "b"], multipart.as_bytes()),
-        "unsupported Content-Type 'multipart/mixed'",
+        "multipart mail has no parts for its declared boundary",
     );
     assert!(!temp.path().join("a").exists());
     assert!(!temp.path().join("b").exists());

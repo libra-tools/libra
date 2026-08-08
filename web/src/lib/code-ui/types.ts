@@ -15,7 +15,9 @@ export type CodeUiSessionStatus =
   | "executing_tool"
   | "awaiting_interaction"
   | "completed"
-  | "error";
+  | "error"
+  /** A mutating command may have taken effect; reconcile before retrying. */
+  | "indeterminate_side_effect";
 
 /** Capability flags advertised by the runtime. All eight default to `false`. */
 export type CodeUiCapabilities = {

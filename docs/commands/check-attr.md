@@ -11,9 +11,15 @@ analogue of `git check-attr`.
 
 Attribute sources are applied from lower to higher precedence:
 `core.attributesFile`, per-directory `.gitattributes` from root to child,
-same-directory `.libra_attributes`, then `.git/info/attributes`.
-Libra extension files override sibling `.gitattributes` rules, while
-`.git/info/attributes` keeps Git's highest-precedence worktree-local tier.
+same-directory `.libra_attributes`, then the worktree-local
+`info/attributes` — `.libra/info/attributes` in the CURRENT worktree's own
+gitdir, plus `.git/info/attributes` in a Git-layout or dual-layout tree (a
+repo converted from Git keeps both consulted). Libra extension files
+override sibling `.gitattributes` rules, while `info/attributes` keeps
+Git's highest-precedence worktree-local tier. It is per-worktree: each
+isolated linked worktree reads its own file, never another's via `commondir`
+(intentionally different from Git's repository-wide sharing; a pre-isolation
+legacy-symlink worktree still shares main's until migrated).
 
 ## Synopsis
 

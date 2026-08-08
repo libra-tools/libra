@@ -87,9 +87,11 @@ pub struct CheckoutArgs {
     track: bool,
 
     /// Check out a branch even if it is already checked out in another worktree.
-    /// Accepted for Git parity and is a no-op: Libra worktrees share a single
-    /// `HEAD`/refs store, so a branch is never locked to one worktree and there
-    /// is no other-worktree restriction to override.
+    /// Accepted for Git parity, but NOT honored against a real collision: each
+    /// worktree owns its HEAD, and one branch may be checked out by at most one
+    /// live worktree (ADR-0714-09), so checking out a branch held by another
+    /// worktree is refused with or without this flag. It is a silent no-op in a
+    /// single-worktree repository.
     #[clap(long = "ignore-other-worktrees")]
     ignore_other_worktrees: bool,
 
@@ -720,10 +722,23 @@ async fn switch_branch_with_output(
     // branch checked out in two worktrees. `branch_checked_out_elsewhere` only
     // returns Some when a real collision exists, so single-worktree repos are
     // unaffected and the flag is a silent no-op there.
-    if let Some(other) = Head::branch_checked_out_elsewhere(branch_name).await {
+    let checked_out = Head::branch_checked_out_elsewhere_result(branch_name)
+        .await
+        .map_err(|error| {
+            CheckoutError::DelegatedCli(
+                crate::utils::error::CliError::fatal(format!(
+                    "cannot determine whether branch '{branch_name}' is checked out in another \
+                     worktree: {error}"
+                ))
+                .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt),
+            )
+        })?;
+    if let Some(other) = checked_out {
         let hint = if ignore_other_worktrees {
             "Libra does not honor --ignore-other-worktrees (it never allows the same branch \
-             checked out in two worktrees): check out a different branch, or use --detach"
+             checked out in two worktrees): check out a different branch, or use --detach; \
+             if the recorded owner looks stale, inspect it with `libra worktree doctor` and \
+             settle the registry with `libra worktree repair --confirm`"
         } else {
             "check out a different branch, or use --detach"
         };

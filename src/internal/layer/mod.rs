@@ -30,7 +30,7 @@ use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 use crate::{
-    internal::db::get_db_conn_instance,
+    internal::worktree_scope::WorktreeScope,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         util,
@@ -58,19 +58,21 @@ pub struct MaterializedPath {
 pub struct LayerStore;
 
 impl LayerStore {
-    /// All registered layers, ordered (priority ASC, name ASC) — the
-    /// deterministic apply stack order (higher priority materializes last,
-    /// so it wins a same-destination collision).
-    pub async fn list() -> Result<Vec<Layer>, String> {
-        let db = get_db_conn_instance().await;
-        let stmt = Statement::from_string(
+    /// All layers registered in `scope`, ordered (priority ASC, name ASC) —
+    /// the deterministic apply stack order (higher priority materializes
+    /// last, so it wins a same-destination collision). W1 §C.4.1.1: every
+    /// method takes the request's ONE resolved [`WorktreeScope`] — the same
+    /// layer name may exist independently in different worktrees.
+    pub async fn list(scope: &WorktreeScope) -> Result<Vec<Layer>, String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT name, source, priority, enabled FROM layer \
-             ORDER BY priority ASC, name ASC"
-                .to_string(),
+             WHERE worktree_id = ? ORDER BY priority ASC, name ASC",
+            [scope.storage_key().into()],
         );
         let rows = db
-            .query_all(stmt)
+            .query_all_raw(stmt)
             .await
             .map_err(|e| format!("failed to list layers: {e}"))?;
         let mut layers = Vec::with_capacity(rows.len());
@@ -85,14 +87,22 @@ impl LayerStore {
         Ok(layers)
     }
 
-    /// Register a new layer. Duplicate names are rejected by the UNIQUE
-    /// constraint, surfaced as a clean error.
-    pub async fn add(name: &str, source: &str, priority: i64, enabled: bool) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        db.execute(Statement::from_sql_and_values(
+    /// Register a new layer in `scope`. Duplicate names (within the scope)
+    /// are rejected by the UNIQUE constraint, surfaced as a clean error.
+    pub async fn add(
+        scope: &WorktreeScope,
+        name: &str,
+        source: &str,
+        priority: i64,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO layer (name, source, priority, enabled) VALUES (?, ?, ?, ?)",
+            "INSERT INTO layer (worktree_id, name, source, priority, enabled) \
+             VALUES (?, ?, ?, ?, ?)",
             [
+                scope.storage_key().into(),
                 name.into(),
                 source.into(),
                 priority.into(),
@@ -110,42 +120,54 @@ impl LayerStore {
         Ok(())
     }
 
-    /// Look up one layer by name.
-    pub async fn get(name: &str) -> Result<Option<Layer>, String> {
-        Ok(Self::list().await?.into_iter().find(|l| l.name == name))
+    /// Look up one layer by name within `scope`.
+    pub async fn get(scope: &WorktreeScope, name: &str) -> Result<Option<Layer>, String> {
+        Ok(Self::list(scope)
+            .await?
+            .into_iter()
+            .find(|l| l.name == name))
     }
 
-    /// Enable/disable a layer. Returns whether a row was affected.
-    pub async fn set_enabled(name: &str, enabled: bool) -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
+    /// Enable/disable a layer in `scope`. Returns whether a row was affected.
+    pub async fn set_enabled(
+        scope: &WorktreeScope,
+        name: &str,
+        enabled: bool,
+    ) -> Result<bool, String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
         let result = db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "UPDATE layer SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?",
-                [(if enabled { 1 } else { 0 }).into(), name.into()],
+                "UPDATE layer SET enabled = ?, updated_at = CURRENT_TIMESTAMP \
+                 WHERE worktree_id = ? AND name = ?",
+                [
+                    (if enabled { 1 } else { 0 }).into(),
+                    scope.storage_key().into(),
+                    name.into(),
+                ],
             ))
             .await
             .map_err(|e| format!("failed to update layer: {e}"))?;
         Ok(result.rows_affected() > 0)
     }
 
-    /// Remove a layer registration and its path records (the caller unapplies
-    /// the materialized files first).
-    pub async fn remove(name: &str) -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
+    /// Remove a layer registration and its path records within `scope` (the
+    /// caller unapplies the materialized files first).
+    pub async fn remove(scope: &WorktreeScope, name: &str) -> Result<bool, String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
         let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "DELETE FROM layer_path WHERE layer_name = ?",
-            [name.into()],
+            "DELETE FROM layer_path WHERE worktree_id = ? AND layer_name = ?",
+            [scope.storage_key().into(), name.into()],
         ))
         .await
         .map_err(|e| format!("failed to clear layer paths: {e}"))?;
         let result = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "DELETE FROM layer WHERE name = ?",
-                [name.into()],
+                "DELETE FROM layer WHERE worktree_id = ? AND name = ?",
+                [scope.storage_key().into(), name.into()],
             ))
             .await
             .map_err(|e| format!("failed to remove layer: {e}"))?;
@@ -153,16 +175,20 @@ impl LayerStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Every currently-materialized overlay path (repo-relative, '/'-sep).
-    /// This is the set the ignore resolver and the `add` guard consult; an
-    /// empty set (no layers applied) makes both a zero-overhead no-op.
-    pub async fn materialized_paths() -> Result<Vec<MaterializedPath>, String> {
-        let db = get_db_conn_instance().await;
-        let stmt = Statement::from_string(
+    /// Every overlay path currently materialized in `scope` (repo-relative,
+    /// '/'-sep). This is the set the ignore resolver and the `add` guard
+    /// consult; an empty set (no layers applied) makes both a zero-overhead
+    /// no-op.
+    pub async fn materialized_paths(
+        scope: &WorktreeScope,
+    ) -> Result<Vec<MaterializedPath>, String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT layer_name, path, content_hash FROM layer_path".to_string(),
+            "SELECT layer_name, path, content_hash FROM layer_path WHERE worktree_id = ?",
+            [scope.storage_key().into()],
         );
-        let rows = match db.query_all(stmt).await {
+        let rows = match db.query_all_raw(stmt).await {
             Ok(rows) => rows,
             // Absence-tolerant: before the migration created the table (or on
             // an old binary), there are simply no materialized paths.
@@ -180,47 +206,253 @@ impl LayerStore {
         Ok(out)
     }
 
-    /// The set of layer-owned paths as a fast lookup (for the ignore
-    /// resolver + `add` guard). Errors resolve to an EMPTY set so a probe
-    /// failure never blocks normal `status`/`add` (the apply path, which
-    /// mutates, surfaces real errors).
-    pub async fn owned_path_set() -> HashSet<String> {
-        Self::materialized_paths()
+    /// The set of layer-owned paths in `scope` as a fast lookup (for the
+    /// ignore resolver's snapshot refresh). Errors resolve to an EMPTY set so
+    /// a probe failure never blocks normal `status`/`add` — the `add` staging
+    /// guard and the apply path (which mutate) surface real errors instead of
+    /// consuming this advisory set.
+    pub async fn owned_path_set(scope: &WorktreeScope) -> HashSet<String> {
+        Self::materialized_paths(scope)
             .await
             .map(|paths| paths.into_iter().map(|p| p.path).collect())
             .unwrap_or_default()
+    }
+
+    /// [`Self::owned_path_set`] that FAILS instead of returning an empty set.
+    ///
+    /// For a DESTRUCTIVE caller. Fail-open is the right default for `status` and
+    /// `add`, where a probe failure must not block ordinary work — but `clean`
+    /// deletes, and an empty set from a locked or corrupt query means "no
+    /// overlays are protected", so it would remove files only a re-apply could
+    /// restore. A destructive caller has to be able to see the failure.
+    pub async fn owned_path_set_strict(scope: &WorktreeScope) -> Result<HashSet<String>, String> {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        // NOT `materialized_paths`, which is absence-tolerant: a missing
+        // `layer_path` table there means "no overlays" so an old binary or a
+        // pre-migration database does not break `status`. For a DESTRUCTIVE
+        // caller that same answer is indistinguishable from "nothing is
+        // protected", so every error — including the missing table — is
+        // propagated and `clean` refuses.
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT path FROM layer_path WHERE worktree_id = ?",
+                [scope.storage_key().into()],
+            ))
+            .await
+            .map_err(|error| {
+                format!("failed to read layer ownership for this worktree: {error}")
+            })?;
+        let mut out = HashSet::with_capacity(rows.len());
+        for row in rows {
+            out.insert(
+                row.try_get_by_index::<String>(0)
+                    .map_err(|error| format!("failed to read a layer path: {error}"))?,
+            );
+        }
+        Ok(out)
     }
 }
 
 /// Process-global snapshot of layer-owned paths, consulted SYNCHRONOUSLY by
 /// the ignore resolver (which cannot await a DB read). Async command entry
 /// points that enumerate the working tree (`status`, `add`) call
-/// [`refresh_exclusion_snapshot`] first so the sync consult is consistent
-/// within one command; the default (no layers) is an empty set → zero
-/// overhead and byte-identical pre-feature behavior.
-static EXCLUSION_SNAPSHOT: std::sync::RwLock<Option<HashSet<String>>> =
-    std::sync::RwLock::new(None);
+/// [`refresh_exclusion_snapshot`] with their ONE resolved scope first, so the
+/// sync consult is consistent within one command; the default (no layers) is
+/// an empty set → zero overhead and byte-identical pre-feature behavior.
+///
+/// W1 §C.4.1.1: the snapshot is keyed by the scope that loaded it (storage
+/// key), so it can never silently carry another worktree's set across a
+/// refresh. Keyed by scope rather than holding a single last-refreshed set:
+/// the consult resolves the INVOCATION's scope (a pinned lookup, not a
+/// filesystem probe, so it stays cheap in the per-path hot loop) and reads
+/// that worktree's own set.
+static EXCLUSION_SNAPSHOT: std::sync::RwLock<
+    Option<std::collections::HashMap<String, std::sync::Arc<HashSet<String>>>>,
+> = std::sync::RwLock::new(None);
 
-/// Load the current layer-owned path set into the process snapshot. Cheap and
-/// idempotent; call at the start of any command that enumerates untracked
-/// files so layer overlays are excluded like ignored paths.
-pub async fn refresh_exclusion_snapshot() {
-    let set = LayerStore::owned_path_set().await;
+/// Refuse to turn an index that stages a materialized layer overlay into
+/// anything reachable (lore.md 2.4, §C.11 W1 layer commit guard).
+///
+/// THE single implementation, because every index-to-history route needs it and
+/// they are not one path: `commit`, `write-tree`, `stash push`, and the
+/// sequencer `--continue` paths each build a tree from the current index. A
+/// guard on one of them is a guard on none.
+///
+/// STRICT: a failure to read ownership refuses. An empty set from an unreadable
+/// table is indistinguishable from "nothing is owned", and this is the last
+/// gate before content the repository cannot reproduce becomes reachable.
+pub async fn reject_layer_owned_entries(
+    index: &git_internal::internal::index::Index,
+    action: &str,
+) -> Result<(), String> {
+    let scope = WorktreeScope::for_request();
+    let owned = LayerStore::owned_path_set_strict(&scope)
+        .await
+        .map_err(|error| format!("cannot verify layer-owned paths before {action}: {error}"))?;
+    if owned.is_empty() {
+        return Ok(());
+    }
+    let mut blocked: Vec<String> = index
+        .tracked_entries(0)
+        .into_iter()
+        .filter(|entry| owned.contains(&entry.name))
+        .map(|entry| entry.name.clone())
+        .collect();
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    blocked.sort();
+    Err(format!(
+        "refusing {action}: {} path(s) are owned by a materialized layer overlay ({}). Overlay \
+         content is local — its source lives outside this repository — so making it reachable \
+         would produce history the repository cannot reproduce. Unstage them (`libra restore \
+         --staged <path>`), or run `libra layer unapply`.",
+        blocked.len(),
+        blocked.join(", ")
+    ))
+}
+
+/// The per-worktree lock that serializes layer MUTATION against a destructive
+/// enumeration (§C.10 lock ordering).
+///
+/// `clean` snapshots layer ownership and then deletes; `layer apply` records
+/// ownership and then materializes. Without a shared lock the two interleave:
+/// `clean` snapshots an empty set, `apply` records and materializes, and
+/// `clean` deletes the file it never saw. Held across snapshot-plus-delete on
+/// one side and apply/unapply on the other.
+pub fn layer_mutation_lock(scope: &WorktreeScope) -> std::io::Result<std::fs::File> {
+    // The FALLIBLE resolver: `..._strict` panics when the pin has no gitdir,
+    // and a concurrent repair can make a command's preflight succeed after its
+    // scope was pinned invalid. A destructive command must report that, not
+    // abort the process.
+    let gitdir = crate::utils::util::request_worktree_gitdir()?;
+    let _ = std::fs::create_dir_all(&gitdir);
+    let name = if scope.storage_key().is_empty() {
+        "layer-mutation.lock".to_string()
+    } else {
+        format!("layer-mutation-{}.lock", scope.storage_key())
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(gitdir.join(name))?;
+    // std file locking: flock on Unix, LockFileEx on Windows, and BLOCKING —
+    // a concurrent apply/clean queues rather than failing.
+    file.lock()?;
+    Ok(file)
+}
+
+/// [`refresh_exclusion_snapshot`] that FAILS on a read error, for a
+/// destructive caller that must not proceed on an empty set.
+pub async fn refresh_exclusion_snapshot_strict(scope: &WorktreeScope) -> Result<(), String> {
+    let set = LayerStore::owned_path_set_strict(scope).await?;
+    let key = exclusion_key(scope);
     let mut guard = EXCLUSION_SNAPSHOT
         .write()
         .unwrap_or_else(|poison| poison.into_inner());
-    *guard = Some(set);
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(key, std::sync::Arc::new(set));
+    Ok(())
+}
+
+/// Load `scope`'s layer-owned path set into the process snapshot. Cheap and
+/// idempotent; call at the start of any command that enumerates untracked
+/// files so layer overlays are excluded like ignored paths.
+pub async fn refresh_exclusion_snapshot(scope: &WorktreeScope) {
+    let set = LayerStore::owned_path_set(scope).await;
+    let key = exclusion_key(scope);
+    let mut guard = EXCLUSION_SNAPSHOT
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Keyed BY SCOPE, not "whoever refreshed last": an in-process host that
+    // serves two worktrees would otherwise have one refresh replace the
+    // other's set, and the consult below — which cannot re-resolve the scope
+    // in a per-path hot loop — would answer for the wrong worktree.
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(key, std::sync::Arc::new(set));
 }
 
 /// SYNC un-negatable consult: is `path_norm` (repo-relative, '/'-sep) a
-/// layer-owned overlay path? A `!path` negation in `.libraignore` must NOT be
-/// able to un-exclude it. Returns `false` when the snapshot is empty/unloaded.
+/// layer-owned overlay path in the scope that last refreshed the snapshot
+/// (the current command's scope)? A `!path` negation in `.libraignore` must
+/// NOT be able to un-exclude it. Returns `false` when the snapshot is
+/// empty/unloaded.
 pub fn is_layer_owned(path_norm: &str) -> bool {
-    EXCLUSION_SNAPSHOT
-        .read()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(path_norm))
+    ExclusionSnapshot::for_request().is_owned(path_norm)
+}
+
+/// An IMMUTABLE, request-local view of one scope's layer-owned path set.
+///
+/// Resolved once per walk and passed down, rather than read per path from
+/// process-global state. Two reasons, and the first is a correctness one:
+/// `is_layer_owned` used to derive its key from the process-global request
+/// scope, so two in-process tasks interleaving their pins could have one
+/// worktree's ignore walk consult the other's set. A snapshot captured at the
+/// top of the walk cannot be switched underneath it. The second is cost — the
+/// consult runs per path, and this removes a lock acquisition, a scope clone
+/// and a key allocation from that loop.
+#[derive(Clone, Default)]
+pub struct ExclusionSnapshot {
+    owned: std::sync::Arc<HashSet<String>>,
+}
+
+impl ExclusionSnapshot {
+    /// Capture the set for THIS invocation's scope.
+    pub fn for_request() -> Self {
+        Self::for_scope(&WorktreeScope::for_request())
+    }
+
+    /// Capture the set for an EXPLICIT scope — for a caller that already knows
+    /// which worktree it is walking (and must not consult a global).
+    pub fn for_scope(scope: &WorktreeScope) -> Self {
+        let key = exclusion_key(scope);
+        // Cloning the Arc, NOT the set: a capture is one refcount bump, so
+        // `check_gitignore` taking a snapshot per call cannot turn a walk into
+        // O(paths × overlays).
+        let owned = EXCLUSION_SNAPSHOT
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .and_then(|by_scope| by_scope.get(&key).cloned())
+            .unwrap_or_default();
+        Self { owned }
+    }
+
+    /// Whether `path_norm` is a layer-owned overlay path in this snapshot.
+    pub fn is_owned(&self, path_norm: &str) -> bool {
+        self.owned.contains(path_norm)
+    }
+
+    /// Whether this snapshot excludes nothing — the overwhelmingly common
+    /// case, and the one that must cost nothing in the walk.
+    pub fn is_empty(&self) -> bool {
+        self.owned.is_empty()
+    }
+}
+
+/// The snapshot key: REPOSITORY plus worktree, not the worktree alone.
+///
+/// Main's storage key is the empty string in every repository, so keying by
+/// scope alone makes two repositories open in one process share a slot — and
+/// one repository's overlay paths would then be excluded in the other.
+fn exclusion_key(scope: &WorktreeScope) -> String {
+    // The repository comes from the INVOCATION's workdir, not the ambient cwd:
+    // resolving it from a cwd that has moved would key the snapshot under a
+    // different repository than the scope belongs to.
+    let repo = match WorktreeScope::request_scope() {
+        Some(pinned) => pinned.storage.to_string_lossy().into_owned(),
+        None => crate::utils::util::try_get_storage_path(None)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    format!("{repo}\u{0}{}", scope.storage_key())
 }
 
 /// Normalize an arbitrary worktree-relative path to the snapshot's key form.
@@ -229,22 +461,29 @@ pub fn normalize_key(path: &Path) -> Option<String> {
 }
 
 impl LayerStore {
-    /// Transactionally replace the `layer_path` records (single DELETE+INSERT,
-    /// torn-write-safe like `internal::sequencer::save`).
-    async fn rewrite_paths(records: &[MaterializedPath]) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
+    /// Transactionally replace `scope`'s `layer_path` records (scoped
+    /// DELETE+INSERT, torn-write-safe like `internal::sequencer::save`).
+    /// Another worktree's ownership rows are never touched.
+    async fn rewrite_paths(
+        scope: &WorktreeScope,
+        records: &[MaterializedPath],
+    ) -> Result<(), String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
         let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute(Statement::from_string(
+        txn.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "DELETE FROM layer_path".to_string(),
+            "DELETE FROM layer_path WHERE worktree_id = ?",
+            [scope.storage_key().into()],
         ))
         .await
         .map_err(|e| format!("failed to clear layer paths: {e}"))?;
         for record in records {
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO layer_path (layer_name, path, content_hash) VALUES (?, ?, ?)",
+                "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
+                 VALUES (?, ?, ?, ?)",
                 [
+                    scope.storage_key().into(),
                     record.layer_name.as_str().into(),
                     record.path.as_str().into(),
                     record.content_hash.as_str().into(),
@@ -256,6 +495,89 @@ impl LayerStore {
         txn.commit().await.map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// W1 §C.4.1.1 scope↔workdir binding: a MUTATION entry point verifies that
+/// the scope it was handed matches the working tree it is about to touch. A
+/// concurrent process-cwd switch between the caller's scope resolution and
+/// the mutation (async await points in between) must fail closed — never
+/// materialize/prune one worktree's files against another worktree's
+/// ownership rows.
+fn verify_scope_matches_workdir(scope: &WorktreeScope, workdir: &Path) -> CliResult<()> {
+    // The REPOSITORY first, because the scope alone cannot tell two apart:
+    // main's storage key is the empty string in every repository, so `Main` in
+    // repository B satisfies a scope check made for `Main` in repository A —
+    // and `apply` would then materialize A's layer rows into B's working tree,
+    // or `unapply` delete B's files on the strength of A's ownership records.
+    if let Some(pinned) = WorktreeScope::request_scope() {
+        let here = crate::utils::util::try_get_storage_path(Some(workdir.to_path_buf())).map_err(
+            |error| {
+                CliError::fatal(format!(
+                    "cannot resolve the repository at '{}': {error}",
+                    workdir.display()
+                ))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+            },
+        )?;
+        let same = std::fs::canonicalize(&here).unwrap_or(here)
+            == std::fs::canonicalize(&pinned.storage).unwrap_or_else(|_| pinned.storage.clone());
+        if !same {
+            return Err(CliError::fatal(format!(
+                "the repository changed mid-command: this request resolved '{}', but the working                  tree at '{}' belongs to another repository; nothing was written",
+                pinned.storage.display(),
+                workdir.display()
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint("re-run the command from inside the target repository"));
+        }
+    }
+    let derived = WorktreeScope::for_workdir(workdir);
+    if derived != *scope {
+        let show = |s: &WorktreeScope| match s.storage_key() {
+            "" => "the main worktree".to_string(),
+            id => format!("worktree '{id}'"),
+        };
+        return Err(CliError::fatal(format!(
+            "the worktree scope changed mid-command: this request resolved {}, but the working \
+             tree at '{}' belongs to {}",
+            show(scope),
+            workdir.display(),
+            show(&derived)
+        ))
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+        .with_hint("re-run the command from inside the target worktree"));
+    }
+    Ok(())
+}
+
+/// Last-moment staging-context re-verification for the `add` hard guard
+/// (W1 §C.4.1.1): after the awaits between entry and staging, the process
+/// cwd must still resolve to the captured workdir AND that workdir's scope
+/// must still be the one this request resolved — otherwise the guard would
+/// protect a different tree than the index being written. Fail closed.
+pub(crate) fn verify_staging_context(workdir: &Path, scope: &WorktreeScope) -> CliResult<()> {
+    verify_workdir_unchanged(workdir)?;
+    verify_scope_matches_workdir(scope, workdir)
+}
+
+/// Companion re-check for the await gaps AFTER the entry binding: the
+/// index/HEAD reads and the ambient path helpers resolve from the process
+/// cwd, so a cwd switch to another worktree mid-command would split them
+/// from the captured workdir. Cheap (one cwd read), called before each
+/// cwd-dependent phase — fail closed on any drift.
+fn verify_workdir_unchanged(workdir: &Path) -> CliResult<()> {
+    let now = util::working_dir();
+    if now != *workdir {
+        return Err(CliError::fatal(format!(
+            "the working directory changed while the layer operation was running \
+             (started in '{}', now '{}'); nothing further was written",
+            workdir.display(),
+            now.display()
+        ))
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+        .with_hint("re-run the command from inside the target worktree"));
+    }
+    Ok(())
 }
 
 /// Content hash of a file's bytes, in the repo's active blob-object framing
@@ -409,15 +731,18 @@ pub struct ApplyReport {
 /// NOTHING written or pruned. Only once all destinations are proven safe does
 /// the MUTATION phase prune stale unmodified materializations, write the new
 /// overlay, and rewrite the records.
-pub async fn apply() -> CliResult<ApplyReport> {
+pub async fn apply(scope: &WorktreeScope) -> CliResult<ApplyReport> {
     if util::find_git_repository(None).is_some_and(|loc| loc.is_bare) {
         return Err(CliError::fatal("cannot apply layers in a bare repository")
             .with_stable_code(StableErrorCode::RepoStateInvalid));
     }
-    let workdir = util::working_dir();
+    // §C.4.2: the tree this materializes into is the one the INVOCATION is
+    // acting on, not whatever directory the cwd has become.
+    let workdir = util::request_working_dir();
+    verify_scope_matches_workdir(scope, &workdir)?;
     // Canonical worktree root for the source-inside-worktree check.
     let workdir_canon = std::fs::canonicalize(&workdir).unwrap_or_else(|_| workdir.clone());
-    let layers = LayerStore::list()
+    let layers = LayerStore::list(scope)
         .await
         .map_err(|e| CliError::fatal(format!("failed to load layers: {e}")))?;
     let enabled: Vec<&Layer> = layers.iter().filter(|l| l.enabled).collect();
@@ -453,7 +778,10 @@ pub async fn apply() -> CliResult<ApplyReport> {
     }
 
     // ── VALIDATION phase (no mutation) ──
-    // Collision with a tracked path.
+    // Collision with a tracked path. `tracked_path_set` reads the index/HEAD
+    // through cwd-ambient paths — re-verify the cwd is still the bound
+    // workdir after the awaits above (fail closed on drift).
+    verify_workdir_unchanged(&workdir)?;
     let tracked = tracked_path_set()
         .await
         .map_err(|e| CliError::fatal(format!("failed to read tracked paths: {e}")))?;
@@ -466,7 +794,7 @@ pub async fn apply() -> CliResult<ApplyReport> {
         .with_hint("rename the layer source path, or untrack the base path first"));
     }
     // Read all sources up front + prove each destination is safe to write.
-    let previous = LayerStore::materialized_paths()
+    let previous = LayerStore::materialized_paths(scope)
         .await
         .map_err(|e| CliError::fatal(format!("failed to read materialized paths: {e}")))?;
     let prior: std::collections::HashMap<&str, &str> = previous
@@ -531,6 +859,8 @@ pub async fn apply() -> CliResult<ApplyReport> {
     }
 
     // ── MUTATION phase (all destinations proven safe) ──
+    // Last re-check before anything is pruned or written.
+    verify_workdir_unchanged(&workdir)?;
     let mut report = ApplyReport {
         layers: enabled.len(),
         ..Default::default()
@@ -580,7 +910,7 @@ pub async fn apply() -> CliResult<ApplyReport> {
         });
     }
     records.extend(carried_records);
-    LayerStore::rewrite_paths(&records)
+    LayerStore::rewrite_paths(scope, &records)
         .await
         .map_err(|e| CliError::fatal(format!("failed to record materialized paths: {e}")))?;
 
@@ -611,9 +941,14 @@ pub async fn apply() -> CliResult<ApplyReport> {
 /// layer-owned (Codex P1 — an edited overlay must never silently become
 /// committable via `unapply`; only an explicit `layer remove` detaches it).
 /// Returns `(removed, kept_edited)`.
-pub async fn unapply(layer_filter: Option<&str>) -> CliResult<(usize, usize)> {
-    let workdir = util::working_dir();
-    let previous = LayerStore::materialized_paths()
+pub async fn unapply(
+    scope: &WorktreeScope,
+    layer_filter: Option<&str>,
+) -> CliResult<(usize, usize)> {
+    // §C.4.2: deletes land in the INVOCATION's worktree — see `apply`.
+    let workdir = util::request_working_dir();
+    verify_scope_matches_workdir(scope, &workdir)?;
+    let previous = LayerStore::materialized_paths(scope)
         .await
         .map_err(|e| CliError::fatal(format!("failed to read materialized paths: {e}")))?;
     let mut removed = 0usize;
@@ -660,7 +995,7 @@ pub async fn unapply(layer_filter: Option<&str>) -> CliResult<(usize, usize)> {
             }
         }
     }
-    LayerStore::rewrite_paths(&remaining)
+    LayerStore::rewrite_paths(scope, &remaining)
         .await
         .map_err(|e| CliError::fatal(format!("failed to update materialized paths: {e}")))?;
     Ok((removed, skipped))
@@ -691,34 +1026,323 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let _guard = ChangeDirGuard::new(tmp.path());
         setup_with_new_libra_in(tmp.path()).await;
+        let scope = WorktreeScope::Main;
 
-        LayerStore::add("b", "/src/b", 5, true)
+        LayerStore::add(&scope, "b", "/src/b", 5, true)
             .await
             .expect("add b");
-        LayerStore::add("a", "/src/a", 5, true)
+        LayerStore::add(&scope, "a", "/src/a", 5, true)
             .await
             .expect("add a");
-        LayerStore::add("z", "/src/z", 1, false)
+        LayerStore::add(&scope, "z", "/src/z", 1, false)
             .await
             .expect("add z");
         // Ordered priority ASC, name ASC: z(1), a(5), b(5).
-        let layers = LayerStore::list().await.expect("list");
+        let layers = LayerStore::list(&scope).await.expect("list");
         let names: Vec<&str> = layers.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(names, vec!["z", "a", "b"]);
         assert!(!layers[0].enabled, "z registered disabled");
 
         // Duplicate name rejected.
-        let err = LayerStore::add("a", "/other", 0, true)
+        let err = LayerStore::add(&scope, "a", "/other", 0, true)
             .await
             .expect_err("dup");
         assert!(err.contains("already exists"), "{err}");
 
         // Enable/disable + remove.
-        assert!(LayerStore::set_enabled("z", true).await.expect("enable"));
-        assert!(LayerStore::get("z").await.expect("get").unwrap().enabled);
-        assert!(LayerStore::remove("z").await.expect("remove"));
-        assert!(LayerStore::get("z").await.expect("get").is_none());
-        assert!(!LayerStore::remove("nope").await.expect("remove-missing"));
+        assert!(
+            LayerStore::set_enabled(&scope, "z", true)
+                .await
+                .expect("enable")
+        );
+        assert!(
+            LayerStore::get(&scope, "z")
+                .await
+                .expect("get")
+                .unwrap()
+                .enabled
+        );
+        assert!(LayerStore::remove(&scope, "z").await.expect("remove"));
+        assert!(LayerStore::get(&scope, "z").await.expect("get").is_none());
+        assert!(
+            !LayerStore::remove(&scope, "nope")
+                .await
+                .expect("remove-missing")
+        );
+    }
+
+    /// W1 §C.4.1.1: two scopes hold same-named layers and same-destination
+    /// path records independently; one scope's remove/rewrite never touches
+    /// the other's rows.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn scopes_are_isolated() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        let main = WorktreeScope::Main;
+        let linked = WorktreeScope::Linked("wt-test".to_string());
+
+        // Same layer name registers independently in both scopes.
+        LayerStore::add(&main, "ov", "/src/main", 0, true)
+            .await
+            .expect("main add");
+        LayerStore::add(&linked, "ov", "/src/linked", 0, true)
+            .await
+            .expect("linked add");
+        assert_eq!(
+            LayerStore::get(&main, "ov")
+                .await
+                .expect("get")
+                .unwrap()
+                .source,
+            "/src/main"
+        );
+        assert_eq!(
+            LayerStore::get(&linked, "ov")
+                .await
+                .expect("get")
+                .unwrap()
+                .source,
+            "/src/linked"
+        );
+
+        // Same destination path is owned independently per scope, and one
+        // scope's rewrite (to empty) leaves the other's ownership intact.
+        let record = |hash: &str| MaterializedPath {
+            layer_name: "ov".to_string(),
+            path: "same/dest.txt".to_string(),
+            content_hash: hash.to_string(),
+        };
+        LayerStore::rewrite_paths(&main, &[record("h-main")])
+            .await
+            .expect("main paths");
+        LayerStore::rewrite_paths(&linked, &[record("h-linked")])
+            .await
+            .expect("linked paths");
+        LayerStore::rewrite_paths(&main, &[])
+            .await
+            .expect("main clear");
+        let linked_paths = LayerStore::materialized_paths(&linked)
+            .await
+            .expect("linked paths");
+        assert_eq!(linked_paths.len(), 1);
+        assert_eq!(linked_paths[0].content_hash, "h-linked");
+        assert!(
+            LayerStore::materialized_paths(&main)
+                .await
+                .expect("main paths")
+                .is_empty()
+        );
+
+        // The exclusion snapshot is keyed BY SCOPE, and the consult answers for
+        // the INVOCATION's scope — not for whichever scope refreshed last.
+        // Both sets are loaded first, so the assertions below can only pass if
+        // the consult is picking the right one.
+        refresh_exclusion_snapshot(&linked).await;
+        refresh_exclusion_snapshot(&main).await;
+        {
+            let _pin = WorktreeScope::pin_scope_for_test(
+                linked.clone(),
+                std::env::current_dir().expect("cwd"),
+            );
+            assert!(
+                is_layer_owned("same/dest.txt"),
+                "the linked scope owns its overlay path"
+            );
+        }
+        {
+            let _pin = WorktreeScope::pin_scope_for_test(
+                main.clone(),
+                std::env::current_dir().expect("cwd"),
+            );
+            assert!(
+                !is_layer_owned("same/dest.txt"),
+                "main's set is empty, even though linked refreshed too"
+            );
+        }
+
+        // Scoped remove of the linked registration (and its path records)
+        // leaves main's registration row untouched.
+        assert!(LayerStore::remove(&linked, "ov").await.expect("remove"));
+        assert!(LayerStore::get(&main, "ov").await.expect("get").is_some());
+    }
+
+    /// §C.4.1.1: the process-wide exclusion snapshot is keyed by
+    /// `(repo, worktree)`, not by "whoever refreshed last".
+    ///
+    /// The consult is synchronous and runs per path, so it cannot re-resolve
+    /// the scope from the filesystem — it reads the invocation's pinned scope.
+    /// With a single last-refreshed set, an in-process host serving two
+    /// worktrees would have one refresh replace the other's, and the second
+    /// worktree would then exclude — or fail to exclude — the wrong paths.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn layer_exclusion_snapshot_keyed_by_scope() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+
+        let a = WorktreeScope::Linked("wt-a".to_string());
+        let b = WorktreeScope::Linked("wt-b".to_string());
+        LayerStore::add(&a, "la", "/src/a", 0, true)
+            .await
+            .expect("register a");
+        LayerStore::add(&b, "lb", "/src/b", 0, true)
+            .await
+            .expect("register b");
+        LayerStore::rewrite_paths(
+            &a,
+            &[MaterializedPath {
+                layer_name: "la".to_string(),
+                path: "a/only.txt".to_string(),
+                content_hash: "h".to_string(),
+            }],
+        )
+        .await
+        .expect("a paths");
+        LayerStore::rewrite_paths(
+            &b,
+            &[MaterializedPath {
+                layer_name: "lb".to_string(),
+                path: "b/only.txt".to_string(),
+                content_hash: "h".to_string(),
+            }],
+        )
+        .await
+        .expect("b paths");
+
+        // Refresh A, then B — the order that breaks a single-slot snapshot.
+        refresh_exclusion_snapshot(&a).await;
+        refresh_exclusion_snapshot(&b).await;
+
+        let cwd = std::env::current_dir().expect("cwd");
+        // Captured snapshots, taken while each scope is pinned. These are what
+        // a walk holds: once captured, a later re-pin cannot change what they
+        // answer — which is the property the process-global consult lacked.
+        let snapshot_a = {
+            let _pin = WorktreeScope::pin_scope_for_test(a.clone(), cwd.clone());
+            assert!(is_layer_owned("a/only.txt"), "A sees its own path");
+            assert!(
+                !is_layer_owned("b/only.txt"),
+                "A does not see B's — B refreshing last must not answer for A"
+            );
+            ExclusionSnapshot::for_request()
+        };
+        let snapshot_b = {
+            let _pin = WorktreeScope::pin_scope_for_test(b.clone(), cwd);
+            assert!(is_layer_owned("b/only.txt"), "B sees its own path");
+            assert!(!is_layer_owned("a/only.txt"), "and not A's");
+            ExclusionSnapshot::for_request()
+        };
+
+        // No pin at all now: a captured snapshot still answers for the scope it
+        // was taken in. A per-path consult of process-global state could not.
+        assert!(snapshot_a.is_owned("a/only.txt") && !snapshot_a.is_owned("b/only.txt"));
+        assert!(snapshot_b.is_owned("b/only.txt") && !snapshot_b.is_owned("a/only.txt"));
+        assert!(ExclusionSnapshot::for_scope(&a).is_owned("a/only.txt"));
+        assert!(ExclusionSnapshot::default().is_empty());
+    }
+
+    /// §C.4.2: the binding check distinguishes two REPOSITORIES, not just two
+    /// scopes.
+    ///
+    /// Main's storage key is the empty string everywhere, so a check that
+    /// compares only the scope passes for `Main` in any repository — and a
+    /// mutation pinned to repository A would then be allowed to run against
+    /// repository B's working tree.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_binding_refuses_another_repositorys_main_worktree() {
+        let repo_a = tempfile::tempdir().expect("repo a");
+        let repo_b = tempfile::tempdir().expect("repo b");
+        let original = std::env::current_dir().expect("cwd");
+        for repo in [repo_a.path(), repo_b.path()] {
+            let _guard = ChangeDirGuard::new(repo);
+            setup_with_new_libra_in(repo).await;
+        }
+
+        let _pin = WorktreeScope::pin_request_scope(repo_a.path().to_path_buf());
+        // Both are `Main`; only the repository differs.
+        verify_scope_matches_workdir(&WorktreeScope::Main, repo_a.path())
+            .expect("the pinned repository's own worktree is accepted");
+        let err = verify_scope_matches_workdir(&WorktreeScope::Main, repo_b.path())
+            .expect_err("another repository's main worktree is refused");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("another repository"),
+            "the refusal names what is wrong: {rendered}"
+        );
+
+        std::env::set_current_dir(&original).expect("restore the cwd");
+    }
+
+    /// W1 §C.4.1.1 scope↔workdir binding: every fail-closed verification
+    /// branch refuses on drift — a wrong scope for the workdir, a moved cwd,
+    /// and the combined staging-context check the `add` hard guard calls —
+    /// and the mutation entry points (`apply`/`unapply`) surface the same
+    /// refusal before touching anything.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn scope_workdir_binding_fails_closed_on_drift() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        let workdir = util::working_dir();
+        let wrong_scope = WorktreeScope::Linked("wt-elsewhere".to_string());
+
+        // Matching pair passes; a scope that does not own the workdir fails.
+        verify_scope_matches_workdir(&WorktreeScope::Main, &workdir).expect("main scope matches");
+        let err = verify_scope_matches_workdir(&wrong_scope, &workdir)
+            .expect_err("wrong scope must fail closed");
+        assert!(
+            format!("{err:?}").contains("scope changed"),
+            "actionable scope error: {err:?}"
+        );
+
+        // Unchanged cwd passes; a foreign workdir (cwd drifted) fails.
+        verify_workdir_unchanged(&workdir).expect("cwd unchanged");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let err =
+            verify_workdir_unchanged(elsewhere.path()).expect_err("cwd drift must fail closed");
+        assert!(
+            format!("{err:?}").contains("working directory changed"),
+            "actionable drift error: {err:?}"
+        );
+
+        // The combined staging-context check (the `add` hard guard's gate)
+        // refuses on either half.
+        verify_staging_context(&workdir, &WorktreeScope::Main).expect("bound context passes");
+        assert!(verify_staging_context(&workdir, &wrong_scope).is_err());
+        assert!(verify_staging_context(elsewhere.path(), &WorktreeScope::Main).is_err());
+
+        // Mutation entry points refuse a scope that does not own the cwd's
+        // worktree BEFORE touching files or rows.
+        let err = apply(&wrong_scope).await.expect_err("apply refuses");
+        assert!(
+            format!("{err:?}").contains("scope changed"),
+            "apply surfaces the binding refusal: {err:?}"
+        );
+        let err = unapply(&wrong_scope, None)
+            .await
+            .expect_err("unapply refuses");
+        assert!(
+            format!("{err:?}").contains("scope changed"),
+            "unapply surfaces the binding refusal: {err:?}"
+        );
+        // Nothing was written for either scope.
+        assert!(
+            LayerStore::materialized_paths(&WorktreeScope::Main)
+                .await
+                .expect("paths")
+                .is_empty()
+        );
+        assert!(
+            LayerStore::materialized_paths(&wrong_scope)
+                .await
+                .expect("paths")
+                .is_empty()
+        );
     }
 
     #[test]

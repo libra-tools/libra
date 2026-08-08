@@ -154,12 +154,25 @@ pub async fn encode_hashes_to_pack(
 /// share a stable, content-derived name. Returns the written `.pack` path, or
 /// `Ok(None)` when `hashes` is empty (`PackEncoder` cannot encode a zero-object
 /// pack, and an empty pack would be pointless on disk).
+/// A pack that was written, and whether its NAME is durable.
+///
+/// `durable` is `true` only when the directory entries naming the pack and
+/// its index were successfully `fsync`ed. Callers that go on to delete the
+/// objects' other copy (`repack -d`, the `loose-objects` maintenance task,
+/// old-pack deletion) must refuse when it is `false`: file contents that
+/// survive a crash under a name that does not are not a copy.
+#[derive(Debug, Clone)]
+pub struct PackPublication {
+    pub path: PathBuf,
+    pub durable: bool,
+}
+
 pub async fn write_pack_with_index(
     storage: &ClientStorage,
     hashes: &[ObjectHash],
     pack_dir: &Path,
     hash_kind: HashKind,
-) -> io::Result<Option<PathBuf>> {
+) -> io::Result<Option<PackPublication>> {
     let Some(pack_bytes) = encode_hashes_to_pack(storage, hashes, hash_kind).await? else {
         return Ok(None);
     };
@@ -188,5 +201,85 @@ pub async fn write_pack_with_index(
     build_index_v2(pack_str, index_str)
         .map_err(|error| io::Error::other(format!("failed to index new pack: {error}")))?;
 
-    Ok(Some(pack_path))
+    // The pack becomes the ONLY home of the objects it holds: `repack -d` and
+    // the `loose-objects` maintenance task unlink the loose copies right
+    // after this returns. A pack that exists only in the page cache is not a
+    // copy — a power loss between the write and the unlink would take
+    // reachable objects with it. So the pack, its index, and the directory
+    // entries naming them are made durable HERE, where the callers cannot
+    // forget to, rather than at each deletion site.
+    //
+    // File contents first, then the directory: syncing the entry before the
+    // bytes it names would make a name durable for data that is not.
+    fsync_path(&pack_path)?;
+    fsync_path(&index_path)?;
+    // A directory sync that cannot be PROVEN is reported, not swallowed. The
+    // file data is durable either way, so creating a pack stays allowed; what
+    // is not allowed is treating an unproven directory entry as licence to
+    // delete the only other copy of those objects, which is the caller's
+    // decision to make and now the caller's information to make it with.
+    let durable = fsync_dir(pack_dir)?;
+    // The PARENT is synced unconditionally, not only when this call created
+    // `objects/pack`. `init` precreates that directory, so a "created here"
+    // condition is false on every normal repository — and an entry that has
+    // never been synced is exactly as losable whether this process made it or
+    // an earlier one did. The cost is one more directory fsync per pack.
+    let durable = durable
+        && match pack_dir.parent() {
+            Some(parent) => fsync_dir(parent)?,
+            None => true,
+        };
+
+    Ok(Some(PackPublication {
+        path: pack_path,
+        durable,
+    }))
+}
+
+/// `fsync` one file by path.
+fn fsync_path(path: &std::path::Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// `fsync` a directory so the entries created inside it survive a crash.
+///
+/// Returns whether durability was actually PROVEN. Opening a directory for
+/// reading and syncing it is the POSIX way to make its entries durable; where
+/// the platform refuses (Windows, some network filesystems) the result is
+/// `false`, not an error — the pack's contents are durable regardless, so
+/// creating it stays allowed. Only deletion of the objects' other copy
+/// requires the `true`.
+fn fsync_dir(dir: &std::path::Path) -> io::Result<bool> {
+    // Every "this platform or filesystem will not sync a directory" answer is
+    // `false`, never an error: a pack whose CONTENTS are durable is still a
+    // valid pack, and failing the write would break `pack-objects` and every
+    // other non-deleting caller on a filesystem that simply does not support
+    // the operation. Only deletion requires the `true`.
+    match std::fs::File::open(dir) {
+        Ok(handle) => match handle.sync_all() {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput
+                        | io::ErrorKind::Unsupported
+                        | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        },
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+                    | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }

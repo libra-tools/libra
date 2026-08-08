@@ -1288,6 +1288,7 @@ async fn test_basic_rebase() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1372,6 +1373,7 @@ async fn test_basic_rebase() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1421,6 +1423,7 @@ async fn test_basic_rebase() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1542,6 +1545,7 @@ async fn test_rebase_preserves_untracked_files() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1591,6 +1595,7 @@ async fn test_rebase_preserves_untracked_files() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1640,6 +1645,7 @@ async fn test_rebase_preserves_untracked_files() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1770,6 +1776,7 @@ async fn test_rebase_already_up_to_date() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1856,6 +1863,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1905,6 +1913,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1954,6 +1963,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2090,6 +2100,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2139,6 +2150,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2188,6 +2200,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2488,6 +2501,7 @@ async fn test_rebase_with_conflict_and_abort() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2541,6 +2555,7 @@ async fn test_rebase_with_conflict_and_abort() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2590,6 +2605,7 @@ async fn test_rebase_with_conflict_and_abort() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2745,6 +2761,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2793,6 +2810,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2841,6 +2859,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2972,6 +2991,7 @@ async fn test_rebase_with_conflict_and_skip() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3065,6 +3085,7 @@ async fn test_rebase_with_conflict_and_skip() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3114,6 +3135,7 @@ async fn test_rebase_with_conflict_and_skip() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3240,6 +3262,7 @@ async fn test_rebase_with_conflict_and_continue() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3293,6 +3316,7 @@ async fn test_rebase_with_conflict_and_continue() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3342,6 +3366,7 @@ async fn test_rebase_with_conflict_and_continue() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3510,6 +3535,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3634,6 +3660,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3683,6 +3710,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3826,6 +3854,7 @@ async fn test_rebase_state_persistence() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3875,6 +3904,7 @@ async fn test_rebase_state_persistence() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3924,6 +3954,7 @@ async fn test_rebase_state_persistence() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4068,6 +4099,7 @@ async fn test_rebase_fast_forward_branch_behind() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4083,6 +4115,7 @@ async fn test_rebase_fast_forward_branch_behind() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4134,6 +4167,7 @@ async fn test_rebase_fast_forward_branch_behind() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4231,6 +4265,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4246,6 +4281,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4295,6 +4331,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4395,6 +4432,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4410,6 +4448,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4459,6 +4498,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4559,6 +4599,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4608,6 +4649,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4657,6 +4699,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4764,6 +4807,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4814,6 +4858,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4863,6 +4908,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4983,6 +5029,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5051,6 +5098,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5100,6 +5148,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5219,6 +5268,7 @@ async fn test_rebase_continue_requires_resolution() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5268,6 +5318,7 @@ async fn test_rebase_continue_requires_resolution() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5317,6 +5368,7 @@ async fn test_rebase_continue_requires_resolution() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -6107,5 +6159,146 @@ fn test_rebase_empty_drop_survives_conflict_resume() {
         String::from_utf8_lossy(&after.stderr).contains("no rebase in progress"),
         "state cleared after the sequence completes: {}",
         String::from_utf8_lossy(&after.stderr)
+    );
+}
+
+/// Regression: every replayed commit was built with `Commit::from_tree_id`,
+/// which hardcodes `mega <admin@mega.org>` as author AND committer. A rebase
+/// rewrites history's shape, not its authorship, so the original author must
+/// survive while the committer becomes whoever ran the rebase.
+#[test]
+#[serial]
+fn test_rebase_preserves_original_author_and_stamps_current_committer() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    commit_file_via_cli(repo_path, "base.txt", "base\n", "Base");
+
+    let output = run_libra_command(&["switch", "-c", "feature"], repo_path);
+    assert_cli_success(&output, "failed to create feature branch");
+
+    // Author the feature commit as somebody other than the configured identity.
+    fs::write(repo_path.join("feature.txt"), "feature\n").expect("write feature file");
+    assert_cli_success(
+        &run_libra_command(&["add", "feature.txt"], repo_path),
+        "stage feature file",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "-m",
+                "Feature adds file",
+                "--author",
+                "Original Author <orig@example.com>",
+                "--no-verify",
+            ],
+            repo_path,
+        ),
+        "commit as a different author",
+    );
+
+    let output = run_libra_command(&["switch", "main"], repo_path);
+    assert_cli_success(&output, "failed to switch to main");
+    commit_file_via_cli(repo_path, "main.txt", "main\n", "Main adds file");
+
+    let output = run_libra_command(&["switch", "feature"], repo_path);
+    assert_cli_success(&output, "failed to switch back to feature");
+
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], repo_path),
+        "rebase feature onto main",
+    );
+
+    let output = run_libra_command(&["log", "-n", "1", "--format=%an|%ae|%cn|%ce"], repo_path);
+    assert_cli_success(&output, "log replayed commit");
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(
+        line, "Original Author|orig@example.com|Test User|test@example.com",
+        "rebase must preserve the author and stamp the running user as committer"
+    );
+    assert!(
+        !line.contains("mega") && !line.contains("admin@mega.org"),
+        "replayed commit must not carry the hardcoded placeholder identity: {line}"
+    );
+}
+
+/// `fixup`/`squash`/`amend` fold into an earlier commit, so the result keeps
+/// *that* commit's author (Git: the author of the first commit in the group) —
+/// not the folded commit's, and not a hardcoded placeholder.
+#[test]
+#[serial]
+fn test_rebase_autosquash_keeps_target_author_and_current_committer() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    commit_file_via_cli(repo_path, "base.txt", "base\n", "Base");
+
+    let output = run_libra_command(&["switch", "-c", "feature"], repo_path);
+    assert_cli_success(&output, "failed to create feature branch");
+
+    // Target commit is authored by "Target Author"; the fixup by someone else.
+    fs::write(repo_path.join("feature.txt"), "feature\n").expect("write feature file");
+    assert_cli_success(
+        &run_libra_command(&["add", "feature.txt"], repo_path),
+        "stage feature file",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "-m",
+                "Feature adds file",
+                "--author",
+                "Target Author <target@example.com>",
+                "--no-verify",
+            ],
+            repo_path,
+        ),
+        "commit target as Target Author",
+    );
+
+    fs::write(repo_path.join("feature.txt"), "feature\nfixup\n").expect("write fixup");
+    assert_cli_success(
+        &run_libra_command(&["add", "feature.txt"], repo_path),
+        "stage fixup",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "-m",
+                "fixup! Feature adds file",
+                "--author",
+                "Fixup Author <fixup@example.com>",
+                "--no-verify",
+            ],
+            repo_path,
+        ),
+        "commit fixup as Fixup Author",
+    );
+
+    let output = run_libra_command(&["switch", "main"], repo_path);
+    assert_cli_success(&output, "failed to switch to main");
+    commit_file_via_cli(repo_path, "main.txt", "main\n", "Main adds file");
+
+    let output = run_libra_command(&["switch", "feature"], repo_path);
+    assert_cli_success(&output, "failed to switch back to feature");
+
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--autosquash", "main"], repo_path),
+        "autosquash rebase",
+    );
+
+    let output = run_libra_command(&["log", "-n", "1", "--format=%an|%ae|%cn|%ce"], repo_path);
+    assert_cli_success(&output, "log folded commit");
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(
+        line, "Target Author|target@example.com|Test User|test@example.com",
+        "a fold keeps the target commit's author and stamps the running user as committer"
     );
 }

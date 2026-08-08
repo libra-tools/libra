@@ -200,6 +200,12 @@ pub struct ReviewRunRequest {
     /// `true`: a read-only review must still run on large repos.
     pub allow_full_copy: bool,
     pub claude_max_budget_usd: String,
+    /// PD-02 checkpoint scope: when set, the reviewers' workspace is the
+    /// checkpoint's materialized content (`<run_dir>/checkpoint-input/`)
+    /// instead of an isolated worktree snapshot — the run consumes ONLY
+    /// the named checkpoint. The spec was validated by the command layer
+    /// before any run side effect.
+    pub checkpoint_input: Option<crate::internal::ai::checkpoint_input::CheckpointInputSpec>,
 }
 
 impl ReviewRunRequest {
@@ -221,6 +227,7 @@ impl ReviewRunRequest {
             max_concurrent_reviewers: DEFAULT_MAX_CONCURRENT_REVIEWERS,
             allow_full_copy: true,
             claude_max_budget_usd: DEFAULT_CLAUDE_REVIEW_MAX_BUDGET_USD.to_string(),
+            checkpoint_input: None,
         }
     }
 }
@@ -384,67 +391,101 @@ async fn run_review_inner(
     }
 
     // ---- Mandatory isolated workspace (plan.md:946/:947). ----
-    // The copy backend is pinned: it materializes through an
-    // ignore-aware walk, so gitignored secret files never enter the
-    // workspace. (FUSE would need its own exposure proof first.)
-    let fuse_state = FuseProvisionState::default();
-    let _ = fuse_state.disable_first_time();
-    let isolation = WorkspaceIsolationConfig {
-        fuse_state,
-        sessions_root: store.sessions_root().to_path_buf(),
-        allow_full_copy: request.allow_full_copy,
-    };
-    let repo_root = request.repo_root.clone();
-    let thread_id = run_id.0;
-    let materialized = tokio::task::spawn_blocking(move || {
-        materialize_isolated_workspace(&repo_root, thread_id, run_id, &isolation)
-    })
-    .await;
-    let workspace = match materialized {
-        Ok(Ok(workspace)) => workspace,
-        Ok(Err(err)) => {
-            let outcome = finalize(
-                store,
-                &run_id_str,
-                &run_dir,
-                false,
-                Vec::new(),
-                HashMap::new(),
-                RedactionReportSummary::default(),
-                &request,
-                started,
-                Some(format!("workspace materialization failed: {err}")),
-            )?;
-            finish(outcome.terminal_state);
-            return Ok(outcome);
+    // Worktree scope: the copy backend is pinned — it materializes
+    // through an ignore-aware walk, so gitignored secret files never
+    // enter the workspace. (FUSE would need its own exposure proof
+    // first.) Checkpoint scope (PD-02): the reviewers' workspace is the
+    // checkpoint's own materialized content inside the run directory —
+    // no worktree snapshot exists at all, so a scoped run can only
+    // consume the named checkpoint.
+    let mut workspace_guard;
+    let workspace_root;
+    if let Some(spec) = &request.checkpoint_input {
+        let storage = request.repo_root.join(crate::utils::util::ROOT_DIR);
+        match crate::internal::ai::checkpoint_input::materialize_checkpoint_input(
+            &storage, spec, &run_dir,
+        ) {
+            Ok(root) => {
+                workspace_guard = ReviewWorkspaceGuard { workspace: None };
+                workspace_root = root;
+            }
+            Err(err) => {
+                let outcome = finalize(
+                    store,
+                    &run_id_str,
+                    &run_dir,
+                    false,
+                    Vec::new(),
+                    HashMap::new(),
+                    RedactionReportSummary::default(),
+                    &request,
+                    started,
+                    Some(format!("checkpoint input materialization failed: {err}")),
+                )?;
+                finish(outcome.terminal_state);
+                return Ok(outcome);
+            }
         }
-        Err(join_err) => {
-            let outcome = finalize(
-                store,
-                &run_id_str,
-                &run_dir,
-                false,
-                Vec::new(),
-                HashMap::new(),
-                RedactionReportSummary::default(),
-                &request,
-                started,
-                Some(format!(
-                    "workspace materialization task panicked: {join_err}"
-                )),
-            )?;
-            finish(outcome.terminal_state);
-            return Ok(outcome);
-        }
-    };
-    let mut workspace_guard = ReviewWorkspaceGuard {
-        workspace: Some(workspace),
-    };
-    let workspace_root = workspace_guard
-        .workspace
-        .as_ref()
-        .map(|ws| ws.root().to_path_buf())
-        .unwrap_or_default();
+    } else {
+        let fuse_state = FuseProvisionState::default();
+        let _ = fuse_state.disable_first_time();
+        let isolation = WorkspaceIsolationConfig {
+            fuse_state,
+            sessions_root: store.sessions_root().to_path_buf(),
+            allow_full_copy: request.allow_full_copy,
+        };
+        let repo_root = request.repo_root.clone();
+        let thread_id = run_id.0;
+        let materialized = tokio::task::spawn_blocking(move || {
+            materialize_isolated_workspace(&repo_root, thread_id, run_id, &isolation)
+        })
+        .await;
+        let workspace = match materialized {
+            Ok(Ok(workspace)) => workspace,
+            Ok(Err(err)) => {
+                let outcome = finalize(
+                    store,
+                    &run_id_str,
+                    &run_dir,
+                    false,
+                    Vec::new(),
+                    HashMap::new(),
+                    RedactionReportSummary::default(),
+                    &request,
+                    started,
+                    Some(format!("workspace materialization failed: {err}")),
+                )?;
+                finish(outcome.terminal_state);
+                return Ok(outcome);
+            }
+            Err(join_err) => {
+                let outcome = finalize(
+                    store,
+                    &run_id_str,
+                    &run_dir,
+                    false,
+                    Vec::new(),
+                    HashMap::new(),
+                    RedactionReportSummary::default(),
+                    &request,
+                    started,
+                    Some(format!(
+                        "workspace materialization task panicked: {join_err}"
+                    )),
+                )?;
+                finish(outcome.terminal_state);
+                return Ok(outcome);
+            }
+        };
+        workspace_guard = ReviewWorkspaceGuard {
+            workspace: Some(workspace),
+        };
+        workspace_root = workspace_guard
+            .workspace
+            .as_ref()
+            .map(|ws| ws.root().to_path_buf())
+            .unwrap_or_default();
+    }
     // Record the workspace root so an orphaned-run cancel (this process
     // dies without finalizing) can still release the directory.
     store.update_state(&run_id_str, |state| {

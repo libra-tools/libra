@@ -84,14 +84,14 @@ pub async fn execute_safe(args: PackObjectsArgs, output: &OutputConfig) -> CliRe
     }
 
     let pack_dir = path::objects().join("pack");
-    let pack_path = pack_writer::write_pack_with_index(&storage, &hashes, &pack_dir, hash_kind)
+    let publication = pack_writer::write_pack_with_index(&storage, &hashes, &pack_dir, hash_kind)
         .await
         .map_err(|e| CliError::fatal(format!("failed to write pack: {e}")))?
         .ok_or_else(|| CliError::fatal("no objects to pack"))?;
 
     // Git's `pack-objects` prints the packed checksum to stdout; mirror that by
     // printing the `pack-<checksum>` stem so callers can locate the new pack.
-    if let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str())
+    if let Some(stem) = publication.path.file_stem().and_then(|s| s.to_str())
         && !output.quiet
     {
         println!("{stem}");

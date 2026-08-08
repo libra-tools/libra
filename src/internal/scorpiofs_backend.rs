@@ -204,6 +204,7 @@ impl ScorpioFsStateLock {
         })?;
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -284,13 +285,13 @@ impl LibraScorpioFsState {
         endpoint: String,
     ) -> Result<(), BackendError> {
         request.validate()?;
-        if let Some(existing) = self.mounts.get(&request.job_id) {
-            if existing.request.path != request.path || existing.request.cl != request.cl {
-                return Err(BackendError::InvalidRecord(format!(
-                    "ScorpioFS job '{}' is already assigned to '{}' with CL {:?}",
-                    request.job_id, existing.request.path, existing.request.cl
-                )));
-            }
+        if let Some(existing) = self.mounts.get(&request.job_id)
+            && (existing.request.path != request.path || existing.request.cl != request.cl)
+        {
+            return Err(BackendError::InvalidRecord(format!(
+                "ScorpioFS job '{}' is already assigned to '{}' with CL {:?}",
+                request.job_id, existing.request.path, existing.request.cl
+            )));
         }
         self.mounts.insert(
             request.job_id.clone(),
@@ -781,22 +782,21 @@ impl WorktreeBackendDriver for ScorpioFsDriver {
         let mount = self.client.mount(&scorpio_request).await.map_err(|error| {
             WorktreeBackendError::operation(BackendKind::ScorpioFs, "mount", error)
         })?;
-        if mount.ready != Some(true) {
-            if let Err(error) = self
+        if mount.ready != Some(true)
+            && let Err(error) = self
                 .client
                 .wait_until_ready(
                     &mount.mount_id,
                     Duration::from_secs(request.ready_timeout_secs),
                 )
                 .await
-            {
-                let _ = self.client.delete_by_job(&request.instance_id).await;
-                return Err(WorktreeBackendError::operation(
-                    BackendKind::ScorpioFs,
-                    "wait_until_ready",
-                    error,
-                ));
-            }
+        {
+            let _ = self.client.delete_by_job(&request.instance_id).await;
+            return Err(WorktreeBackendError::operation(
+                BackendKind::ScorpioFs,
+                "wait_until_ready",
+                error,
+            ));
         }
 
         Ok(BackendMountSession {

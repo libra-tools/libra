@@ -521,8 +521,8 @@ impl LocalStorage {
                 let base_obj = Arc::new(base_obj);
                 Pack::rebuild_delta(obj, base_obj)
             }
-            _ => obj,
-        };
+            _ => Ok(obj),
+        }?;
 
         if PACK_OBJ_CACHE
             .lock()
@@ -558,7 +558,7 @@ impl LocalStorage {
                     ))
                 })? as u64;
                 let base = Arc::new(Self::read_pack_obj_uncached(pack_file, base_offset)?);
-                Ok(Pack::rebuild_delta(object, base))
+                Pack::rebuild_delta(object, base)
             }
             ObjectType::HashDelta => {
                 let base_hash = object.hash_delta().ok_or_else(|| {
@@ -574,7 +574,7 @@ impl LocalStorage {
                     ))
                 })?;
                 let base = Arc::new(Self::read_pack_obj_uncached(pack_file, base_offset)?);
-                Ok(Pack::rebuild_delta(object, base))
+                Pack::rebuild_delta(object, base)
             }
             _ => Ok(object),
         }

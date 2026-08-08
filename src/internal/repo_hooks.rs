@@ -39,6 +39,9 @@ pub enum RepoHook {
     PreMergeCommit,
     PostMerge,
     PostRewrite,
+    ApplypatchMsg,
+    PreApplypatch,
+    PostApplypatch,
 }
 
 impl RepoHook {
@@ -53,6 +56,9 @@ impl RepoHook {
             Self::PreMergeCommit => "pre-merge-commit",
             Self::PostMerge => "post-merge",
             Self::PostRewrite => "post-rewrite",
+            Self::ApplypatchMsg => "applypatch-msg",
+            Self::PreApplypatch => "pre-applypatch",
+            Self::PostApplypatch => "post-applypatch",
         }
     }
 }
@@ -278,6 +284,8 @@ pub async fn run_repo_hook_with_io(
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            // Hooks are repo-content-controlled code: metadata stays read-only.
+            allow_metadata_writes: false,
         },
         permissions: SandboxPermissions::UseDefault,
     };

@@ -18,6 +18,38 @@ writes shell environment files, and creates the optional relative symlink:
 Both names execute the same binary. The relative target remains valid when the
 whole Libra home directory is moved.
 
+## Windows
+
+```powershell
+irm https://download.libra.tools/install.ps1 | iex
+```
+
+`install.ps1` installs per-user (no administrator rights), places `libra.exe`
+under `%LOCALAPPDATA%\libra\bin`, adds that directory to the user `PATH`, and
+writes `libra.cmd` plus the optional `lba.cmd` shorthand into the first
+writable shim directory (`%LOCALAPPDATA%\Microsoft\WindowsApps`, else
+`%USERPROFILE%\.local\bin`).
+
+Windows has no symlink equivalent available to an unprivileged install, so the
+alias is a `.cmd` shim rather than a symlink. The safety contract is otherwise
+the same as the POSIX one:
+
+- Every shim the installer writes carries a `@rem libra-managed-shim` marker.
+  That marker is how a reinstall recognises its own shim (rewriting is
+  idempotent) and how it recognises one it did not write.
+- An existing `lba.cmd` WITHOUT the marker, or any existing `lba.exe`,
+  `lba.bat`, or `lba.ps1`, is left untouched — `lba` is short enough to belong
+  to another tool, and Windows would resolve those extensions ahead of ours.
+- `-NoAlias` (or `LIBRA_NO_ALIAS=1`) skips the shorthand. To pass the
+  switch, save and invoke the installer rather than piping it to `iex`:
+
+  ```powershell
+  irm https://download.libra.tools/install.ps1 -OutFile install.ps1
+  .\install.ps1 -NoAlias
+  ```
+
+- Failing to write the shim warns; it does not fail the installation.
+
 ## Alias safety and idempotency
 
 - A fresh install creates `lba` by default.

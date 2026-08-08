@@ -40,11 +40,12 @@ use tokio::io::AsyncReadExt;
 use crate::internal::ai::observed_agents::{
     Redactor, TranscriptSource,
     transcript_source::ExportAuthorized,
-    trust::{read_trust, revalidate_trust},
+    trust::{OPENCODE_EXPORTER_SLUG, read_trust, revalidate_trust},
 };
 
-/// Trust-record slug for the OpenCode exporter binary.
-const OPENCODE_TRUST_SLUG: &str = "opencode";
+/// Trust-record slug for the OpenCode exporter binary (shared with the
+/// `agent rpc trust` provider-exporter registration path, DR-04b).
+const OPENCODE_TRUST_SLUG: &str = OPENCODE_EXPORTER_SLUG;
 /// Default stdout byte cap (GC-DR-04 Bytes/export cap).
 pub const EXPORT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// Default subprocess wall-clock deadline (GC-DR-04: ≤3 s, leaving
@@ -92,9 +93,10 @@ async fn trusted_opencode_binary_from(
 ) -> Result<PathBuf> {
     let record = record.ok_or_else(|| {
         anyhow!(
-            "the 'opencode' binary is not trusted for export; run \
-             'libra agent rpc trust opencode' (after verifying the binary) \
-             to enable the OpenCode export bridge"
+            "the 'opencode' binary is not trusted for export; register its \
+             directory with 'libra agent rpc trust --dir <path>' and then run \
+             'libra agent rpc trust opencode' (after verifying the binary) to \
+             enable the OpenCode export bridge"
         )
     })?;
     let provenance = revalidate_trust(OPENCODE_TRUST_SLUG, &record)

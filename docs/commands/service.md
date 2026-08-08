@@ -32,7 +32,7 @@ libra service events
 |---|---|---|
 | `GET /api/health` | loopback | Liveness probe. |
 | `GET /api/service/events` | token | SSE notification stream. |
-| `POST /api/service/dirty/mark` | token | `{"paths":[...]}` — advisory dirty marks through the validated owner API (whole batch refused if any path escapes the repo; over-report-only). |
+| `POST /api/service/dirty/mark` | token | `{"paths":[...],"scope":{...}}` — advisory dirty marks through the validated owner API (whole batch refused if any path escapes the repo; over-report-only). `scope` is a TAGGED worktree scope: `{"kind":"main"}`, or `{"kind":"linked","worktree_id":"wt-…","workdir":"/abs/path","epoch":<n>}` — `workdir` and `epoch` are REQUIRED for a linked scope and both are validated against the registry entry under the registry lock. Instance ids are path-derived and paths repeat, so a worktree removed and re-added in place looks identical to its predecessor; `epoch` (reported by `libra worktree list`) is the fence that tells the two registrations apart, and a request carrying a stale one is rejected. The named scope is validated against the registry — an unknown id, a registry with duplicate linked ids, or one whose linked entry uses the reserved id `main`, is rejected with **409**. A request WITHOUT `scope` is still accepted only in a single-main repository: in a multi-worktree repository (or when the registry is corrupt/unreadable — including parseable states without exactly one main entry) it is rejected with **409**, because the dirty cache is per-worktree and the caller's scope is unknown; name the scope, or run `libra dirty <paths>` in the target worktree. |
 | `POST /api/service/notify` | token | `{"type":"...","data":{...}}` — publish a custom notification (automation triggers). |
 
 **Notification v1 semantics**: events are `{seq,type,at,data}` with `seq`
@@ -64,7 +64,7 @@ libra service events                   # tail notifications
 TOKEN=$(cat .libra/service/service-token)
 URL=$(libra --json service status | jq -r .data.base_url)
 curl -H "X-Libra-Service-Token: $TOKEN" -X POST "$URL/api/service/dirty/mark" \
-     -H 'content-type: application/json' -d '{"paths":["src/main.rs"]}'
+     -H 'content-type: application/json' -d '{"paths":["src/main.rs"],"scope":{"kind":"main"}}'
 ```
 
 ## Comparison with Git

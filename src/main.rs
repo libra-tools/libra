@@ -414,7 +414,14 @@ fn main() {
         // parse-time failures follow the same precedence rules as successful dispatch.
         // We must read from `std::env::args()` (not the dispatcher's parsed `args`)
         // because the dispatcher returned an error before producing them.
-        let argv: Vec<String> = std::env::args().collect();
+        // `args_os`, not `args`: the latter PANICS on an argument that is
+        // not valid UTF-8, and this runs on the ERROR path — aborting here
+        // would replace a clean diagnostic with a panic. Tokens that are not
+        // UTF-8 cannot be the ASCII output flags this resolves, so they are
+        // dropped rather than lossily transcoded.
+        let argv: Vec<String> = std::env::args_os()
+            .filter_map(|arg| arg.into_string().ok())
+            .collect();
         let output = OutputConfig::resolve_from_argv(&argv);
         err.print_for_output(&output);
         flush_telemetry();

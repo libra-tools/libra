@@ -21,9 +21,11 @@ use crate::{
                 DetailedImportSummary, ExistingSessionOwnershipSnapshot, ImportError,
                 ImportPreparationContext, ImportProgressError, ImportRequest, ImportSummary,
                 identity_id as import_identity_id, import_prepared_with_subagent_discovery,
-                load_existing_session_ownership, prepare_import_request, read_import_source,
-                restore_tombstone, session_is_tombstoned, validate_prepared_existing_session,
+                load_existing_session_ownership_in_scope, prepare_import_request,
+                read_import_source, restore_tombstone, session_is_tombstoned,
+                validate_prepared_existing_session,
             },
+            capture_scope::CaptureScope,
             observed_agents::{
                 AgentKind, AgentSessionCtx, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
                 agent_for, claude_session_dir, claude_session_id_is_safe_path_component,
@@ -799,7 +801,7 @@ fn discover_codex(since: Option<i64>, deadline: Instant) -> Result<Vec<Candidate
     return discover_codex_unix(&root, &directory, since, deadline);
     #[cfg(not(unix))]
     {
-        let pinned_root = root;
+        let pinned_root = root.clone();
         let mut scanned = 0usize;
         let mut candidates = Vec::new();
         for year in read_codex_discovery_directory(&pinned_root, deadline, &mut scanned)? {
@@ -1815,7 +1817,7 @@ async fn lock_import_index_barrier_row<C: ConnectionTrait>(db: &C, session_id: &
     // This no-op UPDATE is deliberately the first statement in each barrier
     // transaction. On SQLite it obtains the writer slot before we inspect the
     // marker, preventing a read/overwrite race with another process.
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "UPDATE metadata_kv SET updated_at = updated_at
          WHERE scope = ? AND target = ? AND key = ?",
@@ -1890,7 +1892,7 @@ async fn set_import_index_barrier_pending(
         if identity.identity_id != marker.identity_id {
             anyhow::bail!("import object-index barrier identity changed before finalization");
         }
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_import_identity
              SET state = 'partial', last_error_code = 'LBR-AGENT-018', updated_at = ?
@@ -1952,7 +1954,7 @@ async fn acquire_import_index_barrier(
         .context("begin import object-index barrier acquisition")?;
     lock_import_index_barrier_row(&txn, &request.session_id).await?;
     let tombstone = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -2054,7 +2056,7 @@ async fn import_index_barrier_erasure_won(
         anyhow::bail!("test-only import index tombstone lookup failure");
     }
     Ok(conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT 1 FROM agent_import_tombstone
          WHERE agent_kind = ? AND provider_session_id = ?",
@@ -2093,6 +2095,7 @@ async fn prepare_candidate_bounded(
     storage_root: &Path,
     read_cap: u64,
     conn: &sea_orm::DatabaseConnection,
+    capture_scope: &CaptureScope,
     deadline: Instant,
 ) -> Result<PreparedCandidateOutcome> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2100,7 +2103,12 @@ async fn prepare_candidate_bounded(
     ensure_before_deadline(deadline)?;
     let existing_session = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
-        load_existing_session_ownership(conn, candidate.kind, &candidate.provider_session_id),
+        load_existing_session_ownership_in_scope(
+            conn,
+            candidate.kind,
+            &candidate.provider_session_id,
+            capture_scope,
+        ),
     )
     .await
     .map_err(|_| ImportError::DeadlineExceeded)??;
@@ -2225,10 +2233,14 @@ async fn prepare_candidate_bounded(
     let response: PreparationHelperResponse = serde_json::from_slice(&response_bytes)
         .context("decode bounded import preparation response")?;
     Ok(match response {
-        PreparationHelperResponse::Ok { request, raw_bytes } => PreparedCandidateOutcome {
-            request: Ok(*request),
-            raw_bytes,
-        },
+        PreparationHelperResponse::Ok { request, raw_bytes } => {
+            let mut request = *request;
+            request.capture_scope = Some(capture_scope.clone());
+            PreparedCandidateOutcome {
+                request: Ok(request),
+                raw_bytes,
+            }
+        }
         PreparationHelperResponse::Error {
             error_kind,
             raw_bytes,
@@ -2343,6 +2355,13 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
     let conn = db::get_db_conn_instance_for_path(&storage_root.join(util::DATABASE))
         .await
         .map_err(|error| CliError::fatal(format!("failed to open repository database: {error}")))?;
+    let capture_scope = CaptureScope::resolve(&conn, &repo_root)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to resolve import workspace scope: {error:#}"
+            ))
+        })?;
     let (configured_source_cap, explicitly_configured) =
         max_transcript_read_bytes_setting().await.map_err(|error| {
             CliError::fatal(format!(
@@ -2409,6 +2428,7 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
                 &storage_root,
                 remaining_raw_bytes,
                 &conn,
+                &capture_scope,
                 deadline,
             )
             .await?;

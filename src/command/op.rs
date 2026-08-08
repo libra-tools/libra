@@ -396,6 +396,112 @@ async fn handle_op_restore(
     let target_graph = load_operation_graph(&db, &target_op_id).await?;
     let target_op = target_graph.operation.clone();
 
+    // plan-20260714 W0 (§C.11, ADR-0714-08): restoring rewrites THIS
+    // worktree's HEAD, index and working tree from a snapshot. Doing that
+    // from an operation that ran in a DIFFERENT worktree grafts that
+    // worktree's state onto this one; doing it from an operation whose scope
+    // was never recorded is the same act performed blind. Both are refused
+    // before the dry-run report, so the preview cannot describe a restore
+    // that is not permitted. Restoring the current worktree's own operations
+    // is unaffected.
+    // W1 §C.9: the snapshot is HEAD and refs. An operation that also moved an
+    // index, a working tree or sequencer state declared itself non-restorable
+    // when it was recorded — replaying it would move HEAD while leaving
+    // `sequence_state` pointing at a todo that no longer matches. Checked
+    // FIRST, before the dry-run report, so the preview cannot describe a
+    // restore that will not happen. A stored property, not a guess from the
+    // command name.
+    if !target_op.restorable {
+        return Err(CliError::fatal(format!(
+            "cannot restore operation {}: '{}' changed state this snapshot does not \
+             capture (the index, the working tree, or an in-progress sequence)",
+            &target_op_id[..8.min(target_op_id.len())],
+            target_op.command_name
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "inspect it with `libra op show`, and undo a sequencer control with that \
+             command's own `--abort`",
+        ));
+    }
+    // §C.9: a repository-scope operation acts on state every worktree shares,
+    // and an `unknown` one was never attributed at all. Replaying either into
+    // ONE worktree is what the plan says must fail closed until LR-02, and the
+    // kind is what distinguishes them from a main-scope operation — their
+    // `worktree_id` is the same empty string.
+    // §C.9 fail-closed: `repository` (no worktree scope at all) and `unknown`
+    // (never recorded) are both refused. A `branch` operation is NOT
+    // repository-scoped — it is recorded with the worktree it ran in, so branch
+    // restore keeps working, and the shared refs it would move are protected by
+    // the checked-out-elsewhere guard further down (Codex R24).
+    if !matches!(target_op.scope_kind.as_str(), "main" | "linked") {
+        return Err(CliError::fatal(format!(
+            "cannot restore operation {}: it is recorded with scope kind '{}', which this \
+             snapshot cannot be replayed into a single worktree",
+            &target_op_id[..8.min(target_op_id.len())],
+            target_op.scope_kind
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "inspect it with `libra op show`; repository-wide restore is deferred to the \
+             operation-recovery work",
+        ));
+    }
+    // A claim that was never closed: the command crashed, or is still running.
+    // Either way its recorded view is not the state it will end in.
+    if target_op.status != crate::internal::operation::OperationStatus::Succeeded {
+        return Err(CliError::fatal(format!(
+            "cannot restore operation {}: it is recorded as {}, not a completed success",
+            &target_op_id[..8.min(target_op_id.len())],
+            target_op.status.as_str()
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("wait for it to finish, then restore from a completed operation"));
+    }
+    let current_scope = crate::utils::util::current_worktree_id().unwrap_or_default();
+    // Accept ONLY the positive value. Testing for the literal "unknown"
+    // instead would let any corrupted or mistyped provenance ("declraed")
+    // through as trusted — failing open on precisely the rows whose
+    // trustworthiness is the question.
+    if target_op.scope_provenance != "declared" {
+        let detail = if target_op.scope_provenance == "unknown" {
+            "which worktree it ran in was never recorded (it predates worktree-scoped \
+             operation records in a repository that has linked worktrees)"
+                .to_string()
+        } else {
+            format!(
+                "its recorded scope provenance '{}' is not a value this version understands",
+                target_op.scope_provenance
+            )
+        };
+        return Err(CliError::fatal(format!(
+            "cannot restore operation {}: {detail}",
+            &target_op_id[..8.min(target_op_id.len())]
+        ))
+        .with_stable_code(StableErrorCode::RepoCorrupt)
+        .with_hint(
+            "restore from an operation recorded after the upgrade, or inspect it with \
+             `libra op log` and reproduce the change directly",
+        ));
+    }
+    if target_op.worktree_id != current_scope {
+        let describe = |scope: &str| {
+            if scope.is_empty() {
+                "the main worktree".to_string()
+            } else {
+                format!("worktree '{scope}'")
+            }
+        };
+        return Err(CliError::fatal(format!(
+            "operation {} ran in {}, but this is {}",
+            &target_op_id[..8.min(target_op_id.len())],
+            describe(&target_op.worktree_id),
+            describe(&current_scope)
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("run `libra op restore` from the worktree the operation ran in"));
+    }
+
     if !force && !status::is_clean().await {
         return Err(CliError::fatal("working tree has uncommitted changes")
             .with_stable_code(StableErrorCode::ConflictUnresolved)
@@ -454,11 +560,25 @@ async fn handle_op_restore(
         affected.extend(pruned);
         for branch in &affected {
             let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
-            if let Some(other) = Head::branch_checked_out_elsewhere(short).await {
+            // §C.4.4: fail CLOSED. The infallible probe folded a database
+            // error into "nobody has it checked out", so a transient DB
+            // failure let a restore move a branch another worktree was on.
+            let checked_out = Head::branch_checked_out_elsewhere_result(short)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "cannot determine whether branch '{short}' is checked out in another \
+                         worktree: {error}"
+                    ))
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+            if let Some(other) = checked_out {
                 return Err(CliError::fatal(format!(
                     "cannot restore: branch '{short}' is checked out at worktree '{other}'"
                 ))
-                .with_stable_code(StableErrorCode::Unsupported)
+                // §C.13: branch checked out in another worktree →
+                // LBR-CONFLICT-002.
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("switch that worktree to another branch first, or run restore there"));
             }
         }

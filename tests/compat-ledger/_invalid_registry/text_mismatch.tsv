@@ -1,0 +1,1 @@
+update-ref	--stdin	deferred	docs/commands/update-ref.md#synopsis

@@ -1,0 +1,11 @@
+-- Rollback of 2026073005_worktree_registry_v3_capability.
+--
+-- Removing the marker re-admits a v2-era binary, which parses a v3
+-- `worktrees.json`, does not know `epoch_counter` or an entry's `epoch`, and
+-- drops both when it rewrites the file. The next registration then reissues a
+-- generation a live service client is still fenced on.
+--
+-- SQL cannot read the registry file, so the guard CANNOT live here. It lives in
+-- `MigrationRunner::rollback_to`, which refuses this version while the registry
+-- carries live generations — see `registry_v3_rollback_preflight`.
+DELETE FROM `worktree_registry_capability` WHERE `version` = 3;

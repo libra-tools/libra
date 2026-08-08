@@ -5,7 +5,7 @@ Run read-only, strict round-robin investigations with external agent CLIs (AG-23
 ## Synopsis
 
 ```bash
-libra investigate start --topic <text> --agent <slug>... [--max-turns <n>] [--quorum <n>]
+libra investigate start --topic <text> --agent <slug>... [--max-turns <n>] [--quorum <n>] [--checkpoint <id>]
 libra investigate list [--json] [--limit <n>] [--cursor <token>]
 libra investigate show <run_id> [--json]
 libra investigate continue <run_id>
@@ -39,6 +39,20 @@ repository materialized with ignore rules applied (gitignored secret
 files such as `.env.test` never enter it) — with a minimal read-only CLI
 invocation and an environment cleared down to a documented allowlist.
 Investigators never run in the repository worktree itself.
+
+With `start --checkpoint <id>` the investigation is scoped to a captured
+agent checkpoint instead: the investigators' workspace is the
+checkpoint's own content — `metadata.json`, an optional `manifest.json`,
+and the transcript files — materialized READ-ONLY under the run
+directory (`<run_dir>/checkpoint-input/`). No repository snapshot is
+materialized at all, so a scoped run can only consume the named
+checkpoint; the scope is persisted in the run state, so an
+`investigate continue` resume re-materializes the SAME checkpoint and
+can never fall back to the current worktree. A missing checkpoint, a
+malformed checkpoint tree, or content absent from the local object store
+fails closed BEFORE any run is created (no run residue). The
+materialization shares the run's retention (`investigate clean` removes
+it with the run) and `agent doctor` needs no new orphan class.
 
 Each turn collects the investigator's stance from its stdout (redacted),
 appends it to the run's `stances` list and single-writer `findings.md`,
@@ -128,6 +142,9 @@ libra investigate start --topic "auth bug" --agent codex --agent claude-code
 
 # Bound turns and require two concluding agents
 libra investigate start --topic "memory leak" --agent codex --max-turns 8 --quorum 2
+
+# Investigate a captured checkpoint's transcript (read-only input)
+libra investigate start --topic "replay" --agent codex --checkpoint <checkpoint_id>
 
 # List runs, then fetch the next page
 libra investigate list

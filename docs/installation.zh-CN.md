@@ -17,6 +17,34 @@ curl -fsSL https://download.libra.tools/install.sh | sh
 
 两个名称执行同一个二进制。整个 Libra home 目录移动后，相对目标仍有效。
 
+## Windows
+
+```powershell
+irm https://download.libra.tools/install.ps1 | iex
+```
+
+`install.ps1` 为**当前用户**安装（无需管理员权限）：把 `libra.exe` 放到
+`%LOCALAPPDATA%\libra\bin`，将该目录加入用户 `PATH`，并在第一个可写的 shim
+目录（`%LOCALAPPDATA%\Microsoft\WindowsApps`，否则 `%USERPROFILE%\.local\bin`）
+写入 `libra.cmd` 与可选的 `lba.cmd` 简写。
+
+Windows 上非特权安装无法使用 symlink，因此别名是 `.cmd` shim 而非符号链接；
+其余安全契约与 POSIX 一致：
+
+- 安装器写出的每个 shim 都带 `@rem libra-managed-shim` 标记。该标记既让重装
+  幂等（识别自己写的 shim），也让它能识别**不是自己写的**文件。
+- 没有该标记的既有 `lba.cmd`，以及任何既有的 `lba.exe`、`lba.bat`、`lba.ps1`，
+  一律不覆盖——`lba` 足够短，可能属于别的工具，而 Windows 会优先解析这些扩展名。
+- `-NoAlias`（或 `LIBRA_NO_ALIAS=1`）跳过该简写。要传递此开关，请保存并执行
+  安装脚本，而非将它管道传给 `iex`：
+
+  ```powershell
+  irm https://download.libra.tools/install.ps1 -OutFile install.ps1
+  .\install.ps1 -NoAlias
+  ```
+
+- 写入 shim 失败只告警，不会导致安装失败。
+
 ## Alias 安全性与幂等性
 
 - 全新安装默认创建 `lba`。

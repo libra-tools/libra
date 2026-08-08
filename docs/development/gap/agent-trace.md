@@ -182,7 +182,7 @@ Claude Code `PostToolUse` hook（`reference/trace-hook.ts:94`）对 `Write` 和 
 5. **`Vault` 有 `pgp_sign` 但无 `verify`**（`src/internal/vault.rs`：`pgp_sign`、`signature_to_gpgsig` 存在，无任何 verify）。签名可行，验证侧是净新工作，还需密钥分发/信任模型。
 6. **Agent Trace 参考实现不是可直接照搬的合同**。`schemas.ts` 要求 `version` 满足三段 semver，README 示例用 `0.1.0`，但 `reference/trace-store.ts:151` 实际写 `version: "1.0"`；`computeRangePositions:102` 在 hook 未给 range 且字符串回查失败时会退化成 `1..lineCount`（甚至硬 `1..1`）。此外还会写 `.shell-history`、`.sessions` 合成文件。
    → Libra 应该**严格导出（永远用 `0.1.0` 或后续正式三段）、宽容导入（接受 "1.0" / "0.1.0"，对合成路径与全文件 fallback 打低 `trusted`）、显式降级可信度**。参考实现只可作兼容测试样本。
-7. **Libra worktree 共享同一个 `.libra/libra.db`**（核验：`src/command/worktree.rs:671,844` 把每个 worktree 的 `.libra` 建成指向 shared storage 的**符号链接**；`src/utils/path.rs:23` `database()` = `storage_path().join("libra.db")`）。叠加 worktree 还共享 HEAD/index/refs 的既有事实，意味着 **P1-4 规划的 `ai_edit_trace` 表是跨所有并发 worktree 会话共享的单一物理表**——不是 git worktree 那种各自隔离。
+7. **Libra worktree 共享同一个 `.libra/libra.db`**（核验：`src/command/worktree.rs:671,844` 把每个 worktree 的 `.libra` 建成指向 shared storage 的**符号链接**；`src/utils/path.rs:23` `database()` = `storage_path().join("libra.db")`）。（**注**：本条写于 plan-20260714 Part C 之前;linked worktree 的 HEAD/index 自 W0 起已按 `worktree_id` 隔离,但 `libra.db` 本身仍是单一共享物理库,故下述结论不变。）意味着 **P1-4 规划的 `ai_edit_trace` 表是跨所有并发 worktree 会话共享的单一物理表**——不是 git worktree 那种各自隔离。
    → 任何“apply 时写 NULL `commit_oid`、commit 时回填全部 NULL 行”的简单方案在并发会话下**会串号**（worktree A 的提交回填了 worktree B 的待提交行）。回填**必须按 `session_id`（或 `run_id`）严格 scope**，绝不按“所有 `commit_oid IS NULL`”一把回填。详见 §7.2。
 
 **利好**：
@@ -473,7 +473,7 @@ Libra 的 Intent→Plan→Task→Run→PatchSet→Provenance 对象链路不应�
 
 1. `libra worktree add` 把新 worktree 的 `.libra` 建成**指向 shared storage 的符号链接**（`src/command/worktree.rs:671` 文档注释 + `:844` `std::os::unix::fs::symlink(storage, link_path)`）。
 2. 所有路径解析走同一 storage：`src/utils/path.rs:23` `database()` = `util::storage_path().join("libra.db")`，`index()`/`objects()` 同理。
-3. 因此**所有 worktree 共享同一个 `.libra/libra.db`**，且（按既有事实）共享 HEAD/index/refs——这与 git worktree 的"各自独立 HEAD/index"**语义相反**。
+3. 因此**所有 worktree 共享同一个 `.libra/libra.db`**，。HEAD/index 曾经也共享,但自 plan-20260714 Part C W0 起已按 `worktree_id` 隔离,与 git worktree 的"各自独立 HEAD/index"语义一致;共享的只剩物理数据库文件本身。
 
 **推论（对 P1-4 的修正）**：
 

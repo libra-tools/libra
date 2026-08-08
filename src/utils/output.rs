@@ -491,14 +491,64 @@ pub fn record_warning() {
     WARNING_EMITTED.store(true, Ordering::Relaxed);
 }
 
+/// Messages recorded by [`record_warning_message`], in emission order.
+///
+/// Warnings raised by repository-level preflight (before any command runs)
+/// have no command-owned warning list to join, yet they DO trip the
+/// `--exit-code-on-warning` tracker. Buffering them here lets a command's
+/// structured envelope carry them, so `--json` never reports exit 9 with an
+/// empty `warnings[]` — the "no stderr-only bypass" rule.
+static PENDING_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Record a warning AND retain its text for a structured envelope.
+pub fn record_warning_message(message: String) {
+    record_warning();
+    PENDING_WARNINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(message);
+}
+
+/// Snapshot the buffered preflight warnings (leaves them in place: several
+/// envelopes may render within one invocation).
+pub fn pending_warning_messages() -> Vec<String> {
+    PENDING_WARNINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Returns `true` if [`record_warning`] was called at least once.
 pub fn warning_was_emitted() -> bool {
     WARNING_EMITTED.load(Ordering::Relaxed)
 }
 
+/// Whether the active invocation renders a structured (JSON) envelope.
+///
+/// Set once by the CLI after argument parsing. Warning emitters consult it so
+/// a warning raised BEFORE any command runs is buffered into the envelope
+/// instead of leaking onto stderr, which is what keeps the "JSON delivers
+/// warnings only through `data.warnings[]`" contract exact.
+static STRUCTURED_OUTPUT: AtomicBool = AtomicBool::new(false);
+
+/// Declare whether this invocation renders a structured envelope.
+pub fn set_structured_output(active: bool) {
+    STRUCTURED_OUTPUT.store(active, Ordering::Relaxed);
+}
+
+/// Whether this invocation renders a structured envelope.
+pub fn structured_output_active() -> bool {
+    STRUCTURED_OUTPUT.load(Ordering::Relaxed)
+}
+
 /// Reset the warning tracker before each top-level CLI invocation.
 pub fn reset_warning_tracker() {
     WARNING_EMITTED.store(false, Ordering::Relaxed);
+    STRUCTURED_OUTPUT.store(false, Ordering::Relaxed);
+    PENDING_WARNINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 // ---------------------------------------------------------------------------
