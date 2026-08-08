@@ -33,7 +33,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `worktree_delete_dir.rs` | C5 | `worktree remove` with and without `--delete-dir`; dirty-worktree refusal |
 | `checkout_alias_help.rs` | C5 | top-level `--help` includes `checkout`; the help banner mentions `switch` / `restore` |
 | `matrix_alignment.rs` | C2 / Web Phase E / P2-04 | `COMPATIBILITY.md` ↔ `src/cli.rs::Commands` enum drift detection; explicit no-CLI/no-SMTP `send-email` policy with EN/zh/dev docs; `docs/commands/code.md` docs script coverage for every `/api/code/*` router endpoint; Web CI checks `web/out` drift after static export |
-| `install_alias_test.rs` + `install_alias_smoke.sh` | IX-01 (Issue #437) | 隔离 HOME + 假 downloader 驱动完整 installer：默认相对 `lba -> libra`、same-version 缺失修复/幂等、CLI/env opt-out、regular/foreign-symlink 不覆盖、无 symlink 能力时告警但安装成功 |
+| `install_alias_test.rs` + `install_alias_smoke.sh` + `install_alias_windows.ps1` | IX-01 / plan-20260714 PD-10 | Unix symlink 与 Windows `lba.cmd` 安装器：Windows 端到端覆盖命令解析、CLI/env opt-out 与用户文件保护；Windows 通过 PowerShell 分支执行，非 Windows gate-skip |
 | `live_compat_workflow.rs` | C2 | optional `compat-live-ai` / `compat-live-cloud` workflow stays manual/scheduled, secret-gated, and outside `base.yml` |
 | `branch_lossy_wrapper_guard.rs` | branch follow-up | `src/` production code must use branch `*_result` APIs instead of lossy compatibility wrappers |
 | `lfs_client_production_unwrap_guard.rs` | unwrap audit (v0.17.260) | `src/internal/protocol/lfs_client.rs` must not regress on bare `.unwrap()` |
