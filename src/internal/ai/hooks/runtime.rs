@@ -3620,8 +3620,7 @@ mod tests {
         // contract that matters; this one only pins that erasure is named as a
         // cause rather than the write silently succeeding.
         assert!(
-            err.to_string().contains("could not be claimed")
-                && err.to_string().contains("erased"),
+            err.to_string().contains("could not be claimed") && err.to_string().contains("erased"),
             "unexpected error: {err:#}"
         );
 
