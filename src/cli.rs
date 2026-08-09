@@ -737,6 +737,8 @@ enum Commands {
         hide = true
     )]
     Hooks(command::hooks::HooksArgs),
+    #[command(about = "Run a Libra-owned ScorpioFS worker", hide = true)]
+    ScorpiofsWorker(command::scorpiofs_worker::ScorpioFsWorkerArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1808,6 +1810,12 @@ fn command_scope(command: &Commands) -> CommandScope {
         | Commands::Revision(_)
         | Commands::Hooks(_)
         | Commands::Service(_)
+        // The hidden resident ScorpioFS worker is a daemon like `service`:
+        // it owns no Libra state (durable desired state stays with the
+        // `worktree scorpiofs` commands), but it is classified as a writer
+        // rather than read-only so a future publication cannot slip through
+        // an under-claimed scope. Its LIFETIME hold is dropped below.
+        | Commands::ScorpiofsWorker(_)
         | Commands::Lfs(_)
         | Commands::Deps(_)
         | Commands::Auth(_)
@@ -1925,6 +1933,10 @@ fn command_holds_shared_maintenance_lock(command: &Commands) -> bool {
             | Commands::Automation(_)
             | Commands::Sandbox(_)
             | Commands::Service(_)
+            // The ScorpioFS worker outlives the `worktree scorpiofs attach`
+            // that spawned it; a lifetime hold would starve every deletion
+            // phase for as long as the mount is up.
+            | Commands::ScorpiofsWorker(_)
             | Commands::Agent(_)
             | Commands::Review(_)
             | Commands::Investigate(_)
@@ -2895,6 +2907,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
                 command::agent::investigate::execute_safe(cmd_args, &output).await?
             }
             Commands::Hooks(cmd_args) => command::hooks::execute_safe(cmd_args, &output).await?,
+            Commands::ScorpiofsWorker(cmd_args) => {
+                command::scorpiofs_worker::execute_safe(cmd_args).await?
+            }
             Commands::Bisect(bisect_cmd) => {
                 command::bisect::execute_safe(bisect_cmd, &output).await?
             }

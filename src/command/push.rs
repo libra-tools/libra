@@ -785,12 +785,16 @@ fn validate_push_args(args: &PushArgs) -> Result<(), PushError> {
     Ok(())
 }
 
-async fn validate_local_refspecs(args: &PushArgs, current_branch: &str) -> Result<(), PushError> {
+async fn validate_local_refspecs(
+    args: &PushArgs,
+    current_branch: Option<&str>,
+) -> Result<(), PushError> {
     if args.mirror {
         return Ok(());
     }
 
     if args.refspecs.is_empty() && !args.tags {
+        let current_branch = current_branch.ok_or(PushError::DetachedHead)?;
         resolve_local_ref(current_branch).await?;
     }
 
@@ -819,13 +823,14 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     validate_push_args(&args)?;
 
     let current_branch = match Head::current().await {
-        Head::Branch(name) => name,
-        Head::Detached(_) => return Err(PushError::DetachedHead),
+        Head::Branch(name) => Some(name),
+        Head::Detached(_) => None,
     };
     let repository = match args.repository.clone() {
         Some(repo) => repo,
         None => {
-            let remote = ConfigKv::get_remote(&current_branch).await.ok().flatten();
+            let current_branch = current_branch.as_deref().ok_or(PushError::DetachedHead)?;
+            let remote = ConfigKv::get_remote(current_branch).await.ok().flatten();
             match remote {
                 Some(remote) => remote,
                 None => return Err(PushError::NoRemoteConfigured),
@@ -850,7 +855,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         return Err(PushError::UnsupportedLocalFileRemote);
     }
 
-    validate_local_refspecs(&args, &current_branch).await?;
+    validate_local_refspecs(&args, current_branch.as_deref()).await?;
 
     // Determine transport: SSH or HTTPS
     let is_ssh = is_ssh_spec(&repo_url);
@@ -921,6 +926,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         let mut seen_remote_refs = HashSet::new();
 
         if args.refspecs.is_empty() && !args.tags {
+            let current_branch = current_branch.as_deref().ok_or(PushError::DetachedHead)?;
             let tracked_ref = ConfigKv::get(&format!("branch.{current_branch}.merge"))
                 .await
                 .ok()
@@ -928,7 +934,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
                 .map(|e| e.value)
                 .unwrap_or_else(|| format!("refs/heads/{current_branch}"));
             add_update_ref_plan(
-                resolve_local_ref(&current_branch).await?,
+                resolve_local_ref(current_branch).await?,
                 tracked_ref,
                 &remote_refs,
                 effective_force,
@@ -3875,6 +3881,25 @@ old1 new1 refs/heads/main\n"
         let err: CliError = PushError::DetachedHead.into();
         assert_eq!(err.stable_code(), StableErrorCode::RepoStateInvalid);
         assert_eq!(err.exit_code(), 128);
+    }
+
+    #[tokio::test]
+    async fn detached_head_only_rejects_pushes_that_need_the_current_branch() {
+        let explicit_delete = PushArgs::for_refspecs(
+            "origin".to_string(),
+            vec![":refs/heads/obsolete".to_string()],
+        );
+        assert!(
+            validate_local_refspecs(&explicit_delete, None)
+                .await
+                .is_ok()
+        );
+
+        let default_push = PushArgs::for_refspecs("origin".to_string(), Vec::new());
+        assert!(matches!(
+            validate_local_refspecs(&default_push, None).await,
+            Err(PushError::DetachedHead)
+        ));
     }
 
     #[test]

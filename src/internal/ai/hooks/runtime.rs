@@ -3627,6 +3627,13 @@ mod tests {
         run_builtin_migrations(&conn)
             .await
             .expect("run_builtin_migrations");
+        // `libra init` writes `libra.repoid` as part of bootstrap, and every
+        // ingest path resolves its `CaptureScope` through `RepoIdentity` — a
+        // fixture without it is not a repository this code will write to, it
+        // is one with corrupt metadata.
+        ConfigKv::set_with_conn(&conn, "libra.repoid", "repo-ingest-fixture", false)
+            .await
+            .expect("seed libra.repoid");
         (dir, conn)
     }
 
@@ -3730,8 +3737,13 @@ mod tests {
         )
         .await
         .expect_err("stale hook must not resurrect an erased session");
+        // The tombstone is now enforced inside the scope-claim upsert's WHERE
+        // clause rather than by a separate pre-check, so the refusal surfaces
+        // through the claim diagnostic. The row-count assertion below is the
+        // contract that matters; this one only pins that erasure is named as a
+        // cause rather than the write silently succeeding.
         assert!(
-            err.to_string().contains("anti-resurrection tombstone"),
+            err.to_string().contains("could not be claimed") && err.to_string().contains("erased"),
             "unexpected error: {err:#}"
         );
 
@@ -4153,14 +4165,20 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_fails_loud_when_table_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("noschema.db");
-        std::fs::File::create(&path).expect("touch sqlite file");
-        let url = format!("sqlite://{}", path.display());
-        let mut opts = ConnectOptions::new(url);
-        opts.sqlx_logging(false);
-        let conn = Database::connect(opts).await.expect("connect");
-        // intentionally NOT calling run_builtin_migrations.
+        // A fully bootstrapped repository with exactly ONE table removed. A
+        // schema-less database would fail earlier and for a different reason
+        // (`config_kv` is read first, to resolve the capture scope), which
+        // would leave the claim this test actually makes — that a missing
+        // `agent_session` is reported loudly and by name — untested.
+        let (_dir, conn) = ingest_fresh_conn().await;
+        let backend = conn.get_database_backend();
+        let _: ExecResult = conn
+            .execute_raw(Statement::from_string(
+                backend,
+                "DROP TABLE agent_session".to_string(),
+            ))
+            .await
+            .expect("drop agent_session");
 
         let payload = ingest_envelope("SessionStart", "S-bare", json!({}));
         let err = ingest_agent_traces_payload(

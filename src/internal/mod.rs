@@ -49,6 +49,7 @@ pub mod publish;
 pub mod reflog;
 pub mod repo_hooks;
 pub mod revision_ordinal;
+pub mod scorpiofs_backend;
 pub mod sequencer;
 #[cfg(test)]
 pub mod source_scan;
@@ -59,4 +60,5 @@ pub mod tui;
 pub mod upgrade;
 pub mod vault;
 pub mod workspace;
+pub mod worktree_backend;
 pub mod worktree_scope;

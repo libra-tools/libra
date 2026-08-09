@@ -90,6 +90,11 @@ pub enum WorktreeSubcommand {
         #[clap(long, help = "Allow other users to access the mounted worktree")]
         allow_other: bool,
     },
+    /// Manage a linked worktree backed by a ScorpioFS Antares mount.
+    Scorpiofs {
+        #[clap(subcommand)]
+        command: legacy::ScorpioFsSubcommand,
+    },
     List {
         /// Emit a stable, machine-readable porcelain format (one attribute per
         /// line, blank line between worktrees).
@@ -430,6 +435,15 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                     .await
                     .map_err(|e| CliError::fatal(e.to_string()))
             }
+        }
+        WorktreeSubcommand::Scorpiofs { command } => {
+            legacy::execute_safe(
+                legacy::WorktreeArgs {
+                    command: legacy::WorktreeSubcommand::Scorpiofs { command },
+                },
+                output,
+            )
+            .await
         }
         WorktreeSubcommand::List {
             porcelain,

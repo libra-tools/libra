@@ -6,6 +6,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
+use axum::{Json, Router};
 use clap::Parser;
 use libra::{
     command::{
@@ -125,6 +126,145 @@ fn assert_worktree_error(output: &std::process::Output, error_code: &str) -> Cli
     let (_, report) = parse_cli_error_stderr(&output.stderr);
     assert_eq!(report.error_code, error_code, "unexpected error report");
     report
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_scorpiofs_attach_is_persistent_idempotent_and_detachable() {
+    let repo_dir = tempdir().unwrap();
+    let mount_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+
+    let mountpoint = mount_dir.path().canonicalize().unwrap();
+    fs::write(mountpoint.join("hello.txt"), "hello from ScorpioFS\n").unwrap();
+    fs::write(
+        mountpoint.join("unreported-local-artifact.txt"),
+        "not part of the ScorpioFS change set\n",
+    )
+    .unwrap();
+    let mountpoint_json = mountpoint.to_string_lossy().into_owned();
+    let mount_response_path = mountpoint_json.clone();
+    let app = Router::new()
+        .route(
+            "/health",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({
+                    "protocol_version": 1,
+                    "service": "scorpiofs",
+                    "service_version": "test",
+                    "capabilities": ["mount.v1", "ready.v1", "changes.v1"],
+                    "status": "healthy",
+                    "mount_count": 1,
+                    "uptime_secs": 0
+                }))
+            }),
+        )
+        .route(
+            "/mounts",
+            axum::routing::post(move || {
+                let mountpoint = mount_response_path.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "mount_id": "11111111-1111-4111-8111-111111111111",
+                        "mountpoint": mountpoint,
+                        "ready": true
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/mounts/11111111-1111-4111-8111-111111111111/changes",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({
+                    "mount_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 0,
+                    "changes": [{
+                        "kind": "modified",
+                        "path": "hello.txt"
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/mounts/by-job/dev-project",
+            axum::routing::delete(|| async { Json(serde_json::json!({"deleted": true})) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    exec_worktree(&[
+        "scorpiofs",
+        "attach",
+        "--endpoint",
+        &endpoint,
+        "--remote-path",
+        "/project",
+        "--job-id",
+        "dev-project",
+    ])
+    .await
+    .expect("ScorpioFS attach should succeed");
+    exec_worktree(&[
+        "scorpiofs",
+        "attach",
+        "--endpoint",
+        &endpoint,
+        "--remote-path",
+        "/project",
+        "--job-id",
+        "dev-project",
+    ])
+    .await
+    .expect("repeated ScorpioFS attach should be idempotent");
+
+    let pointer = mountpoint.join(util::ROOT_DIR);
+    assert!(
+        pointer.is_file(),
+        "mount root should contain a .libra pointer"
+    );
+    let gitdir = util::try_get_worktree_gitdir(Some(mountpoint.clone())).unwrap();
+    assert!(gitdir.join("backend.json").is_file());
+    assert_eq!(
+        read_worktree_state()
+            .entries
+            .iter()
+            .filter(|entry| entry.path == mountpoint_json)
+            .count(),
+        1
+    );
+
+    let status = run_libra_command(&["status", "--porcelain"], &mountpoint);
+    assert_cli_success(&status, "ScorpioFS worktree status");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("hello.txt"),
+        "changed-path candidate should be visible to status"
+    );
+    let add = run_libra_command(&["add", "hello.txt"], &mountpoint);
+    assert_cli_success(&add, "ScorpioFS worktree add");
+    let commit = run_libra_command(
+        &["commit", "-m", "test ScorpioFS-backed commit"],
+        &mountpoint,
+    );
+    assert_cli_success(&commit, "ScorpioFS worktree commit");
+    let status = run_libra_command(&["status", "--porcelain"], &mountpoint);
+    assert_cli_success(&status, "clean ScorpioFS worktree status");
+    assert!(
+        status.stdout.is_empty(),
+        "committed ScorpioFS worktree should be clean: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    exec_worktree(&["scorpiofs", "detach", &mountpoint_json])
+        .await
+        .expect("ScorpioFS detach should succeed");
+    assert!(!pointer.exists());
+    assert!(!gitdir.exists());
+
+    server.abort();
 }
 
 /// §C.8 (W4 review): the `worktree list` JSON data half carries its OWN

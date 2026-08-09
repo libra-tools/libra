@@ -1325,6 +1325,22 @@ impl WorktreeReadBudget {
 mod tests {
     use super::*;
 
+    /// Make `root` discoverable as a repository and step the process cwd into
+    /// it, returning the guard that restores the cwd.
+    ///
+    /// Deliberately NOT a full `libra init`: the worktree read path only needs
+    /// repository DISCOVERY to succeed (`util::working_dir`, for the LFS
+    /// attribute lookup), and a terminal common storage is a gitdir carrying
+    /// the repository database. Standing up a real database here would drag a
+    /// connection pool into a test about byte accounting.
+    fn repo_fixture(root: &Path) -> crate::utils::test::ChangeDirGuard {
+        let gitdir = root.join(crate::utils::util::ROOT_DIR);
+        std::fs::create_dir_all(gitdir.join("objects")).expect("create object store");
+        std::fs::write(gitdir.join(crate::utils::util::DATABASE), b"")
+            .expect("create repository db");
+        crate::utils::test::ChangeDirGuard::new(root)
+    }
+
     fn regular(evidence: BlobEvidence, size: u64) -> BlobRef {
         BlobRef {
             kind: BlobKind::Regular,
@@ -2288,6 +2304,12 @@ mod tests {
         const SHRUNK: u64 = 4;
         const GROWTH: u64 = 4096;
         let dir = tempfile::tempdir().expect("tempdir");
+        // The read path classifies LFS through `attribute_state_for_path`,
+        // which resolves `working_dir()` — infallibly, from the PROCESS cwd,
+        // on the pooled io thread. Outside a repository that panics the
+        // worker and the caller only ever sees the resulting `IoTimeout`,
+        // so the fixture has to be a repository.
+        let _repo = repo_fixture(dir.path());
         let path = dir.path().join("grows.txt");
         std::fs::write(&path, vec![b'a'; (SHRUNK + GROWTH) as usize])
             .expect("write the full-size file");
@@ -2456,6 +2478,11 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempfile::tempdir().expect("tempdir");
+        // See `worktree_total_charges_bytes_read_not_stale_stat`: the LFS
+        // classification resolves `working_dir()` on the io thread, so a
+        // repo-less fixture fails with `IoTimeout` no matter what the seams
+        // are doing — which is precisely the outcome this test denies.
+        let _repo = repo_fixture(dir.path());
         let path = dir.path().join("fast.txt");
         std::fs::write(&path, b"content").expect("write fixture");
 
@@ -2466,8 +2493,21 @@ mod tests {
             std::env::set_var("LIBRA_TEST_SLOW_WORKTREE_READ_MS", "5000");
             std::env::set_var("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS", "5000");
         }
-        let mut budget = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_millis(1500));
-        let outcome = budget.read_worktree_blob(&path);
+        // A jammed I/O pool and a fired seam both surface as `IoTimeout`, and
+        // the pool is process-global: the seam tests above abandon reads that
+        // keep sleeping in a worker, and their slots outlive them. So drain
+        // the pool first and retry — with the seams inert one attempt
+        // succeeds as soon as a worker is free, while a 5s seam that really
+        // did fire would blow the 1.5s batch on EVERY attempt.
+        let mut outcome = ContentOutcome::Skipped(SkipReason::IoTimeout);
+        for _ in 0..8 {
+            crate::command::status_probe::wait_for_idle_io_pool();
+            let mut budget = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_millis(1500));
+            outcome = budget.read_worktree_blob(&path);
+            if matches!(outcome, ContentOutcome::Content(_)) {
+                break;
+            }
+        }
         unsafe {
             std::env::remove_var("LIBRA_TEST_SLOW_WORKTREE_STAT_MS");
             std::env::remove_var("LIBRA_TEST_SLOW_WORKTREE_READ_MS");
