@@ -129,6 +129,24 @@ static IO_POOL: std::sync::OnceLock<std::sync::Arc<IoWorkerPool>> = std::sync::O
 static IO_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static IO_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Block until every pooled slot has been released.
+///
+/// The deadline tests deliberately ABANDON reads: the caller gives up at its
+/// deadline while the worker keeps sleeping inside the armed seam, and the
+/// slot stays busy until that sleep ends — outliving the test that started
+/// it. A later test whose contract is "this must NOT time out" therefore has
+/// to start from an idle pool, or it measures the previous test's leftover
+/// delay and fails for a reason that has nothing to do with what it asserts.
+#[cfg(test)]
+pub(crate) fn wait_for_idle_io_pool() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while IO_BUSY.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Run one blocking filesystem operation with a wall-clock deadline.
 ///
 /// A hung syscall cannot be interrupted in safe Rust, so the operation runs
