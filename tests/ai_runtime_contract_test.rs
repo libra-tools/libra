@@ -327,14 +327,150 @@ fn durable_intent_precedes_mutation_in_four_crash_windows() {
 }
 
 #[tokio::test]
+async fn recovered_mutating_command_fences_worker_session_before_admission() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExternalTurnTrackingExecutor,
+            InMemoryAuditSink, RuntimeCommandDurability, RuntimeWorkerError, ToolBoundaryRuntime,
+            TurnRequest,
+        },
+        session::{CodeCommandIdentity, CodeCommandIntent, CodeCommandStatus, SessionJsonlStore},
+    };
+
+    let temp = tempfile::TempDir::new().expect("temporary session root");
+    let durability =
+        RuntimeCommandDurability::new(SessionJsonlStore::new(temp.path().join("session")));
+    let intent = CodeCommandIntent::new(
+        CodeCommandIdentity::new("repo", "session", "principal", "interrupted-turn"),
+        "agent_runtime_turn",
+        "sha256:request",
+        true,
+    );
+    durability
+        .admit(intent)
+        .expect("persist interrupted intent");
+    assert_eq!(
+        durability
+            .recover_pending_mutations()
+            .expect("recover pending mutations"),
+        vec![CodeCommandIdentity::new(
+            "repo",
+            "session",
+            "principal",
+            "interrupted-turn"
+        )]
+    );
+    assert!(matches!(
+        durability
+            .session_store()
+            .recover_code_command(&CodeCommandIdentity::new(
+                "repo",
+                "session",
+                "principal",
+                "interrupted-turn"
+            ))
+            .expect("read recovered command"),
+        libra::internal::ai::session::CodeCommandRecovery::Existing {
+            status: CodeCommandStatus::Indeterminate { .. }
+        }
+    ));
+
+    let config = AgentRuntimeWorkerConfig::new(
+        Arc::new(ExternalTurnTrackingExecutor),
+        ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
+    )
+    .with_durability(durability, "repo", "principal")
+    .with_recovered_reconciliation_session("session");
+    let (handle, worker) = AgentRuntimeWorker::spawn(config);
+
+    assert!(matches!(
+        handle
+            .submit(TurnRequest::new("session", "next-turn", "next input", true))
+            .await,
+        Err(RuntimeWorkerError::ReconciliationRequired { session_id }) if session_id == "session"
+    ));
+    worker.abort();
+}
+
+#[tokio::test]
+async fn second_restart_keeps_reconciliation_fence_for_indeterminate_mutation() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExternalTurnTrackingExecutor,
+            InMemoryAuditSink, RuntimeCommandDurability, RuntimeWorkerError, ToolBoundaryRuntime,
+            TurnRequest,
+        },
+        session::{CodeCommandIdentity, CodeCommandIntent, SessionJsonlStore},
+    };
+
+    let temp = tempfile::TempDir::new().expect("temporary session root");
+    let session_root = temp.path().join("session");
+    let first = RuntimeCommandDurability::new(SessionJsonlStore::new(session_root.clone()));
+    let intent = CodeCommandIntent::new(
+        CodeCommandIdentity::new("repo", "session", "principal", "interrupted-turn"),
+        "agent_runtime_turn",
+        "sha256:request",
+        true,
+    );
+    first.admit(intent).expect("persist interrupted intent");
+    assert_eq!(
+        first
+            .recover_pending_mutations()
+            .expect("first restart fences pending mutation")
+            .len(),
+        1,
+        "first restart must fence the pending mutating command"
+    );
+
+    // A later process opens the same durable log with no Pending rows left.
+    // Recovery must still report the indeterminate mutation so callers keep the
+    // in-memory reconciliation fence.
+    let second = RuntimeCommandDurability::new(SessionJsonlStore::new(session_root));
+    let recovered = second
+        .recover_pending_mutations()
+        .expect("second restart must still surface reconciliation");
+    assert_eq!(
+        recovered,
+        vec![CodeCommandIdentity::new(
+            "repo",
+            "session",
+            "principal",
+            "interrupted-turn"
+        )]
+    );
+
+    let config = AgentRuntimeWorkerConfig::new(
+        Arc::new(ExternalTurnTrackingExecutor),
+        ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
+    )
+    .with_durability(second, "repo", "principal")
+    .with_recovered_reconciliation_session("session");
+    let (handle, worker) = AgentRuntimeWorker::spawn(config);
+    assert!(matches!(
+        handle
+            .submit(TurnRequest::new("session", "next-turn", "next input", true))
+            .await,
+        Err(RuntimeWorkerError::ReconciliationRequired { session_id }) if session_id == "session"
+    ));
+    worker.abort();
+}
+
+#[tokio::test]
 async fn cancel_during_mutation_requires_reconciliation() {
     use std::sync::Arc;
 
-    use libra::internal::ai::runtime::{
-        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionState,
-        PrincipalContext, PrincipalRole, RuntimeExecutionContext, RuntimeTurnExecution,
-        RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor, ToolBoundaryPolicy,
-        ToolBoundaryRuntime, TurnRequest,
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionState,
+            PrincipalContext, PrincipalRole, RuntimeCommandDurability, RuntimeExecutionContext,
+            RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+            ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        },
+        session::{CodeCommandIdentity, CodeCommandRecovery, CodeCommandStatus, SessionJsonlStore},
     };
     use tokio::{
         sync::Notify,
@@ -388,8 +524,16 @@ async fn cancel_during_mutation_requires_reconciliation() {
         SecretRedactor::default_runtime(),
         Arc::new(InMemoryAuditSink::default()),
     );
-    let (handle, worker) =
-        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+    let temp = tempfile::TempDir::new().expect("temporary session JSONL root");
+    let durability =
+        RuntimeCommandDurability::new(SessionJsonlStore::new(temp.path().join("session")));
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(executor, boundary).with_durability(
+            durability.clone(),
+            "runtime-contract-repo",
+            "runtime-cancel-test",
+        ),
+    );
 
     handle
         .submit(TurnRequest::new("session", "first", "apply patch", true))
@@ -432,6 +576,20 @@ async fn cancel_during_mutation_requires_reconciliation() {
     })
     .await
     .expect("ambiguous mutation result becomes indeterminate");
+    assert!(matches!(
+        durability
+            .session_store()
+            .recover_code_command(&CodeCommandIdentity::new(
+                "runtime-contract-repo",
+                "session",
+                "runtime-cancel-test",
+                "first",
+            ))
+            .expect("read durable cancellation result"),
+        CodeCommandRecovery::Existing {
+            status: CodeCommandStatus::Indeterminate { .. }
+        }
+    ));
     assert!(
         timeout(Duration::from_millis(100), second_started.notified())
             .await
@@ -443,6 +601,127 @@ async fn cancel_during_mutation_requires_reconciliation() {
             .submit(TurnRequest::new("session", "third", "another patch", true))
             .await,
         Err(RuntimeWorkerError::ReconciliationRequired { .. })
+    ));
+    if let Err(error) = handle
+        .submit(TurnRequest::new(
+            "session",
+            "fourth",
+            "must not replay",
+            true,
+        ))
+        .await
+    {
+        assert!(
+            libra::internal::ai::runtime::runtime_worker_adapter_message(error)
+                .contains("RECONCILIATION_REQUIRED"),
+            "resubmit after cancel-indeterminate must expose a stable reconciliation code"
+        );
+    } else {
+        panic!("resubmit after cancel-indeterminate must be rejected, not replayed");
+    }
+    worker.abort();
+}
+
+/// W1-04: the legacy TUI tool loop is externally executed, but its cancel
+/// request must still enter the runtime before the adapter signals its local
+/// cooperative token. A mutation marker shared with the runtime turns an
+/// ambiguous local cancellation into the durable reconciliation fence.
+#[tokio::test]
+async fn external_tui_turn_cancel_uses_runtime_reconciliation() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExternalTurnTrackingExecutor,
+            InMemoryAuditSink, InteractionState, PrincipalContext, PrincipalRole,
+            RuntimeCommandDurability, RuntimeWorkerError, SecretRedactor, ToolBoundaryPolicy,
+            ToolBoundaryRuntime, TurnRequest,
+        },
+        session::{CodeCommandIdentity, CodeCommandRecovery, CodeCommandStatus, SessionJsonlStore},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "tui-runtime-contract-test".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let temp = tempfile::TempDir::new().expect("temporary TUI session JSONL root");
+    let durability =
+        RuntimeCommandDurability::new(SessionJsonlStore::new(temp.path().join("session")));
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(Arc::new(ExternalTurnTrackingExecutor), boundary)
+            .with_durability(durability.clone(), "tui-contract-repo", "tui-local")
+            .with_durability_command_kind("tui_local_turn"),
+    );
+    let cancellation = CancellationToken::new();
+    let mutation_started = Arc::new(AtomicBool::new(true));
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "turn-1", "apply patch", true),
+            cancellation.clone(),
+            Arc::clone(&mutation_started),
+        )
+        .await
+        .expect("external TUI turn admitted");
+
+    handle
+        .cancel("session", "turn-1")
+        .await
+        .expect("runtime accepted TUI cancellation");
+    assert!(
+        !cancellation.is_cancelled(),
+        "a started mutation must not be locally aborted by runtime cancellation"
+    );
+    assert_eq!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("runtime snapshot")
+            .interaction,
+        InteractionState::Cancelling
+    );
+
+    mutation_started.store(false, Ordering::Release);
+    let finalization = handle
+        .finish_external_turn("session", "turn-1", Err(RuntimeWorkerError::Cancelled))
+        .await;
+    assert!(
+        matches!(
+            finalization,
+            Err(RuntimeWorkerError::ReconciliationRequired { .. })
+        ),
+        "the adapter must observe the worker's durable indeterminate fence"
+    );
+    assert!(matches!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("reconciled snapshot")
+            .interaction,
+        InteractionState::IndeterminateSideEffect { .. }
+    ));
+    assert!(matches!(
+        durability
+            .session_store()
+            .recover_code_command(&CodeCommandIdentity::new(
+                "tui-contract-repo",
+                "session",
+                "tui-local",
+                "turn-1",
+            ))
+            .expect("durable TUI cancellation result"),
+        CodeCommandRecovery::Existing {
+            status: CodeCommandStatus::Indeterminate { .. }
+        }
     ));
     worker.abort();
 }

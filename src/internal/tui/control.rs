@@ -81,6 +81,8 @@ pub enum TuiControlError {
     InteractionNotActive,
     UnsupportedInteractionKind,
     ControllerConflict,
+    /// Durable mutation reconciliation is required before another turn can run.
+    ReconciliationRequired(String),
     Internal(String),
     /// `goal.start` was called while a Goal is already active in
     /// this session. The user / automation must `goal.cancel` (or
@@ -110,6 +112,7 @@ impl TuiControlError {
             Self::InteractionNotActive => 409,
             Self::UnsupportedInteractionKind => 422,
             Self::ControllerConflict => 409,
+            Self::ReconciliationRequired(_) => 409,
             Self::Internal(_) => 500,
             Self::GoalAlreadyActive => 409,
             Self::GoalNotActive => 409,
@@ -124,6 +127,7 @@ impl TuiControlError {
             Self::InteractionNotActive => "INTERACTION_NOT_ACTIVE",
             Self::UnsupportedInteractionKind => "UNSUPPORTED_INTERACTION_KIND",
             Self::ControllerConflict => "CONTROLLER_CONFLICT",
+            Self::ReconciliationRequired(_) => "RECONCILIATION_REQUIRED",
             Self::Internal(_) => "TUI_CONTROL_INTERNAL",
             Self::GoalAlreadyActive => "GOAL_ALREADY_ACTIVE",
             Self::GoalNotActive => "GOAL_NOT_ACTIVE",
@@ -144,6 +148,9 @@ impl TuiControlError {
             Self::ControllerConflict => {
                 "The local TUI controller is not reclaimable in this session".to_string()
             }
+            Self::ReconciliationRequired(session_id) => format!(
+                "session '{session_id}' requires mutation reconciliation before another turn can run"
+            ),
             Self::Internal(message) => message.clone(),
             Self::GoalAlreadyActive => {
                 "A Goal is already active in this session — cancel it first".to_string()
@@ -208,6 +215,10 @@ mod tests {
             "The local TUI controller is not reclaimable in this session",
         );
         assert_eq!(
+            TuiControlError::ReconciliationRequired("sess-1".to_string()).to_string(),
+            "session 'sess-1' requires mutation reconciliation before another turn can run",
+        );
+        assert_eq!(
             TuiControlError::Internal("downstream blew up".to_string()).to_string(),
             "downstream blew up",
         );
@@ -240,6 +251,10 @@ mod tests {
         assert_eq!(TuiControlError::InteractionNotActive.status(), 409);
         assert_eq!(TuiControlError::UnsupportedInteractionKind.status(), 422);
         assert_eq!(TuiControlError::ControllerConflict.status(), 409);
+        assert_eq!(
+            TuiControlError::ReconciliationRequired(String::new()).status(),
+            409,
+        );
         assert_eq!(TuiControlError::Internal(String::new()).status(), 500);
         assert_eq!(TuiControlError::GoalAlreadyActive.status(), 409);
         assert_eq!(TuiControlError::GoalNotActive.status(), 409);
@@ -271,6 +286,10 @@ mod tests {
         assert_eq!(
             TuiControlError::ControllerConflict.code(),
             "CONTROLLER_CONFLICT",
+        );
+        assert_eq!(
+            TuiControlError::ReconciliationRequired(String::new()).code(),
+            "RECONCILIATION_REQUIRED",
         );
         assert_eq!(
             TuiControlError::Internal(String::new()).code(),

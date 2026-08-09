@@ -575,6 +575,130 @@ fn code_ui_scenarios_require_test_provider_feature() {
     eprintln!("skipping code UI scenarios; enable --features test-provider");
 }
 
+/// W0-02 baseline skeleton (cargo filter: `plan_workflow`).
+///
+/// Pins IntentSpec review + post-plan choice labels owned by the TUI today so
+/// later Web harness work can retarget these contracts instead of deleting them.
+#[test]
+fn plan_workflow_baseline_pins_intent_and_post_plan_choices() {
+    use libra::internal::tui::{INTENT_REVIEW_CHOICES, POST_PLAN_CHOICES};
+
+    assert_eq!(
+        INTENT_REVIEW_CHOICES,
+        &["Confirm Intent", "Modify Intent", "Cancel"]
+    );
+    assert_eq!(
+        POST_PLAN_CHOICES,
+        &["Execute Plan", "Modify Plan", "Cancel"]
+    );
+    assert!(
+        !INTENT_REVIEW_CHOICES
+            .iter()
+            .any(|choice| choice.contains("Execute")),
+        "IntentSpec review must stay phase-specific"
+    );
+}
+
+/// W0-02 baseline skeleton (cargo filter: `plan_review`).
+///
+/// Pins the network-policy human gate that follows Plan approval.
+#[test]
+fn plan_review_baseline_pins_network_policy_choices() {
+    use libra::internal::tui::NETWORK_POLICY_CHOICES;
+
+    assert_eq!(
+        NETWORK_POLICY_CHOICES,
+        &["Network: Deny", "Network: Allow", "Back"]
+    );
+    assert!(
+        !NETWORK_POLICY_CHOICES
+            .iter()
+            .any(|choice| choice.contains("Execute")),
+        "network policy must not reuse post-plan Execute labels"
+    );
+}
+
+/// W0-02 baseline for automatic plan-repair threshold copy (filter: `repair`).
+#[test]
+fn repair_loop_baseline_threshold_keeps_plan_continue_affordance() {
+    use libra::internal::tui::plan_repair_threshold_baseline_message;
+
+    let message = plan_repair_threshold_baseline_message("task failed: missing fixture", 3, 3);
+    assert!(message.contains(
+        "Automatic plan repair stopped after 3 failed repair attempts (automatic threshold: 3)."
+    ));
+    assert!(message.contains("/plan continue"));
+    assert!(message.contains("task failed: missing fixture"));
+}
+
+/// W0-02 baseline for request_user_input wire kind (filter: `user_input`).
+#[test]
+fn user_input_baseline_interaction_kind_is_request_user_input() {
+    // Keep the TUI-owned interaction kind stable for Code UI wire consumers.
+    // Full multi-question PTY coverage remains on the approval/interaction path;
+    // this pin prevents silent rename during runtime migration.
+    let value = serde_json::to_value(
+        libra::internal::ai::web::code_ui::CodeUiInteractionKind::RequestUserInput,
+    )
+    .expect("RequestUserInput must serialize");
+    assert_eq!(
+        value,
+        serde_json::Value::String("request_user_input".into())
+    );
+}
+
+/// W0-02 goal/task control-surface baseline (filter: `goal_task`).
+///
+/// Pins the SessionEvent kind tag that `/goal` slash commands and Code Control
+/// `goal.*` methods both project. Full Goal state-machine coverage remains in
+/// `ai_goal_state_test`; this filter keeps the TUI-facing wire tag discoverable
+/// from the plan's `code_ui_scenarios` verification entry.
+#[test]
+fn goal_task_control_baseline_session_event_kind_tag_is_goal() {
+    use chrono::Utc;
+    use libra::internal::ai::{
+        goal::{
+            GoalActor, GoalCriterion, GoalEvent, GoalEventEnvelope, GoalEvidencePolicy, GoalSpec,
+        },
+        session::jsonl::SessionEvent,
+    };
+    use uuid::Uuid;
+
+    let goal_id = Uuid::nil();
+    let spec = GoalSpec::new(
+        goal_id,
+        "thread-w0-02",
+        "session-w0-02",
+        "freeze goal/task control baseline",
+        vec![GoalCriterion {
+            id: "baseline".into(),
+            description: "goal/task control remains addressable".into(),
+            required: true,
+            verifier_hint: None,
+            requires_workspace_change: false,
+        }],
+        Vec::new(),
+        GoalEvidencePolicy::Standard,
+        Default::default(),
+        Utc::now(),
+        GoalActor::User {
+            id: Some("w0-02".into()),
+        },
+    )
+    .expect("baseline GoalSpec must construct");
+    let event = SessionEvent::Goal(GoalEventEnvelope::new(
+        goal_id,
+        Utc::now(),
+        GoalEvent::Created(spec),
+    ));
+    let encoded = serde_json::to_value(&event).expect("SessionEvent::Goal must serialize");
+    assert_eq!(
+        encoded.get("kind").and_then(|v| v.as_str()),
+        Some("goal"),
+        "goal/task control must keep SessionEvent kind tag `goal`: {encoded}"
+    );
+}
+
 #[cfg(feature = "test-provider")]
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

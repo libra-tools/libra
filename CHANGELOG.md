@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Changed (plan-20260715 W0-03, 2026-08-09)
+
+- **W0-03 Web-only completion gate is machine-checkable.**
+  Strengthen `code_web_only_completion_gate` to assert AC1–AC6 checklist
+  items (parity gates, direct-turn non-completion, A0 inputs, non-Code TUI
+  consumers, product decisions) and fail with a missing-item list; document
+  that current Web-only direct-turn is not a completion state.
+
+### Changed (plan-20260715 W0-02, 2026-08-09)
+
+- **W0-02 freeze TUI-owned workflow baselines before Web migration.**
+  Add `workflow_baseline` choice/threshold contracts, named
+  `plan_workflow`/`plan_review`/`repair`/`user_input`/`goal_task` filters, and
+  an INDEX inventory of baseline test names + expected outputs so later Web
+  harness work can retarget these behaviors instead of deleting them.
+
+### Changed (plan-20260715 W0-01, 2026-08-09)
+
+- **W0-01 source-anchor refresh for the Web-only migration plan.**
+  Revalidated `docs/development/tracing/code.md` C1–C10 conflict table, A0-02..A0-11
+  bind/consume inventory, runtime namespace decision, and non-Code TUI consumers
+  against `main` @ `25c8f6a` / v0.19.104; synchronized plan fact-baseline anchors and
+  recorded `agent/graph.rs` as a required W5-03/W5-10 consumer. Docs-only; no runtime
+  behavior change.
+
 ### Added (plan-20260729 CT2-03, 2026-08-08)
 
 - **The clean-room phrase allowlist, frozen.**

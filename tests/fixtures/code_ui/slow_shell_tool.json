@@ -6,7 +6,7 @@
       "id": "slow-shell-1",
       "name": "shell",
       "arguments": {
-        "command": "sleep 20",
+        "command": "sleep 3",
         "timeout_ms": 30000
       }
     },

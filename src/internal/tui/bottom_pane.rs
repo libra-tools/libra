@@ -861,41 +861,68 @@ impl BottomPane {
 
     /// Render the post-plan dialog (Execute Plan / Modify Plan / Cancel).
     fn render_post_plan_dialog(&self, area: Rect, buf: &mut Buffer) -> Option<Position> {
-        self.render_choice_dialog(
-            area,
-            buf,
-            &[
-                ("Execute Plan", "Run the Scheduler"),
-                ("Modify Plan", "Edit the plan"),
-                ("Cancel", "Return to chat"),
-            ],
-        )
+        self.render_choice_dialog(area, buf, &Self::post_plan_options())
     }
 
     /// Render the network policy dialog shown after the developer approves the plan.
     fn render_network_policy_dialog(&self, area: Rect, buf: &mut Buffer) -> Option<Position> {
-        self.render_choice_dialog(
-            area,
-            buf,
-            &[
-                ("Network: Deny", "Run shell/gates offline"),
-                ("Network: Allow", "Shell/gates may use network"),
-                ("Back", "Return to plan choices"),
-            ],
-        )
+        self.render_choice_dialog(area, buf, &Self::network_policy_options())
     }
 
     /// Render the IntentSpec dialog (Confirm / Modify / Cancel).
     fn render_intent_review_dialog(&self, area: Rect, buf: &mut Buffer) -> Option<Position> {
-        self.render_choice_dialog(
-            area,
-            buf,
-            &[
-                ("Confirm Intent", "Generate plan"),
-                ("Modify Intent", "Revise spec"),
-                ("Cancel", "Return to chat"),
-            ],
-        )
+        self.render_choice_dialog(area, buf, &Self::intent_review_options())
+    }
+
+    fn intent_review_options() -> [(&'static str, &'static str); 3] {
+        [
+            (
+                super::workflow_baseline::INTENT_REVIEW_CHOICES[0],
+                super::workflow_baseline::INTENT_REVIEW_HELP[0],
+            ),
+            (
+                super::workflow_baseline::INTENT_REVIEW_CHOICES[1],
+                super::workflow_baseline::INTENT_REVIEW_HELP[1],
+            ),
+            (
+                super::workflow_baseline::INTENT_REVIEW_CHOICES[2],
+                super::workflow_baseline::INTENT_REVIEW_HELP[2],
+            ),
+        ]
+    }
+
+    fn post_plan_options() -> [(&'static str, &'static str); 3] {
+        [
+            (
+                super::workflow_baseline::POST_PLAN_CHOICES[0],
+                super::workflow_baseline::POST_PLAN_HELP[0],
+            ),
+            (
+                super::workflow_baseline::POST_PLAN_CHOICES[1],
+                super::workflow_baseline::POST_PLAN_HELP[1],
+            ),
+            (
+                super::workflow_baseline::POST_PLAN_CHOICES[2],
+                super::workflow_baseline::POST_PLAN_HELP[2],
+            ),
+        ]
+    }
+
+    fn network_policy_options() -> [(&'static str, &'static str); 3] {
+        [
+            (
+                super::workflow_baseline::NETWORK_POLICY_CHOICES[0],
+                super::workflow_baseline::NETWORK_POLICY_HELP[0],
+            ),
+            (
+                super::workflow_baseline::NETWORK_POLICY_CHOICES[1],
+                super::workflow_baseline::NETWORK_POLICY_HELP[1],
+            ),
+            (
+                super::workflow_baseline::NETWORK_POLICY_CHOICES[2],
+                super::workflow_baseline::NETWORK_POLICY_HELP[2],
+            ),
+        ]
     }
 
     fn render_choice_dialog(
@@ -1803,9 +1830,12 @@ mod tests {
             .map(|y| row_text(&plan_buf, y, plan_area.width))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(plan_text.contains("Execute Plan"));
-        assert!(plan_text.contains("Modify Plan"));
-        assert!(plan_text.contains("Cancel"));
+        for label in crate::internal::tui::workflow_baseline::POST_PLAN_CHOICES {
+            assert!(
+                plan_text.contains(label),
+                "post-plan dialog missing baseline choice {label:?}: {plan_text}"
+            );
+        }
         assert!(!plan_text.contains("Network: Deny"));
         assert!(!plan_text.contains("Network: Allow"));
         assert!(!plan_text.contains("Execute Spec"));
@@ -1819,9 +1849,12 @@ mod tests {
             .map(|y| row_text(&network_buf, y, plan_area.width))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(network_text.contains("Network: Deny"));
-        assert!(network_text.contains("Network: Allow"));
-        assert!(network_text.contains("Back"));
+        for label in crate::internal::tui::workflow_baseline::NETWORK_POLICY_CHOICES {
+            assert!(
+                network_text.contains(label),
+                "network-policy dialog missing baseline choice {label:?}: {network_text}"
+            );
+        }
         assert!(!network_text.contains("Execute Plan"));
         assert!(!network_text.contains("Modify Plan"));
 
@@ -1834,8 +1867,12 @@ mod tests {
             .map(|y| row_text(&intent_buf, y, area.width))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(intent_text.contains("Confirm Intent"));
-        assert!(intent_text.contains("Modify Intent"));
+        for label in crate::internal::tui::workflow_baseline::INTENT_REVIEW_CHOICES {
+            assert!(
+                intent_text.contains(label),
+                "intent-review dialog missing baseline choice {label:?}: {intent_text}"
+            );
+        }
         assert!(!intent_text.contains("Execute Plan"));
         assert!(!intent_text.contains("Modify Plan"));
     }

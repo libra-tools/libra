@@ -149,6 +149,17 @@ impl RuntimeCommandDurability {
         Ok(self.session_store.recover_code_command(&intent.identity)?)
     }
 
+    /// Fence every pending mutating command in this session during runtime
+    /// startup. Callers must not accept another turn until this completes.
+    pub fn recover_pending_mutations(
+        &self,
+    ) -> Result<Vec<crate::internal::ai::session::CodeCommandIdentity>, RuntimeCommandDurabilityError>
+    {
+        Ok(self
+            .session_store
+            .recover_pending_mutating_code_commands()?)
+    }
+
     /// Dispatch an explicitly recovered read-only command. This refuses to
     /// replay a pending mutating command: `recover` will instead have made it
     /// durable `Indeterminate` and return that state here.

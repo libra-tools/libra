@@ -54,10 +54,11 @@ pub use services::{
 pub use snapshot::Snapshot;
 pub use worker::{
     AgentEvent, AgentEventKind, AgentEventStream, AgentRuntimeHandle, AgentRuntimeWorker,
-    AgentRuntimeWorkerConfig, AgentSnapshot, EventCursor, InteractionResponse, InteractionState,
-    RuntimeCommand, RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeObserveError,
-    RuntimeShutdownError, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
-    TurnReceipt, TurnRequest, TurnStateMachine,
+    AgentRuntimeWorkerConfig, AgentSnapshot, EventCursor, ExternalTurnTrackingExecutor,
+    InteractionResponse, InteractionState, RuntimeCommand, RuntimeExecutionContext,
+    RuntimeInteractionDelivery, RuntimeObserveError, RuntimeShutdownError, RuntimeTurnExecution,
+    RuntimeTurnExecutor, RuntimeWorkerError, TurnReceipt, TurnRequest, TurnStateMachine,
+    runtime_worker_adapter_message,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

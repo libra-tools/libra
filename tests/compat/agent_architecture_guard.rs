@@ -328,34 +328,45 @@ fn agent_kind_enum_sql_check_and_doc_roster_stay_in_sync() {
 }
 
 /// W0-03: TUI removal is forbidden until the Web-only completion checklist is
-/// both complete and still tied to the runtime source seam.  While TUI remains
-/// compiled, this test freezes the complete checklist so later phases cannot
-/// silently omit a parity or security dimension.
+/// both complete and still tied to the runtime source seam. While TUI remains
+/// compiled, this test freezes the complete checklist (parity dimensions,
+/// A0 inputs, non-Code TUI consumers, and fixed product decisions) so later
+/// phases cannot silently omit a required closeout item.
 #[test]
 fn code_web_only_completion_gate() {
     let code_doc = fs::read_to_string(repo_root().join("docs/development/tracing/code.md"))
         .expect("read tracing/code.md");
-    assert!(
-        code_doc.contains("## Web-only completion gate（W0-03）"),
-        "tracing/code.md must retain the W0-03 Web-only completion gate"
-    );
+    let mut missing = Vec::new();
+
+    if !code_doc.contains("## Web-only completion gate（W0-03）") {
+        missing.push("heading:## Web-only completion gate（W0-03）".to_string());
+    }
+    // AC2: current Web-only direct-turn is explicitly not a completion state.
+    if !(code_doc.contains("当前 Web-only direct-turn 不是完成态")
+        || code_doc.contains("这不是 Web-only completion"))
+    {
+        missing.push("AC2:direct-turn-not-complete".to_string());
+    }
 
     let gates = [
-        "GATE-WEB-PLAN",
-        "GATE-WEB-GOAL",
-        "GATE-WEB-RESUME",
-        "GATE-WEB-APPROVAL",
-        "GATE-WEB-SSE",
-        "GATE-WEB-CODEX",
-        "GATE-WEB-MCP",
-        "GATE-WEB-DOCS",
+        ("GATE-WEB-PLAN", "plan workflow parity"),
+        ("GATE-WEB-GOAL", "goal/task parity"),
+        ("GATE-WEB-RESUME", "resume parity"),
+        ("GATE-WEB-APPROVAL", "approval/cancel parity"),
+        ("GATE-WEB-SSE", "SSE gap/backpressure"),
+        ("GATE-WEB-CODEX", "Codex normalization"),
+        ("GATE-WEB-MCP", "MCP / `code --control stdio` boundary"),
+        ("GATE-WEB-DOCS", "docs/compat closeout"),
     ];
-    for gate in gates {
-        assert!(
-            code_doc.contains(&format!("| [ ] {gate}"))
-                || code_doc.contains(&format!("| [x] {gate}")),
-            "Web-only completion gate is missing {gate}"
-        );
+    for (gate, phrase) in gates {
+        let listed = code_doc.contains(&format!("| [ ] {gate}"))
+            || code_doc.contains(&format!("| [x] {gate}"));
+        if !listed {
+            missing.push(format!("gate:{gate}"));
+        }
+        if !code_doc.contains(phrase) {
+            missing.push(format!("gate-phrase:{phrase}"));
+        }
     }
     for decision in [
         "GATE-WEB-DECISION-WEB-ONLY",
@@ -364,11 +375,43 @@ fn code_web_only_completion_gate() {
         "GATE-WEB-DECISION-SSH",
         "GATE-WEB-DECISION-GRAPH",
     ] {
-        assert!(
-            code_doc.contains(decision),
-            "Web-only completion gate is missing product decision {decision}"
-        );
+        if !code_doc.contains(decision) {
+            missing.push(format!("decision:{decision}"));
+        }
     }
+    // AC4: A0-02..A0-11 are completed inputs; the gate must not recreate them.
+    if !(code_doc.contains("A0-02..A0-11") && code_doc.contains("不因为本清单而被复制")) {
+        missing.push("AC4:A0-inputs-not-copied".to_string());
+    }
+    // AC5: non-Code TUI consumers stay visible so W5 cannot orphan-delete tui.
+    for consumer in [
+        "src/command/graph.rs",
+        "src/command/agent/graph.rs",
+        "TuiControlError",
+        "src/internal/ai/agent/format.rs",
+    ] {
+        if !code_doc.contains(consumer) {
+            missing.push(format!("consumer:{consumer}"));
+        }
+    }
+    // Product-decision fixed phrases (compat window / bake / stdio / SSH / graph).
+    for phrase in [
+        "--web-only",
+        "3 patch",
+        "MCP transport",
+        "SSH",
+        "libra graph",
+    ] {
+        if !code_doc.contains(phrase) {
+            missing.push(format!("decision-phrase:{phrase}"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "Web-only completion gate missing required items: {}",
+        missing.join(", ")
+    );
 
     let internal_mod =
         fs::read_to_string(repo_root().join("src/internal/mod.rs")).expect("read internal/mod.rs");
@@ -376,8 +419,8 @@ fn code_web_only_completion_gate() {
     if !tui_still_compiled {
         let incomplete = gates
             .iter()
+            .map(|(gate, _)| *gate)
             .filter(|gate| code_doc.contains(&format!("| [ ] {gate}")))
-            .copied()
             .collect::<Vec<_>>();
         assert!(
             incomplete.is_empty(),

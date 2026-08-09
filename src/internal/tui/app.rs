@@ -11,7 +11,7 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -28,6 +28,7 @@ use tokio::{
     time::{interval, sleep, timeout},
 };
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     app_event::{
@@ -56,7 +57,10 @@ use crate::{
             format_agents_table, format_budget_status,
             profile::{AgentProfileRouter, AgentsConfig},
             run_tool_loop_with_history_and_observer,
-            runtime::{TaskEntryKind, TaskInvocation, TaskResult as SubAgentTaskResult},
+            runtime::{
+                TaskEntryKind, TaskInvocation, TaskResult as SubAgentTaskResult,
+                ToolLoopCancellation,
+            },
         },
         commands::CommandDispatcher,
         completion::{
@@ -101,9 +105,15 @@ use crate::{
         },
         projection::ProjectionRebuilder,
         prompt::SystemPromptBuilder,
-        runtime::phase0::{
-            ContextSnapshotItem, ContextSnapshotRequest, write_context_snapshot_if_needed,
-            write_intent,
+        runtime::{
+            AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig,
+            ExternalTurnTrackingExecutor, InMemoryAuditSink, RuntimeCommandDurability,
+            RuntimeTurnExecution, RuntimeWorkerError, ToolBoundaryRuntime, TurnRequest,
+            phase0::{
+                ContextSnapshotItem, ContextSnapshotRequest, write_context_snapshot_if_needed,
+                write_intent,
+            },
+            runtime_worker_adapter_message,
         },
         sandbox::{
             ApprovalMemo, ExecApprovalRequest, FileHistoryRuntimeContext, NetworkAccess,
@@ -442,6 +452,10 @@ pub struct AppConfig {
     pub code_control_rx: Option<UnboundedReceiver<TuiControlCommand>>,
     /// Optional managed provider runtime controlled through the same TUI.
     pub managed_code_ui_runtime: Option<Arc<CodeUiRuntimeHandle>>,
+    /// Runtime control plane for non-managed local tool-loop turns.
+    pub local_turn_runtime: Option<AgentRuntimeHandle>,
+    /// JoinHandle for the local AgentRuntime worker (must be shut down on exit).
+    pub local_turn_runtime_task: Option<JoinHandle<()>>,
     /// Default network access policy selected at TUI launch.
     pub default_network_access: bool,
     /// Whether the first unprofiled user message should be model-classified.
@@ -484,6 +498,15 @@ pub struct App<M: CompletionModel> {
     /// runner's `tokio::select!` (v0.17.767). Reset at every
     /// turn start; cleared when the turn ends.
     current_turn_abort_token: Option<crate::internal::ai::agent::runtime::AbortToken>,
+    /// Cooperative cancellation token wired into the active turn's
+    /// [`ToolLoopConfig::cancellation`]. Signalled by
+    /// [`Self::interrupt_agent_task`]; never hard-aborts a started
+    /// mutation dispatch (ADR-CODE-05).
+    current_turn_cancellation: Option<CancellationToken>,
+    /// Shared with [`ToolLoopCancellation`] for the active turn. When
+    /// set, [`Self::interrupt_agent_task`] must not
+    /// [`JoinHandle::abort`] the background agent task.
+    current_turn_mutation_started: Option<Arc<AtomicBool>>,
     /// Delayed draw task for frame coalescing inside frame interval.
     scheduled_draw_task: Option<JoinHandle<()>>,
     /// Initial welcome message.
@@ -551,6 +574,13 @@ pub struct App<M: CompletionModel> {
     active_turn_id: Option<TurnId>,
     /// Monotonic turn counter.
     next_turn_id: TurnId,
+    /// Fresh durable identity for the active legacy local-runtime turn.
+    ///
+    /// Numeric UI turn ids restart when a session resumes, so they must not be
+    /// reused as durable command ids.
+    /// Runtime turn id admitted for the active local UI turn, paired with that
+    /// UI turn so a stale terminal AppEvent cannot finalize a newer admission.
+    active_local_runtime_turn: Option<(TurnId, String)>,
     /// Shared view of active turn for global retry observer callbacks.
     active_turn_signal: Arc<AtomicU64>,
     /// Number of tool calls currently running in UI.
@@ -565,6 +595,10 @@ pub struct App<M: CompletionModel> {
     code_control_rx: Option<UnboundedReceiver<TuiControlCommand>>,
     /// Managed provider runtime for providers that own their own tool loop.
     managed_code_ui_runtime: Option<Arc<CodeUiRuntimeHandle>>,
+    /// Runtime cancellation and reconciliation authority for local tool loops.
+    local_turn_runtime: Option<AgentRuntimeHandle>,
+    /// JoinHandle for the current local AgentRuntime worker task.
+    local_turn_runtime_task: Option<JoinHandle<()>>,
     /// Default network access policy selected at TUI launch.
     default_network_access: bool,
     /// Whether the first unprofiled user message should be model-classified.
@@ -711,6 +745,8 @@ where
             last_draw_time: Instant::now(),
             agent_task: None,
             current_turn_abort_token: None,
+            current_turn_cancellation: None,
+            current_turn_mutation_started: None,
             scheduled_draw_task: None,
             welcome_message: app_config.welcome_message,
             welcome_active: true,
@@ -744,6 +780,7 @@ where
             mcp_write_tracker: McpWriteTracker::default(),
             active_turn_id: None,
             next_turn_id: 1,
+            active_local_runtime_turn: None,
             active_turn_signal,
             running_tool_calls: 0,
             active_turn_run_id: None,
@@ -751,6 +788,8 @@ where
             code_ui_runtime: app_config.code_ui_runtime,
             code_control_rx: app_config.code_control_rx,
             managed_code_ui_runtime: app_config.managed_code_ui_runtime,
+            local_turn_runtime: app_config.local_turn_runtime,
+            local_turn_runtime_task: app_config.local_turn_runtime_task,
             default_network_access: app_config.default_network_access,
             auto_classify_first_user_message: app_config.auto_classify_first_user_message,
             next_code_ui_item_id: 1,
@@ -764,7 +803,7 @@ where
         // Enter alternate screen
         self.tui.enter_alt_screen()?;
         let run_result = self.run_in_alt_screen().await;
-        self.interrupt_agent_task();
+        self.finalize_local_runtime_on_shutdown().await;
         let leave_result = self.tui.leave_alt_screen();
         self.sweep_fuse_task_worktrees_on_shutdown().await;
 
@@ -936,7 +975,7 @@ where
             }
         }
 
-        self.interrupt_agent_task();
+        self.finalize_local_runtime_on_shutdown().await;
         if let Some(task) = managed_event_task {
             task.abort();
         }
@@ -970,7 +1009,275 @@ where
 
     fn clear_turn_tracking(&mut self) {
         self.clear_active_turn();
+        self.active_local_runtime_turn = None;
         self.clear_mcp_run_id();
+        self.clear_turn_cancellation();
+    }
+
+    fn attach_turn_cancellation(&mut self, config: &mut ToolLoopConfig) {
+        let token = CancellationToken::new();
+        let mutation_started = Arc::new(AtomicBool::new(false));
+        self.current_turn_cancellation = Some(token.clone());
+        self.current_turn_mutation_started = Some(Arc::clone(&mutation_started));
+        config.cancellation = Some(ToolLoopCancellation::new(token, mutation_started));
+    }
+
+    fn clear_turn_cancellation(&mut self) {
+        self.current_turn_cancellation = None;
+        self.current_turn_mutation_started = None;
+    }
+
+    async fn finish_local_runtime_turn(
+        &self,
+        turn_id: TurnId,
+        result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Ok(());
+        };
+        let Some((active_ui_turn, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+            return Ok(());
+        };
+        // Ignore stale terminal AppEvents from a previous UI turn so they
+        // cannot finalize a newer durable admission.
+        if active_ui_turn != turn_id {
+            tracing::debug!(
+                stale_turn_id = turn_id,
+                active_turn_id = active_ui_turn,
+                "ignoring stale local runtime finalization for inactive UI turn"
+            );
+            return Ok(());
+        }
+        runtime
+            .finish_external_turn(self.session.id.clone(), runtime_turn_id, result)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    error = %runtime_worker_adapter_message(error.clone()),
+                    turn_id,
+                    "failed to finalize local TUI turn in AgentRuntime"
+                );
+            })
+    }
+
+    /// Complete a tracked local TUI turn in the runtime before clearing App
+    /// turn tracking. Workflow terminal events must call this so the durable
+    /// command does not remain Pending across the next admission or restart.
+    async fn settle_local_runtime_turn_completed(
+        &mut self,
+        turn_id: TurnId,
+        summary: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        self.finish_local_runtime_turn(
+            turn_id,
+            Ok(RuntimeTurnExecution::Completed {
+                summary: summary.to_string(),
+            }),
+        )
+        .await
+    }
+
+    async fn report_local_runtime_finalization_fence(
+        &mut self,
+        error: RuntimeWorkerError,
+        context: &str,
+    ) {
+        self.finish_turn_state();
+        self.widget.bottom_pane.set_status(AgentStatus::Idle);
+        self.complete_streaming_assistant_cell(format!(
+            "{context}: {}",
+            runtime_worker_adapter_message(error)
+        ));
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            code_ui_session
+                .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                .await;
+        }
+        self.schedule_draw();
+    }
+
+    /// Rebuild the local AgentRuntime worker against the current session root.
+    /// Required after `/clear`, which replaces `self.session` with a new ID.
+    async fn rebind_local_turn_runtime_for_current_session(&mut self) {
+        if self.local_turn_runtime.is_none() && self.local_turn_runtime_task.is_none() {
+            return;
+        }
+        if let Some(previous) = self.local_turn_runtime.take() {
+            if let Err(error) = previous.shutdown().await {
+                tracing::warn!(
+                    error = %error,
+                    "failed to shut down previous local AgentRuntime before rebinding"
+                );
+            }
+        }
+        if let Some(task) = self.local_turn_runtime_task.take() {
+            // Shutdown should have ended the actor; abort as a last resort so a
+            // stuck worker cannot accumulate across repeated `/clear` cycles.
+            task.abort();
+        }
+
+        let working_dir = self.registry.working_dir().to_string_lossy().into_owned();
+        let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(
+            self.session_store.session_root(&self.session.id),
+        ));
+        let (recovered_mutations, recovery_failed) = match durability.recover_pending_mutations() {
+            Ok(mutations) => (mutations, false),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    session_id = %self.session.id,
+                    "failed to recover pending durable commands while rebinding local runtime; fencing session"
+                );
+                self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                    format!(
+                        "Session rebound, but durable command recovery failed ({error}). Mutation reconciliation is required before another turn can run."
+                    ),
+                )));
+                // Fail closed: refuse new mutating admissions until the log can
+                // be inspected, instead of treating recovery as empty/clean.
+                (Vec::new(), true)
+            }
+        };
+        let mut worker_config = AgentRuntimeWorkerConfig::new(
+            Arc::new(ExternalTurnTrackingExecutor),
+            ToolBoundaryRuntime::system(
+                uuid::Uuid::new_v4(),
+                Arc::new(InMemoryAuditSink::default()),
+            ),
+        )
+        .with_durability(durability, working_dir, "tui-local")
+        .with_durability_command_kind("tui_local_turn");
+        if recovery_failed || !recovered_mutations.is_empty() {
+            worker_config =
+                worker_config.with_recovered_reconciliation_session(self.session.id.clone());
+        }
+        let (handle, worker_task) = AgentRuntimeWorker::spawn(worker_config);
+        self.local_turn_runtime = Some(handle);
+        self.local_turn_runtime_task = Some(worker_task);
+        self.active_local_runtime_turn = None;
+    }
+
+    /// Cancel/finalize any tracked local runtime turn before hard-aborting the
+    /// JoinHandle on TUI shutdown. Thinking turns without a started mutation
+    /// must not be left Pending across process exit. A started mutation is
+    /// waited out briefly so its determinate terminal can be reported; if it
+    /// does not settle, the durable command is fenced as indeterminate.
+    async fn finalize_local_runtime_on_shutdown(&mut self) {
+        if self.active_local_runtime_turn.is_none() {
+            let _ = self.interrupt_agent_task();
+            self.shutdown_local_turn_runtime_worker().await;
+            return;
+        }
+
+        let mutation_in_progress = self.turn_mutation_in_progress();
+        if let Err(error) = self.cancel_current_turn(CancelSource::SlashQuit).await {
+            tracing::warn!(
+                error = %error,
+                "failed to cancel active local runtime turn during TUI shutdown"
+            );
+            let local_runtime_turn_id = self
+                .active_local_runtime_turn
+                .as_ref()
+                .map(|(_, runtime_turn_id)| runtime_turn_id.clone());
+            if self.interrupt_agent_task()
+                && let (Some(runtime), Some(turn_id)) =
+                    (self.local_turn_runtime.clone(), local_runtime_turn_id)
+            {
+                let _ = runtime
+                    .finish_external_turn(
+                        self.session.id.clone(),
+                        turn_id,
+                        Err(RuntimeWorkerError::Cancelled),
+                    )
+                    .await;
+            }
+            self.shutdown_local_turn_runtime_worker().await;
+            return;
+        }
+
+        if self.active_local_runtime_turn.is_none() {
+            self.shutdown_local_turn_runtime_worker().await;
+            return;
+        }
+
+        // Cooperative cancel left the adapter turn alive (typical once a
+        // mutation has started). Drain terminal AppEvents until the runtime
+        // turn is finalized, then fail-closed to indeterminate.
+        if mutation_in_progress || self.agent_task.is_some() {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if let Err(error) = self.drain_pending_app_events().await {
+                    tracing::warn!(
+                        error = %error,
+                        "failed while draining AppEvents during TUI shutdown finalization"
+                    );
+                }
+                if self.active_local_runtime_turn.is_none() {
+                    self.shutdown_local_turn_runtime_worker().await;
+                    return;
+                }
+                if self
+                    .agent_task
+                    .as_ref()
+                    .is_none_or(|handle| handle.is_finished())
+                {
+                    if let Err(error) = self.drain_pending_app_events().await {
+                        tracing::warn!(
+                            error = %error,
+                            "failed while draining finished-turn AppEvents during TUI shutdown"
+                        );
+                    }
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        if let (Some(runtime), Some((_, turn_id))) = (
+            self.local_turn_runtime.clone(),
+            self.active_local_runtime_turn.clone(),
+        ) {
+            let _ = runtime
+                .finish_external_turn(
+                    self.session.id.clone(),
+                    turn_id,
+                    Err(RuntimeWorkerError::IndeterminateSideEffect(
+                        "TUI exited while a local turn was still settling after cancellation"
+                            .to_string(),
+                    )),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+        }
+        let _ = self.interrupt_agent_task();
+        self.shutdown_local_turn_runtime_worker().await;
+    }
+
+    async fn shutdown_local_turn_runtime_worker(&mut self) {
+        if let Some(runtime) = self.local_turn_runtime.take()
+            && let Err(error) = runtime.shutdown().await
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to shut down local AgentRuntime worker during TUI exit"
+            );
+        }
+        if let Some(task) = self.local_turn_runtime_task.take() {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+    }
+
+    fn turn_mutation_in_progress(&self) -> bool {
+        if !agent_task_join_abort_allowed(self.current_turn_mutation_started.as_ref()) {
+            return true;
+        }
+        // Fallback when the marker is unavailable: an executing tool with
+        // no cooperative contract is still safer to treat as non-abortable
+        // than to hard-kill mid-flight.
+        self.current_turn_mutation_started.is_none()
+            && self.agent_task.is_some()
+            && matches!(self.widget.bottom_pane.status, AgentStatus::ExecutingTool)
+            && self.running_tool_calls > 0
     }
 
     fn next_code_ui_id(&mut self, prefix: &str) -> String {
@@ -1257,9 +1564,167 @@ where
         if !self.can_accept_code_ui_submit() {
             return Err(TuiControlError::Busy);
         }
-        self.submit_message_from_source(text, TurnInputSource::Automation)
-            .await;
+        self.submit_message_from_source_for_control(text).await
+    }
+
+    /// Automation/browser submit path: admit through the local runtime *before*
+    /// acknowledging the control command so a fenced session returns
+    /// `409 RECONCILIATION_REQUIRED` instead of a silent success ack.
+    async fn submit_message_from_source_for_control(
+        &mut self,
+        text: String,
+    ) -> Result<(), TuiControlError> {
+        if let Some((cmd, args)) = super::slash_command::parse_builtin(&text) {
+            self.handle_builtin_command(cmd, args).await;
+            return Ok(());
+        }
+
+        if let Some(pending) = self.pending_execution_plan_revision.take() {
+            if text.trim_start().starts_with('/') {
+                self.pending_execution_plan_revision = Some(pending);
+                self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                    pending_execution_plan_revision_help_message(),
+                )));
+                self.sync_mux_input_context();
+                self.schedule_draw();
+                return Ok(());
+            }
+            if let PendingPlanRevisionCommand::ContinueAutoRepair { max_attempts } =
+                parse_pending_plan_revision_command(&text)
+            {
+                self.continue_automatic_execution_plan_repair(pending, max_attempts)
+                    .await;
+                return Ok(());
+            }
+            self.begin_execution_plan_revision_flow(pending, &text)
+                .await;
+            return Ok(());
+        }
+
+        if let Some(spec_json) = self.pending_plan_revision.take() {
+            if text.trim_start().starts_with('/') {
+                self.pending_plan_revision = Some(spec_json);
+                self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                    pending_plan_revision_help_message(),
+                )));
+                self.sync_mux_input_context();
+                self.schedule_draw();
+                return Ok(());
+            }
+            self.begin_plan_revision_flow(spec_json, &text).await;
+            return Ok(());
+        }
+
+        if self.managed_code_ui_runtime.is_none() && should_route_plain_message_to_plan(&text) {
+            self.start_plan_workflow_from_plain_message(&text).await;
+            return Ok(());
+        }
+
+        let (effective_text, agent_name) =
+            if let Some(result) = self.command_dispatcher.dispatch(&text) {
+                (result.prompt, result.agent)
+            } else {
+                (text.clone(), None)
+            };
+        let agent = agent_name
+            .as_deref()
+            .and_then(|name| self.agent_router.get(name));
+        let agent_prompt = agent.map(|a| a.system_prompt.clone());
+        let allowed_tools = agent.map(|a| a.tools.clone()).filter(|t| !t.is_empty());
+        let final_text = if let Some(prompt) = agent_prompt {
+            format!("{prompt}\n\n---\n\n{effective_text}")
+        } else {
+            effective_text
+        };
+
+        let turn_id = self
+            .preadmit_local_runtime_turn_for_control(&final_text)
+            .await?;
+        self.widget.clear_dag_panel();
+        self.sync_mux_input_context();
+        self.submit_direct_agent_message(
+            final_text,
+            allowed_tools,
+            TurnInputSource::Automation,
+            Some(turn_id),
+        );
         Ok(())
+    }
+
+    async fn preadmit_local_runtime_turn_for_control(
+        &mut self,
+        text: &str,
+    ) -> Result<TurnId, TuiControlError> {
+        let turn_id = self.begin_turn();
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Ok(turn_id);
+        };
+
+        let mut config = self.config.clone();
+        apply_automation_approval_scope(&mut config, turn_id);
+        if let Some(rt) = config.subagent_runtime.clone() {
+            let turn_token = crate::internal::ai::agent::runtime::AbortToken::new();
+            self.current_turn_abort_token = Some(turn_token.clone());
+            config.subagent_runtime = Some(rt.with_abort_token(turn_token));
+        }
+        self.attach_turn_cancellation(&mut config);
+
+        if let Err(error) = self.ensure_session_snapshot_before_admission() {
+            self.clear_turn_tracking();
+            self.running_tool_calls = 0;
+            self.widget.bottom_pane.set_status(AgentStatus::Idle);
+            self.sync_mux_input_context();
+            self.schedule_draw();
+            return Err(TuiControlError::Internal(error.to_string()));
+        }
+
+        let cancellation = self
+            .current_turn_cancellation
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                TuiControlError::Internal("local turn cancellation token missing".to_string())
+            })?;
+        let mutation_started = self
+            .current_turn_mutation_started
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                TuiControlError::Internal("local turn mutation marker missing".to_string())
+            })?;
+        let runtime_turn_id = format!("tui-local-{}", uuid::Uuid::new_v4());
+        if let Err(error) = runtime
+            .track_external_turn(
+                TurnRequest::new(
+                    self.session.id.clone(),
+                    runtime_turn_id.clone(),
+                    text.to_string(),
+                    true,
+                ),
+                cancellation,
+                mutation_started,
+            )
+            .await
+        {
+            self.clear_turn_tracking();
+            self.running_tool_calls = 0;
+            self.widget.bottom_pane.set_status(AgentStatus::Idle);
+            self.sync_mux_input_context();
+            self.widget
+                .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                    "Turn was not admitted: {}",
+                    runtime_worker_adapter_message(error.clone())
+                ))));
+            self.schedule_draw();
+            return Err(match error {
+                RuntimeWorkerError::ReconciliationRequired { session_id } => {
+                    TuiControlError::ReconciliationRequired(session_id)
+                }
+                other => TuiControlError::Internal(runtime_worker_adapter_message(other)),
+            });
+        }
+        self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
+        Ok(turn_id)
     }
 
     fn can_accept_code_ui_submit(&self) -> bool {
@@ -1364,7 +1829,7 @@ where
                 pending.selected = selected;
                 self.widget.bottom_pane.exec_approval_selected = selected;
             }
-            self.submit_exec_approval_decision();
+            self.submit_exec_approval_decision().await;
             return Ok(());
         }
 
@@ -1500,13 +1965,42 @@ where
             return Err(TuiControlError::Busy);
         }
 
+        let mutation_in_progress = self.turn_mutation_in_progress();
         let reason = match source {
             CancelSource::Esc => "Turn interrupted by user",
             CancelSource::SlashQuit => "Turn interrupted by quit command",
             CancelSource::Automation => "Turn interrupted by automation",
             CancelSource::Budget => "Turn interrupted by budget cap",
         };
-        self.enqueue_mcp_turn_decision("abandon", reason.to_string());
+        let local_runtime_turn_id = self
+            .active_local_runtime_turn
+            .as_ref()
+            .map(|(_, runtime_turn_id)| runtime_turn_id.clone());
+        if let (Some(runtime), Some(turn_id)) = (
+            self.local_turn_runtime.clone(),
+            local_runtime_turn_id.as_ref(),
+        ) {
+            match runtime
+                .cancel(self.session.id.clone(), turn_id.clone())
+                .await
+            {
+                Ok(()) | Err(RuntimeWorkerError::UnknownTurn { .. }) => {}
+                Err(error @ RuntimeWorkerError::ReconciliationRequired { .. }) => {
+                    return Err(TuiControlError::Internal(runtime_worker_adapter_message(
+                        error,
+                    )));
+                }
+                Err(error) => {
+                    return Err(TuiControlError::Internal(format!(
+                        "runtime cancellation failed: {}",
+                        runtime_worker_adapter_message(error)
+                    )));
+                }
+            }
+        }
+        if !mutation_in_progress {
+            self.enqueue_mcp_turn_decision("abandon", reason.to_string());
+        }
         self.cancel_pending_user_input();
         self.cancel_pending_exec_approval();
         self.cancel_pending_phase_confirmation_for_control();
@@ -1519,10 +2013,12 @@ where
         // turn — error_kind carries the CancelSource so an
         // operator can distinguish Esc / SlashQuit / Automation /
         // Budget abandons in the rollup.
-        if let (Some(recorder), Some(context)) = (
-            self.config.usage_recorder.as_ref(),
-            self.config.usage_context.as_ref(),
-        ) {
+        if !mutation_in_progress
+            && let (Some(recorder), Some(context)) = (
+                self.config.usage_recorder.as_ref(),
+                self.config.usage_context.as_ref(),
+            )
+        {
             let error_kind = match source {
                 CancelSource::Esc => "cancelled_esc",
                 CancelSource::SlashQuit => "cancelled_quit",
@@ -1537,15 +2033,37 @@ where
                 );
             }
         }
-        self.interrupt_agent_task();
-        self.clear_mcp_run_id();
-        self.widget.bottom_pane.set_status(AgentStatus::Idle);
-        self.sync_mux_input_context();
-        self.complete_streaming_assistant_cell("Interrupted.".to_string());
-        self.complete_running_tool_cells_with_interrupt();
-        self.schedule_draw();
-        if let Some(code_ui_session) = self.code_ui_session.clone() {
-            code_ui_session.cancel_active_turn("Interrupted.").await;
+        let hard_interrupted = self.interrupt_agent_task();
+        if hard_interrupted
+            && let (Some(runtime), Some(turn_id)) =
+                (self.local_turn_runtime.clone(), local_runtime_turn_id)
+        {
+            runtime
+                .finish_external_turn(
+                    self.session.id.clone(),
+                    turn_id,
+                    Err(RuntimeWorkerError::Cancelled),
+                )
+                .await
+                .map_err(|error| {
+                    TuiControlError::Internal(format!(
+                        "runtime cancellation finalization failed: {}",
+                        runtime_worker_adapter_message(error)
+                    ))
+                })?;
+        }
+        if hard_interrupted {
+            self.clear_mcp_run_id();
+            self.widget.bottom_pane.set_status(AgentStatus::Idle);
+            self.sync_mux_input_context();
+            self.complete_streaming_assistant_cell("Interrupted.".to_string());
+            self.complete_running_tool_cells_with_interrupt();
+            self.schedule_draw();
+            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                code_ui_session.cancel_active_turn("Interrupted.").await;
+            }
+        } else {
+            self.schedule_draw();
         }
         Ok(())
     }
@@ -1611,14 +2129,14 @@ where
     async fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> anyhow::Result<()> {
         // Check for Ctrl+C first (always handled)
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.request_user_exit();
+            self.request_user_exit().await;
             return Ok(());
         }
 
         // `/quit` is a local TUI command and must preempt every interaction
         // state, including a running workflow mux. Otherwise it is treated as
         // ordinary shared-input text while the orchestrator keeps running.
-        if key.code == KeyCode::Enter && self.try_handle_global_quit_command() {
+        if key.code == KeyCode::Enter && self.try_handle_global_quit_command().await {
             return Ok(());
         }
 
@@ -1771,7 +2289,7 @@ where
                     if self.pending_phase_confirmation.is_some() {
                         self.submit_phase_confirmation_decision();
                     } else {
-                        self.submit_exec_approval_decision();
+                        self.submit_exec_approval_decision().await;
                     }
                 }
                 KeyCode::Esc => {
@@ -2501,7 +3019,7 @@ where
         self.widget.bottom_pane.set_exec_approval(None);
     }
 
-    fn submit_exec_approval_decision(&mut self) {
+    async fn submit_exec_approval_decision(&mut self) {
         if self.pending_managed_interaction.is_some() {
             self.submit_managed_interaction_decision();
             return;
@@ -2541,12 +3059,12 @@ where
                 "abandon",
                 "Turn interrupted by approval dialog".to_string(),
             );
-            self.interrupt_agent_task();
-            self.clear_mcp_run_id();
-            self.widget.bottom_pane.set_status(AgentStatus::Idle);
-            self.complete_streaming_assistant_cell("Interrupted.".to_string());
-            self.complete_running_tool_cells_with_interrupt();
-            self.schedule_draw();
+            if let Err(error) = self.cancel_current_turn(CancelSource::Esc).await {
+                tracing::warn!(
+                    error = %error,
+                    "failed to cancel local runtime turn after approval abort"
+                );
+            }
             if let Some(code_ui_session) = self.code_ui_session.clone() {
                 tokio::spawn(async move {
                     code_ui_session.resolve_interaction(&interaction_id).await;
@@ -2796,6 +3314,150 @@ where
                 source,
                 allowed_tools,
             } => {
+                if self.managed_code_ui_runtime.is_some() {
+                    let browser_user_entry = CodeUiTranscriptEntry {
+                        id: Self::code_ui_user_entry_id(turn_id),
+                        kind: CodeUiTranscriptEntryKind::UserMessage,
+                        title: Some("Developer".to_string()),
+                        content: Some(text.clone()),
+                        status: None,
+                        streaming: false,
+                        metadata: serde_json::json!({
+                            "allowedTools": allowed_tools.clone(),
+                        }),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    };
+                    let browser_assistant_entry = CodeUiTranscriptEntry {
+                        id: Self::code_ui_assistant_entry_id(turn_id),
+                        kind: CodeUiTranscriptEntryKind::AssistantMessage,
+                        title: Some("Assistant".to_string()),
+                        content: Some(String::new()),
+                        status: Some("thinking".to_string()),
+                        streaming: true,
+                        metadata: serde_json::json!({}),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    };
+                    self.running_tool_calls = 0;
+                    self.session.add_user_message(&text);
+                    self.save_session_snapshot_after_user_message();
+                    self.widget
+                        .add_cell(Box::new(UserHistoryCell::new(text.clone())));
+                    self.widget
+                        .add_cell(Box::new(AssistantHistoryCell::streaming()));
+                    self.widget.bottom_pane.set_status(AgentStatus::Thinking);
+                    self.sync_mux_input_context();
+                    self.schedule_draw();
+                    if let Some(code_ui_session) = self.code_ui_session.clone() {
+                        code_ui_session
+                            .upsert_transcript_entry(browser_user_entry)
+                            .await;
+                        code_ui_session
+                            .upsert_transcript_entry(browser_assistant_entry)
+                            .await;
+                        code_ui_session
+                            .set_status(CodeUiSessionStatus::Thinking)
+                            .await;
+                    }
+                    self.start_managed_code_turn(turn_id, text).await;
+                    return Ok(());
+                }
+
+                // Admit through the runtime control plane before mutating the
+                // session/UI. A fenced or rejected admission must not leave a
+                // durable user message for a turn that never started, and must
+                // not tear down the TUI main loop. Automation submits may have
+                // already admitted before the control ack (see
+                // `preadmit_local_runtime_turn_for_control`); skip a second
+                // admission for those turns.
+                let already_admitted = self
+                    .active_local_runtime_turn
+                    .as_ref()
+                    .is_some_and(|(ui_turn, _)| *ui_turn == turn_id);
+                let mut config = self.config.clone();
+                if source == TurnInputSource::Automation {
+                    apply_automation_approval_scope(&mut config, turn_id);
+                }
+                if already_admitted {
+                    if let (Some(token), Some(mutation_started)) = (
+                        self.current_turn_cancellation.clone(),
+                        self.current_turn_mutation_started.clone(),
+                    ) {
+                        config.cancellation = Some(
+                            crate::internal::ai::agent::runtime::tool_loop::ToolLoopCancellation::new(
+                                token,
+                                mutation_started,
+                            ),
+                        );
+                    }
+                    if let Some(abort) = self.current_turn_abort_token.clone()
+                        && let Some(rt) = config.subagent_runtime.clone()
+                    {
+                        config.subagent_runtime = Some(rt.with_abort_token(abort));
+                    }
+                } else {
+                    if let Some(rt) = config.subagent_runtime.clone() {
+                        let turn_token = crate::internal::ai::agent::runtime::AbortToken::new();
+                        self.current_turn_abort_token = Some(turn_token.clone());
+                        config.subagent_runtime = Some(rt.with_abort_token(turn_token));
+                    }
+                    self.attach_turn_cancellation(&mut config);
+                    if let Some(runtime) = self.local_turn_runtime.clone() {
+                        let cancellation = self
+                            .current_turn_cancellation
+                            .as_ref()
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("local turn cancellation token missing")
+                            })?;
+                        let mutation_started = self
+                            .current_turn_mutation_started
+                            .as_ref()
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("local turn mutation marker missing"))?;
+                        let runtime_turn_id = format!("tui-local-{}", uuid::Uuid::new_v4());
+                        if let Err(error) = self.ensure_session_snapshot_before_admission() {
+                            self.clear_turn_tracking();
+                            self.running_tool_calls = 0;
+                            self.widget.bottom_pane.set_status(AgentStatus::Idle);
+                            self.sync_mux_input_context();
+                            self.widget
+                                .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                                    "Turn was not admitted: {error}"
+                                ))));
+                            self.schedule_draw();
+                            return Ok(());
+                        }
+                        if let Err(error) = runtime
+                            .track_external_turn(
+                                TurnRequest::new(
+                                    self.session.id.clone(),
+                                    runtime_turn_id.clone(),
+                                    text.clone(),
+                                    true,
+                                ),
+                                cancellation,
+                                mutation_started,
+                            )
+                            .await
+                        {
+                            self.clear_turn_tracking();
+                            self.running_tool_calls = 0;
+                            self.widget.bottom_pane.set_status(AgentStatus::Idle);
+                            self.sync_mux_input_context();
+                            self.widget
+                                .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                                    "Turn was not admitted: {}",
+                                    runtime_worker_adapter_message(error)
+                                ))));
+                            self.schedule_draw();
+                            return Ok(());
+                        }
+                        self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
+                    }
+                }
+
                 let browser_user_entry = CodeUiTranscriptEntry {
                     id: Self::code_ui_user_entry_id(turn_id),
                     kind: CodeUiTranscriptEntryKind::UserMessage,
@@ -2877,31 +3539,9 @@ where
                     });
                 }
 
-                if self.managed_code_ui_runtime.is_some() {
-                    self.start_managed_code_turn(turn_id, text).await;
-                    return Ok(());
-                }
-
                 // Prepare components for background task
                 let model = self.model.clone();
                 let registry = self.registry.clone();
-                let mut config = self.config.clone();
-                if source == TurnInputSource::Automation {
-                    apply_automation_approval_scope(&mut config, turn_id);
-                }
-                // OC-Phase 3 P3.7 per-turn abort token (v0.17.786):
-                // attach a fresh `AbortToken` to the sub-agent
-                // runtime via the v0.17.779 `with_abort_token`
-                // builder. `cancel_current_turn` cancels this
-                // token to short-circuit any in-flight sub-agent
-                // dispatch independent of the session-level token,
-                // while the session token survives for subsequent
-                // turns. No-op when sub-agents are disabled.
-                if let Some(rt) = config.subagent_runtime.clone() {
-                    let turn_token = crate::internal::ai::agent::runtime::AbortToken::new();
-                    self.current_turn_abort_token = Some(turn_token.clone());
-                    config.subagent_runtime = Some(rt.with_abort_token(turn_token));
-                }
                 let session_root = self.session_store.session_root(&self.session.id);
                 attach_file_history_context(&mut config, session_root.clone(), turn_id);
                 config.context_frame_session_root = Some(session_root.clone());
@@ -3379,6 +4019,29 @@ where
                     } => {
                         self.pending_stream_output_tokens = 0;
                         let rendered_text = render_goal_response_text(&text, &decision);
+                        if let Err(error) = self
+                            .finish_local_runtime_turn(
+                                _turn_id,
+                                Ok(RuntimeTurnExecution::Completed {
+                                    summary: "local TUI Goal turn completed".to_string(),
+                                }),
+                            )
+                            .await
+                        {
+                            self.finish_turn_state();
+                            self.widget.bottom_pane.set_status(AgentStatus::Idle);
+                            self.complete_streaming_assistant_cell(format!(
+                                "Goal turn completed, but its durable finalization requires reconciliation before continuing: {}",
+                                runtime_worker_adapter_message(error)
+                            ));
+                            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                                code_ui_session
+                                    .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                                    .await;
+                            }
+                            self.schedule_draw();
+                            return Ok(());
+                        }
                         let mcp_decision = match &decision {
                             GoalLoopDecision::Completed { .. } => "Goal completed successfully",
                             GoalLoopDecision::Cancelled => "Goal cancelled",
@@ -3472,6 +4135,29 @@ where
                     }
                     AgentEvent::ResponseComplete { text, new_history } => {
                         self.pending_stream_output_tokens = 0;
+                        if let Err(error) = self
+                            .finish_local_runtime_turn(
+                                _turn_id,
+                                Ok(RuntimeTurnExecution::Completed {
+                                    summary: "local TUI turn completed".to_string(),
+                                }),
+                            )
+                            .await
+                        {
+                            self.finish_turn_state();
+                            self.widget.bottom_pane.set_status(AgentStatus::Idle);
+                            self.complete_streaming_assistant_cell(format!(
+                                "Turn completed, but its durable finalization requires reconciliation before continuing: {}",
+                                runtime_worker_adapter_message(error)
+                            ));
+                            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                                code_ui_session
+                                    .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                                    .await;
+                            }
+                            self.schedule_draw();
+                            return Ok(());
+                        }
                         self.enqueue_mcp_turn_decision(
                             "checkpoint",
                             "Turn completed successfully".to_string(),
@@ -3508,7 +4194,30 @@ where
                     }
                     AgentEvent::Error { message } => {
                         self.pending_stream_output_tokens = 0;
+                        let finalization = self
+                            .finish_local_runtime_turn(
+                                _turn_id,
+                                Err(RuntimeWorkerError::ExecutionFailed(message.clone())),
+                            )
+                            .await;
                         self.pending_auto_plan_repair_execution = None;
+                        if let Err(error @ RuntimeWorkerError::ReconciliationRequired { .. }) =
+                            finalization
+                        {
+                            self.finish_turn_state();
+                            self.widget.bottom_pane.set_status(AgentStatus::Idle);
+                            self.complete_streaming_assistant_cell(format!(
+                                "Turn failed, and its durable finalization requires reconciliation before continuing: {}",
+                                runtime_worker_adapter_message(error)
+                            ));
+                            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                                code_ui_session
+                                    .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                                    .await;
+                            }
+                            self.schedule_draw();
+                            return Ok(());
+                        }
                         self.enqueue_mcp_turn_decision(
                             "abandon",
                             format!("Turn failed: {message}"),
@@ -3616,7 +4325,7 @@ where
                 }
             }
             AppEvent::PlanWorkflowComplete {
-                turn_id: _turn_id,
+                turn_id,
                 text,
                 llm_output,
                 new_history,
@@ -3631,6 +4340,20 @@ where
                 automatic_repair_attempts,
                 automatic_repair_max_attempts,
             } => {
+                if let Err(error) = self
+                    .settle_local_runtime_turn_completed(
+                        turn_id,
+                        "local TUI plan workflow completed",
+                    )
+                    .await
+                {
+                    self.report_local_runtime_finalization_fence(
+                        error,
+                        "Plan workflow completed, but its durable finalization requires reconciliation before continuing",
+                    )
+                    .await;
+                    return Ok(());
+                }
                 self.finish_turn_state();
                 self.history = new_history;
                 self.session.add_assistant_message(&text);
@@ -3718,9 +4441,7 @@ where
                     self.session.add_assistant_message(&note);
                     if let Some(code_ui_session) = self.code_ui_session.clone() {
                         let plan_snapshot = CodeUiPlanSnapshot {
-                            id: plan_id
-                                .clone()
-                                .unwrap_or_else(|| format!("plan-{_turn_id}")),
+                            id: plan_id.clone().unwrap_or_else(|| format!("plan-{turn_id}")),
                             title: Some("Execution Plan".to_string()),
                             summary: Some(text.clone()),
                             status: "executing".to_string(),
@@ -3728,7 +4449,7 @@ where
                             updated_at: Utc::now(),
                         };
                         let transcript_entry = CodeUiTranscriptEntry {
-                            id: Self::code_ui_assistant_entry_id(_turn_id),
+                            id: Self::code_ui_assistant_entry_id(turn_id),
                             kind: CodeUiTranscriptEntryKind::PlanSummary,
                             title: Some("Plan Ready".to_string()),
                             content: Some(text.clone()),
@@ -3767,9 +4488,7 @@ where
                 }
                 if let Some(code_ui_session) = self.code_ui_session.clone() {
                     let plan_snapshot = CodeUiPlanSnapshot {
-                        id: plan_id
-                            .clone()
-                            .unwrap_or_else(|| format!("plan-{_turn_id}")),
+                        id: plan_id.clone().unwrap_or_else(|| format!("plan-{turn_id}")),
                         title: Some("Execution Plan".to_string()),
                         summary: Some(text.clone()),
                         status: "ready".to_string(),
@@ -3777,7 +4496,7 @@ where
                         updated_at: Utc::now(),
                     };
                     let transcript_entry = CodeUiTranscriptEntry {
-                        id: Self::code_ui_assistant_entry_id(_turn_id),
+                        id: Self::code_ui_assistant_entry_id(turn_id),
                         kind: CodeUiTranscriptEntryKind::PlanSummary,
                         title: Some("Plan Ready".to_string()),
                         content: Some(text.clone()),
@@ -3861,7 +4580,7 @@ where
                 self.schedule_draw();
             }
             AppEvent::IntentSpecReviewReady {
-                turn_id: _turn_id,
+                turn_id,
                 text,
                 llm_output,
                 new_history,
@@ -3869,6 +4588,20 @@ where
                 spec_json,
                 warnings,
             } => {
+                if let Err(error) = self
+                    .settle_local_runtime_turn_completed(
+                        turn_id,
+                        "local TUI IntentSpec review ready",
+                    )
+                    .await
+                {
+                    self.report_local_runtime_finalization_fence(
+                        error,
+                        "IntentSpec review is ready, but its durable finalization requires reconciliation before continuing",
+                    )
+                    .await;
+                    return Ok(());
+                }
                 self.finish_turn_state();
                 self.widget.clear_task_mux();
                 self.sync_mux_input_context();
@@ -3925,10 +4658,10 @@ where
                 }
                 let interaction_id = intent_id
                     .clone()
-                    .unwrap_or_else(|| format!("intent-review-{_turn_id}"));
+                    .unwrap_or_else(|| format!("intent-review-{turn_id}"));
                 if let Some(code_ui_session) = self.code_ui_session.clone() {
                     let transcript_entry = CodeUiTranscriptEntry {
-                        id: Self::code_ui_assistant_entry_id(_turn_id),
+                        id: Self::code_ui_assistant_entry_id(turn_id),
                         kind: CodeUiTranscriptEntryKind::AssistantMessage,
                         title: Some("IntentSpec Review".to_string()),
                         content: Some(text.clone()),
@@ -4461,7 +5194,7 @@ where
                 }
             }
             AppEvent::ExecuteWorkflowComplete {
-                turn_id: _turn_id,
+                turn_id,
                 text,
                 new_history,
                 result,
@@ -4473,6 +5206,20 @@ where
                 automatic_repair_attempts,
                 automatic_repair_max_attempts,
             } => {
+                if let Err(error) = self
+                    .settle_local_runtime_turn_completed(
+                        turn_id,
+                        "local TUI execute workflow completed",
+                    )
+                    .await
+                {
+                    self.report_local_runtime_finalization_fence(
+                        error,
+                        "Execute workflow completed, but its durable finalization requires reconciliation before continuing",
+                    )
+                    .await;
+                    return Ok(());
+                }
                 self.finish_turn_state();
                 self.widget.clear_task_mux();
                 self.sync_mux_input_context();
@@ -4518,7 +5265,7 @@ where
                 if let Some(code_ui_session) = self.code_ui_session.clone() {
                     code_ui_session
                         .upsert_transcript_entry(CodeUiTranscriptEntry {
-                            id: Self::code_ui_assistant_entry_id(_turn_id),
+                            id: Self::code_ui_assistant_entry_id(turn_id),
                             kind: CodeUiTranscriptEntryKind::AssistantMessage,
                             title: Some("Assistant".to_string()),
                             content: Some(
@@ -4873,7 +5620,7 @@ where
 
         self.widget.clear_dag_panel();
         self.sync_mux_input_context();
-        self.submit_direct_agent_message(final_text, allowed_tools, source);
+        self.submit_direct_agent_message(final_text, allowed_tools, source, None);
     }
 
     fn submit_direct_agent_message(
@@ -4881,8 +5628,9 @@ where
         text: String,
         allowed_tools: Option<Vec<String>>,
         source: TurnInputSource,
+        turn_id: Option<TurnId>,
     ) {
-        let turn_id = self.begin_turn();
+        let turn_id = turn_id.unwrap_or_else(|| self.begin_turn());
         let _ = self.app_event_tx.send(AppEvent::SubmitUserMessage {
             turn_id,
             text,
@@ -4921,6 +5669,9 @@ where
                 self.pending_plan_revision = None;
                 self.pending_execution_plan_revision = None;
                 self.pending_auto_plan_repair_execution = None;
+                // The prior worker was bound to the previous session root; rebuild
+                // durability admission against the new session before the next turn.
+                self.rebind_local_turn_runtime_for_current_session().await;
                 self.sync_mux_input_context();
             }
             BuiltinCommand::Chat => {
@@ -4944,6 +5695,7 @@ where
                         "web_search".to_string(),
                     ]),
                     TurnInputSource::Local,
+                    None,
                 );
             }
             BuiltinCommand::Run => {
@@ -4966,7 +5718,12 @@ where
                 }
                 self.widget.clear_dag_panel();
                 self.sync_mux_input_context();
-                self.submit_direct_agent_message(request.to_string(), None, TurnInputSource::Local);
+                self.submit_direct_agent_message(
+                    request.to_string(),
+                    None,
+                    TurnInputSource::Local,
+                    None,
+                );
             }
             BuiltinCommand::Model => {
                 let info = format!(
@@ -5070,6 +5827,7 @@ where
                         result.prompt,
                         Some(result.allowed_tools),
                         TurnInputSource::Local,
+                        None,
                     );
                 }
                 Err(error) => {
@@ -5183,7 +5941,7 @@ where
                     .add_cell(Box::new(AssistantHistoryCell::new(message)));
             }
             BuiltinCommand::Quit => {
-                self.request_user_exit();
+                self.request_user_exit().await;
             }
         }
     }
@@ -5598,17 +6356,17 @@ where
         }
     }
 
-    fn try_handle_global_quit_command(&mut self) -> bool {
+    async fn try_handle_global_quit_command(&mut self) -> bool {
         if !is_global_quit_command_input(&self.widget.bottom_pane.input) {
             return false;
         }
         self.widget.bottom_pane.take_input();
         self.widget.bottom_pane.sync_command_popup();
-        self.request_user_exit();
+        self.request_user_exit().await;
         true
     }
 
-    fn request_user_exit(&mut self) {
+    async fn request_user_exit(&mut self) {
         self.cancel_pending_user_input();
         self.cancel_pending_phase_confirmation();
         self.cancel_pending_exec_approval();
@@ -5623,8 +6381,38 @@ where
         }
         self.pending_execution_plan_revision = None;
         self.pending_plan_revision = None;
-        self.interrupt_agent_task();
-        self.clear_mcp_run_id();
+        // Prefer the shared cancel path so a thinking (non-mutating) local turn
+        // is durably finalized as Cancelled instead of left Pending for the
+        // next restart's reconciliation fence.
+        if self.active_local_runtime_turn.is_some()
+            && (self.has_local_active_turn() || self.agent_task.is_some())
+        {
+            if let Err(error) = self.cancel_current_turn(CancelSource::SlashQuit).await {
+                tracing::warn!(
+                    error = %error,
+                    "failed to cancel active turn during TUI exit"
+                );
+                let local_runtime_turn_id = self
+                    .active_local_runtime_turn
+                    .as_ref()
+                    .map(|(_, runtime_turn_id)| runtime_turn_id.clone());
+                if self.interrupt_agent_task()
+                    && let (Some(runtime), Some(turn_id)) =
+                        (self.local_turn_runtime.clone(), local_runtime_turn_id)
+                {
+                    let _ = runtime
+                        .finish_external_turn(
+                            self.session.id.clone(),
+                            turn_id,
+                            Err(RuntimeWorkerError::Cancelled),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            let _ = self.interrupt_agent_task();
+            self.clear_mcp_run_id();
+        }
         self.widget.bottom_pane.clear();
         self.widget.bottom_pane.sync_command_popup();
         self.widget.bottom_pane.set_status(AgentStatus::Idle);
@@ -5830,6 +6618,19 @@ where
                 "failed to save session snapshot before context-frame recording"
             );
         }
+    }
+
+    /// Persist a discoverable `session_snapshot` before durable command
+    /// admission. Without this, a crash between intent append and the later
+    /// user-message save leaves workflow-only JSONL that `SessionStore::load`
+    /// rejects, so recovery never fences the pending mutation.
+    fn ensure_session_snapshot_before_admission(&self) -> anyhow::Result<()> {
+        self.session_store.save(&self.session).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to persist session '{}' before admitting a durable turn: {error}",
+                self.session.id
+            )
+        })
     }
 
     fn set_idle_and_draw(&mut self) {
@@ -6114,6 +6915,7 @@ where
         let session_root = self.session_store.session_root(&self.session.id);
         config.context_frame_session_root = Some(session_root);
         config.context_frame_prompt_id = Some(format!("turn-{turn_id}"));
+        self.attach_turn_cancellation(&mut config);
         let tx = self.app_event_tx.clone();
         let mcp_server = self.mcp_server.clone();
         let fallback_history = self.history.clone();
@@ -6641,8 +7443,6 @@ where
         }
 
         self.widget.clear_dag_panel();
-        self.widget
-            .add_cell(Box::new(AssistantHistoryCell::streaming()));
         self.widget.bottom_pane.set_status(AgentStatus::Thinking);
         self.sync_mux_input_context();
         self.schedule_draw();
@@ -6652,6 +7452,70 @@ where
         let model = self.model.clone();
         let registry = self.registry.clone();
         let mut tool_loop_config = self.config.clone();
+        self.attach_turn_cancellation(&mut tool_loop_config);
+        if let Some(runtime) = self.local_turn_runtime.clone() {
+            let cancellation = match self.current_turn_cancellation.as_ref().cloned() {
+                Some(token) => token,
+                None => {
+                    self.finish_turn_state();
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                        "Execute workflow was not admitted: local turn cancellation token missing"
+                            .to_string(),
+                    )));
+                    self.set_idle_and_draw();
+                    return;
+                }
+            };
+            let mutation_started = match self.current_turn_mutation_started.as_ref().cloned() {
+                Some(marker) => marker,
+                None => {
+                    self.finish_turn_state();
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                        "Execute workflow was not admitted: local turn mutation marker missing"
+                            .to_string(),
+                    )));
+                    self.set_idle_and_draw();
+                    return;
+                }
+            };
+            let runtime_turn_id = format!("tui-local-{}", uuid::Uuid::new_v4());
+            if let Err(error) = self.ensure_session_snapshot_before_admission() {
+                self.finish_turn_state();
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Execute workflow was not admitted: {error}"
+                    ))));
+                self.set_idle_and_draw();
+                return;
+            }
+            if let Err(error) = runtime
+                .track_external_turn(
+                    TurnRequest::new(
+                        self.session.id.clone(),
+                        runtime_turn_id.clone(),
+                        "execute workflow".to_string(),
+                        true,
+                    ),
+                    cancellation,
+                    mutation_started,
+                )
+                .await
+            {
+                self.finish_turn_state();
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Execute workflow was not admitted: {}",
+                        runtime_worker_adapter_message(error)
+                    ))));
+                self.set_idle_and_draw();
+                return;
+            }
+            self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
+        }
+        // Admit before showing a streaming placeholder so a rejected
+        // reconciliation fence cannot leave a stuck spinner cell.
+        self.widget
+            .add_cell(Box::new(AssistantHistoryCell::streaming()));
         attach_file_history_context(
             &mut tool_loop_config,
             self.session_store.session_root(&self.session.id),
@@ -7057,6 +7921,77 @@ where
         self.pending_plan_revision = None;
         let turn_id = self.begin_turn();
         self.running_tool_calls = 0;
+
+        let model = self.model.clone();
+        let registry = self.registry.clone();
+        let mut config = phase0_plan_tool_loop_config(self.config.clone());
+        let session_root = self.session_store.session_root(&self.session.id);
+        attach_file_history_context(&mut config, session_root.clone(), turn_id);
+        config.context_frame_session_root = Some(session_root.clone());
+        config.context_frame_prompt_id = Some(format!("turn-{turn_id}"));
+        self.attach_turn_cancellation(&mut config);
+        if let Some(runtime) = self.local_turn_runtime.clone() {
+            let cancellation = match self.current_turn_cancellation.as_ref().cloned() {
+                Some(token) => token,
+                None => {
+                    self.finish_turn_state();
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                        "Plan workflow was not admitted: local turn cancellation token missing"
+                            .to_string(),
+                    )));
+                    self.set_idle_and_draw();
+                    return;
+                }
+            };
+            let mutation_started = match self.current_turn_mutation_started.as_ref().cloned() {
+                Some(marker) => marker,
+                None => {
+                    self.finish_turn_state();
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                        "Plan workflow was not admitted: local turn mutation marker missing"
+                            .to_string(),
+                    )));
+                    self.set_idle_and_draw();
+                    return;
+                }
+            };
+            let runtime_turn_id = format!("tui-local-{}", uuid::Uuid::new_v4());
+            if let Err(error) = self.ensure_session_snapshot_before_admission() {
+                self.finish_turn_state();
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Plan workflow was not admitted: {error}"
+                    ))));
+                self.set_idle_and_draw();
+                return;
+            }
+            if let Err(error) = runtime
+                .track_external_turn(
+                    TurnRequest::new(
+                        self.session.id.clone(),
+                        runtime_turn_id.clone(),
+                        "plan workflow".to_string(),
+                        true,
+                    ),
+                    cancellation,
+                    mutation_started,
+                )
+                .await
+            {
+                self.finish_turn_state();
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Plan workflow was not admitted: {}",
+                        runtime_worker_adapter_message(error)
+                    ))));
+                self.set_idle_and_draw();
+                return;
+            }
+            self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
+        }
+
+        // Admit before mutating session/UI so a rejected fence cannot leave a
+        // durable user message or stuck spinner for a turn that never started.
         self.session.add_user_message(&user_text);
         self.save_session_snapshot_after_user_message();
         self.widget
@@ -7069,13 +8004,6 @@ where
         self.sync_mux_input_context();
         self.schedule_draw();
 
-        let model = self.model.clone();
-        let registry = self.registry.clone();
-        let mut config = phase0_plan_tool_loop_config(self.config.clone());
-        let session_root = self.session_store.session_root(&self.session.id);
-        attach_file_history_context(&mut config, session_root.clone(), turn_id);
-        config.context_frame_session_root = Some(session_root.clone());
-        config.context_frame_prompt_id = Some(format!("turn-{turn_id}"));
         let should_auto_classify = should_auto_classify_first_user_message(
             self.auto_classify_first_user_message,
             &self.history,
@@ -7090,6 +8018,7 @@ where
         let working_dir = self.registry.working_dir().to_path_buf();
         let default_network_access = self.default_network_access;
         let classification_text = user_text.clone();
+        let mutation_started = self.current_turn_mutation_started.clone();
 
         let handle = ClientStorage::spawn_background_index_work(async move {
             struct PlanObserver {
@@ -7356,6 +8285,13 @@ where
                 return;
             }
 
+            // MCP IntentSpec / ContextSnapshot writes are mutating side effects.
+            // Mark the durable turn before persistence so interrupt/shutdown
+            // cannot hard-abort through that window without a reconciliation fence.
+            if let Some(marker) = mutation_started.as_ref() {
+                marker.store(true, Ordering::Release);
+            }
+
             let mut persistence_warning = None;
             let intent_id = if let Some(ref mcp_server) = mcp_server {
                 match persist_phase0_intent_for_review(&spec, mcp_server).await {
@@ -7594,22 +8530,40 @@ where
         LatestIntentSpecLoad::Missing
     }
 
-    fn interrupt_agent_task(&mut self) {
-        // v0.17.786: cancel the per-turn sub-agent abort token
-        // BEFORE aborting the JoinHandle so cooperative-cancel
-        // paths (the runner's `tokio::select!`) get the signal
-        // even when the JoinHandle drop alone wouldn't unwind a
-        // detached worker future.
-        if let Some(token) = self.current_turn_abort_token.take() {
+    /// Returns `true` when the active turn was hard-interrupted (JoinHandle
+    /// aborted). Returns `false` when only cooperative cancellation was
+    /// signalled because a mutation has already occurred (or is in flight) on
+    /// this turn — the sticky mutation latch must settle with a durable
+    /// terminal rather than an ordinary cancel.
+    fn interrupt_agent_task(&mut self) -> bool {
+        let mutation_in_progress = self.turn_mutation_in_progress();
+        // Once a mutating tool has started, AgentRuntimeWorker::cancel leaves
+        // the shared tool-loop token live so the mutation can finish with a
+        // determinate terminal. Cancelling it here would re-introduce mid-flight
+        // interruption even though the JoinHandle is not aborted.
+        if !mutation_in_progress && let Some(token) = self.current_turn_cancellation.as_ref() {
             token.cancel();
         }
-        if let Some(handle) = self.agent_task.take() {
-            handle.abort();
+
+        if !mutation_in_progress {
+            // A sub-agent abort token can terminate its own dispatch tree.
+            // Only signal it when the JoinHandle is also safe to abort; a
+            // started mutation must settle under cooperative cancellation.
+            if let Some(token) = self.current_turn_abort_token.take() {
+                token.cancel();
+            }
+            if let Some(handle) = self.agent_task.take() {
+                handle.abort();
+            }
+            self.pending_auto_plan_repair_execution = None;
+            self.complete_streaming_thinking_cells();
+            self.clear_active_turn();
+            self.running_tool_calls = 0;
+            self.clear_turn_cancellation();
+            return true;
         }
-        self.pending_auto_plan_repair_execution = None;
-        self.complete_streaming_thinking_cells();
-        self.clear_active_turn();
-        self.running_tool_calls = 0;
+
+        false
     }
 
     fn update_status_after_tool_progress(&mut self) {
@@ -8921,6 +9875,12 @@ fn escape_markdown_cell(text: &str) -> String {
     text.replace('|', "\\|").replace('\n', " ")
 }
 
+/// Returns `true` when the active turn's background JoinHandle may be
+/// hard-aborted. Mutating tool dispatches must never be aborted mid-flight.
+fn agent_task_join_abort_allowed(mutation_marker: Option<&Arc<AtomicBool>>) -> bool {
+    !mutation_marker.is_some_and(|marker| marker.load(Ordering::Acquire))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -8937,12 +9897,12 @@ mod tests {
         DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS, ExecutionFailureRevision,
         FirstTurnIntentPolicyUpdate, MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
         PendingPlanRevisionCommand, ProviderPlanDraft, ProviderPlanDraftStep, ReviewScrollAction,
-        append_to_last_tool_group_cell, append_to_last_tool_group_preview_cell,
-        apply_developer_network_access, apply_final_usage_update, apply_goal_tool_visibility,
-        apply_streaming_usage_delta, automatic_plan_repair_request_from_report,
-        automatic_plan_repair_threshold_message, bind_goal_stop_policy,
-        build_execution_plan_prompt, build_execution_plan_revision_prompt, build_plan_prompt,
-        build_plan_revision_prompt, changed_path_from_short_status_line,
+        agent_task_join_abort_allowed, append_to_last_tool_group_cell,
+        append_to_last_tool_group_preview_cell, apply_developer_network_access,
+        apply_final_usage_update, apply_goal_tool_visibility, apply_streaming_usage_delta,
+        automatic_plan_repair_request_from_report, automatic_plan_repair_threshold_message,
+        bind_goal_stop_policy, build_execution_plan_prompt, build_execution_plan_revision_prompt,
+        build_plan_prompt, build_plan_revision_prompt, changed_path_from_short_status_line,
         classify_execution_failure_revision, classify_first_turn_task_intent,
         code_ui_response_from_managed_selection, default_chat_allowed_tools,
         estimate_streamed_output_tokens, exec_approval_decision_from_selection,
@@ -10516,6 +11476,33 @@ mod tests {
             ReviewDecision::Abort
         );
     }
+
+    #[test]
+    fn interrupt_agent_skips_join_abort_after_mutation_marker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let marker = Arc::new(AtomicBool::new(false));
+        assert!(
+            agent_task_join_abort_allowed(Some(&marker)),
+            "pre-dispatch turns may hard-abort for responsiveness"
+        );
+
+        marker.store(true, Ordering::Release);
+        assert!(
+            !agent_task_join_abort_allowed(Some(&marker)),
+            "started mutation dispatch must not be hard-aborted"
+        );
+
+        marker.store(false, Ordering::Release);
+        assert!(
+            agent_task_join_abort_allowed(Some(&marker)),
+            "cleared marker restores safe hard-abort"
+        );
+        assert!(
+            agent_task_join_abort_allowed(None),
+            "missing marker defaults to safe hard-abort"
+        );
+    }
 }
 
 fn assistant_entry_ids(snapshot: &CodeUiSessionSnapshot) -> HashSet<String> {
@@ -11175,11 +12162,10 @@ Use this failure evidence as the source of truth:\n{report}",
 }
 
 fn automatic_plan_repair_threshold_message(report: &str, attempts: u8, max_attempts: u8) -> String {
-    format!(
-        "Automatic plan repair stopped after {attempts} failed repair attempts (automatic threshold: {max_attempts}).\n\
-Developer confirmation is required before more automatic correction.\n\
-{report}\n\
-Reply `continue` or `/plan continue <max-attempts>` to allow more automatic repair attempts, describe specific Plan repair guidance, or use `/plan cancel` to stop."
+    crate::internal::tui::workflow_baseline::plan_repair_threshold_baseline_message(
+        report,
+        attempts,
+        max_attempts,
     )
 }
 

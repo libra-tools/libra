@@ -1,4 +1,10 @@
 //! Thread graph TUI for inspecting AI workflow version state.
+//!
+//! Thread structure (Intent/Plan/Task/Run/PatchSet) is sourced from
+//! [`ThreadBundle`] projection indexes. Code-UI-equivalent transcript,
+//! interaction, and status overlays must fold workflow events through
+//! [`crate::internal::ai::web::code_ui::graph_code_ui_read_model_from_events`]
+//! — the same bounded entry used by Code UI resume.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -25,6 +31,12 @@ use crate::{
         ai::{
             history::HistoryManager,
             projection::{ProjectionRebuilder, ProjectionResolver, ThreadBundle},
+            session::{SessionJsonlStore, SessionStore},
+            web::code_ui::{
+                CodeUiCapabilities, CodeUiInteractionStatus, CodeUiProviderInfo,
+                CodeUiSessionSnapshot, CodeUiSessionStatus, graph_code_ui_read_model_from_events,
+                initial_snapshot,
+            },
         },
         db::establish_connection,
         model::{
@@ -201,7 +213,226 @@ async fn load_thread_graph(storage_root: &Path, requested_thread_id: Uuid) -> Re
     let rows = load_projection_index_rows(&db_conn, &bundle).await?;
     let object_details =
         load_graph_object_details(&history, storage.as_ref(), &bundle, &rows).await;
-    Ok(ThreadGraph::from_projection(bundle, rows, object_details))
+    let mut graph = ThreadGraph::from_projection(bundle, rows, object_details);
+    // Overlay lookup must use the resolved canonical thread id: callers may
+    // pass an intent UUID that projection remaps to its owning thread.
+    match load_code_ui_overlay_for_thread(storage_root, graph.thread_id)? {
+        Some((status, transcript_len, pending_interactions)) => {
+            graph = graph.with_code_ui_overlay(status, transcript_len, pending_interactions);
+        }
+        None => {}
+    }
+    Ok(graph)
+}
+
+/// Fold the session workflow log into Code-UI-equivalent status/transcript
+/// overlays for graph JSON/TUI. Missing sessions are non-fatal; unreadable or
+/// malformed workflow logs for a session that matches the selected thread are
+/// hard errors so operators cannot miss a fence.
+///
+/// Candidate sessions come from the durable thread→session index maintained by
+/// [`SessionStore::save`] / [`SessionStore::session_ids_for_thread`], so graph
+/// does not synchronously scan every historical session log.
+fn load_code_ui_overlay_for_thread(
+    storage_root: &Path,
+    thread_id: Uuid,
+) -> Result<Option<(CodeUiSessionStatus, usize, usize)>> {
+    let session_store = SessionStore::from_storage_path(storage_root);
+    let thread_id = thread_id.to_string();
+    let candidate_ids = session_store.session_ids_for_thread(&thread_id).with_context(|| {
+        format!("failed to resolve Code sessions for thread '{thread_id}' while building graph overlay")
+    })?;
+
+    let mut latest: Option<(
+        crate::internal::ai::session::SessionState,
+        (std::time::SystemTime, DateTime<Utc>, String),
+    )> = None;
+    for session_id in candidate_ids {
+        let session = match session_store.load(&session_id) {
+            Ok(session) => session,
+            Err(error)
+                if session_id == thread_id && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // Canonical thread ids often differ from Code session ids.
+                continue;
+            }
+            Err(error) if session_id == thread_id => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to load Code session '{session_id}' while building graph overlay for thread '{thread_id}'"
+                    )
+                });
+            }
+            Err(error) => {
+                // Indexed candidates must fail closed — skipping could hide a fence.
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to load indexed Code session '{session_id}' while building graph overlay for thread '{thread_id}'"
+                    )
+                });
+            }
+        };
+        if !session_matches_thread_for_graph(&session, &thread_id) {
+            continue;
+        }
+        let events_path =
+            SessionJsonlStore::new(session_store.session_root(&session.id)).events_path();
+        let modified = std::fs::metadata(&events_path)
+            .and_then(|meta| meta.modified())
+            .or_else(|_| {
+                session_store
+                    .session_root(&session.id)
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+            })
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let rank = (modified, session.updated_at, session.id.clone());
+        if latest
+            .as_ref()
+            .is_none_or(|(_, best_rank)| rank > *best_rank)
+        {
+            latest = Some((session, rank));
+        }
+    }
+    let Some((session, _)) = latest else {
+        return Ok(None);
+    };
+
+    let provider = CodeUiProviderInfo {
+        provider: "graph".to_string(),
+        model: None,
+        mode: Some("graph-fold".to_string()),
+        managed: false,
+    };
+    let capabilities = CodeUiCapabilities {
+        message_input: false,
+        streaming_text: false,
+        plan_updates: true,
+        tool_calls: true,
+        patchsets: true,
+        interactive_approvals: false,
+        structured_questions: false,
+        provider_session_resume: false,
+    };
+    let projection_cursor = session
+        .metadata
+        .get("code_ui_projection_cursor")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let mut bootstrap = session
+        .metadata
+        .get("code_ui_snapshot")
+        .and_then(|value| serde_json::from_value::<CodeUiSessionSnapshot>(value.clone()).ok())
+        .unwrap_or_else(|| {
+            initial_snapshot(
+                session.working_dir.clone(),
+                provider.clone(),
+                capabilities.clone(),
+            )
+        });
+    bootstrap.session_id = session.id.clone();
+    bootstrap.thread_id = Some(thread_id.clone());
+    bootstrap.working_dir = session.working_dir.clone();
+    bootstrap.provider = provider;
+    bootstrap.capabilities = capabilities;
+    let has_pending_interaction = bootstrap
+        .interactions
+        .iter()
+        .any(|interaction| matches!(interaction.status, CodeUiInteractionStatus::Pending));
+    if bootstrap.status != CodeUiSessionStatus::IndeterminateSideEffect
+        && !matches!(
+            bootstrap.status,
+            CodeUiSessionStatus::Thinking
+                | CodeUiSessionStatus::ExecutingTool
+                | CodeUiSessionStatus::AwaitingInteraction
+        )
+    {
+        bootstrap.status = if has_pending_interaction {
+            CodeUiSessionStatus::AwaitingInteraction
+        } else {
+            CodeUiSessionStatus::Idle
+        };
+    } else if bootstrap.status != CodeUiSessionStatus::IndeterminateSideEffect
+        && has_pending_interaction
+    {
+        bootstrap.status = CodeUiSessionStatus::AwaitingInteraction;
+    }
+
+    let replay = SessionJsonlStore::new(session_store.session_root(&session.id))
+        .load_code_workflow_replay_since(
+            projection_cursor,
+            crate::internal::ai::web::code_ui_projection::MAX_CODE_UI_PROJECTION_EVENTS,
+            crate::internal::ai::web::code_ui_projection::MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+        )
+        .with_context(|| {
+            format!(
+                "failed to load Code workflow events for session '{}' while building graph overlay",
+                session.id
+            )
+        })?;
+    if !replay.gaps.is_empty() {
+        bail!(
+            "Code workflow log for session '{}' exceeds the bounded graph overlay window after cursor {projection_cursor}; refusing a partial fold that could hide reconciliation state",
+            session.id
+        );
+    }
+    let workflow = SessionJsonlStore::new(session_store.session_root(&session.id));
+    let unresolved_mutation = workflow
+        .has_unresolved_mutating_reconciliation_bounded(
+            crate::internal::ai::web::code_ui_projection::MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+        )
+        .with_context(|| {
+            format!(
+                "failed to inspect durable mutating commands for session '{}' while building graph overlay",
+                session.id
+            )
+        })?;
+    if unresolved_mutation {
+        // Pending mutations are invisible to the projection fold until a
+        // runtime fences them. Graph is an inspection path before restart, so
+        // fail closed to the reconciliation status instead of emitting idle.
+        bootstrap.status = CodeUiSessionStatus::IndeterminateSideEffect;
+    }
+    let fold = graph_code_ui_read_model_from_events(bootstrap, &replay).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to fold Code UI overlay for session '{}': {error}",
+            session.id
+        )
+    })?;
+    let status = if unresolved_mutation {
+        CodeUiSessionStatus::IndeterminateSideEffect
+    } else {
+        fold.snapshot.status
+    };
+    let pending = fold
+        .snapshot
+        .interactions
+        .iter()
+        .filter(|interaction| matches!(interaction.status, CodeUiInteractionStatus::Pending))
+        .count();
+    Ok(Some((status, fold.snapshot.transcript.len(), pending)))
+}
+
+fn session_matches_thread_for_graph(
+    session: &crate::internal::ai::session::SessionState,
+    thread_id: &str,
+) -> bool {
+    session.id == thread_id
+        || session
+            .metadata
+            .get("thread_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == thread_id)
+        || session
+            .metadata
+            .get("canonical_thread_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == thread_id)
+        || session
+            .metadata
+            .get("threadId")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == thread_id)
 }
 
 async fn load_bundle_for_graph(
@@ -393,6 +624,11 @@ struct ThreadGraph {
     selected_plan_id: Option<Uuid>,
     active_task_id: Option<Uuid>,
     active_run_id: Option<Uuid>,
+    /// Code-UI-equivalent session status folded from the session workflow log
+    /// (for example `indeterminate_side_effect` after mutation recovery).
+    code_ui_status: Option<String>,
+    code_ui_transcript_len: usize,
+    code_ui_pending_interactions: usize,
     lines: Vec<GraphLine>,
 }
 
@@ -552,6 +788,9 @@ impl ThreadGraph {
             "selected_plan_id": self.selected_plan_id.map(|id| id.to_string()),
             "active_task_id": self.active_task_id.map(|id| id.to_string()),
             "active_run_id": self.active_run_id.map(|id| id.to_string()),
+            "code_ui_status": self.code_ui_status,
+            "code_ui_transcript_len": self.code_ui_transcript_len,
+            "code_ui_pending_interactions": self.code_ui_pending_interactions,
             "nodes": nodes,
         })
     }
@@ -751,8 +990,25 @@ impl ThreadGraph {
             selected_plan_id: bundle.scheduler.selected_plan_id,
             active_task_id: bundle.scheduler.active_task_id,
             active_run_id: bundle.scheduler.active_run_id,
+            code_ui_status: None,
+            code_ui_transcript_len: 0,
+            code_ui_pending_interactions: 0,
             lines: graph_rows,
         }
+    }
+
+    fn with_code_ui_overlay(
+        mut self,
+        status: CodeUiSessionStatus,
+        transcript_len: usize,
+        pending_interactions: usize,
+    ) -> Self {
+        self.code_ui_status = serde_json::to_value(&status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned));
+        self.code_ui_transcript_len = transcript_len;
+        self.code_ui_pending_interactions = pending_interactions;
+        self
     }
 }
 
@@ -2601,6 +2857,9 @@ mod tests {
             ),
             active_task_id: None,
             active_run_id: None,
+            code_ui_status: None,
+            code_ui_transcript_len: 0,
+            code_ui_pending_interactions: 0,
             lines: vec![
                 GraphLine {
                     depth: 0,
@@ -2761,6 +3020,9 @@ mod tests {
             selected_plan_id: None,
             active_task_id: None,
             active_run_id: None,
+            code_ui_status: None,
+            code_ui_transcript_len: 0,
+            code_ui_pending_interactions: 0,
             lines,
         };
         let app = GraphTuiApp::new(graph);
@@ -2945,6 +3207,9 @@ mod tests {
             selected_plan_id: None,
             active_task_id: None,
             active_run_id: None,
+            code_ui_status: None,
+            code_ui_transcript_len: 0,
+            code_ui_pending_interactions: 0,
             lines: vec![
                 GraphLine {
                     depth: 0,
@@ -2977,5 +3242,84 @@ mod tests {
         app.scroll_details_page_up();
         assert_eq!(app.selected, 1);
         assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn graph_overlay_selects_newest_matching_session_and_emits_wire_status() {
+        use crate::internal::ai::{
+            session::{
+                CodeCommandIdentity, CodeCommandIntent, CodeWorkflowEventKind, SessionJsonlStore,
+                SessionState, SessionStore,
+            },
+            web::code_ui::CodeUiSessionStatus,
+        };
+
+        let temp = tempfile::TempDir::new().expect("temp storage");
+        let storage_root = temp.path();
+        let session_store = SessionStore::from_storage_path(storage_root);
+        let thread_id = id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+
+        let mut stale = SessionState::new("/repo");
+        stale.metadata.insert(
+            "thread_id".to_string(),
+            serde_json::json!(thread_id.to_string()),
+        );
+        session_store.save(&stale).expect("save stale session");
+        SessionJsonlStore::new(session_store.session_root(&stale.id))
+            .append_code_workflow(CodeWorkflowEventKind::CommandAccepted {
+                command_id: "stale".to_string(),
+                workflow: "idle".to_string(),
+            })
+            .expect("append stale event");
+
+        // Ensure the newer session's event log has a later mtime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut fresh = SessionState::new("/repo");
+        fresh.metadata.insert(
+            "thread_id".to_string(),
+            serde_json::json!(thread_id.to_string()),
+        );
+        session_store.save(&fresh).expect("save fresh session");
+        let fresh_store = SessionJsonlStore::new(session_store.session_root(&fresh.id));
+        let intent = CodeCommandIntent::new(
+            CodeCommandIdentity::new("repo", &fresh.id, "principal", "interrupted"),
+            "agent_runtime_turn",
+            "sha256:request",
+            true,
+        );
+        fresh_store
+            .admit_code_command(intent)
+            .expect("admit mutating intent");
+        // Do not recover/fence here: graph must surface Pending mutations as
+        // indeterminate_side_effect before a runtime restart writes the fence.
+
+        let (status, _transcript_len, _pending) =
+            load_code_ui_overlay_for_thread(storage_root, thread_id)
+                .expect("overlay load")
+                .expect("matching session must produce an overlay");
+        assert_eq!(status, CodeUiSessionStatus::IndeterminateSideEffect);
+
+        let mut graph = ThreadGraph {
+            thread_id,
+            title: None,
+            freshness: "Fresh".into(),
+            thread_version: 1,
+            scheduler_version: 1,
+            updated_at: ts(1),
+            selected_plan_id: None,
+            active_task_id: None,
+            active_run_id: None,
+            code_ui_status: None,
+            code_ui_transcript_len: 0,
+            code_ui_pending_interactions: 0,
+            lines: Vec::new(),
+        };
+        graph = graph.with_code_ui_overlay(status, 0, 0);
+        let json = graph.to_json();
+        assert_eq!(
+            json.get("code_ui_status").and_then(|value| value.as_str()),
+            Some("indeterminate_side_effect")
+        );
     }
 }

@@ -65,6 +65,27 @@ impl fmt::Display for CodeUiProjectionFoldError {
 
 impl std::error::Error for CodeUiProjectionFoldError {}
 
+/// Canonical workflow-event fold for Code UI read-model fields.
+///
+/// Resume, SSE recovery, and graph/history Code-UI-equivalent read paths
+/// must use this entry (or [`fold_graph_compatible_code_ui_snapshot`]) —
+/// not a separate projection implementation.
+pub fn rebuild_code_ui_read_model_from_events(
+    bootstrap: CodeUiSessionSnapshot,
+    replay: &CodeWorkflowReplay,
+) -> Result<CodeUiProjectionFold, CodeUiProjectionFoldError> {
+    fold_code_ui_snapshot(bootstrap, replay)
+}
+
+/// Graph/history read paths that surface transcript, interaction, and status
+/// fields equivalent to Code UI must fold through the same entry as resume.
+pub fn fold_graph_compatible_code_ui_snapshot(
+    bootstrap: CodeUiSessionSnapshot,
+    replay: &CodeWorkflowReplay,
+) -> Result<CodeUiProjectionFold, CodeUiProjectionFoldError> {
+    rebuild_code_ui_read_model_from_events(bootstrap, replay)
+}
+
 /// Fold ordered Code workflow events over a bootstrap snapshot.
 ///
 /// Unknown projection names and historical `code_ui_projection_delta` rows

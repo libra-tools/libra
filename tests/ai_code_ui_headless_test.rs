@@ -46,7 +46,7 @@ fn fixture_path(name: &str) -> PathBuf {
     path
 }
 
-fn build_runtime(
+async fn build_runtime(
     fixture: &str,
     working_dir: PathBuf,
 ) -> (
@@ -54,10 +54,10 @@ fn build_runtime(
     mpsc::UnboundedSender<UserInputRequest>,
     mpsc::UnboundedSender<ExecApprovalRequest>,
 ) {
-    build_runtime_with_persistence(fixture, working_dir, Vec::new(), None)
+    build_runtime_with_persistence(fixture, working_dir, Vec::new(), None).await
 }
 
-fn build_runtime_with_persistence(
+async fn build_runtime_with_persistence(
     fixture: &str,
     working_dir: PathBuf,
     initial_history: Vec<Message>,
@@ -78,10 +78,10 @@ fn build_runtime_with_persistence(
             .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
             .build(),
     );
-    build_runtime_with_registry(fixture, working_dir, initial_history, persistence, registry)
+    build_runtime_with_registry(fixture, working_dir, initial_history, persistence, registry).await
 }
 
-fn build_runtime_with_registry(
+async fn build_runtime_with_registry(
     fixture: &str,
     working_dir: PathBuf,
     initial_history: Vec<Message>,
@@ -100,9 +100,10 @@ fn build_runtime_with_registry(
         registry,
         Arc::new(ToolLoopConfig::default),
     )
+    .await
 }
 
-fn build_runtime_with_registry_and_config(
+async fn build_runtime_with_registry_and_config(
     fixture: &str,
     working_dir: PathBuf,
     initial_history: Vec<Message>,
@@ -123,9 +124,10 @@ fn build_runtime_with_registry_and_config(
         config_factory,
         None,
     )
+    .await
 }
 
-fn build_runtime_with_registry_and_config_and_shutdown_timeout(
+async fn build_runtime_with_registry_and_config_and_shutdown_timeout(
     fixture: &str,
     working_dir: PathBuf,
     initial_history: Vec<Message>,
@@ -169,6 +171,7 @@ fn build_runtime_with_registry_and_config_and_shutdown_timeout(
             persistence,
             shutdown_timeout,
         )
+        .await
         .expect("test registry must retain the shared tool boundary"),
         None => HeadlessCodeRuntime::new_with_persistence(
             session,
@@ -181,6 +184,7 @@ fn build_runtime_with_registry_and_config_and_shutdown_timeout(
             initial_history,
             persistence,
         )
+        .await
         .expect("test registry must retain the shared tool boundary"),
     };
 
@@ -223,7 +227,7 @@ impl ToolHandler for BlockingMutationHandler {
 #[tokio::test(flavor = "multi_thread")]
 async fn initial_snapshot_is_writable_non_placeholder_runtime() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     let snapshot = runtime.snapshot().await;
 
@@ -250,7 +254,7 @@ async fn initial_snapshot_is_writable_non_placeholder_runtime() {
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_message_streams_assistant_reply_into_snapshot() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("hello headless".to_string())
@@ -309,7 +313,7 @@ async fn submit_message_streams_assistant_reply_into_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_message_is_owned_by_agent_runtime_worker() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("runtime-owned turn".to_string())
@@ -347,7 +351,7 @@ async fn submit_message_is_owned_by_agent_runtime_worker() {
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_message_is_rejected_before_any_transcript_mutation() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     let result = runtime.submit_message("   ".to_string()).await;
     assert!(result.is_err(), "whitespace-only messages must be rejected");
@@ -379,7 +383,8 @@ async fn submit_rejects_unpersistable_turn_before_live_session_mutation() {
         workdir.path().to_path_buf(),
         Vec::new(),
         Some(persistence),
-    );
+    )
+    .await;
 
     let error = runtime
         .submit_message("must not start".to_string())
@@ -421,7 +426,8 @@ async fn submit_message_persists_resumable_session_snapshot() {
         workdir.path().to_path_buf(),
         Vec::new(),
         Some(persistence),
-    );
+    )
+    .await;
 
     runtime
         .submit_message("persist this turn".to_string())
@@ -543,7 +549,7 @@ fn headless_capabilities_match_phase3_v1_contract() {
 #[tokio::test(flavor = "multi_thread")]
 async fn update_plan_tool_call_projects_plan_into_snapshot() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("plan_update", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("plan_update", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("please update the plan".to_string())
@@ -580,7 +586,7 @@ async fn update_plan_tool_call_projects_plan_into_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_plan_draft_tool_call_projects_draft_plan_into_snapshot() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("plan_draft", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("plan_draft", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("please draft an execution plan".to_string())
@@ -658,7 +664,7 @@ async fn submit_plan_draft_tool_call_projects_draft_plan_into_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_turn_finalizes_streaming_assistant_entry() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("slow".to_string())
@@ -725,7 +731,7 @@ async fn cancel_turn_finalizes_streaming_assistant_entry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_waits_for_cooperative_turn_finalization() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("slow shutdown".to_string())
@@ -761,7 +767,7 @@ async fn shutdown_waits_for_cooperative_turn_finalization() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_shutdown_joins_the_same_terminal_result() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
     runtime
         .submit_message("slow repeated shutdown".to_string())
         .await
@@ -819,7 +825,8 @@ async fn shutdown_timeout_persists_indeterminate_state() {
         registry,
         config_factory,
         Some(Duration::from_millis(40)),
-    );
+    )
+    .await;
 
     runtime
         .submit_message("start blocking mutation".to_string())
@@ -935,7 +942,8 @@ async fn cancel_does_not_abort_started_mutating_headless_tool() {
         None,
         registry,
         config_factory,
-    );
+    )
+    .await;
 
     runtime
         .submit_message("start blocking mutation".to_string())
@@ -1113,7 +1121,7 @@ async fn append_assistant_delta_still_accepts_thinking_status() {
 #[tokio::test(flavor = "multi_thread")]
 async fn respond_interaction_unknown_id() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf());
+    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     let result = runtime
         .respond_interaction("ignored", CodeUiInteractionResponse::default())
@@ -1128,7 +1136,8 @@ async fn respond_interaction_unknown_id() {
 #[tokio::test(flavor = "multi_thread")]
 async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, user_input_tx, _) = build_runtime("basic_chat", workdir.path().to_path_buf());
+    let (runtime, user_input_tx, _) =
+        build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     let interaction_id = "request-user-input-1".to_string();
     let question_id = "q1".to_string();
@@ -1211,7 +1220,8 @@ async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() 
 #[tokio::test(flavor = "multi_thread")]
 async fn request_user_input_validates_and_delivers_all_requested_answers() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, user_input_tx, _) = build_runtime("basic_chat", workdir.path().to_path_buf());
+    let (runtime, user_input_tx, _) =
+        build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     let interaction_id = "request-user-input-many".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel::<UserInputResponse>();
@@ -1327,7 +1337,8 @@ async fn request_user_input_validates_and_delivers_all_requested_answers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn live_user_input_interaction_is_registered_with_agent_runtime() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, user_input_tx, _) = build_runtime("delayed_chat", workdir.path().to_path_buf());
+    let (runtime, user_input_tx, _) =
+        build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("slow turn with input".to_string())
@@ -1428,7 +1439,8 @@ async fn live_user_input_interaction_is_registered_with_agent_runtime() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_live_user_input_closes_worker_owned_continuation() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, user_input_tx, _) = build_runtime("delayed_chat", workdir.path().to_path_buf());
+    let (runtime, user_input_tx, _) =
+        build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("slow turn with input".to_string())
@@ -1533,7 +1545,7 @@ async fn cancelling_live_user_input_closes_worker_owned_continuation() {
 async fn live_exec_approval_interaction_is_registered_with_agent_runtime() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
     let (runtime, _, exec_approval_tx) =
-        build_runtime("delayed_chat", workdir.path().to_path_buf());
+        build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
         .submit_message("slow turn with approval".to_string())
@@ -1647,7 +1659,8 @@ async fn live_exec_approval_interaction_is_registered_with_agent_runtime() {
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_approval_request_is_reflected_in_snapshot_and_responded_to() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, exec_approval_tx) = build_runtime("basic_chat", workdir.path().to_path_buf());
+    let (runtime, _, exec_approval_tx) =
+        build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     let interaction_id = "exec-approval-1".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1747,7 +1760,8 @@ async fn exec_approval_request_is_reflected_in_snapshot_and_responded_to() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_idle_runtime_closes_pending_exec_approval() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let (runtime, _, exec_approval_tx) = build_runtime("basic_chat", workdir.path().to_path_buf());
+    let (runtime, _, exec_approval_tx) =
+        build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     let interaction_id = "cancel-idle-exec-approval".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1821,7 +1835,8 @@ async fn unpersistable_approval_response_does_not_release_the_tool_loop() {
         workdir.path().to_path_buf(),
         Vec::new(),
         Some(persistence),
-    );
+    )
+    .await;
 
     let interaction_id = "persisted-exec-approval".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1908,10 +1923,8 @@ async fn unpersistable_approval_response_does_not_release_the_tool_loop() {
         .await
         .expect_err("indeterminate sessions must reject follow-up turns");
     assert!(
-        submit_error
-            .to_string()
-            .contains("indeterminate persistence state"),
-        "follow-up rejection must explain reconciliation: {submit_error:#}",
+        submit_error.to_string().contains("RECONCILIATION_REQUIRED"),
+        "follow-up rejection must expose stable reconciliation code: {submit_error:#}",
     );
 }
 
@@ -1931,7 +1944,8 @@ async fn persisted_approval_response_records_durable_interaction_audit_event() {
         workdir.path().to_path_buf(),
         Vec::new(),
         Some(persistence),
-    );
+    )
+    .await;
 
     let interaction_id = "durable-exec-approval".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -2013,7 +2027,8 @@ async fn live_unpersistable_approval_preserves_indeterminate_state_after_executo
         workdir.path().to_path_buf(),
         Vec::new(),
         Some(persistence),
-    );
+    )
+    .await;
 
     runtime
         .submit_message("slow interaction persistence failure".to_string())

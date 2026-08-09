@@ -119,7 +119,9 @@ use crate::{
                 openai::GPT_4O_MINI, zhipu::GLM_5,
             },
             runtime::{
-                CodeAgentApprovalConfig, CodeAgentSandboxProfile, CodeAgentServicesBuilder,
+                AgentRuntimeWorker, AgentRuntimeWorkerConfig, CodeAgentApprovalConfig,
+                CodeAgentSandboxProfile, CodeAgentServicesBuilder, ExternalTurnTrackingExecutor,
+                InMemoryAuditSink, RuntimeCommandDurability, ToolBoundaryRuntime,
                 tool_runtime_context,
             },
             sandbox::{
@@ -143,7 +145,7 @@ use crate::{
                 },
                 code_ui_projection::{
                     MAX_CODE_UI_PROJECTION_EVENTS, MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
-                    fold_code_ui_snapshot,
+                    rebuild_code_ui_read_model_from_events,
                 },
                 headless::{
                     HeadlessCodeRuntime, HeadlessSessionPersistence, headless_capabilities,
@@ -867,6 +869,14 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             // §C.4.1: refuse rather than mint a phantom `<working_dir>/.libra`.
             let storage_root = require_storage_root(&working_dir)?;
             let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+            session_store
+                .rebuild_thread_session_index()
+                .map_err(|error| {
+                    CliError::io(format!(
+                        "failed to rebuild the Code thread→session index under '{}': {error}",
+                        storage_root.display()
+                    ))
+                })?;
             let session_state =
                 load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
             // All accepted non-Codex web-only providers now route through the
@@ -2133,31 +2143,17 @@ fn load_or_create_headless_web_session_state(
     Ok(session)
 }
 
-fn build_headless_web_code_ui_snapshot(
-    working_dir: &Path,
-    provider: CodeUiProviderInfo,
-    capabilities: CodeUiCapabilities,
-    session: &SessionState,
-) -> CodeUiSessionSnapshot {
-    let working_dir = working_dir.to_string_lossy().to_string();
-    let mut snapshot = session
-        .metadata
-        .get(HEADLESS_CODE_UI_SNAPSHOT_METADATA_KEY)
-        .and_then(|value| serde_json::from_value::<CodeUiSessionSnapshot>(value.clone()).ok())
-        .unwrap_or_else(|| {
-            initial_snapshot(working_dir.clone(), provider.clone(), capabilities.clone())
-        });
+struct CodeUiResumeFold {
+    snapshot: CodeUiSessionSnapshot,
+    projection_sequence: u64,
+}
 
-    snapshot.session_id = session.id.clone();
-    snapshot.thread_id =
-        Some(session_canonical_thread_id(session).unwrap_or_else(|| session.id.clone()));
-    snapshot.working_dir = working_dir;
-    snapshot.provider = provider;
-    snapshot.capabilities = capabilities;
-    if snapshot.transcript.is_empty() {
-        snapshot.transcript = build_tui_code_ui_transcript(session);
-    }
-
+/// Normalize a legacy/bootstrap snapshot before applying the bounded workflow fold.
+///
+/// Cancels in-flight streaming transcript rows and preserves durable safety fences
+/// (`IndeterminateSideEffect`, pending interactions) that an empty replay suffix
+/// would otherwise erase.
+fn finalize_code_ui_resume_bootstrap_snapshot(snapshot: &mut CodeUiSessionSnapshot) {
     let now = Utc::now();
     for entry in &mut snapshot.transcript {
         if entry.streaming {
@@ -2188,7 +2184,112 @@ fn build_headless_web_code_ui_snapshot(
         CodeUiSessionStatus::Idle
     };
     snapshot.updated_at = now;
-    snapshot
+}
+
+/// Build the legacy/bootstrap Code UI snapshot shared by TUI and headless resume.
+fn build_code_ui_resume_bootstrap_snapshot(
+    working_dir: impl Into<String>,
+    session: &SessionState,
+    provider: CodeUiProviderInfo,
+    capabilities: CodeUiCapabilities,
+    projection_bundle: Option<&ThreadBundle>,
+) -> Result<CodeUiSessionSnapshot, String> {
+    let working_dir = working_dir.into();
+    // Prefer a durable Code UI checkpoint over a ThreadBundle skeleton. The
+    // bundle has no transcript/interaction overlays, so using it when a
+    // checkpoint exists would drop indeterminate fences and live UI state
+    // while replay starts after the projection cursor.
+    let checkpoint = match session.metadata.get(HEADLESS_CODE_UI_SNAPSHOT_METADATA_KEY) {
+        Some(value) => match serde_json::from_value::<CodeUiSessionSnapshot>(value.clone()) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                return Err(format!(
+                    "session '{}' has a durable Code UI checkpoint that cannot be deserialized ({error}); refusing to resume with a fresh snapshot that could hide an indeterminate reconciliation fence",
+                    session.id
+                ));
+            }
+        },
+        None => None,
+    };
+    let used_checkpoint = checkpoint.is_some();
+    let mut snapshot = match (checkpoint, projection_bundle) {
+        (Some(checkpoint), _) => checkpoint,
+        (None, Some(bundle)) => snapshot_from_thread_bundle(
+            working_dir.clone(),
+            provider.clone(),
+            capabilities.clone(),
+            bundle,
+        ),
+        (None, None) => {
+            initial_snapshot(working_dir.clone(), provider.clone(), capabilities.clone())
+        }
+    };
+
+    if used_checkpoint || projection_bundle.is_none() {
+        snapshot.session_id = session.id.clone();
+        snapshot.thread_id =
+            Some(session_canonical_thread_id(session).unwrap_or_else(|| session.id.clone()));
+    }
+    snapshot.working_dir = working_dir;
+    snapshot.provider = provider;
+    snapshot.capabilities = capabilities;
+    if snapshot.transcript.is_empty() {
+        snapshot.transcript = build_tui_code_ui_transcript(session);
+    }
+
+    finalize_code_ui_resume_bootstrap_snapshot(&mut snapshot);
+    Ok(snapshot)
+}
+
+fn build_headless_web_code_ui_snapshot(
+    working_dir: &Path,
+    provider: CodeUiProviderInfo,
+    capabilities: CodeUiCapabilities,
+    session: &SessionState,
+) -> Result<CodeUiSessionSnapshot, String> {
+    build_code_ui_resume_bootstrap_snapshot(
+        working_dir.to_string_lossy(),
+        session,
+        provider,
+        capabilities,
+        None,
+    )
+}
+
+fn fold_code_ui_resume_from_session(
+    session_store: &SessionStore,
+    session: &SessionState,
+    bootstrap: CodeUiSessionSnapshot,
+) -> Result<CodeUiResumeFold, String> {
+    let projection_store = SessionJsonlStore::new(session_store.session_root(&session.id));
+    let projection_cursor = session
+        .metadata
+        .get("code_ui_projection_cursor")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let projection_replay = projection_store
+        .load_code_workflow_replay_since(
+            projection_cursor,
+            MAX_CODE_UI_PROJECTION_EVENTS,
+            MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+        )
+        .map_err(|error| {
+            format!(
+                "failed to load the Code UI workflow projection for session '{}': {error}",
+                session.id
+            )
+        })?;
+    let folded =
+        rebuild_code_ui_read_model_from_events(bootstrap, &projection_replay).map_err(|error| {
+            format!(
+                "cannot safely resume the Code UI workflow projection for session '{}': {error}",
+                session.id
+            )
+        })?;
+    Ok(CodeUiResumeFold {
+        snapshot: folded.snapshot,
+        projection_sequence: folded.last_sequence.unwrap_or(projection_cursor),
+    })
 }
 
 /// Build a headless Code UI runtime for `--web-only` non-Codex providers.
@@ -2237,37 +2338,16 @@ where
     let initial_history = session_state.to_history();
     let bootstrap_snapshot = build_headless_web_code_ui_snapshot(
         working_dir,
-        provider,
+        provider.clone(),
         capabilities.clone(),
         &session_state,
-    );
-    let projection_store = SessionJsonlStore::new(session_store.session_root(&session_state.id));
-    let projection_cursor = session_state
-        .metadata
-        .get("code_ui_projection_cursor")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let projection_replay = projection_store
-        .load_code_workflow_replay_since(
-            projection_cursor,
-            MAX_CODE_UI_PROJECTION_EVENTS,
-            MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
-        )
-        .map_err(|error| {
-            CliError::fatal(format!(
-                "failed to load the Code UI workflow projection for session '{}': {error}",
-                session_state.id
-            ))
-        })?;
-    let folded_projection =
-        fold_code_ui_snapshot(bootstrap_snapshot, &projection_replay).map_err(|error| {
-            CliError::fatal(format!(
-                "cannot safely resume the Code UI workflow projection for session '{}': {error}",
-                session_state.id
-            ))
-        })?;
-    let projection_sequence = folded_projection.last_sequence.unwrap_or(projection_cursor);
-    let snapshot = folded_projection.snapshot;
+    )
+    .map_err(CliError::fatal)?;
+    let folded =
+        fold_code_ui_resume_from_session(&session_store, &session_state, bootstrap_snapshot)
+            .map_err(CliError::fatal)?;
+    let projection_sequence = folded.projection_sequence;
+    let snapshot = folded.snapshot;
     let session = CodeUiSession::new(snapshot.clone());
     let persistence = HeadlessSessionPersistence::with_projection_checkpoint(
         session_store,
@@ -2316,6 +2396,7 @@ where
         initial_history,
         Some(persistence),
     )
+    .await
     .map_err(|error| {
         CliError::fatal(format!(
             "failed to construct the headless AgentRuntime adapter: {error}"
@@ -2872,6 +2953,7 @@ fn session_canonical_thread_id(session: &SessionState) -> Option<String> {
 async fn build_tui_code_ui_runtime(
     working_dir: &str,
     session: &SessionState,
+    session_store: &SessionStore,
     provider_name: &str,
     model_name: &str,
     projection_bundle: Option<&ThreadBundle>,
@@ -2879,7 +2961,7 @@ async fn build_tui_code_ui_runtime(
     automation_write_enabled: bool,
     browser_write_enabled: bool,
     lease_duration_override: Option<chrono::Duration>,
-) -> Arc<CodeUiRuntimeHandle> {
+) -> CliResult<Arc<CodeUiRuntimeHandle>> {
     let capabilities = build_tui_code_ui_capabilities();
     let provider = CodeUiProviderInfo {
         provider: provider_name.to_string(),
@@ -2887,22 +2969,17 @@ async fn build_tui_code_ui_runtime(
         mode: Some("tui".to_string()),
         managed: false,
     };
-    let mut snapshot = if let Some(bundle) = projection_bundle {
-        snapshot_from_thread_bundle(
-            working_dir.to_string(),
-            provider,
-            capabilities.clone(),
-            bundle,
-        )
-    } else {
-        initial_snapshot(working_dir.to_string(), provider, capabilities.clone())
-    };
-    if projection_bundle.is_none() {
-        snapshot.session_id = session.id.clone();
-        snapshot.thread_id = session_canonical_thread_id(session);
-    }
-    snapshot.transcript = build_tui_code_ui_transcript(session);
-    snapshot.updated_at = Utc::now();
+    let bootstrap = build_code_ui_resume_bootstrap_snapshot(
+        working_dir,
+        session,
+        provider,
+        capabilities.clone(),
+        projection_bundle,
+    )
+    .map_err(CliError::fatal)?;
+    let folded = fold_code_ui_resume_from_session(session_store, session, bootstrap)
+        .map_err(CliError::fatal)?;
+    let snapshot = folded.snapshot;
 
     let code_ui_session = CodeUiSession::new(snapshot);
     let adapter: Arc<dyn CodeUiProviderAdapter> = if let Some(control_tx) = code_control_tx {
@@ -2932,7 +3009,7 @@ async fn build_tui_code_ui_runtime(
         initial_controller,
     );
     runtime_options.lease_duration = lease_duration_override;
-    CodeUiRuntimeHandle::build_with_options(adapter, runtime_options).await
+    Ok(CodeUiRuntimeHandle::build_with_options(adapter, runtime_options).await)
 }
 
 async fn load_code_ui_projection_bundle(
@@ -3137,6 +3214,14 @@ where
     let session_working_dir = registry.working_dir().to_path_buf();
     let storage_root = require_storage_root(registry.working_dir())?;
     let session_store = SessionStore::from_storage_path(&storage_root);
+    session_store
+        .rebuild_thread_session_index()
+        .map_err(|error| {
+            CliError::io(format!(
+                "failed to rebuild the Code thread→session index under '{}': {error}",
+                storage_root.display()
+            ))
+        })?;
     let session = if let Some(thread_id) = params.resume_thread_id.as_deref() {
         // The resume identifier may be either a canonical UUID (planning-bound
         // thread) or a chat-flow session id from `generate_session_id`
@@ -3163,6 +3248,33 @@ where
         }
     } else {
         SessionState::new(&working_dir_str)
+    };
+    // Non-managed TUI providers still execute the legacy local tool loop, but
+    // their cancellation authority must be the shared AgentRuntime worker so
+    // admission and any mutation reconciliation are durable.
+    let (local_turn_runtime, local_turn_runtime_task) = if managed_code_ui_runtime.is_none() {
+        let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(
+            session_store.session_root(&session.id),
+        ));
+        let recovered_mutations = durability.recover_pending_mutations().map_err(|error| {
+            CliError::io(format!(
+                "failed to recover pending durable commands for Code session '{}': {error}",
+                session.id
+            ))
+        })?;
+        let mut worker_config = AgentRuntimeWorkerConfig::new(
+            Arc::new(ExternalTurnTrackingExecutor),
+            ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
+        )
+        .with_durability(durability, working_dir_str.clone(), "tui-local")
+        .with_durability_command_kind("tui_local_turn");
+        if !recovered_mutations.is_empty() {
+            worker_config = worker_config.with_recovered_reconciliation_session(session.id.clone());
+        }
+        let (handle, worker_task) = AgentRuntimeWorker::spawn(worker_config);
+        (Some(handle), Some(worker_task))
+    } else {
+        (None, None)
     };
     // v0.17.791 session-bootstrap usage auto-prune: if the
     // operator configured `[usage] retention_days = N` in
@@ -3240,6 +3352,7 @@ where
         build_tui_code_ui_runtime(
             &working_dir_str,
             &session,
+            &session_store,
             &provider_name,
             &model_name,
             projection_bundle.as_ref(),
@@ -3248,7 +3361,7 @@ where
             browser_write_enabled,
             code_ui_test_lease_duration_override()?,
         )
-        .await
+        .await?
     };
     let code_ui_session = code_ui_runtime.adapter().session();
     params
@@ -3523,6 +3636,8 @@ where
             code_ui_runtime: Some(code_ui_runtime_for_app),
             code_control_rx,
             managed_code_ui_runtime,
+            local_turn_runtime,
+            local_turn_runtime_task,
             default_network_access: params.network_access,
             auto_classify_first_user_message,
             initial_goal: params.initial_goal.clone(),
@@ -4934,12 +5049,105 @@ mod tests {
             provider,
             capabilities,
             &session,
-        );
+        )
+        .expect("valid checkpoint must resume");
 
         assert_eq!(
             restored.status,
             CodeUiSessionStatus::IndeterminateSideEffect,
             "resume must retain the reconciliation fence even when projection replay is empty"
+        );
+    }
+
+    #[test]
+    fn code_ui_resume_rejects_malformed_durable_checkpoint() {
+        let working_dir = tempfile::tempdir().expect("create temporary workspace");
+        let provider = CodeUiProviderInfo {
+            provider: "test".to_string(),
+            model: Some("test-model".to_string()),
+            mode: Some("web-headless".to_string()),
+            managed: false,
+        };
+        let capabilities = headless_capabilities();
+        let mut session = SessionState::new(&working_dir.path().to_string_lossy());
+        session.metadata.insert(
+            HEADLESS_CODE_UI_SNAPSHOT_METADATA_KEY.to_string(),
+            serde_json::json!({"not": "a CodeUiSessionSnapshot"}),
+        );
+        session.metadata.insert(
+            "code_ui_projection_cursor".to_string(),
+            serde_json::json!(7),
+        );
+
+        let headless_error = build_headless_web_code_ui_snapshot(
+            working_dir.path(),
+            provider.clone(),
+            capabilities.clone(),
+            &session,
+        )
+        .expect_err("malformed checkpoint must fail closed");
+        assert!(
+            headless_error.contains("cannot be deserialized"),
+            "headless resume must reject a corrupt durable checkpoint: {headless_error}"
+        );
+
+        let tui_error = build_code_ui_resume_bootstrap_snapshot(
+            working_dir.path().to_string_lossy(),
+            &session,
+            provider,
+            build_tui_code_ui_capabilities(),
+            None,
+        )
+        .expect_err("malformed checkpoint must fail closed for TUI bootstrap");
+        assert!(
+            tui_error.contains("cannot be deserialized"),
+            "TUI resume must reject a corrupt durable checkpoint: {tui_error}"
+        );
+    }
+
+    #[test]
+    fn code_ui_resume_fold_preserves_indeterminate_side_effect_fence() {
+        let working_dir = tempfile::tempdir().expect("create temporary workspace");
+        let session_store = SessionStore::from_storage_path(&working_dir.path().join(".libra"));
+        let provider = CodeUiProviderInfo {
+            provider: "test".to_string(),
+            model: Some("test-model".to_string()),
+            mode: Some("tui".to_string()),
+            managed: false,
+        };
+        let capabilities = build_tui_code_ui_capabilities();
+        let mut persisted = initial_snapshot(
+            working_dir.path().to_string_lossy().to_string(),
+            provider.clone(),
+            capabilities.clone(),
+        );
+        persisted.status = CodeUiSessionStatus::IndeterminateSideEffect;
+
+        let mut session = SessionState::new(&working_dir.path().to_string_lossy());
+        session.metadata.insert(
+            HEADLESS_CODE_UI_SNAPSHOT_METADATA_KEY.to_string(),
+            serde_json::to_value(persisted).expect("serialize persisted Code UI snapshot"),
+        );
+        session.metadata.insert(
+            "code_ui_projection_cursor".to_string(),
+            serde_json::json!(42),
+        );
+
+        let bootstrap = build_code_ui_resume_bootstrap_snapshot(
+            working_dir.path().to_string_lossy(),
+            &session,
+            provider,
+            capabilities,
+            None,
+        )
+        .expect("valid checkpoint must bootstrap");
+        let folded = fold_code_ui_resume_from_session(&session_store, &session, bootstrap)
+            .expect("fold resume snapshot with empty replay suffix");
+
+        assert_eq!(
+            folded.snapshot.status,
+            CodeUiSessionStatus::IndeterminateSideEffect,
+            "TUI/headless shared fold must retain the reconciliation fence when replay is empty"
         );
     }
 
@@ -5910,10 +6118,12 @@ no_cache_unknown_network = true
         };
         let mut session = SessionState::new("/tmp/workspace");
         session.id = "legacy-session".to_string();
+        let session_store = SessionStore::from_storage_path(Path::new("/tmp/workspace/.libra"));
 
         let runtime = build_tui_code_ui_runtime(
             "/tmp/workspace",
             &session,
+            &session_store,
             "ollama",
             "gemma4:31b",
             Some(&bundle),
@@ -5922,7 +6132,8 @@ no_cache_unknown_network = true
             false,
             None,
         )
-        .await;
+        .await
+        .expect("build TUI runtime from projection bundle");
         let snapshot = runtime.snapshot().await;
 
         assert_eq!(snapshot.session_id, thread_id.to_string());

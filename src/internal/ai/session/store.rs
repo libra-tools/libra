@@ -198,9 +198,175 @@ impl SessionStore {
 
     /// Save a session to disk.
     pub fn save(&self, session: &SessionState) -> io::Result<()> {
+        if !is_safe_session_path_id(&session.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to save session with unsafe id '{}': session ids must be a single relative path component",
+                    session.id
+                ),
+            ));
+        }
         self.ensure_dir()?;
         SessionJsonlStore::new(self.session_root(&session.id))
-            .append(&SessionEvent::snapshot(session.clone()))
+            .append(&SessionEvent::snapshot(session.clone()))?;
+        if let Err(error) = self.record_thread_session_index(session) {
+            // Drop the one-time backfill marker so the next lookup rebuilds
+            // instead of permanently omitting this session after a partial save.
+            // Propagate cleanup failure: a stale marker with an unindexed
+            // snapshot would hide the session from thread lookups forever.
+            if let Err(cleanup_error) = fs::remove_file(self.thread_index_backfill_marker_path())
+                && cleanup_error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to record thread session index for '{}': {error}; additionally failed to invalidate the thread-index backfill marker so lookups can rebuild ({cleanup_error})",
+                        session.id
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Session ids known to belong to `thread_id` (exact id and/or index).
+    ///
+    /// The index is maintained on [`Self::save`]. When the one-time migration
+    /// marker is absent, [`Self::rebuild_thread_session_index`] runs first so
+    /// pre-index sessions remain visible without a per-request historical scan
+    /// afterward.
+    pub fn session_ids_for_thread(&self, thread_id: &str) -> io::Result<Vec<String>> {
+        self.rebuild_thread_session_index()?;
+        let mut ids = BTreeSet::new();
+        if !is_safe_thread_index_id(thread_id) {
+            return Ok(Vec::new());
+        }
+        ids.insert(thread_id.to_string());
+        let index_path = self.thread_index_path(thread_id);
+        if index_path.exists() {
+            for line in fs::read_to_string(&index_path)?.lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    ids.insert(line.to_string());
+                }
+            }
+        }
+        Ok(ids
+            .into_iter()
+            .filter(|id| self.session_root(id).exists() || self.session_path(id).exists())
+            .collect())
+    }
+
+    /// Rebuild `.thread_index` from every readable session (one-time).
+    ///
+    /// Called from Code startup and from the first graph overlay lookup when
+    /// the migration marker is absent. Subsequent calls are no-ops. Fails
+    /// closed if any session cannot be loaded or indexed so a partial
+    /// migration cannot hide reconciliation overlays.
+    pub fn rebuild_thread_session_index(&self) -> io::Result<()> {
+        let marker = self.thread_index_backfill_marker_path();
+        if marker.exists() {
+            return Ok(());
+        }
+        if !self.sessions_dir.exists() {
+            fs::create_dir_all(self.thread_index_dir())?;
+            fs::write(&marker, b"1\n")?;
+            return Ok(());
+        }
+
+        fs::create_dir_all(self.thread_index_dir())?;
+        let mut failures = Vec::new();
+        for entry in fs::read_dir(&self.sessions_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if id.starts_with('.') {
+                continue;
+            }
+            let session_id = if path.is_dir() {
+                id.to_string()
+            } else if path.extension().is_some_and(|ext| ext == "json") {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or(id)
+                    .to_string()
+            } else {
+                continue;
+            };
+            match self.load(&session_id) {
+                Ok(session) => {
+                    if let Err(error) = self.record_thread_session_index(&session) {
+                        failures.push(format!(
+                            "{session_id}: failed to record thread index ({error})"
+                        ));
+                    }
+                }
+                Err(error) => {
+                    failures.push(format!("{session_id}: failed to load session ({error})"));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "thread session index rebuild is incomplete; refusing to mark it complete while {} session(s) cannot be indexed: {}",
+                    failures.len(),
+                    failures.join("; ")
+                ),
+            ));
+        }
+        fs::write(&marker, b"1\n")?;
+        Ok(())
+    }
+
+    fn thread_index_backfill_marker_path(&self) -> PathBuf {
+        self.thread_index_dir().join(".backfilled")
+    }
+
+    fn thread_index_dir(&self) -> PathBuf {
+        self.sessions_dir.join(".thread_index")
+    }
+
+    fn thread_index_path(&self, thread_id: &str) -> PathBuf {
+        // INVARIANT: callers only pass `is_safe_thread_index_id` values.
+        self.thread_index_dir().join(thread_id)
+    }
+
+    fn record_thread_session_index(&self, session: &SessionState) -> io::Result<()> {
+        let mut thread_ids = BTreeSet::new();
+        for key in THREAD_ID_METADATA_KEYS {
+            if let Some(value) = session
+                .metadata
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| is_safe_thread_index_id(value))
+            {
+                thread_ids.insert(value.to_string());
+            }
+        }
+        if thread_ids.is_empty() {
+            return Ok(());
+        }
+        fs::create_dir_all(self.thread_index_dir())?;
+        for thread_id in thread_ids {
+            let path = self.thread_index_path(&thread_id);
+            let existing = if path.exists() {
+                fs::read_to_string(&path)?
+            } else {
+                String::new()
+            };
+            if existing.lines().any(|line| line.trim() == session.id) {
+                continue;
+            }
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+            writeln!(file, "{}", session.id)?;
+        }
+        Ok(())
     }
 
     /// Load a session by ID.
@@ -357,6 +523,9 @@ impl SessionStore {
             let path = entry.path();
             if path.is_dir() {
                 if let Some(id) = path.file_name().and_then(|name| name.to_str()) {
+                    if id.starts_with('.') {
+                        continue;
+                    }
                     ids.insert(id.to_string());
                 }
             } else if path.extension().is_some_and(|ext| ext == "json")
@@ -672,6 +841,31 @@ fn uuid_session_id(session_id: &str) -> Option<String> {
         .map(|id| id.to_string())
 }
 
+fn is_safe_thread_index_id(thread_id: &str) -> bool {
+    // Only UUID thread ids are indexed on disk so metadata cannot escape the
+    // `.thread_index` directory via `..`, separators, or absolute paths.
+    uuid::Uuid::parse_str(thread_id).is_ok()
+        && !thread_id.contains('/')
+        && !thread_id.contains('\\')
+        && !thread_id.contains('\0')
+}
+
+fn is_safe_session_path_id(session_id: &str) -> bool {
+    // Session ids are used as directory/file names under sessions/. Reject
+    // path escape and absolute components.
+    if session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains('\0')
+    {
+        return false;
+    }
+    let path = Path::new(session_id);
+    !path.is_absolute() && path.components().count() == 1
+}
+
 /// Brief info about a saved session.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -684,6 +878,33 @@ pub struct SessionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_rejects_unsafe_session_ids() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::from_storage_path(tmp.path());
+        for unsafe_id in [
+            "../escape",
+            "/tmp/abs",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            ".",
+            "..",
+            "",
+        ] {
+            let mut session = SessionState::new("/repo");
+            session.id = unsafe_id.to_string();
+            let error = store
+                .save(&session)
+                .expect_err("unsafe id must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                !tmp.path().join("sessions").join(unsafe_id).exists(),
+                "unsafe id must not create a session path: {unsafe_id}"
+            );
+        }
+    }
 
     #[test]
     fn test_save_and_load() {

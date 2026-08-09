@@ -1,0 +1,255 @@
+# Compatibility evidence for upstream t4010-diff-pathspec.sh, migrated in the t4 wave.
+# One [[scenario]] per upstream test. The command and flags come from each
+# scenario's BODY — what its assertion actually runs — and every flag is checked
+# against the real CLI, not the documentation. A scenario that passes a flag Libra
+# does not accept is blocked, however well documented the rest of it is.
+
+[[scenario]]
+id = "t4010-diff-pathspec::setup"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:176"
+reason = "hash-object is partial and every flag this scenario passes is accepted by Libra, with hash-object recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "hash-object"
+libra_surface = "hash-object"
+
+[[scenario]]
+id = "t4010-diff-pathspec::limit-to-path-should-show-nothing"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "deferred"
+surface_evidence = "docs/commands/diff-index.md#comparison-with-git"
+reason = "diff-index --cached parses but is documented not yet supported (exit 128), so the scenario cannot run (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-index"
+libra_surface = "--cached"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::limit-to-path1-should-show-path1-file1"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "deferred"
+surface_evidence = "docs/commands/diff-index.md#comparison-with-git"
+reason = "diff-index --cached parses but is documented not yet supported (exit 128), so the scenario cannot run (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-index"
+libra_surface = "--cached"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::limit-to-path1-should-show-path1-file1-2"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "deferred"
+surface_evidence = "docs/commands/diff-index.md#comparison-with-git"
+reason = "diff-index --cached parses but is documented not yet supported (exit 128), so the scenario cannot run (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-index"
+libra_surface = "--cached"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::file1-should-show-path1-file1"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "deferred"
+surface_evidence = "docs/commands/diff-index.md#comparison-with-git"
+reason = "diff-index --cached parses but is documented not yet supported (exit 128), so the scenario cannot run (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-index"
+libra_surface = "--cached"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::limit-to-file0-should-show-file0"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "deferred"
+surface_evidence = "docs/commands/diff-index.md#comparison-with-git"
+reason = "diff-index --cached parses but is documented not yet supported (exit 128), so the scenario cannot run (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-index"
+libra_surface = "--cached"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::limit-to-file0-should-emit-nothing"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "deferred"
+surface_evidence = "docs/commands/diff-index.md#comparison-with-git"
+reason = "diff-index --cached parses but is documented not yet supported (exit 128), so the scenario cannot run (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-index"
+libra_surface = "--cached"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-tree-pathspec"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff-tree.md#comparison-with-git"
+reason = "Upstream needs diff-tree -r, --name-only, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-tree"
+libra_surface = "-r"
+blocked_by = ["expose the diff-tree porcelain flag surface (-r, --stdin, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-tree-with-wildcard-shows-dir-also-matches"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-tree --name-only, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-tree"
+libra_surface = "--name-only"
+blocked_by = ["expose the diff-tree porcelain flag surface (-r, --stdin, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-tree-r-with-wildcard"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff-tree.md#comparison-with-git"
+reason = "Upstream needs diff-tree -r, --name-only, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-tree"
+libra_surface = "-r"
+blocked_by = ["expose the diff-tree porcelain flag surface (-r, --stdin, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-tree-with-wildcard-shows-dir-also-matches-2"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-tree --name-only, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-tree"
+libra_surface = "--name-only"
+blocked_by = ["expose the diff-tree porcelain flag surface (-r, --stdin, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-tree-r-with-wildcard-from-beginning"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff-tree.md#comparison-with-git"
+reason = "Upstream needs diff-tree -r, --name-only, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-tree"
+libra_surface = "-r"
+blocked_by = ["expose the diff-tree porcelain flag surface (-r, --stdin, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-tree-r-with-wildcard-2"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff-tree.md#comparison-with-git"
+reason = "Upstream needs diff-tree -r, --name-only, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff-tree"
+libra_surface = "-r"
+blocked_by = ["expose the diff-tree porcelain flag surface (-r, --stdin, raw output)"]
+
+[[scenario]]
+id = "t4010-diff-pathspec::setup-submodules"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:147"
+reason = "commit is partial and every flag this scenario passes is accepted by Libra, with -m recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "commit"
+libra_surface = "-m"
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-tree-ignores-trailing-slash-on-submodule-path"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --name-only recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff"
+libra_surface = "--name-only"
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-multiple-wildcard-pathspecs"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --name-only recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff"
+libra_surface = "--name-only"
+
+[[scenario]]
+id = "t4010-diff-pathspec::diff-cache-ignores-trailing-slash-on-submodule-path"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --name-only recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4010-diff-pathspec.sh"
+libra_command = "diff"
+libra_surface = "--name-only"

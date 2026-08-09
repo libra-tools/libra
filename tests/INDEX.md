@@ -109,10 +109,26 @@
 
 ## Wave 2 — Code UI & local automation
 
+### plan-20260715 W0-02 — TUI behavior baselines
+
+Machine-readable inventory for Checkpoint A. Later Web harness work must **retarget** these rows, not delete the behaviors.
+
+| TUI-owned behavior | baseline test name | expected output / assertion |
+|---|---|---|
+| IntentSpec review | `code_ui_scenarios::plan_workflow_baseline_pins_intent_and_post_plan_choices` | choices = `Confirm Intent` / `Modify Intent` / `Cancel` |
+| Plan review (post-plan) | `code_ui_scenarios::plan_workflow_baseline_pins_intent_and_post_plan_choices` | choices = `Execute Plan` / `Modify Plan` / `Cancel` |
+| Network policy | `code_ui_scenarios::plan_review_baseline_pins_network_policy_choices` | choices = `Network: Deny` / `Network: Allow` / `Back` |
+| Repair loop threshold | `code_ui_remote_state_matrix::repair_loop_baseline_threshold_keeps_plan_continue_affordance` (also `code_ui_scenarios::repair_loop_baseline_threshold_keeps_plan_continue_affordance`) | message contains automatic-threshold stop text + `/plan continue` |
+| Resume | `code_resume_test::resume_with_chat_session_id_restores_prior_transcript` | prior transcript restored after `--resume <session>` |
+| Goal/task control | `code_ui_scenarios::goal_task_control_baseline_session_event_kind_tag_is_goal` (+ `ai_goal_state_test::session_event_goal_variant_round_trips_through_serde`) | SessionEvent kind tag `goal` round-trips |
+| Approval | `code_ui_remote_approval_matrix::approval_accept_path_runs_shell_and_completes_assistant` | shell tool completes after `approved: true` |
+| User-input | `code_ui_scenarios::user_input_baseline_interaction_kind_is_request_user_input` | wire kind = `request_user_input` |
+| Generation / CLI entry | `code_ui_remote_generation_matrix::generation_sse_observes_tool_execution_and_final_completion`; `code_cli_dispatch_test::defaults_are_observe_control_and_deny_network` | generation settles idle; CLI defaults observe + deny-network |
+
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `harness_self_test` | 2 | Smoke-checks the PTY harness itself | `tests/harness/` |
-| `code_ui_scenarios` | 2 | End-to-end scenarios on the Code UI through the harness | `src/command/code.rs`, `src/internal/tui/` |
+| `code_ui_scenarios` | 2 | End-to-end scenarios on the Code UI through the harness; includes plan-20260715 W0-02 `plan_workflow` / `plan_review` / `repair` / `user_input` / `goal_task` baseline filters | `src/command/code.rs`, `src/internal/tui/` |
 | `code_ui_remote_lease_matrix` | 2 | Browser/automation lease lifecycle matrix | `src/command/code.rs` controller, `src/command/code_control.rs` |
 | `code_ui_remote_sse_matrix` | 2 | SSE event stream matrix from web view | `src/internal/tui/`, `src/command/code.rs` (axum) |
 | `code_ui_remote_state_matrix` | 2 | Cross-surface state replication matrix, including mid-turn detach/cancel settling | `src/internal/tui/`, `src/internal/ai/web/code_ui.rs`, `src/command/code_control.rs` |

@@ -461,6 +461,94 @@ fn command_idempotency_and_indeterminate_recovery() {
     )));
 }
 
+#[test]
+fn terminal_before_intent_fails_closed_on_admit() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let jsonl = SessionJsonlStore::new(tmp.path().join("session"));
+    let identity = CodeCommandIdentity::new("repo-a", "session-a", "alice", "cmd-orphan");
+    let intent = CodeCommandIntent::new(
+        identity.clone(),
+        "apply_patch",
+        "sha256:request-orphan",
+        true,
+    );
+
+    jsonl
+        .append_code_workflow(CodeWorkflowEventKind::CommandTerminalSuccess {
+            command: identity.clone(),
+            summary: "orphaned success".to_string(),
+        })
+        .unwrap();
+
+    let orphan = jsonl.recover_code_command(&identity).unwrap_err();
+    assert!(matches!(
+        orphan,
+        CodeCommandStoreError::TerminalWithoutIntent { .. }
+    ));
+
+    // A later intent must not clear the orphan terminal into a re-dispatchable
+    // Pending state.
+    jsonl
+        .append_code_workflow(CodeWorkflowEventKind::CommandIntentPersisted {
+            command: intent.clone(),
+        })
+        .unwrap();
+    let conflict = jsonl.admit_code_command(intent).unwrap_err();
+    assert!(matches!(
+        conflict,
+        CodeCommandStoreError::TerminalConflict { .. }
+    ));
+}
+
+#[test]
+fn command_status_cache_refreshes_under_append_lock() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let session_root = tmp.path().join("session");
+    let writer = SessionJsonlStore::new(session_root.clone());
+    let stale_reader = SessionJsonlStore::new(session_root);
+    let identity = CodeCommandIdentity::new("repo-a", "session-a", "alice", "cmd-cache");
+    let intent = CodeCommandIntent::new(
+        identity.clone(),
+        "apply_patch",
+        "sha256:request-cache",
+        true,
+    );
+
+    assert!(matches!(
+        writer.admit_code_command(intent.clone()).unwrap(),
+        CodeCommandAdmission::Execute { .. }
+    ));
+    // Populate the second store's cache while the command is still Pending.
+    assert!(matches!(
+        stale_reader.admit_code_command(intent.clone()).unwrap(),
+        CodeCommandAdmission::Existing {
+            status: CodeCommandStatus::Pending
+        }
+    ));
+    assert!(matches!(
+        writer
+            .complete_code_command_success(&identity, "mutation applied")
+            .unwrap(),
+        CodeCommandStatus::Succeeded { .. }
+    ));
+
+    // After the durable terminal append, the stale store must refresh under the
+    // lock and refuse a conflicting failure terminal instead of appending it.
+    let conflict = stale_reader
+        .complete_code_command_failure(&identity, "stale failure")
+        .unwrap_err();
+    assert!(matches!(
+        conflict,
+        CodeCommandStoreError::TerminalConflict { .. }
+    ));
+    assert!(matches!(
+        stale_reader.admit_code_command(intent).unwrap(),
+        CodeCommandAdmission::Existing {
+            status: CodeCommandStatus::Succeeded { .. }
+        }
+    ));
+}
+
 fn assert_event_trait(event: &dyn Event) {
     assert_eq!(event.event_kind(), "session_snapshot");
     assert_ne!(event.event_id(), uuid::Uuid::nil());

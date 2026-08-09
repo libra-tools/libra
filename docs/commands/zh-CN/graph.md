@@ -22,6 +22,16 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 Details 面板会显示所选图节点的投影链接，以及从历史中加载的持久化 AI 对象内容，包括对应 `intent`、`plan`、`task`、`run` 或 `patchset` 对象的有界美化 JSON 视图。
 
+使用全局 `--json`（或 `--machine`）时，`libra graph` 会跳过交互式 TUI，改为输出结构化 JSON。`data` 除线程元数据（`thread_id`、`title`、`freshness`、`thread_version`、`scheduler_version`、`updated_at`，以及 `selected_plan_id` / `active_task_id` / `active_run_id`）外，还包含从最新匹配会话 workflow 日志 fold 出的可选 Code UI 覆盖字段：
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `code_ui_status` | string 或 null | 公开 wire 的 `snake_case` Code UI 状态（`idle`、`thinking`、`executing_tool`、`awaiting_interaction`、`completed`、`error`、`indeterminate_side_effect`）。无线程会话时为 null。 |
+| `code_ui_transcript_len` | number | fold 后的 transcript 条目数（无覆盖时为 0）。 |
+| `code_ui_pending_interactions` | number | fold 后仍为 pending 的交互数（无覆盖时为 0）。 |
+
+缺少会话是非致命的（覆盖字段保持 null/0）；会话 workflow 日志不可读或畸形则为硬错误，避免隐藏需要 reconciliation 的 indeterminate 栅栏。首次覆盖查找时可能在 `.libra/.../sessions/.thread_index/` 下执行一次性 thread→session 索引重建（`libra code` 启动时也会执行）；任一既有会话无法加载或索引时迁移失败封闭。无活 owner 的 Pending 变更命令在运行时重启写栅栏之前也会显示为 `indeterminate_side_effect`。
+
 `libra code` 退出后，会打印如下形式的后续命令：
 
 ```bash

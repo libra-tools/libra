@@ -37,7 +37,11 @@ use crate::{
     internal::{
         ai::{
             projection::ThreadProjection,
-            runtime::hardening::{AuditEvent, AuditSink, SecretRedactor, TracingAuditSink},
+            runtime::{
+                RuntimeWorkerError,
+                hardening::{AuditEvent, AuditSink, SecretRedactor, TracingAuditSink},
+                runtime_worker_adapter_message,
+            },
         },
         db::establish_connection,
     },
@@ -1174,6 +1178,24 @@ impl From<CodeUiApiError> for WebApiError {
 
 impl From<anyhow::Error> for WebApiError {
     fn from(value: anyhow::Error) -> Self {
+        // Prefer typed sources over message-text matching so an ordinary
+        // failure that happens to mention reconciliation cannot become a 409.
+        if let Some(api_error) = value.downcast_ref::<CodeUiApiError>() {
+            return api_error.clone().into();
+        }
+        if let Some(RuntimeWorkerError::ReconciliationRequired { session_id }) =
+            value.downcast_ref::<RuntimeWorkerError>()
+        {
+            return Self {
+                status: StatusCode::CONFLICT,
+                code: "RECONCILIATION_REQUIRED".to_string(),
+                message: runtime_worker_adapter_message(
+                    RuntimeWorkerError::ReconciliationRequired {
+                        session_id: session_id.clone(),
+                    },
+                ),
+            };
+        }
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "INTERNAL_ERROR".to_string(),

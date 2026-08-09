@@ -70,6 +70,8 @@ mod terminal;
 mod theme;
 // Animated welcome screen.
 mod welcome_shader;
+// W0-02 frozen IntentSpec / Plan / network / repair baseline contracts.
+pub mod workflow_baseline;
 
 // Curated public surface: only types that callers outside the module need.
 pub use agent_run_pane::{
@@ -83,3 +85,7 @@ pub use history_cell::{AssistantHistoryCell, DiffHistoryCell, HistoryCell, PlanU
 pub use slash_command::{BuiltinCommand, parse_builtin};
 pub use status_indicator::StatusIndicator;
 pub use terminal::{Tui, TuiEvent, init as tui_init, restore as tui_restore};
+pub use workflow_baseline::{
+    INTENT_REVIEW_CHOICES, NETWORK_POLICY_CHOICES, POST_PLAN_CHOICES,
+    plan_repair_threshold_baseline_message,
+};

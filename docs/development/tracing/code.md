@@ -48,12 +48,15 @@ flowchart TD
 | Mode 与参数 | TUI、web-only、stdio 已共用 `CodeArgs` 和 `validate_mode_args`；C1 审计出的 help/banner 与 web-only provider 校验漂移已由 C2 放宽 web-only provider/model/api-base/temperature + provider-specific flags 消除（`--stdio` 保持锁定）。 | C2 已落地放宽并有 CLI regression（`code_cli_dispatch_test` + `src/command/code.rs::tests` web-only accept/reject 矩阵）；后续任何 mode 变更仍必须带 CLI regression。 |
 | Provider / env | provider-specific flags 和 `--api-base` 规则已有校验；live/provider tests 依赖 `.env.test` 时不得泄露 key。 | C3 固定 provider factory、env-file 优先级、Vault/env lookup、missing-key 错误和 feature-gated live tests。 |
 | Web-only / Code UI | Code UI API、SSE、browser control、control token、diagnostics redaction 是用户可见接口。 | C4 固定 `/api/code/*` observe-only contract；control token 0600；diagnostics/SSE/control info 不泄露 secrets。 |
-| Session / graph | `--resume` 只应在 TUI path 允许；projection、graph handoff、audit sink 不能与 user transcript 混用。 | C5 固定 SessionStore JSONL unknown-event-safe、truncated-tail recovery、graph handoff 和 resume audit。 |
+| Session / graph | non-Codex `--web-only --resume` 已走 headless JSONL projection fold；TUI resume 仍走 `SessionState`；`--stdio`/managed Codex 继续拒绝 resume。projection、graph handoff、audit sink 不能与 user transcript 混用。 | C5/W1-06 固定 SessionStore JSONL unknown-event-safe、truncated-tail recovery、统一 event fold；TUI/managed-Codex/graph 尚未共用同一 fold。 |
 | MCP / code-control | `libra code --stdio` 是 MCP stdio server；`libra code-control --stdio` 是 automation/control client。 | C6 禁止把 MCP stdio 当 turn control plane；双入口 tool set、shutdown、token/lease gate 都要有测试。 |
 | Sandbox / approval / fix bridge | workspace mutation 只能走内部 AgentRuntime serialized queue、approval、sandbox 和 tool ACL。 | C7 是 `review --fix` / `investigate fix` 的唯一解锁点；证据不足时 Agent 阶段必须返回 `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE` 对应错误码。 |
 | Docs / compat | `libra code` 是 Libra-only extension；用户文档、compat matrix、tests/INDEX 必须与源码同步。 | C8 收敛 `docs/commands/code.md`、zh-CN、`COMPATIBILITY.md`、`tests/INDEX.md`、release notes。 |
 
-## W0-01 runtime 命名空间与写入面审计（2026-08-04）
+## W0-01 runtime 命名空间与写入面审计（2026-08-09 重刷）
+
+> 基线：已提交 `main` @ `25c8f6aee0ebe967d51cb0cba1b89031b0548b18`（v0.19.104）。
+> 本轮只刷新锚点与冲突/漂移表；未把工作区未提交改动计为完成证据。
 
 **决策：** UI-neutral 的 `AgentRuntimeHandle`、`AgentRuntimeWorker`、turn queue、
 interaction state、event cursor 与 runtime snapshot 的唯一归属是
@@ -65,20 +68,19 @@ interaction state、event cursor 与 runtime snapshot 的唯一归属是
 
 此决策避免在既有 `runtime` 与 `agent/runtime` 之外增设第三个持久化或 mutation
 queue。新的 worker 在执行 mutating tool 前必须复用现有 `ToolRegistry` 的
-`ToolBoundaryRuntime`（`src/internal/ai/tools/registry.rs:82-83,143-150`）及
+`ToolBoundaryRuntime`（`src/internal/ai/tools/registry.rs:82,143-149`）及
 `ToolRuntimeContext` 的 sandbox/approval 通道；不得复刻 policy 表、approval store
 或 shell 执行路径。
 
-| 面 / 事实源 | 已核对锚点 | W1+ 的收敛动作 |
+| 面 / 事实源 | 已核对锚点（2026-08-09） | W1+ 的收敛动作 |
 |---|---|---|
-| Runtime contracts 与 safety boundary | `src/internal/ai/runtime/mod.rs:6-38` 导出 contracts、event、hardening 与 phase0..4；`src/internal/ai/runtime/hardening.rs:289-380,532-568` 定义 tool policy/audit runtime。 | 在该 module 增加 worker/state-machine；所有 mutating turn 以既有 hardening 为唯一判定来源。 |
-| Provider/tool-loop 执行 | `src/internal/ai/agent/runtime/mod.rs:28-37`；`src/internal/ai/agent/runtime/tool_loop.rs:310`。 | worker 持有或接收一个 executor adapter，执行层仍调用该 loop，不把 queue 反向塞进 provider 模块。 |
-| Phase 0 Intent | `src/internal/ai/runtime/phase0.rs:51-79` 的 `write_intent`；当前 TUI 已在 `src/internal/tui/app.rs:104-107,11475` 调用。 | Intent interaction 由 worker 统一推进，并继续调用 `write_intent`；不复制 `persist_intentspec`。 |
-| Phase 1 Plan | `src/internal/ai/runtime/phase1.rs:385-416` 的 `write_plan_set` 委派现有 orchestrator persistence。 | Plan review/approval 通过 worker 后调用该入口；不得写新的 plan 表或直接复制 orchestrator 的配对写入。 |
-| Phase 2 Attempt | `src/internal/ai/runtime/phase2.rs:205-235` 的 start/finish session bridges。 | worker/executor 的执行 lifecycle 只经这些 bridge 记录 attempt，保持 current Run/TaskEvent/PlanStepEvent 关联。 |
-| Phase 3 validation | `src/internal/ai/runtime/phase3.rs:218-255` 的 `ValidationReportStore` 事务写入。 | validation 结果保留该 store 和 session mirror，不另存 worker 专用报告。 |
-| Phase 4 decision | `src/internal/ai/runtime/phase4.rs:565-635` 的 `FinalDecisionStore` 与 JSONL mirror。 | terminal decision 继续由该 store 写入；worker 只发布 normalized event/snapshot。 |
-| 当前 adapter 漂移 | headless 仍在 `src/internal/ai/web/headless.rs:343-390` 直接 spawn 并调用 tool loop；TUI 在 `src/command/code.rs:3600-3639` 自建 sandbox/approval context。 | W1/W2 改为 adapter 组装 executor/services 后交给 worker；迁移前的直接路径必须显式 guard/登记，不得新增第二条。 |
+| Runtime contracts 与 safety boundary | `src/internal/ai/runtime/mod.rs` 导出 contracts、event、hardening、phase0..4、`worker`/`controller`/`durability`；`hardening.rs:540,548` 的 `ToolBoundaryRuntime`。 | worker/state-machine 已落在该 module；所有 mutating turn 以既有 hardening 为唯一判定来源。 |
+| Provider/tool-loop 执行 | `src/internal/ai/agent/runtime/mod.rs`；`tool_loop.rs` 的 `run_tool_loop_with_history_and_observer`；headless executor 在 `headless.rs:815` 调用该 loop。 | worker 持有/接收 executor adapter，执行层仍调用该 loop，不把 queue 反向塞进 provider 模块。 |
+| Phase 0 Intent | `phase0.rs:67` 的 `write_intent`；TUI 在 `app.rs:106` 导入、`app.rs:11486` 调用。 | Intent interaction 由 worker 统一推进，并继续调用 `write_intent`；不复制 `persist_intentspec`。 |
+| Phase 1 Plan | `phase1.rs:401` 的 `write_plan_set` 委派 orchestrator persistence。 | Plan review/approval 通过 worker 后调用该入口；不得写新的 plan 表。 |
+| Phase 2 Attempt | `phase2.rs:160,191` 的 start/finish；orchestrator `persistence.rs:727,859` 已桥接。 | worker/executor lifecycle 只经这些 bridge 记录 attempt。 |
+| Phase 3 / Phase 4 | `phase3`/`phase4` ValidationReportStore / FinalDecisionStore 仍为 formal write 面。 | validation/terminal decision 继续由既有 store 写入；worker 只发布 normalized event/snapshot。 |
+| 当前 adapter 漂移 | non-Codex headless browser submit 已经 `AgentRuntimeWorker::spawn`（`headless.rs:718`）；TUI/managed Codex/workflow interactions 仍未完全迁入。共享面拆分：`CodeAgentServicesBuilder`（`code.rs:1616,2338`）统一 **tool registry + hardening boundary**；provider/env/model 仍经 `build_any_completion_model_for_args`（`:1209`）；sandbox/approval 仍经 `tui_approval_config_from_args`（`:3832`）与 `default_tui_runtime_context`（`:3730`，返回 `ToolRuntimeContext`）。不得把后两者误并入 builder 所有权。 | W1-04/W1-06/W1-08 与 W2 继续把 cancel/projection/shutdown/workflow 收敛到 runtime-only；禁止新增平行状态机或第三条 bootstrap。 |
 
 三态所有权图：
 
@@ -100,22 +102,22 @@ bridge 仍未迁入，不能把这条 direct-chat 链路当作 Web-only completi
 
 ### C1–C10 契约冲突表（W0-01）
 
-本表以开工时已提交的 `main`（`c747e97`）的 A0 产物为前提；当前工作区的未提交
-worker、迁移或其它并行改动绝不作为 A0 已完成的证据。2026-08-04 的源码重验确认
-下列冲突仍存在，且每一项都有唯一后续 owner；这里登记冲突，不提前宣布其已解决。
+本表以开工时已提交的 `main`（`25c8f6a` / v0.19.104）的 A0 产物为前提；当前工作区的
+未提交改动绝不作为 A0 已完成的证据。2026-08-09 的源码重验确认下列冲突仍存在，且
+每一项都有唯一后续 owner；这里登记冲突，不提前宣布其已解决。
 
 | C | 当前源码/文档契约 | 与目标态的冲突或风险 | breaking / owner |
 |---|---|---|---|
-| C1 | `src/command/code.rs:697-706,4247,4458` 保留 TUI、web-only、MCP stdio 三路分发及各自 flag matrix。 | 直接改默认分支会绕开既有行为矩阵。 | W4-01；默认切换是 public 行为变更。 |
-| C2 | web-only 已可选 provider，且 non-Codex headless 已接受 `--resume`；仍拒绝 `--env-file`、approval/network 等 TUI flags。 | Web default 仍会删除既有可配置能力。 | W3-03/W3-13 → W4-01；若删除 flag 必须 breaking migration。 |
-| C3 | W1-02 的 `runtime::CodeAgentServicesBuilder` 已统一 TUI/headless registry、hardening 与 sandbox/approval context；两路径均经 `build_any_completion_model_for_args` 的 env-file → process → Vault lookup。 | Web-only 仍拒绝公开 `--env-file`，但不得再靠独立 default bootstrap 形成隐式分叉；usage、skills/hooks、source pool 的完整 launch-service 收敛仍在 W1-02 范围内。 | W1-02 继续；W3-13/W4-01 决定公开 flag parity。 |
-| C4 | `src/internal/ai/web/code_ui.rs:681-690` 发送完整 snapshot；browser control/SSE 是公开 wire。 | 全量 snapshot 与有界 cursor/replay 目标不相容。 | W3-01/W3-06/W3-08；v2 须保留 v1 兼容窗口。 |
-| C5 | non-Codex headless 已经由公开 `--web-only --resume` 进入 JSONL fold；stdio 与 managed Codex 仍不共享该协议。 | TUI/managed-Codex/graph 的 resume/recovery 尚未收敛为一个 runtime owner。 | W3-03、W4-01/W4-05。 |
-| C6 | `code --stdio` 是 MCP transport，`code-control --stdio` 仍是独立 automation/control 入口。 | `--control stdio` 尚不能由当前 `ControlMode` 表达，二者不可混作 turn control plane。 | W4-02/W4-09/W4-10；breaking command migration。 |
-| C7 | `runtime::hardening` 是 mutating policy；A0-05 fix 仍 fail-closed `LBR-AGENT-010`。 | 不能把不存在的 bridge 当可复用实现，也不能另建 mutation/approval 表。 | W1-01/W2-04/W6-02；bridge 仍 deferred。 |
+| C1 | `src/command/code.rs:694-707` 三路分发；`ControlMode`/`BrowserControlMode`/`WebOnlyRuntimeKind` 在 `:233/:248/:790`。 | 直接改默认分支会绕开既有行为矩阵。 | W4-01；默认切换是 public 行为变更。 |
+| C2 | web-only 已可选 provider，且 non-Codex headless 已接受 `--resume`；仍拒绝 `--env-file`、approval/network 等 TUI flags（`reject_non_tui_flags` @ `:4571`）。 | Web default 仍会删除既有可配置能力。 | W3-03/W3-13 → W4-01；若删除 flag 必须 breaking migration。 |
+| C3 | TUI/headless 共享三层 bootstrap：`CodeAgentServicesBuilder`（`:1616,2338`）→ registry/hardening；`build_any_completion_model_for_args`（`:1209`）→ env/model；`tui_approval_config_from_args` + `default_tui_runtime_context`（`:3832/:3730`）→ approval/sandbox。 | Web-only 仍拒绝公开 `--env-file`，但不得再靠独立 default bootstrap 形成隐式分叉。 | W3-13/W4-01 决定公开 flag parity。 |
+| C4 | `code_ui.rs:674-685` `broadcast_snapshot` 仍发送完整 `CodeUiSessionSnapshot`；browser control/SSE 是公开 wire。 | 全量 snapshot 与有界 cursor/replay 目标不相容。 | W3-01/W3-06/W3-08；v2 须保留 v1 兼容窗口。 |
+| C5 | non-Codex headless 已经由公开 `--web-only --resume` 进入 JSONL fold；stdio 与 managed Codex 仍不共享该协议。 | TUI/managed-Codex/graph 的 resume/recovery 尚未收敛为一个 runtime owner。 | W1-06 → W3-03、W4-01/W4-05。 |
+| C6 | `code --stdio`（`execute_stdio` @ `:4309`）是 MCP transport，`code-control --stdio` 仍是独立 automation/control 入口；`ControlMode` 仅 `Observe\|Write`。 | `--control stdio` 尚不能由当前 `ControlMode` 表达，二者不可混作 turn control plane。 | W4-02/W4-09/W4-10；breaking command migration。 |
+| C7 | `runtime::hardening` 是 mutating policy；A0-05 fix 仍 fail-closed `LBR-AGENT-010`（`review.rs:23,74` / `investigate.rs:22,77`）。 | 不能把不存在的 bridge 当可复用实现，也不能另建 mutation/approval 表。 | W1-01/W2-04/W6-02；bridge 仍 deferred。 |
 | C8 | command docs、compat matrix、tests index 尚描述 TUI/current commands。 | 源码迁移会留下错误的公开行为承诺。 | W4-05/W6-01/W6-02；用户可见文档为发布门禁。 |
 | C9 | MCP authorizer 仍是显式 deferred，生产没有 handler 时不可视为完整 authz。 | Web write security 不能依赖 MCP authorization 的不存在保证。 | W3-05/W4-03；保持 loopback/token/lease/tool ACL 的独立边界。 |
-| C10 | `src/internal/ai/web/headless.rs` 的 direct-turn 已通过 `AgentRuntimeWorker` 执行，但仍跳过 Phase 0/1 IntentSpec/Plan 审阅。 | 这不是 Web-only completion，也不能安全替换 TUI workflow。 | W2-02/W2-03；完成后才更新 C10 文案。 |
+| C10 | headless direct-turn 已通过 `AgentRuntimeWorker` 执行（`headless.rs:718`），但仍跳过 Phase 0/1 IntentSpec/Plan 审阅（TUI 仍拥有 `pending_intent_review`/`pending_plan_revision` @ `app.rs:524,526`）。 | 这不是 Web-only completion，也不能安全替换 TUI workflow。 | W2-02/W2-03；完成后才更新 C10 文案。 |
 
 ### A0 接口漂移登记表（W0-01）
 
@@ -123,18 +125,18 @@ worker、迁移或其它并行改动绝不作为 A0 已完成的证据。2026-08
 锚点或语义失效，只能补最小 adapter 或更新消费方，禁止在 Code 路径复制 queue、trust、
 retention、artifact store 或 fix bridge。
 
-| A0 产物 | 已核对接口（2026-08-04） | Code 消费决定 / 漂移处置 |
+| A0 产物 | 已核对接口（2026-08-09） | Code 消费决定 / 漂移处置 |
 |---|---|---|
-| A0-02 subagent checkpoint | `src/command/agent/hooks.rs:61-78` 的 `SubagentStart/SubagentEnd`；`docs/development/tracing/agent.md:1057` 记录 `CheckpointScope::Subagent`。 | 非 Code turn queue；Code 不复制 checkpoint writer。 |
-| A0-03 stable error emit | `src/command/agent/hooks.rs:134-141` 映射 `HookEnvelopeInvalid`；`checkpoint.rs:337,351` 映射 store-inconsistent。 | 保留 agent error model；Code runtime 只返回其自己的 typed worker error。 |
+| A0-02 subagent checkpoint | `src/command/agent/hooks.rs:61-78` 的 `SubagentStart/SubagentEnd`；`src/internal/ai/history.rs:4764-4780` 的 `CheckpointScope::Subagent`；agent.md `:1057` 记录消费关系。 | 非 Code turn queue；Code 不复制 checkpoint writer。 |
+| A0-03 stable error emit | `src/command/agent/hooks.rs:133-141` 映射 `HookEnvelopeInvalid` → `LBR-AGENT-008`；`src/command/agent/checkpoint.rs:337,351` 映射 `LBR-AGENT-009`/`AgentCheckpointStoreInconsistent`。 | 保留 agent error model；Code runtime 只返回其自己的 typed worker error。 |
 | A0-04 run admission | `src/internal/ai/run_admission.rs:82,132,147` 的 `decide`、`RunSlot`、`QueueTicket`。 | 仅 review/investigate run 粒度；W1 worker 另行拥有 session turn 串行化。 |
 | A0-05 fix bridge | `src/command/agent/review.rs:23,74` 与 `investigate.rs:22,77` 保持 `LBR-AGENT-010` fail-closed。 | 不等待、不伪造 bridge；W1 绑定 hardening/tool-loop，W6-02 再登记 bridge restart。 |
-| A0-06 findings artifacts | `src/internal/ai/{review,investigate}/store.rs:608-618,691-701` 写 `findings_oid`；doctor/attach 为 agent 路径。 | Code session 不拥有或 GC agent artifacts。 |
+| A0-06 findings artifacts | `src/internal/ai/review/store.rs:608-618` 与 `src/internal/ai/investigate/store.rs:691-701` 均写 `findings_oid`；doctor/attach 为 agent 路径。 | Code session 不拥有或 GC agent artifacts。 |
 | A0-07 skill projection | `observed_agents/skill_projection.rs:85` 的 `SkillEventProjection`；`extract.rs:40` 的 `skill_registry_for`。 | W2-06 只消费 registry/projection，不重建 discovery store。 |
-| A0-08 trust | `observed_agents/trust.rs:195,295,311` 的 trusted dirs、forbidden env、allowlist。 | W3-05 复用 trust/redaction policy，禁止重写 secret allowlist。 |
+| A0-08 trust | `observed_agents/trust.rs:195` `read_trusted_dirs`；`:297-305` `env_name_is_forbidden`；`:311` `env_allowlist_extra`。 | W3-05 复用 trust/redaction policy，禁止重写 secret allowlist。 |
 | A0-09 retention | `src/command/agent/clean.rs:766` 的 `gc_expired_findings_runs`。 | Code JSONL lifecycle 归 W1-03；不混入 agent findings GC。 |
-| A0-10 cloud tombstone | `src/command/cloud.rs:4186-4193,4349-4357` 发布/恢复 agent tombstone。 | 非 Code worker ownership；R2 physical delete 的 deferred 事实由 agent docs 保持。 |
-| A0-11 deferred parity | `docs/development/tracing/agent.md:2115,2127-2131` 固定 remaining non-goals。 | 不以 Web migration 偷渡 external RPC/provider parity。 |
+| A0-10 cloud tombstone | `src/command/cloud.rs:4186-4193` 发布 import tombstone；restore 路径约 `:4699` 起。R2 物理删除仍 deferred（agent.md A0-11/A0-10 事实）。 | 非 Code worker ownership；不得在 Code 路径复制 tombstone store。 |
+| A0-11 deferred parity | `docs/development/tracing/agent.md:2115,2122-2136` 固定 remaining non-goals。 | 不以 Web migration 偷渡 external RPC/provider parity。 |
 
 ### W1-03 Code 会话事件边界
 
@@ -221,19 +223,23 @@ projection 已事件化。
 
 ### 非 Code TUI 消费者登记
 
-W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际命中；它们不是 W1 的
-删除范围。`agent/graph.rs` 是本次重验发现的额外编译期 consumer，不能因旧清单漏列而
-被静默遗忘。
+W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际命中（2026-08-09 `rg`
+重验）；它们不是 W1 的删除范围。`agent/graph.rs` 仍是额外编译期 consumer，不能因旧
+清单漏列而被静默遗忘。
 
 | 路径 | 当前依赖 | 后续 owner |
 |---|---|---|
-| `src/command/graph.rs:12-13,34,1133` | 直接 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`。 | W4-04/W5-08 → W5-10。 |
-| `src/command/agent/graph.rs:16-17,31,725` | 同样直接创建 TUI。 | W5-03/W5-10 必须单独迁移或明确保留兼容策略。 |
-| `src/internal/ai/web/code_ui.rs:1442` | `TuiControlError` downcast 是 Web API 的编译期耦合。 | W5-02 先迁为 UI-neutral error。 |
-| `src/command/code.rs:159,3000` | Code TUI startup/adapter。 | W5-01，不能在 W1 删除。 |
+| `src/command/graph.rs:12-13,34,1129` | 直接 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`。 | W4-04/W5-08 → W5-10。 |
+| `src/command/agent/graph.rs:16-17,31,721` | 同样直接创建 TUI。 | W5-03/W5-10 必须单独迁移或明确保留兼容策略。 |
+| `src/internal/ai/web/code_ui.rs:1266` | `TuiControlError` downcast 是 Web API 的编译期耦合。 | W5-02 先迁为 UI-neutral error。 |
+| `src/command/code.rs` `execute_tui` @ `:1561` | Code TUI startup/adapter。 | W5-01/W5-06，不能在 W1 删除。 |
 | `src/internal/ai/agent/format.rs:6` | 仅 rustdoc intra-doc link，非编译依赖。 | W5-03 清理链接即可。 |
 
 ## Web-only completion gate（W0-03）
+
+**当前 Web-only direct-turn 不是完成态。** headless/`--web-only` 仍可跳过
+IntentSpec/Plan human gates（见 C10）；不得据此删除默认 TUI 或宣称 Web-only
+parity closeout。
 
 `src/internal/tui` 仍在 production 编译图中时，下列清单是迁移契约，不代表已经
 达到 Web-only。任何删除 `internal::tui` 的变更必须在同一发布组把所有行更新为

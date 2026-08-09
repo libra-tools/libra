@@ -1,0 +1,5 @@
+show --no-color dfb079967b9cbc99e533c21e65f674bb3f5e8b07:tests/t4000-diff-format.sh
+show --no-color dfb079967b9cbc99e533c21e65f674bb3f5e8b07:tests/t4017-diff-retval.sh
+ls-tree --name-only dfb079967b9cbc99e533c21e65f674bb3f5e8b07 tests
+rev-parse dfb079967b9cbc99e533c21e65f674bb3f5e8b07
+diff-tree --no-renames --raw dfb079967b9cbc99e533c21e65f674bb3f5e8b07 dfb079967b9cbc99e533c21e65f674bb3f5e8b07

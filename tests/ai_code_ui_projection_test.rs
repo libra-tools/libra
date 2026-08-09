@@ -21,9 +21,13 @@ use libra::internal::ai::{
         code_ui::{
             CodeUiCapabilities, CodeUiInteractionRequest, CodeUiInteractionStatus,
             CodeUiPlanSnapshot, CodeUiProviderInfo, CodeUiSessionSnapshot, CodeUiSessionStatus,
-            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, snapshot_from_thread_bundle,
+            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, graph_code_ui_read_model_from_events,
+            snapshot_from_thread_bundle,
         },
-        code_ui_projection::fold_code_ui_snapshot,
+        code_ui_projection::{
+            fold_code_ui_snapshot, fold_graph_compatible_code_ui_snapshot,
+            rebuild_code_ui_read_model_from_events,
+        },
     },
 };
 use serde_json::{json, to_value};
@@ -205,12 +209,122 @@ fn code_ui_plan_snapshot_updated_at_tracks_scheduler_revision_not_wall_clock() {
 /// visibly indeterminate after the rebuild.
 #[test]
 fn snapshot_rebuilt_from_event_fold() {
-    let bootstrap = CodeUiSessionSnapshot {
+    let bootstrap = sample_event_fold_bootstrap();
+    let events = sample_event_fold_suffix();
+    let replay = CodeWorkflowReplay {
+        events: events.clone(),
+        gaps: Vec::new(),
+    };
+
+    let folded = rebuild_code_ui_read_model_from_events(bootstrap.clone(), &replay)
+        .expect("ordered fine-grained events must rebuild a snapshot");
+
+    assert_eq!(folded.last_sequence, Some(7));
+    assert_eq!(folded.snapshot.transcript.len(), 2);
+    assert_eq!(
+        folded.snapshot.transcript[1].content.as_deref(),
+        Some("I found the issue.")
+    );
+    assert!(folded.snapshot.transcript[1].streaming);
+    assert_eq!(
+        folded.snapshot.interactions[0].status,
+        CodeUiInteractionStatus::Resolved
+    );
+    assert_eq!(folded.snapshot.plans[0].status, "running");
+    assert_eq!(
+        folded.snapshot.status,
+        CodeUiSessionStatus::IndeterminateSideEffect
+    );
+
+    // Stepwise one-event-at-a-time folds must match the single bounded replay.
+    let mut incremental = bootstrap;
+    for event in &events {
+        incremental = fold_code_ui_snapshot(
+            incremental,
+            &CodeWorkflowReplay {
+                events: vec![event.clone()],
+                gaps: Vec::new(),
+            },
+        )
+        .expect("single-event fold must succeed")
+        .snapshot;
+    }
+    assert_eq!(incremental.status, folded.snapshot.status);
+    assert_eq!(
+        incremental.transcript.len(),
+        folded.snapshot.transcript.len()
+    );
+    assert_eq!(
+        incremental.transcript[1].content.as_deref(),
+        folded.snapshot.transcript[1].content.as_deref()
+    );
+    assert_eq!(
+        incremental.interactions[0].status,
+        folded.snapshot.interactions[0].status
+    );
+    assert_eq!(incremental.plans[0].status, folded.snapshot.plans[0].status);
+}
+
+/// W1-06 regression: graph/history Code-UI-equivalent read paths must call the
+/// same workflow-event fold as Code UI resume, not a separate projection.
+#[test]
+fn graph_read_model_uses_same_event_fold() {
+    let bootstrap = sample_event_fold_bootstrap();
+    let replay = CodeWorkflowReplay {
+        events: sample_event_fold_suffix(),
+        gaps: Vec::new(),
+    };
+
+    let code_ui = rebuild_code_ui_read_model_from_events(bootstrap.clone(), &replay)
+        .expect("Code UI fold must succeed");
+    let graph = graph_code_ui_read_model_from_events(bootstrap.clone(), &replay)
+        .expect("graph read-model fold must succeed");
+    let graph_direct = fold_graph_compatible_code_ui_snapshot(bootstrap, &replay)
+        .expect("graph alias must succeed");
+
+    assert_eq!(graph.last_sequence, code_ui.last_sequence);
+    assert_eq!(graph_direct.last_sequence, code_ui.last_sequence);
+    assert_eq!(graph.snapshot.status, code_ui.snapshot.status);
+    assert_eq!(graph_direct.snapshot.status, code_ui.snapshot.status);
+    assert_eq!(
+        graph.snapshot.transcript.len(),
+        code_ui.snapshot.transcript.len()
+    );
+    assert_eq!(
+        graph.snapshot.transcript[1].content.as_deref(),
+        code_ui.snapshot.transcript[1].content.as_deref()
+    );
+    assert_eq!(
+        graph_direct.snapshot.transcript[1].content.as_deref(),
+        code_ui.snapshot.transcript[1].content.as_deref()
+    );
+    assert_eq!(
+        graph.snapshot.interactions[0].status,
+        code_ui.snapshot.interactions[0].status
+    );
+    assert_eq!(
+        graph_direct.snapshot.interactions[0].status,
+        code_ui.snapshot.interactions[0].status
+    );
+    assert_eq!(
+        graph.snapshot.plans[0].status,
+        code_ui.snapshot.plans[0].status
+    );
+    assert_eq!(
+        graph_direct.snapshot.plans[0].status,
+        code_ui.snapshot.plans[0].status
+    );
+}
+
+fn sample_event_fold_bootstrap() -> CodeUiSessionSnapshot {
+    CodeUiSessionSnapshot {
         session_id: "session-projection-fold".to_string(),
         working_dir: "/repo".to_string(),
         ..CodeUiSessionSnapshot::default()
-    };
+    }
+}
 
+fn sample_event_fold_suffix() -> Vec<CodeWorkflowEvent> {
     let user = CodeUiTranscriptEntry {
         id: "user-1".to_string(),
         kind: CodeUiTranscriptEntryKind::UserMessage,
@@ -243,7 +357,7 @@ fn snapshot_rebuilt_from_event_fold() {
         ..CodeUiPlanSnapshot::default()
     };
 
-    let events = vec![
+    vec![
         workflow_event(
             1,
             CodeWorkflowEventKind::CodeUiProjectionDelta {
@@ -307,32 +421,7 @@ fn snapshot_rebuilt_from_event_fold() {
                 reason: "process ended before result was persisted".to_string(),
             },
         ),
-    ];
-    let folded = fold_code_ui_snapshot(
-        bootstrap,
-        &CodeWorkflowReplay {
-            events,
-            gaps: Vec::new(),
-        },
-    )
-    .expect("ordered fine-grained events must rebuild a snapshot");
-
-    assert_eq!(folded.last_sequence, Some(7));
-    assert_eq!(folded.snapshot.transcript.len(), 2);
-    assert_eq!(
-        folded.snapshot.transcript[1].content.as_deref(),
-        Some("I found the issue.")
-    );
-    assert!(folded.snapshot.transcript[1].streaming);
-    assert_eq!(
-        folded.snapshot.interactions[0].status,
-        CodeUiInteractionStatus::Resolved
-    );
-    assert_eq!(folded.snapshot.plans[0].status, "running");
-    assert_eq!(
-        folded.snapshot.status,
-        CodeUiSessionStatus::IndeterminateSideEffect
-    );
+    ]
 }
 
 fn workflow_event(sequence: u64, event: CodeWorkflowEventKind) -> CodeWorkflowEvent {

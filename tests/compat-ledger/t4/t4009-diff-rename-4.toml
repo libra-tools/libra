@@ -1,0 +1,109 @@
+# Compatibility evidence for upstream t4009-diff-rename-4.sh, migrated in the t4 wave.
+# One [[scenario]] per upstream test. The command and flags come from each
+# scenario's BODY — what its assertion actually runs — and every flag is checked
+# against the real CLI, not the documentation. A scenario that passes a flag Libra
+# does not accept is blocked, however well documented the rest of it is.
+
+[[scenario]]
+id = "t4009-diff-rename-4::prepare-reference-tree"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:177"
+reason = "write-tree is partial and every flag this scenario passes is accepted by Libra, with write-tree recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4009-diff-rename-4.sh"
+libra_command = "write-tree"
+libra_surface = "write-tree"
+
+[[scenario]]
+id = "t4009-diff-rename-4::prepare-work-tree"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-index -z, -C, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4009-diff-rename-4.sh"
+libra_command = "diff-index"
+libra_surface = "-z"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4009-diff-rename-4::validate-output-from-rename-copy-detection-1"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Compares the artefact an earlier scenario produced with diff-index -z, -C, which Libra does not accept (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4009-diff-rename-4.sh"
+libra_command = "diff-index"
+libra_surface = "-z"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4009-diff-rename-4::prepare-work-tree-again"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-index -z, -C, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4009-diff-rename-4.sh"
+libra_command = "diff-index"
+libra_surface = "-z"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4009-diff-rename-4::validate-output-from-rename-copy-detection-2"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Compares the artefact an earlier scenario produced with diff-index -z, -C, which Libra does not accept (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4009-diff-rename-4.sh"
+libra_command = "diff-index"
+libra_surface = "-z"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4009-diff-rename-4::prepare-work-tree-once-again"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-index -z, -C, --find-copies-harder, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4009-diff-rename-4.sh"
+libra_command = "diff-index"
+libra_surface = "-z"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4009-diff-rename-4::validate-output-from-rename-copy-detection-3"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Compares the artefact an earlier scenario produced with diff-index -z, -C, --find-copies-harder, which Libra does not accept (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4009-diff-rename-4.sh"
+libra_command = "diff-index"
+libra_surface = "-z"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]

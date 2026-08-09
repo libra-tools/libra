@@ -1,0 +1,104 @@
+# Compatibility evidence for upstream t4006-diff-mode.sh, migrated in the t4 wave.
+# One [[scenario]] per upstream test. The command and flags come from each
+# scenario's BODY — what its assertion actually runs — and every flag is checked
+# against the real CLI, not the documentation. A scenario that passes a flag Libra
+# does not accept is blocked, however well documented the rest of it is.
+
+[[scenario]]
+id = "t4006-diff-mode::setup"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:177"
+reason = "write-tree is partial and every flag this scenario passes is accepted by Libra, with write-tree recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4006-diff-mode.sh"
+libra_command = "write-tree"
+libra_surface = "write-tree"
+
+[[scenario]]
+id = "t4006-diff-mode::chmod"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff-index.md#comparison-with-git"
+reason = "Upstream needs diff-index raw output, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4006-diff-mode.sh"
+libra_command = "diff-index"
+libra_surface = "raw output"
+blocked_by = ["expose the diff-index porcelain flag surface (rename/copy detection, raw output)"]
+
+[[scenario]]
+id = "t4006-diff-mode::prepare-binary-file"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:147"
+reason = "commit is partial and every flag this scenario passes is accepted by Libra, with -m recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4006-diff-mode.sh"
+libra_command = "commit"
+libra_surface = "-m"
+
+[[scenario]]
+id = "t4006-diff-mode::stat-output-after-text-chmod"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --stat recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4006-diff-mode.sh"
+libra_command = "diff"
+libra_surface = "--stat"
+
+[[scenario]]
+id = "t4006-diff-mode::shortstat-output-after-text-chmod"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --shortstat recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4006-diff-mode.sh"
+libra_command = "diff"
+libra_surface = "--shortstat"
+
+[[scenario]]
+id = "t4006-diff-mode::stat-output-after-binary-chmod"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --stat recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4006-diff-mode.sh"
+libra_command = "diff"
+libra_surface = "--stat"
+
+[[scenario]]
+id = "t4006-diff-mode::shortstat-output-after-binary-chmod"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --shortstat recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4006-diff-mode.sh"
+libra_command = "diff"
+libra_surface = "--shortstat"

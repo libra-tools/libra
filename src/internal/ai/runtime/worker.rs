@@ -21,6 +21,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
@@ -28,7 +29,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{BoundaryDecision, ToolBoundaryRuntime, ToolOperation};
+use super::{BoundaryDecision, RuntimeCommandDurability, ToolBoundaryRuntime, ToolOperation};
+use crate::internal::ai::session::{CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent};
 
 /// A monotonically increasing event position within one runtime session.
 ///
@@ -322,6 +324,24 @@ pub trait RuntimeTurnExecutor: Send + Sync + 'static {
     }
 }
 
+/// Placeholder executor for adapters that use [`AgentRuntimeHandle`] solely
+/// for external-turn admission and cancellation authority.
+#[derive(Default)]
+pub struct ExternalTurnTrackingExecutor;
+
+#[async_trait]
+impl RuntimeTurnExecutor for ExternalTurnTrackingExecutor {
+    async fn execute(
+        &self,
+        _request: TurnRequest,
+        _context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        Err(RuntimeWorkerError::ExecutionFailed(
+            "external tracking executor must not execute submitted turns".to_string(),
+        ))
+    }
+}
+
 /// A continuation for an interaction emitted by a long-lived executor.
 ///
 /// The worker owns this continuation while the interaction is pending, so an
@@ -352,6 +372,9 @@ pub trait RuntimeInteractionDelivery: Send + 'static {
 pub struct AgentRuntimeWorkerConfig {
     pub executor: Arc<dyn RuntimeTurnExecutor>,
     pub tool_boundary: ToolBoundaryRuntime,
+    /// Optional session command log used to make runtime cancellation outcomes
+    /// recoverable across a process restart.
+    pub durability: Option<RuntimeCommandDurability>,
     pub max_queued_turns_per_session: usize,
     pub command_buffer: usize,
     pub event_buffer: usize,
@@ -359,6 +382,14 @@ pub struct AgentRuntimeWorkerConfig {
     /// owned by the runtime rather than a UI adapter so every caller receives
     /// the same diagnostic if an executor does not release its resources.
     pub shutdown_timeout: Duration,
+    pub durability_repo_id: Option<String>,
+    pub durability_principal_id: Option<String>,
+    /// Command kind persisted for runtime-owned durable intents. Headless
+    /// adapters set this to match their browser direct-turn admission record.
+    pub durability_command_kind: Option<String>,
+    /// Sessions with a recovered mutating command are created in a
+    /// reconciliation fence before the worker reads its first turn request.
+    pub recovered_reconciliation_sessions: Vec<String>,
 }
 
 impl AgentRuntimeWorkerConfig {
@@ -366,11 +397,60 @@ impl AgentRuntimeWorkerConfig {
         Self {
             executor,
             tool_boundary,
+            durability: None,
             max_queued_turns_per_session: 16,
             command_buffer: 128,
             event_buffer: 1_024,
             shutdown_timeout: Duration::from_secs(30),
+            durability_repo_id: None,
+            durability_principal_id: None,
+            durability_command_kind: None,
+            recovered_reconciliation_sessions: Vec::new(),
         }
+    }
+
+    /// Attach the session durability owner and the stable identity fields used
+    /// for each accepted turn's command intent.
+    pub fn with_durability(
+        mut self,
+        durability: RuntimeCommandDurability,
+        repo_id: impl Into<String>,
+        principal_id: impl Into<String>,
+    ) -> Self {
+        self.durability = Some(durability);
+        self.durability_repo_id = Some(repo_id.into());
+        self.durability_principal_id = Some(principal_id.into());
+        self
+    }
+
+    /// Override the durable command kind written by this worker. Production
+    /// headless runtimes set this to their browser direct-turn kind so cancel
+    /// reconciliation shares the same JSONL record as adapter admission.
+    pub fn with_durability_command_kind(mut self, command_kind: impl Into<String>) -> Self {
+        self.durability_command_kind = Some(command_kind.into());
+        self
+    }
+
+    /// Fence recovered sessions so a restarted runtime cannot blindly accept
+    /// a new turn after an interrupted mutation.
+    pub fn with_recovered_reconciliation_session(mut self, session_id: impl Into<String>) -> Self {
+        self.recovered_reconciliation_sessions
+            .push(session_id.into());
+        self
+    }
+}
+
+/// Map internal runtime worker failures to stable adapter/wire messages.
+///
+/// Public adapters use this helper instead of exposing `RuntimeWorkerError`
+/// variants directly so JSON clients can match on stable codes such as
+/// `RECONCILIATION_REQUIRED`.
+pub fn runtime_worker_adapter_message(error: RuntimeWorkerError) -> String {
+    match error {
+        RuntimeWorkerError::ReconciliationRequired { session_id } => format!(
+            "RECONCILIATION_REQUIRED: session '{session_id}' requires mutation reconciliation before another turn can run"
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -409,8 +489,12 @@ pub enum RuntimeWorkerError {
     ExecutorDoesNotSupportResponses,
     #[error("runtime executor failed: {0}")]
     ExecutionFailed(String),
+    #[error("runtime turn reached an indeterminate side effect: {0}")]
+    IndeterminateSideEffect(String),
     #[error("runtime turn was cancelled")]
     Cancelled,
+    #[error("runtime command durability failed: {0}")]
+    DurabilityFailure(String),
     #[error("the AgentRuntime worker is shutting down and cannot accept new commands")]
     ShuttingDown,
 }
@@ -438,6 +522,15 @@ pub enum RuntimeShutdownError {
 pub enum RuntimeCommand {
     Submit {
         request: TurnRequest,
+        reply: oneshot::Sender<Result<TurnReceipt, RuntimeWorkerError>>,
+    },
+    /// Admit a turn executed by an existing adapter-owned loop. The runtime
+    /// still owns admission, cancellation, durability, and reconciliation;
+    /// the adapter reports its terminal result through `finish_external_turn`.
+    TrackExternalTurn {
+        request: TurnRequest,
+        cancellation: CancellationToken,
+        mutation_started: Arc<AtomicBool>,
         reply: oneshot::Sender<Result<TurnReceipt, RuntimeWorkerError>>,
     },
     Respond {
@@ -546,6 +639,66 @@ impl AgentRuntimeHandle {
         reply_rx
             .await
             .map_err(|_| RuntimeWorkerError::ResponseDropped)?
+    }
+
+    /// Register an adapter-owned turn with the runtime control plane.
+    ///
+    /// This is for legacy loops which cannot yet execute through
+    /// `RuntimeTurnExecutor`. Their cancellation token and mutation marker are
+    /// shared with the runtime so `cancel` applies the same safety fence.
+    pub async fn track_external_turn(
+        &self,
+        request: TurnRequest,
+        cancellation: CancellationToken,
+        mutation_started: Arc<AtomicBool>,
+    ) -> Result<TurnReceipt, RuntimeWorkerError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.client
+            .command_tx
+            .send(RuntimeCommand::TrackExternalTurn {
+                request,
+                cancellation,
+                mutation_started,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| RuntimeWorkerError::WorkerStopped)?;
+        reply_rx
+            .await
+            .map_err(|_| RuntimeWorkerError::ResponseDropped)?
+    }
+
+    /// Report the terminal outcome of an adapter-owned tracked turn.
+    pub async fn finish_external_turn(
+        &self,
+        session_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
+    ) -> Result<(), RuntimeWorkerError> {
+        let session_id = session_id.into();
+        self.client
+            .command_tx
+            .send(RuntimeCommand::ExecutionFinished {
+                session_id: session_id.clone(),
+                turn_id: turn_id.into(),
+                result,
+            })
+            .await
+            .map_err(|_| RuntimeWorkerError::WorkerStopped)?;
+
+        // The snapshot request is ordered after ExecutionFinished on the
+        // worker mailbox. It therefore acknowledges that terminal durability
+        // has settled before an adapter reports the turn as finalized.
+        match self.snapshot(session_id.clone()).await?.interaction {
+            InteractionState::Completed | InteractionState::Cancelled => Ok(()),
+            InteractionState::IndeterminateSideEffect { .. } => {
+                Err(RuntimeWorkerError::ReconciliationRequired { session_id })
+            }
+            InteractionState::Failed { reason } => Err(RuntimeWorkerError::ExecutionFailed(reason)),
+            state => Err(RuntimeWorkerError::ExecutionFailed(format!(
+                "external turn finalization did not reach a terminal state: {state:?}"
+            ))),
+        }
     }
 
     pub async fn respond(
@@ -782,10 +935,19 @@ impl AgentRuntimeWorker {
                 shutdown_result: Arc::clone(&shutdown_result),
             }),
         };
+        let mut sessions = HashMap::new();
+        for session_id in &config.recovered_reconciliation_sessions {
+            let mut session = SessionQueue::new(session_id.clone(), config.event_buffer.max(1));
+            session.set_state(InteractionState::IndeterminateSideEffect {
+                reason: "runtime recovered an interrupted mutating command; manual reconciliation is required"
+                    .to_string(),
+            });
+            sessions.insert(session_id.clone(), session);
+        }
         let worker = Self {
             config,
             command_tx,
-            sessions: HashMap::new(),
+            sessions,
             shutdown: None,
             shutdown_result,
         };
@@ -832,6 +994,18 @@ impl AgentRuntimeWorker {
                 WorkerInput::Command(Some(command)) => match command {
                     RuntimeCommand::Submit { request, reply } => {
                         let _ = reply.send(self.submit(request));
+                    }
+                    RuntimeCommand::TrackExternalTurn {
+                        request,
+                        cancellation,
+                        mutation_started,
+                        reply,
+                    } => {
+                        let _ = reply.send(self.track_external_turn(
+                            request,
+                            cancellation,
+                            mutation_started,
+                        ));
                     }
                     RuntimeCommand::Respond {
                         session_id,
@@ -935,6 +1109,14 @@ impl AgentRuntimeWorker {
                     limit: queue_limit,
                 });
             }
+        }
+        self.admit_durable_turn(&request)?;
+        {
+            let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
+                RuntimeWorkerError::UnknownSession {
+                    session_id: session_id.clone(),
+                }
+            })?;
             session.queued.push_back(request);
             session.snapshot.queued_turns = session.queued.len();
             if session.active.is_none() {
@@ -948,6 +1130,76 @@ impl AgentRuntimeWorker {
             AgentEventKind::TurnQueued,
         );
         self.start_next_if_idle(&session_id);
+        Ok(TurnReceipt {
+            session_id,
+            turn_id,
+        })
+    }
+
+    fn track_external_turn(
+        &mut self,
+        request: TurnRequest,
+        cancellation: CancellationToken,
+        mutation_started: Arc<AtomicBool>,
+    ) -> Result<TurnReceipt, RuntimeWorkerError> {
+        if self.shutdown.is_some() {
+            return Err(RuntimeWorkerError::ShuttingDown);
+        }
+        if request.session_id.is_empty() || request.turn_id.is_empty() {
+            return Err(RuntimeWorkerError::InvalidTurnIdentifier);
+        }
+        let session_id = request.session_id.clone();
+        let turn_id = request.turn_id.clone();
+        let event_buffer = self.config.event_buffer.max(1);
+        {
+            let session = self
+                .sessions
+                .entry(session_id.clone())
+                .or_insert_with(|| SessionQueue::new(session_id.clone(), event_buffer));
+            if matches!(
+                session.snapshot.interaction,
+                InteractionState::IndeterminateSideEffect { .. }
+            ) {
+                return Err(RuntimeWorkerError::ReconciliationRequired { session_id });
+            }
+            if session.active.is_some() || !session.queued.is_empty() {
+                return Err(RuntimeWorkerError::QueueFull {
+                    session_id,
+                    limit: 0,
+                });
+            }
+        }
+        self.admit_durable_turn(&request)?;
+        let session = self.sessions.get_mut(&request.session_id).ok_or_else(|| {
+            RuntimeWorkerError::UnknownSession {
+                session_id: request.session_id.clone(),
+            }
+        })?;
+        session.snapshot.active_turn_id = Some(turn_id.clone());
+        session.snapshot.queued_turns = 0;
+        session.set_state(InteractionState::Running);
+        session.active = Some(ActiveTurn {
+            request,
+            cancellation,
+            mutation_started,
+            cancel_requested_after_mutation: false,
+            interaction: None,
+            interaction_delivery: None,
+            execution_in_progress: true,
+            response_in_progress: false,
+            deferred_execution: None,
+            response_delivery_failure: None,
+        });
+        self.emit(
+            &session_id,
+            Some(turn_id.clone()),
+            AgentEventKind::TurnQueued,
+        );
+        self.emit(
+            &session_id,
+            Some(turn_id.clone()),
+            AgentEventKind::TurnStarted,
+        );
         Ok(TurnReceipt {
             session_id,
             turn_id,
@@ -1064,8 +1316,8 @@ impl AgentRuntimeWorker {
 
     fn cancel(&mut self, session_id: String, turn_id: String) -> Result<(), RuntimeWorkerError> {
         enum CancelOutcome {
-            Queued,
-            WaitingActive,
+            Queued(TurnRequest),
+            WaitingActive(TurnRequest),
             RunningActive,
             Missing,
         }
@@ -1081,9 +1333,9 @@ impl AgentRuntimeWorker {
                 .iter()
                 .position(|queued| queued.turn_id == turn_id)
             {
-                if session.queued.remove(position).is_some() {
+                if let Some(request) = session.queued.remove(position) {
                     session.snapshot.queued_turns = session.queued.len();
-                    CancelOutcome::Queued
+                    CancelOutcome::Queued(request)
                 } else {
                     CancelOutcome::Missing
                 }
@@ -1092,7 +1344,7 @@ impl AgentRuntimeWorker {
                 .as_ref()
                 .is_some_and(|active| active.request.turn_id == turn_id)
             {
-                let (mutation_started, waiting_for_interaction, execution_in_progress) =
+                let (mutation_started, waiting_for_interaction, execution_in_progress, request) =
                     {
                         let active = session.active.as_mut().ok_or_else(|| {
                             RuntimeWorkerError::UnknownTurn {
@@ -1121,6 +1373,7 @@ impl AgentRuntimeWorker {
                             mutation_started,
                             waiting_for_interaction,
                             active.execution_in_progress,
+                            active.request.clone(),
                         )
                     };
                 if mutation_started {
@@ -1136,7 +1389,7 @@ impl AgentRuntimeWorker {
                     session.active = None;
                     session.snapshot.active_turn_id = None;
                     session.set_state(InteractionState::Cancelled);
-                    CancelOutcome::WaitingActive
+                    CancelOutcome::WaitingActive(request)
                 } else {
                     session.set_state(InteractionState::Cancelling);
                     CancelOutcome::RunningActive
@@ -1147,11 +1400,31 @@ impl AgentRuntimeWorker {
         };
 
         match outcome {
-            CancelOutcome::Queued => {
+            CancelOutcome::Queued(request) => {
+                if let Err(error) = Self::persist_cancelled_turn(
+                    self.config.durability.as_ref(),
+                    self.config.durability_repo_id.as_deref(),
+                    self.config.durability_principal_id.as_deref(),
+                    self.config.durability_command_kind.as_deref(),
+                    &request,
+                ) {
+                    self.fence_for_durability_failure(&session_id, &turn_id, &error);
+                    return Err(error);
+                }
                 self.emit(&session_id, Some(turn_id), AgentEventKind::TurnCancelled);
                 Ok(())
             }
-            CancelOutcome::WaitingActive => {
+            CancelOutcome::WaitingActive(request) => {
+                if let Err(error) = Self::persist_cancelled_turn(
+                    self.config.durability.as_ref(),
+                    self.config.durability_repo_id.as_deref(),
+                    self.config.durability_principal_id.as_deref(),
+                    self.config.durability_command_kind.as_deref(),
+                    &request,
+                ) {
+                    self.fence_for_durability_failure(&session_id, &turn_id, &error);
+                    return Err(error);
+                }
                 self.emit(&session_id, Some(turn_id), AgentEventKind::TurnCancelled);
                 self.start_next_if_idle(&session_id);
                 Ok(())
@@ -1184,7 +1457,7 @@ impl AgentRuntimeWorker {
         let mut cancellation_requested_turns = Vec::new();
         for (session_id, session) in &mut self.sessions {
             for queued in session.queued.drain(..) {
-                cancelled_turns.push((session_id.clone(), queued.turn_id));
+                cancelled_turns.push((session_id.clone(), queued));
             }
             session.snapshot.queued_turns = 0;
 
@@ -1192,6 +1465,7 @@ impl AgentRuntimeWorker {
                 continue;
             };
             let turn_id = active.request.turn_id.clone();
+            let request = active.request.clone();
             let mutation_started =
                 active.request.mutating && active.mutation_started.load(Ordering::Acquire);
             let waiting_for_interaction = active.interaction.is_some();
@@ -1215,7 +1489,7 @@ impl AgentRuntimeWorker {
                 session.active = None;
                 session.snapshot.active_turn_id = None;
                 session.set_state(InteractionState::Cancelled);
-                cancelled_turns.push((session_id.clone(), turn_id));
+                cancelled_turns.push((session_id.clone(), request));
             } else {
                 active.cancellation.cancel();
                 session.set_state(InteractionState::Cancelling);
@@ -1223,8 +1497,22 @@ impl AgentRuntimeWorker {
             }
         }
 
-        for (session_id, turn_id) in cancelled_turns {
-            self.emit(&session_id, Some(turn_id), AgentEventKind::TurnCancelled);
+        for (session_id, request) in cancelled_turns {
+            if let Err(error) = Self::persist_cancelled_turn(
+                self.config.durability.as_ref(),
+                self.config.durability_repo_id.as_deref(),
+                self.config.durability_principal_id.as_deref(),
+                self.config.durability_command_kind.as_deref(),
+                &request,
+            ) {
+                self.fence_for_durability_failure(&session_id, &request.turn_id, &error);
+                continue;
+            }
+            self.emit(
+                &session_id,
+                Some(request.turn_id),
+                AgentEventKind::TurnCancelled,
+            );
         }
         for (session_id, turn_id) in cancellation_requested_turns {
             self.emit(&session_id, Some(turn_id), AgentEventKind::CancelRequested);
@@ -1238,6 +1526,85 @@ impl AgentRuntimeWorker {
     }
 
     fn finish_shutdown(&mut self, result: Result<(), RuntimeShutdownError>) {
+        if result.is_err() {
+            // The worker owns terminal durability. A shutdown deadline leaves
+            // only active mutations that have crossed their mutation boundary
+            // indeterminate. Queued turns and non-mutating active work can be
+            // conclusively cancelled because they cannot have changed state.
+            let active_turns: Vec<_> = self
+                .sessions
+                .iter()
+                .filter_map(|(session_id, session)| {
+                    session
+                        .active
+                        .as_ref()
+                        .map(|active| (session_id.clone(), active.request.clone()))
+                })
+                .collect();
+            for (session_id, request) in active_turns {
+                let mutation_started = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.active.as_ref())
+                    .is_some_and(|active| {
+                        active.request.mutating
+                            && (active.mutation_started.load(Ordering::Acquire)
+                                || active.cancel_requested_after_mutation)
+                    });
+                if !mutation_started {
+                    if let Err(error) = Self::persist_cancelled_turn(
+                        self.config.durability.as_ref(),
+                        self.config.durability_repo_id.as_deref(),
+                        self.config.durability_principal_id.as_deref(),
+                        self.config.durability_command_kind.as_deref(),
+                        &request,
+                    ) {
+                        self.fence_for_durability_failure(&session_id, &request.turn_id, &error);
+                        continue;
+                    }
+                    if let Some(session) = self.sessions.get_mut(&session_id) {
+                        session.active = None;
+                        session.snapshot.active_turn_id = None;
+                        session.set_state(InteractionState::Cancelled);
+                    }
+                    self.emit(
+                        &session_id,
+                        Some(request.turn_id),
+                        AgentEventKind::TurnCancelled,
+                    );
+                    continue;
+                }
+                let reason = "runtime shutdown timed out before the active turn reached a determinate result";
+                match Self::persist_indeterminate_turn(
+                    self.config.durability.as_ref(),
+                    self.config.durability_repo_id.as_deref(),
+                    self.config.durability_principal_id.as_deref(),
+                    self.config.durability_command_kind.as_deref(),
+                    &request,
+                    reason,
+                ) {
+                    Ok(()) => {
+                        if let Some(session) = self.sessions.get_mut(&session_id) {
+                            session.active = None;
+                            session.snapshot.active_turn_id = None;
+                            session.set_state(InteractionState::IndeterminateSideEffect {
+                                reason: reason.to_string(),
+                            });
+                        }
+                        self.emit(
+                            &session_id,
+                            Some(request.turn_id),
+                            AgentEventKind::TurnIndeterminateSideEffect {
+                                reason: reason.to_string(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.fence_for_durability_failure(&session_id, &request.turn_id, &error);
+                    }
+                }
+            }
+        }
         let Some(shutdown) = self.shutdown.take() else {
             return;
         };
@@ -1496,6 +1863,10 @@ impl AgentRuntimeWorker {
         turn_id: &str,
         result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
     ) {
+        let durability = self.config.durability.clone();
+        let durability_repo_id = self.config.durability_repo_id.clone();
+        let durability_principal_id = self.config.durability_principal_id.clone();
+        let durability_command_kind = self.config.durability_command_kind.clone();
         let Some(session) = self.sessions.get_mut(session_id) else {
             return;
         };
@@ -1513,6 +1884,7 @@ impl AgentRuntimeWorker {
         }
         let cancel_requested_after_mutation = active.cancel_requested_after_mutation;
         let response_delivery_failure = active.response_delivery_failure.clone();
+        let request = active.request.clone();
 
         if let Some(reason) = response_delivery_failure {
             session.active = None;
@@ -1521,6 +1893,17 @@ impl AgentRuntimeWorker {
                 let reason = format!(
                     "mutating turn could not reconcile a failed interaction response; reconciliation is required: {reason}"
                 );
+                if let Err(error) = Self::persist_indeterminate_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &reason,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
                 session.set_state(InteractionState::IndeterminateSideEffect {
                     reason: reason.clone(),
                 });
@@ -1530,6 +1913,17 @@ impl AgentRuntimeWorker {
                     AgentEventKind::TurnIndeterminateSideEffect { reason },
                 );
             } else {
+                if let Err(error) = Self::persist_failed_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &reason,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
                 session.set_state(InteractionState::Failed {
                     reason: reason.clone(),
                 });
@@ -1564,23 +1958,44 @@ impl AgentRuntimeWorker {
                 );
             }
             Ok(RuntimeTurnExecution::AwaitingInteraction(_)) => {
+                let reason = "executor returned a non-interactive waiting state".to_string();
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                if let Err(error) = Self::persist_failed_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &reason,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
                 session.set_state(InteractionState::Failed {
-                    reason: "executor returned a non-interactive waiting state".to_string(),
+                    reason: reason.clone(),
                 });
                 self.emit(
                     session_id,
                     Some(turn_id.to_string()),
-                    AgentEventKind::TurnFailed {
-                        reason: "executor returned a non-interactive waiting state".to_string(),
-                    },
+                    AgentEventKind::TurnFailed { reason },
                 );
                 self.start_next_if_idle(session_id);
             }
             Ok(RuntimeTurnExecution::Completed { summary }) => {
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                if let Err(error) = Self::persist_successful_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &summary,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
                 session.set_state(InteractionState::Completed);
                 self.emit(
                     session_id,
@@ -1593,6 +2008,40 @@ impl AgentRuntimeWorker {
                 let reason = "mutating dispatch did not report a determinate result after cancellation; reconciliation is required".to_string();
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                if let Err(error) = Self::persist_indeterminate_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &reason,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
+                session.set_state(InteractionState::IndeterminateSideEffect {
+                    reason: reason.clone(),
+                });
+                self.emit(
+                    session_id,
+                    Some(turn_id.to_string()),
+                    AgentEventKind::TurnIndeterminateSideEffect { reason },
+                );
+            }
+            Err(RuntimeWorkerError::IndeterminateSideEffect(reason)) => {
+                session.active = None;
+                session.snapshot.active_turn_id = None;
+                if let Err(error) = Self::persist_indeterminate_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &reason,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
                 session.set_state(InteractionState::IndeterminateSideEffect {
                     reason: reason.clone(),
                 });
@@ -1605,6 +2054,16 @@ impl AgentRuntimeWorker {
             Err(RuntimeWorkerError::Cancelled) => {
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                if let Err(error) = Self::persist_cancelled_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
                 session.set_state(InteractionState::Cancelled);
                 self.emit(
                     session_id,
@@ -1619,6 +2078,17 @@ impl AgentRuntimeWorker {
                 );
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                if let Err(error) = Self::persist_indeterminate_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &reason,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
                 session.set_state(InteractionState::IndeterminateSideEffect {
                     reason: reason.clone(),
                 });
@@ -1632,6 +2102,17 @@ impl AgentRuntimeWorker {
                 let reason = error.to_string();
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                if let Err(error) = Self::persist_failed_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &reason,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
                 session.set_state(InteractionState::Failed {
                     reason: reason.clone(),
                 });
@@ -1643,6 +2124,229 @@ impl AgentRuntimeWorker {
                 self.start_next_if_idle(session_id);
             }
         }
+    }
+
+    fn durable_intent(
+        durability: Option<&RuntimeCommandDurability>,
+        repo_id: Option<&str>,
+        principal_id: Option<&str>,
+        command_kind: Option<&str>,
+        request: &TurnRequest,
+    ) -> Result<Option<CodeCommandIntent>, RuntimeWorkerError> {
+        let Some(_) = durability else {
+            return Ok(None);
+        };
+        let repo_id = repo_id.ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability is configured without a repository identity".to_string(),
+            )
+        })?;
+        let principal_id = principal_id.ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability is configured without a principal identity".to_string(),
+            )
+        })?;
+        let request_hash = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(request.input.as_bytes()))
+        );
+        Ok(Some(CodeCommandIntent::new(
+            CodeCommandIdentity::new(
+                repo_id,
+                request.session_id.clone(),
+                principal_id,
+                request.turn_id.clone(),
+            ),
+            command_kind.unwrap_or("agent_runtime_turn"),
+            request_hash,
+            request.mutating,
+        )))
+    }
+
+    fn admit_durable_turn(&self, request: &TurnRequest) -> Result<(), RuntimeWorkerError> {
+        let Some(intent) = Self::durable_intent(
+            self.config.durability.as_ref(),
+            self.config.durability_repo_id.as_deref(),
+            self.config.durability_principal_id.as_deref(),
+            self.config.durability_command_kind.as_deref(),
+            request,
+        )?
+        else {
+            return Ok(());
+        };
+        let durability = self.config.durability.as_ref().ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability disappeared while admitting a runtime turn".to_string(),
+            )
+        })?;
+        match durability.admit(intent).map_err(|error| {
+            RuntimeWorkerError::DurabilityFailure(format!(
+                "could not persist intent for turn '{}': {error}",
+                request.turn_id
+            ))
+        })? {
+            CodeCommandAdmission::Execute { .. } => Ok(()),
+            CodeCommandAdmission::Existing { status } => {
+                Err(RuntimeWorkerError::DurabilityFailure(format!(
+                    "turn '{}' already has durable command state {status:?}; refusing to dispatch it again",
+                    request.turn_id
+                )))
+            }
+        }
+    }
+
+    fn persist_cancelled_turn(
+        durability: Option<&RuntimeCommandDurability>,
+        repo_id: Option<&str>,
+        principal_id: Option<&str>,
+        command_kind: Option<&str>,
+        request: &TurnRequest,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(intent) =
+            Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
+        else {
+            return Ok(());
+        };
+        let durability = durability.ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability disappeared while recording a cancellation".to_string(),
+            )
+        })?;
+        durability
+            .complete_failure(
+                &intent,
+                "runtime turn cancelled before a mutating side effect began",
+            )
+            .map_err(|error| {
+                RuntimeWorkerError::DurabilityFailure(format!(
+                    "could not durably record cancellation for turn '{}': {error}",
+                    request.turn_id
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn persist_successful_turn(
+        durability: Option<&RuntimeCommandDurability>,
+        repo_id: Option<&str>,
+        principal_id: Option<&str>,
+        command_kind: Option<&str>,
+        request: &TurnRequest,
+        summary: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(intent) =
+            Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
+        else {
+            return Ok(());
+        };
+        let durability = durability.ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability disappeared while recording successful completion".to_string(),
+            )
+        })?;
+        durability
+            .complete_success(&intent, summary)
+            .map_err(|error| {
+                RuntimeWorkerError::DurabilityFailure(format!(
+                    "could not durably record successful completion for turn '{}': {error}",
+                    request.turn_id
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn persist_failed_turn(
+        durability: Option<&RuntimeCommandDurability>,
+        repo_id: Option<&str>,
+        principal_id: Option<&str>,
+        command_kind: Option<&str>,
+        request: &TurnRequest,
+        reason: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(intent) =
+            Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
+        else {
+            return Ok(());
+        };
+        let durability = durability.ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability disappeared while recording failed completion".to_string(),
+            )
+        })?;
+        durability
+            .complete_failure(&intent, reason)
+            .map_err(|error| {
+                RuntimeWorkerError::DurabilityFailure(format!(
+                    "could not durably record failed completion for turn '{}': {error}",
+                    request.turn_id
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn persist_indeterminate_turn(
+        durability: Option<&RuntimeCommandDurability>,
+        repo_id: Option<&str>,
+        principal_id: Option<&str>,
+        command_kind: Option<&str>,
+        request: &TurnRequest,
+        reason: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(intent) =
+            Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
+        else {
+            return Ok(());
+        };
+        let durability = durability.ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability disappeared while recording an indeterminate mutation".to_string(),
+            )
+        })?;
+        let effect = if reason.contains("runtime shutdown timed out") {
+            "runtime_shutdown_timeout"
+        } else {
+            "mutating_runtime_turn"
+        };
+        durability
+            .mark_indeterminate(&intent, effect, reason)
+            .map_err(|error| {
+                RuntimeWorkerError::DurabilityFailure(format!(
+                    "could not durably record reconciliation requirement for turn '{}': {error}",
+                    request.turn_id
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn fence_for_durability_failure(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        error: &RuntimeWorkerError,
+    ) {
+        let reason = format!("reconciliation is required because {error}");
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            // Only drop the active slot when it belongs to the failed turn.
+            // Queued-cancel durability failures must not orphan a still-running
+            // sibling turn that remains active on the same session.
+            let clears_active = session
+                .active
+                .as_ref()
+                .is_some_and(|active| active.request.turn_id == turn_id)
+                || session.snapshot.active_turn_id.as_deref() == Some(turn_id);
+            if clears_active {
+                session.active = None;
+                session.snapshot.active_turn_id = None;
+            }
+            session.set_state(InteractionState::IndeterminateSideEffect {
+                reason: reason.clone(),
+            });
+        }
+        self.emit(
+            session_id,
+            Some(turn_id.to_string()),
+            AgentEventKind::TurnIndeterminateSideEffect { reason },
+        );
     }
 
     fn emit(&mut self, session_id: &str, turn_id: Option<String>, kind: AgentEventKind) {

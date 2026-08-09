@@ -1,0 +1,75 @@
+# Compatibility evidence for upstream t4016-diff-quote.sh, migrated in the t4 wave.
+# One [[scenario]] per upstream test. The command and flags come from each
+# scenario's BODY — what its assertion actually runs — and every flag is checked
+# against the real CLI, not the documentation. A scenario that passes a flag Libra
+# does not accept is blocked, however well documented the rest of it is.
+
+[[scenario]]
+id = "t4016-diff-quote::setup"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:128"
+reason = "mv is partial and every flag this scenario passes is accepted by Libra, with mv recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4016-diff-quote.sh"
+libra_command = "mv"
+libra_surface = "mv"
+
+[[scenario]]
+id = "t4016-diff-quote::setup-expected-files"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:128"
+reason = "Compares the artefact an earlier scenario produced with mv; every flag that scenario passes is accepted by Libra (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4016-diff-quote.sh"
+libra_command = "mv"
+libra_surface = "mv"
+
+[[scenario]]
+id = "t4016-diff-quote::git-diff-summary-m-head"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --summary recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4016-diff-quote.sh"
+libra_command = "diff"
+libra_surface = "--summary"
+
+[[scenario]]
+id = "t4016-diff-quote::git-diff-numstat-m-head"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --numstat recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4016-diff-quote.sh"
+libra_command = "diff"
+libra_surface = "--numstat"
+
+[[scenario]]
+id = "t4016-diff-quote::git-diff-stat-m-head"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --stat recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4016-diff-quote.sh"
+libra_command = "diff"
+libra_surface = "--stat"

@@ -1,10 +1,11 @@
 //! Append-only JSONL session event storage.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -612,23 +613,70 @@ fn payload_conflict(identity: &CodeCommandIdentity) -> CodeCommandStoreError {
     }
 }
 
-fn update_code_command_terminal(
-    status: &mut Option<CodeCommandStatus>,
-    target: CodeCommandStatus,
-    identity: &CodeCommandIdentity,
-) -> Result<(), CodeCommandStoreError> {
-    match status {
-        None => Err(CodeCommandStoreError::TerminalWithoutIntent {
-            command_id: identity.command_id.clone(),
-        }),
-        Some(CodeCommandStatus::Pending) => {
-            *status = Some(target);
-            Ok(())
+fn apply_command_status_event(
+    commands: &mut HashMap<CodeCommandIdentity, CachedCodeCommand>,
+    event: &CodeWorkflowEventKind,
+) {
+    let (identity, intent, terminal) = match event {
+        CodeWorkflowEventKind::CommandIntentPersisted { command } => {
+            (&command.identity, Some(command), None)
         }
-        Some(existing) if *existing == target => Ok(()),
-        Some(_) => Err(CodeCommandStoreError::TerminalConflict {
-            command_id: identity.command_id.clone(),
-        }),
+        CodeWorkflowEventKind::CommandTerminalSuccess { command, summary } => (
+            command,
+            None,
+            Some(CodeCommandStatus::Succeeded {
+                summary: summary.clone(),
+            }),
+        ),
+        CodeWorkflowEventKind::CommandTerminalFailure { command, reason } => (
+            command,
+            None,
+            Some(CodeCommandStatus::Failed {
+                reason: reason.clone(),
+            }),
+        ),
+        CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+            command,
+            effect,
+            reason,
+        } => (
+            command,
+            None,
+            Some(CodeCommandStatus::Indeterminate {
+                effect: effect.clone(),
+                reason: reason.clone(),
+            }),
+        ),
+        _ => return,
+    };
+    let cached = commands.entry(identity.clone()).or_default();
+    if let Some(intent) = intent {
+        if let Some(existing) = cached.intent.as_ref()
+            && existing != intent
+        {
+            cached.payload_conflict = true;
+        } else {
+            cached.intent = Some(intent.clone());
+            match &cached.status {
+                None => {
+                    cached.status = Some(CodeCommandStatus::Pending);
+                }
+                Some(CodeCommandStatus::Pending) => {}
+                // Intent after a terminal row is malformed: fail closed so
+                // admit/recover cannot treat the command as a fresh Pending.
+                Some(_) => cached.terminal_conflict = true,
+            }
+        }
+    }
+    if let Some(target) = terminal {
+        match &cached.status {
+            // Keep an orphan terminal so lookups surface TerminalWithoutIntent
+            // instead of silently dropping it and later re-dispatching.
+            None => cached.status = Some(target),
+            Some(CodeCommandStatus::Pending) => cached.status = Some(target),
+            Some(existing) if *existing == target => {}
+            Some(_) => cached.terminal_conflict = true,
+        }
     }
 }
 
@@ -641,6 +689,18 @@ pub struct SessionContextReplay {
 #[derive(Debug, Clone)]
 pub struct SessionJsonlStore {
     session_root: PathBuf,
+    /// Lazily populated from the workflow log, then updated by each durable
+    /// command transition. This avoids replaying the entire session log for
+    /// every command admission or completion in one running session.
+    command_status_cache: Arc<Mutex<Option<HashMap<CodeCommandIdentity, CachedCodeCommand>>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CachedCodeCommand {
+    intent: Option<CodeCommandIntent>,
+    status: Option<CodeCommandStatus>,
+    payload_conflict: bool,
+    terminal_conflict: bool,
 }
 
 /// A narrow cross-process lock for sequence allocation plus one Code workflow
@@ -668,7 +728,10 @@ impl Drop for CodeWorkflowAppendLock {
 
 impl SessionJsonlStore {
     pub fn new(session_root: PathBuf) -> Self {
-        Self { session_root }
+        Self {
+            session_root,
+            command_status_cache: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn session_root(&self) -> &Path {
@@ -765,6 +828,7 @@ impl SessionJsonlStore {
             &SessionEvent::code_workflow(workflow_event.clone()),
             durable,
         )?;
+        self.update_command_status_cache(&workflow_event.event);
         Ok(workflow_event)
     }
 
@@ -951,20 +1015,32 @@ impl SessionJsonlStore {
         }
         fs::create_dir_all(&self.session_root)?;
         let _lock = self.acquire_code_workflow_append_lock()?;
+        // Rebuild after the lock so another process's terminal append is visible
+        // before we decide whether this identity may dispatch again.
+        self.invalidate_command_status_cache();
         if let Some((existing_intent, status)) = self.code_command_status(&intent.identity)? {
             if existing_intent != intent {
                 return Err(payload_conflict(&intent.identity));
             }
             return Ok(CodeCommandAdmission::Existing { status });
         }
-
-        self.append_code_workflow_while_locked(
+        if intent.mutating {
+            self.claim_mutating_owner_lease()?;
+        }
+        match self.append_code_workflow_while_locked(
             CodeWorkflowEventKind::CommandIntentPersisted {
                 command: intent.clone(),
             },
             true,
-        )?;
-        Ok(CodeCommandAdmission::Execute { intent })
+        ) {
+            Ok(_) => Ok(CodeCommandAdmission::Execute { intent }),
+            Err(error) => {
+                if intent.mutating {
+                    self.release_mutating_owner_lease();
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Recover a command after an interrupted runtime. Read-only pending
@@ -980,6 +1056,7 @@ impl SessionJsonlStore {
         }
         fs::create_dir_all(&self.session_root)?;
         let _lock = self.acquire_code_workflow_append_lock()?;
+        self.invalidate_command_status_cache();
         let Some((intent, status)) = self.code_command_status(identity)? else {
             return Err(CodeCommandStoreError::MissingIntent {
                 command_id: identity.command_id.clone(),
@@ -988,6 +1065,11 @@ impl SessionJsonlStore {
 
         match status {
             CodeCommandStatus::Pending if intent.mutating => {
+                if self.live_mutating_owner_exists() {
+                    return Ok(CodeCommandRecovery::Existing {
+                        status: CodeCommandStatus::Pending,
+                    });
+                }
                 let status = CodeCommandStatus::Indeterminate {
                     effect: "unknown_mutating_dispatch".to_string(),
                     reason:
@@ -1003,11 +1085,164 @@ impl SessionJsonlStore {
                     },
                     true,
                 )?;
+                self.release_mutating_owner_lease_if_no_pending_mutations()?;
                 Ok(CodeCommandRecovery::Existing { status })
             }
             CodeCommandStatus::Pending => Ok(CodeCommandRecovery::RetryReadOnly { intent }),
             status => Ok(CodeCommandRecovery::Existing { status }),
         }
+    }
+
+    /// Recover every mutating command that still requires reconciliation before
+    /// a new runtime accepts turns. Pending mutations are durably fenced as
+    /// `Indeterminate`; already-indeterminate mutating commands are returned so
+    /// a later restart keeps the same fence instead of silently accepting turns.
+    pub fn recover_pending_mutating_code_commands(
+        &self,
+    ) -> Result<Vec<CodeCommandIdentity>, CodeCommandStoreError> {
+        // A brand-new session has no command log to recover. Do not create
+        // storage here: ordinary turn admission owns that precondition and
+        // reports a repairable persistence failure to its caller.
+        match fs::metadata(self.events_path()) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        // Cross-process writers may have appended while this store held a stale
+        // in-memory cache; rebuild under the lock before deciding recovery.
+        self.invalidate_command_status_cache();
+        let mut fence_mutations = Vec::new();
+        let mut pending_to_fence = Vec::new();
+        for (identity, cached) in self.all_code_command_statuses()? {
+            if cached.payload_conflict {
+                return Err(payload_conflict(&identity));
+            }
+            if cached.terminal_conflict {
+                return Err(CodeCommandStoreError::TerminalConflict {
+                    command_id: identity.command_id.clone(),
+                });
+            }
+            match (&cached.intent, &cached.status) {
+                (None, None) => {}
+                (None, Some(_)) | (Some(_), None) => {
+                    return Err(CodeCommandStoreError::TerminalWithoutIntent {
+                        command_id: identity.command_id.clone(),
+                    });
+                }
+                (Some(intent), Some(status)) if intent.mutating => match status {
+                    CodeCommandStatus::Pending => {
+                        // A live owner may still be executing this mutation in
+                        // another process. Fencing it here would race the
+                        // owner's terminal append into TerminalConflict.
+                        if self.live_mutating_owner_exists() {
+                            tracing::info!(
+                                command_id = %identity.command_id,
+                                "skipping pending mutation fence because another live runtime still owns this session"
+                            );
+                        } else {
+                            pending_to_fence.push(identity.clone());
+                            fence_mutations.push(identity);
+                        }
+                    }
+                    CodeCommandStatus::Indeterminate { .. } => {
+                        fence_mutations.push(identity);
+                    }
+                    _ => {}
+                },
+                (Some(_), Some(_)) => {}
+            }
+        }
+
+        for identity in &pending_to_fence {
+            self.append_code_workflow_while_locked(
+                CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                    command: identity.clone(),
+                    effect: "unknown_mutating_dispatch".to_string(),
+                    reason:
+                        "runtime stopped after durable intent; manual reconciliation is required"
+                            .to_string(),
+                },
+                true,
+            )?;
+        }
+        if !pending_to_fence.is_empty() {
+            self.release_mutating_owner_lease_if_no_pending_mutations()?;
+        }
+        Ok(fence_mutations)
+    }
+
+    /// Read-only inspection for surfaces such as `libra graph`: true when a
+    /// mutating command is still Pending with no live owner, or already
+    /// Indeterminate. Does not append a fence — callers surface
+    /// `indeterminate_side_effect` so operators cannot miss reconciliation.
+    ///
+    /// The workflow log must fit in `max_bytes`; larger logs fail closed so
+    /// graph cannot hide reconciliation behind a partial scan.
+    pub fn has_unresolved_mutating_reconciliation_bounded(
+        &self,
+        max_bytes: u64,
+    ) -> Result<bool, CodeCommandStoreError> {
+        let path = self.events_path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Code workflow log '{}' is {} bytes, exceeding the bounded reconciliation inspection limit of {max_bytes}; create a projection checkpoint or fence pending mutations before inspecting graph overlays",
+                    path.display(),
+                    metadata.len()
+                ),
+            )
+            .into());
+        }
+        // Prefer a fresh rebuild; inspection must not trust a stale cache from
+        // another long-lived reader in the same process.
+        self.invalidate_command_status_cache();
+        let live_owner = self.live_mutating_owner_exists();
+        for (identity, cached) in self.all_code_command_statuses()? {
+            if cached.payload_conflict {
+                return Err(payload_conflict(&identity));
+            }
+            if cached.terminal_conflict {
+                return Err(CodeCommandStoreError::TerminalConflict {
+                    command_id: identity.command_id.clone(),
+                });
+            }
+            match (&cached.intent, &cached.status) {
+                (None, None) => {}
+                (None, Some(_)) | (Some(_), None) => {
+                    return Err(CodeCommandStoreError::TerminalWithoutIntent {
+                        command_id: identity.command_id.clone(),
+                    });
+                }
+                (Some(intent), Some(status)) if intent.mutating => match status {
+                    CodeCommandStatus::Pending if !live_owner => return Ok(true),
+                    CodeCommandStatus::Indeterminate { .. } => return Ok(true),
+                    _ => {}
+                },
+                (Some(_), Some(_)) => {}
+            }
+        }
+        Ok(false)
     }
 
     pub fn complete_code_command_success(
@@ -1079,7 +1314,10 @@ impl SessionJsonlStore {
         }
         fs::create_dir_all(&self.session_root)?;
         let _lock = self.acquire_code_workflow_append_lock()?;
-        let Some((_intent, status)) = self.code_command_status(identity)? else {
+        // Another SessionJsonlStore may have recorded a terminal state while this
+        // instance still believed the command was Pending; refresh under the lock.
+        self.invalidate_command_status_cache();
+        let Some((intent, status)) = self.code_command_status(identity)? else {
             return Err(CodeCommandStoreError::MissingIntent {
                 command_id: identity.command_id.clone(),
             });
@@ -1087,6 +1325,9 @@ impl SessionJsonlStore {
         match status {
             CodeCommandStatus::Pending => {
                 self.append_code_workflow_while_locked(event, true)?;
+                if intent.mutating {
+                    self.release_mutating_owner_lease_if_no_pending_mutations()?;
+                }
                 Ok(target)
             }
             existing if existing == target => Ok(existing),
@@ -1100,55 +1341,19 @@ impl SessionJsonlStore {
         &self,
         identity: &CodeCommandIdentity,
     ) -> Result<Option<(CodeCommandIntent, CodeCommandStatus)>, CodeCommandStoreError> {
-        let mut intent = None;
-        let mut status = None;
-        for event in self.load_code_workflow_replay()?.events {
-            match event.event {
-                CodeWorkflowEventKind::CommandIntentPersisted { command }
-                    if command.identity == *identity =>
-                {
-                    if let Some(existing) = intent.as_ref()
-                        && existing != &command
-                    {
-                        return Err(payload_conflict(identity));
-                    }
-                    intent = Some(command);
-                    status.get_or_insert(CodeCommandStatus::Pending);
-                }
-                CodeWorkflowEventKind::CommandTerminalSuccess { command, summary }
-                    if command == *identity =>
-                {
-                    update_code_command_terminal(
-                        &mut status,
-                        CodeCommandStatus::Succeeded { summary },
-                        identity,
-                    )?;
-                }
-                CodeWorkflowEventKind::CommandTerminalFailure { command, reason }
-                    if command == *identity =>
-                {
-                    update_code_command_terminal(
-                        &mut status,
-                        CodeCommandStatus::Failed { reason },
-                        identity,
-                    )?;
-                }
-                CodeWorkflowEventKind::CommandIndeterminateSideEffect {
-                    command,
-                    effect,
-                    reason,
-                } if command == *identity => {
-                    update_code_command_terminal(
-                        &mut status,
-                        CodeCommandStatus::Indeterminate { effect, reason },
-                        identity,
-                    )?;
-                }
-                _ => {}
-            }
+        let cached = self
+            .all_code_command_statuses()?
+            .remove(identity)
+            .unwrap_or_default();
+        if cached.payload_conflict {
+            return Err(payload_conflict(identity));
         }
-
-        match (intent, status) {
+        if cached.terminal_conflict {
+            return Err(CodeCommandStoreError::TerminalConflict {
+                command_id: identity.command_id.clone(),
+            });
+        }
+        match (cached.intent, cached.status) {
             (Some(intent), Some(status)) => Ok(Some((intent, status))),
             (None, None) => Ok(None),
             (None, Some(_)) => Err(CodeCommandStoreError::TerminalWithoutIntent {
@@ -1157,6 +1362,137 @@ impl SessionJsonlStore {
             (Some(_), None) => Err(CodeCommandStoreError::TerminalWithoutIntent {
                 command_id: identity.command_id.clone(),
             }),
+        }
+    }
+
+    fn all_code_command_statuses(
+        &self,
+    ) -> Result<HashMap<CodeCommandIdentity, CachedCodeCommand>, CodeCommandStoreError> {
+        let mut cache = self
+            .command_status_cache
+            .lock()
+            .map_err(|_| io::Error::other("session command status cache lock was poisoned"))?;
+        if cache.is_none() {
+            let replay = self.load_code_workflow_replay()?;
+            let mut rebuilt = HashMap::new();
+            for event in replay.events {
+                apply_command_status_event(&mut rebuilt, &event.event);
+            }
+            *cache = Some(rebuilt);
+        }
+        Ok(cache.clone().unwrap_or_default())
+    }
+
+    /// Drop the in-memory command-status cache. Call after acquiring the
+    /// cross-process append lock so subsequent lookups rebuild from the durable
+    /// log instead of a stale same-process snapshot.
+    fn invalidate_command_status_cache(&self) {
+        let Ok(mut cache) = self.command_status_cache.lock() else {
+            tracing::warn!(
+                "session command status cache lock was poisoned; leaving None for rebuild"
+            );
+            return;
+        };
+        *cache = None;
+    }
+
+    fn mutating_owner_lock_path(&self) -> PathBuf {
+        self.session_root.join("mutating_owner.lock")
+    }
+
+    fn claim_mutating_owner_lease(&self) -> io::Result<()> {
+        if self.foreign_live_mutating_owner_exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "session '{}' still has a live mutating runtime owner; refuse concurrent mutating admission",
+                    self.session_root.display()
+                ),
+            ));
+        }
+        let path = self.mutating_owner_lock_path();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        let owner = current_process_owner_identity();
+        writeln!(file, "pid={}", owner.pid)?;
+        if let Some(starttime) = owner.starttime {
+            writeln!(file, "starttime={starttime}")?;
+        }
+        if let Some(boot_id) = owner.boot_id.as_deref() {
+            writeln!(file, "boot_id={boot_id}")?;
+        }
+        Ok(())
+    }
+
+    fn release_mutating_owner_lease_if_no_pending_mutations(
+        &self,
+    ) -> Result<(), CodeCommandStoreError> {
+        for (_identity, cached) in self.all_code_command_statuses()? {
+            if cached.intent.as_ref().is_some_and(|intent| intent.mutating)
+                && matches!(cached.status, Some(CodeCommandStatus::Pending))
+            {
+                return Ok(());
+            }
+        }
+        self.release_mutating_owner_lease();
+        Ok(())
+    }
+
+    fn release_mutating_owner_lease(&self) {
+        let path = self.mutating_owner_lock_path();
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to release mutating owner lease"
+            );
+        }
+    }
+
+    fn foreign_live_mutating_owner_exists(&self) -> bool {
+        let path = self.mutating_owner_lock_path();
+        let Ok(content) = fs::read_to_string(&path) else {
+            return false;
+        };
+        let Some(pid) = content.lines().find_map(|line| {
+            line.strip_prefix("pid=")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        }) else {
+            return false;
+        };
+        if pid == std::process::id() {
+            return false;
+        }
+        let recorded_starttime = content.lines().find_map(|line| {
+            line.strip_prefix("starttime=")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        });
+        let recorded_boot_id = content.lines().find_map(|line| {
+            line.strip_prefix("boot_id=")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+        process_appears_alive(pid, &path, recorded_starttime, recorded_boot_id.as_deref())
+    }
+
+    fn live_mutating_owner_exists(&self) -> bool {
+        self.foreign_live_mutating_owner_exists()
+    }
+
+    fn update_command_status_cache(&self, event: &CodeWorkflowEventKind) {
+        let Ok(mut cache) = self.command_status_cache.lock() else {
+            tracing::warn!(
+                "session command status cache lock was poisoned; rebuilding on next lookup"
+            );
+            return;
+        };
+        if let Some(cache) = cache.as_mut() {
+            apply_command_status_event(cache, event);
         }
     }
 
@@ -1578,6 +1914,93 @@ fn code_workflow_append_lock_is_stale(path: &Path) -> bool {
 
 pub fn session_events_path(session_root: &Path) -> PathBuf {
     session_root.join(SESSION_EVENTS_FILE)
+}
+
+fn process_appears_alive(
+    pid: u32,
+    lock_path: &Path,
+    recorded_starttime: Option<u64>,
+    recorded_boot_id: Option<&str>,
+) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = lock_path;
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return false;
+        }
+        let current = process_owner_identity_for_pid(pid);
+        if let (Some(expected), Some(actual)) = (recorded_starttime, current.starttime)
+            && expected != actual
+        {
+            return false;
+        }
+        if let (Some(expected), Some(actual)) = (recorded_boot_id, current.boot_id.as_deref())
+            && expected != actual
+        {
+            return false;
+        }
+        return true;
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = (lock_path, recorded_starttime, recorded_boot_id);
+        // SAFETY: kill(pid, 0) is a existence/permission probe and does not
+        // deliver a signal.
+        return unsafe { libc::kill(pid as i32, 0) == 0 };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, recorded_starttime, recorded_boot_id);
+        // Without a portable PID probe, treat a recent lock as live and a lock
+        // older than the session-lock stale age as dead so crash recovery can
+        // fence Pending mutations.
+        let Ok(metadata) = fs::metadata(lock_path) else {
+            return false;
+        };
+        let Ok(modified_at) = metadata.modified() else {
+            return true;
+        };
+        let Ok(elapsed) = modified_at.elapsed() else {
+            return true;
+        };
+        elapsed < STALE_CODE_WORKFLOW_APPEND_LOCK_AGE
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProcessOwnerIdentity {
+    pid: u32,
+    starttime: Option<u64>,
+    boot_id: Option<String>,
+}
+
+fn current_process_owner_identity() -> ProcessOwnerIdentity {
+    process_owner_identity_for_pid(std::process::id())
+}
+
+fn process_owner_identity_for_pid(pid: u32) -> ProcessOwnerIdentity {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let starttime = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            // /proc/<pid>/stat: fields after the command) — starttime is field 22.
+            let after_comm = stat.rsplit_once(')')?.1;
+            after_comm
+                .split_whitespace()
+                .nth(19)
+                .and_then(|value| value.parse::<u64>().ok())
+        });
+    ProcessOwnerIdentity {
+        pid,
+        starttime,
+        boot_id,
+    }
 }
 
 #[cfg(test)]

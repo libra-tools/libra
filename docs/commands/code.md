@@ -167,6 +167,7 @@ Code UI API errors use `{ error: { code, message } }`:
 | `STATUS_UNAVAILABLE` | 500 | Runtime status snapshot is unavailable. |
 | `THREAD_LIST_FAILED` | 500 | Thread projection enumeration failed. |
 | `DB_UNAVAILABLE` | 500 | Session database is offline. |
+| `RECONCILIATION_REQUIRED` | 409 | A mutating turn needs manual reconciliation before another turn can run. |
 | `INTERNAL_ERROR` | 500 | Fallback internal failure. |
 | `UNSUPPORTED_OPERATION` | 422 | Runtime rejected a requested operation that is not yet supported. |
 

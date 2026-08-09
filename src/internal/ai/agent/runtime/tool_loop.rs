@@ -96,10 +96,23 @@ impl ToolLoopCancellation {
         self.mutation_started.store(true, Ordering::Release);
     }
 
-    /// Clear the marker only after the handler has returned its determinate
-    /// result. A later model/read-only phase is safe to cancel cooperatively.
-    pub fn mark_mutation_finished(&self) {
+    /// Release a pre-dispatch classification claim when cancellation wins
+    /// before the mutating handler runs. The tool never executed, so the
+    /// turn must not keep a sticky mutation fence.
+    pub fn release_pre_dispatch_mutation_claim(&self) {
         self.mutation_started.store(false, Ordering::Release);
+    }
+
+    /// Keep the turn-level mutation latch set after the handler returns.
+    ///
+    /// Post-mutation model/read-only work may still run, but cancel must not
+    /// treat the turn as never-mutating: hard-abort and ordinary
+    /// `Cancelled` terminals would hide side effects that already happened.
+    /// Pre-dispatch cancellation must call
+    /// [`Self::release_pre_dispatch_mutation_claim`] instead.
+    pub fn mark_mutation_finished(&self) {
+        // Sticky latch after dispatch: intentionally leave `mutation_started`
+        // set for the remainder of the turn.
     }
 
     async fn cancelled(&self) {
@@ -705,7 +718,7 @@ where
                 if mutates_state && let Some(cancellation) = config.cancellation.as_ref() {
                     cancellation.mark_mutation_started();
                     if cancellation.is_cancelled() {
-                        cancellation.mark_mutation_finished();
+                        cancellation.release_pre_dispatch_mutation_claim();
                         return Err(tool_loop_cancelled_error());
                     }
                 } else if tool_loop_cancelled(&config) {
@@ -1740,8 +1753,8 @@ mod tests {
 
         assert_eq!(turn.final_text, "done");
         assert!(
-            !mutation_started.load(Ordering::Acquire),
-            "the marker must be cleared after the mutation handler returns",
+            mutation_started.load(Ordering::Acquire),
+            "the marker must stay set after the mutation handler returns so post-mutation cancel cannot hard-abort",
         );
     }
 

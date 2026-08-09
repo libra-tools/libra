@@ -135,44 +135,53 @@ fn state_cancel_while_executing_tool_settles_running_tool_call() -> Result<()> {
         status_executing && tool_running
     })?;
 
+    // W1-04: once a mutating tool has started, cancel is cooperative — the
+    // runtime must wait for a determinate tool result instead of JoinHandle
+    // abort + ordinary "Interrupted." So this matrix case waits out the
+    // in-flight shell and asserts the turn settles without staying stuck in
+    // `executing_tool` / `running`.
     session.cancel_turn()?;
-    session.wait_for_snapshot(Duration::from_secs(5), |snapshot| {
-        let status_idle = snapshot.get("status").and_then(|value| value.as_str()) == Some("idle");
+    session.wait_for_snapshot(Duration::from_secs(15), |snapshot| {
+        let status = snapshot.get("status").and_then(|value| value.as_str());
+        let status_settled = matches!(
+            status,
+            Some("idle" | "completed" | "error" | "indeterminate_side_effect")
+        );
         let tool_settled = snapshot
             .get("toolCalls")
             .and_then(|value| value.as_array())
             .is_some_and(|tool_calls| {
                 tool_calls.iter().any(|tool_call| {
                     tool_call.get("id").and_then(|value| value.as_str()) == Some("slow-shell-1")
-                        && tool_call.get("status").and_then(|value| value.as_str())
-                            == Some("failed")
-                        && tool_call
-                            .get("details")
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|details| details.contains("Interrupted"))
+                        && !matches!(
+                            tool_call.get("status").and_then(|value| value.as_str()),
+                            Some("running" | "pending")
+                        )
                 })
             });
         let transcript_settled = snapshot
             .get("transcript")
             .and_then(|value| value.as_array())
             .is_some_and(|entries| {
-                let tool_entry = entries.iter().any(|entry| {
+                let tool_settled = entries.iter().any(|entry| {
                     entry.get("id").and_then(|value| value.as_str()) == Some("slow-shell-1")
-                        && entry.get("status").and_then(|value| value.as_str()) == Some("failed")
-                        && entry.get("streaming").and_then(|value| value.as_bool()) == Some(false)
+                        && entry.get("streaming").and_then(|value| value.as_bool()) != Some(true)
+                        && !matches!(
+                            entry.get("status").and_then(|value| value.as_str()),
+                            Some("running" | "pending")
+                        )
                 });
-                let assistant_entry = entries.iter().any(|entry| {
+                let assistant_settled = entries.iter().any(|entry| {
                     entry.get("id").and_then(|value| value.as_str()) == Some("turn-1-assistant")
-                        && entry.get("status").and_then(|value| value.as_str()) == Some("cancelled")
-                        && entry.get("streaming").and_then(|value| value.as_bool()) == Some(false)
-                        && entry
-                            .get("content")
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|content| content.contains("Interrupted"))
+                        && entry.get("streaming").and_then(|value| value.as_bool()) != Some(true)
+                        && !matches!(
+                            entry.get("status").and_then(|value| value.as_str()),
+                            Some("thinking" | "running" | "pending")
+                        )
                 });
-                tool_entry && assistant_entry
+                tool_settled && assistant_settled
             });
-        status_idle && tool_settled && transcript_settled
+        status_settled && tool_settled && transcript_settled
     })?;
 
     session.shutdown()
@@ -182,6 +191,22 @@ fn state_cancel_while_executing_tool_settles_running_tool_call() -> Result<()> {
 #[test]
 fn state_matrix_requires_test_provider_feature() {
     eprintln!("skipping state matrix; enable --features test-provider");
+}
+
+/// W0-02 repair-loop baseline (cargo filter: `repair`).
+///
+/// Keeps the automatic plan-repair threshold copy and `/plan continue`
+/// affordance discoverable from the state-matrix target listed in the plan.
+#[test]
+fn repair_loop_baseline_threshold_keeps_plan_continue_affordance() {
+    use libra::internal::tui::plan_repair_threshold_baseline_message;
+
+    let message = plan_repair_threshold_baseline_message("step failed", 2, 2);
+    assert!(message.contains(
+        "Automatic plan repair stopped after 2 failed repair attempts (automatic threshold: 2)."
+    ));
+    assert!(message.contains("Reply `continue` or `/plan continue"));
+    assert!(message.contains("step failed"));
 }
 
 #[cfg(feature = "test-provider")]

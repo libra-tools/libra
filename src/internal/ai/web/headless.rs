@@ -47,7 +47,6 @@ use std::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;
-use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
@@ -55,7 +54,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::code_ui::{
-    CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
+    CodeUiApiError, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
     CodeUiInteractionKind, CodeUiInteractionOption, CodeUiInteractionRequest,
     CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiPatchChange, CodeUiPatchsetSnapshot,
     CodeUiPlanSnapshot, CodeUiPlanStep, CodeUiReadModel, CodeUiSession, CodeUiSessionSnapshot,
@@ -69,15 +68,12 @@ use crate::internal::ai::{
     },
     runtime::{
         AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig, AgentSnapshot,
-        InteractionState, RuntimeCommandDurability, RuntimeCommandDurabilityError,
-        RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
-        RuntimeTurnExecutor, RuntimeWorkerError, TurnRequest,
+        InteractionState, RuntimeCommandDurability, RuntimeExecutionContext,
+        RuntimeInteractionDelivery, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
+        TurnRequest, runtime_worker_adapter_message,
     },
     sandbox::{ExecApprovalRequest, NetworkAccess, ReviewDecision},
-    session::{
-        CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandStatus,
-        CodeWorkflowEventKind, SessionJsonlStore, SessionState, SessionStore,
-    },
+    session::{CodeWorkflowEventKind, SessionJsonlStore, SessionState, SessionStore},
     tools::{
         ToolOutput, ToolRegistry,
         context::{
@@ -109,6 +105,8 @@ pub fn headless_capabilities() -> CodeUiCapabilities {
 /// indefinitely unresponsive. The timeout error is deliberately actionable;
 /// the caller must surface it rather than silently treating shutdown as clean.
 const HEADLESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const HEADLESS_BROWSER_PRINCIPAL: &str = "web-headless-browser";
+const HEADLESS_DIRECT_TURN_KIND: &str = "headless_direct_turn";
 
 #[derive(Clone)]
 pub struct HeadlessSessionPersistence {
@@ -116,6 +114,8 @@ pub struct HeadlessSessionPersistence {
     state: Arc<Mutex<SessionState>>,
     projection_store: SessionJsonlStore,
     projection_checkpoint: Arc<Mutex<HeadlessProjectionCheckpoint>>,
+    durability_repo_id: String,
+    durability_session_id: String,
 }
 
 struct HeadlessProjectionCheckpoint {
@@ -142,13 +142,28 @@ impl HeadlessSessionPersistence {
         let projection_store = SessionJsonlStore::new(store.session_root(&state.id));
         Self {
             store,
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(state.clone())),
             projection_store,
             projection_checkpoint: Arc::new(Mutex::new(HeadlessProjectionCheckpoint {
                 snapshot: initial_projection_snapshot,
                 sequence: initial_projection_sequence,
             })),
+            durability_repo_id: state.working_dir.clone(),
+            durability_session_id: state.id.clone(),
         }
+    }
+
+    /// Stable durable identity fields used by the runtime worker.
+    pub fn worker_durability_config(&self) -> (RuntimeCommandDurability, String, String) {
+        (
+            RuntimeCommandDurability::new(self.projection_store.clone()),
+            self.durability_repo_id.clone(),
+            HEADLESS_BROWSER_PRINCIPAL.to_string(),
+        )
+    }
+
+    pub fn durability_session_id(&self) -> &str {
+        &self.durability_session_id
     }
 
     async fn record_user_message(
@@ -180,63 +195,6 @@ impl HeadlessSessionPersistence {
         let mut state = self.state.lock().await;
         sync_session_metadata_from_snapshot(&mut state, snapshot, sequence)?;
         self.store.save(&state)
-    }
-
-    /// Admit a browser direct-turn command before opening the runtime
-    /// executor's gate. Browser wire v1 has no caller-supplied command id, so
-    /// this uses the worker turn id as the current process-local identity;
-    /// W3's versioned control wire must replace it with a stable caller id for
-    /// retry de-duplication across requests.
-    async fn admit_browser_turn(
-        &self,
-        command_id: &str,
-        request_text: &str,
-    ) -> Result<CodeCommandAdmission, RuntimeCommandDurabilityError> {
-        let state = self.state.lock().await;
-        let request_hash = format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(request_text.as_bytes()))
-        );
-        let intent = CodeCommandIntent::new(
-            CodeCommandIdentity::new(
-                state.working_dir.clone(),
-                state.id.clone(),
-                "web-headless-browser",
-                command_id,
-            ),
-            "headless_direct_turn",
-            request_hash,
-            true,
-        );
-        RuntimeCommandDurability::new(self.projection_store.clone()).admit(intent)
-    }
-
-    fn complete_browser_turn_success(
-        &self,
-        intent: &CodeCommandIntent,
-        summary: &str,
-    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
-        RuntimeCommandDurability::new(self.projection_store.clone())
-            .complete_success(intent, summary)
-    }
-
-    fn complete_browser_turn_failure(
-        &self,
-        intent: &CodeCommandIntent,
-        reason: &str,
-    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
-        RuntimeCommandDurability::new(self.projection_store.clone())
-            .complete_failure(intent, reason)
-    }
-
-    fn mark_browser_turn_indeterminate(
-        &self,
-        intent: &CodeCommandIntent,
-        effect: &str,
-        reason: &str,
-    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
-        RuntimeCommandDurability::new(self.projection_store.clone())
-            .mark_indeterminate(intent, effect, reason)
     }
 
     /// Record the non-sensitive fact that a browser interaction was resolved
@@ -522,7 +480,6 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
 struct InFlightTurn {
     runtime_turn_id: String,
     assistant_entry_id: String,
-    durable_command: Option<CodeCommandIntent>,
     start_gate: Arc<tokio::sync::Notify>,
     start_open: Arc<AtomicBool>,
     /// Signals once terminal UI state and the worker's active-turn slot have
@@ -611,7 +568,7 @@ where
     /// `config_factory` is invoked once per turn so per-call `usage_context`
     /// fields (turn id, etc.) can be refreshed without mutating the original
     /// config in place.
-    pub fn new(
+    pub async fn new(
         session: Arc<CodeUiSession>,
         capabilities: CodeUiCapabilities,
         model: M,
@@ -633,12 +590,13 @@ where
             Vec::new(),
             None,
         )
+        .await
     }
 
     /// Build a headless runtime with restored model history and optional
     /// SessionStore persistence.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_persistence(
+    pub async fn new_with_persistence(
         session: Arc<CodeUiSession>,
         capabilities: CodeUiCapabilities,
         model: M,
@@ -663,6 +621,7 @@ where
             persistence,
             HEADLESS_SHUTDOWN_TIMEOUT,
         )
+        .await
     }
 
     /// Build a headless runtime with an explicit graceful-shutdown bound.
@@ -672,7 +631,7 @@ where
     /// timeout-injection tests that need to verify the indeterminate recovery
     /// path without waiting for the production deadline.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_persistence_and_shutdown_timeout(
+    pub async fn new_with_persistence_and_shutdown_timeout(
         session: Arc<CodeUiSession>,
         capabilities: CodeUiCapabilities,
         model: M,
@@ -715,6 +674,29 @@ where
         });
         let mut worker_config = AgentRuntimeWorkerConfig::new(executor, tool_boundary);
         worker_config.shutdown_timeout = shutdown_timeout;
+        let runtime_session_id = persistence
+            .as_ref()
+            .map(HeadlessSessionPersistence::durability_session_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut recovered_reconciliation = false;
+        if let Some(persistence) = persistence.as_ref() {
+            let (durability, repo_id, principal_id) = persistence.worker_durability_config();
+            let recovered_mutations = durability.recover_pending_mutations().map_err(|error| {
+                anyhow!(
+                    "failed to recover pending durable commands for headless Code session '{}': {error}",
+                    persistence.durability_session_id()
+                )
+            })?;
+            worker_config = worker_config
+                .with_durability(durability, repo_id, principal_id)
+                .with_durability_command_kind(HEADLESS_DIRECT_TURN_KIND);
+            if !recovered_mutations.is_empty() {
+                recovered_reconciliation = true;
+                worker_config = worker_config
+                    .with_recovered_reconciliation_session(persistence.durability_session_id());
+            }
+        }
         let (runtime_handle, runtime_worker_task) = AgentRuntimeWorker::spawn(worker_config);
         let runtime = Arc::new(Self {
             model_type: PhantomData,
@@ -722,7 +704,7 @@ where
             capabilities,
             in_flight,
             next_turn_id: Arc::new(AtomicU64::new(1)),
-            runtime_session_id: uuid::Uuid::new_v4().to_string(),
+            runtime_session_id,
             runtime: runtime_handle,
             runtime_worker_task: Mutex::new(Some(runtime_worker_task)),
             active_turn_mutations,
@@ -746,6 +728,25 @@ where
             )
             .await;
         });
+
+        if recovered_reconciliation {
+            // Keep the browser-visible snapshot aligned with the worker fence
+            // so SSE/snapshot clients see reconciliation before the first 409.
+            runtime
+                .session
+                .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                .await;
+            if let Some(persistence) = runtime.persistence.as_ref()
+                && let Err(error) = persistence
+                    .persist_snapshot(runtime.session.snapshot().await)
+                    .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "failed to persist recovered reconciliation fence for headless Code session"
+                );
+            }
+        }
 
         Ok(runtime)
     }
@@ -784,13 +785,6 @@ where
             release_headless_turn(&self.in_flight, &request.turn_id).await;
             return Err(RuntimeWorkerError::Cancelled);
         }
-
-        let durable_command = {
-            let slot = self.in_flight.lock().await;
-            slot.as_ref()
-                .filter(|turn| turn.runtime_turn_id == request.turn_id)
-                .and_then(|turn| turn.durable_command.clone())
-        };
 
         let mutation_started = context.mutation_started_marker();
         {
@@ -845,142 +839,93 @@ where
         };
         let terminal = if let Some((effect, reason, log_message)) = reconciliation_required {
             tracing::error!("{log_message}");
-            if let Err(error) = mark_headless_command_indeterminate(
-                self.persistence.as_ref(),
-                durable_command.as_ref(),
-                effect,
-                reason,
-            ) {
-                tracing::error!(
-                    error = %error,
-                    "failed to durably record indeterminate browser command after a reconciliation-required runtime failure"
-                );
-            }
             self.session
                 .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
                 .await;
-            Err(RuntimeWorkerError::ExecutionFailed(format!(
-                "{reason}; session requires reconciliation"
+            // With worker durability configured, the worker is the sole
+            // terminal persistence owner for this command.
+            Err(RuntimeWorkerError::IndeterminateSideEffect(format!(
+                "{effect}: {reason}; session requires reconciliation"
             )))
         } else {
             match result {
                 Ok(turn) => {
-                    if let Err(error) = finish_headless_command(
-                        self.persistence.as_ref(),
-                        durable_command.as_ref(),
-                        Ok(turn.final_text.as_str()),
-                    ) {
-                        self.session
-                            .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
-                            .await;
-                        Err(RuntimeWorkerError::ExecutionFailed(format!(
-                            "headless turn completed but its durable terminal result could not be recorded; reconciliation is required: {error}"
-                        )))
-                    } else {
-                        {
-                            let mut history = self.history.lock().await;
-                            *history = turn.history;
-                        }
-                        finalize_assistant_entry(
+                    {
+                        let mut history = self.history.lock().await;
+                        *history = turn.history;
+                    }
+                    finalize_assistant_entry(
+                        &self.session,
+                        &assistant_entry_id,
+                        &turn.final_text,
+                        "completed",
+                    )
+                    .await;
+                    self.session.set_status(CodeUiSessionStatus::Idle).await;
+                    if let Some(persistence) = self.persistence.as_ref()
+                        && let Err(error) = persistence
+                            .record_assistant_message(
+                                self.session.snapshot().await,
+                                turn.final_text.as_str(),
+                            )
+                            .await
+                    {
+                        mark_persistence_failure(
                             &self.session,
-                            &assistant_entry_id,
-                            &turn.final_text,
-                            "completed",
+                            "failed to persist headless web assistant message",
+                            error,
                         )
                         .await;
-                        self.session.set_status(CodeUiSessionStatus::Idle).await;
-                        if let Some(persistence) = self.persistence.as_ref()
-                            && let Err(error) = persistence
-                                .record_assistant_message(
-                                    self.session.snapshot().await,
-                                    turn.final_text.as_str(),
-                                )
-                                .await
-                        {
-                            mark_persistence_failure(
-                                &self.session,
-                                "failed to persist headless web assistant message",
-                                error,
-                            )
-                            .await;
-                        }
-                        Ok(RuntimeTurnExecution::Completed {
-                            summary: "headless direct turn completed".to_string(),
-                        })
+                        return Err(RuntimeWorkerError::IndeterminateSideEffect(
+                            "failed to persist headless web assistant message after a successful mutating turn; session requires reconciliation"
+                                .to_string(),
+                        ));
                     }
+                    Ok(RuntimeTurnExecution::Completed {
+                        summary: "headless direct turn completed".to_string(),
+                    })
                 }
                 Err(_error) if cancellation.is_cancelled() => {
-                    if let Err(error) = finish_headless_command(
-                        self.persistence.as_ref(),
-                        durable_command.as_ref(),
-                        Err("cancelled before the browser turn reached its terminal result"),
-                    ) {
-                        self.session
-                            .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
-                            .await;
-                        Err(RuntimeWorkerError::ExecutionFailed(format!(
-                            "cancelled headless turn could not record its durable terminal result; reconciliation is required: {error}"
-                        )))
-                    } else {
-                        finalize_assistant_entry(
+                    finalize_assistant_entry(
+                        &self.session,
+                        &assistant_entry_id,
+                        "(turn cancelled by user)",
+                        "cancelled",
+                    )
+                    .await;
+                    self.session.set_status(CodeUiSessionStatus::Idle).await;
+                    if let Some(persistence) = self.persistence.as_ref()
+                        && let Err(error) = persistence
+                            .persist_snapshot(self.session.snapshot().await)
+                            .await
+                    {
+                        mark_persistence_failure(
                             &self.session,
-                            &assistant_entry_id,
-                            "(turn cancelled by user)",
-                            "cancelled",
+                            "failed to persist cancelled headless web turn",
+                            error,
                         )
                         .await;
-                        self.session.set_status(CodeUiSessionStatus::Idle).await;
-                        if let Some(persistence) = self.persistence.as_ref()
-                            && let Err(error) = persistence
-                                .persist_snapshot(self.session.snapshot().await)
-                                .await
-                        {
-                            mark_persistence_failure(
-                                &self.session,
-                                "failed to persist cancelled headless web turn",
-                                error,
-                            )
-                            .await;
-                        }
-                        Err(RuntimeWorkerError::Cancelled)
                     }
+                    Err(RuntimeWorkerError::Cancelled)
                 }
                 Err(error) => {
                     let message = format_completion_error(&error);
-                    if let Err(durability_error) = finish_headless_command(
-                        self.persistence.as_ref(),
-                        durable_command.as_ref(),
-                        Err(message.as_str()),
-                    ) {
-                        self.session
-                            .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
-                            .await;
-                        Err(RuntimeWorkerError::ExecutionFailed(format!(
-                            "failed headless turn could not record its durable terminal result; reconciliation is required: {durability_error}"
-                        )))
-                    } else {
-                        finalize_assistant_entry(
+                    finalize_assistant_entry(&self.session, &assistant_entry_id, &message, "error")
+                        .await;
+                    self.session.set_status(CodeUiSessionStatus::Error).await;
+                    if let Some(persistence) = self.persistence.as_ref()
+                        && let Err(error) = persistence
+                            .persist_snapshot(self.session.snapshot().await)
+                            .await
+                    {
+                        mark_persistence_failure(
                             &self.session,
-                            &assistant_entry_id,
-                            &message,
-                            "error",
+                            "failed to persist headless web failed turn snapshot",
+                            error,
                         )
                         .await;
-                        self.session.set_status(CodeUiSessionStatus::Error).await;
-                        if let Some(persistence) = self.persistence.as_ref()
-                            && let Err(error) = persistence
-                                .persist_snapshot(self.session.snapshot().await)
-                                .await
-                        {
-                            mark_persistence_failure(
-                                &self.session,
-                                "failed to persist headless web failed turn snapshot",
-                                error,
-                            )
-                            .await;
-                        }
-                        Err(RuntimeWorkerError::ExecutionFailed(message))
                     }
+                    Err(RuntimeWorkerError::ExecutionFailed(message))
                 }
             }
         };
@@ -1307,38 +1252,6 @@ async fn release_headless_turn(in_flight: &Mutex<Option<InFlightTurn>>, runtime_
     }
 }
 
-fn finish_headless_command(
-    persistence: Option<&HeadlessSessionPersistence>,
-    intent: Option<&CodeCommandIntent>,
-    terminal: Result<&str, &str>,
-) -> Result<(), RuntimeCommandDurabilityError> {
-    let (Some(persistence), Some(intent)) = (persistence, intent) else {
-        return Ok(());
-    };
-    match terminal {
-        Ok(summary) => persistence
-            .complete_browser_turn_success(intent, summary)
-            .map(|_| ()),
-        Err(reason) => persistence
-            .complete_browser_turn_failure(intent, reason)
-            .map(|_| ()),
-    }
-}
-
-fn mark_headless_command_indeterminate(
-    persistence: Option<&HeadlessSessionPersistence>,
-    intent: Option<&CodeCommandIntent>,
-    effect: &str,
-    reason: &str,
-) -> Result<(), RuntimeCommandDurabilityError> {
-    let (Some(persistence), Some(intent)) = (persistence, intent) else {
-        return Ok(());
-    };
-    persistence
-        .mark_browser_turn_indeterminate(intent, effect, reason)
-        .map(|_| ())
-}
-
 #[async_trait]
 impl<M> CodeUiReadModel for HeadlessCodeRuntime<M>
 where
@@ -1404,8 +1317,10 @@ where
             created_at: now,
             updated_at: now,
         };
+        // Fresh UUID per submission so resume/restart cannot reuse a prior
+        // durable command identity (numeric counters restart at 1).
         let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
-        let runtime_turn_id = format!("headless-{turn_id}");
+        let runtime_turn_id = format!("headless-{turn_id}-{}", uuid::Uuid::new_v4());
         let start_gate = Arc::new(tokio::sync::Notify::new());
         let start_open = Arc::new(AtomicBool::new(false));
         let completion = Arc::new(tokio::sync::Notify::new());
@@ -1413,7 +1328,6 @@ where
         *slot = Some(InFlightTurn {
             runtime_turn_id: runtime_turn_id.clone(),
             assistant_entry_id: assistant_entry_id.clone(),
-            durable_command: None,
             start_gate: start_gate.clone(),
             start_open: start_open.clone(),
             completion,
@@ -1435,8 +1349,12 @@ where
             .await
         {
             *slot = None;
+            if matches!(error, RuntimeWorkerError::ReconciliationRequired { .. }) {
+                return Err(error.into());
+            }
             return Err(anyhow!(
-                "Unable to admit the browser turn to the AgentRuntime queue; no tool was started: {error}"
+                "Unable to admit the browser turn to the AgentRuntime queue; no turn was started: {}",
+                runtime_worker_adapter_message(error)
             ));
         }
 
@@ -1444,37 +1362,6 @@ where
         // durable admission checks. A failure below can then cancel the
         // waiting executor and let it release the slot without any tool call.
         drop(slot);
-        let durable_command = if let Some(persistence) = self.persistence.as_ref() {
-            match persistence
-                .admit_browser_turn(&runtime_turn_id, &text)
-                .await
-            {
-                Ok(CodeCommandAdmission::Execute { intent }) => Some(intent),
-                Ok(CodeCommandAdmission::Existing { status }) => {
-                    self.cancel_gated_runtime_turn(
-                        &runtime_turn_id,
-                        completion_for_rollback.clone(),
-                    )
-                    .await?;
-                    return Err(anyhow!(
-                        "The browser command was already durably admitted with state {status:?}; it was not dispatched again"
-                    ));
-                }
-                Err(error) => {
-                    self.cancel_gated_runtime_turn(
-                        &runtime_turn_id,
-                        completion_for_rollback.clone(),
-                    )
-                    .await?;
-                    return Err(anyhow!(
-                        "Unable to durably admit the browser command; no turn was started. Verify session storage and retry: {error}"
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
         // The worker has accepted the turn, but its executor is blocked on
         // `start_gate`. Persist the complete initial projection before opening
         // that gate or exposing the live transcript. This ordering prevents
@@ -1490,35 +1377,12 @@ where
                 .record_user_message(durable_snapshot, &text)
                 .await
             {
-                if let Some(intent) = durable_command.as_ref()
-                    && let Err(terminal_error) = persistence.complete_browser_turn_failure(
-                        intent,
-                        "initial_headless_projection_persistence_failed",
-                    )
-                {
-                    tracing::error!(
-                        error = %terminal_error,
-                        "failed to record durable terminal failure for a gated browser command"
-                    );
-                }
                 self.cancel_gated_runtime_turn(&runtime_turn_id, completion_for_rollback.clone())
                     .await?;
                 return Err(anyhow!(
                     "Unable to persist the headless web message; no turn was started. Verify session storage and retry: {error}"
                 ));
             }
-        }
-        {
-            let mut slot = self.in_flight.lock().await;
-            let turn = slot
-                .as_mut()
-                .filter(|turn| turn.runtime_turn_id == runtime_turn_id)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "AgentRuntime released the browser turn before its durable projection could be opened"
-                    )
-                })?;
-            turn.durable_command = durable_command;
         }
         self.session.upsert_transcript_entry(user_entry).await;
         self.session.upsert_transcript_entry(assistant_entry).await;
@@ -1722,9 +1586,13 @@ where
             .await
         {
             Ok(()) | Err(RuntimeWorkerError::UnknownTurn { .. }) => {}
+            Err(error @ RuntimeWorkerError::ReconciliationRequired { .. }) => {
+                return Err(error.into());
+            }
             Err(error) => {
                 return Err(anyhow!(
-                    "Unable to request cancellation from the AgentRuntime: {error}"
+                    "Unable to request cancellation from the AgentRuntime: {}",
+                    runtime_worker_adapter_message(error)
                 ));
             }
         }
@@ -1792,9 +1660,13 @@ where
                 // reservation as well so a storage repair can be retried.
                 release_headless_turn(&self.in_flight, runtime_turn_id).await;
             }
+            Err(error @ RuntimeWorkerError::ReconciliationRequired { .. }) => {
+                return Err(error.into());
+            }
             Err(error) => {
                 return Err(anyhow!(
-                    "The gated AgentRuntime turn could not be cancelled; no tool gate was opened. Verify runtime/session storage before retrying: {error}"
+                    "The gated AgentRuntime turn could not be cancelled; no tool gate was opened. Verify runtime/session storage before retrying: {}",
+                    runtime_worker_adapter_message(error)
                 ));
             }
         }
@@ -1802,25 +1674,10 @@ where
     }
 
     async fn shutdown_once(&self) -> anyhow::Result<()> {
-        let durable_command = {
-            let slot = self.in_flight.lock().await;
-            slot.as_ref().and_then(|turn| turn.durable_command.clone())
-        };
         self.clear_pending_user_inputs().await;
         let shutdown_result = self.runtime.shutdown().await;
         if shutdown_result.is_err() {
             self.shutdown_timed_out.store(true, Ordering::Release);
-            if let Err(error) = mark_headless_command_indeterminate(
-                self.persistence.as_ref(),
-                durable_command.as_ref(),
-                "runtime_shutdown_timeout",
-                "runtime shutdown did not complete before its deadline",
-            ) {
-                tracing::error!(
-                    error = %error,
-                    "failed to durably record indeterminate browser command during shutdown"
-                );
-            }
             self.session
                 .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
                 .await;
@@ -2088,9 +1945,10 @@ where
 
     async fn ensure_session_is_recoverable(&self) -> anyhow::Result<()> {
         if self.session.snapshot().await.status == CodeUiSessionStatus::IndeterminateSideEffect {
-            return Err(anyhow!(
-                "This headless web session has an indeterminate persistence state; restart and inspect its durable session data before sending another request"
-            ));
+            return Err(CodeUiApiError::reconciliation_required(
+                "this headless web session has an indeterminate persistence state; restart and inspect its durable session data before sending another request",
+            )
+            .into());
         }
         Ok(())
     }

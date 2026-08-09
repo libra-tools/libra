@@ -1,0 +1,613 @@
+# Compatibility evidence for upstream t4000-diff-format.sh, migrated in the t4 wave.
+# One [[scenario]] per upstream test. The command and flags come from each
+# scenario's BODY — what its assertion actually runs — and every flag is checked
+# against the real CLI, not the documentation. A scenario that passes a flag Libra
+# does not accept is blocked, however well documented the rest of it is.
+
+[[scenario]]
+id = "t4000-diff-format::update-index-add-two-files-with-and-without-x"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:179"
+reason = "update-index is partial and every flag this scenario passes is accepted by Libra, with --add recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "update-index"
+libra_surface = "--add"
+
+[[scenario]]
+id = "t4000-diff-format::git-diff-files-p-after-editing-work-tree"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "intentionally-different"
+surface_evidence = "COMPATIBILITY.md:167"
+reason = "diff-files keeps a deliberately minimal flag surface, so -p cannot run; no D number covers it yet, so ADR-CT-06 rule 3 applies rather than declined."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "porcelain flag surface"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::validate-git-diff-files-p-output"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "intentionally-different"
+surface_evidence = "COMPATIBILITY.md:167"
+reason = "diff-files keeps a deliberately minimal flag surface, so -p cannot run; no D number covers it yet, so ADR-CT-06 rule 3 applies rather than declined."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "porcelain flag surface"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::git-diff-files-s-after-editing-work-tree"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files -s, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "-s"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::git-diff-files-no-patch-as-synonym-for-s"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, -s, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::git-diff-files-no-patch-patch-shows-the-patch"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --patch, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::git-diff-files-no-patch-patch-with-raw-shows-the-patch-and-raw-data"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --patch-with-raw, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::git-diff-files-patch-no-patch-does-not-show-the-patch"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --patch, --no-patch, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-stat-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --stat, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-raw-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --raw, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-numstat-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --numstat, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-shortstat-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --shortstat, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-summary-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --summary, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-dirstat-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --dirstat, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-cumulative-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --cumulative, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-dirstat-by-file-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --dirstat-by-file, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-patch-with-raw-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --patch-with-raw, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-patch-with-stat-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --patch-with-stat, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-files-no-patch-compact-summary-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --no-patch, --compact-summary, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--no-patch"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --stat, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--stat"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-2"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --raw, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--raw"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-3"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --numstat, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--numstat"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-4"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --shortstat, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--shortstat"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-5"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --summary, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--summary"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-6"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --dirstat, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "-s"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-7"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --cumulative, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "-s"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-8"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --dirstat-by-file, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "-s"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-9"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --patch-with-raw, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "-s"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-10"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --patch-with-stat, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "-s"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-clears-all-previous-ones-11"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "absent"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Upstream needs diff-files --compact-summary, -s, -p, which Libra does not accept; the gap is exposure, not a design divergence (ADR-CT-06 rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff-files"
+libra_surface = "--compact-summary"
+blocked_by = ["expose the diff-files porcelain flag surface"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-stat-is-a-no-op"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --no-patch recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-raw-is-a-no-op"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --no-patch recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-numstat-is-a-no-op"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --no-patch recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-shortstat-is-a-no-op"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --no-patch recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-summary-is-a-no-op"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --no-patch recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-dirstat-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Exercises --no-patch, which Libra has, but cannot run: diff rejects --dirstat, undocumented in Libra so not citable as a surface (rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+blocked_by = ["add the missing diff output surfaces"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-cumulative-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Exercises --no-patch, which Libra has, but cannot run: diff rejects --cumulative, undocumented in Libra so not citable as a surface (rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+blocked_by = ["add the missing diff output surfaces"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-dirstat-by-file-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Exercises --no-patch, which Libra has, but cannot run: diff rejects --dirstat-by-file, undocumented in Libra so not citable as a surface (rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+blocked_by = ["add the missing diff output surfaces"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-patch-with-raw-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Exercises --no-patch, which Libra has, but cannot run: diff rejects --patch-with-raw, undocumented in Libra so not citable as a surface (rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+blocked_by = ["add the missing diff output surfaces"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-patch-with-stat-is-a-no-op"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "Exercises --no-patch, which Libra has, but cannot run: diff rejects --patch-with-stat, undocumented in Libra so not citable as a surface (rule 3)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
+blocked_by = ["add the missing diff output surfaces"]
+
+[[scenario]]
+id = "t4000-diff-format::no-patch-in-git-diff-no-patch-compact-summary-is-a-no-op"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "docs/commands/diff.md#options"
+reason = "diff is partial and every flag this scenario passes is accepted by Libra, with --no-patch recorded git-compatible at the cited anchor (ADR-CT-06 rule 5)."
+owner = "libra-compat"
+review_date = "2026-08-08"
+upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
+upstream_file = "t4000-diff-format.sh"
+libra_command = "diff"
+libra_surface = "--no-patch"
