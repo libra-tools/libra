@@ -1022,6 +1022,123 @@ async fn runtime_shutdown_releases_resources() {
         .expect("timed-out mutating worker task does not panic");
 }
 
+/// W1-08: SIGINT/SIGTERM-shaped process shutdown and half-initialized startup
+/// failure share one [`LifecycleShutdownOwner`] deadline/result contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_shutdown_on_signal_and_startup_failure() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::runtime::{
+        LifecycleShutdownError, LifecycleShutdownOwner, LifecycleStepError, lifecycle_resource,
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+
+    // Signal path: runtime finishes, but a stuck listener reports its category
+    // under the shared owner deadline (same contract as SIGINT/SIGTERM cleanup).
+    let signal_owner = LifecycleShutdownOwner::with_timeout(Duration::from_millis(40));
+    signal_owner
+        .push_step(lifecycle_resource::RUNTIME_TURN, async { Ok(()) })
+        .await;
+    signal_owner
+        .push_step(lifecycle_resource::CONTROLLER_LEASE, async { Ok(()) })
+        .await;
+    signal_owner
+        .push_step(lifecycle_resource::MCP_SERVER, async { Ok(()) })
+        .await;
+    signal_owner
+        .push_step(lifecycle_resource::CONTROL_LOCK, async { Ok(()) })
+        .await;
+    signal_owner
+        .push_step(lifecycle_resource::WEB_SERVER, async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        })
+        .await;
+
+    let signal_first = {
+        let owner = signal_owner.clone();
+        tokio::spawn(async move { owner.shutdown().await })
+    };
+    let signal_second = {
+        let owner = signal_owner.clone();
+        tokio::spawn(async move { owner.shutdown().await })
+    };
+    let signal_a = signal_first.await.expect("join signal shutdown");
+    let signal_b = signal_second.await.expect("join repeated signal shutdown");
+    assert_eq!(signal_a, signal_b);
+    assert!(matches!(
+        signal_a,
+        Err(LifecycleShutdownError::TimedOut {
+            unreleased_resources
+        }) if unreleased_resources == vec![lifecycle_resource::WEB_SERVER.to_string()]
+    ));
+
+    // Startup-failure path: only the resources that were actually started are
+    // registered; a stuck managed child still surfaces under the same owner.
+    let started = Arc::new(Notify::new());
+    let startup_owner = LifecycleShutdownOwner::with_timeout(Duration::from_millis(30));
+    startup_owner
+        .push_step(lifecycle_resource::RUNTIME_TURN, async { Ok(()) })
+        .await;
+    startup_owner
+        .push_step(lifecycle_resource::TEMP_FILE, async { Ok(()) })
+        .await;
+    {
+        let started = Arc::clone(&started);
+        startup_owner
+            .push_step(lifecycle_resource::MANAGED_CODEX_CHILD, async move {
+                started.notify_one();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
+            })
+            .await;
+    }
+
+    let startup = {
+        let owner = startup_owner.clone();
+        tokio::spawn(async move { owner.shutdown().await })
+    };
+    timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("startup-failure cleanup reached the managed child step");
+    let startup_result = startup.await.expect("join startup shutdown");
+    assert!(matches!(
+        &startup_result,
+        Err(LifecycleShutdownError::TimedOut {
+            unreleased_resources
+        }) if unreleased_resources.as_slice()
+            == [lifecycle_resource::MANAGED_CODEX_CHILD]
+    ));
+    assert_eq!(
+        startup_owner.shutdown().await,
+        startup_result,
+        "startup-failure shutdown must stay idempotent"
+    );
+
+    // Nested runtime timeout categories propagate through a lifecycle step.
+    let nested = LifecycleShutdownOwner::with_timeout(Duration::from_millis(50));
+    nested
+        .push_step(lifecycle_resource::RUNTIME_TURN, async {
+            Err(LifecycleStepError::timed_out_with([
+                lifecycle_resource::MUTATING_RUNTIME_TURN_RECONCILIATION,
+            ]))
+        })
+        .await;
+    nested
+        .push_step(lifecycle_resource::WEB_SERVER, async { Ok(()) })
+        .await;
+    assert!(matches!(
+        nested.shutdown().await,
+        Err(LifecycleShutdownError::TimedOut {
+            unreleased_resources
+        }) if unreleased_resources
+            == vec![lifecycle_resource::MUTATING_RUNTIME_TURN_RECONCILIATION.to_string()]
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // CEX-00.5: top-level Event / Snapshot trait contract
 // ---------------------------------------------------------------------------

@@ -376,6 +376,13 @@ impl ControllerService {
         Ok(())
     }
 
+    /// Process-level shutdown release. Clears any active remote/local lease so
+    /// a restarted controller cannot reuse a fence from this process. Idempotent.
+    pub async fn release_for_process_shutdown(&self) {
+        let mut state = self.state.lock().await;
+        state.active_lease = None;
+    }
+
     fn clear_expired_lease(state: &mut ControllerRuntimeState, now: DateTime<Utc>) {
         if state
             .active_lease

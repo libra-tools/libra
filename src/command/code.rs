@@ -121,8 +121,9 @@ use crate::{
             runtime::{
                 AgentRuntimeWorker, AgentRuntimeWorkerConfig, CodeAgentApprovalConfig,
                 CodeAgentSandboxProfile, CodeAgentServicesBuilder, ExternalTurnTrackingExecutor,
-                InMemoryAuditSink, RuntimeCommandDurability, ToolBoundaryRuntime,
-                tool_runtime_context,
+                InMemoryAuditSink, LifecycleShutdownError, LifecycleShutdownOwner,
+                LifecycleStepError, RuntimeCommandDurability, ToolBoundaryRuntime,
+                lifecycle_resource, tool_runtime_context,
             },
             sandbox::{
                 ApprovalCachePolicy, AskForApproval, DEFAULT_APPROVAL_TTL, ExecApprovalRequest,
@@ -155,13 +156,14 @@ use crate::{
         },
         db::establish_connection,
         tui::{
-            App, AppConfig, ExitReason, Tui, TuiCodeUiAdapter, control::TuiControlCommand,
-            tui_init, tui_restore,
+            App, AppConfig, ExitReason, ProcessTerminateGate, Tui, TuiCodeUiAdapter,
+            control::TuiControlCommand, tui_init, tui_restore,
         },
     },
     utils::{
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
+        fuse as fuse_utils,
         output::OutputConfig,
         storage::local::LocalStorage,
         util::{DATABASE, try_get_storage_path},
@@ -729,6 +731,10 @@ struct McpServerHandle {
 
 const MCP_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Outer deadline for the process-level [`LifecycleShutdownOwner`] that
+/// sequences runtime, lease, listeners, managed child, and control cleanup.
+const CODE_LIFECYCLE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
+
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 enum McpServerShutdownError {
     #[error("mcp_server did not stop before the shutdown deadline")]
@@ -756,22 +762,279 @@ impl McpServerHandle {
             handle.abort();
         }
 
-        let mut join = self.join;
-        match tokio::time::timeout(shutdown_timeout, &mut join).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(error))) => Err(McpServerShutdownError::TaskFailed {
-                reason: error.to_string(),
-            }),
-            Ok(Err(error)) => Err(McpServerShutdownError::TaskFailed {
-                reason: error.to_string(),
-            }),
+        // Abort the listener if an outer lifecycle deadline cancels this future
+        // before the local timeout can call `join.abort()`.
+        let mut join = McpAbortJoinOnDrop {
+            handle: Some(self.join),
+        };
+        match tokio::time::timeout(shutdown_timeout, join.as_mut()).await {
+            Ok(Ok(Ok(()))) => {
+                join.disarm();
+                Ok(())
+            }
+            Ok(Ok(Err(error))) => {
+                join.disarm();
+                Err(McpServerShutdownError::TaskFailed {
+                    reason: error.to_string(),
+                })
+            }
+            Ok(Err(error)) => {
+                join.disarm();
+                Err(McpServerShutdownError::TaskFailed {
+                    reason: error.to_string(),
+                })
+            }
             Err(_) => {
-                join.abort();
-                let _ = join.await;
+                join.abort_now().await;
                 Err(McpServerShutdownError::TimedOut)
             }
         }
     }
+}
+
+struct McpAbortJoinOnDrop {
+    handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl McpAbortJoinOnDrop {
+    fn as_mut(&mut self) -> &mut tokio::task::JoinHandle<anyhow::Result<()>> {
+        // INVARIANT: handle is present until `disarm` / `abort_now`.
+        self.handle
+            .as_mut()
+            .expect("McpAbortJoinOnDrop used after disarm")
+    }
+
+    fn disarm(&mut self) {
+        self.handle.take();
+    }
+
+    async fn abort_now(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for McpAbortJoinOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn lifecycle_shutdown_cli_error(error: LifecycleShutdownError) -> CliError {
+    match error {
+        LifecycleShutdownError::TimedOut {
+            unreleased_resources,
+        } => CliError::failure(format!(
+            "Libra Code did not shut down cleanly before the deadline; unreleased resources: {unreleased_resources:?}"
+        )),
+        LifecycleShutdownError::Failed {
+            failed_resources,
+            detail,
+        } => CliError::failure(format!(
+            "Libra Code failed to release {failed_resources:?} during shutdown: {detail}"
+        )),
+    }
+}
+
+async fn push_code_ui_lifecycle_step(
+    owner: &LifecycleShutdownOwner,
+    runtime: Arc<CodeUiRuntimeHandle>,
+) {
+    owner
+        .push_step(lifecycle_resource::RUNTIME_TURN, async move {
+            runtime.shutdown_for_lifecycle().await
+        })
+        .await;
+}
+
+async fn push_controller_lease_lifecycle_step(
+    owner: &LifecycleShutdownOwner,
+    runtime: Arc<CodeUiRuntimeHandle>,
+) {
+    owner
+        .push_step(lifecycle_resource::CONTROLLER_LEASE, async move {
+            runtime.release_controller_for_lifecycle().await;
+            Ok(())
+        })
+        .await;
+}
+
+async fn push_web_server_lifecycle_step(owner: &LifecycleShutdownOwner, handle: WebServerHandle) {
+    owner
+        .push_step(lifecycle_resource::WEB_SERVER, async move {
+            match handle.shutdown().await {
+                Ok(()) => Ok(()),
+                Err(crate::internal::ai::web::WebServerShutdownError::TimedOut) => {
+                    Err(LifecycleStepError::timed_out())
+                }
+                Err(error) => Err(LifecycleStepError::failed(error.to_string())),
+            }
+        })
+        .await;
+}
+
+async fn push_mcp_server_lifecycle_step(owner: &LifecycleShutdownOwner, handle: McpServerHandle) {
+    owner
+        .push_step(lifecycle_resource::MCP_SERVER, async move {
+            match handle.shutdown().await {
+                Ok(()) => Ok(()),
+                Err(McpServerShutdownError::TimedOut) => Err(LifecycleStepError::timed_out()),
+                Err(error) => Err(LifecycleStepError::failed(error.to_string())),
+            }
+        })
+        .await;
+}
+
+async fn push_managed_codex_lifecycle_step(
+    owner: &LifecycleShutdownOwner,
+    mut server: ManagedCodexServer,
+) {
+    owner
+        .push_step(lifecycle_resource::MANAGED_CODEX_CHILD, async move {
+            match server.shutdown().await {
+                Ok(()) => Ok(()),
+                Err(ManagedCodexShutdownError::TimedOut) => Err(LifecycleStepError::timed_out()),
+                Err(error) => Err(LifecycleStepError::failed(error.to_string())),
+            }
+        })
+        .await;
+}
+
+async fn push_control_runtime_lifecycle_step(
+    owner: &LifecycleShutdownOwner,
+    control_runtime: ControlRuntimeConfig,
+) {
+    owner
+        .push_step(lifecycle_resource::CONTROL_LOCK, async move {
+            control_runtime.cleanup();
+            // Prevent Drop from double-cleaning; cleanup is idempotent on disk
+            // but we still forget the guard's Drop path by leaking... actually
+            // Drop also calls cleanup which is fine/idempotent. Just drop.
+            drop(control_runtime);
+            Ok(())
+        })
+        .await;
+}
+
+#[cfg(unix)]
+async fn push_fuse_task_worktree_lifecycle_step(
+    owner: &LifecycleShutdownOwner,
+    repo_working_dir: std::path::PathBuf,
+) {
+    owner
+        .push_step(lifecycle_resource::FUSE_TASK_WORKTREE, async move {
+            let display_repo = repo_working_dir.display().to_string();
+            let sweep = tokio::task::spawn_blocking(move || {
+                fuse_utils::sweep_repo_fuse_task_worktrees(&repo_working_dir)
+            });
+            match sweep.await {
+                Ok(Ok(report)) => {
+                    if !report.is_empty() {
+                        tracing::info!(
+                            repo = %display_repo,
+                            scanned = report.scanned,
+                            cleaned = report.cleaned,
+                            skipped_live_owner = report.skipped_live_owner,
+                            failures = report.failures.len(),
+                            "swept repo-local FUSE task worktrees during lifecycle shutdown"
+                        );
+                    }
+                    for failure in report.failures {
+                        tracing::warn!(
+                            path = %failure.path.display(),
+                            error = %failure.message,
+                            "failed to clean repo-local FUSE task worktree during lifecycle shutdown"
+                        );
+                    }
+                    Ok(())
+                }
+                Ok(Err(err)) => Err(LifecycleStepError::failed(err.to_string())),
+                Err(err) => Err(LifecycleStepError::failed(err.to_string())),
+            }
+        })
+        .await;
+}
+
+/// Build and run the shared process shutdown owner. Order matches W1-08:
+/// stop admitting / finalize runtime turns, then listeners, then managed
+/// child, then control lock / temp files (via [`ControlRuntimeConfig`] Drop).
+async fn push_local_runtime_lifecycle_step(
+    owner: &LifecycleShutdownOwner,
+    runtime: crate::internal::ai::runtime::AgentRuntimeHandle,
+    worker_task: Option<tokio::task::JoinHandle<()>>,
+) {
+    owner
+        .push_step(lifecycle_resource::RUNTIME_TURN, async move {
+            match runtime.shutdown().await {
+                Ok(()) => {
+                    if let Some(task) = worker_task {
+                        let _ = task.await;
+                    }
+                    Ok(())
+                }
+                Err(crate::internal::ai::runtime::RuntimeShutdownError::TimedOut {
+                    unreleased_resources,
+                }) => {
+                    if let Some(task) = worker_task {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    Err(LifecycleStepError::timed_out_with(unreleased_resources))
+                }
+                Err(error) => {
+                    if let Some(task) = worker_task {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    Err(LifecycleStepError::failed_with(
+                        [lifecycle_resource::RUNTIME_TURN],
+                        error.to_string(),
+                    ))
+                }
+            }
+        })
+        .await;
+}
+
+async fn shutdown_code_lifecycle(
+    code_ui: Option<Arc<CodeUiRuntimeHandle>>,
+    local_runtime: Option<(
+        crate::internal::ai::runtime::AgentRuntimeHandle,
+        Option<tokio::task::JoinHandle<()>>,
+    )>,
+    web: Option<WebServerHandle>,
+    mcp: Option<McpServerHandle>,
+    managed_codex: Option<ManagedCodexServer>,
+    control_runtime: Option<ControlRuntimeConfig>,
+) -> Result<(), LifecycleShutdownError> {
+    let owner = LifecycleShutdownOwner::with_timeout(CODE_LIFECYCLE_SHUTDOWN_TIMEOUT);
+    if let Some((runtime, worker_task)) = local_runtime {
+        push_local_runtime_lifecycle_step(&owner, runtime, worker_task).await;
+    }
+    let code_ui_for_lease = code_ui.clone();
+    if let Some(runtime) = code_ui {
+        push_code_ui_lifecycle_step(&owner, runtime).await;
+    }
+    if let Some(handle) = web {
+        push_web_server_lifecycle_step(&owner, handle).await;
+    }
+    if let Some(handle) = mcp {
+        push_mcp_server_lifecycle_step(&owner, handle).await;
+    }
+    if let Some(server) = managed_codex {
+        push_managed_codex_lifecycle_step(&owner, server).await;
+    }
+    if let Some(runtime) = code_ui_for_lease {
+        push_controller_lease_lifecycle_step(&owner, runtime).await;
+    }
+    if let Some(control_runtime) = control_runtime {
+        push_control_runtime_lifecycle_step(&owner, control_runtime).await;
+    }
+    owner.shutdown().await
 }
 
 // ---------------------------------------------------------------------------
@@ -837,29 +1100,52 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     // non-default file, but that policy no longer creates a second factory.
     let env_file = load_code_env_file(args.env_file.as_deref())?;
     let browser_control = resolve_browser_control_mode(args)?;
+    // Arm SIGINT/SIGTERM before spawning managed Codex or binding listeners.
+    let process_terminate = ProcessTerminateGate::install().map_err(|error| {
+        CliError::failure(format!(
+            "failed to install the web-only process terminate listener: {error}"
+        ))
+    })?;
+    let check_process_terminate = |gate: &ProcessTerminateGate| -> CliResult<()> {
+        if gate.is_signaled() {
+            Err(CliError::failure(
+                "received a terminate signal while starting Libra Code web-only mode; shutting down"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
     let control_runtime = prepare_control_runtime(args, &working_dir).await?;
     let mcp_server = init_mcp_server(&working_dir).await;
 
-    let mut managed_codex_server = None;
+    let mut managed_codex_server = ManagedCodexBootstrapGuard::new(None);
     let code_ui_runtime =
         if web_only_runtime_kind(args.provider) == WebOnlyRuntimeKind::ManagedCodexAppServer {
             let server =
                 start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
+            if let Err(error) = check_process_terminate(&process_terminate) {
+                let shutdown_error =
+                    shutdown_code_lifecycle(None, None, None, None, Some(server), None)
+                        .await
+                        .err();
+                if let Some(shutdown_error) = shutdown_error {
+                    return Err(error.with_detail("shutdown", shutdown_error.to_string()));
+                }
+                return Err(error);
+            }
             println!("Starting Libra Code Web UI with Codex provider");
             println!("Working directory: {}", working_dir.display());
             println!("Codex WebSocket: {}", server.ws_url);
             println!("Codex app-server: auto-started");
             println!("Browser control: {}", browser_control.as_str());
-            managed_codex_server = Some(server);
+            let ws_url = server.ws_url.clone();
+            managed_codex_server = ManagedCodexBootstrapGuard::new(Some(server));
 
-            let ws_url = managed_codex_server
-                .as_ref()
-                .map(|server| server.ws_url.as_str())
-                .unwrap_or_default();
             start_codex_code_ui_runtime(
                 args,
                 &working_dir,
-                ws_url,
+                &ws_url,
                 mcp_server.clone(),
                 browser_control == BrowserControlMode::Loopback,
                 CodeUiInitialController::Unclaimed,
@@ -908,6 +1194,23 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
         };
     mcp_server.set_code_ui_session(code_ui_runtime.adapter().session());
 
+    if let Err(error) = check_process_terminate(&process_terminate) {
+        let shutdown_error = shutdown_code_lifecycle(
+            Some(code_ui_runtime),
+            None,
+            None,
+            None,
+            managed_codex_server.take(),
+            Some(control_runtime),
+        )
+        .await
+        .err();
+        if let Some(shutdown_error) = shutdown_error {
+            return Err(error.with_detail("shutdown", shutdown_error.to_string()));
+        }
+        return Err(error);
+    }
+
     let web_handle = match start_web_server(
         &args.host,
         args.port,
@@ -922,14 +1225,22 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     {
         Ok(handle) => handle,
         Err(err) => {
-            let _ = code_ui_runtime.shutdown().await;
-            if let Some(server) = managed_codex_server.as_mut() {
-                let _ = server.shutdown().await;
+            let shutdown_error = shutdown_code_lifecycle(
+                Some(code_ui_runtime),
+                None,
+                None,
+                None,
+                managed_codex_server.take(),
+                Some(control_runtime),
+            )
+            .await
+            .err();
+            let mut error = CliError::network(format!("failed to start web server: {err}"))
+                .with_detail("component", "web_server");
+            if let Some(shutdown_error) = shutdown_error {
+                error = error.with_detail("shutdown", shutdown_error.to_string());
             }
-            return Err(
-                CliError::network(format!("failed to start web server: {err}"))
-                    .with_detail("component", "web_server"),
-            );
+            return Err(error);
         }
     };
     let base_url = format!("http://{}", web_handle.addr);
@@ -937,11 +1248,19 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     if let Err(error) =
         control_runtime.write_info_file(&working_dir, base_url.clone(), None, thread_id.clone())
     {
-        let _ = code_ui_runtime.shutdown().await;
-        if let Some(server) = managed_codex_server.as_mut() {
-            let _ = server.shutdown().await;
+        let shutdown_error = shutdown_code_lifecycle(
+            Some(code_ui_runtime),
+            None,
+            Some(web_handle),
+            None,
+            managed_codex_server.take(),
+            Some(control_runtime),
+        )
+        .await
+        .err();
+        if let Some(shutdown_error) = shutdown_error {
+            return Err(error.with_detail("shutdown", shutdown_error.to_string()));
         }
-        let _ = web_handle.shutdown().await;
         return Err(error);
     }
     println!("Libra Code server running at {base_url}");
@@ -956,88 +1275,58 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
                 Some(mcp_url.clone()),
                 thread_id.clone(),
             ) {
-                let _ = code_ui_runtime.shutdown().await;
-                if let Some(server) = managed_codex_server.as_mut() {
-                    let _ = server.shutdown().await;
+                let shutdown_error = shutdown_code_lifecycle(
+                    Some(code_ui_runtime),
+                    None,
+                    Some(web_handle),
+                    Some(handle),
+                    managed_codex_server.take(),
+                    Some(control_runtime),
+                )
+                .await
+                .err();
+                if let Some(shutdown_error) = shutdown_error {
+                    return Err(error.with_detail("shutdown", shutdown_error.to_string()));
                 }
-                let _ = web_handle.shutdown().await;
-                let _ = handle.shutdown().await;
                 return Err(error);
             }
             println!("MCP: {mcp_url}");
             handle
         }
         Err(err) => {
-            let _ = code_ui_runtime.shutdown().await;
-            if let Some(server) = managed_codex_server.as_mut() {
-                let _ = server.shutdown().await;
+            let shutdown_error = shutdown_code_lifecycle(
+                Some(code_ui_runtime),
+                None,
+                Some(web_handle),
+                None,
+                managed_codex_server.take(),
+                Some(control_runtime),
+            )
+            .await
+            .err();
+            let mut error = CliError::network(format!("failed to start MCP server: {err}"))
+                .with_detail("component", "mcp_server");
+            if let Some(shutdown_error) = shutdown_error {
+                error = error.with_detail("shutdown", shutdown_error.to_string());
             }
-            let _ = web_handle.shutdown().await;
-            return Err(
-                CliError::network(format!("failed to start MCP server: {err}"))
-                    .with_detail("component", "mcp_server"),
-            );
+            return Err(error);
         }
     };
 
-    let shutdown_signal_result = wait_for_web_only_shutdown_signal().await;
-    let web_shutdown_result = web_handle.shutdown().await;
-    let mcp_shutdown_result = mcp_handle.shutdown().await;
-    let runtime_shutdown_result = code_ui_runtime.shutdown().await;
-    let managed_codex_shutdown_result = match managed_codex_server.as_mut() {
-        Some(server) => Some(server.shutdown().await),
-        None => None,
-    };
-    if let Err(error) = runtime_shutdown_result {
-        return Err(CliError::failure(format!(
-            "Libra Code runtime did not shut down cleanly: {error}"
-        )));
-    }
-    if let Err(error) = web_shutdown_result {
-        return Err(CliError::failure(format!(
-            "Libra Code web server did not shut down cleanly: {error}"
-        )));
-    }
-    if let Err(error) = mcp_shutdown_result {
-        return Err(CliError::failure(format!(
-            "Libra Code MCP server did not shut down cleanly: {error}"
-        )));
-    }
-    if let Some(Err(error)) = managed_codex_shutdown_result {
-        return Err(CliError::failure(format!(
-            "Libra Code managed Codex server did not shut down cleanly: {error}"
-        )));
-    }
-    if let Err(error) = shutdown_signal_result {
-        return Err(CliError::failure(format!(
-            "Libra Code could not listen for a shutdown signal: {error}"
-        )));
+    process_terminate.wait().await;
+    if let Err(error) = shutdown_code_lifecycle(
+        Some(code_ui_runtime),
+        None,
+        Some(web_handle),
+        Some(mcp_handle),
+        managed_codex_server.take(),
+        Some(control_runtime),
+    )
+    .await
+    {
+        return Err(lifecycle_shutdown_cli_error(error));
     }
     Ok(())
-}
-
-/// Wait for the termination signals relevant to a web-only process.  Unix
-/// supervisors normally use SIGTERM, while Ctrl-C provides SIGINT on every
-/// supported platform.
-async fn wait_for_web_only_shutdown_signal() -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut sigterm = web_only_sigterm_listener()?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = sigterm.recv() => Ok(()),
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await
-    }
-}
-
-#[cfg(unix)]
-fn web_only_sigterm_listener() -> std::io::Result<tokio::signal::unix::Signal> {
-    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,6 +1861,13 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
     let working_dir = resolve_code_working_dir(&args)?;
     let env_file = load_code_env_file(args.env_file.as_deref())?;
     let browser_control = resolve_browser_control_mode(&args)?;
+    // Install SIGINT/SIGTERM before spawning the managed Codex child or binding
+    // listeners so a supervisor signal during bootstrap still reaches cleanup.
+    let process_terminate = ProcessTerminateGate::install().map_err(|error| {
+        CliError::failure(format!(
+            "failed to install the TUI process terminate listener: {error}"
+        ))
+    })?;
     let control_runtime = prepare_control_runtime(&args, &working_dir).await?;
 
     let task_intent = task_intent_for_context(args.context);
@@ -1637,7 +1933,7 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
     // (criterion 2), shared with the headless launch path.
     let approval_cfg = tui_approval_config_from_args(&args, registry.working_dir());
     let provider_name = format!("{:?}", args.provider).to_lowercase();
-    let launch_config = TuiLaunchConfig {
+    let mut launch_config = TuiLaunchConfig {
         host,
         port: args.port,
         mcp_port: args.mcp_port,
@@ -1664,14 +1960,30 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
         control_runtime,
         browser_control,
         initial_goal: args.goal.clone(),
+        managed_codex_server: None,
+        process_terminate,
     };
 
     // Create agent based on provider. Every non-Codex provider funnels
     // through `ProviderFactory`; Codex keeps its own managed-runtime path.
     match args.provider {
         CodeProvider::Codex => {
-            let mut server =
+            let server =
                 start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
+            if launch_config.process_terminate.is_signaled() {
+                let shutdown_error =
+                    shutdown_code_lifecycle(None, None, None, None, Some(server), None)
+                        .await
+                        .err();
+                let mut error = CliError::failure(
+                    "received a terminate signal while starting the managed Codex child; shutting down"
+                        .to_string(),
+                );
+                if let Some(shutdown_error) = shutdown_error {
+                    error = error.with_detail("shutdown", shutdown_error.to_string());
+                }
+                return Err(error);
+            }
             let browser_write_enabled =
                 launch_config.browser_control == BrowserControlMode::Loopback;
             // `LocalTui` keeps the terminal as the visible owner while letting
@@ -1703,6 +2015,7 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    let mut server = server;
                     if let Err(cleanup_error) = server.shutdown().await {
                         return Err(CliError::failure(format!(
                             "failed to initialize the managed Codex runtime: {error}; managed Codex cleanup failed: {cleanup_error}"
@@ -1711,21 +2024,35 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
                     return Err(error);
                 }
             };
+            if launch_config.process_terminate.is_signaled() {
+                let shutdown_error = shutdown_code_lifecycle(
+                    Some(code_ui_runtime),
+                    None,
+                    None,
+                    None,
+                    Some(server),
+                    None,
+                )
+                .await
+                .err();
+                let mut error = CliError::failure(
+                    "received a terminate signal while initializing the managed Codex runtime; shutting down"
+                        .to_string(),
+                );
+                if let Some(shutdown_error) = shutdown_error {
+                    error = error.with_detail("shutdown", shutdown_error.to_string());
+                }
+                return Err(error);
+            }
             let model_name = args.model.clone().unwrap_or_else(|| "codex".to_string());
-            let result = run_tui_with_managed_code_runtime(
+            launch_config.managed_codex_server = Some(server);
+            run_tui_with_managed_code_runtime(
                 code_ui_runtime,
                 launch_config,
                 model_name,
                 provider_name,
             )
-            .await;
-            let shutdown_result = server.shutdown().await;
-            result?;
-            shutdown_result.map_err(|error| {
-                CliError::failure(format!(
-                    "Libra Code managed Codex server did not shut down cleanly: {error}"
-                ))
-            })?;
+            .await?;
         }
         _ => {
             // OC-Phase 2 P2.4: the helper returns the *effective* provider
@@ -1805,6 +2132,46 @@ fn preserve_reasoning_content_for_provider(provider: CodeProvider) -> bool {
 struct ManagedCodexServer {
     ws_url: String,
     child: Child,
+}
+
+/// Owns a managed Codex child until the process lifecycle owner takes it.
+///
+/// Bootstrap early-returns (terminal init, session load, runtime construction)
+/// drop this guard instead of calling `shutdown`; Drop best-effort kills and
+/// reaps so the child cannot outlive the failed start path.
+struct ManagedCodexBootstrapGuard {
+    server: Option<ManagedCodexServer>,
+}
+
+impl ManagedCodexBootstrapGuard {
+    fn new(server: Option<ManagedCodexServer>) -> Self {
+        Self { server }
+    }
+
+    fn take(&mut self) -> Option<ManagedCodexServer> {
+        self.server.take()
+    }
+}
+
+impl Drop for ManagedCodexBootstrapGuard {
+    fn drop(&mut self) {
+        let Some(mut server) = self.server.take() else {
+            return;
+        };
+        if server.child.id().is_none() {
+            return;
+        }
+        // Prefer bounded async shutdown/reaping on the current runtime so we do
+        // not leave a zombie after a nonblocking try_wait race in sync Drop.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = server.shutdown_with_timeout(Duration::from_secs(2)).await;
+            });
+            return;
+        }
+        let _ = server.child.start_kill();
+        let _ = server.child.try_wait();
+    }
 }
 
 const MANAGED_CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2877,6 +3244,12 @@ struct TuiLaunchConfig {
     /// uses this to bootstrap a `GoalSpec` and seed
     /// [`AppConfig::initial_goal`] before the first turn.
     initial_goal: Option<String>,
+    /// Managed Codex app-server child, when the TUI owns a Codex provider
+    /// session. Released through [`shutdown_code_lifecycle`] with the same
+    /// deadline/result contract as listeners and the Code UI runtime.
+    managed_codex_server: Option<ManagedCodexServer>,
+    /// Process terminate gate installed before provider/child startup.
+    process_terminate: ProcessTerminateGate,
 }
 
 #[derive(Clone)]
@@ -3156,7 +3529,21 @@ where
 {
     let registry = params.registry;
     let control_runtime = params.control_runtime;
+    let mut managed_codex_for_lifecycle =
+        ManagedCodexBootstrapGuard::new(params.managed_codex_server);
     let browser_control = params.browser_control;
+    let process_terminate = params.process_terminate;
+    let process_terminate_for_deadline = process_terminate.clone();
+    let check_process_terminate = |gate: &ProcessTerminateGate| -> CliResult<()> {
+        if gate.is_signaled() {
+            Err(CliError::failure(
+                "received a terminate signal while starting Libra Code; shutting down before the TUI started"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
     let hook_runner = {
         let runner = HookRunner::load(registry.working_dir());
         if runner.has_hooks() {
@@ -3190,6 +3577,8 @@ where
         preserve_reasoning_content: params.preserve_reasoning_content,
         ..Default::default()
     };
+
+    check_process_terminate(&process_terminate)?;
 
     // Initialize terminal.
     let terminal = match tui_init() {
@@ -3249,10 +3638,12 @@ where
     } else {
         SessionState::new(&working_dir_str)
     };
+    check_process_terminate(&process_terminate)?;
     // Non-managed TUI providers still execute the legacy local tool loop, but
     // their cancellation authority must be the shared AgentRuntime worker so
     // admission and any mutation reconciliation are durable.
-    let (local_turn_runtime, local_turn_runtime_task) = if managed_code_ui_runtime.is_none() {
+    let (mut local_turn_runtime, mut local_turn_runtime_task) = if managed_code_ui_runtime.is_none()
+    {
         let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(
             session_store.session_root(&session.id),
         ));
@@ -3276,12 +3667,15 @@ where
     } else {
         (None, None)
     };
+    check_process_terminate(&process_terminate)?;
     // v0.17.791 session-bootstrap usage auto-prune: if the
     // operator configured `[usage] retention_days = N` in
     // `config.toml`, drop usage rows older than N days at session
     // start. Soft-failure (logs warn + continues) so a malformed
     // config or DB error doesn't block startup.
     crate::command::usage::auto_prune_at_session_start(&storage_root).await;
+
+    check_process_terminate(&process_terminate)?;
 
     if let Some(usage_recorder) = build_usage_recorder(&storage_root).await {
         config.usage_recorder = Some(usage_recorder);
@@ -3369,6 +3763,25 @@ where
         .set_code_ui_session(code_ui_session.clone());
     let code_ui_runtime_for_app = code_ui_runtime.clone();
 
+    if let Err(error) = check_process_terminate(&process_terminate) {
+        let shutdown_error = shutdown_code_lifecycle(
+            Some(code_ui_runtime_for_app.clone()),
+            local_turn_runtime
+                .take()
+                .map(|runtime| (runtime, local_turn_runtime_task.take())),
+            None,
+            None,
+            managed_codex_for_lifecycle.take(),
+            Some(control_runtime),
+        )
+        .await
+        .err();
+        if let Some(shutdown_error) = shutdown_error {
+            return Err(error.with_detail("shutdown", shutdown_error.to_string()));
+        }
+        return Err(error);
+    }
+
     let control_thread_id = session_canonical_thread_id(&session);
     let (mut web_handle, web_line) = match start_web_server(
         &params.host,
@@ -3390,9 +3803,20 @@ where
                 None,
                 control_thread_id.clone(),
             ) {
-                let _ = handle.shutdown().await;
-                if let Some(runtime) = managed_code_ui_runtime.as_ref() {
-                    let _ = runtime.shutdown().await;
+                let shutdown_error = shutdown_code_lifecycle(
+                    Some(code_ui_runtime_for_app.clone()),
+                    local_turn_runtime
+                        .take()
+                        .map(|runtime| (runtime, local_turn_runtime_task.take())),
+                    Some(handle),
+                    None,
+                    managed_codex_for_lifecycle.take(),
+                    None,
+                )
+                .await
+                .err();
+                if let Some(shutdown_error) = shutdown_error {
+                    return Err(error.with_detail("shutdown", shutdown_error.to_string()));
                 }
                 return Err(error);
             }
@@ -3400,19 +3824,48 @@ where
             (Some(handle), line)
         }
         Err(err) if control_runtime.is_write() => {
-            if let Some(runtime) = managed_code_ui_runtime.as_ref() {
-                let _ = runtime.shutdown().await;
+            let shutdown_error = shutdown_code_lifecycle(
+                Some(code_ui_runtime_for_app.clone()),
+                local_turn_runtime
+                    .take()
+                    .map(|runtime| (runtime, local_turn_runtime_task.take())),
+                None,
+                None,
+                managed_codex_for_lifecycle.take(),
+                None,
+            )
+            .await
+            .err();
+            let mut error = CliError::network(format!("failed to start web server: {err}"))
+                .with_detail("component", "web_server");
+            if let Some(shutdown_error) = shutdown_error {
+                error = error.with_detail("shutdown", shutdown_error.to_string());
             }
-            return Err(
-                CliError::network(format!("failed to start web server: {err}"))
-                    .with_detail("component", "web_server"),
-            );
+            return Err(error);
         }
         Err(err) => (
             None::<WebServerHandle>,
             format!("Web: failed to start ({err})"),
         ),
     };
+    if let Err(error) = check_process_terminate(&process_terminate) {
+        let shutdown_error = shutdown_code_lifecycle(
+            Some(code_ui_runtime_for_app.clone()),
+            local_turn_runtime
+                .take()
+                .map(|runtime| (runtime, local_turn_runtime_task.take())),
+            web_handle.take(),
+            None,
+            managed_codex_for_lifecycle.take(),
+            Some(control_runtime),
+        )
+        .await
+        .err();
+        if let Some(shutdown_error) = shutdown_error {
+            return Err(error.with_detail("shutdown", shutdown_error.to_string()));
+        }
+        return Err(error);
+    }
     let control_base_url = web_handle
         .as_ref()
         .map(|handle| format!("http://{}", handle.addr));
@@ -3430,12 +3883,20 @@ where
                         control_thread_id.clone(),
                     )
                 {
-                    if let Some(handle) = web_handle.take() {
-                        let _ = handle.shutdown().await;
-                    }
-                    let _ = handle.shutdown().await;
-                    if let Some(runtime) = managed_code_ui_runtime.as_ref() {
-                        let _ = runtime.shutdown().await;
+                    let shutdown_error = shutdown_code_lifecycle(
+                        Some(code_ui_runtime_for_app.clone()),
+                        local_turn_runtime
+                            .take()
+                            .map(|runtime| (runtime, local_turn_runtime_task.take())),
+                        web_handle.take(),
+                        Some(handle),
+                        managed_codex_for_lifecycle.take(),
+                        None,
+                    )
+                    .await
+                    .err();
+                    if let Some(shutdown_error) = shutdown_error {
+                        return Err(error.with_detail("shutdown", shutdown_error.to_string()));
                     }
                     return Err(error);
                 }
@@ -3443,19 +3904,45 @@ where
                 (Some(handle), line)
             }
             Err(err) if control_runtime.is_write() => {
-                if let Some(handle) = web_handle.take() {
-                    let _ = handle.shutdown().await;
+                let shutdown_error = shutdown_code_lifecycle(
+                    Some(code_ui_runtime_for_app.clone()),
+                    local_turn_runtime
+                        .take()
+                        .map(|runtime| (runtime, local_turn_runtime_task.take())),
+                    web_handle.take(),
+                    None,
+                    managed_codex_for_lifecycle.take(),
+                    None,
+                )
+                .await
+                .err();
+                let mut error = CliError::network(format!("failed to start MCP server: {err}"))
+                    .with_detail("component", "mcp_server");
+                if let Some(shutdown_error) = shutdown_error {
+                    error = error.with_detail("shutdown", shutdown_error.to_string());
                 }
-                if let Some(runtime) = managed_code_ui_runtime.as_ref() {
-                    let _ = runtime.shutdown().await;
-                }
-                return Err(
-                    CliError::network(format!("failed to start MCP server: {err}"))
-                        .with_detail("component", "mcp_server"),
-                );
+                return Err(error);
             }
             Err(err) => (None, format!("MCP: failed to start ({err})")),
         };
+    if let Err(error) = check_process_terminate(&process_terminate) {
+        let shutdown_error = shutdown_code_lifecycle(
+            Some(code_ui_runtime_for_app.clone()),
+            local_turn_runtime
+                .take()
+                .map(|runtime| (runtime, local_turn_runtime_task.take())),
+            web_handle.take(),
+            mcp_handle,
+            managed_codex_for_lifecycle.take(),
+            Some(control_runtime),
+        )
+        .await
+        .err();
+        if let Some(shutdown_error) = shutdown_error {
+            return Err(error.with_detail("shutdown", shutdown_error.to_string()));
+        }
+        return Err(error);
+    }
 
     let input_guidance = if managed_code_ui_runtime.is_some() {
         "Type your message and press Enter to work with the managed provider."
@@ -3609,7 +4096,7 @@ where
         }
     }
 
-    let managed_runtime_for_shutdown = managed_code_ui_runtime.clone();
+    let code_ui_for_lifecycle = code_ui_runtime_for_app.clone();
     let auto_classify_first_user_message =
         params.auto_classify_first_user_message && managed_code_ui_runtime.is_none();
 
@@ -3642,30 +4129,79 @@ where
             auto_classify_first_user_message,
             initial_goal: params.initial_goal.clone(),
             source_pool,
+            process_terminate: Some(process_terminate),
         },
     );
 
-    let graph_thread_hint = match app.run().await {
+    let run_result = app.run().await;
+    // Prefer the signal receipt timestamp so SIGTERM spent draining the TUI
+    // still counts against the shared process shutdown budget.
+    let process_deadline = process_terminate_for_deadline
+        .signaled_at()
+        .unwrap_or_else(std::time::Instant::now)
+        + CODE_LIFECYCLE_SHUTDOWN_TIMEOUT;
+    // Keep the historical ~30s mutating reconciliation window when budget
+    // remains; never exceed the shared process deadline.
+    let settle_budget = process_deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .min(Duration::from_secs(30));
+    app.finalize_local_runtime_for_lifecycle(settle_budget)
+        .await;
+    let fuse_repo = app.working_dir().to_path_buf();
+    let local_runtime = {
+        let (handle, task) = app.take_local_turn_runtime();
+        handle.map(|runtime| (runtime, task))
+    };
+    let remaining = process_deadline.saturating_duration_since(std::time::Instant::now());
+    let shutdown_result = {
+        let owner = LifecycleShutdownOwner::with_timeout(remaining);
+        if let Some((runtime, worker_task)) = local_runtime {
+            push_local_runtime_lifecycle_step(&owner, runtime, worker_task).await;
+        }
+        let code_ui_for_lease = code_ui_for_lifecycle.clone();
+        if let Some(runtime) = Some(code_ui_for_lifecycle) {
+            push_code_ui_lifecycle_step(&owner, runtime).await;
+        }
+        if let Some(handle) = web_handle {
+            push_web_server_lifecycle_step(&owner, handle).await;
+        }
+        if let Some(handle) = mcp_handle {
+            push_mcp_server_lifecycle_step(&owner, handle).await;
+        }
+        if let Some(server) = managed_codex_for_lifecycle.take() {
+            push_managed_codex_lifecycle_step(&owner, server).await;
+        }
+        #[cfg(unix)]
+        push_fuse_task_worktree_lifecycle_step(&owner, fuse_repo).await;
+        push_controller_lease_lifecycle_step(&owner, code_ui_for_lease).await;
+        push_control_runtime_lifecycle_step(&owner, control_runtime).await;
+        owner.shutdown().await
+    };
+
+    let graph_thread_hint = match run_result {
         Ok(exit_info) => {
             if let ExitReason::Fatal(msg) = exit_info.reason {
-                return Err(
-                    CliError::fatal(msg).with_stable_code(StableErrorCode::InternalInvariant)
-                );
+                let mut error =
+                    CliError::fatal(msg).with_stable_code(StableErrorCode::InternalInvariant);
+                if let Err(shutdown_error) = shutdown_result {
+                    error = error.with_detail("shutdown", shutdown_error.to_string());
+                }
+                return Err(error);
+            }
+            if let Err(error) = shutdown_result {
+                return Err(lifecycle_shutdown_cli_error(error));
             }
             exit_info.thread_id
         }
-        Err(e) => return Err(CliError::internal(format!("TUI exited unexpectedly: {e}"))),
+        Err(e) => {
+            let mut error = CliError::internal(format!("TUI exited unexpectedly: {e}"));
+            if let Err(shutdown_error) = shutdown_result {
+                error = error.with_detail("shutdown", shutdown_error.to_string());
+            }
+            return Err(error);
+        }
     };
 
-    if let Some(handle) = web_handle {
-        let _ = handle.shutdown().await;
-    }
-    if let Some(handle) = mcp_handle {
-        let _ = handle.shutdown().await;
-    }
-    if let Some(runtime) = managed_runtime_for_shutdown {
-        let _ = runtime.shutdown().await;
-    }
     if let Some(thread_id) = graph_thread_hint {
         let current_dir = std::env::current_dir().ok();
         println!(
@@ -4794,9 +5330,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn web_only_shutdown_registers_a_sigterm_listener() {
-        let _listener = web_only_sigterm_listener()
-            .expect("web-only mode must be able to subscribe to SIGTERM on Unix");
+    async fn process_terminate_gate_registers_sigterm_listener() {
+        let _gate = ProcessTerminateGate::install()
+            .expect("web-only/TUI modes must subscribe to SIGTERM/SIGINT on Unix");
     }
 
     #[cfg(unix)]

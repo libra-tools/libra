@@ -46,8 +46,6 @@ use super::{
     terminal::{TARGET_FRAME_INTERVAL, Tui, TuiEvent},
     welcome_shader::{self, WelcomeView},
 };
-#[cfg(unix)]
-use crate::utils::fuse as fuse_utils;
 use crate::{
     cli_error,
     internal::ai::{
@@ -464,6 +462,178 @@ pub struct AppConfig {
     pub initial_goal: Option<String>,
     /// Source Pool control surface backing `/source` commands.
     pub source_pool: SourcePool,
+    /// Process-level terminate gate installed before servers start so a
+    /// supervisor SIGTERM during TUI bootstrap still reaches graceful shutdown.
+    pub process_terminate: Option<ProcessTerminateGate>,
+}
+
+/// Shared SIGTERM gate for TUI bootstrap + event-loop shutdown.
+#[derive(Clone, Debug)]
+pub struct ProcessTerminateGate {
+    signaled: Arc<std::sync::atomic::AtomicBool>,
+    signaled_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl ProcessTerminateGate {
+    /// Install SIGINT and (on Unix) SIGTERM listeners synchronously, then wait
+    /// for the first signal on a background task.
+    pub fn install() -> anyhow::Result<Self> {
+        let gate = Self {
+            signaled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            signaled_at: Arc::new(std::sync::Mutex::new(None)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        let signaled = Arc::clone(&gate.signaled);
+        let signaled_at = Arc::clone(&gate.signaled_at);
+        let notify = Arc::clone(&gate.notify);
+
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to subscribe to SIGTERM for TUI process terminate gate: {error}"
+                )
+            })?;
+            let mut sigint = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::interrupt(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to subscribe to SIGINT for TUI process terminate gate: {error}"
+                )
+            })?;
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = sigint.recv() => {}
+                }
+                {
+                    let mut stamped = signaled_at
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if stamped.is_none() {
+                        *stamped = Some(Instant::now());
+                    }
+                }
+                signaled.store(true, std::sync::atomic::Ordering::Release);
+                notify.notify_waiters();
+            });
+        }
+
+        #[cfg(not(unix))]
+        {
+            tokio::spawn(async move {
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(
+                        error = %error,
+                        "failed while waiting for SIGINT/ctrl_c in TUI process terminate gate"
+                    );
+                }
+                {
+                    let mut stamped = signaled_at
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if stamped.is_none() {
+                        *stamped = Some(Instant::now());
+                    }
+                }
+                signaled.store(true, std::sync::atomic::Ordering::Release);
+                notify.notify_waiters();
+            });
+        }
+
+        Ok(gate)
+    }
+
+    pub fn is_signaled(&self) -> bool {
+        self.signaled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Instant the first terminate signal was observed, if any.
+    pub fn signaled_at(&self) -> Option<Instant> {
+        *self
+            .signaled_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub async fn wait(&self) {
+        loop {
+            // Creating `Notified` does not register a waiter until it is
+            // enabled/polled. Enable first, then read the flag, otherwise a
+            // SIGINT/SIGTERM between the load and registration is lost and
+            // web-only `wait()` can hang forever.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_signaled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_terminate_gate_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::ProcessTerminateGate;
+
+    fn test_gate() -> ProcessTerminateGate {
+        ProcessTerminateGate {
+            signaled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            signaled_at: Arc::new(std::sync::Mutex::new(None)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_returns_when_already_signaled_without_notify() {
+        let gate = test_gate();
+        gate.signaled
+            .store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_millis(100), gate.wait())
+            .await
+            .expect("already-signaled wait must return without a notification");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_does_not_miss_concurrent_terminate_signal() {
+        for _ in 0..100 {
+            let gate = test_gate();
+            let waiter = {
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    gate.wait().await;
+                })
+            };
+            let signaler = {
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    gate.signaled
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    {
+                        let mut stamped = gate
+                            .signaled_at
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *stamped = Some(std::time::Instant::now());
+                    }
+                    gate.notify.notify_waiters();
+                })
+            };
+            signaler.await.expect("signaler join");
+            tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("wait must observe concurrent terminate without lost wakeup")
+                .expect("waiter join");
+        }
+    }
 }
 
 /// The main application struct.
@@ -612,6 +782,8 @@ pub struct App<M: CompletionModel> {
     goal_session: Option<super::goal_session::GoalSession>,
     /// Source Pool control state for this TUI session.
     source_pool: SourcePool,
+    /// Optional process terminate gate shared with TUI bootstrap.
+    process_terminate: Option<ProcessTerminateGate>,
 }
 
 impl<M: CompletionModel + Clone + 'static> App<M>
@@ -795,17 +967,25 @@ where
             next_code_ui_item_id: 1,
             goal_session: initial_goal_session,
             source_pool: app_config.source_pool,
+            process_terminate: app_config.process_terminate,
         }
     }
 
     /// Run the main event loop.
+    ///
+    /// Local AgentRuntime finalization is intentionally left to the caller
+    /// ([`crate::command::code`] process lifecycle owner) so it shares the same
+    /// deadline as web/MCP/managed-child cleanup.
     pub async fn run(&mut self) -> anyhow::Result<AppExitInfo> {
-        // Enter alternate screen
-        self.tui.enter_alt_screen()?;
-        let run_result = self.run_in_alt_screen().await;
-        self.finalize_local_runtime_on_shutdown().await;
+        // Enter alternate screen.
+        let run_result = match self.tui.enter_alt_screen() {
+            Ok(()) => self.run_in_alt_screen().await,
+            Err(error) => Err(error.into()),
+        };
         let leave_result = self.tui.leave_alt_screen();
-        self.sweep_fuse_task_worktrees_on_shutdown().await;
+        // FUSE task-worktree sweep is registered with the process lifecycle
+        // owner after `run` returns so a stalled umount is reported under the
+        // shared deadline instead of being detached by a local timeout.
 
         // Save session on exit (best-effort)
         if self.session.message_count() > 0
@@ -822,54 +1002,30 @@ where
         }
     }
 
-    #[cfg(unix)]
-    async fn sweep_fuse_task_worktrees_on_shutdown(&self) {
-        let repo_working_dir = self.registry.working_dir().to_path_buf();
-        let display_repo = repo_working_dir.display().to_string();
-        let sweep_result = tokio::task::spawn_blocking(move || {
-            fuse_utils::sweep_repo_fuse_task_worktrees(&repo_working_dir)
-        })
-        .await;
-
-        match sweep_result {
-            Ok(Ok(report)) => {
-                if !report.is_empty() {
-                    tracing::info!(
-                        repo = %display_repo,
-                        scanned = report.scanned,
-                        cleaned = report.cleaned,
-                        skipped_live_owner = report.skipped_live_owner,
-                        failures = report.failures.len(),
-                        "swept repo-local FUSE task worktrees during TUI shutdown"
-                    );
-                }
-                for failure in report.failures {
-                    tracing::warn!(
-                        path = %failure.path.display(),
-                        error = %failure.message,
-                        "failed to clean repo-local FUSE task worktree during TUI shutdown"
-                    );
-                }
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    repo = %display_repo,
-                    error = %err,
-                    "failed to sweep repo-local FUSE task worktrees during TUI shutdown"
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    repo = %display_repo,
-                    error = %err,
-                    "repo-local FUSE task worktree shutdown sweep task failed"
-                );
-            }
-        }
+    /// Repo working directory used for process-lifecycle FUSE cleanup.
+    pub fn working_dir(&self) -> &Path {
+        self.registry.working_dir()
     }
 
-    #[cfg(not(unix))]
-    async fn sweep_fuse_task_worktrees_on_shutdown(&self) {}
+    /// Take the local AgentRuntime handle/task for process-level shutdown.
+    pub fn take_local_turn_runtime(
+        &mut self,
+    ) -> (
+        Option<crate::internal::ai::runtime::AgentRuntimeHandle>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
+        (
+            self.local_turn_runtime.take(),
+            self.local_turn_runtime_task.take(),
+        )
+    }
+
+    /// Cancel/settle any tracked local runtime turn, leaving the AgentRuntime
+    /// handle for the process lifecycle owner to shut down under its deadline.
+    pub async fn finalize_local_runtime_for_lifecycle(&mut self, settle_budget: Duration) {
+        self.settle_local_runtime_turns_for_shutdown(settle_budget)
+            .await;
+    }
 
     async fn run_in_alt_screen(&mut self) -> anyhow::Result<AppExitInfo> {
         self.tui.clear()?;
@@ -919,6 +1075,7 @@ where
                 }
             })
         });
+        let process_terminate = self.process_terminate.clone();
 
         loop {
             // Check if we should exit
@@ -972,10 +1129,43 @@ where
                         self.schedule_draw();
                     }
                 }
+
+                // Supervisor SIGTERM (installed before servers start) takes the
+                // same graceful exit path as `/quit`.
+                _ = async {
+                    match process_terminate.as_ref() {
+                        Some(gate) => gate.wait().await,
+                        None => std::future::pending().await,
+                    }
+                }, if process_terminate.is_some() => {
+                    tracing::info!("received SIGTERM; requesting graceful TUI shutdown");
+                    // Bound cancel so a stuck local turn cannot prevent App::run
+                    // from returning; the process lifecycle owner then drains
+                    // web/MCP/child/control under the shared deadline.
+                    const SIGTERM_EXIT_CANCEL_BUDGET: Duration = Duration::from_secs(5);
+                    match tokio::time::timeout(
+                        SIGTERM_EXIT_CANCEL_BUDGET,
+                        self.request_user_exit(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => {
+                            tracing::warn!(
+                                "SIGTERM exit cancel exceeded {SIGTERM_EXIT_CANCEL_BUDGET:?}; forcing TUI exit for lifecycle shutdown"
+                            );
+                            let _ = self.interrupt_agent_task();
+                            self.clear_mcp_run_id();
+                            self.exit_info = Some(AppExitInfo {
+                                reason: ExitReason::UserRequested,
+                                thread_id: None,
+                            });
+                        }
+                    }
+                }
             }
         }
 
-        self.finalize_local_runtime_on_shutdown().await;
         if let Some(task) = managed_event_task {
             task.abort();
         }
@@ -1157,15 +1347,9 @@ where
         self.active_local_runtime_turn = None;
     }
 
-    /// Cancel/finalize any tracked local runtime turn before hard-aborting the
-    /// JoinHandle on TUI shutdown. Thinking turns without a started mutation
-    /// must not be left Pending across process exit. A started mutation is
-    /// waited out briefly so its determinate terminal can be reported; if it
-    /// does not settle, the durable command is fenced as indeterminate.
-    async fn finalize_local_runtime_on_shutdown(&mut self) {
+    async fn settle_local_runtime_turns_for_shutdown(&mut self, settle_budget: Duration) {
         if self.active_local_runtime_turn.is_none() {
             let _ = self.interrupt_agent_task();
-            self.shutdown_local_turn_runtime_worker().await;
             return;
         }
 
@@ -1191,12 +1375,10 @@ where
                     )
                     .await;
             }
-            self.shutdown_local_turn_runtime_worker().await;
             return;
         }
 
         if self.active_local_runtime_turn.is_none() {
-            self.shutdown_local_turn_runtime_worker().await;
             return;
         }
 
@@ -1204,7 +1386,7 @@ where
         // mutation has started). Drain terminal AppEvents until the runtime
         // turn is finalized, then fail-closed to indeterminate.
         if mutation_in_progress || self.agent_task.is_some() {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + settle_budget;
             while Instant::now() < deadline {
                 if let Err(error) = self.drain_pending_app_events().await {
                     tracing::warn!(
@@ -1213,7 +1395,6 @@ where
                     );
                 }
                 if self.active_local_runtime_turn.is_none() {
-                    self.shutdown_local_turn_runtime_worker().await;
                     return;
                 }
                 if self
@@ -1250,21 +1431,6 @@ where
             self.active_local_runtime_turn = None;
         }
         let _ = self.interrupt_agent_task();
-        self.shutdown_local_turn_runtime_worker().await;
-    }
-
-    async fn shutdown_local_turn_runtime_worker(&mut self) {
-        if let Some(runtime) = self.local_turn_runtime.take()
-            && let Err(error) = runtime.shutdown().await
-        {
-            tracing::warn!(
-                error = %error,
-                "failed to shut down local AgentRuntime worker during TUI exit"
-            );
-        }
-        if let Some(task) = self.local_turn_runtime_task.take() {
-            let _ = timeout(Duration::from_secs(5), task).await;
-        }
     }
 
     fn turn_mutation_in_progress(&self) -> bool {

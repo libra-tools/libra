@@ -77,7 +77,7 @@ pub mod workflow_baseline;
 pub use agent_run_pane::{
     format_agent_run_pane_with_usage, format_agent_run_pane_with_usage_and_sources,
 };
-pub use app::{App, AppConfig, AppExitInfo, ExitReason};
+pub use app::{App, AppConfig, AppExitInfo, ExitReason, ProcessTerminateGate};
 pub use app_event::{AgentEvent, AgentStatus, AppEvent};
 pub use code_ui_adapter::TuiCodeUiAdapter;
 pub use diff::{DiffSummary, FileChange};

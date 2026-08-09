@@ -9,7 +9,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -25,6 +25,9 @@ use ratatui::{
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
+
+/// Ranking key for choosing the freshest Code session overlay candidate.
+type GraphOverlaySessionRank = (SystemTime, DateTime<Utc>, String);
 
 use crate::{
     internal::{
@@ -232,12 +235,6 @@ async fn load_thread_graph(storage_root: &Path, requested_thread_id: Uuid) -> Re
 /// Candidate sessions come from the durable thread→session index maintained by
 /// [`SessionStore::save`] / [`SessionStore::session_ids_for_thread`], so graph
 /// does not synchronously scan every historical session log.
-/// How recently a session was written, as an ordering key: the events log's
-/// mtime first, then the recorded `updated_at`, then the session id so two
-/// sessions written in the same clock tick still order deterministically
-/// rather than picking whichever the index happened to yield first.
-type SessionRecency = (std::time::SystemTime, DateTime<Utc>, String);
-
 fn load_code_ui_overlay_for_thread(
     storage_root: &Path,
     thread_id: Uuid,
@@ -248,7 +245,10 @@ fn load_code_ui_overlay_for_thread(
         format!("failed to resolve Code sessions for thread '{thread_id}' while building graph overlay")
     })?;
 
-    let mut latest: Option<(crate::internal::ai::session::SessionState, SessionRecency)> = None;
+    let mut latest: Option<(
+        crate::internal::ai::session::SessionState,
+        GraphOverlaySessionRank,
+    )> = None;
     for session_id in candidate_ids {
         let session = match session_store.load(&session_id) {
             Ok(session) => session,

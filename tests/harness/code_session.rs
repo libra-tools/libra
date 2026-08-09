@@ -440,6 +440,10 @@ impl CodeSession {
         &self.info_path
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn run_default_control_conflict(&self) -> Result<Output> {
         let mut child = Command::new(libra_bin())
             .args([
@@ -1328,6 +1332,58 @@ impl CodeSession {
         }
         self.join_reader();
         Ok(())
+    }
+
+    /// SIGTERM the TUI and require a natural exit (no SIGKILL fallback).
+    ///
+    /// Used by W1-08 to prove the ProcessTerminateGate path in `App::run`
+    /// reaches the shared lifecycle owner instead of hanging until force-kill.
+    #[cfg(unix)]
+    pub fn sigterm_expect_natural_exit(&mut self, timeout: Duration) -> Result<()> {
+        let Some(child) = self.child.as_mut() else {
+            self.join_reader();
+            return Ok(());
+        };
+        let pid = child
+            .process_id()
+            .ok_or_else(|| anyhow!("TUI child has no process id for SIGTERM"))?;
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to SIGTERM libra code child {pid}"));
+        }
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if child
+                .try_wait()
+                .context("failed to poll SIGTERM'd libra code child")?
+                .is_some()
+            {
+                let status = child
+                    .wait()
+                    .context("failed to wait for naturally exited libra code child")?;
+                self.child = None;
+                self.join_reader();
+                if !status.success() {
+                    bail!(
+                        "libra code TUI exited after SIGTERM with failure status {status:?}\n{}",
+                        self.debug_context()
+                    );
+                }
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        self.child = None;
+        self.join_reader();
+        bail!(
+            "libra code TUI did not exit naturally within {timeout:?} after SIGTERM; forced SIGKILL\n{}",
+            self.debug_context()
+        )
     }
 
     fn wait_for_control_info(

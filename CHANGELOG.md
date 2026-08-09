@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W1-08, 2026-08-09)
+
+- **W1-08 structured process lifecycle shutdown for `libra code`.**
+  Introduce `LifecycleShutdownOwner` so SIGINT/SIGTERM, bootstrap failure, and
+  normal exit share one deadline/result contract for runtime, listeners,
+  managed Codex child, controller lease, FUSE sweep, and control files.
+  Document SIGTERM graceful shutdown; add web-only and TUI SIGTERM regressions.
+
 ### Changed (plan-20260715 W0-03, 2026-08-09)
 
 - **W0-03 Web-only completion gate is machine-checkable.**

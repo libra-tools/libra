@@ -315,7 +315,7 @@ The embedded Code UI exposes the same canonical identifier as `threadId` in its 
 
 For a persistent non-Codex Web session, the initial session write is a prerequisite for starting a turn: if it fails, Libra starts no turn and the browser can repair storage and retry. A later persistence failure changes the live session to `indeterminate_side_effect` and blocks further submits or interaction replies; inspect the durable session data before restarting or reconciling it.
 
-On `Ctrl-C`, a non-Codex headless runtime first closes browser command admission, then waits up to 30 seconds for the active turn to reach a determinate result. Read-only/model work is cooperatively cancelled; a started mutating tool is allowed to finish. If the deadline expires, `libra code` exits with an explicit shutdown failure and requires session inspection and reconciliation before restart.
+On `Ctrl-C` or `SIGTERM`, a non-Codex headless or web-only process closes browser command admission, then runs the shared process lifecycle shutdown owner (runtime/listeners/managed child/control) under one deadline. Read-only/model work is cooperatively cancelled; a started mutating tool is allowed to finish within that budget. If the deadline expires, `libra code` exits with an explicit shutdown failure and requires session inspection and reconciliation before restart. Supervisors should prefer `SIGTERM` (or `Ctrl-C` / `SIGINT`) over `SIGKILL` so ports, leases, and child processes are released cleanly.
 
 ## Parameter Comparison: Libra vs Git vs jj
 

@@ -96,20 +96,70 @@ impl WebServerHandle {
         shutdown_timeout: Duration,
     ) -> Result<(), WebServerShutdownError> {
         let _ = self.shutdown_tx.send(());
-        let mut join = self.join;
-        match timeout(shutdown_timeout, &mut join).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(error))) => Err(WebServerShutdownError::TaskFailed {
-                reason: error.to_string(),
-            }),
-            Ok(Err(error)) => Err(WebServerShutdownError::TaskFailed {
-                reason: error.to_string(),
-            }),
+        // Abort the listener if this future is cancelled by an outer lifecycle
+        // deadline before the local timeout can call `join.abort()`.
+        let mut join = AbortJoinOnDrop::new(self.join);
+        match timeout(shutdown_timeout, join.as_mut()).await {
+            Ok(Ok(Ok(()))) => {
+                join.disarm();
+                Ok(())
+            }
+            Ok(Ok(Err(error))) => {
+                join.disarm();
+                Err(WebServerShutdownError::TaskFailed {
+                    reason: error.to_string(),
+                })
+            }
+            Ok(Err(error)) => {
+                join.disarm();
+                Err(WebServerShutdownError::TaskFailed {
+                    reason: error.to_string(),
+                })
+            }
             Err(_) => {
-                join.abort();
-                let _ = join.await;
+                join.abort_now().await;
                 Err(WebServerShutdownError::TimedOut)
             }
+        }
+    }
+}
+
+/// Ensures a Tokio task is aborted if its owning shutdown future is dropped
+/// mid-wait (for example when a process lifecycle deadline cancels the step).
+struct AbortJoinOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortJoinOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn as_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        // INVARIANT: handle is present until `disarm` / `abort_now`.
+        self.handle
+            .as_mut()
+            .expect("AbortJoinOnDrop used after disarm")
+    }
+
+    fn disarm(&mut self) {
+        self.handle.take();
+    }
+
+    async fn abort_now(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl<T> Drop for AbortJoinOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }

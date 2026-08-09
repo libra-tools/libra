@@ -10,6 +10,7 @@ pub mod durability;
 pub mod environment;
 pub mod event;
 pub mod hardening;
+pub mod lifecycle;
 pub mod phase0;
 pub mod phase1;
 pub mod phase2;
@@ -36,6 +37,10 @@ pub use hardening::{
     AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext, PrincipalRole,
     SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, ToolOperation, ToolOperationDetails,
     TracingAuditSink,
+};
+pub use lifecycle::{
+    LifecycleShutdownError, LifecycleShutdownOwner, LifecycleShutdownStep, LifecycleStepError,
+    resource as lifecycle_resource,
 };
 pub use phase3::{
     ArtifactLedger, ValidationOutcome, ValidationReport, ValidationReportStore, ValidationStage,

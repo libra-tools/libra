@@ -452,3 +452,135 @@ async fn test_e2e_mcp_flow() {
     let _ = child.wait();
     println!("E2E MCP flow test passed!");
 }
+
+/// W1-08: web-only mode must exit naturally on SIGTERM and release listeners
+/// so the same ports can bind again without a forced SIGKILL.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_web_only_sigterm_releases_ports() {
+    use std::{net::TcpListener, time::Instant};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo_path = temp_dir.path();
+    let home_dir = repo_path.join(".home");
+    let config_home = home_dir.join(".config");
+    std::fs::create_dir_all(&config_home).expect("failed to create isolated HOME");
+
+    let status = Command::new("cargo")
+        .args(["build", "--bin", "libra"])
+        .env("LIBRA_SKIP_WEB_BUILD", "1")
+        .status()
+        .expect("Failed to build libra");
+    assert!(status.success(), "cargo build failed");
+
+    let project_root = std::env::current_dir().expect("Failed to get current dir");
+    let libra_bin = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| project_root.join("target"))
+        .join("debug/libra");
+
+    let status = Command::new(&libra_bin)
+        .args(["init"])
+        .current_dir(repo_path)
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .status()
+        .expect("Failed to init repo");
+    assert!(status.success(), "libra init failed");
+
+    let (mcp_port, web_port) = pick_test_ports();
+    let child = Command::new(&libra_bin)
+        .args([
+            "code",
+            "--web-only",
+            "--mcp-port",
+            &mcp_port.to_string(),
+            "--port",
+            &web_port.to_string(),
+        ])
+        .current_dir(repo_path)
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .env("GEMINI_API_KEY", "test-gemini-api-key")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start libra code --web-only");
+    // SIGKILL+wait on any early return/panic so failed assertions cannot leak
+    // a running web-only process into later tests.
+    struct KillChildOnDrop(Option<std::process::Child>);
+    impl Drop for KillChildOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut child_guard = KillChildOnDrop(Some(child));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let web_url = format!("http://127.0.0.1:{web_port}/");
+    let ready_deadline = Instant::now() + Duration::from_secs(45);
+    let mut ready = false;
+    while Instant::now() < ready_deadline {
+        let child = child_guard.0.as_mut().expect("child present");
+        if let Some(status) = child.try_wait().expect("poll child") {
+            panic!("libra code exited before ready: {status}");
+        }
+        match client.get(&web_url).send().await {
+            Ok(resp) if resp.status().is_success() || resp.status().as_u16() < 500 => {
+                ready = true;
+                break;
+            }
+            _ => sleep(Duration::from_millis(200)).await,
+        }
+    }
+    assert!(
+        ready,
+        "web-only server did not become ready for SIGTERM test"
+    );
+
+    let pid = child_guard.0.as_ref().expect("child present").id();
+    let kill_rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(kill_rc, 0, "failed to SIGTERM libra code pid {pid}");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(60);
+    let mut exited = false;
+    while Instant::now() < exit_deadline {
+        let child = child_guard.0.as_mut().expect("child present");
+        if child.try_wait().expect("poll after SIGTERM").is_some() {
+            exited = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        exited,
+        "libra code did not exit naturally after SIGTERM within 60s (would require SIGKILL)"
+    );
+    let status = child_guard
+        .0
+        .as_mut()
+        .expect("child present")
+        .wait()
+        .expect("wait after natural exit");
+    assert!(
+        status.success(),
+        "SIGTERM graceful shutdown should exit successfully, got {status}"
+    );
+    // Natural exit succeeded — disarm the SIGKILL fallback.
+    let _ = child_guard.0.take();
+
+    // Ports must be reusable immediately after graceful shutdown.
+    TcpListener::bind(("127.0.0.1", web_port))
+        .unwrap_or_else(|e| panic!("web port {web_port} still held after SIGTERM: {e}"));
+    TcpListener::bind(("127.0.0.1", mcp_port))
+        .unwrap_or_else(|e| panic!("mcp port {mcp_port} still held after SIGTERM: {e}"));
+}

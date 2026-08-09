@@ -1135,7 +1135,44 @@ impl CodeUiRuntimeHandle {
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.adapter.shutdown().await
+        self.shutdown_for_lifecycle()
+            .await
+            .map_err(|error| match error {
+                crate::internal::ai::runtime::LifecycleStepError::TimedOut { categories } => {
+                    anyhow::anyhow!(
+                        "Code UI runtime shutdown timed out waiting for: {categories:?}"
+                    )
+                }
+                crate::internal::ai::runtime::LifecycleStepError::Failed { categories, detail } => {
+                    anyhow::anyhow!(
+                        "Code UI runtime shutdown failed releasing {categories:?}: {detail}"
+                    )
+                }
+            })
+    }
+
+    /// Process-level adapter shutdown used by [`LifecycleShutdownOwner`].
+    /// Closes provider/runtime admission first; the controller lease is
+    /// released separately after listeners drain so a browser cannot attach
+    /// and submit during teardown.
+    pub async fn shutdown_for_lifecycle(
+        &self,
+    ) -> Result<(), crate::internal::ai::runtime::LifecycleStepError> {
+        use crate::internal::ai::runtime::lifecycle_resource;
+
+        match self.adapter.shutdown().await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(lifecycle_step_error_from_shutdown_message(
+                &error.to_string(),
+                lifecycle_resource::RUNTIME_TURN,
+            )),
+        }
+    }
+
+    /// Drop the process controller lease after listeners/child have stopped.
+    pub async fn release_controller_for_lifecycle(&self) {
+        self.controller_service.release_for_process_shutdown().await;
+        self.sync_controller_snapshot().await;
     }
 
     /// Validate a controller token and return the active lease.
@@ -1211,6 +1248,35 @@ impl CodeUiRuntimeHandle {
             reason,
             loopback_only: true,
         }
+    }
+}
+
+fn lifecycle_step_error_from_shutdown_message(
+    message: &str,
+    fallback_category: &str,
+) -> crate::internal::ai::runtime::LifecycleStepError {
+    use crate::internal::ai::runtime::{LifecycleStepError, lifecycle_resource};
+
+    let known = [
+        lifecycle_resource::MUTATING_RUNTIME_TURN_RECONCILIATION,
+        lifecycle_resource::RUNTIME_TURN,
+        lifecycle_resource::PROVIDER_STREAM,
+        lifecycle_resource::CONTROLLER_LEASE,
+    ];
+    let found: Vec<String> = known
+        .iter()
+        .filter(|category| message.contains(*category))
+        .map(|category| (*category).to_string())
+        .collect();
+    let categories = if found.is_empty() {
+        vec![fallback_category.to_string()]
+    } else {
+        found
+    };
+    if message.contains("timed out") {
+        LifecycleStepError::timed_out_with(categories)
+    } else {
+        LifecycleStepError::failed_with(categories, message.to_string())
     }
 }
 
