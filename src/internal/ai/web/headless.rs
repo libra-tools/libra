@@ -98,6 +98,7 @@ pub fn headless_capabilities() -> CodeUiCapabilities {
         interactive_approvals: true,
         structured_questions: true,
         provider_session_resume: true,
+        command_idempotency: true,
     }
 }
 
@@ -479,6 +480,8 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
 /// intentionally asynchronous.
 struct InFlightTurn {
     runtime_turn_id: String,
+    /// Canonical browser text admitted with this command id (retry compare).
+    input: String,
     assistant_entry_id: String,
     start_gate: Arc<tokio::sync::Notify>,
     start_open: Arc<AtomicBool>,
@@ -521,6 +524,9 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     /// an empty slot. `cancel_turn` and the runtime executor acquire the lock
     /// to release / finalize the slot.
     in_flight: Arc<Mutex<Option<InFlightTurn>>>,
+    /// Admitted command inputs retained through worker finalization so a
+    /// completion-race `DuplicateTurn` retry can still enforce payload match.
+    admitted_command_inputs: Arc<Mutex<HashMap<String, String>>>,
     /// Monotonic turn id; used by spawned tasks to detect that a successor
     /// turn has claimed the slot before they cleared their own entry.
     next_turn_id: Arc<AtomicU64>,
@@ -647,6 +653,7 @@ where
     ) -> anyhow::Result<Arc<Self>> {
         let (shutdown_result_tx, _) = watch::channel(None);
         let in_flight = Arc::new(Mutex::new(None));
+        let admitted_command_inputs = Arc::new(Mutex::new(HashMap::new()));
         let history = Arc::new(Mutex::new(initial_history));
         let shutdown_timed_out = Arc::new(AtomicBool::new(false));
         let interaction_persistence_failed = Arc::new(AtomicBool::new(false));
@@ -658,6 +665,14 @@ where
                 "Headless Code runtime requires the registry's shared tool-boundary policy; rebuild CodeAgentServices before starting a browser turn"
             )
         })?;
+        // Durable commandId idempotency requires the SessionStore-backed
+        // command log. Without it, refuse to advertise the capability so
+        // browsers omit commandId rather than getting a best-effort cache.
+        let mut capabilities = capabilities;
+        if persistence.is_none() {
+            capabilities.command_idempotency = false;
+            session.set_capabilities(capabilities.clone()).await;
+        }
         let executor = Arc::new(HeadlessDirectTurnExecutor {
             session: session.clone(),
             history: history.clone(),
@@ -703,6 +718,7 @@ where
             session,
             capabilities,
             in_flight,
+            admitted_command_inputs,
             next_turn_id: Arc::new(AtomicU64::new(1)),
             runtime_session_id,
             runtime: runtime_handle,
@@ -806,10 +822,11 @@ where
             mutation_started,
         ));
         let cancellation = context.cancellation();
+        let request_input = request.input.clone();
         let result = run_tool_loop_with_history_and_observer(
             self.model.as_ref(),
             prior_history,
-            request.input,
+            request_input,
             self.registry.as_ref(),
             config,
             &mut observer,
@@ -1274,11 +1291,56 @@ where
     }
 
     async fn submit_message(&self, text: String) -> anyhow::Result<()> {
+        self.submit_message_with_command_id(text, None).await
+    }
+
+    async fn submit_message_with_command_id(
+        &self,
+        text: String,
+        command_id: Option<String>,
+    ) -> anyhow::Result<()> {
         if text.trim().is_empty() {
             return Err(anyhow!("Empty messages are not accepted by libra code"));
         }
         self.ensure_not_shutting_down()?;
         self.ensure_session_is_recoverable().await?;
+        if command_id.is_some() && self.persistence.is_none() {
+            return Err(anyhow!(
+                "commandId requires a resumable headless session with durable command storage; omit commandId or enable session persistence"
+            ));
+        }
+
+        let runtime_turn_id = match command_id {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow!(
+                        "commandId must be a non-empty string when provided"
+                    ));
+                }
+                if trimmed.chars().count() > 512 {
+                    return Err(anyhow!(
+                        "commandId must be at most 512 characters (got {})",
+                        trimmed.chars().count()
+                    ));
+                }
+                if trimmed
+                    .chars()
+                    .any(|ch| ch.is_control() || ch.is_whitespace())
+                {
+                    return Err(anyhow!(
+                        "commandId must not contain whitespace or control characters"
+                    ));
+                }
+                trimmed.to_string()
+            }
+            None => {
+                // Fresh UUID per submission so resume/restart cannot reuse a prior
+                // durable command identity (numeric counters restart at 1).
+                let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
+                format!("headless-{turn_id}-{}", uuid::Uuid::new_v4())
+            }
+        };
 
         // Hold the in_flight lock continuously across the check + runtime
         // admission + slot assignment. Two concurrent submits cannot both
@@ -1286,7 +1348,19 @@ where
         // first has installed its worker request.
         let mut slot = self.in_flight.lock().await;
         self.ensure_not_shutting_down()?;
-        if slot.is_some() {
+        if let Some(existing) = slot.as_ref() {
+            // Same caller-stable command id while the turn is still live is an
+            // idempotent network/lease retry only when the payload matches.
+            if existing.runtime_turn_id == runtime_turn_id {
+                if existing.input == text {
+                    return Ok(());
+                }
+                return Err(RuntimeWorkerError::CommandPayloadConflict {
+                    session_id: self.runtime_session_id.clone(),
+                    turn_id: runtime_turn_id,
+                }
+                .into());
+            }
             return Err(anyhow!(
                 "A turn is already running; cancel it or wait for the assistant to finish before sending another message"
             ));
@@ -1317,16 +1391,13 @@ where
             created_at: now,
             updated_at: now,
         };
-        // Fresh UUID per submission so resume/restart cannot reuse a prior
-        // durable command identity (numeric counters restart at 1).
-        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
-        let runtime_turn_id = format!("headless-{turn_id}-{}", uuid::Uuid::new_v4());
         let start_gate = Arc::new(tokio::sync::Notify::new());
         let start_open = Arc::new(AtomicBool::new(false));
         let completion = Arc::new(tokio::sync::Notify::new());
         let completion_for_rollback = completion.clone();
         *slot = Some(InFlightTurn {
             runtime_turn_id: runtime_turn_id.clone(),
+            input: text.clone(),
             assistant_entry_id: assistant_entry_id.clone(),
             start_gate: start_gate.clone(),
             start_open: start_open.clone(),
@@ -1349,13 +1420,77 @@ where
             .await
         {
             *slot = None;
-            if matches!(error, RuntimeWorkerError::ReconciliationRequired { .. }) {
-                return Err(error.into());
+            match error {
+                RuntimeWorkerError::IdempotentCommand { ack_ok: true, .. } => {
+                    // Matching payload already pending or succeeded. Treat as a
+                    // successful retry acknowledgement without re-dispatch.
+                    return Ok(());
+                }
+                RuntimeWorkerError::DuplicateTurn { turn_id, .. } if turn_id == runtime_turn_id => {
+                    // Completion race: worker still has this turn active after the
+                    // executor released its slot. Compare against the admitted
+                    // payload so a conflicting retry cannot be silently ACK'd.
+                    let admitted = self
+                        .admitted_command_inputs
+                        .lock()
+                        .await
+                        .get(&runtime_turn_id)
+                        .cloned();
+                    debug_assert!(slot.is_none());
+                    match admitted.as_deref() {
+                        Some(prior) if prior == text => return Ok(()),
+                        _ => {
+                            return Err(RuntimeWorkerError::CommandPayloadConflict {
+                                session_id: self.runtime_session_id.clone(),
+                                turn_id: runtime_turn_id,
+                            }
+                            .into());
+                        }
+                    }
+                }
+                RuntimeWorkerError::IdempotentCommand {
+                    ack_ok: false,
+                    turn_id,
+                    status,
+                    ..
+                } => {
+                    return Err(CodeUiApiError::conflict(
+                        "COMMAND_ALREADY_TERMINAL",
+                        format!(
+                            "commandId '{turn_id}' already finished with state {status}; allocate a new commandId to retry"
+                        ),
+                    )
+                    .into());
+                }
+                RuntimeWorkerError::CommandPayloadConflict { .. }
+                | RuntimeWorkerError::ReconciliationRequired { .. } => {
+                    return Err(error.into());
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Unable to admit the browser turn to the AgentRuntime queue; no turn was started: {}",
+                        runtime_worker_adapter_message(other)
+                    ));
+                }
             }
-            return Err(anyhow!(
-                "Unable to admit the browser turn to the AgentRuntime queue; no turn was started: {}",
-                runtime_worker_adapter_message(error)
-            ));
+        }
+
+        {
+            // Bound retention for long-lived headless sessions: keep only the
+            // most recent admitted identities for completion-race compare.
+            let mut admitted = self.admitted_command_inputs.lock().await;
+            const ADMITTED_COMMAND_INPUT_LIMIT: usize = 64;
+            admitted.insert(runtime_turn_id.clone(), text.clone());
+            while admitted.len() > ADMITTED_COMMAND_INPUT_LIMIT {
+                if let Some(evict) = admitted.keys().next().cloned() {
+                    if evict == runtime_turn_id {
+                        break;
+                    }
+                    admitted.remove(&evict);
+                } else {
+                    break;
+                }
+            }
         }
 
         // The executor is gated, so release the local slot lock before the

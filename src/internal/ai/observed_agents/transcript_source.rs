@@ -225,6 +225,19 @@ impl TranscriptSource {
 /// Resolve the provider root that contains `canonical_path`, if any. Mirrors
 /// the Codex `$CODEX_HOME` relocation honored elsewhere in the codex chain so a
 /// relocated home is not silently captured with an empty transcript.
+fn normalize_macos_var_alias(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        path.strip_prefix("/var")
+            .map(|suffix| Path::new("/private/var").join(suffix))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.to_path_buf()
+    }
+}
+
 fn provider_root_containing(adapter: &dyn ObservedAgent, canonical_path: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("LIBRA_TEST_HOME")
         .map(PathBuf::from)
@@ -238,7 +251,7 @@ fn provider_root_containing(adapter: &dyn ObservedAgent, canonical_path: &Path) 
         } else {
             home.join(dir)
         };
-        let root = root.canonicalize().ok()?;
+        let root = normalize_macos_var_alias(&root).canonicalize().ok()?;
         canonical_path.starts_with(&root).then_some(root)
     })
 }
@@ -254,14 +267,15 @@ fn configured_provider_roots(adapter: &dyn ObservedAgent) -> Vec<PathBuf> {
         .protected_dirs()
         .iter()
         .map(|dir| {
-            if *dir == ".codex" {
+            let root = if *dir == ".codex" {
                 match std::env::var_os("CODEX_HOME").map(PathBuf::from) {
                     Some(path) if path.is_absolute() => path,
                     _ => home.join(dir),
                 }
             } else {
                 home.join(dir)
-            }
+            };
+            normalize_macos_var_alias(&root)
         })
         .collect()
 }
@@ -566,6 +580,7 @@ fn securely_open_provider_file(
     if !path.is_absolute() {
         return Ok(None);
     }
+    let path = normalize_macos_var_alias(path);
     for root in configured_provider_roots(adapter) {
         let Ok(relative) = path.strip_prefix(&root) else {
             continue;

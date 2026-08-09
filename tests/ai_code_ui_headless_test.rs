@@ -530,6 +530,199 @@ async fn submit_message_persists_resumable_session_snapshot() {
     panic!("session store did not receive the completed headless turn before deadline");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn caller_supplied_command_id_is_durable_and_idempotent() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
+    let mut state = SessionState::new(&workdir.path().to_string_lossy());
+    let thread_id = state.id.clone();
+    state.metadata.insert(
+        "thread_id".to_string(),
+        serde_json::json!(thread_id.clone()),
+    );
+    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let (runtime, _, _) = build_runtime_with_persistence(
+        "basic_chat",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+    let command_id = "browser-cmd-stable-1".to_string();
+
+    runtime
+        .submit_message_with_command_id(
+            "persist with stable id".to_string(),
+            Some(command_id.clone()),
+        )
+        .await
+        .expect("first submit with commandId should admit");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_terminal = false;
+    while std::time::Instant::now() < deadline {
+        let projection_store = SessionJsonlStore::new(store.session_root(&thread_id));
+        if let Ok(replay) = projection_store.load_code_workflow_replay() {
+            let durable_command = replay.events.iter().find_map(|event| match &event.event {
+                CodeWorkflowEventKind::CommandIntentPersisted { command }
+                    if command.command_kind == "headless_direct_turn"
+                        && command.identity.command_id == command_id =>
+                {
+                    Some(command.clone())
+                }
+                _ => None,
+            });
+            if let Some(command) = durable_command {
+                assert!(
+                    command.canonical_request_hash.starts_with("sha256:"),
+                    "caller-supplied commandId must still hash the request payload"
+                );
+                saw_terminal = replay.events.iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        CodeWorkflowEventKind::CommandTerminalSuccess {
+                            command: identity,
+                            ..
+                        } if identity.command_id == command_id
+                    )
+                });
+                if saw_terminal {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        saw_terminal,
+        "caller-supplied commandId must reach a durable terminal success"
+    );
+
+    // Same commandId + same payload is an idempotent retry (no second dispatch).
+    runtime
+        .submit_message_with_command_id(
+            "persist with stable id".to_string(),
+            Some(command_id.clone()),
+        )
+        .await
+        .expect("matching retry must acknowledge without error");
+
+    let conflict = runtime
+        .submit_message_with_command_id(
+            "different payload for same command id".to_string(),
+            Some(command_id.clone()),
+        )
+        .await;
+    let conflict_err = conflict.expect_err("same commandId with different text must fail closed");
+    let conflict_message = conflict_err.to_string();
+    assert!(
+        conflict_message.contains("different canonical payload")
+            || conflict_message.contains("COMMAND_PAYLOAD_CONFLICT")
+            || conflict_err
+                .downcast_ref::<libra::internal::ai::runtime::RuntimeWorkerError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        libra::internal::ai::runtime::RuntimeWorkerError::CommandPayloadConflict { .. }
+                    )
+                }),
+        "payload conflict should surface clearly, got: {conflict_message}"
+    );
+
+    let projection_store = SessionJsonlStore::new(store.session_root(&thread_id));
+    let replay = projection_store
+        .load_code_workflow_replay()
+        .expect("workflow projection should remain readable");
+    let intent_count = replay
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.event,
+                CodeWorkflowEventKind::CommandIntentPersisted { command }
+                    if command.identity.command_id == command_id
+            )
+        })
+        .count();
+    assert_eq!(
+        intent_count, 1,
+        "idempotent retry and payload conflict must not append a second intent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_flight_command_id_rejects_payload_mismatch() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
+    let mut state = SessionState::new(&workdir.path().to_string_lossy());
+    let thread_id = state.id.clone();
+    state.metadata.insert(
+        "thread_id".to_string(),
+        serde_json::json!(thread_id.clone()),
+    );
+    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let (runtime, _, _) = build_runtime_with_persistence(
+        "delayed_chat",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+    let command_id = "browser-cmd-inflight-1".to_string();
+
+    runtime
+        .submit_message_with_command_id("slow".to_string(), Some(command_id.clone()))
+        .await
+        .expect("first submit must admit before the delayed reply finishes");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_streaming = false;
+    while std::time::Instant::now() < deadline {
+        let snapshot = runtime.snapshot().await;
+        if snapshot.transcript.iter().any(|entry| {
+            entry.kind
+                == libra::internal::ai::web::code_ui::CodeUiTranscriptEntryKind::AssistantMessage
+                && entry.streaming
+        }) {
+            saw_streaming = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw_streaming,
+        "assistant entry must be streaming before the conflicting retry"
+    );
+
+    let matching = runtime
+        .submit_message_with_command_id("slow".to_string(), Some(command_id.clone()))
+        .await;
+    assert!(
+        matching.is_ok(),
+        "same commandId + same text while in flight must be idempotent"
+    );
+
+    let conflict = runtime
+        .submit_message_with_command_id("different slow text".to_string(), Some(command_id.clone()))
+        .await;
+    let conflict_err = conflict.expect_err("same commandId with different text must fail closed");
+    assert!(
+        conflict_err
+            .downcast_ref::<libra::internal::ai::runtime::RuntimeWorkerError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    libra::internal::ai::runtime::RuntimeWorkerError::CommandPayloadConflict { .. }
+                )
+            }),
+        "in-flight payload mismatch must surface CommandPayloadConflict, got: {conflict_err}"
+    );
+
+    runtime.cancel_turn().await.expect("cancel must succeed");
+}
+
 /// The headless runtime advertises the Phase 3 v1 browser surfaces it can
 /// actually deliver. Locking these down catches accidental capability drift
 /// between the Rust runtime and the Web UI feature gates.
@@ -544,6 +737,7 @@ fn headless_capabilities_match_phase3_v1_contract() {
     assert!(caps.interactive_approvals);
     assert!(caps.structured_questions);
     assert!(caps.provider_session_resume);
+    assert!(caps.command_idempotency);
 }
 
 #[tokio::test(flavor = "multi_thread")]

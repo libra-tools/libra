@@ -191,6 +191,14 @@ struct SessionRow {
     working_dir: String,
     started_at: i64,
     last_event_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_error_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_failed_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -384,6 +392,10 @@ async fn list(args: SessionListArgs, output: &OutputConfig) -> CliResult<()> {
             last_event_at: row
                 .try_get_by::<i64, _>("last_event_at")
                 .unwrap_or_default(),
+            capture_status: None,
+            capture_error_code: None,
+            capture_error_stage: None,
+            capture_failed_at: None,
         });
     }
     let next_cursor = if out.len() as u64 > limit {
@@ -427,6 +439,10 @@ async fn show(args: SessionShowArgs, output: &OutputConfig) -> CliResult<()> {
         .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
     match row {
         Some(row) => {
+            let metadata_json = row
+                .try_get_by::<String, _>("metadata_json")
+                .unwrap_or_else(|_| "{}".to_string());
+            let capture = capture_diagnostic_from_metadata(&metadata_json);
             let payload = SessionRow {
                 session_id: row
                     .try_get_by::<String, _>("session_id")
@@ -442,6 +458,10 @@ async fn show(args: SessionShowArgs, output: &OutputConfig) -> CliResult<()> {
                 last_event_at: row
                     .try_get_by::<i64, _>("last_event_at")
                     .unwrap_or_default(),
+                capture_status: capture.status,
+                capture_error_code: capture.error_code,
+                capture_error_stage: capture.error_stage,
+                capture_failed_at: capture.failed_at,
             };
             let transcript = if let Some(path) = args.extract_transcript.as_deref() {
                 let metadata_json = row.try_get_by::<String, _>("metadata_json").map_err(|e| {
@@ -763,7 +783,53 @@ fn emit_one(row: &SessionRow, output: &OutputConfig) -> CliResult<()> {
     println!("working_dir   : {}", row.working_dir);
     println!("started_at    : {}", row.started_at);
     println!("last_event_at : {}", row.last_event_at);
+    if let Some(status) = row.capture_status.as_deref() {
+        println!("capture_status: {status}");
+        if let Some(code) = row.capture_error_code.as_deref() {
+            println!("capture_error : {code}");
+        }
+        if let Some(stage) = row.capture_error_stage.as_deref() {
+            println!("capture_stage : {stage}");
+        }
+        if let Some(failed_at) = row.capture_failed_at {
+            println!("capture_failed: {failed_at}");
+        }
+        println!(
+            "capture_retry : next Codex Stop or `libra agent import --session <id> --agent codex --yes`"
+        );
+    }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct CaptureDiagnostic {
+    status: Option<String>,
+    error_code: Option<String>,
+    error_stage: Option<String>,
+    failed_at: Option<i64>,
+}
+
+fn capture_diagnostic_from_metadata(metadata_json: &str) -> CaptureDiagnostic {
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
+        return CaptureDiagnostic::default();
+    };
+    CaptureDiagnostic {
+        status: metadata
+            .get("capture_status")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        error_code: metadata
+            .get("capture_error_code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        error_stage: metadata
+            .get("capture_error_stage")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        failed_at: metadata
+            .get("capture_failed_at")
+            .and_then(serde_json::Value::as_i64),
+    }
 }
 
 async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> CliResult<bool> {
@@ -1162,6 +1228,10 @@ mod tests {
                     working_dir: "/tmp/repo".to_string(),
                     started_at: now - 2 * 3_600,
                     last_event_at: 1_700_000_100,
+                    capture_status: None,
+                    capture_error_code: None,
+                    capture_error_stage: None,
+                    capture_failed_at: None,
                 },
                 SessionRow {
                     session_id: "short-session".to_string(),
@@ -1170,6 +1240,10 @@ mod tests {
                     working_dir: "/tmp/repo".to_string(),
                     started_at: now - 20 * 86_400,
                     last_event_at: 1_700_000_110,
+                    capture_status: None,
+                    capture_error_code: None,
+                    capture_error_stage: None,
+                    capture_failed_at: None,
                 },
             ],
             next_cursor: Some("v1:1700000010:short-session".to_string()),

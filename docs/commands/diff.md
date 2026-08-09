@@ -76,9 +76,9 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | Shortstat | | `--shortstat` | Show only the trailing summary line of `--stat` (files changed / insertions / deletions), omitting a clause when its count is zero. |
 | Summary | | `--summary` | Show a condensed summary of created/deleted files, detected renames, and mode changes (rename detection is on by default; `diff.renames=false` or `--no-renames` disables it). Plain content-only edits produce no line. |
 | No patch | `-s` | `--no-patch` | Suppress the patch (diff body). Combine with `--exit-code` for a status-only check. |
-| Exit code | | `--exit-code` | Still print the diff, but exit with code 1 when there are differences (0 otherwise). Unlike `--quiet`, the diff is not suppressed. |
+| Exit code | | `--exit-code` | Still print the diff, but exit with code 1 when there are differences (0 otherwise). Unlike `--quiet`, the diff is not suppressed. Combined with `--check` the two statuses **add**: see the `--check` row. |
 | NUL output | `-z` | `--null` | NUL-terminate `--raw`/`--name-only`/`--name-status`/`--numstat` records. Raw renames and name-status fields become separate NUL fields; other modes are unaffected. |
-| Whitespace check | | `--check` | Instead of the diff, warn about safety problems on added lines: trailing whitespace, space-before-tab in the indent, leftover conflict markers, and new blank lines at EOF. Prints `<path>:<line>: <message>` and exits 2 when any are found; takes precedence over other output modes. |
+| Whitespace check | | `--check` | Instead of the diff, warn about safety problems on added lines: trailing whitespace, space-before-tab in the indent, leftover conflict markers, and new blank lines at EOF. Prints `<path>:<line>: <message>` and exits 2 when any are found; takes precedence over other output modes. With `--exit-code` the two statuses **add**, matching Git: `0` with nothing to report, `1` for a difference with no damage, `2` for damage without `--exit-code`, and `3` (1 + 2) for a damaged difference. |
 | Reverse | `-R` | `--reverse` | Swap the two sides so additions become deletions and vice-versa (the patch that would undo the change). |
 | Text | `-a` | `--text` | Treat all files as text: diff the content even of files detected as binary (a NUL byte in either side, or non-UTF-8 content), suppressing the "Binary files … differ" line. Libra's diff is text-based, so a non-UTF-8 change that is identical after lossy-UTF-8 conversion still shows "Binary files … differ". |
 | Binary patch | | `--binary` | Emit a `GIT binary patch` (base85 `literal` chunks for both directions) for binary files instead of "Binary files … differ". It implies `--full-index`. The patch is valid and appliable, but its compressed bytes are not byte-identical to Git's (Libra deflates with a different zlib and always emits `literal`, not Git's smaller-of-literal/delta). |
@@ -288,10 +288,10 @@ Supported output modes:
 - `--shortstat` (just the trailing summary line of `--stat`, with zero-count clauses omitted)
 - `--summary` (condensed create/delete/rename/mode-change summary; renames are detected by default unless disabled)
 - `-s` / `--no-patch` suppresses the patch body (for status-only checks)
-- `--exit-code` still prints the diff but exits `1` when there are differences
+- `--exit-code` still prints the diff but exits `1` when there are differences (with `--check` the two statuses add)
 - `--diff-filter=<FILTER>` restricts all output, JSON, and exit-code decisions to the selected change kinds
 - `-z` / `--null` NUL-terminates `--raw`/`--name-only`/`--name-status`/`--numstat` records (raw rename and name-status path fields become separate NUL fields)
-- `--check` scans added lines for trailing whitespace, space-before-tab, leftover conflict markers, and new blank lines at EOF; any hit exits `2`
+- `--check` scans added lines for trailing whitespace, space-before-tab, leftover conflict markers, and new blank lines at EOF; any hit exits `2`, and with `--exit-code` the statuses add (`3` for a damaged difference)
 - `--quiet` suppresses stdout and uses exit `1` to signal that differences exist
 
 By default these machine-oriented diff modes report only tracked/index-vs-worktree changes. Untracked files, including an untracked `.libraignore`, do not appear and do not make `--quiet` or `--exit-code` fail.

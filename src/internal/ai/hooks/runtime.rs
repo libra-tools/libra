@@ -976,6 +976,27 @@ async fn ingest_agent_traces_payload_with_scope(
             );
             return Ok(());
         }
+        // Codex hooks skip the generic command preflight so an auxiliary
+        // callback can be acknowledged when storage is unavailable. Take the
+        // shared hold at the actual object-publication boundary instead.
+        let _maintenance_lock = match crate::internal::maintenance_lock::MaintenanceLock::shared(
+            repo,
+        )
+        .context(
+            "failed to acquire the repository maintenance lock before writing an agent checkpoint",
+        ) {
+            Ok(lock) => lock,
+            Err(error) => {
+                record_retryable_checkpoint_failure(
+                    conn,
+                    &session_id,
+                    "maintenance-lock",
+                    "maintenance_lock",
+                )
+                .await;
+                return Err(error);
+            }
+        };
         // A0-02: `SubagentStart` / `SubagentEnd` boundaries materialise an
         // independent `scope='subagent'` checkpoint (its own `traces`
         // commit + `agent_checkpoint` row) that carries parent session /
@@ -1061,7 +1082,7 @@ async fn ingest_agent_traces_payload_with_scope(
             {
                 bail!("injected failure after subagent content before parent checkpoint");
             }
-            write_committed_checkpoint(
+            if let Err(error) = write_committed_checkpoint(
                 conn,
                 repo,
                 &session_id,
@@ -1075,7 +1096,18 @@ async fn ingest_agent_traces_payload_with_scope(
                 &subagent_discovery.sources,
                 subagent_discovery.warning.as_deref(),
             )
-            .await?;
+            .await
+            {
+                record_retryable_checkpoint_failure(
+                    conn,
+                    &session_id,
+                    "checkpoint-write",
+                    "checkpoint_write",
+                )
+                .await;
+                return Err(error);
+            }
+            clear_retryable_checkpoint_failure(conn, &session_id).await;
         }
     }
 
@@ -1196,6 +1228,13 @@ async fn cleanup_failed_registered_checkpoint(
     claim_owner: Option<&str>,
     export_lease: Option<(&str, i64)>,
 ) {
+    record_retryable_checkpoint_failure(
+        conn,
+        &marker.session_id,
+        &marker.attempt_id,
+        "checkpoint_write",
+    )
+    .await;
     if let Some(owner) = claim_owner
         && let Err(error) = crate::internal::ai::coverage_gate::abandon_reserved_turn_claims(
             conn,
@@ -1247,6 +1286,90 @@ async fn cleanup_failed_registered_checkpoint(
             checkpoint_id = %marker.attempt_id,
             error = %format!("{error:#}"),
             "failed to clear ordinary marker after checkpoint write failure"
+        );
+    }
+}
+
+/// Persist a non-sensitive, retryable capture outcome on the session row.
+///
+/// Codex hooks are intentionally acknowledged even when capture fails, but an
+/// acknowledged callback must not become an invisible data-loss event. The
+/// coverage gate already allows a later Stop to re-own an `abandoned` claim;
+/// this metadata makes that recovery state visible to operators without
+/// storing hook payloads, transcript contents, paths, or internal errors.
+async fn record_retryable_checkpoint_failure(
+    conn: &sea_orm::DatabaseConnection,
+    session_id: &str,
+    attempt_id: &str,
+    stage: &str,
+) {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let failure = serde_json::json!({
+        "capture_status": "retryable",
+        "capture_error_code": "checkpoint_write_failed",
+        "capture_error_stage": stage,
+        "capture_attempt_id": attempt_id,
+        "capture_failed_at": Utc::now().timestamp(),
+    });
+    let value = match serde_json::to_string(&failure) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to serialize retryable checkpoint diagnostic"
+            );
+            return;
+        }
+    };
+    if let Err(error) = conn
+        .execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "UPDATE agent_session
+             SET metadata_json = json_patch(COALESCE(metadata_json, '{}'), ?),
+                 sync_revision = sync_revision + 1
+             WHERE session_id = ?",
+            [value.into(), session_id.into()],
+        ))
+        .await
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %format!("{error:#}"),
+            "failed to persist retryable checkpoint diagnostic"
+        );
+    }
+}
+
+/// Clear a prior retryable diagnostic after a successful checkpoint attempt.
+/// This is best-effort because the checkpoint itself is already durable and
+/// must not be made visible as failed solely because its status cleanup races
+/// another session metadata update.
+async fn clear_retryable_checkpoint_failure(conn: &sea_orm::DatabaseConnection, session_id: &str) {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    if let Err(error) = conn
+        .execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "UPDATE agent_session
+             SET metadata_json = json_remove(
+                     COALESCE(metadata_json, '{}'),
+                     '$.capture_status', '$.capture_error_code',
+                     '$.capture_error_stage', '$.capture_attempt_id',
+                     '$.capture_failed_at'
+                 ),
+                 sync_revision = sync_revision + 1
+             WHERE session_id = ?
+               AND json_extract(COALESCE(metadata_json, '{}'), '$.capture_status') = 'retryable'",
+            [session_id.into()],
+        ))
+        .await
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %format!("{error:#}"),
+            "failed to clear retryable checkpoint diagnostic after success"
         );
     }
 }

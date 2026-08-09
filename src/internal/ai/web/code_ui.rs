@@ -56,6 +56,9 @@ pub struct CodeUiCapabilities {
     pub interactive_approvals: bool,
     pub structured_questions: bool,
     pub provider_session_resume: bool,
+    /// Browser/automation `commandId` retry de-duplication is honored.
+    #[serde(default)]
+    pub command_idempotency: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -357,6 +360,10 @@ pub struct CodeUiControllerDetachRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CodeUiMessageRequest {
     pub text: String,
+    /// Caller-stable runtime command identity for retry de-duplication.
+    /// When omitted, adapters mint a process-local id (not cross-request stable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,6 +525,13 @@ impl CodeUiSession {
     pub async fn set_status(&self, status: CodeUiSessionStatus) {
         self.mutate(CodeUiEventType::StatusChanged, |snapshot| {
             snapshot.status = status;
+        })
+        .await;
+    }
+
+    pub async fn set_capabilities(&self, capabilities: CodeUiCapabilities) {
+        self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
+            snapshot.capabilities = capabilities;
         })
         .await;
     }
@@ -721,6 +735,25 @@ pub trait CodeUiCommandAdapter: Send + Sync {
     fn capabilities(&self) -> CodeUiCapabilities;
 
     async fn submit_message(&self, text: String) -> anyhow::Result<()>;
+
+    /// Submit with an optional caller-stable `command_id` (wire: `commandId`).
+    ///
+    /// Adapters that honor durable command identity override this. The default
+    /// fails closed when an id is supplied so TUI/Codex paths cannot silently
+    /// ignore retry de-duplication. Callers that do not need identity must
+    /// pass `None` (or omit `commandId` on the wire).
+    async fn submit_message_with_command_id(
+        &self,
+        text: String,
+        command_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        if command_id.is_some() {
+            return Err(anyhow!(
+                "This libra code session does not support caller-supplied commandId; omit commandId or use a runtime that advertises commandIdempotency"
+            ));
+        }
+        self.submit_message(text).await
+    }
 
     async fn respond_interaction(
         &self,
@@ -1022,11 +1055,57 @@ impl CodeUiRuntimeHandle {
         &self,
         token: Option<&str>,
         text: String,
+        command_id: Option<String>,
     ) -> Result<(), CodeUiApiError> {
         let permit = self.acquire_controller_write_permit(token).await?;
+        // Length-prefix hex(client_id) so arbitrary client ids (including ':')
+        // cannot forge another controller's durable command namespace.
+        let command_id = match command_id {
+            None => None,
+            Some(raw) => {
+                if raw != raw.trim() {
+                    return Err(CodeUiApiError::bad_request(
+                        "INVALID_COMMAND_ID",
+                        "commandId must not contain leading or trailing whitespace",
+                    ));
+                }
+                if raw.is_empty() {
+                    return Err(CodeUiApiError::bad_request(
+                        "INVALID_COMMAND_ID",
+                        "commandId must be a non-empty string when provided",
+                    ));
+                }
+                if raw.chars().count() > 128 {
+                    return Err(CodeUiApiError::bad_request(
+                        "INVALID_COMMAND_ID",
+                        format!(
+                            "commandId must be at most 128 characters (got {})",
+                            raw.chars().count()
+                        ),
+                    ));
+                }
+                if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+                    return Err(CodeUiApiError::bad_request(
+                        "INVALID_COMMAND_ID",
+                        "commandId must not contain whitespace or control characters",
+                    ));
+                }
+                let client_id = permit.lease().client_id.as_str();
+                // Non-reversible controller fence: clientId must never land in the
+                // durable command log in recoverable form (automation clients may
+                // put secrets in clientId).
+                let client_tag = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(
+                        format!("libra.code.controller.v1\0{client_id}").as_bytes(),
+                    ))
+                };
+                Some(format!("{client_tag}:{raw}"))
+            }
+        };
         let result = self
             .adapter
-            .submit_message(text)
+            .submit_message_with_command_id(text, command_id)
             .await
             .map_err(CodeUiApiError::unsupported_from_error);
         drop(permit);
@@ -1361,6 +1440,18 @@ impl CodeUiApiError {
                 "session '{session_id}' requires mutation reconciliation before another turn can run"
             ));
         }
+        if let Some(crate::internal::ai::runtime::RuntimeWorkerError::CommandPayloadConflict {
+            turn_id,
+            ..
+        }) = error.downcast_ref::<crate::internal::ai::runtime::RuntimeWorkerError>()
+        {
+            return Self::conflict(
+                "COMMAND_PAYLOAD_CONFLICT",
+                format!(
+                    "commandId '{turn_id}' was reused with a different message payload; allocate a new commandId or retry the original text"
+                ),
+            );
+        }
 
         Self {
             status: 422,
@@ -1413,11 +1504,14 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         // Tail: read-side and runtime-availability errors.
         ("CODE_UI_UNAVAILABLE", 404),
         ("INVALID_QUERY_PARAM", 400),
+        ("INVALID_COMMAND_ID", 400),
         ("STORAGE_PATH_INVALID", 500),
         ("STATUS_UNAVAILABLE", 500),
         ("THREAD_LIST_FAILED", 500),
         ("DB_UNAVAILABLE", 500),
         ("RECONCILIATION_REQUIRED", 409),
+        ("COMMAND_PAYLOAD_CONFLICT", 409),
+        ("COMMAND_ALREADY_TERMINAL", 409),
         ("INTERNAL_ERROR", 500),
         ("UNSUPPORTED_OPERATION", 422),
     ]
@@ -1837,6 +1931,17 @@ mod tests {
                 "RECONCILIATION_REQUIRED",
             ),
             (
+                CodeUiApiError::conflict(
+                    "COMMAND_PAYLOAD_CONFLICT",
+                    "commandId reused with different payload",
+                ),
+                "COMMAND_PAYLOAD_CONFLICT",
+            ),
+            (
+                CodeUiApiError::conflict("COMMAND_ALREADY_TERMINAL", "commandId already finished"),
+                "COMMAND_ALREADY_TERMINAL",
+            ),
+            (
                 CodeUiApiError::forbidden("BROWSER_CONTROL_DISABLED", "off"),
                 "BROWSER_CONTROL_DISABLED",
             ),
@@ -1847,6 +1952,10 @@ mod tests {
             (
                 CodeUiApiError::bad_request("INVALID_QUERY_PARAM", "limit"),
                 "INVALID_QUERY_PARAM",
+            ),
+            (
+                CodeUiApiError::bad_request("INVALID_COMMAND_ID", "bad id"),
+                "INVALID_COMMAND_ID",
             ),
             (
                 CodeUiApiError::unsupported_from_error(anyhow::anyhow!("operation refused")),
@@ -2075,7 +2184,11 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let error = runtime
-            .submit_message(Some(&attach.controller_token), "after expiry".to_string())
+            .submit_message(
+                Some(&attach.controller_token),
+                "after expiry".to_string(),
+                None,
+            )
             .await
             .expect_err("expired browser token must not write");
         assert_eq!(error.status, 409);
@@ -2167,7 +2280,7 @@ mod tests {
             },
             async move {
                 runtime_for_submit
-                    .submit_message(Some(&submit_token), "hello".to_string())
+                    .submit_message(Some(&submit_token), "hello".to_string(), None)
                     .await
             },
         );
@@ -2181,7 +2294,11 @@ mod tests {
         }
 
         let stale_error = runtime
-            .submit_message(Some(&attach.controller_token), "after detach".to_string())
+            .submit_message(
+                Some(&attach.controller_token),
+                "after detach".to_string(),
+                None,
+            )
             .await
             .expect_err("detached token must not submit again");
         assert_eq!(stale_error.status, 409);

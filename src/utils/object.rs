@@ -1,10 +1,12 @@
 //! Helpers to read or write compressed git objects on disk, returning raw payloads and computing their object hashes.
 
+#[cfg(target_os = "linux")]
+use std::time::SystemTime;
 use std::{
     fs,
     io::{Read, Write},
     path::Path,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use flate2::read::ZlibDecoder;
@@ -13,8 +15,10 @@ use git_internal::{errors::GitError, hash::ObjectHash};
 use crate::utils::atomic_write::{self, ensure_dir_exists};
 
 const STALE_LOOSE_OBJECT_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(target_os = "linux")]
 const MAX_STALE_LOOSE_OBJECT_TEMPS_PER_WRITE: usize = 64;
 
+#[cfg(target_os = "linux")]
 fn loose_object_temp_name_is_valid(name: &str) -> bool {
     let Some(rest) = name.strip_prefix('.') else {
         return false;
@@ -97,6 +101,16 @@ fn open_directory_tree_no_follow(path: &Path) -> std::io::Result<fs::File> {
         os::{fd::AsRawFd, unix::ffi::OsStrExt},
         path::Component,
     };
+
+    // macOS exposes the system temporary directory through `/var`, which is
+    // a symlink to `/private/var`. Keep the no-follow walk strict for every
+    // repository-controlled component, but normalize this fixed OS alias so
+    // descriptor-relative checkpoint writes work with `tempfile::TempDir`.
+    #[cfg(target_os = "macos")]
+    let path = path
+        .strip_prefix("/var")
+        .map(|suffix| Path::new("/private/var").join(suffix))
+        .unwrap_or_else(|_| path.to_path_buf());
 
     let start = if path.is_absolute() { "/" } else { "." };
     let start = CString::new(start).map_err(|_| {
@@ -207,6 +221,12 @@ fn open_or_create_directory_tree_no_follow(
     sync_data: bool,
 ) -> std::io::Result<fs::File> {
     use std::path::Component;
+
+    #[cfg(target_os = "macos")]
+    let path = path
+        .strip_prefix("/var")
+        .map(|suffix| Path::new("/private/var").join(suffix))
+        .unwrap_or_else(|_| path.to_path_buf());
 
     let mut current = open_directory_tree_no_follow(if path.is_absolute() {
         Path::new("/")
@@ -692,7 +712,13 @@ fn write_git_object_with_status_inner(
     // Power-loss durability follows the repository-wide bulk-object contract
     // and is enabled only by --sync-data / LIBRA_SYNC_DATA.
     #[cfg(unix)]
-    let directories = prepare_loose_object_directories(git_dir, &hash_str[..2], sync_data)?;
+    let directories = prepare_loose_object_directories(git_dir, &hash_str[..2], sync_data)
+        .map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "prepare loose-object directories under '{}': {error}",
+                git_dir.display()
+            ))
+        })?;
     #[cfg(not(unix))]
     let temporary_dir = {
         // INVARIANT: `object_path` is built from three fixed components, so
@@ -781,7 +807,7 @@ fn write_git_object_with_status_inner(
 /// temp directory. Only exact Libra temp names are disposable. Unix pins the
 /// directory no-follow and unlinks relative to that descriptor so a symlink
 /// or concurrent path swap can never redirect cleanup outside the object DB.
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "linux"))]
 fn scavenge_stale_loose_object_temps_in_dir(
     directory: &fs::File,
     stale_age: Duration,
@@ -789,10 +815,7 @@ fn scavenge_stale_loose_object_temps_in_dir(
 ) -> Result<(), GitError> {
     use std::{ffi::CString, os::fd::AsRawFd};
 
-    #[cfg(target_os = "linux")]
     let pinned_path = Path::new("/proc/self/fd").join(directory.as_raw_fd().to_string());
-    #[cfg(all(unix, not(target_os = "linux")))]
-    let pinned_path = Path::new("/dev/fd").join(directory.as_raw_fd().to_string());
     let now = SystemTime::now();
     let mut removed = false;
     for entry in fs::read_dir(pinned_path)?.take(MAX_STALE_LOOSE_OBJECT_TEMPS_PER_WRITE) {
@@ -835,6 +858,22 @@ fn scavenge_stale_loose_object_temps_in_dir(
     if removed {
         sync_loose_object_file(directory, sync_data)?;
     }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn scavenge_stale_loose_object_temps_in_dir(
+    directory: &fs::File,
+    stale_age: Duration,
+    sync_data: bool,
+) -> Result<(), GitError> {
+    // macOS exposes an open directory descriptor through `/dev/fd/<fd>` as a
+    // special file, not an enumerable directory. Calling `read_dir` on that
+    // path therefore returns ENOTDIR and used to block every checkpoint blob
+    // write. Keep the write path available; the owning process still removes
+    // its own temporary file, while a later maintenance pass can handle old
+    // crash remnants with a platform-native descriptor iterator.
+    let _ = (directory, stale_age, sync_data);
     Ok(())
 }
 
@@ -960,12 +999,14 @@ fn validate_existing_object_file(file: fs::File, expected: &[u8]) -> Result<(), 
 mod bounded_read_tests {
     use std::io::Write;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use super::open_directory_tree_no_follow;
+    #[cfg(target_os = "linux")]
+    use super::scavenge_stale_loose_object_temps_in_dir;
     use super::{
         git_object_hash, read_git_object_bounded, reset_test_loose_object_sync_calls,
-        scavenge_stale_loose_object_temps_in_dir, test_loose_object_sync_calls, write_git_object,
-        write_git_object_with_status, write_git_object_with_status_inner,
+        test_loose_object_sync_calls, write_git_object, write_git_object_with_status,
+        write_git_object_with_status_inner,
     };
 
     /// Bounded reads never return more than the cap, flag truncation only
@@ -1067,6 +1108,7 @@ mod bounded_read_tests {
             .expect_err("status writer must reject trailing storage bytes");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writer_scavenger_is_bounded_and_cross_oid() {
         let dir = tempfile::tempdir().unwrap();
@@ -1097,6 +1139,7 @@ mod bounded_read_tests {
         assert!(unrelated.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writer_scavenger_removes_sha256_temp_names() {
         let dir = tempfile::tempdir().unwrap();
@@ -1118,6 +1161,7 @@ mod bounded_read_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writer_scavenger_is_bounded() {
         let dir = tempfile::tempdir().unwrap();

@@ -315,6 +315,7 @@ fn load_code_ui_overlay_for_thread(
         interactive_approvals: false,
         structured_questions: false,
         provider_session_resume: false,
+        command_idempotency: false,
     };
     let projection_cursor = session
         .metadata

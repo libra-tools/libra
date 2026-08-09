@@ -1561,14 +1561,26 @@ fn load_checkpoint_transcript_bytes(
 ) -> Result<(Vec<u8>, bool), CliError> {
     let storage = util::try_get_storage_path(None)
         .map_err(|e| CliError::fatal(format!("not in a libra repository: {e}")))?;
-    let root = read_tree_object(&storage, &row.tree_oid).map_err(CliError::fatal)?;
-    let checkpoint_tree = subtree(&storage, &root, "checkpoint").map_err(CliError::fatal)?;
-    let prefix = row.checkpoint_id.get(..2).ok_or_else(|| {
-        CliError::fatal(format!("checkpoint id '{}' too short", row.checkpoint_id))
-    })?;
-    let prefix_tree = subtree(&storage, &checkpoint_tree, prefix).map_err(CliError::fatal)?;
-    let inner =
-        subtree(&storage, &prefix_tree, &row.checkpoint_id[2..]).map_err(CliError::fatal)?;
+    load_checkpoint_transcript_bytes_from_storage(&storage, &row.checkpoint_id, &row.tree_oid, cap)
+}
+
+/// Read a bounded checkpoint transcript using an already-resolved repository
+/// storage path. The graph TUI uses this read-only helper for its content
+/// preview; keeping the object traversal here ensures graph and checkpoint
+/// export agree on the E4-libra manifest/chunk rules.
+pub(super) fn load_checkpoint_transcript_bytes_from_storage(
+    storage: &Path,
+    checkpoint_id: &str,
+    tree_oid: &str,
+    cap: u64,
+) -> Result<(Vec<u8>, bool), CliError> {
+    let root = read_tree_object(storage, tree_oid).map_err(CliError::fatal)?;
+    let checkpoint_tree = subtree(storage, &root, "checkpoint").map_err(CliError::fatal)?;
+    let prefix = checkpoint_id
+        .get(..2)
+        .ok_or_else(|| CliError::fatal(format!("checkpoint id '{checkpoint_id}' too short")))?;
+    let prefix_tree = subtree(storage, &checkpoint_tree, prefix).map_err(CliError::fatal)?;
+    let inner = subtree(storage, &prefix_tree, &checkpoint_id[2..]).map_err(CliError::fatal)?;
 
     let manifest_item = tree_entry(&inner, "manifest.json").ok_or_else(|| {
         CliError::fatal(
@@ -1578,7 +1590,7 @@ fn load_checkpoint_transcript_bytes(
     // Bounded read: manifest.json is small JSON; refuse an oversized
     // (corrupt/hostile) one rather than inflate it unbounded.
     let (manifest_bytes, manifest_truncated) = read_git_object_bounded(
-        &storage,
+        storage,
         &manifest_item.id,
         CHECKPOINT_METADATA_READ_MAX_BYTES,
     )
@@ -1635,7 +1647,7 @@ fn load_checkpoint_transcript_bytes(
         // Bounded read: never decompress more than `remaining` content
         // bytes into memory, so a hostile/corrupt blob whose inflated size
         // dwarfs the cap cannot force an unbounded allocation.
-        let (part, part_truncated) = read_git_object_bounded(&storage, &hash, remaining)
+        let (part, part_truncated) = read_git_object_bounded(storage, &hash, remaining)
             .map_err(|e| CliError::fatal(format!("read transcript blob {oid}: {e}")))?;
         bytes.extend_from_slice(&part);
         if part_truncated {

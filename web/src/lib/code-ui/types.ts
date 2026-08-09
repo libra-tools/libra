@@ -29,6 +29,8 @@ export type CodeUiCapabilities = {
   interactiveApprovals: boolean;
   structuredQuestions: boolean;
   providerSessionResume: boolean;
+  /** When true, browser submits include a stable `commandId` for retry dedup. */
+  commandIdempotency?: boolean;
 };
 
 export type CodeUiProviderInfo = {
@@ -210,6 +212,8 @@ export type CodeUiControllerDetachRequest = {
 
 export type CodeUiMessageRequest = {
   text: string;
+  /** Caller-stable runtime command identity for retry de-duplication. */
+  commandId?: string;
 };
 
 export type CodeUiAckResponse = {

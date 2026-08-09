@@ -21,6 +21,8 @@ libra hooks gemini   <event>   # 拒绝并给出提示：gemini 已是 uninstall
 
 `libra hooks claude <verb>` 是 `libra agent enable --agent claude-code` 写入项目 `.claude/settings.json` 的稳定调用面；`libra hooks codex <verb>`（AG-19）是 `libra agent enable --agent codex` 写入 `$CODEX_HOME/hooks.json` 的稳定调用面。两者都记录到 AgentTraces 捕获存储（`refs/libra/traces`）；claude 历史上路由到 `refs/libra/intent` 写入器的行为已由 Task A6.5 本地采集 smoke 收敛（该 smoke 要求已安装 hook 的采集出现在 `libra agent session/checkpoint list` 中）。Codex 额外转发原生子代理边界（`subagent-start` / `subagent-end`）。
 
+Codex 回调对宿主 Agent 属于辅助采集：在非 Libra 仓库中触发，或因仓库存储不可用而无法完成捕获时，Libra 会在已捕获的 session 上记录不含敏感内容、可重试的诊断并成功退出。受影响的回调可能不会出现在捕获结果中，或缺少对应检查点；捕获不可用本身不会让 Codex 任务失败。后续 Codex `Stop` 可以重新取得已放弃的 coverage claim；可用 `libra agent session show <session>` 查看状态。
+
 `libra hooks gemini <verb>` 不再摄入：gemini 已是 uninstall-only（AG-17），降级前安装的过时 hook 配置会得到指向 `libra agent remove gemini` 的可操作错误，而不是静默捕获数据。
 
 要启用捕获，对 supported roster 中的 agent 运行 `libra agent enable --agent <name>`；这会安装提供商 hook 配置。要禁用捕获，运行 `libra agent disable --agent <name>`。
@@ -46,7 +48,7 @@ Claude Code 与 Codex 暴露相同的七个 Claude-Code 风格生命周期事件
 任何 `Subagent*` 边界事件（只有 Codex 发出原生子 agent 边界），因此 Claude 磁盘上的子
 agent 内容被捕获为 `unresolved`。
 
-每个事件都会从 stdin 读取其提供商特定 JSON payload，运行脱敏流水线（secrets / tokens / 文件内容 >256 KiB），并将一条 `AgentTraceEvent` JSONL 记录追加到活动会话存储中。除非 payload 解析失败，否则 hook 返回退出码 0；提供商 hook 绝不能阻塞在 Libra 侧处理上。
+每个事件都会从 stdin 读取其提供商特定 JSON payload，运行脱敏流水线（secrets / tokens / 文件内容 >256 KiB），并将一条 `AgentTraceEvent` JSONL 记录追加到活动会话存储中。Codex 在辅助捕获失败后仍会确认回调；Claude 保持其原有的验证失败状态。提供商 hook 绝不能阻塞在 Libra 侧处理上。
 
 ## 选项
 
@@ -106,6 +108,6 @@ libra hooks codex subagent-start
 
 | 代码 | 含义 |
 |------|---------|
-| `0` | 事件已记录（或因捕获被禁用 / 会话未知而静默跳过） |
-| `1` | stdin payload 未通过 schema 验证；hook 调用方可能显示警告，但提供商 hook 流程会将其视为非致命 |
-| `128` | 处理任何 payload 前发生致命初始化错误 |
+| `0` | Codex 事件已记录、被跳过，或在辅助捕获失败后已确认；其他提供商在正常跳过时也可能返回成功 |
+| `1` | 非 Codex 的 stdin payload 未通过 schema 验证；hook 调用方可能显示警告，但提供商 hook 流程会将其视为非致命 |
+| `128` | 非 Codex hook 在处理 payload 前发生致命初始化错误 |

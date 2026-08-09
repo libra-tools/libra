@@ -194,7 +194,7 @@ where
     });
 
     if IO_BUSY
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             (current < MAX_INFLIGHT_IO_WORKERS).then_some(current + 1)
         })
         .is_err()
@@ -208,7 +208,7 @@ where
     // slots, and never past the cap.
     let needed = IO_BUSY.load(Ordering::SeqCst);
     if IO_WORKERS
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |workers| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |workers| {
             (workers < MAX_INFLIGHT_IO_WORKERS && workers < needed).then_some(workers + 1)
         })
         .is_ok()
@@ -329,7 +329,7 @@ where
         })
     });
     if IO_BUSY
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             (current < MAX_INFLIGHT_IO_WORKERS).then_some(current + 1)
         })
         .is_err()
@@ -338,7 +338,7 @@ where
     }
     let needed = IO_BUSY.load(Ordering::SeqCst);
     if IO_WORKERS
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |workers| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |workers| {
             (workers < MAX_INFLIGHT_IO_WORKERS && workers < needed).then_some(workers + 1)
         })
         .is_ok()

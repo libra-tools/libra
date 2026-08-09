@@ -124,7 +124,7 @@ exporter 与 sandbox。启用该 exporter 的方式：先注册包含已核验 `
 `cli`）返回 `LBR-AGENT-017`。当平台无法提供 Libra 的 provider-root 安全打开
 原语时，Claude/Codex 的发现与导入会如实报告为 unavailable。
 
-`agent graph` 输出冻结的 capture-graph schema version 1。其 `data` 对象只含
+`agent graph --json` 输出冻结的 capture-graph schema version 1。其 `data` 对象只含
 `schema_version`、`state`、`session`、`turns`、`subagents`。存在的 session
 只暴露 session id、agent kind、状态和时间；indexed turn 暴露逻辑键、派生的
 零基 ordinal、coverage schema/completeness/current revision、checkpoint id、
@@ -134,10 +134,13 @@ M1 前的 capture 以 `coverage_state="unindexed"` checkpoint 时间线返回，
 revision。subagent 节点只暴露 checkpoint/link 结构，并明确保留 `resolved` 或
 `unresolved`。
 
-graph 查询不会打开 transcript/object blob，也不 SELECT working directory、
-description、metadata JSON、redaction report 或 coverage digest。本地已擦除 session
-成功返回 `state="erased"`、null session、空 turns 与 unavailable subagents，且不会
-重建；session 与 tombstone 均不存在时返回 `LBR-AGENT-021`。未指定全局 `--json`
+JSON/machine graph 查询不会打开 transcript/object blob，也不 SELECT working directory、
+description、metadata JSON、redaction report 或 coverage digest。交互式 TUI 中，选中
+session、turn、revision 或 subagent 后，detail 会额外显示关联 checkpoint 的受限内容摘要：
+事件计数以及紧凑的 user/assistant 消息预览。TUI 每个 checkpoint 最多读取 256 KiB，
+严格按 manifest 读取，并再次经过默认脱敏；不会显示完整 transcript 或 provider 文件路径。
+本地已擦除 session 成功返回 `state="erased"`、null session、空 turns 与 unavailable
+subagents，且不会重建；session 与 tombstone 均不存在时返回 `LBR-AGENT-021`。未指定全局 `--json`
 或 `--machine` 时，stdin/stdout 都必须是终端；非交互调用在初始化 TUI 前返回 usage
 错误。
 

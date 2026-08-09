@@ -2881,6 +2881,7 @@ async fn build_placeholder_web_code_ui_runtime(
         interactive_approvals: false,
         structured_questions: false,
         provider_session_resume: false,
+        command_idempotency: false,
     };
 
     let mut snapshot = initial_snapshot(
@@ -3278,6 +3279,7 @@ fn build_tui_code_ui_capabilities() -> CodeUiCapabilities {
         interactive_approvals: true,
         structured_questions: true,
         provider_session_resume: false,
+        command_idempotency: false,
     }
 }
 

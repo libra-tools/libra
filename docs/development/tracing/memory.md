@@ -3,13 +3,12 @@
 > **Out-of-scope of `tracing/plan.md`**（§0 范围声明）：AI-agent persistent memory 设计面（agent knowledge store）不属于 AG-16~AG-24 外部捕获改进计划。本文已按当前事实对齐两项历史冲突：`LifecycleEventKind` 现为 13 个变体；MCP transport 使用 `libra code --stdio`。Memory MCP 工具仍须等待 `tracing/code.md` 所列 C9 default-deny 生产授权闭环，不能因为 transport 已存在就提前暴露。
 
 > Status: draft
-> Last updated: 2026-08-09
+> Last updated: 2026-08-10
 > Scope: 规范 Memory 子系统——agent 跨 run / thread / branch 的持久化知识存储，及其在 Libra 三层对象模型（快照/事件/投影）、运行时生命周期与 MCP 边界上的落地约定。
 
 本文档规范 `Memory`——一个让 agent 能够跨 run、跨 thread、跨 branch 记住事物的 Libra 子系统，且不会像 `CLAUDE.md` 这样的扁平大块文件那样污染上下文。
 
-本设计借鉴了 [`memoir-ai`](https://github.com/zhangfengcdt/memoir) 项目（“Git for AI Memory”），以及相关的记忆系统，如
-[Letta / MemGPT](https://docs.letta.com/guides/agents/memory)、
+本设计以 [`Letta / MemGPT`](https://docs.letta.com/guides/agents/memory) 的「小型常驻 core + 大型按需 archival」双层记忆为**主要架构参考**：始终可见的核心记忆（core memory）与按需调取的归档记忆（archival memory）分离，是本文组织 Memory 的第一性原理。次要参考是 [`memoir-ai`](https://github.com/zhangfengcdt/memoir)（“Git for AI Memory”）的**分层语义路径**，作为归档记忆层的键控与分类机制。此外还参考了
 [LangGraph memory](https://docs.langchain.com/oss/python/langgraph/memory)、
 [OpenAI Agents SDK memory](https://openai.github.io/openai-agents-python/sandbox/memory/)、
 [Mem0](https://arxiv.org/abs/2504.19413) 与
@@ -21,11 +20,11 @@ Libra 在 [`object-model.md`](../../ai/object-model.md) 与
 
 ## 执行摘要
 
-Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / branch 记住事物，且不会像 `CLAUDE.md` 扁平大块文件那样污染上下文或不可审计。核心机制是快照（`MemoryNote`）/ 事件（`MemoryEvent`）/ 投影（SQLite）三层，历史真源落在 `refs/libra/memory/*` 的普通 Git 线性历史上。每一条写入都必须携带 `CompileRecord`（可复现），每一次注入都必须产出 `ContextReceipt`（可重放）；写入统一经 `MemoryWriter` 单一 seam，读取统一经冻结的 `ResolvedMemoryView`。安全性以 fail-closed 为底线：Draft / Quarantined / SecretLike 永不注入 prompt，MCP 工具在 C9 default-deny authorizer 落地前不注册。本设计对应长期路线图 `MEM-01..05`（见下方追溯表与 [`plan-long.md`](../plan/plan-long.md)）。
+Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / branch 记住事物，且不会像 `CLAUDE.md` 扁平大块文件那样污染上下文或不可审计。核心机制是快照（`MemoryNote`）/ 事件（`MemoryEvent`）/ 投影（SQLite）三层，历史真源落在 `refs/libra/memory/*` 的普通 Git 线性历史上。每一条写入都必须携带 `CompileRecord`（可复现），每一次注入都必须产出 `ContextReceipt`（可重放）；写入统一经 `MemoryWriter` 单一 seam，读取统一经冻结的 `ResolvedMemoryView`。安全性以 fail-closed 为底线：Draft / Quarantined / SecretLike 永不注入 prompt，MCP 工具在 C9 default-deny authorizer 落地前不注册。本设计对应长期路线图 `MEM-01..05`，并行协调 `MEM-06` 见本文 §19（见下方追溯表与 [`plan-long.md`](../plan/plan-long.md)）。
 
 ### 目录
 
-- §0 设计基线（外部参考 + 六条不可折中约束 + 竞品语料复核）
+- §0 设计基线（外部参考 + 六条不可折中约束 + GitOfThoughts 实证 + 竞品语料复核）
 - §1 目标与非目标
 - §2 为何需要 Memory（CLAUDE.md 反模式）
 - §3 概念模型（四轴分类、分类树、`ResolvedMemoryView`）
@@ -45,6 +44,7 @@ Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / b
 - §17 验证计划
 - §18 开放问题
 - §19 并行多 Agent 协调 Memory（MEM-06）
+- §20 修订台账（原 gap/memory-redesign.md）
 - 总结规则
 
 ### MEM 追溯表
@@ -121,11 +121,20 @@ Libra 不采用其 Postgres / pgvector 真源，也不照搬「相同查询返�
 
 Libra 不引入 Neo4j / FalkorDB / Neptune 一类图后端作为权威层，也不假设外部图对节点属性、显著性、冲突和 Git 分支语义已给出完整答案。
 
-#### 0.0.5 Git UX 与自编辑边界：Letta Code / MemGPT
+#### 0.0.5 主要架构参考：Letta / MemGPT 的 core + archival 双层记忆
 
-[Letta Code](https://github.com/letta-ai/letta-code) 证明 context、memory block 与 skill 可以具备 Git history、agent / project scope、查看与质量诊断 UX；[Letta / MemGPT](https://docs.letta.com/guides/agents/memory) 的「小型常驻 core + 大型按需 archival」也为 token 分级提供了直接参考。
+[Letta / MemGPT](https://docs.letta.com/guides/agents/memory) 是本文的**主要架构参考**。其承重设计是「**小型常驻 core memory + 大型按需 archival memory**」的双层分离：core memory 始终可见、常驻 prompt、token 预算小、由 agent 直接读写；archival memory 体量大、按需检索、不常驻 prompt。这一分离直接回答了「agent 该把什么一直放在眼前、什么该按需调取」——正是本文 §1.1 目标「召回透明且廉价」与 §11.7 prompt 预算的出处。
 
-Libra 采纳 diff / history / review、常驻小核心、按需档案与 scope-aware skill，但拒绝 agent 无审查地重写 memory、prompt、Policy、Skill 或 Constraint。所有高影响自编辑都必须先形成显式 proposal，经过 evidence、权限、schema 和安全策略验证后才追加新事件；历史版本保持可 blame / revert。
+Libra 的映射为：
+
+| Letta / MemGPT 概念 | Libra 归属 | 禁止的捷径 |
+|---|---|---|
+| Core memory（常驻、始终可见） | `MemoryAnchor` 注入槽 + `ContextSegmentKind::ProjectMemory`（§11.6）；高置信、已确认、短小的 `procedural.*` / `semantic.*` head | 不把大体量 episodic / semantic 记忆塞进常驻段 |
+| Archival memory（按需、体量大） | 路径键控的 `MemoryNote` / `MemoryEvent` 归档层（§4）；经 §8 召回按需调取 | 不因持久化就自动常驻 prompt |
+| Agent 直接读写 core | 经 `MemoryWriter` 单一 seam 的显式 `remember` / `revise` | 不允许 agent 无审查地重写 memory、prompt、Policy、Skill 或 Constraint |
+| 后台 consolidation / 归档 | §10.5 排期归并作业 | 不在 hook 热路径中静默改写真源 |
+
+[Letta Code](https://github.com/letta-ai/letta-code) 进一步证明 context、memory block 与 skill 可以具备 Git history、agent / project scope、查看与质量诊断 UX。Libra 采纳 diff / history / review、常驻小核心、按需档案与 scope-aware skill，但拒绝 agent 无审查地重写 memory、prompt、Policy、Skill 或 Constraint。所有高影响自编辑都必须先形成显式 proposal，经过 evidence、权限、schema 和安全策略验证后才追加新事件；历史版本保持可 blame / revert。
 
 #### 0.0.6 运行状态与长期记忆分离：LangGraph / LangMem
 
@@ -207,11 +216,22 @@ Libra 采纳 diff / history / review、常驻小核心、按需档案与 scope-a
 - append / confirm / supersede / revoke / forget / import / merge 均须 schema validation、CAS / lease、审计事件和稳定错误语义，mutating path fail-closed；
 - 安全 fixture 覆盖跨 actor / user 越权、poisoning、secret recall、malformed import、stale receipt、投影漂移、tombstone 与 rollback；外部自报 benchmark 只能提供场景，不能替代 Libra 测试结果。
 
-最终定位：**Libra Memory = Libra-native 内容寻址与事件历史 + Statewave 式 compiler / receipt + ReMe 式可读投影 + Graphiti 式时间事实 + Letta 式 Git 审计 UX + LangGraph 式运行态分离 + PowerMem / MemOS 式受审查 Skill 晋升；图、向量与外部框架永远是可替换的候选层。**
+最终定位：**Libra Memory = Letta / MemGPT 式 core + archival 双层记忆（主要参考）+ memoir-ai 式分层语义路径（次要参考，归档层键控）+ Libra-native 内容寻址与事件历史 + Statewave 式 compiler / receipt + Graphiti 式时间事实 + LangGraph 式运行态分离 + PowerMem / MemOS 式受审查 Skill 晋升；图、向量与外部框架永远是可替换的候选层。**
+
+#### 0.0.12 GitOfThoughts 实证：载体选型买审计，不买检索增益（arXiv 2606.14470v2）
+
+[GitOfThoughts](https://arxiv.org/abs/2606.14470v2)（2026-06）在固定 agent 的前提下，对同一记忆语料在 {none, markdown, vector, graph, git} 五种载体上做受控、预注册的跨问题记忆评测（GPQA-Diamond、MATH-500，两代 backbone Qwen3.5-9B / Qwen2.5-7B，最高 n=500）。它把每条推理节点当作一次 git commit、分数存 notes、结果打 tags、检索走 `git log --grep / -S`。其结论对本文是**方向性实证**而非验收标准，但直接背书了本文两处核心取舍：
+
+- **载体不决定检索增益。** 在「新问题」上，任何载体都不稳定提升 agent 准确率（跨两 benchmark、两 backbone、最高 n=500 均为 null）；git 与最优语义载体在准确率上统计不可区分，却唯一地提供审计、重放、diff、merge 与可复现。这印证 §8.7 的「确定性基线常开 + 向量/图为可替换候选层」：**选型买的是 provenance / merge / replay，不是 recall 提升**。
+- **记忆只在近重复区间有效，且是答案检索而非方法迁移。** 测试问题与召回案例余弦 ≥0.8 时记忆才稳定生效（+12~13.5pp），方法带（cos≈0.72，同方法不同数、不可复制答案）为 null（−4.1）；4.5× 更大模型只会加陡近重复步，不会解锁方法迁移。
+- **无在线学习曲线。** git 记忆在 500 题流上累积验证解，准确率按四分位不升反微降。记忆积累的价值是连续性 / 审计 / 合并，不是已被证明的准确率增益。
+- **唯一稳定提升新问题准确率的杠杆是测试时采样（self-consistency +3.4pp），与记忆无关。** 记忆注入应定位为「指引 + 审计」，不应被当作准确率放大器来验收。
+
+本文据此（1）把「近重复门」（τ≈0.8）定为向量/embedding 内容通道的明确用例（§8.7）；(2) 在 §16 补结局级准确率基线与「新问题预期 null / 无在线学习曲线」的诚实约束，避免把检索排序质量误当成结局增益；(3) 在 §18 保留「富情景记忆 / 更强 backbone 能否降低 τ、解锁方法迁移」与「合并记忆的准确率」两个开放问题。
 
 #### 0.0.4 本地竞品语料复核（2026-08-07，第六次审计）
 
-本节把第六次竞品审计的本地语料（`/Volumes/Data/competition/*/*`，Memory 类 11 个 + 相邻参考 3 个，revision 已引脚）固化为设计取舍；逐项目机制分析与验证入口见 [`../gap/memory-redesign.md`](../gap/memory-redesign.md) §2。vendor 自报数字只提供场景与目标参考，不进入验收（§16）。**第七次审计（2026-08-09）**：Memory 类竞品仓库全部无更新，唯一 revision 变化是 `letta-ai/letta-code` `ac359eeb`→`a75f4d93`（新增 `EnterWorktree`/`ExitWorktree` worktree 工具，属 LR-01 并行工作区，与 Memory 核心无关）；设计取舍不变，新增 G12–G15 固化投毒隔离、高信任再验证、`--debug-memory` 硬交付与 adaptive 触发（见 §10.5/§13.1/§18）。
+本节把第六次竞品审计的本地语料（`/Volumes/Data/competition/*/*`，Memory 类 11 个 + 相邻参考 3 个，revision 已引脚）固化为设计取舍；逐项目机制分析与验证入口见 §20.4（原 `gap/memory-redesign.md` §2，已并入本文）。vendor 自报数字只提供场景与目标参考，不进入验收（§16）。**第七次审计（2026-08-09）**：Memory 类竞品仓库全部无更新，唯一 revision 变化是 `letta-ai/letta-code` `ac359eeb`→`a75f4d93`（新增 `EnterWorktree`/`ExitWorktree` worktree 工具，属 LR-01 并行工作区，与 Memory 核心无关）；设计取舍不变，新增 G12–G15 固化投毒隔离、高信任再验证、`--debug-memory` 硬交付与 adaptive 触发（见 §10.5/§13.1/§18）。
 
 | 项目 | revision | 承重机制 | 取舍 |
 |---|---|---|---|
@@ -262,16 +282,16 @@ Libra 采纳 diff / history / review、常驻小核心、按需档案与 scope-a
 7. **prune / forget 语义**：缓存修剪不能产生历史状态，也不需要 `revive`；法律遗忘只能阻止未来默认读取并记录 tombstone，不能虚假承诺从 Git、backup 或远端副本物理删除。
 8. **确定性边界**：receipt 保证固定 source OID 与 selector snapshot 下的选择输入、顺序和渲染可验证；使用次数、wall clock、随机 UUID 与 provider 输出不得进入 canonical bundle hash。
 
-### 0.2 骨架选型决策（2026-07-13）
+### 0.2 骨架选型决策（2026-07-13；2026-08-09 主参考调整为 Letta / MemGPT）
 
-基于 §0.0 的外部参考，曾对比五种互斥骨架：**A** 分类树导航型（memoir-ai 主导，即本文 §1–§18 的形态）、**B** 记忆编译器型（Statewave 主导，M0 唯一入口、一切皆编译产物）、**C** 双时间事实账本型（Graphiti 主导）、**D** 可读投影审查型（ReMe / Letta Code 主导）、**E** 运行态分离蒸馏型（LangGraph / PowerMem / MemOS 主导）。
+基于 §0.0 的外部参考，曾对比五种互斥骨架：**A** 分类树导航型（memoir-ai 主导）、**B** 记忆编译器型（Statewave 主导，M0 唯一入口、一切皆编译产物）、**C** 双时间事实账本型（Graphiti 主导）、**D** 可读投影审查型（ReMe / Letta Code 主导）、**E** 运行态分离蒸馏型（LangGraph / PowerMem / MemOS 主导）。
 
-**决策：骨架采用 A，同时把 B 的两个原语从「字段级补丁」升级为硬性退出门槛。** 这不是可选优化——骨架 A 的原始形态（直接 `remember` 即成为 confirmed 候选）对 §0.0.1 约束 2「先编译，再使用」满足最弱，以下两条是让 A 合规的必要修正：
+**决策：骨架采用 Letta / MemGPT 的 core + archival 双层记忆（§0.0.5）作为第一性组织原则，memoir-ai 的分层语义路径作为归档记忆层的键控与分类机制（次要参考）。** 即：常驻、始终可见的 core 层由 `MemoryAnchor` 注入槽 + 高置信短小 head 承载（§11.6）；按需、体量大的 archival 层由路径键控的 `MemoryNote` / `MemoryEvent` 承载（§4），经 §8 召回按需调取。memoir-ai 的路径分类树（§3.3 / §6）只作用于 archival 层，不改变 core 层的常驻语义。这不是可选优化——骨架 A 的原始形态（直接 `remember` 即成为 confirmed 候选）对 §0.0.1 约束 2「先编译，再使用」满足最弱，以下两条是让双层骨架合规的必要修正：
 
 1. **编译记录（`CompileRecord`，§4.1.1）是 Phase A 的发布门槛。** 任何入口（显式 remember、anchor 提升、frame 蒸馏、分类器、consolidation、onboarding、branch fork、import）产生的每条 `MemoryNote` 都必须携带完整编译记录（来源入口、producer / prompt / model / policy 版本、输入对象哈希、幂等键）；缺失或不完整一律拒绝写入，同幂等键重复摄入不产生新 note。
 2. **注入回执（`ContextReceipt`，§8.6）是 Phase C 的发布门槛。** 每次 prompt 注入与引擎内召回都必须产出回执，记录选中对象、排序原因、token 预算与 policy / index 快照；`memory inspect-injection` 从回执重放，而非从当前投影反推。回执原语与 mainline ML-05 / ML-08 共用（§0.0.10），本文不新建第二种 receipt。
 
-C 的双时间语义（§4.1 已含 `valid_from` / `valid_until` + commit anchor 形态的 `evidence_refs`）与 E 的 skill promotion 管线（§0.0.7、§10.5）保留为骨架 A 上的后续增量，不改变本决策。
+C 的双时间语义（§4.1 已含 `valid_from` / `valid_until` + commit anchor 形态的 `evidence_refs`）与 E 的 skill promotion 管线（§0.0.7、§10.5）保留为双层骨架上的后续增量，不改变本决策。
 
 ### 0.3 采用 perstate 参考后的演进顺序（2026-07-18）
 
@@ -306,6 +326,8 @@ perstate 证明 Git-native memory 的第一性产品价值并不来自新的后�
 - 跨仓库联邦化记忆。Memory 是**按仓库（per-repo）**的构造，就像 `.libra/` 状态那样。跨仓库联邦留待将来的设计。
 - 与完整聊天历史持久化竞争。Memory 存储的是**蒸馏后的、可复用的事实**，而不是原始 transcript。Transcript 已经存放在 `.libra/sessions/*.jsonl` 与 `git-internal` 的 AI 历史中。
 
+**成本-价值定位。** GitOfThoughts 实证（§0.0.12）表明记忆对新问题准确率增益预期为 null、且无在线学习曲线——Memory 的购买理由是**连续性 / 审计 / 合并**（跨 run 不丢上下文、agent 学到的东西可 diff / blame / revert、并行工作可协调），不是准确率放大器。据此，§16 把结局级准确率设为「平价」基准而非「显著提升」承诺，任何「记忆提升准确率」的主张必须由结局指标单独证明。本设计的 ROI 判断标准是：是否降低重复蒸馏成本、是否让 agent 行为可审计可回滚、是否让多 agent 协作可协调——而非 recall 排序分数或短期准确率数字。若后续观察表明这些价值未兑现，Phase E 之前都应允许砍掉可选通道（分类器 / 向量 / 图），而不影响存储与审计主路径。
+
 ## 2. 为何需要 Memory
 
 ### 2.1 CLAUDE.md 反模式
@@ -331,15 +353,15 @@ Memory 是位于上述所有机制**之上**的那一层：
 - `MemoryAnchor` 是 **thread 内**的草稿——对单次对话有用，但无法按路径或 branch 寻址。
 - Memory 是**跨 thread、跨 branch、可查询的**——由语义路径作键的持久知识。
 
-### 2.3 memoir-ai 做对了什么
+### 2.3 memoir-ai 做对了什么（次要参考：归档层的键控与分类）
 
-我们原封不动采纳 memoir-ai 的三个核心做法：
+memoir-ai 是本文的**次要参考**，其价值集中在**归档记忆层（archival）的键控与分类**，而非整体骨架。我们采纳它的三个核心做法：
 
-1. **分层语义路径**（`procedural.coding.tabs`），而非 UUID 或向量键。带复合索引和有界范围扫描时，定位起点为 O(log n)，总查询成本为 O(log n + k)；且人类可读。
+1. **分层语义路径**（`procedural.coding.tabs`），而非 UUID 或向量键。带复合索引和有界范围扫描时，定位起点为 O(log n)，总查询成本为 O(log n + k)；且人类可读。这是 archival 层按需检索的键控机制。
 2. **在路径处做记忆聚合**——把多条记忆收拢在同一个语义位置之下，而不是散落为彼此独立的文档。
 3. **价值过滤（worthiness）**——并非每个 turn 都值得写入记忆；系统会显式地分类“到底要不要记”。
 
-memoir-ai 使用 Prolly-tree 作为后端存储。**Libra 不需要这套**：我们已经实现了 Git 的磁盘格式，并拥有一等的内容寻址存储、refs、branch、commit、blame 与 revert。Memory 搭载在 `git-internal` 的 refs 上，与现有 AI 工作流对象所在的孤儿分支 `libra/intent` 并列共存。
+memoir-ai 使用 Prolly-tree 作为后端存储。**Libra 不需要这套**：我们已经实现了 Git 的磁盘格式，并拥有一等的内容寻址存储、refs、branch、commit、blame 与 revert。Memory 搭载在 `git-internal` 的 refs 上，与现有 AI 工作流对象所在的孤儿分支 `libra/intent` 并列共存。memoir-ai 的路径分类树只作用于 archival 层（§3.3 / §6）；core 层的常驻语义由 Letta / MemGPT 双层模型（§0.0.5）决定。
 
 ### 2.4 其他系统对本设计的改变
 
@@ -347,18 +369,24 @@ memoir-ai 使用 Prolly-tree 作为后端存储。**Libra 不需要这套**：�
 
 | 系统 | 有用的想法 | Libra 的改编 |
 |---|---|---|
-| memoir-ai | 分类树路径、branch 感知记忆、读取 hook、Stop-hook 捕获、代码库 onboarding 命名空间 | 采纳按路径作键的存储与 branch refs，但把历史真源存放在 `git-internal`，而非 Prolly tree。引入命名空间，使 `default` 用户事实与 `codebase:onboard` 快照不共享保留策略与 prompt 策略。 |
+| Letta / MemGPT（主要参考） | 小型常驻 core + 大型按需 archival 双层记忆；agent 直接读写 core | 采纳双层分离为第一性组织原则：core 层映射到 `MemoryAnchor` 注入槽 + `ContextSegmentKind::ProjectMemory`（§11.6），archival 层由路径键控的 `MemoryNote` / `MemoryEvent` 承载（§4）；拒绝 agent 无审查地重写 memory、prompt、Policy、Skill 或 Constraint。 |
+| memoir-ai（次要参考） | 分类树路径、branch 感知记忆、读取 hook、Stop-hook 捕获、代码库 onboarding 命名空间 | 采纳按路径作键的存储与 branch refs，但把历史真源存放在 `git-internal`，而非 Prolly tree。路径分类树只作用于 archival 层（§3.3 / §6）。引入命名空间，使 `default` 用户事实与 `codebase:onboard` 快照不共享保留策略与 prompt 策略。 |
 | perstate | `repo + branch` state 绑定、session fork / switch / status、Markdown/YAML 文件图与 shell 渐进查询 | 采纳可解释的 `ResolvedMemoryView`、显式语义 fork、只读 status 与物化投影；拒绝把 branch 当 actor、把 worktree 当并发锁、pull 失败后继续写或让 Agent 直接编辑权威文件。 |
-| Letta / MemGPT | 把始终可见的核心记忆与按需调取的归档记忆分开 | 把始终可见的记忆映射到 `ContextSegmentKind::ProjectMemory` / `MemoryAnchor`；除非被召回选中，episodic 与大体量 semantic 记忆保持按需调取。 |
 | LangGraph / Deep Agents | 区分 semantic、episodic、procedural 记忆；支持 user / agent / organization 作用域以及后台归并（consolidation） | 保留 CoALA 风格的 kind 轴，新增 `namespace`，并把归并做成一个排期的 Memory 作业，而非临时的 prompt 摘要。 |
 | OpenAI Agents SDK memory | 渐进式披露：先给小摘要，再给搜索索引，再给详细的 rollout 摘要；记忆可能过时 | `memory.summarize()` 必须成为面向 agent 的默认原语。召回到的笔记是指引，必须附带 evidence、置信度（confidence）、可信度（trust）与陈旧度（staleness）元数据。 |
 | Mem0 | 抽取、归并、图增强召回，以及可度量的延迟 / token 节省 | 增加抽取 / 归并流水线与延迟 / token 度量。把向量 / 图召回保留为可选的二级索引，绝不作为真源。 |
 | Zep / Graphiti | 时序事实与实体关系能改善多跳召回与“何时发生了什么变化”的召回 | 现在就加入有效期区间（validity interval）、来源时间戳与显式的记忆链接；把实体图的物化推迟到扩展中实现。 |
 | [agentmemory.md](https://agentmemory.md/) / [Memoria](https://arxiv.org/abs/2512.12686) | 人类可读文件、仅追加日志、混合搜索、回滚、对低置信度或相互矛盾事实的隔离（quarantine） | 把可审计性与回滚作为一等公民保留。引入隔离（quarantine）、隐私把关，以及投影层修剪（prune），而非破坏性删除。 |
+| GitOfThoughts（arXiv 2606.14470v2） | 受控评测证明：载体（none / markdown / vector / graph / git）不决定新问题的准确率，git 只在审计 / 重放 / diff / merge 上胜出且准确率平价；记忆仅在近重复（cos≥0.8）时有效 | 强化「载体选型买审计不买检索增益」；把向量内容通道的定位收敛为近重复门（τ≈0.8）判定（§8.7）；记忆注入定位为指引 + 审计，不作为准确率放大器验收（§16）；保留富情景记忆 / 更强 backbone 能否降低 τ 的开放问题（§18）。 |
 
 ## 3. 概念模型
 
 ### 3.1 Memory vs ContextFrame vs MemoryAnchor
+
+Memory 采用 Letta / MemGPT 的 **core + archival 双层**组织（§0.0.5）：
+
+- **core 层（常驻、始终可见）**：由 `MemoryAnchor` 注入槽 + `ContextSegmentKind::ProjectMemory` 承载（§11.6），token 预算小（§11.7），只放高置信、已确认、短小的 `procedural.*` / `semantic.*` head。
+- **archival 层（按需、体量大）**：由路径键控的 `MemoryNote` / `MemoryEvent` 承载（§4），经 §8 召回按需调取，不常驻 prompt。
 
 ```text
 within-run        cross-thread / cross-run
@@ -381,6 +409,8 @@ within-run        cross-thread / cross-run
 
 - 被发现可复用的 `ContextFrame`（例如在某次 Run 中检测到的“用户偏好 tabs”）可被**蒸馏（distil）**为一次 Memory 写入。
 - 在某个 thread 中被确认的 `MemoryAnchor` 可被**提升（promote）**为某条合适路径下的 Memory 条目。降级（demotion，Memory → anchor）是读取侧的操作：与当前 prompt 相关的 Memory 条目会在 prompt 构建时被投影回 `with_memory_anchors()` 注入槽。
+
+core / archival 的边界由 §11.6 的 wire 映射与 §11.7 的 prompt 预算共同决定：core 层是常驻注入槽，archival 层是召回候选集；两者共享同一 `MemoryNote` / `MemoryEvent` 对象模型与 `MemoryWriter` 单一 seam，不引入第二套存储。
 
 ### 3.2 四轴分类
 
@@ -527,7 +557,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `origin` | enum | `Explicit` / `PromotedFromAnchor` / `DistilledFromFrame` / `Classifier` / `Consolidation` / `Onboard` / `BranchFork` / `Import` |
+| `origin` | enum | `Explicit` / `PromotedFromAnchor` / `DistilledFromFrame` / `Classifier` / `Consolidation` / `Onboard` / `BranchFork` / `Import` / `Coordinator`（MEM-06 协调写入，additive，见 §19.4） |
 | `producer` | `String` | 生产者标识与版本，如 `libra-memory/0.19.0` 或 `consolidation-job/1` |
 | `rules_version` | `u32` | 确定性规则集（worthiness 正则、路径验证、redaction 策略）的版本 |
 | `prompt_version` | `Option<String>` | 参与生产的 LLM prompt 模板版本；纯确定性路径为 `None` |
@@ -705,7 +735,7 @@ ContextReceipt (local ledger) --selected--> MemoryHead[L] / MemoryNote[S]
 
 ### 5.1 Git refs
 
-如 §4 开头所述，Memory 的字节是自定义 JSON blob，存活在自己的 `libra/memory*` ref 上，与内部 AgentRuntime 的对象历史分离。后者位于孤儿分支 `libra/intent`（常量 `AI_REF`，`src/internal/ai/history.rs:72`），承载 git-internal 的 typed AI 对象（Intent/Plan/...）；而外部 agent 捕获位于 `traces`（常量 `TRACES_BRANCH`，`src/internal/branch.rs:42`，文档中写作 `refs/libra/traces`）。Memory 自己的 ref 命名沿用同一约定：
+如 §4 开头所述，Memory 的字节是自定义 JSON blob，存活在自己的 `libra/memory*` ref 上，与内部 AgentRuntime 的对象历史分离。后者位于孤儿分支 `libra/intent`（常量 `AI_REF`，`src/internal/ai/history.rs:90`），承载 git-internal 的 typed AI 对象（Intent/Plan/...）；而外部 agent 捕获位于 `traces`（常量 `TRACES_BRANCH`，`src/internal/branch.rs:40`，文档中写作 `refs/libra/traces`）。Memory 自己的 ref 命名沿用同一约定：
 
 ```text
 refs/libra/intent                              # 现有 AI 工作流对象的孤儿分支（Intent/Plan/...，归 AgentRuntime）
@@ -1117,6 +1147,8 @@ audit 中记录非敏感 reason code、producer 版本与脱敏输入 HMAC；它
 
 安全顺序不可颠倒：任何内容进入 LLM worthiness / classifier 之前，必须先完成本地 redaction、owner filtering、size cap 与来源标注。若内容被判定为 `Confidential` 或 `SecretLike`，默认不得发送给远端 LLM provider；只有在明确配置允许、provider 被标记为本地或受信任、且正文已脱敏后才可调用。分类失败时必须返回 draft + `unsorted` 路径或拒绝摄入，不能把未分类正文直接确认为 prompt-visible memory。
 
+**敏感内容分类兜底（默认策略）。** 当内容被判定为 `Confidential` / `SecretLike` 且当前 provider 配置不允许外发时，分类器无法为其建议路径：这类记忆默认保持 `Draft` + `<root>.unsorted` 或直接拒绝摄入，**不晋升、不注入**。写入结果必须返回稳定 reason code（如 `sensitivity-classifier-blocked`）并给出「手动指定 `-p / --path`」的提示，让用户 / agent 明确知道该记忆因敏感度无法自动分类；只有配置了本地或受信任 provider（如 ollama 本地小模型）且正文已脱敏时，分类器才可为敏感内容运行。该兜底不产生新的权威事件，只记录本地 intake audit。
+
 ### 7.2 阶段 1 —— 模式分类器（离线）
 
 如果调用方已经提供了 `path`，直接跳到验证（§7.4）。否则：
@@ -1284,7 +1316,7 @@ memory.get(scope, namespace, path) -> Vec<MemoryRecord>
    secret-like。
 3. 对于 `episodic.*`，默认 deterministic profile 按「有效 commit anchor / recorded time / confidence / trust / 与当前任务的标签重叠度」排序前 K 个 head，K 取较小值（5–10）。访问次数只可用于显式的 adaptive profile，且必须冻结统计快照并写入 receipt，否则无法承诺重放。
 4. 作为有预算约束的 `ProjectMemory` 与 `MemoryAnchor` 上下文段注入 prompt，
-   上限为可配置的 token 天花板（默认 1.5k tokens）。
+   上限为可配置的 token 天花板（默认 1600 tokens，与既有 `ProjectMemory` 段预算一致，见 `src/internal/ai/context_budget/budget.rs`）。
 
 该注入渲染为稳定、对前缀缓存友好的块。顺序由固定 selector/render version、source ref OID、policy snapshot 和 code anchor 决定；wall clock 只先归一化为 receipt 中冻结的 `effective_at`。同一快照下不得因一次读取更新统计而改变下一次默认排序。
 
@@ -1334,8 +1366,9 @@ query
 - **Channel 2（Phase E）**：§6.4 已定义的实体图有界一跳/两跳查询，只返回候选。
 - **融合与去重**：RRF 融合使用固定 k（起点 k=60，agentmemory 口径）；MMR 或等价去重 + 会话多样化上限（起点 max 3/session），避免同一事实多 chunk 重复注入。
 - **确定性边界**：融合排序、channel snapshot（哪些通道启用、各自版本与权重）必须冻结进 ContextReceipt（§8.6）；embedding 向量与索引**不**进入 canonical hash / `bundle_hash` / 回执。
+- **近重复门（copyability threshold，τ≈0.8）**：GitOfThoughts（§0.0.12）实证，记忆仅在召回案例与当前问题的内容余弦相似度 ≥0.8 时稳定改善 agent；方法带（同方法、不同数、不可复制答案）为 null。据此，向量内容通道的一个明确用例是提供**内容级近重复判定**：当余弦 ≥τ 时将该案例视为「可直接复用」候选并提升注入权重；低于 τ 的候选不得借相似度提升权重，只能进入普通确定性排名。τ 判定依赖 embedding 内容通道（§8.7 Channel 1），不能只靠 §6.2 路径 / 关键词。
 - **adaptive profile**：`memory_access_stats.use_count` / `last_used_at` 只能用于离线训练、诊断或显式 adaptive profile（冻结统计快照并写入 receipt），不得改写 canonical `MemoryHead.rank_hint`（§18 开放问题 4）。
-- **评测**：Channel 0 单独与 Channel 0+1 融合分别上报 recall/NDCG（§16.3），确保「无 embedding 配置仍可用」始终可验证。
+- **评测**：Channel 0 单独与 Channel 0+1 融合分别上报 recall/NDCG（§16.3），确保「无 embedding 配置仍可用」始终可验证；并上报结局级准确率基线与新问题 null 预期（§16.2 原则 4）。
 
 ## 9. 分支与版本
 
@@ -1613,8 +1646,9 @@ hook 热路径只允许 enqueue 有界候选任务，不允许同步调用远端
 
 `MemoryAnchor`（既有于
 `src/internal/ai/context_budget/memory_anchor.rs`）保持其当前角色，
-即**活动 thread 的 prompt 注入槽位**。记忆则成为填充该槽位的
-**持久化后备存储**：
+即**活动 thread 的 prompt 注入槽位**。在 Letta / MemGPT 双层模型（§0.0.5）中，
+`MemoryAnchor` 注入槽就是 **core 层**：常驻、始终可见、token 预算小。记忆则成为填充该槽位的
+**持久化后备存储**（archival 层）：
 
 - 在 SessionStart 时，`MemoryAnchor` 行从 `MemoryHead` 读取中
   播种（read-side 投影）。
@@ -1635,7 +1669,7 @@ session JSONL 模型，只有 Draft / Confirmed / Revoked / Superseded。Memory 
 | MemoryAnchor 字段 | MemoryNote / MemoryEvent 对应 | 方向 |
 |---|---|---|
 | `MemoryAnchorKind`（`VerifiedFinding` 等） | `MemoryNote.kind` / `links`（finding 关联） | read 播种时推断 |
-| `MemoryAnchorScope`（`Thread` / `Project`） | `Project` → Memory 候选提升；`Thread` 不提升 | write 提升门 |
+| `MemoryAnchorScope`（`Session` / `AgentRun` / `Project`；现有 wire 枚举无 `Thread` 变体，见 `src/internal/ai/context_budget/memory_anchor.rs`） | `Project` → Memory 候选提升；`Session` / `AgentRun` 不提升 | write 提升门 |
 | `MemoryAnchorConfidence` | `MemoryNote.confidence`（Low / Medium / High） | 双向复用语义 |
 | `MemoryAnchorReviewState`（`Draft` / `Confirmed` / `Revoked` / `Superseded`） | 映射到 `MemoryNote` review state；`Quarantined` **不**进 anchor wire enum | read 投影 |
 | 单条规则正文 | `MemoryNote.body` | 播种 / 提升 |
@@ -1644,7 +1678,7 @@ session JSONL 模型，只有 Draft / Confirmed / Revoked / Superseded。Memory 
   `Confirmed` / 非 `Quarantined` / 非 `SecretLike` head 投影为活动 anchor；
   `Quarantined` 一律不生成活动 anchor。
 - **write 提升（SessionEnd）**：仅 `MemoryAnchorScope::Project` 且
-  `Confirmed` 的 anchor 进入提升候选；`Thread` 作用域不提升。提升后经
+  `Confirmed` 的 anchor 进入提升候选；`Session` / `AgentRun` 作用域不提升。提升后经
   §7.5.1 Trust Gate 才能 `Confirmed`（§11.5）。
 - **wire 约束**：任何 `Quarantined` 投影到 anchor 只写本地审计，不写入
   session JSONL 的 `MemoryAnchorReviewState`；`SecretLike` 原文与
@@ -1653,7 +1687,8 @@ session JSONL 模型，只有 Draft / Confirmed / Revoked / Superseded。Memory 
 ### 11.7 prompt 预算
 
 记忆 prompt 槽位的硬上限：可通过
-`LIBRA_MEMORY_PROMPT_BUDGET_TOKENS` 配置（默认 1500）。当预算
+`LIBRA_MEMORY_PROMPT_BUDGET_TOKENS` 配置（默认 1600，与既有
+`ContextSegmentKind::ProjectMemory` 段预算对齐，`src/internal/ai/context_budget/budget.rs`）。当预算
 溢出时，注入器按以下顺序丢弃：
 
 1. 已过期的 note 与过时的 onboarding 提示。
@@ -1831,7 +1866,7 @@ Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身
   编译记录，幂等键在 `(scope, namespace)` 内去重。
 
 退出门槛：所有 Phase A 写入 Adapter 都无法绕过 `MemoryWriter`；路径聚合与 `memory status` 可用；物化投影对同一 `view_hash` 产生相同 manifest / 文件集合，且不可见正文不落盘、raw HTML 默认禁用、frontmatter 与 URL 经转义 / 净化；投影重建在语义行、watermark、排序与 canonical digest 上稳定；OID 无自引用；损坏点阻止对应 scope watermark 前进；**每条已写入 note 都携带完整编译记录，
-缺失即拒绝写入，同幂等键重复摄入不产生新 note——硬性门槛，见 §0.2**。
+缺失即拒绝写入，同幂等键重复摄入不产生新 note——硬性门槛，见 §0.2**；**写路径成本探针**：单条 note 写入（blob + event + commit + ref CAS + 投影表事务）的端到端延迟与新增对象数量有确定预算，并纳入 §16 的确定性探针，防止投影写放大失控。
 
 ### Phase B — 摄入安全（1–2 周）
 
@@ -1919,6 +1954,7 @@ source 在 dry-run 后移动必须使 fork fail-closed，重复 fork 幂等。
 1. **两层评测**：确定性探针（离线、无 LLM、CI 必跑）与 LLM 场景（nightly，`--features test-live-ai`）。
 2. **评测只读**：使用独立 seed corpus 与冻结 view 快照；不修改权威 ref，不写 receipt 之外的本地账本。
 3. **双口径**：官方 benchmark 标签为主（LongMemEval-S / BEAM），能力桶为辅助视角（Memoria `memory-ability-taxonomy.md` 的 6-bucket）。
+4. **结局级准确率基线（GitOfThoughts 实证，§0.0.12）**：recall@k / NDCG@k 只度量「排序是否更准」，不度量「记忆是否让 agent 更行」。每个记忆通道必须另报**结局指标**：固定 agent 与任务集，比较 none vs 各通道的 task 准确率，配 paired bootstrap 95% CI 与基线（none）对比。依据论文，接受「新问题上任一通道对准确率的增益预期为 null、且无在线学习曲线」这一前提——把记忆的价值定位为连续性 / 审计 / 合并，而非已验证的准确率提升；任何声称「记忆提升准确率」的结论必须由结局指标单独证明，不得由 recall 排序质量推断。
 
 ### 16.2 能力桶与场景集
 
@@ -1931,13 +1967,14 @@ source 在 dry-run 后移动必须使 fork fail-closed，重复 fork 幂等。
 | Knowledge Update & Conflict | 新旧知识、矛盾消解 | supersede / quarantine 后的 recall 结果 |
 | Abstention & Constraint | 无证据拒答、遵守约束 | 无命中时不注入、不编造 |
 
-Libra 专属场景（官方 benchmark 不覆盖）：branch/commit anchor 切换后 recall 变化；supersession 隐藏旧版；`forget` 后默认读取不可见；actor 隐私隔离；跨 worktree 边界；无 embedding 配置降级。
+Libra 专属场景（官方 benchmark 不覆盖）：branch/commit anchor 切换后 recall 变化；supersession 隐藏旧版；`forget` 后默认读取不可见；actor 隐私隔离；跨 worktree 边界；无 embedding 配置降级。**近重复 / 方法带对比**（GitOfThoughts §0.0.12）：构造「近重复案例（cos≥0.8，可直接复用）」与「方法带案例（同方法、不同数、不可复制答案）」两组，断言前者按 τ 门提升权重、后者不因相似度提升权重，结局口径上方法带对准确率的增益预期为 null。
 
 ### 16.3 指标定义
 
 | 指标 | 定义 | 门槛 |
 |---|---|---|
 | recall@k / NDCG@k | k=5、10；Channel 0 与 Channel 0+1 分别上报（§8.7） | Phase C 基线冻结后定目标 |
+| 结局准确率（outcome accuracy） | 固定 agent 与任务集，none vs 各通道的 task 准确率，paired bootstrap 95% CI（§16.1 原则 4） | 不设「记忆必须显著提升」门槛；目标是**平价**（none 与各通道 CI 重叠），并显式记录近重复（cos≥0.8）与「无在线学习曲线」两个预期 |
 | 注入预算合规 | 注入 tokens ≤ `LIBRA_MEMORY_PROMPT_BUDGET_TOKENS` | 100% |
 | 重放一致性 | 同 view 快照 → 同 selected IDs / 顺序 / `bundle_hash` | 100%（硬门槛） |
 | 隐私泄漏 | `SecretLike` / `Confidential` 进入 prompt / 日志 / receipt 次数 | 0（硬门槛） |
@@ -1954,10 +1991,10 @@ Libra 专属场景（官方 benchmark 不覆盖）：branch/commit anchor 切换
 | MEM | 门槛 |
 |---|---|
 | MEM-01 | 本地单仓记录/列出/删除 round-trip；秘密探针零泄漏；schema forward + 迁移测试；损坏数据 fail loud |
-| MEM-02 | 无 embedding 配置召回可用且可测；注入不超预算；citation 可人工核验；与 LR-07 preflight 共享同一检索服务 |
+| MEM-02 | 无 embedding 配置召回可用且可测；注入不超预算；citation 可人工核验；与 LR-07 preflight 共享同一检索服务；结局级准确率基线（none vs 各通道）上报且不设「显著提升」门槛（§16.1 原则 4）；近重复门（τ≈0.8）场景通过（§16.2） |
 | MEM-03 | 巩固/遗忘单测 + 集成测；晋升失败不泄漏私有原文；doctor 可报告记忆健康 |
 | MEM-05 | 导出→清空→导入→召回命中；兼容范围文档化 |
-| MEM-06 | 单写者赢（并发 claim 恰一成功）；移交闭环（A→B/`any` 注入 + ack）；TTL 过期不毒化、历史可审计；冲突声明触发隔离；协调条目可从 refs 重建且不绕过 `MemoryWriter` |
+| MEM-06 | 见 §19.8：单写者赢（并发 claim 恰一成功）；移交闭环（A→B/`any` 注入 + ack）；TTL 过期不毒化、历史可审计；冲突声明触发隔离；协调条目可从 refs 重建且不绕过 `MemoryWriter` |
 
 ## 17. 验证计划
 
@@ -2039,10 +2076,14 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
    标志每个 turn 逐字打印被注入的 memory 槽位，让人类能在每次工具调用前
    精确看到 agent 究竟「记得」什么。该标志已由开放问题升级为 Phase C 硬性
    退出门槛（与 §8.6 的 `ContextReceipt` / `inspect-injection` 并列，G14）。
+7. **富情景记忆能否降低 copyability 阈值 τ。** GitOfThoughts（§0.0.12）的 null 只覆盖「单次蒸馏、answer-free 摘要 + 工作示例检索」与两代开源权重（7B/9B）。它明确把「frontier 级 backbone + 富情景记忆（完整推理 trace 而非一句话摘要）」列为最可能降低 τ（≈0.8）、从而解锁方法迁移的两个变量，且未测多 agent 合并记忆的准确率。本文的 episodic 富记忆（§6/§7）与 merge（§9.3）目前**不**宣称已解锁方法迁移；τ 是否因富记忆下降、合并记忆是否带来单 agent 无法获得的准确率增益，均为待测实验，不得写入硬性验收门槛。
+8. **「记忆提升准确率」的诚实口径。** 依据论文，新问题上任一记忆通道对准确率的增益预期为 null、且无在线学习曲线；唯一稳定杠杆是测试时采样。因此本文**不**以「记忆显著提升 agent 准确率」作为任何 MEM 的验收标准（§16.1 原则 4 / §16.3），只把记忆定位为连续性 / 审计 / 合并；若后续实现观察到准确率提升，须由结局指标单独证明并复核其是否来自记忆本身、而非测试时采样或额外计算预算。
 
-## 19. 并行多 Agent 协调 Memory（MEM-06，设计提案）
+## 19. 并行多 Agent 协调 Memory（MEM-06）
 
-前文 §1–§18 规范的 `Memory` 是**持久知识层**：agent 跨 run / thread / branch 记住并召回可复用事实。本节新增一个**相邻但正交**的能力——**协调 Memory（Coordination Memory）**：多个 Agent 在同一仓库中**并行执行开发工作**时，通过 Memory 通道相互通信与协调。它与持久知识共享同一套基础设施（`MemoryWriter` seam、`refs/libra/memory/*`、事件系统、CAS、Working 缓冲），但语义、生命周期与授权目标不同。
+> 本节原为独立设计文档 `docs/development/tracing/memory-coordination.md`（2026-08-10 拆分），现合并回本文（2026-08-10）。与主 Memory 设计共享的所有原语、约束与验收口径以本文为准。
+
+本设计为本文（主 Memory 设计）的**相邻但正交**扩展：多个 Agent 在同一仓库中**并行执行开发工作**时，通过 Memory 通道相互通信与协调。它与持久知识共享同一套基础设施（`MemoryWriter` seam、`refs/libra/memory/*`、事件系统、CAS、Working 缓冲），但语义、生命周期与授权目标不同。本设计**不新增存储层、不新增第二套并发机制**，完全构建在本文 §3（概念模型）/ §4（对象模型）/ §5（存储布局）之上：一个保留 namespace（`coordination`）+ 一个 `MemoryCoordinator` 入口 + 一个 `CoordinationView` 投影，并复用 Working 缓冲（§10.5）与 Trust Gate（§7.5.1）。`CompileRecord.origin` 相应新增 `Coordinator` 值（§4.1.1 的 additive 扩展）。
 
 ### 19.1 开发者问题
 
@@ -2074,7 +2115,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 
 ### 19.3 数据模型：CoordinationNamespace 与协调条目
 
-新增一个保留 namespace `coordination`，与 `default` / `codebase:onboard` / `project:onboard` / `private:*` 并列。其路径使用既有 §6.2 文法，根为 `coordination.*`：
+新增一个保留 namespace `coordination`，与 `default` / `codebase:onboard` / `project:onboard` / `private:*` 并列。其路径使用 §6.2 文法，根为 `coordination.*`：
 
 ```text
 coordination.<task-id>.claims             # 任务所有权声明（replacement，单写者赢）
@@ -2095,7 +2136,7 @@ coordination.conflicts.<path-or-tag>      # 变更面冲突声明（accretive，
 | `body` | 有界正文：声明的文件/路径范围、移交的交付物摘要、进度的一行状态 |
 | `evidence_refs` | 移交/冲突可选引用 commit OID / Run / Evidence |
 
-协调条目**默认**是本地 Working 缓冲中的 ephemeral 状态，只有达到晋升门槛（§19.5）才写为持久 `MemoryNote`。为区分，协调写入走 `MemoryWriter` 的一个专门入口 `MemoryCoordinator`（见 §19.4），它复用 `CompileRecord.origin` 的 `Coordinator` 值。
+协调条目**默认**是本地 Working 缓冲中的 ephemeral 状态，只有达到晋升门槛（§19.5）才写为持久 `MemoryNote`。为区分，协调写入走 `MemoryWriter` 的一个专门入口 `MemoryCoordinator`（见 §19.4），它复用 `CompileRecord.origin` 的 `Coordinator` 值（§4.1.1 的 additive 扩展）。
 
 ### 19.4 `MemoryCoordinator` Module 与并发语义
 
@@ -2108,11 +2149,11 @@ coordination.conflicts.<path-or-tag>      # 变更面冲突声明（accretive，
 - **conflict-declare**：`conflict_declare(paths_or_tag, mine, theirs, evidence_refs)` 追加 `Accretive` note 到 `coordination.conflicts.*`，触发 `contradicts` 链接，进入隔离/人工解决（§7.5）。
 - **sync-point**：`sync_point(task_id, revision, description)` 追加 `Accretive` note，登记一个可被其他 agent 查询的同步点。
 
-并发语义与现有 §4.2.1 完全一致：所有协调写入都走 ref CAS + 有界重试；claim 的单写者赢在 `(scope, namespace, path)` cell 上由事件状态机 + CAS 共同保证，**不引入文件系统锁**（§4.2.1 明确 worktree checkout 状态不能充当 writer lock）。
+并发语义与 §4.2.1 完全一致：所有协调写入都走 ref CAS + 有界重试；claim 的单写者赢在 `(scope, namespace, path)` cell 上由事件状态机 + CAS 共同保证，**不引入文件系统锁**（§4.2.1 明确 worktree checkout 状态不能充当 writer lock）。
 
 ### 19.5 `CoordinationView` 与注入
 
-每个 agent 在 SessionStart（§11.1）额外解析一个 `CoordinationView`——它是 `ResolvedMemoryView` 的一个协调子集，冻结当前仓库作用域下的：
+每个 agent 在 SessionStart（§11.1）额外解析一个 `CoordinationView`——它是 `ResolvedMemoryView`（§3.4）的一个协调子集，冻结当前仓库作用域下的：
 
 - 活跃 claims（未过期的所有权声明，含持有者与路径范围）；
 - 待处理 handoff（`to = <me>` 或 `any` 且未 ack）；
@@ -2131,7 +2172,7 @@ coordination.conflicts.<path-or-tag>      # 变更面冲突声明（accretive，
 - 短 TTL 只从 `CoordinationView` 与默认召回排除过期条目；**历史事件与 note 不物理删除**（§10.7），可 `libra memory log` 审计。
 - 协调条目**不得**进入团队 publication / 远端 durable tier，除非经 §5.4 的团队 publication 流程（前置 C9 + SB-02 + mainline ML-01 manifest）。
 
-### 19.7 与现有 MEM 的关系
+### 19.7 与 MEM-01..05 的关系
 
 | 能力 | MEM-01..05 | MEM-06 协调 |
 |---|---|---|
@@ -2167,30 +2208,140 @@ MEM-06 依赖 MEM-01（存储/隐私）与 MEM-03（Trust Gate / 巩固），建
 
 协调 Memory 的价值在于：它把并行 agent 的隐式协调（靠猜、靠共享文件、靠 merge 后撞冲突）变成显式、可审计、可过期的仓库内通道，与 Libra 的 VCS-native + 事件历史 + 单一 writer 纪律完全同构。
 
+## 20. 修订台账（原 `gap/memory-redesign.md`，2026-08-09 合并）
+
+> 本节是 2026-08-07 第六次竞品审计 / 2026-08-09 第七次审计驱动的**设计修订台账**，原独立文档 `docs/development/gap/memory-redesign.md` 已并入本文并删除。它记录「提出 → 落地」的审计轨迹；所有修订的**规范正文**已落在本文对应章节（§16 / §8.7 / §0.0.4 / §10.5 / §7.5.1 / §5.6 / §18 / §19），本节只保留台账、差距清单与竞品语料全表，不再重复规范全文。
+
+### 20.1 修订项状态（A1–A7 + B + C + G12–G15 + D1）
+
+| 修订项 | 目标位置 | 对应 | 优先级 | 状态 |
+|---|---|---|---|---|
+| A1 评测与验收 | §16 | MEM-02 验收 | P0 | 已落地 |
+| A2 混合检索通道 | §8.7、§5.2/§14 表 | MEM-02 | P0 | 已落地 |
+| A7 §0.0 语料刷新 + 反例登记 | §0.0.4 | 文档治理 | P0 | 已落地 |
+| A3 四层巩固与归并语义 | §3.2 / §10.5 | MEM-03 | P1 | 已落地（§10.5 Working 层） |
+| A4 Trust Gate 显式化 | §7.5 / §10 | MEM-03 | P1 | 已落地（§7.5.1） |
+| A5 可移植导出/导入 | §5.5 扩展 | MEM-05 | P2 | 已落地（§5.6） |
+| A6 数据边界与团队同步 | §5.4 / §18 | 开放问题 | P1 决策 / P3 实现 | 决策已落地（scope_key 最小单位、团队同步 local-only）；实现待 Phase D |
+| B1 §0.0 细节外移 | 本文承接 | 结构 | P1 | 待落地 |
+| B2 目录 + 执行摘要 + MEM 追溯表 | 头部 | 治理 | P1 | 已落地 |
+| B3 MemoryAnchor 规范性 wire 映射 | §11.6 | 一致性 | P1 | 已落地（§11.6.1） |
+| C `consolidate` 命令补齐 | §12 / §13 | 一致性 | P1 | 已落地 |
+| G12 投毒隔离与再验证闭环 | §10.5 / §13.1 | MEM-03 | P1 | 已落地（§10.6 / §13.1） |
+| G13 高信任 note 定期再验证 | §7.5 | MEM-03 | P2 | 已落地（§10.6 / §13.1） |
+| G14 `--debug-memory` 升 Phase C 硬交付 | §18 | 可观测性 | P1 | 已落地（§18） |
+| G15 adaptive profile 触发与验收 | §8.7 / §18 | MEM-02 | P2 | 已落地（§18） |
+| D1 MEM-06 拆分独立文档（2026-08-10 评审意见：范围蔓延） | §19 → 独立文档 | 治理 | P1 | 已落地（正文拆分）；2026-08-10 已合并回本文 §19，独立文档删除 |
+
+### 20.2 差距清单（G1–G11）
+
+| # | 差距 | 证据 | 对应修订 |
+|---|---|---|---|
+| G1 | 无评测/验收面，MEM-02 无法验收 | agentmemory / memweave / Memoria 均有 recall 基准与能力桶 | A1 |
+| G2 | 混合检索只是开放问题，不是一等设计 | agentmemory / memweave / sqlite-memory / Memoria 收敛到 BM25+向量 hybrid + 降级 | A2 |
+| G3 | 四层巩固模型不完整（无 Working 层、无调度/衰减语义） | agentmemory 四层 + Ebbinghaus；letta `/sleeptime`；MEM-03 | A3 |
+| G4 | Trust Gate 未显式化 | fava-trails drafts 隔离 + LLM 评审 | A4 |
+| G5 | 可移植导出/导入（MEM-05）在设计文档缺失 | letta `.af` / MemFS / skills | A5 |
+| G6 | 团队同步与数据边界无决策记录 | Memoria per-user DB；sqlite-sync CRDT；Sapling Crewmate | A6 |
+| G7 | §0.0 语料停留在 2026-07-13，缺本地主证据与反例登记 | 第六次审计语料 | A7 |
+| G8 | CLI/MCP 缺 `consolidate`（§10.5/Phase D 引用但 §12/§13 列表缺失） | memory.md 内部 | C |
+| G9 | 无目录/执行摘要/MEM 追溯表 | memory.md 内部 | B2 |
+| G10 | §11.6 MemoryAnchor 对齐是散文，无规范性 wire 映射 | memory.md 内部 | B3 |
+| G11 | §0.0 大段外部分析混在规范内 | memory.md 内部 | B1 |
+
+### 20.3 保留的强项（不修改）
+
+1. Snapshot/Event/Projection 三层模型 + `refs/libra/memory/*` 线性历史 + CAS 并发（§0.1、§4）。
+2. CompileRecord / ContextReceipt 的确定性可重放承诺（§0.2、§8.6）。
+3. 分层 scope（Actor→Worktree→Branch→Repo→Global）与 fail-closed 读取（§3.4）。
+4. 遗忘/脱敏语义、MCP C9 门禁、`SecretLike` 边界（§10.6、§13）。
+5. 投影表可重建、账本表豁免 rebuild 的边界（§5.2、§14）。
+
+### 20.4 本地竞品语料与机制分析（第六次审计，revision 引脚）
+
+范围：`/Volumes/Data/competition/*/*` 30 个仓库中 Memory 类 11 个 + 相邻参考 3 个。所有 revision 为 2026-08-07 第六次同步后的本地 HEAD。
+
+| 项目 | revision | 承重机制（已验证入口） | 取舍 |
+|---|---|---|---|
+| `rohitg00/agentmemory` | `d60652a` | 四层巩固 working→episodic→semantic→procedural；Ebbinghaus 衰减；SHA-256 去重（5min 窗口）；隐私过滤；BM25+vector+graph 三流 RRF(k=60) + 会话去重（max 3/session）；SessionStart 注入 2000-token；Git snapshot（README "Memory Pipeline" / "4-Tier Memory Consolidation"） | 采纳机制（MEM-01/02/03 主证据）；54 MCP tools 作规模反例；R@5 95.2% 为自报口径 |
+| `MachineWisdomAI/fava-trails` | `6653f9f` | Markdown+YAML 存于 Git（JJ colocate）；`drafts/` 隔离；Trust Gate（LLM 评审）；supersession 隐藏旧版；原子提交；engine/fuel 分离（README） | 采纳 Trust Gate 为显式 promotion 阶段（A4）；数据仓库分离形态不照搬 |
+| `matrixorigin/Memoria` | `54c9114` | 记忆 snapshot/branch/merge/rollback（MatrixOne CoW）；vector+全文混合；自治理（矛盾检测、低置信隔离）；**per-user DB 数据边界**（docs/per-user-database-architecture.md）；LongMemEval+BEAM 6-bucket 能力分类（docs/memory-ability-taxonomy.md） | 采纳「版本语义必须落在正确数据边界」与 6-bucket 评测视角（A1/A6）；「Git for memory」宣传口径不采纳 |
+| `sachinsharma9780/memweave` | `2ff82df` | 纯 Markdown + SQLite（FTS5 BM25 + sqlite-vec）；MMR 去重；核心路径零 LLM；embedding 内容哈希缓存；无 embedding 时降级纯关键词；LongMemEval-S R@5 97.24%±0.12%（README + benchmarks/） | 采纳「确定性基线常开 + 可选向量 + 降级」（A2）；数字自报 |
+| `sqliteai/sqlite-memory` | `0f0aede` | SQLite 扩展；Markdown 为真源；vector+FTS5 混合；markdown-aware chunking；llama.cpp 本地 embedding；**CRDT offline-first 同步**（sqlite-sync） | 参考团队同步（A6）；默认上传托管服务不采纳 |
+| `graphwisdom/perstate` | `95e27e3` | branch-as-identity；session↔branch 绑定；fork/switch/prune；物化 Markdown 视图（SKILL.md） | 已采纳（memory.md §3.4 / §5.5），维持 |
+| `sl4m3/ledgermind` | `99220d1` | 自主知识生命周期（SQLite+Git）；自愈衰减；PATTERN→EMERGENT→CANONICAL；无监督演化（README） | **反例**：无审计自主变异；登记不采纳 |
+| `ruvnet/agentic-flow` | `d3735a3` | 编排 + 自学习 hooks + 记忆/trajectory；66 agents / 213 MCP tools / QuantumDAG（README） | 宣传口径，不作证据 |
+| `letta-ai/trajectory` | `59c0db5` | 多 runtime transcript 归一化为验证记录；`diagnostics` 恒存在（README） | 采纳为外部 transcript 导入前置（A5，与 AG-ATTR 衔接） |
+| `letta-ai/agent-file` | `78212eb` | `.af` 开放格式：identity / memory blocks / skills / settings；可 checkpoint 与版本控制（README） | 采纳子集评估（A5）；完整云生态绑定不采纳 |
+| `letta-ai/letta-code` | `ac359eeb` | memory blocks（agent 自改写）；MemFS（全部上下文 git 跟踪）；`/sleeptime` dreaming；`/doctor` / `/palace`；三级 skills（README） | 采纳记忆块投影与排期巩固（A3/A5）；「自改 harness」哲学不采纳 |
+| `letta-ai/skills` | `16352df` | 社区 skill 知识库 + peer review（README） | 参考 skill 投影（A5） |
+| 相邻：`facebook/sapling` | `119e6d1f75d` | Crewmate 私有目录授权钩子：默认 deny、有界授权扇出（commit 119e6d1f75d） | 参考团队 publication 的 fail-closed 授权（A6） |
+
+注意事项（source-grounded 纪律）：
+
+- `agentmemory/DESIGN.md` 实为 Lamborghini 网站设计稿，与记忆无关——语料内部质量参差，机制引用必须按 README / 源码文件逐一验证，不能因仓库名采信。
+- 所有 R@5 / token 节省数字均为 vendor 自报口径，只提供场景与目标参考，不进入 Libra 验收（见 §20.7）。
+- 本轮所有仓库均以 `--ff-only` 同步且 revision 已引脚；`agenta-ai/agenta` 因 dirty 不作证据。
+
+### 20.5 优先级与阶段映射
+
+| 修订项 | memory.md 位置 | 对应 | 优先级 | 阶段 |
+|---|---|---|---|---|
+| A1 | §16（新） | MEM-02 | P0 | Phase A 起 |
+| A2 | §8.7 | MEM-02 | P0 | Phase C |
+| A7 | §0.0.4 | 治理 | P0 | 本次 |
+| A6（决策） | §5.4 / §18 | 开放问题 | P1 | 本次评审 |
+| C | §12 / §13 | 一致性 | P1 | Phase A 前（第七次提前） |
+| A3 | §3.2 / §10.5 | MEM-03 | P1 | Phase B 前（第七次提前） |
+| A4 | §7.5 / §10 | MEM-03 | P1 | Phase B 前（第七次提前） |
+| G12 投毒隔离与再验证闭环 | §10.5 / §13.1 | MEM-03 | P1 | Phase B（新增，第七次） |
+| G14 `--debug-memory` 升硬交付 | §18 | 可观测性 | P1 | Phase C（新增，第七次） |
+| A5 | §5.5 扩展 | MEM-05 | P2 | Phase D/E |
+| G13 高信任 note 再验证 | §7.5 | MEM-03 | P2 | Phase D（新增，第七次） |
+| G15 adaptive profile 触发与验收 | §8.7 / §18 | MEM-02 | P2 | Phase C 后（新增，第七次） |
+| A6（实现） | §5.4 | 团队同步 | P3 | 未来 |
+| B1–B3 | 结构 | 治理 | P1 | 随 A 项改版 |
+
+### 20.6 落地顺序
+
+1. 本次：A7（§0.0.4 语料刷新 + 反例）→ A2（§8.7 混合检索 + 表）→ A1（§16 评测与验收）→ 提交。
+2. 下次：C（consolidate 命令补齐）→ A4（Trust Gate）→ A3（四层巩固）→ G12（投毒隔离闭环）→ A6 决策定案 → B2/B3。
+3. 每次落地执行：结构校验（表格列数、链接、编号引用、冲突标记、尾随空白）、`libra diff --check`、仅提交目标文件。
+
+### 20.7 vendor 参考口径
+
+| 项目 | 自报数字 | 用途 |
+|---|---|---|
+| agentmemory | R@5 95.2%；92% fewer tokens | 场景/目标参考，不验收 |
+| memweave | LongMemEval-S R@5 97.24%±0.12%；NDCG@5 92.28% | 场景/目标参考，不验收 |
+| Memoria | LongMemEval + BEAM 双基准 | 能力桶与双口径（retrieval + end-to-end QA）参考 |
+
 ## 总结规则（Summary Rule）
 
 ```text
-1. Hierarchical paths replace flat blobs.        (memoir-ai)
-2. Namespaces separate user facts, onboarding,
-   metrics, and private actor memory.             (memoir-ai + Libra)
-3. Snapshot stores "what the memory is".          (libra)
-4. Event stores "what happened to the memory".    (libra)
-5. Projection stores "what is current".           (libra)
-6. Draft, quarantine, trust, and sensitivity
-   gates decide what can enter the prompt.         (Libra safety)
-7. Git refs are the historical truth — refs,
+1. Core memory stays resident; archival memory
+   is recalled on demand.                     (Letta / MemGPT, §0.0.5)
+2. Hierarchical paths key the archival layer.  (memoir-ai, §2.3)
+3. Namespaces separate user facts, onboarding,
+   metrics, and private actor memory.          (memoir-ai + Libra)
+4. Snapshot stores "what the memory is".       (libra)
+5. Event stores "what happened to the memory". (libra)
+6. Projection stores "what is current".        (libra)
+7. Draft, quarantine, trust, and sensitivity
+   gates decide what can enter the prompt.     (Libra safety)
+8. Git refs are the historical truth — refs,
    commits, blame, diff, revert all work
-   unchanged on memory.                           (libra-native)
-8. Compile records make every write reproducible;
+   unchanged on memory.                        (libra-native)
+9. Compile records make every write reproducible;
    context receipts make every injection
-   replayable.                                    (Statewave, §0.2)
-9. One MemoryWriter owns every mutation; callers
-   never edit refs or projections directly.       (Libra safety)
-10. ResolvedMemoryView freezes session-visible
-    scopes, refs, watermarks, and policy.          (perstate UX + Libra)
-11. Markdown and graph views are rebuildable,
-    redacted, untrusted projections.               (perstate + Libra)
-12. Coordination Memory gives parallel agents a
+   replayable.                                 (Statewave, §0.2)
+10. One MemoryWriter owns every mutation; callers
+    never edit refs or projections directly.   (Libra safety)
+11. ResolvedMemoryView freezes session-visible
+    scopes, refs, watermarks, and policy.      (perstate UX + Libra)
+12. Markdown and graph views are rebuildable,
+    redacted, untrusted projections.           (perstate + Libra)
+13. Coordination Memory gives parallel agents a
     shared, bounded, expiring, single-writer channel
     for claims, handoffs, conflicts, and sync points. (MEM-06, §19)
 ```

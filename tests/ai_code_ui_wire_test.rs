@@ -47,6 +47,7 @@ fn fully_populated_snapshot() -> CodeUiSessionSnapshot {
             interactive_approvals: true,
             structured_questions: true,
             provider_session_resume: true,
+            command_idempotency: true,
         },
         controller: CodeUiControllerState {
             kind: CodeUiControllerKind::Browser,
@@ -168,6 +169,7 @@ fn snapshot_round_trips_through_camel_case_wire_shape() {
         "interactiveApprovals",
         "structuredQuestions",
         "providerSessionResume",
+        "commandIdempotency",
     ] {
         assert_eq!(caps.get(flag), Some(&Value::Bool(true)), "{flag}");
     }

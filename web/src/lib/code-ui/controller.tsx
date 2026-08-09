@@ -73,6 +73,13 @@ function generateClientId(): string {
   return `browser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function generateCommandId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `cmd-${crypto.randomUUID()}`;
+  }
+  return `cmd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 /**
  * Single browser-controller instance shared across the workspace through
  * {@link BrowserControllerProvider}. Mounting `useBrowserController()`
@@ -112,6 +119,9 @@ function useBrowserControllerInternal(): BrowserControllerHook {
   if (clientIdRef.current == null) clientIdRef.current = generateClientId();
 
   const leaseRef = useRef<LeaseState | null>(null);
+  const pendingCommandsRef = useRef<Map<string, string>>(new Map());
+  const submitInFlightRef = useRef(false);
+  const PENDING_COMMAND_LIMIT = 32;
 
   const setAttached = useCallback((attach: CodeUiControllerAttachResponse) => {
     leaseRef.current = {
@@ -184,9 +194,66 @@ function useBrowserControllerInternal(): BrowserControllerHook {
 
   const submit = useCallback(
     async (text: string) => {
-      await withLease((token) => submitMessage({ text }, token));
+      // Serialize local submits so a double-click cannot attach two overlapping
+      // POSTs to the same pending commandId map entry.
+      if (submitInFlightRef.current) {
+        throw new CodeUiClientError(
+          "TURN_IN_PROGRESS",
+          "A message submit is already in progress; wait for it to finish before sending again",
+          409,
+        );
+      }
+      // Only mint commandId when the runtime advertises durable command
+      // identity (headless web-only today). Other adapters fail closed if an
+      // id is sent, so gated clients must omit it.
+      // Keep every unacknowledged text→commandId mapping so interleaved
+      // failures cannot overwrite an earlier pending id.
+      let commandId: string | undefined;
+      if (snapshot?.capabilities.commandIdempotency) {
+        const pending = pendingCommandsRef.current.get(text);
+        commandId = pending ?? generateCommandId();
+        if (
+          !pending &&
+          pendingCommandsRef.current.size >= PENDING_COMMAND_LIMIT
+        ) {
+          throw new CodeUiClientError(
+            "TURN_IN_PROGRESS",
+            "Too many unacknowledged message submits are waiting for a response; wait for one to finish before sending another",
+            409,
+          );
+        }
+        pendingCommandsRef.current.set(text, commandId);
+      }
+      submitInFlightRef.current = true;
+      try {
+        await withLease((token) =>
+          submitMessage(commandId ? { text, commandId } : { text }, token),
+        );
+        if (commandId) {
+          pendingCommandsRef.current.delete(text);
+        }
+      } catch (error) {
+        if (
+          error instanceof CodeUiClientError &&
+          (error.code === "COMMAND_PAYLOAD_CONFLICT" ||
+            error.code === "COMMAND_ALREADY_TERMINAL" ||
+            error.code === "INVALID_COMMAND_ID" ||
+            error.code === "PAYLOAD_TOO_LARGE" ||
+            error.code === "TURN_IN_PROGRESS" ||
+            /allocate a new commandId/i.test(error.message))
+        ) {
+          // Terminal / non-retryable identity failures must not sticky-cache
+          // the dead commandId across later user retries of the same text.
+          if (error.code !== "TURN_IN_PROGRESS") {
+            pendingCommandsRef.current.delete(text);
+          }
+        }
+        throw error;
+      } finally {
+        submitInFlightRef.current = false;
+      }
     },
-    [withLease],
+    [withLease, snapshot?.capabilities.commandIdempotency],
   );
 
   const respond = useCallback(

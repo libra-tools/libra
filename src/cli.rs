@@ -1473,6 +1473,13 @@ fn repair_invocation_refused_without_confirmation(
 
 fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
     match command {
+        // Codex invokes this user-level callback in every trusted working
+        // directory. Resolve storage lazily in the handler so an unrelated
+        // callback cannot fail before it is acknowledged because the current
+        // directory is outside a Libra repository or its storage is busy.
+        Commands::Hooks(command::hooks::HooksArgs {
+            command: command::hooks::HooksProviderSubcommand::Codex { .. },
+        }) => Ok(CommandPreflight::none()),
         Commands::Init(_)
         | Commands::Clone(_)
         | Commands::Open(_)

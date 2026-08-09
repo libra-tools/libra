@@ -29,8 +29,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{BoundaryDecision, RuntimeCommandDurability, ToolBoundaryRuntime, ToolOperation};
-use crate::internal::ai::session::{CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent};
+use super::{
+    BoundaryDecision, RuntimeCommandDurability, RuntimeCommandDurabilityError, ToolBoundaryRuntime,
+    ToolOperation,
+};
+use crate::internal::ai::session::{
+    CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandStatus,
+    CodeCommandStoreError,
+};
 
 /// A monotonically increasing event position within one runtime session.
 ///
@@ -468,6 +474,21 @@ pub enum RuntimeWorkerError {
     InvalidTurnIdentifier,
     #[error("turn '{turn_id}' already exists in session '{session_id}'")]
     DuplicateTurn { session_id: String, turn_id: String },
+    #[error(
+        "command '{turn_id}' in session '{session_id}' was already admitted with a matching payload ({status})"
+    )]
+    IdempotentCommand {
+        session_id: String,
+        turn_id: String,
+        status: String,
+        /// When false, the prior terminal state was failed/cancelled/indeterminate
+        /// and must not be acknowledged as a successful browser submit.
+        ack_ok: bool,
+    },
+    #[error(
+        "command '{turn_id}' in session '{session_id}' was reused with a different canonical payload"
+    )]
+    CommandPayloadConflict { session_id: String, turn_id: String },
     #[error("session '{session_id}' already has {limit} queued turns")]
     QueueFull { session_id: String, limit: usize },
     #[error("session '{session_id}' requires mutation reconciliation before another turn can run")]
@@ -2179,18 +2200,32 @@ impl AgentRuntimeWorker {
                 "durability disappeared while admitting a runtime turn".to_string(),
             )
         })?;
-        match durability.admit(intent).map_err(|error| {
-            RuntimeWorkerError::DurabilityFailure(format!(
-                "could not persist intent for turn '{}': {error}",
+        match durability.admit(intent).map_err(|error| match error {
+            RuntimeCommandDurabilityError::Store(CodeCommandStoreError::PayloadConflict {
+                session_id,
+                command_id,
+                ..
+            }) => RuntimeWorkerError::CommandPayloadConflict {
+                session_id,
+                turn_id: command_id,
+            },
+            other => RuntimeWorkerError::DurabilityFailure(format!(
+                "could not persist intent for turn '{}': {other}",
                 request.turn_id
-            ))
+            )),
         })? {
             CodeCommandAdmission::Execute { .. } => Ok(()),
             CodeCommandAdmission::Existing { status } => {
-                Err(RuntimeWorkerError::DurabilityFailure(format!(
-                    "turn '{}' already has durable command state {status:?}; refusing to dispatch it again",
-                    request.turn_id
-                )))
+                let ack_ok = matches!(
+                    status,
+                    CodeCommandStatus::Pending | CodeCommandStatus::Succeeded { .. }
+                );
+                Err(RuntimeWorkerError::IdempotentCommand {
+                    session_id: request.session_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                    status: format!("{status:?}"),
+                    ack_ok,
+                })
             }
         }
     }

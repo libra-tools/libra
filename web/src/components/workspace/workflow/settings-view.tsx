@@ -25,6 +25,7 @@ const CAPABILITY_LABELS: { key: keyof CodeUiCapabilities; label: string }[] = [
   { key: "interactiveApprovals", label: "Interactive approvals" },
   { key: "structuredQuestions", label: "Structured questions" },
   { key: "providerSessionResume", label: "Provider session resume" },
+  { key: "commandIdempotency", label: "Command idempotency" },
 ];
 
 export function SettingsView() {

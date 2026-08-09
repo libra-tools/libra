@@ -66,7 +66,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `disable` | Disable one or more external agents and uninstall hooks |
 | `remove` | Alias of `disable`: `remove <name>` ≡ `disable --agent <name>` |
 | `session list` | List captured sessions |
-| `session show <id>` | Show a captured session |
+| `session show <id>` | Show a captured session, including a non-sensitive retryable checkpoint-capture diagnostic when the last Codex Stop failed |
 | `session stop <id>` | Mark a captured session as stopped |
 | `session resume <id>` | Mark a stopped captured session active again |
 | `session promote <id>` | Promote a captured session into Libra intent metadata |
@@ -156,7 +156,7 @@ cannot provide Libra's secure provider-root file-open primitive.
 Unsupported schema versions fail as a usage error (exit 129, category `cli`)
 with `LBR-AGENT-017`.
 
-`agent graph` emits the frozen capture-graph schema version 1. Its `data`
+`agent graph --json` emits the frozen capture-graph schema version 1. Its `data`
 object contains exactly `schema_version`, `state`, `session`, `turns`, and
 `subagents`. Present sessions expose only the session id, agent kind, state,
 and timestamps. Indexed turns expose their logical key, derived zero-based
@@ -168,9 +168,14 @@ hidden as superseded. Pre-coverage captures are returned as
 facts. Subagent nodes expose only checkpoint/link structure and retain
 `resolved` or `unresolved` explicitly.
 
-The graph query never opens transcript or object blobs and never selects
-working directories, descriptions, metadata JSON, redaction reports, or
-coverage digests. A locally erased session succeeds with `state="erased"`, a
+The JSON/machine graph query never opens transcript or object blobs and never
+selects working directories, descriptions, metadata JSON, redaction reports,
+or coverage digests. In the interactive TUI, selecting a session, turn,
+revision, or subagent additionally shows a bounded content summary: event
+counts plus compact user/assistant message previews from the linked
+checkpoint. The TUI reads at most 256 KiB per checkpoint, follows the stored
+manifest, and applies the default redactor again; it never renders the full
+transcript or provider file path. A locally erased session succeeds with `state="erased"`, a
 null session, empty turns, and unavailable subagents; it is not recreated.
 An id absent from both the session catalog and erasure tombstones fails with
 `LBR-AGENT-021`. Without global `--json` or `--machine`, stdin and stdout must

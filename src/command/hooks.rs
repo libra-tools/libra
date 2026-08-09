@@ -139,14 +139,26 @@ pub async fn execute_safe(args: HooksArgs, _output: &OutputConfig) -> CliResult<
         HooksProviderSubcommand::Codex { command } => {
             let cmd = command.as_command();
             let expected_kind = cmd.lifecycle_event_kind();
-            process_hook_event_with_target(
+            if process_hook_event_with_target(
                 cmd,
                 expected_kind,
                 codex_provider(),
                 HookTarget::AgentTraces,
             )
             .await
-            .map_err(|err| CliError::fatal(format!("hook ingestion failed: {err}")))?;
+            .is_err()
+            {
+                // Codex treats hook failures as task failures. Capture is
+                // auxiliary, so acknowledge the callback and keep any
+                // diagnostic free of hook payload or filesystem details.
+                tracing::warn!(
+                    target: "agent.hook.ingest",
+                    provider = "codex",
+                    verb = %cmd,
+                    reason = "capture_failed",
+                    "Codex hook capture failed; acknowledging callback"
+                );
+            }
             // Codex trust-gap banner (AG-19): SessionStart is the single
             // banner point; stderr only, never blocks the hook.
             if matches!(command, ProviderHookSubcommand::SessionStart)

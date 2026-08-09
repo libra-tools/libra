@@ -72,7 +72,7 @@ Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改�
 | Shortstat | | `--shortstat` | 只显示 `--stat` 的汇总行（文件数/插入/删除），零项省略对应子句。 |
 | Summary | | `--summary` | 显示创建/删除、已检测重命名及 mode 变更的精简摘要（默认开启重命名检测；`diff.renames=false` 或 `--no-renames` 可关闭）。纯内容修改不产生行。 |
 | No patch | `-s` | `--no-patch` | 抑制 patch（diff 主体）。与 `--exit-code` 组合做状态检查。 |
-| 空白检查 | | `--check` | 不输出 diff，而是对新增行的安全问题告警：尾随空白、indent 中 space-before-tab、遗留冲突标记、EOF 新增空行。打印 `<path>:<line>: <message>`，发现即退出码 2；优先于其他输出模式。 |
+| 空白检查 | | `--check` | 不输出 diff，而是对新增行的安全问题告警：尾随空白、indent 中 space-before-tab、遗留冲突标记、EOF 新增空行。打印 `<path>:<line>: <message>`，发现即退出码 2；优先于其他输出模式。与 `--exit-code` 同时给出时两个状态码**相加**（与 Git 一致）：无可报告为 `0`，有差异但无空白破坏为 `1`，不带 `--exit-code` 的空白破坏为 `2`，既有差异又有空白破坏为 `3`（1 + 2）。 |
 | 反向 | `-R` | `--reverse` | 交换两侧，使新增变删除、删除变新增（即可撤销该变更的 patch）。 |
 | 文本 | `-a` | `--text` | 把所有文件按文本处理：即便检测为二进制（任一侧含 NUL 字节，或非 UTF-8 内容）也输出内容 diff，抑制 “Binary files … differ” 行。Libra 的 diff 基于文本，故非 UTF-8 改动若经 lossy-UTF-8 转换后相同，仍显示 “Binary files … differ”。 |
 | 二进制 patch | | `--binary` | 对二进制文件输出 `GIT binary patch`（两个方向的 base85 `literal` 块），而非 “Binary files … differ”；隐含 `--full-index`。该补丁有效且可 apply，但压缩字节与 Git 不完全一致（Libra 用不同的 zlib，且始终输出 `literal` 而非 Git 的 literal/delta 取小）。 |
@@ -90,7 +90,7 @@ Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改�
 | 不用 indent 启发式 | | `--no-indent-heuristic` | 禁用 hunk 边界的 indent 启发式。接受式 no-op：Libra 的 diff 不使用 Git 的 indent 启发式。（Git 的 `--indent-heuristic` 不支持。） |
 | Textconv | | `--textconv` | 运行 textconv 过滤器使内容可读地 diff：文件的 `diff=<driver>` 属性来自 Git/Libra attributes 来源，指向一个配置了 `diff.<driver>.textconv` 命令的 driver 时，diff 前先用该命令转换两侧内容。与 Git 一致，`diff` 默认开启；此 flag 为 `--no-textconv` 的显式反面。生成的补丁用于阅读，不可 apply。textconv 命令失败为致命错误；`--check` 或 `diff.external` 激活时不应用。 |
 | 不用 textconv | | `--no-textconv` | diff 原始内容，跳过 textconv 过滤器（countermand 先前的 `--textconv`）。 |
-| Exit code | | `--exit-code` | 仍打印 diff，但存在差异时退出码为 1（否则 0）。区别于 `--quiet`，不抑制 diff。 |
+| Exit code | | `--exit-code` | 仍打印 diff，但存在差异时退出码为 1（否则 0）。区别于 `--quiet`，不抑制 diff。与 `--check` 同时给出时两个状态码**相加**，见 `--check` 行。 |
 | NUL 输出 | `-z` | `--null` | 对 `--raw`/`--name-only`/`--name-status`/`--numstat` 用 NUL 终止每条记录。raw 重命名与 name-status 字段拆为独立 NUL 字段；其他模式不受影响。 |
 | JSON | | `--json` | 输出结构化 JSON。 |
 | Quiet | | `--quiet` | 抑制 stdout；存在差异时退出码为 1，否则为 0。与 `--output` 组合时，文件仍会被写入。 |
@@ -266,11 +266,11 @@ diff 驱动的 verbatim 输出。与 Git 一样，`commit -v` 始终使用内建
 - `-s` / `--no-patch` 抑制 patch 主体（用于仅状态检查）
 - `--diff-filter=<FILTER>` 将全部输出、JSON 与退出码判断限制到所选变更类型
 - `-z` / `--null` 对 `--raw`/`--name-only`/`--name-status`/`--numstat` 用 NUL 终止记录（raw 重命名与 name-status 路径字段拆为独立 NUL 字段）
-- `--check` 对新增行检测尾随空白、indent 中 space-before-tab、遗留冲突标记和 EOF 新增空行，打印 `<path>:<line>: <message>`，发现即退出码 2
+- `--check` 对新增行检测尾随空白、indent 中 space-before-tab、遗留冲突标记和 EOF 新增空行，打印 `<path>:<line>: <message>`，发现即退出码 2；与 `--exit-code` 同时给出时状态码相加（既有差异又有空白破坏为 `3`）
 - `-R` / `--reverse` 交换两侧得到反向 diff（新增↔删除）
 - `-a` / `--text` 把所有文件按文本处理：即便检测为二进制也输出内容 diff（抑制 “Binary files … differ”）；`--binary` 则对二进制文件输出 `GIT binary patch`
 - `--no-ext-diff` 本次运行禁用外部 diff 驱动，强制内建引擎；`--ext-diff` 允许已配置的 `diff.external` 外部驱动生成 patch（按 Git GIT_EXTERNAL_DIFF 协议，仅 patch 输出模式；`--stat`/name/numstat/`-s`/`--check` 绕过）
-- `--exit-code` 仍打印 diff，但存在差异时退出码为 `1`
+- `--exit-code` 仍打印 diff，但存在差异时退出码为 `1`（与 `--check` 同时给出时两者相加）
 - `--quiet` 抑制 stdout，并用退出码 `1` 表示存在差异
 
 默认情况下，这些偏机器输出的 diff 模式只报告 tracked/index 与工作树之间的差异。未跟踪文件（包括未跟踪的 `.libraignore`）不会出现，也不会让 `--quiet` 或 `--exit-code` 失败。

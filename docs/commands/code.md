@@ -91,7 +91,7 @@ Ollama requests stream `/api/chat` responses by default and add a per-request `r
 
 Write control is local-only. `--control write` is rejected with `--stdio`, and it requires `--host` to be loopback (`127.0.0.1`, `::1`, or `localhost`). A second write-control instance using the same default paths fails fast with `CONTROL_INSTANCE_CONFLICT`; use distinct `--control-token-file` and `--control-info-file` paths only when the caller intentionally manages multiple local instances.
 
-Automation clients attach with `POST /api/code/controller/attach`, body `{ "clientId": "...", "kind": "automation" }`, header `X-Libra-Control-Token`, and then use the returned `X-Code-Controller-Token` for writes. Automation-held leases require both tokens for `/api/code/messages`, `/api/code/interactions/{id}`, `/api/code/controller/detach`, and `/api/code/control/cancel`. The local TUI can reclaim control with `/control reclaim`, which invalidates the automation lease. Code UI write request bodies are capped at 256KiB.
+Automation clients attach with `POST /api/code/controller/attach`, body `{ "clientId": "...", "kind": "automation" }`, header `X-Libra-Control-Token`, and then use the returned `X-Code-Controller-Token` for writes. Automation-held leases require both tokens for `/api/code/messages`, `/api/code/interactions/{id}`, `/api/code/controller/detach`, and `/api/code/control/cancel`. The local TUI can reclaim control with `/control reclaim`, which invalidates the automation lease. Code UI write request bodies are capped at 256KiB. When the session advertises `capabilities.commandIdempotency` (headless web-only today), `POST /api/code/messages` accepts `{ "text": "...", "commandId": "..." }` for retry de-duplication (same id + same text is idempotent; same id + different text returns `COMMAND_PAYLOAD_CONFLICT`). The runtime namespaces each `commandId` under a SHA-256 fence of the active controller `clientId` before durable admission (the raw clientId is never written into the command log). `commandIdempotency` is advertised only when durable SessionStore command admission is configured.
 
 `GET /api/code/diagnostics` returns a redacted observe-only status summary for local tools. Control attach, detach, submit, respond, and cancel operations emit `local-tui-control/v1` audit events through the runtime audit sink. For stdio automation clients, use [`libra code-control --stdio`](code-control.md); `libra code --stdio` remains the MCP stdio server and does not control a live TUI.
 
@@ -163,11 +163,14 @@ Code UI API errors use `{ error: { code, message } }`:
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | An automation-only path was called with a non-automation lease. |
 | `CODE_UI_UNAVAILABLE` | 404 | No active `libra code` session is attached to the web server. |
 | `INVALID_QUERY_PARAM` | 400 | Query parsing failed, currently for `/threads` pagination. |
+| `INVALID_COMMAND_ID` | 400 | `commandId` was empty, too long, or contained whitespace/control characters. |
 | `STORAGE_PATH_INVALID` | 500 | Storage-root resolution failed. |
 | `STATUS_UNAVAILABLE` | 500 | Runtime status snapshot is unavailable. |
 | `THREAD_LIST_FAILED` | 500 | Thread projection enumeration failed. |
 | `DB_UNAVAILABLE` | 500 | Session database is offline. |
 | `RECONCILIATION_REQUIRED` | 409 | A mutating turn needs manual reconciliation before another turn can run. |
+| `COMMAND_PAYLOAD_CONFLICT` | 409 | The same `commandId` was reused with a different message payload. |
+| `COMMAND_ALREADY_TERMINAL` | 409 | The same `commandId` already finished failed/cancelled/indeterminate; allocate a new `commandId` to retry. |
 | `INTERNAL_ERROR` | 500 | Fallback internal failure. |
 | `UNSUPPORTED_OPERATION` | 422 | Runtime rejected a requested operation that is not yet supported. |
 

@@ -48,6 +48,14 @@ smoke, which requires installed hooks to surface in `libra agent
 session/checkpoint list`. Codex additionally emits native sub-agent
 boundaries (`subagent-start` / `subagent-end`).
 
+Codex callbacks are advisory to the host agent. If a callback is invoked
+outside a Libra repository, or capture cannot complete because repository
+storage is unavailable, Libra records a non-sensitive retryable diagnostic on
+the captured session and exits successfully. The affected callback may be
+absent from capture output or lack its checkpoint, but capture availability
+never fails the Codex task. A later Codex `Stop` can re-own the abandoned
+coverage claim; inspect the state with `libra agent session show <session>`.
+
 `libra hooks gemini <verb>` no longer ingests: gemini is uninstall-only
 (AG-17), so stale hook configs installed before the demotion get an
 actionable error pointing at `libra agent remove gemini` instead of
@@ -85,8 +93,9 @@ boundaries), so Claude's on-disk sub-agent content is captured as `unresolved`.
 Each event reads its provider-specific JSON payload from stdin, runs
 the redaction pipeline (secrets / tokens / file content >256 KiB), and
 appends an `AgentTraceEvent` JSONL record into the active session
-store. The hook returns exit code 0 unless the payload fails to parse
-— provider hooks must never block on Libra-side processing.
+store. Codex always acknowledges its callback after an advisory capture
+failure; Claude keeps its validation failure status. Provider hooks must
+never block on Libra-side processing.
 
 ## Options
 
@@ -152,6 +161,6 @@ claude` looks roughly like:
 
 | Code | Meaning |
 |------|---------|
-| `0` | Event recorded (or silently skipped because capture is disabled / the session is unknown) |
-| `1` | The stdin payload failed schema validation; the hook caller may surface a warning, but provider hook flows treat this as non-fatal |
-| `128` | Fatal initialization error before any payload could be processed |
+| `0` | Codex event recorded, skipped, or acknowledged after an advisory capture failure; other providers may also return success after a normal skip |
+| `1` | A non-Codex stdin payload failed schema validation; the hook caller may surface a warning, but provider hook flows treat this as non-fatal |
+| `128` | A non-Codex hook encountered a fatal initialization error before its payload could be processed |

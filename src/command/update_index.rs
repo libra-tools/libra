@@ -126,11 +126,28 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
     // Positional paths: remove, or (re)stage from the working tree.
     let workdir = util::working_dir();
     for path_str in &args.paths {
+        // `--add` and `--remove` are separate permissions, not alternatives:
+        // Git reads `--add` as "a path the index does not know may be added"
+        // and `--remove` as "a path missing from the work tree may be dropped".
+        // Given both, presence on disk decides which applies — so a call that
+        // passes both must still stage a file that exists. Handling `--remove`
+        // first for every path made it swallow `--add` entirely: the command
+        // exited 0 having staged nothing.
+        //
+        // Only the combined case is re-routed here. `--remove` on its own keeps
+        // its established meaning (drop the path, present or not), because that
+        // is what the documented example and the existing coverage rely on.
         if args.remove {
-            if index.remove(path_str, 0).is_some() {
-                removed += 1;
+            // `join` with an absolute argument replaces the base, which matches
+            // what `resolve_within_worktree` does below, so the two agree on
+            // which file is being talked about.
+            let present = workdir.join(path_str).symlink_metadata().is_ok();
+            if !args.add || !present {
+                if index.remove(path_str, 0).is_some() {
+                    removed += 1;
+                }
+                continue;
             }
-            continue;
         }
 
         let tracked = index.tracked(path_str, 0);

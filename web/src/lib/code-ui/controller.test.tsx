@@ -12,6 +12,12 @@ const clientMocks = vi.hoisted(() => ({
   submitMessage: vi.fn(),
 }));
 
+const storeState = vi.hoisted(() => ({
+  snapshot: null as null | {
+    capabilities: { commandIdempotency?: boolean };
+  },
+}));
+
 vi.mock("./client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./client")>();
   return {
@@ -25,7 +31,9 @@ vi.mock("./client", async (importOriginal) => {
 });
 
 vi.mock("./store", () => ({
-  useCodeUiStore: () => ({ snapshot: null }),
+  useCodeUiStore: () => ({
+    snapshot: storeState.snapshot,
+  }),
 }));
 
 import { CodeUiClientError } from "./client";
@@ -104,7 +112,14 @@ async function captureControllerError(run: () => Promise<void>): Promise<unknown
 
 beforeEach(() => {
   (globalThis as ActGlobal).IS_REACT_ACT_ENVIRONMENT = true;
-  vi.stubGlobal("crypto", { randomUUID: () => "client-1" });
+  let uuidCounter = 0;
+  vi.stubGlobal("crypto", {
+    randomUUID: () => {
+      uuidCounter += 1;
+      return `id-${uuidCounter}`;
+    },
+  });
+  storeState.snapshot = null;
   vi.clearAllMocks();
 });
 
@@ -131,7 +146,7 @@ describe("BrowserControllerProvider", () => {
 
     expect(clientMocks.attachController).toHaveBeenCalledTimes(2);
     expect(clientMocks.attachController).toHaveBeenNthCalledWith(1, {
-      clientId: "browser-client-1",
+      clientId: expect.stringMatching(/^browser-id-\d+$/),
       kind: "browser",
     });
     expect(clientMocks.submitMessage).toHaveBeenNthCalledWith(
@@ -148,6 +163,91 @@ describe("BrowserControllerProvider", () => {
       kind: "attached",
       lease: { controllerToken: "fresh-token" },
     });
+
+    harness.unmount();
+  });
+
+  it("includes a stable commandId when the runtime advertises commandIdempotency", async () => {
+    storeState.snapshot = { capabilities: { commandIdempotency: true } };
+    clientMocks.attachController.mockResolvedValueOnce(attachResponse("lease-token"));
+    clientMocks.submitMessage
+      .mockRejectedValueOnce(
+        new CodeUiClientError("INVALID_CONTROLLER_TOKEN", "expired lease", 401),
+      )
+      .mockResolvedValueOnce({ accepted: true });
+    clientMocks.attachController.mockResolvedValueOnce(attachResponse("fresh-token"));
+
+    const harness = renderController();
+    await act(async () => {
+      await harness.controller.submit("/chat hello");
+    });
+
+    expect(clientMocks.submitMessage).toHaveBeenNthCalledWith(
+      1,
+      { text: "/chat hello", commandId: expect.stringMatching(/^cmd-/) },
+      "lease-token",
+    );
+    expect(clientMocks.submitMessage).toHaveBeenNthCalledWith(
+      2,
+      { text: "/chat hello", commandId: expect.stringMatching(/^cmd-/) },
+      "fresh-token",
+    );
+    const firstCommandId = clientMocks.submitMessage.mock.calls[0]?.[0]?.commandId;
+    const secondCommandId = clientMocks.submitMessage.mock.calls[1]?.[0]?.commandId;
+    expect(firstCommandId).toBe(secondCommandId);
+
+    harness.unmount();
+  });
+
+  it("reuses the same commandId when submit is retried after a transport failure", async () => {
+    storeState.snapshot = { capabilities: { commandIdempotency: true } };
+    clientMocks.attachController.mockResolvedValue(attachResponse("lease-token"));
+    clientMocks.submitMessage
+      .mockRejectedValueOnce(new CodeUiClientError("INTERNAL_ERROR", "network blip", 500))
+      .mockResolvedValueOnce({ accepted: true });
+
+    const harness = renderController();
+    const firstError = await captureControllerError(() =>
+      harness.controller.submit("/chat hello"),
+    );
+    expect(firstError).toBeInstanceOf(CodeUiClientError);
+
+    await act(async () => {
+      await harness.controller.submit("/chat hello");
+    });
+
+    const firstCommandId = clientMocks.submitMessage.mock.calls[0]?.[0]?.commandId;
+    const secondCommandId = clientMocks.submitMessage.mock.calls[1]?.[0]?.commandId;
+    expect(firstCommandId).toMatch(/^cmd-/);
+    expect(secondCommandId).toBe(firstCommandId);
+
+    harness.unmount();
+  });
+
+  it("keeps distinct pending commandIds when submits interleave before ack", async () => {
+    storeState.snapshot = { capabilities: { commandIdempotency: true } };
+    clientMocks.attachController.mockResolvedValue(attachResponse("lease-token"));
+    clientMocks.submitMessage
+      .mockRejectedValueOnce(new CodeUiClientError("INTERNAL_ERROR", "first failed", 500))
+      .mockRejectedValueOnce(new CodeUiClientError("INTERNAL_ERROR", "second failed", 500))
+      .mockResolvedValueOnce({ accepted: true })
+      .mockResolvedValueOnce({ accepted: true });
+
+    const harness = renderController();
+    await captureControllerError(() => harness.controller.submit("/chat one"));
+    await captureControllerError(() => harness.controller.submit("/chat two"));
+
+    await act(async () => {
+      await harness.controller.submit("/chat one");
+      await harness.controller.submit("/chat two");
+    });
+
+    const ids = clientMocks.submitMessage.mock.calls.map((call) => call[0]?.commandId);
+    expect(ids[0]).toMatch(/^cmd-/);
+    expect(ids[1]).toMatch(/^cmd-/);
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(ids[2]).toBe(ids[0]);
+    expect(ids[3]).toBe(ids[1]);
 
     harness.unmount();
   });

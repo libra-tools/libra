@@ -1262,6 +1262,7 @@ fn codex_code_ui_capabilities() -> CodeUiCapabilities {
         interactive_approvals: true,
         structured_questions: false,
         provider_session_resume: false,
+        command_idempotency: false,
     }
 }
 
