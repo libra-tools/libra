@@ -179,6 +179,12 @@ jobs:
       LIBRA_SKIP_WEB_BUILD: "1"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "1"
+      # libtest runs each test in a thread with a 2 MiB stack. An unoptimized
+      # async state machine — `switch::execute` and friends inline every
+      # awaited future into one frame — does not fit, and the test process
+      # ABORTS rather than failing. The real CLI runs those futures on the
+      # 8 MiB main thread, so this is a harness limit, not a product one.
+      RUST_MIN_STACK: "16777216"
 
     steps:
       - name: Checkout repository
@@ -256,10 +262,21 @@ jobs:
           #
           # Coverage is unchanged: lib, bins and doctests run here, so does
           # every other integration target, and `command_test` runs there.
+          #
+          # Targets whose `required-features` are not enabled are dropped, not
+          # named: `cargo test --all` SKIPS those silently, but naming one with
+          # `--test` is a hard error. The later steps in this job run each of
+          # them explicitly with the feature it needs.
           mapfile -t TARGETS < <(
             cargo metadata --no-deps --format-version 1 \
-              | jq -r '.packages[].targets[] | select(.kind[] == "test") | .name' \
-              | grep -vx command_test | sort -u
+              | jq -r '.packages[]
+                       | (.features.default // []) as $default
+                       | .targets[]
+                       | select(.kind[] == "test")
+                       | select(.name != "command_test")
+                       | select(((((."required-features") // []) - $default) | length) == 0)
+                       | .name' \
+              | sort -u
           )
           if [ "${#TARGETS[@]}" -lt 100 ]; then
             echo "::error::enumerated only ${#TARGETS[@]} integration targets; refusing to run a truncated suite"
@@ -351,7 +368,7 @@ jobs:
       # to see the whole binary's result in one run.
       fail-fast: false
       matrix:
-        shard: [0, 1]
+        shard: [0, 1, 2, 3]
 
     env:
       CARGO_TERM_COLOR: always
@@ -359,6 +376,13 @@ jobs:
       LIBRA_SKIP_WEB_BUILD: "1"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "1"
+      # See compat-offline-core: 2 MiB test threads cannot hold an
+      # unoptimized async state machine, and the process aborts if one
+      # overflows. `command::switch_test` needs a little over 2 MiB.
+      RUST_MIN_STACK: "16777216"
+      # Kept in one place so the matrix above and the partition below cannot
+      # disagree — a mismatch would silently drop or double-run tests.
+      SHARD_COUNT: "4"
 
     steps:
       - name: Checkout repository
@@ -406,11 +430,11 @@ jobs:
           fi
           MINE=()
           for index in "${!ALL[@]}"; do
-            if [ "$(( index % 2 ))" -eq "${{ matrix.shard }}" ]; then
+            if [ "$(( index % SHARD_COUNT ))" -eq "${{ matrix.shard }}" ]; then
               MINE+=("${ALL[$index]}")
             fi
           done
-          echo "shard ${{ matrix.shard }} of 2: ${#MINE[@]} of $total tests"
+          echo "shard ${{ matrix.shard }} of $SHARD_COUNT: ${#MINE[@]} of $total tests"
           cargo test --test command_test -- --exact "${MINE[@]}"
 
   network-remotes:
