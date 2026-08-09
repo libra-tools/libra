@@ -2823,6 +2823,17 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::File,
+        location: "<storage>/scorpiofs",
+        column: "",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::JsonManifest,
+        schema: "LibraScorpioFsState (schema_version, worker record, mounts[] with request.base_oid), plus the state lock and the managed worker's log",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "the ScorpioFS backend's DESIRED-state file: `base_oid` names a REMOTE monorepo revision the mount projects, not a local object-store id, so rooting it would demand objects this repository never wrote (same shape as MERGE_RR). Libra owns the durable desired state here precisely because the embedded worker persists none; the mount's own Git writes land in the object store through the ordinary commit path, which roots them",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
         location: "<gitdir>/merge-file-backup",
         column: "",
         status: GcSourceStatus::NonRoot,
