@@ -6,6 +6,9 @@
 //! row names the surface and cites the evidence; this file proves the surface
 //! behaves.
 //!
+//! Source family: `t4`. Pinned upstream revision:
+//! `dfb079967b9cbc99e533c21e65f674bb3f5e8b07`. Migration mode: clean-room.
+//!
 //! **Clean room.** Nothing here is transcribed from the upstream suite. The
 //! scenarios were read for their intent, then rewritten against Libra's own
 //! helpers with expectations taken from the Git-side contract. A gate enforces
@@ -56,8 +59,10 @@ fn t4_stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// Upstream scenario `t4000-diff-format::no-patch-in-git-diff-no-patch-compact-summary-is-a-no-op`.
-/// Ledger surface: `diff --no-patch`.
+/// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
+/// 覆盖范围: `libra diff` 的 `--no-patch` 子面；本用例实际执行 `libra diff --no-patch`。
+/// 边界: 覆盖 --no-patch 抑制补丁正文而不影响命令自身成功；不覆盖与 --no-patch 同时给出的统计类输出的具体格式。
+/// scenario_id: t4000-diff-format::no-patch-in-git-diff-no-patch-compact-summary-is-a-no-op
 #[test]
 fn t4_port_t4000_no_patch_in_git_diff_no_patch_compact_summary_is_a_no_op() {
     // `--no-patch` suppresses the patch body while the diff still runs.
@@ -68,8 +73,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_compact_summary_is_a_no_op() {
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
 }
 
-/// Upstream scenario `t4000-diff-format::no-patch-in-git-diff-no-patch-numstat-is-a-no-op`.
-/// Ledger surface: `diff --no-patch`.
+/// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
+/// 覆盖范围: `libra diff` 的 `--no-patch` 子面；本用例实际执行 `libra diff --no-patch`。
+/// 边界: 覆盖 --no-patch 抑制补丁正文而不影响命令自身成功；不覆盖与 --no-patch 同时给出的统计类输出的具体格式。
+/// scenario_id: t4000-diff-format::no-patch-in-git-diff-no-patch-numstat-is-a-no-op
 #[test]
 fn t4_port_t4000_no_patch_in_git_diff_no_patch_numstat_is_a_no_op() {
     // `--no-patch` suppresses the patch body while the diff still runs.
@@ -80,8 +87,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_numstat_is_a_no_op() {
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
 }
 
-/// Upstream scenario `t4000-diff-format::no-patch-in-git-diff-no-patch-raw-is-a-no-op`.
-/// Ledger surface: `diff --no-patch`.
+/// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
+/// 覆盖范围: `libra diff` 的 `--no-patch` 子面；本用例实际执行 `libra diff --no-patch`。
+/// 边界: 覆盖 --no-patch 抑制补丁正文而不影响命令自身成功；不覆盖与 --no-patch 同时给出的统计类输出的具体格式。
+/// scenario_id: t4000-diff-format::no-patch-in-git-diff-no-patch-raw-is-a-no-op
 #[test]
 fn t4_port_t4000_no_patch_in_git_diff_no_patch_raw_is_a_no_op() {
     // `--no-patch` suppresses the patch body while the diff still runs.
@@ -92,8 +101,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_raw_is_a_no_op() {
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
 }
 
-/// Upstream scenario `t4000-diff-format::no-patch-in-git-diff-no-patch-shortstat-is-a-no-op`.
-/// Ledger surface: `diff --no-patch`.
+/// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
+/// 覆盖范围: `libra diff` 的 `--no-patch` 子面；本用例实际执行 `libra diff --no-patch`。
+/// 边界: 覆盖 --no-patch 抑制补丁正文而不影响命令自身成功；不覆盖与 --no-patch 同时给出的统计类输出的具体格式。
+/// scenario_id: t4000-diff-format::no-patch-in-git-diff-no-patch-shortstat-is-a-no-op
 #[test]
 fn t4_port_t4000_no_patch_in_git_diff_no_patch_shortstat_is_a_no_op() {
     // `--no-patch` suppresses the patch body while the diff still runs.
@@ -104,8 +115,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_shortstat_is_a_no_op() {
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
 }
 
-/// Upstream scenario `t4000-diff-format::no-patch-in-git-diff-no-patch-stat-is-a-no-op`.
-/// Ledger surface: `diff --no-patch`.
+/// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
+/// 覆盖范围: `libra diff` 的 `--no-patch` 子面；本用例实际执行 `libra diff --no-patch`。
+/// 边界: 覆盖 --no-patch 抑制补丁正文而不影响命令自身成功；不覆盖与 --no-patch 同时给出的统计类输出的具体格式。
+/// scenario_id: t4000-diff-format::no-patch-in-git-diff-no-patch-stat-is-a-no-op
 #[test]
 fn t4_port_t4000_no_patch_in_git_diff_no_patch_stat_is_a_no_op() {
     // `--no-patch` suppresses the patch body while the diff still runs.
@@ -116,8 +129,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_stat_is_a_no_op() {
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
 }
 
-/// Upstream scenario `t4000-diff-format::no-patch-in-git-diff-no-patch-summary-is-a-no-op`.
-/// Ledger surface: `diff --no-patch`.
+/// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
+/// 覆盖范围: `libra diff` 的 `--no-patch` 子面；本用例实际执行 `libra diff --no-patch`。
+/// 边界: 覆盖 --no-patch 抑制补丁正文而不影响命令自身成功；不覆盖与 --no-patch 同时给出的统计类输出的具体格式。
+/// scenario_id: t4000-diff-format::no-patch-in-git-diff-no-patch-summary-is-a-no-op
 #[test]
 fn t4_port_t4000_no_patch_in_git_diff_no_patch_summary_is_a_no_op() {
     // `--no-patch` suppresses the patch body while the diff still runs.
@@ -128,8 +143,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_summary_is_a_no_op() {
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
 }
 
-/// Upstream scenario `t4000-diff-format::update-index-add-two-files-with-and-without-x`.
-/// Ledger surface: `update-index --add`.
+/// 功能: 用 update-index --add 直接把路径写进索引，断言 ls-files 能看到它。
+/// 覆盖范围: `libra update-index` 的 `--add` 子面；本用例实际执行 `libra update-index --add indexed.txt`。
+/// 边界: 覆盖 update-index --add 绕过 porcelain 的入索引路径；不覆盖 --remove 的反方向，也不含模式位改写。
+/// scenario_id: t4000-diff-format::update-index-add-two-files-with-and-without-x
 #[test]
 fn t4_port_t4000_update_index_add_two_files_with_and_without_x() {
     // `update-index --add` stages a path without the porcelain add.
@@ -145,8 +162,10 @@ fn t4_port_t4000_update_index_add_two_files_with_and_without_x() {
     );
 }
 
-/// Upstream scenario `t4001-diff-rename::favour-same-basenames-even-with-minor-differences`.
-/// Ledger surface: `status status`.
+/// 功能: 改动一个被跟踪路径后运行 status，断言 porcelain 输出报告了它。
+/// 覆盖范围: `libra status` 的 `status` 子面；本用例实际执行 `libra status --porcelain=v1`。
+/// 边界: 覆盖 status 的 porcelain 形式对已跟踪路径改动的报告；不覆盖未跟踪文件与忽略规则。
+/// scenario_id: t4001-diff-rename::favour-same-basenames-even-with-minor-differences
 #[test]
 fn t4_port_t4001_favour_same_basenames_even_with_minor_differences() {
     // `status` reports a modified tracked path in its porcelain form.
@@ -158,8 +177,10 @@ fn t4_port_t4001_favour_same_basenames_even_with_minor_differences() {
     assert!(text.contains(&name), "the modified path is listed: {text}");
 }
 
-/// Upstream scenario `t4001-diff-rename::favour-same-basenames-over-different-ones`.
-/// Ledger surface: `status status`.
+/// 功能: 改动一个被跟踪路径后运行 status，断言 porcelain 输出报告了它。
+/// 覆盖范围: `libra status` 的 `status` 子面；本用例实际执行 `libra status --porcelain=v1`。
+/// 边界: 覆盖 status 的 porcelain 形式对已跟踪路径改动的报告；不覆盖未跟踪文件与忽略规则。
+/// scenario_id: t4001-diff-rename::favour-same-basenames-over-different-ones
 #[test]
 fn t4_port_t4001_favour_same_basenames_over_different_ones() {
     // `status` reports a modified tracked path in its porcelain form.
@@ -171,125 +192,181 @@ fn t4_port_t4001_favour_same_basenames_over_different_ones() {
     assert!(text.contains(&name), "the modified path is listed: {text}");
 }
 
-/// Upstream scenario `t4001-diff-rename::rename-pretty-print-common-prefix-and-suffix-overlap`.
-/// Ledger surface: `diff -M`.
+/// 功能: 先用 mv 制造重命名，再以 -M --stat 渲染，断言统计行把新旧路径写成一对且只记一个改动文件。
+/// 覆盖范围: `libra diff` 的 `-M` 子面；本用例实际执行 `libra diff -M --staged --stat`。
+/// 边界: 覆盖 -M 的重命名还原与 --stat 的成对渲染；不覆盖相似度阈值的取值，也不含非重命名改动的统计。
+/// scenario_id: t4001-diff-rename::rename-pretty-print-common-prefix-and-suffix-overlap
 #[test]
 fn t4_port_t4001_rename_pretty_print_common_prefix_and_suffix_overlap() {
-    // `-M` turns a delete/create pair back into the rename it was.
+    // `-M` restores the rename and `--stat` renders it as ONE changed path
+    // written `old => new`, not as a delete plus a create.
     let (repo, name) = t4_repo("t009");
     assert_cli_success(
         &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
         "rename it",
     );
-    let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
-    assert_cli_success(&out, "diff -M --staged --name-status");
+    let out = run_libra_command(&["diff", "-M", "--staged", "--stat"], repo.path());
+    assert_cli_success(&out, "diff -M --staged --stat");
     let text = t4_stdout(&out);
-    assert!(text.contains("moved.txt"), "the new path appears: {text}");
     assert!(
-        text.starts_with('R') || text.contains(&name),
-        "rename or pair: {text}"
+        text.contains(&format!("{name} => moved.txt")),
+        "the stat line pairs both paths: {text}"
+    );
+    assert!(
+        text.contains("1 file changed"),
+        "a rename is one changed path, not two: {text}"
     );
 }
 
-/// Upstream scenario `t4001-diff-rename::rename-pretty-print-with-common-prefix`.
-/// Ledger surface: `diff -M`.
+/// 功能: 先用 mv 制造重命名，再以 -M --stat 渲染，断言统计行把新旧路径写成一对且只记一个改动文件。
+/// 覆盖范围: `libra diff` 的 `-M` 子面；本用例实际执行 `libra diff -M --staged --stat`。
+/// 边界: 覆盖 -M 的重命名还原与 --stat 的成对渲染；不覆盖相似度阈值的取值，也不含非重命名改动的统计。
+/// scenario_id: t4001-diff-rename::rename-pretty-print-with-common-prefix
 #[test]
 fn t4_port_t4001_rename_pretty_print_with_common_prefix() {
-    // `-M` turns a delete/create pair back into the rename it was.
+    // `-M` restores the rename and `--stat` renders it as ONE changed path
+    // written `old => new`, not as a delete plus a create.
     let (repo, name) = t4_repo("t010");
     assert_cli_success(
         &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
         "rename it",
     );
-    let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
-    assert_cli_success(&out, "diff -M --staged --name-status");
+    let out = run_libra_command(&["diff", "-M", "--staged", "--stat"], repo.path());
+    assert_cli_success(&out, "diff -M --staged --stat");
     let text = t4_stdout(&out);
-    assert!(text.contains("moved.txt"), "the new path appears: {text}");
     assert!(
-        text.starts_with('R') || text.contains(&name),
-        "rename or pair: {text}"
+        text.contains(&format!("{name} => moved.txt")),
+        "the stat line pairs both paths: {text}"
+    );
+    assert!(
+        text.contains("1 file changed"),
+        "a rename is one changed path, not two: {text}"
     );
 }
 
-/// Upstream scenario `t4001-diff-rename::rename-pretty-print-with-common-prefix-and-suffix`.
-/// Ledger surface: `diff -M`.
+/// 功能: 先用 mv 制造重命名，再以 -M --stat 渲染，断言统计行把新旧路径写成一对且只记一个改动文件。
+/// 覆盖范围: `libra diff` 的 `-M` 子面；本用例实际执行 `libra diff -M --staged --stat`。
+/// 边界: 覆盖 -M 的重命名还原与 --stat 的成对渲染；不覆盖相似度阈值的取值，也不含非重命名改动的统计。
+/// scenario_id: t4001-diff-rename::rename-pretty-print-with-common-prefix-and-suffix
 #[test]
 fn t4_port_t4001_rename_pretty_print_with_common_prefix_and_suffix() {
-    // `-M` turns a delete/create pair back into the rename it was.
+    // `-M` restores the rename and `--stat` renders it as ONE changed path
+    // written `old => new`, not as a delete plus a create.
     let (repo, name) = t4_repo("t011");
     assert_cli_success(
         &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
         "rename it",
     );
-    let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
-    assert_cli_success(&out, "diff -M --staged --name-status");
+    let out = run_libra_command(&["diff", "-M", "--staged", "--stat"], repo.path());
+    assert_cli_success(&out, "diff -M --staged --stat");
     let text = t4_stdout(&out);
-    assert!(text.contains("moved.txt"), "the new path appears: {text}");
     assert!(
-        text.starts_with('R') || text.contains(&name),
-        "rename or pair: {text}"
+        text.contains(&format!("{name} => moved.txt")),
+        "the stat line pairs both paths: {text}"
+    );
+    assert!(
+        text.contains("1 file changed"),
+        "a rename is one changed path, not two: {text}"
     );
 }
 
-/// Upstream scenario `t4001-diff-rename::rename-pretty-print-with-common-suffix`.
-/// Ledger surface: `diff -M`.
+/// 功能: 先用 mv 制造重命名，再以 -M --stat 渲染，断言统计行把新旧路径写成一对且只记一个改动文件。
+/// 覆盖范围: `libra diff` 的 `-M` 子面；本用例实际执行 `libra diff -M --staged --stat`。
+/// 边界: 覆盖 -M 的重命名还原与 --stat 的成对渲染；不覆盖相似度阈值的取值，也不含非重命名改动的统计。
+/// scenario_id: t4001-diff-rename::rename-pretty-print-with-common-suffix
 #[test]
 fn t4_port_t4001_rename_pretty_print_with_common_suffix() {
-    // `-M` turns a delete/create pair back into the rename it was.
+    // `-M` restores the rename and `--stat` renders it as ONE changed path
+    // written `old => new`, not as a delete plus a create.
     let (repo, name) = t4_repo("t012");
     assert_cli_success(
         &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
         "rename it",
     );
-    let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
-    assert_cli_success(&out, "diff -M --staged --name-status");
+    let out = run_libra_command(&["diff", "-M", "--staged", "--stat"], repo.path());
+    assert_cli_success(&out, "diff -M --staged --stat");
     let text = t4_stdout(&out);
-    assert!(text.contains("moved.txt"), "the new path appears: {text}");
     assert!(
-        text.starts_with('R') || text.contains(&name),
-        "rename or pair: {text}"
+        text.contains(&format!("{name} => moved.txt")),
+        "the stat line pairs both paths: {text}"
+    );
+    assert!(
+        text.contains("1 file changed"),
+        "a rename is one changed path, not two: {text}"
     );
 }
 
-/// Upstream scenario `t4001-diff-rename::rename-pretty-print-with-nothing-in-common`.
-/// Ledger surface: `diff -M`.
+/// 功能: 先用 mv 制造重命名，再以 -M --stat 渲染，断言统计行把新旧路径写成一对且只记一个改动文件。
+/// 覆盖范围: `libra diff` 的 `-M` 子面；本用例实际执行 `libra diff -M --staged --stat`。
+/// 边界: 覆盖 -M 的重命名还原与 --stat 的成对渲染；不覆盖相似度阈值的取值，也不含非重命名改动的统计。
+/// scenario_id: t4001-diff-rename::rename-pretty-print-with-nothing-in-common
 #[test]
 fn t4_port_t4001_rename_pretty_print_with_nothing_in_common() {
-    // `-M` turns a delete/create pair back into the rename it was.
+    // `-M` restores the rename and `--stat` renders it as ONE changed path
+    // written `old => new`, not as a delete plus a create.
     let (repo, name) = t4_repo("t013");
     assert_cli_success(
         &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
         "rename it",
     );
-    let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
-    assert_cli_success(&out, "diff -M --staged --name-status");
+    let out = run_libra_command(&["diff", "-M", "--staged", "--stat"], repo.path());
+    assert_cli_success(&out, "diff -M --staged --stat");
     let text = t4_stdout(&out);
-    assert!(text.contains("moved.txt"), "the new path appears: {text}");
     assert!(
-        text.starts_with('R') || text.contains(&name),
-        "rename or pair: {text}"
+        text.contains(&format!("{name} => moved.txt")),
+        "the stat line pairs both paths: {text}"
+    );
+    assert!(
+        text.contains("1 file changed"),
+        "a rename is one changed path, not two: {text}"
     );
 }
 
-/// Upstream scenario `t4001-diff-rename::renamed-and-edited-the-file`.
-/// Ledger surface: `update-index --add`.
+/// 功能: 一次调用同时给出 --add 与 --remove：先断言新路径进入索引，删除该文件后再断言它被移出索引。
+/// 覆盖范围: `libra update-index` 的 `--add` 子面；本用例实际执行 `libra update-index --add --remove indexed.txt`。
+/// 边界: 覆盖 --add 与 --remove 组合时的两个方向；不覆盖 --refresh 与 --cacheinfo 等其它 update-index 子面。
+/// scenario_id: t4001-diff-rename::renamed-and-edited-the-file
 #[test]
 fn t4_port_t4001_renamed_and_edited_the_file() {
-    // `update-index --add` stages a path without the porcelain add.
+    // `--add` stages a path the index does not know and `--remove` records the
+    // disappearance of one that is gone from the work tree. The upstream setup
+    // passes both in a single call, so both halves are exercised here.
     let (repo, _name) = t4_repo("t014");
     std::fs::write(repo.path().join("indexed.txt"), "content\n").expect("write it");
-    let out = run_libra_command(&["update-index", "--add", "indexed.txt"], repo.path());
-    assert_cli_success(&out, "update-index --add");
+    assert_cli_success(
+        &run_libra_command(
+            &["update-index", "--add", "--remove", "indexed.txt"],
+            repo.path(),
+        ),
+        "update-index --add --remove stages a new path",
+    );
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
     assert!(
         t4_stdout(&listed).contains("indexed.txt"),
-        "the path is in the index"
+        "--add put the path in the index"
+    );
+    std::fs::remove_file(repo.path().join("indexed.txt")).expect("delete it");
+    assert_cli_success(
+        &run_libra_command(
+            &["update-index", "--add", "--remove", "indexed.txt"],
+            repo.path(),
+        ),
+        "update-index --add --remove drops a vanished path",
+    );
+    let after = run_libra_command(&["ls-files"], repo.path());
+    assert_cli_success(&after, "ls-files after the removal");
+    assert!(
+        !t4_stdout(&after).contains("indexed.txt"),
+        "--remove took the vanished path back out: {}",
+        t4_stdout(&after)
     );
 }
 
-/// Upstream scenario `t4001-diff-rename::setup`.
-/// Ledger surface: `diff diff`.
+/// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
+/// 覆盖范围: `libra diff` 的 `diff` 子面；本用例实际执行 `libra diff`。
+/// 边界: 覆盖 默认（无 --cached）的工作区 vs 索引比较与补丁正文；不覆盖 --cached 的索引 vs HEAD 比较，也不含重命名检测。
+/// scenario_id: t4001-diff-rename::setup
 #[test]
 fn t4_port_t4001_setup() {
     // The default diff: the working tree against the index, as a patch that
@@ -303,23 +380,37 @@ fn t4_port_t4001_setup() {
     assert!(text.contains("three"), "the added line appears: {text}");
 }
 
-/// Upstream scenario `t4001-diff-rename::test-diff-renames-unset`.
-/// Ledger surface: `diff diff`.
+/// 功能: 暂存改动后以 --cached 比较索引与 HEAD，并断言工作区已无剩余差异，证明是 --cached 看到了它。
+/// 覆盖范围: `libra diff` 的 `diff` 子面；本用例实际执行 `libra diff`。
+/// 边界: 覆盖 --cached 选择索引 vs HEAD 的比较面；不覆盖三方比较与 HEAD 之外的 commit-ish。
+/// scenario_id: t4001-diff-rename::test-diff-renames-unset
 #[test]
 fn t4_port_t4001_test_diff_renames_unset() {
-    // The default diff: the working tree against the index, as a patch that
-    // names the path it changed.
+    // The staged diff compares the index against HEAD, which is what `--cached`
+    // selects; without it the same command would report the work tree instead.
     let (repo, name) = t4_repo("t016");
     t4_touch(&repo, &name);
-    let out = run_libra_command(&["diff"], repo.path());
-    assert_cli_success(&out, "diff");
+    assert_cli_success(
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    let out = run_libra_command(&["diff", "--cached"], repo.path());
+    assert_cli_success(&out, "diff --cached");
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the patch names the path: {text}");
-    assert!(text.contains("three"), "the added line appears: {text}");
+    assert!(text.contains("three"), "the staged line appears: {text}");
+    let worktree = run_libra_command(&["diff"], repo.path());
+    assert_cli_success(&worktree, "diff");
+    assert!(
+        t4_stdout(&worktree).is_empty(),
+        "nothing is left unstaged, so --cached is what showed the change"
+    );
 }
 
-/// Upstream scenario `t4001-diff-rename::two-files-with-same-basename-and-same-content`.
-/// Ledger surface: `status status`.
+/// 功能: 改动一个被跟踪路径后运行 status，断言 porcelain 输出报告了它。
+/// 覆盖范围: `libra status` 的 `status` 子面；本用例实际执行 `libra status --porcelain=v1`。
+/// 边界: 覆盖 status 的 porcelain 形式对已跟踪路径改动的报告；不覆盖未跟踪文件与忽略规则。
+/// scenario_id: t4001-diff-rename::two-files-with-same-basename-and-same-content
 #[test]
 fn t4_port_t4001_two_files_with_same_basename_and_same_content() {
     // `status` reports a modified tracked path in its porcelain form.
@@ -331,8 +422,10 @@ fn t4_port_t4001_two_files_with_same_basename_and_same_content() {
     assert!(text.contains(&name), "the modified path is listed: {text}");
 }
 
-/// Upstream scenario `t4001-diff-rename::update-index-add-a-file`.
-/// Ledger surface: `update-index --add`.
+/// 功能: 用 update-index --add 直接把路径写进索引，断言 ls-files 能看到它。
+/// 覆盖范围: `libra update-index` 的 `--add` 子面；本用例实际执行 `libra update-index --add indexed.txt`。
+/// 边界: 覆盖 update-index --add 绕过 porcelain 的入索引路径；不覆盖 --remove 的反方向，也不含模式位改写。
+/// scenario_id: t4001-diff-rename::update-index-add-a-file
 #[test]
 fn t4_port_t4001_update_index_add_a_file() {
     // `update-index --add` stages a path without the porcelain add.
@@ -348,8 +441,10 @@ fn t4_port_t4001_update_index_add_a_file() {
     );
 }
 
-/// Upstream scenario `t4001-diff-rename::write-that-tree`.
-/// Ledger surface: `write-tree write-tree`.
+/// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
+/// 覆盖范围: `libra write-tree` 的 `write-tree` 子面；本用例实际执行 `libra write-tree`。
+/// 边界: 覆盖 write-tree 从索引产出树对象并打印其 id；不覆盖树内容的逐项比对，也不含空索引的行为。
+/// scenario_id: t4001-diff-rename::write-that-tree
 #[test]
 fn t4_port_t4001_write_that_tree() {
     // `write-tree` records the index as a tree and prints its object id.
@@ -361,8 +456,10 @@ fn t4_port_t4001_write_that_tree() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
 }
 
-/// Upstream scenario `t4003-diff-rename-1::prepare-reference-tree`.
-/// Ledger surface: `write-tree write-tree`.
+/// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
+/// 覆盖范围: `libra write-tree` 的 `write-tree` 子面；本用例实际执行 `libra write-tree`。
+/// 边界: 覆盖 write-tree 从索引产出树对象并打印其 id；不覆盖树内容的逐项比对，也不含空索引的行为。
+/// scenario_id: t4003-diff-rename-1::prepare-reference-tree
 #[test]
 fn t4_port_t4003_prepare_reference_tree() {
     // `write-tree` records the index as a tree and prints its object id.
@@ -374,8 +471,10 @@ fn t4_port_t4003_prepare_reference_tree() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
 }
 
-/// Upstream scenario `t4004-diff-rename-symlink::prepare-reference-tree`.
-/// Ledger surface: `write-tree write-tree`.
+/// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
+/// 覆盖范围: `libra write-tree` 的 `write-tree` 子面；本用例实际执行 `libra write-tree`。
+/// 边界: 覆盖 write-tree 从索引产出树对象并打印其 id；不覆盖树内容的逐项比对，也不含空索引的行为。
+/// scenario_id: t4004-diff-rename-symlink::prepare-reference-tree
 #[test]
 fn t4_port_t4004_prepare_reference_tree() {
     // `write-tree` records the index as a tree and prints its object id.
@@ -387,25 +486,51 @@ fn t4_port_t4004_prepare_reference_tree() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
 }
 
-/// Upstream scenario `t4004-diff-rename-symlink::prepare-work-tree`.
-/// Ledger surface: `update-index --add`.
+/// 功能: 一次调用同时给出 --add 与 --remove：先断言新路径进入索引，删除该文件后再断言它被移出索引。
+/// 覆盖范围: `libra update-index` 的 `--add` 子面；本用例实际执行 `libra update-index --add --remove indexed.txt`。
+/// 边界: 覆盖 --add 与 --remove 组合时的两个方向；不覆盖 --refresh 与 --cacheinfo 等其它 update-index 子面。
+/// scenario_id: t4004-diff-rename-symlink::prepare-work-tree
 #[test]
 fn t4_port_t4004_prepare_work_tree() {
-    // `update-index --add` stages a path without the porcelain add.
+    // `--add` stages a path the index does not know and `--remove` records the
+    // disappearance of one that is gone from the work tree. The upstream setup
+    // passes both in a single call, so both halves are exercised here.
     let (repo, _name) = t4_repo("t022");
     std::fs::write(repo.path().join("indexed.txt"), "content\n").expect("write it");
-    let out = run_libra_command(&["update-index", "--add", "indexed.txt"], repo.path());
-    assert_cli_success(&out, "update-index --add");
+    assert_cli_success(
+        &run_libra_command(
+            &["update-index", "--add", "--remove", "indexed.txt"],
+            repo.path(),
+        ),
+        "update-index --add --remove stages a new path",
+    );
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
     assert!(
         t4_stdout(&listed).contains("indexed.txt"),
-        "the path is in the index"
+        "--add put the path in the index"
+    );
+    std::fs::remove_file(repo.path().join("indexed.txt")).expect("delete it");
+    assert_cli_success(
+        &run_libra_command(
+            &["update-index", "--add", "--remove", "indexed.txt"],
+            repo.path(),
+        ),
+        "update-index --add --remove drops a vanished path",
+    );
+    let after = run_libra_command(&["ls-files"], repo.path());
+    assert_cli_success(&after, "ls-files after the removal");
+    assert!(
+        !t4_stdout(&after).contains("indexed.txt"),
+        "--remove took the vanished path back out: {}",
+        t4_stdout(&after)
     );
 }
 
-/// Upstream scenario `t4005-diff-rename-2::setup-reference-tree`.
-/// Ledger surface: `hash-object hash-object`.
+/// 功能: 对同一内容两次求 id，断言结果一致，证明它是内容的纯函数。
+/// 覆盖范围: `libra hash-object` 的 `hash-object` 子面；本用例实际执行 `libra hash-object blob.txt`。
+/// 边界: 覆盖 hash-object 的内容决定性；不覆盖 -w 落盘与 --stdin 输入形式。
+/// scenario_id: t4005-diff-rename-2::setup-reference-tree
 #[test]
 fn t4_port_t4005_setup_reference_tree() {
     // `hash-object` is a pure function of the content: same bytes, same id.
@@ -423,8 +548,10 @@ fn t4_port_t4005_setup_reference_tree() {
     assert_eq!(t4_stdout(&first).len(), 40);
 }
 
-/// Upstream scenario `t4006-diff-mode::prepare-binary-file`.
-/// Ledger surface: `commit -m`.
+/// 功能: 以 -m 提交并回读日志，断言给定的消息被原样记录。
+/// 覆盖范围: `libra commit` 的 `-m` 子面；本用例实际执行 `libra commit -m recorded subject --no-verify`。
+/// 边界: 覆盖 commit -m 的消息记录；不覆盖提交者身份与签名，也不含多段消息。
+/// scenario_id: t4006-diff-mode::prepare-binary-file
 #[test]
 fn t4_port_t4006_prepare_binary_file() {
     // `commit -m` records the message it was given.
@@ -447,8 +574,10 @@ fn t4_port_t4006_prepare_binary_file() {
     );
 }
 
-/// Upstream scenario `t4006-diff-mode::setup`.
-/// Ledger surface: `write-tree write-tree`.
+/// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
+/// 覆盖范围: `libra write-tree` 的 `write-tree` 子面；本用例实际执行 `libra write-tree`。
+/// 边界: 覆盖 write-tree 从索引产出树对象并打印其 id；不覆盖树内容的逐项比对，也不含空索引的行为。
+/// scenario_id: t4006-diff-mode::setup
 #[test]
 fn t4_port_t4006_setup() {
     // `write-tree` records the index as a tree and prints its object id.
@@ -460,8 +589,10 @@ fn t4_port_t4006_setup() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
 }
 
-/// Upstream scenario `t4006-diff-mode::shortstat-output-after-binary-chmod`.
-/// Ledger surface: `diff --shortstat`.
+/// 功能: 运行 --shortstat，断言输出收敛为单行汇总。
+/// 覆盖范围: `libra diff` 的 `--shortstat` 子面；本用例实际执行 `libra diff --shortstat`。
+/// 边界: 覆盖 --shortstat 的单行汇总；不覆盖逐文件明细，也不含二进制文件的计数。
+/// scenario_id: t4006-diff-mode::shortstat-output-after-binary-chmod
 #[test]
 fn t4_port_t4006_shortstat_output_after_binary_chmod() {
     // `--shortstat` collapses the diffstat to a single summary line.
@@ -475,8 +606,10 @@ fn t4_port_t4006_shortstat_output_after_binary_chmod() {
     assert!(text.contains("1 insertion"), "{text}");
 }
 
-/// Upstream scenario `t4006-diff-mode::shortstat-output-after-text-chmod`.
-/// Ledger surface: `diff --shortstat`.
+/// 功能: 运行 --shortstat，断言输出收敛为单行汇总。
+/// 覆盖范围: `libra diff` 的 `--shortstat` 子面；本用例实际执行 `libra diff --shortstat`。
+/// 边界: 覆盖 --shortstat 的单行汇总；不覆盖逐文件明细，也不含二进制文件的计数。
+/// scenario_id: t4006-diff-mode::shortstat-output-after-text-chmod
 #[test]
 fn t4_port_t4006_shortstat_output_after_text_chmod() {
     // `--shortstat` collapses the diffstat to a single summary line.
@@ -490,8 +623,10 @@ fn t4_port_t4006_shortstat_output_after_text_chmod() {
     assert!(text.contains("1 insertion"), "{text}");
 }
 
-/// Upstream scenario `t4006-diff-mode::stat-output-after-binary-chmod`.
-/// Ledger surface: `diff --stat`.
+/// 功能: 运行 --stat，断言每个路径带变更条、末尾给出总计。
+/// 覆盖范围: `libra diff` 的 `--stat` 子面；本用例实际执行 `libra diff --stat`。
+/// 边界: 覆盖 --stat 的逐路径明细与总计行；不覆盖列宽自适应与 --stat-width 调整。
+/// scenario_id: t4006-diff-mode::stat-output-after-binary-chmod
 #[test]
 fn t4_port_t4006_stat_output_after_binary_chmod() {
     // `--stat` names each path with its change bar, then totals the series.
@@ -504,8 +639,10 @@ fn t4_port_t4006_stat_output_after_binary_chmod() {
     assert!(text.contains("1 file changed"), "{text}");
 }
 
-/// Upstream scenario `t4006-diff-mode::stat-output-after-text-chmod`.
-/// Ledger surface: `diff --stat`.
+/// 功能: 运行 --stat，断言每个路径带变更条、末尾给出总计。
+/// 覆盖范围: `libra diff` 的 `--stat` 子面；本用例实际执行 `libra diff --stat`。
+/// 边界: 覆盖 --stat 的逐路径明细与总计行；不覆盖列宽自适应与 --stat-width 调整。
+/// scenario_id: t4006-diff-mode::stat-output-after-text-chmod
 #[test]
 fn t4_port_t4006_stat_output_after_text_chmod() {
     // `--stat` names each path with its change bar, then totals the series.
@@ -518,8 +655,10 @@ fn t4_port_t4006_stat_output_after_text_chmod() {
     assert!(text.contains("1 file changed"), "{text}");
 }
 
-/// Upstream scenario `t4007-rename-3::prepare-reference-tree`.
-/// Ledger surface: `rev-parse rev-parse`.
+/// 功能: 解析 HEAD，断言得到一个具体的对象 id。
+/// 覆盖范围: `libra rev-parse` 的 `rev-parse` 子面；本用例实际执行 `libra rev-parse HEAD`。
+/// 边界: 覆盖 rev-parse 对 HEAD 的解析；不覆盖 --abbrev-ref 与其它 revision 语法。
+/// scenario_id: t4007-rename-3::prepare-reference-tree
 #[test]
 fn t4_port_t4007_prepare_reference_tree() {
     // `rev-parse HEAD` resolves the tip to a concrete object id.
@@ -531,25 +670,51 @@ fn t4_port_t4007_prepare_reference_tree() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
 }
 
-/// Upstream scenario `t4007-rename-3::prepare-work-tree`.
-/// Ledger surface: `update-index --add`.
+/// 功能: 一次调用同时给出 --add 与 --remove：先断言新路径进入索引，删除该文件后再断言它被移出索引。
+/// 覆盖范围: `libra update-index` 的 `--add` 子面；本用例实际执行 `libra update-index --add --remove indexed.txt`。
+/// 边界: 覆盖 --add 与 --remove 组合时的两个方向；不覆盖 --refresh 与 --cacheinfo 等其它 update-index 子面。
+/// scenario_id: t4007-rename-3::prepare-work-tree
 #[test]
 fn t4_port_t4007_prepare_work_tree() {
-    // `update-index --add` stages a path without the porcelain add.
+    // `--add` stages a path the index does not know and `--remove` records the
+    // disappearance of one that is gone from the work tree. The upstream setup
+    // passes both in a single call, so both halves are exercised here.
     let (repo, _name) = t4_repo("t031");
     std::fs::write(repo.path().join("indexed.txt"), "content\n").expect("write it");
-    let out = run_libra_command(&["update-index", "--add", "indexed.txt"], repo.path());
-    assert_cli_success(&out, "update-index --add");
+    assert_cli_success(
+        &run_libra_command(
+            &["update-index", "--add", "--remove", "indexed.txt"],
+            repo.path(),
+        ),
+        "update-index --add --remove stages a new path",
+    );
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
     assert!(
         t4_stdout(&listed).contains("indexed.txt"),
-        "the path is in the index"
+        "--add put the path in the index"
+    );
+    std::fs::remove_file(repo.path().join("indexed.txt")).expect("delete it");
+    assert_cli_success(
+        &run_libra_command(
+            &["update-index", "--add", "--remove", "indexed.txt"],
+            repo.path(),
+        ),
+        "update-index --add --remove drops a vanished path",
+    );
+    let after = run_libra_command(&["ls-files"], repo.path());
+    assert_cli_success(&after, "ls-files after the removal");
+    assert!(
+        !t4_stdout(&after).contains("indexed.txt"),
+        "--remove took the vanished path back out: {}",
+        t4_stdout(&after)
     );
 }
 
-/// Upstream scenario `t4007-rename-3::tweak-index`.
-/// Ledger surface: `update-index --remove`.
+/// 功能: 用 update-index --remove 把路径移出索引，断言 ls-files 不再列出它。
+/// 覆盖范围: `libra update-index` 的 `--remove` 子面；本用例实际执行 `libra update-index --remove`。
+/// 边界: 覆盖 update-index --remove 的移除方向；不覆盖 --add 的反方向。
+/// scenario_id: t4007-rename-3::tweak-index
 #[test]
 fn t4_port_t4007_tweak_index() {
     // `update-index --remove` drops a path from the index.
@@ -565,8 +730,10 @@ fn t4_port_t4007_tweak_index() {
     );
 }
 
-/// Upstream scenario `t4009-diff-rename-4::prepare-reference-tree`.
-/// Ledger surface: `write-tree write-tree`.
+/// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
+/// 覆盖范围: `libra write-tree` 的 `write-tree` 子面；本用例实际执行 `libra write-tree`。
+/// 边界: 覆盖 write-tree 从索引产出树对象并打印其 id；不覆盖树内容的逐项比对，也不含空索引的行为。
+/// scenario_id: t4009-diff-rename-4::prepare-reference-tree
 #[test]
 fn t4_port_t4009_prepare_reference_tree() {
     // `write-tree` records the index as a tree and prints its object id.
@@ -578,8 +745,10 @@ fn t4_port_t4009_prepare_reference_tree() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
 }
 
-/// Upstream scenario `t4010-diff-pathspec::diff-cache-ignores-trailing-slash-on-submodule-path`.
-/// Ledger surface: `diff --name-only`.
+/// 功能: 运行 --name-only，断言输出只剩改动路径而没有补丁正文。
+/// 覆盖范围: `libra diff` 的 `--name-only` 子面；本用例实际执行 `libra diff --name-only`。
+/// 边界: 覆盖 --name-only 的路径清单输出；不覆盖路径的排序规则，也不含重命名的成对显示。
+/// scenario_id: t4010-diff-pathspec::diff-cache-ignores-trailing-slash-on-submodule-path
 #[test]
 fn t4_port_t4010_diff_cache_ignores_trailing_slash_on_submodule_path() {
     // `--name-only` reduces the diff to the changed paths, nothing else.
@@ -590,8 +759,10 @@ fn t4_port_t4010_diff_cache_ignores_trailing_slash_on_submodule_path() {
     assert_eq!(t4_stdout(&out), name);
 }
 
-/// Upstream scenario `t4010-diff-pathspec::diff-multiple-wildcard-pathspecs`.
-/// Ledger surface: `diff --name-only`.
+/// 功能: 运行 --name-only，断言输出只剩改动路径而没有补丁正文。
+/// 覆盖范围: `libra diff` 的 `--name-only` 子面；本用例实际执行 `libra diff --name-only`。
+/// 边界: 覆盖 --name-only 的路径清单输出；不覆盖路径的排序规则，也不含重命名的成对显示。
+/// scenario_id: t4010-diff-pathspec::diff-multiple-wildcard-pathspecs
 #[test]
 fn t4_port_t4010_diff_multiple_wildcard_pathspecs() {
     // `--name-only` reduces the diff to the changed paths, nothing else.
@@ -602,8 +773,10 @@ fn t4_port_t4010_diff_multiple_wildcard_pathspecs() {
     assert_eq!(t4_stdout(&out), name);
 }
 
-/// Upstream scenario `t4010-diff-pathspec::diff-tree-ignores-trailing-slash-on-submodule-path`.
-/// Ledger surface: `diff --name-only`.
+/// 功能: 运行 --name-only，断言输出只剩改动路径而没有补丁正文。
+/// 覆盖范围: `libra diff` 的 `--name-only` 子面；本用例实际执行 `libra diff --name-only`。
+/// 边界: 覆盖 --name-only 的路径清单输出；不覆盖路径的排序规则，也不含重命名的成对显示。
+/// scenario_id: t4010-diff-pathspec::diff-tree-ignores-trailing-slash-on-submodule-path
 #[test]
 fn t4_port_t4010_diff_tree_ignores_trailing_slash_on_submodule_path() {
     // `--name-only` reduces the diff to the changed paths, nothing else.
@@ -614,8 +787,10 @@ fn t4_port_t4010_diff_tree_ignores_trailing_slash_on_submodule_path() {
     assert_eq!(t4_stdout(&out), name);
 }
 
-/// Upstream scenario `t4010-diff-pathspec::setup`.
-/// Ledger surface: `hash-object hash-object`.
+/// 功能: 对同一内容两次求 id，断言结果一致，证明它是内容的纯函数。
+/// 覆盖范围: `libra hash-object` 的 `hash-object` 子面；本用例实际执行 `libra hash-object blob.txt`。
+/// 边界: 覆盖 hash-object 的内容决定性；不覆盖 -w 落盘与 --stdin 输入形式。
+/// scenario_id: t4010-diff-pathspec::setup
 #[test]
 fn t4_port_t4010_setup() {
     // `hash-object` is a pure function of the content: same bytes, same id.
@@ -633,8 +808,10 @@ fn t4_port_t4010_setup() {
     assert_eq!(t4_stdout(&first).len(), 40);
 }
 
-/// Upstream scenario `t4010-diff-pathspec::setup-submodules`.
-/// Ledger surface: `commit -m`.
+/// 功能: 以 -m 提交并回读日志，断言给定的消息被原样记录。
+/// 覆盖范围: `libra commit` 的 `-m` 子面；本用例实际执行 `libra commit -m recorded subject --no-verify`。
+/// 边界: 覆盖 commit -m 的消息记录；不覆盖提交者身份与签名，也不含多段消息。
+/// scenario_id: t4010-diff-pathspec::setup-submodules
 #[test]
 fn t4_port_t4010_setup_submodules() {
     // `commit -m` records the message it was given.
@@ -657,8 +834,10 @@ fn t4_port_t4010_setup_submodules() {
     );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-attach-produces-mime-attachment`.
-/// Ledger surface: `format-patch --attach`.
+/// 功能: 带 --attach 生成邮件，断言产出的邮件里带上了该标记。
+/// 覆盖范围: `libra format-patch` 的 `--attach` 子面；本用例实际执行 `libra format-patch --attach --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch --attach 的标记写入；不覆盖 MIME 分段的具体结构。
+/// scenario_id: t4015-format-patch-options::format-patch-attach-produces-mime-attachment
 #[test]
 fn t4_port_t4015_format_patch_attach_produces_mime_attachment() {
     // `format-patch --attach` must put its mark in the produced mail.
@@ -687,8 +866,10 @@ fn t4_port_t4015_format_patch_attach_produces_mime_attachment() {
     );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-base-commit-adds-base-commit-info`.
-/// Ledger surface: `format-patch --base`.
+/// 功能: 带 --base 生成邮件，断言产出的邮件里带上了该标记。
+/// 覆盖范围: `libra format-patch` 的 `--base` 子面；本用例实际执行 `libra format-patch --base HEAD~1 --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch --base 的标记写入；不覆盖 base 提交的选取算法。
+/// scenario_id: t4015-format-patch-options::format-patch-base-commit-adds-base-commit-info
 #[test]
 fn t4_port_t4015_format_patch_base_commit_adds_base_commit_info() {
     // `format-patch --base` must put its mark in the produced mail.
@@ -723,8 +904,10 @@ fn t4_port_t4015_format_patch_base_commit_adds_base_commit_info() {
     );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-base-with-multi-patch-puts-base-commit-on-last-patch-only`.
-/// Ledger surface: `format-patch --base`.
+/// 功能: 带 --base 生成邮件，断言产出的邮件里带上了该标记。
+/// 覆盖范围: `libra format-patch` 的 `--base` 子面；本用例实际执行 `libra format-patch --base HEAD~1 --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch --base 的标记写入；不覆盖 base 提交的选取算法。
+/// scenario_id: t4015-format-patch-options::format-patch-base-with-multi-patch-puts-base-commit-on-last-patch-only
 #[test]
 fn t4_port_t4015_format_patch_base_with_multi_patch_puts_base_commit_on_last_patch_only() {
     // `format-patch --base` must put its mark in the produced mail.
@@ -759,8 +942,10 @@ fn t4_port_t4015_format_patch_base_with_multi_patch_puts_base_commit_on_last_pat
     );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-cc-adds-cc-header`.
-/// Ledger surface: `format-patch --cc`.
+/// 功能: 带 --cc 生成邮件，断言邮件头里出现了抄送标记。
+/// 覆盖范围: `libra format-patch` 的 `--cc` 子面；本用例实际执行 `libra format-patch --cc reviewer@example.com --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch --cc 的收件头写入；不覆盖与 --to 组合时的相互影响。
+/// scenario_id: t4015-format-patch-options::format-patch-cc-adds-cc-header
 #[test]
 fn t4_port_t4015_format_patch_cc_adds_cc_header() {
     // `format-patch --cc` must put its mark in the produced mail.
@@ -792,11 +977,15 @@ fn t4_port_t4015_format_patch_cc_adds_cc_header() {
     assert!(text.contains("Cc:"), "the mail carries Cc: : {text}");
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-cc-and-to-can-be-combined`.
-/// Ledger surface: `format-patch --cc`.
+/// 功能: 同时给出 --cc 与 --to，断言两个收件头都出现在同一封邮件里。
+/// 覆盖范围: `libra format-patch` 的 `--cc` 子面；本用例实际执行 `libra format-patch --cc reviewer@example.com --to maintainer@example.com --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 --cc 与 --to 的组合生效；不覆盖多个 --to 的重复给出。
+/// scenario_id: t4015-format-patch-options::format-patch-cc-and-to-can-be-combined
 #[test]
 fn t4_port_t4015_format_patch_cc_and_to_can_be_combined() {
-    // `format-patch --cc` must put its mark in the produced mail.
+    // The scenario is that the two recipient options COMBINE: both headers must
+    // appear in the same mail, so asserting only on `Cc:` would pass even if
+    // `--to` were dropped on the floor.
     let (repo, name) = t4_repo("t043");
     t4_touch(&repo, &name);
     assert_cli_success(
@@ -815,18 +1004,29 @@ fn t4_port_t4015_format_patch_cc_and_to_can_be_combined() {
             "format-patch",
             "--cc",
             "reviewer@example.com",
+            "--to",
+            "maintainer@example.com",
             "--stdout",
             "HEAD~1..HEAD",
         ],
         repo.path(),
     );
-    assert_cli_success(&out, "format-patch --cc");
+    assert_cli_success(&out, "format-patch --cc --to");
     let text = t4_stdout(&out);
-    assert!(text.contains("Cc:"), "the mail carries Cc: : {text}");
+    assert!(
+        text.contains("Cc: reviewer@example.com"),
+        "the mail carries the Cc: recipient: {text}"
+    );
+    assert!(
+        text.contains("To: maintainer@example.com"),
+        "the mail carries the To: recipient: {text}"
+    );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-in-reply-to-adds-in-reply-to-and-references`.
-/// Ledger surface: `format-patch --in-reply-to`.
+/// 功能: 带 --in-reply-to 生成邮件，断言产出的邮件里带上了该标记。
+/// 覆盖范围: `libra format-patch` 的 `--in-reply-to` 子面；本用例实际执行 `libra format-patch --in-reply-to <thread@example.com> --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch --in-reply-to 的标记写入；不覆盖 Message-Id 的生成规则。
+/// scenario_id: t4015-format-patch-options::format-patch-in-reply-to-adds-in-reply-to-and-references
 #[test]
 fn t4_port_t4015_format_patch_in_reply_to_adds_in_reply_to_and_references() {
     // `format-patch --in-reply-to` must put its mark in the produced mail.
@@ -861,8 +1061,10 @@ fn t4_port_t4015_format_patch_in_reply_to_adds_in_reply_to_and_references() {
     );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-inline-produces-mime-inline`.
-/// Ledger surface: `format-patch --inline`.
+/// 功能: 带 --inline 生成邮件，断言产出的邮件里带上了该标记。
+/// 覆盖范围: `libra format-patch` 的 `--inline` 子面；本用例实际执行 `libra format-patch --inline --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch --inline 的标记写入；不覆盖 MIME 分段的具体结构。
+/// scenario_id: t4015-format-patch-options::format-patch-inline-produces-mime-inline
 #[test]
 fn t4_port_t4015_format_patch_inline_produces_mime_inline() {
     // `format-patch --inline` must put its mark in the produced mail.
@@ -891,8 +1093,10 @@ fn t4_port_t4015_format_patch_inline_produces_mime_inline() {
     );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-s-adds-signed-off-by`.
-/// Ledger surface: `format-patch -s`.
+/// 功能: 带 -s 生成邮件，断言产出的邮件里带上了签名行。
+/// 覆盖范围: `libra format-patch` 的 `-s` 子面；本用例实际执行 `libra format-patch -s --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch -s 的签名行写入；不覆盖签名者身份的取值来源。
+/// scenario_id: t4015-format-patch-options::format-patch-s-adds-signed-off-by
 #[test]
 fn t4_port_t4015_format_patch_s_adds_signed_off_by() {
     // `format-patch -s` must put its mark in the produced mail.
@@ -921,8 +1125,10 @@ fn t4_port_t4015_format_patch_s_adds_signed_off_by() {
     );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-signoff-adds-signed-off-by`.
-/// Ledger surface: `format-patch --signoff`.
+/// 功能: 带 --signoff 生成邮件，断言产出的邮件里带上了签名行。
+/// 覆盖范围: `libra format-patch` 的 `--signoff` 子面；本用例实际执行 `libra format-patch --signoff --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch --signoff 的签名行写入；不覆盖与 -s 的等价性证明。
+/// scenario_id: t4015-format-patch-options::format-patch-signoff-adds-signed-off-by
 #[test]
 fn t4_port_t4015_format_patch_signoff_adds_signed_off_by() {
     // `format-patch --signoff` must put its mark in the produced mail.
@@ -951,8 +1157,10 @@ fn t4_port_t4015_format_patch_signoff_adds_signed_off_by() {
     );
 }
 
-/// Upstream scenario `t4015-format-patch-options::format-patch-to-adds-to-header`.
-/// Ledger surface: `format-patch --to`.
+/// 功能: 带 --to 生成邮件，断言邮件头里出现了收件标记。
+/// 覆盖范围: `libra format-patch` 的 `--to` 子面；本用例实际执行 `libra format-patch --to maintainer@example.com --stdout HEAD~1..HEAD`。
+/// 边界: 覆盖 format-patch --to 的收件头写入；不覆盖与 --cc 组合时的相互影响。
+/// scenario_id: t4015-format-patch-options::format-patch-to-adds-to-header
 #[test]
 fn t4_port_t4015_format_patch_to_adds_to_header() {
     // `format-patch --to` must put its mark in the produced mail.
@@ -984,8 +1192,10 @@ fn t4_port_t4015_format_patch_to_adds_to_header() {
     assert!(text.contains("To:"), "the mail carries To: : {text}");
 }
 
-/// Upstream scenario `t4015-format-patch-options::setup`.
-/// Ledger surface: `commit -m`.
+/// 功能: 以 -m 提交并回读日志，断言给定的消息被原样记录。
+/// 覆盖范围: `libra commit` 的 `-m` 子面；本用例实际执行 `libra commit -m recorded subject --no-verify`。
+/// 边界: 覆盖 commit -m 的消息记录；不覆盖提交者身份与签名，也不含多段消息。
+/// scenario_id: t4015-format-patch-options::setup
 #[test]
 fn t4_port_t4015_setup() {
     // `commit -m` records the message it was given.
@@ -1008,52 +1218,78 @@ fn t4_port_t4015_setup() {
     );
 }
 
-/// Upstream scenario `t4016-diff-quote::git-diff-numstat-m-head`.
-/// Ledger surface: `diff --numstat`.
+/// 功能: 重命名后以 --numstat -M 输出，断言得到一条增删均为 0、路径列为新旧成对的记录。
+/// 覆盖范围: `libra diff` 的 `--numstat` 子面；本用例实际执行 `libra diff --staged --numstat -M`。
+/// 边界: 覆盖 --numstat 与 -M 组合下的重命名记录；不覆盖二进制文件的 - - 计数形式。
+/// scenario_id: t4016-diff-quote::git-diff-numstat-m-head
 #[test]
 fn t4_port_t4016_git_diff_numstat_m_head() {
-    // `--numstat` reports machine-readable counts: added, deleted, path.
+    // `--numstat` with `-M` reports the rename as one record whose path column
+    // is the `old => new` pair and whose counts are zero.
     let (repo, name) = t4_repo("t050");
-    t4_touch(&repo, &name);
-    let out = run_libra_command(&["diff", "--numstat"], repo.path());
-    assert_cli_success(&out, "diff --numstat");
-    assert_eq!(t4_stdout(&out), format!("1\t0\t{name}"));
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
+    let out = run_libra_command(&["diff", "--staged", "--numstat", "-M"], repo.path());
+    assert_cli_success(&out, "diff --numstat -M");
+    assert_eq!(
+        t4_stdout(&out),
+        format!("0\t0\t{name} => moved.txt"),
+        "one rename record with zero added and zero deleted"
+    );
 }
 
-/// Upstream scenario `t4016-diff-quote::git-diff-stat-m-head`.
-/// Ledger surface: `diff --stat`.
+/// 功能: 重命名后以 --stat -M 输出，断言统计行把新旧路径写成一对。
+/// 覆盖范围: `libra diff` 的 `--stat` 子面；本用例实际执行 `libra diff --staged --stat -M`。
+/// 边界: 覆盖 --stat 与 -M 组合下的重命名渲染；不覆盖相似度阈值的取值。
+/// scenario_id: t4016-diff-quote::git-diff-stat-m-head
 #[test]
 fn t4_port_t4016_git_diff_stat_m_head() {
-    // `--stat` names each path with its change bar, then totals the series.
+    // `--stat` with `-M` renders the rename on a single line pairing both paths.
     let (repo, name) = t4_repo("t051");
-    t4_touch(&repo, &name);
-    let out = run_libra_command(&["diff", "--stat"], repo.path());
-    assert_cli_success(&out, "diff --stat");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
+    let out = run_libra_command(&["diff", "--staged", "--stat", "-M"], repo.path());
+    assert_cli_success(&out, "diff --stat -M");
     let text = t4_stdout(&out);
-    assert!(text.contains(&name), "the stat names the path: {text}");
-    assert!(text.contains("1 file changed"), "{text}");
+    assert!(
+        text.contains(&format!("{name} => moved.txt")),
+        "the stat line pairs both paths: {text}"
+    );
+    assert!(
+        text.contains("1 file changed"),
+        "the rename counts as one changed path: {text}"
+    );
 }
 
-/// Upstream scenario `t4016-diff-quote::git-diff-summary-m-head`.
-/// Ledger surface: `diff --summary`.
+/// 功能: 重命名后以 --summary -M 输出，断言摘要显式写出 rename 与相似度。
+/// 覆盖范围: `libra diff` 的 `--summary` 子面；本用例实际执行 `libra diff --staged --summary -M`。
+/// 边界: 覆盖 --summary 与 -M 组合下的重命名摘要；不覆盖模式位变更的摘要行。
+/// scenario_id: t4016-diff-quote::git-diff-summary-m-head
 #[test]
 fn t4_port_t4016_git_diff_summary_m_head() {
-    // `--summary` reports structural changes; a new file is a create entry.
-    let (repo, _name) = t4_repo("t052");
-    std::fs::write(repo.path().join("added.txt"), "fresh\n").expect("create a file");
+    // `--summary` with `-M` states the rename explicitly, with its similarity.
+    let (repo, name) = t4_repo("t052");
     assert_cli_success(
-        &run_libra_command(&["add", "added.txt"], repo.path()),
-        "stage it",
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
     );
-    let out = run_libra_command(&["diff", "--summary", "--staged"], repo.path());
-    assert_cli_success(&out, "diff --summary --staged");
+    let out = run_libra_command(&["diff", "--staged", "--summary", "-M"], repo.path());
+    assert_cli_success(&out, "diff --summary -M");
     let text = t4_stdout(&out);
-    assert!(text.contains("create mode"), "{text}");
-    assert!(text.contains("added.txt"), "{text}");
+    assert!(
+        text.contains(&format!("rename {name} => moved.txt")),
+        "the summary names the rename: {text}"
+    );
 }
 
-/// Upstream scenario `t4016-diff-quote::setup`.
-/// Ledger surface: `mv mv`.
+/// 功能: 用 mv 重命名一个被跟踪路径，断言重命名的两端都已进入索引。
+/// 覆盖范围: `libra mv` 的 `mv` 子面；本用例实际执行 `libra mv renamed.txt`。
+/// 边界: 覆盖 mv 的重命名与自动暂存；不覆盖目录整体移动与覆盖既有路径。
+/// scenario_id: t4016-diff-quote::setup
 #[test]
 fn t4_port_t4016_setup() {
     // `mv` renames a tracked path and stages both halves of the rename.
@@ -1069,8 +1305,10 @@ fn t4_port_t4016_setup() {
     assert!(!repo.path().join(&name).exists(), "the old path is gone");
 }
 
-/// Upstream scenario `t4016-diff-quote::setup-expected-files`.
-/// Ledger surface: `mv mv`.
+/// 功能: 用 mv 重命名一个被跟踪路径，断言重命名的两端都已进入索引。
+/// 覆盖范围: `libra mv` 的 `mv` 子面；本用例实际执行 `libra mv renamed.txt`。
+/// 边界: 覆盖 mv 的重命名与自动暂存；不覆盖目录整体移动与覆盖既有路径。
+/// scenario_id: t4016-diff-quote::setup-expected-files
 #[test]
 fn t4_port_t4016_setup_expected_files() {
     // `mv` renames a tracked path and stages both halves of the rename.
@@ -1086,8 +1324,10 @@ fn t4_port_t4016_setup_expected_files() {
     assert!(!repo.path().join(&name).exists(), "the old path is gone");
 }
 
-/// Upstream scenario `t4017-diff-retval::check-detects-leftover-conflict-markers`.
-/// Ledger surface: `add add`.
+/// 功能: 用 add 把工作区路径移入索引，断言它随后出现在索引里。
+/// 覆盖范围: `libra add` 的 `add` 子面；本用例实际执行 `libra add staged.txt`。
+/// 边界: 覆盖 add 的入索引行为；不覆盖 -p 交互式与 pathspec 通配。
+/// scenario_id: t4017-diff-retval::check-detects-leftover-conflict-markers
 #[test]
 fn t4_port_t4017_check_detects_leftover_conflict_markers() {
     // `add` moves a working-tree path into the index.
@@ -1105,65 +1345,78 @@ fn t4_port_t4017_check_detects_leftover_conflict_markers() {
     );
 }
 
-/// Upstream scenario `t4017-diff-retval::check-exit-code-returns-0-for-no-difference`.
-/// Ledger surface: `diff --check`.
+/// 功能: 在无差异的仓库上运行 --check --exit-code，断言退出码为 0，作为另外两个取值的基线。
+/// 覆盖范围: `libra diff` 的 `--check` 子面；本用例实际执行 `libra diff --check --exit-code --staged`。
+/// 边界: 覆盖 --check 与 --exit-code 组合在无差异时的退出码；不覆盖有差异时的取值（由同族另外两个用例承担）。
+/// scenario_id: t4017-diff-retval::check-exit-code-returns-0-for-no-difference
 #[test]
 fn t4_port_t4017_check_exit_code_returns_0_for_no_difference() {
-    // `--check` looks for whitespace damage and refuses the change if it finds
-    // any; Git signals that with a dedicated non-zero status.
+    // Git contract: with nothing to report, `--check --exit-code` is a plain
+    // success. This is the baseline the other two exit codes are measured from.
     let (repo, _name) = t4_repo("t056");
-    std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
-    assert_cli_success(
-        &run_libra_command(&["add", "ws.txt"], repo.path()),
-        "stage it",
+    let out = run_libra_command(&["diff", "--check", "--exit-code", "--staged"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "no difference and no damage is exit 0: {}",
+        t4_stderr(&out)
     );
-    let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
-    assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
-    let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
-    assert!(text.contains("ws.txt"), "the report names the path: {text}");
-    assert!(text.contains("trailing whitespace"), "{text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::check-exit-code-returns-1-for-a-clean-difference`.
-/// Ledger surface: `diff --check`.
+/// 功能: 暂存一处无空白问题的改动，断言 --check --exit-code 给出 Git 契约的退出码 1。
+/// 覆盖范围: `libra diff` 的 `--check` 子面；本用例实际执行 `libra diff --check --exit-code --staged`。
+/// 边界: 覆盖 --exit-code 在 --check 同时给出时仍贡献「有差异 = 1」；不覆盖空白破坏叠加后的取值。
+/// scenario_id: t4017-diff-retval::check-exit-code-returns-1-for-a-clean-difference
 #[test]
 fn t4_port_t4017_check_exit_code_returns_1_for_a_clean_difference() {
-    // `--check` looks for whitespace damage and refuses the change if it finds
-    // any; Git signals that with a dedicated non-zero status.
+    // Git contract: a difference with no whitespace damage is exit 1 — the bit
+    // `--exit-code` contributes on its own. `--check` adds nothing here, so the
+    // status must not collapse back to 0 just because the check found nothing.
     let (repo, _name) = t4_repo("t057");
-    std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
+    std::fs::write(repo.path().join("clean.txt"), "no damage here\n").expect("write it");
     assert_cli_success(
-        &run_libra_command(&["add", "ws.txt"], repo.path()),
+        &run_libra_command(&["add", "clean.txt"], repo.path()),
         "stage it",
     );
-    let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
-    assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
-    let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
-    assert!(text.contains("ws.txt"), "the report names the path: {text}");
-    assert!(text.contains("trailing whitespace"), "{text}");
+    let out = run_libra_command(&["diff", "--check", "--exit-code", "--staged"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a clean difference is exit 1: {}",
+        t4_stderr(&out)
+    );
 }
 
-/// Upstream scenario `t4017-diff-retval::check-exit-code-returns-3-for-a-dirty-difference`.
-/// Ledger surface: `diff --check`.
+/// 功能: 暂存带尾随空白的改动，断言 --check --exit-code 给出 Git 契约的退出码 3（1 + 2）。
+/// 覆盖范围: `libra diff` 的 `--check` 子面；本用例实际执行 `libra diff --check --exit-code --staged`。
+/// 边界: 覆盖 --check 的 2 与 --exit-code 的 1 相加；不覆盖无差异与干净差异两种基线。
+/// scenario_id: t4017-diff-retval::check-exit-code-returns-3-for-a-dirty-difference
 #[test]
 fn t4_port_t4017_check_exit_code_returns_3_for_a_dirty_difference() {
-    // `--check` looks for whitespace damage and refuses the change if it finds
-    // any; Git signals that with a dedicated non-zero status.
+    // Git contract: whitespace damage on top of a difference is exit 3 — the 1
+    // that `--exit-code` contributes plus the 2 that `--check` contributes. A
+    // status of 2 would mean the difference bit was lost.
     let (repo, _name) = t4_repo("t058");
     std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
     assert_cli_success(
         &run_libra_command(&["add", "ws.txt"], repo.path()),
         "stage it",
     );
-    let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
-    assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
+    let out = run_libra_command(&["diff", "--check", "--exit-code", "--staged"], repo.path());
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
     assert!(text.contains("ws.txt"), "the report names the path: {text}");
     assert!(text.contains("trailing whitespace"), "{text}");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a dirty difference is exit 1 + 2 = 3: {text}"
+    );
 }
 
-/// Upstream scenario `t4017-diff-retval::check-honors-conflict-marker-length`.
-/// Ledger surface: `diff --check`.
+/// 功能: 构造尾随空白并运行 --check，断言它报出该路径与空白问题。
+/// 覆盖范围: `libra diff` 的 `--check` 子面；本用例实际执行 `libra diff --check --staged`。
+/// 边界: 覆盖 --check 对空白破坏的识别与报告；不覆盖 core.whitespace 的自定义规则。
+/// scenario_id: t4017-diff-retval::check-honors-conflict-marker-length
 #[test]
 fn t4_port_t4017_check_honors_conflict_marker_length() {
     // `--check` looks for whitespace damage and refuses the change if it finds
@@ -1181,8 +1434,10 @@ fn t4_port_t4017_check_honors_conflict_marker_length() {
     assert!(text.contains("trailing whitespace"), "{text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::check-should-test-not-just-the-last-line`.
-/// Ledger surface: `diff --check`.
+/// 功能: 构造尾随空白并运行 --check，断言它报出该路径与空白问题。
+/// 覆盖范围: `libra diff` 的 `--check` 子面；本用例实际执行 `libra diff --check --staged`。
+/// 边界: 覆盖 --check 对空白破坏的识别与报告；不覆盖 core.whitespace 的自定义规则。
+/// scenario_id: t4017-diff-retval::check-should-test-not-just-the-last-line
 #[test]
 fn t4_port_t4017_check_should_test_not_just_the_last_line() {
     // `--check` looks for whitespace damage and refuses the change if it finds
@@ -1200,8 +1455,10 @@ fn t4_port_t4017_check_should_test_not_just_the_last_line() {
     assert!(text.contains("trailing whitespace"), "{text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::check-with-no-pager-returns-2-for-dirty-difference`.
-/// Ledger surface: `diff --check`.
+/// 功能: 构造尾随空白并运行 --check，断言它报出该路径与空白问题。
+/// 覆盖范围: `libra diff` 的 `--check` 子面；本用例实际执行 `libra diff --check --staged`。
+/// 边界: 覆盖 --check 对空白破坏的识别与报告；不覆盖 core.whitespace 的自定义规则。
+/// scenario_id: t4017-diff-retval::check-with-no-pager-returns-2-for-dirty-difference
 #[test]
 fn t4_port_t4017_check_with_no_pager_returns_2_for_dirty_difference() {
     // `--check` looks for whitespace damage and refuses the change if it finds
@@ -1219,8 +1476,10 @@ fn t4_port_t4017_check_with_no_pager_returns_2_for_dirty_difference() {
     assert!(text.contains("trailing whitespace"), "{text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-exit-code-returns-1-for-changed-binary-file`.
-/// Ledger surface: `diff --exit-code`.
+/// 功能: 分别在干净与改动状态下运行 --exit-code，断言退出码为 0 与 1。
+/// 覆盖范围: `libra diff` 的 `--exit-code` 子面；本用例实际执行 `libra diff --exit-code`。
+/// 边界: 覆盖 --exit-code 的状态码语义；不覆盖与 --check 组合时的相加规则。
+/// scenario_id: t4017-diff-retval::git-diff-exit-code-returns-1-for-changed-binary-file
 #[test]
 fn t4_port_t4017_git_diff_exit_code_returns_1_for_changed_binary_file() {
     // `--exit-code` carries the difference in the status code, like Git.
@@ -1237,26 +1496,40 @@ fn t4_port_t4017_git_diff_exit_code_returns_1_for_changed_binary_file() {
     assert_eq!(dirty.status.code(), Some(1), "a difference is exit 1");
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-exit-code-returns-1-for-renamed-file`.
-/// Ledger surface: `diff --exit-code`.
+/// 功能: mv 暂存重命名后，用 --cached --exit-code 询问索引侧的状态，断言从 0 变为 1。
+/// 覆盖范围: `libra diff` 的 `--exit-code` 子面；本用例实际执行 `libra diff --cached --exit-code`。
+/// 边界: 覆盖 --cached 选择索引比较面时 --exit-code 的取值；不覆盖工作区侧的同名询问。
+/// scenario_id: t4017-diff-retval::git-diff-exit-code-returns-1-for-renamed-file
 #[test]
 fn t4_port_t4017_git_diff_exit_code_returns_1_for_renamed_file() {
-    // `--exit-code` carries the difference in the status code, like Git.
+    // A rename lives in the index once `mv` has staged it, so the scenario asks
+    // the STAGED diff for its status: `--cached` selects it, `--exit-code`
+    // reports "there is a difference" as exit 1.
     let (repo, name) = t4_repo("t063");
-    let clean = run_libra_command(&["diff", "--exit-code"], repo.path());
+    let clean = run_libra_command(&["diff", "--cached", "--exit-code"], repo.path());
     assert_eq!(
         clean.status.code(),
         Some(0),
-        "clean tree: {}",
+        "nothing staged yet: {}",
         t4_stderr(&clean)
     );
-    t4_touch(&repo, &name);
-    let dirty = run_libra_command(&["diff", "--exit-code"], repo.path());
-    assert_eq!(dirty.status.code(), Some(1), "a difference is exit 1");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
+    let dirty = run_libra_command(&["diff", "--cached", "--exit-code"], repo.path());
+    assert_eq!(
+        dirty.status.code(),
+        Some(1),
+        "a staged rename is a difference: {}",
+        t4_stderr(&dirty)
+    );
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo`.
-/// Ledger surface: `diff diff`.
+/// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
+/// 覆盖范围: `libra diff` 的 `diff` 子面；本用例实际执行 `libra diff`。
+/// 边界: 覆盖 默认（无 --cached）的工作区 vs 索引比较与补丁正文；不覆盖 --cached 的索引 vs HEAD 比较，也不含重命名检测。
+/// scenario_id: t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo
 #[test]
 fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo() {
     // The default diff: the working tree against the index, as a patch that
@@ -1270,8 +1543,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo() {
     assert!(text.contains("three"), "the added line appears: {text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-2`.
-/// Ledger surface: `diff diff`.
+/// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
+/// 覆盖范围: `libra diff` 的 `diff` 子面；本用例实际执行 `libra diff`。
+/// 边界: 覆盖 默认（无 --cached）的工作区 vs 索引比较与补丁正文；不覆盖 --cached 的索引 vs HEAD 比较，也不含重命名检测。
+/// scenario_id: t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-2
 #[test]
 fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_2() {
     // The default diff: the working tree against the index, as a patch that
@@ -1285,8 +1560,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_2() {
     assert!(text.contains("three"), "the added line appears: {text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-3`.
-/// Ledger surface: `diff diff`.
+/// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
+/// 覆盖范围: `libra diff` 的 `diff` 子面；本用例实际执行 `libra diff`。
+/// 边界: 覆盖 默认（无 --cached）的工作区 vs 索引比较与补丁正文；不覆盖 --cached 的索引 vs HEAD 比较，也不含重命名检测。
+/// scenario_id: t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-3
 #[test]
 fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_3() {
     // The default diff: the working tree against the index, as a patch that
@@ -1300,8 +1577,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_3() {
     assert!(text.contains("three"), "the added line appears: {text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-4`.
-/// Ledger surface: `diff diff`.
+/// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
+/// 覆盖范围: `libra diff` 的 `diff` 子面；本用例实际执行 `libra diff`。
+/// 边界: 覆盖 默认（无 --cached）的工作区 vs 索引比较与补丁正文；不覆盖 --cached 的索引 vs HEAD 比较，也不含重命名检测。
+/// scenario_id: t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-4
 #[test]
 fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_4() {
     // The default diff: the working tree against the index, as a patch that
@@ -1315,8 +1594,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_4() {
     assert!(text.contains("three"), "the added line appears: {text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-5`.
-/// Ledger surface: `diff diff`.
+/// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
+/// 覆盖范围: `libra diff` 的 `diff` 子面；本用例实际执行 `libra diff`。
+/// 边界: 覆盖 默认（无 --cached）的工作区 vs 索引比较与补丁正文；不覆盖 --cached 的索引 vs HEAD 比较，也不含重命名检测。
+/// scenario_id: t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-5
 #[test]
 fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_5() {
     // The default diff: the working tree against the index, as a patch that
@@ -1330,8 +1611,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_5() {
     assert!(text.contains("three"), "the added line appears: {text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-6`.
-/// Ledger surface: `diff diff`.
+/// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
+/// 覆盖范围: `libra diff` 的 `diff` 子面；本用例实际执行 `libra diff`。
+/// 边界: 覆盖 默认（无 --cached）的工作区 vs 索引比较与补丁正文；不覆盖 --cached 的索引 vs HEAD 比较，也不含重命名检测。
+/// scenario_id: t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-6
 #[test]
 fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_6() {
     // The default diff: the working tree against the index, as a patch that
@@ -1345,8 +1628,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_6() {
     assert!(text.contains("three"), "the added line appears: {text}");
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-quiet-head-head`.
-/// Ledger surface: `diff --quiet`.
+/// 功能: 分别在干净与改动状态下运行 --quiet，断言退出码为 0 与非 0 且不打印内容。
+/// 覆盖范围: `libra diff` 的 `--quiet` 子面；本用例实际执行 `libra diff --quiet`。
+/// 边界: 覆盖 --quiet 的纯状态码语义；不覆盖与 --exit-code 组合时的取值。
+/// scenario_id: t4017-diff-retval::git-diff-quiet-head-head
 #[test]
 fn t4_port_t4017_git_diff_quiet_head_head() {
     // `--quiet` is a status-only check: clean is 0, any change is non-zero.
@@ -1367,8 +1652,10 @@ fn t4_port_t4017_git_diff_quiet_head_head() {
     );
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-quiet-returns-1-for-changed-binary-file`.
-/// Ledger surface: `diff --quiet`.
+/// 功能: 分别在干净与改动状态下运行 --quiet，断言退出码为 0 与非 0 且不打印内容。
+/// 覆盖范围: `libra diff` 的 `--quiet` 子面；本用例实际执行 `libra diff --quiet`。
+/// 边界: 覆盖 --quiet 的纯状态码语义；不覆盖与 --exit-code 组合时的取值。
+/// scenario_id: t4017-diff-retval::git-diff-quiet-returns-1-for-changed-binary-file
 #[test]
 fn t4_port_t4017_git_diff_quiet_returns_1_for_changed_binary_file() {
     // `--quiet` is a status-only check: clean is 0, any change is non-zero.
@@ -1389,98 +1676,136 @@ fn t4_port_t4017_git_diff_quiet_returns_1_for_changed_binary_file() {
     );
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-quiet-returns-1-for-renamed-file`.
-/// Ledger surface: `diff --quiet`.
+/// 功能: 同一处已暂存的重命名改用 --quiet 询问，断言退出码为 1 且不打印任何内容。
+/// 覆盖范围: `libra diff` 的 `--quiet` 子面；本用例实际执行 `libra diff --cached --quiet`。
+/// 边界: 覆盖 --cached 与 --quiet 组合的纯状态码语义；不覆盖 --exit-code 的同名询问。
+/// scenario_id: t4017-diff-retval::git-diff-quiet-returns-1-for-renamed-file
 #[test]
 fn t4_port_t4017_git_diff_quiet_returns_1_for_renamed_file() {
-    // `--quiet` is a status-only check: clean is 0, any change is non-zero.
+    // Same staged rename, asked with `--quiet`: no output, status only.
     let (repo, name) = t4_repo("t072");
-    let clean = run_libra_command(&["diff", "--quiet"], repo.path());
+    let clean = run_libra_command(&["diff", "--cached", "--quiet"], repo.path());
     assert_eq!(
         clean.status.code(),
         Some(0),
-        "clean tree: {}",
+        "nothing staged yet: {}",
         t4_stderr(&clean)
     );
-    t4_touch(&repo, &name);
-    let dirty = run_libra_command(&["diff", "--quiet"], repo.path());
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
+    let dirty = run_libra_command(&["diff", "--cached", "--quiet"], repo.path());
     assert_eq!(
         dirty.status.code(),
         Some(1),
-        "a modified path makes it non-zero"
+        "a staged rename is a difference: {}",
+        t4_stderr(&dirty)
+    );
+    assert!(
+        t4_stdout(&dirty).is_empty(),
+        "--quiet prints nothing: {}",
+        t4_stdout(&dirty)
     );
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-quiet-w-head-head`.
-/// Ledger surface: `diff --quiet`.
+/// 功能: 只做空白改动，断言不带 -w 时是差异（退出 1）、带 -w 时不是差异（退出 0）。
+/// 覆盖范围: `libra diff` 的 `--quiet` 子面；本用例实际执行 `libra diff --quiet -w`。
+/// 边界: 覆盖 -w 对纯空白改动的忽略，两个方向都断言；不覆盖 --ignore-space-at-eol 等更细的空白开关。
+/// scenario_id: t4017-diff-retval::git-diff-quiet-w-head-head
 #[test]
 fn t4_port_t4017_git_diff_quiet_w_head_head() {
-    // `--quiet` is a status-only check: clean is 0, any change is non-zero.
+    // `-w` makes the comparison ignore whitespace, so a whitespace-only edit is
+    // NOT a difference and `--quiet` reports success — while the same edit
+    // without `-w` is exit 1. Both halves are asserted; testing only the second
+    // would pass with `-w` ignored entirely.
     let (repo, name) = t4_repo("t073");
-    let clean = run_libra_command(&["diff", "--quiet"], repo.path());
+    let path = repo.path().join(&name);
+    let original = std::fs::read_to_string(&path).expect("read the seed");
+    let spaced = original.replace('\n', " \n");
+    std::fs::write(&path, &spaced).expect("write a whitespace-only change");
+    let without = run_libra_command(&["diff", "--quiet"], repo.path());
     assert_eq!(
-        clean.status.code(),
-        Some(0),
-        "clean tree: {}",
-        t4_stderr(&clean)
-    );
-    t4_touch(&repo, &name);
-    let dirty = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(
-        dirty.status.code(),
+        without.status.code(),
         Some(1),
-        "a modified path makes it non-zero"
+        "without -w the whitespace edit is a difference: {}",
+        t4_stderr(&without)
+    );
+    let with_w = run_libra_command(&["diff", "--quiet", "-w"], repo.path());
+    assert_eq!(
+        with_w.status.code(),
+        Some(0),
+        "with -w the whitespace-only edit is not a difference: {}",
+        t4_stderr(&with_w)
     );
 }
 
-/// Upstream scenario `t4017-diff-retval::git-diff-quiet-w-head-head-2`.
-/// Ledger surface: `diff --quiet`.
+/// 功能: 只做空白改动，断言不带 -w 时是差异（退出 1）、带 -w 时不是差异（退出 0）。
+/// 覆盖范围: `libra diff` 的 `--quiet` 子面；本用例实际执行 `libra diff --quiet -w`。
+/// 边界: 覆盖 -w 对纯空白改动的忽略，两个方向都断言；不覆盖 --ignore-space-at-eol 等更细的空白开关。
+/// scenario_id: t4017-diff-retval::git-diff-quiet-w-head-head-2
 #[test]
 fn t4_port_t4017_git_diff_quiet_w_head_head_2() {
-    // `--quiet` is a status-only check: clean is 0, any change is non-zero.
+    // `-w` makes the comparison ignore whitespace, so a whitespace-only edit is
+    // NOT a difference and `--quiet` reports success — while the same edit
+    // without `-w` is exit 1. Both halves are asserted; testing only the second
+    // would pass with `-w` ignored entirely.
     let (repo, name) = t4_repo("t074");
-    let clean = run_libra_command(&["diff", "--quiet"], repo.path());
+    let path = repo.path().join(&name);
+    let original = std::fs::read_to_string(&path).expect("read the seed");
+    let spaced = original.replace('\n', " \n");
+    std::fs::write(&path, &spaced).expect("write a whitespace-only change");
+    let without = run_libra_command(&["diff", "--quiet"], repo.path());
     assert_eq!(
-        clean.status.code(),
-        Some(0),
-        "clean tree: {}",
-        t4_stderr(&clean)
-    );
-    t4_touch(&repo, &name);
-    let dirty = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(
-        dirty.status.code(),
+        without.status.code(),
         Some(1),
-        "a modified path makes it non-zero"
+        "without -w the whitespace edit is a difference: {}",
+        t4_stderr(&without)
+    );
+    let with_w = run_libra_command(&["diff", "--quiet", "-w"], repo.path());
+    assert_eq!(
+        with_w.status.code(),
+        Some(0),
+        "with -w the whitespace-only edit is not a difference: {}",
+        t4_stderr(&with_w)
     );
 }
 
-/// Upstream scenario `t4017-diff-retval::setup`.
-/// Ledger surface: `commit -m`.
+/// 功能: 用 commit -a -m 提交而不预先 add，断言消息被记录且工作区不再有剩余改动。
+/// 覆盖范围: `libra commit` 的 `-m` 子面；本用例实际执行 `libra commit -a -m recorded subject --no-verify`。
+/// 边界: 覆盖 commit -a 对已跟踪改动的自动暂存；不覆盖未跟踪文件（-a 本就不收）。
+/// scenario_id: t4017-diff-retval::setup
 #[test]
 fn t4_port_t4017_setup() {
-    // `commit -m` records the message it was given.
+    // `-a` stages every tracked modification as part of the commit, so the
+    // scenario never calls `add`; asserting the message alone would pass even
+    // if `-a` had staged nothing.
     let (repo, name) = t4_repo("t075");
     t4_touch(&repo, &name);
-    assert_cli_success(
-        &run_libra_command(&["add", &name], repo.path()),
-        "stage the change",
-    );
     let out = run_libra_command(
-        &["commit", "-m", "recorded subject", "--no-verify"],
+        &["commit", "-a", "-m", "recorded subject", "--no-verify"],
         repo.path(),
     );
-    assert_cli_success(&out, "commit -m");
+    assert_cli_success(&out, "commit -a -m");
     let log = run_libra_command(&["log", "-1"], repo.path());
     assert_cli_success(&log, "log");
     assert!(
         t4_stdout(&log).contains("recorded subject"),
         "the message is recorded"
     );
+    let left = run_libra_command(&["diff"], repo.path());
+    assert_cli_success(&left, "diff");
+    assert!(
+        t4_stdout(&left).is_empty(),
+        "-a swept the modification into the commit: {}",
+        t4_stdout(&left)
+    );
 }
 
-/// Upstream scenario `t4017-diff-retval::setup-dirty-subrepo`.
-/// Ledger surface: `commit -m`.
+/// 功能: 以 -m 提交并回读日志，断言给定的消息被原样记录。
+/// 覆盖范围: `libra commit` 的 `-m` 子面；本用例实际执行 `libra commit -m recorded subject --no-verify`。
+/// 边界: 覆盖 commit -m 的消息记录；不覆盖提交者身份与签名，也不含多段消息。
+/// scenario_id: t4017-diff-retval::setup-dirty-subrepo
 #[test]
 fn t4_port_t4017_setup_dirty_subrepo() {
     // `commit -m` records the message it was given.
@@ -1552,6 +1877,143 @@ const T4_PORT_GUARDS: &[&str] = &[
     "t4_port_tests_document_scope_and_boundaries",
     "t4_port_direct_rows_have_tests",
 ];
+
+/// The `///` block immediately above each `fn t4_port_*`, keyed by function name.
+fn t4_doc_blocks(text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.strip_prefix("fn ") else {
+            continue;
+        };
+        let Some(name) = rest.split('(').next() else {
+            continue;
+        };
+        if !name.starts_with("t4_port_") {
+            continue;
+        }
+        // Walk back over the attribute run to the contiguous `///` block.
+        let mut k = i;
+        while k > 0 && lines[k - 1].trim_start().starts_with("#[") {
+            k -= 1;
+        }
+        let mut doc = Vec::new();
+        while k > 0 && lines[k - 1].starts_with("///") {
+            k -= 1;
+            doc.push(lines[k].trim_start_matches("///").trim_start());
+        }
+        doc.reverse();
+        out.push((name.to_string(), doc.join("\n") + "\n"));
+    }
+    out
+}
+
+/// Every `[[scenario]].id` in the t4 ledger, so `scenario_id:` can be resolved.
+fn t4_ledger_scenario_ids() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/compat-ledger/t4");
+    let mut ids = Vec::new();
+    let entries = std::fs::read_dir(&dir).expect("read the t4 ledger directory");
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    paths.sort();
+    for p in paths {
+        let text = std::fs::read_to_string(&p).expect("read a ledger file");
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("id = \"")
+                && let Some(id) = rest.strip_suffix('"')
+            {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    assert!(!ids.is_empty(), "the ledger yielded no scenario ids");
+    ids
+}
+
+/// `None` when the block satisfies the four-section contract; otherwise the
+/// reason, naming the section at fault so a counterexample cannot pass for an
+/// unrelated reason.
+fn t4_check_doc_contract(doc: &str, ids: &[String]) -> Option<String> {
+    let section = |label: &str| -> Option<String> {
+        let start = doc.find(&format!("{label}: "))?;
+        let rest = &doc[start + label.len() + 2..];
+        let end = rest
+            .find(&format!("\n功能: "))
+            .or_else(|| rest.find("\n覆盖范围: "))
+            .or_else(|| rest.find("\n边界: "))
+            .or_else(|| rest.find("\nscenario_id: "))
+            .unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
+    };
+    let nonspace = |s: &str| s.chars().filter(|c| !c.is_whitespace()).count();
+
+    let feature = match section("功能") {
+        Some(v) => v,
+        None => return Some("功能 section is missing".to_string()),
+    };
+    let scope = match section("覆盖范围") {
+        Some(v) => v,
+        None => return Some("覆盖范围 section is missing".to_string()),
+    };
+    let bounds = match section("边界") {
+        Some(v) => v,
+        None => return Some("边界 section is missing".to_string()),
+    };
+    let sid = match section("scenario_id") {
+        Some(v) => v,
+        None => return Some("scenario_id section is missing".to_string()),
+    };
+
+    if nonspace(&feature) < 20 {
+        return Some(format!("功能 is thinner than 20 characters: {feature}"));
+    }
+    // The scope must name the command and at least one surface. Both are written
+    // inside backticks, so a bare mention in prose does not count.
+    let ticked: Vec<&str> = scope.split('`').skip(1).step_by(2).collect();
+    if ticked.len() < 2 {
+        return Some(format!("覆盖范围 names no command and surface: {scope}"));
+    }
+    if !bounds.contains("覆盖") {
+        return Some(format!("边界 states nothing it covers: {bounds}"));
+    }
+    let has_exclusion = bounds.split(['；', ';']).any(|part| {
+        part.trim_start().starts_with("不覆盖") || part.trim_start().starts_with("不含")
+    });
+    if !has_exclusion {
+        return Some(format!("边界 carries no 排除项: {bounds}"));
+    }
+    if nonspace(&feature) + nonspace(&scope) + nonspace(&bounds) + nonspace(&sid) < 80 {
+        return Some("the four sections together are thinner than 80 characters".to_string());
+    }
+    // Placeholders. `x` is matched as a standalone ASCII word so that `-x`,
+    // `+x` and `0x…` — which appear in real flag and mode discussions — do not
+    // trip it. The scenario_id line is excluded: slugs legitimately end in `-x`.
+    let prose = format!("{feature}\n{scope}\n{bounds}");
+    for word in ["TODO", "TBD", "同上", "见上", "N/A"] {
+        if prose.contains(word) {
+            return Some(format!("占位词 {word} appears in the documentation"));
+        }
+    }
+    let bytes: Vec<char> = prose.chars().collect();
+    for (i, c) in bytes.iter().enumerate() {
+        if *c != 'x' {
+            continue;
+        }
+        let boundary = |o: Option<&char>| {
+            o.is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '+'))
+        };
+        if boundary(bytes.get(i.wrapping_sub(1)).filter(|_| i > 0)) && boundary(bytes.get(i + 1)) {
+            return Some("占位词 x appears in the documentation".to_string());
+        }
+    }
+    if !ids.iter().any(|id| id == &sid) {
+        return Some(format!("scenario_id does not resolve in the ledger: {sid}"));
+    }
+    None
+}
 
 /// `assert!(true)` type-checks, runs, and proves nothing; it is the cheapest
 /// way to satisfy a presence check while the real assertion hides elsewhere.
@@ -1893,14 +2355,99 @@ fn t4_port_tests_document_scope_and_boundaries() {
         .take_while(|l| l.starts_with("//!"))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        header.len() > 400,
-        "{path}: the module header is too thin to state scope and boundaries"
-    );
-    for needle in ["Clean room", "Boundaries", "blocked", "adapted"] {
+    // The module header states where the wave came from and under what rule.
+    for needle in [
+        "t4",
+        "dfb079967b9cbc99e533c21e65f674bb3f5e8b07",
+        "clean-room",
+        "Clean room",
+        "Boundaries",
+        "blocked",
+        "adapted",
+    ] {
         assert!(
             header.contains(needle),
             "{path}: the header never mentions {needle}"
+        );
+    }
+
+    // Every migrated scenario carries the four-section contract. The four fixed
+    // guards are exempt by name: they are integrity checks over this file, not
+    // migrated scenarios, so `scenario_id:` has nothing to resolve to.
+    let ids = t4_ledger_scenario_ids();
+    let mut seen_blocks: Vec<String> = Vec::new();
+    for (name, doc) in t4_doc_blocks(&text) {
+        if t4_is_infrastructure(&name) {
+            continue;
+        }
+        let report = t4_check_doc_contract(&doc, &ids);
+        assert!(
+            report.is_none(),
+            "{path}: {name}: {}",
+            report.unwrap_or_default()
+        );
+        assert!(
+            !seen_blocks.contains(&doc),
+            "{path}: {name} repeats another function's documentation verbatim"
+        );
+        seen_blocks.push(doc);
+    }
+    assert!(
+        seen_blocks.len() >= 2,
+        "{path}: found {} documented scenarios, so the walk is not working",
+        seen_blocks.len()
+    );
+
+    // Inline counterexamples: each must be rejected, and for the stated reason.
+    let good = concat!(
+        "功能: 运行该命令并断言输出里出现被改动的路径与新增的那一行内容。\n",
+        "覆盖范围: `libra diff` 的 `--stat` 子面；本用例实际执行 `libra diff --stat`。\n",
+        "边界: 覆盖 --stat 的逐路径明细；不覆盖列宽自适应。\n",
+        "scenario_id: PLACEHOLDER_ID\n"
+    );
+    let sample = |s: &str| {
+        s.replace(
+            "PLACEHOLDER_ID",
+            ids.first().map(String::as_str).unwrap_or(""),
+        )
+    };
+    assert!(
+        t4_check_doc_contract(&sample(good), &ids).is_none(),
+        "the reference block must satisfy the contract: {:?}",
+        t4_check_doc_contract(&sample(good), &ids)
+    );
+    let cases: [(&str, &str); 5] = [
+        (
+            &sample(good).replace("边界: 覆盖 --stat 的逐路径明细；不覆盖列宽自适应。\n", ""),
+            "边界",
+        ),
+        (&sample(good).replace("逐路径明细", "TODO"), "占位词"),
+        (
+            &sample(good).replace(
+                "覆盖范围: `libra diff` 的 `--stat` 子面；本用例实际执行 `libra diff --stat`。",
+                "覆盖范围: 见上。",
+            ),
+            "覆盖范围",
+        ),
+        (&sample(good).replace("；不覆盖列宽自适应", ""), "排除项"),
+        (
+            &sample(good).replace(
+                ids.first().map(String::as_str).unwrap_or(""),
+                "no::such-scenario",
+            ),
+            "scenario_id",
+        ),
+    ];
+    for (bad, why) in cases {
+        let report = t4_check_doc_contract(bad, &ids);
+        assert!(
+            report.is_some(),
+            "the {why} counterexample was accepted:\n{bad}"
+        );
+        let report = report.unwrap_or_default();
+        assert!(
+            report.contains(why),
+            "the {why} counterexample was rejected for the wrong reason: {report}"
         );
     }
 }

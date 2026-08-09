@@ -1,4 +1,4 @@
-# Memory 设计修订方案（2026-08-07，第六次竞品审计）
+# Memory 设计修订方案（2026-08-07 第六次竞品审计；2026-08-09 第七次审计增补 G12–G15）
 
 ## 文档职责
 
@@ -7,7 +7,7 @@
 - **代码现状（2026-08-07 复核）**：`src/` 中尚无 `MemoryNote` / `MemoryEvent` / `refs/libra/memory/*` 实现，也无 `libra memory` 命令；已落地的只有 `MemoryAnchor` 体系（`src/internal/ai/context_budget/memory_anchor.rs`）与 `with_memory_anchors()`（`src/internal/ai/prompt/builder.rs`）。memory.md 的 Phase A 尚未开工，设计修订成本最低。
 - **事实来源**：memory.md 全文、`plan-long.md`（MEM-01..05）、本地竞品仓库 README / DESIGN / docs（revision 引脚见 §2）、Libra 相关源码。
 - **权威边界**：本文是提案，不替代 memory.md / `agent.md` / `code.md` / `mainline.md` 的设计权威；与既有文档冲突时以对应权威为准，本文只登记「文档同步债」或「待决策」。
-- **落地状态**：A1 / A2 / A7 已按本文落地到 memory.md（§16 评测与验收、§8.7 混合检索通道、§0.0.4 本地语料复核）；A3–A6、B、C 待评审后落地。
+- **落地状态**：A1 / A2 / A7 已按本文落地到 memory.md（§16 评测与验收、§8.7 混合检索通道、§0.0.4 本地语料复核）；**A3（Working 层 / §10.5）、A4（Trust Gate / §7.5.1）、A5（可移植导出导入 / §5.6）、A6 决策（scope_key 为最小单位 / 团队同步维持 local-only）、B2（TOC + 执行摘要 + MEM 追溯表）、B3（MemoryAnchor wire 映射 / §11.6.1）、C（consolidate 命令 / §12–§13）以及 G12–G15（§10.5/§13.1/§18）已按第七次审计合并到 memory.md（2026-08-09）**；B1（§0.0 细节外移）留待后续按需。**2026-08-09 增补 MEM-06**：memory.md 新增 §19 并行多 Agent 协调 Memory（`coordination` namespace + `MemoryCoordinator` + `CoordinationView`），plan-long.md 登记 MEM-06（P1 候选），见 memory.md §19 与 plan-long.md MEM-06。
 
 ## 1. 结论速览
 
@@ -16,14 +16,18 @@
 | A1 评测与验收 | memory.md 新 §16 | MEM-02 验收 | P0 | **已落地** |
 | A2 混合检索通道 | memory.md §8.7、§5.2/§14 表 | MEM-02 | P0 | **已落地** |
 | A7 §0.0 语料刷新 + 反例登记 | memory.md §0.0.4 | 文档治理 | P0 | **已落地** |
-| A3 四层巩固与归并语义 | §3.2 / §10.5 | MEM-03 | P1 | 待落地 |
-| A4 Trust Gate 显式化 | §7.5 / §10 | MEM-03 | P1 | 待落地 |
-| A5 可移植导出/导入 | §5.5 扩展 | MEM-05 | P2 | 待落地 |
-| A6 数据边界与团队同步 | §5.4 / §17(→18) | 开放问题 | P1 决策 / P3 实现 | 待落地 |
+| A3 四层巩固与归并语义 | §3.2 / §10.5 | MEM-03 | P1 | **已落地（§10.5 Working 层）** |
+| A4 Trust Gate 显式化 | §7.5 / §10 | MEM-03 | P1 | **已落地（§7.5.1）** |
+| A5 可移植导出/导入 | §5.5 扩展 | MEM-05 | P2 | **已落地（§5.6）** |
+| A6 数据边界与团队同步 | §5.4 / §17(→18) | 开放问题 | P1 决策 / P3 实现 | **决策已落地（scope_key 最小单位、团队同步 local-only）；实现待 Phase D** |
 | B1 §0.0 细节外移 | gap/memory-redesign.md 承接 | 结构 | P1 | 待落地 |
-| B2 目录 + 执行摘要 + MEM 追溯表 | memory.md 头部 | 治理 | P1 | 待落地 |
-| B3 MemoryAnchor 规范性 wire 映射 | §11.6 | 一致性 | P1 | 待落地 |
-| C `consolidate` 命令补齐 | §12 / §13 | 一致性 | P1 | 待落地 |
+| B2 目录 + 执行摘要 + MEM 追溯表 | memory.md 头部 | 治理 | P1 | **已落地** |
+| B3 MemoryAnchor 规范性 wire 映射 | §11.6 | 一致性 | P1 | **已落地（§11.6.1）** |
+| C `consolidate` 命令补齐 | §12 / §13 | 一致性 | P1 | **已落地** |
+| G12 投毒隔离与再验证闭环 | §10.5 / §13.1 | MEM-03 | P1 | **已落地（§10.6 / §13.1）** |
+| G13 高信任 note 定期再验证 | §7.5 | MEM-03 | P2 | **已落地（§10.6 / §13.1）** |
+| G14 `--debug-memory` 升 Phase C 硬交付 | §18 | 可观测性 | P1 | **已落地（§18）** |
+| G15 adaptive profile 触发与验收 | §8.7 / §18 | MEM-02 | P2 | **已落地（§18）** |
 
 ## 2. 本地竞品语料与机制分析（第六次审计，revision 引脚）
 
@@ -215,15 +219,59 @@ query
 | A2 | §8.7 | MEM-02 | P0 | Phase C |
 | A7 | §0.0.4 | 治理 | P0 | 本次 |
 | A6（决策） | §5.4 / §18 | 开放问题 | P1 | 本次评审 |
-| A3 | §3.2 / §10.5 | MEM-03 | P1 | Phase D |
-| A4 | §7.5 / §10 | MEM-03 | P1 | Phase B |
-| C | §12 / §13 | 一致性 | P1 | Phase A 前 |
+| C | §12 / §13 | 一致性 | P1 | **Phase A 前（第七次提前）** |
+| A3 | §3.2 / §10.5 | MEM-03 | P1 | **Phase B 前（第七次提前）** |
+| A4 | §7.5 / §10 | MEM-03 | P1 | **Phase B 前（第七次提前）** |
+| G12 投毒隔离与再验证闭环 | §10.5 / §13.1 | MEM-03 | P1 | **Phase B（新增，第七次）** |
+| G14 `--debug-memory` 升硬交付 | §18 | 可观测性 | P1 | **Phase C（新增，第七次）** |
 | A5 | §5.5 扩展 | MEM-05 | P2 | Phase D/E |
+| G13 高信任 note 再验证 | §7.5 | MEM-03 | P2 | **Phase D（新增，第七次）** |
+| G15 adaptive profile 触发与验收 | §8.7 / §18 | MEM-02 | P2 | **Phase C 后（新增，第七次）** |
 | A6（实现） | §5.4 | 团队同步 | P3 | 未来 |
 | B1–B3 | 结构 | 治理 | P1 | 随 A 项改版 |
 
 ## 8. 落地顺序与验收
 
 1. 本次：A7（§0.0.4 语料刷新 + 反例）→ A2（§8.7 混合检索 + 表）→ A1（§16 评测与验收）→ 提交。
-2. 下次：C（consolidate 命令补齐）→ A4（Trust Gate）→ A3（四层巩固）→ A6 决策定案 → B2/B3。
+2. 下次：C（consolidate 命令补齐）→ A4（Trust Gate）→ A3（四层巩固）→ G12（投毒隔离闭环）→ A6 决策定案 → B2/B3。
 3. 每次落地执行：结构校验（表格列数、链接、编号引用、冲突标记、尾随空白）、`libra diff --check`、仅提交目标文件。
+
+## 9. 第七次审计新增缺口（G12–G15）
+
+第七次竞品审计（2026-08-09）Memory 类竞品仓库（agentmemory `d60652a`、fava-trails `6653f9f`、Memoria `54c9114`、memweave `2ff82df`、sqlite-memory `0f0aede`、ledgermind `99220d1`、perstate `95e27e3`、letta agent-file `78212eb` / skills `16352df` / trajectory `59c0db5` / letta-code `a75f4d93`）**全部无更新**，无新机制需吸收。下列缺口来自对 memory.md 现有规范的深读，非竞品更新触发；它们把 §0.0.11 已列出的投毒风险与可观测性承诺固化为可执行规范。
+
+### G12 投毒隔离与再验证闭环（P1，对应 MEM-03）
+
+**现状缺口**：§0.0.11 把 OWASP 记忆投毒列为风险，§4.1.1 支持按 CompileRecord（producer/prompt/model 版本）批量定位受影响 note，但没有定义「投毒隔离 → 追溯 → 再验证或重编译 → 恢复」的可执行闭环；§13.1 只有零散不变量。ledgermind 的无监督自愈是反例（不可审计），Libra 需要**有审计**的投毒处置。
+
+**修订方案**：在 §10 增补「投毒隔离」小节——
+- **触发**：矛盾检测、低置信度骤增、来源失效（`EvidenceRef` 不可解析）、或人工 `quarantine --reason poisoning` 批量隔离。
+- **处置**：批量 `Quarantined`（不静默删除），按 `CompileRecord` 的 `producer`/`prompt_version`/`model_id`/`rules_version` 追溯受影响 note 集合。
+- **恢复**：`revalidate`（在固定 code version 上重跑确定性验证）或 `recompile`（以新 producer/prompt 版本重生成），均产生新 Draft 重走 gate；无修复路径者保持 `Quarantined`。
+- **反例登记**：拒绝 ledgermind 式无监督自主变异；任何投毒处置都必须可解释、可回滚、写入 event reason。
+
+**验收**：投毒注入 fixture → 断言受影响 note 全部 quarantine、prompt 注入排除、可按 producer/model 版本追溯、revalidate/recompile 后恢复或保持隔离；处置过程写入 `memory_context_receipt` 之外的独立 audit。
+
+### G13 高信任 note 定期再验证（P2，对应 MEM-03）
+
+**现状缺口**：`trust = Verified/RepoEvidence` 是写入时快照，代码/依赖/事实变化后信任不自动衰减或降级；§10.5 归并与 §7.5 门禁都是写入时，无再验证。
+
+**修订方案**：在 §7.5 增补确定性再验证规则——对高信任 `procedural.*`/`semantic.repo.*` 绑定 `valid_until` 或 `revalidate_after`（借鉴 agentmemory 衰减、PowerMem revalidate-on-code-change）；代码/依赖版本变化时重跑验证，失败则降级 `trust` 或 quarantine。写入时信任不永久固化。
+
+**验收**：code commit 变化后高信任 note 触发再验证；验证失败 → 降级/quarantine；`doctor` 可报告待再验证集合。
+
+### G14 `--debug-memory` 升为 Phase C 硬交付（P1，可观测性）
+
+**现状缺口**：§18 开放问题 6 仍把它列为开放问题，但这是低成本、高价值的注入可观测性。
+
+**修订方案**：把「`libra code --debug-memory` 每 turn 逐字打印被注入的 memory 槽位」从开放问题升为 Phase C 硬性退出门槛（与 `inspect-injection` 回执并列）。
+
+**验收**：Phase C 退出时该标志可用，逐 turn 打印注入槽位与 `ContextReceipt` 对应。
+
+### G15 adaptive profile 触发与验收（P2，对应 MEM-02）
+
+**现状缺口**：§8.7 已把混合检索定案，但 §18 开放问题 4 的「离线训练/显式 adaptive profile」无明确触发与验收；统计快照冻结进 receipt 的约束已写，触发条件缺失。
+
+**修订方案**：明确 adaptive profile 触发信号（统计成功任务中反复访问的内容 → LLM 反推「什么本该更早浮现」，Cursor 自报实践）与硬约束——必须冻结统计快照并写入 receipt、不得改写 canonical `MemoryHead.rank_hint`、仅离线训练/显式 opt-in。
+
+**验收**：adaptive profile 开启时 receipt 含统计快照 OID/hash；关闭时默认 deterministic ranking 不受 access stats 影响。

@@ -4733,8 +4733,12 @@ fn check_whitespace_in_file(
     problems
 }
 
-/// `diff --check`: print whitespace warnings and exit 2 when any are found.
-fn render_diff_check(result: &DiffOutput) -> CliResult<()> {
+/// `diff --check`: print whitespace warnings, reporting whether any were found.
+///
+/// The caller turns that into a status code, because `--check` is not the only
+/// contributor: Git *adds* the bits, so `--check --exit-code` over a change with
+/// whitespace damage is `1 + 2 = 3`, not `2`.
+fn render_diff_check(result: &DiffOutput) -> CliResult<bool> {
     let problems: Vec<String> = result
         .files
         .iter()
@@ -4743,10 +4747,10 @@ fn render_diff_check(result: &DiffOutput) -> CliResult<()> {
         })
         .collect();
     if problems.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     println!("{}", problems.join("\n"));
-    Err(CliError::silent_exit(2))
+    Ok(true)
 }
 
 fn render_diff_output(
@@ -4758,8 +4762,19 @@ fn render_diff_output(
     // bad mode is rejected like Git does at parse time).
     let color_moved = color_moved_active(args)?;
     // `--check` replaces the normal diff output with whitespace-error warnings.
+    // Its status is 2 when it finds damage, and `--exit-code` independently
+    // contributes 1 when there is any difference at all. Git adds the two, so a
+    // damaged change asked with both is 3 and a clean change asked with both is
+    // still 1 — returning early here would have thrown that second bit away.
     if args.check {
-        return render_diff_check(result);
+        let damaged = render_diff_check(result)?;
+        let code =
+            i32::from(args.exit_code && result.files_changed > 0) + if damaged { 2 } else { 0 };
+        return if code == 0 {
+            Ok(())
+        } else {
+            Err(CliError::silent_exit(code))
+        };
     }
     if output.is_json() {
         emit_json_data("diff", result, output)?;
