@@ -1102,13 +1102,13 @@ where
         if self.local_turn_runtime.is_none() && self.local_turn_runtime_task.is_none() {
             return;
         }
-        if let Some(previous) = self.local_turn_runtime.take() {
-            if let Err(error) = previous.shutdown().await {
-                tracing::warn!(
-                    error = %error,
-                    "failed to shut down previous local AgentRuntime before rebinding"
-                );
-            }
+        if let Some(previous) = self.local_turn_runtime.take()
+            && let Err(error) = previous.shutdown().await
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to shut down previous local AgentRuntime before rebinding"
+            );
         }
         if let Some(task) = self.local_turn_runtime_task.take() {
             // Shutdown should have ended the actor; abort as a last resort so a

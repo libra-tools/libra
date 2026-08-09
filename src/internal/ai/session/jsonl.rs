@@ -1942,7 +1942,7 @@ fn process_appears_alive(
         {
             return false;
         }
-        return true;
+        true
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {

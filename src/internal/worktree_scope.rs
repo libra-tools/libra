@@ -377,19 +377,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_pinned_scope_survives_a_cwd_change() {
-        // Moving the process cwd is not this test's business alone: every
-        // `ChangeDirGuard` in the suite reads the same one. `#[serial]` only
-        // orders this against other `#[serial]` tests, so hold the cwd lock
-        // the guard uses — otherwise the `set_current_dir` below yanks the
-        // directory out from under whatever repository fixture is mid-flight.
-        let _cwd_lock = crate::utils::test::cwd_lock_guard();
-        let original = std::env::current_dir().expect("cwd");
-        let elsewhere = std::env::temp_dir();
-
         // A REAL repository, because `pin_scope_for_test` resolves its paths
         // through `RequestScope::resolve` and installs nothing when the
         // workdir is not inside one — pinning the ambient cwd only appeared to
         // work when another test had parked it in someone else's fixture.
+        //
+        // Built BEFORE the cwd lock below: `setup_with_new_libra_in` takes and
+        // releases that lock itself, and running a whole `libra init` while
+        // holding it would block every other fixture in the suite for the
+        // duration.
         let repo = tempfile::tempdir().expect("repo");
         {
             let _cd = crate::utils::test::ChangeDirGuard::new(repo.path());
@@ -399,6 +395,15 @@ mod tests {
                 .expect("runtime")
                 .block_on(crate::utils::test::setup_with_new_libra_in(repo.path()));
         }
+
+        // Moving the process cwd is not this test's business alone: every
+        // `ChangeDirGuard` in the suite reads the same one. `#[serial]` only
+        // orders this against other `#[serial]` tests, so hold the cwd lock
+        // the guard uses — otherwise the `set_current_dir` below yanks the
+        // directory out from under whatever repository fixture is mid-flight.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
+        let original = std::env::current_dir().expect("cwd");
+        let elsewhere = std::env::temp_dir();
 
         let _pin = WorktreeScope::pin_scope_for_test(
             WorktreeScope::Linked("wt-pinned".to_string()),
@@ -441,9 +446,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_pinned_workdir_keeps_sidecars_in_their_own_gitdir() {
-        // See `a_pinned_scope_survives_a_cwd_change`: the raw `set_current_dir`
-        // below is process-wide, so it has to hold `ChangeDirGuard`'s lock.
-        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
         // A real repository, so the resolver has a storage root to find.
@@ -455,6 +457,10 @@ mod tests {
                 .expect("runtime")
                 .block_on(crate::utils::test::setup_with_new_libra_in(repo.path()));
         }
+        // See `a_pinned_scope_survives_a_cwd_change`: the raw `set_current_dir`
+        // below is process-wide, so it has to hold `ChangeDirGuard`'s lock —
+        // taken only now, so the `libra init` above does not run under it.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let original = std::env::current_dir().expect("cwd");
 
         // Pin a SUBDIRECTORY, which is what a command invoked from one does.
@@ -496,9 +502,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_pinned_request_resolves_storage_and_worktree_root_once() {
-        // See `a_pinned_scope_survives_a_cwd_change`: the raw `set_current_dir`
-        // below is process-wide, so it has to hold `ChangeDirGuard`'s lock.
-        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
         {
@@ -509,6 +512,10 @@ mod tests {
                 .expect("runtime")
                 .block_on(crate::utils::test::setup_with_new_libra_in(repo.path()));
         }
+        // See `a_pinned_scope_survives_a_cwd_change`: the raw `set_current_dir`
+        // below is process-wide, so it has to hold `ChangeDirGuard`'s lock —
+        // taken only now, so the `libra init` above does not run under it.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let original = std::env::current_dir().expect("cwd");
         let canonical_repo =
             std::fs::canonicalize(repo.path()).unwrap_or_else(|_| repo.path().to_path_buf());
@@ -547,16 +554,17 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_request_database_follows_the_pin_not_the_cwd() {
-        // See `a_pinned_scope_survives_a_cwd_change`: the raw `set_current_dir`
-        // below is process-wide, so it has to hold `ChangeDirGuard`'s lock.
-        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo_a = tempfile::tempdir().expect("repo a");
         let repo_b = tempfile::tempdir().expect("repo b");
-        let original = std::env::current_dir().expect("cwd");
         for repo in [repo_a.path(), repo_b.path()] {
             let _cd = crate::utils::test::ChangeDirGuard::new(repo);
             crate::utils::test::setup_with_new_libra_in(repo).await;
         }
+        // See `a_pinned_scope_survives_a_cwd_change`: the raw `set_current_dir`
+        // below is process-wide, so it has to hold `ChangeDirGuard`'s lock —
+        // taken only now, so the two `libra init`s above do not run under it.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
+        let original = std::env::current_dir().expect("cwd");
 
         let _pin = WorktreeScope::pin_request_scope(repo_a.path().to_path_buf());
         // The cwd is repository B; the pin is repository A.
@@ -602,17 +610,18 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn an_unresolvable_pin_installs_nothing_and_never_inherits() {
-        // See `a_pinned_scope_survives_a_cwd_change`: the raw `set_current_dir`
-        // below is process-wide, so it has to hold `ChangeDirGuard`'s lock.
-        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let outer = tempfile::tempdir().expect("the enclosing repository");
         let ambient = tempfile::tempdir().expect("the repository the cwd is in");
         let nowhere = tempfile::tempdir().expect("not a repository");
-        let original = std::env::current_dir().expect("cwd");
         for repo in [outer.path(), ambient.path()] {
             let _cd = crate::utils::test::ChangeDirGuard::new(repo);
             crate::utils::test::setup_with_new_libra_in(repo).await;
         }
+        // See `a_pinned_scope_survives_a_cwd_change`: the raw `set_current_dir`
+        // below is process-wide, so it has to hold `ChangeDirGuard`'s lock —
+        // taken only now, so the two `libra init`s above do not run under it.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
+        let original = std::env::current_dir().expect("cwd");
 
         let _outer_pin = WorktreeScope::pin_request_scope(outer.path().to_path_buf());
         std::env::set_current_dir(ambient.path()).expect("move the cwd");
