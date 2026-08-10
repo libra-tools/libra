@@ -169,12 +169,22 @@ jobs:
 
     runs-on: [self-hosted]
 
+    # Below GitHub's 360-minute default so an overrun fails as a timeout with
+    # the log intact, rather than being reaped at the platform cap.
+    timeout-minutes: 350
+
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
       LIBRA_SKIP_WEB_BUILD: "1"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "1"
+      # libtest runs each test in a thread with a 2 MiB stack. An unoptimized
+      # async state machine — `switch::execute` and friends inline every
+      # awaited future into one frame — does not fit, and the test process
+      # ABORTS rather than failing. The real CLI runs those futures on the
+      # 8 MiB main thread, so this is a harness limit, not a product one.
+      RUST_MIN_STACK: "16777216"
 
     steps:
       - name: Checkout repository
@@ -240,7 +250,45 @@ jobs:
           LIBRA_STORAGE_BUCKET: ${{ secrets.LIBRA_STORAGE_BUCKET }}
           LIBRA_STORAGE_ACCESS_KEY: ${{ secrets.LIBRA_STORAGE_ACCESS_KEY }}
           LIBRA_STORAGE_SECRET_KEY: ${{ secrets.LIBRA_STORAGE_SECRET_KEY }}
-        run: cargo test --all
+        run: |
+          set -euo pipefail
+          # `cargo test --all` minus the `command_test` binary, which
+          # `compat-offline-command` shards instead. That one target compiles
+          # 150 modules (~2950 tests) into a SINGLE process, and roughly a
+          # third of them serialize on the process-global cwd lock that every
+          # `ChangeDirGuard` takes — so it runs at about one core regardless of
+          # the machine. It went past the 360-minute cap the first time the lib
+          # suite stopped failing early and cargo actually reached it.
+          #
+          # Coverage is unchanged: lib, bins and doctests run here, so does
+          # every other integration target, and `command_test` runs there.
+          #
+          # Targets whose `required-features` are not enabled are dropped, not
+          # named: `cargo test --all` SKIPS those silently, but naming one with
+          # `--test` is a hard error. The later steps in this job run each of
+          # them explicitly with the feature it needs.
+          mapfile -t TARGETS < <(
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[]
+                       | (.features.default // []) as $default
+                       | .targets[]
+                       | select(.kind[] == "test")
+                       | select(.name != "command_test")
+                       | select(((((."required-features") // []) - $default) | length) == 0)
+                       | .name' \
+              | sort -u
+          )
+          if [ "${#TARGETS[@]}" -lt 100 ]; then
+            echo "::error::enumerated only ${#TARGETS[@]} integration targets; refusing to run a truncated suite"
+            exit 1
+          fi
+          echo "running lib + bins + doctests + ${#TARGETS[@]} integration targets"
+          ARGS=()
+          for target in "${TARGETS[@]}"; do
+            ARGS+=(--test "$target")
+          done
+          cargo test --lib --bins "${ARGS[@]}"
+          cargo test --doc
 
       # Phase 6 — Local TUI Automation Control scenario suite (docs/improvement/agent.md Part C).
       # Without `--features test-provider` + `LIBRA_ENABLE_TEST_PROVIDER=1`, the scenarios
@@ -302,6 +350,92 @@ jobs:
           path: target/code-ui-scenarios/**
           if-no-files-found: ignore
           retention-days: 7
+
+  # The `command_test` half of what `cargo test --all` used to do in one job.
+  # See the note on compat-offline-core's test step for why it is split out:
+  # the binary is lock-bound rather than CPU-bound, so the only thing that
+  # shortens it is running it in more than one PROCESS. Shards are separate
+  # jobs, so each gets its own cwd lock and they scale with the runner pool.
+  command-tests:
+    name: compat-offline-command
+
+    runs-on: [self-hosted]
+
+    timeout-minutes: 350
+
+    strategy:
+      # One shard failing must not cancel the others: the point of the split is
+      # to see the whole binary's result in one run.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+      LIBRA_SKIP_WEB_BUILD: "1"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "1"
+      # See compat-offline-core: 2 MiB test threads cannot hold an
+      # unoptimized async state machine, and the process aborts if one
+      # overflows. `command::switch_test` needs a little over 2 MiB.
+      RUST_MIN_STACK: "16777216"
+      # Kept in one place so the matrix above and the partition below cannot
+      # disagree — a mismatch would silently drop or double-run tests.
+      SHARD_COUNT: "4"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.10.0 --activate
+
+      - name: Run command_test shard ${{ matrix.shard }}
+        env:
+          LIBRA_TEST_GITHUB_TOKEN: ${{ secrets.LIBRA_TEST_GITHUB_TOKEN }}
+          LIBRA_TEST_GITHUB_NAMESPACE: ${{ secrets.LIBRA_TEST_GITHUB_NAMESPACE }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          LIBRA_D1_ACCOUNT_ID: ${{ secrets.LIBRA_D1_ACCOUNT_ID }}
+          LIBRA_D1_API_TOKEN: ${{ secrets.LIBRA_D1_API_TOKEN }}
+          LIBRA_D1_DATABASE_ID: ${{ secrets.LIBRA_D1_DATABASE_ID }}
+          LIBRA_STORAGE_ENDPOINT: ${{ secrets.LIBRA_STORAGE_ENDPOINT }}
+          LIBRA_STORAGE_BUCKET: ${{ secrets.LIBRA_STORAGE_BUCKET }}
+          LIBRA_STORAGE_ACCESS_KEY: ${{ secrets.LIBRA_STORAGE_ACCESS_KEY }}
+          LIBRA_STORAGE_SECRET_KEY: ${{ secrets.LIBRA_STORAGE_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # Partition by ENUMERATED TEST NAME, not by module prefix. The modulo
+          # split is exhaustive and disjoint by construction, so a renamed or
+          # newly added test cannot silently fall out of every shard the way a
+          # hand-maintained filter list would eventually let one do.
+          cargo test --test command_test --no-run
+          mapfile -t ALL < <(
+            cargo test --test command_test -- --list --format terse \
+              | sed -n 's/: test$//p' | sort
+          )
+          total=${#ALL[@]}
+          if [ "$total" -lt 2000 ]; then
+            echo "::error::enumerated only $total command tests; refusing to run a truncated shard"
+            exit 1
+          fi
+          MINE=()
+          for index in "${!ALL[@]}"; do
+            if [ "$(( index % SHARD_COUNT ))" -eq "${{ matrix.shard }}" ]; then
+              MINE+=("${ALL[$index]}")
+            fi
+          done
+          echo "shard ${{ matrix.shard }} of $SHARD_COUNT: ${#MINE[@]} of $total tests"
+          cargo test --test command_test -- --exact "${MINE[@]}"
 
   network-remotes:
     name: compat-network-remotes
