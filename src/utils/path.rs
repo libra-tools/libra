@@ -98,6 +98,11 @@ mod tests {
         let linked = root.path().join("linked");
         let linked_gitdir = linked.join(".libra");
         fs::create_dir_all(common.join("objects")).expect("create shared object store");
+        // The commondir target must look like TERMINAL common storage
+        // (`util::is_terminal_common_storage`), which an object store alone
+        // does not: a real main gitdir also carries the repository database,
+        // and without it the pointer is refused as corruption.
+        fs::write(common.join(crate::utils::util::DATABASE), b"").expect("create repository db");
         fs::create_dir_all(&linked_gitdir).expect("create linked worktree gitdir");
         fs::write(
             linked_gitdir.join("commondir"),
