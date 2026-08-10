@@ -1591,10 +1591,13 @@ mod tests {
 
         use axum::extract::connect_info::MockConnectInfo;
 
+        /// What the adapter recorded, as `(message body, command id)`.
+        type Submitted = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
         #[derive(Clone)]
         struct CommandIdAdapter {
             session: Arc<CodeUiSession>,
-            submitted: Arc<Mutex<Vec<(String, Option<String>)>>>,
+            submitted: Submitted,
         }
 
         #[async_trait::async_trait]
