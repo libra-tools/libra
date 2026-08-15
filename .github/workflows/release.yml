@@ -123,6 +123,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path "build" | Out-Null
           Copy-Item "target\${{ matrix.target.rust }}\release\${{ matrix.component }}.exe" "build\$binaryName.exe"
 
+          (Get-FileHash "build\$binaryName.exe" -Algorithm SHA256).Hash.ToLowerInvariant() |
+            Set-Content "build\$binaryName.exe.sha256" -NoNewline
+
           Write-Output "Built binary: $binaryName"
 
       - name: Upload to Cloudflare R2 (Unix)

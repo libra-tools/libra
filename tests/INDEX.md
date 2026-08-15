@@ -23,7 +23,7 @@
 | `compat_worktree_delete_dir` | 1 | Guards worktree delete semantics on dir removal | `src/command/worktree.rs` |
 | `compat_checkout_alias_help` | 1 | Guards `--help` text for checkout aliases | `src/command/checkout.rs` |
 | `compat_matrix_alignment` | 1 | Guards public docs/release matrices vs. real CLI/API surfaces, including P2-04's explicit non-sending `send-email` policy | `COMPATIBILITY.md`, `docs/commands/code.md`, `docs/commands/send-email.md`, `.github/workflows/base.yml`, `src/cli.rs`, `src/internal/ai/web/mod.rs` |
-| `compat_install_alias` | 1 | Guards IX-01 full-installer `lba -> libra` creation, same-version repair/idempotency, CLI/env opt-outs, foreign-path preservation, and symlink-unavailable fallback with an isolated fake downloader | `install.sh`, `tests/compat/install_alias_smoke.sh`, `README.md`, `README.zh-CN.md` |
+| `compat_install_alias` | 1 | Guards IX-01 Unix `lba -> libra` and plan-20260714 PD-10 Windows `lba.cmd` resolution, CLI/env opt-outs, and foreign-path preservation | `install.sh`, `install.ps1`, `tests/compat/install_alias_smoke.sh`, `tests/compat/install_alias_windows.ps1` |
 | `compat_live_compat_workflow` | 1 | Guards optional live AI/cloud workflow remains manual/scheduled and secret-gated | `.github/workflows/live-compat.yml` |
 | `compat_branch_lossy_wrapper_guard` | 1 | Guards branch-name lossy conversion wrapper | `src/internal/branch.rs` |
 | `compat_lfs_client_production_unwrap_guard` | 1 | Bans `unwrap()/expect()` in `internal/protocol/lfs_client.rs` | `src/internal/protocol/lfs_client.rs` |

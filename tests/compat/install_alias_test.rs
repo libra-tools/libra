@@ -30,10 +30,36 @@ fn installer_creates_and_repairs_safe_optional_lba_alias() {
     );
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 #[test]
-fn installer_alias_smoke_is_unix_only() {
-    eprintln!("skipped: install.sh supports Linux and macOS");
+fn installer_alias_smoke_windows() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("tests/compat/install_alias_windows.ps1");
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-RepoRoot")
+        .arg(&repo)
+        .output()
+        .expect("run Windows install alias smoke script");
+
+    assert!(
+        output.status.success(),
+        "Windows install alias smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("install alias Windows smoke: ok"),
+        "Windows smoke script did not print its completion marker\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[cfg(all(not(unix), not(windows)))]
+#[test]
+fn installer_alias_smoke_is_unsupported_platform() {
+    eprintln!("skipped: installer aliases are covered on Unix and Windows");
 }
 
 /// plan-20260714 PD-10: the Windows installer ships the same optional `lba`
