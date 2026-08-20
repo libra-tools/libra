@@ -1,10 +1,6 @@
 # Operation Log、Working Copy 快照与稳定 Change ID 设计
 
-**状态：** Proposed
-
 **面向读者：** Libra 维护者、贡献者与 CLI 功能开发者
-
-**代码基线：** e951251698222465bd0a749dc398e66788284166（v0.19.156）
 
 ## 1. 背景与设计选择
 
@@ -455,7 +451,7 @@ graph TB
 
 ### 5.1 模块划分与文件落点
 
-现有 `src/internal/operation_wrapper.rs` 是 v1 的唯一 wrapper。v2 不原地堆功能，而是拆成模块，`operation_wrapper.rs` 降级为 v1 兼容 adapter，只读兼容旧 `op log/show` 与旧 `restorable` 语义。
+当前 `src/internal/operation_wrapper.rs` 与 `src/internal/operation.rs`（`OperationService`）、`operation_view*` 三表构成 v1。本方案处于开发阶段，**不维护 v1 兼容层**：v2 直接替换 v1 的模块与 schema，v2 每阶段验证通过后即删除被替换的 v1 代码（`operation_wrapper.rs`、v1 表与 model、v1 专用命令路径），最终不存在双写或兼容 adapter。过渡期只保留最短并行窗口用于 shadow 对比，不投入长期兼容成本。
 
 | 新模块/文件 | 职责 | 借鉴的 jj 实现 |
 |---|---|---|
@@ -476,7 +472,7 @@ graph TB
 | `src/internal/change/genealogy.rs` | typed predecessor 多边与 evolution 查询 | `jj/lib/src/op_store.rs::Operation.commit_predecessors` |
 | `src/internal/change/resolve.rs` | short-prefix 解析与歧义诊断 | `jj/lib/src/id_prefix.rs` |
 | `src/internal/worktree_io/` | 从 `status_io_worker.rs` 抽取的通用 bounded 只读 I/O executor | jj 无直接对应（Libra 特有可靠性层） |
-| `sql/migrations/*operation_v2*` | additive v2 schema | — |
+| `db.rs` v2 schema + `sql/` 表定义 | 替换 v1 operation 表与 model（开发期直接重建，不做 additive） | — |
 | `src/internal/ai/tools/*`、`ai/libra_vcs.rs` | Agent tool mutation gateway（AGOP） | — |
 
 ### 5.2 核心结构体设计
@@ -512,6 +508,8 @@ pub trait StateFacet: Send + Sync {
     fn capture(&self, ctx: &FacetCaptureCtx) -> Result<FacetCapture, FacetError>;
     fn validate(&self, capture: &FacetCapture) -> Result<(), FacetError>;
     fn restore(&self, capture: &FacetCapture, ctx: &mut FacetRestoreCtx) -> Result<(), FacetError>;
+    /// 计算 from -> to 的语义 delta，供 `op revert` 做逆向合并；restore 用完整 capture，revert 用 delta。
+    fn diff(&self, from: &FacetCapture, to: &FacetCapture) -> Result<FacetDiff, FacetError>;
     fn roots(&self, capture: &FacetCapture) -> Vec<ObjectHash>; // GC/cloud-sync root 枚举
 }
 ```
@@ -560,16 +558,16 @@ pub struct WorkspaceSnapshotV2 {
 // src/internal/operation/store.rs
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationV2 {
-    pub op_id: String,                       // canonical op identity（见 5.2.5）
+    pub op_id: String,                       // UUIDv7，时间有序（不承担内容身份）
     pub parent_op_ids: Vec<String>,          // 多父 DAG；Phase 1 可先只写一个父
-    pub pre_view_oid: ObjectHash,            // mutation 前 RepoViewV2
+    pub pre_view_oid: ObjectHash,            // mutation 前 RepoViewV2（pre-view 规则见 5.3.1）
     pub post_view_oid: ObjectHash,           // mutation 后 RepoViewV2
-    pub kind: OperationKind,                 // Command | ExternalSnapshot | Undo | Redo | Restore | Revert | Reconcile | InternalWorker
+    pub kind: OperationKind,                 // Command | ExternalSnapshot | Undo | Redo | Restore | Revert | Reconcile
     pub status: OperationStatusV2,           // Running | Success | Failed | Partial | Aborted
     pub metadata: OperationMetaV2,           // redacted：command/args_digest/actor/causal ids
     pub restores_op_id: Option<String>,
     pub reverts_op_id: Option<String>,
-    pub predecessor_map_oid: Option<ObjectHash>, // successor_oid -> typed predecessor(s)
+    pub predecessor_map_oid: Option<ObjectHash>, // typed PredecessorEdge 清单（含 relation kind），供 genealogy 重建
 }
 ```
 
@@ -609,19 +607,39 @@ pub struct PredecessorEdge {
 
 jj 的 `ChangeId` 是 `id_type!(ChangeId { reverse_hex() })`（`jj/lib/src/backend.rs:52-56`），`Commit` 结构自带 `change_id` 字段并在 rewrite 时默认继承（`jj/lib/src/commit_builder.rs:336-344` 的 `set_change_id` / `generate_new_change_id`）。Libra 不把 ChangeId 塞进 Git commit 对象格式（避免改动 OID），而是：随机新 ID 写入 sidecar/operation manifest；legacy import 用 `synthetic_for_commit`（`SHA-256("libra-change-id-v1\0" || object_format || commit_oid_bytes)` 前 16 字节）；`ChangeRevision` 投影记录 `(change_id, commit_oid)` 二元组，解决“一个 change 有多个 revision”的查询；`PredecessorEdge` 对应 jj `Operation.commit_predecessors`（`BTreeMap<CommitId, Vec<CommitId>>`），但加上 relation kind 以表达 squash/split/duplicate 多边语义。
 
-#### 5.2.5 SQLite v2 表结构（additive migration）
+#### 5.2.5 SQLite v2 表结构（开发期直接替换 v1）
 
-在现有 `operation / operation_parent / operation_view / operation_view_ref / operation_view_workspace`（`src/internal/db.rs:557-606`）之上新增，不原地伪升级 v1：
+开发期直接替换 v1 schema：删除 `operation / operation_parent / operation_view / operation_view_ref / operation_view_workspace`（`src/internal/db.rs:557-606`）及其 SeaORM model，按下面 v2 表重建；旧仓库若需保留审计数据，用一次性导入脚本，不做长期兼容层。
 
 ```sql
--- operation v2 列（additive）：
--- ALTER TABLE operation ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1;
--- ALTER TABLE operation ADD COLUMN kind TEXT NOT NULL DEFAULT 'command';
--- ALTER TABLE operation ADD COLUMN pre_view_oid TEXT;
--- ALTER TABLE operation ADD COLUMN post_view_oid TEXT;
--- ALTER TABLE operation ADD COLUMN restores_op_id TEXT;
--- ALTER TABLE operation ADD COLUMN reverts_op_id TEXT;
--- ALTER TABLE operation ADD COLUMN causal_context_id TEXT;
+CREATE TABLE IF NOT EXISTS operation (
+    op_id              TEXT PRIMARY KEY,
+    repo_id            TEXT NOT NULL,
+    format_version     INTEGER NOT NULL DEFAULT 2,
+    kind               TEXT NOT NULL,          -- command|external_snapshot|undo|redo|restore|revert|reconcile
+    status             TEXT NOT NULL,          -- running|success|failed|partial|aborted
+    command_name       TEXT,
+    description        TEXT,
+    args_digest        TEXT,
+    actor              TEXT,
+    worktree_id        TEXT,
+    scope_kind         TEXT NOT NULL,          -- main|linked|repository
+    pre_view_oid       TEXT NOT NULL,
+    post_view_oid      TEXT NOT NULL,
+    restores_op_id     TEXT,
+    reverts_op_id      TEXT,
+    predecessor_map_oid TEXT,
+    causal_context_id  TEXT,
+    start_ts           INTEGER NOT NULL,
+    end_ts             INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS operation_parent (
+    op_id        TEXT NOT NULL,
+    parent_op_id TEXT NOT NULL,
+    ordinal      INTEGER NOT NULL,
+    PRIMARY KEY (op_id, parent_op_id)
+);
 
 CREATE TABLE IF NOT EXISTS operation_head (
     repo_id    TEXT NOT NULL,
@@ -683,7 +701,7 @@ CREATE TABLE IF NOT EXISTS ai_operation_link (
 );
 ```
 
-`operation_head` 对应 jj 的 op heads store（`jj/lib/src/op_heads_store.rs`）：发布采用 CAS（比较旧 generation/旧 head 集合），并发分叉时允许多行存在，之后由 reconcile operation 收敛。v1 的 `op_id` 目前是 `Uuid::now_v7()`（`operation_wrapper.rs:440`），v2 保持 op_id 的 UUID 形态以兼容查询，但新增 `format_version` 与 `pre/post_view_oid` 列；`view_id` 从 UUID 升级为 `RepoViewV2` manifest 的 `ObjectHash`（`view_oid` 是 canonical manifest 内容身份，SQLite row ID 不是）。migration 必须保留 v1 `op log/show`，v1 `restorable` 不能因新增默认值变成 true。
+`operation_head` 对应 jj 的 op heads store（`jj/lib/src/op_heads_store.rs`）：发布采用 CAS（比较旧 generation/旧 head 集合），并发分叉时允许多行存在，之后由 reconcile operation 收敛。v2 的 `op_id` 沿用 UUIDv7（时间有序、方便日志排序），不承担内容身份；`view_id` 从 v1 的 UUID 升级为 `RepoViewV2` manifest 的 `ObjectHash`（`view_oid` 是 canonical manifest 内容身份，SQLite row ID 不是）。v1 的 `restorable` 标志被 `completeness` + `facet_restore_policies` 取代，不再单独维护。
 
 ### 5.3 核心函数设计
 
@@ -728,6 +746,8 @@ graph TD
     I --> J["CAS 发布 op head + 原子更新 workspace pointer"]
     J --> K["返回 OperationResult，失败则留可诊断 operation"]
 ```
+
+pre-view 规则：命令 Operation 的 `pre_view_oid` 等于入口检测到外部变化时外部 snapshot op 的 `post_view_oid`；无外部变化时等于 last post-view。
 
 `src/cli.rs` 的 `enum Commands`（`:336`）与各 dispatch match（`:1474/:1681/:2123`）改为先过 `classify_command`；Agent 侧在 `src/internal/ai/tools/*` 与 `ai/libra_vcs.rs` 的每个会产生持久修改的 tool call 前后调用同一入口。`InternalWorker` 在 `main` 进入 upgrade/recovery/middleware 之前分流，只执行 capability-scoped 只读 IPC，永不创建 Operation。
 
@@ -854,19 +874,19 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 
 ### 5.4 实现路径与阶段门
 
-实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做 Web projection。每阶段对应具体写集与验证入口：
+实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做 Web projection。但本仓库文档明确：**开发期不维护 v1 兼容层**，v2 每阶段验证通过后即删除被替换的 v1 代码，最终不存在双写或兼容 adapter。每阶段对应具体写集与验证入口：
 
 | 阶段 | 落点（写集） | 验证入口 | 决策门 |
 |---|---|---|---|
 | 0 设计冻结 | 第 5 节结构体/函数定稿；CID-00 header spike | `cargo test --test commit_change_id_header_spike` | Gate-0：ADR 冻结、header go/no-go |
-| 1 持久化与 I/O 底座 | `src/internal/worktree_io/`、`operation/{store,view,facet}.rs`、`sql/migrations/*operation_v2*` | `cargo test internal::operation::store`；`cargo test --test operation_dag`；status 零回归 benchmark | Gate-1：对象格式、journal phase、I/O 协议冻结 |
+| 1 持久化与 I/O 底座 | `src/internal/worktree_io/`、`operation/{store,view,facet}.rs`、`db.rs` v2 schema（替换 v1 表与 model） | `cargo test internal::operation::store`；`cargo test --test operation_dag`；status 零回归 benchmark | Gate-1：对象格式、journal phase、I/O 协议冻结 |
 | 2 完整快照 | `operation/{snapshot,working_copy}.rs`、HEAD/refs/index/sequencer/sparse facet adapter | `cargo test --test workspace_snapshot_roundtrip`；`--test index_snapshot_roundtrip`；`--test sequencer_snapshot_roundtrip` | Gate-2：facet restore policy、untracked/ignored/large-file 政策 |
 | 3 CLI + Agent 全修改记录 | `operation/middleware.rs`、`src/cli.rs` classification、`ai/tools/*` gateway | `cargo test --test operation_command_coverage`；`--test agent_shell_operation`；census zero-unclassified guard | Gate-3：shadow mismatch、失败 operation、lease takeover |
 | 4 可逆用户工作流 | `operation/{restore,undo,doctor}.rs`、`src/command/op.rs` 新子命令 | `cargo test --test operation_restore_faults`；`--test op_undo_redo`；crash matrix | Gate-4：crash/安全 review、秒级 SLO、机器接口冻结 |
 | 5 稳定逻辑身份 | `change/{identity,store,resolve}.rs`、commit serialization adapter | `cargo test internal::change::identity`；`--test change_id_resolution` | Gate-5：Change ID 格式、legacy synthetic、header/sidecar 一致 |
 | 6 Rewrite 与 Agent 逻辑链接 | `change/{builder,genealogy}.rs`、commit/rebase/cherry-pick/squash 调用点、`ai_operation_link` | `cargo test --test change_genealogy_rebase`；`--test change_genealogy_squash_split` | Gate-6：relation 语义、hook/Git 兼容、legacy adapter |
 | 7 并发与 Web 展示 | `operation/store.rs` 多 head reconcile、独立 Operation/Change read model | `cargo test --test operation_restore_multi_worktree`；web graph tests | Gate-7：multihead fallback、redaction、bounded graph |
-| 8 迁移与 GA | MIG/DOC/REL 收口 | 迁移演练、文档、签名 release | Gate-8：默认值、retention、rollback 批准 |
+| 8 移除 v1 与 GA | 删除 v1 代码/表/命令路径（`operation_wrapper.rs`、`operation_view*` 与 v1 model、v1 `op` 分支）、文档与测试收口 | `rg 'operation_wrapper|operation_view|restorable' src` 零命中；签名 release | Gate-8：v1 代码移除完成、默认值、retention 批准 |
 
 依赖链：`worktree_io → store → snapshot → middleware → restore → undo`；`store → change/identity → change/builder → change/genealogy`；Agent gateway 消费 middleware 与 genealogy。每个生产 mutation surface 都由注册表穷举分类，未知/新增 mutation 默认 fail closed；所有跨介质窗口（对象/refs/index/worktree/SQLite/AI link）都有 journal phase 与 doctor 动作。
 
@@ -874,11 +894,11 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 
 | 现状（v1，`e9512516`） | 目标（v2） | jj 参考 |
 |---|---|---|
-| `with_operation_log`（`operation_wrapper.rs:405`） | `middleware::run_with_operation` | `jj/lib/src/transaction.rs::commit` |
-| `OperationMeta`（`operation_wrapper.rs:60`） | `OperationMetaV2`（redacted causal ids） | `jj/lib/src/op_store.rs::OperationMetadata` |
-| `ParentSelectionMode::SingleLatestSuccess`（`operation_wrapper.rs:46`） | `cas_update_op_heads` + 多父 reconcile | `jj/lib/src/op_heads_store.rs` |
-| `OperationService::persist_operation_graph`（`operation.rs:1018`） | `OperationStoreV2::write_operation` + journal | `jj/lib/src/op_store.rs` |
-| `operation_view*` 三表（`db.rs:581-605`） | `RepoViewV2` / `WorkspaceSnapshotV2` manifest OID | `jj/lib/src/op_store.rs::View` |
+| `with_operation_log`（`operation_wrapper.rs:405`，v1 最终删除） | `middleware::run_with_operation` | `jj/lib/src/transaction.rs::commit` |
+| `OperationMeta`（`operation_wrapper.rs:60`，v1 最终删除） | `OperationMetaV2`（redacted causal ids） | `jj/lib/src/op_store.rs::OperationMetadata` |
+| `ParentSelectionMode::SingleLatestSuccess`（`operation_wrapper.rs:46`，v1 最终删除） | `cas_update_op_heads` + 多父 reconcile | `jj/lib/src/op_heads_store.rs` |
+| `OperationService::persist_operation_graph`（`operation.rs:1018`，v1 最终删除） | `OperationStoreV2::write_operation` + journal | `jj/lib/src/op_store.rs` |
+| `operation_view*` 三表（`db.rs:581-605`，v1 删除） | `RepoViewV2` / `WorkspaceSnapshotV2` manifest OID | `jj/lib/src/op_store.rs::View` |
 | 无（v1 不恢复 index/WC/sequencer） | `WorkspaceSnapshotter` / `RestoreEngine` | `jj/lib/src/local_working_copy.rs::TreeState::snapshot`、`jj/cli/src/commands/restore.rs` |
 | 无（commit 只有 OID） | `ChangeId` / `ChangeRevision` / `PredecessorEdge` | `jj/lib/src/backend.rs::ChangeId`、`jj/lib/src/commit_builder.rs` |
 | `FileHistoryStore`（AI apply_patch 前镜像） | 只读/迁移兼容，不再作为新 undo 实现 | jj 无直接对应 |
