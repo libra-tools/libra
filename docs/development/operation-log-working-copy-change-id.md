@@ -435,7 +435,7 @@ graph TB
 | 1. Operation/Snapshot 底座 | 固定 mutation/state census；实现不可变 View、Operation DAG、journal、CAS heads 和 bounded I/O |
 | 2. 完整快照与 Undo | 覆盖 HEAD/refs/index/files/sequencer；接入全部CLI mutation并进行shadow验证；开放crash-safe undo/redo/restore |
 | 3. Change ID 与 Genealogy | 接入amend/rebase/squash/split/duplicate，形成完整revision evolution，并关联Intent/Run/Invocation |
-| 4. 并发、Web 与迁移 | 支持多worktree Operation heads/reconcile；提供Operation/Change Web图；迁移旧Operation |
+| 4. 并发、Web 与收口 | 支持多worktree Operation heads/reconcile；提供Operation/Change Web图；移除v1 Operation代码 |
 
 实施遵循三个顺序：
 
@@ -485,12 +485,9 @@ graph TB
 // src/internal/operation/facet.rs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestorePolicy {
-    AutoRestore,       // HEAD/refs/index/tracked/untracked/sequencer/sparse —— 普通 undo 自动恢复
-    ExplicitRestore,   // ExtensionConfig —— 需 receipt 显式确认
-    SecurityConfirm,   // SecurityPolicy —— 重新授权/放宽限制需确认
-    AuditOnly,         // approvals —— 只审计不恢复
-    Rebuild,           // DerivedProjection —— 从事实源重建（object_index、stat cache、change projection）
-    NeverRestore,      // EphemeralRuntime —— session memo、lease token 恢复即违反控制权
+    AutoRestore,    // HEAD/refs/index/tracked/untracked/sequencer/sparse —— 普通 undo 自动恢复
+    Rebuild,        // DerivedProjection —— 从事实源重建（object_index、stat cache、change projection）
+    NeverRestore,   // EphemeralRuntime —— session memo、lease token 恢复会破坏并发控制
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,6 +512,8 @@ pub trait StateFacet: Send + Sync {
 ```
 
 `FacetRegistry` 用 `FacetName -> Box<dyn StateFacet>` 注册所有 mutable state owner。新增 mutable state 若未注册，任何命令都不得把它标为 `fully_restorable`（fail closed）。当前 v1 的 `operation_view_ref` / `operation_view_workspace` 只是 HEAD/refs 快照，升级后这些信息由 RefStateFacet + WorkspaceFacet 表达。
+
+本方案不设权限模型（第 1 节范围假设：CLI、Agent、automation 默认拥有最大权限），因此 `RestorePolicy` 只保留数据一致性与并发控制语义，不含 security/approval 类别；extension/security 配置作为普通 AutoRestore facet 处理。
 
 #### 5.2.2 RepoViewV2 与 WorkspaceSnapshotV2
 
@@ -874,7 +873,9 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 
 ### 5.4 实现路径与阶段门
 
-实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做 Web projection。但本仓库文档明确：**开发期不维护 v1 兼容层**，v2 每阶段验证通过后即删除被替换的 v1 代码，最终不存在双写或兼容 adapter。每阶段对应具体写集与验证入口：
+实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做 Web projection。但本仓库文档明确：**开发期不维护 v1 兼容层**，v2 每阶段验证通过后即删除被替换的 v1 代码，最终不存在双写或兼容 adapter。
+
+每个阶段进入下一阶段的 Gate 必要条件：本阶段验证入口的测试全部通过（含既有 `status`/CLI 回归与 fail-closed 守卫），任一未通过不得推进，不允许把未验证代码带进下一阶段。每阶段对应具体写集与验证入口：
 
 | 阶段 | 落点（写集） | 验证入口 | 决策门 |
 |---|---|---|---|
@@ -882,9 +883,9 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 | 1 持久化与 I/O 底座 | `src/internal/worktree_io/`、`operation/{store,view,facet}.rs`、`db.rs` v2 schema（替换 v1 表与 model） | `cargo test internal::operation::store`；`cargo test --test operation_dag`；status 零回归 benchmark | Gate-1：对象格式、journal phase、I/O 协议冻结 |
 | 2 完整快照 | `operation/{snapshot,working_copy}.rs`、HEAD/refs/index/sequencer/sparse facet adapter | `cargo test --test workspace_snapshot_roundtrip`；`--test index_snapshot_roundtrip`；`--test sequencer_snapshot_roundtrip` | Gate-2：facet restore policy、untracked/ignored/large-file 政策 |
 | 3 CLI + Agent 全修改记录 | `operation/middleware.rs`、`src/cli.rs` classification、`ai/tools/*` gateway | `cargo test --test operation_command_coverage`；`--test agent_shell_operation`；census zero-unclassified guard | Gate-3：shadow mismatch、失败 operation、lease takeover |
-| 4 可逆用户工作流 | `operation/{restore,undo,doctor}.rs`、`src/command/op.rs` 新子命令 | `cargo test --test operation_restore_faults`；`--test op_undo_redo`；crash matrix | Gate-4：crash/安全 review、秒级 SLO、机器接口冻结 |
+| 4 可逆用户工作流 | `operation/{restore,undo,doctor}.rs`、`src/command/op.rs` 新子命令 | `cargo test --test operation_restore_faults`；`--test op_undo_redo`；crash matrix | Gate-4：crash/数据安全 review、秒级 SLO、机器接口冻结 |
 | 5 稳定逻辑身份 | `change/{identity,store,resolve}.rs`、commit serialization adapter | `cargo test internal::change::identity`；`--test change_id_resolution` | Gate-5：Change ID 格式、legacy synthetic、header/sidecar 一致 |
-| 6 Rewrite 与 Agent 逻辑链接 | `change/{builder,genealogy}.rs`、commit/rebase/cherry-pick/squash 调用点、`ai_operation_link` | `cargo test --test change_genealogy_rebase`；`--test change_genealogy_squash_split` | Gate-6：relation 语义、hook/Git 兼容、legacy adapter |
+| 6 Rewrite 与 Agent 逻辑链接 | `change/{builder,genealogy}.rs`、commit/rebase/cherry-pick/squash 调用点、`ai_operation_link` | `cargo test --test change_genealogy_rebase`；`--test change_genealogy_squash_split` | Gate-6：relation 语义、hook/Git 兼容、AI FileHistoryStore 读取迁移（非 operation v1） |
 | 7 并发与 Web 展示 | `operation/store.rs` 多 head reconcile、独立 Operation/Change read model | `cargo test --test operation_restore_multi_worktree`；web graph tests | Gate-7：multihead fallback、redaction、bounded graph |
 | 8 移除 v1 与 GA | 删除 v1 代码/表/命令路径（`operation_wrapper.rs`、`operation_view*` 与 v1 model、v1 `op` 分支）、文档与测试收口 | `rg 'operation_wrapper|operation_view|restorable' src` 零命中；签名 release | Gate-8：v1 代码移除完成、默认值、retention 批准 |
 
