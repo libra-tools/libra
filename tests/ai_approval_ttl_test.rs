@@ -594,18 +594,24 @@ async fn session_approval_not_reused_after_lease_takeover() {
     adapter.set_approval_store(store.clone()).await;
 
     let mut options = CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed);
-    options.lease_duration = Some(chrono::Duration::milliseconds(1));
+    options.lease_duration = Some(chrono::Duration::milliseconds(80));
     let runtime = CodeUiRuntimeHandle::build_with_options(adapter, options).await;
 
-    let first = runtime
-        .attach_browser_controller("browser-a")
-        .await
-        .expect("first attach");
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    let second = runtime
-        .attach_browser_controller("browser-b")
-        .await
-        .expect("takeover attach");
+    let first = tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.attach_browser_controller("browser-a"),
+    )
+    .await
+    .expect("first attach timed out")
+    .expect("first attach");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.attach_browser_controller("browser-b"),
+    )
+    .await
+    .expect("takeover attach timed out")
+    .expect("takeover attach");
     assert_ne!(first.controller_token, second.controller_token);
 
     assert_eq!(
@@ -613,13 +619,29 @@ async fn session_approval_not_reused_after_lease_takeover() {
         None,
         "session approval must not survive lease takeover"
     );
-    let respond = handle
-        .respond(
+    let runtime_snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("runtime snapshot after takeover");
+    assert!(
+        !matches!(
+            runtime_snapshot.interaction,
+            InteractionState::AwaitingToolApproval { .. }
+                | InteractionState::AwaitingUserInput { .. }
+        ),
+        "pending runtime interaction must not survive lease takeover: {:?}",
+        runtime_snapshot.interaction
+    );
+    let respond = tokio::time::timeout(
+        Duration::from_secs(2),
+        handle.respond(
             "session",
             "turn-1",
             InteractionResponse::new("approve-1", "approved"),
-        )
-        .await;
+        ),
+    )
+    .await
+    .expect("respond after takeover timed out");
     assert!(
         respond.is_err(),
         "pending approval interaction must not be reusable after takeover: {respond:?}"

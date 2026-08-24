@@ -440,7 +440,7 @@ fn libra_code_provider_codex_boots_against_mock_app_server() -> Result<()> {
     let port = server.port().to_string();
     let fake_codex_bin = fake_codex_bin_path()?;
 
-    let _session = CodeSession::spawn(
+    let session = CodeSession::spawn(
         CodeSessionOptions::new("code-codex-binary-boot", fixture_path())
             .with_live_provider("codex", "codex-test")
             .push_extra_cli_arg("--codex-port")
@@ -448,6 +448,20 @@ fn libra_code_provider_codex_boots_against_mock_app_server() -> Result<()> {
             .push_extra_cli_arg("--codex-bin")
             .push_extra_cli_arg(fake_codex_bin),
     )?;
+
+    let snapshot = session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        snapshot
+            .pointer("/provider/provider")
+            .and_then(serde_json::Value::as_str)
+            == Some("codex")
+    })?;
+    assert_eq!(
+        snapshot
+            .pointer("/provider/mode")
+            .and_then(serde_json::Value::as_str),
+        Some("web"),
+        "the actual managed Codex launch path must publish the Web-only provider mode; got {snapshot}",
+    );
 
     let captured = wait_for_codex_methods(
         &server,

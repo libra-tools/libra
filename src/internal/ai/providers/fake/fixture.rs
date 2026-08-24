@@ -53,6 +53,7 @@ impl FakeFixture {
             &FakeMatchContext {
                 latest_user_text,
                 after_tool_result: false,
+                after_tool_name: None,
             },
             &std::collections::HashSet::new(),
         )
@@ -96,6 +97,8 @@ pub struct FakeMatchContext<'a> {
     pub latest_user_text: &'a str,
     /// True when the latest user message is a tool result (same-turn follow-up).
     pub after_tool_result: bool,
+    /// Name of the latest tool-result, when the latest user message is one.
+    pub after_tool_name: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -110,6 +113,11 @@ pub struct FakeMatcher {
     /// the post-tool invocation that still carries the original prompt text.
     #[serde(default, rename = "afterToolResult")]
     pub after_tool_result: Option<bool>,
+    /// When set, the rule only matches if the latest tool-result name equals
+    /// this value. Distinguishes post-risk drafts from a later empty-prompt
+    /// follow-up after `submit_intent_draft`.
+    #[serde(default, rename = "afterToolName")]
+    pub after_tool_name: Option<String>,
 }
 
 impl FakeMatcher {
@@ -125,7 +133,11 @@ impl FakeMatcher {
         let after_tool_result = self
             .after_tool_result
             .is_none_or(|expected| expected == ctx.after_tool_result);
-        contains && equals && after_tool_result
+        let after_tool_name = self
+            .after_tool_name
+            .as_ref()
+            .is_none_or(|expected| ctx.after_tool_name.is_some_and(|actual| actual == expected));
+        contains && equals && after_tool_result && after_tool_name
     }
 }
 
@@ -215,6 +227,7 @@ mod tests {
                     contains: Some("hello".to_string()),
                     equals: None,
                     after_tool_result: None,
+                    after_tool_name: None,
                 },
                 once: false,
                 action: FakeResponseAction::Text {
@@ -277,6 +290,7 @@ mod tests {
                 &FakeMatchContext {
                     latest_user_text: "/run approval-shell-test",
                     after_tool_result: false,
+                    after_tool_name: None,
                 },
                 &std::collections::HashSet::new(),
             )
@@ -291,6 +305,7 @@ mod tests {
                 &FakeMatchContext {
                     latest_user_text: "/run approval-shell-test",
                     after_tool_result: true,
+                    after_tool_name: Some("shell"),
                 },
                 &consumed,
             )
@@ -298,6 +313,58 @@ mod tests {
         assert_eq!(follow_up.0, Some(1));
         assert!(
             matches!(follow_up.1, FakeResponseAction::Text { text, .. } if text == "turn complete")
+        );
+    }
+
+    #[test]
+    fn fixture_after_tool_name_selects_post_risk_draft_not_post_draft_follow_up() {
+        let fixture: FakeFixture = serde_json::from_value(serde_json::json!({
+            "responses": [
+                {
+                    "match": {
+                        "equals": "",
+                        "afterToolResult": true,
+                        "afterToolName": "request_user_input"
+                    },
+                    "type": "tool_call",
+                    "id": "draft-1",
+                    "name": "submit_intent_draft",
+                    "arguments": {}
+                }
+            ],
+            "fallback": { "type": "text", "text": "no second draft" }
+        }))
+        .expect("fixture should parse");
+
+        let after_risk = fixture
+            .select_ctx(
+                &FakeMatchContext {
+                    latest_user_text: "",
+                    after_tool_result: true,
+                    after_tool_name: Some("request_user_input"),
+                },
+                &std::collections::HashSet::new(),
+            )
+            .expect("post-risk empty prompt matches the draft");
+        assert_eq!(after_risk.0, Some(0));
+        assert!(matches!(
+            after_risk.1,
+            FakeResponseAction::ToolCall { name, .. } if name == "submit_intent_draft"
+        ));
+
+        let after_draft = fixture
+            .select_ctx(
+                &FakeMatchContext {
+                    latest_user_text: "",
+                    after_tool_result: true,
+                    after_tool_name: Some("submit_intent_draft"),
+                },
+                &std::collections::HashSet::new(),
+            )
+            .expect("post-draft empty prompt falls back instead of a second draft");
+        assert_eq!(after_draft.0, None);
+        assert!(
+            matches!(after_draft.1, FakeResponseAction::Text { text, .. } if text == "no second draft")
         );
     }
 

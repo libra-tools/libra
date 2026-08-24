@@ -2,8 +2,8 @@
 //!
 //! Each `#[test]` here loads
 //! `tests/data/code_ui_remote/approval_cases.json` and drives the
-//! shell-tool approval lifecycle through a real `libra code` PTY
-//! session, asserting that:
+//! shell-tool approval lifecycle through a real non-TTY `libra code`
+//! Web process, asserting that:
 //!
 //! 1. a fixture-driven `shell` tool call enters the
 //!    `awaiting_interaction` state with a pending interaction

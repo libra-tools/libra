@@ -391,12 +391,21 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_pinned_scope_survives_a_cwd_change() {
+        let repo = tempfile::tempdir().expect("repo");
+        {
+            let _cd = crate::utils::test::ChangeDirGuard::new(repo.path());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(crate::utils::test::setup_with_new_libra_in(repo.path()));
+        }
         let original = std::env::current_dir().expect("cwd");
         let elsewhere = std::env::temp_dir();
 
         let _pin = WorktreeScope::pin_scope_for_test(
             WorktreeScope::Linked("wt-pinned".to_string()),
-            original.clone(),
+            repo.path().to_path_buf(),
         );
         assert!(WorktreeScope::request_scope_is_pinned());
         assert_eq!(WorktreeScope::for_request().storage_key(), "wt-pinned");

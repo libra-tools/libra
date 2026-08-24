@@ -1,12 +1,11 @@
 test_fn	lane	reason
-<unparsed:tests/code_ui_remote_approval_matrix.rs:56>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<unparsed:tests/code_ui_remote_generation_matrix.rs:56>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<unparsed:tests/code_ui_remote_lease_matrix.rs:40>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<unparsed:tests/code_ui_remote_model_generation_matrix.rs:86>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<unparsed:tests/code_ui_remote_security_matrix.rs:57>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<unparsed:tests/code_ui_remote_sse_matrix.rs:46>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<unparsed:tests/code_ui_remote_state_matrix.rs:52>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
-<unparsed:tests/compat/compat_status_wave0_register.rs:347>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_approval_matrix.rs:56>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_generation_matrix.rs:56>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_lease_matrix.rs:40>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_model_generation_matrix.rs:86>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_security_matrix.rs:57>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_sse_matrix.rs:46>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_state_matrix.rs:52>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_checkpoint_subagent_scope_listed_and_linked	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_remove_gemini_uninstalls_legacy_hooks_idempotent	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -18,7 +17,7 @@ api_warning_survives_await	lane:cwd	changes the process working directory (Chang
 branch_already_exists_with_track_returns_conflict	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 checkout_restore_rejects_sha1_hash_in_sha256_repo	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 cherry_pick_state_roundtrip_persists_and_clears	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-chunking_large_transcript_splits_line_safe	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+chunking_large_transcript_splits_line_safe	lane:env	mutates process-wide environment via set_var/remove_var (composable env lane)
 cloud_full_workflow_end_to_end	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 cloud_sync_name_conflict	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 cloud_tombstone_propagates_for_agent_capture	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
@@ -28,9 +27,9 @@ d1_connection	lane:cloud_live	shares a live cloud account/bucket with the other 
 d1_ensure_table	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 d1_upsert_and_query	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 discovery_reference_restores_current_dir_after_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-discovery_skips_builtin_slug_impersonation	lane:rpc_path_env	shares the RPC socket path environment variable
+discovery_skips_builtin_slug_impersonation	lane:env	mutates process-wide PATH via set_var/remove_var (composable env lane)
 fsck_heal_restores_object_from_durable_tier	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
-gc_ten_thousand_objects_within_budget	lane:hash_kind	sets the process-wide hash kind
+gc_ten_thousand_objects_within_budget	lane:hash_kind+cwd	sets the process-wide hash kind and changes the process working directory (mixed resources keep both lanes)
 get_best_effort_reads_value_inside_repository	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 get_best_effort_returns_err_outside_repository	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 got_remote_branch_suggests_track	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -54,7 +53,7 @@ resolved_conflict_with_stage0_emits_no_u_line	lane:cwd	changes the process worki
 runtime_formal_writes_preserve_order_and_minimal_object_set	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 scan_lock_stolen_warning	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 scan_stale_lock_broken_pipe_stays_silent	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-spawn_clears_parent_env_and_injects_allowlist	lane:rpc_env_probe	probes RPC environment resolution
+spawn_clears_parent_env_and_injects_allowlist	lane:env	mutates process-wide HOME and probe variables via set_var/remove_var (composable env lane)
 status_corrupt_head_reference_returns_repo_corrupt	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 status_sync_wrappers_honor_core_ignorecase_override	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 takeover_reports_its_own_fence_even_if_another_lands_immediately_after	lane:workspace_failpoints	installs process-wide failpoints
@@ -171,7 +170,7 @@ test_clone_to_existing_dir	lane:cwd	changes the process working directory (Chang
 test_clone_to_existing_empty_dir	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_clone_with_depth	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_clone_with_depth_and_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_commit_amend_preserves_author_unless_reset	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+test_commit_amend_preserves_author_unless_reset	lane:env+cwd	mutates process-wide environment and changes the process working directory (mixed resources keep both lanes)
 test_commit_amend_signoff_persists_trailer	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_commit_amend_with_custom_author	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_commit_amend_without_changes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -180,7 +179,7 @@ test_commit_cleanup_strips_comments	lane:cwd	changes the process working directo
 test_commit_dry_run_does_not_create_commit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_commit_empty_working_tree	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_commit_fixup_sets_subject	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_commit_requires_configured_identity_in_strict_mode	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+test_commit_requires_configured_identity_in_strict_mode	lane:env+cwd	mutates process-wide environment and changes the process working directory (mixed resources keep both lanes)
 test_commit_reuse_message	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_commit_sha256	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_commit_signoff_persists_trailer	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -189,7 +188,7 @@ test_commit_with_actual_changes	lane:cwd	changes the process working directory (
 test_commit_with_all_flag_records_deletions	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_commit_with_all_flag_stages_tracked_changes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_commit_with_custom_author	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_commit_without_identity_fails_by_default	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+test_commit_without_identity_fails_by_default	lane:env+cwd	mutates process-wide environment and changes the process working directory (mixed resources keep both lanes)
 test_config_add_rejects_implicit_encryption_mixed_with_existing_plaintext	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_cascade_system_is_lowest_precedence	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_generate_global_gpg_key_is_rejected_without_local_side_effects	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -258,11 +257,11 @@ test_fetch_ssh_respects_strict_host_key_checking_config_casing	lane:cwd	changes 
 test_fetch_tagopt_all_fetches_every_tag	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_fetch_tags_from_libra_native_remote_serves_annotated	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_filter_branches_propagates_error_for_corrupt_commit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_for_each_ref_deref_size_errors_on_broken_tag_chain	lane:hash_kind	sets the process-wide hash kind
+test_for_each_ref_deref_size_errors_on_broken_tag_chain	lane:hash_kind+cwd	sets the process-wide hash kind and changes the process working directory (mixed resources keep both lanes)
 test_for_each_ref_merged_resolves_remote_tracking_namespace	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_for_each_ref_sort_by_committerdate	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_for_each_ref_sort_peels_nested_annotated_tags	lane:hash_kind	sets the process-wide hash kind
+test_for_each_ref_sort_peels_nested_annotated_tags	lane:hash_kind+cwd	sets the process-wide hash kind and changes the process working directory (mixed resources keep both lanes)
 test_for_each_ref_symref_atom	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_fuse_multiple_worktrees_mount_and_access	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_fuse_worktree_add_list_remove_flow	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -604,7 +603,7 @@ test_worktree_remove_with_delete_dir_dirty_path_is_rejected	lane:cwd	changes the
 test_worktree_repair_deduplicates_entries	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_worktree_repair_json_reports_changed_state	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_worktree_repair_persists_main_flag_fix_without_duplicates	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-trusted_dirs_env_allowlist_extra	lane:rpc_env_probe	probes RPC environment resolution
+trusted_dirs_env_allowlist_extra	lane:env	mutates process-wide environment variables via set_var/remove_var (composable env lane)
 unmerged_path_never_pairs_as_a_staged_rename_source	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 unmerged_stage_presence_to_xy_mapping	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 worktree_add_sweeps_stale_scope_rows	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

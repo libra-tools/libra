@@ -4,7 +4,7 @@
 
 本文是 Libra 不绑定具体发布日期和版本号的长期能力组合路线图。它回答「哪些能力值得长期投资、为什么、依赖什么、何时具备进入日期计划的条件」，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划或后续 RFC/ADR。
 
-**本次改版（2026-08-09，第七次竞品审计）**：按 `/Volumes/Data/competition` 下全部直接仓库的最新事实，把长期能力重组为三类——**版本管理**、**Agent 生成代码**、**Memory**。每类列出最要完成的任务；既有 `CT-*` / `UP-*` / `LR-*` / `SB-*` 编号保留并归入对应类；Memory 类新增 `MEM-*` 编号。详细实施切片仍由日期计划承接。**本次核心变化：CT-01 由「已验证（下一个执行任务）」推进为「实施中」**——`plan-20260729.md` 的兼容证据账本（S0/S1/S3/S4 首个 wave t4）已实质执行并合入（账本 schema、29 个 t4 账本行、surface registry、预检/净室基础设施均已提交），`t4_port_test.rs` 仍为未提交 WIP，CT4-01 发布卡未执行。
+**本次改版（2026-08-22，第八次竞品审计）**：按 `/Volumes/Data/competition` 下全部直接仓库的最新事实刷新。**本轮核心变化在 Libra 自身而非竞品**：RT-01 由「已排期」推进为「实施中」（plan-20260715 W4 已全部合入，W5 家族经 v0.20.0 breaking minor 基本收口，剩 W5-04/W5-05/W5-10 收尾与 W6-01/02）；UP-01 由「实施中（CT-01 之后）」改判为「已排期」（设计稿 D1–D10 冻结 + `plan-20260822.md` 已建，客户端仍 inert，`PRODUCTION_TRUSTED_KEYS` 仍为空）；MEM-01/MEM-02 由「已验证」推进为「已排期」（M2 纵向切片计划 `plan-20260819.md` 已建，尚无实现合入）。竞品侧新纳入 7 个仓库（deepseek-harness、ctx-open、dolt、lorevcs/lore、memorax-code、Lit、rekal-cli），其中 rekal-cli（git-native 会话记忆）与 letta-code 本轮新增的 shared-memory skills 直接加强 MEM-* 证据；无竞品证据推翻既有优先级。
 
 状态定义：
 
@@ -37,70 +37,88 @@
 
 ## 本次竞品审计快照
 
-审计时间：**2026-08-09（第七次）**。范围严格限定为 `/Volumes/Data/competition/*/*` 直接两层仓库（30 个）。Git 仓库在 `git status --porcelain` 为空且有 upstream 时 `git fetch` + `git pull --ff-only`；Libra 仓库在 `libra status --short` 为空时 `libra pull --ff-only`。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新。
+审计时间：**2026-08-22（第八次，当晚补充）**。范围严格限定为 `/Volumes/Data/competition/*/*` 直接两层仓库（40 个：35 Git + 5 Libra）。Git 仓库在 `git status --porcelain` 为空且有 upstream 时 `git fetch --prune` + `git pull --ff-only`；Libra 仓库在 `libra status --short` 为空时 `libra pull --ff-only`。本轮全部仓库工作区 clean、无未完成操作。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新。多个仓库本地 revision 在上次审计后已由用户或其它会话前移（非本轮 fast-forward），按「上次记录 revision -> 本次 revision」增量分析。
 
 | 竞品 | 归类 | 分支 | 审计 revision | 更新结果 | 证据入口 |
 |---|---|---|---|---|---|
-| `facebook/sapling` | 版本管理 | `main` | `5a7052545ef` | **fast-forward** `119e6d1f75d`→`5a7052545ef` | EdenFS / worktree / Smartlog、Crewmate 授权钩子 |
-| `jj-vcs/jj` | 版本管理 | `main` | `6e98d068b` | **fast-forward** `786e65a1e`→`6e98d068b` | operation、ChangeId、一等冲突 |
-| `GitButler/gitbutler` | 版本管理 | `master` | `b98b6dc84a` | **fast-forward** `9e3b2a7c2a`→`b98b6dc84a` | workspace、change ID、land 后删远端分支 |
+| `facebook/sapling` | 版本管理 | `main` | `942dd4c6e38` | up-to-date（上次记录 `5a7052545ef`，+316 提交，非本轮 FF） | EdenFS / worktree / Smartlog |
+| `jj-vcs/jj` | 版本管理 | `main` | `9d905d543` | up-to-date（上次记录 `6e98d068b`，+44 提交；新增 `jj converge` 命令） | operation、ChangeId、一等冲突、converge |
+| `GitButler/gitbutler` | 版本管理 | `master` | `a085f7ec59` | up-to-date（上次记录 `b98b6dc84a`，+587 提交，非本轮 FF） | workspace、change ID、land 后删远端分支 |
 | `GitButler/grit` | 版本管理 | `main` | `dfb079967` | 已是最新 | 上游 Git 套件驱动的兼容治理 |
-| `epicgames/lore` | 版本管理 | `main` | `d09b12354a` | **fast-forward** `afef703`→`d09b12354a` | batch revision-tree、storage lifecycle、JWK 硬化 |
-| `git/git` | 版本管理（参考基线） | `master` | `010afd3166` | **fast-forward** `2c78326f81`→`010afd3166` | protocol / reftable / `t/` 套件、sparse-index ITA 修复 |
-| `go-git/go-git` | 版本管理（架构参考） | `main` | `d6cbbfaa` | 已是最新 | 兼容缺口矩阵、storage conformance |
-| `go-git/go-billy` | 版本管理（架构参考） | `main` | `6c0a968` | 已是最新 | FS 抽象与 capability |
-| `entireio/git-sync` | 版本管理 | `main` | `298c7f1` | 已是最新 | ref/object 复制、pack relay |
-| `entireio/forgemark` | 版本管理（协作参考） | `main` | `d15ceaf` | 已是最新 | Forge metadata |
-| `xai-org/grok-build` | Agent 生成代码 | `main` | `8a14c91` | **fast-forward** `393430e`→`8a14c91` | TUI/ACP/headless、ProcessScope、git ODB 门控 |
-| `entireio/cli` | Agent 生成代码 | `main` | `caa0c9b` | **fast-forward** `b329335`→`caa0c9b` | session/checkpoint、rewind/resume、review |
-| `entireio/cli-checkpoints` | Agent 生成代码 | `entire/checkpoints/v1` | `0204a02` | 已是最新 | checkpoint object/refs 形态 |
+| `epicgames/lore` | 版本管理 | `main` | `b563f2b` | up-to-date（上次记录 `d09b12354a`，+86 提交；新增 `lore-client link info`、link 归档、AWS immutable store 迁移工具） | batch revision-tree、storage lifecycle、links |
+| `git/git` | 版本管理（参考基线） | `master` | `1a3e64c6c4` | up-to-date（上次记录 `010afd3166`，+78 提交；`hn/branch-delete-merged`、bisect-reset、pluggable ODB creation） | protocol / reftable / `t/` 套件 |
+| `go-git/go-git` | 版本管理（架构参考） | `main` | `374c3548` | 已是最新 | 兼容缺口矩阵、storage conformance |
+| `go-git/go-billy` | 版本管理（架构参考） | `main` | `7bd0594` | 已是最新 | FS 抽象与 capability |
+| `entireio/git-sync` | 版本管理（Libra） | `main` | `2a61c8c` | up-to-date（上次记录 `298c7f1`，本地已前移） | ref/object 复制、pack relay |
+| `entireio/forgemark` | 版本管理（协作参考） | `main` | `47f57bf` | up-to-date（上次记录 `d15ceaf`，+44 提交；User-Agent 标记与 transport context-deadline） | Forge metadata |
+| `dolthub/dolt` | 版本管理（相邻，新纳入） | `main` | `afd22743ad` | 已是最新 | 「Git for Data」：SQL+版本控制融合、cell 级 diff/merge |
+| `lorevcs/lore` | 版本管理（相邻，新纳入） | `main` | `1fd2ea9` | 已是最新 | 「version control for intent, not code」；MIT |
+| `nervosys/Lit` | 版本管理（相邻，新纳入） | `master` | `a930e44` | 已是最新 | agent-first VCS 宣传（JSON 默认、30 MCP tools、后量子密码声明） |
+| `git-ai-project/git-ai` | Agent 生成代码（相邻，新纳入） | `main` | `c08de56df` | 已是最新 | git 扩展：AI 生成代码行级归因到 agent/model/prompt；AG-ATTR 相邻参考 |
+| `treeverse/lakeFS` | 版本管理（相邻，新纳入） | `master` | `4bb11638e` | 已是最新 | 数据湖对象级版本控制（branch/merge/commit over object store）；Apache-2.0；与 LR-09 大仓对象面相邻 |
+| `xai-org/grok-build` | Agent 生成代码 | `main` | `19d42e3` | up-to-date（上次记录 `8a14c91`，+11 提交，均「Synced from monorepo」） | TUI/ACP/headless、ProcessScope、git ODB 门控 |
+| `entireio/cli` | Agent 生成代码（Libra） | `main` | `6bf587d` | up-to-date（上次记录 `caa0c9b` 已不在本地对象库，无法做增量 diff） | session/checkpoint、rewind/resume、review |
+| `entireio/cli-checkpoints` | Agent 生成代码（Libra） | `entire/checkpoints/v1` | `0204a02` | 已是最新 | checkpoint object/refs 形态 |
 | `mainline/mainline` | Agent 生成代码 | `main` | `5704305` | 已是最新 | intent seal、preflight、hook 预算 |
-| `StepzeroLab/research-git` | Agent 生成代码 | `main` | `62bcdf5` | 已是最新 | Feature Capsule、recall/compose |
-| `cursor/agent-trace` | Agent 生成代码 | `main` | `2754f07` | 已是最新 | AI 代码归因规范（RFC） |
-| `letta-ai/letta-code` | Agent 生成代码 | `main` | `a75f4d93` | **fast-forward** `ac359eeb`→`a75f4d93` | 有状态 coding harness、skills、hooks、worktree 工具 |
-| `letta-ai/letta-agent-sdk` | Agent 生成代码 | `main` | `faf3496` | **fast-forward** `22752a6`→`faf3496` | 有状态 Agent SDK、Cloud 会话恢复 |
-| `letta-ai/trajectory` | Agent 生成代码 | `main` | `59c0db5` | 已是最新 | 多 runtime transcript 归一化 |
-| `agenta-ai/agenta` | Agent 生成代码（相邻） | `main` | `a125cce` | **blocked-dirty** | LLMOps；不作最新证据 |
-| `rohitg00/agentmemory` | Memory | `main` | `d60652a` | 已是最新 | 四层记忆、混合检索、MCP、hooks |
+| `StepzeroLab/research-git` | Agent 生成代码（Libra） | `main` | `62bcdf5` | 已是最新 | Feature Capsule、recall/compose |
+| `cursor/agent-trace` | Agent 生成代码 | `main` | `2754f07` | **blocked-network**（`git fetch` 404：远端 `cursor/agent-trace` 仓库已删除/迁移） | AI 代码归因规范（RFC）；本地 revision 未证明是远端最新 |
+| `cursor/cursor` | Agent 生成代码（相邻，新纳入） | `main` | `654b1b4` | 新克隆（getcursor/cursor 官方仓库；issue-tracker 性质，无产品源码） | Cursor 公开反馈仓库：需求/缺陷信号来源，不作实现证据 |
+| `letta-ai/letta-code` | Agent 生成代码 | `main` | `8b65ca27` | **fast-forward** `33bf5e07`->`8b65ca27`（+2：shared-memory skills 加载 `src/agent/shared-memory-skills.ts`、client-skills.ts 扩展，含 307 行测试） | 有状态 coding harness、skills、hooks、worktree 工具 |
+| `letta-ai/letta-agent-sdk` | Agent 生成代码 | `main` | `8ca21c4` | up-to-date（上次记录 `faf3496`，+21 提交；新增 conversation forks API） | 有状态 Agent SDK、Cloud 会话恢复、forks |
+| `letta-ai/trajectory` | Agent 生成代码 | `main` | `21ae92d` | 已是最新 | 多 runtime transcript 归一化 |
+| `deepseek-ai/deepseek-harness` | Agent 生成代码（相邻，新纳入） | `master` | `b150a551b8` | 已是最新 | 全插件架构 agent harness（Cordis）；MIT；Libra 已有对接计划 `plan-20260818.md` |
+| `diegoxtr/ctx-open` | Memory（相邻，新纳入） | `main` | `862e12b` | 已是最新 | 「认知版本控制」：goal/hypothesis/decision 作为版本化对象；source-available（非 OSI）许可证 |
+| `memorax-ai/memorax-code` | Memory（相邻，新纳入） | `main` | `071e4d2` | 已是最新 | npm memory 层产品；MIT |
+| `rekal-dev/rekal-cli` | Memory（新纳入） | `main` | `aace7a29` | 已是最新 | **git-native 会话记忆**：每次 commit 捕获 AI 会话、`.rekal/` 入 git、仅 merged 工作共享、本地 secret 脱敏 + 本地 embedding；Apache-2.0 |
+| `agenta-ai/agenta` | Agent 生成代码（相邻，Libra） | `main` | `53717db` | up-to-date（工作区 clean，本轮可更新；上次 `blocked-dirty` 已解除；本地 revision 已前移，非最新证明不足，仍不作强证据） | LLMOps |
+| `rohitg00/agentmemory` | Memory | `main` | `2d38daf` | up-to-date（上次记录 `d60652a`，+7 提交；recall 质量/provenance/keyless graph/connector parity、Devin/Cursor 集成） | 四层记忆、混合检索、MCP、hooks |
 | `MachineWisdomAI/fava-trails` | Memory | `main` | `6653f9f` | 已是最新 | jj 上的共享记忆、Trust Gate |
 | `ruvnet/agentic-flow` | Memory | `main` | `d3735a3` | 已是最新 | 编排 + agentic-jujutsu 记忆/trajectory |
 | `graphwisdom/perstate` | Memory | `master` | `95e27e3` | 已是最新 | git-native personality/state |
 | `letta-ai/agent-file` | Memory | `main` | `78212eb` | 已是最新 | `.af` 有状态 Agent 可移植格式 |
 | `letta-ai/skills` | Memory | `main` | `16352df` | 已是最新 | 社区 skill 知识库 |
-| `matrixorigin/Memoria` | Memory | `main` | `54c9114` | 已是最新 | 记忆 snapshot/branch/merge/rollback、MCP |
+| `matrixorigin/Memoria` | Memory | `main` | `efd3d65` | 已是最新 | 记忆 snapshot/branch/merge/rollback、MCP |
 | `sachinsharma9780/memweave` | Memory | `main` | `2ff82df` | 已是最新 | Markdown+SQLite 索引、零外部服务 |
 | `sl4m3/ledgermind` | Memory | `main` | `99220d1` | 已是最新 | 自演进记忆管理（反例） |
 | `sqliteai/sqlite-memory` | Memory | `main` | `0f0aede` | 已是最新 | SQLite 混合检索、离线同步 |
 
 | 审计日期 | 仓库数 | 更新摘要 | 路线图结论 |
 |---|---:|---|---|
-| 2026-08-09（第七次） | 30 | 9 个 fast-forward（Lore、Sapling、git/git、GitButler、jj、letta-code、letta-agent-sdk、grok-build、entireio/cli）、20 个已是最新、1 个 `blocked-dirty`（agenta） | **CT-01 由「已验证（下一个执行任务）」推进为「实施中」。** 版本管理侧证据面加厚（git/git sparse-index ITA 修复、GitButler land 后删远端分支、Grok git ODB 门控）；Memory 类证据面不变，MEM-01/MEM-02 维持已验证。 |
-| 2026-08-07（第六次） | 30 | 2 个 fast-forward（Lore、Sapling）、27 个已是最新、1 个 `blocked-dirty`（agenta）；新纳入 `matrixorigin/Memoria`、`memweave`、`ledgermind`、`sqlite-memory`（4 个 Memory 参考） | **无优先级变化。** Memory 类证据面加厚：Memoria 直接给出记忆版本化（snapshot/branch/merge/rollback）证据；CT-01 仍是下一个执行任务，MEM-01/MEM-02 维持已验证。 |
-| 2026-08-07（第五次） | 26 | 1 个 fast-forward（Lore）、24 个已是最新、1 个 `blocked-dirty`（agenta）；首次按三类重组；新纳入 `letta-ai/*`（5）与 `rohitg00/agentmemory` | **结构重组。** Memory 升格为第一类长期能力（`MEM-*`）；Agent 生成代码与版本管理分列。CT-01 仍是版本管理类下一个执行任务；MEM-01 为 Memory 类首个验证任务。 |
+| 2026-08-22（第八次） | 40（35 Git + 5 Libra） | 1 个 fast-forward（letta-code）、38 个 up-to-date、1 个 `blocked-network`（agent-trace 远端 404）；新纳入 10 仓库（deepseek-harness、ctx-open、dolt、lorevcs/lore、memorax-code、Lit、rekal-cli、git-ai、lakeFS、cursor/cursor） | **RT-01 推进为实施中、UP-01 改判已排期、MEM-01/02 推进已排期**（均为 Libra 自身进展驱动）；竞品侧 rekal-cli 与 letta-code shared-memory skills 加强 MEM-* 证据；无优先级降级或新增编号 |
+| 2026-08-09（第七次） | 30 | 9 个 fast-forward（Lore、Sapling、git/git、GitButler、jj、letta-code、letta-agent-sdk、grok-build、entireio/cli）、20 个已是最新、1 个 `blocked-dirty`（agenta） | **CT-01 由「已验证（下一个执行任务）」推进为「实施中」。** 版本管理侧证据面加厚；Memory 类证据面不变，MEM-01/MEM-02 维持已验证。 |
+| 2026-08-07（第六次） | 30 | 2 个 fast-forward（Lore、Sapling）、27 个已是最新、1 个 `blocked-dirty`（agenta）；新纳入 `matrixorigin/Memoria`、`memweave`、`ledgermind`、`sqlite-memory`（4 个 Memory 参考） | **无优先级变化。** Memory 类证据面加厚；CT-01 仍是下一个执行任务，MEM-01/MEM-02 维持已验证。 |
+| 2026-08-07（第五次） | 26 | 1 个 fast-forward（Lore）、24 个已是最新、1 个 `blocked-dirty`（agenta）；首次按三类重组；新纳入 `letta-ai/*`（5）与 `rohitg00/agentmemory` | **结构重组。** Memory 升格为第一类长期能力（`MEM-*`）；CT-01 仍是版本管理类下一个执行任务；MEM-01 为 Memory 类首个验证任务。 |
 | 2026-08-02（第四次） | 20 | 9 个 fast-forward、10 个已是最新、1 个 blocked-dirty | 无优先级变化 |
-| 2026-07-31（第三次） | 20 | 10 个 fast-forward、9 个已是最新、1 个首次纳入 | 无优先级变化 |
 
-**本次结论：** 竞品格局仍三分。版本管理侧由 Jujutsu / GitButler / Sapling / Lore / Grit 定义正确性与规模问题；Agent 生成代码侧由 Entire / Mainline / Grok Build / Letta Code / research-git 定义 session、intent、runtime 与实验谱系；Memory 侧由 agentmemory / fava-trails / Letta MemFS·`.af` / perstate 定义跨会话召回与巩固。`agenta-ai/agenta` 因 dirty 不作最新证据。**本次最重要的路线图变化不在竞品侧，而在 Libra 自身**：`plan-20260729.md` 的 CT-01 兼容证据账本已实质执行并合入（账本 schema、29 个 t4 账本行、surface registry、预检/净室基础设施均已提交），CT-01 由「已验证（下一个执行任务）」推进为「实施中」，下一个执行任务顺延为 UP-01。竞品更新不足以改变其余长期优先级。
+**本次结论：** 竞品格局仍三分，且「git/仓库-native Memory」成为更明确的产品方向信号（rekal-cli 把会话记忆完整放进 `.rekal/` 入 git、仅 merged 工作共享；letta-code 让 skills 从 attached shared memory 加载；ctx-open 把 goal/decision 当版本化对象）。这些加强而非改变 MEM-01..MEM-06 的既有判断。**本轮最重要的路线图变化全部来自 Libra 自身**：RT-01（Code Web-only 迁移）W4 全部合入、W5 家族经 v0.20.0 breaking minor 基本收口；UP-01 设计冻结并建立日期计划；MEM-01/02 建立 M2 纵向切片计划。下一个执行任务顺延为 **CT-01/UP-01/plan-20260822 的实施**。
 
 本轮竞品要点：
 
-- **git/git `010afd3166`**：sparse-index 修复 intent-to-add 条目在 cone 外崩溃（`eede1e69fe`）、pack-bitmap 位置零处理、`cat-file --batch-command` 无 type 请求修复；是 LR-09 sparse 与 CT-01 上游语料持续演进的参考。
-- **GitButler `b98b6dc84a`**：land 成功后删除已合入分支的远端副本（仅删 tip 被合入目标包含的远端分支，未合入远端提交不丢弃）；是 LR-08 Forge/PR 生命周期与 LR-03 change 谱系的补充证据。
-- **Grok Build `8a14c91`**：新增进程级 git ODB 门控（`git_odb.rs`/`git_gate.rs`）——libgit2 status/diff 在进程互斥下串行、相同 in-flight 工作 join、短快照复用、超时不取消；是 SB-04 资源生命周期与 LR-01 并行工作区性能的补充证据。
-- **Lore `d09b12354a`**：JWK 服务硬化（sync cache、throttled fetches、key rotation）、revision 文件操作迁到 lore-io 驱动、fragment chunker 引擎迁移；继续支撑 LR-09 与存储生命周期。
-- **Jujutsu `6e98d068b`**：`common_ancestors()` 改 async、merge API 重构收尾；继续强化 LR-02/LR-05。
-- **Entire `caa0c9b`**：checkpoint remote 选举去掉 tracking tier（`checkpoint_remote` 归属基于 origin 而非 push target）、status cache 集中门控；强化 AG/LR-06 的 checkpoint 可靠性。
-- **Letta Code `a75f4d93`**：新增 `EnterWorktree`/`ExitWorktree` 工具（进入/离开/清理 worktree，跨 Agent 锁释放、拒绝未合入改动删除）；是 LR-01 并行 Agent 工作区与 worktree 生命周期的直接证据。
-- **Letta Agent SDK `faf3496`**：Cloud 会话恢复（idle 状态恢复）、app-server transport 断开时 fail session；强化 AG/LR-06 会话可靠性。
-- **Sapling `5a7052545ef`**：依赖升级（lancedb、blake3、sha1/digest 重命名）；无新能力信号。
-- **agentmemory / fava-trails / Memoria / memweave / sqlite-memory / ledgermind / perstate / agent-file / skills / trajectory / mainline / research-git / agent-trace / forgemark / git-sync / go-git / go-billy / grit / cli-checkpoints**：本轮无更新，维持第六次审计的 revision 与结论。
+- **letta-code `8b65ca27`（本轮唯一 fast-forward）**：skills 可从 attached shared memory 加载（`src/agent/shared-memory-skills.ts`、`src/agent/client-skills.ts`、307 行测试 `client-skills-shared-memory.test.ts`）--共享记忆直接进入 skill 加载路径，是 MEM-04（Memory 机器面）与 MEM-03（晋升后知识可被 Agent 消费）的补充证据。
+- **rekal-cli `aace7a29`（新纳入，Apache-2.0）**：每次 git commit 捕获会话、原始存 git、`.rekal/` 目录即存储、仅 merged 工作随 push 共享、本地背景索引 + 本地 embedding、写入前 pattern+entropy secret 脱敏与 home 路径匿名化；与 Libra 的 VCS-native Memory 方向（MEM-01 隐私基线、MEM-03「merged 才晋升共享」）高度同构，是 Memory 类最直接的新证据；其单仓 git-hook 捕获不涉及 Libra 的对象库/SQLite 双层，不照搬。
+- **agentmemory `2d38daf`（+7 提交）**：recall 质量、provenance、keyless graph、connector parity、Devin/Cursor 插件与 MCP 版本协商；修复 prompt 去重（hash payload）与 Docker teardown 作用域。巩固 MEM-02（citation/provenance）证据。
+- **jj `9d905d543`（+44 提交）**：新增 `jj converge` 命令（divergent change 收敛）与 colocated workspace 测试；LR-03/LR-05 的补充证据。
+- **git/git `1a3e64c6c4`（+78 提交）**：`branch-delete-merged`（删除已合入分支）、bisect found 时 reset、pluggable ODB creation；继续作为 CT-01 上游语料与 LR-08（删已合入分支与 GitButler land 语义汇合）参考。
+- **lorevcs/lore `1fd2ea9`（新纳入，MIT）**：「version control for intent, not code」定位；与 mainline/research-git 同属 intent 谱系，作 LR-06 相邻参考（早期项目，证据深度有限，未验证）。
+- **ctx-open `862e12b`（新纳入）**：把 goal/task/hypothesis/decision/conclusion 作为版本化「认知对象」；与 Libra Intent/Memory 对象化方向同题，但 source-available 许可证限制借鉴边界（只作概念参考，不复制实现）。
+- **Lit `a930e44`（新纳入，双许可）**：宣传性「agent-first VCS」（JSON 默认、MCP 工具、后量子密码）；大部分为未验证的宣传声明，登记为相邻参考，不采纳其口径为完成判据。
+- **dolt `afd22743ad`（新纳入）**：数据版本控制（cell 级 diff/merge、SQL 面版本操作）；与 Libra 源码 VCS 定位正交，作相邻参考。
+- **memorax-code `071e4d2`（新纳入， MIT）**：npm 记忆层产品；与 agentmemory 同类，证据面无新增机制。
+- **deepseek-harness `b150a551b8`（新纳入， MIT）**：全插件 agent harness；Libra 已有独立对接计划 `plan-20260818.md`（bridge），按该计划承接，不在本文展开。
+- **git-ai `c08de56df`（新纳入）**：git 扩展，把 AI 生成代码行级链接到 agent/model/prompt；与 AG-ATTR（agent-trace 方向）同题，且 agent-trace 远端已 404，git-ai 成为该方向更可用的相邻参考；其「prompt 全量入 git 元数据」的隐私面未经其文档证明，借鉴时须过 Libra 安全发布门禁（LR-06）。
+- **lakeFS `4bb11638e`（新纳入，Apache-2.0）**：对象存储上的 branch/commit/merge 数据湖版本控制；大规模对象分发的相邻参考（LR-09），无优先级影响。
+- **agent-trace `2754f07`**：远端仓库 404（已删除或迁移）；本地 RFC 材料仍可作 AG-ATTR 候选线索，但标注为「上游状态未知」。
+- **sapling / gitbutler / epicgames-lore / grok-build / forgemark / letta-agent-sdk（conversation forks）**：增量均为依赖升级、产品细节与常规演进，无改变长期优先级的新能力证据。
 
-Libra 自身（`HEAD` `302844b`，`Cargo.toml` version `0.19.106`）：
+Libra 自身（`HEAD` `917eea8c`，`Cargo.toml` version `0.20.3`，本地领先 origin/main 3 个提交）：
 
-- `1a200a9`→`302844b` 共 57 个提交，全部为 **CT-01 兼容证据账本**（`plan-20260729.md`）的 S0/S1/S3/S4 首个 wave（t4）执行：账本 schema 与守卫（`compat_ledger_schema`）、29 个 t4 账本行、surface registry（`SURFACES.gen`/`SURFACES.lock`）、预检/净室基础设施（`PRECHECK*.sh`/`CLEANROOM.sh`/`REPLAY_SOURCES.sh`/`PROJECT_DRAFT.sh`）均已提交；`tests/command/t4_port_test.rs` 仍为未提交 WIP；CT4-01 发布卡未执行（版本面未 bump、无新 tag）。
-- Part B R0 / Part C W1–W2 / registry v2 / Agent lease / W4 list|show 等已合入事实不变；LR-01 仍实施中。
-- Agent session/checkpoint/skill/review 捕获面已存在；尚无一等 Memory 引擎（混合检索、四层巩固、跨 Agent 共享记忆）。
-- CT-01 已推进为「实施中」；UP-01 / SB-01..SB-04 优先级与完成判据不变。
+- 上次审计 `302844b`->`917eea8c` 共 148 个提交。主线为 **RT-01 / plan-20260715**：W3 SSE wire v2、W4 全部合入（`libra code` 默认 Web Code UI、canonical `--control stdio`、code-control 转发 shim、统一配置 resolver、approved_permission Repository 所有权、linked-worktree code/automation、thread graph 迁入 Web）、W5 家族经 **v0.20.0 breaking minor** 收口（TUI 启动路径/内部 TUI 模块/`--web` 别名/graph TUI 入口删除、ratatui/crossterm 依赖退场）、WIO-01..03 out-of-process I/O worker、W6-03 CDN 安装脚本上传。W5-04/W5-05/W5-10 收尾与 W6-01/W6-02 尚未见合入，plan-20260715 完成判据复选框仍未勾选，RT-01 判「实施中」。
+- **CT-01 / plan-20260729**：首个 t4 wave 已入库（`t4_port_test.rs` 已合入 `tests/command/`，`a9b2eebf` CT3-02）；FIX-01/FIX-03 修复、CT3-07 转 blocked 延后（DEFER-09）、FIX-04 R94–R97 收口且 M4e 移入 v2.1 independent 发布轨（`917eea8c`）；CT4-01 发布卡未执行（a5f28150 记录其 blocked on upstream test failures）。工作区仍有该计划未提交 WIP（`tests/SERIAL_CLASSIFY.sh`、`tests/SERIAL_REGISTRY.tsv`、`tests/compat/README.md`、`tests/compat/serial_registry.rs`、`plan-20260729.md`），按 FIX-04/R97 属进行中工作，非本轮审计改动。
+- **UP-01**：设计讨论稿冻结（`docs/development/internal/release-signing-auto-upgrade.md`，D1–D10）；日期计划 `plan-20260822.md`（客户端+CI 侧）已建。当前实现仍 inert：`src/internal/upgrade/trusted_keys.rs:39` `PRODUCTION_TRUSTED_KEYS: &[TrustedKey] = &[]`；无签名发布。判「已排期」。
+- **Memory**：M2 研发历程记忆纵向切片计划 `plan-20260819.md` 已建（承接 MEM-01/MEM-02；`MemoryNote`/`MemoryEvent`、`refs/heads/libra/memory/repo` 权威历史、`MemoryWriter` 单一写入器、FTS5/BM25 召回、`libra memory search/show/status/rebuild` 命令面）；无 Memory 代码合入（`src/cli.rs` 无 `memory` 子命令，`src/internal/ai/` 无 memory 模块），判「已排期」。MEM-06 设计在 `tracing/memory.md` §19，仍候选。
+- **deepseek-harness bridge**：`plan-20260818.md` 已建（`libra agent bridge --stdio`）；`src/cli.rs` 尚无 `bridge` 子命令，实现未开始。
+- Part B R0 / Agent lease / W4 list|show 等已合入事实不变；LR-01 仍实施中。
+- SB-01..SB-04 优先级与完成判据不变。
 
 ---
 
@@ -108,8 +126,8 @@ Libra 自身（`HEAD` `302844b`，`Cargo.toml` version `0.19.106`）：
 
 | 类 | 最要完成（按执行优先） | 既有/新增编号 |
 |---|---|---|
-| **A. 版本管理** | CT-01 收尾 → UP-01 → LR-01 收尾 → LR-02 → LR-03 → LR-04/LR-05 → LR-08 → LR-09 | CT-01, UP-01, LR-01..05, LR-08, LR-09 |
-| **B. Agent 生成代码** | 工程安全 SB-02/SB-04 → LR-06 → LR-07 → runtime/UI（plan-20260715）→ LR-10 → 归因/trajectory | LR-06, LR-07, LR-10；横切 SB；日期计划 plan-20260715 |
+| **A. 版本管理** | CT-01 收尾 -> UP-01 -> LR-01 收尾 -> LR-02 -> LR-03 -> LR-04/LR-05 -> LR-08 -> LR-09 | CT-01, UP-01, LR-01..05, LR-08, LR-09 |
+| **B. Agent 生成代码** | 工程安全 SB-02/SB-04 -> RT-01 收尾 -> LR-06 -> LR-07 -> LR-10 -> 归因/trajectory -> harness bridge（plan-20260818） | LR-06, LR-07, LR-10, RT-01；横切 SB；日期计划 plan-20260715 / plan-20260818 |
 | **C. Memory** | MEM-01 存储与隐私 → MEM-02 混合召回 → MEM-03 巩固/晋升 → MEM-04 MCP 面 → MEM-05 可移植导出 → MEM-06 并行协调 | MEM-01..MEM-06（MEM-06 新增） |
 
 横切工程门禁 **SB-01..SB-04** 适用于三类，不单独占一类名额。
@@ -173,8 +191,8 @@ flowchart LR
 
 | ID | 任务 | 优先级 | 状态 | 一句话缺口 |
 |---|---|---:|---|---|
-| **CT-01** | 上游 Git 套件驱动的兼容性证据账本 | P0 | 实施中 | 账本 schema/守卫、29 个 t4 账本行、surface registry、预检/净室基础设施已合入（[`plan-20260729.md`](plan-20260729.md) S0/S1/S3/S4 首个 wave）；`t4_port_test.rs` 仍为 WIP，CT4-01 发布卡未执行；机制归 [`../gap/grit-gap.md`](../gap/grit-gap.md) GGT-00A |
-| **UP-01** | 官方签名自动升级链 | P0 | 实施中（CT-01 之后） | 客户端 inert；缺 release-key ceremony、签名 job、`install.sh` 验签 |
+| **CT-01** | 上游 Git 套件驱动的兼容性证据账本 | P0 | 实施中 | 首个 t4 wave 已入库（含 `tests/command/t4_port_test.rs`）；FIX-01/03/04 收口（FIX-04 R94–R97、M4e 走 v2.1 independent 发布轨）；CT3-07 转 blocked（DEFER-09）；**CT4-01 发布卡仍未执行**；机制归 [`../gap/grit-gap.md`](../gap/grit-gap.md) GGT-00A |
+| **UP-01** | 官方签名自动升级链 | P0 | 已排期 | 设计稿 D1–D10 冻结 + [`plan-20260822.md`](plan-20260822.md) 已建；客户端仍 inert（`trusted_keys.rs` `PRODUCTION_TRUSTED_KEYS` 为空；缺 release-key ceremony、签名 job、`install.sh` 验签） |
 | **LR-01** | 完整多工作区隔离与并行 Agent 工作区 | P0 | 实施中 | W1–W2/lease/list\|show 已合入；缺 capture/export ownership、doctor、崩溃矩阵、parallel lanes |
 | **LR-02** | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 已验证 | mutation 覆盖与 index/worktree/sequencer snapshot 不完整 |
 | **LR-03** | 稳定 Change ID 与历史重写谱系 | P0 | 已验证 | 无稳定 change identity / 持久 lineage |
@@ -185,7 +203,7 @@ flowchart LR
 
 ### A 类完成判据（摘要）
 
-- **CT-01**：按命令族可复算的证据账本入库；`direct`/`adapted`/`declined`/`blocked` 分型；净室边界不被突破；首批 wave 有回归。**当前进度**：账本 schema/守卫、29 个 t4 账本行、surface registry、预检/净室基础设施已合入；`t4_port_test.rs` 待入库，CT4-01 发布卡待执行。
+- **CT-01**：按命令族可复算的证据账本入库；`direct`/`adapted`/`declined`/`blocked` 分型；净室边界不被突破；首批 wave 有回归。**当前进度**：首个 t4 wave 与 FIX-01/03/04 已合入；CT4-01 发布卡待执行。
 - **UP-01**：非空 `PRODUCTION_TRUSTED_KEYS`、发布签名 job、官方 install 验签；未签名包 fail closed。
 - **LR-01**：linked worktree 的 HEAD/index/sequencer/lease 崩溃与并行矩阵通过；`worktree doctor` 可诊断/修复。
 - **LR-02**：生产 mutation 默认进 operation log；snapshot 含恢复所需状态；`op restore` 可验证。
@@ -214,7 +232,7 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 - CT-01 阶段契约见上表；任务卡、ADR、净室门与发布模型以 [`plan-20260729.md`](plan-20260729.md) 为准。
 - UP-01 / LR-01..LR-05 / LR-08 / LR-09 的细规格以对应日期计划与当前代码复核为准；本文总览只保留状态与一句话缺口。
-- 日期计划：[`plan-20260708.md`](plan-20260708.md)、[`plan-20260714.md`](plan-20260714.md)、[`plan-20260729.md`](plan-20260729.md)。
+- 日期计划：[`plan-20260708.md`](plan-20260708.md)、[`plan-20260714.md`](plan-20260714.md)、[`plan-20260729.md`](plan-20260729.md)、[`plan-20260822.md`](plan-20260822.md)。
 
 ---
 
@@ -241,16 +259,16 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 | **SB-04** | 测试与子进程资源生命周期隔离 | P1/P2 | 已验证 | 环境/临时路径/child scope 未统一；Grok ProcessScope 为证据 |
 | **LR-06** | Intent Seal、Intent-Commit Pin、安全团队发布 | P1 | 已验证 | 本地 Intent/Decision/checkpoint 有；seal/pin/白名单 publication 无 |
 | **LR-07** | 开工前意图检索与语义冲突 Preflight | P1 | 已验证 | 缺团队 intent projection、确定性 overlap receipt、pre-edit gate |
-| **RT-01** | AgentRuntime / Code UI 中立承载（日期计划） | P1 | 已排期 | [`plan-20260715.md`](plan-20260715.md)：UI-neutral runtime、Web adapter、TUI 迁移 |
+| **RT-01** | AgentRuntime / Code UI 中立承载（日期计划） | P1 | 已完成 | [`plan-20260715.md`](plan-20260715.md) 完成判据与 Checkpoint A–D 全部满足：Code TUI 已删除、`libra code` 默认 Web Code UI、runtime 为唯一状态机 owner；剩余仅 DEFER-01..10（SSE v1 物理移除 DEFER-08 等），按各自重启条件独立立项 |
 | **LR-10** | Feature/Research Capsule 与实验谱系 | P2 | 已验证 | 有 artifact/skill 捕获；无 capsule lifecycle / compare / ablation |
-| **AG-ATTR** | Agent 代码归因与 transcript 归一（候选） | P2 | 候选 | agent-trace / trajectory 证明互操作需求；先只读导出，不改 Git 对象默认语义 |
+| **AG-ATTR** | Agent 代码归因与 transcript 归一（候选） | P2 | 候选 | agent-trace / trajectory / **git-ai（行级 agent/model/prompt 归因）**证明互操作需求；先只读导出，不改 Git 对象默认语义 |
 
 ### B 类完成判据（摘要）
 
 - **SB-02 / SB-04**：见下文「工程安全基线」；Agent 新 mutation 不得绕过。
 - **LR-06**：intent 可 seal；与 commit/change 稳定 pin；团队发布经白名单与 redaction；可撤销/tombstone。
 - **LR-07**：开工前确定性 overlap receipt；可注入有界上下文；误报/漏报有可测基线。
-- **RT-01**：runtime 与 TUI/Web 解耦；审批/preflight/lease 单一事实源。
+- **RT-01**：runtime 与 TUI/Web 解耦（TUI 已退场）；审批/preflight/lease 单一事实源；plan-20260715 完成判据全部满足才算关闭。
 - **LR-10**：capsule 可捕获、召回、在今日代码上安全 reapply/remove，并带 provenance。
 - **AG-ATTR**：至少一种外部 transcript/归因格式可导入为只读证据；默认不污染 Git 历史。
 
@@ -277,6 +295,8 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 | **memweave** | Markdown 文件 + SQLite 索引、零外部服务、recall 基线 | 单机库形态不替代 Libra VCS-native 边界 |
 | **ledgermind** | 自演进记忆管理（反例：自主变异不可审计） | 无监督自主改写当默认行为 |
 | **sqlite-memory** | Markdown + SQLite 混合检索、离线同步 | 默认上传托管服务 |
+| **rekal-cli**（新纳入，Apache-2.0） | git-native 会话记忆全链路：commit 时自动捕获、`.rekal/` 即存储、仅 merged 共享、写入前 secret 脱敏 + home 匿名化、本地背景索引/embedding | 单仓 git-hook 捕获不含对象库/SQLite 双层与 Trust Gate；复制其「raw 会话全量入 git」形态 |
+| **ctx-open** / **memorax-code**（新纳入，相邻） | 认知对象版本化（ctx-open，source-available 许可只作概念参考）；npm 记忆层产品形态（memorax-code） | 作为 Memory 主线证据；不复制实现 |
 
 ### 为什么现在升格
 
@@ -290,9 +310,9 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 | ID | 任务 | 优先级 | 状态 | 主要竞品证据 |
 |---|---|---:|---|---|
-| **MEM-01** | VCS-native Memory 存储与隐私基线 | P0 | 已验证 | agentmemory 管道；fava-trails draft 隔离；Libra 已有 session 对象可作源 |
-| **MEM-02** | 混合召回与会话注入（有界 token） | P0 | 已验证 | agentmemory BM25+vector+graph + SessionStart 注入 |
-| **MEM-03** | 巩固、衰减、遗忘与团队晋升门禁 | P1 | 已验证 | agentmemory 四层 + decay；fava-trails Trust Gate |
+| **MEM-01** | VCS-native Memory 存储与隐私基线 | P0 | 已排期 | agentmemory 管道；fava-trails draft 隔离；**rekal-cli `.rekal/` 入 git + 写入前 secret 脱敏/home 匿名化**；M2 计划 [`plan-20260819.md`](plan-20260819.md)（MemoryNote/MemoryEvent、MemoryWriter 单一写入器），尚无实现合入 |
+| **MEM-02** | 混合召回与会话注入（有界 token） | P0 | 已排期 | agentmemory BM25+vector+graph + provenance；SessionStart 注入；M2 首切片固定 SQLite FTS5 + `bm25()`（`libra memory search/show/status/rebuild`），尚无实现合入 |
+| **MEM-03** | 巩固、衰减、遗忘与团队晋升门禁 | P1 | 已验证 | agentmemory 四层 + decay；fava-trails Trust Gate；rekal-cli「仅 merged 工作才随 push 共享」作为晋升边界证据 |
 | **MEM-04** | 经鉴权的 Memory MCP / 机器接口 | P1 | 已验证 | agentmemory 54 tools（规模作反例）；须服从 SB-02 |
 | **MEM-05** | 可移植导出（`.af` / MemFS 子集）与 skill 投影 | P2 | 候选 | Letta agent-file、skills、MemFS |
 | **MEM-06** | 并行多 Agent 协调 Memory（协调通道） | P1 | 候选（新增） | 并行工作区需求；Libra worktree/lease 基础；复用 MEM-01/03 |
@@ -426,9 +446,11 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 ### 下一个执行任务（全局）
 
-1. **UP-01**（版本管理）：签名自动升级链 — 紧随 CT-01（CT-01 已推进为「实施中」，其首个 wave 已实质合入，见 [`plan-20260729.md`](plan-20260729.md)）。
-2. **CT-01 收尾**（版本管理）：`t4_port_test.rs` 入库 + CT4-01 发布卡（版本面 bump、tag、D-02 证据）。
-3. **MEM-01**（Memory）：与 CT-01 的 S1 可并行启动设计/RFC，但不得在 SB-02 完成前开放非 loopback Memory MCP。
+1. **CT-01 收尾**（版本管理）：CT3-07（DEFER-09）处置 + **CT4-01 发布卡**（版本面 bump、tag、D-02 证据）；FIX-04/M4e 走 v2.1 independent 发布轨。
+2. **UP-01**（版本管理）：按 [`plan-20260822.md`](plan-20260822.md) 执行客户端 trust table、单调 generation floor、`release.yml` 签名、`install.sh/ps1` fail-closed 验签。
+3. ~~**RT-01 收尾**（Agent 生成代码）~~：已完成——plan-20260715 的 W5-04/05/10 与 W6-01/02 均已收口，完成判据全部勾选；后续只按 DEFER-08 等重启条件独立立项。
+4. **MEM-01/MEM-02**（Memory）：按 M2 计划 [`plan-20260819.md`](plan-20260819.md) 执行首个纵向切片；不得在 SB-02 完成前开放非 loopback Memory MCP。
+5. deepseek-harness bridge（plan-20260818）按其任务卡排期执行，不与 M2 抢 `agent bridge` 面。
 
 ### 阶段零：工程安全
 
@@ -444,7 +466,7 @@ LR-04 → LR-05；并行推进 LR-08 设计。
 
 ### 阶段三：Agent 意图与运行时
 
-LR-06 → LR-07 + RT-01（plan-20260715）；Memory MEM-01/MEM-02 向 LR-07 供数。
+LR-06 -> LR-07（RT-01 / plan-20260715 已完成，不再是本阶段前置）；Memory MEM-01/MEM-02（plan-20260819 M2 切片）向 LR-07 供数；deepseek-harness bridge（plan-20260818）按任务卡独立排期。
 
 ### 阶段四：Memory 巩固与规模
 
@@ -501,9 +523,12 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260708.md`](plan-20260708.md) | A（LR-04/05/09 相邻基础） | 主线已完成 | 不关闭对应 LR |
 | [`plan-20260713.md`](plan-20260713.md) | B（LR-06/07/10 捕获前置） | 已完成 | 不覆盖 seal/preflight/capsule |
 | [`plan-20260714.md`](plan-20260714.md) | A（UP-01、LR-01）+ 横切 | Part A→UP-01；Part C/D 残留 | LR-01 仍实施中 |
-| [`plan-20260715.md`](plan-20260715.md) | B（RT-01） | 已排期 | runtime/UI；非 intent publication |
-| [`plan-20260729.md`](plan-20260729.md) | A（CT-01） | 实施中 | **S0 + S1 前两项 + S3 + S4 首个 wave（t4）**已实质执行并合入（账本 schema/守卫、29 个 t4 账本行、surface registry、预检/净室基础设施）；`t4_port_test.rs` 待入库、CT4-01 发布卡待执行；不覆盖 S2 离线发现器、S5 CI 落点与其余族 wave |
-| （待建）Memory 首个日期计划 | C（MEM-01/02） | 未建 | 须先 RFC：对象模型、隐私、与 session 真源关系 |
+| [`plan-20260715.md`](plan-20260715.md) | B（RT-01） | 已完成 | W0–W6 主线、W5-01 家族（v0.20.0 breaking minor）与正交 WIO-01..03 / W6-03 全部合入；W5-04/05/10 与 W6-01/02 已收口，完成判据与 Checkpoint A–D 全部勾选；不覆盖 DEFER-01..10（含 SSE v1 物理移除 DEFER-08） |
+| [`plan-20260729.md`](plan-20260729.md) | A（CT-01） | 实施中 | 首个 t4 wave（含 `t4_port_test.rs`）与 FIX-01/03/04 已合入；FIX-04/M4e 走 v2.1 independent 发布轨；CT3-07 转 blocked（DEFER-09）；**CT4-01 发布卡待执行**；不覆盖 S2 离线发现器、S5 CI 落点与其余族 wave |
+| [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | 已排期 | `libra agent bridge --stdio` 唯一标准入站面；实现未开始（无 `bridge` 子命令）；不覆盖 MCP/旧工具服务器恢复 |
+| [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02） | 已排期 | M2 研发历程记忆首个纵向切片（MemoryNote/MemoryEvent、MemoryWriter、FTS5/BM25、`libra memory` 命令面）；实现未开始；不覆盖 MCP 面、向量检索、团队同步与 MEM-03..06 |
+| [`plan-20260822.md`](plan-20260822.md) | A（UP-01） | 已排期 | 客户端与发布 CI 侧（trust table、generation floor、`release.yml`、install 验签）；Backend Workers 侧在 libra-backend 姊妹计划；密钥 ceremony 私钥半边不在本仓库 |
+| （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---
 
@@ -515,20 +540,23 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 
 ### 不采纳
 
-- 不把 Agenta 当源码 VCS 对标（且本轮 `blocked-dirty`）。
+- 不把 Agenta 当源码 VCS 对标（本轮工作区 clean、可更新，但其本地 revision 前移过程非本审计执行，仍不作强证据）。
 - 不把 Grok portable agent definition / TUI 复制为新 VCS LR（可作 SB-02/SB-04 证据）。
 - 不采用 Grok hook 通用 fail-open。
 - 不采用 Grit 二元 skip 元数据与「绝不修改测试」原文策略；CT-01 用分型账本。
 - 不逐字 vendor GPLv2 测试。
-- 不采纳未经限定的竞品宣传指标作为完成判据。
+- 不采纳未经限定的竞品宣传指标作为完成判据（含 Lit 的「agent-first VCS / 后量子密码」口径、agentic-flow 宣传指标）。
+- 不复制 ctx-open（source-available 许可）的认知对象实现，也不复制 dolt 的 SQL 数据版本面为 Libra 能力（相邻参考）。
+- 不把 rekal-cli 的「raw 会话全量入 git」当 Libra 存储形态--Libra 保存有界摘要 + 类型化证据引用（M2 计划口径）；rekal 的「仅 merged 才共享、写入前脱敏」作为 MEM-01/03 边界证据。
 - 不把 Grok 进程级 git ODB 门控（`git_odb.rs`/`git_gate.rs`）当作 Libra 的并发模型照搬——Libra 的 SQLite 状态与对象库访问路径不同；其「相同 in-flight 工作 join + 短快照复用 + 超时不取消」可作 SB-04 资源生命周期与 LR-01 并行工作区性能的参考。
 - 不把 Letta `EnterWorktree`/`ExitWorktree` 的「跨 Agent 锁释放 + 拒绝未合入改动删除」直接复制为 Libra 的 worktree 语义——Libra 已有 `worktree doctor`/lease 模型；其「离开前释放锁、删除前拒绝未合入改动」是 LR-01 完成判据的补充证据。
 - 不把 MEM-06 协调通道实现为实时消息总线 / agent IM / 分布式锁替代：它只协调工作所有权（CAS 单写者赢），真正写入冲突仍由 ref CAS / 冲突检测兜底；不承诺实时投递，也不替代 mainline intent-team publication。
 
 ### 已实现
 
-- 无 LR-01..LR-10 / MEM-01..MEM-06 满足全部长期完成判据。部分基础（worktree、operation、Agent capture、sparse-view）据实记录在总览，不提前关闭整项。
-- **CT-01 部分落地**：兼容证据账本 schema/守卫、29 个 t4 账本行、surface registry、预检/净室基础设施已合入（`plan-20260729.md` S0/S1/S3/S4 首个 wave）；`t4_port_test.rs` 待入库、CT4-01 发布卡待执行，故 CT-01 仍为「实施中」，不标「已实现」。
+- 无 LR-01..LR-10 / MEM-01..MEM-06 满足全部长期完成判据。部分基础（worktree、operation、Agent capture、sparse-view、Code Web-only UI 默认化）据实记录在总览，不提前关闭整项。
+- **CT-01 部分落地**：首个 t4 wave（含 `t4_port_test.rs`）与 FIX-01/03/04 已合入；CT4-01 发布卡待执行，故 CT-01 仍为「实施中」，不标「已实现」。
+- **RT-01 部分落地**：W3/W4 全部合入、TUI 经 v0.20.0 breaking minor 退场；W5 收尾与 W6-01/02 未完成，判据复选框未勾选，仍为「实施中」。
 
 ---
 

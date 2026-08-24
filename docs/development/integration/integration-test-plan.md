@@ -51,7 +51,7 @@ cargo test --test ai_agent_test -- --test-threads=1
 |---|---|---|
 | 命令层集成测试汇总入口 | 已存在 | `tests/command_test.rs` + `tests/command/*.rs` |
 | 兼容性专项测试 | 已存在 | `tests/compat/*.rs` + `Cargo.toml` `[[test]]` 注册 |
-| Code UI PTY harness | 已存在 | `tests/harness/code_session.rs` |
+| Code UI Web process harness | 已存在（non-TTY） | `tests/harness/code_session.rs` |
 | Code UI 事件流 harness | 已存在 | `tests/harness/event_stream.rs` |
 | Code UI 数据驱动矩阵 runner | 已存在 | `tests/code_ui_remote_{lease,sse,state,security,generation,approval,model_generation}_matrix.rs` |
 | Code UI 场景回归 | 已存在 | `tests/code_ui_scenarios.rs` |
@@ -217,7 +217,8 @@ cargo test --features test-provider \
   --test code_tool_acl_test \
   --test code_mcp_dual_entry_test \
   --test code_resume_test \
-  --test code_codex_default_tui_test \
+  --test code_codex_default_web_test \
+  --test ai_code_ui_headless_test \
   --test code_codex_runtime_test \
   -- --test-threads=1
 ```

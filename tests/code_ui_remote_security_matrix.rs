@@ -1,7 +1,7 @@
 //! Wave 7 / PR 7 — `code_ui_remote_security` matrix runner.
 //!
 //! Loads `tests/data/code_ui_remote/security_cases.json` and runs
-//! the L2-driven P1 cases through a real `libra code` PTY session:
+//! the L2-driven P1 cases through a real non-TTY `libra code` Web process:
 //!
 //! 1. diagnostics body never echoes either the harness's
 //!    `X-Libra-Control-Token` value or the issued

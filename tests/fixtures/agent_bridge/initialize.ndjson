@@ -1,0 +1,6 @@
+{"jsonrpc":"2.0","method":"initialize","params":{"protocol":{"major":1,"minor":0}},"id":1}
+{"jsonrpc":"2.0","method":"session.open","params":{"session_id":"s1"},"id":2}
+{"jsonrpc":"2.0","method":"event.append","params":{"session_id":"s1","events":[{"seq":1,"type":"tool/result","payload":"{\"tool\":\"libra_status\",\"ok\":true}"}]},"id":3}
+{"jsonrpc":"2.0","method":"session.flush","params":{"session_id":"s1"},"id":4}
+{"jsonrpc":"2.0","method":"status.get","id":5}
+{"jsonrpc":"2.0","method":"session.close","params":{"session_id":"s1"},"id":6}

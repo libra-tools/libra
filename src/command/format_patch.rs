@@ -173,8 +173,13 @@ pub struct FormatPatchArgs {
     #[arg(long = "from", value_name = "IDENT", num_args = 0..=1, require_equals = true)]
     pub from: Option<Option<String>>,
 
-    /// Mark the patch series as version N (changes "[PATCH]" to "[PATCH vN]").
-    #[arg(short = 'v', long = "reroll-count", value_name = "N")]
+    /// Mark the patch series as version N (changes `[PATCH]` to `[PATCH vN]`).
+    #[arg(
+        short = 'v',
+        long = "reroll-count",
+        value_name = "N",
+        help = "Mark the patch series as version N (changes \"[PATCH]\" to \"[PATCH vN]\")"
+    )]
     pub reroll_count: Option<usize>,
 
     /// Append a Signed-off-by trailer to each commit message.
@@ -238,9 +243,12 @@ pub struct FormatPatchArgs {
     #[arg(long = "no-stat")]
     pub no_stat: bool,
 
-    /// Keep the original [PATCH] prefix if present in the commit subject,
+    /// Keep the original `[PATCH]` prefix if present in the commit subject,
     /// instead of stripping it (default behaviour in Git).
-    #[arg(long = "keep-subject")]
+    #[arg(
+        long = "keep-subject",
+        help = "Keep the original [PATCH] prefix if present in the commit subject, instead of stripping it (default behaviour in Git)"
+    )]
     pub keep_subject: bool,
 
     /// Filename suffix for generated patches (default ".patch"); e.g. ".txt".

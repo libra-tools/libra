@@ -883,7 +883,11 @@ JSON key 冻结为 `input_tokens`、`cache_creation_tokens`、`cache_read_tokens
 - review：多 reviewer 并发、fan-in channel、串行 sink dispatch；findings 是 agent stdout 自由文本，`--fix` 才启发式解析 severity/ID/title/body。Libra 可以增强结构化 manifest，但必须标注这是 Libra 增强，不是 entire parity。
 - investigate：strict round-robin，`RunState` 持久化 `run_id/topic/agents/max_turns/quorum/completed_rounds/turn/next_agent_idx/stances/findings_doc/starting_sha/started_at/updated_at/pending_turn`；单线程写 `findings.md`；issue-link/untrusted seed 默认只读，非交互必须显式允许。
 - launch/fix：剥离 review/investigate provenance env 后进入普通 session。Libra 的 mutating fix 必须桥接回内部 AgentRuntime serialized queue、approval/sandbox/tool gate；observed external agent 只能提供 transcript、hook event、findings、manual attach/provenance。
-- ⚠️ **fix-bridge 前置**：上述「内部 AgentRuntime serialized fix 入口」当前**无源码锚点**。AG-22 启动前须由 `docs/development/internal/code-agent-runtime.md` 给出源码锚点；未就绪时 AG-22/AG-23 只能交付 read-only（`ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`）。
+- ⚠️ **fix-bridge 前置（plan-20260715 W6-02 重启条件已登记）**：内部 AgentRuntime **serialized mutating 入口已就绪**，锚点：
+  - `AgentRuntimeHandle::submit` / `AgentRuntimeWorker` 串行 turn queue（`src/internal/ai/runtime/worker.rs`）
+  - confirmed-plan execution：`submit_confirmed_plan_execution`（`src/internal/ai/runtime/plan_execution.rs`），默认 Web 经 `HeadlessPhase1Command::StartPlanExecution`
+  - 共享 mutating 安全边界：`runtime::hardening` + 既有 tool-loop approval/sandbox/ACL（`ensure_plan_execution_mutating_gate`）
+  `review --fix` / `investigate fix` **仍 fail-closed**（`LBR-AGENT-010`）；本登记只证明内部 serialized fix 入口存在，不实现 bridge。实现归 plan-20260714 PD-01。未接 PD-01 前 AG-22/AG-23 只能交付 read-only。
 
 ### E8-libra：Review / Investigate run wire
 

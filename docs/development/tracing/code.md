@@ -75,11 +75,11 @@ queue。新的 worker 在执行 mutating tool 前必须复用现有 `ToolRegistr
 |---|---|---|
 | Runtime contracts 与 safety boundary | `src/internal/ai/runtime/mod.rs` 导出 contracts、event、hardening、phase0..4、`worker`/`controller`/`durability`；`hardening.rs:540,548` 的 `ToolBoundaryRuntime`。 | worker/state-machine 已落在该 module；所有 mutating turn 以既有 hardening 为唯一判定来源。 |
 | Provider/tool-loop 执行 | `src/internal/ai/agent/runtime/mod.rs`；`tool_loop.rs` 的 `run_tool_loop_with_history_and_observer`；headless executor 在 `headless.rs:815` 调用该 loop。 | worker 持有/接收 executor adapter，执行层仍调用该 loop，不把 queue 反向塞进 provider 模块。 |
-| Phase 0 Intent | `phase0.rs:67` 的 `write_intent`；历史 TUI adapter 曾在已删除的 `app.rs` 导入并调用。 | Intent interaction 由 worker 统一推进，并继续调用 `write_intent`；不复制 `persist_intentspec`。 |
-| Phase 1 Plan | `phase1.rs:401` 的 `write_plan_set` 委派 orchestrator persistence。 | Plan review/approval 通过 worker 后调用该入口；不得写新的 plan 表。 |
+| Phase 0 Intent | `phase0.rs:67` 的 `write_intent`；历史 TUI adapter 曾在已删除的 `app.rs` 导入并调用。IntentSpec revision 的私有 authority 是 Prepared/Active/Claiming/Consuming + HMAC + durable receipt：Claiming 在 Runtime admission 前固定 command，Consuming 在 executor start gate 前固定 intent event。Startup 对每份 committed replay 只构造一次线性的 `ValidatedIntentRevisionReceiptIndex`；source terminal、receipt、consumer status、replacement marker 与 retry lineage 都复用该 index。5,000-event / 700-receipt 回归把 relationship visit 限制为 replay event 数量的四倍。 | Intent interaction 由 worker 统一推进，并继续调用 `write_intent`；不复制 `persist_intentspec`。精确 raw `/intent cancel` 以固定无-provider effect 提交收据；Modify 必须恰好一次成功 `submit_intent_draft` 且 replacement review marker 已 durable 才提交收据。收据永久闭合准确 retry lineage；marker/terminal/receipt 冲突则 fail closed。 |
+| Phase 1 Plan | `runtime::phase1::write_plan_set` 委派 orchestrator persistence；Web recovery envelope 使用有界、typed、checkout-bound 的 Phase 1 context，durable workflow log 仍是 gate authority。Identity tuple 固定 canonical cwd/repo/base/HEAD/worktree；精确 content fingerprint 是 Execute authority；Network gate 写入前还会在 content scan 后再次校验 checkout identity，防止同内容 HEAD/repository race，additive `metadata-v1` token 用作 resume 投影与可判定 pre-write 校验/重试信号，绝不授权 Execute；新 binding 以 metadata-before/exact-before/exact-after/metadata-after 稳定区间捕获并拒绝任一不匹配，旧 content-only context 继续可读并回退精确 content 比较。每次 scanner 采用 30 秒 / 1,000,000 遍历 entry / 累计 128 MiB 编码路径名的 cooperative work budget；目录在有界 manifest 排序前流式计数，阻塞式文件系统调用和最终 EOF 返回后均复查预算并 fail-closed。路径名枚举仍是 ignore-aware path walk，只提供候选列表而不充当 read authority；Unix 对权威读取使用 pinned root/parent fd 与 `openat`/`fstatat`/`readlinkat`、no-follow/nonblocking 以及 identity/path/reopen 校验；Windows 使用 pinned handle、`FILE_FLAG_OPEN_REPARSE_POINT`、final-path/file-identity 与 `FSCTL_GET_REPARSE_POINT`；其他平台 fail closed。启动只使用一次完整 committed replay；sequence gap/window cut 在 authority 选择或 context GC 前拒绝。append lock 是持久 regular-file OS advisory lock，不按 age 回收、不 unlink，并拒绝 symlink/special entry。独立的 process-lifetime Phase 1 writer lease 必须在 reload/fold 前取得，绑定精确 SessionStore/session 且 clone 共享 one-shot claim；它不同于 append/controller lock，Unix 校验 nofollow/nonblock + dev/inode，Windows 拒绝 reparse 并校验 volume/file identity。 | Confirm 后的 draft/revision 与 Plan/network-policy gate 通过 worker；不得写新的 plan 表或由 Web adapter 保存私有 workflow FSM。resume change signal 不进入 `IndeterminateSideEffect`：投影 `workspaceDrifted`/`workspaceWarning`；metadata-only 信号可通过 Execute 的精确复核，精确 identity/content 漂移则以 `PHASE1_WORKSPACE_CHANGED` 保留 gate；同 repo 新 HEAD 可显式 Modify recapture，不同 repo 必须重新 Intent review。当前 Network Allow 在 W2-04 confirmed-plan handoff 恢复前以 `PLAN_EXECUTION_NOT_AVAILABLE` fail-closed。 |
 | Phase 2 Attempt | `phase2.rs:160,191` 的 start/finish；orchestrator `persistence.rs:727,859` 已桥接。 | worker/executor lifecycle 只经这些 bridge 记录 attempt。 |
 | Phase 3 / Phase 4 | `phase3`/`phase4` ValidationReportStore / FinalDecisionStore 仍为 formal write 面。 | validation/terminal decision 继续由既有 store 写入；worker 只发布 normalized event/snapshot。 |
-| Adapter ownership | non-Codex Web Code UI browser submit 已经 `AgentRuntimeWorker::spawn`（`headless.rs:718`）；workflow interaction 已收敛至 runtime。managed Codex 的 app-server interaction 仍依 DEFER-07 保持其明确的外部 owner。共享面拆分：`CodeAgentServicesBuilder`（`code.rs:1616,2338`）统一 **tool registry + hardening boundary**；provider/env/model 仍经 `build_any_completion_model_for_args`（`:1209`）；sandbox/approval 仍经保留的历史命名 helper `tui_approval_config_from_args`（`:3832`）与 `default_tui_runtime_context`（`:3730`，返回 `ToolRuntimeContext`）。无调用者的 `CodeAgentServicesBuilder::tui_baseline*` / `TuiBaseline` 是 W5-06 后遗留，已登记给 W5-10 的 zero-`Tui` sweep，禁止重新实例化。不得把后两类历史命名误并入 builder 所有权。 | W1-04/W1-06/W1-08 与 W2 已将 cancel/projection/shutdown/workflow 收敛到 runtime-only；禁止新增平行状态机或第三条 bootstrap。 |
+| Adapter ownership | non-Codex Web Code UI browser submit 已经 `AgentRuntimeWorker::spawn`（`headless.rs:718`）；workflow interaction 已收敛至 runtime。managed Codex 的 app-server interaction 仍依 DEFER-07 保持其明确的外部 owner。共享面拆分：`CodeAgentServicesBuilder`（`code.rs:1616,2338`）统一 **tool registry + hardening boundary**；provider/env/model 仍经 `build_any_completion_model_for_args`（`:1209`）；sandbox/approval 由 `approval_config_from_args` 与 `default_runtime_context`（返回 `ToolRuntimeContext`）装配。W5-10 已删除无调用者的旧 full-workflow builder 分支和所有源码 `Tui` 类型名，不得重新实例化第二条 registry/bootstrap 路径。 | W1-04/W1-06/W1-08 与 W2 已将 cancel/projection/shutdown/workflow 收敛到 runtime-only；禁止新增平行状态机或第三条 bootstrap。 |
 
 三态所有权图：
 
@@ -109,14 +109,14 @@ defer 项；不能把 direct-chat 链路当作该 bridge 完成证据。
 |---|---|---|---|
 | C1 | `src/command/code.rs:694-707` 三路分发；`ControlMode`/`BrowserControlMode`/`WebOnlyRuntimeKind` 在 `:233/:248/:790`。 | 直接改默认分支会绕开既有行为矩阵。 | W4-01；默认切换是 public 行为变更。 |
 | C2 | web-only 已可选 provider，且 non-Codex headless 已接受 `--resume` / `--env-file` / `--context` / `--approval-policy` / `--approval-ttl`（W3-13）；仍拒绝 `--network-access allow`（`reject_non_tui_flags`，直到 Plan gate 拥有 per-execution sandbox network）。 | Web default 切默认时不得再丢这些可配置能力。 | W4-01；若删除 flag 必须 breaking migration。 |
-| C3 | Web Code UI/headless 共享三层 bootstrap：`CodeAgentServicesBuilder` → registry/hardening；`build_any_completion_model_for_args` → env/model；保留历史命名的 `tui_approval_config_from_args` + `default_tui_runtime_context` → approval/sandbox。 | Web-only 已公开接受 `--env-file`（W3-13），优先级仍为 env-file > process/vault。 | W4-01 默认路径复用同一断言。 |
+| C3 | Web Code UI/headless 共享三层 bootstrap：`CodeAgentServicesBuilder` → registry/hardening；`build_any_completion_model_for_args` → env/model；`approval_config_from_args` + `default_runtime_context` → approval/sandbox。 | Web-only 已公开接受 `--env-file`（W3-13），优先级仍为 env-file > process/vault。 | W4-01 默认路径复用同一断言。 |
 | C4 | `code_ui.rs:674-685` `broadcast_snapshot` 仍发送完整 `CodeUiSessionSnapshot`；browser control/SSE 是公开 wire。 | 全量 snapshot 与有界 cursor/replay 目标不相容。 | W3-01/W3-06/W3-08；v2 须保留 v1 兼容窗口。 |
 | C5 | non-Codex headless 已经由公开 Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）进入 JSONL fold；stdio 与 managed Codex 仍不共享该协议。 | Web workflow recovery 已收敛至 runtime；managed Codex 仍依 DEFER-07 保持外部 owner，graph 仅为独立 read-model consumer。 | W1-06 → W3-03、W4-01/W4-05。 |
 | C6 | `code --stdio`（`execute_stdio`）是弃用的 MCP-only legacy transport（tools/resources；stderr 警告；非 turn control）；canonical automation client 是 `code --control stdio`（`ControlMode::Stdio` + `run_control_stdio_client` + W4-10 control-info discovery）；`code-control --stdio` 是 W4-09 弃用转发 shim（已于 W5-01 物理删除）；独立 `libra mcp --stdio` 为 DEFER-02。 | MCP 与 control client 不可混作 turn control plane；discovery/attach fail-closed（`CONTROL_*` / JSON-RPC `-32000`）。 | W4-02/W4-03/W4-09/W4-10；breaking command migration。 |
 | C7 | `runtime::hardening` 是 mutating policy；A0-05 fix 仍 fail-closed `LBR-AGENT-010`（`review.rs:23,74` / `investigate.rs:22,77`）。 | 不能把不存在的 bridge 当可复用实现，也不能另建 mutation/approval 表。 | W1-01/W2-04/W6-02；bridge 仍 deferred。 |
 | C8 | 基线快照中的 command docs、compat matrix、tests index 曾描述 TUI/current commands；W5-03 已清除该当前行为承诺。 | 源码迁移若未同步文档会留下错误的公开行为承诺。 | W4-05/W6-01/W6-02；用户可见文档为发布门禁。 |
 | C9 | MCP authorizer 仍是显式 deferred，生产没有 handler 时不可视为完整 authz。 | Web write security 不能依赖 MCP authorization 的不存在保证。 | W3-05/W4-03；保持 loopback/token/lease/tool ACL 的独立边界。 |
-| C10 | headless direct-turn 已通过 `AgentRuntimeWorker` 执行（`headless.rs:718`）；**W2-02**：IntentSpec review gate 已迁入 runtime interaction state（`IntentReviewAckDelivery` / durable `IntentReviewRequested`）。Plan review、network policy 及 repair interaction 亦已由 runtime 持有，并由 Web Code UI 投影。 | 未确认时不得执行 mutation；该约束由 typed interaction state 与 formal phase writes 共同保证。 | W2-03/W2-16 已完成；Web-only completion gate 持续以回归 target 钉住。 |
+| C10 | headless direct-turn 已通过 `AgentRuntimeWorker` 执行；**W2-02** 的 IntentSpec review gate 使用 runtime interaction state（`IntentReviewAckDelivery` / durable `IntentReviewRequested`）。W5 TUI retirement 暴露出 Web Phase 1 回归：W2-03 恢复 Plan revision 与 Plan/network-policy durable gates，并把 resume drift 保留为 recoverable gate（Execute 409、Modify recapture）；当前缺口是 W2-04 的 Web confirmed-plan execution handoff，完成后接回既有 execution/repair path，repair state machine 与语义仍由 W2-11 持有。 | 未确认或 checkout/content 不匹配时不得执行 mutation；不同 repo identity 不得复用旧 IntentSpec。Network Allow 在 W2-04 恢复前必须 fail-closed，不能把历史 TUI execution path 当 Web 当前实现。 | W2-03 regression repair → W2-04 execution handoff（接回 W2-11-owned repair path）→ W2-16 Web projection；完成态须由当前 Web E2E 与 Claude Code PASS 重新证明。 |
 
 ### W3-07 / DEFER-07 — managed Codex interaction ownership
 
@@ -252,45 +252,47 @@ headless shutdown 现先关闭 adapter admission，再等待 active turn 的 ter
 shutdown owner、Web/MCP/provider child 的资源 owner 合并，不能作为 W1-08 完成证据。
 
 这仍不是 W1-06 完成证据：Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）现已让非 Codex headless 路径可达，但
-TUI/managed-Codex 的 live projection 与 graph read model 尚未接入同一 fold，`CodeUiSession`
+legacy/managed-Codex 的 live projection 与 graph read model 尚未接入同一 fold，`CodeUiSession`
 仍保留内存 cache 供现有 SSE 使用。因此不得以 headless resume 已通就宣称所有 Code UI
 projection 已事件化。
 
-### 非 Code TUI 消费者登记
+### 非 Code UI 消费者审计（已完成）
 
-W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际命中（2026-08-09 `rg`
-重验）；它们不是 W1 的删除范围。`agent/graph.rs` 仍是额外编译期 consumer，不能因旧
-清单漏列而被静默遗忘。**2026-08-17 更新**：W5-08 删除 interactive graph 公开入口时，
-两处 graph 模块内的 ratatui/crossterm 渲染器与 TUI-only 结构随之移除（保留即为死代码，
-无法过 clippy `-D warnings`），故 helper 解耦轴实际由 W5-08 吸收；W5-10 保留
-`Cargo.toml`/`Cargo.lock` 依赖摘除、`format.rs` doc-link 清理与零命中守卫。
+W5-03（模块退场）与 W5-10（依赖摘除）覆盖了下列 2026-08-09 `rg` 基线；它们不是 W1
+的删除范围。`agent/graph.rs` 是额外编译期 consumer，不能因旧清单漏列而被静默遗忘。
+**2026-08-19 收口**：W5-08 删除 interactive graph 公开入口时，两处 graph 模块内的
+ratatui/crossterm 渲染器与 terminal-only 结构已一并移除；W5-10 随后删除
+`Cargo.toml`/`Cargo.lock` 依赖、清理残余源码类型名，并以 rustdoc 和零命中守卫复核
+`format.rs` doc-link。
 
 | 路径 | 当前依赖 | 后续 owner |
 |---|---|---|
-| `src/command/graph.rs:12-13,34,1129` | 直接 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`（W5-08 已随 interactive 入口删除一并移除）。 | W4-04/W5-08 → W5-10（仅余依赖摘除）。 |
-| `src/command/agent/graph.rs:16-17,31,721` | 同样直接创建 TUI（W5-08 已一并移除）。 | W5-08 已解耦；W5-10 负责依赖摘除与守卫。 |
+| `src/command/graph.rs:12-13,34,1129` | 曾直接使用 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`；W5-08 已随 interactive 入口删除一并移除。 | W4-04/W5-08 解耦；W5-10 依赖摘除与守卫已完成。 |
+| `src/command/agent/graph.rs:16-17,31,721` | 曾同样直接创建 TUI；W5-08 已一并移除。 | W5-08 解耦；W5-10 依赖摘除与守卫已完成。 |
 | `src/internal/ai/web/code_ui.rs`（原 `:1266` downcast） | `TuiControlError` downcast 曾是 Web API 的编译期耦合（W5-02 已删除；wire code 由 UI-neutral `CodeUiApiError` 目录产生，`TuiControlError` 仅存于垂死 tui 模块作迁移期 fixture）。 | W5-02 已完成；类型本体随 W5-03 模块退场消亡。 |
 | `src/command/code.rs` `execute_tui`（原 `:1561`） | Code TUI startup/adapter（W5-06 已删除）。 | W5-06 已随 TUI 启动路径一并删除。 |
-| `src/internal/ai/agent/format.rs:6` | 仅 rustdoc intra-doc link，非编译依赖。 | W5-03 已清理链接；W5-10 仅将该零命中作为 rustdoc 验证。 |
+| `src/internal/ai/agent/format.rs:6` | 仅 rustdoc intra-doc link，非编译依赖。 | W5-03 已清理链接；W5-10 rustdoc 验证已通过。 |
 
 ## Web-only completion gate（W0-03）
 
-**Web-only 完成态已达成（W5-03,2026-08-19）。** 历史上 headless Web 默认路径可跳过
-IntentSpec/Plan human gates（C10）——彼时这不是 Web-only completion 的状态,该缺口由
-W2-04 的 confirmed-plan-execution 入队门关闭；W5-06 删除 TUI 启动路径、W5-02 删除 control bridge 后,W5-03 将
-`src/internal/tui` 整体移出编译图。下列清单在删除的同一发布组内全部勾满,
-证据 target 均有可复跑记录;`code_web_only_completion_gate` 持续钉住该状态。
+**当前重验（2026-08-22）。** W2-03 已恢复 durable Plan revision 与 Plan/network-policy gates；
+W2-04 已把 Network Allow 接到 `submit_confirmed_plan_execution` 与共享 hardening/approval/sandbox/ACL
+边界，失败进入既有 W2-11-owned repair path。历史 TUI handoff 不得再当作当前 Web execution 证据。
+GATE-WEB-PLAN 在 W2-03 leftover 与 W2-04 Web E2E 通过后闭合。目录中的
+`PLAN_EXECUTION_NOT_AVAILABLE` 仅作旧客户端解码，Allow 不再产生该码。
+当前 Web-only direct-turn 不是完成态；完成态是 IntentSpec → Plan review → Network Allow →
+`submit_confirmed_plan_execution` 的 serialized runtime path，而不是绕过 Phase 0/1 的 direct chat。
 
 | Gate | 删除 TUI 前的不可省略条件 | 证据 target / source of truth |
 |---|---|---|
-| [x] GATE-WEB-PLAN | **plan workflow parity**：IntentSpec、plan review、repair state 由 worker 的单一 typed interaction state 推进，未确认时不执行 mutation。 | `ai_runtime_contract_test`、`ai_code_ui_wire_test`；`runtime::phase0..2` formal writes。 |
+| [x] GATE-WEB-PLAN | **plan workflow parity**：IntentSpec、plan review、confirmed execution/repair state 由 worker 的单一 typed interaction state 推进，未确认时不执行 mutation。W2-04 把 Network Allow 接到 `submit_confirmed_plan_execution` 与 W2-11-owned repair path。 | `ai_runtime_contract_test`、`ai_code_ui_wire_test`、当前 Web `code_ui_scenarios` resume/deny/allow E2E（含 `plan_review_network_allow_enters_runtime_queue`），以及 `plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout` / empty-note authority 回归；`runtime::phase0..2` formal writes。 |
 | [x] GATE-WEB-GOAL | **goal/task parity**：goal、task、sub-agent promotion 和 automation/trigger 输入全经 serialized turn queue。 | `ai_goal_*`、`ai_multi_agent_e2e_test`。 |
 | [x] GATE-WEB-RESUME | **resume parity**：worker crash/cancel 后从 JSONL authoritative event log 恢复 interaction/snapshot，截断尾行 fail-closed。 | `ai_session_jsonl_test`、`code_resume_test`。 |
 | [x] GATE-WEB-APPROVAL | **approval/cancel parity**：所有 mutating tools 同时受 hardening、ToolRuntimeContext sandbox 与 approval 约束；取消不与下一 mutation 并发。 | `code_tool_acl_test`、`code_ui_remote_approval_matrix`、runtime worker tests。 |
 | [x] GATE-WEB-SSE | **SSE gap/backpressure**：cursor scoped to one session；慢消费者收到 gap/lagged 并从持久化状态恢复，不造成无界内存。 | `ai_code_ui_wire_test`、SSE regression target。 |
 | [x] GATE-WEB-CODEX | **Codex normalization**：Codex 和 generic provider 的 adapter 都输出同一 AgentEvent/snapshot 形状。 | `ai_code_ui_wire_test`、`code_codex_runtime_test`。 |
 | [x] GATE-WEB-MCP | **MCP / `code --control stdio` boundary**：MCP tools/resources 不成为 turn control plane；control 的 token/lease/approval 仍经 runtime。 | `code_mcp_dual_entry_test`、`code_ui_remote_security_matrix`。 |
-| [x] GATE-WEB-DOCS | **docs/compat closeout**：用户文档、compat matrix、tests index、release notes 不再把 TUI 当 runtime owner。 | `compat_matrix_alignment`、`compat_agent_architecture_guard`。 |
+| [x] GATE-WEB-DOCS | **docs/compat closeout**：用户文档、compat matrix、tests index、release notes 不再把 TUI 当 runtime owner；Network Allow 经 `submit_confirmed_plan_execution` 进入 serialized runtime queue。 | W2-03/W2-04 各自的 EN/zh docs、`compat_matrix_alignment`、`compat_agent_architecture_guard`。 |
 
 Gate 的 A0 输入是上表 A0-02..A0-11 的已核对消费接口；它们不因为本清单而被复制或
 重验。非 Code TUI consumer 的迁移状态同样由上一表约束，不能以删除 `internal::tui`

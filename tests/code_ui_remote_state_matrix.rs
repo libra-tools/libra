@@ -1,8 +1,8 @@
 //! Wave 7 / PR 7 — `code_ui_remote_state` matrix runner.
 //!
 //! Loads `tests/data/code_ui_remote/state_cases.json` and runs the
-//! P1 concurrency / size-limit cases through a real `libra code`
-//! PTY session:
+//! P1 concurrency / size-limit cases through a real non-TTY `libra code`
+//! Web process:
 //!
 //! 1. serial detach → re-attach issues a fresh controllerToken,
 //! 2. parallel attach yields exactly one 200 + one 409
@@ -95,7 +95,7 @@ fn state_detach_while_thinking_allows_turn_to_settle() -> Result<()> {
         let controller_released = snapshot
             .pointer("/controller/kind")
             .and_then(|v| v.as_str())
-            .is_some_and(|kind| kind == "tui" || kind == "none");
+            .is_some_and(|kind| kind == "none");
         let transcript = snapshot
             .get("transcript")
             .and_then(|v| serde_json::to_string(v).ok())

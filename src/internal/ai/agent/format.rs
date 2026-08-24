@@ -6,7 +6,7 @@
 //! the formatters in the agent layer (not a UI layer) means the
 //! same renderers can be reused by `libra agent status` (CLI), an
 //! external observability pipe, or a future JSON projection without
-//! coupling to ratatui.
+//! coupling to terminal-renderer types.
 //!
 //! All renderers are pure functions of their input (no I/O, no clock
 //! reads) so callers can snapshot them in tests without mocking.

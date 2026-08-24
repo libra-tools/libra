@@ -5893,14 +5893,17 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         // cleanly here because a fresh repository holds no workspace lease —
         // its own down guard refuses once one exists, which is also what keeps
         // a live lease from being rolled through the deeper guards.
-        assert_eq!(
-            rolled,
-            vec![
-                2026081301, 2026080403, 2026080402, 2026080401, 2026073101, 2026073005, 2026073004,
-                2026073003, 2026073002, 2026073001, 2026072902, 2026072901, 2026072502, 2026072501,
-                2026072403, 2026072402, 2026072401
-            ]
-        );
+        // Derived from the registry rather than pinned to a literal: every
+        // unrelated migration that lands on top rolls back with the marker,
+        // so a hard-coded list turns the next schema addition into a spurious
+        // failure here.
+        let mut expected_rolled: Vec<i64> = libra::internal::db::migration::builtin_migrations()
+            .into_iter()
+            .map(|migration| migration.version)
+            .filter(|version| *version > 2026072304)
+            .collect();
+        expected_rolled.reverse();
+        assert_eq!(rolled, expected_rolled);
         conn.close().await.expect("close");
     }
 
@@ -8562,13 +8565,21 @@ async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
     let conn = Database::connect(&db_url)
         .await
         .expect("open repository db");
+    // Registry-derived for the same reason as the capability-marker case
+    // above: everything registered above 2026073101 rolls back with it.
+    let mut expected_rolled_back: Vec<i64> = libra::internal::db::migration::builtin_migrations()
+        .into_iter()
+        .map(|migration| migration.version)
+        .filter(|version| *version > 2026073101)
+        .collect();
+    expected_rolled_back.reverse();
     assert_eq!(
         builtin_runner()
             .expect("builtin runner")
             .rollback_to(&conn, 2026073101)
             .await
             .expect("roll back newest migration"),
-        vec![2026081301, 2026080403, 2026080402, 2026080401]
+        expected_rolled_back
     );
     conn.close().await.expect("close repository db");
     assert!(

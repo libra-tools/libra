@@ -1,8 +1,8 @@
 //! Phase 2 Execution — formal write helpers (schema-only landing).
 //!
 //! The Code UI Phase Workflow models Phase 2 as the **Execution** phase: a
-//! [`TaskExecutionContext`] is dispatched to a [`TaskExecutor`], runs a
-//! single task attempt, and produces a [`TaskExecutionResult`] alongside the
+//! `TaskExecutionContext` is dispatched to a `TaskExecutor`, runs a
+//! single task attempt, and produces a `TaskExecutionResult` alongside the
 //! attempt-lifecycle formal writes (start / finish / patchset / evidence).
 //!
 //! # Runtime-owned contract, transitional storage

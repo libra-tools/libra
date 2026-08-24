@@ -289,6 +289,7 @@ fn skip_permission_denied_test_if_root(test_name: &str) -> bool {
 mod add_cli_test;
 mod add_json_test;
 mod add_test;
+mod agent_bridge_test;
 mod agent_checkpoint_export_test;
 mod agent_checkpoint_test;
 mod agent_clean_test;

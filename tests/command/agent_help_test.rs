@@ -45,7 +45,9 @@ fn test_agent_help_lists_examples_banner() {
         "libra agent push --remote origin",
         "libra agent rpc list",
         "libra agent rpc invoke",
-        "libra agent --json status",
+        // `--json` is a global flag, so it precedes the subcommand; the
+        // banner was corrected to this form in f742fa25.
+        "libra --json agent status",
     ] {
         assert!(
             stdout.contains(invocation),

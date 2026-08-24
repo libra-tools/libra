@@ -3,7 +3,7 @@
 //!
 //! Loads `tests/data/code_ui_remote/model_generation_cases.json`
 //! and runs the live-model-generation cases through a real
-//! `libra code` PTY session. The matrix harness now supports the
+//! non-TTY `libra code` Web process. The matrix harness supports the
 //! `provider.mode == "model_from_env_file"` shape; this runner
 //! reads the configured env file (default `.env.test`), resolves
 //! `LIBRA_CODE_TEST_PROVIDER` + `LIBRA_CODE_TEST_MODEL`, and

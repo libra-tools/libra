@@ -22,7 +22,7 @@
 | `compat_bisect_subcommand_surface` | 1 | Guards `libra bisect` subcommand surface | `src/command/bisect.rs` |
 | `compat_worktree_delete_dir` | 1 | Guards worktree delete semantics on dir removal | `src/command/worktree.rs` |
 | `compat_checkout_alias_help` | 1 | Guards `--help` text for checkout aliases | `src/command/checkout.rs` |
-| `compat_matrix_alignment` | 1 | Guards public docs/release matrices vs. real CLI/API surfaces, including P2-04's explicit non-sending `send-email` policy | `COMPATIBILITY.md`, `docs/commands/code.md`, `docs/commands/send-email.md`, `.github/workflows/base.yml`, `src/cli.rs`, `src/internal/ai/web/mod.rs` |
+| `compat_matrix_alignment` | 1 | Guards public docs/release matrices vs. real CLI/API surfaces, including `w203_revision_receipt_and_network_boundary_stay_aligned` for W2-03 digest-only receipts, the shared linear receipt index, permanent retry closure, typed revision errors, Phase 1 scanner/session-writer leases, and the Network-Allow 409 boundary | `COMPATIBILITY.md`, `CHANGELOG.md`, `docs/commands/code.md`, `docs/commands/zh-CN/code.md`, `docs/error-codes.md`, `docs/development/{commands/_compatibility,tracing/code,plan/plan-20260715}.md`, `src/internal/ai/{session/jsonl,workspace_snapshot}.rs`, `src/internal/ai/web/{headless,web_admission}.rs` |
 | `compat_install_alias` | 1 | Guards IX-01 full-installer `lba -> libra` creation, same-version repair/idempotency, CLI/env opt-outs, foreign-path preservation, and symlink-unavailable fallback with an isolated fake downloader | `install.sh`, `tests/compat/install_alias_smoke.sh`, `README.md`, `README.zh-CN.md` |
 | `compat_live_compat_workflow` | 1 | Guards optional live AI/cloud workflow remains manual/scheduled and secret-gated | `.github/workflows/live-compat.yml` |
 | `compat_branch_lossy_wrapper_guard` | 1 | Guards branch-name lossy conversion wrapper | `src/internal/branch.rs` |
@@ -36,7 +36,7 @@
 | `compat_agent_run_non_exhaustive_guard` | 1 | Enforces `#[non_exhaustive]` on every `pub enum` under `agent_run/` for additive evolution | `src/internal/ai/agent_run/` |
 | `compat_agent_docs_contract` | 1 | Guards active Agent plan claims against stale removed-provider status, public schema/retention/raw-export wording, and stale internal-plan links | `docs/development/tracing/agent.md`, `src/command/code.rs` |
 | `compat_agent_capability_matrix_pin` | 1 | Pins the E1 8-bool `DeclaredAgentCaps` wire keys and the first-batch supported roster (`claude-code`/`codex`/`opencode`) against drift (AG-16) | `src/internal/ai/observed_agents/{capability,registry}.rs`, `docs/development/tracing/agent.md` |
-| `compat_agent_architecture_guard` | 1 | Observed-agents capture layer stays decoupled from AgentRuntime/checkpoint layers; every `AgentKind` resolves an adapter; external agents need the AG-18 info/trust flow; SQL CHECK / doc roster / enum stay in sync (AG-16); W0-01’s C1–C10/A0 runtime-anchor audit and W0-03 Web-only completion gate prevent a premature TUI removal | `src/internal/ai/observed_agents/`, `src/internal/ai/runtime/`, `sql/migrations/2026050303_agent_capture.sql`, `docs/development/tracing/{agent,code}.md` |
+| `compat_agent_architecture_guard` | 1 | Observed-agents capture layer stays decoupled from AgentRuntime/checkpoint layers; every `AgentKind` resolves an adapter; external agents need the AG-18 info/trust flow; SQL CHECK / doc roster / enum stay in sync (AG-16); W0-01’s C1–C10/A0 runtime-anchor audit and W0-03 Web-only completion gate prevent a premature TUI removal; W5-10 forbids restoring terminal-UI dependencies or production symbols | `src/internal/ai/observed_agents/`, `src/internal/ai/runtime/`, `src/{command,internal}/`, `Cargo.toml`, `sql/migrations/2026050303_agent_capture.sql`, `docs/development/tracing/{agent,code}.md` |
 | `compat_subface_labels` | 1 | Guards the CG-01 sub-face grading matrix: fixed five-label enumeration, graded command set pinned to `src/cli.rs::Commands`, no dual-tier sub-face, and unsupported sub-faces carrying governance IDs synced bidirectionally with `_compatibility.md` | `COMPATIBILITY.md`, `docs/development/commands/_compatibility.md`, `src/cli.rs` |
 | `compat_conflict_status_diff` | 1 | Guards unmerged conflict reporting across merge/rebase/cherry-pick: status v1/v2, ls-files stages/tags, and conflict-aware diff headers | `src/command/status.rs`, `src/command/diff.rs`, `src/command/ls_files.rs`, `src/command/merge.rs` |
 | `compat_diff_check_safety` | 1 | Guards `diff --check` safety classes: trailing whitespace, space-before-tab in indent, leftover conflict markers, and new blank lines at EOF with exit code 2 | `src/command/diff.rs` |
@@ -73,6 +73,21 @@
 | `compat_noninteractive_history_controls` | 1 | Guards P1-07a rebase controls, P1-07b merge controls, and P1-07c hunk-level cherry-pick/revert `-X`, revert cleanup persistence/fail-closed recovery, guarded reset merge/keep staged/unstaged preservation and refusal, untracked collisions, file/directory transitions, no-follow symlink safety, and rollback contracts (33 E2E cases on Unix) | `src/command/rebase.rs`, `src/command/merge.rs`, `src/command/merge_message.rs`, `src/command/cherry_pick.rs`, `src/command/revert.rs`, `src/command/reset.rs`, `src/command/stash.rs`, `src/command/maintenance.rs` |
 | `agent_rpc_external_test` | 1 | AG-18 external `libra-agent-*` protocol v2 + security: info/v1 negotiation, protocol-version fail-closed, capability gate, timeout/oversize caps, stderr capture/cap/redaction, env_clear allowlist, built-in slug impersonation skip | `src/internal/ai/observed_agents/rpc.rs` |
 | `agent_rpc_span_test` | 1 | `agent.rpc.invoke` span fake-sink assertion (required fields present, raw response absent) — own binary to avoid tracing callsite-cache races | `src/internal/ai/observed_agents/rpc.rs` |
+| `agent_bridge_protocol_test` | 1 | plan-20260818 LB-01 bridge protocol v1: 20-method allowlist, v1 limits (256 KiB frame, 64 in-flight, 64-event batch, page 100), initialize/major-mismatch/unknown-method/parse rejection, stable LBR-AGENT-024..036 catalogue | `src/internal/ai/agent_bridge/protocol.rs` |
+| `agent_bridge_stdio_test` | 1 | plan-20260818 LB-01 bridge NDJSON transport: stdout carries only parseable frames (GC-LB-04), errors never masquerade as success (ER-LB-09), oversized frame refused and connection survives | `src/internal/ai/agent_bridge/transport.rs` |
+| `agent_bridge_migration_test` | 1 | plan-20260818 LB-02 bridge migration contract: fresh bootstrap, old→new upgrade, repeated apply, forward-only down/freeze (refuses while bridge rows exist, never deletes acked events), source/payload CHECK enforcement | `sql/migrations/2026081801_agent_bridge_capture{,_down}.sql`, `src/internal/db/migration.rs` |
+| `agent_bridge_schema_test` | 1 | plan-20260818 LB-02 bridge storage semantics: idempotent session open, event append accepted/duplicate/digest-conflict, oversize rejection, operation idempotency + digest conflict, monotonic ack | `src/internal/ai/agent_bridge/storage.rs` |
+| `agent_bridge_ingress_test` | 1 | plan-20260818 LB-03 session/event ingress: idempotent `session.open` scope-bound, `event.append` batch ack with duplicate/digest-conflict/oversize handling, `session.flush`/`close` durable, evidence/provenance link recording, v1 caps fail-closed | `src/internal/ai/agent_bridge/{ingress,storage}.rs` |
+| `agent_bridge_crash_test` | 1 | plan-20260818 LB-03 crash-after-write-before-ack: durable events survive, reconnect replay is a no-op (no duplicate rows), ack cursor advances exactly to contiguous end; gap stops the cursor | `src/internal/ai/agent_bridge/storage.rs` |
+| `agent_bridge_redaction_test` | 1 | plan-20260818 LB-03 server-side redaction fail-closed: secret-bearing payload persisted redacted (no raw token), non-JSON payload refused (no raw fallback, no ack), valid projection persists | `src/internal/ai/agent_bridge/redaction.rs` |
+| `agent_bridge_span_test` | 1 | plan-20260818 LB-03 per-request tracing span (GC-LB-10): `agent.bridge.request` carries method/id/repository scope, never the raw payload (GC-LB-08); span is emitted and closed on both success and error paths | `src/command/agent/bridge.rs` |
+| `agent_bridge_read_methods_test` | 1 | plan-20260818 LB-04 typed read methods: `context.get`/`status.get`/`history.search`/`checkpoint.list`/`checkpoint.show` over the bridge projection, unified `{schema_version,repository_id,workspace_id,operation_id,status,data,warnings}` envelope, bounded pagination, repository-scoped queries, missing-object error (not empty) | `src/internal/ai/agent_bridge/methods.rs` |
+| `agent_bridge_security_test` | 1 | plan-20260818 LB-04/GC-LB-03/06 security: read-method registry rejects unknown/low-level/SQL/shell methods, search term is parameterized (no SQL injection), read results never leak raw secrets | `src/internal/ai/agent_bridge/{methods,protocol}.rs` |
+| `agent_bridge_workspace_test` | 1 | plan-20260818 LB-06 workspace lease binding: `workspace.claim`/`renew`/`release` route through `WorkspaceStore` (owner+fence), actor-derived owner, stale-fence and missing-session fail closed, self-reported owner never honoured | `src/internal/ai/agent_bridge/workspace.rs`, `src/internal/workspace.rs` |
+| `agent_bridge_mutation_test` | 1 | plan-20260818 LB-05 mutations: operation-id mandatory + idempotent, digest conflict fails closed, actor spoof rejected, `checkpoint.create` real, VCS side-effect mutations validate approval and typed params before touching the repository, `checkpoint.restore` requires an explicit head fence | `src/internal/ai/agent_bridge/{mutations,authorization,provenance}.rs` |
+| `agent_bridge_approval_test` | 1 | plan-20260818 LB-05/成功定义+ADR-LB approval gate: dangerous actions default deny, approved passes admission, denied fails, malformed approval invalid-params, actor binding rejects spoof | `src/internal/ai/agent_bridge/authorization.rs` |
+| `agent_bridge_checkpoint_test` | 1 | plan-20260818 LB-05 checkpoint round-trip: create via mutation registry then list/show via read registry; missing session fails closed; checkpoint reads are repository-scoped (a repo-2 context never sees repo-1's checkpoints) | `src/internal/ai/agent_bridge/{mutations,methods}.rs` |
+| `agent_bridge_vcs_test` | 1 | plan-20260818 LB-04/LB-05 real VCS wiring against a temp repository: `diff.get` returns the actual worktree/staged patch and is path-scoped, untyped selectors refused; `commit.create` commits the index, moves HEAD, and replays without a second commit; head-drift and dirty-worktree fences refuse before any write (`LBR-AGENT-038`); `checkpoint.restore` restores the worktree without moving HEAD; `review.run` refuses unlaunchable reviewers with no run residue | `src/internal/ai/agent_bridge/{vcs,methods,mutations}.rs`, `src/command/diff.rs` |
 | `agent_transcript_intelligence_test` | 1 | AG-21 transcript intelligence: first-batch adapters extract prompts/model/tokens/modified-files/subagent totals/skill events from fixtures (provenance manifest in tests/fixtures/agent_transcripts/MANIFEST.md); E6 wire-key mapping pinned; fail-open partial semantics | `src/internal/ai/observed_agents/{extract.rs,builtin/}` |
 | `agent_audit_log_test` | 3 | AG-24a compliance: append-only `agent_audit_log` enforcement (UPDATE/DELETE rejected by triggers, INSERT/SELECT allowed, denials recorded); retention-default constants pinned | `sql/migrations/2026070803_agent_audit_log.sql`, `src/internal/ai/observed_agents/compliance.rs` |
 | `agent_lifecycle_event_test` | 1 | AG-19 central hook dispatcher contract (plan.md Task A4): invalid-envelope rejection without stdin echo, first-writer-wins owner filtering (SessionStart exempt), unknown-event skip-and-log, verb/kind mismatch fail-closed — via `libra agent hooks <agent> <verb>` E2E | `src/internal/ai/hooks/runtime.rs` |
@@ -101,6 +116,7 @@
 | `compat_command_docs_examples_section` | 1 | Every `docs/commands/<name>.md` page carries an `## Examples` / `## Common Commands` heading | `docs/commands/**` |
 | `compat_r0_9_doc_closeout` | 1 | plan-20260714 R0-9 docs close-out: the warning code/source table, the `io_blocked` JSON schema (with the `reason` enum parsed out of `io_blocked_reason_and_code` so a new variant cannot ship undocumented), the `{from, to}` typing of nested `staged.renamed` / `unstaged.renamed`, the three rename config keys across the status docs + `COMPATIBILITY.md`, and the `diff.renameLimit` degradation semantics (exact **and** unique-basename survive) across the diff docs + CHANGELOG — EN and zh asserted in parallel | `docs/commands/status.md`, `docs/commands/diff.md`, `COMPATIBILITY.md`, `CHANGELOG.md` |
 | `compat_version_surface_sync` | 1 | plan-20260714 PD-00/PD-10 release-surface guard: `Cargo.toml`, `web/package.json`, `worker/package.json`, `install.sh` `DEFAULT_VERSION`, and `install.ps1` `$DefaultVersion` all carry the same version; both installer values keep their `v` prefix | `Cargo.toml`, `web/package.json`, `worker/package.json`, `install.sh`, `install.ps1` |
+| `compat_serial_registry` | 1 | plan-20260729 CT3-07/FIX-04 serial-annotation guard over `tests/**`: every non-`none` `#[serial]` there has exactly one `tests/SERIAL_REGISTRY.tsv` row with a non-empty `global`/`lane:*` reason, registry and `tests/SERIAL_CLASSIFY.sh` verdicts match bidirectionally (missing/dangling/drift asserted, duplicate fn rows rejected, `<site:path:line>` macro sites verified, string/same-line-attribute lexer counterexamples, named keys that do not cover process-wide pollution rejected, `inner_attrs`/`crate = <path>` config items not counted as lock keys), and the classifier is deterministic on raw stdout | `tests/SERIAL_CLASSIFY.sh`, `tests/SERIAL_REGISTRY.tsv`, `tests/compat/serial_registry.rs` |
 | `compat_help_flag_descriptions` | 1 | Every visible flag and positional under `Options:` / `Arguments:` carries a non-empty description; covers 42 root commands + 53 sub/sub-sub-commands (110 surfaces) | `src/cli.rs`, `src/command/**` |
 | `compat_help_no_impl_meta_leak` | 1 | No `libra <cmd> --help` body leaks contributor-facing rustdoc into clap's long_about; forbids 6 phrase classes (e.g. `Codex pass-`, raw markdown headings, code fences) | `src/cli.rs`, `src/command/**` |
 | `verify_pack_multi_test` | 1 | Guards `verify-pack <idx>...` multi-index verification, JSON wrapping, and `--pack` argument rejection | `src/command/verify_pack*.rs` |
@@ -133,11 +149,13 @@ were removed with W5-03).
 Default `CodeSession` spawn is flagless `libra code` (the default Web launch;
 W5-07 removed the `--web-only` alias) with `--port 0` /
 `--mcp-port 0`. Readiness waits on `control.json` (MCP URL populated) then an
-HTTP `/session` snapshot — not sleep-only. W5-06 removed the legacy TUI startup path together with the PTY
-harness hooks (`CodeSessionOptions::with_pty_tui()`,
+HTTP `/session` snapshot — not sleep-only. W5-06 removed the legacy TUI startup path together with its PTY
+control hooks (`CodeSessionOptions::with_pty_tui()`,
 `CodeSession::write_tui_line`, `ScenarioStep::reclaim_via_tui_command`);
-`CodeSession::shutdown` always SIGTERMs the headless Web process. The
-PTY legacy-TUI scenarios (reclaim / legacy TUI lifecycle) were deleted
+W5-04 then replaced the pseudo-terminal process launch and its log artifact with
+a non-TTY `std::process::Command` launch and `process.log`; `CodeSession::shutdown`
+always SIGTERMs the headless Web process. The legacy-TUI scenarios
+(reclaim / legacy TUI lifecycle) were deleted
 from `code_ui_scenarios`, and the remaining scenarios that used
 `.with_pty_tui()` were converted to the headless Web driver. Always run Code UI harness
 targets with
@@ -147,23 +165,93 @@ targets with
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `harness_self_test` | 2 | Smoke-checks the Code UI Web harness (control files, SIGTERM port release) | `tests/harness/` |
-| `code_ui_scenarios` | 2 | End-to-end scenarios on the Code UI through the Web harness; includes plan-20260715 W0-02 `plan_workflow` / `plan_review` / `repair` / `user_input` / `goal_task` baseline filters | `src/command/code.rs`, `src/internal/ai/web/`, `src/internal/ai/workflow_baseline.rs` |
+| `code_ui_scenarios` | 2 | End-to-end Web-harness scenarios, including W2-03 `plan_review_modify_next_plain_text_opens_replacement_plan_gate`, `plan_review_empty_revision_note_is_typed_and_preserves_authority`, `plan_review_repository_replacement_after_modify_keeps_revision_note_retryable`, `plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout`, `plan_review_metadata_only_drift_warns_but_exact_execute_recheck_succeeds`, `plan_review_head_drift_survives_resume_and_requires_explicit_modify`, `plan_review_repository_replacement_blocks_modify_and_preserves_gate`, `plan_review_network_allow_enters_runtime_queue`, `plan_review_network_allow_returns_conflict_and_preserves_pending_gate`, and network-gate crash/resume | `src/command/code.rs`, `src/internal/ai/web/`, `src/internal/ai/workflow_baseline.rs` |
 | `code_ui_remote_lease_matrix` | 2 | Browser/automation lease lifecycle matrix | `src/command/code.rs` controller, `src/command/code_control.rs` |
 | `code_ui_remote_sse_matrix` | 2 | SSE event stream matrix from web view | `src/internal/ai/web/`, `src/command/code.rs` (axum) |
 | `code_ui_remote_state_matrix` | 2 | Cross-surface state replication matrix, including mid-turn detach/cancel settling | `src/internal/ai/web/code_ui.rs`, `src/command/code_control.rs`, `src/internal/ai/workflow_baseline.rs` |
 | `code_ui_remote_security_matrix` | 2 | Auth/token/origin enforcement matrix | `src/command/code_control*.rs` |
 | `code_ui_remote_generation_matrix` | 2 | Generation control across surfaces (no live LLM) | `src/internal/ai/web/`, `src/command/code.rs` |
-| `code_ui_remote_approval_matrix` | 2 | Approval flow across Web/automation | `src/internal/ai/agent/` approvals |
+| `code_ui_remote_approval_matrix` | 2 | Approval flow across Web/automation, including runtime-owned Plan review and network-policy gate parity | `src/internal/ai/agent/` approvals, `src/internal/ai/runtime/phase1.rs` |
 | `code_cli_dispatch_test` | 2 | `libra code …` argv parsing & dispatch; W5-09 aggregate breaking guard `breaking_code_surface_migration` pins the whole family surface (removed `--web`/`--web-only` aliases + inert rollback env, unexposed `code-control`, refused interactive graph with `--json`/`--machine` pinned to the structured `LBR-REPO-001` path, rejected bare codex+resume) in one pre-push run | `src/command/code.rs` |
 | `code_provider_boot_test` | 2 | Provider/agent bootstrap inside `libra code`, including the shared env-file → process → Vault factory used by default Web and headless launch | `src/command/code.rs`, `src/internal/ai/providers/`, `src/internal/ai/runtime/services.rs` |
 | `code_tool_acl_test` | 2 | Tool registry ACL & safety classification, consumed through the runtime-owned CodeAgentServices builder | `src/internal/ai/tools/`, `src/internal/ai/runtime/services.rs` |
 | `code_mcp_dual_entry_test` | 2 | MCP stdio + http dual entry parity | `src/internal/ai/mcp/`, `src/command/code.rs` |
 | `code_resume_test` | 2 | Session resume across restarts | `src/internal/ai/session/`, `src/command/code.rs` |
-| `code_codex_default_tui_test` | 2 | W4-01/W5-06/W5-07: default `libra code` routes to Web Code UI; `--provider codex` still uses managed runtime (legacy stdin loop unreachable; the TUI resume driver was removed in W5-06 and bare `--provider codex --resume` is rejected with a usage error plus a migration hint) | `src/command/code.rs`, `src/internal/ai/codex/` |
+| `code_codex_default_web_test` | 2 | W4-01/W5-06/W5-07: default `libra code` routes to Web Code UI; `--provider codex` still uses managed runtime (legacy stdin loop unreachable; the legacy terminal resume driver was removed in W5-06 and bare `--provider codex --resume` is rejected with a usage error plus a migration hint) | `src/command/code.rs`, `src/internal/ai/codex/` |
 | `code_codex_runtime_test` | 2 | `--provider codex` WS runtime boot: `--codex-port` validation, managed app-server initialize/thread-start, approval-interaction regression, W3-04 `AgentEvent` envelope normalize, W3-07 cancel/interrupt + sequential approval ownership | `src/command/code.rs`, `src/internal/ai/codex/` |
-| `ai_code_ui_headless_test` | 2 | Headless Code UI runtime and projection coverage | `src/internal/ai/web/headless.rs` |
+| `ai_code_ui_headless_test` | 2 | Headless Code UI runtime/projection coverage, including `active_revision_blocks_new_direct_but_preserves_exact_terminal_retry`, `slash_intent_cancel_durably_exits_revision_and_unblocks_direct_turns` (padded cancel 409), `oversized_intent_modify_note_is_typed_400_without_consuming_gate` (16 KiB pre-Claiming cap), `slash_intent_modify_provider_prompt_uses_only_the_change_suffix`, `slash_intent_modify_multiple_successful_drafts_preserve_the_revision`, stale cancel/replacement projection healing, and process-lifetime `headless_session_writer_lease_*` ownership/race tests | `src/internal/ai/web/{headless,web_admission}.rs`, `src/internal/ai/session/jsonl.rs` |
 | `ai_code_ui_projection_test` | 2 | Projection snapshot replication; W3-14 10k-event fold bound + release p95 (`large_session_projection_smoke`); W4-04 null `thread_graph` delta fold | `src/internal/ai/history.rs`, `src/internal/ai/web/code_ui_projection.rs` |
-| `ai_code_ui_wire_test` | 2 | Wire-format contract for UI events, including camelCase `threadGraph` | `src/internal/ai/web/`, `src/internal/ai/agent/` |
+| `ai_code_ui_wire_test` | 2 | Wire-format contract including camelCase `threadGraph`, digest-only/raw-note-free `intent_revision_recovery_is_additive_and_pins_sse_snake_case`, dedicated receipt `sse_wire_v2_intent_revision_consumed_uses_dedicated_payload`, catalogued 409 `plan_execution_not_available_is_a_catalogued_conflict`, and typed drift/revision errors in `phase1_workspace_and_revision_errors_are_catalogued` | `src/internal/ai/web/`, `src/internal/ai/agent/` |
+
+W2-03's focused `cargo test --lib --all-features` anchors are
+`phase1_workspace_binding_uses_content_authority_and_legacy_fallback`,
+`phase1_capture_rejects_change_between_content_and_metadata_scans`,
+`metadata_fingerprint_changes_without_reading_file_bodies`,
+`content_fingerprint_detects_same_length_change_with_restored_mtime`,
+`fingerprint_budget_counts_directories_and_propagates_entry_limit`,
+`fingerprint_budget_propagates_path_name_limit`,
+`fingerprint_budget_timeout_is_typed_and_actionable`,
+`fingerprint_budget_checks_manifest_post_blocking_and_return_boundaries`,
+`fingerprint_budget_checks_exact_blocking_operations_after_return`,
+`fingerprint_budget_checks_metadata_and_symlink_operations_after_return`,
+`fingerprint_budget_streams_wide_directory_before_rejecting`,
+`fingerprint_entry_cap_stops_before_poisoned_iterator_tail`,
+`bounded_manifest_order_matches_legacy_sorted_walk`, and
+`stable_fingerprint_pair_rejects_change_after_content_scan`. Crash-resume
+lock recovery is pinned by `code_workflow_append_lock_uses_os_liveness_without_aba`
+and `code_workflow_append_lock_rejects_symlink_without_touching_event_log`.
+Strict ordinary Plan/Network recovery before context GC is pinned by
+`phase1_recovery_rejects_sequence_gap_without_revision_sidecar_before_gc`.
+The W2-03 shared replay index and permanent authority closure are pinned in
+`src/internal/ai/session/jsonl.rs` by
+`committed_revision_receipt_batch_index_visits_five_thousand_events_linearly`,
+`claiming_and_consuming_revision_retry_index_visits_five_thousand_events_linearly`
+(5,000 events / 2,000 retries across startup, Claiming, and Consuming),
+`invalid_nonmutating_web_intent_after_receipt_fails_closed`,
+`pending_revision_receipt_followed_by_web_intent_pins_display`,
+`resolved_replacement_receipt_permanently_closes_its_retry_lineage`,
+`intent_revision_terminal_retry_rejects_marker_appended_after_terminal`,
+`replacement_marker_after_consumer_terminal_never_authorizes_a_receipt`,
+`effectless_intent_revision_receipt_fails_closed_in_batch_validation`,
+`duplicate_source_intent_after_its_terminal_fails_closed_in_batch_validation`,
+`reused_web_command_id_across_scopes_fails_closed_before_marker_attribution`,
+`conflicting_or_duplicate_intent_review_marker_ownership_fails_closed`, and
+`intent_revision_consumption_is_first_writer_for_source_consumer_and_event`.
+Headless claiming and admission anchors in `src/internal/ai/web/headless.rs` /
+`tests/ai_code_ui_headless_test.rs` are
+`claiming_without_command_rearms_active_before_mutation_recovery`,
+`claiming_pending_command_promotes_before_generic_recovery`,
+`claiming_canonical_cancel_and_double_attempt_remain_retryable`,
+`active_revision_blocks_new_direct_but_preserves_exact_terminal_retry`,
+`slash_intent_cancel_durably_exits_revision_and_unblocks_direct_turns`,
+`oversized_intent_modify_note_is_typed_400_without_consuming_gate`,
+`slash_intent_modify_provider_prompt_uses_only_the_change_suffix`,
+`slash_intent_modify_multiple_successful_drafts_preserve_the_revision`,
+`slash_intent_cancel_succeeded_with_stale_non_streaming_ack_recovers`,
+`pending_cancel_receipt_before_later_web_never_rewrites_later_projection`, and
+`restart_reconciles_stale_intent_projection_after_atomic_control_cancel`.
+The distinct session-writer lease is pinned by
+`headless_session_writer_lease_rejects_second_attach_and_reacquires_after_drop`,
+`headless_session_writer_lease_cannot_be_rebound_to_another_session`,
+`headless_session_writer_lease_clone_cannot_attach_a_second_persistence`,
+`headless_session_writer_lease_rejects_symlink_without_touching_target`,
+`headless_session_writer_lease_rejects_replaced_lock_inode_before_attach`,
+`headless_session_writer_lease_rejects_fifo_without_blocking`, and
+`headless_session_writer_lease_is_released_immediately_after_sigkill`.
+Scanner race/platform anchors in `src/internal/ai/workspace_snapshot.rs` are
+`content_fingerprint_rejects_file_swapped_to_external_symlink_before_read`,
+`content_fingerprint_rejects_file_swapped_to_fifo_before_read`,
+`content_fingerprint_rejects_parent_swapped_to_external_symlink_before_read`,
+`content_fingerprint_rejects_symlink_parent_swapped_outside_before_readlink`,
+`metadata_fingerprint_rejects_symlink_parent_swapped_outside_before_readlink`,
+`metadata_fingerprint_reuses_pinned_root_after_workspace_path_replacement`,
+`fingerprint_budget_checks_post_read_and_reopen_boundaries_by_occurrence`,
+`windows_reparse_parser_uses_symlink_substitute_name`,
+`windows_reparse_parser_accepts_mount_point_substitute_name`, and
+`windows_reparse_parser_rejects_truncated_odd_and_out_of_range_records`;
+post-content checkout identity is pinned by
+`phase1_exact_validation_rejects_identity_change_after_content_scan` in
+`src/internal/ai/runtime/phase1.rs`.
 
 ### plan-20260715 W3-15 — Playwright real-browser e2e
 
@@ -244,13 +332,13 @@ workdir on exit.
 | `ai_provider_error_taxonomy_test` | 2 | Integration fixtures for OC-Phase 4 provider error taxonomy | `src/internal/ai/providers/` |
 | `ai_provider_retry_policy_test` | 2 | OC-Phase 4 retry-policy integration test | `src/internal/ai/providers/` |
 | `ai_provider_transform_test` | 2 | Integration tests for OC-Phase 4 P4.1 provider transform pipeline | `src/internal/ai/providers/` |
-| `ai_runtime_contract_test` | 2 | Wave 1A runtime contracts: TaskExecutor, W1-01 UI-neutral serialized AgentRuntime worker/state machine, and W1-05 durable intent-before-dispatch crash windows | `src/internal/ai/runtime/` |
+| `ai_runtime_contract_test` | 2 | Runtime contracts for serialized worker state, durable intent-before-dispatch, and W2-03 Plan review/network-policy gate and restart behavior | `src/internal/ai/runtime/` |
 | `ai_scheduler_plan_set_test` | 2 | Phase 0 selected plan set and task dependency tests | `src/internal/ai/orchestrator/` |
 | `ai_schema_migration_test` | 2 | Phase 0 schema migration tests for AI runtime contract tables | `src/internal/db.rs`, `sql/` |
 | `ai_security_runtime_test` | 2 | Phase 5 security runtime (authz, redaction, shell, audit) | `src/internal/ai/sandbox/` |
 | `ai_semantic_rust_test` | 2 | Semantic Rust code indexing and structure extraction | `src/internal/ai/skills/` |
 | `ai_semantic_tools_test` | 2 | Semantic tools registration and classification | `src/internal/ai/tools/` |
-| `ai_session_jsonl_test` | 2 | Session JSONL persistence plus W1-03 additive Code workflow sequence/dedup/gap/torn-tail recovery and W1-05 command idempotency/recovery | `src/internal/ai/session/` |
+| `ai_session_jsonl_test` | 2 | Session JSONL sequence/dedup/gap recovery, command idempotency, W2-03 public receipt ordering (`intent_revision_receipt_orders_source_consumer_and_resyncs_exact_postwrite_retry`), and unit-level shared `ValidatedIntentRevisionReceiptIndex`/first-writer/permanent-lineage authority | `src/internal/ai/session/jsonl.rs` |
 | `ai_skill_test` | 2 | System skills load, parse, and execution validation | `src/internal/ai/skills/` |
 | `ai_source_pool_test` | 2 | CEX-14 source-pool isolation and MCP integration tests | `src/internal/ai/session/` |
 | `ai_storage_flow_test` | 2 | Integration tests for AI object storage on local and R2 backends | `src/utils/storage/` |
@@ -262,7 +350,7 @@ workdir on exit.
 | `ai_subagent_user_initiated_cancel_test` | 3 | OC-Phase 3 UserInitiated cancel E2E: pre-flight cancel short-circuits before JSONL writes; mid-flight parent abort returns `Cancelled { ParentAbort }`, parent JSONL writes `Spawned + Cancelled { UserRequested }`, and child JSONL replays to a cancelled snapshot | `src/internal/ai/agent/runtime/`. Gated `--features test-provider`. |
 | `ai_subagent_worktree_readonly_test` | 3 | Sub-agent worktree isolation guard: pins historical edit-tool pre-filter and `libra code` workspace-isolation bootstrap wiring | `src/internal/ai/tools/registry.rs`, `src/internal/ai/permission/`, `src/command/code.rs` |
 | `ai_usage_stats_test` | 2 | CEX-16 usage persistence plus W2-12 replay-safe runtime totals, uncertainty states, per-turn deltas, and child attribution | `src/internal/ai/usage/`, `src/internal/ai/agent/runtime/usage.rs` |
-| `ai_usage_tui_test` | 2 | CEX-16 usage display formatting tests | `src/internal/ai/usage/` |
+| `ai_usage_display_test` | 2 | CEX-16 usage display formatting tests | `src/internal/ai/usage/` |
 | `ai_validation_decision_flow_test` | 2 | Phase D validation and decision derived-record tests | `src/internal/ai/orchestrator/` |
 | `diagnostics_redaction_test` | 2 | Diagnostics logs redaction and sanitization | `src/internal/ai/usage/` |
 | `local_client_test` | 2 | Local Git protocol client working directory restoration on error | `src/internal/protocol/` |

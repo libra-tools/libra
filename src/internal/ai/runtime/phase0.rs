@@ -75,13 +75,39 @@ pub fn open_intent_review_from_workflow<'a>(
                     order.push(interaction_id.clone());
                 }
             }
-            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. }
-            | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
-                interaction_id,
+            CodeWorkflowEventKind::CommandTerminalFailure {
+                retry_intent_review: Some(retry),
                 ..
             } => {
-                open.remove(interaction_id);
-                order.retain(|id| id != interaction_id);
+                if open
+                    .insert(
+                        retry.interaction_id.clone(),
+                        (retry.intent_id.clone(), String::new(), String::new()),
+                    )
+                    .is_none()
+                {
+                    order.push(retry.interaction_id.clone());
+                }
+            }
+            CodeWorkflowEventKind::InteractionResolved {
+                interaction_id,
+                prior_interaction_resolutions,
+                intent_revision_consumption: None,
+                ..
+            }
+            | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                interaction_id,
+                prior_interaction_resolutions,
+                ..
+            } => {
+                for resolved_id in prior_interaction_resolutions
+                    .iter()
+                    .map(|(interaction_id, _)| interaction_id)
+                    .chain(std::iter::once(interaction_id))
+                {
+                    open.remove(resolved_id);
+                    order.retain(|id| id != resolved_id);
+                }
             }
             _ => {}
         }
@@ -133,7 +159,10 @@ User request:\n{request}"
 
 /// Help text shown after IntentSpec review chooses Modify/Revise.
 pub fn phase0_revision_help_message() -> String {
-    "IntentSpec revise mode is active. Describe changes in plain text, use `/intent modify <changes>` to keep revising, or `/intent cancel` to exit.".to_string()
+    format!(
+        "IntentSpec revise mode is active. Describe changes in plain text, use `/intent modify <changes>` to keep revising, or `{}` to exit.",
+        crate::internal::ai::session::jsonl::INTENT_REVISION_CANCEL_COMMAND_INPUT
+    )
 }
 
 /// Shared Phase 0 revision prompt: current IntentSpec is the baseline and the
@@ -250,7 +279,7 @@ impl RuntimeInteractionDelivery for IntentReviewAckDelivery {
         IntentReviewDecision::from_wire_id(&interaction.response)
             .map(|_| ())
             .ok_or_else(|| {
-                RuntimeWorkerError::ExecutionFailed(format!(
+                RuntimeWorkerError::InvalidInteractionResponse(format!(
                     "unrecognized IntentSpec review response '{}'; expected one of confirm/modify/cancel",
                     interaction.response
                 ))
@@ -269,7 +298,7 @@ impl RuntimeInteractionDelivery for IntentReviewAckDelivery {
     ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
         let decision =
             IntentReviewDecision::from_wire_id(&interaction.response).ok_or_else(|| {
-                RuntimeWorkerError::ExecutionFailed(format!(
+                RuntimeWorkerError::InvalidInteractionResponse(format!(
                     "unrecognized IntentSpec review response '{}'",
                     interaction.response
                 ))
@@ -818,6 +847,9 @@ mod tests {
         let resolved = CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "intent-1".to_string(),
             resolution: "confirm".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         };
         assert_eq!(
             open_intent_review_from_workflow([&requested, &resolved]),
@@ -827,6 +859,9 @@ mod tests {
         let other_resolved = CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "other".to_string(),
             resolution: "cancel".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         };
         assert_eq!(
             open_intent_review_from_workflow([&requested, &other_resolved]),
@@ -847,6 +882,9 @@ mod tests {
         let second_resolved = CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "intent-2".to_string(),
             resolution: "confirm".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         };
         assert_eq!(
             open_intent_review_from_workflow([&requested, &second, &second_resolved]),
@@ -870,6 +908,8 @@ mod tests {
                 summary: "confirmed".to_string(),
                 interaction_id: "intent-1".to_string(),
                 resolution: "confirm".to_string(),
+                prior_interaction_resolutions: Vec::new(),
+                intent_revision: None,
             };
         assert_eq!(
             open_intent_review_from_workflow([&requested, &atomic_resolved]),
@@ -928,7 +968,10 @@ mod tests {
         let error = delivery
             .validate(&InteractionResponse::new("intent-1", "not-a-decision"))
             .expect_err("unrecognized response must fail validation");
-        assert!(matches!(error, RuntimeWorkerError::ExecutionFailed(_)));
+        assert!(matches!(
+            error,
+            RuntimeWorkerError::InvalidInteractionResponse(_)
+        ));
     }
 
     /// End-to-end through a real [`AgentRuntimeWorker`]: an
@@ -977,6 +1020,26 @@ mod tests {
             InteractionState::AwaitingIntentReview {
                 interaction_id: "intent-1".to_string(),
             }
+        );
+
+        let invalid = handle
+            .respond(
+                "session",
+                "phase0-turn",
+                InteractionResponse::new("intent-1", "not-a-decision"),
+            )
+            .await
+            .expect_err("malformed restored review response must be retryable");
+        assert!(matches!(
+            invalid,
+            RuntimeWorkerError::InvalidInteractionResponse(_)
+        ));
+        assert_eq!(
+            handle.snapshot("session").await.unwrap().interaction,
+            InteractionState::AwaitingIntentReview {
+                interaction_id: "intent-1".to_string(),
+            },
+            "pre-consume validation must leave the restored gate pending"
         );
 
         handle

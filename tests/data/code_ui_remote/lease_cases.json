@@ -77,7 +77,7 @@
           "op": "attach",
           "kind": "tui",
           "clientId": "lease-invalid-kind",
-          "auth": "valid_control",
+          "auth": "none",
           "expect": {
             "status": 400,
             "errorCode": "INVALID_CONTROLLER_KIND"

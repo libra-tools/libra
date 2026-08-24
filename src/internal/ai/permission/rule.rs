@@ -32,7 +32,7 @@ pub enum PermissionAction {
 /// - `action`: the action to take when both `permission` and `pattern`
 ///   wildcard-match.
 ///
-/// Order in a [`PermissionRuleset`] is significant: [`super::evaluate`]
+/// Order in a [`PermissionRuleset`] is significant: [`super::evaluate()`]
 /// returns the **last** matching rule (`findLast` semantics). Earlier
 /// rules act as fallbacks that later rules override.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

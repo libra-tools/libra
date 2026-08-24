@@ -120,7 +120,7 @@ impl RevisionChainEntry {
     ///
     /// The three forms correspond to `is_first()` (head), `is_continuation()`
     /// (rev>1 with parent), and the degenerate "revision 1 with a parent"
-    /// case ([`first_and_continuation_flag_chain_position_correctly`] test
+    /// case (`first_and_continuation_flag_chain_position_correctly` test
     /// describes when this happens) which represents a forced re-derive.
     pub fn audit_label(&self) -> String {
         let kind = self.kind.label();

@@ -1,0 +1,95 @@
+{
+  "responses": [
+    {
+      "match": { "contains": "You are revising an existing IntentSpec." },
+      "once": true,
+      "type": "tool_call",
+      "id": "multiple_drafts_risk",
+      "name": "request_user_input",
+      "arguments": {
+        "questions": [
+          {
+            "id": "risk_profile",
+            "header": "Risk",
+            "question": "What risk level should be used?",
+            "options": ["Low", "Medium", "High"]
+          }
+        ]
+      }
+    },
+    {
+      "match": { "equals": "" },
+      "once": true,
+      "type": "tool_call",
+      "id": "multiple_drafts_first",
+      "name": "submit_intent_draft",
+      "arguments": {
+        "draft": {
+          "intent": {
+            "summary": "First replacement draft",
+            "problemStatement": "The provider must submit exactly one replacement draft",
+            "changeType": "test",
+            "objectives": [
+              { "title": "retain the first candidate", "kind": "implementation" }
+            ],
+            "inScope": ["README.md"],
+            "outOfScope": []
+          },
+          "acceptance": {
+            "successCriteria": ["multiple successful drafts fail closed"],
+            "fastChecks": [],
+            "integrationChecks": [],
+            "securityChecks": [],
+            "releaseChecks": []
+          },
+          "risk": {
+            "rationale": "test fixture",
+            "level": "low"
+          }
+        }
+      }
+    },
+    {
+      "match": { "afterToolResult": true },
+      "once": true,
+      "type": "tool_call",
+      "id": "multiple_drafts_second",
+      "name": "submit_intent_draft",
+      "arguments": {
+        "draft": {
+          "intent": {
+            "summary": "Conflicting second replacement draft",
+            "problemStatement": "A second successful draft must invalidate the provider turn",
+            "changeType": "test",
+            "objectives": [
+              { "title": "reject the second candidate", "kind": "implementation" }
+            ],
+            "inScope": ["README.md"],
+            "outOfScope": []
+          },
+          "acceptance": {
+            "successCriteria": ["the source revision remains retryable"],
+            "fastChecks": [],
+            "integrationChecks": [],
+            "securityChecks": [],
+            "releaseChecks": []
+          },
+          "risk": {
+            "rationale": "test fixture",
+            "level": "low"
+          }
+        }
+      }
+    },
+    {
+      "match": { "afterToolResult": true },
+      "once": true,
+      "type": "text",
+      "text": "two replacement drafts were submitted"
+    }
+  ],
+  "fallback": {
+    "type": "text",
+    "text": "multiple draft fixture exhausted"
+  }
+}

@@ -3146,6 +3146,17 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
+        location: "agent_bridge_checkpoint",
+        column: "target_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "DeepSeek Harness bridge checkpoint target object (2026081801)",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
         location: "agent_session",
         column: "parent_commit",
         status: GcSourceStatus::TracedRoot,
@@ -3374,6 +3385,12 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
             "SELECT base_commit FROM workspace_record WHERE base_commit IS NOT NULL \
              AND state IN ('provisioning', 'active', 'releasing', 'orphaned')",
             &["base_commit"],
+            CellMode::StrictOid,
+        ),
+        (
+            "agent_bridge_checkpoint",
+            "SELECT target_oid FROM agent_bridge_checkpoint WHERE target_oid IS NOT NULL",
+            &["target_oid"],
             CellMode::StrictOid,
         ),
     ];

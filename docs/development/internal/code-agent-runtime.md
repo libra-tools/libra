@@ -1232,7 +1232,11 @@ libra graph
 - 对 `object_index` 的写入是 cloud sync 可见性的边界。任何绕过 `ClientStorage::put` 或 `append_checkpoint_commit` 的底层对象写入，都必须证明对象被加入 `object_index`，否则本地可读但 R2/D1 restore 会缺对象。
 - 遇到 SQLite `locked` / `busy`、ref head conflict、对象索引后台队列拥塞时，优先使用现有事务、busy timeout、retry/CAS helper；不得吞错后继续返回成功，也不得让用户看到“checkpoint 已保存”但 DB/ref/object 任一环缺失。
 
-## 当前基线
+## 迁移前基线（历史快照）
+
+本节保留的是 W5-06/W5-03/W5-10 前的设计审计输入，不能作为当前源码状态。
+其中的已删除符号仅用于说明迁移来源；当前 Code 路径是 Web Code UI，审批/sandbox
+context 由 `default_runtime_context` 构造。
 
 执行前先用 `rg` 复核符号仍存在，行号不要作为唯一依据。Phase 0 校准清单时必须更新本节输出。
 
@@ -1241,7 +1245,7 @@ rg -n "fn execute\\(|execute_tui|execute_web_only|execute_stdio|validate_mode_ar
 rg -n "start_plan_workflow|begin_plan_workflow|handle_intent_review_choice|handle_post_plan_choice|automatic_plan_repair|goal_session|handle_builtin_command|handle_tui_control_command" src/internal/tui src/command/code.rs
 rg -n "HeadlessCodeRuntime|CodeUiCommandAdapter|CodeUiInitialController|TuiCodeUiAdapter|TuiControlCommand" src/internal src/command/code.rs
 rg -n "GraphArgs|GRAPH_EXAMPLES|run_graph_tui|render_graph|load_thread_graph" src/command/graph.rs
-rg -n "default_tui_runtime_context|build_non_codex_headless_runtime|build_headless_tool_registry" src/command/code.rs src/internal/ai/web
+rg -n "default_runtime_context|build_non_codex_headless_runtime|build_headless_tool_registry" src/command/code.rs src/internal/ai/web
 rg -n "SubAgentDispatcher|run_tool_loop_with_history_and_observer|ToolLoopConfig" src/internal/ai
 ```
 
@@ -1249,11 +1253,11 @@ rg -n "SubAgentDispatcher|run_tool_loop_with_history_and_observer|ToolLoopConfig
 
 - `src/command/code.rs` 只有 `execute_web_only`、`execute_stdio` 两条 mode path（`execute_tui` 已由 plan-20260715 **W5-06** 删除；bare `--provider codex --resume` 现在 fail-closed 为 usage error + 迁移提示）。
 - （历史，W5-07 前）`--web` 曾是 `CodeArgs.web_only` 的 alias——两者均已由 **W5-07** 删除；`--mcp-stdio` 仍是 `CodeArgs.stdio` 的 alias。
-- （历史，W5-06 前）generic provider 的 IntentSpec/Plan 两阶段确认和 repair loop 曾由 TUI App 承载；现由 AgentRuntime worker 持有（headless 场景覆盖 intent review/plan/repair 门），TUI App 内的副本是待 W5-03 删除的死代码。
+- （历史，W5-06 前）generic provider 的 IntentSpec/Plan 两阶段确认和 repair loop 曾由 TUI App 承载；现由 AgentRuntime worker 持有（headless 场景覆盖 intent review/plan/repair 门），该 App 副本已由 W5-03 删除。
 - （历史，W5-06 前）goal、usage、skill、task 等 slash command 效果曾由 TUI 私有 handler 承载；现经 runtime / `CodeUiCommandAdapter` 暴露。
-- Web headless path 已有 submit/streaming/approval/user-input/cancel/patchset/session persistence 的部分能力 + 复用 `ProviderFactory` + `ToolRuntimeContext`，**但仍调用 `default_tui_runtime_context`（命名为 tui 系历史遗留，归 W5-02/W5-03 搬迁更名）且未完整加载 skills/hooks/profiles/SourcePool**，不能作为最终核心 runtime。
+- Web headless path 已有 submit/streaming/approval/user-input/cancel/patchset/session persistence 的部分能力 + 复用 `ProviderFactory` + `ToolRuntimeContext`；其 context 由 `default_runtime_context` 构造（W5-10 已完成中性命名），但仍未完整加载 skills/hooks/profiles/SourcePool，不能作为最终核心 runtime。
 - （历史，W5-06 前）`TuiCodeUiAdapter`/`TuiControlCommand` 曾是 Web write 进入 TUI App 的桥；**W5-06 已删除该桥**，Web write 直达 AgentRuntime adapter（`TuiControlError` downcast 残留归 W5-02，`control.rs` 迁移归 W5-02/W5-03）。
-- `src/command/graph.rs` 曾直接依赖 ratatui/crossterm；**W5-08 已删除 interactive TUI 入口并移除渲染器**，仅余 `--json`/`--machine` 结构化输出（依赖摘除归 W5-10）。
+- `src/command/graph.rs` 曾直接依赖 ratatui/crossterm；**W5-08 已删除 interactive TUI 入口并移除渲染器，W5-10 已摘除依赖**，仅余 `--json`/`--machine` 结构化输出。
 - `src/internal/ai/agent/runtime/` 已提供 `ChatAgent` / `run_tool_loop*` / `SubAgentDispatcher` 等可复用的中立执行原语；`intentspec/` / `goal/` / `runtime/phase*.rs` 已有部分 workflow 合同。
 - **dagrs 的实际位置（2026-06-17 复核，勿误判）：** `rg -ln "dagrs::|use dagrs" src/internal/ai/` 显示 dagrs 实际仅在 **2 文件**中使用：`orchestrator/executor.rs`（`execute_dag`/`build_dagrs_graph`/`TaskDagrsAction`）和 `node_adapter.rs`（`AgentAction`/`ToolLoopAction` 把 agent/tool-loop 包成 `dagrs::Action`）。`runtime/phase1.rs`、`task_executors.rs` 中只是**注释**提到 dagrs。`runtime/mod.rs` 仅 `pub mod phase0..4` + 类型 re-export，**不是** dagrs 执行器。结论：dagrs 驱动的是**多 agent 执行 DAG**，不是 Intent/Plan/Validation 的 phase 推进。（注：原版本声称 dagrs 在 orchestrator/ 的 9 个文件中使用，经 2026-06-17 复核不正确——实际仅 `executor.rs` + `node_adapter.rs`。）
 - **交互 plan workflow 现状：** 在 `tui/app.rs` 是 `pending_intent_review: Option<PendingIntentReview>` / `pending_plan_revision: Option<String>` 字段 + `handle_intent_review_choice` / `handle_post_plan_choice` 等 async 方法（约 `app.rs:523-525`、`5884`、`6377`），**字段散落、非 dagrs、非单一 enum**。AG-03 的中立化目标即把它收敛成 worker 持有的序列化 typed 状态机。
@@ -1288,8 +1292,8 @@ rg -n "SubAgentDispatcher|run_tool_loop_with_history_and_observer|ToolLoopConfig
 | `enum SessionEvent` | `internal/ai/session/jsonl.rs:32` | 存在（`Workflow` variant 待 AG-13 加） |
 | `CodexTaskExecutor` / `CompletionTaskExecutor` / `trait AuditSink` | `runtime/task_executors.rs:63` / `:284` / `runtime/hardening.rs:451` | 存在 |
 | `CodeUiSessionSnapshot` / `CodeUiInteractionRequest` / `HeadlessCodeRuntime` | `web/code_ui.rs:268` / `:158` / `web/headless.rs:163` | 存在 |
-| `fn default_tui_runtime_context` | `command/code.rs:3406` | 存在（仅 code.rs 定义；web/ 不直接引用——Phase 2 须消除其作为 headless ToolRuntimeContext 来源的耦合） |
-| `fn execute_tui` / `execute_web_only` / `execute_stdio` / `validate_mode_args` | `command/code.rs:1401` / `:759` / `:3927` / `:3967` | 存在 |
+| `fn default_runtime_context` | `command/code.rs`（行号随 W5-10 重命名漂移） | 存在（仅 code.rs 定义；web/ 不直接引用） |
+| `fn execute_web_only` / `execute_stdio` / `validate_mode_args` | `command/code.rs` | 存在；`execute_tui` 已由 W5-06 删除 |
 | `fn load_thread_graph` / `struct GraphArgs` | `command/graph.rs:176` / `:133` | 存在 |
 | `App` plan-workflow 字段/方法：`pending_intent_review` / `pending_plan_revision` / `handle_intent_review_choice` / `handle_post_plan_choice` / `start_plan_workflow` / `begin_plan_workflow` | `internal/tui/app.rs:523` / `:525` / `:5884` / `:6377` / `:6995` / `:7048` | 存在（AG-03 迁出源） |
 | `AgentRuntimeHandle` / `AgentRuntimeWorker` / `CodeAgentServices` / `AgentEvent` / `AgentSnapshot` / `TurnRequest` / `AgentInteraction` | — | **待建**（AG-01/AG-02） |
@@ -1387,7 +1391,7 @@ rg -n "struct Runtime|pub struct TaskExecutor|pub enum WorkflowPhase" src/intern
 rg -n "struct GoalSpec|struct GoalState|pub enum GoalLoopDecision" src/internal/ai/goal
 
 # AG-05/AG-10: Web adapter
-rg -n "default_tui_runtime_context|build_non_codex_headless_runtime|build_headless_tool_registry" src/command/code.rs src/internal/ai/web
+rg -n "default_runtime_context|build_non_codex_headless_runtime|build_headless_tool_registry" src/command/code.rs src/internal/ai/web
 
 # AG-13~AG-15: workflow pattern
 rg -n "fn execute_dag|fn build_dagrs_graph|TaskDagrsAction" src/internal/ai/orchestrator/executor.rs
@@ -1503,7 +1507,7 @@ rg -n "struct Runtime|pub struct TaskExecutor|pub enum WorkflowPhase|struct Sess
 rg -n "struct GoalSpec|struct GoalState|pub enum GoalLoopDecision" src/internal/ai/goal
 rg -n "SubAgentDispatcher|run_tool_loop_with_history_and_observer|ToolLoopConfig" src/internal/ai/agent/runtime
 # AG-02: bootstrap
-rg -n "default_tui_runtime_context|build_non_codex_headless_runtime|build_headless_tool_registry" src/command/code.rs src/internal/ai/web
+rg -n "default_runtime_context|build_non_codex_headless_runtime|build_headless_tool_registry" src/command/code.rs src/internal/ai/web
 rg -n "fn load_skills|struct SkillDispatcher|struct HookRunner" src/internal/ai/skills src/internal/ai/hooks
 # AG-03: plan workflow
 rg -n "pending_intent_review|pending_plan_revision|handle_intent_review_choice|handle_post_plan_choice|automatic_plan_repair" src/internal/tui/app.rs
@@ -1707,7 +1711,7 @@ fn web_build_required_test() {
 **验收（除原有外新增）：**
 
 - 种子清单中的每一项在 AG-00 后都有准确的「当前文件:行号范围」（用 rg 固定）、目标模块和可执行的测试命令。
-- `rg "default_tui_runtime_context" src/internal/ai/web src/command/code.rs` 在 Phase 2 后只剩兼容 wrapper。
+- `rg "default_runtime_context" src/internal/ai/web src/command/code.rs` 确认 context builder 保持 UI-neutral；Web caller 可直接使用该中性 helper。
 - 新增遗漏行为 ≤ 10 项（若超过，说明种子清单不完整，需更新本计划）。
 - 所有 `must-migrate` 项的目标模块精确到 `src/internal/ai/<module>/<file.rs>` 级别。
 - 该行为清单**保留为 living parity 矩阵**（借鉴 `pie` 的 `docs/web-ui-parity.md`），随每张 AG 卡更新「TUI 行为 → 中立实现 → Web/MCP 覆盖」三列状态，不在 Gate 6 后丢弃；它是 Gate 6 删 TUI 前「无能力丢失」的权威依据。
@@ -1757,8 +1761,8 @@ fn web_build_required_test() {
 - `CodeAgentServices` 结构体存在于代码中（非 trait），且被 `AgentRuntimeWorker` 持有（`services: Arc<CodeAgentServices>`）。**验证：** `rg "struct CodeAgentServices" src/internal/ai/` 有定义；`rg "CodeAgentServices" src/internal/ai/agent/runtime/` 或 `src/internal/ai/runtime/` 显示 worker 字段引用。
 - Web/headless tests 能证明 `--env-file`、`--network-access`、`--approval-policy`、`--approval-ttl` 生效。**验证：** `ai_code_ui_headless_test` 或等价测试在 `LIBRA_ENABLE_TEST_PROVIDER=1` 下覆盖上述 flag。
 - `task` tool 仍按 feature/config gate，不被无条件开放。**验证：** `rg "task" src/internal/ai/agent/runtime/` 或工具注册处显示 `task` 的启用条件与之前一致（feature gate + config gate）；新增测试 `task_tool_requires_feature_gate` 证明 flag-off 时返回 unsupported。
-- `rg "default_tui_runtime_context" src/internal/ai/web src/command/code.rs` 只剩兼容 wrapper 或无 Web 调用（当前 headless 仍通过它构造 ToolRuntimeContext，此为 Phase 2 必须消除的遗留耦合）。**验证：** 上述 rg 命令无 Web 路径调用；若存在 TUI-only wrapper，须标注 `#[cfg(feature = "tui")]` 或含 `tui` 路径名。
-- 同一份 `build_code_agent_services` / bootstrap helper 被 TUI path 与 `build_non_codex_headless_runtime` / `build_headless_web_code_ui_runtime` 共同使用（无逻辑分叉）。**验证：** `rg "build_code_agent_services" src/` 显示被 `src/command/code.rs`（TUI path）和 `src/internal/ai/web/headless.rs`（Web path）同时调用；两者的调用参数差异只限于 UI-neutral 配置（如 port/host），不涉及 skills/hooks/profiles/SourcePool/approval/sandbox 的装配逻辑差异。
+- `rg "default_runtime_context" src/internal/ai/web src/command/code.rs` 证明 context builder 没有 terminal-specific 命名或 wrapper，且 Web 路径只通过该 UI-neutral helper 构造 `ToolRuntimeContext`。**验证：** 上述 rg 命令的调用点只引用 `default_runtime_context`。
+- 同一份 `build_code_agent_services` / bootstrap helper 被 `build_non_codex_headless_runtime` 与 `build_headless_web_code_ui_runtime` 共同使用（无逻辑分叉，也不得恢复 terminal launch branch）。**验证：** `rg "build_code_agent_services" src/` 显示所有调用均来自现存 Web/headless runtime；调用参数差异只限于 UI-neutral 配置（如 port/host），不涉及 skills/hooks/profiles/SourcePool/approval/sandbox 的装配逻辑差异。
 - `build_code_agent_services` 的测试覆盖 skills/hooks/profiles/SourcePool/usage/approval/compaction/sub-agent gate 的组合装配，等价于 `pie` 的 harness composer 级别验证。**验证：** 新增 `ai_bootstrap_composer_test.rs` 或 lib test：`services_assemble_all_modules`、`services_skills_gate_not_weakened`、`services_hooks_loaded_and_audited`、`services_source_pool_trust_preserved`、`services_sub_agent_cap_respected`。每项断言一个装配不变量。
 
 ### Phase 3: 抽出 plan workflow
@@ -2197,9 +2201,9 @@ cargo +nightly fmt --all --check  # 虽然不改 Rust，确认基线能通过
 验收：
 
 - Web/headless env-file、approval、network、sandbox policy 测试通过。
-- TUI path 行为不变。
+- 已删除的 terminal path 不得复活；现存 Web/headless path 的行为由对应集成测试固定。
 - bootstrap 包含 prompt/context/compaction/memory/provider descriptor，不允许 headless 另拼 system prompt 或上下文预算。
-- `CodeAgentServices` 是**被 runtime worker 持有**的单一结构（非松散 helper 返回值）；TUI launch path 与 headless path 装配出的 services 集合等价（同一构造、无逻辑分叉），等价于 `pie` `agent_harness.rs` 级别的 composer 验证。
+- `CodeAgentServices` 是**被 runtime worker 持有**的单一结构（非松散 helper 返回值）；所有现存 Web/headless launch path 装配出的 services 集合等价（同一构造、无逻辑分叉），等价于 `pie` `agent_harness.rs` 级别的 composer 验证。
 
 ### AG-03: Plan workflow parity
 
@@ -2700,7 +2704,7 @@ test ! -e docs/development/web-only.md
 ! rg -n "\\]\\([^)]*(\\.\\./agent\\.md|\\.\\./web-only\\.md|docs/development/agent\\.md|docs/development/web-only\\.md)" docs/development docs/commands README.md COMPATIBILITY.md tests
 rg -n "execute_tui|run_tui_with_model|TuiLaunchConfig|TuiCodeUiAdapter|TuiControlCommand|tui_init\\(|tui_restore\\(" src/command/code.rs
 rg -n "libra code --web|libra code --web-only|libra code --stdio|--mcp-stdio|libra graph|GraphArgs|GRAPH_EXAMPLES|Launch the default TUI session" README.md docs/commands docs/development/commands tests src/command/code.rs
-rg -n "default_tui_runtime_context" src/internal/ai/web src/command/code.rs
+rg -n "default_runtime_context" src/internal/ai/web src/command/code.rs
 cargo test --test compat_matrix_alignment
 ```
 

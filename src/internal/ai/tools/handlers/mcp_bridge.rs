@@ -22,10 +22,13 @@ use crate::internal::ai::{
     },
 };
 
-/// Legacy MCP bridge handler. New source-prefixed handlers are produced by
-/// [`crate::internal::ai::sources::SourcePool`], but this type remains the
-/// stable compatibility shim for existing `McpBridgeHandler::all_handlers`
-/// callers.
+/// Legacy MCP bridge handler retained temporarily as an internal test seam.
+///
+/// New source-prefixed handlers are produced by
+/// [`crate::internal::ai::sources::SourcePool`]. There are no current
+/// production registrations of [`Self::all_handlers`]; the type remains as an
+/// internal test seam that pins the legacy aggregate-handler contract while
+/// source-prefixed handlers complete their staged migration.
 pub struct McpBridgeHandler {
     delegate: SourceToolHandler,
 }

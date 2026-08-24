@@ -1,15 +1,17 @@
 //! Wave 8 / PR 8 — Tool registry ACL coverage for the
 //! `libra code` `--context` modes (§5.9 first bullet).
 //!
-//! The Code UI runtime registers ~12 first-party tools plus the
-//! semantic / MCP bridge sets (see `src/command/code.rs`). The
+//! The Code UI runtime registers its first-party and semantic tools through
+//! `CodeAgentServicesBuilder`. The
 //! `--context` flag maps to a `TaskIntent` (Dev → Feature,
 //! Review → Review, Research → Question), and
-//! `ToolRegistry::filter_by_intent` is the single point of truth
-//! for which tools the agent is allowed to invoke. These tests
-//! pin the Code UI tool set against the filter so a future
-//! intent-mapping or registry change can't silently expose
-//! mutating tools to a Review/Research session.
+//! `ToolRegistry::filter_by_intent` defines the intent-filter policy used by
+//! Code UI callers. These tests pin the production base registry and a real
+//! source-prefixed dynamic registration and the legacy MCP bridge names against
+//! that policy so a future
+//! intent-mapping or registry change cannot silently classify a mutating tool
+//! as review/research-safe. Runtime wiring remains covered by its own tool-loop
+//! integration tests.
 //!
 //! `tool ACL × --approval-policy` tracking listed in §5.9 is
 //! covered by `code_ui_remote_approval_matrix`; `--network-access
@@ -21,57 +23,45 @@ use std::sync::Arc;
 use libra::internal::ai::{
     agent::TaskIntent,
     mcp::server::LibraMcpServer,
-    tools::{
-        ToolRegistry, ToolRegistryBuilder,
-        handlers::{
-            ApplyPatchHandler, GrepFilesHandler, ListDirHandler, McpBridgeHandler, PlanHandler,
-            ReadFileHandler, SearchFilesHandler, ShellHandler, SubmitIntentDraftHandler,
-            SubmitPlanDraftHandler, SubmitTaskCompleteHandler, WebSearchHandler,
-            register_semantic_handlers,
-        },
+    runtime::services::CodeAgentServicesBuilder,
+    sources::{
+        CapabilityManifest, Source, SourceCallContext, SourceKind, SourcePool,
+        SourceToolCapability, SourceToolNaming, TrustTier,
     },
+    tools::{ToolInvocation, ToolOutput, ToolSpec, handlers::McpBridgeHandler},
 };
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
-/// Build a `ToolRegistry` that mirrors what `src/command/code.rs`
-/// registers for the Code UI agent at startup. The set kept in sync
-/// with the live registration block in `src/command/code.rs:1438-
-/// 1462` (Wave 8 / PR 8 captured this with commit 70619aef);
-/// when adding a new tool there, mirror the registration here so
-/// the ACL contract is exercised against the full live surface.
-///
-/// Excluded from this helper:
-///   * `RequestUserInputHandler` — needs a runtime `mpsc::Sender`
-///     and is irrelevant to ACL filtering because its name is on
-///     the read-only-or-semantic allowlist regardless.
-///
-/// MCP bridge handlers ARE included via
-/// `McpBridgeHandler::all_handlers(...)`. Their names are
-/// dynamic (driven off the `LibraMcpServer` manifest) so the
-/// Review/Research assertions intentionally pin only the names
-/// `is_read_only_or_semantic_tool` lists, not the whole MCP
-/// surface — Codex pass-1 P2 follow-up calls this out so a
-/// future MCP-bridge tool that names itself `delete_*` doesn't
-/// silently slip into a Review session.
-fn build_code_ui_like_registry() -> Arc<ToolRegistry> {
-    let dir = tempfile::tempdir().expect("tempdir for ACL test");
-    let mut builder = ToolRegistryBuilder::with_working_dir(dir.path().to_path_buf())
-        .register("read_file", Arc::new(ReadFileHandler))
-        .register("list_dir", Arc::new(ListDirHandler))
-        .register("grep_files", Arc::new(GrepFilesHandler))
-        .register("search_files", Arc::new(SearchFilesHandler))
-        .register("web_search", Arc::new(WebSearchHandler))
-        .register("apply_patch", Arc::new(ApplyPatchHandler))
-        .register("shell", Arc::new(ShellHandler))
-        .register("update_plan", Arc::new(PlanHandler))
-        .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
-        .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
-        .register("submit_task_complete", Arc::new(SubmitTaskCompleteHandler));
-    builder = register_semantic_handlers(builder);
-    let mcp_server = Arc::new(LibraMcpServer::new(None, None));
-    for (name, handler) in McpBridgeHandler::all_handlers(mcp_server) {
-        builder = builder.register(name, handler);
+#[derive(Clone)]
+struct DynamicReadOnlySource {
+    manifest: CapabilityManifest,
+}
+
+#[async_trait::async_trait]
+impl Source for DynamicReadOnlySource {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
     }
-    Arc::new(builder.build())
+
+    async fn call_tool(
+        &self,
+        _context: SourceCallContext,
+        _invocation: ToolInvocation,
+    ) -> libra::internal::ai::tools::ToolResult<ToolOutput> {
+        Ok(ToolOutput::success("dynamic source lookup"))
+    }
+}
+
+/// Build the actual production Web Code UI registry. Keeping test construction
+/// on `CodeAgentServicesBuilder` means a registration change cannot leave the
+/// ACL suite validating a stale hand-assembled tool set.
+fn build_production_code_ui_registry() -> std::sync::Arc<libra::internal::ai::tools::ToolRegistry> {
+    let dir = tempfile::tempdir().expect("tempdir for ACL test");
+    let (user_input_tx, _user_input_rx) = mpsc::unbounded_channel();
+    CodeAgentServicesBuilder::web_headless(dir.path(), Uuid::new_v4(), user_input_tx)
+        .build()
+        .registry()
 }
 
 /// `Dev` → `TaskIntent::Feature` lets every registered tool through
@@ -82,7 +72,7 @@ fn build_code_ui_like_registry() -> Arc<ToolRegistry> {
 /// dev-mode tool.
 #[test]
 fn dev_context_filter_keeps_all_registered_tools() {
-    let registry = build_code_ui_like_registry();
+    let registry = build_production_code_ui_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Feature);
 
     for required in [
@@ -96,7 +86,6 @@ fn dev_context_filter_keeps_all_registered_tools() {
         "update_plan",
         "submit_intent_draft",
         "submit_plan_draft",
-        "submit_task_complete",
     ] {
         assert!(
             allowed.iter().any(|name| name == required),
@@ -112,7 +101,7 @@ fn dev_context_filter_keeps_all_registered_tools() {
 /// `shell` into the read-only allowlist would fail loud.
 #[test]
 fn review_context_filter_drops_mutating_tools() {
-    let registry = build_code_ui_like_registry();
+    let registry = build_production_code_ui_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Review);
 
     for forbidden in [
@@ -120,7 +109,6 @@ fn review_context_filter_drops_mutating_tools() {
         "shell",
         "submit_intent_draft",
         "submit_plan_draft",
-        "submit_task_complete",
         "update_plan",
     ] {
         assert!(
@@ -149,7 +137,7 @@ fn review_context_filter_drops_mutating_tools() {
 /// can diverge in the future without a shared-test regression.
 #[test]
 fn research_context_filter_drops_mutating_tools() {
-    let registry = build_code_ui_like_registry();
+    let registry = build_production_code_ui_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Question);
 
     for forbidden in ["apply_patch", "shell"] {
@@ -170,7 +158,7 @@ fn research_context_filter_drops_mutating_tools() {
 /// filtering would defeat that path.
 #[test]
 fn unknown_intent_keeps_all_registered_tools() {
-    let registry = build_code_ui_like_registry();
+    let registry = build_production_code_ui_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Unknown);
 
     for required in ["apply_patch", "shell", "read_file", "submit_intent_draft"] {
@@ -188,7 +176,7 @@ fn unknown_intent_keeps_all_registered_tools() {
 /// `tool_allowed_for_intent` in `tools/registry.rs`.
 #[test]
 fn command_intent_allows_shell_only_among_mutating_tools() {
-    let registry = build_code_ui_like_registry();
+    let registry = build_production_code_ui_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Command);
 
     assert!(
@@ -199,7 +187,6 @@ fn command_intent_allows_shell_only_among_mutating_tools() {
         "apply_patch",
         "submit_intent_draft",
         "submit_plan_draft",
-        "submit_task_complete",
         "update_plan",
     ] {
         assert!(
@@ -209,41 +196,75 @@ fn command_intent_allows_shell_only_among_mutating_tools() {
     }
 }
 
-/// MCP bridge tools (e.g. `run_libra_vcs`, `create_*`,
-/// `update_intent`) are dynamically added to the live agent
-/// registry. The `is_read_only_or_semantic_tool` allowlist in
-/// `tools/registry.rs` is hardcoded with a small set of names —
-/// MCP bridge mutating tools deliberately DON'T appear there, so
-/// Review and Research filters drop them.
-///
-/// This test pins that contract: any MCP-bridge name starting
-/// with `run_`, `create_`, or `update_` MUST be dropped under
-/// `TaskIntent::Review`. A future MCP-bridge tool that ships
-/// under one of those prefixes without an explicit Review allow
-/// would silently slip through to a Review session — Codex
-/// pass-1 P2 follow-up flagged this as a gap; this test closes
-/// it.
+/// Source tools are injected into an effective run registry after the base
+/// Code UI services have been built. A prefixed source tool has no semantic
+/// allowlist entry, so Review/Research must default-deny it instead of treating
+/// an arbitrary dynamically supplied name as read-only.
 #[test]
-fn mcp_bridge_mutating_tools_are_dropped_in_review_intent() {
-    let registry = build_code_ui_like_registry();
-    let dev_allowed = registry.filter_by_intent(TaskIntent::Feature);
-    let review_allowed = registry.filter_by_intent(TaskIntent::Review);
+fn review_and_research_filters_default_deny_prefixed_dynamic_source_tools() {
+    let mut registry = (*build_production_code_ui_registry()).clone();
+    let source = DynamicReadOnlySource {
+        manifest: CapabilityManifest::new(
+            "project_docs",
+            SourceKind::LocalDocs,
+            TrustTier::Project,
+        )
+        .with_tool(SourceToolCapability::new(
+            "lookup",
+            ToolSpec::new("lookup", "read a project document"),
+        )),
+    };
+    let sources = SourcePool::new();
+    sources
+        .register_source(std::sync::Arc::new(source))
+        .expect("project source registration must succeed");
+    for (name, handler) in sources
+        .tool_handlers_for_session("acl-test", SourceToolNaming::Prefixed)
+        .expect("source handlers must be materialized with production naming")
+    {
+        registry.register(name, handler);
+    }
 
-    let mutating_mcp_in_dev: Vec<&String> = dev_allowed
-        .iter()
+    for intent in [TaskIntent::Review, TaskIntent::Question] {
+        let allowed = registry.filter_by_intent(intent);
+        assert!(
+            !allowed.iter().any(|name| name == "project_docs__lookup"),
+            "{intent:?} must default-deny dynamic source tools; allowed: {allowed:?}",
+        );
+    }
+}
+
+/// The SourcePool path above protects production's dynamically prefixed tools.
+/// Keep this legacy bridge-name assertion as well: it verifies the intent ACL
+/// remains conservative for the real mutating MCP names while the aggregate
+/// bridge is retained as a migration test seam.
+#[test]
+fn review_and_research_filters_drop_real_mcp_bridge_mutating_tools() {
+    let mut registry = (*build_production_code_ui_registry()).clone();
+    for (name, handler) in McpBridgeHandler::all_handlers(Arc::new(LibraMcpServer::new(None, None)))
+    {
+        registry.register(name, handler);
+    }
+
+    let mutating_mcp_names = registry
+        .filter_by_intent(TaskIntent::Feature)
+        .into_iter()
         .filter(|name| {
-            name.starts_with("run_") || name.starts_with("create_") || name.starts_with("update_")
+            name == "run_libra_vcs" || name.starts_with("create_") || name.starts_with("update_")
         })
-        .collect();
+        .collect::<Vec<_>>();
     assert!(
-        !mutating_mcp_in_dev.is_empty(),
-        "expected at least one MCP-bridge mutating tool in the Dev allowlist; found: {dev_allowed:?}",
+        !mutating_mcp_names.is_empty(),
+        "the real MCP bridge must expose mutating tool names"
     );
 
-    for name in &mutating_mcp_in_dev {
-        assert!(
-            !review_allowed.iter().any(|allowed| allowed == *name),
-            "MCP-bridge mutating tool '{name}' must be dropped under Review, but allowed: {review_allowed:?}",
-        );
+    for intent in [TaskIntent::Review, TaskIntent::Question] {
+        let allowed = registry.filter_by_intent(intent);
+        for name in &mutating_mcp_names {
+            assert!(
+                !allowed.iter().any(|allowed_name| allowed_name == name),
+                "{intent:?} must drop mutating MCP tool '{name}'; allowed: {allowed:?}",
+            );
+        }
     }
 }

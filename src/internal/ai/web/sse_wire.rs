@@ -150,6 +150,13 @@ pub struct CodeUiWireV2Event {
 impl CodeUiWireV2Event {
     pub fn from_workflow_event(event: &CodeWorkflowEvent) -> Self {
         let (kind, payload) = match &event.event {
+            CodeWorkflowEventKind::InteractionResolved {
+                intent_revision_consumption: Some(consumption),
+                ..
+            } => (
+                "intent_revision_consumed".to_string(),
+                serde_json::json!({ "consumption": consumption }),
+            ),
             CodeWorkflowEventKind::CodeUiProjectionDelta {
                 projection,
                 summary,
@@ -182,10 +189,15 @@ fn workflow_kind_name(kind: &CodeWorkflowEventKind) -> &'static str {
         CodeWorkflowEventKind::CommandAccepted { .. } => "command_accepted",
         CodeWorkflowEventKind::IntentReviewRequested { .. } => "intent_review_requested",
         CodeWorkflowEventKind::PlanReviewRequested { .. } => "plan_review_requested",
+        CodeWorkflowEventKind::Phase1FormalWriteStarted { .. } => "phase1_formal_write_started",
         CodeWorkflowEventKind::NetworkPolicyRequested { .. } => "network_policy_requested",
         CodeWorkflowEventKind::PlanExecutionRepairRequested { .. } => {
             "plan_execution_repair_requested"
         }
+        CodeWorkflowEventKind::InteractionResolved {
+            intent_revision_consumption: Some(_),
+            ..
+        } => "intent_revision_consumed",
         CodeWorkflowEventKind::InteractionResolved { .. } => "interaction_resolved",
         CodeWorkflowEventKind::CodeUiProjectionDelta { .. } => "code_ui_projection_delta",
         CodeWorkflowEventKind::TerminalSuccess { .. } => "terminal_success",
@@ -556,6 +568,57 @@ mod tests {
             parse_code_events_wire_version(&CodeEventsQuery::default(), &headers).unwrap(),
             CodeUiSseWireVersion::V1
         );
+    }
+
+    #[test]
+    fn intent_revision_consumption_uses_dedicated_non_resolution_payload() {
+        use crate::internal::ai::session::{
+            CodeCommandIdentity, CodeCommandIntent, INTENT_REVISION_CONSUMER_COMMAND_KIND,
+            INTENT_REVISION_CONSUMPTION_SCHEMA_VERSION, IntentRevisionConsumption,
+            IntentRevisionConsumptionClaim,
+        };
+
+        let source = CodeCommandIdentity::new("repo", "session", "principal", "source");
+        let consumer = CodeCommandIntent::new(
+            CodeCommandIdentity::new("repo", "session", "principal", "consumer"),
+            INTENT_REVISION_CONSUMER_COMMAND_KIND,
+            "sha256:consumer",
+            true,
+        );
+        let consumption = IntentRevisionConsumption {
+            claim: IntentRevisionConsumptionClaim {
+                schema_version: INTENT_REVISION_CONSUMPTION_SCHEMA_VERSION,
+                interaction_id: "intent-review".to_string(),
+                source_command: source,
+                consumer_intent: consumer,
+                terminal_event_id: Uuid::new_v4(),
+                terminal_sequence: 2,
+                intent_id: "intent-1".to_string(),
+                sidecar_digest: Some(format!("hmac-sha256:{}", "a".repeat(64))),
+            },
+            consumer_intent_event_id: Uuid::new_v4(),
+            consumer_intent_sequence: 3,
+        };
+        let event = CodeWorkflowEvent::new(
+            4,
+            CodeWorkflowEventKind::InteractionResolved {
+                interaction_id: "intent-review".to_string(),
+                resolution: "modify".to_string(),
+                command: None,
+                prior_interaction_resolutions: Vec::new(),
+                intent_revision_consumption: Some(consumption.clone()),
+            },
+        );
+
+        let wire = CodeUiWireV2Event::from_workflow_event(&event);
+        assert_eq!(wire.kind, "intent_revision_consumed");
+        assert_eq!(
+            wire.payload,
+            serde_json::json!({ "consumption": consumption })
+        );
+        assert!(wire.payload.get("event").is_none());
+        assert!(wire.payload.get("resolution").is_none());
+        assert!(wire.payload.get("priorInteractionResolutions").is_none());
     }
 
     #[test]

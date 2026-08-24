@@ -618,8 +618,8 @@ impl std::fmt::Display for RepoIdentity {
 /// 猜时序；使用 barrier/failpoint 确认两个 operation 已进入指定窗口").
 ///
 /// The store's two contended writes — the acquire election and the reclaim
-/// takeover — call [`before_write`] immediately before their statement and
-/// [`after_write`] immediately after it, so a test can prove a second writer
+/// takeover — call `before_write` immediately before their statement and
+/// `after_write` immediately after it, so a test can prove a second writer
 /// entered that window, and can hold a writer between its statement and its
 /// return value.
 ///

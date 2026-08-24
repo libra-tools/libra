@@ -1,6 +1,23 @@
 {
   "responses": [
     {
+      "match": {
+        "contains": "Keep the command list concise and add an explicit rollback note."
+      },
+      "type": "tool_call",
+      "id": "call_submit_plan_draft_revision_1",
+      "name": "submit_plan_draft",
+      "arguments": {
+        "explanation": "Revised Phase 1 plan with concise commands and rollback guidance",
+        "steps": [
+          { "title": "Open README.md and locate the introduction" },
+          { "title": "Add a concise Usage section with the essential CLI commands" },
+          { "title": "Document how to roll back the README-only change" },
+          { "title": "Verify the revised Usage section renders clearly" }
+        ]
+      }
+    },
+    {
       "match": { "contains": "You are running /plan mode." },
       "type": "tool_call",
       "id": "call_request_user_input_1",

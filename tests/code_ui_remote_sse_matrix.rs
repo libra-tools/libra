@@ -1,8 +1,8 @@
 //! Data-driven SSE matrix runner (Wave 1 closing case).
 //!
 //! Each `#[test]` here loads `tests/data/code_ui_remote/sse_cases.json`
-//! and runs the named case end-to-end against a fresh `libra code` PTY
-//! session, subscribing to `/api/code/events` through the new
+//! and runs the named case end-to-end against a fresh non-TTY `libra code`
+//! Web process, subscribing to `/api/code/events` through the
 //! `tests/harness/event_stream.rs` blocking client.
 //!
 //! Wave 1's exit criteria from `docs/development/commands/_general.md` is to prove

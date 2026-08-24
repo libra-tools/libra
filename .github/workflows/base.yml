@@ -1,8 +1,5 @@
 on:
   pull_request:
-    paths-ignore:
-      - '.github/**'
-      - 'docs/**'
 
 name: Check, Build and Test
 
@@ -61,6 +58,9 @@ jobs:
 
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check Rustdoc intra-doc links
+        run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features
 
   web-check:
     name: compat-web-check
@@ -382,7 +382,7 @@ jobs:
           cargo test --lib --bins "${ARGS[@]}"
           cargo test --doc
 
-      # Phase 6 — Local TUI Automation Control scenario suite (docs/improvement/agent.md Part C).
+      # Phase 6 — Local Code UI automation scenario suite (docs/improvement/agent.md Part C).
       # Without `--features test-provider` + `LIBRA_ENABLE_TEST_PROVIDER=1`, the scenarios
       # in tests/code_ui_scenarios.rs and tests/harness_self_test.rs short-circuit; CI
       # would silently skip them. `--test-threads=1` because each scenario spawns a
@@ -391,7 +391,7 @@ jobs:
       # docs/improvement/test.md Wave 1 + Wave 3 also require the SSE harness and
       # lease matrix to run under the same gate, otherwise CI silently skips every
       # `lease_case!()` / `sse_case!()` registration.
-      - name: Run TUI automation scenarios
+      - name: Run Code UI automation scenarios
         env:
           LIBRA_ENABLE_TEST_PROVIDER: "1"
           # These scenarios validate the loopback browser against the real
@@ -401,7 +401,9 @@ jobs:
           cargo test --features test-provider \
             --test code_ui_scenarios \
             --test harness_self_test \
-            --test code_codex_default_tui_test \
+            --test code_codex_default_web_test \
+            --test ai_code_ui_headless_test \
+            --test code_codex_runtime_test \
             --test code_ui_remote_lease_matrix \
             --test code_ui_remote_sse_matrix \
             -- --test-threads=1
@@ -434,7 +436,7 @@ jobs:
             --test upgrade_auto_test \
             --test upgrade_publish_contract_test -- --test-threads=1
 
-      - name: Upload TUI scenario artifacts on failure
+      - name: Upload Code UI scenario artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:

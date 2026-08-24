@@ -647,7 +647,7 @@ fn code_router() -> Router<WebAppState> {
     // would let axum's `Json<...>` extractor reject malformed/
     // oversized bodies BEFORE the per-handler loopback check ran,
     // leaking that the runtime is up to a remote caller.
-    Router::new()
+    let router = Router::new()
         .route("/session", get(code_session_handler))
         .route("/thread-graph", get(code_thread_graph_handler))
         .route("/events", get(code_events_handler))
@@ -657,7 +657,13 @@ fn code_router() -> Router<WebAppState> {
         .route("/skills", get(code_skills_handler))
         .route("/goal/status", get(code_goal_status_handler))
         .route("/controller/attach", post(code_controller_attach_handler))
-        .route("/controller/detach", post(code_controller_detach_handler))
+        .route("/controller/detach", post(code_controller_detach_handler));
+    #[cfg(feature = "test-provider")]
+    let router = router.route(
+        "/test/expire-controller-lease",
+        post(code_expire_controller_lease_for_test_handler),
+    );
+    router
         .merge(code_write_router())
         .layer(middleware::from_fn(enforce_code_route_loopback))
 }
@@ -1780,6 +1786,15 @@ async fn code_controller_attach_handler(
     let runtime = code_ui_runtime(&state)?;
     let kind = resolve_controller_attach_kind(body.kind, &headers);
     let result = async {
+        if !matches!(
+            kind,
+            CodeUiControllerKind::Browser | CodeUiControllerKind::Automation
+        ) {
+            return Err(WebApiError::from(CodeUiApiError::bad_request(
+                "INVALID_CONTROLLER_KIND",
+                format!("Controller kind '{}' cannot attach", kind.as_str()),
+            )));
+        }
         if kind == CodeUiControllerKind::Browser {
             ensure_browser_origin_for_write(&state, &headers)?;
             ensure_browser_bootstrap_token(&headers, state.browser_bootstrap_token.as_ref())?;
@@ -1805,6 +1820,41 @@ async fn code_controller_attach_handler(
     .await;
     let response = result?;
     Ok(Json(serde_json::to_value(response)?))
+}
+
+/// Test-provider-only subprocess seam. Authentication is identical to a
+/// regular browser/automation write; the environment opt-in prevents an
+/// all-features development binary from exposing the seam accidentally.
+#[cfg(feature = "test-provider")]
+async fn code_expire_controller_lease_for_test_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<WebAppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, WebApiError> {
+    ensure_loopback_api_request(remote_addr)?;
+    if std::env::var("LIBRA_ENABLE_TEST_PROVIDER").as_deref() != Ok("1") {
+        return Err(WebApiError::forbidden(
+            "CONTROL_DISABLED",
+            "controller lease test seam requires LIBRA_ENABLE_TEST_PROVIDER=1",
+        ));
+    }
+    let runtime = code_ui_runtime(&state)?;
+    let token = browser_controller_token_from_headers(&headers);
+    let lease = runtime
+        .ensure_controller_write_access(token.as_deref())
+        .await?;
+    if lease.kind == CodeUiControllerKind::Browser {
+        ensure_browser_origin_for_write(&state, &headers)?;
+    } else if lease.kind == CodeUiControllerKind::Automation {
+        ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
+    }
+    if !runtime.expire_active_controller_lease_for_test().await {
+        return Err(WebApiError::from(CodeUiApiError::conflict(
+            "CONTROLLER_CONFLICT",
+            "no active controller lease exists to expire",
+        )));
+    }
+    Ok(Json(serde_json::json!({ "expired": true })))
 }
 
 /// Resolve attach `kind` when callers omit it.

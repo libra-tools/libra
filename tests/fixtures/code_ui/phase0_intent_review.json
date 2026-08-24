@@ -33,7 +33,11 @@
       }
     },
     {
-      "match": { "equals": "" },
+      "match": {
+        "equals": "",
+        "afterToolResult": true,
+        "afterToolName": "request_user_input"
+      },
       "type": "tool_call",
       "id": "call_submit_intent_draft_web_1",
       "name": "submit_intent_draft",

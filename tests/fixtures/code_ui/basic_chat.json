@@ -3,7 +3,7 @@
     {
       "match": { "contains": "hello" },
       "type": "text",
-      "text": "fake assistant: hello from the PTY harness",
+      "text": "fake assistant: hello from the Web harness",
       "usage": {
         "input_tokens": 7,
         "output_tokens": 3,

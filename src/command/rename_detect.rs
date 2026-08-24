@@ -2365,9 +2365,17 @@ mod tests {
     fn worktree_total_charges_bytes_read_not_stale_stat() {
         use std::time::Duration;
 
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
         const SHRUNK: u64 = 4;
         const GROWTH: u64 = 4096;
         let dir = tempfile::tempdir().expect("tempdir");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(setup_with_new_libra_in(dir.path()));
+        let _cwd = ChangeDirGuard::new(dir.path());
         let path = dir.path().join("grows.txt");
         std::fs::write(&path, vec![b'a'; (SHRUNK + GROWTH) as usize])
             .expect("write the full-size file");
@@ -2535,7 +2543,15 @@ mod tests {
     fn slow_op_seams_are_ignored_without_the_harness_gate() {
         use std::time::Duration;
 
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
         let dir = tempfile::tempdir().expect("tempdir");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(setup_with_new_libra_in(dir.path()));
+        let _cwd = ChangeDirGuard::new(dir.path());
         let path = dir.path().join("fast.txt");
         std::fs::write(&path, b"content").expect("write fixture");
 

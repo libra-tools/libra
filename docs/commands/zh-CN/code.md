@@ -19,7 +19,7 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 
 该命令支持八种 AI provider 后端（Gemini、OpenAI、Anthropic、DeepSeek、Kimi、Zhipu、Ollama、Codex），以及三种运行上下文（dev、review、research），用于针对不同工作流调节 agent 行为。会话可以通过 Libra 规范的 `--resume <thread_id>` 流程持久化和恢复。传入 `--goal "<objective>"` 会直接以 goal 模式启动会话，由 supervisor 驱动 tool loop 朝既定 objective 前进，直到 verifier 接受完成。
 
-沙箱化工具执行层会强制 approval policies，控制 agent 何时可以运行 shell 命令、应用补丁、Web 搜索或执行其他可能破坏性的操作。Headless Web 会话在 `dev` 上下文中默认使用 workspace-write 执行且禁止网络访问（遗留 TUI resume driver 已在 W5-06 删除）。执行计划就绪后，Plan review 对话框提供 Execute Plan / Modify Plan / Cancel；选择 Execute 后会再打开独立的强制 network-policy 提示（`Network: Deny` / `Network: Allow` / `Back`），只有该 gate 解决后才会应用网络策略，且两个 gate 都可在崩溃后恢复。Review 和 research 上下文保持只读，且不授予网络访问。
+沙箱化工具执行层会强制 approval policies，控制 agent 何时可以运行 shell 命令、应用补丁、Web 搜索或执行其他可能破坏性的操作。Headless Web 会话在 `dev` 上下文中默认使用 workspace-write 执行且禁止网络访问（遗留 TUI resume driver 已在 W5-06 删除）。执行计划就绪后，Plan review 对话框提供 Execute Plan / Modify Plan / Cancel。Modify 会关闭当前 review，并把下一条纯文本消息作为 durable revision instruction，随后打开替换 review。Execute 会打开独立的强制 network-policy 提示（`Network: Deny` / `Network: Allow` / `Back`）；Deny 放弃执行，Back 返回新一代 Plan review，两个 gate 都可在崩溃后恢复。Network Allow 会把 confirmed plan execution 送入串行的 AgentRuntime 队列。Mutating tools 仍须通过 approval、sandbox 与 tool ACL；失败进入 W2-11 repair loop。目录中保留的 `PLAN_EXECUTION_NOT_AVAILABLE` 409 供旧客户端解码，Allow 不再产生该码。Review 和 research 上下文保持只读，且不授予网络访问。
 
 实时版本图在 Web Code UI 中查看；`libra graph --json` 仍是 agent 路径，交互式 graph TUI 入口已在 W5 breaking 发布中删除（W5-08）。遗留 TUI 退出时打印后续 `libra graph --json <thread_id>` 命令的行为已随 TUI 在 W5-06 一并删除；请自行运行 `libra graph --json <thread_id>`（紧凑形式可用 `--machine`）。检查非当前目录仓库时，使用 `libra graph --json <thread_id> --repo <path>`。
 
@@ -93,7 +93,7 @@ Write control 仅限本地。`--control write` 与 `--stdio` 组合会被拒绝�
 
 Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 `{ "clientId": "...", "kind": "automation" }`，header `X-Libra-Control-Token`，然后使用返回的 `X-Code-Controller-Token` 写入。Automation-held leases 对 `/api/code/messages`、`/api/code/interactions/{id}`、`/api/code/controller/detach` 和 `/api/code/control/cancel` 同时要求两个 tokens。Code UI 写请求体上限为 256KiB。当会话广告 `capabilities.commandIdempotency`（当前仅 headless web-only）时，`POST /api/code/messages` 接受 `{ "text": "...", "commandId": "..." }` 以支持重试去重（相同 id + 相同 text 幂等；相同 id + 不同 text 返回 `COMMAND_PAYLOAD_CONFLICT`）。运行时会用活动 controller `clientId` 的 SHA-256 fence 命名空间化 `commandId`（原始 clientId 不会写入 durable command log）。`commandIdempotency` 仅在配置了 durable SessionStore command admission 时广告。其他 runtime 若收到 `commandId` 会显式拒绝，而不会静默忽略。
 
-`GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client：默认从 `.libra/code/control.json` discovery（可用 `--control-url` / `--control-token-file` / `--control-info-file` 覆盖）。Discovery fail-closed 使用稳定码（`CONTROL_INFO_MISSING`、`CONTROL_INFO_PERMS`、`CONTROL_TOKEN_MISSING`、`CONTROL_TOKEN_PERMS`、`CONTROL_SCOPE_CONFLICT`、`CONTROL_SERVER_MISSING`）；attach lease/ownership 冲突以 JSON-RPC `-32000` + Libra 码（如 `CONTROLLER_CONFLICT`）返回。原 `libra code-control` 转发 shim 已在 **W5 breaking 发布（W5-01）中删除**；`libra code --control stdio` 是唯一的 stdio automation client（见[迁移说明](code-control.md)）。弃用的 `libra code --stdio` 仍是 **MCP-only** tools/resources 传输（stderr 弃用警告；非 turn control），不得与 `--control stdio` 混同；独立的 `libra mcp --stdio` 计划在 W5 之后。
+`GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events；此标识为兼容既有 audit consumers 而冻结，并不代表仍存在 terminal UI。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client：默认从 `.libra/code/control.json` discovery（可用 `--control-url` / `--control-token-file` / `--control-info-file` 覆盖）。Discovery fail-closed 使用稳定码（`CONTROL_INFO_MISSING`、`CONTROL_INFO_PERMS`、`CONTROL_TOKEN_MISSING`、`CONTROL_TOKEN_PERMS`、`CONTROL_SCOPE_CONFLICT`、`CONTROL_SERVER_MISSING`）；attach lease/ownership 冲突以 JSON-RPC `-32000` + Libra 码（如 `CONTROLLER_CONFLICT`）返回。原 `libra code-control` 转发 shim 已在 **W5 breaking 发布（W5-01）中删除**；`libra code --control stdio` 是唯一的 stdio automation client（见[迁移说明](code-control.md)）。弃用的 `libra code --stdio` 仍是 **MCP-only** tools/resources 传输（stderr 弃用警告；非 turn control），不得与 `--control stdio` 混同；独立的 `libra mcp --stdio` 计划在 W5 之后。
 
 Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方法映射到 loopback `/api/code/*` HTTP/SSE 控制接口：
 
@@ -144,7 +144,61 @@ Execution/repair 面板从 live session snapshot 投影 `plans[]`、`toolCalls[]
 
 SSE resilience 面板展示 reconnecting / resync-required / resynced 状态，同时保留最后一次投影的 session snapshot 与 wire 提供的 cursor seq（浏览器从不自造序号）。显式 snapshot resync 走共享 store 的 `refresh()`，仅在 refresh 成功应用（或被更新的 live 更新 superseded）时报告成功；production v2 backlog/resync 事件在后续 wire 卡（W3-06/W3-08）落地，内置 SPA 切换归 W3-09。
 
-Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_choice`（network policy 同 kind，用 `metadata.phase = "networkPolicy"` 区分）。Confirm/modify/cancel（以及 execute / network-allow / network-deny / back）经 leased interaction endpoint 发送 `selectedOption`；当浏览器不能 write 时 turn cancel fail-closed。面板不保存第二套 workflow FSM，等待下一次 snapshot/SSE 更新。
+Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_choice`（network policy 同 kind，用 `metadata.phase = "networkPolicy"` 区分）。Confirm/modify/cancel（以及 execute / network-allow / network-deny / back）经 leased interaction endpoint 发送 `selectedOption`；当浏览器不能 write 时 turn cancel fail-closed。选择 Plan Modify 后，下一条被接纳的纯文本消息就是 revision note；Libra 将其 durable 绑定到被拒绝的计划，并在 Phase 1 完成后打开替换 review。面板不保存第二套 workflow FSM，等待下一次 snapshot/SSE 更新。Network Allow 会消费 network gate，并把 confirmed plan execution 送入串行 runtime 队列；mutating tools 仍走 approval/sandbox/ACL，repair 仍由 W2-11 持有。
+
+IntentSpec Modify 后，revision mode 可接收下一条纯文本消息，也可使用严格控制形式 `/intent modify <changes>`。其私有 HMAC 认证状态依次经过 `Prepared`、`Active`、`Claiming` 和绑定 event 的 `Consuming`：完整 consumer command binding 在 Runtime admission 前 fsync，精确 event id/sequence 在 executor start gate 打开前绑定。只有 durable effect proof 成立后才会提交收据：原始文本精确等于 `/intent cancel` 时是固定的无 provider effect，Modify 时则是恰好一次成功的 `submit_intent_draft` 加替换 review marker。收据之后才能删除 sidecar。该 authority 活跃时，新的 explicit direct command 在写入 intent 或 transcript 前返回 `409 SESSION_BUSY`；精确 terminal 重试或匹配的 live `commandId` 重试仍是幂等确认。带空白的 cancel 写法是普通 explicit-direct 输入。`/intent cancel` 不会取消 pending Plan revision；后者仍需要下一条非空纯文本 Plan note。
+
+启动时只构造一次共享、线性的 `ValidatedIntentRevisionReceiptIndex` 来验证
+revision authority。source terminal、receipt、consumer status、replacement marker 与 retry
+lineage 都复用这个索引，不会为每张收据重新扫描完整 event stream。回归 fixture 精确包含
+5,000 个 events 与 700 张 receipts，并要求 indexed relationship visit 不超过 replay event
+数量的四倍。
+
+每个 Phase 1 review 都绑定 canonical checkout identity 与精确、ignore-aware 的
+content fingerprint。v0.20.4 新写入的 binding 还携带
+`metadata-v1:<sha256>` change token，覆盖路径、entry kind、symlink target 与
+change-sensitive metadata；它用于快速 resume 投影和可判定的 pre-write
+校验/重试信号，绝不能单独授权 Execute，Execute 仍会重算 content fingerprint。每个新
+binding 都在同一稳定区间内按 `metadata before -> exact content before -> exact content
+after -> metadata after` 捕获；任一 exact 或 metadata 不匹配都会拒绝捕获，不会把旧
+content authority 与较新的 drift baseline 配对，在文件 metadata 较粗的平台上也一样。
+没有该 additive token 的旧 review context 继续可读，并回退到精确 content
+fingerprint 比较。每次扫描都执行 30 秒 cooperative work budget、1,000,000 个遍历 entry
+（包括目录）的工作预算，以及累计 128 MiB 编码路径名的内存预算。路径会先流式计数并受限，
+再对有界 manifest 做确定性排序，因此超宽目录不能绕过 entry 上限。单次阻塞式文件系统操作
+或目录 iterator step 可能超过 cooperative 时间预算；包括最终 EOF 在内，每次重新取得控制
+都会复查预算并 fail-closed，不会接受未验证的 workspace。路径名枚举仍由 ignore-aware
+walker 完成，只提供有界、排序后的 name list，本身不是读取 authority。Unix 的权威 entry
+访问使用 pinned root/parent file descriptor 与 `openat`/`fstatat`/`readlinkat`，以
+no-follow/nonblocking 打开并复核 identity、type、metadata、path 与 reopen 结果。Windows
+使用 pinned handle、`FILE_FLAG_OPEN_REPARSE_POINT`、final-path/file-identity 校验与
+`FSCTL_GET_REPARSE_POINT` 验证 regular file 和 reparse target。其他平台因为不支持安全
+workspace fingerprint read 而 fail-closed。因此 symlink、FIFO、replacement、parent/root
+swap、rename 或 reparse race 都不能让 scanner hash checkout 外部的内容。
+
+启动恢复要求一份完整、连续且已 committed 的 workflow replay。发现 sequence gap 或
+bounded-window cut 时，会在选择 Plan/Network authority 或 GC 任一 Phase 1 context 前
+fail-closed。Session append lock 是持久 regular-file 上的 OS advisory lock：不会按年龄
+回收，guard 也不会 unlink；lock path 若为 symlink 或 special entry 会 fail-closed。
+
+可恢复 headless session 还会在 reload 或 projection fold **之前**取得进程生命周期的
+Phase 1 writer lease。它与短时 workflow append lock、browser/automation controller lease
+是三个不同的锁与 ownership domain。writer lease 绑定精确 SessionStore path 与 session id；
+所有 clone 共享一次性 claim，因此只能构造一个独立 persistence graph。Unix 以
+`O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` 打开并校验 device/inode；Windows 以
+`FILE_FLAG_OPEN_REPARSE_POINT` 打开、拒绝 reparse point，并校验 volume/file identity。
+持久 lock path 从不 unlink，进程退出则由 OS 立即释放 advisory lock。
+
+resume 时，workspace 或 checkout 变化信号保持为可恢复 gate 状态：interaction metadata
+暴露 `workspaceDrifted: true` 与可操作的 `workspaceWarning`；Libra 不会 fence session，
+也不会启动 mutation。仅 metadata 变化时该信号只是提示：Execute 会执行精确
+identity/content 复核，并可在 authority 仍匹配时继续。精确 identity/content 已漂移或
+精确验证失败时，Execute 返回 `409 PHASE1_WORKSPACE_CHANGED` 并保留原 pending Plan
+gate。对于同一 Intent repository 内的新 HEAD，Modify 后的下一条非空纯文本 note
+会重新捕获当前 checkout、生成替换 Plan，并保留用户已有文件；不同 repository identity
+必须 Cancel 后发起新 request，重新审阅 IntentSpec。重新捕获失败时返回同一 409，note
+不会被消费。空或纯空白 revision message 返回
+`400 PLAN_REVISION_NOTE_REQUIRED`，revision authority 继续 pending。
 
 当服务器绑定到非 loopback host（`--host 0.0.0.0` 或局域网地址）时，非 loopback 浏览器的 HTML navigation 会收到静态 remote access notice，而不是 SPA。该 notice 零 JavaScript，只包含 bind/remote/version/commit 占位符；asset/API fallback 返回 404，使远程 clients 无法探测 session state。Snapshot、transcript、SSE、approval 以及所有 `/api/code/*` 读写 surface 仍保持 loopback-only（`LOOPBACK_REQUIRED`）。远程人工应通过 SSH port-forward 访问 loopback（`ssh -L 3000:127.0.0.1:3000 user@host`），不要期望远端浏览器直接可写；经认证的 TLS 反代属 DEFER-04，不是本计划默认面。
 
@@ -152,7 +206,7 @@ Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_c
 
 同一时间只有一个 writer 持有 controller lease：当已有 lease 活跃时，第二个 browser 或 automation attach 会以 `CONTROLLER_CONFLICT` 失败；lease takeover 会丢弃前一个 controller 的 session 审批（见下文 Approval Policies）。
 
-对于默认 Web 启动的非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走共享的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop。IntentSpec、Phase 1 plan review、confirmed execution、repair、approval 与 resume 都使用 runtime-owned interaction 和 event 路径；Web-only completion gate 固定这组对等行为。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。默认 Web `--resume <thread_id>` 会为非 Codex provider 在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。Web `--provider codex` 仍拒绝 `--resume`；裸 `libra code --provider codex --resume <thread_id>` 以 usage error 加迁移提示被拒绝（遗留 TUI resume driver 已在 W5-06 删除；managed Codex Web resume 尚未落地）。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
+对于默认 Web 启动的非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走共享的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop，但上文的 revision controls `/intent modify <changes>` 和 `/intent cancel` 例外。IntentSpec review、Phase 1 draft/revision、Plan/network-policy gates、approval 与 resume 使用 runtime-owned interaction 和 event 路径。Network Allow 经 `submit_confirmed_plan_execution` 把 confirmed plan execution 送入串行 AgentRuntime 队列。Mutating tools 仍走共享 hardening/approval/sandbox/ACL 边界，分类失败后由 W2-11 repair loop 接管。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。默认 Web `--resume <thread_id>` 会为非 Codex provider 在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。Web `--provider codex` 仍拒绝 `--resume`；裸 `libra code --provider codex --resume <thread_id>` 以 usage error 加迁移提示被拒绝（遗留 TUI resume driver 已在 W5-06 删除；managed Codex Web resume 尚未落地）。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，取消会被接受（`200`），runtime interaction 进入 `Cancelling`；浏览器可见的 `status` 在工具取得可判定结果前仍为 `executing_tool`。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn；取消等待期间的并发 submit 会以 `SESSION_BUSY` 被拒绝。
 
 对于 Web `--provider codex`，managed app-server 的 websocket 通知归一到共享 runtime `AgentEvent` 信封（与其他 provider 同一 projection 路径）。未知 Codex method 走显式可诊断的 `ProviderNotification` fallback，不 silent drop、也不 panic。Ask-mode approvals 挂在共享 `AgentRuntime` interaction 注册表上，并把浏览器 `respond_interaction` 决策转发到 app-server；Codex 仍拥有 app-server 内的 approval 回环（见 `docs/development/tracing/code.md` 的 DEFER-07）。对外 approval option id 与非 Codex 一致（`approve` / `deny` / `abort`）。
 
@@ -169,7 +223,7 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | `workingDir` | string | 会话工作目录。 |
 | `provider` | object | `{ provider, model?, mode?, managed }`。 |
 | `capabilities` | object | 八个 booleans：`messageInput`、`streamingText`、`planUpdates`、`toolCalls`、`patchsets`、`interactiveApprovals`、`structuredQuestions`、`providerSessionResume`。 |
-| `controller` | object | `{ kind, ownerLabel?, canWrite, leaseExpiresAt?, reason?, loopbackOnly }`；`kind` 是 `none`、`browser`、`automation`、`tui` 或 `cli`。 |
+| `controller` | object | `{ kind, ownerLabel?, canWrite, leaseExpiresAt?, reason?, loopbackOnly }`；`kind` 是 `none`、`browser`、`automation`、`tui` 或 `cli`。`tui` 仅从历史 snapshot 解码；每个新的 lease 都会以 `INVALID_CONTROLLER_KIND` 拒绝它，并且新会话绝不会输出该值。 |
 | `status` | string | `idle`、`thinking`、`executing_tool`、`awaiting_interaction`、`completed`、`error` 或 `indeterminate_side_effect`。最后一种表示变异命令可能已生效；再次尝试前必须先完成 reconciliation。 |
 | `transcript` | array | 带 `id`、`kind`、可选 `title` / `content` / `status`、`streaming`、`metadata`、`createdAt`、`updatedAt` 的条目。 |
 | `plans` / `tasks` / `toolCalls` / `patchsets` | arrays | Workflow、Summary、Diff 和 Terminal panes 使用的 runtime projections。 |
@@ -203,6 +257,95 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 **SSE v1**（默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
 
 **SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在 **transport** backlog 窗口内无重复、无丢事件（W3-08 / GC-CODE-12）：**1,024 条或 8 MiB**，先达者为准（`MAX_CODE_UI_TRANSPORT_BACKLOG_*`）。Code UI **projection** 热窗口是同数值、独立命名的预算（`MAX_CODE_UI_PROJECTION_EVENTS` / `MAX_CODE_UI_PROJECTION_REPLAY_BYTES`），两者不可相加。单事件 fold 只访问 suffix，不回放整段 session 历史（W3-14；10k events 下 release p95 ≤ 5 ms）。bootstrap 或慢消费者 catch-up 将超过该预算时，服务器发送 `event: resync`（`WIRE_V2_RESYNC_REQUIRED`，含 `reason` / `lastCursor` / `durableTail` / `action: fetch_snapshot`）并结束流，**不 silent drop**。客户端应拉取 session snapshot，再以 `durableTail` 重连。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的默认 Web headless（非 Codex `HeadlessCodeRuntime`）；managed `--provider codex` Web 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
+
+v2 envelope 使用 camelCase，但各 `payload` 保留 durable workflow event 的
+snake_case schema。新的 `plan_review_requested` payload 包含 `context_id`，用于绑定
+immutable Phase 1 context；Back 会创建新的 interaction id，但复用来源 `context_id`，
+而不复制 context。Modify 后产生的替换计划还可以携带可选 `revision_of`，其值是被消费
+的上一代 Plan review interaction。Back 准备替换 Plan gate 时，该行还会携带可选
+`prepared_from_network`；只有被引用的 Network gate 已持久化 `back` resolution 后，
+该 Plan gate 才成为权威。历史行省略这些字段：`context_id` 解码为 `""` 并回退到该行的
+`interaction_id`，`revision_of` 与 `prepared_from_network` 解码为 `None`。客户端必须把
+缺省 lineage 解释为初始或 legacy Plan review，不能自行推断。早于这些字段的 reader 会
+忽略 additive members，仍把该行识别为 `plan_review_requested`。
+
+runtime 在正式写入 execution/test Plan pair 前会发送
+`phase1_formal_write_started`，payload 包含 `phase1_turn_id`、
+`source_interaction_id` 与不含秘密正文的 `seed_digest`。恢复仅可在此 marker 尚不存在时，
+重挂与 seed 精确匹配的 Pending Phase 1 command；marker 已存在却没有后续
+`plan_review_requested` 时属于不确定写入边界，必须 fail closed 并要求 reconciliation。
+
+当 command 接受一条 interaction 后还会继续运行时，durable checkpoint 继续复用既有的
+`interaction_resolved` event kind。新行可以携带 `command` identity 与
+`prior_interaction_resolutions`；兼容字段 `interaction_id` / `resolution` 仍表示本次
+checkpoint。该 additive 形状使旧 reader 仍能推进 workflow sequence 并保留当前非敏感审计标签，
+同时不会把仍为 Pending 的 command 误判为 terminal。
+
+命令终态行同样沿用 snake_case payload。`command_terminal_success_with_interaction_resolved`
+把当前 gate 保留在兼容字段 `interaction_id` / `resolution` 中，并可用
+`prior_interaction_resolutions` 记录同一 command 先前已经交付的 approval 或 user-input；
+`command_terminal_failure` 可同样携带 `interaction_resolutions`。每条历史记录都是二元素数组
+`[interaction_id, non_secret_resolution_label]`，其中不会保存原始回答、approval payload 或
+provider 输出。
+
+规范的 IntentSpec `modify` 终态只可额外携带公开绑定
+`intent_revision: { "interaction_id": "...", "sidecar_digest":
+"hmac-sha256:<64 个小写十六进制字符>" }`。非空 Modify note 会先去除首尾空白，其 UTF-8
+表示不得超过 16 KiB（16,384 bytes）。提交 terminal 前，Libra 会先 durable 写入私有、
+session-local 的 **Prepared** sidecar；其中保存原始 note、准确 IntentSpec，以及覆盖 schema、lineage
+和正文的 keyed HMAC-SHA256。crash-atomic terminal row 与同一次 fsync 只保留兼容主字段
+`interaction_id` / `resolution` 和 digest 绑定，绝不写入原始 note 或 HMAC key。这个排除
+边界适用于 workflow terminal、消费收据及其专用 SSE v2 payload；它不会清除普通 transcript
+entry、完整 session snapshot 或对应 projection delta 中的用户内容，用户文本仍按既有边界保留。
+
+HMAC key 仅属于当前 session，并与本地 sidecar 一同存放。digest 用于跨崩溃证明准确的
+durable lineage，并避免私有正文进入公开 workflow stream；它**不能**防御能够同时改写这两个
+本地文件的同用户攻击者。已有 HMAC 绑定后 key 缺失、digest 非规范或不匹配、lineage 有歧义，
+以及已绑定 terminal 同时缺少 sidecar 与准确消费收据，都会 fail closed 并要求 reconciliation。
+
+terminal fsync 后，**Prepared** 会提升为已认证的 **Active** revision mode。startup 遇到
+原 gate 仍开放的孤立 Prepared 时会将其丢弃；若存在匹配的已提交 terminal 则完成提升，任何
+不匹配都 fail closed。下一条被接受的 revision turn 会先 durable 写入 consumer command intent
+与 browser-message snapshot，再在 Runtime admission 之前 fsync 携带完整 command identity 的
+**Claiming** envelope。当 durable intent 的 event id 和 sequence 已确定后，Libra 会在
+executor start gate 打开前把 Claiming 提升为绑定 event 的 **Consuming**。
+
+只有请求的 effect 获得 durable proof 后才会提交消费。对于原始文本精确等于
+`/intent cancel` 的输入，该 proof 是固定的“不调用 provider”取消 effect；Libra 会在
+unlink sidecar 并确认取消前追加、fsync 收据。对于普通 revision note 或严格的
+`/intent modify <changes>`，provider 必须恰好一次成功调用 `submit_intent_draft`；
+Libra 会先 durable 写入替换 IntentSpec 及其 `IntentReviewRequested` marker，再追加收据并
+unlink sidecar。成功 draft 调用为零次或多次时都 fail closed，且不消费 revision。带前后
+空白或其它不精确写法的 `/intent cancel` 是普通 explicit-direct 输入，不会获得固定
+cancel 特权。Modify suffix 会在写入 Claiming 之前去除首尾空白并限制为 16 KiB。
+
+已提交的消费会以 additive 的 `intent_revision_consumption` 收据字段追加到 workflow
+事件流中，绑定准确的 terminal lineage、consumer command intent 以及 consumer intent 的
+event id/sequence。SSE v2 把已提交收据投影为专用的
+`kind: "intent_revision_consumed"`，payload 为
+`{ "consumption": ... }`；其中不含通用 resolution 字段或原始 note。durable effect proof
+之前崩溃会保留 Consuming，以便按准确 consumer 身份恢复。替换 review marker 或 cancel
+收据之后崩溃时，startup 不会重跑 provider，会规范化残留的 transcript/tool projection，并
+保留同一 replacement gate（或已完成的取消）。有效收据会永久闭合整条准确 retry lineage，
+即使后续已解决 replacement gate，更晚的 Web command 也不会使历史 consumer 变得有歧义。
+互相冲突的 marker/terminal/receipt 顺序（包括在不兼容的 consumer terminal 之后才写入
+replacement marker）会 fail closed，且绝不伪造收据。
+
+Prepared 与 Consuming 会故意留下空的 legacy `intentSpec`，因此早于这些 envelope 的 reader
+会拒绝它们，而不会激活未提交或消费状态有歧义的 revision。Active 只有在 terminal 已提交后
+才对旧 reader 保持可读；若旧 binary 在没有新收据的情况下消费它，之后的新 reader 会 fail
+closed，而不会把 sidecar 缺失当作已消费证明。历史 terminal 行省略 `intent_revision`，解码为
+`None`；旧 workflow reader 会忽略这个 additive member，仍根据兼容主字段关闭 terminal。
+新 reader 只会在存在唯一、准确 terminal lineage 时接受绑定机制之前的 legacy Active sidecar，
+并在消费前补上 digest；缺失的非空 legacy note 无法重建。上述 resolution-history 字段继续保持
+additive，缺省为空列表。
+
+在 `phase1_formal_write_started` 之前，失败的 Phase 1 command 可以把
+`retry_intent_review` 与 `command_terminal_failure` Failure 终态放在同一个
+crash-atomic row 和 fsync 中。该行同时是 Failure 终态与唯一的 IntentSpec retry
+review authority，因此恢复不会看到缺少替换 gate 的失败。Cancel 会等待已 admission 的
+terminal writer，在 durable 地以 `cancel` 关闭内嵌 retry interaction 后才确认取消；
+replay 因而不会重新打开该 gate。
 
 ### SSE v1 兼容窗口（DEFER-08）
 
@@ -244,11 +387,14 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `INVALID_CONTROLLER_KIND` | 400 | Controller attach 请求了不支持的 kind。 |
 | `CONTROLLER_CONFLICT` | 409 | 另一个 live controller 拥有 lease，或会话正忙。 |
 | `INTERACTION_NOT_ACTIVE` | 409 | respond 目标 interaction 没有活跃的 runtime turn。 |
-| `SESSION_BUSY` | 409 | 有 turn 运行时重复 submit,或无 turn 可取消时 cancel(W5-02:已删除 TUI 桥错误码的 UI 中立继承者)。 |
+| `PHASE1_WORKSPACE_CHANGED` | 409 | Execute 的精确 checkout identity/content 不再匹配已审 Plan，或 Libra 无法验证/重新捕获。仅 metadata 变化的 `workspaceWarning` 可能通过精确复核，本身不会产生此错误。不会启动 mutation，陈旧 Execute 保留 pending gate。同一 repository 的新 HEAD 可用 Modify 重生成；不同 repository 必须 Cancel 后发起新 request。重新捕获失败不会消费 note。 |
+| `PLAN_EXECUTION_NOT_AVAILABLE` | 409 | 历史 Web 409：当时 confirmed-plan execution 尚未接线。W2-04 之后 Network Allow 会把执行送入串行 runtime 队列，而不再产生该码。旧客户端仍可解码目录中的 409。 |
+| `SESSION_BUSY` | 409 | 有 turn 运行时重复 submit、无 turn 可取消时 cancel，或 IntentSpec revision authority 活跃时发送新的 explicit-direct command。精确 terminal retry 与匹配 live `commandId` retry 是幂等确认，不追加事件。 |
 | `BROWSER_CONTROL_DISABLED` | 403 | 浏览器写控制已禁用。 |
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | 用非 automation lease 调用了 automation-only 路径。 |
 | `CODE_UI_UNAVAILABLE` | 404 | 没有 active `libra code` session 附加到 Web 服务器。 |
-| `INVALID_QUERY_PARAM` | 400 | 查询解析失败，目前用于 `/threads` 分页。 |
+| `INVALID_QUERY_PARAM` | 400 | 查询或 interaction response 校验失败，包括 `/threads` 分页，以及超过 16 KiB（16,384 UTF-8 bytes）上限的 IntentSpec Modify note。过大的 plain 或 `/intent modify` 输入会在 Claiming、Runtime admission 与任何 workflow append 前被拒绝。 |
+| `PLAN_REVISION_NOTE_REQUIRED` | 400 | Plan Modify 后的下一条纯文本消息为空或只有空白。Revision authority 保持 pending 且未消费；请发送非空修改说明，或 Cancel。 |
 | `INVALID_COMMAND_ID` | 400 | `commandId` 为空、过长，或包含空白/控制字符。 |
 | `THREAD_GRAPH_INVALID_ID` | 400 | `GET /api/code/thread-graph` 的 `threadId` 不是 canonical UUID。 |
 | `STORAGE_PATH_INVALID` / `STORAGE_ROOT_UNRESOLVED` / `STATUS_UNAVAILABLE` / `THREAD_LIST_FAILED` / `DB_UNAVAILABLE` / `USAGE_UNAVAILABLE` / `THREAD_GRAPH_STORAGE_UNAVAILABLE` / `THREAD_GRAPH_UNAVAILABLE` / `SESSION_RESUME_LOAD_FAILED` / `INTERNAL_ERROR` | 500 | 服务端 storage、status、projection、database、usage、thread graph、resume load 或 fallback internal failure。 |
@@ -370,7 +516,7 @@ libra code --provider codex --plan-mode
 
 ## 人工输出
 
-输出会根据模式通过 Web UI 或 MCP 协议交付。Web 模式会在 stdout 打印 URL / control 信息并前台常驻直到 SIGINT/SIGTERM。在 generic provider workflow 中，普通纯文本请求会自动启动 plan workflow；显式 slash commands 保持其命令专用行为。Generic provider planning 使用两步审阅：LLM 首先起草 IntentSpec 供确认，然后确认后的 IntentSpec 会被送回 LLM，用于在任何执行开始前生成可审阅执行计划。如果已确认计划执行失败，或 orchestrator 在到达最终决策前中止，Libra 会将失败证据反馈给 planner，要求其添加或调整修复步骤，并在自动修复阈值内自动运行修订计划。达到阈值后，会话会等待开发者以更高的重试限制继续（Code UI Continue 需提高 `maxAttempts`），或提供显式计划修复指导；普通 `continue` 会保留已耗尽的限制并返回 `PLAN_REPAIR_RETRY_LIMIT_REACHED`。Cancel 为终态。Web 服务器提供嵌入式 Next.js 应用。Stdio 模式通过遵循 Model Context Protocol 的 JSON-RPC 消息通信。
+输出会根据模式通过 Web UI 或 MCP 协议交付。Web 模式会在 stdout 打印 URL / control 信息并前台常驻直到 SIGINT/SIGTERM。在 generic provider workflow 中，普通纯文本请求会自动启动 plan workflow；显式 slash commands 保持其命令专用行为。Generic provider planning 使用两步审阅：LLM 首先起草 IntentSpec 供确认，然后确认后的 IntentSpec 会被送回 LLM，用于在任何执行开始前生成可审阅执行计划。Modify 会等待下一条纯文本 revision note，再展示替换计划；Execute 只推进到强制 network-policy gate。Deny 与 Back 可用；Network Allow 会把 confirmed plan execution 送入串行 runtime 队列。Mutating tools 仍须 approval/sandbox/ACL，分类失败进入 W2-11 repair loop。Web 服务器提供嵌入式 Next.js 应用。Stdio 模式通过遵循 Model Context Protocol 的 JSON-RPC 消息通信。
 
 ## Diagnostics
 
@@ -423,7 +569,7 @@ AI agents 在开发者机器上执行 shell 命令存在真实安全风险。五
 
 嵌入式 Code UI 在其 session snapshot 中以 `threadId` 暴露相同规范标识。较旧的 `session_id` 字段仍保留以维持兼容，但新集成应使用 `threadId` 作为 resume、Web、MCP 和 diagnostics 流程的 key。
 
-对于持久化的非 Codex Web session，初始 session 写入是启动 turn 的前提：写入失败时 Libra 不会启动 turn，浏览器可修复存储后重试。若后续持久化失败，live session 会变为 `indeterminate_side_effect`，并阻止新的 submit 或 interaction reply；重启或 reconciliation 前必须检查 durable session data。
+对于持久化的非 Codex Web session，初始 session 写入是启动 turn 的前提：写入失败时 Libra 不会启动 turn，浏览器可修复存储后重试。Approval 与 user-input response 也会在释放 continuation 前写入 checkpoint；若该 checkpoint 失败，原 interaction 保持 pending、尚未启动获批操作，修复存储后可以重试同一 response。若 response 或 side-effect boundary 已被消费后再发生持久化失败，live session 会变为 `indeterminate_side_effect`，并阻止新的 submit 或 interaction reply；重启或 reconciliation 前必须检查 durable session data。
 
 收到 `Ctrl-C` / `SIGINT` 或 `SIGTERM` 时，非 Codex headless / web-only 进程会关闭浏览器命令 admission，再走统一的进程级 lifecycle shutdown owner（runtime / listeners / managed child / control），并共享同一 deadline。read-only/model 工作会 cooperative cancel；已经开始的 mutating tool 在预算内被允许完成。若超过期限，`libra code` 会以明确的 shutdown failure 退出，重启前必须检查 session 并完成 reconciliation。进程编排应优先发送 `SIGTERM`（或 `Ctrl-C`/`SIGINT`），避免直接 `SIGKILL`，以便端口、lease 与子进程被干净释放。
 

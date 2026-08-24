@@ -90,7 +90,7 @@ EXAMPLES:
     libra diff -R                           Reverse diff (swap additions and deletions)
     libra --json diff --staged              Structured JSON output for agents";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(after_help = DIFF_EXAMPLES)]
 pub struct DiffArgs {
     /// Old commit, default is HEAD
@@ -497,6 +497,46 @@ pub struct DiffFileStat {
     new_mode: Option<u32>,
 }
 
+impl DiffArgs {
+    /// Build the diff selection an in-process service caller needs
+    /// (plan-20260818 LB-04), with every presentation and extension flag off.
+    ///
+    /// Lives here because `pathspec` is a private field: a service caller must
+    /// go through this constructor rather than assemble a `DiffArgs` literal,
+    /// so the two execution-capable knobs can never be left on by accident.
+    ///
+    /// # Arguments
+    ///
+    /// * `staged` - Compare the index against HEAD instead of the working tree.
+    /// * `old` - The old side, when comparing against a specific commit.
+    /// * `pathspec` - Path selectors, already validated by the caller.
+    ///
+    /// # Returns
+    ///
+    /// A `DiffArgs` with `--no-ext-diff` and `--no-textconv` forced on, so
+    /// repository configuration can never turn the diff into process execution.
+    pub(crate) fn for_service(staged: bool, old: Option<String>, pathspec: Vec<String>) -> Self {
+        Self {
+            staged,
+            old,
+            pathspec,
+            no_ext_diff: true,
+            no_textconv: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl DiffFileStat {
+    /// The raw unified patch body for this file, exactly as `run_diff`
+    /// produced it. Exposed for in-process service callers (the agent bridge's
+    /// `diff.get`, plan-20260818 LB-04) that render their own bounded
+    /// projection instead of the CLI's output.
+    pub fn raw_patch(&self) -> &str {
+        &self.raw_diff
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffOutput {
     pub old_ref: String,
@@ -721,6 +761,60 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
         apply_diff_prefixes(&mut result, &config.prefixes);
     }
     render_diff_output(&args, &result, output)
+}
+
+/// Run the diff pipeline for an in-process service caller and return the
+/// structured result without rendering anything (plan-20260818 LB-04).
+///
+/// This is the seam the agent bridge's `diff.get` uses: it performs the same
+/// revision resolution, config resolution and diff computation as
+/// [`execute_safe`], including the read-only sparse-view projection, but it
+/// never writes to stdout/stderr and never applies the CLI-only presentation
+/// passes (`--relative` rewriting, word-diff rendering, prefixes). Keeping the
+/// bridge on this seam is what makes GC-LB-04 stdout purity provable: the
+/// caller owns every byte it emits.
+///
+/// The caller is responsible for pinning the fields it cares about on `args`
+/// (e.g. `staged`, `old`, `pathspec`) and for disabling any flag whose
+/// behaviour it does not want; [`DiffArgs::default()`] is the all-off starting
+/// point.
+///
+/// # Arguments
+///
+/// * `args` - The diff selection. Consumed because revision resolution
+///   rewrites the positional/`--old`/`--new` fields in place.
+///
+/// # Returns
+///
+/// The computed [`DiffOutput`], or a [`DiffError`] describing the first
+/// failure (not in a repository, unresolvable revision, bad pathspec, …).
+pub(crate) async fn run_diff_for_service(mut args: DiffArgs) -> Result<DiffOutput, DiffError> {
+    if util::require_repo().is_err() {
+        return Err(DiffError::NotInRepo);
+    }
+    resolve_positional_revisions(&mut args).await?;
+    let diff_algorithm = resolve_diff_algorithm(&args)?;
+    let pickaxe = parse_diff_pickaxe(&args)?;
+    let config = resolve_diff_config(&args).await?;
+    // A quiet, non-paged, machine-mode config: `run_diff` uses it only for
+    // progress/hook I/O decisions, and every one of those must stay silent for
+    // a service caller.
+    let output = OutputConfig {
+        json_format: Some(crate::utils::output::JsonFormat::Compact),
+        color: ColorChoice::Never,
+        pager: false,
+        quiet: true,
+        exit_code_on_warning: false,
+        progress: ProgressMode::None,
+        progress_preference: crate::utils::output::ProgressPreference::None,
+    };
+    let mut result = run_diff(&args, &output, &config, pickaxe.as_ref(), &diff_algorithm).await?;
+    // Same read-only sparse-view scoping as the CLI: only the pure-browsing
+    // working-tree diff is filtered, never `--staged` or rev-vs-rev.
+    if !result.external_diff_applied && !args.staged && args.new.is_none() {
+        apply_sparse_view_filter(&mut result).await;
+    }
+    Ok(result)
 }
 
 /// Whether `--word-diff` is set to a rendering mode (i.e. not `none`/absent), in

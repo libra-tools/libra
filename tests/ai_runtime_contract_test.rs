@@ -1481,6 +1481,9 @@ fn plan_review_execute_leaves_network_policy_gate_recoverable() {
             plan_id: "plan-42".to_string(),
             turn_id: "plan-review-turn".to_string(),
             phase1_turn_id: "phase1-turn".to_string(),
+            context_id: "review-42".to_string(),
+            revision_of: None,
+            prepared_from_network: None,
         })
         .expect("plan review marker persists");
     // Premature marker (before Execute) must not restore.
@@ -1510,6 +1513,9 @@ fn plan_review_execute_leaves_network_policy_gate_recoverable() {
         .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "review-42".to_string(),
             resolution: "execute".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("plan review resolution persists");
 
@@ -1545,6 +1551,9 @@ fn plan_review_execute_leaves_network_policy_gate_recoverable() {
         .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
             interaction_id: network_interaction_id,
             resolution: "network-allow".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("network policy resolution persists");
     assert!(
@@ -1603,6 +1612,9 @@ async fn plan_review_execute_hold_queued_persists_interaction_resolved() {
             plan_id: "plan-hold".to_string(),
             turn_id: "plan-review-turn".to_string(),
             phase1_turn_id: "phase1-turn".to_string(),
+            context_id: "review-hold".to_string(),
+            revision_of: None,
+            prepared_from_network: None,
         })
         .expect("plan review marker");
     store
@@ -1654,6 +1666,7 @@ async fn plan_review_execute_hold_queued_persists_interaction_resolved() {
             CodeWorkflowEventKind::InteractionResolved {
                 interaction_id,
                 resolution,
+                ..
             }
             | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
                 interaction_id,
@@ -1979,6 +1992,9 @@ async fn plan_review_network_gate_survives_worker_restart_after_execute() {
             plan_id: "plan-restart".to_string(),
             turn_id: "plan-review-turn".to_string(),
             phase1_turn_id: "phase1-turn".to_string(),
+            context_id: "review-restart".to_string(),
+            revision_of: None,
+            prepared_from_network: None,
         })
         .expect("plan review marker");
     handle
@@ -2918,6 +2934,9 @@ fn plan_execution_repair_loop() {
         .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "repair-after-restart".to_string(),
             resolution: "continue".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("resolve repair gate");
     let replay = store
@@ -3037,6 +3056,9 @@ fn plan_execution_repair_manual_revision_continuation_survives_phase1_admit_cras
         .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "repair-manual-guidance".to_string(),
             resolution: "continue".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("acknowledge original gate");
     store
@@ -3045,6 +3067,9 @@ fn plan_execution_repair_manual_revision_continuation_survives_phase1_admit_cras
             plan_id: "revised-plan".to_string(),
             turn_id: "revised-plan-review-turn".to_string(),
             phase1_turn_id: "revised-phase1-turn".to_string(),
+            context_id: "revised-plan-review".to_string(),
+            revision_of: None,
+            prepared_from_network: None,
         })
         .expect("record revised plan review after Phase 1 admission");
 
@@ -3105,6 +3130,9 @@ fn plan_execution_repair_manual_revision_cancel_retires_continuation() {
         .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "repair-manual-guidance".to_string(),
             resolution: "continue".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("acknowledge original gate");
     store
@@ -3113,6 +3141,9 @@ fn plan_execution_repair_manual_revision_cancel_retires_continuation() {
             plan_id: "revised-plan".to_string(),
             turn_id: "revised-plan-review-turn".to_string(),
             phase1_turn_id: "revised-phase1-turn".to_string(),
+            context_id: "revised-plan-review".to_string(),
+            revision_of: None,
+            prepared_from_network: None,
         })
         .expect("record regenerated plan review");
 
@@ -3122,6 +3153,9 @@ fn plan_execution_repair_manual_revision_cancel_retires_continuation() {
         .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "repair-manual-guidance-continuation".to_string(),
             resolution: "repaired execution plan cancelled".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("retire continuation on regenerated plan cancellation");
 
@@ -3318,12 +3352,18 @@ fn plan_execution_repair_recovery_retires_raised_limit_pre_ack_continuation() {
             interaction_id: "repair-crash-continuation".to_string(),
             resolution: "repair continuation retired while restoring its unresolved predecessor"
                 .to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("retire speculative continuation");
     store
         .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "repair-crash-predecessor".to_string(),
             resolution: "continue".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("resolve restored predecessor");
 
@@ -3871,6 +3911,9 @@ async fn plan_execution_repair_reopens_gate_when_phase1_replan_fails() {
             libra::internal::ai::session::CodeWorkflowEventKind::InteractionResolved {
                 interaction_id: "repair-continuation-after-ack".to_string(),
                 resolution: "repair continuation superseded by replan failure".to_string(),
+                command: None,
+                prior_interaction_resolutions: Vec::new(),
+                intent_revision_consumption: None,
             },
         )
         .expect("retire continuation after replacement gate persists");
@@ -4393,45 +4436,30 @@ async fn sequential_user_input_resolutions_all_persist_on_terminal_success() {
         .into_iter()
         .map(|event| event.event)
         .collect();
-    let resolved_ids: Vec<&str> = events
-        .iter()
-        .filter_map(|event| match event {
-            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. }
-            | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
-                interaction_id,
-                ..
-            } => Some(interaction_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        resolved_ids.contains(&"input-first"),
-        "first sequential resolution must be durable: {events:?}"
-    );
-    assert!(
-        resolved_ids.contains(&"input-second"),
-        "second sequential resolution must be durable: {events:?}"
-    );
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            CodeWorkflowEventKind::InteractionResolved {
-                interaction_id,
-                resolution,
-            } if interaction_id == "input-first" && resolution == "answered-first"
-        )),
-        "earlier resolution must appear as InteractionResolved before terminal: {events:?}"
-    );
     assert!(
         events.iter().any(|event| matches!(
             event,
             CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
                 interaction_id,
                 resolution,
+                prior_interaction_resolutions,
                 ..
-            } if interaction_id == "input-second" && resolution == "answered-second"
+            } if interaction_id == "input-second"
+                && resolution == "answered-second"
+                && prior_interaction_resolutions == &vec![(
+                    "input-first".to_string(),
+                    "answered-first".to_string(),
+                )]
         )),
-        "last resolution must ride with CommandTerminalSuccessWithInteractionResolved: {events:?}"
+        "all sequential resolutions must share one crash-atomic terminal row: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. }
+                if interaction_id == "input-first"
+        )),
+        "the earlier resolution must not be exposed as a torn-write prefix: {events:?}"
     );
     worker.abort();
 }

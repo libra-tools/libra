@@ -139,7 +139,7 @@ impl Drop for RunSlot {
     }
 }
 
-/// A parked queue reservation. Blocks in [`wait_for_slot`] until a slot frees
+/// A parked queue reservation. Blocks in `wait_for_slot` until a slot frees
 /// and this ticket is the oldest waiter, then converts to a [`RunSlot`].
 /// Dropping it without promotion removes the reservation (e.g. Ctrl-C on a
 /// queued foreground run advances the queue for others).

@@ -55,6 +55,8 @@ when the object is missing.
 
 Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2-8) described in the migration section below. When this variable is unset or `0`, Libra uses the Git-standard codes shown above.
 
+Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly.
+
 ## Migration From Fine-Grained Exit Codes
 
 Libra previously used fine-grained exit codes (2-8) to distinguish failure categories.
@@ -135,6 +137,21 @@ structured report is always present.
 | `128` | `LBR-AGENT-021` | `internal` | Requested captured-agent session is absent from both the session catalog and local erasure tombstones | `libra agent graph unknown-session` |
 | `128` | `LBR-AGENT-022` | `internal` | Agent workspace lease refused: another live workspace record already claims the linked worktree identity or the canonical directory | two agents requesting a writable lease on the same linked worktree, or on an alias of an already-leased path |
 | `128` | `LBR-AGENT-023` | `internal` | Workspace lease owner/fence is stale — the lease was reclaimed with a higher fence or already settled | renewing or releasing after the expired lease was reclaimed with a higher fence by its workspace owner |
+| `frame` | `LBR-AGENT-024` | `internal` | Bridge protocol frame failed JSON parsing (JSON-RPC `-32700`) | a peer writes a non-JSON NDJSON line to `libra agent bridge --stdio` |
+| `frame` | `LBR-AGENT-025` | `internal` | Bridge request is not a valid JSON-RPC 2.0 object (JSON-RPC `-32600`) | a peer sends a frame missing `jsonrpc`/`method`, or with an unsupported `jsonrpc` version |
+| `frame` | `LBR-AGENT-026` | `internal` | Bridge method is not in the v1 20-method allowlist (JSON-RPC `-32601`) | invoking `create_intent` or another low-level method over the bridge |
+| `frame` | `LBR-AGENT-027` | `internal` | Bridge method params failed schema/limit validation (JSON-RPC `-32602`) | `event.append` with a batch over 64 events or 256 KiB |
+| `frame` | `LBR-AGENT-028` | `internal` | Bridge request exceeded the v1 frame byte cap (256 KiB) and was refused | a peer writes an NDJSON line larger than 256 KiB |
+| `frame` | `LBR-AGENT-029` | `internal` | Bridge connection already has the maximum in-flight requests (64) | a peer floods requests without waiting for responses |
+| `frame` | `LBR-AGENT-030` | `internal` | Bridge method is allowlisted but not implemented by this build | invoking a session/workspace method before its card (LB-03..LB-06) ships |
+| `frame` | `LBR-AGENT-031` | `internal` | Bridge protocol major mismatch — the peer's declared major differs from this build's, so every request is refused | a peer speaks protocol `2.x` against this `1.x` bridge |
+| `frame` | `LBR-AGENT-032` | `internal` | Bridge scope conflict — a self-reported/stale repository, worktree, workspace or actor disagrees with the trusted handshake/context (fail-closed) | a peer self-reports a repository id that differs from the bridge's trusted repo |
+| `frame` | `LBR-AGENT-033` | `internal` | Bridge payload digest conflict — a duplicate `(session_id,event_seq)` or `operation_id` carried a different payload hash | a peer replays an event sequence with altered payload |
+| `frame` | `LBR-AGENT-034` | `internal` | Bridge redaction or payload-size validation could not be satisfied; the original payload was refused (no raw fallback) | a peer sends a payload that cannot be safely redacted |
+| `frame` | `LBR-AGENT-035` | `internal` | Bridge mutating operation denied by policy or approval | `checkpoint.restore` without the required approval |
+| `frame` | `LBR-AGENT-036` | `internal` | Bridge request exceeded its deadline (default 30 s) | a `commit.create` that stalls past the request deadline |
+| `frame` | `LBR-AGENT-037` | `internal` | Bridge internal error (JSON-RPC `-32603`) — a database/VCS/generic failure that cannot be attributed to the peer | the bridge's SQLite store returns a transient error during `event.append` |
+| `frame` | `LBR-AGENT-038` | `internal` | Bridge mutation fence drifted — HEAD moved, or the index/worktree is dirty where the operation requires a clean one; refused **before** any write | `commit.create` with a stale `expected_head`, or `checkpoint.restore` against a dirty working tree |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 > **update-ref exit-code exception** — `src/command/update_ref.rs:107-113` stamps **every**
@@ -235,6 +252,21 @@ structured report is always present.
 | `LBR-AGENT-021` | Requested captured-agent session does not exist in this repository |
 | `LBR-AGENT-022` | Another live workspace record already leases this linked worktree or directory |
 | `LBR-AGENT-023` | The presented workspace lease owner/fence is stale; the lease was reclaimed or already released |
+| `LBR-AGENT-024` | Bridge protocol frame failed JSON parsing |
+| `LBR-AGENT-025` | Bridge request is not a valid JSON-RPC 2.0 object |
+| `LBR-AGENT-026` | Bridge method is not in the v1 20-method allowlist |
+| `LBR-AGENT-027` | Bridge method params failed schema/limit validation |
+| `LBR-AGENT-028` | Bridge request exceeded the v1 frame byte cap (256 KiB) and was refused |
+| `LBR-AGENT-029` | Bridge connection already has the maximum in-flight requests (64) |
+| `LBR-AGENT-030` | Bridge method is allowlisted but not implemented by this build |
+| `LBR-AGENT-031` | Bridge protocol major mismatch; every request is refused |
+| `LBR-AGENT-032` | Bridge scope conflict; a self-reported/stale scope disagrees with the trusted context |
+| `LBR-AGENT-033` | Bridge payload digest conflict on a duplicate `(session_id,event_seq)` or `operation_id` |
+| `LBR-AGENT-034` | Bridge redaction or payload-size validation could not be satisfied; payload refused |
+| `LBR-AGENT-035` | Bridge mutating operation denied by policy or approval |
+| `LBR-AGENT-036` | Bridge request exceeded its deadline |
+| `LBR-AGENT-037` | Bridge internal error (DB/VCS/generic failure) |
+| `LBR-AGENT-038` | Bridge mutation fence drifted (HEAD moved or the index/worktree is dirty); refused before any write |
 
 ### Unsupported
 
@@ -274,6 +306,11 @@ failures as `-32000` with `data.status` and `data.code`.
 
 | Wire code | HTTP | Meaning |
 | --- | --- | --- |
+| `SESSION_BUSY` | `409` | A turn is already running, no turn exists for the requested cancel, or a fresh explicit-direct command was submitted while IntentSpec revision authority is active. Exact terminal retries and matching live `commandId` retries are the only revision-gate exceptions; they are idempotent acknowledgements and append nothing. A padded or otherwise non-exact `/intent cancel` is a fresh explicit-direct command and receives this 409 while the revision remains pending. |
+| `INVALID_QUERY_PARAM` | `400` | Query or interaction-response validation failed. IntentSpec Modify notes are limited to 16 KiB (16,384 UTF-8 bytes); oversized plain notes and `/intent modify <changes>` suffixes are rejected before Claiming, Runtime admission, or any workflow append, so revision authority remains pending and unconsumed. |
+| `PHASE1_WORKSPACE_CHANGED` | `409` | Execute's exact checkout identity/content no longer matches the reviewed Plan, or Libra cannot verify/recapture it. A metadata-only `workspaceWarning` may pass that exact recheck and does not itself produce this error. No mutation starts; stale Execute preserves the pending gate. Modify may regenerate for a new HEAD in the same repository, while a different repository requires Cancel and a new request/IntentSpec review. Failed recapture leaves the note unconsumed. |
+| `PLAN_EXECUTION_NOT_AVAILABLE` | `409` | Historical Web 409 while confirmed-plan execution was unwired. After W2-04, Network Allow admits execution onto the serialized runtime queue instead of producing this code. Older clients may still decode the catalogued 409. |
+| `PLAN_REVISION_NOTE_REQUIRED` | `400` | The message after Plan Modify was empty or whitespace-only. Revision authority remains pending and unconsumed; send a non-empty change description or Cancel. |
 | `PLAN_REPAIR_RETRY_LIMIT_REACHED` | `409` | A plan-repair Continue request did not raise the exhausted automatic retry cap. For Code UI/control, retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |
 | `REDACTION_FAILED` | `500` | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the HTTP body or SSE payload omits unredacted content. Restart `libra code` or fix redactor configuration, then retry. |
 | `INVALID_WIRE_VERSION` | `400` | `GET /api/code/events` `wire` query / `Accept;libra-wire=` value was not `1`/`v1` or `2`/`v2`. |

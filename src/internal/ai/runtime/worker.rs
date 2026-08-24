@@ -35,8 +35,12 @@ use super::{
 };
 use crate::internal::ai::session::{
     CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandStatus,
-    CodeCommandStoreError,
+    CodeCommandStoreError, IntentRevisionRecovery, Phase1RetryIntentReview,
 };
+
+const TERMINAL_PERSISTENCE_FAILURE_EFFECT: &str = "terminal_persistence_failure";
+const TERMINAL_PERSISTENCE_FAILURE_REASON: &str =
+    "runtime terminal persistence could not be confirmed; manual reconciliation is required";
 
 /// A monotonically increasing event position within one runtime session.
 ///
@@ -194,6 +198,12 @@ impl TurnRequest {
 pub struct InteractionResponse {
     pub interaction_id: String,
     pub response: String,
+    /// Non-sensitive HMAC commitment to a local IntentSpec revision sidecar.
+    /// It binds durable lineage for crash recovery; it is not a same-user
+    /// local-tampering boundary. Web admission sets it only after the prepared
+    /// sidecar is durably written, and serde inputs cannot supply it.
+    #[serde(skip)]
+    intent_revision_sidecar_digest: Option<String>,
 }
 
 impl InteractionResponse {
@@ -201,7 +211,17 @@ impl InteractionResponse {
         Self {
             interaction_id: interaction_id.into(),
             response: response.into(),
+            intent_revision_sidecar_digest: None,
         }
+    }
+
+    pub(crate) fn with_intent_revision_sidecar_digest(mut self, digest: impl Into<String>) -> Self {
+        self.intent_revision_sidecar_digest = Some(digest.into());
+        self
+    }
+
+    pub(crate) fn intent_revision_sidecar_digest(&self) -> Option<&str> {
+        self.intent_revision_sidecar_digest.as_deref()
     }
 }
 
@@ -277,7 +297,7 @@ pub enum RuntimeTurnExecution {
     Completed {
         summary: String,
     },
-    /// Finish the active turn as [`Completed`], but cancel every turn already
+    /// Finish the active turn as `Completed`, but cancel every turn already
     /// queued for the session instead of admitting them via
     /// [`AgentRuntimeWorker::start_next_if_idle`].
     ///
@@ -287,7 +307,7 @@ pub enum RuntimeTurnExecution {
     CompletedDiscardQueued {
         summary: String,
     },
-    /// Finish the active turn as [`Completed`] without admitting the next
+    /// Finish the active turn as `Completed` without admitting the next
     /// queued turn, and keep [`SessionQueue::hold_queued_admission`] set until a
     /// follow-up gate turn is tracked. Used when an adapter is about to park
     /// the next human gate (Plan review → network policy, IntentSpec review,
@@ -375,6 +395,51 @@ pub trait RuntimeTurnExecutor: Send + Sync + 'static {
         Err(RuntimeWorkerError::ExecutorDoesNotSupportResponses)
     }
 
+    /// Optional non-sensitive resolution label that must be committed
+    /// atomically with a legacy executor-owned interaction response's terminal
+    /// command. Runtime-owned delivery objects provide the same authority via
+    /// [`RuntimeInteractionDelivery::interaction_resolution`].
+    async fn interaction_resolution(
+        &self,
+        _request: &TurnRequest,
+        _interaction: &InteractionResponse,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Optional bounded recovery data for an IntentSpec Modify response. The
+    /// worker persists this only alongside the same response's primary
+    /// canonical `modify` resolution; implementations must validate the exact
+    /// interaction in [`Self::validate_interaction_response`] first.
+    async fn intent_revision_recovery(
+        &self,
+        _request: &TurnRequest,
+        _interaction: &InteractionResponse,
+    ) -> Option<IntentRevisionRecovery> {
+        None
+    }
+
+    /// Validate a legacy executor-owned response before the worker consumes
+    /// the live interaction. Runtime-owned deliveries use their own validator.
+    fn validate_interaction_response(
+        &self,
+        _interaction: &InteractionResponse,
+    ) -> Result<(), RuntimeWorkerError> {
+        Ok(())
+    }
+
+    /// Whether graceful process shutdown should drop only the live ownership
+    /// of this parked interaction while preserving its durable Pending command
+    /// and workflow marker for resume. Explicit user cancellation is separate
+    /// and always terminalizes the command plus its gate resolution.
+    fn preserve_pending_interaction_on_shutdown(
+        &self,
+        _request: &TurnRequest,
+        _interaction: &InteractionState,
+    ) -> bool {
+        false
+    }
+
     /// Invoked when a queued (or otherwise never-executed) admission is removed
     /// without calling [`Self::execute`] — for example cancel or shutdown drain.
     /// Executors that stage per-turn work must release it here.
@@ -423,12 +488,42 @@ pub trait RuntimeInteractionDelivery: Send + 'static {
         false
     }
 
+    /// Whether an accepted non-terminal response must be durably checkpointed
+    /// before its continuation is released. User input and approvals can
+    /// unblock a mutating tool loop, so acknowledging or forwarding them first
+    /// would leave a crash window with an unaudited side effect. Terminal
+    /// review gates keep this false and use the combined terminal row instead.
+    fn checkpoint_interaction_resolved_before_delivery(&self) -> bool {
+        false
+    }
+
+    /// Test-only timing seam after the pre-delivery checkpoint is durable and
+    /// before the continuation is released. Production implementations leave
+    /// the default no-op in place.
+    async fn after_pre_delivery_checkpoint(&mut self) {}
+
     /// Non-sensitive audit label persisted with `InteractionResolved` when
     /// [`Self::persist_interaction_resolved_after_terminal`] is enabled.
     /// Deliveries carrying structured user input must override this instead of
     /// persisting the opaque response payload, which can contain secrets.
     fn interaction_resolution(&self, interaction: &InteractionResponse) -> String {
         interaction.response.clone()
+    }
+
+    /// Optional bounded recovery data for a terminal IntentSpec Modify gate.
+    /// Runtime-owned deliveries must return this only for their exact,
+    /// previously validated Intent review interaction.
+    fn intent_revision_recovery(
+        &self,
+        _interaction: &InteractionResponse,
+    ) -> Option<IntentRevisionRecovery> {
+        None
+    }
+
+    /// Review gates are durable workflow authority and must survive graceful
+    /// process shutdown. Ephemeral tool prompts retain the default `false`.
+    fn preserve_pending_on_shutdown(&self) -> bool {
+        false
     }
 
     /// Persist and release the continuation.  This runs outside the actor but
@@ -462,6 +557,10 @@ pub struct AgentRuntimeWorkerConfig {
     /// Command kind persisted for runtime-owned durable intents. Headless
     /// adapters set this to match their browser direct-turn admission record.
     pub durability_command_kind: Option<String>,
+    /// One startup-only mutating Pending command that was proven, under the
+    /// durable append lock, not to have crossed Phase 1's formal-write marker.
+    /// Consumed exactly once by external-turn reattachment.
+    pub phase1_prewrite_reattach_turn_id: Option<String>,
     /// Sessions with a recovered mutating command are created in a
     /// reconciliation fence before the worker reads its first turn request.
     pub recovered_reconciliation_sessions: Vec<String>,
@@ -480,6 +579,7 @@ impl AgentRuntimeWorkerConfig {
             durability_repo_id: None,
             durability_principal_id: None,
             durability_command_kind: None,
+            phase1_prewrite_reattach_turn_id: None,
             recovered_reconciliation_sessions: Vec::new(),
         }
     }
@@ -506,6 +606,11 @@ impl AgentRuntimeWorkerConfig {
         self
     }
 
+    pub fn with_phase1_prewrite_reattach_turn(mut self, turn_id: impl Into<String>) -> Self {
+        self.phase1_prewrite_reattach_turn_id = Some(turn_id.into());
+        self
+    }
+
     /// Fence recovered sessions so a restarted runtime cannot blindly accept
     /// a new turn after an interrupted mutation.
     pub fn with_recovered_reconciliation_session(mut self, session_id: impl Into<String>) -> Self {
@@ -526,6 +631,15 @@ pub fn runtime_worker_adapter_message(error: RuntimeWorkerError) -> String {
             "RECONCILIATION_REQUIRED: session '{session_id}' requires mutation reconciliation before another turn can run"
         ),
         other => other.to_string(),
+    }
+}
+
+fn code_command_status_label(status: &CodeCommandStatus) -> &'static str {
+    match status {
+        CodeCommandStatus::Pending => "Pending",
+        CodeCommandStatus::Succeeded { .. } => "Succeeded",
+        CodeCommandStatus::Failed { .. } => "Failed",
+        CodeCommandStatus::Indeterminate { .. } => "Indeterminate",
     }
 }
 
@@ -569,10 +683,19 @@ pub enum RuntimeWorkerError {
         turn_id: String,
         interaction_id: String,
     },
+    #[error("invalid interaction response: {0}")]
+    InvalidInteractionResponse(String),
     #[error("turn '{turn_id}' cannot register a non-interactive runtime state")]
     InvalidInteractionState { turn_id: String },
     #[error("turn '{turn_id}' already has a pending interaction")]
     InteractionAlreadyPending { turn_id: String },
+    #[error(
+        "interaction '{interaction_id}' for turn '{turn_id}' is already being answered with a different response"
+    )]
+    InteractionResponseConflict {
+        turn_id: String,
+        interaction_id: String,
+    },
     #[error("turn '{turn_id}' has already stopped executing and cannot register a new interaction")]
     InteractionRegistrationClosed { turn_id: String },
     #[error("runtime executor does not support interaction responses")]
@@ -639,6 +762,7 @@ pub enum RuntimeCommand {
     Cancel {
         session_id: String,
         turn_id: String,
+        interaction_resolution: Option<(String, String)>,
         reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
     },
     Snapshot {
@@ -682,6 +806,10 @@ pub enum RuntimeCommand {
         session_id: String,
         turn_id: String,
         result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
+        /// Optional retry gate authority that is committed in the same row as
+        /// a failed external Phase 1 terminal.
+        retry_intent_review: Option<Phase1RetryIntentReview>,
+        reply: Option<oneshot::Sender<Result<(), RuntimeWorkerError>>>,
     },
     /// Completion of an executor-side interaction response delivery.  This is
     /// separate from [`Self::ExecutionFinished`] because a response may resume
@@ -693,9 +821,59 @@ pub enum RuntimeCommand {
         /// Wire response text used for post-terminal `InteractionResolved`
         /// when the delivery opted into that audit.
         resolution: Option<String>,
+        /// Non-sensitive revision-sidecar digest binding committed in the
+        /// same terminal row as the primary interaction resolution.
+        intent_revision: Option<IntentRevisionRecovery>,
+        checkpointed_before_delivery: bool,
+        /// Legacy executor responses have no pre-delivery checkpoint hook, so
+        /// a non-terminal delivery must checkpoint their audit immediately.
+        /// Runtime-owned deliveries that opt into terminal persistence keep
+        /// their accumulated resolutions for the combined terminal row.
+        checkpoint_after_delivery: bool,
         result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
         reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
     },
+}
+
+/// Result of settling one exact active turn inside the worker actor.
+///
+/// This is deliberately distinct from the session snapshot: a determinate
+/// terminal may immediately admit the next queued turn, changing the session
+/// projection before an external caller receives its acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinishExecutionOutcome {
+    NoMatchingActiveTurn,
+    Deferred,
+    Continued,
+    DeterminateTerminal,
+    IndeterminateTerminal,
+}
+
+struct FinishResponseInput {
+    session_id: String,
+    turn_id: String,
+    interaction_id: String,
+    resolution: Option<String>,
+    intent_revision: Option<IntentRevisionRecovery>,
+    checkpointed_before_delivery: bool,
+    checkpoint_after_delivery: bool,
+    result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
+    reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
+}
+
+struct FinishExecutionOptions<'a> {
+    start_next_on_completed: bool,
+    interaction_resolution: Option<(&'a str, &'a str)>,
+    intent_revision: Option<IntentRevisionRecovery>,
+    retry_intent_review: Option<Phase1RetryIntentReview>,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeDurabilityContext<'a> {
+    durability: Option<&'a RuntimeCommandDurability>,
+    repo_id: Option<&'a str>,
+    principal_id: Option<&'a str>,
+    command_kind: Option<&'a str>,
 }
 
 /// Thin UI-neutral client handle.  It owns no session or interaction state.
@@ -794,30 +972,35 @@ impl AgentRuntimeHandle {
         turn_id: impl Into<String>,
         result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
     ) -> Result<(), RuntimeWorkerError> {
+        self.finish_external_turn_with_retry_intent_review(session_id, turn_id, result, None)
+            .await
+    }
+
+    /// Report an adapter-owned terminal together with optional retry gate
+    /// authority. The worker persists both in one failure row/fsync.
+    pub async fn finish_external_turn_with_retry_intent_review(
+        &self,
+        session_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
+        retry_intent_review: Option<Phase1RetryIntentReview>,
+    ) -> Result<(), RuntimeWorkerError> {
         let session_id = session_id.into();
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.client
             .command_tx
             .send(RuntimeCommand::ExecutionFinished {
-                session_id: session_id.clone(),
+                session_id,
                 turn_id: turn_id.into(),
                 result,
+                retry_intent_review,
+                reply: Some(reply_tx),
             })
             .await
             .map_err(|_| RuntimeWorkerError::WorkerStopped)?;
-
-        // The snapshot request is ordered after ExecutionFinished on the
-        // worker mailbox. It therefore acknowledges that terminal durability
-        // has settled before an adapter reports the turn as finalized.
-        match self.snapshot(session_id.clone()).await?.interaction {
-            InteractionState::Completed | InteractionState::Cancelled => Ok(()),
-            InteractionState::IndeterminateSideEffect { .. } => {
-                Err(RuntimeWorkerError::ReconciliationRequired { session_id })
-            }
-            InteractionState::Failed { reason } => Err(RuntimeWorkerError::ExecutionFailed(reason)),
-            state => Err(RuntimeWorkerError::ExecutionFailed(format!(
-                "external turn finalization did not reach a terminal state: {state:?}"
-            ))),
-        }
+        reply_rx
+            .await
+            .map_err(|_| RuntimeWorkerError::ResponseDropped)?
     }
 
     pub async fn respond(
@@ -909,6 +1092,32 @@ impl AgentRuntimeHandle {
             .send(RuntimeCommand::Cancel {
                 session_id: session_id.into(),
                 turn_id: turn_id.into(),
+                interaction_resolution: None,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| RuntimeWorkerError::WorkerStopped)?;
+        reply_rx
+            .await
+            .map_err(|_| RuntimeWorkerError::ResponseDropped)?
+    }
+
+    /// Cancel a parked workflow gate and atomically persist both the command
+    /// terminal and the interaction resolution.
+    pub async fn cancel_interaction(
+        &self,
+        session_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        interaction_id: impl Into<String>,
+        resolution: impl Into<String>,
+    ) -> Result<(), RuntimeWorkerError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.client
+            .command_tx
+            .send(RuntimeCommand::Cancel {
+                session_id: session_id.into(),
+                turn_id: turn_id.into(),
+                interaction_resolution: Some((interaction_id.into(), resolution.into())),
                 reply: reply_tx,
             })
             .await
@@ -1115,7 +1324,7 @@ pub enum RuntimeObserveError {
 enum WorkerInput {
     Deadline,
     Lifecycle(Option<RuntimeLifecycleCommand>),
-    Command(Option<RuntimeCommand>),
+    Command(Option<Box<RuntimeCommand>>),
 }
 
 /// Owns session-local queues and dispatches executor work.  The worker is
@@ -1178,7 +1387,7 @@ impl AgentRuntimeWorker {
                     WorkerInput::Deadline
                 }
                 lifecycle = lifecycle_rx.recv(), if lifecycle_open => WorkerInput::Lifecycle(lifecycle),
-                command = command_rx.recv() => WorkerInput::Command(command),
+                command = command_rx.recv() => WorkerInput::Command(command.map(Box::new)),
             };
             match input {
                 WorkerInput::Deadline => {
@@ -1201,7 +1410,7 @@ impl AgentRuntimeWorker {
                     }
                     break;
                 }
-                WorkerInput::Command(Some(command)) => match command {
+                WorkerInput::Command(Some(command)) => match *command {
                     RuntimeCommand::Submit { request, reply } => {
                         let _ = reply.send(self.submit(request));
                     }
@@ -1223,7 +1432,7 @@ impl AgentRuntimeWorker {
                         interaction,
                         reply,
                     } => {
-                        self.respond(session_id, turn_id, interaction, reply);
+                        self.respond(session_id, turn_id, interaction, reply, Vec::new());
                     }
                     RuntimeCommand::RegisterInteraction {
                         session_id,
@@ -1242,9 +1451,11 @@ impl AgentRuntimeWorker {
                     RuntimeCommand::Cancel {
                         session_id,
                         turn_id,
+                        interaction_resolution,
                         reply,
                     } => {
-                        let _ = reply.send(self.cancel(session_id, turn_id));
+                        let _ =
+                            reply.send(self.cancel(session_id, turn_id, interaction_resolution));
                     }
                     RuntimeCommand::Snapshot { session_id, reply } => {
                         let _ = reply.send(self.snapshot(&session_id));
@@ -1290,22 +1501,79 @@ impl AgentRuntimeWorker {
                         session_id,
                         turn_id,
                         result,
-                    } => self.finish_execution(&session_id, &turn_id, result, true, None),
+                        retry_intent_review,
+                        reply,
+                    } => {
+                        let active_matches = self
+                            .sessions
+                            .get(&session_id)
+                            .and_then(|session| session.active.as_ref())
+                            .is_some_and(|active| active.request.turn_id == turn_id);
+                        if !active_matches {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(RuntimeWorkerError::UnknownTurn {
+                                    session_id,
+                                    turn_id,
+                                }));
+                            }
+                        } else {
+                            let outcome = self.finish_execution(
+                                &session_id,
+                                &turn_id,
+                                result,
+                                FinishExecutionOptions {
+                                    start_next_on_completed: true,
+                                    interaction_resolution: None,
+                                    intent_revision: None,
+                                    retry_intent_review,
+                                },
+                            );
+                            if let Some(reply) = reply {
+                                let terminal_ack = match outcome {
+                                    FinishExecutionOutcome::DeterminateTerminal => Ok(()),
+                                    FinishExecutionOutcome::IndeterminateTerminal => {
+                                        Err(RuntimeWorkerError::ReconciliationRequired {
+                                            session_id: session_id.clone(),
+                                        })
+                                    }
+                                    FinishExecutionOutcome::NoMatchingActiveTurn => {
+                                        Err(RuntimeWorkerError::UnknownTurn {
+                                            session_id: session_id.clone(),
+                                            turn_id: turn_id.clone(),
+                                        })
+                                    }
+                                    FinishExecutionOutcome::Deferred
+                                    | FinishExecutionOutcome::Continued => {
+                                        Err(RuntimeWorkerError::ExecutionFailed(format!(
+                                            "external turn finalization did not reach a terminal state ({outcome:?})"
+                                        )))
+                                    }
+                                };
+                                let _ = reply.send(terminal_ack);
+                            }
+                        }
+                    }
                     RuntimeCommand::ResponseFinished {
                         session_id,
                         turn_id,
                         interaction_id,
                         resolution,
+                        intent_revision,
+                        checkpointed_before_delivery,
+                        checkpoint_after_delivery,
                         result,
                         reply,
-                    } => self.finish_response(
-                        &session_id,
-                        &turn_id,
-                        &interaction_id,
-                        resolution.as_deref(),
+                    } => self.finish_response(FinishResponseInput {
+                        session_id,
+                        turn_id,
+                        interaction_id,
+                        resolution,
+                        intent_revision,
+                        checkpointed_before_delivery,
+                        checkpoint_after_delivery,
                         result,
                         reply,
-                    ),
+                    }),
                 },
             }
             if self.shutdown.is_some() && self.shutdown_is_complete() {
@@ -1400,7 +1668,7 @@ impl AgentRuntimeWorker {
         let session_id = request.session_id.clone();
         let turn_id = request.turn_id.clone();
         let event_buffer = self.config.event_buffer.max(1);
-        {
+        let has_active_turn = {
             let session = self
                 .sessions
                 .entry(session_id.clone())
@@ -1414,12 +1682,33 @@ impl AgentRuntimeWorker {
             // An active turn still blocks, but a non-empty queue is allowed so
             // an adapter can park a gate turn (e.g. IntentSpec review) in front
             // of work that was queued under a prior fence.
-            if session.active.is_some() {
-                return Err(RuntimeWorkerError::QueueFull {
-                    session_id,
-                    limit: 0,
-                });
+            session.active.is_some()
+        };
+        if has_active_turn {
+            // Do not append a new intent while another turn owns the session.
+            // An exact terminal retry is different: its intent and result are
+            // already durable, so report that status before the generic busy
+            // fence. The Phase 1 coordinator still has to prove that the live
+            // owner is the fresh retry gate before treating a Failed status as
+            // an idempotent close-out.
+            if let Some(status) = self.existing_durable_status(&request)? {
+                if matches!(&status, CodeCommandStatus::Indeterminate { .. }) {
+                    return Err(RuntimeWorkerError::ReconciliationRequired { session_id });
+                }
+                if !matches!(&status, CodeCommandStatus::Pending) {
+                    let ack_ok = matches!(&status, CodeCommandStatus::Succeeded { .. });
+                    return Err(RuntimeWorkerError::IdempotentCommand {
+                        session_id,
+                        turn_id,
+                        status: code_command_status_label(&status).to_string(),
+                        ack_ok,
+                    });
+                }
             }
+            return Err(RuntimeWorkerError::QueueFull {
+                session_id,
+                limit: 0,
+            });
         }
         // Non-mutating external turns (e.g. IntentSpec review) may re-attach
         // after a crash while their durable command is still Pending.
@@ -1446,6 +1735,8 @@ impl AgentRuntimeWorker {
             external_adapter_owned: true,
             execution_in_progress: true,
             response_in_progress: false,
+            response_in_flight: None,
+            early_response: None,
             deferred_execution: None,
             response_delivery_failure: None,
         });
@@ -1471,7 +1762,170 @@ impl AgentRuntimeWorker {
         turn_id: String,
         interaction: InteractionResponse,
         reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
+        duplicate_replies: Vec<oneshot::Sender<Result<(), RuntimeWorkerError>>>,
     ) {
+        let mut response_hasher = Sha256::new();
+        response_hasher.update(interaction.response.as_bytes());
+        response_hasher.update(b"\0intent-revision-sidecar\0");
+        if let Some(digest) = interaction.intent_revision_sidecar_digest() {
+            response_hasher.update(digest.as_bytes());
+        }
+        let response_digest = hex::encode(response_hasher.finalize());
+        let executor = self.config.executor.clone();
+        if let Some(active) = self.sessions.get_mut(&session_id).and_then(|session| {
+            session
+                .active
+                .as_mut()
+                .filter(|active| active.request.turn_id == turn_id)
+        }) && active.interaction.is_none()
+            && active.execution_in_progress
+            && !active.response_in_progress
+        {
+            if active.cancellation.is_cancelled() || active.cancel_requested_after_mutation {
+                // Lease takeover / cancel dropped the pending gate. Do not
+                // park an early response waiting for a gate that will never
+                // be re-registered on this turn.
+                let _ = reply.send(Err(RuntimeWorkerError::UnknownInteraction {
+                    turn_id: turn_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                }));
+                return;
+            }
+            const MAX_EARLY_RESPONSE_WAITERS: usize = 8;
+            match active.early_response.as_mut() {
+                Some(early)
+                    if early.interaction.interaction_id == interaction.interaction_id
+                        && early.response_digest == response_digest =>
+                {
+                    if early.duplicate_replies.len() >= MAX_EARLY_RESPONSE_WAITERS {
+                        let _ = reply.send(Err(RuntimeWorkerError::InteractionAlreadyPending {
+                            turn_id,
+                        }));
+                    } else {
+                        early.duplicate_replies.push(reply);
+                    }
+                }
+                Some(_) => {
+                    let _ = reply.send(Err(RuntimeWorkerError::InteractionResponseConflict {
+                        turn_id,
+                        interaction_id: interaction.interaction_id,
+                    }));
+                }
+                None => {
+                    active.early_response = Some(EarlyInteractionResponse {
+                        interaction,
+                        response_digest,
+                        reply,
+                        duplicate_replies,
+                    });
+                }
+            }
+            return;
+        }
+        if let Some(active) = self.sessions.get_mut(&session_id).and_then(|session| {
+            session
+                .active
+                .as_mut()
+                .filter(|active| active.request.turn_id == turn_id)
+        }) && active.response_in_progress
+        {
+            const MAX_DUPLICATE_RESPONSE_WAITERS: usize = 8;
+            let duplicate_result = match active.response_in_flight.as_mut() {
+                Some(in_flight)
+                    if in_flight.interaction_id == interaction.interaction_id
+                        && in_flight.response_digest == response_digest =>
+                {
+                    if in_flight.duplicate_replies.len() >= MAX_DUPLICATE_RESPONSE_WAITERS {
+                        Err(RuntimeWorkerError::InteractionAlreadyPending {
+                            turn_id: turn_id.clone(),
+                        })
+                    } else {
+                        in_flight.duplicate_replies.push(reply);
+                        return;
+                    }
+                }
+                Some(_) => Err(RuntimeWorkerError::InteractionResponseConflict {
+                    turn_id: turn_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                }),
+                None => Err(RuntimeWorkerError::InteractionAlreadyPending {
+                    turn_id: turn_id.clone(),
+                }),
+            };
+            let _ = reply.send(duplicate_result);
+            return;
+        }
+        let mut duplicate_replies = Some(duplicate_replies);
+        let pre_delivery_checkpoint = (|| {
+            let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
+                RuntimeWorkerError::UnknownSession {
+                    session_id: session_id.clone(),
+                }
+            })?;
+            let active = session
+                .active
+                .as_mut()
+                .filter(|active| active.request.turn_id == turn_id)
+                .ok_or_else(|| RuntimeWorkerError::UnknownTurn {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                })?;
+            let is_pending = active.interaction.as_ref().is_some_and(|state| {
+                state.is_awaiting_response()
+                    && state.interaction_id() == Some(interaction.interaction_id.as_str())
+            });
+            if !is_pending {
+                return Err(RuntimeWorkerError::UnknownInteraction {
+                    turn_id: turn_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                });
+            }
+            if let Some(delivery) = active.interaction_delivery.as_ref() {
+                delivery.validate(&interaction)?;
+                if delivery.checkpoint_interaction_resolved_before_delivery() {
+                    let resolution = delivery.interaction_resolution(&interaction);
+                    let candidate = (interaction.interaction_id.clone(), resolution.clone());
+                    let mut histories = active.interaction_resolutions.clone();
+                    if histories.last() != Some(&candidate) {
+                        histories.push(candidate);
+                    }
+                    return Ok(Some((active.request.clone(), histories, resolution)));
+                }
+            } else {
+                executor.validate_interaction_response(&interaction)?;
+            }
+            Ok(None)
+        })();
+        let pre_delivery_checkpoint = match pre_delivery_checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                for duplicate_reply in duplicate_replies.take().unwrap_or_default() {
+                    let _ = duplicate_reply.send(Err(error.clone()));
+                }
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        if let Some((request, histories, _)) = pre_delivery_checkpoint.as_ref()
+            && let Err(error) = Self::persist_pending_interaction_checkpoint(
+                self.config.durability.as_ref(),
+                self.config.durability_repo_id.as_deref(),
+                self.config.durability_principal_id.as_deref(),
+                self.config.durability_command_kind.as_deref(),
+                request,
+                histories,
+            )
+        {
+            for duplicate_reply in duplicate_replies.take().unwrap_or_default() {
+                let _ = duplicate_reply.send(Err(error.clone()));
+            }
+            let _ = reply.send(Err(error));
+            return;
+        }
+        let checkpointed_before_delivery = pre_delivery_checkpoint.is_some();
+        let pre_delivery_resolution = pre_delivery_checkpoint
+            .as_ref()
+            .map(|(_, _, resolution)| resolution.clone());
         let response = (|| {
             let (request, cancellation, mutation_started, delivery) = {
                 let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
@@ -1499,9 +1953,22 @@ impl AgentRuntimeWorker {
                 }
                 if let Some(delivery) = active.interaction_delivery.as_ref() {
                     delivery.validate(&interaction)?;
+                } else {
+                    executor.validate_interaction_response(&interaction)?;
                 }
                 active.interaction = None;
+                if let Some(resolution) = pre_delivery_resolution.as_ref() {
+                    let candidate = (interaction.interaction_id.clone(), resolution.clone());
+                    if active.interaction_resolutions.last() != Some(&candidate) {
+                        active.interaction_resolutions.push(candidate);
+                    }
+                }
                 active.response_in_progress = true;
+                active.response_in_flight = Some(InFlightInteractionResponse {
+                    interaction_id: interaction.interaction_id.clone(),
+                    response_digest: response_digest.clone(),
+                    duplicate_replies: duplicate_replies.take().unwrap_or_default(),
+                });
                 let request = active.request.clone();
                 let cancellation = active.cancellation.clone();
                 let mutation_started = active.mutation_started.clone();
@@ -1522,10 +1989,14 @@ impl AgentRuntimeWorker {
                     cancellation,
                     mutation_started,
                     delivery,
+                    checkpointed_before_delivery,
                     reply,
                 });
             }
             Err(error) => {
+                for duplicate_reply in duplicate_replies.take().unwrap_or_default() {
+                    let _ = duplicate_reply.send(Err(error.clone()));
+                }
                 let _ = reply.send(Err(error));
             }
         }
@@ -1541,7 +2012,7 @@ impl AgentRuntimeWorker {
         if !interaction.is_awaiting_response() {
             return Err(RuntimeWorkerError::InvalidInteractionState { turn_id });
         }
-        {
+        let early_response = {
             let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
                 RuntimeWorkerError::UnknownSession {
                     session_id: session_id.clone(),
@@ -1587,20 +2058,40 @@ impl AgentRuntimeWorker {
             if active.external_adapter_owned && active.interaction_delivery.is_some() {
                 active.execution_in_progress = false;
             }
+            let early_response = active.early_response.take();
             session.set_state(interaction.clone());
-        }
+            early_response
+        };
         self.emit(
             &session_id,
-            Some(turn_id),
+            Some(turn_id.clone()),
             AgentEventKind::InteractionRequested { state: interaction },
         );
+        // A browser may answer immediately after the projection becomes
+        // visible but before a long-lived tool handler registers its delivery.
+        // Begin that first response in this actor turn so a later mailbox
+        // response cannot overtake it and invert the user's decision.
+        if let Some(early) = early_response {
+            self.respond(
+                session_id,
+                turn_id,
+                early.interaction,
+                early.reply,
+                early.duplicate_replies,
+            );
+        }
         Ok(())
     }
 
-    fn cancel(&mut self, session_id: String, turn_id: String) -> Result<(), RuntimeWorkerError> {
+    fn cancel(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        interaction_resolution: Option<(String, String)>,
+    ) -> Result<(), RuntimeWorkerError> {
         enum CancelOutcome {
             Queued(TurnRequest),
-            WaitingActive(TurnRequest),
+            WaitingActive(TurnRequest, Vec<(String, String)>),
             RunningActive,
             Missing,
         }
@@ -1627,7 +2118,13 @@ impl AgentRuntimeWorker {
                 .as_ref()
                 .is_some_and(|active| active.request.turn_id == turn_id)
             {
-                let (mutation_started, waiting_for_interaction, execution_in_progress, request) =
+                let (
+                    mutation_started,
+                    waiting_for_interaction,
+                    execution_in_progress,
+                    request,
+                    historical_interaction_resolutions,
+                ) =
                     {
                         let active = session.active.as_mut().ok_or_else(|| {
                             RuntimeWorkerError::UnknownTurn {
@@ -1657,6 +2154,7 @@ impl AgentRuntimeWorker {
                             waiting_for_interaction,
                             active.execution_in_progress,
                             active.request.clone(),
+                            active.interaction_resolutions.clone(),
                         )
                     };
                 if mutation_started {
@@ -1672,7 +2170,7 @@ impl AgentRuntimeWorker {
                     session.active = None;
                     session.snapshot.active_turn_id = None;
                     session.set_state(InteractionState::Cancelled);
-                    CancelOutcome::WaitingActive(request)
+                    CancelOutcome::WaitingActive(request, historical_interaction_resolutions)
                 } else {
                     session.set_state(InteractionState::Cancelling);
                     CancelOutcome::RunningActive
@@ -1694,6 +2192,8 @@ impl AgentRuntimeWorker {
                     self.config.durability_principal_id.as_deref(),
                     self.config.durability_command_kind.as_deref(),
                     &request,
+                    None,
+                    &[],
                 ) {
                     self.fence_for_durability_failure(&session_id, &turn_id, &error);
                     return Err(error);
@@ -1701,13 +2201,15 @@ impl AgentRuntimeWorker {
                 self.emit(&session_id, Some(turn_id), AgentEventKind::TurnCancelled);
                 Ok(())
             }
-            CancelOutcome::WaitingActive(request) => {
+            CancelOutcome::WaitingActive(request, historical_interaction_resolutions) => {
                 if let Err(error) = Self::persist_cancelled_turn(
                     self.config.durability.as_ref(),
                     self.config.durability_repo_id.as_deref(),
                     self.config.durability_principal_id.as_deref(),
                     self.config.durability_command_kind.as_deref(),
                     &request,
+                    interaction_resolution.as_ref(),
+                    &historical_interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(&session_id, &turn_id, &error);
                     return Err(error);
@@ -1756,6 +2258,48 @@ impl AgentRuntimeWorker {
             let mutation_started =
                 active.request.mutating && active.mutation_started.load(Ordering::Acquire);
             let waiting_for_interaction = active.interaction.is_some();
+            let preserve_pending_review = active.interaction.as_ref().is_some_and(|interaction| {
+                active
+                    .interaction_delivery
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.preserve_pending_on_shutdown())
+                    || active.interaction_delivery.is_none()
+                        && self
+                            .config
+                            .executor
+                            .preserve_pending_interaction_on_shutdown(&active.request, interaction)
+            });
+            if preserve_pending_review {
+                let checkpoint_result = Self::persist_pending_interaction_checkpoint(
+                    self.config.durability.as_ref(),
+                    self.config.durability_repo_id.as_deref(),
+                    self.config.durability_principal_id.as_deref(),
+                    self.config.durability_command_kind.as_deref(),
+                    &active.request,
+                    &active.interaction_resolutions,
+                );
+                if let Err(error) = checkpoint_result {
+                    tracing::error!(
+                        turn_id = %active.request.turn_id,
+                        %error,
+                        "failed to checkpoint delivered interaction responses while preserving a review gate during shutdown"
+                    );
+                    // Do not report a clean shutdown after losing responses
+                    // that were accepted in memory. Keep the turn live until
+                    // the shutdown deadline classifies it fail-closed.
+                    active.cancel_requested_after_mutation = true;
+                    session.set_state(InteractionState::Cancelling);
+                    cancellation_requested_turns.push((session_id.clone(), turn_id));
+                    continue;
+                }
+                // This is process shutdown, not a user decision. Drop only
+                // live ownership so resume can reattach the still-Pending
+                // durable command to the still-open workflow marker.
+                session.active = None;
+                session.snapshot.active_turn_id = None;
+                session.set_state(InteractionState::Idle);
+                continue;
+            }
             if waiting_for_interaction {
                 // Match ordinary cancellation: a parked tool loop can be
                 // waiting exclusively on the response sender, so shutdown
@@ -1792,6 +2336,8 @@ impl AgentRuntimeWorker {
                 self.config.durability_principal_id.as_deref(),
                 self.config.durability_command_kind.as_deref(),
                 &request,
+                None,
+                &[],
             ) {
                 self.fence_for_durability_failure(&session_id, &request.turn_id, &error);
                 continue;
@@ -1823,13 +2369,16 @@ impl AgentRuntimeWorker {
                 .sessions
                 .iter()
                 .filter_map(|(session_id, session)| {
-                    session
-                        .active
-                        .as_ref()
-                        .map(|active| (session_id.clone(), active.request.clone()))
+                    session.active.as_ref().map(|active| {
+                        (
+                            session_id.clone(),
+                            active.request.clone(),
+                            active.interaction_resolutions.clone(),
+                        )
+                    })
                 })
                 .collect();
-            for (session_id, request) in active_turns {
+            for (session_id, request, interaction_resolutions) in active_turns {
                 let mutation_started = self
                     .sessions
                     .get(&session_id)
@@ -1846,6 +2395,8 @@ impl AgentRuntimeWorker {
                         self.config.durability_principal_id.as_deref(),
                         self.config.durability_command_kind.as_deref(),
                         &request,
+                        None,
+                        &interaction_resolutions,
                     ) {
                         self.fence_for_durability_failure(&session_id, &request.turn_id, &error);
                         continue;
@@ -1870,6 +2421,7 @@ impl AgentRuntimeWorker {
                     self.config.durability_command_kind.as_deref(),
                     &request,
                     reason,
+                    &interaction_resolutions,
                 ) {
                     Ok(()) => {
                         if let Some(session) = self.sessions.get_mut(&session_id) {
@@ -1954,7 +2506,7 @@ impl AgentRuntimeWorker {
         else {
             return Ok(());
         };
-        match self.cancel(session_id, turn_id) {
+        match self.cancel(session_id, turn_id, None) {
             Err(RuntimeWorkerError::UnknownSession { .. })
             | Err(RuntimeWorkerError::UnknownTurn { .. }) => Ok(()),
             other => other,
@@ -1975,8 +2527,24 @@ impl AgentRuntimeWorker {
                 .sessions
                 .entry(session_id.clone())
                 .or_insert_with(|| SessionQueue::new(session_id.clone(), event_buffer));
-            session.active = None;
-            session.snapshot.active_turn_id = None;
+            let retain_live_executor = session
+                .active
+                .as_ref()
+                .is_some_and(|active| active.execution_in_progress);
+            if retain_live_executor {
+                if let Some(active) = session.active.as_mut() {
+                    // A durable-fence request must not discard a still-running
+                    // executor. Keep the serialized owner, stop further work,
+                    // and force its eventual terminal result through the
+                    // indeterminate epilogue.
+                    active.response_delivery_failure = Some(reason.clone());
+                    active.cancel_requested_after_mutation = true;
+                    active.cancellation.cancel();
+                }
+            } else {
+                session.active = None;
+                session.snapshot.active_turn_id = None;
+            }
             session.set_state(InteractionState::IndeterminateSideEffect {
                 reason: reason.clone(),
             });
@@ -2053,6 +2621,8 @@ impl AgentRuntimeWorker {
                 external_adapter_owned: false,
                 execution_in_progress: true,
                 response_in_progress: false,
+                response_in_flight: None,
+                early_response: None,
                 deferred_execution: None,
                 response_delivery_failure: None,
             });
@@ -2092,27 +2662,46 @@ impl AgentRuntimeWorker {
                     session_id,
                     turn_id,
                     result,
+                    retry_intent_review: None,
+                    reply: None,
                 })
                 .await;
         });
     }
 
-    fn spawn_response(&self, response: ResponseExecution) {
+    fn spawn_response(&self, mut response: ResponseExecution) {
         let executor = self.config.executor.clone();
         let tool_boundary = self.config.tool_boundary.clone();
         let command_tx = self.command_tx.clone();
         let interaction_id = response.interaction.interaction_id.clone();
-        let resolution = response.delivery.as_ref().and_then(|delivery| {
-            delivery
-                .persist_interaction_resolved_after_terminal()
-                .then(|| delivery.interaction_resolution(&response.interaction))
-        });
         tokio::spawn(async move {
+            let checkpoint_after_delivery = response.delivery.is_none();
+            let resolution = if let Some(delivery) = response.delivery.as_ref() {
+                (!response.checkpointed_before_delivery
+                    && delivery.persist_interaction_resolved_after_terminal())
+                .then(|| delivery.interaction_resolution(&response.interaction))
+            } else {
+                executor
+                    .interaction_resolution(&response.request, &response.interaction)
+                    .await
+            };
+            let intent_revision = if let Some(delivery) = response.delivery.as_ref() {
+                delivery.intent_revision_recovery(&response.interaction)
+            } else {
+                executor
+                    .intent_revision_recovery(&response.request, &response.interaction)
+                    .await
+            };
             let context = RuntimeExecutionContext {
                 tool_boundary,
                 cancellation: response.cancellation,
                 mutation_started: response.mutation_started,
             };
+            if response.checkpointed_before_delivery
+                && let Some(delivery) = response.delivery.as_mut()
+            {
+                delivery.after_pre_delivery_checkpoint().await;
+            }
             let result = if let Some(delivery) = response.delivery {
                 delivery
                     .deliver(response.request, response.interaction, context)
@@ -2128,6 +2717,9 @@ impl AgentRuntimeWorker {
                     turn_id: response.turn_id,
                     interaction_id,
                     resolution,
+                    intent_revision,
+                    checkpointed_before_delivery: response.checkpointed_before_delivery,
+                    checkpoint_after_delivery,
                     result,
                     reply: response.reply,
                 })
@@ -2140,15 +2732,22 @@ impl AgentRuntimeWorker {
     /// prior implementation returned success as soon as the actor queued an
     /// executor task, which could tell a browser that an approval/input had
     /// been delivered even if the executor subsequently rejected it.
-    fn finish_response(
-        &mut self,
-        session_id: &str,
-        turn_id: &str,
-        interaction_id: &str,
-        resolution: Option<&str>,
-        result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
-        reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
-    ) {
+    fn finish_response(&mut self, input: FinishResponseInput) {
+        let FinishResponseInput {
+            session_id,
+            turn_id,
+            interaction_id,
+            resolution,
+            intent_revision,
+            checkpointed_before_delivery,
+            checkpoint_after_delivery,
+            result,
+            reply,
+        } = input;
+        let session_id = session_id.as_str();
+        let turn_id = turn_id.as_str();
+        let interaction_id = interaction_id.as_str();
+        let resolution = resolution.as_deref();
         let mut reply_result = match &result {
             Ok(_) => Ok(()),
             Err(error) => Err(error.clone()),
@@ -2165,6 +2764,11 @@ impl AgentRuntimeWorker {
             })
             .map(|active| {
                 active.response_in_progress = false;
+                let duplicate_replies = active
+                    .response_in_flight
+                    .take()
+                    .map(|in_flight| in_flight.duplicate_replies)
+                    .unwrap_or_default();
                 if let Some(reason) = response_failure.as_ref() {
                     // The original executor can still be running while its
                     // interaction response is being persisted or forwarded.
@@ -2179,17 +2783,100 @@ impl AgentRuntimeWorker {
                         active.cancellation.cancel();
                     }
                 } else if let Some(resolution) = resolution {
-                    active
-                        .interaction_resolutions
-                        .push((interaction_id.to_string(), resolution.to_string()));
+                    let candidate = (interaction_id.to_string(), resolution.to_string());
+                    if active.interaction_resolutions.last() != Some(&candidate) {
+                        active.interaction_resolutions.push(candidate);
+                    }
                 }
+                let pending_checkpoint = (!checkpointed_before_delivery
+                    && checkpoint_after_delivery
+                    && matches!(
+                        &result,
+                        Ok(RuntimeTurnExecution::InteractionResponseDelivered)
+                    ))
+                .then(|| {
+                    (
+                        active.request.clone(),
+                        active.interaction_resolutions.clone(),
+                    )
+                });
                 (
                     active.deferred_execution.take(),
                     response_failure.is_some() && !active.execution_in_progress,
+                    duplicate_replies,
+                    pending_checkpoint,
                 )
             });
-        let (deferred_execution, response_failure_without_live_execution) =
-            response_delivery_state.unwrap_or((None, false));
+        let (
+            deferred_execution,
+            response_failure_without_live_execution,
+            duplicate_replies,
+            pending_checkpoint,
+        ) = response_delivery_state.unwrap_or((None, false, Vec::new(), None));
+        if let Some((request, interaction_resolutions)) = pending_checkpoint
+            && let Err(error) = Self::persist_pending_interaction_checkpoint(
+                self.config.durability.as_ref(),
+                self.config.durability_repo_id.as_deref(),
+                self.config.durability_principal_id.as_deref(),
+                self.config.durability_command_kind.as_deref(),
+                &request,
+                &interaction_resolutions,
+            )
+        {
+            let mut checkpoint_without_live_execution = false;
+            if let Some(session) = self.sessions.get_mut(session_id)
+                && let Some(active) = session
+                    .active
+                    .as_mut()
+                    .filter(|active| active.request.turn_id == turn_id)
+            {
+                active.response_delivery_failure = Some(error.to_string());
+                if active.request.mutating && active.mutation_started.load(Ordering::Acquire) {
+                    active.cancel_requested_after_mutation = true;
+                } else {
+                    active.cancellation.cancel();
+                }
+                checkpoint_without_live_execution = !active.execution_in_progress;
+                session.set_state(InteractionState::Cancelling);
+            }
+            for duplicate_reply in duplicate_replies {
+                let _ = duplicate_reply.send(Err(error.clone()));
+            }
+            let _ = reply.send(Err(error.clone()));
+            if let Some(deferred_execution) = deferred_execution {
+                // ExecutionFinished can race ahead of the response durability
+                // checkpoint. It was removed from ActiveTurn above, so settle
+                // it now instead of dropping the only terminal result and
+                // leaving the command permanently Cancelling.
+                self.finish_execution(
+                    session_id,
+                    turn_id,
+                    deferred_execution,
+                    FinishExecutionOptions {
+                        start_next_on_completed: true,
+                        interaction_resolution: None,
+                        intent_revision: None,
+                        retry_intent_review: None,
+                    },
+                );
+            } else if checkpoint_without_live_execution {
+                // Adapter-owned deliveries have no executor future that can
+                // report a later terminal result. Drive the retained active
+                // turn through the same response-delivery-failure epilogue.
+                self.finish_execution(
+                    session_id,
+                    turn_id,
+                    Err(error),
+                    FinishExecutionOptions {
+                        start_next_on_completed: true,
+                        interaction_resolution: None,
+                        intent_revision: None,
+                        retry_intent_review: None,
+                    },
+                );
+            }
+            return;
+        }
         if response_failure.is_some()
             && let Some(session) = self.sessions.get_mut(session_id)
             && session
@@ -2218,13 +2905,36 @@ impl AgentRuntimeWorker {
             );
         }
         if reply_result.is_ok() || response_failure_without_live_execution {
-            self.finish_execution(session_id, turn_id, result, true, resolution_audit);
+            self.finish_execution(
+                session_id,
+                turn_id,
+                result,
+                FinishExecutionOptions {
+                    start_next_on_completed: true,
+                    interaction_resolution: resolution_audit,
+                    intent_revision,
+                    retry_intent_review: None,
+                },
+            );
         }
         if let Some(deferred_execution) = deferred_execution {
-            self.finish_execution(session_id, turn_id, deferred_execution, true, None);
+            self.finish_execution(
+                session_id,
+                turn_id,
+                deferred_execution,
+                FinishExecutionOptions {
+                    start_next_on_completed: true,
+                    interaction_resolution: None,
+                    intent_revision: None,
+                    retry_intent_review: None,
+                },
+            );
         }
         if reply_result.is_ok() {
             reply_result = self.finalize_response_acknowledgement(session_id);
+        }
+        for duplicate_reply in duplicate_replies {
+            let _ = duplicate_reply.send(reply_result.clone());
         }
         let _ = reply.send(reply_result);
     }
@@ -2262,40 +2972,141 @@ impl AgentRuntimeWorker {
         session_id: &str,
         turn_id: &str,
         result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
-        start_next_on_completed: bool,
-        interaction_resolution: Option<(&str, &str)>,
-    ) {
+        options: FinishExecutionOptions<'_>,
+    ) -> FinishExecutionOutcome {
+        let FinishExecutionOptions {
+            start_next_on_completed,
+            interaction_resolution,
+            intent_revision,
+            retry_intent_review,
+        } = options;
         let durability = self.config.durability.clone();
         let durability_repo_id = self.config.durability_repo_id.clone();
         let durability_principal_id = self.config.durability_principal_id.clone();
         let durability_command_kind = self.config.durability_command_kind.clone();
+        let durability_context = RuntimeDurabilityContext {
+            durability: durability.as_ref(),
+            repo_id: durability_repo_id.as_deref(),
+            principal_id: durability_principal_id.as_deref(),
+            command_kind: durability_command_kind.as_deref(),
+        };
         let Some(session) = self.sessions.get_mut(session_id) else {
-            return;
+            return FinishExecutionOutcome::NoMatchingActiveTurn;
         };
         let Some(active) = session.active.as_ref() else {
-            return;
+            return FinishExecutionOutcome::NoMatchingActiveTurn;
         };
         if active.request.turn_id != turn_id {
-            return;
+            return FinishExecutionOutcome::NoMatchingActiveTurn;
         }
         if active.response_in_progress {
             if let Some(active) = session.active.as_mut() {
                 active.deferred_execution = Some(result);
             }
-            return;
+            return FinishExecutionOutcome::Deferred;
+        }
+        let executor_returned_terminal = matches!(
+            &result,
+            Ok(RuntimeTurnExecution::Completed { .. }
+                | RuntimeTurnExecution::CompletedHoldQueued { .. }
+                | RuntimeTurnExecution::CompletedDiscardQueued { .. })
+                | Err(_)
+        );
+        if executor_returned_terminal
+            && active.execution_in_progress
+            && active
+                .interaction
+                .as_ref()
+                .is_some_and(InteractionState::is_awaiting_response)
+        {
+            // A tool executor can finish independently while its registered
+            // approval/input continuation is still waiting. Keep that result
+            // behind the interaction first-writer: a failed pre-delivery
+            // checkpoint must leave the gate retryable, and a later exact
+            // retry consumes this cached result only after the continuation
+            // has been durably released.
+            if let Some(active) = session.active.as_mut() {
+                active.execution_in_progress = false;
+                active.deferred_execution = Some(result);
+            }
+            return FinishExecutionOutcome::Deferred;
         }
         let cancel_requested_after_mutation = active.cancel_requested_after_mutation;
         let response_delivery_failure = active.response_delivery_failure.clone();
         let request = active.request.clone();
+        let mut interaction_resolutions = active.interaction_resolutions.clone();
+        let mut early_response = session
+            .active
+            .as_mut()
+            .and_then(|active| active.early_response.take());
+        let will_register_interaction = matches!(
+            &result,
+            Ok(RuntimeTurnExecution::AwaitingInteraction(state)) if state.is_awaiting_response()
+        );
+        if !will_register_interaction && let Some(early) = early_response.take() {
+            let error = RuntimeWorkerError::UnknownInteraction {
+                turn_id: turn_id.to_string(),
+                interaction_id: early.interaction.interaction_id,
+            };
+            let _ = early.reply.send(Err(error.clone()));
+            for duplicate_reply in early.duplicate_replies {
+                let _ = duplicate_reply.send(Err(error.clone()));
+            }
+        }
         // Prefer the accumulated list from the active turn; merge an optional
         // one-shot from `finish_response` without duplicating the last push.
-        let mut interaction_resolutions = active.interaction_resolutions.clone();
         if let Some((interaction_id, resolution)) = interaction_resolution {
             let candidate = (interaction_id.to_string(), resolution.to_string());
             let already_last = interaction_resolutions.last() == Some(&candidate);
             if !already_last {
                 interaction_resolutions.push(candidate);
             }
+        }
+
+        if self.shutdown.is_some()
+            && early_response.is_none()
+            && let Ok(RuntimeTurnExecution::AwaitingInteraction(state)) = &result
+            && state.is_awaiting_response()
+            && self
+                .config
+                .executor
+                .preserve_pending_interaction_on_shutdown(&request, state)
+        {
+            match Self::persist_pending_interaction_checkpoint(
+                durability.as_ref(),
+                durability_repo_id.as_deref(),
+                durability_principal_id.as_deref(),
+                durability_command_kind.as_deref(),
+                &request,
+                &interaction_resolutions,
+            ) {
+                Ok(()) => {
+                    // Shutdown began while the executor was publishing this
+                    // durable review gate. Drop only live ownership: the
+                    // Pending command and open workflow marker are the exact
+                    // restart authority, and no interactive runtime event is
+                    // emitted after shutdown has claimed the process.
+                    session.active = None;
+                    session.snapshot.active_turn_id = None;
+                    session.set_state(InteractionState::Idle);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        turn_id,
+                        %error,
+                        "failed to checkpoint a late review registration during shutdown"
+                    );
+                    if let Some(active) = session.active.as_mut() {
+                        active.execution_in_progress = false;
+                        active.interaction = Some(state.clone());
+                        active.cancel_requested_after_mutation = true;
+                    }
+                    // Keep the live owner until the structured shutdown
+                    // deadline persists an explicit reconciliation fence.
+                    session.set_state(InteractionState::Cancelling);
+                }
+            }
+            return FinishExecutionOutcome::Continued;
         }
 
         if let Some(reason) = response_delivery_failure {
@@ -2312,9 +3123,10 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &reason,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::IndeterminateSideEffect {
                     reason: reason.clone(),
@@ -2324,17 +3136,17 @@ impl AgentRuntimeWorker {
                     Some(turn_id.to_string()),
                     AgentEventKind::TurnIndeterminateSideEffect { reason },
                 );
+                return FinishExecutionOutcome::IndeterminateTerminal;
             } else {
                 if let Err(error) = Self::persist_failed_turn(
-                    durability.as_ref(),
-                    durability_repo_id.as_deref(),
-                    durability_principal_id.as_deref(),
-                    durability_command_kind.as_deref(),
+                    durability_context,
                     &request,
                     &reason,
+                    &interaction_resolutions,
+                    retry_intent_review.as_ref(),
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::Failed {
                     reason: reason.clone(),
@@ -2345,8 +3157,8 @@ impl AgentRuntimeWorker {
                     AgentEventKind::TurnFailed { reason },
                 );
                 self.start_next_if_idle(session_id);
+                return FinishExecutionOutcome::DeterminateTerminal;
             }
-            return;
         }
 
         match result {
@@ -2354,6 +3166,7 @@ impl AgentRuntimeWorker {
                 // The original executor future remains responsible for the
                 // eventual terminal result. `respond` already advanced the
                 // observable interaction state back to Running.
+                FinishExecutionOutcome::Continued
             }
             Ok(RuntimeTurnExecution::AwaitingInteraction(state))
                 if state.is_awaiting_response() =>
@@ -2368,21 +3181,30 @@ impl AgentRuntimeWorker {
                     Some(turn_id.to_string()),
                     AgentEventKind::InteractionRequested { state },
                 );
+                if let Some(early) = early_response.take() {
+                    self.respond(
+                        session_id.to_string(),
+                        turn_id.to_string(),
+                        early.interaction,
+                        early.reply,
+                        early.duplicate_replies,
+                    );
+                }
+                FinishExecutionOutcome::Continued
             }
             Ok(RuntimeTurnExecution::AwaitingInteraction(_)) => {
                 let reason = "executor returned a non-interactive waiting state".to_string();
                 session.active = None;
                 session.snapshot.active_turn_id = None;
                 if let Err(error) = Self::persist_failed_turn(
-                    durability.as_ref(),
-                    durability_repo_id.as_deref(),
-                    durability_principal_id.as_deref(),
-                    durability_command_kind.as_deref(),
+                    durability_context,
                     &request,
                     &reason,
+                    &interaction_resolutions,
+                    retry_intent_review.as_ref(),
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::Failed {
                     reason: reason.clone(),
@@ -2393,22 +3215,21 @@ impl AgentRuntimeWorker {
                     AgentEventKind::TurnFailed { reason },
                 );
                 self.start_next_if_idle(session_id);
+                FinishExecutionOutcome::DeterminateTerminal
             }
             Ok(RuntimeTurnExecution::Completed { summary }) => {
                 session.active = None;
                 session.snapshot.active_turn_id = None;
                 session.hold_queued_admission = false;
                 if let Err(error) = Self::persist_successful_turn(
-                    durability.as_ref(),
-                    durability_repo_id.as_deref(),
-                    durability_principal_id.as_deref(),
-                    durability_command_kind.as_deref(),
+                    durability_context,
                     &request,
                     &summary,
                     &interaction_resolutions,
+                    intent_revision.as_ref(),
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::Completed);
                 self.emit(
@@ -2419,6 +3240,7 @@ impl AgentRuntimeWorker {
                 if start_next_on_completed {
                     self.start_next_if_idle(session_id);
                 }
+                FinishExecutionOutcome::DeterminateTerminal
             }
             Ok(RuntimeTurnExecution::CompletedHoldQueued { summary }) => {
                 // Same durable terminal as `Completed`, including optional
@@ -2432,16 +3254,14 @@ impl AgentRuntimeWorker {
                 session.snapshot.active_turn_id = None;
                 session.hold_queued_admission = true;
                 if let Err(error) = Self::persist_successful_turn(
-                    durability.as_ref(),
-                    durability_repo_id.as_deref(),
-                    durability_principal_id.as_deref(),
-                    durability_command_kind.as_deref(),
+                    durability_context,
                     &request,
                     &summary,
                     &interaction_resolutions,
+                    intent_revision.as_ref(),
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::Completed);
                 self.emit(
@@ -2449,6 +3269,7 @@ impl AgentRuntimeWorker {
                     Some(turn_id.to_string()),
                     AgentEventKind::TurnCompleted { summary },
                 );
+                FinishExecutionOutcome::DeterminateTerminal
             }
             Ok(RuntimeTurnExecution::CompletedDiscardQueued { summary }) => {
                 // Complete the active turn before touching the queue so a
@@ -2457,16 +3278,14 @@ impl AgentRuntimeWorker {
                 session.snapshot.active_turn_id = None;
                 session.hold_queued_admission = false;
                 if let Err(error) = Self::persist_successful_turn(
-                    durability.as_ref(),
-                    durability_repo_id.as_deref(),
-                    durability_principal_id.as_deref(),
-                    durability_command_kind.as_deref(),
+                    durability_context,
                     &request,
                     &summary,
                     &interaction_resolutions,
+                    intent_revision.as_ref(),
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::Completed);
                 // Cancel one queued turn at a time. On persistence failure,
@@ -2486,6 +3305,8 @@ impl AgentRuntimeWorker {
                         durability_principal_id.as_deref(),
                         durability_command_kind.as_deref(),
                         &queued,
+                        None,
+                        &[],
                     ) {
                         session.queued.push_front(queued);
                         session.snapshot.queued_turns = session.queued.len();
@@ -2513,6 +3334,9 @@ impl AgentRuntimeWorker {
                 }
                 if let Some((queued_turn_id, error)) = cancel_error {
                     self.fence_for_durability_failure(session_id, &queued_turn_id, &error);
+                    FinishExecutionOutcome::IndeterminateTerminal
+                } else {
+                    FinishExecutionOutcome::DeterminateTerminal
                 }
             }
             Err(RuntimeWorkerError::Cancelled) if cancel_requested_after_mutation => {
@@ -2526,9 +3350,10 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &reason,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::IndeterminateSideEffect {
                     reason: reason.clone(),
@@ -2538,6 +3363,7 @@ impl AgentRuntimeWorker {
                     Some(turn_id.to_string()),
                     AgentEventKind::TurnIndeterminateSideEffect { reason },
                 );
+                FinishExecutionOutcome::IndeterminateTerminal
             }
             Err(RuntimeWorkerError::IndeterminateSideEffect(reason)) => {
                 session.active = None;
@@ -2549,9 +3375,10 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &reason,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::IndeterminateSideEffect {
                     reason: reason.clone(),
@@ -2561,6 +3388,7 @@ impl AgentRuntimeWorker {
                     Some(turn_id.to_string()),
                     AgentEventKind::TurnIndeterminateSideEffect { reason },
                 );
+                FinishExecutionOutcome::IndeterminateTerminal
             }
             Err(RuntimeWorkerError::Cancelled) => {
                 session.active = None;
@@ -2571,9 +3399,11 @@ impl AgentRuntimeWorker {
                     durability_principal_id.as_deref(),
                     durability_command_kind.as_deref(),
                     &request,
+                    None,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::Cancelled);
                 self.emit(
@@ -2582,6 +3412,7 @@ impl AgentRuntimeWorker {
                     AgentEventKind::TurnCancelled,
                 );
                 self.start_next_if_idle(session_id);
+                FinishExecutionOutcome::DeterminateTerminal
             }
             Err(error) if cancel_requested_after_mutation => {
                 let reason = format!(
@@ -2596,9 +3427,10 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &reason,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::IndeterminateSideEffect {
                     reason: reason.clone(),
@@ -2608,21 +3440,21 @@ impl AgentRuntimeWorker {
                     Some(turn_id.to_string()),
                     AgentEventKind::TurnIndeterminateSideEffect { reason },
                 );
+                FinishExecutionOutcome::IndeterminateTerminal
             }
             Err(error) => {
                 let reason = error.to_string();
                 session.active = None;
                 session.snapshot.active_turn_id = None;
                 if let Err(error) = Self::persist_failed_turn(
-                    durability.as_ref(),
-                    durability_repo_id.as_deref(),
-                    durability_principal_id.as_deref(),
-                    durability_command_kind.as_deref(),
+                    durability_context,
                     &request,
                     &reason,
+                    &interaction_resolutions,
+                    retry_intent_review.as_ref(),
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
-                    return;
+                    return FinishExecutionOutcome::IndeterminateTerminal;
                 }
                 session.set_state(InteractionState::Failed {
                     reason: reason.clone(),
@@ -2633,6 +3465,7 @@ impl AgentRuntimeWorker {
                     AgentEventKind::TurnFailed { reason },
                 );
                 self.start_next_if_idle(session_id);
+                FinishExecutionOutcome::DeterminateTerminal
             }
         }
     }
@@ -2674,7 +3507,44 @@ impl AgentRuntimeWorker {
         )))
     }
 
-    fn admit_durable_turn(&self, request: &TurnRequest) -> Result<(), RuntimeWorkerError> {
+    fn existing_durable_status(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<Option<CodeCommandStatus>, RuntimeWorkerError> {
+        let Some(intent) = Self::durable_intent(
+            self.config.durability.as_ref(),
+            self.config.durability_repo_id.as_deref(),
+            self.config.durability_principal_id.as_deref(),
+            self.config.durability_command_kind.as_deref(),
+            request,
+        )?
+        else {
+            return Ok(None);
+        };
+        let durability = self.config.durability.as_ref().ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability disappeared while probing a runtime turn".to_string(),
+            )
+        })?;
+        durability
+            .existing_status_for_intent(&intent)
+            .map_err(|error| match error {
+                RuntimeCommandDurabilityError::Store(CodeCommandStoreError::PayloadConflict {
+                    session_id,
+                    command_id,
+                    ..
+                }) => RuntimeWorkerError::CommandPayloadConflict {
+                    session_id,
+                    turn_id: command_id,
+                },
+                other => RuntimeWorkerError::DurabilityFailure(format!(
+                    "could not inspect durable status for turn '{}': {other}",
+                    request.turn_id
+                )),
+            })
+    }
+
+    fn admit_durable_turn(&mut self, request: &TurnRequest) -> Result<(), RuntimeWorkerError> {
         self.admit_durable_turn_inner(request, false)
     }
 
@@ -2682,14 +3552,14 @@ impl AgentRuntimeWorker {
     /// non-mutating command that is still Pending after a process crash
     /// (IntentSpec review gate restore).
     fn admit_durable_turn_allowing_pending_reattach(
-        &self,
+        &mut self,
         request: &TurnRequest,
     ) -> Result<(), RuntimeWorkerError> {
         self.admit_durable_turn_inner(request, true)
     }
 
     fn admit_durable_turn_inner(
-        &self,
+        &mut self,
         request: &TurnRequest,
         allow_pending_reattach: bool,
     ) -> Result<(), RuntimeWorkerError> {
@@ -2726,6 +3596,16 @@ impl AgentRuntimeWorker {
             CodeCommandAdmission::Existing {
                 status: CodeCommandStatus::Pending,
             } if allow_pending_reattach && !request.mutating => Ok(()),
+            CodeCommandAdmission::Existing {
+                status: CodeCommandStatus::Pending,
+            } if allow_pending_reattach
+                && request.mutating
+                && self.config.phase1_prewrite_reattach_turn_id.as_deref()
+                    == Some(request.turn_id.as_str()) =>
+            {
+                self.config.phase1_prewrite_reattach_turn_id = None;
+                Ok(())
+            }
             CodeCommandAdmission::Existing { status } => {
                 let ack_ok = matches!(
                     status,
@@ -2734,7 +3614,7 @@ impl AgentRuntimeWorker {
                 Err(RuntimeWorkerError::IdempotentCommand {
                     session_id: request.session_id.clone(),
                     turn_id: request.turn_id.clone(),
-                    status: format!("{status:?}"),
+                    status: code_command_status_label(&status).to_string(),
                     ack_ok,
                 })
             }
@@ -2747,6 +3627,8 @@ impl AgentRuntimeWorker {
         principal_id: Option<&str>,
         command_kind: Option<&str>,
         request: &TurnRequest,
+        control_interaction_resolution: Option<&(String, String)>,
+        historical_interaction_resolutions: &[(String, String)],
     ) -> Result<(), RuntimeWorkerError> {
         let Some(intent) =
             Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
@@ -2758,79 +3640,206 @@ impl AgentRuntimeWorker {
                 "durability disappeared while recording a cancellation".to_string(),
             )
         })?;
-        durability
-            .complete_failure(
+        let terminal = crate::internal::ai::session::jsonl::PRE_MUTATION_CANCELLED_COMMAND_REASON;
+        let persist = || match control_interaction_resolution {
+            None => durability.complete_failure_with_interaction_resolutions(
                 &intent,
-                "runtime turn cancelled before a mutating side effect began",
-            )
-            .map_err(|error| {
-                RuntimeWorkerError::DurabilityFailure(format!(
-                    "could not durably record cancellation for turn '{}': {error}",
-                    request.turn_id
-                ))
-            })?;
+                terminal,
+                historical_interaction_resolutions,
+            ),
+            Some((interaction_id, resolution)) => {
+                let mut resolutions = historical_interaction_resolutions.to_vec();
+                resolutions.push((interaction_id.clone(), resolution.clone()));
+                durability.complete_success_with_interaction_resolutions(
+                    &intent,
+                    "review gate cancelled by control request",
+                    &resolutions,
+                )
+            }
+        };
+        if let Err(first_error) = persist() {
+            // A failed sync can still leave the exact terminal row visible.
+            // Replaying the complete payload lets the store re-sync that row;
+            // injected pre-write crashes remain hard failures so their open
+            // gate semantics stay observable to fault tests.
+            let error = if matches!(
+                &first_error,
+                RuntimeCommandDurabilityError::InjectedCrash(_)
+            ) {
+                first_error
+            } else {
+                match persist() {
+                    Ok(_) => return Ok(()),
+                    Err(retry_error) => retry_error,
+                }
+            };
+            tracing::error!(
+                turn_id = %request.turn_id,
+                %error,
+                "failed to durably commit a cancelled runtime terminal"
+            );
+            if let Err(fence_error) = durability.mark_indeterminate(
+                &intent,
+                TERMINAL_PERSISTENCE_FAILURE_EFFECT,
+                TERMINAL_PERSISTENCE_FAILURE_REASON,
+            ) {
+                tracing::error!(
+                    turn_id = %request.turn_id,
+                    %fence_error,
+                    "failed to durably fence an uncommitted cancelled runtime terminal"
+                );
+            }
+            return Err(RuntimeWorkerError::DurabilityFailure(format!(
+                "could not durably record cancellation for turn '{}': {error}",
+                request.turn_id
+            )));
+        }
         Ok(())
     }
 
-    fn persist_successful_turn(
+    fn persist_pending_interaction_checkpoint(
         durability: Option<&RuntimeCommandDurability>,
         repo_id: Option<&str>,
         principal_id: Option<&str>,
         command_kind: Option<&str>,
         request: &TurnRequest,
-        summary: &str,
         interaction_resolutions: &[(String, String)],
     ) -> Result<(), RuntimeWorkerError> {
+        if interaction_resolutions.is_empty() {
+            return Ok(());
+        }
         let Some(intent) =
             Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
         else {
-            return Ok(());
+            return Err(RuntimeWorkerError::DurabilityFailure(
+                "interaction responses were delivered but runtime durability is unavailable"
+                    .to_string(),
+            ));
         };
         let durability = durability.ok_or_else(|| {
+            RuntimeWorkerError::DurabilityFailure(
+                "durability disappeared while checkpointing interaction responses".to_string(),
+            )
+        })?;
+        durability
+            .checkpoint_pending_interaction_resolutions(&intent, interaction_resolutions)
+            .map_err(|error| {
+                RuntimeWorkerError::DurabilityFailure(format!(
+                    "could not checkpoint interaction responses for turn '{}': {error}",
+                    request.turn_id
+                ))
+            })
+    }
+
+    fn persist_successful_turn(
+        context: RuntimeDurabilityContext<'_>,
+        request: &TurnRequest,
+        summary: &str,
+        interaction_resolutions: &[(String, String)],
+        intent_revision: Option<&IntentRevisionRecovery>,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(intent) = Self::durable_intent(
+            context.durability,
+            context.repo_id,
+            context.principal_id,
+            context.command_kind,
+            request,
+        )?
+        else {
+            return Ok(());
+        };
+        let durability = context.durability.ok_or_else(|| {
             RuntimeWorkerError::DurabilityFailure(
                 "durability disappeared while recording successful completion".to_string(),
             )
         })?;
-        durability
-            .complete_success_with_interaction_resolutions(
+        let persist = || {
+            durability.complete_success_with_interaction_resolutions_and_intent_revision(
                 &intent,
                 summary,
                 interaction_resolutions,
+                intent_revision,
             )
-            .map_err(|error| {
-                RuntimeWorkerError::DurabilityFailure(format!(
-                    "could not durably record successful completion{} for turn '{}': {error}",
-                    if interaction_resolutions.is_empty() {
-                        ""
-                    } else {
-                        " and interaction resolution(s)"
-                    },
-                    request.turn_id
-                ))
-            })?;
+        };
+        if let Err(first_error) = persist() {
+            // A store error may be a post-write fsync failure. Retrying the
+            // complete payload is the store's exact-retry/resync path and
+            // prevents the live runtime from fencing a terminal that Web can
+            // already prove committed. The injected pre-write crash seam must
+            // remain a hard failure so tests exercise the original open gate.
+            let error = if matches!(
+                &first_error,
+                RuntimeCommandDurabilityError::InjectedCrash(_)
+            ) {
+                first_error
+            } else {
+                match persist() {
+                    Ok(_) => return Ok(()),
+                    Err(retry_error) => retry_error,
+                }
+            };
+            tracing::error!(
+                turn_id = %request.turn_id,
+                %error,
+                "failed to durably commit a successful runtime terminal"
+            );
+            if let Err(fence_error) = durability.mark_indeterminate(
+                &intent,
+                TERMINAL_PERSISTENCE_FAILURE_EFFECT,
+                TERMINAL_PERSISTENCE_FAILURE_REASON,
+            ) {
+                // The original terminal may have reached the log before a
+                // post-write sync error, or storage may be wholly unavailable.
+                // Either case still returns the original failure and keeps the
+                // live runtime fenced; never manufacture a success ACK.
+                tracing::error!(
+                    turn_id = %request.turn_id,
+                    %fence_error,
+                    "failed to durably fence an uncommitted runtime terminal"
+                );
+            }
+            return Err(RuntimeWorkerError::DurabilityFailure(format!(
+                "could not durably record successful completion{} for turn '{}': {error}",
+                if interaction_resolutions.is_empty() {
+                    ""
+                } else {
+                    " and interaction resolution(s)"
+                },
+                request.turn_id
+            )));
+        }
         Ok(())
     }
 
     fn persist_failed_turn(
-        durability: Option<&RuntimeCommandDurability>,
-        repo_id: Option<&str>,
-        principal_id: Option<&str>,
-        command_kind: Option<&str>,
+        context: RuntimeDurabilityContext<'_>,
         request: &TurnRequest,
         reason: &str,
+        interaction_resolutions: &[(String, String)],
+        retry_intent_review: Option<&Phase1RetryIntentReview>,
     ) -> Result<(), RuntimeWorkerError> {
-        let Some(intent) =
-            Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
+        let Some(intent) = Self::durable_intent(
+            context.durability,
+            context.repo_id,
+            context.principal_id,
+            context.command_kind,
+            request,
+        )?
         else {
             return Ok(());
         };
-        let durability = durability.ok_or_else(|| {
+        let durability = context.durability.ok_or_else(|| {
             RuntimeWorkerError::DurabilityFailure(
                 "durability disappeared while recording failed completion".to_string(),
             )
         })?;
         durability
-            .complete_failure(&intent, reason)
+            .complete_failure_with_interaction_resolutions_and_retry_intent_review(
+                &intent,
+                reason,
+                interaction_resolutions,
+                retry_intent_review,
+            )
             .map_err(|error| {
                 RuntimeWorkerError::DurabilityFailure(format!(
                     "could not durably record failed completion for turn '{}': {error}",
@@ -2847,6 +3856,7 @@ impl AgentRuntimeWorker {
         command_kind: Option<&str>,
         request: &TurnRequest,
         reason: &str,
+        interaction_resolutions: &[(String, String)],
     ) -> Result<(), RuntimeWorkerError> {
         let Some(intent) =
             Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
@@ -2863,6 +3873,16 @@ impl AgentRuntimeWorker {
         } else {
             "mutating_runtime_turn"
         };
+        if !interaction_resolutions.is_empty() {
+            durability
+                .checkpoint_pending_interaction_resolutions(&intent, interaction_resolutions)
+                .map_err(|error| {
+                    RuntimeWorkerError::DurabilityFailure(format!(
+                        "could not durably checkpoint interaction responses before marking turn '{}' indeterminate: {error}",
+                        request.turn_id
+                    ))
+                })?;
+        }
         durability
             .mark_indeterminate(&intent, effect, reason)
             .map_err(|error| {
@@ -3027,10 +4047,32 @@ struct ActiveTurn {
     /// original executor is deferred so observers see a linearized response
     /// acknowledgement before the turn terminal event.
     response_in_progress: bool,
+    /// Hash-only identity and bounded duplicate waiters for the response that
+    /// currently owns delivery. HTTP retries attach here instead of guessing
+    /// whether an absent live interaction has already been consumed.
+    response_in_flight: Option<InFlightInteractionResponse>,
+    /// One bounded response submitted after the UI projection became visible
+    /// but before the executor returned its AwaitingInteraction registration.
+    /// It is in-memory only and is either delivered immediately on
+    /// registration or rejected when the turn settles otherwise.
+    early_response: Option<EarlyInteractionResponse>,
     deferred_execution: Option<Result<RuntimeTurnExecution, RuntimeWorkerError>>,
     /// A response-delivery task failed while the original executor remained
     /// live. Its final completion must not be reported as a successful turn.
     response_delivery_failure: Option<String>,
+}
+
+struct InFlightInteractionResponse {
+    interaction_id: String,
+    response_digest: String,
+    duplicate_replies: Vec<oneshot::Sender<Result<(), RuntimeWorkerError>>>,
+}
+
+struct EarlyInteractionResponse {
+    interaction: InteractionResponse,
+    response_digest: String,
+    reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
+    duplicate_replies: Vec<oneshot::Sender<Result<(), RuntimeWorkerError>>>,
 }
 
 struct ResponseExecution {
@@ -3041,6 +4083,7 @@ struct ResponseExecution {
     cancellation: CancellationToken,
     mutation_started: Arc<AtomicBool>,
     delivery: Option<Box<dyn RuntimeInteractionDelivery>>,
+    checkpointed_before_delivery: bool,
     reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
 }
 
@@ -3138,6 +4181,136 @@ mod tests {
             .cancel("session", "missing")
             .await
             .expect_err("unknown turn");
+        worker.abort();
+    }
+
+    /// An external adapter can finish one command while a queued command is
+    /// admitted in the same actor turn. The acknowledgement must describe the
+    /// exact command that was durably terminalized, not the session projection
+    /// after the queued command has already changed it back to `Running`.
+    #[tokio::test]
+    async fn external_failure_ack_survives_immediate_next_turn_admission() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let durability = RuntimeCommandDurability::new(store.clone());
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let executor = Arc::new(BlockingExecutor {
+            starts: starts.clone(),
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let runtime_config = config(executor)
+            .with_durability(durability, "repo", "principal")
+            .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+
+        handle
+            .track_external_turn(
+                TurnRequest::new("session", "phase1", "plan", true),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("external Phase 1 turn accepted");
+        handle
+            .submit(TurnRequest::new("session", "next", "queued", false))
+            .await
+            .expect("next turn queued");
+
+        let retry_intent_review = Phase1RetryIntentReview {
+            interaction_id: "intent-review-retry-phase1".to_string(),
+            intent_id: "intent-1".to_string(),
+            intent_spec_id: "intent-spec-1".to_string(),
+            source_interaction_id: "intent-review-source".to_string(),
+            source_resolution: "confirm".to_string(),
+            source_phase1_turn_id: "phase1".to_string(),
+            start_seed_digest: "ab".repeat(32),
+        };
+        handle
+            .finish_external_turn_with_retry_intent_review(
+                "session",
+                "phase1",
+                Err(RuntimeWorkerError::ExecutionFailed(
+                    "planner rejected the draft before formal write".to_string(),
+                )),
+                Some(retry_intent_review.clone()),
+            )
+            .await
+            .expect("durable Failed is a successful external closeout");
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("queued turn starts immediately after determinate failure");
+        assert_eq!(starts.lock().await.as_slice(), ["next"]);
+
+        let retry_error = handle
+            .track_external_turn(
+                TurnRequest::new("session", "phase1", "plan", true),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect_err("terminal retry is acknowledged without replacing the live turn");
+        assert!(matches!(
+            retry_error,
+            RuntimeWorkerError::IdempotentCommand {
+                ack_ok: false,
+                status,
+                ..
+            } if status == "Failed"
+        ));
+        assert_eq!(
+            handle
+                .snapshot("session")
+                .await
+                .expect("snapshot after terminal retry")
+                .active_turn_id
+                .as_deref(),
+            Some("next"),
+            "the exact terminal probe must leave the current owner untouched"
+        );
+
+        assert!(matches!(
+            handle
+                .track_external_turn(
+                    TurnRequest::new("session", "phase1", "different plan", true),
+                    CancellationToken::new(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .expect_err("same identity with another payload must conflict before busy"),
+            RuntimeWorkerError::CommandPayloadConflict { .. }
+        ));
+
+        let replay = store
+            .load_code_workflow_replay()
+            .expect("durable workflow replay");
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    crate::internal::ai::session::CodeWorkflowEventKind::CommandTerminalFailure {
+                        command,
+                        retry_intent_review: Some(retry),
+                        ..
+                    } if command.command_id == "phase1" && retry == &retry_intent_review
+                ))
+                .count(),
+            1,
+            "the determinate Phase 1 failure is written exactly once"
+        );
+        assert!(replay.events.iter().all(|event| !matches!(
+            &event.event,
+            crate::internal::ai::session::CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                command,
+                ..
+            } if command.command_id == "phase1"
+        )));
+
+        release.notify_one();
         worker.abort();
     }
 
@@ -4021,6 +5194,7 @@ mod tests {
     struct RacingInteractionExecutor {
         release_execution: Arc<Notify>,
         execution_finished: Arc<Notify>,
+        audit_resolution: bool,
     }
 
     #[async_trait]
@@ -4050,6 +5224,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             Ok(RuntimeTurnExecution::InteractionResponseDelivered)
         }
+
+        async fn interaction_resolution(
+            &self,
+            _request: &TurnRequest,
+            interaction: &InteractionResponse,
+        ) -> Option<String> {
+            self.audit_resolution.then(|| interaction.response.clone())
+        }
     }
 
     /// If the original tool-loop continuation finishes immediately after a
@@ -4063,6 +5245,7 @@ mod tests {
         let executor = Arc::new(RacingInteractionExecutor {
             release_execution: release_execution.clone(),
             execution_finished: execution_finished.clone(),
+            audit_resolution: false,
         });
         let (handle, worker) = AgentRuntimeWorker::spawn(config(executor));
         let mut events = handle
@@ -4115,6 +5298,723 @@ mod tests {
                 AgentEventKind::TurnCompleted { .. }
             ]
         ));
+        worker.abort();
+    }
+
+    /// A response checkpoint can fail after the original executor has already
+    /// queued its terminal result. The worker must settle that deferred result
+    /// through the response-failure epilogue instead of dropping it and
+    /// leaving the command permanently active.
+    #[tokio::test]
+    async fn checkpoint_failure_settles_racing_deferred_execution() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let durability = RuntimeCommandDurability::new(store.clone());
+        let release_execution = Arc::new(Notify::new());
+        let execution_finished = Arc::new(Notify::new());
+        let executor = Arc::new(RacingInteractionExecutor {
+            release_execution,
+            execution_finished,
+            audit_resolution: true,
+        });
+        let runtime_config = config(executor)
+            .with_durability(durability, "repo", "principal")
+            .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+
+        handle
+            .submit(TurnRequest::new("session", "turn", "ask", false))
+            .await
+            .expect("turn accepted");
+        handle
+            .register_interaction(
+                "session",
+                "turn",
+                InteractionState::AwaitingUserInput {
+                    interaction_id: "input-1".to_string(),
+                },
+            )
+            .await
+            .expect("live executor interaction registered");
+        store.fail_next_pending_interaction_checkpoint_for_test();
+
+        assert!(matches!(
+            handle
+                .respond(
+                    "session",
+                    "turn",
+                    InteractionResponse::new("input-1", "continue"),
+                )
+                .await,
+            Err(RuntimeWorkerError::DurabilityFailure(_))
+        ));
+        let snapshot = handle.snapshot("session").await.expect("terminal snapshot");
+        assert!(snapshot.active_turn_id.is_none());
+        assert!(matches!(
+            snapshot.interaction,
+            InteractionState::Failed { .. }
+        ));
+
+        let replay = store
+            .load_code_workflow_replay()
+            .expect("durable command replay");
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.event,
+            crate::internal::ai::session::CodeWorkflowEventKind::CommandTerminalFailure {
+                command,
+                interaction_resolutions,
+                ..
+            } if command.command_id == "turn"
+                && interaction_resolutions
+                    == &vec![("input-1".to_string(), "continue".to_string())]
+        )));
+        worker.abort();
+    }
+
+    struct PendingCheckpointExecutor {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for PendingCheckpointExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.notify_one();
+            context.cancellation().cancelled().await;
+            Err(RuntimeWorkerError::Cancelled)
+        }
+    }
+
+    struct PreCheckpointDelivery {
+        delivered: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeInteractionDelivery for PreCheckpointDelivery {
+        fn validate(&self, _interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError> {
+            Ok(())
+        }
+
+        fn checkpoint_interaction_resolved_before_delivery(&self) -> bool {
+            true
+        }
+
+        fn interaction_resolution(&self, _interaction: &InteractionResponse) -> String {
+            "answered".to_string()
+        }
+
+        async fn deliver(
+            self: Box<Self>,
+            _request: TurnRequest,
+            _interaction: InteractionResponse,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.delivered.notify_one();
+            Ok(RuntimeTurnExecution::InteractionResponseDelivered)
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_delivery_checkpoint_failure_keeps_gate_and_does_not_release_continuation() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let durability = RuntimeCommandDurability::new(store.clone());
+        let started = Arc::new(Notify::new());
+        let delivered = Arc::new(Notify::new());
+        let executor = Arc::new(PendingCheckpointExecutor {
+            started: started.clone(),
+        });
+        let runtime_config = config(executor)
+            .with_durability(durability, "repo", "principal")
+            .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+
+        handle
+            .submit(TurnRequest::new("session", "turn", "ask", false))
+            .await
+            .expect("turn accepted");
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("executor started");
+        handle
+            .register_interaction_with_delivery(
+                "session",
+                "turn",
+                InteractionState::AwaitingUserInput {
+                    interaction_id: "input-1".to_string(),
+                },
+                Box::new(PreCheckpointDelivery {
+                    delivered: delivered.clone(),
+                }),
+            )
+            .await
+            .expect("interaction registered");
+        store.fail_next_durable_sync_after_write_for_test();
+
+        assert!(matches!(
+            handle
+                .respond(
+                    "session",
+                    "turn",
+                    InteractionResponse::new("input-1", "continue"),
+                )
+                .await,
+            Err(RuntimeWorkerError::DurabilityFailure(_))
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), delivered.notified())
+                .await
+                .is_err(),
+            "a failed pre-delivery checkpoint must not release the continuation"
+        );
+        assert!(
+            handle
+                .snapshot("session")
+                .await
+                .expect("pending snapshot")
+                .interaction
+                .is_awaiting_response(),
+            "the original gate remains retryable"
+        );
+
+        handle
+            .respond(
+                "session",
+                "turn",
+                InteractionResponse::new("input-1", "continue"),
+            )
+            .await
+            .expect("retry succeeds after the one-shot durability fault");
+        timeout(Duration::from_secs(1), delivered.notified())
+            .await
+            .expect("continuation released only after the durable checkpoint");
+        handle
+            .cancel("session", "turn")
+            .await
+            .expect("test turn cancelled");
+        worker.abort();
+    }
+
+    struct CompletingWhileInteractionPendingExecutor {
+        started: Arc<Notify>,
+        finish: Arc<Notify>,
+        finished: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for CompletingWhileInteractionPendingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.notify_one();
+            self.finish.notified().await;
+            self.finished.notify_one();
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "executor completed while approval was pending".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_checkpoint_retry_releases_before_cached_executor_terminal() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let started = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let delivered = Arc::new(Notify::new());
+        let runtime_config = config(Arc::new(CompletingWhileInteractionPendingExecutor {
+            started: started.clone(),
+            finish: finish.clone(),
+            finished: finished.clone(),
+        }))
+        .with_durability(
+            RuntimeCommandDurability::new(store.clone()),
+            "repo",
+            "principal",
+        )
+        .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+
+        handle
+            .submit(TurnRequest::new("session", "turn", "ask", false))
+            .await
+            .expect("turn accepted");
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("executor started");
+        handle
+            .register_interaction_with_delivery(
+                "session",
+                "turn",
+                InteractionState::AwaitingToolApproval {
+                    interaction_id: "approval-1".to_string(),
+                    tool_name: "shell".to_string(),
+                },
+                Box::new(PreCheckpointDelivery {
+                    delivered: delivered.clone(),
+                }),
+            )
+            .await
+            .expect("approval registered");
+        store.fail_next_durable_sync_after_write_for_test();
+        assert!(matches!(
+            handle
+                .respond(
+                    "session",
+                    "turn",
+                    InteractionResponse::new("approval-1", "approve"),
+                )
+                .await,
+            Err(RuntimeWorkerError::DurabilityFailure(_))
+        ));
+
+        finish.notify_one();
+        timeout(Duration::from_secs(1), finished.notified())
+            .await
+            .expect("executor returned its terminal result");
+        let pending = handle
+            .snapshot("session")
+            .await
+            .expect("pending snapshot after executor completion");
+        assert_eq!(pending.active_turn_id.as_deref(), Some("turn"));
+        assert!(matches!(
+            pending.interaction,
+            InteractionState::AwaitingToolApproval { .. }
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), delivered.notified())
+                .await
+                .is_err(),
+            "the cached executor terminal must not release the continuation"
+        );
+
+        handle
+            .respond(
+                "session",
+                "turn",
+                InteractionResponse::new("approval-1", "approve"),
+            )
+            .await
+            .expect("exact checkpoint retry releases the continuation");
+        timeout(Duration::from_secs(1), delivered.notified())
+            .await
+            .expect("continuation released after durable checkpoint");
+        let terminal = handle
+            .snapshot("session")
+            .await
+            .expect("terminal snapshot after retry");
+        assert!(terminal.active_turn_id.is_none());
+        assert_eq!(terminal.interaction, InteractionState::Completed);
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn external_parked_turn_can_still_finish_with_a_pending_delivery() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let runtime_config = config(Arc::new(ExternalTurnTrackingExecutor))
+            .with_durability(
+                RuntimeCommandDurability::new(store.clone()),
+                "repo",
+                "principal",
+            )
+            .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+        handle
+            .track_external_turn(
+                TurnRequest::new("session", "turn", "external gate", false),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("external turn tracked");
+        handle
+            .register_interaction_with_delivery(
+                "session",
+                "turn",
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: "intent-review".to_string(),
+                },
+                Box::new(PreCheckpointDelivery {
+                    delivered: Arc::new(Notify::new()),
+                }),
+            )
+            .await
+            .expect("external interaction registered");
+
+        handle
+            .finish_external_turn(
+                "session",
+                "turn",
+                Ok(RuntimeTurnExecution::Completed {
+                    summary: "external gate completed".to_string(),
+                }),
+            )
+            .await
+            .expect("external owner can terminalize its parked gate");
+        let snapshot = handle
+            .snapshot("session")
+            .await
+            .expect("external terminal snapshot");
+        assert!(snapshot.active_turn_id.is_none());
+        assert_eq!(snapshot.interaction, InteractionState::Completed);
+        assert!(matches!(
+            store
+                .code_command_intent_status(&CodeCommandIdentity::new(
+                    "repo",
+                    "session",
+                    "principal",
+                    "turn",
+                ))
+                .expect("external durable status"),
+            Some((_, CodeCommandStatus::Succeeded { .. }))
+        ));
+        worker.abort();
+    }
+
+    struct TerminalReviewExecutor;
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for TerminalReviewExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            Ok(RuntimeTurnExecution::AwaitingInteraction(
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: "intent-review".to_string(),
+                },
+            ))
+        }
+
+        async fn respond(
+            &self,
+            _request: TurnRequest,
+            _interaction: InteractionResponse,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                summary: "review cancelled".to_string(),
+            })
+        }
+
+        async fn interaction_resolution(
+            &self,
+            _request: &TurnRequest,
+            _interaction: &InteractionResponse,
+        ) -> Option<String> {
+            Some("cancel".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn combined_terminal_failure_persists_bounded_indeterminate_without_resolution() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let runtime_config = config(Arc::new(TerminalReviewExecutor))
+            .with_durability(
+                RuntimeCommandDurability::new(store.clone()),
+                "repo",
+                "principal",
+            )
+            .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+        handle
+            .submit(TurnRequest::new("session", "turn", "review", true))
+            .await
+            .expect("turn accepted");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    handle
+                        .snapshot("session")
+                        .await
+                        .expect("snapshot")
+                        .interaction,
+                    InteractionState::AwaitingIntentReview { .. }
+                ) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("review interaction registered");
+
+        store.fail_next_combined_terminal_append_for_test();
+        assert!(matches!(
+            handle
+                .respond(
+                    "session",
+                    "turn",
+                    InteractionResponse::new("intent-review", "cancel"),
+                )
+                .await,
+            Err(RuntimeWorkerError::ReconciliationRequired { .. })
+        ));
+        assert!(matches!(
+            handle
+                .snapshot("session")
+                .await
+                .expect("fenced snapshot")
+                .interaction,
+            InteractionState::IndeterminateSideEffect { .. }
+        ));
+
+        let replay = store
+            .load_code_workflow_replay()
+            .expect("durable workflow replay");
+        assert!(replay.events.iter().all(|event| !matches!(
+            &event.event,
+            crate::internal::ai::session::CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved { .. }
+                | crate::internal::ai::session::CodeWorkflowEventKind::InteractionResolved { .. }
+        )));
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.event,
+            crate::internal::ai::session::CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                command,
+                effect,
+                reason,
+            } if command.command_id == "turn"
+                && effect == "terminal_persistence_failure"
+                && reason == "runtime terminal persistence could not be confirmed; manual reconciliation is required"
+                && !reason.contains("injected")
+                && !reason.contains(temp.path().to_string_lossy().as_ref())
+        )));
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn combined_terminal_post_write_sync_failure_exact_retries_without_fence() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let runtime_config = config(Arc::new(TerminalReviewExecutor))
+            .with_durability(
+                RuntimeCommandDurability::new(store.clone()),
+                "repo",
+                "principal",
+            )
+            .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+        handle
+            .submit(TurnRequest::new("session", "turn", "review", true))
+            .await
+            .expect("turn accepted");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    handle
+                        .snapshot("session")
+                        .await
+                        .expect("snapshot")
+                        .interaction,
+                    InteractionState::AwaitingIntentReview { .. }
+                ) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("review interaction registered");
+
+        store.fail_next_durable_sync_after_write_for_test();
+        handle
+            .respond(
+                "session",
+                "turn",
+                InteractionResponse::new("intent-review", "cancel"),
+            )
+            .await
+            .expect("exact retry re-syncs the visible combined terminal");
+        let snapshot = handle.snapshot("session").await.expect("terminal snapshot");
+        assert!(snapshot.active_turn_id.is_none());
+        assert!(!matches!(
+            snapshot.interaction,
+            InteractionState::IndeterminateSideEffect { .. }
+        ));
+
+        let replay = store
+            .load_code_workflow_replay()
+            .expect("durable workflow replay");
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    crate::internal::ai::session::CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                        command,
+                        interaction_id,
+                        resolution,
+                        ..
+                    } if command.command_id == "turn"
+                        && interaction_id == "intent-review"
+                        && resolution == "cancel"
+                ))
+                .count(),
+            1
+        );
+        assert!(replay.events.iter().all(|event| !matches!(
+            &event.event,
+            crate::internal::ai::session::CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                command,
+                ..
+            } if command.command_id == "turn"
+        )));
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_combined_terminal_failure_persists_bounded_indeterminate() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let runtime_config = config(Arc::new(TerminalReviewExecutor))
+            .with_durability(
+                RuntimeCommandDurability::new(store.clone()),
+                "repo",
+                "principal",
+            )
+            .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+        handle
+            .submit(TurnRequest::new("session", "turn", "review", true))
+            .await
+            .expect("turn accepted");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    handle
+                        .snapshot("session")
+                        .await
+                        .expect("snapshot")
+                        .interaction,
+                    InteractionState::AwaitingIntentReview { .. }
+                ) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("review interaction registered");
+
+        store.fail_next_combined_terminal_append_for_test();
+        assert!(matches!(
+            handle
+                .cancel_interaction("session", "turn", "intent-review", "cancel")
+                .await,
+            Err(RuntimeWorkerError::DurabilityFailure(_))
+        ));
+        assert!(matches!(
+            handle
+                .snapshot("session")
+                .await
+                .expect("fenced snapshot")
+                .interaction,
+            InteractionState::IndeterminateSideEffect { .. }
+        ));
+        let replay = store
+            .load_code_workflow_replay()
+            .expect("durable workflow replay");
+        assert!(replay.events.iter().all(|event| !matches!(
+            &event.event,
+            crate::internal::ai::session::CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved { .. }
+                | crate::internal::ai::session::CodeWorkflowEventKind::InteractionResolved { .. }
+        )));
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.event,
+            crate::internal::ai::session::CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                command,
+                effect,
+                reason,
+            } if command.command_id == "turn"
+                && effect == TERMINAL_PERSISTENCE_FAILURE_EFFECT
+                && reason == TERMINAL_PERSISTENCE_FAILURE_REASON
+        )));
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_combined_terminal_post_write_sync_exact_retries_without_fence() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = crate::internal::ai::session::SessionJsonlStore::new(temp.path().to_path_buf());
+        let runtime_config = config(Arc::new(TerminalReviewExecutor))
+            .with_durability(
+                RuntimeCommandDurability::new(store.clone()),
+                "repo",
+                "principal",
+            )
+            .with_durability_command_kind("worker-test");
+        let (handle, worker) = AgentRuntimeWorker::spawn(runtime_config);
+        handle
+            .submit(TurnRequest::new("session", "turn", "review", true))
+            .await
+            .expect("turn accepted");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    handle
+                        .snapshot("session")
+                        .await
+                        .expect("snapshot")
+                        .interaction,
+                    InteractionState::AwaitingIntentReview { .. }
+                ) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("review interaction registered");
+
+        store.fail_next_durable_sync_after_write_for_test();
+        handle
+            .cancel_interaction("session", "turn", "intent-review", "cancel")
+            .await
+            .expect("exact retry re-syncs the visible cancelled terminal");
+        let snapshot = handle.snapshot("session").await.expect("terminal snapshot");
+        assert!(snapshot.active_turn_id.is_none());
+        assert!(!matches!(
+            snapshot.interaction,
+            InteractionState::IndeterminateSideEffect { .. }
+        ));
+        let replay = store
+            .load_code_workflow_replay()
+            .expect("durable workflow replay");
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    crate::internal::ai::session::CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                        command,
+                        interaction_id,
+                        resolution,
+                        ..
+                    } if command.command_id == "turn"
+                        && interaction_id == "intent-review"
+                        && resolution == "cancel"
+                ))
+                .count(),
+            1
+        );
+        assert!(replay.events.iter().all(|event| !matches!(
+            &event.event,
+            crate::internal::ai::session::CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                command,
+                ..
+            } if command.command_id == "turn"
+        )));
         worker.abort();
     }
 

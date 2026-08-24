@@ -11,10 +11,16 @@ use chrono::{DateTime, Utc};
 use libra::internal::ai::{
     agent::runtime::{RuntimeUsageTotals, UsageStatus},
     runtime::{ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairState},
+    session::{
+        CodeCommandIdentity, CodeCommandIntent, CodeWorkflowEvent, CodeWorkflowEventKind,
+        INTENT_REVISION_CONSUMER_COMMAND_KIND, INTENT_REVISION_CONSUMPTION_SCHEMA_VERSION,
+        IntentRevisionConsumption, IntentRevisionConsumptionClaim, IntentRevisionRecovery,
+        Phase1RetryIntentReview,
+    },
     web::{
         ThreadListItem,
         code_ui::{
-            CodeUiAckResponse, CodeUiApplyToFuture, CodeUiCapabilities,
+            CodeUiAckResponse, CodeUiApiError, CodeUiApplyToFuture, CodeUiCapabilities,
             CodeUiControllerAttachRequest, CodeUiControllerAttachResponse, CodeUiControllerKind,
             CodeUiControllerState, CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind,
             CodeUiInteractionOption, CodeUiInteractionRequest, CodeUiInteractionResponse,
@@ -22,8 +28,9 @@ use libra::internal::ai::{
             CodeUiPlanStep, CodeUiProviderInfo, CodeUiSession, CodeUiSessionResumeRequest,
             CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiSkillActivateRequest,
             CodeUiTaskSnapshot, CodeUiThreadGraph, CodeUiThreadGraphNode, CodeUiToolCallSnapshot,
-            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
+            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, code_ui_error_codes,
         },
+        sse_wire::CodeUiWireV2Event,
     },
 };
 use serde_json::{Value, json};
@@ -327,6 +334,722 @@ fn event_envelope_round_trips_typed_event_and_snapshot_payload() {
     );
 }
 
+/// W2-03: Plan lineage fields are additive durable-field extensions.
+/// Historical Plan review rows omit them and must continue to decode as an
+/// initial gate with the legacy interaction-id context fallback; replacement
+/// rows preserve their identities through a serde round trip.
+#[test]
+fn plan_review_revision_lineage_defaults_for_old_rows_and_round_trips() {
+    let legacy_row = json!({
+        "event_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 41,
+        "recorded_at": "2024-03-09T16:00:00Z",
+        "event": "plan_review_requested",
+        "interaction_id": "plan-review-legacy",
+        "plan_id": "plan-legacy",
+        "turn_id": "review-turn-legacy",
+        "phase1_turn_id": "phase1-turn-legacy",
+    });
+    let decoded: CodeWorkflowEvent =
+        serde_json::from_value(legacy_row).expect("legacy Plan review row must deserialize");
+    assert!(matches!(
+        decoded.event,
+        CodeWorkflowEventKind::PlanReviewRequested {
+            context_id,
+            revision_of: None,
+            prepared_from_network: None,
+            ..
+        } if context_id.is_empty()
+    ));
+
+    let replacement = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 42,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "plan-review-replacement".to_string(),
+            plan_id: "plan-replacement".to_string(),
+            turn_id: "review-turn-replacement".to_string(),
+            phase1_turn_id: "phase1-turn-replacement".to_string(),
+            context_id: "phase1-context-replacement".to_string(),
+            revision_of: Some("plan-review-source".to_string()),
+            prepared_from_network: None,
+        },
+    };
+    let serialized = serde_json::to_value(&replacement).expect("replacement row must serialize");
+    assert_eq!(
+        serialized["revision_of"],
+        Value::String("plan-review-source".to_string())
+    );
+    assert_eq!(
+        serialized["context_id"],
+        Value::String("phase1-context-replacement".to_string())
+    );
+    assert!(
+        serialized.get("revisionOf").is_none() && serialized.get("contextId").is_none(),
+        "durable workflow rows keep snake_case field names"
+    );
+    let round_tripped: CodeWorkflowEvent =
+        serde_json::from_value(serialized).expect("replacement row must deserialize");
+    assert_eq!(round_tripped, replacement);
+}
+
+/// W2-03: the v2 envelope is camelCase, but its workflow payload deliberately
+/// preserves the durable event's snake_case schema, including `revision_of`
+/// and the immutable `context_id`. Back opens a fresh gate identity while
+/// retaining the source context binding.
+#[test]
+fn sse_wire_v2_plan_revision_payload_pins_snake_case_lineage() {
+    let event = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 42,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "plan-review-replacement".to_string(),
+            plan_id: "plan-replacement".to_string(),
+            turn_id: "review-turn-replacement".to_string(),
+            phase1_turn_id: "phase1-turn-replacement".to_string(),
+            context_id: "phase1-context-replacement".to_string(),
+            revision_of: Some("plan-review-source".to_string()),
+            prepared_from_network: None,
+        },
+    };
+
+    let wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&event))
+        .expect("v2 Plan review event must serialize");
+    assert_eq!(
+        wire,
+        json!({
+            "cursor": 42,
+            "eventId": "00000000-0000-0000-0000-000000000000",
+            "kind": "plan_review_requested",
+            "at": "2024-03-09T16:00:00Z",
+            "payload": {
+                "event": "plan_review_requested",
+                "interaction_id": "plan-review-replacement",
+                "plan_id": "plan-replacement",
+                "turn_id": "review-turn-replacement",
+                "phase1_turn_id": "phase1-turn-replacement",
+                "context_id": "phase1-context-replacement",
+                "revision_of": "plan-review-source",
+            },
+        })
+    );
+    assert!(
+        wire["payload"].get("revisionOf").is_none() && wire["payload"].get("contextId").is_none(),
+        "payload fields must not inherit the envelope's camelCase rename"
+    );
+
+    let back_event = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 43,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "plan-review-after-back".to_string(),
+            plan_id: "plan-replacement".to_string(),
+            turn_id: "review-turn-after-back".to_string(),
+            phase1_turn_id: String::new(),
+            context_id: "phase1-context-replacement".to_string(),
+            revision_of: None,
+            prepared_from_network: Some("network-policy-source".to_string()),
+        },
+    };
+    let back_wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&back_event))
+        .expect("v2 Back replacement event must serialize");
+    assert_eq!(
+        back_wire["payload"]["interaction_id"],
+        Value::String("plan-review-after-back".to_string())
+    );
+    assert_eq!(
+        back_wire["payload"]["context_id"],
+        Value::String("phase1-context-replacement".to_string()),
+        "Back must keep the immutable source context while opening a fresh gate"
+    );
+    assert!(
+        back_wire["payload"].get("revision_of").is_none(),
+        "Back is a gate replacement, not a plan revision"
+    );
+    assert_eq!(
+        back_wire["payload"]["prepared_from_network"],
+        Value::String("network-policy-source".to_string()),
+        "Back replacement stays provisional until its source Network gate is durably resolved"
+    );
+}
+
+/// W2-03: the formal-write marker is a public recovery boundary on SSE v2.
+/// It carries only stable identifiers and a digest, never the raw IntentSpec,
+/// revision note, or provider output.
+#[test]
+fn sse_wire_v2_phase1_formal_write_marker_pins_recovery_payload() {
+    let event = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 44,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::Phase1FormalWriteStarted {
+            phase1_turn_id: "phase1-turn".to_string(),
+            source_interaction_id: "intent-review".to_string(),
+            seed_digest: "sha256-redacted-digest".to_string(),
+        },
+    };
+
+    let wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&event))
+        .expect("v2 Phase 1 formal-write marker must serialize");
+    assert_eq!(
+        wire,
+        json!({
+            "cursor": 44,
+            "eventId": "00000000-0000-0000-0000-000000000000",
+            "kind": "phase1_formal_write_started",
+            "at": "2024-03-09T16:00:00Z",
+            "payload": {
+                "event": "phase1_formal_write_started",
+                "phase1_turn_id": "phase1-turn",
+                "source_interaction_id": "intent-review",
+                "seed_digest": "sha256-redacted-digest",
+            },
+        })
+    );
+}
+
+/// W2-03: a command can deliver risk/user-input interactions before its final
+/// review choice. The current gate stays in the legacy primary fields while
+/// earlier non-secret audit labels are an additive snake_case list on the same
+/// crash-atomic terminal row.
+#[test]
+fn sse_wire_v2_terminal_resolution_history_is_additive_and_snake_case() {
+    let legacy_checkpoint = json!({
+        "event_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 44,
+        "recorded_at": "2024-03-09T16:00:00Z",
+        "event": "interaction_resolved",
+        "interaction_id": "question-legacy",
+        "resolution": "answered"
+    });
+    let decoded_checkpoint: CodeWorkflowEvent = serde_json::from_value(legacy_checkpoint)
+        .expect("legacy interaction resolution must deserialize");
+    assert!(matches!(
+        decoded_checkpoint.event,
+        CodeWorkflowEventKind::InteractionResolved {
+            command: None,
+            prior_interaction_resolutions,
+            intent_revision_consumption: None,
+            ..
+        } if prior_interaction_resolutions.is_empty()
+    ));
+
+    let legacy_row = json!({
+        "event_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 45,
+        "recorded_at": "2024-03-09T16:00:00Z",
+        "event": "command_terminal_success_with_interaction_resolved",
+        "command": {
+            "repo_id": "repo-1",
+            "session_id": "session-1",
+            "principal_id": "principal-1",
+            "command_id": "command-1"
+        },
+        "summary": "IntentSpec confirmed",
+        "interaction_id": "intent-review-1",
+        "resolution": "confirm"
+    });
+    let decoded: CodeWorkflowEvent =
+        serde_json::from_value(legacy_row).expect("legacy combined terminal row must deserialize");
+    assert!(matches!(
+        decoded.event,
+        CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+            prior_interaction_resolutions,
+            ..
+        } if prior_interaction_resolutions.is_empty()
+    ));
+
+    let command = CodeCommandIdentity::new("repo-1", "session-1", "principal-1", "command-1");
+    let checkpoint = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 44,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "question-2".to_string(),
+            resolution: "answered".to_string(),
+            command: Some(command.clone()),
+            prior_interaction_resolutions: vec![("question-1".to_string(), "answered".to_string())],
+            intent_revision_consumption: None,
+        },
+    };
+    let checkpoint_wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&checkpoint))
+        .expect("Pending command interaction checkpoint must serialize");
+    assert_eq!(
+        checkpoint_wire["payload"]["command"]["command_id"],
+        Value::String("command-1".to_string())
+    );
+    assert_eq!(
+        checkpoint_wire["payload"]["prior_interaction_resolutions"],
+        json!([["question-1", "answered"]])
+    );
+    assert_eq!(
+        checkpoint_wire["kind"],
+        Value::String("interaction_resolved".to_string()),
+        "ordinary checkpoints must not use the dedicated revision-consumption event kind"
+    );
+    assert!(
+        checkpoint_wire["payload"].get("commandId").is_none()
+            && checkpoint_wire["payload"]
+                .get("priorInteractionResolutions")
+                .is_none(),
+        "checkpoint payload additions must remain snake_case"
+    );
+
+    let success = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 45,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+            command: command.clone(),
+            summary: "IntentSpec confirmed".to_string(),
+            interaction_id: "intent-review-1".to_string(),
+            resolution: "confirm".to_string(),
+            prior_interaction_resolutions: vec![(
+                "risk-profile-1".to_string(),
+                "answered".to_string(),
+            )],
+            intent_revision: None,
+        },
+    };
+    let success_wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&success))
+        .expect("combined success terminal must serialize");
+    assert_eq!(
+        success_wire["payload"]["prior_interaction_resolutions"],
+        json!([["risk-profile-1", "answered"]])
+    );
+    assert!(
+        success_wire["payload"]
+            .get("priorInteractionResolutions")
+            .is_none(),
+        "workflow payload history must remain snake_case"
+    );
+
+    let failure = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 46,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::CommandTerminalFailure {
+            command,
+            reason: "turn cancelled".to_string(),
+            interaction_resolutions: vec![
+                ("question-1".to_string(), "answered".to_string()),
+                ("approval-1".to_string(), "denied".to_string()),
+            ],
+            retry_intent_review: None,
+        },
+    };
+    let failure_wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&failure))
+        .expect("failure terminal history must serialize");
+    assert_eq!(
+        failure_wire["payload"]["interaction_resolutions"],
+        json!([["question-1", "answered"], ["approval-1", "denied"]])
+    );
+    assert!(
+        failure_wire["payload"]
+            .get("interactionResolutions")
+            .is_none(),
+        "workflow payload history must remain snake_case"
+    );
+}
+
+/// W2-03: an IntentSpec Modify terminal exposes only a session-sidecar HMAC
+/// binding. Historical rows default it to `None`; populated durable rows and
+/// SSE v2 retain digest-only snake_case fields and never copy the raw note.
+#[test]
+fn intent_revision_recovery_is_additive_and_pins_sse_snake_case() {
+    let raw_revision_note = "Keep the public API unchanged.";
+    let sidecar_digest = format!("hmac-sha256:{}", "a".repeat(64));
+    let legacy_row = json!({
+        "event_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 47,
+        "recorded_at": "2024-03-09T16:00:00Z",
+        "event": "command_terminal_success_with_interaction_resolved",
+        "command": {
+            "repo_id": "repo-1",
+            "session_id": "session-1",
+            "principal_id": "principal-1",
+            "command_id": "phase0-turn-1"
+        },
+        "summary": "IntentSpec revision mode armed",
+        "interaction_id": "intent-review-1",
+        "resolution": "modify"
+    });
+    let decoded: CodeWorkflowEvent = serde_json::from_value(legacy_row)
+        .expect("legacy Modify terminal without recovery data must deserialize");
+    assert!(matches!(
+        decoded.event,
+        CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+            intent_revision: None,
+            ..
+        }
+    ));
+
+    let event = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 48,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+            command: CodeCommandIdentity::new(
+                "repo-1",
+                "session-1",
+                "principal-1",
+                "phase0-turn-1",
+            ),
+            summary: "IntentSpec revision mode armed".to_string(),
+            interaction_id: "intent-review-1".to_string(),
+            resolution: "modify".to_string(),
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision: Some(IntentRevisionRecovery {
+                interaction_id: "intent-review-1".to_string(),
+                sidecar_digest: sidecar_digest.clone(),
+            }),
+        },
+    };
+
+    let serialized = serde_json::to_value(&event).expect("Modify terminal must serialize");
+    assert_eq!(
+        serialized["intent_revision"],
+        json!({
+            "interaction_id": "intent-review-1",
+            "sidecar_digest": sidecar_digest,
+        })
+    );
+    assert!(
+        serialized.get("intentRevision").is_none()
+            && serialized["intent_revision"].get("interactionId").is_none()
+            && serialized["intent_revision"].get("sidecarDigest").is_none()
+            && serialized["intent_revision"].get("note").is_none(),
+        "durable recovery fields must remain digest-only snake_case"
+    );
+    let round_tripped: CodeWorkflowEvent = serde_json::from_value(serialized.clone())
+        .expect("populated Modify terminal must round-trip");
+    assert_eq!(round_tripped, event);
+
+    let wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&event))
+        .expect("v2 Modify terminal must serialize");
+    assert_eq!(
+        wire,
+        json!({
+            "cursor": 48,
+            "eventId": "00000000-0000-0000-0000-000000000000",
+            "kind": "command_terminal_success_with_interaction_resolved",
+            "at": "2024-03-09T16:00:00Z",
+            "payload": {
+                "event": "command_terminal_success_with_interaction_resolved",
+                "command": {
+                    "repo_id": "repo-1",
+                    "session_id": "session-1",
+                    "principal_id": "principal-1",
+                    "command_id": "phase0-turn-1",
+                },
+                "summary": "IntentSpec revision mode armed",
+                "interaction_id": "intent-review-1",
+                "resolution": "modify",
+                "intent_revision": {
+                    "interaction_id": "intent-review-1",
+                    "sidecar_digest": format!("hmac-sha256:{}", "a".repeat(64)),
+                },
+            },
+        })
+    );
+    assert!(
+        wire["payload"].get("intentRevision").is_none()
+            && wire["payload"]["intent_revision"]
+                .get("interactionId")
+                .is_none()
+            && wire["payload"]["intent_revision"]
+                .get("sidecarDigest")
+                .is_none()
+            && wire["payload"]["intent_revision"].get("note").is_none(),
+        "SSE workflow payload and nested recovery object must remain digest-only snake_case"
+    );
+
+    assert!(
+        !serialized.to_string().contains(raw_revision_note)
+            && !wire.to_string().contains(raw_revision_note),
+        "raw revision notes must not enter the terminal row or its SSE v2 event"
+    );
+
+    let mut snapshot = fully_populated_snapshot();
+    snapshot.transcript.push(CodeUiTranscriptEntry {
+        id: "msg-revision".to_string(),
+        kind: CodeUiTranscriptEntryKind::UserMessage,
+        title: None,
+        content: Some(raw_revision_note.to_string()),
+        status: None,
+        streaming: false,
+        metadata: json!({}),
+        created_at: fixed_ts(),
+        updated_at: fixed_ts(),
+    });
+    let snapshot_wire = serde_json::to_value(snapshot).expect("session snapshot must serialize");
+    assert_eq!(
+        snapshot_wire["transcript"][1]["content"],
+        Value::String(raw_revision_note.to_string()),
+        "ordinary user transcript content keeps the existing snapshot retention boundary"
+    );
+}
+
+/// W2-03: the irreversible sidecar consumption receipt projects as a dedicated
+/// SSE event. The payload is the exact durable lineage record, not a second
+/// interaction-resolution event and never a carrier for the raw revision note.
+#[test]
+fn sse_wire_v2_intent_revision_consumed_uses_dedicated_payload() {
+    let raw_revision_note = "Keep the public API unchanged.";
+    let sidecar_digest = format!("hmac-sha256:{}", "b".repeat(64));
+    let consumption = IntentRevisionConsumption {
+        claim: IntentRevisionConsumptionClaim {
+            schema_version: INTENT_REVISION_CONSUMPTION_SCHEMA_VERSION,
+            interaction_id: "intent-review-1".to_string(),
+            source_command: CodeCommandIdentity::new(
+                "repo-1",
+                "session-1",
+                "principal-1",
+                "phase0-turn-1",
+            ),
+            consumer_intent: CodeCommandIntent::new(
+                CodeCommandIdentity::new("repo-1", "session-1", "principal-1", "ordinary-turn-1"),
+                INTENT_REVISION_CONSUMER_COMMAND_KIND,
+                "sha256:consumer-request",
+                true,
+            ),
+            terminal_event_id: uuid::Uuid::from_u128(1),
+            terminal_sequence: 48,
+            intent_id: "intent-1".to_string(),
+            sidecar_digest: Some(sidecar_digest.clone()),
+        },
+        consumer_intent_event_id: uuid::Uuid::from_u128(2),
+        consumer_intent_sequence: 49,
+    };
+    let event = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 50,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "intent-review-1".to_string(),
+            resolution: "modify".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: Some(consumption.clone()),
+        },
+    };
+
+    let durable = serde_json::to_value(&event).expect("consumption receipt must serialize");
+    assert_eq!(
+        durable["event"],
+        Value::String("interaction_resolved".to_string())
+    );
+    assert_eq!(
+        durable["intent_revision_consumption"]["claim"]["sidecar_digest"],
+        Value::String(sidecar_digest.clone())
+    );
+    assert!(
+        durable.get("intentRevisionConsumption").is_none()
+            && durable["intent_revision_consumption"]
+                .get("consumerIntentEventId")
+                .is_none()
+            && durable["intent_revision_consumption"]["claim"]
+                .get("sidecarDigest")
+                .is_none(),
+        "durable receipt fields must remain snake_case"
+    );
+
+    let wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&event))
+        .expect("v2 consumption receipt must serialize");
+    assert_eq!(
+        wire,
+        json!({
+            "cursor": 50,
+            "eventId": "00000000-0000-0000-0000-000000000000",
+            "kind": "intent_revision_consumed",
+            "at": "2024-03-09T16:00:00Z",
+            "payload": {
+                "consumption": {
+                    "claim": {
+                        "schema_version": 1,
+                        "interaction_id": "intent-review-1",
+                        "source_command": {
+                            "repo_id": "repo-1",
+                            "session_id": "session-1",
+                            "principal_id": "principal-1",
+                            "command_id": "phase0-turn-1",
+                        },
+                        "consumer_intent": {
+                            "identity": {
+                                "repo_id": "repo-1",
+                                "session_id": "session-1",
+                                "principal_id": "principal-1",
+                                "command_id": "ordinary-turn-1",
+                            },
+                            "command_kind": "headless_direct_turn",
+                            "canonical_request_hash": "sha256:consumer-request",
+                            "mutating": true,
+                        },
+                        "terminal_event_id": "00000000-0000-0000-0000-000000000001",
+                        "terminal_sequence": 48,
+                        "intent_id": "intent-1",
+                        "sidecar_digest": sidecar_digest,
+                    },
+                    "consumer_intent_event_id": "00000000-0000-0000-0000-000000000002",
+                    "consumer_intent_sequence": 49,
+                },
+            },
+        })
+    );
+    assert!(
+        wire["payload"].get("event").is_none()
+            && wire["payload"].get("resolution").is_none()
+            && wire["payload"].get("interaction_id").is_none()
+            && !durable.to_string().contains(raw_revision_note)
+            && !wire.to_string().contains(raw_revision_note),
+        "the dedicated receipt payload must not masquerade as a resolution or expose the note"
+    );
+}
+
+/// W2-03: pre-formal-write Phase 1 failures may atomically carry the sole
+/// retry IntentSpec gate authority. The field is additive for durable replay,
+/// and SSE v2 retains the workflow payload's snake_case field name.
+#[test]
+fn command_terminal_failure_retry_intent_review_is_additive_and_snake_case() {
+    let legacy_row = json!({
+        "event_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 47,
+        "recorded_at": "2024-03-09T16:00:00Z",
+        "event": "command_terminal_failure",
+        "command": {
+            "repo_id": "repo-1",
+            "session_id": "session-1",
+            "principal_id": "principal-1",
+            "command_id": "phase1-turn-1"
+        },
+        "reason": "provider unavailable"
+    });
+    let decoded: CodeWorkflowEvent = serde_json::from_value(legacy_row)
+        .expect("legacy failure without retry authority must deserialize");
+    assert!(matches!(
+        decoded.event,
+        CodeWorkflowEventKind::CommandTerminalFailure {
+            retry_intent_review: None,
+            ..
+        }
+    ));
+
+    let retry = Phase1RetryIntentReview {
+        interaction_id: "intent-retry-1".to_string(),
+        intent_id: "intent-1".to_string(),
+        intent_spec_id: "intent-spec-1".to_string(),
+        source_interaction_id: "intent-review-1".to_string(),
+        source_resolution: "confirm".to_string(),
+        source_phase1_turn_id: "phase1-turn-1".to_string(),
+        start_seed_digest: "a".repeat(64),
+    };
+    let event = CodeWorkflowEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 47,
+        recorded_at: fixed_ts(),
+        event: CodeWorkflowEventKind::CommandTerminalFailure {
+            command: CodeCommandIdentity::new(
+                "repo-1",
+                "session-1",
+                "principal-1",
+                "phase1-turn-1",
+            ),
+            reason: "provider unavailable".to_string(),
+            interaction_resolutions: Vec::new(),
+            retry_intent_review: Some(retry),
+        },
+    };
+
+    let serialized = serde_json::to_value(&event).expect("retry failure row must serialize");
+    assert_eq!(
+        serialized["retry_intent_review"],
+        json!({
+            "interactionId": "intent-retry-1",
+            "intentId": "intent-1",
+            "intentSpecId": "intent-spec-1",
+            "sourceInteractionId": "intent-review-1",
+            "sourceResolution": "confirm",
+            "sourcePhase1TurnId": "phase1-turn-1",
+            "startSeedDigest": "a".repeat(64),
+        })
+    );
+    assert!(
+        serialized.get("retryIntentReview").is_none(),
+        "durable retry authority must keep its snake_case field name"
+    );
+    let round_tripped: CodeWorkflowEvent = serde_json::from_value(serialized)
+        .expect("retry failure row must deserialize after serialization");
+    assert_eq!(round_tripped, event);
+
+    let wire = serde_json::to_value(CodeUiWireV2Event::from_workflow_event(&event))
+        .expect("v2 retry failure event must serialize");
+    assert_eq!(
+        wire["payload"]["retry_intent_review"]["interactionId"],
+        Value::String("intent-retry-1".to_string())
+    );
+    assert!(
+        wire["payload"].get("retryIntentReview").is_none(),
+        "SSE workflow payload must keep retry_intent_review in snake_case"
+    );
+}
+
+/// W2-03: Network Allow remains a documented fail-closed conflict until the
+/// W2-04 execution handoff is available. Pin both the constructor state and
+/// the public Code UI error catalogue entry.
+#[test]
+fn plan_execution_not_available_is_a_catalogued_conflict() {
+    let error = CodeUiApiError::conflict(
+        "PLAN_EXECUTION_NOT_AVAILABLE",
+        "confirmed-plan execution handoff is unavailable",
+    );
+    assert_eq!(error.code, "PLAN_EXECUTION_NOT_AVAILABLE");
+    assert_eq!(error.status, 409);
+    assert_eq!(
+        code_ui_error_codes()
+            .iter()
+            .copied()
+            .find(|(code, _)| *code == error.code.as_str()),
+        Some(("PLAN_EXECUTION_NOT_AVAILABLE", 409))
+    );
+}
+
+/// W2-03: stale checkout execution and an empty Plan revision note are typed
+/// public wire failures, not generic unsupported-operation fallbacks.
+#[test]
+fn phase1_workspace_and_revision_errors_are_catalogued() {
+    for (error, expected_code, expected_status) in [
+        (
+            CodeUiApiError::conflict(
+                "PHASE1_WORKSPACE_CHANGED",
+                "the reviewed Plan no longer matches the checkout",
+            ),
+            "PHASE1_WORKSPACE_CHANGED",
+            409,
+        ),
+        (
+            CodeUiApiError::bad_request(
+                "PLAN_REVISION_NOTE_REQUIRED",
+                "the Plan revision note is empty",
+            ),
+            "PLAN_REVISION_NOTE_REQUIRED",
+            400,
+        ),
+    ] {
+        assert_eq!(error.code, expected_code);
+        assert_eq!(error.status, expected_status);
+        assert_eq!(
+            code_ui_error_codes()
+                .iter()
+                .copied()
+                .find(|(code, _)| *code == expected_code),
+            Some((expected_code, expected_status))
+        );
+    }
+}
+
 /// Every `CodeUiTranscriptEntryKind` variant must serialize to the snake_case
 /// value the browser switches on — drift here silently breaks the chat pane.
 #[test]
@@ -373,20 +1096,25 @@ fn interaction_kinds_use_snake_case_values() {
     }
 }
 
-/// Controller kinds the API layer accepts on attach/detach must keep the same
-/// snake_case tags the frontend embeds in request bodies.
+/// Controller kinds serialized into snapshots must keep stable snake_case
+/// tags; the retired local-interaction value remains decodable for old
+/// snapshots even though new leases reject it.
 #[test]
 fn controller_kinds_use_snake_case_values() {
     for (variant, expected) in [
         (CodeUiControllerKind::None, "none"),
         (CodeUiControllerKind::Browser, "browser"),
         (CodeUiControllerKind::Automation, "automation"),
-        (CodeUiControllerKind::Tui, "tui"),
+        (CodeUiControllerKind::LegacyLocal, "tui"),
         (CodeUiControllerKind::Cli, "cli"),
     ] {
         let value = serde_json::to_value(variant).unwrap();
         assert_eq!(value, Value::String(expected.into()));
     }
+
+    let legacy: CodeUiControllerKind = serde_json::from_value(Value::String("tui".into()))
+        .expect("legacy controller tag must remain decodable");
+    assert_eq!(legacy, CodeUiControllerKind::LegacyLocal);
 }
 
 /// Apply-to-future enum is one of the few request-side enums the frontend

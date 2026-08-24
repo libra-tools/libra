@@ -1,4 +1,4 @@
-//! Codex websocket → runtime [`AgentEvent`] envelope normalization (W3-04).
+//! Codex websocket → runtime `AgentEvent` envelope normalization (W3-04).
 //!
 //! Managed Codex speaks an app-server JSON-RPC notification schema over
 //! WebSocket. This module is the **only** place that classifies those
@@ -477,7 +477,7 @@ fn truncate_for_envelope(input: &str, max_chars: usize) -> String {
 /// managed Codex session mirror; this function is the shared lifecycle
 /// authority so Codex does not project status through a private path.
 ///
-/// `InteractionRequested` only forces [`CodeUiSessionStatus::AwaitingInteraction`]
+/// `InteractionRequested` only forces `CodeUiSessionStatus::AwaitingInteraction`
 /// when the hydrated snapshot still has a pending interaction. Approvals that
 /// were resolved in the same notification batch must not leave the UI stuck
 /// awaiting an action that is no longer available.

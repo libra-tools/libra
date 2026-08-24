@@ -86,7 +86,7 @@ impl AgentProfileRouter {
         self.profiles.iter().find(|a| a.name == name)
     }
 
-    /// Get an [`AgentExecutionSpec`] by name.
+    /// Get an `AgentExecutionSpec` by name.
     ///
     /// This is the OC-Phase 2 P2.2 entry point for callers that need the
     /// runtime-shaped agent contract instead of the parser-shaped

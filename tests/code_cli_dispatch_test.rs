@@ -13,7 +13,7 @@
 //!   the removed hidden legacy-TUI rollback env no longer changes the
 //!   default Web launch (spawns the real binary).
 //! * `--mcp-port 0` is accepted (kernel-assigned port, used by the
-//!   PTY harness).
+//!   Web process harness).
 //! * `--port 0` likewise.
 //! * `--env-file` is parsed into the right field.
 //! * `--repo`, `--cwd`, `--resume` pass through as `Some(...)`.

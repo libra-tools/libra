@@ -12,7 +12,7 @@
 //! - [`model`]: raw sea-orm `Entity`/`Model`/`ActiveModel` definitions. Other modules
 //!   in this layer wrap these so callers do not depend on sea-orm directly.
 //! - [`protocol`]: clients for Git's wire protocols (smart HTTP, ssh, local fs) plus
-//!   the LFS client. These are pluggable behind the [`protocol::SmartProtocol`] trait.
+//!   the LFS client. These are pluggable behind the `protocol::SmartProtocol` trait.
 //! - [`log`]: rendering of `git log`–style output and date/time parsing helpers.
 //! - [`ai`]: agent runtime and Code UI services used by `libra code`.
 //! - [`vault`]: encrypted at-rest storage for credentials and provider secrets.

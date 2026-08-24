@@ -348,7 +348,7 @@ pub async fn begin_write_transaction<
     Ok(txn)
 }
 
-/// [`ConnectionTrait::transaction`] with the write lock taken up front.
+/// `ConnectionTrait::transaction` with the write lock taken up front.
 ///
 /// Same shape and same `TransactionError` mapping as sea-orm's own, so a call
 /// site converts by replacing `db.transaction(...)` with

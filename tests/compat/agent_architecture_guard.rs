@@ -436,6 +436,139 @@ fn code_web_only_completion_gate() {
     }
 }
 
+/// W5-10: once the internal terminal UI module is retired, neither its direct
+/// dependencies nor its production symbol names may return unnoticed.
+#[test]
+fn terminal_ui_dependencies_and_production_symbols_remain_retired() {
+    let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).expect("read Cargo.toml");
+    let manifest: toml::Value = manifest.parse().expect("parse Cargo.toml");
+
+    fn manifest_mentions_dependency(value: &toml::Value, dependency: &str) -> bool {
+        let Some(table) = value.as_table() else {
+            return false;
+        };
+        table.iter().any(|(key, value)| {
+            key == dependency
+                || value
+                    .as_table()
+                    .and_then(|value| value.get("package"))
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|package| package == dependency)
+                || manifest_mentions_dependency(value, dependency)
+        })
+    }
+
+    for dependency in ["ratatui", "crossterm"] {
+        let present = manifest_mentions_dependency(&manifest, dependency);
+        assert!(
+            !present,
+            "Cargo.toml must not restore the retired direct {dependency} dependency"
+        );
+    }
+
+    fn visit_source_tree(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read production source directory") {
+            let entry = entry.expect("read production source entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit_source_tree(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut sources = Vec::new();
+    visit_source_tree(&repo_root().join("src"), &mut sources);
+    let library_root = fs::read_to_string(repo_root().join("src/lib.rs")).expect("read lib.rs");
+    assert!(
+        library_root.contains("supported, patch-compatible embedding API")
+            && library_root.contains("`internal` is an implementation detail"),
+        "the public internal module must remain documented as an unstable implementation detail",
+    );
+    for source in sources {
+        let contents = fs::read_to_string(&source).expect("read production Rust source");
+        for forbidden in ["ratatui", "crossterm", "internal::tui", "Tui"] {
+            assert!(
+                !contents.contains(forbidden),
+                "{} reintroduced retired terminal-UI token {forbidden:?}",
+                source.display()
+            );
+        }
+    }
+}
+
+/// W5-05: Code runtime behavior must not return to TUI or a Web-private plan
+/// workflow state machine. Docs must keep Web as the default surface.
+#[test]
+fn code_runtime_stays_web_owned_without_tui_or_private_plan_state() {
+    let code = fs::read_to_string(repo_root().join("src/command/code.rs")).expect("read code.rs");
+    for forbidden in ["TuiCodeUiAdapter", "execute_tui", "Tui::new", "Tui::"] {
+        assert!(
+            !code.contains(forbidden),
+            "src/command/code.rs must not restore TUI startup/adapter token {forbidden:?}"
+        );
+    }
+
+    let mut web_sources = Vec::new();
+    fn visit(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read web source directory") {
+            let entry = entry.expect("read web source entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    visit(&repo_root().join("src/internal/ai/web"), &mut web_sources);
+    let mut saw_runtime_plan_handoff = false;
+    for source in &web_sources {
+        let contents = fs::read_to_string(source).expect("read web rust source");
+        assert!(
+            !contents.contains("TuiCodeUiAdapter"),
+            "{} must not restore TuiCodeUiAdapter",
+            source.display()
+        );
+        assert!(
+            !contents.contains("pending_post_plan") && !contents.contains("struct PendingPlan"),
+            "{} must not keep a private Plan workflow state machine",
+            source.display()
+        );
+        if contents.contains("submit_confirmed_plan_execution")
+            || contents.contains("StartPlanExecution")
+        {
+            saw_runtime_plan_handoff = true;
+        }
+    }
+    assert!(
+        saw_runtime_plan_handoff,
+        "Web adapter must hand confirmed plan execution to AgentRuntime"
+    );
+
+    let code_doc = fs::read_to_string(repo_root().join("docs/commands/code.md"))
+        .expect("read docs/commands/code.md");
+    let zh_doc = fs::read_to_string(repo_root().join("docs/commands/zh-CN/code.md"))
+        .expect("read docs/commands/zh-CN/code.md");
+    for (path, body) in [
+        ("docs/commands/code.md", &code_doc),
+        ("docs/commands/zh-CN/code.md", &zh_doc),
+    ] {
+        let lowered = body.to_ascii_lowercase();
+        assert!(
+            !lowered.contains("default mode launches the tui")
+                && !lowered.contains("defaults to the tui")
+                && !lowered.contains("默认启动 tui"),
+            "{path} must not advertise TUI as the current default"
+        );
+        assert!(
+            body.contains("Web Code UI") || body.contains("Web Code UI"),
+            "{path} must keep Web Code UI as the default surface"
+        );
+    }
+}
+
 /// W0-01: retain the source-grounded conflict and A0-consumption records
 /// needed to prevent a future Code migration from silently recreating an
 /// Agent-side queue, trust policy, or artifact store.

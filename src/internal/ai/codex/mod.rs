@@ -1183,10 +1183,6 @@ pub struct AgentCodexArgs {
     /// Debug mode: print collected data
     #[arg(long, default_value = "false")]
     pub debug: bool,
-
-    /// UI mode for the embedded Code UI read model.
-    #[arg(skip)]
-    pub ui_mode: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2765,6 +2761,16 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
     }
 }
 
+fn new_code_ui_provider_info(model: Option<String>) -> CodeUiProviderInfo {
+    CodeUiProviderInfo {
+        provider: "codex".to_string(),
+        model,
+        // Web is the only live Code UI mode.
+        mode: Some("web".to_string()),
+        managed: true,
+    }
+}
+
 pub async fn start_code_ui_runtime(
     args: AgentCodexArgs,
     mcp_server: Arc<LibraMcpServer>,
@@ -2809,12 +2815,7 @@ pub async fn start_code_ui_runtime(
 
     let browser_session = CodeUiSession::new(initial_snapshot(
         args.cwd.clone(),
-        CodeUiProviderInfo {
-            provider: "codex".to_string(),
-            model: args.model.clone(),
-            mode: Some(args.ui_mode.clone().unwrap_or_else(|| "web".to_string())),
-            managed: true,
-        },
+        new_code_ui_provider_info(args.model.clone()),
         codex_code_ui_capabilities(),
     ));
     let codex_session: Arc<Mutex<CodexSession>> = Arc::new(Mutex::new(CodexSession::new()));
@@ -8627,10 +8628,19 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        CodexCodeUiAdapter, is_streaming_delta_method, should_finish_codex_turn_completed,
-        truncate_for_log,
+        CodexCodeUiAdapter, is_streaming_delta_method, new_code_ui_provider_info,
+        should_finish_codex_turn_completed, truncate_for_log,
     };
     use crate::internal::ai::codex::protocol::MethodKind;
+
+    #[test]
+    fn new_code_ui_sessions_always_publish_web_mode() {
+        let provider = new_code_ui_provider_info(Some("test-model".to_string()));
+        assert_eq!(provider.provider, "codex");
+        assert_eq!(provider.model.as_deref(), Some("test-model"));
+        assert_eq!(provider.mode.as_deref(), Some("web"));
+        assert!(provider.managed);
+    }
 
     #[test]
     fn lease_takeover_resets_accept_all_approval_mode_to_ask() {

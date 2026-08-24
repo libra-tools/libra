@@ -2,15 +2,13 @@
 
 use std::{
     fs::{self, File},
-    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use reqwest::{StatusCode, blocking::Client};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -224,8 +222,7 @@ pub struct CodeSession {
     /// sessions never get a control token file, so the harness should not
     /// look for one and authorized POSTs are limited to non-write routes.
     control_write: bool,
-    child: Option<Box<dyn Child + Send + Sync>>,
-    reader_thread: Option<thread::JoinHandle<()>>,
+    child: Option<Child>,
     client: Client,
 }
 
@@ -295,43 +292,23 @@ impl CodeSession {
             temp.path().join("control.json")
         };
         let libra_log = logs_dir.join("libra.log");
-        let pty_log = logs_dir.join("pty.log");
+        let process_log = logs_dir.join("process.log");
         let previous_info_text = fs::read_to_string(&info_path).ok();
 
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 40,
-                cols: 120,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("failed to open PTY")?;
+        // W5-04: the Code UI harness is a plain Web process harness. Capture
+        // stdout/stderr in one artifact without allocating a pseudo-terminal;
+        // this keeps terminal detection out of the launch contract entirely.
+        let process_stdout = File::create(&process_log).with_context(|| {
+            format!(
+                "failed to create Web process log '{}'",
+                process_log.display()
+            )
+        })?;
+        let process_stderr = process_stdout
+            .try_clone()
+            .context("failed to clone Web process log handle")?;
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone PTY reader")?;
-        let reader_thread = thread::spawn(move || {
-            let Ok(mut file) = File::create(&pty_log) else {
-                return;
-            };
-            let mut buf = [0_u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if file.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                        let _ = file.flush();
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let mut cmd = CommandBuilder::new(&bin);
+        let mut cmd = Command::new(&bin);
         // Wave 11 / PR 11 — split the provider / model / fixture
         // args so a live-provider spawn (model_generation matrix)
         // can drop `--fake-fixture` entirely and supply real
@@ -385,8 +362,7 @@ impl CodeSession {
         if let Some(thread_id) = options.resume_thread_id.as_deref() {
             cmd.args(["--resume", thread_id]);
         }
-        cmd.cwd(&repo_dir);
-        cmd.env("TERM", "xterm-256color");
+        cmd.current_dir(&repo_dir);
         cmd.env("LIBRA_ENABLE_TEST_PROVIDER", "1");
         cmd.env("LIBRA_LOG_FILE", path_str(&libra_log)?);
         cmd.env("LIBRA_LOG", "info,libra::internal::ai::web=debug");
@@ -400,11 +376,12 @@ impl CodeSession {
             cmd.env(key, value);
         }
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("failed to spawn libra code in PTY")?;
-        drop(pair.slave);
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(process_stdout))
+            .stderr(Stdio::from(process_stderr))
+            .spawn()
+            .context("failed to spawn libra code Web process")?;
 
         let mut session = Self {
             _temp: temp,
@@ -420,7 +397,6 @@ impl CodeSession {
             controller_token: None,
             control_write: options.control_write,
             child: Some(child),
-            reader_thread: Some(reader_thread),
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -460,7 +436,6 @@ impl CodeSession {
                 "0",
             ])
             .current_dir(&self.repo_dir)
-            .env("TERM", "xterm-256color")
             .env("LIBRA_ENABLE_TEST_PROVIDER", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -646,14 +621,14 @@ impl CodeSession {
             .unwrap_or_else(|error| format!("<unavailable: {error:#}>"));
         let control_info = fs::read_to_string(&self.info_path)
             .unwrap_or_else(|error| format!("<unavailable: {error}>"));
-        let pty_tail = tail_file(&self.logs_dir.join("pty.log"), 20);
+        let process_tail = tail_file(&self.logs_dir.join("process.log"), 20);
         let libra_tail = tail_file(&self.logs_dir.join("libra.log"), 20);
         let context = format!(
-            "artifacts: {}\ncontrol.json:\n{}\nlatest snapshot:\n{}\npty.log tail:\n{}\nlibra.log tail:\n{}",
+            "artifacts: {}\ncontrol.json:\n{}\nlatest snapshot:\n{}\nprocess.log tail:\n{}\nlibra.log tail:\n{}",
             self.logs_dir.display(),
             control_info,
             snapshot,
-            pty_tail,
+            process_tail,
             libra_tail
         );
         self.redact_known_secrets(context)
@@ -835,6 +810,28 @@ impl CodeSession {
             text,
             Some(self.base_url.as_str()),
         )
+    }
+
+    #[cfg(feature = "test-provider")]
+    pub fn expire_browser_controller_lease_for_test(
+        &self,
+        controller_token: &str,
+    ) -> Result<StatusCode> {
+        let response = self
+            .client
+            .post(self.url("/test/expire-controller-lease"))
+            .header("X-Code-Controller-Token", controller_token)
+            .header("Origin", self.base_url.as_str())
+            .send()
+            .context("failed to expire browser controller lease through test seam")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(
+                "controller lease test expiry failed with {status}: {}",
+                response.text().unwrap_or_default()
+            );
+        }
+        Ok(status)
     }
 
     /// Like [`Self::browser_submit_message`] but lets tests override or omit
@@ -1359,14 +1356,11 @@ impl CodeSession {
         if let Some(child) = self.child.as_mut() {
             #[cfg(unix)]
             {
-                if let Some(pid) = child.process_id() {
-                    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                    if result != 0 {
-                        return Err(std::io::Error::last_os_error())
-                            .with_context(|| format!("failed to SIGKILL libra code child {pid}"));
-                    }
-                } else {
-                    child.kill().context("failed to kill libra code child")?;
+                let pid = child.id();
+                let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .with_context(|| format!("failed to SIGKILL libra code child {pid}"));
                 }
             }
             #[cfg(not(unix))]
@@ -1378,7 +1372,6 @@ impl CodeSession {
                 .context("failed to wait for killed libra code child")?;
             self.child = None;
         }
-        self.join_reader();
         Ok(())
     }
 
@@ -1390,14 +1383,11 @@ impl CodeSession {
         if let Some(child) = self.child.as_mut() {
             #[cfg(unix)]
             {
-                if let Some(pid) = child.process_id() {
-                    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                    if result != 0 {
-                        return Err(std::io::Error::last_os_error())
-                            .with_context(|| format!("failed to SIGTERM libra code child {pid}"));
-                    }
-                } else {
-                    child.kill().context("failed to kill libra code child")?;
+                let pid = child.id();
+                let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .with_context(|| format!("failed to SIGTERM libra code child {pid}"));
                 }
             }
             #[cfg(not(unix))]
@@ -1416,7 +1406,6 @@ impl CodeSession {
                         .wait()
                         .context("failed to wait for terminated libra code child")?;
                     self.child = None;
-                    self.join_reader();
                     return Ok(());
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -1430,7 +1419,6 @@ impl CodeSession {
                 .context("failed to wait for killed libra code child after SIGTERM timeout")?;
             self.child = None;
         }
-        self.join_reader();
         Ok(())
     }
 
@@ -1441,12 +1429,9 @@ impl CodeSession {
     #[cfg(unix)]
     pub fn sigterm_expect_natural_exit(&mut self, timeout: Duration) -> Result<()> {
         let Some(child) = self.child.as_mut() else {
-            self.join_reader();
             return Ok(());
         };
-        let pid = child
-            .process_id()
-            .ok_or_else(|| anyhow!("libra code child has no process id for SIGTERM"))?;
+        let pid = child.id();
         let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
         if result != 0 {
             return Err(std::io::Error::last_os_error())
@@ -1464,7 +1449,6 @@ impl CodeSession {
                     .wait()
                     .context("failed to wait for naturally exited libra code child")?;
                 self.child = None;
-                self.join_reader();
                 if !status.success() {
                     bail!(
                         "libra code exited after SIGTERM with failure status {status:?}\n{}",
@@ -1479,7 +1463,6 @@ impl CodeSession {
         let _ = child.kill();
         let _ = child.wait();
         self.child = None;
-        self.join_reader();
         bail!(
             "libra code did not exit naturally within {timeout:?} after SIGTERM; forced SIGKILL\n{}",
             self.debug_context()
@@ -1588,12 +1571,6 @@ impl CodeSession {
         }
     }
 
-    fn join_reader(&mut self) {
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
-        }
-    }
-
     fn redact_known_secrets(&self, mut text: String) -> String {
         if !self.control_token.is_empty() {
             text = text.replace(&self.control_token, "[REDACTED_CONTROL_TOKEN]");
@@ -1610,16 +1587,6 @@ impl Drop for CodeSession {
         if self.child.is_some() {
             let _ = self.shutdown();
         }
-        // Wave 9 / PR 9 — Codex pass-1 fix: when the child already
-        // exited (e.g. spawn failed because `--resume <bad>` made
-        // the runtime abort early), `child_exited()` cleared
-        // `self.child` long before Drop ran, so the
-        // `if child.is_some()` shutdown branch was a no-op and
-        // the PTY reader thread was never joined. The negative-
-        // path resume tests then race the reader's pty.log flush.
-        // Join unconditionally here so the log file is fully
-        // flushed by the time the test body reads it.
-        self.join_reader();
     }
 }
 
@@ -1638,7 +1605,7 @@ fn libra_bin() -> PathBuf {
 }
 
 fn read_browser_bootstrap_from_logs(logs_dir: &Path) -> Option<String> {
-    for name in ["pty.log", "libra.log"] {
+    for name in ["process.log", "libra.log"] {
         let Ok(text) = fs::read_to_string(logs_dir.join(name)) else {
             continue;
         };

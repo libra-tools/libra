@@ -9,7 +9,7 @@
 //! What this module owns:
 //! - [`PermissionAction`], [`PermissionRule`], [`PermissionRuleset`] types
 //!   with `serde` round-trip support.
-//! - [`evaluate`] — `findLast` wildcard match across one or more rulesets,
+//! - [`evaluate()`] — `findLast` wildcard match across one or more rulesets,
 //!   matching opencode's `permission/evaluate.ts` semantics so a future
 //!   joint ruleset (session ∪ project) is just a list concatenation.
 //! - [`disabled`] — pattern=`*` deny pre-filter that produces the set of

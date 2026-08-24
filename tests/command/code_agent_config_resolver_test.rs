@@ -69,8 +69,21 @@ fn repo_with_linked_worktree() -> (tempfile::TempDir, tempfile::TempDir) {
 #[test]
 fn code_agent_config_resolver_scope_precedence() {
     let (repo, parent) = repo_with_linked_worktree();
-    let main = repo.path();
-    let wt = parent.path().join("wt");
+    // Provenance reports paths as the worktree registry pinned them, i.e.
+    // canonical. `tempfile` hands back the caller's spelling, and on stock
+    // macOS that still contains `/var -> private/var`, so anchor every
+    // expectation below on the canonical form (same convention as
+    // `worktree_test` / `rev_parse_test`).
+    let main = repo
+        .path()
+        .canonicalize()
+        .expect("canonical repository path");
+    let main = main.as_path();
+    let wt = parent
+        .path()
+        .join("wt")
+        .canonicalize()
+        .expect("canonical linked worktree path");
     let main_request = request_for(main);
     let linked_request = request_for(&wt);
 

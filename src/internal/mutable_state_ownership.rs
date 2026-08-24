@@ -205,6 +205,34 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         owner: StateOwner::Repository,
         rationale: "agent capture/export/coverage state (repository-owned; W4 adds workspace keys)",
     },
+    // Bridge durable projection (plan-20260818 LB-02). Only the session table
+    // carries a `worktree_id` scope column; the event/operation/checkpoint/link
+    // rows are keyed by bridge_session_id and are repository-owned.
+    MutableStateSurface {
+        table: "agent_bridge_session",
+        owner: StateOwner::Composite,
+        rationale: "bridge sessions are repository-owned and record the worktree/workspace scope they were observed in (LB-02)",
+    },
+    MutableStateSurface {
+        table: "agent_bridge_event",
+        owner: StateOwner::Repository,
+        rationale: "bridge events are repository-owned and keyed by bridge_session_id (LB-02)",
+    },
+    MutableStateSurface {
+        table: "agent_bridge_operation",
+        owner: StateOwner::Repository,
+        rationale: "bridge operations are repository-owned and keyed by bridge_session_id (LB-02)",
+    },
+    MutableStateSurface {
+        table: "agent_bridge_checkpoint",
+        owner: StateOwner::Repository,
+        rationale: "bridge checkpoints are repository-owned and keyed by bridge_session_id (LB-02)",
+    },
+    MutableStateSurface {
+        table: "agent_bridge_link",
+        owner: StateOwner::Repository,
+        rationale: "bridge association links are repository-owned and keyed by bridge_session_id (LB-02)",
+    },
     MutableStateSurface {
         table: "agent_usage_stats",
         owner: StateOwner::Repository,
@@ -454,6 +482,8 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "_agent_tombstone_compat_down_guard",
     "_agent_tombstone_down_guard",
     "agent_capture_scope_down_guard",
+    "agent_bridge_capture_down_guard",
+    "agent_bridge_link_relations_down_guard",
     "agent_usage_stats__rebuild",
     "approved_permission_provenance_down_guard",
     "bisect_state__down_guard_2026072301",

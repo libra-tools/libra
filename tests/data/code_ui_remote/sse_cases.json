@@ -119,7 +119,7 @@
           "timeoutMs": 10000,
           "expect": {
             "assertions": [
-              "event_transcript_contains:fake assistant: hello from the PTY harness"
+              "event_transcript_contains:fake assistant: hello from the Web harness"
             ]
           }
         }
@@ -290,7 +290,7 @@
           "event": "session_updated",
           "expect": {
             "assertions": [
-              "event_transcript_contains:fake assistant: hello from the PTY harness"
+              "event_transcript_contains:fake assistant: hello from the Web harness"
             ]
           }
         }

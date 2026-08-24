@@ -27,12 +27,10 @@
 //!     guarantees the resume invocation re-uses the same
 //!     `working_dir` that scoped the `SessionStore::save`.
 //!
-//! All cases drive a real `libra code` invocation through a PTY
-//! so the runtime's terminal-init guard does not short-circuit —
-//! that's why we use the existing `harness::CodeSession::spawn`
-//! path (which provisions a PTY pair) and capture the resume
-//! outcome through both the live HTTP snapshot and the artifact
-//! dir the harness writes for every spawn.
+//! All cases drive a real, non-TTY `libra code` Web process through
+//! `harness::CodeSession::spawn` and capture the resume outcome through
+//! both the live HTTP snapshot and the artifact directory the harness
+//! writes for every spawn.
 //!
 #[cfg(feature = "test-provider")]
 mod harness;
@@ -109,10 +107,10 @@ fn run_libra_init(repo_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Spawn `libra code` through the harness PTY with the supplied
+/// Spawn `libra code` through the Web process harness with the supplied
 /// `--resume <thread_id>` value, expect the spawn to fail
 /// because the runtime exits before writing control info, and
-/// return the captured pty.log + libra.log so the caller can
+/// return the captured process.log + libra.log so the caller can
 /// pin the documented failure message.
 #[cfg(feature = "test-provider")]
 fn expect_resume_spawn_failure(case_name: &str, thread_id: &str) -> Result<(String, String)> {
@@ -139,15 +137,15 @@ fn expect_resume_spawn_failure(case_name: &str, thread_id: &str) -> Result<(Stri
         .join("target")
         .join("code-ui-scenarios")
         .join(case_name);
-    let pty_log = std::fs::read_to_string(logs_dir.join("pty.log")).unwrap_or_default();
+    let process_log = std::fs::read_to_string(logs_dir.join("process.log")).unwrap_or_default();
     let libra_log = std::fs::read_to_string(logs_dir.join("libra.log")).unwrap_or_default();
-    Ok((pty_log, libra_log))
+    Ok((process_log, libra_log))
 }
 
 /// Pin the `--resume <uuid>` failure path: a syntactically valid
 /// UUID that does not match any persisted session must surface
 /// the documented "no Libra Code session found …" error. Driving
-/// this from a real `libra code` PTY (rather than calling
+/// this from a real non-TTY `libra code` Web process (rather than calling
 /// `SessionStore` directly) covers the CLI argv plumbing all the
 /// way down to `SessionStore::load_for_thread_id`.
 #[cfg(feature = "test-provider")]
@@ -155,11 +153,12 @@ fn expect_resume_spawn_failure(case_name: &str, thread_id: &str) -> Result<(Stri
 #[serial]
 fn resume_with_unknown_uuid_thread_id_surfaces_session_not_found() -> Result<()> {
     let phantom_thread_id = "00000000-1111-2222-3333-444455556666";
-    let (pty, libra) = expect_resume_spawn_failure("code-resume-unknown-uuid", phantom_thread_id)?;
-    let combined = format!("{pty}\n{libra}");
+    let (process, libra) =
+        expect_resume_spawn_failure("code-resume-unknown-uuid", phantom_thread_id)?;
+    let combined = format!("{process}\n{libra}");
     assert!(
         combined.contains("no Libra Code session found") && combined.contains(phantom_thread_id),
-        "combined logs did not include the documented session-not-found error;\npty.log:\n{pty}\nlibra.log:\n{libra}"
+        "combined logs did not include the documented session-not-found error;\nprocess.log:\n{process}\nlibra.log:\n{libra}"
     );
     Ok(())
 }
@@ -177,11 +176,11 @@ fn resume_with_unknown_uuid_thread_id_surfaces_session_not_found() -> Result<()>
 #[serial]
 fn resume_with_unknown_non_uuid_thread_id_surfaces_session_not_found() -> Result<()> {
     let bad_thread_id = "not-a-uuid-at-all";
-    let (pty, libra) = expect_resume_spawn_failure("code-resume-bad-format", bad_thread_id)?;
-    let combined = format!("{pty}\n{libra}");
+    let (process, libra) = expect_resume_spawn_failure("code-resume-bad-format", bad_thread_id)?;
+    let combined = format!("{process}\n{libra}");
     assert!(
         combined.contains("no Libra Code session found") && combined.contains(bad_thread_id),
-        "combined logs did not include the unified session-not-found error;\npty.log:\n{pty}\nlibra.log:\n{libra}"
+        "combined logs did not include the unified session-not-found error;\nprocess.log:\n{process}\nlibra.log:\n{libra}"
     );
     Ok(())
 }

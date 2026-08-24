@@ -4048,7 +4048,7 @@ mod tests {
     /// delegation itself.
     ///
     /// Continuation of the v0.17.701..v0.17.708 surface-contract
-    /// sweep (TuiControlError / CherryPickError / RevertError /
+    /// sweep (the retired terminal-control error / CherryPickError / RevertError /
     /// RestoreError / StashError / ResetError / FuseUmountError /
     /// WorktreeError). Per the prioritised backlog, rebase.rs was
     /// the last HIGH-priority pin gap.

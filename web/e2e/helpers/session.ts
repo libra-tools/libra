@@ -1,5 +1,20 @@
 import { expect, type Page } from "@playwright/test";
 
+/** Loopback origin for the deterministic runtime (no bootstrap query). */
+export function e2eOrigin(): string {
+  return (process.env.LIBRA_E2E_BASE_URL ?? "http://127.0.0.1:4410").replace(/\/$/, "");
+}
+
+/**
+ * Browser write attach requires the one-time `?bt=` bootstrap token minted
+ * by `libra code --browser-control loopback`. Without it, composer submit
+ * fails closed with `X-Libra-Browser-Bootstrap is required`.
+ */
+export function e2eStartPath(): string {
+  const token = process.env.LIBRA_E2E_BOOTSTRAP_TOKEN?.trim();
+  return token ? `/?bt=${encodeURIComponent(token)}` : "/";
+}
+
 /** Wait until the embedded shell has a live session snapshot (not Loading…). */
 export async function waitForSessionReady(page: Page): Promise<void> {
   await expect(page.getByRole("heading", { name: "Libra — Agent Workspace" })).toBeVisible();

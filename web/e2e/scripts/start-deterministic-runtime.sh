@@ -7,6 +7,7 @@
 # shell:
 #
 #   export LIBRA_E2E_BASE_URL="http://127.0.0.1:${LIBRA_E2E_PORT:-4410}"
+#   export LIBRA_E2E_BOOTSTRAP_TOKEN="<token printed as LIBRA_E2E_BOOTSTRAP_TOKEN=…>"
 #   export LIBRA_E2E_REQUIRE=1
 #   pnpm --dir web test:e2e
 #
@@ -80,6 +81,7 @@ echo "Using binary: ${BIN}"
 )
 
 echo "Starting ${BIN} on http://127.0.0.1:${PORT} …"
+RUNTIME_LOG="${CONTROL_DIR}/runtime.log"
 (
   cd "${WORKDIR}"
   exec "${BIN}" code \
@@ -94,22 +96,38 @@ echo "Starting ${BIN} on http://127.0.0.1:${PORT} …"
     --mcp-port 0 \
     --control-token-file "${CONTROL_DIR}/token" \
     --control-info-file "${CONTROL_DIR}/info.json"
-) &
+) >"${RUNTIME_LOG}" 2>&1 &
 RUNTIME_PID=$!
+# Mirror the child log so operators still see the printed Code UI URL.
+tail -n +1 -F "${RUNTIME_LOG}" &
+TAIL_PID=$!
 
 for _ in $(seq 1 60); do
   if curl -fsS "http://127.0.0.1:${PORT}/api/health" 2>/dev/null | grep -qx 'ok'; then
+    TOKEN="$(sed -n 's/^Browser bootstrap token: //p' "${RUNTIME_LOG}" | head -n 1)"
+    if [[ -z "${TOKEN}" ]]; then
+      echo "runtime became healthy but printed no browser bootstrap token" >&2
+      exit 1
+    fi
+    printf '%s\n' "${TOKEN}" >"${CONTROL_DIR}/bootstrap-token"
     echo "LIBRA_E2E_BASE_URL=http://127.0.0.1:${PORT}"
+    echo "LIBRA_E2E_BOOTSTRAP_TOKEN=${TOKEN}"
     echo "Runtime ready (pid ${RUNTIME_PID}). Leave this process running for Playwright."
+    echo "Open ${LIBRA_E2E_BASE_URL:-http://127.0.0.1:${PORT}}/?bt=${TOKEN} (loopback write requires the printed token)."
     wait "${RUNTIME_PID}"
+    kill "${TAIL_PID}" 2>/dev/null || true
     exit $?
   fi
   if ! kill -0 "${RUNTIME_PID}" 2>/dev/null; then
     echo "runtime exited before health became ready" >&2
+    cat "${RUNTIME_LOG}" >&2 || true
+    kill "${TAIL_PID}" 2>/dev/null || true
     exit 1
   fi
   sleep 0.5
 done
 
 echo "timed out waiting for /api/health on port ${PORT}" >&2
+kill "${TAIL_PID}" 2>/dev/null || true
+cat "${RUNTIME_LOG}" >&2 || true
 exit 1

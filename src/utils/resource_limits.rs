@@ -3,7 +3,7 @@
 //! Bounds fan-out so a large repository or CI run cannot exhaust host resources.
 //! The concrete, wired limit today is the maximum number of concurrent remote
 //! connections/requests (`--max-connections` / `LIBRA_MAX_CONNECTIONS`),
-//! consumed by [`crate::utils::storage::remote::RemoteStorage::exist_batch`] (and
+//! consumed by `crate::utils::storage::remote::RemoteStorage::exist_batch` (and
 //! any future bounded remote fan-out). File-count/size, thread, and search
 //! limits are documented follow-ons.
 //!

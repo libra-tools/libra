@@ -22,6 +22,7 @@ libra agent workspace list [--limit <n>] [--cursor <token>] [--state <state>]...
 libra agent workspace show <workspace-id>
 libra agent push [--remote <name>] [--force-rewrite]
 libra agent rpc <subcommand>
+libra agent bridge --stdio
 ```
 
 ## 说明
@@ -72,6 +73,7 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 | `rpc trust --dir <path>` | 注册一个受信目录（`agent.external_agents.trusted_dirs`，默认 `~/.libra/agents`）：外部二进制的 canonical path 必须位于其中之一才可被信任。路径会被 canonicalize，且必须是存在且非 world-writable 的目录 |
 | `rpc untrust <slug>` | 撤销信任；二进制回到隔离状态（始终可用，不受开关限制） |
 | `rpc invoke` | 在**已信任**的 `libra-agent-*` 二进制上调用一个 JSON-RPC 方法 |
+| `bridge --stdio` | 在 stdin/stdout 上运行仓库级 DeepSeek Harness 桥接（JSON-RPC 2.0 NDJSON）。这是 Harness 的**唯一**标准入站写入传输；它不是 `libra code --control`，也不是 MCP server。stdout 每条只承载一个协议帧；诊断只写 stderr。协议 v1：20 个 method 的 allowlist、256 KiB 帧上限、64 个 in-flight 请求、默认 30 秒 deadline。20 个 method 全部已实现：`initialize` 握手；session/event ingress `session.open`、`event.append`（batch ack / 幂等 / digest conflict / 服务端脱敏）、`session.flush`、`session.close`、`evidence.append`、`provenance.append`；只读方法 `context.get`、`status.get`、`history.search`、`checkpoint.list`、`checkpoint.show` 与 `diff.get`；mutation `checkpoint.create`、`commit.create`、`checkpoint.restore` 与 `review.run`（均带 `operation_id` 幂等、actor binding 与 approval 门禁）；以及 workspace lease `workspace.claim` / `workspace.renew` / `workspace.release`（owner 从已认证的 bridge session 派生）。`diff.get` 只接受封闭的 `mode`（`worktree` / `staged` / `checkpoint`）加上经校验的仓库相对 `paths`——绝不接受自由形式的 revision 或 pathspec——并强制 `--no-ext-diff` / `--no-textconv`，使仓库配置无法转化为进程执行。`commit.create` 只提交当前 index（无 `-a`、无 pathspec、无 amend、无 author 覆盖），关联图写入 `agent_bridge_link` 而不是拼进 commit message。`checkpoint.restore` 必须携带显式 `expected_head` fence 且要求 index/worktree 干净，并且绝不移动 HEAD。`review.run` 启动只读 review 并返回 `run_id`；用同一个 `operation_id` 重放会返回该 run 的当前状态，而不会启动第二个 run。HEAD 漂移或 worktree 脏在任何写入之前以 `LBR-AGENT-038` 拒绝。ack 只表示脱敏 projection 已 durable，不代表 Harness 原始 transcript 已迁移到 Libra。不是 Git 命令。 |
 
 ## 常用选项
 

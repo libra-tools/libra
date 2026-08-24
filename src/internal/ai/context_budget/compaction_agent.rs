@@ -82,7 +82,7 @@ pub const EMBEDDED_COMPACTION_PROFILE: &str =
 /// step stripped the frontmatter) the entire trimmed file is
 /// returned. This keeps the production path resilient even when the
 /// embedded asset was reshaped at build time; the
-/// [`embedded_compaction_profile_parses_with_canonical_metadata`]
+/// `embedded_compaction_profile_parses_with_canonical_metadata`
 /// unit test catches frontmatter regressions in CI.
 pub fn embedded_compaction_system_prompt() -> &'static str {
     static BODY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();

@@ -58,7 +58,7 @@ pub type MessageId = String;
 /// Inputs the dispatcher needs to materialize an isolated per-run
 /// workspace for a sub-agent (CEX-S2-12 / S2-INV-03).
 ///
-/// Attached to [`DefaultSubAgentDispatcher`] via
+/// Attached to `DefaultSubAgentDispatcher` via
 /// `with_workspace_isolation` (set by `libra code`'s
 /// `build_subagent_runtime_for_session`). When present, the dispatcher
 /// materializes a workspace through
@@ -419,9 +419,9 @@ impl std::fmt::Debug for PermissionService {
 
 // ─── Other runtime service placeholders ─────────────────────────────────
 
-/// Loads the latest [`ContextFrameEvent`] from a session JSONL store so
-/// the dispatcher can build a [`ContextHandoff`] via
-/// [`ContextHandoffBuilder`].
+/// Loads the latest `ContextFrameEvent` from a session JSONL store so
+/// the dispatcher can build a `ContextHandoff` via
+/// `ContextHandoffBuilder`.
 ///
 /// Today the loader is a pure scan over the events already on disk —
 /// no caching, no projection index. The OC-Phase 3 dispatcher needs
@@ -434,9 +434,6 @@ impl std::fmt::Debug for PermissionService {
 /// add an in-memory baseline; until then `Default` is what tests use
 /// when they don't care about handoff content.
 ///
-/// [`ContextFrameEvent`]: super::super::context_budget::frame::ContextFrameEvent
-/// [`ContextHandoff`]: super::super::context_budget::handoff::ContextHandoff
-/// [`ContextHandoffBuilder`]: super::super::context_budget::handoff::ContextHandoffBuilder
 #[derive(Debug, Default)]
 pub struct ContextFrameLoader {
     _marker: (),
@@ -451,7 +448,7 @@ impl ContextFrameLoader {
     }
 
     /// Walk the session's JSONL stream and return the most recent
-    /// [`super::super::context_budget::frame::ContextFrameEvent`], or
+    /// `ContextFrameEvent`, or
     /// `None` if the stream carries no frame events yet (a fresh
     /// session, or one whose frames have been pruned).
     ///
@@ -560,7 +557,7 @@ pub enum BudgetExceededReason {
     Internal { reason: String },
 }
 
-/// Why the dispatcher could not assemble a [`ContextHandoff`] for the
+/// Why the dispatcher could not assemble a `ContextHandoff` for the
 /// child run. The `SchemaMismatch` variant matches the literal-template
 /// validation rule from `opencode.md` (OC-Phase 4 P4.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -794,8 +791,8 @@ pub struct DispatchContext<'a> {
     /// routes the parent's latest `ContextFrameEvent` through
     /// `compaction_agent::run_compaction(...)` to produce a
     /// validated `ContextHandoff`, then materialises it via
-    /// [`ContextHandoff::to_handoff_messages`] (v0.17.781). None
-    /// falls through to [`ContextFrameEvent::to_handoff_messages`]
+    /// `ContextHandoff::to_handoff_messages` (v0.17.781). None
+    /// falls through to `ContextFrameEvent::to_handoff_messages`
     /// (v0.17.773) — same raw-segment path the dispatcher used
     /// before P4.4 was wired.
     pub compaction_model: Option<&'a crate::internal::ai::providers::AnyCompletionModel>,
@@ -835,7 +832,7 @@ impl<'a> DispatchContext<'a> {
         }
     }
 
-    /// Build the child sub-agent's [`AnyCompletionModel`] for OC-Phase 3
+    /// Build the child sub-agent's `AnyCompletionModel` for OC-Phase 3
     /// P3.4 step 9 ("model build for child").
     ///
     /// Sequence:
@@ -936,7 +933,7 @@ pub trait SubAgentChildRunner: Send + Sync {
 /// Default production runner that drives a sub-agent through the
 /// normal tool loop.
 ///
-/// The runner builds an [`AnyCompletionModel`] via
+/// The runner builds an `AnyCompletionModel` via
 /// [`DispatchContext::build_child_model`], threads any dispatcher-built
 /// handoff history into `run_tool_loop_with_history_and_observer`,
 /// enforces the child tool allow-list, forwards the inherited runtime

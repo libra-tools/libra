@@ -18,7 +18,7 @@
 //!
 //! No D1/R2 I/O happens in this module — the builder produces
 //! plans and (optionally) writes blobs through the
-//! [`publish_storage::PublishStorage`] wrapper passed by the
+//! `publish_storage::PublishStorage` wrapper passed by the
 //! orchestrator. The CLI sync command (Phase 4) drives the whole
 //! pipeline.
 
@@ -575,7 +575,7 @@ pub fn language_for_path(path: &str) -> Option<&'static str> {
 /// Classify one file blob given its repo-relative path, byte body,
 /// and the snapshot config. Used by the orchestrator's tree-walk
 /// loop. The blob bytes are not retained — callers stream the
-/// content to R2 via [`PublishStorage::put_bytes`] when this
+/// content to R2 via `PublishStorage::put_bytes` when this
 /// returns `FileSnapshot::Text`.
 pub fn classify_file(
     path: &str,

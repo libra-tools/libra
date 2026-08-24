@@ -1,8 +1,8 @@
 //! Data-driven controller-lease matrix.
 //!
 //! Each `#[test]` here loads `tests/data/code_ui_remote/lease_cases.json`
-//! and runs the named case end-to-end against a fresh `libra code` PTY
-//! session. Adding a new lease scenario is a data-only change in the JSON
+//! and runs the named case end-to-end against a fresh non-TTY `libra code`
+//! Web process. Adding a new lease scenario is a data-only change in the JSON
 //! file plus one one-line entry in this test module.
 
 #[cfg(feature = "test-provider")]

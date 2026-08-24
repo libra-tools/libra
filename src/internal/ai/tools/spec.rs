@@ -254,6 +254,7 @@ impl ToolSpec {
                             "explanation".to_string(),
                             json!({
                                 "type": "string",
+                                "maxLength": 16384,
                                 "description": "Optional rationale for the proposed draft"
                             }),
                         );
@@ -262,12 +263,14 @@ impl ToolSpec {
                             json!({
                                 "type": "array",
                                 "minItems": 1,
+                                "maxItems": 128,
                                 "description": "Ordered draft step titles. Do not include runtime status.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
                                         "title": {
                                             "type": "string",
+                                            "maxLength": 512,
                                             "description": "Human-readable draft step title"
                                         }
                                     },

@@ -1,6 +1,6 @@
 //! SeaORM entity for the [`source_call_log`](../../../../sql/migrations/2026052301_source_call_log.sql)
 //! table — persistent telemetry of every external Source / MCP /
-//! OpenAPI call routed through [`SourcePool`].
+//! OpenAPI call routed through `SourcePool`.
 //!
 //! Migrations land via `sql/migrations/2026052301_source_call_log{,_down}.sql`
 //! and the entity is registered in [`crate::internal::model`].

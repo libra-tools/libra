@@ -15,7 +15,7 @@
 //! - [`capability`]: the frozen E1 8-bool wire contract
 //!   ([`capability::DeclaredAgentCaps`]) and the optional capability traits
 //!   (AG-16; implementations land in AG-19/AG-21).
-//! - [`registry`]: the static capability matrix and roster fact source
+//! - [`registry()`]: the static capability matrix and roster fact source
 //!   ([`registry::AgentRegistration`], first-batch supported roster,
 //!   unknown-slug quarantine).
 //! - [`redaction`]: the [`redaction::Redactor`] engine and the

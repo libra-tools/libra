@@ -38,6 +38,14 @@ impl ImportRepo {
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&repo).expect("create repo dir");
         std::fs::create_dir_all(&home).expect("create home dir");
+        // The binary runs with `current_dir(repo)` and therefore sees the
+        // canonical path, which is what it hashes into the Claude project
+        // slug and compares against for containment. `tempfile` hands back the
+        // caller's spelling, and stock macOS reaches TMPDIR through
+        // `/var -> private/var`, so an uncanonicalized fixture path makes
+        // discovery look in a directory the binary never writes to.
+        let repo = repo.canonicalize().expect("canonical repo dir");
+        let home = home.canonicalize().expect("canonical home dir");
         let fixture = Self {
             _tmp: tmp,
             repo,
@@ -240,6 +248,23 @@ fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Create a directory whose name is deliberately not valid UTF-8.
+///
+/// Returns `None` when the filesystem refuses the name outright (`EILSEQ`),
+/// which is what stock macOS APFS/HFS+ does: those volumes only accept valid
+/// UTF-8 filenames, so the byte sequence the caller wants to exercise cannot
+/// exist there at all. Callers skip in that case rather than fail — the
+/// behaviour under test is the binary's handling of such a path, not the
+/// platform's willingness to create one.
+#[cfg(unix)]
+fn create_non_utf8_dir(path: &std::path::Path) -> Option<()> {
+    match std::fs::create_dir_all(path) {
+        Ok(()) => Some(()),
+        Err(error) if error.raw_os_error() == Some(92) => None,
+        Err(error) => panic!("create non-UTF-8 dir {}: {error}", path.display()),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_repository_is_rejected_with_stable_io_code_before_import() {
@@ -247,7 +272,10 @@ fn non_utf8_repository_is_rejected_with_stable_io_code_before_import() {
 
     let tmp = TempDir::new().expect("create non-UTF-8 import tempdir");
     let repo = tmp.path().join(OsString::from_vec(b"repo-\xff".to_vec()));
-    std::fs::create_dir_all(&repo).expect("create non-UTF-8 repo");
+    if create_non_utf8_dir(&repo).is_none() {
+        eprintln!("skipped (filesystem rejects non-UTF-8 directory names)");
+        return;
+    }
     let init = Command::new(env!("CARGO_BIN_EXE_libra"))
         .current_dir(&repo)
         .arg("init")
@@ -273,7 +301,10 @@ fn agent_import_accepts_non_utf8_provider_root_via_lossless_helper_wire() {
     let repo = tmp.path().join("repo");
     let home = tmp.path().join(OsString::from_vec(b"home-\xfe".to_vec()));
     std::fs::create_dir_all(&repo).expect("create repo");
-    std::fs::create_dir_all(&home).expect("create non-UTF-8 provider home");
+    if create_non_utf8_dir(&home).is_none() {
+        eprintln!("skipped (filesystem rejects non-UTF-8 directory names)");
+        return;
+    }
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_libra"));
         command

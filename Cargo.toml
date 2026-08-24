@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.20.2"
+version = "0.21.21"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -17,7 +17,7 @@ worktree-fuse  = []   # Unix FUSE-backed worktree commands (optional)
 test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
 test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
-test-provider  = []   # deterministic hidden provider for local TUI automation tests
+test-provider  = []   # deterministic hidden provider for local Code UI automation tests
 test-live-agent = [] # plan-20260713 live agent gate: real local claude/codex/opencode CLI data (dev machine acceptance; env LIBRA_RUN_LIVE_AGENT_GATE=1)
 test-upgrade   = []   # plan-20260714 §A.11: auto-upgrade test hooks (trust-root/endpoint injection; requires LIBRA_TEST=1 at runtime; release workflow must NEVER enable this feature)
 fastcdc        = []   # lore.md §6: default-OFF FastCDC LFS media chunking client substrate (no new deps; reuses ring sha256; server protocol frozen)
@@ -62,7 +62,6 @@ reqwest = { version = "0.13.2", default-features = false, features = [
 ]}
 ring = "0.17.14"
 rpassword = "7.4.0"
-scopeguard = "1.2.0"
 sea-orm = { version = "2.0.0", features = [
     "sqlx-sqlite",
     "runtime-tokio-rustls",
@@ -115,9 +114,7 @@ rust-embed = { version = "8.11.0", features = ["mime-guess", "include-exclude"] 
 mime_guess = "2.0.5"
 tempfile = "3.27.0"
 
-# TUI
-ratatui = "0.30.0"
-crossterm = { version = "0.29.0", features = ["bracketed-paste", "event-stream"] }
+# Async stream helpers
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 async-stream = "0.3.6"
 futures-core = "0.3.32"
@@ -329,6 +326,77 @@ path = "tests/compat/agent_capability_matrix_pin.rs"
 [[test]]
 name = "compat_agent_architecture_guard"
 path = "tests/compat/agent_architecture_guard.rs"
+
+# plan-20260818 LB-01: DeepSeek Harness bridge protocol + stdio transport.
+[[test]]
+name = "agent_bridge_protocol_test"
+path = "tests/agent_bridge_protocol_test.rs"
+
+[[test]]
+name = "agent_bridge_stdio_test"
+path = "tests/agent_bridge_stdio_test.rs"
+
+# plan-20260818 LB-02: bridge durable projection migration + storage.
+[[test]]
+name = "agent_bridge_migration_test"
+path = "tests/agent_bridge_migration_test.rs"
+
+[[test]]
+name = "agent_bridge_schema_test"
+path = "tests/agent_bridge_schema_test.rs"
+
+[[test]]
+name = "compat_agent_bridge_schema"
+path = "tests/compat/agent_bridge_schema_test.rs"
+
+# plan-20260818 LB-03: bridge session/event ingress, batch ack, redaction.
+[[test]]
+name = "agent_bridge_ingress_test"
+path = "tests/agent_bridge_ingress_test.rs"
+
+[[test]]
+name = "agent_bridge_crash_test"
+path = "tests/agent_bridge_crash_test.rs"
+
+[[test]]
+name = "agent_bridge_redaction_test"
+path = "tests/agent_bridge_redaction_test.rs"
+
+[[test]]
+name = "agent_bridge_span_test"
+path = "tests/agent_bridge_span_test.rs"
+
+[[test]]
+name = "agent_bridge_workspace_test"
+path = "tests/agent_bridge_workspace_test.rs"
+
+# plan-20260818 LB-04: bridge typed read methods + query scope.
+[[test]]
+name = "agent_bridge_read_methods_test"
+path = "tests/agent_bridge_read_methods_test.rs"
+
+[[test]]
+name = "agent_bridge_security_test"
+path = "tests/agent_bridge_security_test.rs"
+
+# plan-20260818 LB-05: bridge mutations, approval gate, checkpoints.
+[[test]]
+name = "agent_bridge_mutation_test"
+path = "tests/agent_bridge_mutation_test.rs"
+
+[[test]]
+name = "agent_bridge_approval_test"
+path = "tests/agent_bridge_approval_test.rs"
+
+[[test]]
+name = "agent_bridge_checkpoint_test"
+path = "tests/agent_bridge_checkpoint_test.rs"
+
+# plan-20260818 LB-04/LB-05: the bridge's real VCS wiring (diff.get,
+# commit.create, checkpoint.restore, review.run) against a temp repository.
+[[test]]
+name = "agent_bridge_vcs_test"
+path = "tests/agent_bridge_vcs_test.rs"
 
 [[test]]
 name = "compat_subface_labels"

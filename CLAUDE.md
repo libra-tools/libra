@@ -31,7 +31,7 @@ Compatibility is *partial* and governed by the four-tier matrix in [`COMPATIBILI
 
 Libra is an **AI agent–native version control system** written in Rust. It partially implements a Git client with full on-disk format compatibility (`objects`, `index`, `pack`, `pack-index`) while using SQLite for transactional metadata (`config`, `HEAD`, `refs`). It is designed for monorepo/trunk-based development with tiered cloud storage (S3/R2) and a Cloudflare D1/R2 backup path.
 
-The `libra code` command launches an interactive TUI (with a background web server, MCP server, and an automation-control session surface) for collaborative AI-agent and human-driven development. The Git surface is governed by a four-tier compatibility matrix (`supported` / `partial` / `unsupported` / `intentionally-different`) tracked in [`COMPATIBILITY.md`](COMPATIBILITY.md); AI-only commands (`code`, `code-control`, `automation`, `usage`, `graph`, `sandbox`, `agent`, `publish`) are explicitly Libra-only extensions.
+The `libra code` command launches the Web Code UI (with MCP and automation-control session surfaces) for collaborative AI-agent and human-driven development. The Git surface is governed by a four-tier compatibility matrix (`supported` / `partial` / `unsupported` / `intentionally-different`) tracked in [`COMPATIBILITY.md`](COMPATIBILITY.md); AI-only commands (`code`, `code-control`, `automation`, `usage`, `graph`, `sandbox`, `agent`, `publish`) are explicitly Libra-only extensions.
 
 The repository also contains a Next.js frontend (`web/`) embedded into the binary via `rust-embed` and a Cloudflare Worker (`worker/`) for read-only `libra publish` hosting.
 
@@ -72,7 +72,7 @@ pnpm --dir web install --frozen-lockfile && pnpm --dir web build
 | `test-network` | Gate L2 tests requiring outbound network but no secrets |
 | `test-live-ai` | Gate L3 tests calling real LLM APIs |
 | `test-live-cloud` | Gate L3 tests hitting real D1/R2 endpoints |
-| `test-provider` | Deterministic hidden provider for local TUI automation tests (requires `LIBRA_ENABLE_TEST_PROVIDER=1`) |
+| `test-provider` | Deterministic hidden provider for local Code UI automation tests (requires `LIBRA_ENABLE_TEST_PROVIDER=1`) |
 | `test-live-agent` | plan-20260713 live agent gate: real local `claude`/`codex`/`opencode` CLI data on the dev acceptance machine (requires `LIBRA_RUN_LIVE_AGENT_GATE=1`; missing stores print skipped) |
 | `subagent-scaffold` | Schema-only sub-agent contract scaffold (CEX-S2-10, gated on CP-4 in production) |
 | `test-upgrade` | plan-20260714 §A.11 auto-upgrade test hooks (trust-root/endpoint injection; needs `LIBRA_TEST=1` at runtime; release builds must never enable it) |
@@ -85,7 +85,7 @@ All PRs must pass these jobs on the `[self-hosted]` runner pool:
 2. **compat-clippy** — `cargo clippy --all-targets --all-features -- -D warnings` (with `LIBRA_SKIP_WEB_BUILD=1`)
 3. **compat-web-check** — `pnpm --dir web lint` + `pnpm --dir web build` so `web/out/` cannot drift from `WebAssets`
 4. **compat-redundancy** — directory-shape check on `third-party/rust/crates`
-5. **compat-offline-core** — `cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact` + `cargo test --all` + a second pass with `--features test-provider` for the TUI automation matrices (`code_ui_scenarios`, `harness_self_test`, `code_codex_default_tui_test`, `code_ui_remote_lease_matrix`, `code_ui_remote_sse_matrix`) under `--test-threads=1`
+5. **compat-offline-core** — `cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact` + `cargo test --all` + a second pass with `--features test-provider` for the Code UI automation matrices (`code_ui_scenarios`, `harness_self_test`, `code_codex_default_web_test`, `ai_code_ui_headless_test`, `code_codex_runtime_test`, `code_ui_remote_lease_matrix`, `code_ui_remote_sse_matrix`) under `--test-threads=1`
 6. **compat-network-remotes** — `cargo test --features test-network --test network_remotes_test`
 
 Additional workflows: `codeql.yml` (security analysis), `model-generation-nightly.yml` (nightly model-generation matrix), `release.yml` (release pipeline).
@@ -240,5 +240,5 @@ here so contributors do not waste time trying to set them at runtime:
 - `LIBRA_TEST_S3_ENDPOINT`, `LIBRA_TEST_S3_BUCKET`, `LIBRA_TEST_S3_ACCESS_KEY`, `LIBRA_TEST_S3_SECRET_KEY`, `LIBRA_TEST_S3_REGION`, `LIBRA_TEST_S3_ALLOW_HTTP` — L3 S3 protocol gate (separate from the R2 backup credentials above)
 - `LIBRA_PUBLISH_LIVE_WORKER_ORIGIN`, `LIBRA_PUBLISH_LIVE_CLONE_DOMAIN`, `LIBRA_PUBLISH_LIVE_SLUG`, `LIBRA_PUBLISH_LIVE_FILE_PATH` — `publish_live` deploy-smoke gate
 - `LIBRA_TEST_MEGA_SERVER` — LFS protocol live-server gate
-- `LIBRA_ENABLE_TEST_PROVIDER` — activate the `test-provider` deterministic LLM for TUI scenarios (required alongside `--features test-provider`)
+- `LIBRA_ENABLE_TEST_PROVIDER` — activate the `test-provider` deterministic LLM for Code UI scenarios (required alongside `--features test-provider`)
 - `LIBRA_TEST_LOG`, `LIBRA_TEST_HOME`, `LIBRA_TEST_ENV` — test-only logging/home/sentinel overrides

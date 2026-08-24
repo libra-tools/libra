@@ -1,6 +1,11 @@
 import { expect, test, type Browser, type Page } from "@playwright/test";
 
-import { submitMessage, waitForSessionReady } from "./helpers/session";
+import {
+  e2eOrigin,
+  e2eStartPath,
+  submitMessage,
+  waitForSessionReady,
+} from "./helpers/session";
 
 /**
  * W3-15 main chain: submit → approval/user-input → goal/task/skill → usage →
@@ -20,14 +25,15 @@ test.describe("Code UI main chain (real browser)", () => {
 
   test.beforeAll(async ({ browser: workerBrowser }) => {
     browser = workerBrowser;
+    const origin = e2eOrigin();
     const context = await browser.newContext({
-      baseURL: process.env.LIBRA_E2E_BASE_URL ?? "http://127.0.0.1:4410",
+      baseURL: origin,
       extraHTTPHeaders: {
-        Origin: process.env.LIBRA_E2E_BASE_URL ?? "http://127.0.0.1:4410",
+        Origin: origin,
       },
     });
     page = await context.newPage();
-    await page.goto("/");
+    await page.goto(e2eStartPath());
     await waitForSessionReady(page);
   });
 
@@ -47,7 +53,10 @@ test.describe("Code UI main chain (real browser)", () => {
   });
 
   test("loads shell and submits a chat turn", async () => {
-    await submitMessage(page, "e2e-hello from playwright");
+    // `/run` selects the tool-capable / explicit-direct intent so the fake
+    // provider can answer with the e2e_main_chain text match. A bare message
+    // on the Web-default path enters Phase 0 IntentSpec review instead.
+    await submitMessage(page, "/run e2e-hello from playwright");
     await expect(page.getByLabel("Transcript")).toContainText("e2e-hello", {
       timeout: 60_000,
     });
@@ -168,9 +177,15 @@ test.describe("Code UI main chain (real browser)", () => {
     await expect(page.getByLabel("Thread list panel")).toBeVisible();
 
     await submitMessage(page, "/run slow-shell-tool: hold the turn so cancel can fire");
-    await expect(page.getByText(/fake-local: (executing|running|tool)/i)).toBeVisible({
-      timeout: 30_000,
-    });
+    // Shell still needs a human approval even after an earlier Approve-once
+    // (the first approval test leaves "Apply to future commands" at No).
+    const executing = page.getByText(/fake-local: (executing|running|tool)/i);
+    const approval = page.getByLabel("Approval request");
+    await expect(approval.or(executing)).toBeVisible({ timeout: 30_000 });
+    if (await approval.isVisible()) {
+      await approval.getByRole("button", { name: "Approve" }).click();
+    }
+    await expect(executing).toBeVisible({ timeout: 30_000 });
     const cancel = page.getByRole("button", { name: "Cancel turn" }).first();
     await expect(cancel).toBeEnabled();
     await cancel.click();

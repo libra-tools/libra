@@ -1506,9 +1506,9 @@ impl CaseRuntime<'_> {
             );
         }
         // Spawn one OS thread per client_id so the runtime sees
-        // genuinely racing connections. `CodeSession` isn't `Sync`
-        // (it owns the PTY writer `Box<dyn Write + Send>`), so we
-        // can't share `&self.session` across threads. Each thread
+        // genuinely racing connections. Keep the worker inputs independent
+        // from the mutable session lifecycle, so we don't share
+        // `&self.session` across threads. Each thread
         // builds its own short-lived `reqwest::blocking::Client`
         // and gets the small set of values it needs by value
         // (URL + control token); the actual race surface is the

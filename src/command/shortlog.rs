@@ -25,7 +25,7 @@
 //!     stream.
 //!
 //! - **Commit collection and filtering**:
-//!   - [`get_commits_for_shortlog`] resolves the current [`Head`] and
+//!   - [`get_commits_for_shortlog`] resolves the current head and
 //!     obtains the relevant list of [`Commit`] objects to be included in the
 //!     report. The exact traversal strategy is delegated to the internal git
 //!     engine.

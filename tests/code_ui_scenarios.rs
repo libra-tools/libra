@@ -2,7 +2,10 @@
 mod harness;
 
 #[cfg(feature = "test-provider")]
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[cfg(feature = "test-provider")]
 use anyhow::{Context, Result};
@@ -29,7 +32,7 @@ fn basic_chat_submit_updates_transcript() -> Result<()> {
         scenario
             .step("submit direct chat")
             .submit("/chat hello")?
-            .expect_transcript_contains("fake assistant: hello from the PTY harness")?
+            .expect_transcript_contains("fake assistant: hello from the Web harness")?
             .expect_status_eq("idle")?;
     }
 
@@ -59,7 +62,7 @@ fn cancel_running_turn_returns_session_to_idle() -> Result<()> {
 #[cfg(feature = "test-provider")]
 #[test]
 #[serial]
-fn oversized_message_is_rejected_before_reaching_tui() -> Result<()> {
+fn oversized_message_is_rejected_before_reaching_runtime() -> Result<()> {
     let mut session =
         CodeSession::spawn(CodeSessionOptions::new("oversize", fixture("basic_chat")))?;
     session.attach_automation("scenario-oversize")?;
@@ -198,7 +201,7 @@ fn browser_static_app_loads_and_submit_updates_snapshot() -> Result<()> {
 
     session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
         status_eq(snapshot, "idle")
-            && transcript_contains(snapshot, "fake assistant: hello from the PTY harness")
+            && transcript_contains(snapshot, "fake assistant: hello from the Web harness")
     })?;
 
     let (detach_status, _) = session.browser_detach(&token, "scenario-browser-roundtrip")?;
@@ -237,7 +240,7 @@ fn browser_same_client_reconnect_renews_existing_lease() -> Result<()> {
     );
     session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
         status_eq(snapshot, "idle")
-            && transcript_contains(snapshot, "fake assistant: hello from the PTY harness")
+            && transcript_contains(snapshot, "fake assistant: hello from the Web harness")
     })?;
 
     session.shutdown()
@@ -274,10 +277,7 @@ fn browser_attach_rejected_when_control_disabled() -> Result<()> {
 fn browser_expired_controller_token_is_rejected_and_releases_snapshot() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-expired-token", fixture("basic_chat"))
-            .with_browser_control_loopback()
-            // Headless Web startup is slower than the retired terminal flow; keep the lease long
-            // enough to observe the attached browser controller before expiry.
-            .with_lease_duration_ms(500),
+            .with_browser_control_loopback(),
     )?;
 
     let token = session.attach_browser("scenario-browser-expired-token")?;
@@ -285,7 +285,7 @@ fn browser_expired_controller_token_is_rejected_and_releases_snapshot() -> Resul
         controller_kind(snapshot) == Some("browser")
     })?;
 
-    std::thread::sleep(Duration::from_millis(700));
+    session.expire_browser_controller_lease_for_test(&token)?;
     let (status, body) = session.browser_submit_message(&token, "/chat hello")?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error_code(&body), Some("CONTROLLER_CONFLICT"));
@@ -547,7 +547,7 @@ fn plan_workflow_baseline_pins_intent_and_post_plan_choices() {
 ///
 /// W5-06: these scenarios now run against the default headless Web launch —
 /// `HeadlessCodeRuntime` routes plain messages through Phase 0 and owns the
-/// IntentSpec review gate, so no PTY/TUI spawn is involved.
+/// IntentSpec review gate, so no terminal UI is involved.
 #[cfg(feature = "test-provider")]
 fn plan_workflow_intent_review_respond(name: &str, selected_option: &str) -> Result<()> {
     let mut session = CodeSession::spawn(
@@ -578,7 +578,7 @@ fn plan_workflow_intent_review_respond(name: &str, selected_option: &str) -> Res
 
     // Once `submit_intent_draft` lands, the review must be projectable over
     // the wire as `intent_review_choice` (AC2) rather than staying purely
-    // TUI-internal state.
+    // adapter-internal state.
     let snapshot = session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
         find_interaction_by_kind(snapshot, "intent_review_choice").is_some()
     })?;
@@ -768,15 +768,1090 @@ fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<
     resumed.shutdown()
 }
 
+#[cfg(feature = "test-provider")]
+const PLAN_REVIEW_REQUEST: &str = "Add a Usage section to the README documenting the CLI commands.";
+#[cfg(feature = "test-provider")]
+const PLAN_REVIEW_README: &str = "# Fixture\n\nPlaceholder for plan-review Web process.\n";
+#[cfg(feature = "test-provider")]
+const PLAN_REVIEW_REVISION_NOTE: &str =
+    "Keep the command list concise and add an explicit rollback note.";
+#[cfg(feature = "test-provider")]
+const PLAN_REVIEW_DRIFTED_README: &str =
+    "# Fixture\n\nUser edit made while the Plan gate was pending.\n";
+#[cfg(feature = "test-provider")]
+const PLAN_REVIEW_REVISED_SUMMARY: &str =
+    "Revised Phase 1 plan with concise commands and rollback guidance";
+
+#[cfg(feature = "test-provider")]
+fn run_plan_review_libra(repo_dir: &Path, args: &[&str], action: &str) -> Result<()> {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .with_context(|| format!("failed to run {action}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{action} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Phase 1 binds every reviewed plan to an immutable checkout commit. Keep the
+/// Web-process fixtures realistic by creating a born HEAD before runtime start.
+#[cfg(feature = "test-provider")]
+fn initialize_plan_review_repo(case_name: &str) -> Result<tempfile::TempDir> {
+    let repo_root = tempfile::Builder::new()
+        .prefix(&format!("{case_name}-"))
+        .tempdir()
+        .context("failed to create plan-review repo tempdir")?;
+    let repo_dir = repo_root.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).context("failed to create plan-review repo subdir")?;
+    run_plan_review_libra(
+        &repo_dir,
+        &["init", "--vault=false", "--quiet"],
+        "libra init for plan-review fixture",
+    )?;
+    run_plan_review_libra(
+        &repo_dir,
+        &["config", "user.name", "Libra Plan Review Test"],
+        "libra config user.name for plan-review fixture",
+    )?;
+    run_plan_review_libra(
+        &repo_dir,
+        &["config", "user.email", "plan-review-test@example.com"],
+        "libra config user.email for plan-review fixture",
+    )?;
+    std::fs::write(repo_dir.join("README.md"), PLAN_REVIEW_README)
+        .context("failed to seed README.md for plan-review fixture")?;
+    run_plan_review_libra(
+        &repo_dir,
+        &["add", "README.md"],
+        "libra add for plan-review fixture",
+    )?;
+    run_plan_review_libra(
+        &repo_dir,
+        &["commit", "-m", "plan review fixture base", "--no-verify"],
+        "libra commit for plan-review fixture",
+    )?;
+    Ok(repo_root)
+}
+
+/// Drive a real `libra code` process through its HTTP write surface until the
+/// initial post-Plan Execute/Modify/Cancel gate is pending.
+#[cfg(feature = "test-provider")]
+fn drive_to_plan_review_gate(session: &mut CodeSession, client_id: &str) -> Result<Value> {
+    session.attach_automation(client_id)?;
+    session.submit_message(PLAN_REVIEW_REQUEST)?;
+    session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        interaction_status(snapshot, "call_request_user_input_1") == Some("pending")
+    })?;
+    let (http_status, body) = session.respond_interaction(
+        "call_request_user_input_1",
+        &json!({ "answers": { "risk_profile": ["Low"] } }),
+    )?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "risk profile answer rejected: {body}"
+    );
+
+    let snapshot = session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_interaction_by_kind(snapshot, "intent_review_choice")
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+    })?;
+    let intent_id = find_interaction_by_kind(&snapshot, "intent_review_choice")
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("intent_review_choice missing id: {snapshot}"))?
+        .to_string();
+    let (http_status, body) =
+        session.respond_interaction(&intent_id, &json!({ "selectedOption": "confirm" }))?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "intent confirm rejected: {body}"
+    );
+
+    session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        find_post_plan_execute_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+    })
+}
+
+#[cfg(feature = "test-provider")]
+fn plan_ids(snapshot: &Value) -> Vec<&str> {
+    snapshot
+        .get("plans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|plan| plan.get("id").and_then(Value::as_str))
+        .collect()
+}
+
+#[cfg(feature = "test-provider")]
+fn assert_plan_review_has_no_execution_side_effects(
+    session: &CodeSession,
+    snapshot: &Value,
+) -> Result<()> {
+    assert_eq!(
+        session.read_repo_file("README.md")?.as_deref(),
+        Some(PLAN_REVIEW_README),
+        "Plan review must not modify the requested file before W2-04 execution"
+    );
+    assert!(
+        snapshot
+            .get("patchsets")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "Plan review must not project a workspace mutation: {snapshot}"
+    );
+    assert!(
+        snapshot
+            .get("toolCalls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .all(|tool| {
+                !matches!(
+                    tool.get("toolName").and_then(Value::as_str),
+                    Some("apply_patch" | "shell" | "blocking_mutation")
+                )
+            }),
+        "Plan review must not invoke a workspace mutation tool: {snapshot}"
+    );
+    Ok(())
+}
+
+/// W2-03: Modify closes the source Plan gate, but no replacement exists until
+/// the next plain HTTP message supplies the revision note. That note is
+/// consumed once and produces a fresh Plan generation without entering the
+/// network or execution paths.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_modify_next_plain_text_opens_replacement_plan_gate() -> Result<()> {
+    let repo_root = initialize_plan_review_repo("plan-review-modify")?;
+    let repo_dir = repo_root.path().join("repo");
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new("plan-review-modify", fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_context("dev"),
+    )?;
+    let source_snapshot = drive_to_plan_review_gate(&mut session, "scenario-plan-review-modify")?;
+    let source_interaction = find_post_plan_execute_interaction(&source_snapshot)
+        .ok_or_else(|| anyhow::anyhow!("initial Plan review gate missing: {source_snapshot}"))?;
+    let source_interaction_id = source_interaction
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("initial Plan review gate missing id: {source_snapshot}"))?
+        .to_string();
+    let source_plan_id = source_interaction
+        .get("metadata")
+        .and_then(|metadata| metadata.get("planId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("initial Plan review gate missing planId: {source_snapshot}")
+        })?
+        .to_string();
+    let source_plan_ids = plan_ids(&source_snapshot)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let (http_status, body) = session.respond_interaction(
+        &source_interaction_id,
+        &json!({ "selectedOption": "modify" }),
+    )?;
+    assert_eq!(http_status, StatusCode::OK, "Plan Modify rejected: {body}");
+    let before_note = session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        status_eq(snapshot, "idle")
+            && interaction_status(snapshot, &source_interaction_id) == Some("resolved")
+    })?;
+    assert!(
+        before_note
+            .get("interactions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .all(|interaction| {
+                interaction.get("kind").and_then(Value::as_str) != Some("post_plan_choice")
+                    || interaction.get("status").and_then(Value::as_str) != Some("pending")
+            }),
+        "Modify must not synthesize a replacement Plan gate before the next plain message: {before_note}"
+    );
+    assert_eq!(
+        plan_ids(&before_note),
+        source_plan_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "Modify alone must not project a replacement plan"
+    );
+    assert!(
+        find_network_policy_interaction(&before_note).is_none(),
+        "Modify must not enter the network-policy phase: {before_note}"
+    );
+    assert_plan_review_has_no_execution_side_effects(&session, &before_note)?;
+
+    session.submit_message(PLAN_REVIEW_REVISION_NOTE)?;
+    let replacement_snapshot = session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        find_post_plan_execute_interaction(snapshot).is_some_and(|interaction| {
+            interaction.get("status").and_then(Value::as_str) == Some("pending")
+                && interaction.get("id").and_then(Value::as_str)
+                    != Some(source_interaction_id.as_str())
+        })
+    })?;
+    assert_eq!(
+        interaction_status(&replacement_snapshot, &source_interaction_id),
+        Some("resolved"),
+        "the source Plan gate must remain terminal after its replacement opens"
+    );
+    let replacement_interaction = find_post_plan_execute_interaction(&replacement_snapshot)
+        .ok_or_else(|| anyhow::anyhow!("replacement Plan review gate missing"))?;
+    let replacement_interaction_id = replacement_interaction
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("replacement Plan review gate missing id"))?;
+    assert_ne!(replacement_interaction_id, source_interaction_id);
+    let replacement_plan_id = replacement_interaction
+        .get("metadata")
+        .and_then(|metadata| metadata.get("planId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("replacement Plan review gate missing planId"))?;
+    assert_ne!(
+        replacement_plan_id, source_plan_id,
+        "a revision must persist a fresh execution-plan revision"
+    );
+    let replacement_plan = replacement_snapshot
+        .get("plans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|plan| plan.get("id").and_then(Value::as_str) == Some(replacement_interaction_id))
+        .ok_or_else(|| anyhow::anyhow!("replacement gate has no matching plan projection"))?;
+    assert_eq!(
+        replacement_plan.get("summary").and_then(Value::as_str),
+        Some(PLAN_REVIEW_REVISED_SUMMARY),
+        "the distinct revision provider response must drive the replacement plan"
+    );
+    assert_eq!(
+        replacement_snapshot
+            .get("transcript")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry.get("content").and_then(Value::as_str) == Some(PLAN_REVIEW_REVISION_NOTE)
+            })
+            .count(),
+        1,
+        "the plain-text revision note must be durably projected exactly once"
+    );
+    assert!(
+        find_network_policy_interaction(&replacement_snapshot).is_none(),
+        "Plan revision must not enter the network-policy phase: {replacement_snapshot}"
+    );
+    assert_plan_review_has_no_execution_side_effects(&session, &replacement_snapshot)?;
+    session.shutdown()
+}
+
+/// W2-03: an empty message cannot consume Plan Modify authority or fall
+/// through to the generic direct-turn error. The HTTP contract is a typed 400,
+/// and a later valid note must still produce the replacement Plan.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_empty_revision_note_is_typed_and_preserves_authority() -> Result<()> {
+    let repo_root = initialize_plan_review_repo("plan-review-empty-revision")?;
+    let repo_dir = repo_root.path().join("repo");
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new("plan-review-empty-revision", fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_context("dev"),
+    )?;
+    let source_snapshot =
+        drive_to_plan_review_gate(&mut session, "scenario-plan-review-empty-revision")?;
+    let source_interaction_id = find_post_plan_execute_interaction(&source_snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("initial Plan gate missing: {source_snapshot}"))?
+        .to_string();
+
+    let (http_status, body) = session.respond_interaction(
+        &source_interaction_id,
+        &json!({ "selectedOption": "modify" }),
+    )?;
+    assert_eq!(http_status, StatusCode::OK, "Plan Modify rejected: {body}");
+    session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        status_eq(snapshot, "idle")
+            && interaction_status(snapshot, &source_interaction_id) == Some("resolved")
+    })?;
+
+    let (http_status, body) = session.submit_message_expect_error("   \n\t")?;
+    assert_eq!(
+        http_status,
+        StatusCode::BAD_REQUEST,
+        "unexpected body: {body}"
+    );
+    assert_eq!(error_code(&body), Some("PLAN_REVISION_NOTE_REQUIRED"));
+    let after_empty = session.snapshot()?;
+    assert_eq!(
+        interaction_status(&after_empty, &source_interaction_id),
+        Some("resolved"),
+        "the source gate must remain resolved while revision authority waits"
+    );
+    assert!(
+        after_empty
+            .get("interactions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .all(|interaction| {
+                interaction.get("kind").and_then(Value::as_str) != Some("post_plan_choice")
+                    || interaction.get("status").and_then(Value::as_str) != Some("pending")
+            }),
+        "an empty note must not create a replacement Plan: {after_empty}"
+    );
+    assert_plan_review_has_no_execution_side_effects(&session, &after_empty)?;
+
+    session.submit_message(PLAN_REVIEW_REVISION_NOTE)?;
+    let replacement = session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        find_post_plan_execute_interaction(snapshot).is_some_and(|interaction| {
+            interaction.get("status").and_then(Value::as_str) == Some("pending")
+                && interaction.get("id").and_then(Value::as_str)
+                    != Some(source_interaction_id.as_str())
+        })
+    })?;
+    assert_eq!(
+        find_post_plan_execute_interaction(&replacement)
+            .and_then(|interaction| interaction.get("metadata"))
+            .and_then(|metadata| metadata.get("workspaceDrifted"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "the retained revision authority must bind a fresh checkout: {replacement}"
+    );
+    assert_plan_review_has_no_execution_side_effects(&session, &replacement)?;
+    session.shutdown()
+}
+
+/// W2-03: if repository identity changes after Modify is selected, submitting
+/// the note must fail before consumption. Restoring the reviewed repository
+/// lets the exact same note retry once and open the replacement Plan without a
+/// workspace mutation.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_repository_replacement_after_modify_keeps_revision_note_retryable() -> Result<()> {
+    let case_name = "plan-review-repository-replaced-after-modify";
+    let repo_root = initialize_plan_review_repo(case_name)?;
+    let repo_dir = repo_root.path().join("repo");
+    run_plan_review_libra(
+        &repo_dir,
+        &["config", "libra.repoid", "reviewed-repository-id"],
+        "pin reviewed repository identity",
+    )?;
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new(case_name, fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir.clone())
+            .with_context("dev"),
+    )?;
+    let source_snapshot = drive_to_plan_review_gate(&mut session, case_name)?;
+    let source_interaction_id = find_post_plan_execute_interaction(&source_snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("initial Plan gate missing: {source_snapshot}"))?
+        .to_string();
+
+    let (http_status, body) = session.respond_interaction(
+        &source_interaction_id,
+        &json!({ "selectedOption": "modify" }),
+    )?;
+    assert_eq!(http_status, StatusCode::OK, "Plan Modify rejected: {body}");
+    session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        status_eq(snapshot, "idle")
+            && interaction_status(snapshot, &source_interaction_id) == Some("resolved")
+    })?;
+
+    run_plan_review_libra(
+        &repo_dir,
+        &["config", "libra.repoid", "replacement-repository-id"],
+        "replace repository identity after Plan Modify",
+    )?;
+    let (http_status, body) = session.submit_message_expect_error(PLAN_REVIEW_REVISION_NOTE)?;
+    assert_eq!(http_status, StatusCode::CONFLICT, "unexpected body: {body}");
+    assert_eq!(error_code(&body), Some("PHASE1_WORKSPACE_CHANGED"));
+    let message = body
+        .pointer("/error/message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("post-Modify repository error missing message: {body}"))?;
+    assert!(
+        message.contains("not consumed") && message.contains("original repository"),
+        "post-Modify refusal must preserve a retryable note: {message}"
+    );
+    let after_refusal = session.snapshot()?;
+    assert!(
+        after_refusal
+            .get("interactions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .all(|interaction| {
+                interaction.get("kind").and_then(Value::as_str) != Some("post_plan_choice")
+                    || interaction.get("status").and_then(Value::as_str) != Some("pending")
+            }),
+        "repository replacement must not create a replacement Plan: {after_refusal}"
+    );
+    assert_plan_review_has_no_execution_side_effects(&session, &after_refusal)?;
+
+    run_plan_review_libra(
+        &repo_dir,
+        &["config", "libra.repoid", "reviewed-repository-id"],
+        "restore reviewed repository identity",
+    )?;
+    session.submit_message(PLAN_REVIEW_REVISION_NOTE)?;
+    let replacement = session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        find_post_plan_execute_interaction(snapshot).is_some_and(|interaction| {
+            interaction.get("status").and_then(Value::as_str) == Some("pending")
+                && interaction.get("id").and_then(Value::as_str)
+                    != Some(source_interaction_id.as_str())
+        })
+    })?;
+    assert_eq!(
+        replacement
+            .get("transcript")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry.get("content").and_then(Value::as_str) == Some(PLAN_REVIEW_REVISION_NOTE)
+            })
+            .count(),
+        1,
+        "the refused note must be projected only after its successful retry"
+    );
+    assert_plan_review_has_no_execution_side_effects(&session, &replacement)?;
+    session.shutdown()
+}
+
+/// W2-03: ordinary workspace drift is recoverable gate state, not an
+/// indeterminate side effect. Resume must retain the Plan authority, block a
+/// stale Execute with a typed 409, and let Modify regenerate against the
+/// current checkout without mutating the user's edit.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout() -> Result<()> {
+    let case_name = "plan-review-workspace-drift";
+    let repo_root = initialize_plan_review_repo(case_name)?;
+    let repo_dir = repo_root.path().join("repo");
+
+    let (session_id, source_interaction_id) = {
+        let mut session = CodeSession::spawn(
+            CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_review"))
+                .with_existing_repo_dir(repo_dir.clone())
+                .with_context("dev"),
+        )?;
+        let snapshot = drive_to_plan_review_gate(&mut session, &format!("{case_name}-spawn"))?;
+        let session_id = snapshot
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Plan snapshot missing sessionId: {snapshot}"))?
+            .to_string();
+        let interaction_id = find_post_plan_execute_interaction(&snapshot)
+            .and_then(|interaction| interaction.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Plan snapshot missing gate id: {snapshot}"))?
+            .to_string();
+        session.kill_without_cleanup()?;
+        (session_id, interaction_id)
+    };
+
+    std::fs::write(repo_dir.join("README.md"), PLAN_REVIEW_DRIFTED_README)
+        .context("failed to edit README while Plan gate was offline")?;
+
+    let mut resumed = CodeSession::spawn(
+        CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_resume_thread(&session_id)
+            .with_context("dev"),
+    )?;
+    resumed.attach_automation(&format!("{case_name}-resume"))?;
+    let restored = resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_post_plan_execute_interaction(snapshot).is_some_and(|interaction| {
+            interaction.get("status").and_then(Value::as_str) == Some("pending")
+                && interaction
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("workspaceDrifted"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+    })?;
+    let restored_gate = find_post_plan_execute_interaction(&restored)
+        .ok_or_else(|| anyhow::anyhow!("restored Plan gate missing: {restored}"))?;
+    assert_eq!(
+        restored_gate.get("id").and_then(Value::as_str),
+        Some(source_interaction_id.as_str()),
+        "resume must retain the exact pending Plan generation"
+    );
+    assert!(
+        restored_gate
+            .get("metadata")
+            .and_then(|metadata| metadata.get("workspaceWarning"))
+            .and_then(Value::as_str)
+            .is_some_and(|warning| warning.contains("exact identity and content recheck")),
+        "restored gate must explain that Execute uses exact authority: {restored_gate}"
+    );
+
+    let (http_status, body) = resumed.respond_interaction(
+        &source_interaction_id,
+        &json!({ "selectedOption": "execute" }),
+    )?;
+    assert_eq!(http_status, StatusCode::CONFLICT, "unexpected body: {body}");
+    assert_eq!(error_code(&body), Some("PHASE1_WORKSPACE_CHANGED"));
+    let after_execute = resumed.snapshot()?;
+    assert_eq!(
+        interaction_status(&after_execute, &source_interaction_id),
+        Some("pending"),
+        "stale Execute must preserve the same Plan gate"
+    );
+
+    let (http_status, body) = resumed.respond_interaction(
+        &source_interaction_id,
+        &json!({ "selectedOption": "modify" }),
+    )?;
+    assert_eq!(http_status, StatusCode::OK, "Plan Modify rejected: {body}");
+    resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        status_eq(snapshot, "idle")
+            && interaction_status(snapshot, &source_interaction_id) == Some("resolved")
+    })?;
+    resumed.submit_message(PLAN_REVIEW_REVISION_NOTE)?;
+    let replacement = resumed.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        find_post_plan_execute_interaction(snapshot).is_some_and(|interaction| {
+            interaction.get("status").and_then(Value::as_str) == Some("pending")
+                && interaction.get("id").and_then(Value::as_str)
+                    != Some(source_interaction_id.as_str())
+        })
+    })?;
+    assert!(
+        find_post_plan_execute_interaction(&replacement)
+            .and_then(|interaction| interaction.get("metadata"))
+            .and_then(|metadata| metadata.get("workspaceDrifted"))
+            .and_then(Value::as_bool)
+            == Some(false),
+        "replacement Plan must bind the current workspace: {replacement}"
+    );
+    assert_eq!(
+        resumed.read_repo_file("README.md")?.as_deref(),
+        Some(PLAN_REVIEW_DRIFTED_README),
+        "Plan regeneration must preserve the user's workspace edit"
+    );
+    resumed.shutdown()
+}
+
+/// W2-03: the additive metadata token is an advisory resume/pre-write signal,
+/// not Execute authority. A timestamp-only change projects a warning, while
+/// Execute's exact content recheck may still admit the unchanged Plan into the
+/// network-policy gate.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_metadata_only_drift_warns_but_exact_execute_recheck_succeeds() -> Result<()> {
+    let case_name = "plan-review-metadata-only-drift";
+    let repo_root = initialize_plan_review_repo(case_name)?;
+    let repo_dir = repo_root.path().join("repo");
+
+    let (session_id, source_interaction_id) = {
+        let mut session = CodeSession::spawn(
+            CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_review"))
+                .with_existing_repo_dir(repo_dir.clone())
+                .with_context("dev"),
+        )?;
+        let snapshot = drive_to_plan_review_gate(&mut session, &format!("{case_name}-spawn"))?;
+        let session_id = snapshot
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Plan snapshot missing sessionId: {snapshot}"))?
+            .to_string();
+        let interaction_id = find_post_plan_execute_interaction(&snapshot)
+            .and_then(|interaction| interaction.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Plan snapshot missing gate id: {snapshot}"))?
+            .to_string();
+        session.kill_without_cleanup()?;
+        (session_id, interaction_id)
+    };
+
+    let readme_path = repo_dir.join("README.md");
+    let original =
+        std::fs::read(&readme_path).context("failed to read README before touching it")?;
+    let modified = std::fs::metadata(&readme_path)
+        .context("failed to stat README before touching it")?
+        .modified()
+        .context("README has no modification timestamp")?;
+    std::fs::File::options()
+        .write(true)
+        .open(&readme_path)
+        .context("failed to open README for a metadata-only change")?
+        .set_times(std::fs::FileTimes::new().set_modified(modified + Duration::from_secs(60)))
+        .context("failed to change only the README timestamp")?;
+    assert_eq!(
+        std::fs::read(&readme_path).context("failed to reread touched README")?,
+        original,
+        "metadata-only fixture must not change file content"
+    );
+
+    let mut resumed = CodeSession::spawn(
+        CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_resume_thread(&session_id)
+            .with_context("dev"),
+    )?;
+    resumed.attach_automation(&format!("{case_name}-resume"))?;
+    let restored = resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_post_plan_execute_interaction(snapshot).is_some_and(|interaction| {
+            interaction.get("status").and_then(Value::as_str) == Some("pending")
+                && interaction
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("workspaceDrifted"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+    })?;
+    let restored_gate = find_post_plan_execute_interaction(&restored)
+        .ok_or_else(|| anyhow::anyhow!("restored Plan gate missing: {restored}"))?;
+    assert_eq!(
+        restored_gate.get("id").and_then(Value::as_str),
+        Some(source_interaction_id.as_str())
+    );
+    assert!(
+        restored_gate
+            .get("metadata")
+            .and_then(|metadata| metadata.get("workspaceWarning"))
+            .and_then(Value::as_str)
+            .is_some_and(|warning| warning.contains("exact identity and content recheck")),
+        "metadata-only warning must explain Execute's exact authority: {restored_gate}"
+    );
+
+    let (http_status, body) = resumed.respond_interaction(
+        &source_interaction_id,
+        &json!({ "selectedOption": "execute" }),
+    )?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "exact content recheck should admit metadata-only drift: {body}"
+    );
+    let network_snapshot = resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_network_policy_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+    })?;
+    let network_interaction_id = find_network_policy_interaction(&network_snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("network-policy gate missing id: {network_snapshot}"))?
+        .to_string();
+    assert_plan_review_has_no_execution_side_effects(&resumed, &network_snapshot)?;
+
+    let (http_status, body) = resumed.respond_interaction(
+        &network_interaction_id,
+        &json!({ "selectedOption": "network-deny" }),
+    )?;
+    assert_eq!(http_status, StatusCode::OK, "Network Deny rejected: {body}");
+    resumed.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        status_eq(snapshot, "idle")
+            && find_network_policy_interaction(snapshot)
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("resolved")
+    })?;
+    resumed.shutdown()
+}
+
+/// W2-03: a HEAD move while the process is offline follows the same recoverable
+/// gate policy as an online move. Resume must project the original authority,
+/// Execute must fail closed, and an explicit Modify may rebind only because the
+/// repository identity is unchanged.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_head_drift_survives_resume_and_requires_explicit_modify() -> Result<()> {
+    let case_name = "plan-review-head-drift";
+    let repo_root = initialize_plan_review_repo(case_name)?;
+    let repo_dir = repo_root.path().join("repo");
+
+    let (session_id, source_interaction_id) = {
+        let mut session = CodeSession::spawn(
+            CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_review"))
+                .with_existing_repo_dir(repo_dir.clone())
+                .with_context("dev"),
+        )?;
+        let snapshot = drive_to_plan_review_gate(&mut session, &format!("{case_name}-spawn"))?;
+        let session_id = snapshot
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Plan snapshot missing sessionId: {snapshot}"))?
+            .to_string();
+        let interaction_id = find_post_plan_execute_interaction(&snapshot)
+            .and_then(|interaction| interaction.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Plan snapshot missing gate id: {snapshot}"))?
+            .to_string();
+        session.kill_without_cleanup()?;
+        (session_id, interaction_id)
+    };
+
+    std::fs::write(repo_dir.join("README.md"), PLAN_REVIEW_DRIFTED_README)
+        .context("failed to edit README before moving HEAD")?;
+    run_plan_review_libra(&repo_dir, &["add", "README.md"], "stage HEAD-drift fixture")?;
+    run_plan_review_libra(
+        &repo_dir,
+        &[
+            "commit",
+            "-m",
+            "move HEAD while review is offline",
+            "--no-verify",
+        ],
+        "commit HEAD-drift fixture",
+    )?;
+
+    let mut resumed = CodeSession::spawn(
+        CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_resume_thread(&session_id)
+            .with_context("dev"),
+    )?;
+    resumed.attach_automation(&format!("{case_name}-resume"))?;
+    let restored = resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_post_plan_execute_interaction(snapshot).is_some_and(|interaction| {
+            interaction.get("status").and_then(Value::as_str) == Some("pending")
+                && interaction
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("workspaceDrifted"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+    })?;
+    let restored_gate = find_post_plan_execute_interaction(&restored)
+        .ok_or_else(|| anyhow::anyhow!("restored Plan gate missing: {restored}"))?;
+    assert_eq!(
+        restored_gate.get("id").and_then(Value::as_str),
+        Some(source_interaction_id.as_str())
+    );
+    assert!(
+        restored_gate
+            .get("metadata")
+            .and_then(|metadata| metadata.get("workspaceWarning"))
+            .and_then(Value::as_str)
+            .is_some_and(|warning| warning.contains("checkout identity changed")),
+        "resume must explain the HEAD mismatch: {restored_gate}"
+    );
+
+    let (http_status, body) = resumed.respond_interaction(
+        &source_interaction_id,
+        &json!({ "selectedOption": "execute" }),
+    )?;
+    assert_eq!(http_status, StatusCode::CONFLICT, "unexpected body: {body}");
+    assert_eq!(error_code(&body), Some("PHASE1_WORKSPACE_CHANGED"));
+    assert_eq!(
+        interaction_status(&resumed.snapshot()?, &source_interaction_id),
+        Some("pending")
+    );
+
+    let (http_status, body) = resumed.respond_interaction(
+        &source_interaction_id,
+        &json!({ "selectedOption": "modify" }),
+    )?;
+    assert_eq!(http_status, StatusCode::OK, "Plan Modify rejected: {body}");
+    resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        status_eq(snapshot, "idle")
+            && interaction_status(snapshot, &source_interaction_id) == Some("resolved")
+    })?;
+    resumed.submit_message(PLAN_REVIEW_REVISION_NOTE)?;
+    let replacement = resumed.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        find_post_plan_execute_interaction(snapshot).is_some_and(|interaction| {
+            interaction.get("status").and_then(Value::as_str) == Some("pending")
+                && interaction.get("id").and_then(Value::as_str)
+                    != Some(source_interaction_id.as_str())
+        })
+    })?;
+    assert_eq!(
+        find_post_plan_execute_interaction(&replacement)
+            .and_then(|interaction| interaction.get("metadata"))
+            .and_then(|metadata| metadata.get("workspaceDrifted"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "Modify must bind the replacement Plan to the new HEAD: {replacement}"
+    );
+    assert_eq!(
+        resumed.read_repo_file("README.md")?.as_deref(),
+        Some(PLAN_REVIEW_DRIFTED_README)
+    );
+    resumed.shutdown()
+}
+
+/// W2-03: Plan Modify may rebind a moved HEAD, but it must never reuse an old
+/// IntentSpec after the repository identity itself is replaced. The refusal is
+/// typed and leaves the original gate pending so the user can Cancel safely.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_repository_replacement_blocks_modify_and_preserves_gate() -> Result<()> {
+    let case_name = "plan-review-repository-replaced";
+    let repo_root = initialize_plan_review_repo(case_name)?;
+    let repo_dir = repo_root.path().join("repo");
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new(case_name, fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir.clone())
+            .with_context("dev"),
+    )?;
+    let snapshot = drive_to_plan_review_gate(&mut session, case_name)?;
+    let interaction_id = find_post_plan_execute_interaction(&snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Plan snapshot missing gate id: {snapshot}"))?
+        .to_string();
+
+    run_plan_review_libra(
+        &repo_dir,
+        &["config", "libra.repoid", "replacement-repository-id"],
+        "replace repository identity while Plan gate is pending",
+    )?;
+
+    let (http_status, body) =
+        session.respond_interaction(&interaction_id, &json!({ "selectedOption": "execute" }))?;
+    assert_eq!(http_status, StatusCode::CONFLICT, "unexpected body: {body}");
+    assert_eq!(error_code(&body), Some("PHASE1_WORKSPACE_CHANGED"));
+    let message = body
+        .pointer("/error/message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("repository-replacement error missing message: {body}"))?;
+    assert!(
+        message.contains("Cancel") && message.contains("IntentSpec"),
+        "repository replacement must give the only valid recovery path: {message}"
+    );
+    assert!(
+        !message.contains("Choose Modify"),
+        "repository replacement must not recommend a Modify path that will be refused: {message}"
+    );
+
+    let (http_status, body) =
+        session.respond_interaction(&interaction_id, &json!({ "selectedOption": "modify" }))?;
+    assert_eq!(http_status, StatusCode::CONFLICT, "unexpected body: {body}");
+    assert_eq!(error_code(&body), Some("PHASE1_WORKSPACE_CHANGED"));
+    assert_eq!(
+        interaction_status(&session.snapshot()?, &interaction_id),
+        Some("pending"),
+        "repository replacement must not consume the Plan gate"
+    );
+    assert_plan_review_has_no_execution_side_effects(&session, &session.snapshot()?)?;
+    session.shutdown()
+}
+
+/// W2-04: Network Allow admits confirmed plan execution onto the runtime
+/// serialized queue. The network gate is consumed, execution starts, and
+/// mutating tools still pass through approval/sandbox/ACL (the fake fixture
+/// completes without apply_patch/shell).
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_network_allow_enters_runtime_queue() -> Result<()> {
+    let repo_root = initialize_plan_review_repo("plan-review-network-allow")?;
+    let repo_dir = repo_root.path().join("repo");
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new("plan-review-network-allow", fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_context("dev"),
+    )?;
+    let plan_snapshot =
+        drive_to_plan_review_gate(&mut session, "scenario-plan-review-network-allow")?;
+    let plan_interaction_id = find_post_plan_execute_interaction(&plan_snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("post_plan_choice missing id: {plan_snapshot}"))?
+        .to_string();
+    let (http_status, body) = session.respond_interaction(
+        &plan_interaction_id,
+        &json!({ "selectedOption": "execute" }),
+    )?;
+    assert_eq!(http_status, StatusCode::OK, "Plan Execute rejected: {body}");
+
+    let network_snapshot = session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_network_policy_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+    })?;
+    let network_interaction_id = find_network_policy_interaction(&network_snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("network-policy gate missing id: {network_snapshot}"))?
+        .to_string();
+    assert_plan_review_has_no_execution_side_effects(&session, &network_snapshot)?;
+
+    let (http_status, body) = session.respond_interaction(
+        &network_interaction_id,
+        &json!({ "selectedOption": "network-allow" }),
+    )?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "Network Allow should admit confirmed plan execution: {body}"
+    );
+    assert_ne!(error_code(&body), Some("PLAN_EXECUTION_NOT_AVAILABLE"));
+
+    let after = session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        let network_resolved = find_network_policy_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            != Some("pending");
+        let executing = status(snapshot) == Some("thinking")
+            || snapshot
+                .get("transcript")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("phase"))
+                        .and_then(Value::as_str)
+                        == Some("plan_execution")
+                        || entry.get("title").and_then(Value::as_str) == Some("Plan execution")
+                });
+        let settled = matches!(
+            status(snapshot),
+            Some("idle" | "awaiting_interaction" | "error")
+        );
+        network_resolved && (executing || settled)
+    })?;
+    assert!(
+        find_network_policy_interaction(&after)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            != Some("pending"),
+        "Network Allow must consume the pending network gate: {after}"
+    );
+    session.shutdown()
+}
+
+/// Historical W2-03 leftover name: the 409 PLAN_EXECUTION_NOT_AVAILABLE
+/// boundary was replaced by W2-04 Web confirmed-plan admission.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_network_allow_returns_conflict_and_preserves_pending_gate() -> Result<()> {
+    plan_review_network_allow_enters_runtime_queue()
+}
+
+/// Drive the default Web process through IntentSpec confirm → Phase 1
+/// `post_plan_choice` → Execute → network-policy gate, then hard-kill and
+/// `--resume` so the network gate is restored before Deny.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_network_policy_survives_web_resume_and_can_be_denied() -> Result<()> {
+    let case_name = "plan-review-network-resume";
+    let repo_root = initialize_plan_review_repo(case_name)?;
+    let repo_dir = repo_root.path().join("repo");
+
+    let session_id = {
+        let mut session = CodeSession::spawn(
+            CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_review"))
+                .with_existing_repo_dir(repo_dir.clone())
+                .with_context("dev"),
+        )?;
+        let snapshot = drive_to_plan_review_gate(&mut session, &format!("{case_name}-spawn"))?;
+        let plan_id = find_post_plan_execute_interaction(&snapshot)
+            .and_then(|interaction| interaction.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("post_plan_choice missing id: {snapshot}"))?
+            .to_string();
+        let (http_status, body) =
+            session.respond_interaction(&plan_id, &json!({ "selectedOption": "execute" }))?;
+        assert_eq!(http_status, StatusCode::OK, "plan Execute rejected: {body}");
+
+        session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+            find_network_policy_interaction(snapshot)
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("pending")
+        })?;
+        let id = session
+            .wait_for_snapshot(Duration::from_secs(5), |snapshot| {
+                snapshot.get("sessionId").and_then(Value::as_str).is_some()
+            })?
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("snapshot missing sessionId"))?;
+        // A clean shutdown resolves pending dialogs. Hard-kill preserves the
+        // durable pending marker so resume must restore the runtime-owned gate.
+        session.kill_without_cleanup()?;
+        id
+    };
+
+    let mut resumed = CodeSession::spawn(
+        CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_resume_thread(&session_id)
+            .with_context("dev"),
+    )?;
+    resumed.attach_automation(&format!("{case_name}-resume"))?;
+    let snapshot = resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_network_policy_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+    })?;
+    assert_eq!(
+        status(&snapshot),
+        Some("awaiting_interaction"),
+        "resumed session must reopen the network-policy gate: {snapshot}"
+    );
+    let interaction_id = find_network_policy_interaction(&snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("restored network gate missing id: {snapshot}"))?
+        .to_string();
+    let (http_status, body) = resumed.respond_interaction(
+        &interaction_id,
+        &json!({ "selectedOption": "network-deny" }),
+    )?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "network-deny on restored gate should be accepted: {body}"
+    );
+    resumed.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        status_eq(snapshot, "idle")
+            && find_network_policy_interaction(snapshot)
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("resolved")
+    })?;
+    resumed.shutdown()
+}
+
 /// W2-03 Plan review / network-policy recovery contract (cargo filter: `plan_review`).
 ///
 /// Pins the network-policy human-gate labels and exercises the same
 /// `open_plan_review_from_workflow` / `open_network_policy_from_workflow`
 /// scans that the Web resume path performs after crash/resume — including
 /// the Execute→network marker ordering and the Back demote window. The
-/// former end-to-end PTY scenario
-/// (`plan_review_network_policy_survives_resume_and_can_be_denied`) was
-/// deleted in W5-06 together with the TUI startup path it drove.
+/// Web-process counterpart above pins the full HTTP projection/response and
+/// resume path; this focused replay test keeps the state-machine edges local.
 #[test]
 fn plan_review_baseline_pins_network_policy_choices() {
     use libra::internal::ai::{
@@ -817,6 +1892,9 @@ fn plan_review_baseline_pins_network_policy_choices() {
             plan_id: "plan-scenario".to_string(),
             turn_id: "plan-review-turn".to_string(),
             phase1_turn_id: "phase1-turn".to_string(),
+            context_id: "review-scenario".to_string(),
+            revision_of: None,
+            prepared_from_network: None,
         })
         .expect("plan review marker");
     store
@@ -836,6 +1914,9 @@ fn plan_review_baseline_pins_network_policy_choices() {
         .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
             interaction_id: "review-scenario".to_string(),
             resolution: "execute".to_string(),
+            command: None,
+            prior_interaction_resolutions: Vec::new(),
+            intent_revision_consumption: None,
         })
         .expect("Execute resolves plan review");
     assert_eq!(
@@ -856,6 +1937,9 @@ fn plan_review_baseline_pins_network_policy_choices() {
             plan_id: "plan-scenario".to_string(),
             turn_id: "plan-review-turn-2".to_string(),
             phase1_turn_id: String::new(),
+            context_id: "review-scenario".to_string(),
+            revision_of: None,
+            prepared_from_network: None,
         })
         .expect("Back re-opens plan review");
     assert!(
@@ -885,8 +1969,8 @@ fn repair_loop_baseline_threshold_keeps_plan_continue_affordance() {
 /// W0-02 baseline for request_user_input wire kind (filter: `user_input`).
 #[test]
 fn user_input_baseline_interaction_kind_is_request_user_input() {
-    // Keep the TUI-owned interaction kind stable for Code UI wire consumers.
-    // Full multi-question PTY coverage remains on the approval/interaction path;
+    // Keep the migrated interaction kind stable for Code UI wire consumers.
+    // Full multi-question coverage remains on the approval/interaction path;
     // this pin prevents silent rename during runtime migration.
     let value = serde_json::to_value(
         libra::internal::ai::web::code_ui::CodeUiInteractionKind::RequestUserInput,
@@ -1009,6 +2093,51 @@ fn find_interaction_by_kind<'a>(snapshot: &'a Value, kind: &str) -> Option<&'a V
         .into_iter()
         .flatten()
         .find(|interaction| interaction.get("kind").and_then(Value::as_str) == Some(kind))
+}
+
+/// Plan-review Execute gate (`post_plan_choice` without `phase=networkPolicy`).
+/// Prefer a pending item when both Execute and network gates are present.
+#[cfg(feature = "test-provider")]
+fn find_post_plan_execute_interaction(snapshot: &Value) -> Option<&Value> {
+    let interactions = snapshot.get("interactions").and_then(Value::as_array)?;
+    let mut fallback = None;
+    for interaction in interactions {
+        if interaction.get("kind").and_then(Value::as_str) != Some("post_plan_choice") {
+            continue;
+        }
+        if interaction
+            .get("metadata")
+            .and_then(|metadata| metadata.get("phase"))
+            .and_then(Value::as_str)
+            == Some("networkPolicy")
+        {
+            continue;
+        }
+        if interaction.get("status").and_then(Value::as_str) == Some("pending") {
+            return Some(interaction);
+        }
+        fallback = Some(interaction);
+    }
+    fallback
+}
+
+/// Network-policy gate projected as `post_plan_choice` with
+/// `phase=networkPolicy`.
+#[cfg(feature = "test-provider")]
+fn find_network_policy_interaction(snapshot: &Value) -> Option<&Value> {
+    snapshot
+        .get("interactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|interaction| {
+            interaction.get("kind").and_then(Value::as_str) == Some("post_plan_choice")
+                && interaction
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("phase"))
+                    .and_then(Value::as_str)
+                    == Some("networkPolicy")
+        })
 }
 
 #[cfg(feature = "test-provider")]

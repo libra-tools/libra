@@ -3,8 +3,8 @@
 //! CLI adapters choose a launch profile and supply their channels, but they do
 //! not assemble a second tool registry or hardening boundary.  Provider/model
 //! construction remains in the command layer because it owns clap arguments
-//! and the Vault/env lookup; legacy full-workflow and current Web paths feed
-//! that same provider factory.
+//! and the Vault/env lookup; the active Web and headless paths feed that same
+//! provider factory.
 
 use std::{
     path::{Path, PathBuf},
@@ -17,7 +17,6 @@ use uuid::Uuid;
 
 use super::{SecretRedactor, ToolBoundaryRuntime, TracingAuditSink};
 use crate::internal::ai::{
-    mcp::server::LibraMcpServer,
     permission::unbound_approval_cache_scope,
     sandbox::{
         ApprovalCachePolicy, ApprovalStore, AskForApproval, ExecApprovalRequest, NetworkAccess,
@@ -28,10 +27,9 @@ use crate::internal::ai::{
         ToolRegistry, ToolRegistryBuilder,
         context::UserInputRequest,
         handlers::{
-            ApplyPatchHandler, GrepFilesHandler, ListDirHandler, McpBridgeHandler, PlanHandler,
-            ReadFileHandler, RequestUserInputHandler, SearchFilesHandler, ShellHandler,
-            SubmitIntentDraftHandler, SubmitPlanDraftHandler, SubmitTaskCompleteHandler,
-            WebSearchHandler, register_semantic_handlers,
+            ApplyPatchHandler, GrepFilesHandler, ListDirHandler, PlanHandler, ReadFileHandler,
+            RequestUserInputHandler, SearchFilesHandler, ShellHandler, SubmitIntentDraftHandler,
+            SubmitPlanDraftHandler, WebSearchHandler, register_semantic_handlers,
         },
     },
 };
@@ -40,9 +38,6 @@ use crate::internal::ai::{
 /// behavior, not a dependency on a terminal implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodeAgentLaunchProfile {
-    /// Full interactive workflow, including Intent/Task tools and MCP bridge
-    /// tools that use the shared in-process MCP server.
-    TuiBaseline,
     /// Direct-turn browser workflow.  Workflow tools requiring a session
     /// driver remain unavailable until their dedicated migration tasks.
     WebHeadless,
@@ -68,59 +63,13 @@ impl CodeAgentServices {
 
 /// Builds the one Code-agent registry for a launch profile.
 pub struct CodeAgentServicesBuilder {
-    launch: CodeAgentServicesLaunch,
+    redactor: SecretRedactor,
     working_dir: PathBuf,
     trace_id: Uuid,
     user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
 }
 
-enum CodeAgentServicesLaunch {
-    TuiBaseline {
-        mcp_server: Arc<LibraMcpServer>,
-        redactor: SecretRedactor,
-    },
-    WebHeadless {
-        redactor: SecretRedactor,
-    },
-}
-
 impl CodeAgentServicesBuilder {
-    pub fn tui_baseline(
-        working_dir: impl Into<PathBuf>,
-        trace_id: Uuid,
-        user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
-        mcp_server: Arc<LibraMcpServer>,
-    ) -> Self {
-        Self::tui_baseline_with_redactor(
-            working_dir,
-            trace_id,
-            user_input_tx,
-            mcp_server,
-            SecretRedactor::default_runtime(),
-        )
-    }
-
-    /// Legacy full-workflow registry with an explicit audit/projection redactor
-    /// (W3-12). It has no callers after W5-06; W5-10 removes this historical
-    /// name and variant as part of its zero-`Tui` sweep.
-    pub fn tui_baseline_with_redactor(
-        working_dir: impl Into<PathBuf>,
-        trace_id: Uuid,
-        user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
-        mcp_server: Arc<LibraMcpServer>,
-        redactor: SecretRedactor,
-    ) -> Self {
-        Self {
-            launch: CodeAgentServicesLaunch::TuiBaseline {
-                mcp_server,
-                redactor,
-            },
-            working_dir: working_dir.into(),
-            trace_id,
-            user_input_tx,
-        }
-    }
-
     pub fn web_headless(
         working_dir: impl Into<PathBuf>,
         trace_id: Uuid,
@@ -143,7 +92,7 @@ impl CodeAgentServicesBuilder {
         redactor: SecretRedactor,
     ) -> Self {
         Self {
-            launch: CodeAgentServicesLaunch::WebHeadless { redactor },
+            redactor,
             working_dir: working_dir.into(),
             trace_id,
             user_input_tx,
@@ -153,20 +102,12 @@ impl CodeAgentServicesBuilder {
     /// Construct the registry with the shared hardening/audit boundary.
     pub fn build(self) -> CodeAgentServices {
         let Self {
-            launch,
+            redactor,
             working_dir,
             trace_id,
             user_input_tx,
         } = self;
-        let (profile, redactor) = match &launch {
-            CodeAgentServicesLaunch::TuiBaseline { redactor, .. } => {
-                (CodeAgentLaunchProfile::TuiBaseline, redactor.clone())
-            }
-            CodeAgentServicesLaunch::WebHeadless { redactor } => {
-                (CodeAgentLaunchProfile::WebHeadless, redactor.clone())
-            }
-        };
-        let mut builder = ToolRegistryBuilder::with_working_dir(working_dir)
+        let builder = ToolRegistryBuilder::with_working_dir(working_dir)
             .hardening(ToolBoundaryRuntime::system_with_redactor(
                 trace_id,
                 Arc::new(TracingAuditSink),
@@ -183,27 +124,12 @@ impl CodeAgentServicesBuilder {
             .register(
                 "request_user_input",
                 Arc::new(RequestUserInputHandler::new(user_input_tx)),
-            );
-
-        match launch {
-            CodeAgentServicesLaunch::TuiBaseline { mcp_server, .. } => {
-                builder = builder
-                    .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
-                    .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
-                    .register("submit_task_complete", Arc::new(SubmitTaskCompleteHandler));
-                for (name, handler) in McpBridgeHandler::all_handlers(mcp_server) {
-                    builder = builder.register(name, handler);
-                }
-            }
-            CodeAgentServicesLaunch::WebHeadless { .. } => {
-                builder = builder
-                    .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
-                    .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler));
-            }
-        }
+            )
+            .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
+            .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler));
 
         CodeAgentServices {
-            profile,
+            profile: CodeAgentLaunchProfile::WebHeadless,
             registry: Arc::new(register_semantic_handlers(builder).build()),
         }
     }
@@ -225,7 +151,7 @@ pub struct CodeAgentApprovalConfig {
     pub cache_policy: ApprovalCachePolicy,
 }
 
-/// Construct the sole sandbox/approval context used by both interactive and
+/// Construct the sole sandbox/approval context used by the active Web and
 /// headless Code launches.
 ///
 /// `approval_cache_scope` must be a non-empty explicit key (W4-13:

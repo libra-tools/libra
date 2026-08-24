@@ -286,6 +286,37 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
         "agent_checkpoint_prune_tombstone",
         ConfigOwner::RepositoryWithWorkspaceSessionScope,
     ),
+    // Bridge durable projection (plan-20260818 LB-02): repository-scoped rows
+    // carrying repository_id/worktree_id/workspace_id scope (bridge session,
+    // event, operation, checkpoint, link and the migration guard).
+    (
+        "agent_bridge_session",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_event",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_operation",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_checkpoint",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_link",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_capture_down_guard",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_link_relations_down_guard",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
     (
         "agent_subagent_content_claim",
         ConfigOwner::RepositoryWithWorkspaceSessionScope,
@@ -371,6 +402,18 @@ pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
         "compiled parser options constant; input-independent",
     ),
     ("REG", "compiled regex constant; input-independent"),
+    (
+        "CURRENT_PROCESS_OWNER_IDENTITY",
+        "process-lifetime own pid/starttime/boot_id identity for the session \
+         writer-lease liveness probe; holds no repository state",
+    ),
+    (
+        "BRIDGE_LIVE_REVIEW_RUNS",
+        "not a cache: the live-run registry `libra agent bridge --stdio` uses to \
+         cancel and drain the review runs IT started when the stdio loop ends \
+         (GC-LB-10). Keyed by run id, holds only cancel/join handles for this \
+         process's own runs, and is emptied by the shutdown drain",
+    ),
 ];
 
 #[cfg(test)]
@@ -395,8 +438,9 @@ mod tests {
         "capability_packages.json", // agent capability data artifact, not configuration
         "pending_revision.json",    // pending plan-revision state written by the headless
         // runtime (web/headless.rs), not configuration
-        "settings.json", // EXTERNAL provider settings (e.g. Claude Code's
-                         // .claude/settings.json) written by `agent enable` — not a .libra surface
+        "pending-start.json", // crash-recovery seed for a Phase 1 attempt, not configuration
+        "settings.json",      // EXTERNAL provider settings (e.g. Claude Code's
+                              // .claude/settings.json) written by `agent enable` — not a .libra surface
     ];
 
     /// Extract config-file name literals from the PRODUCTION half of one

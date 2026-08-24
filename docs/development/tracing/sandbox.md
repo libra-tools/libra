@@ -138,15 +138,15 @@ shell 工具 → run_shell_command_with_approval (mod.rs:909)
 
 ### 2.4 `libra code` 会话如何接入沙箱
 
-**W5-03 更正（2026-08-19）：** 以下早期 TUI anchor 是迁移前的设计快照；
+**W5-03/W5-10 更正（2026-08-19）：** 以下早期 TUI anchor 是迁移前的设计快照；
 `execute_tui` / `run_tui_with_model*` 已删除。当前默认入口是 Web Code UI 的
-`execute_web_only` / `build_headless_web_code_ui_runtime`，而保留 `tui` 的 helper
-名称仅为 W5-10 的受控清理对象，不能作为可用 TUI 路径。
+`execute_web_only` / `build_headless_web_code_ui_runtime`；W5-10 已移除遗留 helper
+的 TUI 命名和终端依赖，不能从任何旧符号推断存在可用 TUI 路径。
 
 - 入口 `command/code.rs::execute` → `execute_web_only` / `execute_stdio`（TUI 分支已在 W5-06/W5-03 删除）。
 - worktree 根由 `resolve_code_working_dir`（`code.rs:2465`，优先级 `--cwd` > `--repo` > `current_dir()`）解析、`validate_code_working_dir` 校验——**这就是未来 VM 的挂载根**。
 - Web Code UI：`execute_web_only` 建 `ToolRegistry`（注册 `shell`=`ShellHandler`、`apply_patch`=`ApplyPatchHandler`）并启动 `build_headless_web_code_ui_runtime`。
-- 每会话 `runtime_context` 由当前 Web runtime 构造；历史命名的 `default_tui_runtime_context` 仍按 `CodeContext` 选策略：`Review|Research` → `ReadOnly`；`Dev|None` → `WorkspaceWrite { writable_roots: vec![working_dir], network_access, … }`，其更名/摘除归 W5-10。
+- 每会话 `runtime_context` 由当前 Web runtime 的 `default_runtime_context` 按 `CodeContext` 选策略：`Review|Research` → `ReadOnly`；`Dev|None` → `WorkspaceWrite { writable_roots: vec![working_dir], network_access, … }`。
 - **当前接入点**：Web runtime 仍通过 env / `.libra/sandbox.toml` 选择后端。**VM 后端应在 Web runtime 的 `SandboxRuntimeConfig` 装配处持有 VM 句柄，而非恢复已删除的 TUI path。**
 - 历史 `scopeguard` terminal 恢复路径只能作为 VM 销毁的设计参考；VM 销毁需用 §7 Phase 2 的**三层保障**（正常路径 await + Drop 内阻塞兜底 + 启动期 PID 感知回收），不能直接照搬。
 - headless/web 走 `build_headless_web_code_ui_runtime`（`code.rs:1968`），需同等处理。
@@ -278,7 +278,7 @@ shell 工具 → run_shell_command_with_approval (mod.rs:909)
 | D6 | **worktree 读写绑挂（host↔guest 共享）** | 解决 `apply_patch`（宿主写）与 shell（guest 写）的一致性（§9）；worktree 外写入留 ephemeral rootfs = 想要的隔离 |
 | D7 | **网络按策略映射到 VM 网络配置**：Denied→`--network none`；Full→默认 NAT 网络；Allowlist→`--internal` 网络 + 宿主代理经 host-gateway 暴露 + guest 默认拒绝（§8） | 让强制力落到**网络层**而非仅 env 提示 |
 | D8 | **失败闭合 / 降级遵循现有 enforcement 三档** | `Required` 平台不满足→`EnforcementFailed`；`PreferStrict`→审批回退；`BestEffort`→降级 seatbelt |
-| D9 | **`SandboxRuntimeConfig` 承载 VM 句柄/配置** | 已 `Clone`、已贯穿 spec→transform 链路；当前 Web runtime 的历史命名 `default_tui_runtime_context` 装配点改填实例 |
+| D9 | **`SandboxRuntimeConfig` 承载 VM 句柄/配置** | 已 `Clone`、已贯穿 spec→transform 链路；当前 Web runtime 的 `default_runtime_context` 装配点改填实例 |
 | D10 | **新增配置面三入口**：`LIBRA_SANDBOX_BACKEND` env、`.libra/sandbox.toml [sandbox] backend`、`libra code --sandbox-backend` | 与现有 env/file/flag 三层一致；`auto` 自动探测 |
 
 ### 5.1 后端取值语义
@@ -545,7 +545,7 @@ Allowlist/Full 下 guest 需 DNS。优先用默认网络自带 DNS；若用 `--i
 
 沿用 `proxy_enforcement_from_sandbox`（`runtime.rs:747-753`）：`Required`→代理不可用即 `Reject`（`NetworkEnforcementFailed`）；`PreferStrict`/`BestEffort`→`DegradeToDenied`。
 
-**⚠️ 关键修正：VM 网络模式不能从“会话策略”推出。** 历史命名的 `default_tui_runtime_context` 构造的会话 `SandboxPolicy` 只会是 `ReadOnly` 或 `WorkspaceWrite{Full|Denied}`——`network_access` 经 `from_legacy_bool` 只能得 `Full`/`Denied`，**永远不是 `Allowlist`**。`Allowlist` 仅由 `build_command_from_spec` 在**命令级**读 `.libra/sandbox.toml [sandbox.network]` 经 `with_network_restriction`（收紧式）注入。因此**会话创建 VM 时，代码并不知道后续命令会不会是 Allowlist**。
+**⚠️ 关键修正：VM 网络模式不能从“会话策略”推出。** `default_runtime_context` 构造的会话 `SandboxPolicy` 只会是 `ReadOnly` 或 `WorkspaceWrite{Full|Denied}`——`network_access` 经 `from_legacy_bool` 只能得 `Full`/`Denied`，**永远不是 `Allowlist`**。`Allowlist` 仅由 `build_command_from_spec` 在**命令级**读 `.libra/sandbox.toml [sandbox.network]` 经 `with_network_restriction`（收紧式）注入。因此**会话创建 VM 时，代码并不知道后续命令会不会是 Allowlist**。
 
 v1 的确定性做法：
 
@@ -899,7 +899,7 @@ untrusted automatic backend: apple-container only
 | `resolve_sandbox_backend`（仿 enforcement） | `mod.rs:1831-1850` |
 | `.libra/sandbox.toml` 加 `[sandbox] backend` | `SandboxConfigSection` `mod.rs:1567-1572` |
 | 注入代理 env 重写（host-gateway） | `inject_allowlist_proxy_env` `mod.rs:1533-1553` |
-| 会话起/止 VM 接入 + RAII | Web Code UI lifecycle、历史命名 `default_tui_runtime_context` 与 headless runtime（具体锚点需在落地时按 W5-03 后树复核） |
+| 会话起/止 VM 接入 + RAII | Web Code UI lifecycle、`default_runtime_context` 与 headless runtime（具体锚点需在落地时按 W5-03 后树复核） |
 | worktree 根解析（挂载根） | `resolve_code_working_dir` `code.rs:2465` |
 | `--sandbox-backend` flag | `CodeArgs`（`command/code.rs`） |
 | status 新字段/计算 | `command/sandbox.rs:55-69,123-189,236-316,564-659` |

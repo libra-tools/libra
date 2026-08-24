@@ -2,8 +2,8 @@
 //!
 //! All branch state for a Libra repository lives in the SQLite `reference` table
 //! (kind = `Branch`). This module is the only place that should mutate that table
-//! for branch-shaped rows; callers go through [`Branch::find_branch`],
-//! [`Branch::update_branch`], etc.
+//! for branch-shaped rows; callers go through `Branch::find_branch`,
+//! `Branch::update_branch`, etc.
 //!
 //! The public API comes in two flavours:
 //! - **Lossy wrappers** (e.g. `find_branch`, `list_branches`) — collapse storage
@@ -381,7 +381,7 @@ impl Branch {
         resolved
     }
 
-    /// Result-returning variant of [`list_branches_result_with_conn`] that
+    /// Result-returning variant of `list_branches_result_with_conn` that
     /// acquires its own connection from the pool. Use the `_with_conn` form
     /// inside transactions.
     pub async fn list_branches_result(remote: Option<&str>) -> Result<Vec<Self>, BranchStoreError> {
@@ -393,7 +393,7 @@ impl Branch {
     ///
     /// Returns `Ok(true)` when a row matching `(branch_name, remote)` exists,
     /// `Ok(false)` when none does, and a [`BranchStoreError::Query`] on storage
-    /// failures. Unlike [`Branch::exists_with_conn`], a corrupt row still counts
+    /// failures. Unlike `Branch::exists_with_conn`, a corrupt row still counts
     /// as existing (it is not decoded here).
     pub async fn exists_result_with_conn<C>(
         db: &C,

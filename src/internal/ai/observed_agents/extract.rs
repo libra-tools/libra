@@ -33,7 +33,7 @@ pub const CLAUDE_CODE_SKILL_REGISTRY: &[&str] = &["/review", "/security-review",
 pub const CODEX_SKILL_REGISTRY: &[&str] = &["/review"];
 pub const OPENCODE_SKILL_REGISTRY: &[&str] = &["/review"];
 
-/// A0-07: exhaustive [`AgentKind`] → curated skill registry lookup. The single
+/// A0-07: exhaustive `AgentKind` → curated skill registry lookup. The single
 /// fact source both transcript extraction and `libra agent skill` discovery
 /// read through: a new `AgentKind` fails to compile here until it registers.
 /// Non-first-batch agents expose no discoverable skills (`&[]`).

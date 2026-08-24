@@ -1141,6 +1141,18 @@ impl CodeUiRuntimeHandle {
         self.adapter.snapshot().await
     }
 
+    /// Deterministic subprocess seam for controller-expiry scenarios. This is
+    /// compiled only with the fake-provider test feature and is never routed by
+    /// a production build.
+    #[cfg(feature = "test-provider")]
+    pub(crate) async fn expire_active_controller_lease_for_test(&self) -> bool {
+        let expired = self.controller_service.expire_active_lease_for_test().await;
+        if expired {
+            self.sync_controller_snapshot().await;
+        }
+        expired
+    }
+
     pub async fn diagnostics(&self) -> CodeUiDiagnostics {
         self.sync_controller_snapshot().await;
         let snapshot = self.snapshot().await;
@@ -1186,7 +1198,7 @@ impl CodeUiRuntimeHandle {
     /// Errors:
     /// - `BROWSER_CONTROL_DISABLED` / `CONTROL_DISABLED` when the kind is not enabled.
     /// - `CONTROLLER_CONFLICT` when another client already holds an active lease.
-    /// - `INVALID_CONTROLLER_KIND` for `None`, `Tui`, or `Cli`.
+    /// - `INVALID_CONTROLLER_KIND` for `None`, `LegacyLocal`, or `Cli`.
     ///
     /// The lease TTL defaults to `DEFAULT_CONTROLLER_LEASE_SECS` (120s).
     /// Renew by calling again with the same `client_id`.
@@ -1436,7 +1448,7 @@ impl CodeUiRuntimeHandle {
             })
     }
 
-    /// Process-level adapter shutdown used by [`LifecycleShutdownOwner`].
+    /// Process-level adapter shutdown used by `LifecycleShutdownOwner`.
     /// Closes provider/runtime admission first; the controller lease is
     /// released separately after listeners drain so a browser cannot attach
     /// and submit during teardown.
@@ -1713,6 +1725,8 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("INVALID_CONTROLLER_KIND", 400),
         ("CONTROLLER_CONFLICT", 409),
         ("INTERACTION_NOT_ACTIVE", 409),
+        ("PHASE1_WORKSPACE_CHANGED", 409),
+        ("PLAN_EXECUTION_NOT_AVAILABLE", 409),
         // Turn admission (W5-02: UI-neutral successor to the TUI bridge's
         // SESSION_BUSY — submit while a turn runs, cancel with none running).
         ("SESSION_BUSY", 409),
@@ -1721,6 +1735,7 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         // Tail: read-side and runtime-availability errors.
         ("CODE_UI_UNAVAILABLE", 404),
         ("INVALID_QUERY_PARAM", 400),
+        ("PLAN_REVISION_NOTE_REQUIRED", 400),
         ("INVALID_COMMAND_ID", 400),
         ("STORAGE_PATH_INVALID", 500),
         ("STORAGE_ROOT_UNRESOLVED", 500),
@@ -2827,12 +2842,9 @@ mod tests {
     #[tokio::test]
     async fn expired_browser_controller_lease_is_cleaned_before_attach() {
         let session = test_session();
-        let mut options =
-            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed);
-        options.lease_duration = Some(Duration::milliseconds(1));
         let runtime = CodeUiRuntimeHandle::build_with_options(
             ReadOnlyCodeUiAdapter::new(session.clone(), CodeUiCapabilities::default()),
-            options,
+            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed),
         )
         .await;
 
@@ -2840,7 +2852,12 @@ mod tests {
             .attach_browser_controller("browser-a")
             .await
             .expect("browser controller should attach");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            runtime
+                .controller_service
+                .expire_active_lease_for_test()
+                .await
+        );
 
         let replacement_attach = runtime
             .attach_browser_controller("browser-b")
@@ -2870,10 +2887,11 @@ mod tests {
     async fn expired_browser_controller_lease_invokes_takeover_hook() {
         let session = test_session();
         let adapter = RecordingCodeUiAdapter::new(session.clone());
-        let mut options =
-            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed);
-        options.lease_duration = Some(Duration::milliseconds(1));
-        let runtime = CodeUiRuntimeHandle::build_with_options(adapter.clone(), options).await;
+        let runtime = CodeUiRuntimeHandle::build_with_options(
+            adapter.clone(),
+            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed),
+        )
+        .await;
 
         runtime
             .attach_browser_controller("browser-a")
@@ -2885,7 +2903,12 @@ mod tests {
             "initial claim is not a takeover"
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            runtime
+                .controller_service
+                .expire_active_lease_for_test()
+                .await
+        );
         runtime
             .attach_browser_controller("browser-b")
             .await
@@ -2933,10 +2956,11 @@ mod tests {
     #[tokio::test]
     async fn expired_remote_lease_invokes_takeover_hook_on_snapshot() {
         let adapter = RecordingCodeUiAdapter::new(test_session());
-        let mut options =
-            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed);
-        options.lease_duration = Some(Duration::milliseconds(1));
-        let runtime = CodeUiRuntimeHandle::build_with_options(adapter.clone(), options).await;
+        let runtime = CodeUiRuntimeHandle::build_with_options(
+            adapter.clone(),
+            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed),
+        )
+        .await;
 
         runtime
             .attach_browser_controller("browser-a")
@@ -2948,7 +2972,12 @@ mod tests {
             "first attach from an unclaimed session is not a takeover (W5-02)"
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            runtime
+                .controller_service
+                .expire_active_lease_for_test()
+                .await
+        );
         let snapshot = runtime.snapshot().await;
         assert_eq!(snapshot.controller.kind, CodeUiControllerKind::None);
         assert_eq!(
@@ -2961,12 +2990,9 @@ mod tests {
     #[tokio::test]
     async fn expired_browser_controller_write_failure_syncs_snapshot() {
         let session = test_session();
-        let mut options =
-            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed);
-        options.lease_duration = Some(Duration::milliseconds(1));
         let runtime = CodeUiRuntimeHandle::build_with_options(
             ReadOnlyCodeUiAdapter::new(session.clone(), CodeUiCapabilities::default()),
-            options,
+            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed),
         )
         .await;
 
@@ -2980,7 +3006,12 @@ mod tests {
             CodeUiControllerKind::Browser
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            runtime
+                .controller_service
+                .expire_active_lease_for_test()
+                .await
+        );
         let error = runtime
             .submit_message(
                 Some(&attach.controller_token),

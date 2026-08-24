@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use super::parse_arguments;
 use crate::internal::ai::tools::{
     ToolResult,
-    context::{SubmitPlanDraftArgs, ToolInvocation, ToolKind, ToolOutput, ToolPayload},
+    context::{
+        MAX_SUBMIT_PLAN_DRAFT_ARGUMENT_BYTES, SubmitPlanDraftArgs, ToolInvocation, ToolKind,
+        ToolOutput, ToolPayload, validate_submit_plan_draft_bounds,
+    },
     error::ToolError,
     registry::ToolHandler,
     spec::ToolSpec,
@@ -37,6 +40,11 @@ impl ToolHandler for SubmitPlanDraftHandler {
             }
         };
 
+        if arguments.len() > MAX_SUBMIT_PLAN_DRAFT_ARGUMENT_BYTES {
+            return Err(ToolError::InvalidArguments(format!(
+                "submit_plan_draft arguments exceed {MAX_SUBMIT_PLAN_DRAFT_ARGUMENT_BYTES} bytes"
+            )));
+        }
         let args: SubmitPlanDraftArgs = parse_arguments(&arguments)?;
         validate_plan_draft(&args)?;
 
@@ -49,22 +57,7 @@ impl ToolHandler for SubmitPlanDraftHandler {
 }
 
 fn validate_plan_draft(args: &SubmitPlanDraftArgs) -> ToolResult<()> {
-    let non_empty_count = args
-        .steps
-        .iter()
-        .filter(|step| !step.title.trim().is_empty())
-        .count();
-    if non_empty_count == 0 {
-        return Err(ToolError::InvalidArguments(
-            "submit_plan_draft requires at least one non-empty step title".to_string(),
-        ));
-    }
-    if non_empty_count != args.steps.len() {
-        return Err(ToolError::InvalidArguments(
-            "submit_plan_draft step titles must not be empty".to_string(),
-        ));
-    }
-    Ok(())
+    validate_submit_plan_draft_bounds(args).map_err(ToolError::InvalidArguments)
 }
 
 #[cfg(test)]

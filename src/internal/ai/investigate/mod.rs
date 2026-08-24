@@ -5,7 +5,7 @@
 //! [`crate::internal::ai::review`] and deliberately reuses A7's proven
 //! machinery rather than duplicating it:
 //!
-//! - the isolated-workspace seam ([`materialize_isolated_workspace`]),
+//! - the isolated-workspace seam (`materialize_isolated_workspace`),
 //! - the §0.3.2 read-only real-CLI argv builder + minimal-allowlist spawn
 //!   ([`crate::internal::ai::review::build_reviewer_command`] /
 //!   [`crate::internal::ai::review::spawn_reviewer`]),

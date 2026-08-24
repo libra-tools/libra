@@ -2,8 +2,8 @@
 //!
 //! Each `#[test]` here loads
 //! `tests/data/code_ui_remote/generation_cases.json` and drives the
-//! corresponding apply_patch fixture through a real `libra code`
-//! PTY session, asserting that:
+//! corresponding apply_patch fixture through a real non-TTY `libra code`
+//! Web process, asserting that:
 //!
 //! 1. the fake provider's `apply_patch` tool call lands a complete
 //!    file in the temporary working directory,

@@ -2,7 +2,7 @@
 //!
 //! Centralises the per-provider normalisation rules that were previously
 //! scattered across each provider's `completion.rs`. The trait operates on
-//! the **canonical** [`CompletionRequest`] / [`CompletionResponse`] envelopes
+//! the **canonical** `CompletionRequest` / `CompletionResponse` envelopes
 //! — wire-format quirks (empty-content whitespace insertion, `tool_call_id`
 //! shape, JSON-schema mapping) continue to live in each provider's
 //! `build_messages` / response parser, because they need access to the

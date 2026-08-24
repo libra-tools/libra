@@ -22,6 +22,7 @@ libra agent workspace list [--limit <n>] [--cursor <token>] [--state <state>]...
 libra agent workspace show <workspace-id>
 libra agent push [--remote <name>] [--force-rewrite]
 libra agent rpc <subcommand>
+libra agent bridge --stdio
 ```
 
 ## Description
@@ -86,6 +87,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `rpc trust --dir <path>` | Register a trusted directory (`agent.external_agents.trusted_dirs`, default `~/.libra/agents`): external binaries are only trustable when their canonical path lives under one. The path is canonicalized and must be an existing, non-world-writable directory |
 | `rpc untrust <slug>` | Revoke trust; the binary returns to quarantine (always available, even while external agents are disabled) |
 | `rpc invoke` | Invoke one JSON-RPC method on a trusted `libra-agent-*` binary |
+| `bridge --stdio` | Run the repository-scoped DeepSeek Harness bridge over stdin/stdout (JSON-RPC 2.0 NDJSON). The **only** standard inbound write transport for Harness; it is not `libra code --control` and not an MCP server. stdout carries exactly one protocol frame per response; diagnostics go to stderr. Protocol v1: 20-method allowlist, 256 KiB frame cap, 64 in-flight requests, 30 s default deadline. All 20 methods are implemented: the `initialize` handshake; session/event ingress `session.open`, `event.append` (batch ack / idempotent / digest-conflict / server-side redaction), `session.flush`, `session.close`, `evidence.append`, `provenance.append`; the read methods `context.get`, `status.get`, `history.search`, `checkpoint.list`, `checkpoint.show` and `diff.get`; the mutations `checkpoint.create`, `commit.create`, `checkpoint.restore` and `review.run` (each with `operation_id` idempotency, actor binding and approval gating); and workspace lease `workspace.claim` / `workspace.renew` / `workspace.release` (owner derived from the authenticated bridge session). `diff.get` takes a closed `mode` (`worktree` / `staged` / `checkpoint`) plus validated repository-relative `paths` — never a free-form revision or pathspec — and forces `--no-ext-diff` / `--no-textconv` so repository config cannot become process execution. `commit.create` commits the current index only (no `-a`, no pathspec, no amend, no author override) and records its association graph in `agent_bridge_link` rather than in the commit message. `checkpoint.restore` requires an explicit `expected_head` fence plus a clean index/worktree and never moves HEAD. `review.run` starts a read-only review and returns its `run_id`; replaying the same `operation_id` reports that run's state instead of starting a second one. A stale HEAD or dirty worktree is refused with `LBR-AGENT-038` before any write. An ack only means the redacted projection is durable, never that the Harness raw transcript has been migrated. Not a Git command. |
 
 ## Common Options
 
@@ -508,6 +510,10 @@ libra agent rpc list
 
 # Invoke a single JSON-RPC method on a libra-agent-<slug> binary
 libra agent rpc invoke <slug> <method> --params '<json>'
+
+# Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON);
+# feed it a fixture and read one frame per response on stdout
+libra agent bridge --stdio < bridge-initialize.ndjson
 
 # Structured JSON envelope for agents
 libra agent --json status

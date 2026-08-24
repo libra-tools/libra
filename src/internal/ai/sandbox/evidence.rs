@@ -91,7 +91,7 @@ pub enum SandboxEvidenceEvent {
     /// requested under `SandboxEnforcement::Required` while the
     /// per-allowlist proxy backend is unavailable. Doc reference:
     /// `docs/development/commands/sandbox.md:348` ("网络拒绝事件（连接被
-    /// OS 或代理阻断）写入 ToolInvocation[E] + Evidence[E]") and
+    /// OS 或代理阻断）写入 `ToolInvocation[E] + Evidence[E]`) and
     /// L373.
     ///
     /// The runtime's `SandboxTransformError::NetworkEnforcementFailed`
@@ -109,7 +109,7 @@ pub enum SandboxEvidenceEvent {
     /// connection request after inspecting the CONNECT target or HTTP
     /// Host header. Doc reference: `docs/development/commands/sandbox.md:348`
     /// ("网络拒绝事件（连接被 OS 或代理阻断）写入
-    /// ToolInvocation[E] + Evidence[E]").
+    /// `ToolInvocation[E] + Evidence[E]`).
     NetworkRequestDenied {
         /// Stable proxy backend identifier, e.g. `"allowlist"`.
         proxy_backend: String,

@@ -263,7 +263,7 @@ fn codex_summary_from_entries(entries: &[&CodeUiTranscriptEntry]) -> Option<Stri
 /// [`CompletionModel`] for a single task attempt.
 ///
 /// **State (v0.17.1106):** Implementation now invokes the provider in a
-/// **single-shot, tool-loop-less** mode — it builds a [`CompletionRequest`]
+/// **single-shot, tool-loop-less** mode — it builds a `CompletionRequest`
 /// from the [`TaskExecutionContext::prompt`], calls
 /// [`CompletionModel::completion`], stitches the assistant text into a
 /// summary, and returns a `Completed` [`TaskExecutionResult`] only when

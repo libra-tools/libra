@@ -26,7 +26,7 @@ pub struct ProbeRequest {
     pub expected_version: String,
 }
 
-/// Recognize a `__upgrade-probe …` invocation from raw argv (argv[0] is the
+/// Recognize a `__upgrade-probe …` invocation from raw argv (the first argv element is the
 /// program name). Returns `None` for every other command so normal dispatch
 /// is untouched.
 ///

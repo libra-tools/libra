@@ -1268,7 +1268,7 @@ mod tests {
     /// surface unless every variant has its own guard.
     ///
     /// Continuation of the post-v0.17.700 surface-contract sweep
-    /// (TuiControlError / CherryPickError / RevertError /
+    /// (the retired terminal-control error / CherryPickError / RevertError /
     /// RestoreError / StashError / ResetError).
     #[test]
     fn fuse_umount_error_stable_code_pins_each_variant() {

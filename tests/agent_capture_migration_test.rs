@@ -197,16 +197,20 @@ async fn capture_workspace_scope_migration_preserves_legacy_unknown_and_fences_d
     // additive migration runs. Inserting after the latest migration would
     // only prove the column default, not that a real upgrade preserves an
     // existing capture row without inventing a main-worktree owner.
-    assert_eq!(
-        runner
-            .rollback_to(&conn, 2026073101)
-            .await
-            .expect("roll back W4 scope migration on an empty capture catalog"),
-        // Rollback returns every rolled-back version, newest first; the two
-        // agent-usage migrations (2026080402/2026080403) sit on top of the W4
-        // scope migration and ride along without touching agent_session.
-        vec![2026081301, 2026080403, 2026080402, 2026080401]
-    );
+    let rolled_back_to_pre_w4 = runner
+        .rollback_to(&conn, 2026073101)
+        .await
+        .expect("roll back W4 scope migration on an empty capture catalog");
+    // Rollback returns every rolled-back version, newest first. Everything
+    // registered above the W4 scope migration (the agent-usage pair, the
+    // approved-permission provenance migration, the agent-bridge migrations,
+    // …) sits on top of it and rides along without touching agent_session, so
+    // derive the expectation from the registry the way the other rollback
+    // cases in this file do — a hard-coded list silently rots into a failure
+    // the next time any unrelated migration lands.
+    let mut expected_rolled_back_to_pre_w4 = registered_versions_after(2026073101);
+    expected_rolled_back_to_pre_w4.reverse();
+    assert_eq!(rolled_back_to_pre_w4, expected_rolled_back_to_pre_w4);
 
     // This focused migration fixture intentionally does not install the
     // unrelated `ai_thread` parent table that the historical agent-session
@@ -235,9 +239,10 @@ async fn capture_workspace_scope_migration_preserves_legacy_unknown_and_fences_d
             .run_pending(&conn)
             .await
             .expect("upgrade legacy capture row to W4 scope schema"),
-        // Ascending application order: W4 scope first, then the two
-        // agent-usage migrations re-applied on top of it.
-        vec![2026080401, 2026080402, 2026080403, 2026081301]
+        // Ascending application order: W4 scope first, then everything that
+        // was rolled back with it, re-applied on top. Derived from the
+        // registry for the same reason as the rollback expectation above.
+        registered_versions_after(2026073101)
     );
     let row = conn
         .query_one_raw(Statement::from_string(

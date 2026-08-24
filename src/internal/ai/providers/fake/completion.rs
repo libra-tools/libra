@@ -77,9 +77,11 @@ impl CompletionModelTrait for CompletionModel {
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         let latest_user_text = latest_user_text(&request).unwrap_or_default();
+        let after_tool_name = last_tool_result_name(&request);
         let ctx = FakeMatchContext {
             latest_user_text: &latest_user_text,
-            after_tool_result: last_user_is_tool_result(&request),
+            after_tool_result: after_tool_name.is_some(),
+            after_tool_name,
         };
         let (matched_response_index, action) = {
             let mut consumed = match self.consumed.lock() {
@@ -153,20 +155,19 @@ impl CompletionModelTrait for CompletionModel {
     }
 }
 
-fn last_user_is_tool_result(request: &CompletionRequest) -> bool {
-    request
-        .chat_history
-        .iter()
-        .rev()
-        .find_map(|message| match message {
-            Message::User { content } => Some(
-                content
-                    .iter()
-                    .any(|item| matches!(item, UserContent::ToolResult(_))),
-            ),
-            Message::Assistant { .. } | Message::System { .. } => None,
-        })
-        .unwrap_or(false)
+fn last_tool_result_name(request: &CompletionRequest) -> Option<&str> {
+    for message in request.chat_history.iter().rev() {
+        match message {
+            Message::User { content } => {
+                return content.iter().find_map(|item| match item {
+                    UserContent::ToolResult(result) => Some(result.name.as_str()),
+                    UserContent::Text(_) | UserContent::Image(_) => None,
+                });
+            }
+            Message::Assistant { .. } | Message::System { .. } => {}
+        }
+    }
+    None
 }
 
 fn latest_user_text(request: &CompletionRequest) -> Option<String> {
@@ -198,6 +199,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::internal::ai::completion::ToolResult;
 
     #[tokio::test]
     async fn fake_provider_returns_matching_text_response() {
@@ -207,6 +209,7 @@ mod tests {
                     contains: Some("hello".to_string()),
                     equals: None,
                     after_tool_result: None,
+                    after_tool_name: None,
                 },
                 once: false,
                 action: FakeResponseAction::Text {
@@ -271,6 +274,76 @@ mod tests {
             response.content.as_slice(),
             [AssistantContent::ToolCall(ToolCall { id, name, .. })]
                 if id == "call-1" && name == "request_user_input"
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_user_turn_after_a_tool_result_does_not_inherit_after_tool_result() {
+        let fixture = FakeFixture {
+            responses: vec![
+                super::super::fixture::FakeResponseRule {
+                    matcher: super::super::fixture::FakeMatcher {
+                        contains: Some("You are generating an execution plan".to_string()),
+                        equals: None,
+                        after_tool_result: Some(true),
+                        after_tool_name: None,
+                    },
+                    once: false,
+                    action: FakeResponseAction::Text {
+                        text: "wrong follow-up".to_string(),
+                        delay_ms: 0,
+                        stream: vec![],
+                        usage: None,
+                    },
+                },
+                super::super::fixture::FakeResponseRule {
+                    matcher: super::super::fixture::FakeMatcher {
+                        contains: Some("You are generating an execution plan".to_string()),
+                        equals: None,
+                        after_tool_result: Some(false),
+                        after_tool_name: None,
+                    },
+                    once: false,
+                    action: FakeResponseAction::ToolCall {
+                        id: "plan-1".to_string(),
+                        name: "submit_plan_draft".to_string(),
+                        arguments: json!({}),
+                        delay_ms: 0,
+                        stream: vec![],
+                        usage: None,
+                    },
+                },
+            ],
+            fallback: Some(FakeResponseAction::Error {
+                message: "fallback".to_string(),
+                delay_ms: 0,
+            }),
+        };
+        let model = CompletionModel {
+            fixture: Arc::new(fixture),
+            consumed: Arc::new(Mutex::new(HashSet::new())),
+            model: "fake".to_string(),
+        };
+        let prior_tool_result = Message::User {
+            content: OneOrMany::One(UserContent::ToolResult(ToolResult {
+                id: "intent-1".to_string(),
+                name: "submit_intent_draft".to_string(),
+                result: json!({}),
+            })),
+        };
+        let response = model
+            .completion(CompletionRequest::new(vec![
+                prior_tool_result,
+                Message::user(
+                    "You are generating an execution plan for an already confirmed IntentSpec.",
+                ),
+            ]))
+            .await
+            .expect("new user turn must match afterToolResult=false");
+        assert!(matches!(
+            response.content.as_slice(),
+            [AssistantContent::ToolCall(ToolCall { id, name, .. })]
+                if id == "plan-1" && name == "submit_plan_draft"
         ));
     }
 }

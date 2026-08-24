@@ -19,7 +19,8 @@ use crate::{
     },
 };
 
-mod checkpoint;
+pub mod bridge;
+pub(crate) mod checkpoint;
 mod clean;
 mod doctor;
 mod graph;
@@ -110,7 +111,8 @@ EXAMPLES:
     libra agent rpc trust --dir <path>              Register a trusted directory (binaries must live under one)
     libra agent rpc untrust <slug>                  Revoke trust (binary returns to quarantine)
     libra agent rpc invoke <slug> <method>          Invoke a single JSON-RPC method (use --params '<json>' for arguments)
-    libra agent --json status                       Structured JSON output for agents";
+    libra agent bridge --stdio                      Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)
+    libra --json agent status                       Structured JSON output for agents";
 
 #[derive(Args, Debug)]
 #[command(after_help = AGENT_EXAMPLES)]
@@ -193,6 +195,13 @@ pub enum AgentSubcommand {
     /// Phase 4.5 (entire.md §14.4 item 5).
     #[command(subcommand, about = "External libra-agent-<name> RPC")]
     Rpc(rpc::AgentRpcSubcommand),
+
+    /// Repository-scoped JSON-RPC 2.0 NDJSON ingress for the DeepSeek
+    /// Harness plugin (plan-20260818 LB-01). This is the ONLY standard
+    /// inbound write transport for Harness; it is not `libra code --control`
+    /// and not an MCP server.
+    #[command(about = "Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)")]
+    Bridge(bridge::BridgeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -377,6 +386,7 @@ pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<(
         AgentSubcommand::Workspace(cmd) => workspace::execute_safe(cmd, output).await,
         AgentSubcommand::Hooks(cmd) => hooks::execute_safe(cmd, output).await,
         AgentSubcommand::Rpc(cmd) => rpc::execute_safe(cmd, output).await,
+        AgentSubcommand::Bridge(args) => bridge::execute_safe(args, output).await,
     }
 }
 

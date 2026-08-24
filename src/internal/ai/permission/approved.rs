@@ -22,7 +22,7 @@
 //! 3. Pattern-level deletion is handled by [`ApprovedRulesetStore::remove`];
 //!    project-level wipe by [`ApprovedRulesetStore::clear`].
 //! 4. Rows whose `project_id` is not the current `libra.repoid` stay invisible
-//!    to [`load`] until an explicit doctor adopt
+//!    to [`ApprovedRulesetStore::load`] until an explicit doctor adopt
 //!    ([`ApprovedRulesetStore::adopt_legacy_project_id`]) or clear.
 //!
 //! What this module is **not**:
@@ -180,7 +180,7 @@ impl ApprovedRulesetStore {
     }
 
     /// Load every persisted approval for an explicit `project_id` (doctor /
-    /// tests). Prefer [`load`] for runtime paths.
+    /// tests). Prefer [`ApprovedRulesetStore::load`] for runtime paths.
     pub async fn load_for_project_id(
         conn: &DatabaseConnection,
         project_id: &str,
@@ -316,7 +316,7 @@ impl ApprovedRulesetStore {
     }
 
     /// Persist under an explicit `project_id` (legacy seeding / tests).
-    /// Prefer [`append`] for runtime paths.
+    /// Prefer [`ApprovedRulesetStore::append`] for runtime paths.
     pub async fn append_for_project_id(
         conn: &DatabaseConnection,
         project_id: &str,
@@ -407,8 +407,8 @@ impl ApprovedRulesetStore {
 
     /// Distinct `project_id` values that are not the current `libra.repoid`.
     ///
-    /// These rows are invisible to [`load`] until
-    /// [`adopt_legacy_project_id`] or [`clear_for_project_id`]. When the
+    /// These rows are invisible to [`ApprovedRulesetStore::load`] until
+    /// [`ApprovedRulesetStore::adopt_legacy_project_id`] or [`ApprovedRulesetStore::clear_for_project_id`]. When the
     /// repository identity is missing, every stored `project_id` is returned
     /// so doctor can still discover opaque legacy buckets.
     pub async fn list_legacy_project_ids(

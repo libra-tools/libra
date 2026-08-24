@@ -167,7 +167,7 @@ pub trait HookProvider: Sync {
     }
     /// Materialise the provider's hook configuration files on disk.
     fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()>;
-    /// Remove anything previously written by [`install_hooks`].
+    /// Remove anything previously written by [`Self::install_hooks`].
     fn uninstall_hooks(&self) -> Result<()>;
     /// Detect whether the provider's hooks are currently wired up. Used for status
     /// reporting and idempotent installs.

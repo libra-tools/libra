@@ -95,7 +95,7 @@ impl AgentProfile {
     ///   stand-alone `variant:` lines without a `model:` binding are
     ///   intentionally dropped here because the runtime has no place to
     ///   apply them on a non-bound provider.
-    /// - `tools` becomes [`ToolSelection::Allow(_)`] when the parsed list
+    /// - `tools` becomes `ToolSelection::Allow(_)` when the parsed list
     ///   is non-empty, [`ToolSelection::Inherit`] when empty (the runtime
     ///   resolves "inherit" contextually — primary agents inherit the
     ///   session allow-list, sub-agents fall back to deny-everything per

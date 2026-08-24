@@ -101,7 +101,7 @@ Do not dismiss an issue only because:
   - `--features test-network` for Wave 3 (`network_remotes_test`) — no secrets needed.
   - `--features test-live-ai` for Wave 4 (real LLM APIs; needs `DEEPSEEK_API_KEY` etc.).
   - `--features test-live-cloud` for Wave 5 (real D1/R2; needs `LIBRA_D1_*`/`LIBRA_STORAGE_*`).
-  - `--features test-provider` plus `LIBRA_ENABLE_TEST_PROVIDER=1` to activate the deterministic provider used by `code_ui_scenarios`, `harness_self_test`, `code_codex_default_tui_test`, `code_ui_remote_lease_matrix`, and `code_ui_remote_sse_matrix` (run with `--test-threads=1`).
+  - `--features test-provider` plus `LIBRA_ENABLE_TEST_PROVIDER=1` to activate the deterministic provider used by `code_ui_scenarios`, `harness_self_test`, `code_codex_default_web_test`, `ai_code_ui_headless_test`, `code_ui_remote_lease_matrix`, and `code_ui_remote_sse_matrix` (run with `--test-threads=1`).
   - `--features worktree-fuse` for Unix FUSE-backed worktree commands.
   - `--features subagent-scaffold` for the gated CEX-S2-10 schema scaffold (see `docs/development/tracing/agent.md`).
 

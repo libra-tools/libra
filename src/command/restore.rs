@@ -231,7 +231,7 @@ impl RestoreTarget {
 
 // ── Entry points ─────────────────────────────────────────────────────
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(about = "Restore working tree files")]
 #[command(after_help = RESTORE_EXAMPLES)]
 pub struct RestoreArgs {

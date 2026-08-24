@@ -8313,9 +8313,16 @@ mod tests {
     async fn finish_repair_operation_surfaces_close_failure() {
         use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
-        use crate::internal::operation_wrapper::{
-            OperationMeta, OperationScope, begin_operation_with_conn,
+        use crate::{
+            internal::operation_wrapper::{
+                OperationMeta, OperationScope, begin_operation_with_conn,
+            },
+            utils::test::{ChangeDirGuard, setup_with_new_libra_in},
         };
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
 
         let db = Database::connect("sqlite::memory:")
             .await

@@ -31,8 +31,11 @@ pub mod store;
 pub use jsonl::{
     CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandRecovery,
     CodeCommandStatus, CodeCommandStoreError, CodeWorkflowCursor, CodeWorkflowEvent,
-    CodeWorkflowEventKind, CodeWorkflowReplay, CodeWorkflowSequenceGap, SessionEvent,
-    SessionJsonlStore, code_workflow_replay_parse_visits, reset_code_workflow_replay_parse_visits,
+    CodeWorkflowEventKind, CodeWorkflowReplay, CodeWorkflowSequenceGap,
+    INTENT_REVISION_CONSUMER_COMMAND_KIND, INTENT_REVISION_CONSUMPTION_SCHEMA_VERSION,
+    IntentRevisionConsumption, IntentRevisionConsumptionClaim, IntentRevisionRecovery,
+    MAX_INTENT_REVISION_NOTE_BYTES, Phase1RetryIntentReview, SessionEvent, SessionJsonlStore,
+    code_workflow_replay_parse_visits, reset_code_workflow_replay_parse_visits,
 };
 pub use state::{SessionId, SessionMessage, SessionState};
 pub use store::{SessionInfo, SessionStore};

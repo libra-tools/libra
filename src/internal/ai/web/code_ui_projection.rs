@@ -152,32 +152,70 @@ pub fn fold_code_ui_snapshot(
             }
             CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
                 interaction_id,
+                prior_interaction_resolutions,
                 ..
             } => {
                 snapshot.status = CodeUiSessionStatus::Completed;
                 snapshot.updated_at = workflow_event.recorded_at;
-                if let Some(interaction) = snapshot
-                    .interactions
-                    .iter_mut()
-                    .find(|item| item.id == *interaction_id)
+                for resolved_id in prior_interaction_resolutions
+                    .iter()
+                    .map(|(interaction_id, _)| interaction_id)
+                    .chain(std::iter::once(interaction_id))
                 {
-                    interaction.status = CodeUiInteractionStatus::Resolved;
-                    interaction.resolved_at = Some(workflow_event.recorded_at);
+                    if let Some(interaction) = snapshot
+                        .interactions
+                        .iter_mut()
+                        .find(|item| item.id == *resolved_id)
+                    {
+                        interaction.status = CodeUiInteractionStatus::Resolved;
+                        interaction.resolved_at = Some(workflow_event.recorded_at);
+                    }
                 }
             }
-            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. } => {
-                if let Some(interaction) = snapshot
-                    .interactions
-                    .iter_mut()
-                    .find(|item| item.id == *interaction_id)
+            CodeWorkflowEventKind::InteractionResolved {
+                intent_revision_consumption: Some(_),
+                ..
+            } => {}
+            CodeWorkflowEventKind::InteractionResolved {
+                interaction_id,
+                prior_interaction_resolutions,
+                intent_revision_consumption: None,
+                ..
+            } => {
+                for resolved_id in prior_interaction_resolutions
+                    .iter()
+                    .map(|(interaction_id, _)| interaction_id)
+                    .chain(std::iter::once(interaction_id))
                 {
-                    interaction.status = CodeUiInteractionStatus::Resolved;
-                    interaction.resolved_at = Some(workflow_event.recorded_at);
+                    if let Some(interaction) = snapshot
+                        .interactions
+                        .iter_mut()
+                        .find(|item| item.id == *resolved_id)
+                    {
+                        interaction.status = CodeUiInteractionStatus::Resolved;
+                        interaction.resolved_at = Some(workflow_event.recorded_at);
+                    }
                 }
                 snapshot.updated_at = workflow_event.recorded_at;
             }
-            CodeWorkflowEventKind::TerminalFailure { .. }
-            | CodeWorkflowEventKind::CommandTerminalFailure { .. } => {
+            CodeWorkflowEventKind::CommandTerminalFailure {
+                interaction_resolutions,
+                ..
+            } => {
+                for (interaction_id, _) in interaction_resolutions {
+                    if let Some(interaction) = snapshot
+                        .interactions
+                        .iter_mut()
+                        .find(|item| item.id == *interaction_id)
+                    {
+                        interaction.status = CodeUiInteractionStatus::Resolved;
+                        interaction.resolved_at = Some(workflow_event.recorded_at);
+                    }
+                }
+                snapshot.status = CodeUiSessionStatus::Error;
+                snapshot.updated_at = workflow_event.recorded_at;
+            }
+            CodeWorkflowEventKind::TerminalFailure { .. } => {
                 snapshot.status = CodeUiSessionStatus::Error;
                 snapshot.updated_at = workflow_event.recorded_at;
             }

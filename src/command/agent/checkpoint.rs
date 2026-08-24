@@ -782,9 +782,9 @@ async fn truncate_agent_transcript_for_checkpoint_with_conn(
 /// target commit's tree (will be removed from the worktree by the
 /// underlying restore's deleted-files pass — see
 /// `command::restore::restore_worktree_tracked`).
-struct RewindPlan {
-    restore: Vec<String>,
-    delete: Vec<String>,
+pub(crate) struct RewindPlan {
+    pub(crate) restore: Vec<String>,
+    pub(crate) delete: Vec<String>,
 }
 
 /// Fallible recursive expansion of a tree to `(path, oid)` leaves.
@@ -823,7 +823,7 @@ fn try_expand_tree_plain_items(
     Ok(items)
 }
 
-fn build_rewind_plan(commit_oid: &ObjectHash) -> Result<RewindPlan, anyhow::Error> {
+pub(crate) fn build_rewind_plan(commit_oid: &ObjectHash) -> Result<RewindPlan, anyhow::Error> {
     use std::{collections::HashSet, path::PathBuf};
 
     use git_internal::internal::index::Index;
@@ -1279,7 +1279,7 @@ fn tree_entry<'t>(tree: &'t Tree, name: &str) -> Option<&'t TreeItem> {
 /// residue. The returned spec lists the checkpoint's ENTIRE inner tree
 /// (metadata, manifest, transcript parts), each blob verified locally
 /// present.
-pub(super) async fn resolve_checkpoint_input_spec(
+pub(crate) async fn resolve_checkpoint_input_spec(
     checkpoint_id: &str,
 ) -> CliResult<crate::internal::ai::checkpoint_input::CheckpointInputSpec> {
     use crate::internal::ai::checkpoint_input::{CheckpointInputFile, CheckpointInputSpec};

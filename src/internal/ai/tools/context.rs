@@ -407,6 +407,115 @@ pub struct SubmitPlanDraftArgs {
     pub steps: Vec<PlanDraftStep>,
 }
 
+pub const MAX_SUBMIT_PLAN_DRAFT_ARGUMENT_BYTES: usize = 256 * 1024;
+pub const MAX_SUBMIT_PLAN_DRAFT_STEPS: usize = 128;
+pub const MAX_SUBMIT_PLAN_DRAFT_TITLE_BYTES: usize = 512;
+pub const MAX_SUBMIT_PLAN_DRAFT_EXPLANATION_BYTES: usize = 16 * 1024;
+pub const MAX_SUBMIT_PLAN_DRAFT_TEXT_BYTES: usize = 128 * 1024;
+
+pub fn validate_submit_plan_draft_bounds(args: &SubmitPlanDraftArgs) -> Result<(), String> {
+    if args.steps.is_empty() {
+        return Err("submit_plan_draft requires at least one non-empty step title".to_string());
+    }
+    if args.steps.len() > MAX_SUBMIT_PLAN_DRAFT_STEPS {
+        return Err(format!(
+            "submit_plan_draft accepts at most {MAX_SUBMIT_PLAN_DRAFT_STEPS} steps"
+        ));
+    }
+    let explanation_bytes = args.explanation.as_deref().map_or(0, str::len);
+    if explanation_bytes > MAX_SUBMIT_PLAN_DRAFT_EXPLANATION_BYTES {
+        return Err(format!(
+            "submit_plan_draft explanation exceeds {MAX_SUBMIT_PLAN_DRAFT_EXPLANATION_BYTES} bytes"
+        ));
+    }
+    let mut total = explanation_bytes;
+    for step in &args.steps {
+        let title = step.title.trim();
+        if title.is_empty() {
+            return Err("submit_plan_draft step titles must not be empty".to_string());
+        }
+        if title.len() > MAX_SUBMIT_PLAN_DRAFT_TITLE_BYTES {
+            return Err(format!(
+                "submit_plan_draft step title exceeds {MAX_SUBMIT_PLAN_DRAFT_TITLE_BYTES} bytes"
+            ));
+        }
+        total = total
+            .checked_add(title.len())
+            .ok_or_else(|| "submit_plan_draft text size exceeds the supported limit".to_string())?;
+    }
+    if total > MAX_SUBMIT_PLAN_DRAFT_TEXT_BYTES {
+        return Err(format!(
+            "submit_plan_draft text exceeds {MAX_SUBMIT_PLAN_DRAFT_TEXT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_submit_plan_draft_value_bounds(value: &serde_json::Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "submit_plan_draft arguments must be an object".to_string())?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "explanation" | "steps"))
+    {
+        return Err("submit_plan_draft arguments contain an unknown field".to_string());
+    }
+    let explanation_bytes = match object.get("explanation") {
+        Some(serde_json::Value::String(explanation)) => explanation.len(),
+        Some(serde_json::Value::Null) | None => 0,
+        Some(_) => return Err("submit_plan_draft explanation must be a string".to_string()),
+    };
+    if explanation_bytes > MAX_SUBMIT_PLAN_DRAFT_EXPLANATION_BYTES {
+        return Err(format!(
+            "submit_plan_draft explanation exceeds {MAX_SUBMIT_PLAN_DRAFT_EXPLANATION_BYTES} bytes"
+        ));
+    }
+    let steps = object
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "submit_plan_draft steps must be an array".to_string())?;
+    if steps.is_empty() {
+        return Err("submit_plan_draft requires at least one non-empty step title".to_string());
+    }
+    if steps.len() > MAX_SUBMIT_PLAN_DRAFT_STEPS {
+        return Err(format!(
+            "submit_plan_draft accepts at most {MAX_SUBMIT_PLAN_DRAFT_STEPS} steps"
+        ));
+    }
+    let mut total = explanation_bytes;
+    for step in steps {
+        let step = step
+            .as_object()
+            .ok_or_else(|| "submit_plan_draft step must be an object".to_string())?;
+        if step.keys().any(|key| key != "title") {
+            return Err("submit_plan_draft step contains an unknown field".to_string());
+        }
+        let title = step
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "submit_plan_draft step title must be a string".to_string())?
+            .trim();
+        if title.is_empty() {
+            return Err("submit_plan_draft step titles must not be empty".to_string());
+        }
+        if title.len() > MAX_SUBMIT_PLAN_DRAFT_TITLE_BYTES {
+            return Err(format!(
+                "submit_plan_draft step title exceeds {MAX_SUBMIT_PLAN_DRAFT_TITLE_BYTES} bytes"
+            ));
+        }
+        total = total
+            .checked_add(title.len())
+            .ok_or_else(|| "submit_plan_draft text size exceeds the supported limit".to_string())?;
+    }
+    if total > MAX_SUBMIT_PLAN_DRAFT_TEXT_BYTES {
+        return Err(format!(
+            "submit_plan_draft text exceeds {MAX_SUBMIT_PLAN_DRAFT_TEXT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 // ── submit_intent_draft types ─────────────────────────────────────────
 
 /// Arguments for the `submit_intent_draft` tool.

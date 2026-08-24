@@ -52,6 +52,8 @@
 
 // Agent framework: Agent, AgentBuilder, ChatAgent and their builders.
 pub mod agent;
+/// DeepSeek Harness bridge protocol/transport authority (plan-20260818 LB-01).
+pub mod agent_bridge;
 // Rule-driven automation MVP for hooks, cron, and source-triggered workflows.
 pub mod automation;
 // Step 2 sub-agent contracts (CEX-S2-10 schema-only scaffold) plus the

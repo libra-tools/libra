@@ -96,3 +96,28 @@ not process-local "created" state, controls zero-progress session reaping.
 Retention GC physically deletes terminal ownerless import identities once no
 coverage claim remains, including zero-checkpoint rows. Dry-run obtains the
 same identity count by simulating coverage removal in a rolled-back transaction.
+
+## Bridge (plan-20260818 LB-01)
+
+`libra agent bridge --stdio` is the repository-scoped DeepSeek Harness ingress.
+
+- **Transport:** JSON-RPC 2.0 over newline-delimited frames on stdin/stdout.
+  stdout carries exactly one protocol frame per response; diagnostics go to
+  stderr (GC-LB-04). The command requires `--stdio` and has no other transport.
+- **Protocol authority:** the frame/method/limit/error contract lives only in
+  `src/internal/ai/agent_bridge/{protocol,transport}.rs` (GC-LB-02). The
+  TypeScript plugin consumes the fixture generated from it; it must not define
+  a second schema. Protocol v1: 20-method allowlist, 256 KiB frame cap, 64
+  in-flight requests, 64-event/256 KiB batch, 30 s default deadline.
+- **Scope:** repository/worktree/workspace/actor scope is derived from the
+  trusted context at handshake (GC-LB-06/07); self-reported identity is never
+  a credential. `deepseek-harness` is NOT an `AgentKind` (ADR-LB-02).
+- **Non-goals:** not `libra code --control stdio` and not an MCP server
+  (ADR-LB-01). Implemented: the CLI + protocol + transport (LB-01), the durable
+  session/event/operation storage (LB-02), the session/event ingress (LB-03),
+  the typed read methods (LB-04), mutation admission/approval/actor binding
+  (LB-05) and workspace lease claim/renew/release over `WorkspaceStore`
+  (LB-06). `commit.create`/`review.run`/`checkpoint.restore` pass the
+  admission/approval gate but fail closed until the VCS service is wired.
+- **Preflight:** the bridge uses the standard repository preflight (it is
+  repo-scoped). It must never start without `--stdio`.

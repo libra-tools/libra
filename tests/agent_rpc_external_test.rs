@@ -189,7 +189,7 @@ fn stderr_is_capped_redacted_and_not_inherited() {
 /// variables and the non-secret passthrough allowlist (`PATH`, `HOME`, …)
 /// that real external CLIs need — but none of the parent's secrets.
 #[test]
-#[serial(rpc_env_probe)]
+#[serial]
 fn spawn_clears_parent_env_and_injects_allowlist() {
     let dir = tempfile::tempdir().unwrap();
     let body = "#!/bin/sh\n\
@@ -199,7 +199,8 @@ fn spawn_clears_parent_env_and_injects_allowlist() {
 
     let home_sentinel = dir.path().join("home-sentinel");
     let original_home = std::env::var_os("HOME");
-    // SAFETY: serialized via #[serial(rpc_env_probe)]; removed/restored below.
+    // SAFETY: serialized via #[serial] (global lane — this test mutates the
+    // process-wide environment); removed/restored below.
     unsafe {
         std::env::set_var("LIBRA_TEST_SECRET_PROBE", "super-secret-value");
         std::env::set_var("HOME", &home_sentinel);
@@ -235,14 +236,15 @@ fn spawn_clears_parent_env_and_injects_allowlist() {
 
 /// Built-in slug impersonation is skipped-and-logged at discovery.
 #[test]
-#[serial(rpc_path_env)]
+#[serial]
 fn discovery_skips_builtin_slug_impersonation() {
     let dir = tempfile::tempdir().unwrap();
     plant_script(dir.path(), "claude-code", "#!/bin/sh\nexit 0\n");
     plant_script(dir.path(), "legit", "#!/bin/sh\nexit 0\n");
 
     let original = std::env::var_os("PATH");
-    // SAFETY: serialized via #[serial(rpc_path_env)]; restored below.
+    // SAFETY: serialized via #[serial] (global lane — this test mutates the
+    // process-wide PATH); restored below.
     unsafe {
         std::env::set_var("PATH", dir.path());
     }
@@ -280,7 +282,7 @@ fn non_method_not_found_info_failure_propagates() {
 /// explicitly requested; the forbidden-name classifier and trusted-dir
 /// containment predicate are pinned here too.
 #[test]
-#[serial(rpc_env_probe)]
+#[serial]
 fn trusted_dirs_env_allowlist_extra() {
     use libra::internal::ai::observed_agents::{env_name_is_forbidden, path_within_trusted_dirs};
 
@@ -292,7 +294,8 @@ fn trusted_dirs_env_allowlist_extra() {
 
     let original_extra = std::env::var_os("MY_EXTRA_VAR");
     let original_secret = std::env::var_os("MYSERVICE_API_KEY");
-    // SAFETY: serialized via #[serial(rpc_env_probe)]; removed/restored below.
+    // SAFETY: serialized via #[serial] (global lane — this test mutates the
+    // process-wide environment); removed/restored below.
     unsafe {
         std::env::set_var("MY_EXTRA_VAR", "extra-value");
         std::env::set_var("MYSERVICE_API_KEY", "sk-should-be-dropped");

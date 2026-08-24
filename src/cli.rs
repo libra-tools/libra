@@ -2390,7 +2390,7 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
 ///    [`CliError`] (see [`classify_parse_error`]).
 /// 5. Validates command-specific arg constraints that clap cannot express (e.g.
 ///    [`command::tag::validate_cli_args`]).
-/// 6. For commands that operate on a repository, runs [`command_preflight_storage`],
+/// 6. For commands that operate on a repository, runs repository preflight,
 ///    primes the global hash kind via [`set_local_hash_kind_for_storage`], and
 ///    replays durable object-index repair markers.
 /// 7. Resolves the global output flags into a single [`OutputConfig`] and dispatches

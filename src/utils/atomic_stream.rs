@@ -55,7 +55,21 @@ impl StreamingAtomicFile {
 
     /// Flush/fsync the payload, atomically replace `target`, and sync affected
     /// directories where the platform supports it.
-    pub(crate) fn persist(mut self, target: &Path) -> io::Result<()> {
+    pub(crate) fn persist(self, target: &Path) -> io::Result<()> {
+        self.persist_with_post_replace_hook(target, || Ok(()))
+    }
+
+    /// Variant used by recovery tests that need to stop after the replacement
+    /// is visible but before its directory entry is synced. Production callers
+    /// use [`Self::persist`], whose hook is a no-op.
+    pub(crate) fn persist_with_post_replace_hook<F>(
+        mut self,
+        target: &Path,
+        post_replace: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
         let parent = target.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -68,6 +82,7 @@ impl StreamingAtomicFile {
             self.temporary.as_file().sync_all()?;
         }
         persist_temporary(self.temporary, target, self.sync)?;
+        post_replace()?;
         if self.sync {
             fsync_parent_dir(parent)?;
             if self.staging_dir != parent {

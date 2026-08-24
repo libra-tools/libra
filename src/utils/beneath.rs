@@ -38,8 +38,18 @@ thread_local! {
 
 /// Open the repository working tree as a directory fd/handle.
 ///
-/// Every component of `root` is resolved no-follow from the filesystem root
-/// so a swapped ancestor symlink cannot retarget the beneath boundary.
+/// The beneath boundary is the root directory itself, so `root`'s own final
+/// component is pinned no-follow: a symlinked root is rejected. Components
+/// *above* the root are outside the boundary and resolve normally — they are
+/// routinely symlinks on real systems (macOS ships `/var -> private/var` and
+/// `/tmp -> private/tmp`, so every `TMPDIR` path crosses one), and the callers
+/// hand in a path that ordinary repository discovery already resolved.
+/// Requiring them to be symlink-free would fail closed on legitimate trees
+/// without adding a guarantee: once the root fd is held, descent never
+/// re-traverses an ancestor, and [`root_cache_still_valid`] re-pins the
+/// directory identity (which `symlink_metadata` also resolves through
+/// ancestors) before any cached fd is reused.
+///
 /// The opened descriptor is cached per thread for the current root path, but
 /// only reused when the path still names the same directory identity (so a
 /// rename+recreate at the same pathname cannot keep status on a stale tree).
@@ -138,19 +148,38 @@ fn open_root_uncached(abs: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let fs_root = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open("/")?;
         let rel = abs.strip_prefix("/").unwrap_or(abs);
         if is_root_rel(rel) {
-            return Ok(fs_root);
+            return fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open("/");
         }
-        open_beneath_openat_walk(&fs_root, rel)
+        // Resolve the root's ancestors normally (see `open_root`: they sit
+        // above the beneath boundary and are symlinks on stock macOS), then
+        // pin the root component itself through `openat(O_NOFOLLOW)` so a
+        // symlinked root is still rejected.
+        let (parent, name) = match (abs.parent(), abs.file_name()) {
+            (Some(parent), Some(name)) => (parent, name),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "beneath root must be an absolute path with a final component",
+                ));
+            }
+        };
+        let parent_dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(parent)?;
+        open_beneath_openat_walk(&parent_dir, Path::new(name))
     }
     #[cfg(windows)]
     {
-        open_windows_root_nofollow(abs)
+        // Same contract as the Unix arm: `FILE_FLAG_OPEN_REPARSE_POINT`
+        // applies to the final component, so a reparse-point root fails
+        // closed while junctions above the root resolve normally.
+        open_windows_dir_nofollow(abs)
     }
 }
 
@@ -448,7 +477,7 @@ fn mtime_nsec(stat: &libc::stat) -> i64 {
 
 #[cfg(not(unix))]
 fn system_time_parts(time: Option<std::time::SystemTime>) -> (i64, i64) {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::UNIX_EPOCH;
     let Some(time) = time else {
         return (0, 0);
     };
@@ -723,7 +752,7 @@ fn reject_dotdot(rel: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn rel_cstring(rel: &Path) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(rel.as_os_str().as_bytes()).map_err(|_| {
@@ -905,47 +934,6 @@ fn open_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
 #[cfg(windows)]
 fn open_windows_dir_nofollow(path: &Path) -> io::Result<fs::File> {
     open_windows_nofollow(path, false, true)
-}
-
-#[cfg(windows)]
-fn open_windows_root_nofollow(abs: &Path) -> io::Result<fs::File> {
-    let mut components = abs.components();
-    let mut current = PathBuf::new();
-    match components.next() {
-        Some(Component::Prefix(prefix)) => current.push(prefix.as_os_str()),
-        Some(Component::RootDir) => current.push("\\"),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Windows beneath root must be absolute",
-            ));
-        }
-    }
-    if matches!(components.clone().next(), Some(Component::RootDir)) {
-        let _ = components.next();
-        current.push("\\");
-    }
-    let mut dir = open_windows_dir_nofollow(&current)?;
-    for component in components {
-        let name = match component {
-            Component::Normal(name) => name,
-            Component::CurDir => continue,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "beneath root path must not contain '..' after normalize",
-                ));
-            }
-        };
-        current.push(name);
-        // Open by the lexically accumulated path, then require the opened
-        // handle's final path to match that accumulation. A replaced
-        // intermediate junction would resolve to a different final path
-        // (pathname reopen is otherwise racy vs handle-relative openat).
-        dir = open_windows_dir_nofollow(&current)?;
-        assert_final_path_matches(&dir, &current)?;
-    }
-    Ok(dir)
 }
 
 /// Open `path` with `FILE_FLAG_OPEN_REPARSE_POINT` (final component only).

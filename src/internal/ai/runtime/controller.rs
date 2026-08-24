@@ -26,7 +26,10 @@ pub enum ControllerKind {
     None,
     Browser,
     Automation,
-    Tui,
+    /// Historical local interactive owner. This preserves the `"tui"` wire
+    /// value for old snapshots while remaining invalid for new leases.
+    #[serde(rename = "tui")]
+    LegacyLocal,
     Cli,
 }
 
@@ -36,7 +39,7 @@ impl ControllerKind {
             Self::None => "none",
             Self::Browser => "browser",
             Self::Automation => "automation",
-            Self::Tui => "tui",
+            Self::LegacyLocal => "tui",
             Self::Cli => "cli",
         }
     }
@@ -225,6 +228,19 @@ impl ControllerService {
             automation_write_enabled: options.automation_write_enabled,
             lease_duration: options.lease_duration,
         }
+    }
+
+    /// Move the active lease into the past without relying on wall-clock
+    /// sleeps. Unit tests use this to exercise expiry deterministically even
+    /// when the test runner is heavily loaded.
+    #[cfg(any(test, feature = "test-provider"))]
+    pub(crate) async fn expire_active_lease_for_test(&self) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(lease) = state.active_lease.as_mut() else {
+            return false;
+        };
+        lease.expires_at = Utc::now() - Duration::milliseconds(1);
+        true
     }
 
     /// Admit or renew a remote controller.  A different client can only attach
@@ -495,14 +511,16 @@ mod tests {
 
     #[tokio::test]
     async fn expiry_replaces_lease_with_new_fence() {
-        let mut options = ControllerServiceOptions::new(true, false, ControllerInitial::Unclaimed);
-        options.lease_duration = Duration::milliseconds(1);
-        let service = Arc::new(ControllerService::new(options));
+        let service = Arc::new(ControllerService::new(ControllerServiceOptions::new(
+            true,
+            false,
+            ControllerInitial::Unclaimed,
+        )));
         let first = service
             .attach(ControllerKind::Browser, "browser-a")
             .await
             .expect("first browser controller should attach");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(service.expire_active_lease_for_test().await);
         let replacement = service
             .attach(ControllerKind::Browser, "browser-b")
             .await
@@ -532,9 +550,11 @@ mod tests {
 
     #[tokio::test]
     async fn detach_and_expiry_signal_approval_invalidation() {
-        let mut options = ControllerServiceOptions::new(true, false, ControllerInitial::Unclaimed);
-        options.lease_duration = Duration::milliseconds(1);
-        let service = ControllerService::new(options);
+        let service = ControllerService::new(ControllerServiceOptions::new(
+            true,
+            false,
+            ControllerInitial::Unclaimed,
+        ));
         let lease = service
             .attach(ControllerKind::Browser, "browser-a")
             .await
@@ -554,7 +574,7 @@ mod tests {
             .attach(ControllerKind::Browser, "browser-b")
             .await
             .expect("reattach");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(service.expire_active_lease_for_test().await);
         assert!(
             service.take_pending_approval_invalidation().await,
             "expired lease must invalidate before local control resumes"

@@ -195,12 +195,12 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Pre-filter the registry's tool specs against an [`AgentExecutionSpec`]
-    /// and a [`PermissionRuleset`] (OC-Phase 2 P2.3).
+    /// Pre-filter the registry's tool specs against an `AgentExecutionSpec`
+    /// and a `PermissionRuleset` (OC-Phase 2 P2.3).
     ///
     /// Filtering proceeds in two stages:
     ///
-    /// 1. **Spec gating**: the agent's [`ToolSelection`] decides which tool
+    /// 1. **Spec gating**: the agent's `ToolSelection` decides which tool
     ///    names are even candidates.
     ///    - `Inherit`: every registered tool is a candidate (the runtime
     ///      treats Inherit as "use whatever the session would normally

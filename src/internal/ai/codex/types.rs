@@ -134,7 +134,7 @@ pub enum ApprovalType {
 // =============================================================================
 
 /// Thread - represents a conversation session
-/// Corresponds to: Thread[L] in docs/ai/object-model-reference.md
+/// Corresponds to: `Thread[L]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexThread {
     pub id: String,
@@ -160,7 +160,7 @@ impl Default for CodexThread {
 }
 
 /// Intent - user request snapshot
-/// Corresponds to: Intent[S] in docs/ai/object-model-reference.md
+/// Corresponds to: `Intent[S]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Intent {
     pub id: String,
@@ -170,7 +170,7 @@ pub struct Intent {
 }
 
 /// Plan - strategy and steps snapshot
-/// Corresponds to: Plan[S] in docs/ai/object-model-reference.md
+/// Corresponds to: `Plan[S]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub id: String,
@@ -183,7 +183,7 @@ pub struct Plan {
 }
 
 /// Task - work unit definition
-/// Corresponds to: Task[S] in docs/ai/object-model-reference.md
+/// Corresponds to: `Task[S]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -196,7 +196,7 @@ pub struct Task {
 }
 
 /// Run - execution attempt
-/// Corresponds to: Run[S] in docs/ai/object-model-reference.md
+/// Corresponds to: `Run[S]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub id: String,
@@ -207,7 +207,7 @@ pub struct Run {
 }
 
 /// Token usage breakdown
-/// Corresponds to: RunUsage[E] in docs/ai/object-model-reference.md
+/// Corresponds to: `RunUsage[E]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenUsage {
     pub cached_input_tokens: Option<i64>,
@@ -218,7 +218,7 @@ pub struct TokenUsage {
 }
 
 /// Token usage for a turn
-/// Corresponds to: RunUsage[E] in docs/ai/object-model-reference.md
+/// Corresponds to: `RunUsage[E]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnTokenUsage {
     pub thread_id: String,
@@ -230,7 +230,7 @@ pub struct TurnTokenUsage {
 }
 
 /// ToolInvocation - tool call record
-/// Corresponds to: ToolInvocation[E] in docs/ai/object-model-reference.md
+/// Corresponds to: `ToolInvocation[E]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInvocation {
     pub id: String,
@@ -259,7 +259,7 @@ pub struct Reasoning {
 }
 
 /// FileChange - represents a file change
-/// Corresponds to: PatchSet[S] in docs/ai/object-model-reference.md
+/// Corresponds to: `PatchSet[S]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileChange {
     pub path: String,
@@ -268,7 +268,7 @@ pub struct FileChange {
 }
 
 /// PatchSet - candidate patch snapshot
-/// Corresponds to: PatchSet[S] in docs/ai/object-model-reference.md
+/// Corresponds to: `PatchSet[S]` in docs/ai/object-model-reference.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatchSet {
     pub id: String,
@@ -286,7 +286,7 @@ pub struct CommandExecutionBaseline {
 }
 
 /// ApprovalRequest - approval request record
-/// Corresponds to: Decision[E] in docs/ai/object-model-reference.md (pre-decision)
+/// Corresponds to: `Decision[E]` in docs/ai/object-model-reference.md (pre-decision)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,

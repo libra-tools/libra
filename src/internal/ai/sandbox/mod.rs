@@ -93,7 +93,7 @@ pub struct SandboxRuntimeConfig {
     /// and the built-in bwrap path is selected,
     /// [`runtime::create_bwrap_command_args_with_seccomp`] appends
     /// `--seccomp <fd>` to the bwrap args and
-    /// [`runtime::install_seccomp_policy_pre_exec`] opens the
+    /// `runtime::install_seccomp_policy_pre_exec` opens the
     /// file in the child to populate that FD. Default `None`
     /// keeps Linux as opt-in unless `~/.libra/seccomp.bpf` exists and
     /// no explicit `LIBRA_SECCOMP_POLICY` override is set. See

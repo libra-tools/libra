@@ -1,6 +1,239 @@
 # Changelog
 
+## [0.21.1] — 2026-08-24
+
+### Added: the bridge's remaining VCS methods (plan-20260818 LB-04/LB-05, closes DEFER-LB-07)
+
+`0.21.0` shipped `libra agent bridge --stdio` with `diff.get` returning a stable
+not-implemented error and `commit.create` / `review.run` / `checkpoint.restore`
+passing admission but failing closed before any VCS service. All four are now
+wired through a typed adapter (`src/internal/ai/agent_bridge/vcs.rs`), so the
+v1 20-method allowlist is implemented end to end.
+
+- **`diff.get`** returns the real working-tree, staged, or checkpoint-scoped
+  diff. Selectors stay typed: a closed `mode` enum (`worktree` / `staged` /
+  `checkpoint`) plus validated repository-relative `paths` — never a free-form
+  revision or pathspec magic. `checkpoint` mode resolves its revision from the
+  bridge's own `agent_bridge_checkpoint` row (or its linked
+  `agent_checkpoint.parent_commit`), so a request can never name an arbitrary
+  commit. The diff forces `--no-ext-diff` / `--no-textconv`, so repository
+  configuration cannot turn a bridge read into process execution (GC-LB-03).
+  Results are bounded by the page cap and a shared patch budget, with explicit
+  `diff_truncated` / `diff_patch_budget_exhausted` warnings.
+- **`commit.create`** commits the current index — no `-a`, no pathspec, no
+  amend, no author override — and records its association graph (operation,
+  workspace, parent session, evidence ids) as `agent_bridge_link` rows rather
+  than splicing metadata into the commit message. An optional `expected_head`
+  is verified before the commit is created.
+- **`checkpoint.restore`** restores the working tree to the commit a bridge
+  checkpoint pins, reusing the same typed path as
+  `libra agent checkpoint rewind --apply`. It requires an explicit
+  `expected_head` fence **and** a clean index/worktree, and never moves HEAD.
+- **`review.run`** validates the reviewer roster against the launchable
+  capability matrix, resolves an optional checkpoint scope and takes an
+  agent-run admission slot — all before any run directory exists — then runs the
+  read-only review under a supervisor. When the bridge's stdio loop ends the
+  supervisor cancels and drains every live run, so no reviewer process group
+  outlives the bridge (GC-LB-10).
+- **Non-idempotent replay is safe.** Replaying a recorded `operation_id` for
+  `commit.create`, `checkpoint.restore` or `review.run` returns the ORIGINAL
+  result (and, for a review, its current run state) instead of executing a
+  second time — the "response was lost, query by operation id" recovery path.
+
+### Fixed
+
+- **A bridge mutation can record more than one association.**
+  `agent_bridge_link` was keyed `UNIQUE(source_type, source_id)`, which allowed
+  exactly one association per result: every workspace / parent-session /
+  evidence link after the first was reported as a retarget conflict, so the
+  rich provenance LB-05 promises could never be persisted.
+
+### Added
+
+- `LBR-AGENT-038` — a bridge mutation's fence drifted (HEAD moved, or the
+  index/worktree is dirty where the operation requires a clean one). Refused
+  **before** any write, so nothing is partially applied.
+
+### Migration
+
+- `2026082401_agent_bridge_link_relations` rebuilds `agent_bridge_link` with
+  edge-level uniqueness `(source_type, source_id, target_type, target_id)` and
+  adds the `commit` / `restore` / `review` source kinds. Every existing edge is
+  copied verbatim. The down path is forward-only: it freezes while any link row
+  exists and never deletes recorded provenance (ER-LB-04).
+
+## [0.21.0] — 2026-08-23
+
+### Added: DeepSeek Harness bridge (`agent bridge --stdio`, plan-20260818 LB-01..LB-06)
+
+- **`libra agent bridge --stdio`** — the repository-scoped DeepSeek Harness JSON-RPC
+  2.0 NDJSON ingress. The ONLY standard inbound write transport for the Harness
+  plugin; intentionally different from `libra code --control stdio` (a client
+  controlling a live Code session) and from any MCP transport. Protocol v1: a
+  20-method allowlist, 256 KiB frame cap, 64 in-flight requests, 64-event /
+  256 KiB batch, 30 s default request deadline.
+- **Durable ingress** (`agent_bridge_session/event/operation/checkpoint/link`
+  tables, migration `2026081801`): idempotent `session.open`, bounded
+  `event.append` with per-event accepted/duplicate/digest-conflict status and
+  monotonic `last_acked_seq`, `session.flush`/`session.close`, and
+  `evidence.append`/`provenance.append` association links. Ack means the
+  redacted projection is durable — never that Harness took over Libra's raw
+  transcript.
+- **Server-side redaction** (GC-LB-08): only a bounded, redacted projection is
+  persisted; raw prompts/reasoning/tokens/secrets never land in the store, and
+  a payload that cannot be safely redacted is refused fail-closed with no raw
+  fallback.
+- **Typed read methods** (LB-04): `context.get`, `status.get`,
+  `history.search`, `checkpoint.list`, `checkpoint.show` over the bridge
+  projection with a unified `{schema_version, repository_id, workspace_id,
+  operation_id, status, data, warnings}` envelope, bounded pagination, and
+  repository-scoped queries (a cross-repository `status.get` cannot leak
+  another repo's totals).
+- **Mutation admission + approval + actor binding** (LB-05): `checkpoint.create`
+  is fully wired; every mutation requires an `operation_id` (idempotent replay,
+  digest-conflict fail-closed), binds the trusted session/actor scope, and
+  enforces a default-deny approval gate for dangerous actions. `commit.create`,
+  `review.run` and `checkpoint.restore` pass admission but fail closed with a
+  stable "not wired to the VCS service" error until the service plumbing lands
+  (wired in `0.21.1`).
+- **Workspace lease** (LB-06): `workspace.claim`/`renew`/`release` route through
+  the existing `WorkspaceStore` (owner + monotonic fence); the lease owner is
+  derived from the authenticated bridge session identity (never a self-reported
+  value), so a stale owner or a forged `agent_id` cannot reclaim another
+  session's lease. Dedicated error codes `LBR-AGENT-022` (lease held) and
+  `LBR-AGENT-023` (lease lost).
+- **Protocol authority** (GC-LB-02): the schema, method allowlist, limits,
+  error catalogue and frame shapes live only in
+  `src/internal/ai/agent_bridge/protocol.rs`; the TypeScript plugin consumes
+  the fixture published from it and must not define a second schema.
+
+### Migration
+
+- `2026081801_agent_bridge_capture` creates the five bridge durable tables.
+  Down-migration is forward-only: it freezes while any bridge row exists and
+  never deletes acked events/evidence (GC-LB-09 / ER-LB-04).
+
 ## [Unreleased]
+
+### Fixed (plan-20260715 W2-03 repair, 2026-08-21, v0.20.4)
+
+- **Default-Web IntentSpec revision is durable and fail-closed.** IntentSpec
+  Modify consumes either the next accepted plain-text message or canonical
+  `/intent modify <changes>` exactly once. The additive public
+  `intent_revision` binding contains only the interaction id and sidecar
+  digest; an HMAC-authenticated local Prepared/Active/Claiming/Consuming
+  sidecar carries the private recovery copy. Claiming fsyncs the complete
+  consumer command binding before Runtime admission, and promotion binds its
+  exact event id/sequence before the executor start gate opens. Fresh explicit
+  direct commands receive `409 SESSION_BUSY` while revision authority is
+  active, but exact terminal/live `commandId` retries remain idempotent
+  acknowledgements. Exact raw `/intent cancel` uses the same claim and exact
+  consumption receipt before deleting the sidecar, then exits without calling
+  a provider or tool; padded spellings receive no privileged handling, its
+  terminal retry appends nothing, and restart does not revive the revision.
+  A Modify consumer is committed only after exactly one successful
+  `submit_intent_draft` call and the replacement IntentSpec review marker are
+  durable; zero or multiple submissions preserve the revision and fail closed.
+  The 16 KiB Modify suffix is validated before Claiming, and only that suffix
+  is sent as the provider change request. Crash recovery never reruns a
+  provider after durable replacement proof, repairs stale transcript/tool
+  projection, permanently closes the receipt's exact retry lineage, and
+  rejects conflicting marker/terminal ordering. Plan Modify separately retains
+  its next-plain-text replacement-Plan behavior. The
+  revision protocol never copies the raw note into a workflow terminal,
+  receipt, or dedicated SSE payload. Ordinary transcript and session-snapshot
+  retention remain unchanged. Consumption is committed by the additive
+  `intent_revision_consumption` receipt and projected through the dedicated
+  SSE v2 `intent_revision_consumed` kind without masquerading as a second gate
+  resolution. Crash, retry, stale-authority, and malformed-replay paths now
+  either recover the exact revision or require reconciliation.
+  Startup builds one shared linear `ValidatedIntentRevisionReceiptIndex` for
+  source terminals, receipts, consumer status, review-marker proof, and retry
+  lineage instead of rescanning the workflow once per receipt. A 5,000-event
+  regression with 700 receipts caps indexed relationship visits at four times
+  the replay size.
+- **Network Allow admits confirmed plan execution (W2-04).** Allow consumes the
+  network-policy gate and submits the reviewed plan onto the serialized
+  `AgentRuntime` queue via `submit_confirmed_plan_execution`. Mutating tools
+  still pass through the shared hardening/approval/sandbox/ACL boundary;
+  classified failures park the W2-11 repair loop. The catalogued
+  `PLAN_EXECUTION_NOT_AVAILABLE` 409 is retained for older clients and is no
+  longer produced on Allow. Deny, Back, and crash/resume remain usable.
+- **Fresh repositories can enter Phase 1 safely.** A named unborn HEAD after
+  `libra init` is now captured as a valid checkout binding with no object id;
+  detached checkouts and existing branches still require an exact valid id.
+- **Phase 1 workspace drift is recoverable without weakening Execute.** Review
+  contexts retain an exact content fingerprint for Execute and add a
+  body-read-free `metadata-v1:<sha256>` token for fast resume projection and
+  determinate pre-write validation/retry signals. It never authorizes Execute.
+  New bindings use metadata-before/exact-before/exact-after/metadata-after
+  scans and refuse any exact or metadata mismatch rather than pairing
+  mismatched authority and drift state, including on platforms with coarse
+  file metadata.
+  Every scan enforces cooperative 30-second, 1,000,000-traversed-entry, and
+  128-MiB encoded-path-name budgets; it streams and caps directory entries
+  before deterministic sorting and checks the deadline after blocking calls
+  and final EOF. Path-name enumeration remains an ignore-aware walk and is not
+  trusted as read authority. On Unix, authoritative entry reads use pinned
+  root/parent descriptors with `openat`/`fstatat`/`readlinkat`,
+  no-follow/nonblocking opens, and descriptor/path identity revalidation. On
+  Windows, pinned handles, `FILE_FLAG_OPEN_REPARSE_POINT`, final-path/file-
+  identity checks, and `FSCTL_GET_REPARSE_POINT` protect regular files and
+  reparse targets. Other platforms fail closed because secure workspace reads
+  are unsupported. A rename, symlink, FIFO, parent/root replacement, or
+  reparse race therefore cannot hash content outside the checkout. Legacy
+  contexts without the additive token remain readable and fall back to exact
+  content comparison. Resume projects
+  `workspaceDrifted` / `workspaceWarning`; a
+  metadata-only warning may pass Execute's exact recheck, while stale content
+  returns
+  `409 PHASE1_WORKSPACE_CHANGED` without fencing, resolving the gate, or
+  mutating files. Modify recaptures a new HEAD only within the same repository;
+  repository replacement requires a new IntentSpec review. Failed recapture
+  leaves the note unconsumed, while an empty note returns
+  `400 PLAN_REVISION_NOTE_REQUIRED` and keeps revision authority pending.
+- **Headless resume has one process-lifetime session writer.** A dedicated
+  Phase 1 writer lease is acquired before session reload or projection fold,
+  is bound to the exact SessionStore and session id, and lets cloned lease
+  tokens construct only one persistence graph. It is distinct from the
+  short-lived workflow append lock and from browser controller leases. Unix
+  opens use `O_NOFOLLOW | O_NONBLOCK` plus device/inode checks; Windows rejects
+  reparse points and verifies volume/file identity. Process exit releases the
+  advisory lock immediately, while the persistent lock file is never unlinked.
+- **Crash resume uses an ABA-safe workflow append lock.** The append lock is a
+  persistent regular file protected by an OS advisory lock; process exit
+  releases it immediately, while a live owner is never reclaimed by age.
+  Guards never unlink the path, Unix opens use `O_NOFOLLOW`, and symlink or
+  special lock entries fail closed without truncating their targets.
+- **Phase 1 recovery rejects incomplete authority before cleanup.** Startup
+  uses one committed workflow replay for gate validation and context GC;
+  sequence gaps or a cut replay window fail closed before authority selection,
+  event-log rewriting, or irreversible sidecar deletion.
+- **Runtime-owned interaction histories keep their selected durability mode.**
+  Deliveries that defer audit to the combined terminal row no longer emit an
+  intermediate standalone resolution, while legacy executor responses and
+  mutating user-input/approval continuations retain their required checkpoint
+  paths.
+
+### Removed (plan-20260715 W5-10, 2026-08-20, v0.20.3)
+
+- **W5-10 removes the retired terminal-UI dependency surface.** Direct
+  `ratatui` and `crossterm` dependencies, together with the now-unreachable
+  terminal-specific Code runtime branch, are gone. The active Code UI remains
+  the Web UI; persisted legacy controller value `"tui"` is only decoded so it
+  can be rejected fail-closed and is never emitted for a new session. The
+  Rust `internal` module tree is an implementation detail rather than the
+  patch-compatible external embedding API. This internal cleanup is not a
+  Cargo semver surface and is intentionally released as the v0.20.3 patch.
+
+### Fixed (plan-20260715 W5-10, 2026-08-20, v0.20.3)
+
+- **Web runtime cancellation and ACL hardening.** A browser turn cancelled
+  before execution now settles through a bounded admission path; an uncertain
+  durable correction fences the session as `indeterminate_side_effect` rather
+  than treating it as safe to resume. Interaction-registration retries are
+  bounded, and dynamically prefixed SourcePool tools remain default-denied in
+  Review and Research contexts.
 
 ### Breaking (plan-20260715 W5-09, 2026-08-17, v0.20.0)
 

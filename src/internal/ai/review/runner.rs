@@ -24,7 +24,7 @@
 //!    and fans in to a single serial sink that writes the redacted logs.
 //! 5. Aggregate per-reviewer outcomes into exactly one of
 //!    `success` / `error` / `cancelled` / `timeout` / `partial`
-//!    ([`store::aggregate_terminal_state`]), compose `findings.md`
+//!    (`store::aggregate_terminal_state`), compose `findings.md`
 //!    (raw-redacted, spotlighting delimiters, provenance=untrusted),
 //!    finalize `state.json` + `manifest.json`, release the workspace.
 //!

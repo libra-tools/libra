@@ -128,11 +128,11 @@ use crate::{
             web::{
                 WebServerHandle, WebServerOptions,
                 code_ui::{
-                    CodeUiCapabilities, CodeUiControllerKind, CodeUiInitialController,
-                    CodeUiInteractionStatus, CodeUiProviderInfo, CodeUiRuntimeHandle,
-                    CodeUiRuntimeOptions, CodeUiSession, CodeUiSessionSnapshot,
-                    CodeUiSessionStatus, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
-                    ReadOnlyCodeUiAdapter, initial_snapshot, snapshot_from_thread_bundle,
+                    CodeUiCapabilities, CodeUiInitialController, CodeUiInteractionStatus,
+                    CodeUiProviderInfo, CodeUiRuntimeHandle, CodeUiRuntimeOptions, CodeUiSession,
+                    CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTranscriptEntry,
+                    CodeUiTranscriptEntryKind, ReadOnlyCodeUiAdapter, initial_snapshot,
+                    snapshot_from_thread_bundle,
                 },
                 code_ui_projection::{
                     MAX_CODE_UI_PROJECTION_EVENTS, MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
@@ -2690,8 +2690,41 @@ where
 
     let HeadlessWebSessionBootstrap {
         store: session_store,
-        state: session_state,
+        state: bootstrap_session_state,
     } = session_bootstrap;
+    // The initial lookup identifies the durable session. It is not safe to
+    // build a writable projection from that pre-lease snapshot: another
+    // process may append after the lookup and before releasing its writer
+    // lease. Acquire first, then reload and fold exclusively under the lease.
+    let session_lease = HeadlessSessionPersistence::acquire_session_lease(
+        &session_store,
+        &bootstrap_session_state.id,
+    )
+    .map_err(|error| {
+        CliError::fatal(format!(
+            "failed to acquire the writable Code session lease for '{}': {error}",
+            bootstrap_session_state.id
+        ))
+    })?;
+    let requested_session_id = bootstrap_session_state.id.clone();
+    let session_state = match session_store.load(&requested_session_id) {
+        Ok(state) => state,
+        Err(error) if args.resume.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
+            bootstrap_session_state
+        }
+        Err(error) => {
+            return Err(CliError::fatal(format!(
+                "failed to reload Code session '{}' after acquiring its writer lease: {error}",
+                bootstrap_session_state.id
+            )));
+        }
+    };
+    if session_state.id != requested_session_id {
+        return Err(CliError::fatal(format!(
+            "reloaded Code session identity '{}' does not match leased session '{}'; repair the session log before resuming",
+            session_state.id, requested_session_id
+        )));
+    }
     let HeadlessApprovalChannels {
         exec_approval_tx,
         exec_approval_rx,
@@ -2721,13 +2754,11 @@ where
     let session = CodeUiSession::new(snapshot.clone());
 
     let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
-    let approval_cfg =
-        tui_approval_config_from_args(args, working_dir).map_err(CliError::failure)?;
-    let (approval_cfg, approval_cache_scope) =
-        hydrate_tui_approval_runtime(working_dir, approval_cfg)
-            .await
-            .map_err(CliError::failure)?;
-    let runtime_context = Some(default_tui_runtime_context(
+    let approval_cfg = approval_config_from_args(args, working_dir).map_err(CliError::failure)?;
+    let (approval_cfg, approval_cache_scope) = hydrate_approval_runtime(working_dir, approval_cfg)
+        .await
+        .map_err(CliError::failure)?;
+    let runtime_context = Some(default_runtime_context(
         working_dir,
         args.context,
         approval_cfg,
@@ -2833,11 +2864,12 @@ where
             ..Default::default()
         });
 
-    let persistence = HeadlessSessionPersistence::with_projection_checkpoint(
+    let persistence = HeadlessSessionPersistence::with_projection_checkpoint_and_lease(
         session_store,
         session_state,
         snapshot,
         projection_sequence,
+        session_lease,
     )
     .map_err(|error| {
         CliError::fatal(format!(
@@ -3045,17 +3077,6 @@ async fn start_codex_code_ui_runtime(
     browser_write_enabled: bool,
     initial_controller: CodeUiInitialController,
 ) -> CliResult<Arc<CodeUiRuntimeHandle>> {
-    let ui_mode = match &initial_controller {
-        CodeUiInitialController::Fixed {
-            kind: CodeUiControllerKind::Tui,
-            ..
-        } => Some("tui".to_string()),
-        CodeUiInitialController::Fixed {
-            kind: CodeUiControllerKind::Cli,
-            ..
-        } => Some("cli".to_string()),
-        _ => Some("web".to_string()),
-    };
     let plan_mode = effective_plan_mode(args);
     let approval_auto_accepts = matches!(
         args.approval_policy,
@@ -3089,7 +3110,6 @@ async fn start_codex_code_ui_runtime(
         model: args.model.clone(),
         plan_mode,
         debug: false,
-        ui_mode,
     };
 
     agent_codex::start_code_ui_runtime(
@@ -3523,17 +3543,17 @@ fn task_intent_for_context(context: Option<CodeContext>) -> TaskIntent {
 ///
 /// The approval policy and its communication channel are also wired in here.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DefaultTuiApprovalConfig {
+struct DefaultApprovalConfig {
     policy: AskForApproval,
     allow_all_commands: bool,
     ttl: Duration,
     cache_policy: ApprovalCachePolicy,
 }
 
-fn default_tui_runtime_context(
+fn default_runtime_context(
     working_dir: &std::path::Path,
     context: Option<CodeContext>,
-    approval: DefaultTuiApprovalConfig,
+    approval: DefaultApprovalConfig,
     network_access: bool,
     exec_approval_tx: tokio::sync::mpsc::UnboundedSender<ExecApprovalRequest>,
     approval_cache_scope: impl Into<String>,
@@ -3556,10 +3576,10 @@ fn default_tui_runtime_context(
     )
 }
 
-async fn hydrate_tui_approval_runtime(
+async fn hydrate_approval_runtime(
     working_dir: &Path,
-    mut approval: DefaultTuiApprovalConfig,
-) -> Result<(DefaultTuiApprovalConfig, String), String> {
+    mut approval: DefaultApprovalConfig,
+) -> Result<(DefaultApprovalConfig, String), String> {
     match resolve_approval_runtime_cache(working_dir).await {
         Ok(cache) => {
             approval.cache_policy.approved_ruleset = Some(cache.approved_ruleset);
@@ -3573,18 +3593,18 @@ async fn hydrate_tui_approval_runtime(
 }
 
 /// Single source of truth for the approval-related CLI-args -> runtime
-/// [`DefaultTuiApprovalConfig`] mapping (C7 criterion 2): `--approval-policy`
+/// [`DefaultApprovalConfig`] mapping (C7 criterion 2): `--approval-policy`
 /// maps through `.into()`, `--approval-ttl` through `Duration::from_secs`
 /// (CLI flag wins over the project `approval.ttl`, else `DEFAULT_APPROVAL_TTL`),
-/// and `--approval-policy` also drives `allow_all_commands`. The Web and legacy
-/// full-workflow launch paths derive their approval config from here, so a dropped
-/// or hardcoded flag is a single-point regression the unit test guards.
-fn tui_approval_config_from_args(
+/// and `--approval-policy` also drives `allow_all_commands`. The active Web and
+/// headless launch paths derive their approval config from here, so a dropped or
+/// hardcoded flag is a single-point regression the unit test guards.
+fn approval_config_from_args(
     args: &CodeArgs,
     working_dir: &Path,
-) -> Result<DefaultTuiApprovalConfig, String> {
+) -> Result<DefaultApprovalConfig, String> {
     let approval_config = load_approval_project_config(working_dir)?;
-    Ok(DefaultTuiApprovalConfig {
+    Ok(DefaultApprovalConfig {
         policy: args.approval_policy.into(),
         allow_all_commands: args.approval_policy.allows_all_commands(),
         ttl: args
@@ -6067,12 +6087,12 @@ no_cache_unknown_network = true
     }
 
     #[test]
-    fn default_tui_runtime_context_denies_network_in_dev_mode() {
+    fn default_runtime_context_denies_network_in_dev_mode() {
         let (tx, _rx) = unbounded_channel();
-        let runtime = default_tui_runtime_context(
+        let runtime = default_runtime_context(
             Path::new("/tmp/workspace"),
             Some(CodeContext::Dev),
-            DefaultTuiApprovalConfig {
+            DefaultApprovalConfig {
                 policy: AskForApproval::OnRequest,
                 allow_all_commands: false,
                 ttl: DEFAULT_APPROVAL_TTL,
@@ -6080,7 +6100,7 @@ no_cache_unknown_network = true
             },
             false,
             tx,
-            "repo:test-tui-runtime",
+            "repo:test-runtime",
         );
 
         let sandbox = runtime.sandbox.expect("sandbox context should be present");
@@ -6095,12 +6115,12 @@ no_cache_unknown_network = true
     }
 
     #[test]
-    fn default_tui_runtime_context_allows_network_when_requested_in_dev_mode() {
+    fn default_runtime_context_allows_network_when_requested_in_dev_mode() {
         let (tx, _rx) = unbounded_channel();
-        let runtime = default_tui_runtime_context(
+        let runtime = default_runtime_context(
             Path::new("/tmp/workspace"),
             Some(CodeContext::Dev),
-            DefaultTuiApprovalConfig {
+            DefaultApprovalConfig {
                 policy: AskForApproval::OnRequest,
                 allow_all_commands: false,
                 ttl: DEFAULT_APPROVAL_TTL,
@@ -6108,7 +6128,7 @@ no_cache_unknown_network = true
             },
             true,
             tx,
-            "repo:test-tui-runtime",
+            "repo:test-runtime",
         );
 
         let sandbox = runtime.sandbox.expect("sandbox context should be present");
@@ -6123,12 +6143,12 @@ no_cache_unknown_network = true
     }
 
     #[tokio::test]
-    async fn default_tui_runtime_context_can_allow_all_commands() {
+    async fn default_runtime_context_can_allow_all_commands() {
         let (tx, _rx) = unbounded_channel();
-        let runtime = default_tui_runtime_context(
+        let runtime = default_runtime_context(
             Path::new("/tmp/workspace"),
             Some(CodeContext::Dev),
-            DefaultTuiApprovalConfig {
+            DefaultApprovalConfig {
                 policy: AskForApproval::OnRequest,
                 allow_all_commands: true,
                 ttl: DEFAULT_APPROVAL_TTL,
@@ -6136,7 +6156,7 @@ no_cache_unknown_network = true
             },
             true,
             tx,
-            "repo:test-tui-runtime",
+            "repo:test-runtime",
         );
 
         let approval = runtime
@@ -6144,25 +6164,25 @@ no_cache_unknown_network = true
             .expect("approval context should be present");
         assert_eq!(
             approval.scope_key_prefix.as_deref(),
-            Some("repo:test-tui-runtime")
+            Some("repo:test-runtime")
         );
         assert!(
             approval
                 .store
                 .lock()
                 .await
-                .allow_all_commands_for_scope("repo:test-tui-runtime")
+                .allow_all_commands_for_scope("repo:test-runtime")
         );
     }
 
     #[test]
-    fn default_tui_runtime_context_is_read_only_for_review_and_research() {
+    fn default_runtime_context_is_read_only_for_review_and_research() {
         for context in [CodeContext::Review, CodeContext::Research] {
             let (tx, _rx) = unbounded_channel();
-            let runtime = default_tui_runtime_context(
+            let runtime = default_runtime_context(
                 Path::new("/tmp/workspace"),
                 Some(context),
-                DefaultTuiApprovalConfig {
+                DefaultApprovalConfig {
                     policy: AskForApproval::OnRequest,
                     allow_all_commands: false,
                     ttl: DEFAULT_APPROVAL_TTL,
@@ -6170,7 +6190,7 @@ no_cache_unknown_network = true
                 },
                 true,
                 tx,
-                "repo:test-tui-runtime",
+                "repo:test-runtime",
             );
 
             let sandbox = runtime.sandbox.expect("sandbox context should be present");
@@ -6188,12 +6208,12 @@ no_cache_unknown_network = true
     /// these fields to gate execution, so observing them here is the
     /// "visible at invocation" contract.
     #[test]
-    fn default_tui_runtime_context_exposes_approval_policy_and_ttl() {
+    fn default_runtime_context_exposes_approval_policy_and_ttl() {
         // Exercise the PRODUCTION mapping (codex C7 review): the args ->
-        // DefaultTuiApprovalConfig mapping is now the shared helper
-        // `tui_approval_config_from_args`, which both the legacy full-workflow
-        // and Web launch paths call. Feeding it parsed CLI args and running the result
-        // through `default_tui_runtime_context` catches a regression where a
+        // DefaultApprovalConfig mapping is now the shared helper
+        // `approval_config_from_args`, which the Web launch path calls. Feeding
+        // it parsed CLI args and running the result through
+        // `default_runtime_context` catches a regression where a
         // flag is dropped or hardcoded on the real production path — not just
         // inside the runtime-context builder.
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -6207,13 +6227,13 @@ no_cache_unknown_network = true
         .expect("parse code args");
 
         let (tx, _rx) = unbounded_channel();
-        let runtime = default_tui_runtime_context(
+        let runtime = default_runtime_context(
             workspace.path(),
             Some(CodeContext::Dev),
-            tui_approval_config_from_args(&args, workspace.path()).expect("approval config"),
+            approval_config_from_args(&args, workspace.path()).expect("approval config"),
             args.network_access.is_allowed(),
             tx,
-            "repo:test-tui-runtime",
+            "repo:test-runtime",
         );
 
         let approval = runtime
@@ -6229,8 +6249,8 @@ no_cache_unknown_network = true
         // falls back to the 300s default — proving the 4242s above came from
         // the flag, not a hardcode.
         let default_args = CodeArgs::try_parse_from(["libra"]).expect("parse defaults");
-        let default_cfg = tui_approval_config_from_args(&default_args, workspace.path())
-            .expect("default approval");
+        let default_cfg =
+            approval_config_from_args(&default_args, workspace.path()).expect("default approval");
         assert_eq!(default_cfg.ttl, DEFAULT_APPROVAL_TTL);
         assert_ne!(default_cfg.ttl, Duration::from_secs(4242));
     }

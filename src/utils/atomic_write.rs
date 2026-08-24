@@ -69,6 +69,22 @@ pub fn init_sync_data_from_env() {
 /// Propagates any IO error from creating the parent directory, writing/syncing
 /// the temp file, or the rename.
 pub fn write_atomic(path: &Path, bytes: &[u8], fsync: bool) -> io::Result<()> {
+    write_atomic_with_post_replace_hook(path, bytes, fsync, || Ok(()))
+}
+
+/// Atomically write `bytes`, invoking `post_replace` after the final path is
+/// visible but before its directory entry is synced. This narrow hook exists
+/// for instance-scoped durability fault injection; ordinary callers should use
+/// [`write_atomic`].
+pub(crate) fn write_atomic_with_post_replace_hook<F>(
+    path: &Path,
+    bytes: &[u8],
+    fsync: bool,
+    post_replace: F,
+) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -87,7 +103,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], fsync: bool) -> io::Result<()> {
 
     let mut writer = crate::utils::atomic_stream::StreamingAtomicFile::new_in(parent, fsync)?;
     writer.write_all(bytes)?;
-    writer.persist(path)
+    writer.persist_with_post_replace_hook(path, post_replace)
 }
 
 /// Create `dir` and any missing ancestors, fsyncing each newly-created
@@ -147,11 +163,16 @@ pub(crate) fn fsync_parent_dir(_dir: &Path) -> io::Result<()> {
 /// directory open and the sync PROPAGATE — swallowing them would report a
 /// durable deletion that is not.
 pub fn remove_durably(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    }
+    remove_durably_with_post_remove_hook(path, || Ok(()))
+}
+
+/// Durably remove `path`, invoking `post_remove` after the unlink is visible
+/// but before its containing directory is synced. The hook is used only by
+/// scoped recovery tests.
+pub(crate) fn remove_durably_with_post_remove_hook<F>(path: &Path, post_remove: F) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -161,8 +182,64 @@ pub fn remove_durably(path: &Path) -> io::Result<()> {
             ),
         )
     })?;
-    let dir = fs::File::open(parent)?;
-    dir.sync_all()
+    match fs::remove_file(path) {
+        Ok(()) => {
+            post_remove()?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A previous unlink may have become visible before its directory
+            // fsync failed. Re-sync an existing parent before acknowledging an
+            // idempotent retry, otherwise the removed entry may return after a
+            // crash even though this call reported success.
+            return match fs::metadata(parent) {
+                Ok(metadata) if metadata.is_dir() => {
+                    post_remove()?;
+                    fsync_parent_dir(parent)
+                }
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!(
+                        "cannot fsync non-directory parent '{}' after removing '{}'",
+                        parent.display(),
+                        path.display()
+                    ),
+                )),
+                Err(parent_error) if parent_error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(parent_error) => Err(parent_error),
+            };
+        }
+        Err(error) => return Err(error),
+    }
+    fsync_parent_dir(parent)
+}
+
+/// Re-sync a visible recovery sidecar and its containing directory before an
+/// exact idempotent ACK, with a narrow hook between file and parent syncs for
+/// scoped durability tests. A prior atomic replacement can be observable even
+/// if its final directory sync reported failure.
+pub(crate) fn sync_file_and_parent_durably_with_pre_parent_sync_hook<F>(
+    path: &Path,
+    pre_parent_sync: F,
+) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot fsync the parent of a path with none: {}",
+                path.display()
+            ),
+        )
+    })?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    pre_parent_sync()?;
+    fsync_parent_dir(parent)
 }
 
 #[cfg(test)]

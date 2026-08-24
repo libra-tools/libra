@@ -213,7 +213,11 @@ fn unresolved_plan_execution_repair_markers<'a>(
                     order.push(interaction_id.clone());
                 }
             }
-            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. }
+            CodeWorkflowEventKind::InteractionResolved {
+                interaction_id,
+                intent_revision_consumption: None,
+                ..
+            }
             | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
                 interaction_id,
                 ..

@@ -307,7 +307,7 @@ impl RpcAgent {
     /// [`Self::spawn_in_repo`] plus an operator-configured
     /// `extra_env_allowlist` of additional exact env-var names to pass through
     /// (A0-08 `agent.external_agents.env_allowlist_extra`). Each name is
-    /// re-checked against [`env_name_is_forbidden`] here as defense-in-depth,
+    /// re-checked against [`super::trust::env_name_is_forbidden`] here as defense-in-depth,
     /// so a credential/endpoint name can never reach the child even if it
     /// slipped into config.
     pub fn spawn_in_repo_with_env(
@@ -993,7 +993,7 @@ fn pump_stderr_capped(
 /// behaviour).
 ///
 /// Built-in slug impersonation guard (E2 / `LBR-AGENT-006` semantics):
-/// a binary whose slug collides with a built-in [`AgentKind`] CLI slug
+/// a binary whose slug collides with a built-in `AgentKind` CLI slug
 /// (e.g. `libra-agent-claude-code`) is skipped-and-logged — it can never
 /// shadow or override a built-in adapter.
 ///

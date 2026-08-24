@@ -1376,7 +1376,7 @@ impl LibraMcpServer {
         self.dispatch_libra_vcs(&params.command, args).await
     }
 
-    /// Variant of [`run_libra_vcs_impl`] that runs `add`/`commit`/`switch` and
+    /// Variant of [`Self::run_libra_vcs_impl`] that runs `add`/`commit`/`switch` and
     /// other `needs_human` commands without prompting, intended for callers
     /// that have already confirmed the user granted a session-level
     /// allow-all-commands decision. `deny` decisions are still rejected so
