@@ -800,7 +800,7 @@ fn review_prompt(target_scope: &str) -> String {
 /// Live review runs started by this bridge process.
 ///
 /// GC-LB-10 requires that no child process outlives the bridge. Every started
-/// run registers its cancel handle and join handle here; [`shutdown`] cancels
+/// run registers its cancel handle and join handle here; [`supervisor::shutdown`] cancels
 /// them all and drains within a bounded budget when the bridge stops.
 pub mod supervisor {
     use std::sync::{Mutex, OnceLock};
