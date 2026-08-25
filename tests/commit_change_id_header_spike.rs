@@ -112,25 +112,26 @@ fn stdout_trim(output: Output) -> String {
         .to_owned()
 }
 
-fn git_available() -> bool {
-    Command::new("git")
+fn require_git_available() {
+    let available = Command::new("git")
         .arg("--version")
         .env_clear()
         .env("PATH", GIT_PATH)
         .env("LANG", "C")
         .env("LC_ALL", "C")
         .output()
-        .is_ok_and(|output| output.status.success())
+        .is_ok_and(|output| output.status.success());
+    assert!(
+        available,
+        "Git is required for the OL-00 compatibility spike (searched PATH={GIT_PATH})"
+    );
 }
 
 /// A nonstandard `change-id` commit header is accepted by Git's object
 /// parser, remains readable, and survives a local push/clone round trip.
 #[test]
 fn git_change_id_header_survives_fsck_push_and_clone() {
-    if !git_available() {
-        eprintln!("N/A: Git is unavailable; header compatibility was not tested");
-        return;
-    }
+    require_git_available();
 
     let fixture = GitFixture::new();
     let repo = fixture.init_repo("header-source");
@@ -205,10 +206,7 @@ fn git_change_id_header_survives_fsck_push_and_clone() {
 /// object, while the commit's ordinary Git object closure remains enumerable.
 #[test]
 fn sidecar_only_keeps_git_object_closure_enumerable() {
-    if !git_available() {
-        eprintln!("N/A: Git is unavailable; sidecar closure was not tested");
-        return;
-    }
+    require_git_available();
 
     let fixture = GitFixture::new();
     let repo = fixture.init_repo("sidecar-source");
@@ -222,6 +220,12 @@ fn sidecar_only_keeps_git_object_closure_enumerable() {
     let commit_oid = stdout_trim(fixture.git_success(&repo, &["rev-parse", "HEAD"]));
     let tree_oid = stdout_trim(fixture.git_success(&repo, &["rev-parse", "HEAD^{tree}"]));
     let blob_oid = stdout_trim(fixture.git_success(&repo, &["rev-parse", "HEAD:tracked.txt"]));
+    let commit_body_before = String::from_utf8(
+        fixture
+            .git_success(&repo, &["cat-file", "-p", "HEAD"])
+            .stdout,
+    )
+    .expect("original Git commit is UTF-8");
     let sidecar = repo.join(".libra-change-id");
     fs::write(
         &sidecar,
@@ -232,6 +236,27 @@ fn sidecar_only_keeps_git_object_closure_enumerable() {
     let sidecar_body = fs::read_to_string(&sidecar).expect("read Change ID sidecar");
     assert!(sidecar_body.contains(&format!("change_id={CHANGE_ID}")));
     assert!(sidecar_body.contains(&format!("commit_oid={commit_oid}")));
+
+    let commit_oid_after = stdout_trim(fixture.git_success(&repo, &["rev-parse", "HEAD"]));
+    let tree_oid_after = stdout_trim(fixture.git_success(&repo, &["rev-parse", "HEAD^{tree}"]));
+    let blob_oid_after =
+        stdout_trim(fixture.git_success(&repo, &["rev-parse", "HEAD:tracked.txt"]));
+    let commit_body_after = String::from_utf8(
+        fixture
+            .git_success(&repo, &["cat-file", "-p", "HEAD"])
+            .stdout,
+    )
+    .expect("Git commit after sidecar write is UTF-8");
+    assert_eq!(
+        commit_oid_after, commit_oid,
+        "sidecar must not change Commit OID"
+    );
+    assert_eq!(tree_oid_after, tree_oid, "sidecar must not change tree OID");
+    assert_eq!(blob_oid_after, blob_oid, "sidecar must not change blob OID");
+    assert_eq!(
+        commit_body_after, commit_body_before,
+        "sidecar must not change commit content"
+    );
 
     for (kind, oid) in [
         ("commit", &commit_oid),
