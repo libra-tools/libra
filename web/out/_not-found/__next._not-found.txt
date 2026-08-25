@@ -2,4 +2,4 @@
 2:I[71579,["/_next/static/chunks/0-d6j10u4ad6s.js"],"default"]
 3:I[3522,["/_next/static/chunks/0-d6j10u4ad6s.js"],"default"]
 4:[]
-0:{"rsc":["$","$1","c",{"children":[null,["$","$L2",null,{"parallelRouterKey":"children","template":["$","$L3",null,{}]}]]}],"isPartial":false,"staleTime":300,"varyParams":"$W4","buildId":"libra-web-0.21.0"}
+0:{"rsc":["$","$1","c",{"children":[null,["$","$L2",null,{"parallelRouterKey":"children","template":["$","$L3",null,{}]}]]}],"isPartial":false,"staleTime":300,"varyParams":"$W4","buildId":"libra-web-0.21.25"}
