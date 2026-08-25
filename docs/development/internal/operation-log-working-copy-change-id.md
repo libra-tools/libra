@@ -885,7 +885,7 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 
 | 阶段 | 落点（写集） | 验证入口 | 决策门 |
 |---|---|---|---|
-| 0 设计冻结 | 第 5 节结构体/函数定稿；CID-00 header spike | `cargo test --test commit_change_id_header_spike` | Gate-0：ADR 冻结、sidecar-only 写入决策；已有 header 仅作导入兼容 |
+| 0 设计冻结 | 第 5 节结构体/函数定稿；OL-00 header spike | `cargo test --test commit_change_id_header_spike` | Gate-0：ADR 冻结、sidecar-only 写入决策；已有 header 仅作导入兼容 |
 | 1 持久化与 I/O 底座 | `src/internal/worktree_io/`、`operation/{store,view,facet}.rs`、`db.rs` v2 schema（替换 v1 表与 model） | `cargo test internal::operation::store`；`cargo test --test operation_dag`；status 零回归 benchmark | Gate-1：对象格式、journal phase、I/O 协议冻结 |
 | 2 完整快照 | `operation/{snapshot,working_copy}.rs`、HEAD/refs/index/sequencer/sparse facet adapter | `cargo test --test workspace_snapshot_roundtrip`；`--test index_snapshot_roundtrip`；`--test sequencer_snapshot_roundtrip` | Gate-2：facet restore policy、untracked/ignored/large-file 政策 |
 | 3 CLI + Agent 全修改记录 | `operation/middleware.rs`、`src/cli.rs` classification、`ai/tools/*` gateway | `cargo test --test operation_command_coverage`；`--test agent_shell_operation`；census zero-unclassified guard | Gate-3：shadow mismatch、失败 operation、lease takeover |
