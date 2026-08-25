@@ -583,3 +583,8 @@ required-features = ["test-live-ai"]
 [[test]]
 name = "compat_serial_registry"
 path = "tests/compat/serial_registry.rs"
+
+# plan-20260822 OL-00: Change ID header vs sidecar compatibility spike.
+[[test]]
+name = "commit_change_id_header_spike"
+path = "tests/commit_change_id_header_spike.rs"
