@@ -36,8 +36,13 @@ use crate::{
     command::{load_object, log::get_reachable_commits},
     git_protocol::ServiceType,
     internal::{
-        branch::Branch, config::ConfigKv, db::get_db_conn_instance_for_path, head::Head,
-        protocol::DiscRef, reflog, tag,
+        ai::linear_ref::{OwnedRefSpec, OwnedRefTransportPolicy},
+        branch::Branch,
+        config::ConfigKv,
+        db::get_db_conn_instance_for_path,
+        head::Head,
+        protocol::DiscRef,
+        reflog, tag,
     },
     utils::{
         client_storage::ClientStorage,
@@ -419,7 +424,10 @@ impl LocalClient {
 
                     let local_branches = Branch::list_branches_result(None)
                         .await
-                        .map_err(|error| GitError::CustomError(error.to_string()))?;
+                        .map_err(|error| GitError::CustomError(error.to_string()))?
+                        .into_iter()
+                        .filter(|branch| ordinary_transport_branch(&branch.name))
+                        .collect::<Vec<_>>();
 
                     let remote_configs = ConfigKv::all_remote_configs()
                         .await
@@ -429,7 +437,9 @@ impl LocalClient {
                         remote_branches.extend(
                             Branch::list_branches_result(Some(&remote.name))
                                 .await
-                                .map_err(|error| GitError::CustomError(error.to_string()))?,
+                                .map_err(|error| GitError::CustomError(error.to_string()))?
+                                .into_iter()
+                                .filter(|branch| ordinary_transport_branch(&branch.name)),
                         );
                     }
                     let head_commit = Head::current_commit_result()
@@ -617,6 +627,11 @@ impl LocalClient {
             }
         }
     }
+}
+
+fn ordinary_transport_branch(name: &str) -> bool {
+    OwnedRefSpec::for_transport_ref(name)
+        .is_none_or(|spec| spec.transport_policy() != OwnedRefTransportPolicy::LocalOnly)
 }
 
 /// Read `objectformat` from a foreign Git repository's `config`, defaulting to
@@ -1409,6 +1424,32 @@ mod tests {
             message.contains("failed to walk reachable commits for 'not-a-valid-hash'"),
             "fetch_objects should preserve the failing want hash, got: {message}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn libra_discovery_hides_exact_local_only_memory_ref() {
+        let repo_dir = tempdir().unwrap();
+        setup_with_new_libra_in(repo_dir.path()).await;
+        let _guard = ChangeDirGuard::new(repo_dir.path());
+        let oid = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        Branch::update_branch("main", oid, None).await.unwrap();
+        Branch::update_branch("libra/memory/repo", oid, None)
+            .await
+            .unwrap();
+        Branch::update_branch("libra/memory/repo-user", oid, None)
+            .await
+            .unwrap();
+
+        let client = LocalClient::from_path(repo_dir.path()).unwrap();
+        let result = client
+            .discovery_reference(ServiceType::UploadPack)
+            .await
+            .unwrap();
+        let names: HashSet<&str> = result.refs.iter().map(|item| item._ref.as_str()).collect();
+        assert!(names.contains("refs/heads/main"));
+        assert!(names.contains("refs/heads/libra/memory/repo-user"));
+        assert!(!names.contains("refs/heads/libra/memory/repo"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -54,8 +54,7 @@ use git_internal::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr,
-    EntityTrait, QueryFilter, QueryResult, Set, SqlErr, Statement, TransactionTrait, Value,
-    sea_query::Expr,
+    EntityTrait, QueryFilter, QueryResult, Set, Statement, TransactionTrait, Value,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -67,7 +66,13 @@ use tokio::{
 use crate::utils::storage::tiered::verify_fetched_object;
 use crate::{
     internal::{
-        ai::observed_agents::RedactedBytes,
+        ai::{
+            linear_ref::{
+                LinearRefCompanion, LinearRefDeadlineExceeded, LinearRefTransactionOutcome,
+                OwnedRefSpec, linear_ref_transaction,
+            },
+            observed_agents::RedactedBytes,
+        },
         model::reference::{self, ConfigKind},
     },
     utils::{
@@ -115,6 +120,303 @@ pub const CHECKPOINT_OBJECT_IO_HELPER_ARG: &str = "--libra-internal-checkpoint-o
 pub const CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP: u64 = 32 * 1024 * 1024;
 pub const CHECKPOINT_OBJECT_IO_HELPER_OUTPUT_CAP: u64 = 32 * 1024 * 1024;
 const CHECKPOINT_OBJECT_READ_MAX_INFLATED_BYTES: u64 = 16 * 1024 * 1024;
+const PINNED_HISTORY_COMMIT_MAX_BYTES: u64 = 256 * 1024;
+
+/// One object proven reachable from a caller-pinned AI history commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryBlob {
+    object_id: String,
+    oid: ObjectHash,
+    bytes: Vec<u8>,
+}
+
+impl PinnedHistoryBlob {
+    pub(crate) fn object_id(&self) -> &str {
+        &self.object_id
+    }
+
+    pub(crate) const fn oid(&self) -> ObjectHash {
+        self.oid
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A bounded listing from one type subtree in a pinned AI history view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryListing {
+    entries: Vec<PinnedHistoryEntry>,
+    omitted: usize,
+}
+
+impl PinnedHistoryListing {
+    pub(crate) fn entries(&self) -> &[PinnedHistoryEntry] {
+        &self.entries
+    }
+
+    pub(crate) const fn omitted(&self) -> usize {
+        self.omitted
+    }
+}
+
+/// Opaque proof that one path resolved inside a specific pinned view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryEntry {
+    source_head: ObjectHash,
+    object_type: String,
+    object_id: String,
+    oid: ObjectHash,
+}
+
+/// One append commit decoded from a bounded first-parent history interval.
+/// The source commit is retained separately from the leaf blob OID because
+/// compiler generation identity is anchored to the immutable history point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryAppend {
+    source_commit_oid: ObjectHash,
+    object_type: String,
+    object_id: String,
+    object_oid: ObjectHash,
+    bytes: Vec<u8>,
+}
+
+impl PinnedHistoryAppend {
+    pub(crate) const fn source_commit_oid(&self) -> ObjectHash {
+        self.source_commit_oid
+    }
+
+    pub(crate) fn object_type(&self) -> &str {
+        &self.object_type
+    }
+
+    pub(crate) fn object_id(&self) -> &str {
+        &self.object_id
+    }
+
+    pub(crate) const fn object_oid(&self) -> ObjectHash {
+        self.object_oid
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PinnedHistoryDelta {
+    head: ObjectHash,
+    appends: Vec<PinnedHistoryAppend>,
+}
+
+impl PinnedHistoryDelta {
+    pub(crate) const fn head(&self) -> ObjectHash {
+        self.head
+    }
+
+    pub(crate) fn appends(&self) -> &[PinnedHistoryAppend] {
+        &self.appends
+    }
+}
+
+/// Read-only view whose head was proven to belong to the current first-parent
+/// history. Callers cannot accidentally fall through to the moving ref.
+pub(crate) struct PinnedHistoryView<'a> {
+    manager: &'a HistoryManager,
+    head: ObjectHash,
+    max_tree_bytes: u64,
+    root_items: Vec<TreeItem>,
+}
+
+impl PinnedHistoryView<'_> {
+    pub(crate) const fn head(&self) -> ObjectHash {
+        self.head
+    }
+
+    pub(crate) fn list(
+        &self,
+        object_type: &str,
+        max_entries: usize,
+    ) -> Result<PinnedHistoryListing> {
+        validate_history_path_part("object type", object_type)?;
+        if max_entries == 0 {
+            bail!("pinned history listing limit must be greater than zero");
+        }
+        let Some(type_entry) = self.root_items.iter().find(|item| item.name == object_type) else {
+            return Ok(PinnedHistoryListing {
+                entries: Vec::new(),
+                omitted: 0,
+            });
+        };
+        let mut entries = self
+            .manager
+            .load_tree_bounded(&type_entry.id, self.max_tree_bytes)?;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let omitted = entries.len().saturating_sub(max_entries);
+        entries.truncate(max_entries);
+        Ok(PinnedHistoryListing {
+            entries: entries
+                .into_iter()
+                .map(|item| PinnedHistoryEntry {
+                    source_head: self.head,
+                    object_type: object_type.to_string(),
+                    object_id: item.name,
+                    oid: item.id,
+                })
+                .collect(),
+            omitted,
+        })
+    }
+
+    pub(crate) fn get_blob(
+        &self,
+        object_type: &str,
+        object_id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<PinnedHistoryBlob>> {
+        validate_history_path_part("object type", object_type)?;
+        validate_history_path_part("object ID", object_id)?;
+        if max_bytes == 0 {
+            bail!("pinned history object byte limit must be greater than zero");
+        }
+        let Some(type_entry) = self.root_items.iter().find(|item| item.name == object_type) else {
+            return Ok(None);
+        };
+        let type_items = self
+            .manager
+            .load_tree_bounded(&type_entry.id, self.max_tree_bytes)?;
+        let Some(item) = type_items.iter().find(|item| item.name == object_id) else {
+            return Ok(None);
+        };
+        let entry = PinnedHistoryEntry {
+            source_head: self.head,
+            object_type: object_type.to_string(),
+            object_id: object_id.to_string(),
+            oid: item.id,
+        };
+        self.read_blob(&entry, max_bytes).map(Some)
+    }
+
+    pub(crate) fn read_blob(
+        &self,
+        entry: &PinnedHistoryEntry,
+        max_bytes: u64,
+    ) -> Result<PinnedHistoryBlob> {
+        if entry.source_head != self.head {
+            bail!("pinned history entry belongs to a different source view");
+        }
+        validate_history_path_part("object type", &entry.object_type)?;
+        validate_history_path_part("object ID", &entry.object_id)?;
+        if max_bytes == 0 {
+            bail!("pinned history object byte limit must be greater than zero");
+        }
+        let (kind, bytes) =
+            read_git_object_bounded_validated(&self.manager.repo_path, &entry.oid, max_bytes)
+                .with_context(|| {
+                    format!(
+                        "failed to read pinned {}/{}",
+                        entry.object_type, entry.object_id
+                    )
+                })?;
+        if kind != "blob" {
+            bail!(
+                "pinned history entry {}/{} is not a blob",
+                entry.object_type,
+                entry.object_id
+            );
+        }
+        Ok(PinnedHistoryBlob {
+            object_id: entry.object_id.clone(),
+            oid: entry.oid,
+            bytes,
+        })
+    }
+}
+
+fn validate_history_path_part(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        bail!("invalid pinned history {label}");
+    }
+    Ok(())
+}
+
+struct LinearHistoryCommit {
+    tree_oid: ObjectHash,
+    parent_oid: Option<ObjectHash>,
+    message: String,
+}
+
+fn read_linear_history_commit(repo_path: &Path, oid: ObjectHash) -> Result<LinearHistoryCommit> {
+    let (kind, bytes) =
+        read_git_object_bounded_validated(repo_path, &oid, PINNED_HISTORY_COMMIT_MAX_BYTES)
+            .with_context(|| format!("failed to read AI history commit {oid}"))?;
+    if kind != "commit" {
+        bail!("AI history OID {oid} does not identify a commit");
+    }
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("AI history commit {oid} is not UTF-8"))?;
+    let mut lines = text.split('\n');
+    let mut parents = Vec::new();
+    let tree = lines
+        .next()
+        .and_then(|line| line.strip_prefix("tree "))
+        .ok_or_else(|| anyhow!("AI history commit {oid} has no tree header"))?;
+    let tree_oid = ObjectHash::from_str(tree)
+        .map_err(|_| anyhow!("AI history commit {oid} has invalid tree OID"))?;
+    let author_line = loop {
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow!("AI history commit {oid} has no author header"))?;
+        if line.starts_with("author ") {
+            break line;
+        }
+        if let Some(parent) = line.strip_prefix("parent ") {
+            parents.push(
+                ObjectHash::from_str(parent)
+                    .map_err(|_| anyhow!("AI history commit {oid} has invalid parent OID"))?,
+            );
+        } else {
+            bail!("AI history commit {oid} has an unexpected header");
+        }
+    };
+    if author_line.len() == "author ".len() {
+        bail!("AI history commit {oid} has an empty author header");
+    }
+    let committer = lines
+        .next()
+        .ok_or_else(|| anyhow!("AI history commit {oid} has no committer header"))?;
+    if !committer.starts_with("committer ") || committer.len() == "committer ".len() {
+        bail!("AI history commit {oid} has an invalid committer header");
+    }
+    if parents.len() > 1 {
+        bail!("AI history commit {oid} is a merge commit");
+    }
+    let message = lines
+        .skip_while(|line| line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end_matches('\n')
+        .to_string();
+    if message.is_empty() {
+        bail!("AI history commit {oid} has an empty message");
+    }
+    Ok(LinearHistoryCommit {
+        tree_oid,
+        parent_oid: parents.into_iter().next(),
+        message,
+    })
+}
+
+fn read_single_parent_commit(repo_path: &Path, oid: ObjectHash) -> Result<Option<ObjectHash>> {
+    read_linear_history_commit(repo_path, oid).map(|commit| commit.parent_oid)
+}
 
 #[cfg(test)]
 tokio::task_local! {
@@ -339,20 +641,6 @@ struct TracesWriterFence {
     generation: String,
 }
 
-/// Outcome of a compare-and-swap reference update.
-///
-/// Used by [`HistoryManager::update_ref_if_matches`] to communicate whether
-/// the ref moved successfully (`Updated`) or whether the expected head was
-/// stale and the caller must restart the splice (`HeadChanged`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefUpdateOutcome {
-    /// The ref was atomically advanced to the new commit.
-    Updated,
-    /// Another writer advanced the ref before our CAS — caller should
-    /// re-read the head and rebuild the commit on top of it.
-    HeadChanged,
-}
-
 /// Detect transient SQLite contention that should trigger a retry.
 ///
 /// Functional scope:
@@ -373,16 +661,6 @@ fn anyhow_is_sqlite_busy(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<DbErr>())
         .any(is_sqlite_busy)
-}
-
-/// Detect unique-constraint violations on the `reference` table.
-///
-/// Functional scope:
-/// - Used by the optimistic CAS path: when two writers race to insert the
-///   same ref name, one will see a unique-constraint violation; we treat
-///   that as a `HeadChanged` outcome rather than a hard error.
-fn is_sqlite_unique_violation(err: &DbErr) -> bool {
-    matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
 }
 
 fn read_cleanup_regular_file(
@@ -994,17 +1272,16 @@ impl HistoryManager {
         Self::new_with_ref(storage, repo_path, db_conn, AI_REF)
     }
 
-    /// Build a manager bound to an arbitrary ref name.
+    /// Build a manager bound to a named Libra-owned history ref.
     ///
     /// Functional scope:
-    /// - Used by tests and tooling that need to write a parallel AI history
-    ///   under a custom ref (e.g. for staging, comparison, or namespace
-    ///   isolation).
+    /// - Used by traces writers and repair tooling that operate on a parallel
+    ///   Libra-owned history.
     ///
     /// Boundary conditions:
-    /// - The ref name is not validated here; callers must ensure it is a
-    ///   legal Git ref. The CAS path will fail loudly if the database
-    ///   constraint rejects it.
+    /// - Reads and legacy maintenance paths retain the supplied name. The
+    ///   append/checkpoint conditional-CAS path is fail-closed unless the name
+    ///   maps to an [`OwnedRefSpec`].
     pub fn new_with_ref(
         storage: Arc<dyn Storage + Send + Sync>,
         repo_path: PathBuf,
@@ -1095,6 +1372,15 @@ impl HistoryManager {
         &self.ref_name
     }
 
+    /// Return the repository-local Libra storage directory.
+    ///
+    /// This crate-private accessor lets tightly scoped Memory coordinators
+    /// share the existing object database and SQLite file without guessing a
+    /// second path or introducing another storage owner.
+    pub(crate) fn repository_path(&self) -> &Path {
+        &self.repo_path
+    }
+
     /// Append an object to the history log.
     /// This operation is synchronous (commits immediately) for the MVP.
     ///
@@ -1137,11 +1423,13 @@ impl HistoryManager {
                 .update_ref_if_matches(&self.ref_name, parent_commit_id, commit_hash)
                 .await?
             {
-                RefUpdateOutcome::Updated => return Ok(()),
-                RefUpdateOutcome::HeadChanged if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES => {
+                LinearRefTransactionOutcome::Updated => return Ok(()),
+                LinearRefTransactionOutcome::HeadChanged
+                    if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES =>
+                {
                     continue;
                 }
-                RefUpdateOutcome::HeadChanged => {
+                LinearRefTransactionOutcome::HeadChanged => {
                     return Err(anyhow!(
                         "history head changed repeatedly while appending {}/{}",
                         object_type,
@@ -1252,6 +1540,219 @@ impl HistoryManager {
         Ok(Vec::new())
     }
 
+    /// Pin a read-only view to an exact commit on the current AI history's
+    /// first-parent chain. The caller-provided OID is treated as untrusted:
+    /// arbitrary repository commits and stale commits beyond the scan budget
+    /// are rejected before any typed object is returned.
+    pub(crate) async fn pin_history(
+        &self,
+        pinned_head: ObjectHash,
+        max_ancestry_commits: usize,
+        max_tree_bytes: u64,
+    ) -> Result<PinnedHistoryView<'_>> {
+        if max_ancestry_commits == 0 {
+            bail!("pinned history ancestry limit must be greater than zero");
+        }
+        if max_tree_bytes == 0 {
+            bail!("pinned history tree byte limit must be greater than zero");
+        }
+        let current_head = self
+            .resolve_history_head()
+            .await?
+            .ok_or_else(|| anyhow!("AI history is not initialized"))?;
+        let mut cursor = Some(current_head);
+        let mut visited = HashSet::new();
+        let mut found = false;
+        for _ in 0..max_ancestry_commits {
+            let Some(commit_oid) = cursor else {
+                break;
+            };
+            if !visited.insert(commit_oid) {
+                bail!("AI history contains a first-parent cycle");
+            }
+            if commit_oid == pinned_head {
+                found = true;
+                break;
+            }
+            cursor = read_single_parent_commit(&self.repo_path, commit_oid)?;
+        }
+        if !found {
+            bail!(
+                "pinned source commit is not reachable from the current AI history within the configured limit"
+            );
+        }
+        let root_items = self.load_commit_tree_bounded(&pinned_head, max_tree_bytes)?;
+        Ok(PinnedHistoryView {
+            manager: self,
+            head: pinned_head,
+            max_tree_bytes,
+            root_items,
+        })
+    }
+
+    /// Decode append commits between an observer cursor and a pinned head.
+    ///
+    /// The returned appends are oldest-first. The cursor itself is excluded;
+    /// the pinned head is included. Any merge, non-descendant cursor,
+    /// malformed append commit, or budget overrun aborts the entire scan so a
+    /// caller cannot advance a durable observer waterline past unknown data.
+    pub(crate) async fn scan_append_delta(
+        &self,
+        pinned_head: ObjectHash,
+        after: Option<ObjectHash>,
+        max_commits: usize,
+        max_tree_bytes: u64,
+        max_blob_bytes: u64,
+    ) -> Result<PinnedHistoryDelta> {
+        if max_commits == 0 || max_tree_bytes == 0 || max_blob_bytes == 0 {
+            bail!("AI history delta limits must be greater than zero");
+        }
+        let current_head = self
+            .resolve_history_head()
+            .await?
+            .ok_or_else(|| anyhow!("AI history is not initialized"))?;
+        if current_head != pinned_head {
+            bail!("AI history observer head changed before it could be pinned");
+        }
+
+        let mut cursor = Some(pinned_head);
+        let mut visited = HashSet::new();
+        let mut commits = Vec::new();
+        while cursor != after {
+            let Some(commit_oid) = cursor else {
+                bail!("AI history observer cursor is not an ancestor of the pinned head");
+            };
+            if commits.len() == max_commits {
+                bail!("AI history delta exceeds the configured commit budget");
+            }
+            if !visited.insert(commit_oid) {
+                bail!("AI history contains a first-parent cycle");
+            }
+            let commit = read_linear_history_commit(&self.repo_path, commit_oid)?;
+            cursor = commit.parent_oid;
+            commits.push((commit_oid, commit));
+        }
+        commits.reverse();
+
+        let mut appends = Vec::with_capacity(commits.len());
+        for (commit_oid, commit) in commits {
+            let Some(path) = commit.message.strip_prefix("Update ") else {
+                if commit.parent_oid.is_none() {
+                    continue;
+                }
+                bail!("AI history commit {commit_oid} is not a canonical append commit");
+            };
+            let (object_type, object_id) = path.split_once('/').ok_or_else(|| {
+                anyhow!("AI history append commit {commit_oid} has an invalid path")
+            })?;
+            validate_history_path_part("object type", object_type)?;
+            validate_history_path_part("object ID", object_id)?;
+            let object_oid = self
+                .blob_at_tree_path(commit.tree_oid, object_type, object_id, max_tree_bytes)?
+                .ok_or_else(|| {
+                    anyhow!("AI history append commit {commit_oid} does not contain its path")
+                })?;
+            if let Some(parent_oid) = commit.parent_oid {
+                let parent = read_linear_history_commit(&self.repo_path, parent_oid)?;
+                if self.blob_at_tree_path(
+                    parent.tree_oid,
+                    object_type,
+                    object_id,
+                    max_tree_bytes,
+                )? == Some(object_oid)
+                {
+                    bail!("AI history append commit {commit_oid} did not change its path");
+                }
+            }
+            let (kind, bytes) =
+                read_git_object_bounded_validated(&self.repo_path, &object_oid, max_blob_bytes)
+                    .with_context(|| {
+                        format!("failed to read AI history append blob {object_oid}")
+                    })?;
+            if kind != "blob" {
+                bail!("AI history append path does not identify a blob");
+            }
+            appends.push(PinnedHistoryAppend {
+                source_commit_oid: commit_oid,
+                object_type: object_type.to_string(),
+                object_id: object_id.to_string(),
+                object_oid,
+                bytes,
+            });
+        }
+        Ok(PinnedHistoryDelta {
+            head: pinned_head,
+            appends,
+        })
+    }
+
+    /// Read one canonical append commit after proving it remains reachable
+    /// from the moving AI-history head. This is used by generation runners to
+    /// recover the terminal actor from the exact source commit held by their
+    /// lease.
+    pub(crate) async fn read_append_at(
+        &self,
+        commit_oid: ObjectHash,
+        max_ancestry_commits: usize,
+        max_tree_bytes: u64,
+        max_blob_bytes: u64,
+    ) -> Result<PinnedHistoryAppend> {
+        self.pin_history(commit_oid, max_ancestry_commits, max_tree_bytes)
+            .await?;
+        let commit = read_linear_history_commit(&self.repo_path, commit_oid)?;
+        let path = commit
+            .message
+            .strip_prefix("Update ")
+            .ok_or_else(|| anyhow!("AI history commit {commit_oid} is not an append commit"))?;
+        let (object_type, object_id) = path
+            .split_once('/')
+            .ok_or_else(|| anyhow!("AI history append commit {commit_oid} has an invalid path"))?;
+        validate_history_path_part("object type", object_type)?;
+        validate_history_path_part("object ID", object_id)?;
+        let object_oid = self
+            .blob_at_tree_path(commit.tree_oid, object_type, object_id, max_tree_bytes)?
+            .ok_or_else(|| {
+                anyhow!("AI history append commit {commit_oid} does not contain its path")
+            })?;
+        let (kind, bytes) =
+            read_git_object_bounded_validated(&self.repo_path, &object_oid, max_blob_bytes)
+                .with_context(|| format!("failed to read AI history append blob {object_oid}"))?;
+        if kind != "blob" {
+            bail!("AI history append path does not identify a blob");
+        }
+        Ok(PinnedHistoryAppend {
+            source_commit_oid: commit_oid,
+            object_type: object_type.to_string(),
+            object_id: object_id.to_string(),
+            object_oid,
+            bytes,
+        })
+    }
+
+    fn blob_at_tree_path(
+        &self,
+        root_tree_oid: ObjectHash,
+        object_type: &str,
+        object_id: &str,
+        max_tree_bytes: u64,
+    ) -> Result<Option<ObjectHash>> {
+        let root_items = self.load_tree_bounded(&root_tree_oid, max_tree_bytes)?;
+        let Some(type_entry) = root_items.iter().find(|item| item.name == object_type) else {
+            return Ok(None);
+        };
+        if type_entry.mode != TreeItemMode::Tree {
+            bail!("AI history object type path is not a tree");
+        }
+        let type_items = self.load_tree_bounded(&type_entry.id, max_tree_bytes)?;
+        let Some(object_entry) = type_items.iter().find(|item| item.name == object_id) else {
+            return Ok(None);
+        };
+        if object_entry.mode != TreeItemMode::Blob {
+            bail!("AI history object path is not a blob");
+        }
+        Ok(Some(object_entry.id))
+    }
+
     /// List all object types present at the current history head.
     ///
     /// Functional scope:
@@ -1346,6 +1847,40 @@ impl HistoryManager {
             }
         }
         Err(anyhow!("Commit has no tree"))
+    }
+
+    fn load_commit_tree_bounded(
+        &self,
+        commit_id: &ObjectHash,
+        max_tree_bytes: u64,
+    ) -> Result<Vec<TreeItem>> {
+        let (kind, data) = read_git_object_bounded_validated(
+            &self.repo_path,
+            commit_id,
+            PINNED_HISTORY_COMMIT_MAX_BYTES,
+        )?;
+        if kind != "commit" {
+            bail!("pinned AI history OID {commit_id} is not a commit");
+        }
+        let content = std::str::from_utf8(&data)
+            .with_context(|| format!("AI history commit {commit_id} is not UTF-8"))?;
+        for line in content.lines() {
+            if let Some(hash_str) = line.strip_prefix("tree ") {
+                let tree_hash = ObjectHash::from_str(hash_str)
+                    .map_err(|error| anyhow!("invalid tree hash in pinned commit: {error}"))?;
+                return self.load_tree_bounded(&tree_hash, max_tree_bytes);
+            }
+        }
+        bail!("pinned AI history commit has no tree")
+    }
+
+    fn load_tree_bounded(&self, tree_id: &ObjectHash, max_bytes: u64) -> Result<Vec<TreeItem>> {
+        let (kind, data) = read_git_object_bounded_validated(&self.repo_path, tree_id, max_bytes)?;
+        if kind != "tree" {
+            bail!("pinned AI history tree OID {tree_id} is not a tree");
+        }
+        let tree = Tree::from_bytes(&data, *tree_id)?;
+        Ok(tree.tree_items)
     }
 
     /// Load and parse a tree object's items.
@@ -2019,7 +2554,7 @@ impl HistoryManager {
         ref_name: &str,
         expected_head: Option<ObjectHash>,
         new_hash: ObjectHash,
-    ) -> Result<RefUpdateOutcome> {
+    ) -> Result<LinearRefTransactionOutcome> {
         self.update_ref_if_matches_with_extra(ref_name, expected_head, new_hash, None, None, None)
             .await
     }
@@ -2039,172 +2574,33 @@ impl HistoryManager {
         extra: Option<(&dyn TracesTxnExtra, &TracesCommitCtx)>,
         deadline: Option<Instant>,
         marker_fence: Option<&TracesWriterFence>,
-    ) -> Result<RefUpdateOutcome> {
-        let expected_commit = expected_head.map(|hash| hash.to_string());
-        let new_commit = new_hash.to_string();
-
-        for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                bail!("checkpoint append exceeded the historical import execution deadline");
-            }
-            let txn: DatabaseTransaction =
-                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
-                    Ok(txn) => txn,
-                    Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                        sleep(Duration::from_millis(
-                            SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                        ))
-                        .await;
-                        continue;
-                    }
-                    Err(err) => return Err(err).context("Failed to begin transaction"),
-                };
-
-            // An expired ordinary marker may have been fenced and retired by
-            // crash recovery while this writer was stalled. The marker check
-            // rides the same SQLite writer transaction as the ref/catalog CAS:
-            // cleanup wins first => this writer cannot publish; this writer
-            // wins first => cleanup observes the committed root/catalog.
-            if let Some(marker_fence) = marker_fence {
-                let entry = crate::internal::metadata::MetadataKv::get_with_conn(
-                    &txn,
-                    crate::internal::metadata::MetadataScope::AgentTracesInflight,
-                    &marker_fence.session_id,
-                    &marker_fence.attempt_id,
-                )
-                .await
-                .context("revalidate checkpoint writer marker before ref update")?;
-                let Some(entry) = entry else {
-                    txn.rollback().await.ok();
-                    bail!(
-                        "checkpoint writer marker was fenced before ref update; retry the operation"
-                    );
-                };
-                let marker = decode_and_validate_traces_inflight_marker(
-                    &entry.value,
-                    &entry.target,
-                    &entry.key,
-                )?;
-                if let Err(error) = Self::ensure_marker_matches_fence(&marker, marker_fence) {
-                    txn.rollback().await.ok();
-                    return Err(error.context("revalidate marker generation before ref update"));
-                }
-            }
-
-            let existing = match reference::Entity::find()
-                .filter(reference::Column::Name.eq(ref_name))
-                .filter(reference::Column::Kind.eq(ConfigKind::Branch))
-                .one(&txn)
-                .await
-            {
-                Ok(existing) => existing,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    let _ = txn.rollback().await;
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => return Err(err).context("Failed to query reference"),
-            };
-
-            let write_result = match existing {
-                Some(model) if model.commit != expected_commit => {
-                    let _ = txn.rollback().await;
-                    return Ok(RefUpdateOutcome::HeadChanged);
-                }
-                Some(model) => {
-                    let mut update = reference::Entity::update_many()
-                        .filter(reference::Column::Id.eq(model.id))
-                        .filter(reference::Column::Name.eq(ref_name))
-                        .filter(reference::Column::Kind.eq(ConfigKind::Branch));
-                    update = match expected_commit.as_ref() {
-                        Some(commit) => update.filter(reference::Column::Commit.eq(commit.clone())),
-                        None => update.filter(reference::Column::Commit.is_null()),
-                    };
-
-                    update
-                        .col_expr(
-                            reference::Column::Commit,
-                            Expr::value(Some(new_commit.clone())),
-                        )
-                        .exec(&txn)
-                        .await
-                        .map(Some)
-                }
-                None if expected_commit.is_some() => {
-                    let _ = txn.rollback().await;
-                    return Ok(RefUpdateOutcome::HeadChanged);
-                }
-                None => {
-                    let new_ref = reference::ActiveModel {
-                        name: Set(Some(ref_name.to_string())),
-                        kind: Set(ConfigKind::Branch),
-                        commit: Set(Some(new_commit.clone())),
-                        remote: Set(None),
-                        ..Default::default()
-                    };
-                    match new_ref.insert(&txn).await {
-                        Ok(_) => Ok(None),
-                        Err(err) if is_sqlite_unique_violation(&err) => {
-                            let _ = txn.rollback().await;
-                            return Ok(RefUpdateOutcome::HeadChanged);
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-            };
-
-            let rows_affected = match write_result {
-                Ok(rows_affected) => rows_affected,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    let _ = txn.rollback().await;
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => return Err(err).context("Failed to compare-and-swap history head"),
-            };
-
-            if rows_affected.is_some_and(|result| result.rows_affected != 1) {
-                let _ = txn.rollback().await;
-                return Ok(RefUpdateOutcome::HeadChanged);
-            }
-
-            // ADR-DR-10: companion writes ride the ref transaction. A
-            // failure here must NOT move the ref — roll back and fail
-            // closed (no HeadChanged retry: the failure is a gate/fence
-            // violation or DB fault, not a CAS race).
-            if let Some((extra, ctx)) = extra
-                && let Err(err) = extra.apply(&txn, ctx).await
-            {
-                let _ = txn.rollback().await;
-                return Err(
-                    err.context("transactional companion writes failed; ref update rolled back")
-                );
-            }
-
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                let _ = txn.rollback().await;
-                bail!("checkpoint append exceeded the historical import execution deadline");
-            }
-
-            match txn.commit().await {
-                Ok(()) => return Ok(RefUpdateOutcome::Updated),
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                }
-                Err(err) => return Err(err).context("Failed to commit transaction"),
-            }
+    ) -> Result<LinearRefTransactionOutcome> {
+        let spec = OwnedRefSpec::for_history_storage_name(ref_name)
+            .with_context(|| format!("history ref '{ref_name}' is not a named Libra-owned ref"))?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!("checkpoint append exceeded the historical import execution deadline");
         }
 
-        unreachable!("sqlite busy retry loop must return on success or terminal error")
+        let companion = HistoryLinearRefCompanion {
+            extra,
+            deadline,
+            marker_fence,
+        };
+        let result = linear_ref_transaction(
+            self.db_conn.as_ref(),
+            spec,
+            expected_head,
+            new_hash,
+            deadline,
+            Some(&companion),
+        )
+        .await;
+        match result {
+            Err(error) if error.downcast_ref::<LinearRefDeadlineExceeded>().is_some() => Err(
+                anyhow!("checkpoint append exceeded the historical import execution deadline"),
+            ),
+            result => result,
+        }
     }
 
     /// Append a checkpoint commit to this manager's ref.
@@ -2600,7 +2996,7 @@ impl HistoryManager {
                 )
                 .await?
             {
-                RefUpdateOutcome::Updated => {
+                LinearRefTransactionOutcome::Updated => {
                     if cfg!(debug_assertions)
                         && let Ok(value) =
                             std::env::var("LIBRA_TEST_CHECKPOINT_POST_COMMIT_DELAY_MS")
@@ -2617,10 +3013,12 @@ impl HistoryManager {
                         object_count,
                     });
                 }
-                RefUpdateOutcome::HeadChanged if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES => {
+                LinearRefTransactionOutcome::HeadChanged
+                    if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES =>
+                {
                     continue;
                 }
-                RefUpdateOutcome::HeadChanged => {
+                LinearRefTransactionOutcome::HeadChanged => {
                     return Err(anyhow!(
                         "history head changed repeatedly while appending checkpoint {}",
                         params.checkpoint_id
@@ -3435,7 +3833,7 @@ impl HistoryManager {
                 .await?
             {
                 (
-                    RefUpdateOutcome::Updated,
+                    LinearRefTransactionOutcome::Updated,
                     removed_checkpoints,
                     deleted_object_index_rows,
                     deleted_import_identities,
@@ -3450,12 +3848,12 @@ impl HistoryManager {
                         deleted_import_identities,
                     });
                 }
-                (RefUpdateOutcome::HeadChanged, _, _, _)
+                (LinearRefTransactionOutcome::HeadChanged, _, _, _)
                     if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES =>
                 {
                     continue;
                 }
-                (RefUpdateOutcome::HeadChanged, _, _, _) => {
+                (LinearRefTransactionOutcome::HeadChanged, _, _, _) => {
                     return Err(anyhow!(
                         "traces head changed repeatedly while pruning checkpoints"
                     ));
@@ -4014,7 +4412,7 @@ impl HistoryManager {
         remove_ids: &HashSet<String>,
         unreachable_oids: &[String],
         record_cloud_tombstones: bool,
-    ) -> Result<(RefUpdateOutcome, u64, u64, u64)> {
+    ) -> Result<(LinearRefTransactionOutcome, u64, u64, u64)> {
         let expected_commit = expected_head.map(|hash| hash.to_string());
         let new_commit = new_head.map(|hash| hash.to_string());
         let _object_index_deletion_fence =
@@ -4064,7 +4462,7 @@ impl HistoryManager {
             let write_ref = match existing {
                 Some(model) if model.commit != expected_commit => {
                     let _ = txn.rollback().await;
-                    return Ok((RefUpdateOutcome::HeadChanged, 0, 0, 0));
+                    return Ok((LinearRefTransactionOutcome::HeadChanged, 0, 0, 0));
                 }
                 Some(model) => {
                     let mut active: reference::ActiveModel = model.into();
@@ -4073,7 +4471,7 @@ impl HistoryManager {
                 }
                 None if expected_commit.is_some() => {
                     let _ = txn.rollback().await;
-                    return Ok((RefUpdateOutcome::HeadChanged, 0, 0, 0));
+                    return Ok((LinearRefTransactionOutcome::HeadChanged, 0, 0, 0));
                 }
                 None => {
                     let new_ref = reference::ActiveModel {
@@ -4378,7 +4776,7 @@ impl HistoryManager {
             match txn.commit().await {
                 Ok(()) => {
                     return Ok((
-                        RefUpdateOutcome::Updated,
+                        LinearRefTransactionOutcome::Updated,
                         removed,
                         deleted_object_index_rows,
                         deleted_import_identities,
@@ -4750,6 +5148,59 @@ pub fn rebuild_catalog_row_from_traces_ref(
 #[async_trait::async_trait]
 pub trait TracesTxnExtra: Send + Sync {
     async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()>;
+}
+
+struct HistoryLinearRefCompanion<'a> {
+    extra: Option<(&'a dyn TracesTxnExtra, &'a TracesCommitCtx)>,
+    deadline: Option<Instant>,
+    marker_fence: Option<&'a TracesWriterFence>,
+}
+
+#[async_trait::async_trait]
+impl LinearRefCompanion for HistoryLinearRefCompanion<'_> {
+    async fn apply(
+        &self,
+        txn: &crate::internal::ai::linear_ref::LinearRefWriteTransaction<'_>,
+    ) -> Result<()> {
+        let txn = txn.as_database_transaction();
+        // An expired ordinary marker may have been fenced and retired while
+        // this writer was stalled. Revalidation remains inside the winning
+        // ref transaction.
+        if let Some(marker_fence) = self.marker_fence {
+            let entry = crate::internal::metadata::MetadataKv::get_with_conn(
+                txn,
+                crate::internal::metadata::MetadataScope::AgentTracesInflight,
+                &marker_fence.session_id,
+                &marker_fence.attempt_id,
+            )
+            .await
+            .context("revalidate checkpoint writer marker before ref update")?;
+            let Some(entry) = entry else {
+                bail!("checkpoint writer marker was fenced before ref update; retry the operation");
+            };
+            let marker = decode_and_validate_traces_inflight_marker(
+                &entry.value,
+                &entry.target,
+                &entry.key,
+            )?;
+            HistoryManager::ensure_marker_matches_fence(&marker, marker_fence)
+                .context("revalidate marker generation before ref update")?;
+        }
+
+        if let Some((extra, ctx)) = self.extra {
+            extra
+                .apply(txn, ctx)
+                .await
+                .context("transactional companion writes failed; ref update rolled back")?;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            bail!("checkpoint append exceeded the historical import execution deadline");
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for dyn TracesTxnExtra + '_ {
@@ -7113,7 +7564,7 @@ mod tests {
             .update_ref_if_matches(AI_REF, stale_head, stale_commit)
             .await
             .expect("stale ref update should not error");
-        assert_eq!(outcome, RefUpdateOutcome::HeadChanged);
+        assert_eq!(outcome, LinearRefTransactionOutcome::HeadChanged);
 
         manager.append("plan", "plan-1", plan_hash).await.unwrap();
 

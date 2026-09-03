@@ -100,6 +100,11 @@ refs and Libra-owned internal refs (the locked `main`/`intent`/`traces`
 branches and the reserved `libra/` namespace, e.g. the AI history branch
 `libra/intent`) are never pruned.
 
+New operation snapshots omit the repository-local Memory authority. When an
+older snapshot already contains `libra/memory/repo`, restore skips it, reports
+the skipped name, and leaves both its current object ID and projection
+watermark unchanged.
+
 ```bash
 libra op restore [--force] [--dry-run] <OP_REF>
 ```

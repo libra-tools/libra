@@ -171,7 +171,7 @@ flowchart LR
 | IntentSpec 规范化/草稿/校验/评审/scope | `src/internal/ai/intentspec/{canonical,draft,validator,review,scope}.rs` | ML-02 seal、ML-04 指纹（scope 文件维） |
 | git-internal Intent/Decision 对象 + MCP create | `src/internal/ai/mcp/`、`intentspec/persistence.rs`、`workflow_objects.rs` | ML-02/ML-03 |
 | 外部 agent 捕获 + redaction | `src/internal/ai/hooks/runtime.rs` | ML-08 注入（复用 Redactor） |
-| ContextFrame / ContextSnapshot + local reviewed MemoryAnchor | `context_budget/{frame,memory_anchor}.rs`、`runtime/phase0.rs` | ML-05 选择回执的本地关联与 review/revoke/expiry UX；当前仍无 branch-aware team recall 或可共享 receipt |
+| ContextFrame / ContextSnapshot + local reviewed MemoryAnchor + shared local receipt ledger | `context_budget/{frame,memory_anchor,receipt,receipt_store}.rs`、`runtime/phase0.rs` | `ContextSelectionReceiptV1`、SQLite 账本与 retention 已落地；ML-05 仍需把 intent 检索结果接入该写入器。当前仍无 branch-aware team recall；receipt 保持 local-only |
 | 嵌入式 Next.js + 单向 publish 导出 + C4 observe-only API | `src/internal/publish/ai_export.rs`、`src/internal/ai/web/`（C4 /api/code/*） | ML-09 Hub |
 | 稳定错误码 + `--json/--machine` 输出 | `src/utils/{error,output}.rs` | 全部命令 |
 
@@ -784,32 +784,34 @@ content，也不是 intent-team record。
 
 ~~~json
 {
-  "schema_version": "libra.intent.context-receipt.v1",
-  "frame_id": "<optional-local-context-frame-id>",
-  "intent_id": "<optional-local-intent-id>",
-  "query": {"mode": "current|files|query", "hash": "sha256:<hash>", "as_of": "<RFC3339>"},
-  "snapshot": {
-    "code_commit": "<oid>",
-    "branch": "<display-only-ref>",
-    "ai_ref_head": "<oid>",
-    "team_ref_head": "<oid>",
-    "projection_built_from": "<oid>",
-    "index_manifest_hash": "sha256:<hash>",
-    "config_policy_hash": "sha256:<hash>"
-  },
-  "selector": {"id": "intent-v1", "version": "1", "weights_hash": "sha256:<hash>"},
+  "receipt_id": "<uuidv7>",
+  "schema_version": 1,
+  "source_kind": "intent",
+  "repository_id": "<canonical-repository-id>",
+  "digest_key_id": "<repository-key-generation-id>",
+  "principal_hmac": "hmac-sha256:<key-id>:<digest>",
+  "query_hmac": "hmac-sha256:<key-id>:<digest>",
+  "effective_at": "<RFC3339>",
+  "code_commit": "<oid>",
+  "full_branch_ref": "refs/heads/<branch>",
+  "source_heads": {"private_ai": "<oid>", "validated_team": "<oid>"},
+  "projection_watermarks": {"private_ai": "<oid>", "validated_team": "<oid>"},
+  "policy_hash": "sha256:<hash>",
+  "selector_version": "intent-v1",
   "selected": [
-    {"object_id": "<id>", "kind": "sealed_intent|decision", "score": 0, "reasons": ["file_overlap"]}
+    {"object_id": "<id>", "revision_oid": "<oid>", "summary_key": "<key>", "order": 0,
+     "reason_codes": ["file_overlap"], "score_components": {"file_overlap": 1}}
   ],
-  "omissions": [{"object_id": "<id>", "reason": "budget|scope|trust|stale"}],
-  "budget": {"limit_tokens": 0, "selected_tokens": 0},
-  "redaction_policy_hash": "sha256:<hash>",
-  "render_version": "1",
-  "bundle_hash": "sha256:<hash>"
+  "omissions": [{"reason_code": "budget|scope|trust|stale", "count": 0}],
+  "token_budget": 0,
+  "bundle_hash": "sha256:<hash>",
+  "reproducibility_state": "reproducible|stale|expired|non_reproducible",
+  "recorded_at": "<RFC3339>",
+  "frame_id": "<optional-local-context-frame-id>"
 }
 ~~~
 
-Canonical receipt/bundle hash 排除 recorded_at 和 generated UUID。引用 missing、
+Canonical receipt/bundle hash 排除 `recorded_at` 和 `receipt_id`。引用 missing、
 untrusted 或 stale source 的 receipt 必须报告该状态，不能静默换用其他 object。
 
 #### 12.6.2 CLI 命令面（新增 `src/command/intent.rs`，在 `src/cli.rs` 注册为 `Commands::Intent`）
@@ -1128,7 +1130,7 @@ team projection 已就绪，并且明确拒绝 raw AI history；**不得**宣称
 | 不走 git notes 走 history.rs | N/A（mainline 用 notes） | `notes.rs` SQLite 侧表 + 无 Note ConfigKind | ✅ §5 决策成立 |
 | traces 传输的 lease/tracking 机件可复用 | N/A | `agent/push.rs:30-83` force-with-lease | ✅ 仅复用机件；raw AI_REF mirror 已明确禁止 |
 | AI_REF 不可直接成为团队平面 | N/A | `history.rs` 混合对象 + hook `ai_session/raw_hook_events` | ✅ 新增 intent-team allow-list/redaction/manifest 边界 |
-| ContextFrame 不是可发布 retrieval receipt | N/A | frame 可带 raw content/attachment，缺 policy/ranking/watermark | ✅ 新增 local-only ContextReceiptV1 |
+| ContextFrame 不是可发布 retrieval receipt | N/A | frame 可带 raw content/attachment，缺 policy/ranking/watermark | ✅ 复用 local-only `ContextSelectionReceiptV1` |
 | MCP C6 不等于授权 | N/A | production authz None/allow-all，部分调用无 gate | ✅ C9 设为所有 intent MCP tool 的前置 |
 | 决策缺 alternatives | mainline `IntentSummary.rejected` | `phase4.rs:500-524` 仅 rationale | ✅ ML-03 方向正确 |
 | hook 只捕获 vs SessionStart/TurnStart 只读注入 | `hooks/dispatcher.go:16-22,100-110,317-424`（2026-08-27 刷新，文件增至 783 行；另见新增字节预算 `:86-93`） | `hooks/runtime.rs` ingest only | ✅ ML-08 方向正确；本次补充 TurnStart 轻量提醒边界；2026-08-27 再补字节预算边界 |
@@ -1146,7 +1148,7 @@ team projection 已就绪，并且明确拒绝 raw AI history；**不得**宣称
 | 无 auto-sync 命令列表 | 各命令新鲜度门禁不一致 | §12.6.9 |
 | 无 mainline→Libra 工作流映射 | 误造 turn/actor-log 平行平面 | §12.6.7 |
 | 原稿把 AI_REF 当 intent-only remote ref | raw Run/tool/context/session 可能被团队复制，lease 不能弥补授权/脱敏缺口 | §5/ML-01/§12.6.1/§12.8 改为 ML-01a safe rail → ML-02 → ML-01b approved publication |
-| 原稿缺 ContextBundle/receipt | 无法解释为何选中这组意图，且 raw ContextFrame 可能泄露 | ML-05 + §12.6.1 增 local-only ContextReceiptV1、重放/缺失 fail-loud 测试 |
+| 原稿缺 ContextBundle/receipt | 无法解释为何选中这组意图，且 raw ContextFrame 可能泄露 | ML-05 + §12.6.1 复用 local-only `ContextSelectionReceiptV1`、重放/缺失 fail-loud 测试 |
 | 原稿把 C6 当 MCP 安全边界 | production authz allow-all，mutating seal/pin tool 可能无授权暴露 | §8/§12.6.3 改为 C9 default-deny/全覆盖前不注册任何 intent MCP tool |
 | 矩阵遗漏 receipt 行 | 静默欠覆盖 | §3 补 ContextBundle/receipt 行，计数改 36 |
 | `check` phase-2 无 schema | Hub `last_check` 无法落地 | §12.6.2 `check` + judgment event 说明 |

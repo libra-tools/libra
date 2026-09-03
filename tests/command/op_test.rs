@@ -5,9 +5,15 @@
 use std::path::Path;
 
 use libra::{
-    internal::{branch::Branch, head::Head},
+    internal::{
+        branch::Branch,
+        db::get_db_conn_instance,
+        head::Head,
+        operation::{OperationService, OperationViewRefRecord},
+    },
     utils::test::ChangeDirGuard,
 };
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde_json::Value;
 
 use super::*;
@@ -815,4 +821,79 @@ async fn test_op_restore_json_records_new_operation_and_restores_head_and_branch
         latest_log["data"]["operations"][0]["command_name"],
         "op restore"
     );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// Legacy operation views may contain Memory, but restore must preserve its authority and watermark.
+async fn op_restore_preserves_memory_ref_and_projection_watermark() {
+    let repo = create_committed_repo_via_cli();
+    let branch_output = run_libra_command(&["branch", "feature"], repo.path());
+    assert_cli_success(&branch_output, "branch feature");
+    let target_op_id = latest_operation_id(repo.path());
+
+    let _guard = ChangeDirGuard::new(repo.path());
+    let current_oid = Head::current_commit()
+        .await
+        .expect("current commit")
+        .to_string();
+    Branch::update_branch("libra/memory/repo", &current_oid, None)
+        .await
+        .expect("seed Memory authority");
+
+    let db = get_db_conn_instance().await;
+    let graph = OperationService::load_restore_view_by_operation_with_conn(&db, &target_op_id)
+        .await
+        .expect("load target operation")
+        .expect("target operation graph");
+    let mut refs = graph.refs.clone();
+    refs.push(OperationViewRefRecord {
+        view_id: graph.view.view_id.clone(),
+        ref_kind: "branch".to_string(),
+        ref_name: "libra/memory/repo".to_string(),
+        ref_remote: None,
+        target_oid: "2222222222222222222222222222222222222222".to_string(),
+    });
+    OperationService::replace_view_refs_with_conn(&db, &graph.view.view_id, &refs)
+        .await
+        .expect("seed legacy operation view");
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO memory_projection_state(scope_key, projected_ref_oid, last_event_seq, schema_version, policy_version, rebuilt_at) VALUES (?, ?, 42, 1, 'repo-default-v1', 1)",
+        ["test-scope".into(), current_oid.clone().into()],
+    ))
+    .await
+    .expect("seed projection watermark");
+
+    let preview = run_json_op(repo.path(), &["restore", &target_op_id, "--dry-run"]);
+    assert_eq!(preview["data"]["action"], "restore-preview");
+    assert_eq!(
+        preview["data"]["skipped_owned_refs"],
+        serde_json::json!(["libra/memory/repo"])
+    );
+
+    let restored = run_json_op(repo.path(), &["restore", &target_op_id]);
+    assert_eq!(
+        restored["data"]["skipped_owned_refs"],
+        serde_json::json!(["libra/memory/repo"])
+    );
+    let memory = Branch::find_branch_result("libra/memory/repo", None)
+        .await
+        .expect("query Memory authority")
+        .expect("Memory authority remains");
+    assert_eq!(memory.commit.to_string(), current_oid);
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT projected_ref_oid, last_event_seq FROM memory_projection_state WHERE scope_key = 'test-scope'"
+                .to_string(),
+        ))
+        .await
+        .expect("query watermark")
+        .expect("watermark row");
+    let projected: String = row.try_get("", "projected_ref_oid").unwrap();
+    let sequence: i64 = row.try_get("", "last_event_seq").unwrap();
+    assert_eq!(projected, current_oid);
+    assert_eq!(sequence, 42);
 }

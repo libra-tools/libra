@@ -1,0 +1,12 @@
+{
+  "responses": [
+    {
+      "match": {
+        "contains": "task:test"
+      },
+      "type": "text",
+      "text": "{\"summary\":{\"epistemic_status\":\"inference\",\"claim\":\"the task completed after the focused change\",\"confidence\":\"medium\",\"evidence_fragment_ids\":[\"task:test\"]},\"observations\":[{\"epistemic_status\":\"observation\",\"claim\":\"the task reached a terminal state\",\"confidence\":null,\"evidence_fragment_ids\":[\"task:test\"]}],\"inferences\":[],\"decisions\":[],\"failed_attempts\":[],\"unresolved\":[]}",
+      "delayMs": 0
+    }
+  ]
+}

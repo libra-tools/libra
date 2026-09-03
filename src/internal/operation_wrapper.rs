@@ -22,6 +22,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::internal::{
+    ai::linear_ref::OwnedRefSpec,
     branch::Branch,
     head::Head,
     model::reference,
@@ -1466,6 +1467,9 @@ async fn collect_final_view_with_conn<C: sea_orm::ConnectionTrait>(
             .await
             .map_err(|err| DbErr::Custom(format!("failed to list local branches: {err}")))?;
         for branch in local_branches {
+            if !operation_snapshot_includes_branch(&branch.name) {
+                continue;
+            }
             records.push(OperationViewRefRecord {
                 view_id: view_id.to_string(),
                 ref_kind: "branch".to_string(),
@@ -1521,6 +1525,10 @@ async fn collect_final_view_with_conn<C: sea_orm::ConnectionTrait>(
         refs,
         workspace,
     })
+}
+
+fn operation_snapshot_includes_branch(name: &str) -> bool {
+    OwnedRefSpec::for_storage_name(name).is_none_or(|spec| spec.policy().operation_snapshot)
 }
 
 /*
@@ -2131,3 +2139,15 @@ mod tests {
     }
 }
 */
+
+#[cfg(test)]
+mod owned_ref_policy_tests {
+    use super::operation_snapshot_includes_branch;
+
+    #[test]
+    fn operation_snapshot_omits_only_exact_memory_ref() {
+        assert!(!operation_snapshot_includes_branch("libra/memory/repo"));
+        assert!(operation_snapshot_includes_branch("libra/memory/repo-user"));
+        assert!(operation_snapshot_includes_branch("feature/memory"));
+    }
+}

@@ -63,6 +63,8 @@ use crate::internal::ai::{
         CompletionError, CompletionModel, CompletionStreamEvent, CompletionUsage,
         CompletionUsageSummary, Message,
     },
+    context_budget::ContextBudget,
+    memory::{MemoryRuntime, MemoryRuntimeErrorKind},
     runtime::{
         AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig, AgentSnapshot,
         DeferredPlanExecutionExecutor, ExecutionControlService, InteractionResponse,
@@ -115,6 +117,20 @@ fn stable_phase1_gate_id(prefix: &str, source_interaction_id: &str) -> String {
     identity.update(b"\0");
     identity.update(source_interaction_id.as_bytes());
     format!("{prefix}-{}", hex::encode(identity.finalize()))
+}
+
+fn intent_memory_query(spec: &crate::internal::ai::intentspec::IntentSpec) -> String {
+    std::iter::once(spec.intent.summary.as_str())
+        .chain(std::iter::once(spec.intent.problem_statement.as_str()))
+        .chain(
+            spec.intent
+                .objectives
+                .iter()
+                .map(|objective| objective.title.as_str()),
+        )
+        .chain(spec.intent.in_scope.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn phase1_durable_input(confirmed: &ConfirmedIntentForPhase1) -> String {
@@ -1671,9 +1687,69 @@ struct HeadlessTurnExecutor<M: CompletionModel + 'static> {
     interaction_transition: Arc<Mutex<()>>,
     /// Optional MCP server for formal Phase 0 `write_intent` persistence.
     mcp_server: Option<Arc<crate::internal::ai::mcp::server::LibraMcpServer>>,
+    /// Optional repository Memory runtime. It owns generation, recall and
+    /// receipt persistence; Agent paths only provide semantic request text.
+    memory_runtime: Option<Arc<MemoryRuntime>>,
+}
+
+fn attach_prepared_memory_context(
+    mut config: super::super::agent::runtime::tool_loop::ToolLoopConfig,
+    prepared: Result<Option<String>, MemoryRuntimeErrorKind>,
+) -> Result<super::super::agent::runtime::tool_loop::ToolLoopConfig, RuntimeWorkerError> {
+    match prepared {
+        Ok(Some(memory_section)) => {
+            if let Some(preamble) = config.preamble.as_mut() {
+                preamble.push_str("\n\n");
+                preamble.push_str(&memory_section);
+            } else {
+                config.preamble = Some(memory_section);
+            }
+        }
+        Ok(None) => {}
+        Err(MemoryRuntimeErrorKind::ReceiptPersistenceFailed) => {
+            return Err(RuntimeWorkerError::ExecutionFailed(
+                "Memory context selection receipt could not be persisted; the Agent request was not started"
+                    .to_string(),
+            ));
+        }
+        Err(kind) => {
+            tracing::warn!(
+                ?kind,
+                "Memory recall failed; this Agent request will run without injected Memory"
+            );
+        }
+    }
+    Ok(config)
 }
 
 impl<M: CompletionModel + 'static> HeadlessTurnExecutor<M> {
+    /// Attach only a fully selected and durably receipted Memory section.
+    /// Ordinary recall failures never reuse an older section. A receipt write
+    /// failure aborts before the provider/tool loop because continuing would
+    /// make the injected-context decision unauditable.
+    async fn with_memory_context(
+        &self,
+        semantic_request: &str,
+        config: super::super::agent::runtime::tool_loop::ToolLoopConfig,
+    ) -> Result<super::super::agent::runtime::tool_loop::ToolLoopConfig, RuntimeWorkerError> {
+        let Some(runtime) = self.memory_runtime.as_ref() else {
+            return Ok(config);
+        };
+        attach_prepared_memory_context(
+            config,
+            runtime
+                .prepare_context(semantic_request)
+                .await
+                .map_err(|error| error.kind()),
+        )
+    }
+
+    fn schedule_memory_maintenance(&self) {
+        if let Some(runtime) = self.memory_runtime.as_ref() {
+            runtime.schedule_maintenance();
+        }
+    }
+
     /// A late terminal result must not erase an earlier reconciliation
     /// boundary merely because the worker eventually returned.
     async fn preserve_reconciliation(&self) -> bool {
@@ -1911,6 +1987,46 @@ where
             .map(HeadlessSessionPersistence::durability_session_id)
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let memory_runtime = match (
+            mcp_server
+                .as_ref()
+                .and_then(|server| server.intent_history_manager.clone()),
+            (config_factory)().usage_context,
+        ) {
+            (Some(memory_history), Some(usage_context)) => {
+                let budget = ContextBudget::for_provider_model(
+                    &usage_context.provider,
+                    &usage_context.model,
+                );
+                match MemoryRuntime::open(
+                    memory_history,
+                    model.clone(),
+                    usage_context.model,
+                    budget,
+                )
+                .await
+                {
+                    Ok(runtime) => Some(Arc::new(runtime)),
+                    Err(error) => {
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            "Memory runtime could not start; Agent execution will continue without Memory"
+                        );
+                        None
+                    }
+                }
+            }
+            (Some(_), None) => {
+                tracing::debug!(
+                    "Memory runtime is unavailable because provider/model metadata is absent"
+                );
+                None
+            }
+            (None, _) => None,
+        };
+        if let Some(runtime) = memory_runtime.as_ref() {
+            runtime.schedule_maintenance();
+        }
         let executor = Arc::new(HeadlessTurnExecutor {
             session: session.clone(),
             history: history.clone(),
@@ -1928,6 +2044,7 @@ where
             pending_intent_reviews: pending_intent_reviews.clone(),
             pending_intent_revision: pending_intent_revision.clone(),
             mcp_server,
+            memory_runtime,
         });
         let plan_execution_executor = Arc::new(DeferredPlanExecutionExecutor::new());
         let worker_executor = Arc::new(WebRuntimeTurnExecutor {
@@ -3492,6 +3609,11 @@ where
         let model = (*self.turn_executor.model).clone();
         let base_registry = self.turn_executor.registry.clone();
         let mut tool_loop_config = (self.turn_executor.config_factory)();
+        tool_loop_config = self
+            .turn_executor
+            .with_memory_context(&intent_memory_query(&spec), tool_loop_config)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
         let mcp_server = self.turn_executor.mcp_server.clone();
         let working_dir = base_registry.working_dir().to_path_buf();
         let session = self.session.clone();
@@ -5307,6 +5429,7 @@ where
                 return Err(error);
             }
         };
+        config = self.with_memory_context(&request.input, config).await?;
         let result = run_tool_loop_with_history_and_observer(
             self.model.as_ref(),
             prior_history,
@@ -5780,11 +5903,13 @@ where
         request: TurnRequest,
         context: RuntimeExecutionContext,
     ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
-        if is_plan_execution_turn(&request) {
+        let result = if is_plan_execution_turn(&request) {
             self.plan.execute(request, context).await
         } else {
             self.chat.execute(request, context).await
-        }
+        };
+        self.chat.schedule_memory_maintenance();
+        result
     }
 
     async fn respond(
@@ -5793,7 +5918,9 @@ where
         interaction: InteractionResponse,
         context: RuntimeExecutionContext,
     ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
-        self.chat.respond(request, interaction, context).await
+        let result = self.chat.respond(request, interaction, context).await;
+        self.chat.schedule_memory_maintenance();
+        result
     }
 
     async fn interaction_resolution(
@@ -5935,6 +6062,9 @@ where
             ),
             None => phase1_planning_prompt(&confirmed.intent_spec_json),
         };
+        config = self
+            .with_memory_context(&intent_memory_query(&spec), config)
+            .await?;
         let turn_result = run_tool_loop_with_history_and_observer(
             self.model.as_ref(),
             self.history.lock().await.clone(),
@@ -10833,6 +10963,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn receipt_persistence_failure_stops_before_tool_loop_configuration() {
+        let error = attach_prepared_memory_context(
+            crate::internal::ai::agent::runtime::tool_loop::ToolLoopConfig::default(),
+            Err(MemoryRuntimeErrorKind::ReceiptPersistenceFailed),
+        )
+        .expect_err("an unaudited Memory selection must stop the Agent request");
+        assert!(matches!(error, RuntimeWorkerError::ExecutionFailed(message)
+            if message.contains("receipt") && message.contains("not started")));
+    }
 
     fn revision_test_spec(summary: &str) -> crate::internal::ai::intentspec::IntentSpec {
         use crate::internal::ai::intentspec::{

@@ -1,0 +1,12 @@
+{
+  "responses": [
+    {
+      "match": {
+        "contains": "task_episode:test-task"
+      },
+      "type": "text",
+      "text": "{\"summary\":{\"epistemic_status\":\"inference\",\"claim\":\"the iteration converged after correcting a repeated failure\",\"confidence\":\"medium\",\"evidence_fragment_ids\":[\"intent:test\",\"task_episode:test-task\"]},\"observations\":[{\"epistemic_status\":\"observation\",\"claim\":\"one pinned task records a failed attempt\",\"confidence\":null,\"evidence_fragment_ids\":[\"task_episode:test-task\"]}],\"inferences\":[],\"decisions\":[],\"failed_attempts\":[],\"unresolved\":[]}",
+      "delayMs": 0
+    }
+  ]
+}

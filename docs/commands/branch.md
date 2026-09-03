@@ -57,6 +57,9 @@ The `--contains` and `--no-contains` filters (aliased as `--with` and `--without
 | | `--no-column` | | Do not lay the branch list out in columns (equivalent to `--column=never`), countermanding an earlier `--column` (last one wins). Branches list one-per-line by default, so on its own this is a no-op. |
 | `-v` | `--verbose` | | List each branch with its tip's short sha and commit subject. Repeat (`-vv`) to also show the upstream-tracking segment `[<upstream>: ahead N, behind M]` (counts omitted when the remote-tracking ref has not been fetched; nothing shown for a branch with no configured upstream). Takes precedence over `--column`. |
 
+Libra-owned local-only Memory state is hidden from local, remote, and `--all`
+branch listings. Ordinary user branches with similar names remain visible.
+
 ### Flag examples
 
 ```bash

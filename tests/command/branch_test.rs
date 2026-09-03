@@ -35,6 +35,64 @@ use tempfile::tempdir;
 
 use super::*;
 
+#[tokio::test]
+#[serial(cwd)]
+async fn memory_branch_is_hidden_and_locked_across_user_mutation_commands() {
+    let repo = create_committed_repo_via_cli();
+    let _guard = ChangeDirGuard::new(repo.path());
+    let oid = Head::current_commit()
+        .await
+        .expect("current commit")
+        .to_string();
+    Branch::update_branch("libra/memory/repo", &oid, None)
+        .await
+        .expect("seed Memory ref");
+    Branch::update_branch("libra/memory/repo-user", &oid, None)
+        .await
+        .expect("seed lookalike user ref");
+
+    let listing = run_libra_command(&["branch"], repo.path());
+    assert_cli_success(&listing, "branch list");
+    let listing_text = String::from_utf8_lossy(&listing.stdout);
+    let lines: Vec<&str> = listing_text
+        .lines()
+        .map(|line| line.trim_start_matches(['*', ' ']))
+        .collect();
+    assert!(lines.contains(&"libra/memory/repo-user"));
+    assert!(!lines.contains(&"libra/memory/repo"));
+
+    for (label, args) in [
+        ("delete", vec!["branch", "-D", "libra/memory/repo"]),
+        (
+            "rename",
+            vec!["branch", "-m", "libra/memory/repo", "renamed"],
+        ),
+        ("switch", vec!["switch", "libra/memory/repo"]),
+        ("checkout", vec!["checkout", "libra/memory/repo"]),
+        ("reset", vec!["reset", "libra/memory/repo"]),
+        (
+            "update-ref",
+            vec!["update-ref", "refs/heads/libra/memory/repo", oid.as_str()],
+        ),
+        (
+            "symbolic-ref",
+            vec!["symbolic-ref", "HEAD", "refs/heads/libra/memory/repo"],
+        ),
+    ] {
+        let output = run_libra_command(&args, repo.path());
+        assert!(
+            !output.status.success(),
+            "{label} must reject the Memory ref"
+        );
+    }
+    assert!(
+        Branch::find_branch_result("libra/memory/repo", None)
+            .await
+            .expect("query Memory ref")
+            .is_some()
+    );
+}
+
 /// Scenario: `libra branch <new> <bad-ref>` must reject the invalid start
 /// point with exit 129 and a structured `LBR-CLI-003` error. Pins the CLI
 /// usage error envelope.

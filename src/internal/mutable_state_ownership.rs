@@ -349,6 +349,92 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         owner: StateOwner::Repository,
         rationale: "approvals and append-only logs (repo-wide by design, §C.4.1.1)",
     },
+    // ── Shared context-selection audit and Memory state (M2) ────────────
+    MutableStateSurface {
+        table: "context_selection_receipt",
+        owner: StateOwner::Repository,
+        rationale: "append-only context-selection receipts audit repository-scoped Agent inputs",
+    },
+    MutableStateSurface {
+        table: "context_selection_receipt_retention",
+        owner: StateOwner::Repository,
+        rationale: "repository-wide retention watermark bounds the shared receipt ledger",
+    },
+    MutableStateSurface {
+        table: "memory_compile_job",
+        owner: StateOwner::Repository,
+        rationale: "bounded per-root Memory compiler jobs live in the shared repository database",
+    },
+    MutableStateSurface {
+        table: "memory_compile_observer_state",
+        owner: StateOwner::Repository,
+        rationale: "Memory source-ref scan watermarks are shared repository runtime state",
+    },
+    MutableStateSurface {
+        table: "memory_episode_path",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable Episode-to-code-path projection; logical scope_key is not database ownership",
+    },
+    MutableStateSurface {
+        table: "memory_head",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable Memory head projection shared by repository worktrees",
+    },
+    MutableStateSurface {
+        table: "memory_link_index",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable Memory relationship projection shared by repository worktrees",
+    },
+    MutableStateSurface {
+        table: "memory_note_index",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable Memory note projection; semantic scope is stored in scope_key",
+    },
+    MutableStateSurface {
+        table: "memory_path_summary",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable Memory taxonomy summary shared by repository worktrees",
+    },
+    MutableStateSurface {
+        table: "memory_projection_state",
+        owner: StateOwner::Repository,
+        rationale: "repository Memory projection watermark keyed by logical scope_key",
+    },
+    MutableStateSurface {
+        table: "memory_revision_index",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable Memory revision projection shared by repository worktrees",
+    },
+    MutableStateSurface {
+        table: "memory_episode_search_doc",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable single-copy Episode search documents shared by repository worktrees",
+    },
+    MutableStateSurface {
+        table: "memory_episode_fts",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable external-content FTS5 virtual table for Episode search",
+    },
+    MutableStateSurface {
+        table: "memory_episode_fts_config",
+        owner: StateOwner::Repository,
+        rationale: "SQLite-owned persistent FTS5 configuration shadow table",
+    },
+    MutableStateSurface {
+        table: "memory_episode_fts_data",
+        owner: StateOwner::Repository,
+        rationale: "SQLite-owned persistent FTS5 segment-data shadow table",
+    },
+    MutableStateSurface {
+        table: "memory_episode_fts_docsize",
+        owner: StateOwner::Repository,
+        rationale: "SQLite-owned persistent FTS5 document-size shadow table",
+    },
+    MutableStateSurface {
+        table: "memory_episode_fts_idx",
+        owner: StateOwner::Repository,
+        rationale: "SQLite-owned persistent FTS5 segment-index shadow table",
+    },
     MutableStateSurface {
         table: "cherry_pick_state",
         owner: StateOwner::Repository,
@@ -487,9 +573,12 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "agent_usage_stats__rebuild",
     "approved_permission_provenance_down_guard",
     "bisect_state__down_guard_2026072301",
+    "context_selection_receipt_down_guard",
     "head_scope_unique_guard",
     "layer__down_guard_2026072303",
     "layer__legacy_rows_need_explicit_adopt_2026072303",
+    "memory_core_down_guard",
+    "memory_fts_search_down_guard",
     "operation__down_guard_2026073003",
     "operation__down_guard_2026073004",
     "operation_scope_provenance_down_guard",
@@ -652,7 +741,12 @@ mod tests {
         created
     }
 
-    /// Every `CREATE TABLE` name in a lowercased SQL corpus.
+    /// Every persistent table name in a lowercased SQL corpus.
+    ///
+    /// FTS5 virtual tables materialize four persistent SQLite-owned shadow
+    /// tables for this schema shape. They are mutable repository state too,
+    /// so derive and classify them explicitly instead of hiding them behind
+    /// a name-pattern exemption.
     fn tables_in(sql: &str) -> BTreeSet<String> {
         let mut created = BTreeSet::new();
         for chunk in sql.split("create table").skip(1) {
@@ -661,7 +755,41 @@ mod tests {
                 created.insert(name);
             }
         }
+        for chunk in sql.split("create virtual table").skip(1) {
+            let name = table_name_after(chunk);
+            if name.is_empty() {
+                continue;
+            }
+            created.insert(name.clone());
+            let statement = chunk.split(';').next().unwrap_or("");
+            if statement.contains("using fts5") {
+                for suffix in ["config", "data", "docsize", "idx"] {
+                    created.insert(format!("{name}_{suffix}"));
+                }
+            }
+        }
         created
+    }
+
+    #[test]
+    fn fts5_virtual_table_scan_includes_persistent_shadow_tables() {
+        let tables = tables_in(
+            "create virtual table if not exists memory_episode_fts using fts5(\
+             goal, content='memory_episode_search_doc', content_rowid='rowid');",
+        );
+        assert_eq!(
+            tables,
+            [
+                "memory_episode_fts",
+                "memory_episode_fts_config",
+                "memory_episode_fts_data",
+                "memory_episode_fts_docsize",
+                "memory_episode_fts_idx",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
     }
 
     /// PRODUCTION Rust DDL across the whole `src/` tree, minus the explicit

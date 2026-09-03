@@ -22,6 +22,11 @@ one source ref and may map it to an exact local destination (`<src>:<dst>`). Whe
 explicit refspec is given, `remote.<name>.fetch` entries are honored; if none exist,
 all advertised branches use the default `refs/remotes/<name>/*` mapping.
 
+The repository-local Memory authority (`refs/heads/libra/memory/repo`) is
+excluded from ordinary discovery plans and wildcard expansion. Explicit
+refspecs cannot name it as a source or local destination, and a remote HEAD
+that points at it is ignored when choosing the default working branch.
+
 Fetch supports SSH, HTTPS, local file, and `git://` transports. Vault-backed SSH keys
 are loaded automatically when configured via `vault.ssh.<remote>.privkey`.
 

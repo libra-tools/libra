@@ -478,7 +478,7 @@ pub async fn upgrade_database_schema(db_path: &Path) -> io::Result<SchemaUpgrade
     apply_database_schema_upgrades(&conn).await
 }
 
-async fn inspect_database_schema_for_connection(
+pub(crate) async fn inspect_database_schema_for_connection(
     conn: &DatabaseConnection,
 ) -> io::Result<SchemaCompatibility> {
     let current = migration::current_builtin_schema_version_readonly(conn)
@@ -487,25 +487,29 @@ async fn inspect_database_schema_for_connection(
     let latest = migration::latest_builtin_schema_version()
         .map_err(|err| IOError::other(format!("Failed to inspect built-in migrations: {err}")))?;
 
+    Ok(classify_schema_compatibility(current, latest))
+}
+
+fn classify_schema_compatibility(current: Option<i64>, latest: Option<i64>) -> SchemaCompatibility {
     match (current, latest) {
-        (_, None) => Ok(SchemaCompatibility::Compatible {
+        (_, None) => SchemaCompatibility::Compatible {
             current_version: current,
             latest_version: latest,
-        }),
-        (Some(current), Some(latest)) if current == latest => Ok(SchemaCompatibility::Compatible {
+        },
+        (Some(current), Some(latest)) if current == latest => SchemaCompatibility::Compatible {
             current_version: Some(current),
             latest_version: Some(latest),
-        }),
+        },
         (Some(current), Some(latest)) if current > latest => {
-            Ok(SchemaCompatibility::UnsupportedFuture {
+            SchemaCompatibility::UnsupportedFuture {
                 current_version: current,
                 latest_version: Some(latest),
-            })
+            }
         }
-        (current, Some(latest)) => Ok(SchemaCompatibility::UpgradeRequired {
+        (current, Some(latest)) => SchemaCompatibility::UpgradeRequired {
             current_version: current,
             latest_version: latest,
-        }),
+        },
     }
 }
 
@@ -872,6 +876,39 @@ mod tests {
         config, object_index,
         reference::{self, ConfigKind},
     };
+
+    #[test]
+    fn memory_core_old_reader_rejects_migrated_schema() {
+        assert_eq!(
+            classify_schema_compatibility(Some(2026082501), Some(2026082401)),
+            SchemaCompatibility::UnsupportedFuture {
+                current_version: 2026082501,
+                latest_version: Some(2026082401),
+            }
+        );
+    }
+
+    #[test]
+    fn memory_fts_old_reader_rejects_migrated_schema() {
+        assert_eq!(
+            classify_schema_compatibility(Some(2026082502), Some(2026082501)),
+            SchemaCompatibility::UnsupportedFuture {
+                current_version: 2026082502,
+                latest_version: Some(2026082501),
+            }
+        );
+    }
+
+    #[test]
+    fn context_receipt_old_reader_rejects_migrated_schema() {
+        assert_eq!(
+            classify_schema_compatibility(Some(2026082503), Some(2026082502)),
+            SchemaCompatibility::UnsupportedFuture {
+                current_version: 2026082503,
+                latest_version: Some(2026082502),
+            }
+        );
+    }
 
     /// TestDbPath is a helper struct create and delete test database file
     struct TestDbPath(String);

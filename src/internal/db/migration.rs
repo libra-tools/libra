@@ -1403,6 +1403,31 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations.sql"),
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations_down.sql"),
         ),
+        // M2-02: rebuildable Agent Memory projections plus bounded compiler
+        // job/observer state. FTS and receipts intentionally land separately.
+        sql_migration(
+            2026082501,
+            "memory_core",
+            include_str!("../../../sql/migrations/2026082501_memory_core.sql"),
+            include_str!("../../../sql/migrations/2026082501_memory_core_down.sql"),
+        ),
+        // M2-02F: a single-copy Episode search document and its
+        // external-content FTS5 postings. Runtime synchronization is owned by
+        // internal::ai::memory::fts_sql; no triggers or fallback scan exist.
+        sql_migration(
+            2026082502,
+            "memory_fts_search",
+            include_str!("../../../sql/migrations/2026082502_memory_fts_search.sql"),
+            include_str!("../../../sql/migrations/2026082502_memory_fts_search_down.sql"),
+        ),
+        // M2-02R: the single local-only context selection receipt ledger shared
+        // by Memory and mainline, plus its bounded retention watermark.
+        sql_migration(
+            2026082503,
+            "context_selection_receipt",
+            include_str!("../../../sql/migrations/2026082503_context_selection_receipt.sql"),
+            include_str!("../../../sql/migrations/2026082503_context_selection_receipt_down.sql"),
+        ),
     ]
 }
 
@@ -1850,9 +1875,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 57);
+        assert_eq!(runner.len(), 60);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026082401));
+        assert_eq!(runner.max_registered_version(), Some(2026082503));
     }
 
     #[test]

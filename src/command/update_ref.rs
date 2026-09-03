@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::{
     internal::{
-        branch::Branch,
+        branch::{Branch, is_ai_managed_branch},
         db::get_db_conn_instance,
         reflog::{Reflog, ReflogAction, ReflogContext},
     },
@@ -120,6 +120,15 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
     let branch = parse_heads_ref(&args.ref_name).map_err(fatal)?;
     if !util::is_valid_refname(&args.ref_name) {
         return Err(fatal(format!("invalid ref name '{}'", args.ref_name)));
+    }
+    if is_ai_managed_branch(branch) {
+        return Err(CliError::fatal(format!(
+            "cannot update '{}': branch '{branch}' is managed by Libra",
+            args.ref_name
+        ))
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("use the dedicated Libra command that owns this internal ref"));
     }
     // Part C W0 (§C.11): refuse to move or delete a branch checked out in
     // ANOTHER worktree — its HEAD would be left dangling or its working tree

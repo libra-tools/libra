@@ -145,6 +145,7 @@ Every Libra command accepts the following global flags:
 | `libra graph` | | Inspect a Libra Code thread version graph (`--json`/`--machine`; interactive TUI entry removed in the W5 breaking release, use Web Code UI) | [graph.md](graph.md) |
 | `libra sandbox` | | Inspect AI sandbox diagnostics, including OS backend availability and downgrade warnings | [sandbox.md](sandbox.md) |
 | `libra agent` | | Manage external-agent capture, checkpoints, hooks, and RPC adapters | [agent.md](agent.md) |
+| `libra memory` | | Search, inspect, diagnose, and rebuild repository development-history Memory | [memory.md](memory.md) |
 
 ### Low-Level & Inspection
 
@@ -211,6 +212,7 @@ On error:
 | `LBR-IDX-*` | Index/staging area errors (corrupt index, lock contention) |
 | `LBR-OBJ-*` | Object storage errors (missing object, hash mismatch) |
 | `LBR-VAULT-*` | Vault and encryption errors (unseal failure, key generation) |
+| `LBR-MEMORY-*` | Agent Memory query, policy, projection, and storage errors |
 
 ## Design Philosophy
 

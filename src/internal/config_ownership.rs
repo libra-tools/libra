@@ -374,6 +374,14 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
 /// namespaces and fails when a new one is missing here.
 pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
     (
+        "REPOSITORY_KEYED_DIGEST_CACHE",
+        "keyed by canonical repository database path plus immutable repository id; bounded to 64 entries",
+    ),
+    (
+        "CURRENT_PROCESS_OWNER_IDENTITY",
+        "process PID/start-time/boot identity; input-independent and holds no repository state",
+    ),
+    (
         "WORKSPACE_CONTEXT_CACHE",
         "keyed by canonical workspace PathBuf — per-workdir, no cross-scope reuse",
     ),

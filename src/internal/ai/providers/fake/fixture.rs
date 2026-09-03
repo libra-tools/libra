@@ -172,6 +172,9 @@ pub enum FakeResponseAction {
         #[serde(default, rename = "delayMs", alias = "delay_ms")]
         delay_ms: u64,
     },
+    /// Build a structurally valid Episode proposal from the fragment IDs in
+    /// the latest Memory compiler request. Test-provider only.
+    MemoryEpisode,
 }
 
 impl Default for FakeResponseAction {
@@ -189,6 +192,7 @@ impl FakeResponseAction {
             Self::Text { delay_ms, .. }
             | Self::ToolCall { delay_ms, .. }
             | Self::Error { delay_ms, .. } => *delay_ms,
+            Self::MemoryEpisode => 0,
         };
         Duration::from_millis(millis)
     }
@@ -196,14 +200,14 @@ impl FakeResponseAction {
     pub fn stream(&self) -> &[FakeStreamDelta] {
         match self {
             Self::Text { stream, .. } | Self::ToolCall { stream, .. } => stream,
-            Self::Error { .. } => &[],
+            Self::Error { .. } | Self::MemoryEpisode => &[],
         }
     }
 
     pub fn usage(&self) -> Option<CompletionUsageSummary> {
         match self {
             Self::Text { usage, .. } | Self::ToolCall { usage, .. } => usage.clone(),
-            Self::Error { .. } => None,
+            Self::Error { .. } | Self::MemoryEpisode => None,
         }
     }
 }

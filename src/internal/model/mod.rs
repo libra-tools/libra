@@ -23,6 +23,14 @@ pub mod config;
 pub mod config_kv;
 pub mod layer;
 pub mod layer_path;
+pub mod memory_episode_path;
+pub mod memory_episode_search_doc;
+pub mod memory_head;
+pub mod memory_link_index;
+pub mod memory_note_index;
+pub mod memory_path_summary;
+pub mod memory_projection_state;
+pub mod memory_revision_index;
 pub mod metadata_kv;
 pub mod object_index;
 pub mod object_obliteration;
@@ -41,5 +49,7 @@ pub mod sparse_view;
 pub mod working_dirty;
 pub mod working_dirty_meta;
 
+#[cfg(test)]
+mod memory_model_tests;
 #[cfg(test)]
 mod reference_test;

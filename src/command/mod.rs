@@ -75,6 +75,7 @@ pub mod mailinfo;
 pub mod maintenance;
 #[cfg(feature = "fastcdc")]
 pub mod media;
+pub mod memory;
 pub mod merge;
 pub mod merge_base;
 pub mod merge_file;

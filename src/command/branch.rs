@@ -32,7 +32,10 @@ use crate::{
     command::{get_target_commit, load_object, log::get_reachable_commits},
     info_println,
     internal::{
-        ai::automation::{VCS_EVENT_POST_BRANCH, dispatch_current_repo_vcs_event_to_history},
+        ai::{
+            automation::{VCS_EVENT_POST_BRANCH, dispatch_current_repo_vcs_event_to_history},
+            linear_ref::OwnedRefSpec,
+        },
         branch::{self, Branch},
         config::ConfigKv,
         db::get_db_conn_instance,
@@ -1839,6 +1842,12 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
     } else {
         vec![]
     };
+    for branches in [&mut local_branches, &mut remote_branches] {
+        branches.retain(|branch| {
+            OwnedRefSpec::for_storage_name(&branch.name)
+                .is_none_or(|spec| spec.policy().visible_to_branch)
+        });
+    }
 
     let points_at = match args.points_at.as_deref() {
         Some(points_at) => Some(

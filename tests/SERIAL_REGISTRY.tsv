@@ -102,7 +102,10 @@ manifest_roles_oids_and_lengths_match_actual_blobs	lane:cloud_live+cwd+env+hash_
 mcp_created_task_is_observable_through_web_sse	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 mcp_http_and_stdio_expose_identical_tool_set	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 mega_fastcdc_http_interop	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+memory_branch_is_hidden_and_locked_across_user_mutation_commands	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+memory_public_cli_lifecycle_after_agent_terminal	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 metadata_model_field_prefers_event_model	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
+op_restore_preserves_memory_ref_and_projection_watermark	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 oversized_message_is_rejected_before_reaching_runtime	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 package_install_auto_enables_non_mutating_but_defers_mutating	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 package_install_list_diff_uninstall_lifecycle	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -340,6 +343,7 @@ test_config_list_defaults_to_local_scope_without_global_entries	lane:cwd	changes
 test_config_list_gpg_keys_outputs_configured_key_namespaces	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_name_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_ssh_keys_outputs_configured_public_keys	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_config_memory_keyed_digest_is_owner_managed	lane:cwd	changes cwd and process HOME through the command integration harness
 test_config_null_terminated_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_remove_and_rename_section	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_rename_section_preserves_multivalue_order	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

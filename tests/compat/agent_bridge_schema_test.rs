@@ -6,7 +6,7 @@
 //! bumping the version pin without adding a migration) surfaces here as well
 //! as in `db_migration_test`/`agent_bridge_migration_test`.
 
-use libra::internal::db::migration::{builtin_migrations, builtin_runner};
+use libra::internal::db::migration::builtin_migrations;
 
 /// The migration that creates the bridge durable projection (LB-02).
 const BRIDGE_MIGRATION_VERSION: i64 = 2026081801;
@@ -16,18 +16,19 @@ const BRIDGE_MIGRATION_VERSION: i64 = 2026081801;
 const BRIDGE_LINK_RELATIONS_VERSION: i64 = 2026082401;
 
 #[test]
-fn bridge_migrations_are_registered_and_link_relations_is_the_latest() {
-    let runner = builtin_runner().expect("builtin registry builds clean");
+fn bridge_migrations_are_registered_in_order() {
+    let migrations = builtin_migrations();
+    let bridge_index = migrations
+        .iter()
+        .position(|migration| migration.version == BRIDGE_MIGRATION_VERSION)
+        .expect("2026081801_agent_bridge_capture must stay registered");
+    let link_index = migrations
+        .iter()
+        .position(|migration| migration.version == BRIDGE_LINK_RELATIONS_VERSION)
+        .expect("2026082401_agent_bridge_link_relations must stay registered");
     assert!(
-        builtin_migrations()
-            .iter()
-            .any(|migration| migration.version == BRIDGE_MIGRATION_VERSION),
-        "2026081801_agent_bridge_capture must stay registered"
-    );
-    assert_eq!(
-        runner.max_registered_version(),
-        Some(BRIDGE_LINK_RELATIONS_VERSION),
-        "2026082401_agent_bridge_link_relations must be the latest registered migration"
+        bridge_index < link_index,
+        "the link-relations migration must follow the bridge base schema"
     );
 }
 

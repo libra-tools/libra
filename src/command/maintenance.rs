@@ -29,8 +29,11 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use git_internal::{
+    errors::GitError,
     hash::{HashKind, ObjectHash, get_hash_kind},
-    internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
+    internal::object::{
+        ObjectTrait, commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType,
+    },
 };
 use sea_orm::EntityTrait;
 use serde::Serialize;
@@ -40,7 +43,7 @@ use sha1::Digest;
 use sha2::Digest as _;
 
 use crate::{
-    command::{fetch::fetch_repository_safe, load_object_raw, log::get_reachable_commits},
+    command::{fetch::fetch_repository_safe, log::get_reachable_commits},
     internal::{
         branch::Branch,
         config::ConfigKv,
@@ -2699,6 +2702,42 @@ pub struct GcObjectSource {
     pub note: &'static str,
 }
 
+const fn memory_projection_oid(
+    location: &'static str,
+    column: &'static str,
+    note: &'static str,
+) -> GcObjectSource {
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location,
+        column,
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082501_memory_core rebuildable projection",
+        read_bound: "not read by GC; projection replay removes stale rows",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note,
+    }
+}
+
+const fn memory_runtime_oid(
+    location: &'static str,
+    column: &'static str,
+    note: &'static str,
+) -> GcObjectSource {
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location,
+        column,
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082501_memory_core bounded runtime state",
+        read_bound: "not read by GC; one bounded row per compiler root or source cursor",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note,
+    }
+}
+
 /// §C.4.3: the FILE-backed half of the inventory. Each entry names the
 /// collector or gate that implements its classification, so a reader can
 /// check the claim rather than trust it.
@@ -3264,6 +3303,138 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         read_bound: "full table scan, one query per collection pass",
         corruption: GcCorruptionPolicy::LenientSkip,
         note: "cache validity key (the tip is ref-anchored); rebuilt on demand",
+    },
+    memory_projection_oid(
+        "memory_revision_index",
+        "revision_oid",
+        "Memory revision lookup cache; the future authoritative Memory ref/object graph owns reachability, while replay can discard this row",
+    ),
+    memory_projection_oid(
+        "memory_projection_state",
+        "projected_ref_oid",
+        "Memory projection watermark; it records which authoritative ref tip was replayed and never keeps that tip alive",
+    ),
+    memory_projection_oid(
+        "memory_head",
+        "latest_revision_oid",
+        "Latest Memory revision cache; authoritative events and the Memory ref own reachability, and projection replay repairs this pointer",
+    ),
+    memory_projection_oid(
+        "memory_head",
+        "live_revision_oid",
+        "Effective Memory revision cache; authoritative events and the Memory ref own reachability, and projection replay repairs this pointer",
+    ),
+    memory_projection_oid(
+        "memory_head",
+        "effective_from_commit",
+        "Code-applicability cache derived from the authoritative Memory revision; the code ref/reflog and Memory authority, not SQLite, define retention",
+    ),
+    memory_projection_oid(
+        "memory_head",
+        "effective_until_commit",
+        "Code-applicability cache derived from the authoritative Memory revision; the code ref/reflog and Memory authority, not SQLite, define retention",
+    ),
+    memory_projection_oid(
+        "memory_link_index",
+        "source_revision_oid",
+        "Rebuildable Memory link index source; the authoritative Memory event graph owns the revision and replay can discard this row",
+    ),
+    memory_projection_oid(
+        "memory_link_index",
+        "target_revision_oid",
+        "Optional pinned Memory link target in a rebuildable index; the authoritative event graph owns retention and replay repairs the row",
+    ),
+    memory_projection_oid(
+        "memory_episode_path",
+        "revision_oid",
+        "Rebuildable Episode path lookup keyed by a Memory revision; it accelerates filtering and contributes no reachability authority",
+    ),
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "memory_episode_search_doc",
+        column: "revision_oid",
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082502_memory_fts_search rebuildable projection",
+        read_bound: "not read by GC; projection replay rebuilds the search document and FTS postings",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note: "Episode search lookup keyed by an authoritative Memory revision; SQLite search state never owns object reachability",
+    },
+    memory_runtime_oid(
+        "memory_compile_job",
+        "terminal_source_oid",
+        "Compiler input cursor into an authoritative Task or Intent source ref; bounded job state is recoverable by observation and is not an object root",
+    ),
+    memory_runtime_oid(
+        "memory_compile_observer_state",
+        "scanned_through_oid",
+        "First-parent observer watermark into an authoritative source ref; rescanning repairs it and the cursor itself keeps no object alive",
+    ),
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "context_selection_receipt",
+        column: "code_commit",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082503 local-only bounded context selection receipt",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "audit-time code anchor only; the receipt records why context was selected but does not own object reachability, so a collected commit makes replay non-reproducible",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "context_selection_receipt",
+        column: "source_heads_json",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082503 bounded JSON map of receipt source names to observed OIDs",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "audit-time source snapshot only; authoritative refs own reachability and a collected source object makes replay non-reproducible",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "context_selection_receipt",
+        column: "projection_watermarks_json",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082503 bounded JSON map of projection names to observed OIDs",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "audit-time projection watermark only; projections are rebuildable and the receipt cannot keep their source objects alive",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "context_selection_receipt",
+        column: "selected_json",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082503 bounded JSON array containing selected Memory revision OIDs",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "audit-time selection explanation only; Memory refs and events own reachability, so missing selected revisions make replay non-reproducible",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "context_selection_receipt",
+        column: "policy_hash",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082503 SHA-256 policy content digest",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "domain-separated policy digest used for receipt replay checks; it is not an object-store address and keeps no Libra object alive",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "context_selection_receipt",
+        column: "bundle_hash",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026082503 SHA-256 rendered bundle digest",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "integrity digest of the selected context bundle; the bundle is not stored as an object under this hash, so the value contributes no reachability root",
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
@@ -4190,7 +4361,7 @@ fn walk_reachable(
 
     match obj_type {
         ObjectType::Commit => {
-            let commit = load_object_raw::<Commit>(hash).map_err(|error| {
+            let commit = load_reachable_object::<Commit>(storage, hash).map_err(|error| {
                 CliError::fatal(format!(
                     "reachable commit {hash} is corrupt while computing GC roots: {error}"
                 ))
@@ -4207,7 +4378,7 @@ fn walk_reachable(
             }
         }
         ObjectType::Tree => {
-            let tree = load_object_raw::<Tree>(hash).map_err(|error| {
+            let tree = load_reachable_object::<Tree>(storage, hash).map_err(|error| {
                 CliError::fatal(format!(
                     "reachable tree {hash} is corrupt while computing GC roots: {error}"
                 ))
@@ -4218,7 +4389,7 @@ fn walk_reachable(
             }
         }
         ObjectType::Tag => {
-            let tag = load_object_raw::<GitTag>(hash).map_err(|error| {
+            let tag = load_reachable_object::<GitTag>(storage, hash).map_err(|error| {
                 CliError::fatal(format!(
                     "reachable tag {hash} is corrupt while computing GC roots: {error}"
                 ))
@@ -4236,6 +4407,14 @@ fn walk_reachable(
     }
 
     Ok(())
+}
+
+fn load_reachable_object<T: ObjectTrait>(
+    storage: &ClientStorage,
+    hash: &ObjectHash,
+) -> Result<T, GitError> {
+    let data = storage.get(hash)?;
+    T::from_bytes(&data.to_vec(), *hash)
 }
 
 /// List all loose objects in the repository, returning (hash, path) pairs.
@@ -4359,6 +4538,19 @@ fn info_println(output: &OutputConfig, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_ref_policy_remains_a_gc_root() {
+        use crate::internal::ai::linear_ref::OwnedRefSpec;
+
+        let spec = OwnedRefSpec::for_storage_name("libra/memory/repo")
+            .expect("canonical Memory ref classifies");
+        assert!(spec.policy().gc_root);
+        assert_eq!(
+            OwnedRefSpec::for_storage_name("libra/memory/repo-user"),
+            None
+        );
+    }
 
     /// The 4 MiB ledger cap is enforced on the way OUT, not only on the way
     /// in. Checking it only on read lets THIS run write a ledger every later

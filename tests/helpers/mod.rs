@@ -4,6 +4,8 @@
 //! deterministic while avoiding live provider dependencies.
 
 #[allow(dead_code)]
+pub mod memory_cli;
+#[allow(dead_code)]
 pub mod mock_codex;
 #[allow(dead_code)]
 pub mod mock_codex_ws_server;

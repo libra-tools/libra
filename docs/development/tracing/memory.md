@@ -20,7 +20,7 @@ Libra 在 [`object-model.md`](../../ai/object-model.md) 与
 
 ## 执行摘要
 
-Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / branch 记住事物，且不会像 `CLAUDE.md` 扁平大块文件那样污染上下文或不可审计。核心机制是快照（`MemoryNote`）/ 事件（`MemoryEvent`）/ 投影（SQLite）三层，历史真源落在 `refs/libra/memory/*` 的普通 Git 线性历史上。每一条写入都必须携带 `CompileRecord`（可复现），每一次注入都必须产出 `ContextReceipt`（可重放）；写入统一经 `MemoryWriter` 单一 seam，读取统一经冻结的 `ResolvedMemoryView`。安全性以 fail-closed 为底线：Draft / Quarantined / SecretLike 永不注入 prompt，MCP 工具在 C9 default-deny authorizer 落地前不注册。本设计对应长期路线图 `MEM-01..05`，并行协调 `MEM-06` 见本文 §19（见下方追溯表与 [`plan-long.md`](../plan/plan-long.md)）。
+Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / branch 记住事物，且不会像 `CLAUDE.md` 扁平大块文件那样污染上下文或不可审计。核心机制是快照（`MemoryNote`）/ 事件（`MemoryEvent`）/ 投影（SQLite）三层，历史真源落在 `refs/heads/libra/memory/*` 的普通 Git 线性历史上。每一条写入都必须携带 `CompileRecord`（可复现），每一次注入都必须产出 `ContextReceipt`（可重放）；写入统一经 `MemoryWriter` 单一 seam，读取统一经冻结的 `ResolvedMemoryView`。安全性以 fail-closed 为底线：Draft / Quarantined / SecretLike 永不注入 prompt，MCP 工具在 C9 default-deny authorizer 落地前不注册。本设计对应长期路线图 `MEM-01..05`，并行协调 `MEM-06` 见本文 §19（见下方追溯表与 [`plan-long.md`](../plan/plan-long.md)）。
 
 ### 目录
 
@@ -273,7 +273,7 @@ Libra 的映射为：
 
 本轮多维复核同时识别并修正了八个原草案中的实现阻断；后文规范均以这些结论为准：
 
-1. **ref 前缀冲突**：Git 不能同时保存 `refs/libra/memory` 与 `refs/libra/memory/...`；规范根 ref 改为 `refs/libra/memory/repo`，其它 scope 使用其兄弟 ref。
+1. **ref 前缀冲突**：Git 不能同时保存 `refs/heads/libra/memory` 与 `refs/heads/libra/memory/...`；规范根 ref 改为 `refs/heads/libra/memory/repo`，其它 scope 使用其兄弟 ref。
 2. **OID 自引用**：`MemoryNote` 正文不能包含“自身 blob OID”再参与该 OID 的计算；`revision_oid` 改为写入后派生的 envelope / event 字段，不属于序列化正文。
 3. **事件总序**：普通 Git merge 的 DAG 拓扑不是全序；每个 memory ref 必须保持 first-parent 线性历史，并以单调 `event_seq` 重放。跨 ref 合并由 `libra memory merge/cherry-pick` 重新验证并追加，不直接接受任意 merge commit。
 4. **读写分离**：`SessionAttached`、`PromptTrimmed`、`last_used_at`、`use_count` 属本地访问遥测，不写入权威 memory ref；否则一次读取也会争抢 CAS，并破坏“投影可从 note/event 完全重建”的定义。
@@ -321,7 +321,7 @@ perstate 证明 Git-native memory 的第一性产品价值并不来自新的后�
 
 - 取代 `ContextFrame`、`ContextSnapshot` 或 `MemoryAnchor`。Memory 是一个对它们形成补充的新层——见 §3.1。
 - 提供向量 / embedding 搜索引擎。基于路径的召回是默认方案；embedding 索引可作为后续扩展。
-- 在基础实现中提供图数据库。时序图与实体图可以叠加在 Memory 的事件流之上，但历史层面的真源仍然是 `refs/libra/memory*` 上的普通 Git 历史。
+- 在基础实现中提供图数据库。时序图与实体图可以叠加在 Memory 的事件流之上，但历史层面的真源仍然是 `refs/heads/libra/memory*` 上的普通 Git 历史。
 - 静默存储 secret、私有数据或不可信的网络主张。入库时必须先对敏感度（sensitivity）与可信度（trust）进行分类，任何记忆才能成为可进入 prompt 的内容。
 - 跨仓库联邦化记忆。Memory 是**按仓库（per-repo）**的构造，就像 `.libra/` 状态那样。跨仓库联邦留待将来的设计。
 - 与完整聊天历史持久化竞争。Memory 存储的是**蒸馏后的、可复用的事实**，而不是原始 transcript。Transcript 已经存放在 `.libra/sessions/*.jsonl` 与 `git-internal` 的 AI 历史中。
@@ -493,7 +493,7 @@ metrics 不进入上表的权威 namespace：高频遥测会放大 Git 历史、
 - view 解析必须 fail-closed：任何参与层出现未知 policy、watermark 不匹配、principal 不可验证或 scope 编码失败时，该层不得进入 view；安全敏感读取不得静默降级到更宽的 Repo / Global 层。
 - SessionStart 冻结初始 view；branch、worktree 或 principal 改变时必须重新解析并产生新的 `view_hash`。旧 ContextReceipt 继续引用旧 view，不被当前状态覆盖。
 - `memory status` 可按当前状态即时重算 view，并展示每层 source OID、新鲜度和排除原因；session attach / refresh 只进入本地有界 access audit，不推进 memory ref。
-- `ContextReceipt.as_of` 必须包含 `view_hash` 与完整 layer snapshot。selector 不得在一次注入过程中重新读取当前 HEAD 或 wall clock 后偷换 view。
+- `ContextSelectionReceiptV1` 通过 `code_commit` / `full_branch_ref`、`source_heads`、`projection_watermarks` 与 `policy_hash` 记录构成该冻结 view 的输入；debug/status 可按这些字段重算并对照 `view_hash`，回执不另设平行的 `as_of` envelope。selector 不得在一次注入过程中重新读取当前 HEAD 或 wall clock 后偷换 view。
 
 ## 4. 对象模型
 
@@ -519,6 +519,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 | `lifecycle` | enum | `Replacement`（覆盖式）/ `Accretive`（累加式） |
 | `body` | `String` | 被记住的陈述（允许 Markdown，保持简短） |
 | `rationale` | `Option<String>` | 可选的「为何重要」/「从何而来」说明 |
+| `episode` | `Option<EpisodePayloadV1>` | M2 研发历程负载（§4.1.3）；规范 JSON 始终输出该键，无负载时为 `null` |
 | `evidence_refs` | `Vec<EvidenceRef>` | 指向 `Evidence`、`Run`、`Decision`、commit OID 的指针，用以佐证该条记忆 |
 | `links` | `Vec<MemoryLink>` | 显式的 sibling / supports / prerequisite / contradicts / supersedes 链接 |
 | `entities` | `Vec<MemoryEntityMention>` | 可选的结构化实体 mention；用于 alias 消歧与可重建实体索引，不创建第二套实体真源 |
@@ -541,7 +542,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 - `MemoryNote` JSON 必须使用稳定字段名与向后兼容的 serde 策略。新增字段只能 additive，旧 reader 必须忽略未知字段；删除或改变字段语义必须 bump `schema_version` 并提供迁移 / rebuild 逻辑。
 - `revision_oid` 是 `MemoryNote` blob 写入后得到的 Git OID，只存在于 tree path、`MemoryEvent`、返回 envelope 与投影中，**不得**序列化进 `MemoryNote` 正文。否则会出现“正文包含自身哈希”的不可解自引用。
 - canonical JSON 必须固定 UTF-8、字段序、数字与时间格式；`content_digest` 的输入排除该字段本身。读取时同时校验 blob OID 和 `content_digest`，任一不符均视为损坏。
-- **canonical payload 的字段清单（`content_digest` 的唯一规范来源）。** 为消除「digest 不含任何存储 OID」与 `parents` / `evidence_refs` 含 Git OID 之间的冲突，digest 输入被固定为一组**明确列出的内容字段**：`schema_version`、`note_id`、`namespace`、`path`、`kind`、`scope`、`visibility`、`acl_policy_id`、`lifecycle`、`body`、`rationale`、`links`（links 中仅取 `kind` + `target_note_id`，不含 `target_revision_oid`）、`entities`、`tags`、`confidence`、`trust`、`sensitivity`、`valid_from`、`valid_until`、`effective_from_commit`、`effective_until_commit`、`expires_at`、`author`、`created_at`、`compile_record`。**排除**：`content_digest` 自身、`revision_oid`、`evidence_refs`、`parents` 以及任何 Git OID——这些是存储布局 / 引用字段，与正文内容分离，由 blob OID 与事件引用承载完整性。字段清单本身纳入 `schema_version` 的版本化语义：清单变更必须 bump schema 并提供迁移 / rebuild。
+- **canonical payload 的字段清单（`content_digest` 的唯一规范来源）。** digest 输入固定为 `schema_version`、`note_id`、`namespace`、`path`、`kind`、`scope`、`visibility`、`acl_policy_id`、`lifecycle`、`body`、`rationale`、`episode`、`evidence_refs` 的语义投影、`links` 的语义投影、`entities` 的语义投影、`tags`、`confidence`、`trust`、`sensitivity`、`valid_from`、`valid_until`、`effective_from_commit`、`effective_until_commit`、`expires_at`、`author`、`created_at`、`compile_record`。代码适用性 OID（包括 `effective_*_commit`、Episode code anchor 与 `code_range.commit_oid`）属于语义字段并参与 digest。**排除**：`content_digest` 自身、正文中不存在的 `revision_oid`、`parents`、`EvidenceRef.source_ref_oid`、`EvidenceRef.fragment_digest` 与 `MemoryLink.target_revision_oid`；这些字段用于存储定位或完整性复核。EvidenceRef 的 source plane、kind、object ID、locator、visibility、captured time 与可选 code commit 仍参与 digest。canonical writer 固定 UTF-8、对象键 Unicode 码点序、数组顺序、整数与 RFC 3339 时间格式；字段清单或投影规则变化必须 bump `schema_version` 并提供迁移 / rebuild。
 - 一个 `MemoryNote` 快照回答的是**「agent 在这一版本相信什么？」**，且永不被改写。
 - 撤销、取代或遗忘一条记忆都是一个**事件（Event）**，而非对快照的就地编辑；cache prune 不改变 note 生命周期。
 - 对同一 `note_id` 而言，`namespace`、`scope`、`path` 在逻辑上不可变。要移动一条记忆，应写一条新 note 并取代旧的（§10.2）。
@@ -558,7 +559,8 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `origin` | enum | `Explicit` / `PromotedFromAnchor` / `DistilledFromFrame` / `Classifier` / `Consolidation` / `Onboard` / `BranchFork` / `Import` / `Coordinator`（MEM-06 协调写入，additive，见 §19.4） |
+| `schema_version` | `u32` | 编译记录 schema；第一版固定为 `1` |
+| `origin` | enum | `Explicit` / `PromotedFromAnchor` / `DistilledFromFrame` / `Classifier` / `Consolidation` / `Onboard` / `BranchFork` / `Import` / `Coordinator` / `EpisodeCompiler` |
 | `producer` | `String` | 生产者标识与版本，如 `libra-memory/0.19.0` 或 `consolidation-job/1` |
 | `rules_version` | `u32` | 确定性规则集（worthiness 正则、路径验证、redaction 策略）的版本 |
 | `prompt_version` | `Option<String>` | 参与生产的 LLM prompt 模板版本；纯确定性路径为 `None` |
@@ -572,21 +574,97 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 
 - 写入事务（§4.2.1）第 1 步即校验编译记录完整性：`origin` 与调用入口不符、`input_hashes` 为空或幂等键缺失，一律 fail-closed 拒绝写入。
 - 幂等键去重只作用于**新建**（`Created`）：默认按 `idempotency_scope = Cell` 去重，即同一 `(scope, namespace, path)` cell 内同键重复摄入不产生新 note，直接返回既有 `note_id` 且不追加新事件（与 §4.2 的 event 幂等语义一致）；**不同 path 的目标互不干扰**，调用方显式指定的新路径绝不会被同内容去重静默丢弃（§7.4 纪律）。仅 consolidation / onboard 等聚合入口可显式使用 `idempotency_scope = Namespace`（键不含 path），且必须在编译记录中标注。显式 `revise` / `move` 针对既有 `note_id`，不受其约束。`memory_note_index` 的幂等唯一索引按 §5.2 相应区分两种 scope。
-- LLM 参与生产的 note（`prompt_version` / `model_id` 非空）默认最高只能进入 `Draft`；`trust` 上限沿 §7.3 规则，不因编译记录存在而放宽。
+- LLM 参与生产的普通知识 note（`prompt_version` / `model_id` 非空）默认最高只能进入 `Draft`；`trust` 上限沿 §7.3 规则，不因编译记录存在而放宽。首版 M2 Episode 是单独的全自动研发历程路径：它只消费当前 Agent 已经通过用户启动的任务、仓库身份与现有访问控制获准读取的来源，不要求用户逐条二次确认，也不按任务成功/失败、来源 trust 标签或推断置信度决定是否保留。Writer 在持久化前执行 §4.1.3 的确定性研发历程准入；通过后连续追加 `Created|Revised + Confirmed`，失败则返回有类型错误且不写入 Memory ref。compiler 自报的身份、来源范围或准入结果不生效。
 - 发现某个 producer / prompt / model 版本产出系统性坏记忆时，必须能按编译记录批量定位受影响 note 并 quarantine 或重新编译——这是把编译记录设为硬门槛的直接回报。
 - 编译记录是 note 正文的一部分，随 blob 不可变、可随投影重建；`memory_note_index` 投影为此新增 `origin` 与 `idempotency_key` 列（§5.2），存储创建版本的键以支撑去重与批量召回。
 - 每个 revision 的 producer / prompt / model / policy / input fingerprint 进入 `memory_revision_index` 投影；只在 note 级保存创建 origin 无法定位后续坏 revision，因此不能满足批量 quarantine / recompile 要求。
 - `input_hashes` 只能基于已经 redacted、canonicalized 的输入。对可能仍具可识别性的用户文本或 secret-like token，使用 repository-local keyed HMAC 并在字段中标明算法/key generation；普通 SHA-256 不能被当作匿名化。
 
+##### 仓库级密钥摘要提供器（Repository Keyed Digest）
+
+Memory 的幂等键、主体摘要、查询摘要和来源输入摘要共用一个仓库级密钥所有者 `RepositoryKeyedDigest`。调用方只能选择 `Idempotency`、`Principal`、`Query`、`SourceInput` 四种封闭用途并提交字节输入；seed、派生 key 和 HKDF label 都不暴露给调用方。
+
+- 固定配置条目为 `memory.keyed_digest.v1`。其中保存 `schema_version=1`、`generation=1`、随机 UUIDv4 `key_id` 与 32-byte seed，经现有 repository vault 加密后写入 repository-local `config_kv`。该条目由 keyed-digest provider 单独管理：`libra config` 可以只读查看其脱敏占位，但 set/add/unset、import、remove-section 与 rename-section 都不能创建、替换、移动或删除它。
+- 生成前必须在同一个 SQLite 写事务中确认 `libra/memory/*` 本地分支和 `context_selection_receipt` 行都不存在。并发首次调用由 SQLite 写锁串行化，只允许一个加密条目成为 winner；一旦出现 Memory ref 或 receipt，缺失条目不得自动补发新 seed。
+- 密码学配方固定为 `HKDF-Extract(SHA-256, salt="libra/memory/keyed-digest/salt/v1", IKM=seed)`，再对所选用途执行 `HKDF-Expand(PRK, info, 32)`，最后计算 `HMAC-SHA-256(input)`。四个 info 依次为 `libra/memory/idempotency/v1`、`libra/memory/principal/v1`、`libra/memory/query/v1`、`libra/memory/source-input/v1`。配方或 label 变化必须引入新的 generation 和迁移，不能静默修改。
+- 返回值固定携带 `version`、`key_id`、`purpose` 与 `digest`。seed、派生 key、raw principal/query 不进入 envelope、Debug、错误、日志、Git 对象、SQLite 明文字段、远端层或 CI artifact。
+- 配置缺失、重复、被明文保存、无法解密、schema/generation 未知、repository vault key 不可用，或已缓存 provider 观察到持久配置被删除/替换时，统一停止新的 digest-bearing 写入，并使用稳定错误 `LBR-MEMORY-001`。恢复方式是修复原加密条目或以独立迁移显式引入新 generation；旧 receipt 在原 key 无法恢复时标记 `non_reproducible`。
+- provider 按 canonical repository DB path 与不可变 repository ID 放入私有有界进程缓存，同一进程每仓至多解密一次。每次重新获取 provider 时读取该配置行并校验密文 SHA-256 指纹；一旦发现持久配置被删除或替换，共享有效性标记会立即毒化同一缓存项此前发出的全部 handle，后续摘要统一返回 `LBR-MEMORY-001`，修复配置后需要重启进程才能重新载入。真正的摘要热路径只执行两次进程内有效性检查与本地 O(input bytes) 的 HMAC，不访问 SQLite 或网络。
+
 #### 4.1.2 引用、链接与 policy 最小契约
 
 为使授权、provenance 与图扩展可实现，以下 supporting types 必须 versioned，不能留成无约束 JSON：
 
-- `EvidenceRef` 至少包含 `schema_version`、`source_plane`、`kind`、`object_id`、`content_hash`、`visibility`、可选 `captured_at` / `code_commit`。解析或授权失败只会降低 trust / 排除候选，绝不能通过远程 URL 即时抓取来“补齐证据”。
+- `EvidenceRefV1` 包含 `schema_version`、`source_plane`、`kind`、`object_id`、`source_ref_oid`、封闭的 `locator`、脱敏规范片段的 `fragment_digest`、`visibility` 与可选 `captured_at` / `code_commit`。locator 只允许 `object`、`event_seq`、`json_pointer`、`session_fragment`、`tool_call`、`code_range` 六种形态；Session 必须给有界序号区间，工具调用必须指定 invocation/output part，代码必须固定 commit、仓库相对路径和行范围。resolver 在授权和脱敏后重算 fragment digest；解析、授权或 digest 比对失败会隔离/排除候选，不通过网络即时补取来源。
 - `MemoryEntityMention` 至少包含 `schema_version`、`canonical_key`、`display_name`、`aliases`、`role`（subject / object / topic）、`resolution_confidence` 与 evidence 指针。`canonical_key` 是 repository-local 的规范键，不得编码 actor PII；alias 冲突只产生 merge proposal，不自动改写真源。
 - `MemoryLink` 至少包含 `kind`、`target_note_id`、可选 `target_revision_oid`、`evidence_refs` 与可选 `valid_from` / `valid_until`。link 归属于 source `MemoryNote` revision，其变化通过 source note 的新 revision 表达；需要独立 review / revoke / supersede 生命周期的关系必须建模为单独 semantic note，不能把嵌入式 link 扩成第二套事件系统。读取 link 前先对 target 重新执行 scope / ACL / sensitivity 检查；禁止先图扩展后过滤，否则计数、路径和 timing 都会泄露私有节点。
 - `acl_policy_id` 指向 canonical policy snapshot hash。policy 至少定义可读/可写 principal、允许的 namespace/scope、自动确认上限、远端存储许可、retention 与 prompt 注入许可。policy 缺失、未知或 hash 不匹配时，mutating path 与 prompt injection fail-closed。
 - `manifest.json` 固定当前 ref 的 scope、schema version、last_event_seq、policy snapshot hash 与 writer version。它不得携带 secret 或 actor PII；actor ref 使用 principal HMAC / opaque ID。
+
+#### 4.1.3 `EpisodePayloadV1` —— M2 研发历程负载
+
+M2 从现有 Intent / Task / Run / Evidence / Decision / PatchSet / Session 与代码提交编译两级研发历程：
+
+- **任务研发历程摘要（Task Episode Summary）**：汇总一个终态 Task 下的多次 Run、决策、失败尝试、未决项和代码结果。
+- **需求迭代摘要（Intent Iteration Summary）**：汇总一个终态 Intent 下已经固定 revision 的多个 Task Episode；每个贡献 Task 都必须有且只有一个 `kind=Supports` 的 `MemoryLink`，以 Task 的稳定 `note_id + revision_oid` 固定具体版本，后续 Task 修订只会触发新的 Intent revision。
+
+`MemoryWriter` 从受信任触发器和已授权 source window 机械填充身份与边界字段；`EpisodeCompiler` 只提议自然语言内容：
+
+| 字段 | 所有者 | 约束 |
+|---|---|---|
+| `schema_version` | Writer | 固定为 `1` |
+| `root_kind` / `root_id` | Writer | `task \| intent`；编译器不得输出，由 Writer 从受信任目标机械注入 |
+| `related_intent_ids` / `related_task_ids` / `related_run_ids` | Writer | 排序、去重、有界；Intent Episode 至少包含一个贡献 Task |
+| `started_at` / `ended_at` | Writer | 从来源事件时间计算，`started_at <= ended_at` |
+| `completion_status` | Writer | `completed \| failed \| cancelled`，来自终态事实 |
+| `code_change_status` | Writer | `changed \| unchanged \| unknown`，与任务成败正交 |
+| `code` | Writer | 可选 base/result commit、完整 branch ref、排序去重后的仓库相对路径 |
+| `goal` | Writer | 从已授权来源机械生成 observation，保持来源目标语义并带 EvidenceRef；compiler 不得输出或覆盖 |
+| `summary` | compiler proposal | 固定为 inference，带置信度与 EvidenceRef |
+| `observations` | compiler proposal | 每项固定为 observation，不带置信度，EvidenceRef 非空 |
+| `inferences` | compiler proposal | 每项固定为 inference，必须带置信度与 EvidenceRef |
+| `decisions` / `failed_attempts` / `unresolved` | compiler proposal | 每项显式标记 observation 或 inference，并带 EvidenceRef |
+| `omissions` | Writer | 记录每个有界集合被裁掉的条目数 |
+
+Episode 编译前先由 `EpisodeSourceResolver` 固定一份「研发历程来源窗口」
+（Episode source window）。它只接收已认证的仓库与 Agent 身份、受信任的
+Task/Intent 根、AI 历史固定版本 OID 和仓库冻结限制，不接收请求体自报的用户名、
+目录或读取范围。解析器从该固定版本验证根与关系，读取相关 Run、终态事件、Evidence、
+Decision、PatchSet、ToolInvocation 与有明确关联的 ContextFrame。SQLite 反向索引只能
+提示候选 ID，任何候选仍须在固定版本树中重新验证；无法建立明确关系的整段 Session
+不会被拼入模型输入。
+
+来源窗口按以下顺序处理：读取原始对象 → secret 规则 → `<private>` 标记规则 →
+高置信度邮箱与用户主目录规则 → 构造不可由外部代码创建的
+`RedactedEpisodeSource`。默认限制为 256 个入选对象、4096 个候选对象、单对象
+128 KiB、树对象 4 MiB、脱敏正文合计 2 MiB、64 个 ContextFrame 片段、约
+512K tokens 和 2048 个 AI 历史祖先版本。可省略的超限项以稳定 reason code 写入
+omissions；根对象和终态事实若无法在限制内完整取得则整次解析失败，不生成不完整记忆。
+
+每次解析都会产生一份规范来源清单（source manifest），保存根类型/ID、仓库 ID、
+主体 HMAC、固定来源 OID、上述限制、策略/脱敏版本、计数、omissions，以及每个实际输入
+片段的对象类型、对象 ID/OID、类型化 locator、脱敏片段 SHA-256、可选代码版本。
+清单不保存原始正文、主体明文或 secret。模型只返回引用 `fragment_id` 的自然语言提案；
+准入层把它机械映射为 `EvidenceRefV1`，拒绝模型虚构的定位器。Writer 写入前使用同一身份、
+固定版本和限制重新解析并逐项比较清单、事实和脱敏片段；任何漂移、越权或摘要不一致均不
+推进 Memory ref。
+
+`EpisodeClaimV1` 固定为 `epistemic_status + claim + confidence? + evidence_refs`。Observation 禁止携带 confidence；Inference 必须携带 confidence。校验只能证明引用存在、可见且定位/digest 匹配，不能把自然语言蕴含声明为形式化证明。
+
+首个仓库切片固定 `kind=Episodic`、`scope=Repo`、`visibility=RepoLocal`、`lifecycle=Accretive`、`namespace=default`，并使用：
+
+```text
+episodic.tasks.r-<lowercase UTF-8 hex(root_id)>
+episodic.intents.r-<lowercase UTF-8 hex(root_id)>
+```
+
+root ID 采用精确 UTF-8 字节，拒绝空值、首尾空白、控制字符和超过 120 bytes 的输入。稳定 `note_id` 使用冻结的 UUIDv5 namespace `f2b4d3a0-1c9e-4f75-8d20-2a6b7c8d9e01` 与 name bytes `<task|intent> + NUL + root_id` 生成，独立于仓库 SHA-1 / SHA-256 object format。存在 result commit 时 `effective_from_commit=result_oid`，否则使用 base OID；`effective_until_commit=None`。`episode` 有值当且仅当 `CompileRecord.origin=EpisodeCompiler`，避免普通 note 冒充自动编译结果或 Episode 丢失编译来源。
+
+解析器在反序列化前执行原始 JSON 字节上限：`CompileRecord <= 32 KiB`、`MemoryNote <= 256 KiB`、`MemoryEvent <= 128 KiB`、`EpisodePayload <= 64 KiB`、`EvidenceRef <= 16 KiB`。结构内上限为：`body <= 16 KiB`、单个自然语言/路径项 `<= 4 KiB`、标识字段 `<= 512 bytes`、每个可变集合 `<= 128` 项、单个 Session fragment `<= 256` 个序号；线性 note 的 `parents <= 1`。超限先按稳定规则裁剪并记录 omissions，仍超限则拒绝写入。
+
+所有 v1 reader 采用同一兼容规则：`MemoryNoteV1`、`MemoryEventV1`、`EpisodePayloadV1`、`EvidenceRefV1` 与 `CompileRecordV1` 在 `schema_version=1` 时忽略 additive unknown fields；未知 schema version、未知 enum、未知 lifecycle/action/state 一律拒绝。
+
+首版 M2 Episode 不定义 `AutoEpisodeTrustGateV1`，也不产生 `confirmed | quarantined | rejected` 三态摄入结果。它采用**授权来源前提**：当前 Agent 可读取的 Task / Intent / Run / Session 等研发来源，已经由用户启动的任务、仓库身份和现有访问控制授权；Memory 不再要求用户逐条批准，也不对成功、失败、取消、未改代码或低置信度推断作价值判断。Writer 仍执行确定性的**研发历程准入**：验证来源属于 pinned ref 与当前仓库/工作区、EvidenceRef locator/digest 可解析、脱敏已经完成、schema/root/code anchor/CompileRecord 合法且 compiler 实现受配置约束。全部有效时机械追加 `Created|Revised + Confirmed`；任一无效时返回稳定的解析、授权、脱敏或合同错误且不写入 Memory ref。`trust` 与 confidence 继续作为 provenance/认识论标签保存，不是 M2 摄入门槛；`Quarantined` 保留给写入后发现对象损坏、来源失效或投毒时的显式处置。
 
 ### 4.2 `MemoryEvent` —— 事件 [E]
 
@@ -740,15 +818,15 @@ ContextReceipt (local ledger) --selected--> MemoryHead[L] / MemoryNote[S]
 如 §4 开头所述，Memory 的字节是自定义 JSON blob，存活在自己的 `libra/memory*` ref 上，与内部 AgentRuntime 的对象历史分离。后者位于孤儿分支 `libra/intent`（常量 `AI_REF`，`src/internal/ai/history.rs:92`），承载 git-internal 的 typed AI 对象（Intent/Plan/...）；而外部 agent 捕获位于 `traces`（常量 `TRACES_BRANCH`，`src/internal/branch.rs:42`，文档中写作 `refs/libra/traces`）。Memory 自己的 ref 命名沿用同一约定：
 
 ```text
-refs/libra/intent                              # 现有 AI 工作流对象的孤儿分支（Intent/Plan/...，归 AgentRuntime）
-refs/libra/memory/repo                         # 新增：仓库共享 memory（NEW）
-refs/libra/memory/global                       # 新增：仅在显式启用 repo-local global policy 时使用（NEW）
-refs/libra/memory/branch/<encoded-full-refname> # 新增：分支作用域 memory（NEW）
-refs/libra/memory/worktree/<encoded-id>        # 新增：worktree 作用域 memory（NEW）
-refs/libra/memory/actor/<principal-hash>       # 新增：actor 私有 memory；不得用可逆 PII 作 ref 名（NEW）
+refs/heads/libra/intent                              # 现有 AI 工作流对象的孤儿分支；SQLite 名称为 libra/intent
+refs/heads/libra/memory/repo                         # 新增：仓库共享 memory；SQLite 名称为 libra/memory/repo
+refs/heads/libra/memory/global                       # 新增：仅在显式启用 repo-local global policy 时使用（NEW）
+refs/heads/libra/memory/branch/<encoded-full-refname> # 新增：分支作用域 memory（NEW）
+refs/heads/libra/memory/worktree/<encoded-id>        # 新增：worktree 作用域 memory（NEW）
+refs/heads/libra/memory/actor/<principal-hash>       # 新增：actor 私有 memory；不得用可逆 PII 作 ref 名（NEW）
 ```
 
-Git 的 file/dir ref 规则禁止同时存在 `refs/libra/memory` 和 `refs/libra/memory/*`，因此不存在无后缀的 memory ref。`Global` 在本设计中仍是**当前仓库内的逻辑作用域**，不等于跨仓库用户档案；真正跨仓库 federation 仍不在范围内。
+Git 的 file/dir ref 规则禁止同时存在 `refs/heads/libra/memory` 和 `refs/heads/libra/memory/*`，因此不存在无后缀的 memory ref。`Global` 在本设计中仍是**当前仓库内的逻辑作用域**，不等于跨仓库用户档案；真正跨仓库 federation 仍不在范围内。
 
 一个「memory commit」就是一个普通的 Git commit，其 tree 中包含：
 
@@ -766,7 +844,7 @@ manifest.json                                             # schema、scope、las
 Memory 的逻辑 key 不得直接拼接进 Git ref 或 tree path：branch name、namespace、actor ref 与动态 path 段都可能包含 `/`、`..`、控制字符、Unicode 归一化差异或大小写冲突。实现必须使用一套稳定、可逆、跨平台大小写安全的编码：
 
 - `scope_key` 的逻辑编码形如 `repo`、`global`、`branch:<full-refname>`、`worktree:<id>`、`actor:<principal-id>`；branch 使用规范化 full refname（如 `refs/heads/main`），而不是短名或当前 commit OID。分支 rename 是显式 scope migration，不能静默产生一份新 memory 或丢失旧 scope。
-- `refs/libra/memory/branch/<encoded-full-refname>` 使用 validated canonical refname 的跨平台编码。actor ref 使用不可逆 principal hash，避免 ref 枚举泄露账号或邮箱。
+- `refs/heads/libra/memory/branch/<encoded-full-refname>` 使用 validated canonical refname 的跨平台编码。actor ref 使用不可逆 principal hash，避免 ref 枚举泄露账号或邮箱。
 - tree path 中的 `<namespace>`、`<note_id>`、`<revision-oid>`、`<event-id>` 必须只包含 `[A-Za-z0-9._-]`；namespace 如 `private:<actor-ref>` 必须编码为安全 segment。
 - 解码后必须拒绝空 segment、`.`、`..`、绝对路径、反斜杠、NUL、控制字符以及超过长度上限的 segment。
 - macOS / Windows 上不得依赖文件系统大小写行为区分两条 memory key；编码后的 segment 必须规范化为大小写不敏感仍不冲突的形式，或在写入前显式检测冲突并 fail-closed。
@@ -775,37 +853,136 @@ Memory 的逻辑 key 不得直接拼接进 Git ref 或 tree path：branch name�
 
 ### 5.2 SQLite 投影表
 
-这些投影表通过**新建一个版本化迁移** `sql/migrations/YYYYMMDDNN_memory.sql` 引入，前向 DDL 必须幂等（`CREATE TABLE IF NOT EXISTS ...`），并可配套一份 `*_down.sql` 回滚脚本；**不要**把它们追加进 bootstrap 文件 `sql/sqlite_20260309_init.sql`。这与外部捕获采用迁移 `2026050303_agent_capture.sql` 的方式属于同一模式。
+M2-02 使用版本化迁移 `sql/migrations/2026082501_memory_core.sql` 与
+`2026082501_memory_core_down.sql` 引入核心 schema。前向 DDL 必须幂等
+（`CREATE TABLE/INDEX IF NOT EXISTS ...`）；**不要**把它们追加进 bootstrap
+文件 `sql/sqlite_20260309_init.sql`。这与外部捕获采用迁移
+`2026050303_agent_capture.sql` 的方式属于同一模式。
+
+该迁移只创建七张可重建投影表 `memory_head`、`memory_path_summary`、
+`memory_note_index`、`memory_revision_index`、`memory_link_index`、
+`memory_projection_state`、`memory_episode_path`，以及两张有界本地运行状态表
+`memory_compile_job`、`memory_compile_observer_state`。FTS 与 search document、
+selection receipt、entity/taxonomy/access statistics、classifier/embedding cache
+分别由 M2-02F、M2-02R 或后续卡片引入，不能被这次 core migration 提前创建。
+
+投影中的对象时间使用 canonical UTC RFC 3339 `TEXT`；SQLite 只检查字段存在，
+Writer / Rebuilder 负责严格解析。projection rebuild、job、lease、retry 与 observer
+的运行时间使用 Unix epoch milliseconds `INTEGER`，便于在本地事务中比较 deadline。所有 keyed
+source-input fingerprint 拆列保存 `version/key_id/digest`；`purpose=source_input`
+由不可绕过的 `SourceInputFingerprint` 类型固定，不在表中重复存字符串。
+迁移本身不得初始化、读取或轮换 repository keyed-digest seed。
+
+M2-02F 随后的版本化迁移
+`sql/migrations/2026082502_memory_fts_search.sql` 与对应 down 文件增加
+Episode 搜索投影。这里的「搜索正文表」（search document）指 SQLite 普通表
+`memory_episode_search_doc`；它保存唯一一份可搜索文本。「全文倒排索引」
+（FTS5 index）指 external-content 虚拟表 `memory_episode_fts`；它只保存由正文生成的
+posting，不再复制正文。二者共享稳定的 `INTEGER rowid`，并遵守以下固定合同：
+
+| 存储项 | 字段与约束 | 用途 |
+|---|---|---|
+| `memory_episode_search_doc` 身份 | `rowid` 主键；`(note_id, revision_oid)` 唯一并复合外键到 `memory_revision_index`；父项删除使用 `RESTRICT` | 一条 Episode revision 对应一个稳定搜索文档；先执行受控 FTS 删除，才能删除父 revision |
+| root / 过滤元数据 | `root_kind=task\|intent`、有界 `root_id`、`completion_status`、`code_change_status`、可空 `ended_at` | 在 MATCH 前做 root/状态/时间过滤；尚未结束的来源允许 `ended_at=NULL` |
+| 唯一正文 | `goal`、`summary`、`decisions`、`failed_attempts`、`unresolved` 均非空字符串，合计最多 64 KiB | 保留结局级结构，而非把整个 session/transcript 放进 SQLite |
+| `memory_episode_fts` | 同样的五列与相同顺序；`content='memory_episode_search_doc'`、`content_rowid='rowid'` | 只承载可重建倒排索引 |
+| tokenizer | `unicode61 remove_diacritics 2` | Unicode 分词；例如查询 `cafe` 可命中 `café` |
+| BM25 权重 | `goal=8`、`summary=5`、`decisions=4`、`failed_attempts=3`、`unresolved=2`，分数按升序排列 | M2-11 reader 使用的首版固定排序合同；SQLite `bm25()` 分数越小越相关 |
+
+external-content FTS5 不会替调用方同步普通表。唯一 SQL owner 是 crate-private
+`src/internal/ai/memory/fts_sql.rs`。调用方先取得不可从普通事务构造的
+`MemoryWriteTransaction`；该包装通过现有 `begin_write_transaction` 在任何读取前取得
+SQLite 写锁，再向同一事务暴露普通投影写入接口。这样既能与其它 Memory 投影原子提交，
+也不会在并发写入时发生 deferred transaction 的 read→write upgrade `SQLITE_BUSY`。
+`fts_sql` 不自行提交：
+
+1. 新建时先写 `memory_episode_search_doc`，取得 rowid，再写对应 FTS posting。
+2. 更新时先读取旧五列，用 FTS5 的 `delete` 命令删除旧 posting；随后原位更新
+   同一 rowid 的正文，并写入新 posting。
+3. 删除时同样先用旧五列删除 posting，再删除普通表行。不能依赖 FK cascade，
+   因为虚拟表无法参与普通外键级联。
+4. 任一步失败，调用方回滚整个事务；旧正文和旧 posting 必须同时恢复。
+5. 重建使用 FTS5 `rebuild` 命令，并立即执行 external-content `integrity-check`。
+
+查询入口只接受普通文本。`normalize_plain_text_v1` 先提取连续的 Unicode 字母/数字
+词项，以 ASCII 大小写折叠键去重，再按 FTS literal 引号规则转义并以受控 `OR`
+连接；其它 Unicode 词项按原文去重。空输入、控制字符、超过 4 KiB 的 query、超过
+256 bytes 的词项或超过 32 个去重后词项会明确报错。最终表达式仍通过 `MATCH ?`
+参数绑定执行。这样 `authentication/cache` 会生成两个独立词项，自然语言查询只需
+命中部分有效词项；调用方仍不能直接传 `OR`、`NEAR`、列过滤器或其它 FTS 语法。
+首版不内置特定语言的停用词表；召回质量、多语言分词与多字段权重由 M2-14
+benchmark 校准。
+
+该能力不新增数据库服务或第二套 SQLite。当前 SeaORM/sqlx-sqlite 依赖链已经通过
+`libsqlite3-sys` bundled build 启用 `SQLITE_ENABLE_FTS5`；发布门使用与正式二进制
+相同的 `--release --features keyring`，分别在 Linux amd64/arm64、macOS arm64 和
+Windows amd64 上运行 capability probe。任一平台不能 create/MATCH/`bm25()` 时，
+reader 不得以 `LIKE` 全表扫描代替。
 
 下面以普通 `CREATE TABLE` 形式给出表结构，落地时请置于上述迁移文件中并加上 `IF NOT EXISTS` 幂等保护：
 
 ```sql
 -- 每条存活逻辑 note 的当前 head。
 CREATE TABLE memory_head (
-    scope_key             TEXT NOT NULL,
-    namespace             TEXT NOT NULL,
-    path                  TEXT NOT NULL,
-    note_id               TEXT NOT NULL,
-    latest_revision_oid   TEXT NOT NULL,
-    live_revision_oid     TEXT,
-    latest_action         TEXT NOT NULL,
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    namespace             TEXT NOT NULL CHECK (length(CAST(namespace AS BLOB)) BETWEEN 1 AND 512),
+    path                  TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4096),
+    note_id               TEXT NOT NULL CHECK (
+        length(note_id) = 36
+        AND substr(note_id, 9, 1) = '-'
+        AND substr(note_id, 14, 1) = '-'
+        AND substr(note_id, 19, 1) = '-'
+        AND substr(note_id, 24, 1) = '-'
+        AND length(replace(note_id, '-', '')) = 32
+        AND replace(note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    latest_revision_oid   TEXT NOT NULL CHECK (
+        length(latest_revision_oid) IN (40,64)
+        AND latest_revision_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    live_revision_oid     TEXT CHECK (
+        live_revision_oid IS NULL
+        OR (length(live_revision_oid) IN (40,64)
+            AND live_revision_oid NOT GLOB '*[^0-9a-f]*')
+    ),
+    -- taxonomy_expanded 没有 note/revision identity，只更新 taxonomy projection，
+    -- 因而不会成为某条 note 的 latest_action。
+    latest_action         TEXT NOT NULL CHECK (latest_action IN (
+        'created','revised','confirmed','quarantined','superseded',
+        'revoked','forgotten','consolidated'
+    )),
     latest_review_state   TEXT NOT NULL CHECK (latest_review_state IN ('draft','confirmed','quarantined','revoked','superseded','forgotten')),
-    kind                  TEXT NOT NULL,
-    lifecycle             TEXT NOT NULL,
-    confidence            TEXT NOT NULL,
-    trust                 TEXT NOT NULL,
-    sensitivity           TEXT NOT NULL,
-    visibility            TEXT NOT NULL,
+    kind                  TEXT NOT NULL CHECK (kind IN ('procedural','semantic','episodic')),
+    lifecycle             TEXT NOT NULL CHECK (lifecycle IN ('replacement','accretive')),
+    confidence            TEXT NOT NULL CHECK (confidence IN ('low','medium','high')),
+    trust                 TEXT NOT NULL CHECK (trust IN ('verified','repo_evidence','user_asserted','external_untrusted','inferred')),
+    sensitivity           TEXT NOT NULL CHECK (sensitivity IN ('public','internal','confidential','secret_like')),
+    visibility            TEXT NOT NULL CHECK (visibility IN ('private','repo_local','team_candidate')),
     acl_policy_id         TEXT NOT NULL,
     valid_from            TEXT,
     valid_until           TEXT,
-    effective_from_commit TEXT,
-    effective_until_commit TEXT,
+    effective_from_commit TEXT CHECK (
+        effective_from_commit IS NULL
+        OR (length(effective_from_commit) IN (40,64)
+            AND effective_from_commit NOT GLOB '*[^0-9a-f]*')
+    ),
+    effective_until_commit TEXT CHECK (
+        effective_until_commit IS NULL
+        OR (length(effective_until_commit) IN (40,64)
+            AND effective_until_commit NOT GLOB '*[^0-9a-f]*')
+    ),
     expires_at            TEXT,
     rank_hint             INTEGER NOT NULL DEFAULT 0,
-    last_event_seq        INTEGER NOT NULL,
+    last_event_seq        INTEGER NOT NULL CHECK (last_event_seq >= 1),
     updated_at            TEXT NOT NULL,
-    PRIMARY KEY (scope_key, namespace, path, note_id)
+    PRIMARY KEY (scope_key, namespace, path, note_id),
+    UNIQUE (note_id),
+    FOREIGN KEY (scope_key, namespace, path, note_id)
+        REFERENCES memory_note_index(scope_key, namespace, path, note_id),
+    FOREIGN KEY (scope_key, namespace, note_id, latest_revision_oid)
+        REFERENCES memory_revision_index(scope_key, namespace, note_id, revision_oid),
+    FOREIGN KEY (scope_key, namespace, note_id, live_revision_oid)
+        REFERENCES memory_revision_index(scope_key, namespace, note_id, revision_oid)
 );
 CREATE INDEX idx_memory_head_lookup
     ON memory_head(scope_key, namespace, path, latest_review_state);
@@ -815,13 +992,13 @@ CREATE INDEX idx_memory_head_path_prefix
 -- 每条路径的当前聚合。这是 summarize()、prompt 注入、
 -- 以及分类法下钻的快路径。
 CREATE TABLE memory_path_summary (
-    scope_key             TEXT NOT NULL,
-    namespace             TEXT NOT NULL,
-    path                  TEXT NOT NULL,
-    confirmed_count       INTEGER NOT NULL DEFAULT 0,
-    quarantined_count     INTEGER NOT NULL DEFAULT 0,
-    child_count           INTEGER NOT NULL DEFAULT 0,
-    prefix_count          INTEGER NOT NULL DEFAULT 0,
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    namespace             TEXT NOT NULL CHECK (length(CAST(namespace AS BLOB)) BETWEEN 1 AND 512),
+    path                  TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4096),
+    confirmed_count       INTEGER NOT NULL DEFAULT 0 CHECK (confirmed_count >= 0),
+    quarantined_count     INTEGER NOT NULL DEFAULT 0 CHECK (quarantined_count >= 0),
+    child_count           INTEGER NOT NULL DEFAULT 0 CHECK (child_count >= 0),
+    prefix_count          INTEGER NOT NULL DEFAULT 0 CHECK (prefix_count >= 0),
     preview               TEXT NOT NULL DEFAULT '',
     last_changed_at       TEXT NOT NULL,
     PRIMARY KEY (scope_key, namespace, path)
@@ -831,69 +1008,289 @@ CREATE INDEX idx_memory_path_summary_prefix
 
 -- 反向索引：note_id -> head 行，用于 O(1) 回答「这条 note 在哪里？」。
 CREATE TABLE memory_note_index (
-    note_id               TEXT PRIMARY KEY,
-    scope_key             TEXT NOT NULL,
-    namespace             TEXT NOT NULL,
-    path                  TEXT NOT NULL,
-    kind                  TEXT NOT NULL,
-    lifecycle             TEXT NOT NULL,
-    review_state          TEXT NOT NULL,
-    confidence            TEXT NOT NULL,
-    trust                 TEXT NOT NULL,
-    sensitivity           TEXT NOT NULL,
-    visibility            TEXT NOT NULL,
+    note_id               TEXT PRIMARY KEY CHECK (
+        length(note_id) = 36
+        AND substr(note_id, 9, 1) = '-'
+        AND substr(note_id, 14, 1) = '-'
+        AND substr(note_id, 19, 1) = '-'
+        AND substr(note_id, 24, 1) = '-'
+        AND length(replace(note_id, '-', '')) = 32
+        AND replace(note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    namespace             TEXT NOT NULL CHECK (length(CAST(namespace AS BLOB)) BETWEEN 1 AND 512),
+    path                  TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4096),
+    kind                  TEXT NOT NULL CHECK (kind IN ('procedural','semantic','episodic')),
+    lifecycle             TEXT NOT NULL CHECK (lifecycle IN ('replacement','accretive')),
+    review_state          TEXT NOT NULL CHECK (review_state IN ('draft','confirmed','quarantined','revoked','superseded','forgotten')),
+    confidence            TEXT NOT NULL CHECK (confidence IN ('low','medium','high')),
+    trust                 TEXT NOT NULL CHECK (trust IN ('verified','repo_evidence','user_asserted','external_untrusted','inferred')),
+    sensitivity           TEXT NOT NULL CHECK (sensitivity IN ('public','internal','confidential','secret_like')),
+    visibility            TEXT NOT NULL CHECK (visibility IN ('private','repo_local','team_candidate')),
     acl_policy_id         TEXT NOT NULL,
-    origin                TEXT NOT NULL,
+    origin                TEXT NOT NULL CHECK (origin IN (
+        'explicit','promoted_from_anchor','distilled_from_frame','classifier',
+        'consolidation','onboard','branch_fork','import','coordinator','episode_compiler'
+    )),
     idempotency_key       TEXT NOT NULL,
-    idempotency_scope     TEXT NOT NULL DEFAULT 'cell',
-    created_at            TEXT NOT NULL
+    idempotency_scope     TEXT NOT NULL DEFAULT 'cell'
+        CHECK (idempotency_scope IN ('cell','namespace')),
+    created_at            TEXT NOT NULL,
+    UNIQUE (scope_key, namespace, path, note_id),
+    UNIQUE (note_id, scope_key, namespace)
 );
 -- 幂等键去重（§4.1.1）：默认 Cell scope 在 (scope, namespace, path) 内唯一；
 -- Namespace scope 的聚合入口（consolidation / onboard）在 (scope, namespace) 内唯一。
-CREATE UNIQUE INDEX idx_memory_note_idempotency
-    ON memory_note_index(scope_key, namespace, path, idempotency_key);
+CREATE UNIQUE INDEX idx_memory_note_idempotency_cell
+    ON memory_note_index(scope_key, namespace, path, idempotency_key)
+    WHERE idempotency_scope = 'cell';
 CREATE UNIQUE INDEX idx_memory_note_idempotency_ns
     ON memory_note_index(scope_key, namespace, idempotency_key)
     WHERE idempotency_scope = 'namespace';
 
 -- revision 级 provenance / 影响面索引；可由每个 MemoryNote.compile_record 重建。
 CREATE TABLE memory_revision_index (
-    revision_oid          TEXT PRIMARY KEY,
-    note_id               TEXT NOT NULL,
-    scope_key             TEXT NOT NULL,
-    namespace             TEXT NOT NULL,
-    origin                TEXT NOT NULL,
+    revision_oid          TEXT PRIMARY KEY CHECK (
+        length(revision_oid) IN (40,64)
+        AND revision_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    note_id               TEXT NOT NULL CHECK (
+        length(note_id) = 36
+        AND substr(note_id, 9, 1) = '-'
+        AND substr(note_id, 14, 1) = '-'
+        AND substr(note_id, 19, 1) = '-'
+        AND substr(note_id, 24, 1) = '-'
+        AND length(replace(note_id, '-', '')) = 32
+        AND replace(note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    namespace             TEXT NOT NULL CHECK (length(CAST(namespace AS BLOB)) BETWEEN 1 AND 512),
+    origin                TEXT NOT NULL CHECK (origin IN (
+        'explicit','promoted_from_anchor','distilled_from_frame','classifier',
+        'consolidation','onboard','branch_fork','import','coordinator','episode_compiler'
+    )),
     producer              TEXT NOT NULL,
-    rules_version         INTEGER NOT NULL,
+    rules_version         INTEGER NOT NULL CHECK (rules_version > 0),
     prompt_version        TEXT,
     model_id              TEXT,
     policy_version        TEXT NOT NULL,
-    input_fingerprints_json TEXT NOT NULL,
-    created_at            TEXT NOT NULL
+    input_fingerprints_json TEXT NOT NULL CHECK (
+        json_valid(input_fingerprints_json)
+        AND json_type(input_fingerprints_json) = 'array'
+    ),
+    created_at            TEXT NOT NULL,
+    UNIQUE (note_id, revision_oid),
+    UNIQUE (scope_key, namespace, note_id, revision_oid),
+    FOREIGN KEY (note_id, scope_key, namespace)
+        REFERENCES memory_note_index(note_id, scope_key, namespace) ON DELETE CASCADE
 );
+CREATE INDEX idx_memory_revision_note
+    ON memory_revision_index(note_id, created_at, revision_oid);
 CREATE INDEX idx_memory_revision_producer
-    ON memory_revision_index(producer, prompt_version, model_id, policy_version);
+    ON memory_revision_index(scope_key, namespace, producer, prompt_version, model_id, policy_version);
 
 -- 派生的链接索引。历史真相是 MemoryNote.links。
 CREATE TABLE memory_link_index (
-    source_scope_key      TEXT NOT NULL,
-    source_namespace      TEXT NOT NULL,
-    source_note_id        TEXT NOT NULL,
-    source_revision_oid   TEXT NOT NULL,
-    target_note_id        TEXT NOT NULL,
-    target_revision_oid   TEXT,
-    link_kind             TEXT NOT NULL,
+    source_scope_key      TEXT NOT NULL CHECK (length(CAST(source_scope_key AS BLOB)) BETWEEN 1 AND 512),
+    source_namespace      TEXT NOT NULL CHECK (length(CAST(source_namespace AS BLOB)) BETWEEN 1 AND 512),
+    source_note_id        TEXT NOT NULL CHECK (
+        length(source_note_id) = 36
+        AND substr(source_note_id, 9, 1) = '-'
+        AND substr(source_note_id, 14, 1) = '-'
+        AND substr(source_note_id, 19, 1) = '-'
+        AND substr(source_note_id, 24, 1) = '-'
+        AND length(replace(source_note_id, '-', '')) = 32
+        AND replace(source_note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_revision_oid   TEXT NOT NULL CHECK (
+        length(source_revision_oid) IN (40,64)
+        AND source_revision_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    target_note_id        TEXT NOT NULL CHECK (
+        length(target_note_id) = 36
+        AND substr(target_note_id, 9, 1) = '-'
+        AND substr(target_note_id, 14, 1) = '-'
+        AND substr(target_note_id, 19, 1) = '-'
+        AND substr(target_note_id, 24, 1) = '-'
+        AND length(replace(target_note_id, '-', '')) = 32
+        AND replace(target_note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    target_revision_oid   TEXT CHECK (
+        target_revision_oid IS NULL
+        OR (length(target_revision_oid) IN (40,64)
+            AND target_revision_oid NOT GLOB '*[^0-9a-f]*')
+    ),
+    link_kind             TEXT NOT NULL CHECK (link_kind IN ('sibling','supports','prerequisite','contradicts','supersedes')),
     source_path           TEXT NOT NULL,
     target_path           TEXT NOT NULL,
-    evidence_refs_json    TEXT NOT NULL,
+    evidence_refs_json    TEXT NOT NULL CHECK (
+        json_valid(evidence_refs_json)
+        AND json_type(evidence_refs_json) = 'array'
+    ),
     valid_from            TEXT,
     valid_until           TEXT,
-    PRIMARY KEY (source_revision_oid, target_note_id, link_kind)
+    PRIMARY KEY (source_revision_oid, target_note_id, link_kind),
+    FOREIGN KEY (source_scope_key, source_namespace, source_path, source_note_id)
+        REFERENCES memory_note_index(scope_key, namespace, path, note_id) ON DELETE CASCADE,
+    FOREIGN KEY (source_scope_key, source_namespace, source_note_id, source_revision_oid)
+        REFERENCES memory_revision_index(scope_key, namespace, note_id, revision_oid) ON DELETE CASCADE,
+    FOREIGN KEY (target_note_id)
+        REFERENCES memory_note_index(note_id) ON DELETE CASCADE,
+    FOREIGN KEY (target_note_id, target_revision_oid)
+        REFERENCES memory_revision_index(note_id, revision_oid)
 );
 CREATE INDEX idx_memory_link_source
     ON memory_link_index(source_scope_key, source_namespace, source_note_id);
 CREATE INDEX idx_memory_link_target
-    ON memory_link_index(source_scope_key, source_namespace, target_note_id, link_kind);
+    ON memory_link_index(target_note_id, target_revision_oid);
+
+-- 每个 memory ref 的已构建水位线。安全敏感读取要求
+-- projected_ref_oid == current_ref_oid。
+CREATE TABLE memory_projection_state (
+    scope_key             TEXT PRIMARY KEY CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    projected_ref_oid     TEXT NOT NULL CHECK (
+        length(projected_ref_oid) IN (40,64)
+        AND projected_ref_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    last_event_seq        INTEGER NOT NULL CHECK (last_event_seq >= 0),
+    schema_version        INTEGER NOT NULL CHECK (schema_version > 0),
+    policy_version        TEXT NOT NULL,
+    rebuilt_at            INTEGER NOT NULL CHECK (rebuilt_at >= 0)
+);
+
+-- Episode revision -> code path。Git path 使用大小写敏感的 BINARY 排序；
+-- prefix query 通过 code_path 的有界 range 扫描，不使用默认 ASCII-insensitive LIKE。
+CREATE TABLE memory_episode_path (
+    note_id               TEXT NOT NULL CHECK (
+        length(note_id) = 36
+        AND substr(note_id, 9, 1) = '-'
+        AND substr(note_id, 14, 1) = '-'
+        AND substr(note_id, 19, 1) = '-'
+        AND substr(note_id, 24, 1) = '-'
+        AND length(replace(note_id, '-', '')) = 32
+        AND replace(note_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    revision_oid          TEXT NOT NULL CHECK (
+        length(revision_oid) IN (40,64)
+        AND revision_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    code_path             TEXT NOT NULL CHECK (
+        length(CAST(code_path AS BLOB)) BETWEEN 1 AND 4096
+        AND substr(code_path, 1, 1) <> '/'
+        AND instr(code_path, char(92)) = 0
+    ),
+    PRIMARY KEY (note_id, revision_oid, code_path),
+    FOREIGN KEY (note_id, revision_oid)
+        REFERENCES memory_revision_index(note_id, revision_oid) ON DELETE CASCADE
+);
+CREATE INDEX idx_memory_episode_path_code
+    ON memory_episode_path(code_path, note_id, revision_oid);
+
+-- 每个 Task / Intent root 最多一行的有界编译状态。M2-02 只冻结 schema
+-- 与 observation transaction；lease runner / retry state transition 属于 M2-08。
+CREATE TABLE memory_compile_job (
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    root_kind             TEXT NOT NULL CHECK (root_kind IN ('task','intent')),
+    root_id               TEXT NOT NULL CHECK (
+        length(root_id) > 0 AND length(CAST(root_id AS BLOB)) <= 120
+    ),
+    terminal_source_oid   TEXT NOT NULL CHECK (
+        length(terminal_source_oid) IN (40,64)
+        AND terminal_source_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    input_fingerprint_version INTEGER NOT NULL CHECK (input_fingerprint_version = 1),
+    input_fingerprint_key_id TEXT NOT NULL CHECK (
+        length(input_fingerprint_key_id) = 36
+        AND substr(input_fingerprint_key_id, 9, 1) = '-'
+        AND substr(input_fingerprint_key_id, 14, 1) = '-'
+        AND substr(input_fingerprint_key_id, 19, 1) = '-'
+        AND substr(input_fingerprint_key_id, 24, 1) = '-'
+        AND length(replace(input_fingerprint_key_id, '-', '')) = 32
+        AND replace(input_fingerprint_key_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    input_fingerprint_digest TEXT NOT NULL CHECK (
+        length(input_fingerprint_digest) = 64
+        AND input_fingerprint_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    observed_generation   INTEGER NOT NULL DEFAULT 1 CHECK (observed_generation >= 1),
+    processed_generation  INTEGER NOT NULL DEFAULT 0 CHECK (processed_generation >= 0),
+    state                 TEXT NOT NULL DEFAULT 'dirty'
+        CHECK (state IN ('idle','dirty','inflight','failed')),
+    lease_owner           TEXT,
+    lease_fence           INTEGER NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+    lease_expires_at      INTEGER,
+    retry_count           INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    next_retry_at         INTEGER,
+    last_error_code       TEXT CHECK (
+        last_error_code IS NULL
+        OR (length(last_error_code) = 14
+            AND last_error_code GLOB 'LBR-MEMORY-[0-9][0-9][0-9]')
+    ),
+    last_error_summary    TEXT CHECK (
+        last_error_summary IS NULL
+        OR length(CAST(last_error_summary AS BLOB)) <= 1024
+    ),
+    created_at            INTEGER NOT NULL CHECK (created_at >= 0),
+    updated_at            INTEGER NOT NULL CHECK (updated_at >= created_at),
+    PRIMARY KEY (scope_key, root_kind, root_id),
+    CHECK (processed_generation <= observed_generation),
+    CHECK (
+        (lease_owner IS NULL AND lease_expires_at IS NULL)
+        OR
+        (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_fence > 0)
+    ),
+    CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+    CHECK (next_retry_at IS NULL OR next_retry_at >= 0),
+    CHECK (last_error_summary IS NULL OR last_error_code IS NOT NULL),
+    CHECK (
+        (state = 'idle'
+         AND processed_generation = observed_generation
+         AND lease_owner IS NULL AND lease_expires_at IS NULL
+         AND retry_count = 0 AND next_retry_at IS NULL
+         AND last_error_code IS NULL AND last_error_summary IS NULL)
+        OR
+        (state = 'dirty'
+         AND processed_generation < observed_generation
+         AND lease_owner IS NULL AND lease_expires_at IS NULL)
+        OR
+        (state = 'inflight'
+         AND processed_generation < observed_generation
+         AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
+         AND next_retry_at IS NULL)
+        OR
+        (state = 'failed'
+         AND processed_generation < observed_generation
+         AND lease_owner IS NULL AND lease_expires_at IS NULL
+         AND retry_count > 0 AND next_retry_at IS NULL
+         AND last_error_code IS NOT NULL)
+    ),
+    CHECK (next_retry_at IS NULL OR state = 'dirty'),
+    CHECK (
+        retry_count > 0
+        OR (next_retry_at IS NULL
+            AND last_error_code IS NULL AND last_error_summary IS NULL)
+    )
+);
+CREATE INDEX idx_memory_compile_job_runnable
+    ON memory_compile_job(state, next_retry_at, lease_expires_at, updated_at);
+CREATE INDEX idx_memory_compile_job_scope_generation
+    ON memory_compile_job(scope_key, observed_generation, processed_generation);
+
+-- 每个 source ref 的 first-parent 增量扫描水位。名称使用 reference 表中的
+-- Branch.name，而不是展示用 full refname。
+CREATE TABLE memory_compile_observer_state (
+    scope_key             TEXT NOT NULL CHECK (length(CAST(scope_key AS BLOB)) BETWEEN 1 AND 512),
+    source_ref_name       TEXT NOT NULL
+        CHECK (source_ref_name IN ('libra/intent','libra/memory/repo')),
+    scanned_through_oid   TEXT NOT NULL CHECK (
+        length(scanned_through_oid) IN (40,64)
+        AND scanned_through_oid NOT GLOB '*[^0-9a-f]*'
+    ),
+    updated_at            INTEGER NOT NULL CHECK (updated_at >= 0),
+    PRIMARY KEY (scope_key, source_ref_name)
+);
+
+-- 以下均为后续长期方案，不属于 2026082501_memory_core。
 
 -- 实体 mention / alias 反向索引。历史真相是 MemoryNote.entities；
 -- canonical_key 与 alias_key 均为经过规范化的 repository-local key。
@@ -928,17 +1325,6 @@ CREATE TABLE memory_taxonomy_node (
 );
 CREATE INDEX idx_memory_taxonomy_parent
     ON memory_taxonomy_node(scope_key, namespace, parent_path);
-
--- 每个 memory ref 的已构建水位线。安全敏感读取要求
--- projected_ref_oid == current_ref_oid。
-CREATE TABLE memory_projection_state (
-    scope_key             TEXT PRIMARY KEY,
-    projected_ref_oid     TEXT NOT NULL,
-    last_event_seq        INTEGER NOT NULL,
-    schema_version        INTEGER NOT NULL,
-    policy_version        TEXT NOT NULL,
-    rebuilt_at            TEXT NOT NULL
-);
 
 -- 本地访问统计，不是 Git 投影，不参与默认 deterministic ranking。
 CREATE TABLE memory_access_stats (
@@ -975,40 +1361,255 @@ CREATE TABLE memory_embedding_cache (
     created_at            TEXT NOT NULL
 );
 
--- 注入回执账本（§8.6）。注意：这是本地 append-only 审计账本，
+-- 共享上下文选择回执账本（§8.6）。这是本地 append-only 审计账本，
 -- **不是**投影——它记录读取时刻的选择，无法也无须从 Git 历史重建；
 -- rebuild 不触碰它，保留策略负责有界修剪。
-CREATE TABLE memory_context_receipt (
+CREATE TABLE context_selection_receipt (
     receipt_id            TEXT PRIMARY KEY,
-    emitted_at            TEXT NOT NULL,
-    scope_key             TEXT NOT NULL,
-    view_hash             TEXT NOT NULL,
-    source_refs_json      TEXT NOT NULL,
-    projection_watermarks_json TEXT NOT NULL,
-    as_of_commit          TEXT,
+    schema_version        INTEGER NOT NULL,
+    source_kind           TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    digest_key_id         TEXT NOT NULL,
+    principal_hmac        TEXT NOT NULL,
+    query_hmac            TEXT NOT NULL,
     effective_at          TEXT NOT NULL,
+    code_commit           TEXT,
+    full_branch_ref       TEXT,
+    source_heads_json     TEXT NOT NULL,
+    projection_watermarks_json TEXT NOT NULL,
+    policy_hash           TEXT NOT NULL,
     selector_version      TEXT NOT NULL,
-    rules_version         INTEGER NOT NULL,
-    index_version         TEXT NOT NULL,
-    policy_version        TEXT NOT NULL,
-    query_hmac            TEXT,
     token_budget          INTEGER NOT NULL,
-    tokens_used           INTEGER NOT NULL,
     selected_json         TEXT NOT NULL,
-    dropped_json          TEXT NOT NULL,
-    bundle_hash           TEXT NOT NULL
+    omissions_json        TEXT NOT NULL,
+    bundle_hash           TEXT NOT NULL,
+    reproducibility_state TEXT NOT NULL,
+    frame_id              TEXT,
+    recorded_at           TEXT NOT NULL
 );
-CREATE INDEX idx_memory_receipt_time
-    ON memory_context_receipt(emitted_at);
+CREATE INDEX idx_context_selection_receipt_repository_time
+    ON context_selection_receipt(repository_id, recorded_at, receipt_id);
+CREATE INDEX idx_context_selection_receipt_time
+    ON context_selection_receipt(recorded_at, receipt_id);
+
+-- 每仓回执保留水位。ReceiptStore 与回执追加/裁剪在同一短事务更新它；
+-- pruned_before 是已经删除的最晚 recorded_at，用来区分 expired 与 not_found。
+CREATE TABLE context_selection_receipt_retention (
+    repository_id         TEXT PRIMARY KEY,
+    pruned_before         TEXT,
+    last_pruned_at        TEXT,
+    retained_rows         INTEGER NOT NULL DEFAULT 0
+                          CHECK (retained_rows BETWEEN 0 AND 10000)
+);
 ```
 
-`memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 是可重建投影。`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats` 与 `memory_context_receipt` 是本地有界账本，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
+#### 5.2.1 M2-02 observation transaction
+
+M2-02 的 `job_sql` 是 crate-private 深 Module。调用方提交一次 pinned scan 的
+完整结果，不能直接拼表名、SQL 或 generation update。最小 Interface 为：
+
+```rust,ignore
+record_observation_batch(
+    db,
+    ObservationBatch {
+        scope_key,
+        source_ref_name,
+        expected_cursor,
+        scanned_through_oid,
+        roots,
+    },
+) -> Result<ObservationBatchOutcome, RecordObservationError>
+```
+
+`ObservedRoot` 只接收已经通过 M2-01 constructor 的 `EpisodeRoot`、已解析的
+`ObjectHash` 与 purpose-specific `SourceInputFingerprint`。后者是
+`KeyedDigestEnvelope` 的私有 newtype，只公开 `version/key_id/digest` getter；
+通用 envelope 或任意自定义 purpose 不能进入 `job_sql`。同一 batch 内 root key
+必须唯一；空 `roots` 合法，用于记录“该扫描区间没有终态 root”。
+
+Module 使用现有 SQLite writer-lock helper 开启一个短事务，并按固定顺序执行：
+
+1. 读取 `(scope_key, source_ref_name)` 当前 cursor，比较 `expected_cursor`；
+2. 幂等登记 batch 内全部 root job；
+3. CAS 创建或推进 `scanned_through_oid`；
+4. commit。任一步或 commit 失败都整批回滚。
+
+generation 比较完整 `(version, key_id, digest)`：
+
+- 不存在 job 时创建 `observed_generation=1`、`processed_generation=0`、`state=dirty`；
+- fingerprint 与 `terminal_source_oid` 均相同时不改 job 的 generation、lease、retry、error 或 timestamp；
+- fingerprint 相同而 source OID 不同时返回稳定的 source-mismatch 错误并整批回滚；
+- fingerprint 变化时只把 `observed_generation` 加一，更新 source/fingerprint，保持 `processed_generation` 与递增过的 `lease_fence`；`state='inflight'` 时原样保留 lease 与 state，其余状态转为 `dirty` 并清除旧 generation 的 retry/error。M2-02 不读取当前时间，也不判断 `lease_expires_at` 是否已过期；租约接管由 M2-08 负责。
+
+cursor 校验必须先拒绝“`expected_cursor == scanned_through_oid` 且 roots 非空”的
+非法 batch，再进入幂等判断。其余使用 compare-and-swap 语义：无行只接受 `expected_cursor=None`；当前值等于
+expected 时正常推进；当前值已经等于 `scanned_through_oid` 时返回
+`AlreadyRecorded` 且不再碰 job，用于恢复“数据库已提交但调用方未收到成功”；
+其它差异返回 `CursorConflict`。`expected_cursor == scanned_through_oid` 只允许空
+batch。first-parent 后代关系与扫描预算由 M2-08 observer 在调用前验证，SQL
+Module 不读取 Git 对象。
+
+M2-02 只实现上述 observation transaction；M2-08 在该 Interface 上补齐 ref 扫描、
+terminal 判断、canonical input 构造、lease acquire/takeover、runner、retry scheduling
+与 processed-generation completion。down migration 仅在九张 M2-02
+表全部为空时按 `observer/job → episode_path/link/head → revision → note → projection_state/path_summary`
+的依赖顺序删除；任何表有行都以稳定错误拒绝，不能级联丢状态。
+
+#### 5.2.2 M2-08 terminal observer 与 generation runner
+
+自动编译由两条持久 observer 驱动。AI 历史 observer 只把
+`TaskEventKind::{Done, Failed, Cancelled}` 和
+`IntentEventKind::{Completed, Cancelled}` 视为外部触发；其它 append 仍被扫描，
+但只推进 `libra/intent` 水位。Memory observer 扫描
+`libra/memory/repo`，只接受已经 `Confirmed` 的 Task Episode revision，并重新唤醒
+已经有终态 job 的父 Intent。Intent Episode revision 被忽略，因此编译输出不会反向
+触发自身。
+
+两条 observer 都先固定 ref head，再沿 first-parent 读取不可变 append。单次扫描上限为
+2,048 个 commit，tree 与 blob 也有独立字节上限；head 非 cursor 后代、merge、损坏对象
+或预算超限都会报错，SQLite cursor 保持原值。完整扫描后，root job upsert 与 cursor
+推进复用 §5.2.1 的同一短事务，进程在事务前后退出都可以通过下次启动修复重放。
+
+规范输入指纹使用仓库 keyed digest：
+
+- Task：`root_id + terminal_source_commit_oid`；
+- Intent：`root_id + terminal_source_commit_oid + 按 task_id 排序的
+  (task_id, live_revision_oid | missing)`。
+
+指纹和 terminal source 都未变化时不增加 generation。Task revision 变化只会改变父
+Intent 的指纹；缺失 revision 使用稳定的 `missing` marker，后续补齐时自然产生下一代。
+
+runner 每次只领取一行可运行 job。领取会写入 owner、30 秒 deadline 和单调递增 fence；
+过期 lease 可被新 owner 接管。编译完成后，Memory ref CAS、投影更新和 lease 有效性校验
+处于同一个 SQLite write transaction：owner/fence 已失效或 deadline 已过的 runner 不能
+提交权威 revision。完成、失败和释放也都带 owner/fence 条件，旧 runner 无法覆盖新 owner
+的状态。编译期间出现新 generation 时，旧 generation 可以先完成，job 随后回到 `dirty`
+继续处理最新输入。
+
+transient failure 最多重试五次，使用从 500 ms 开始、上限 30 s 的指数退避；稳定的
+schema/auth/policy failure 进入 `failed`，直到新 generation 到来。job 只保存
+`LBR-MEMORY-201..206` 和经默认 Redactor 脱敏、UTF-8 安全截断到 1,024 bytes 的摘要，
+不保存 provider 原始响应、prompt 或 transcript。终态写入只调度后台 observer，不等待
+扫描和模型；MCP runtime 构造时复用同一 repair seam 补齐崩溃窗口。
+
+`memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_projection_state`、`memory_episode_path` 是 M2-02 的可重建投影。`memory_compile_job` 与 `memory_compile_observer_state` 是有界本地运行状态。后续的 `memory_entity_index`、`memory_taxonomy_node` 仍是可重建投影；`memory_classifier_cache` 与 `memory_embedding_cache`（§8.7）是可丢弃 cache；`memory_access_stats`、`context_selection_receipt` 与 `context_selection_receipt_retention` 是本地有界账本及其保留水位，不能从 Git 历史重建，`rebuild` 不触碰它们。删除账本会降低本地可观测性，但不能改变 live memory 语义。
+
+#### 5.2.3 M2-09 Task Episode 编译合同
+
+Task Adapter 复用现有 provider-neutral `CompletionModel`，不创建第二套 Agent runtime。
+它只接受 `RedactedEpisodeSource::Task`、冻结的 rules/prompt/model 配置，并向 provider
+发送 `fragment_id + object_type + redacted text`，不额外发送 source manifest、repository
+ID、principal digest 或 trusted facts。片段正文仍可能包含来源对象自身的 ID、终态、时间、
+commit 或 path，模型只能把它们当证据理解，不能把这些值作为 proposal 的结构字段；proposal
+通过后，准入层会从受信任来源机械注入权威值。
+
+首个合同固定为 `rules_version=1`、`prompt_version=task-episode-v1`。模型只能输出
+`summary`、`observations`、`inferences`、`decisions`、`failed_attempts`、`unresolved`；
+proposal 与每条 claim 都拒绝未知字段，因此模型尝试加入 root、goal、status、time、
+related IDs、commit、branch 或 path 会整体失败。Observation 必须引用至少一个 resolver
+签发的 fragment 且不带 confidence；Inference 必须同时带 confidence 与 fragment 引用。
+每节最多 64 条、每条正文最多 4 KiB、每条最多 32 个不重复引用，整个 provider 文本与
+规范化 proposal 都不得超过 16 KiB。
+
+provider 调用固定 temperature 0、禁用 tools 与 streaming，默认 wall-clock timeout 为
+60 秒。只接受一个纯文本 JSON block；Markdown、tool call、多 block、malformed JSON、
+未知 enum、超限内容和 secret-like echo 都返回稳定的 typed failure。provider error 与
+timeout 归为可重试失败，其余合同错误归为稳定失败。错误、job 和 audit 不保存 provider
+原始响应或原始诊断。
+
+准入成功后，`CompileRecord` 保存 producer、rules/prompt/model/policy version、keyed
+source-manifest fingerprint 与幂等键。Task 的 `completed | failed | cancelled` 与代码的
+`changed | unchanged | unknown` 保持正交；两者均来自受信任 source facts，不由模型判断。
+同一 generation 重放时，既有 job/input fingerprint 和 Writer 幂等合同保证零新增事件。
+
+#### 5.2.4 M2-10 Intent Iteration 编译合同
+
+Intent Adapter 与 Task Adapter 复用同一个 `EpisodeCompiler` 接口和唯一 Writer；混合 job
+队列在领取 root 后按 `Task | Intent` 选择各自冻结的 compiler/config，避免 Intent 被 Task
+prompt 误处理。首个 Intent 合同固定为 `rules_version=1`、
+`prompt_version=intent-iteration-v1`，provider 调用沿用 temperature 0、禁用 tools/stream、
+60 秒 timeout、单 JSON text block 和 16 KiB 输出上限。
+
+来源解析先在终态 Intent 的 AI 历史固定版本中验证根 Intent、终态事件与 child Task 关系，
+再从投影水位与 `libra/memory/repo` 一致的冻结读取视图中取得每个 child Task 当前已确认的
+`note_id + live_revision_oid`。任何一个 Task 缺少已确认 revision 时，本 generation 进入稳定的
+dependency-pending 失败且不推进 processed generation；Task revision 后续写入会改变父 Intent
+的规范输入指纹并重新唤醒 job。Task 数量、Memory 历史回放和来源正文均有硬上限，超限时
+fail-closed，不生成只有部分 Task 的 Intent note。
+
+模型输入只包含两类数据：已脱敏的根 Intent/IntentEvent 片段，以及从固定 Task revision
+机械生成的紧凑结构（状态、summary、observations、inferences、decisions、failed attempts、
+unresolved、相关 Run ID）。紧凑结构移除 Task claim 自身的 EvidenceRef 和 MemoryNote envelope，
+不复制 Task 全文、原始 Run、Session 或工具输出。模型负责综合需求变化、跨 Task 决策、重复
+失败、根因和未决项；root/related IDs、时间、状态、代码锚点和 revision link 仍由准入层填写。
+
+每个贡献 Task 在 Intent `MemoryNote.links` 中恰有一个 `kind=Supports` 链接，目标为 Task 的
+稳定 `note_id`，并以非空 `target_revision_oid` 固定本次汇总实际读取的版本。payload 的
+`related_task_ids` 与 Supports 链接一一对应，`related_run_ids` 来自这些固定 Task revision
+的并集。source manifest 另记冻结的 Memory dependency ref；Writer 重校验时读取该不可变
+依赖快照，因此无关 Memory 写入不会使已准入输入漂移，Task 新 revision 则由下一 generation
+前滚为同一 Intent note 的新 revision。旧 generation 已在执行时可以先提交，但 lease 完成后
+仍保持最新 generation 为 dirty，最终只保留一个固定 Cell/note ID 的 live head。
+
+#### 5.2.5 M2-11 冻结读取与确定性召回合同
+
+`EpisodeReader` 在一个 SQLite 读事务内解析当前 Libra HEAD，并冻结 repository ID、
+principal HMAC、当前代码 commit、完整分支 ref、Memory ref OID、投影事件水位与 policy
+snapshot hash；这些字段共同生成 `view_hash`。detached / unborn HEAD、Memory ref 与投影水位
+不一致、未知 policy 或读取过程中视图变化都会 fail-closed。调用方不能自行拼接代码 commit
+与分支名来构造读取视图。
+
+候选查询只读取 `memory_head.live_revision_oid` 指向且 review state 为 `confirmed` 的 Episode。
+root kind/ID、完成状态、代码变化状态、结束时间与 canonical path exact/prefix 均作为绑定参数
+进入结构化 SQL；Intent/Task relation 在已经授权并加载的 Episode 上做有界复核。文本查询严格
+复用 §5.2 的 `normalize_plain_text_v1`、`unicode61` 与固定五列 BM25 权重。SQL 候选上限为
+200，最终结果上限为 50；普通查询默认返回 10 条。
+
+候选随后按当前代码版本计算 `exact`、`descendant_unchanged`、
+`descendant_path_changed`、`diverged` 或 `unknown`。祖先遍历最多 2,048 个 commit，每条
+Episode 最多比较 512 个 canonical code path；预算耗尽或对象不可解析得到 `unknown`。
+普通注入候选只保留前两种状态，诊断查询可以查看其余状态。固定 selector version 为
+`episode-fts-bm25-v1`，排序依次为 applicability tier、BM25 ASC、`ended_at` DESC、
+`note_id`、`revision_oid`，因此同一冻结视图和查询会产生相同顺序。
+
+证据只对最终选中的 Episode 按需展开。每个 `EvidenceRef` 都重新检查 repo-local visibility、
+固定 source ref 的当前可达性、对象类型/ID、脱敏后 fragment digest 与资源上限。运行历史对象
+沿固定的 `libra/intent` 版本读取；Intent 汇总引用的 Task Episode 沿固定 Memory 版本重放并
+重新生成同一紧凑结构。单次最多处理 64 个去重引用、累计 512 KiB；私有、不可达、损坏、
+摘要不匹配或尚未支持的 locator 只产生稳定 omission，不放宽权限，也不使其它证据失效。
 
 查询实现必须始终带上 `scope_key` 与 `namespace`，禁止只按 `path` 做全局查询后在内存中过滤。跨 scope / namespace 的检索只能由显式 `--all-namespaces` 或策略允许的 scope fallback 触发，并且必须在结果中保留原始 `scope` 与 `namespace`，防止 prompt 注入时发生来源混淆。
 
 `list_prefix` 与 `summarize` 不得执行无上限扫描。实现应使用规范化后的 path 前缀范围查询和 keyset pagination，并设置默认 `LIMIT`（建议 100 条 summary、50 条 note）与硬上限。因为 SQL `LIKE` 的转义与 collation 容易引入前缀越界，推荐存储 canonical `path_key` / `parent_path` 后做复合索引范围查询；复杂度表述统一为 O(log n + k)，其中 k 是有界返回量。
 
-在访问模式上还有一条对齐约定值得明确：Memory 的投影表用 SeaORM entity 来访问（与同样可重建的 `ai_index_*` 投影一致），而不采用 `agent_session` / `agent_checkpoint` / `agent_usage_stats` 那种**故意**保持的 raw-SQL、无 entity 风格。原因在于：`agent_*` 那批表是外部捕获的独立账本，而 Memory 的这些表是 git 真源（`refs/libra/memory/...`）的可重建投影，本质与 `ai_index_*` 同类，因而对齐 `ai_index_*` 的 SeaORM 模式。账本例外是 `memory_access_stats` 与 `memory_context_receipt`（§8.6）：二者都不是可重建投影，沿用 raw-SQL 账本模式，不配 entity。
+在访问模式上还有一条对齐约定值得明确：Memory 的投影表用 SeaORM entity 来访问（与同样可重建的 `ai_index_*` 投影一致），而不采用 `agent_session` / `agent_checkpoint` / `agent_usage_stats` 那种**故意**保持的 raw-SQL、无 entity 风格。原因在于：`agent_*` 那批表是外部捕获的独立账本，而 Memory 的这些表是 git 真源（`refs/heads/libra/memory/...`）的可重建投影，本质与 `ai_index_*` 同类，因而对齐 `ai_index_*` 的 SeaORM 模式。账本例外是 `memory_access_stats` 与 `context_selection_receipt`（§8.6）：二者都不是可重建投影，沿用 raw-SQL 账本模式，不配 entity。
+
+#### 5.2.6 M2-12 冻结注入与审计交付合同
+
+共享上下文层通过 `MemoryContextAssembler` 取得一次已经认证的读取请求。普通执行先由
+`EpisodeReader` 解析当前 repository、principal、代码 commit、完整分支 ref、worktree、
+Memory ref、投影水位与 policy，冻结为一个 `ResolvedMemoryView`；重放执行则必须显式传入
+原来的冻结 view，不能再读取当前 HEAD 或 wall clock。调用方只提供一次 `effective_at`，它同时
+进入有效期过滤、规范查询 HMAC 与 `ContextSelectionReceiptV1`。
+
+`EpisodeReader` 只返回候选、BM25 分数、适用性、来源与读取成本。注入器把内部候选窗口固定为
+50 条，再由共享 `ContextBudgetAllocator` 按 `ProjectMemory` 段预算和总 prompt 预算确定最终集合；
+调用方的 `limit` 仍是最终条目上限。授权、关系、代码适用性、结果窗口和 token 预算产生的
+排除都会以稳定 reason code 聚合进回执。注入只渲染写入准入时已验证的短证据指针，不主动
+展开原始证据正文；显式证据展开仍沿用 M2-11 的逐项授权与 omission 合同。当前注入层没有
+provider 信任配置，因此自动注入只接受 `Public` / `Internal`，`Confidential` 保持可显式读取但
+进入 `sensitivity_policy` omission，`SecretLike` 继续完全不可注入。
+
+注入块只包含稳定、紧凑的 Episode 字段：note/revision ID、path、namespace、scope、confidence、
+trust、代码适用性、Task/Intent 根、完成状态、goal、summary 与简短证据指针。它复用
+`MemoryAnchor` 所在的 prompt 交付位置，但只存在于本次请求，不创建或持久化第二份 Anchor / Note。
+渲染头明确说明记忆用于提供指引，当前源码和命令输出具有更高优先级。
+
+规范查询 HMAC 覆盖 view hash、worktree identity、查询/过滤条件、`effective_at`、Memory token
+预算和 selector version；bundle hash 覆盖最终渲染字节。共享 `ReceiptStore` 成功追加回执后，
+调用方才能获得 `AuditedMemoryContextBundleV1` 并交给 `SystemPromptBuilder`。回执写入失败时不会
+产生可交付 bundle。相同 frozen view、query、budget、effective time 与 selector 会得到相同
+selected IDs、顺序、reason codes 和 bundle hash；UUIDv7 receipt ID 与记录时间不参与确定性结果。
 
 ### 5.3 ClientStorage 分层
 
@@ -1023,7 +1624,7 @@ CREATE INDEX idx_memory_receipt_time
 
 ### 5.4 远端发布与传输边界
 
-第一版所有 `refs/libra/memory/*` 都是 **local-only**，不会进入默认 push/fetch/clone，也不提供 `memory push`。这里的 `Repo` 表示同一仓库 / 关联 worktree 的本地共享 scope，不表示团队远端可见。原因是普通 Git ref 传输只有并发保护，没有 record-level ACL、redaction manifest、revocation propagation 或 remote principal authorization。
+第一版所有 `refs/heads/libra/memory/*` 都是 **local-only**，不会进入默认 push/fetch/clone，也不提供 `memory push`。这里的 `Repo` 表示同一仓库 / 关联 worktree 的本地共享 scope，不表示团队远端可见。原因是普通 Git ref 传输只有并发保护，没有 record-level ACL、redaction manifest、revocation propagation 或 remote principal authorization。
 
 未来若增加团队 Memory publication，必须另行定义类似 `mainline.md` ML-01 的 allow-list manifest、隔离 tracking ref、ingress validation、lease、visibility/trust/sensitivity policy 与 tombstone 传播；不能直接 mirror 本地 memory ref。portable sealed intent / pin 仍由 `refs/libra/intent-team` 负责，Memory 不复制其 transport stack。该约束也意味着 `Confidential`、actor-private note、receipt、access stats 和原始 compile input HMAC 永不进入团队 publication。
 
@@ -1239,6 +1840,12 @@ LLM 输出必须按 schema 校验：未知 enum、未知 namespace、非法 path
 
 #### 7.5.1 Trust Gate —— Draft → Confirmed 的显式晋升阶段（A4）
 
+本节适用于 M1 事实、规则、技能和其它需要晋升的普通知识流。首版 M2 Episode
+按 §4.1.3 的“授权来源前提 + 研发历程准入”直接自动确认，不进入
+`pass | fail | needs-human` 三态，也不因为任务失败、来源 trust 标签或推断置信度
+较低而转入 Draft / Quarantined。二者共享脱敏、EvidenceRef、CompileRecord、
+MemoryWriter 和写入后隔离能力，但摄入语义不同。
+
 沿 §0.0.4（fava-trails Trust Gate）与 §0.2，`Draft → Confirmed` 不是自动
 完成，而必须经过一个命名的 **Trust Gate** 阶段，把「确定性规则 + 可选 LLM
 评审」统一为一条可审计的晋升路径：
@@ -1331,29 +1938,40 @@ memory.get(scope, namespace, path) -> Vec<MemoryRecord>
 `scope`、`confidence`、`trust` 以及一个简短的证据指针。agent 被告知：
 记忆只是指引，当前的源文件 / 命令输出会覆盖陈旧的记忆。
 
-### 8.6 注入回执（`ContextReceipt`，Phase C 硬性门槛）
+### 8.6 上下文选择回执（`ContextSelectionReceiptV1`，简称 `ContextReceipt`，Phase C 硬性门槛）
 
-每次 `with_memory(...)` 注入（§8.5）以及引擎内召回（§8.2 / §8.3）完成后，必须产出一份 `ContextReceipt`；写不出完整回执，该次注入 / 召回按失败处理（fail-closed）。直接路径 get（§8.1）与调用方驱动原语（§8.4）是确定性查询、不含引擎侧选择，不产回执。
+每次 `with_memory(...)` 注入（§8.5）以及引擎内召回（§8.2 / §8.3）完成后，必须产出一份共享 `ContextSelectionReceiptV1`；写不出完整回执，该次注入 / 召回按失败处理（fail-closed）。直接路径 get（§8.1）与调用方驱动原语（§8.4）是确定性查询、不含引擎侧选择，不产回执。该类型由 `src/internal/ai/context_budget/receipt.rs` 的共享上下文层拥有，Memory 与 mainline 都写入同一账本；现有 `ContextFrame` wire schema 保持不变。
 
 | 字段 | 含义 |
 |---|---|
-| `receipt_id` | 回执标识 |
-| `emitted_at` | 产出时间 |
+| `receipt_id` | UUIDv7 回执标识 |
+| `schema_version` / `source_kind` | 回执版本与调用来源（Memory / intent / hook 等） |
+| `repository_id` / `digest_key_id` | 规范仓库身份与仓库本地 keyed-digest generation |
+| `principal_hmac` / `query_hmac` | 已认证主体与规范化查询/过滤/K/排序输入的域分离 HMAC；不保存 raw principal/query |
+| `effective_at` | 本次选择冻结的有效时间；重放不得重新读取当前 wall clock |
 | `selected` | 选中的 note `revision_oid` / path summary key 列表，每项附 reason code、稳定 score 分量与顺序 |
-| `dropped` | 因预算 / 门禁被丢弃项及 reason code |
-| `token_budget` / `tokens_used` | 预算与实际用量 |
-| `as_of` | `ResolvedMemoryView.view_hash`、解析时所有参与 scope 的 memory ref OID、各自 projection watermark 与 code commit / full branch ref |
-| `versions` | selector / rules（编译规则集）/ index（投影 schema）/ policy 版本 |
-| `effective_at` | 选择时冻结的时间，用于 TTL / recency；重放不得读取当前 wall clock |
-| `query_hmac` | 可选，本地密钥派生的查询 HMAC；不得保存 raw query 或可跨仓库关联的普通 hash |
+| `omissions` | 因授权、状态、适用性、预算或资源上限被排除项的稳定 reason code 与有界计数 |
+| `token_budget` | 共享上下文层冻结的预算 |
+| `code_commit` / `full_branch_ref` | 本次选择使用的代码锚点 |
+| `source_heads` / `projection_watermarks` | `ResolvedMemoryView` 的各来源 ref OID 与投影水位 |
+| `policy_hash` / `selector_version` | 授权/选择合同版本 |
 | `bundle_hash` | 注入渲染块的规范化哈希 |
+| `reproducibility_state` | `reproducible \| stale \| expired \| non_reproducible` |
+| `recorded_at` / `frame_id?` | 本地记录时间与可选 ContextFrame 关联；均不把 raw frame 写入回执 |
 
 规则（承 §0.0.2 与 §0.0.11）：
 
-- **同输入同选择可验证。** 固定所有参与 scope 的 source ref OID / projection watermark、code anchor、`effective_at`、query HMAC 对应的调用输入、同一版本组与预算，重放必须得到相同 selected IDs、顺序、reason codes 与 `bundle_hash`；`receipt_id`、`emitted_at` 等非确定字段不进入 canonical hash。缺失对象、policy 或 index snapshot 时返回 `stale / non-reproducible`，不静默 fallback。该承诺只覆盖选择和渲染输入，不承诺 provider 输出逐字节一致。
-- **回执是本地审计账本，不是投影。** 存入本地 append-only 表 `memory_context_receipt`（§5.2）；它记录的是读取时刻的选择，无法也无须从 Git 历史重建，因此明确豁免于「删表可 rebuild」条款（§13.1），并按保留策略有界修剪。回执、query hash 与 selected IDs 可能泄露工作意图，默认 local-only、不进团队 ref；任何共享另做 visibility / retention / threat-model 审查。
+- **同输入同选择可验证。** 固定所有参与 scope 的 source ref OID / projection watermark、code anchor、`effective_at`、query HMAC 对应的调用输入、同一版本组与预算，重放必须得到相同 selected IDs、顺序、reason codes 与 `bundle_hash`；`receipt_id`、`recorded_at` 等非确定字段不进入 canonical hash。缺失对象、policy 或 index snapshot 时返回 `stale / non-reproducible`，不静默 fallback。该承诺只覆盖选择和渲染输入，不承诺 provider 输出逐字节一致。
+- **回执是本地审计账本，不是投影。** 存入本地 append-only 表 `context_selection_receipt`（§5.2）；它记录读取时刻的选择，无法也无须从 Git 历史重建，因此明确豁免于「删表可 rebuild」条款（§13.1）。默认每仓保留 30 天且最多 10,000 行，追加时按 `recorded_at` 索引修剪；缺失 UUIDv7 内嵌时间早于 `pruned_before` 返回 `expired`。回执中的 HMAC 与 selected IDs 仍可能暴露工作模式，默认 local-only、不进团队 ref；任何共享另做 visibility / retention / threat-model 审查。
 - **单一 receipt 原语。** Rust 类型与 mainline ML-05 / ML-08 共用同一定义（§0.0.10）；本文与 mainline 各自的注入管线写同一张回执面，不得分叉出两种 schema。
-- `memory inspect-injection` 从回执读取并重放展示，而非从当前投影反推。被预算丢弃的项直接记录在 receipt 的 `dropped` 中，不再为每次读取追加 `PromptTrimmed` 权威事件。
+- `memory inspect-injection` 从回执读取并重放展示，而非从当前投影反推。被预算丢弃的项直接记录在 receipt 的 `omissions` 中，不再为每次读取追加 `PromptTrimmed` 权威事件。
+
+M2-02R 已落地上述共享类型、`ReceiptStore`、SQLite migration 与 retention
+水位。当前阶段只提供 crate-private 写入/查找原语；Memory 候选选择和 prompt
+注入仍由 M2-12 接线。回执中的 `code_commit`、`source_heads`、
+`projection_watermarks`、`selected`、`policy_hash` 与 `bundle_hash` 已在 GC
+source inventory 中声明为 non-root：回执负责审计选择，不取得对象保活权；
+依赖被清理后，重放状态转为 `non_reproducible`。
 
 ### 8.7 混合检索通道（Hybrid Retrieval Channels）
 
@@ -1368,7 +1986,7 @@ query
   -> fail-closed: 无 embedding 配置或 provider 失败 -> 仅 Channel 0
 ```
 
-- **Channel 0（常开）**：路径前缀（§6.2）+ BM25/FTS5 关键词检索；无任何 embedding 配置即可用、可测（memweave 的「零外部服务 + 纯关键词降级」与 agentmemory 的「BM25 always on」为同向证据）。
+- **Channel 0（常开）**：路径前缀（§6.2）+ BM25/FTS5 关键词检索；无任何 embedding 配置即可用、可测（memweave 的「零外部服务 + 纯关键词降级」与 agentmemory 的「BM25 always on」为同向证据）。首版搜索文档、tokenizer、plain-text query normalization、五列权重与事务维护顺序已经在 §5.2 固定；M2-11 只实现结构化过滤、`MATCH ?`、`bm25(..., 8, 5, 4, 3, 2) ASC` 与稳定 tie-break，不能再定义另一套 FTS schema 或接受原始 MATCH 语法。
 - **Channel 1（可选）**：向量相似度。embedding 必须可本地运行（llama.cpp / Ollama 等）；embedding 按内容哈希缓存（`memory_embedding_cache`，§5.2，可整体丢弃）。provider 缺失、失败或超时 → 自动回退 Channel 0；**不得**把不可验证的向量结果注入 prompt。
 - **Channel 2（Phase E）**：§6.4 已定义的实体图有界一跳/两跳查询，只返回候选。
 - **融合与去重**：RRF 融合使用固定 k（起点 k=60，agentmemory 口径）；MMR 或等价去重 + 会话多样化上限（起点 max 3/session），避免同一事实多 chunk 重复注入。
@@ -1383,13 +2001,13 @@ query
 
 `scope = Branch("main")` 的 note 存放在
 `libra/memory/branch/<encoded-full-refname>`（git ref 全名写作
-`refs/libra/memory/branch/<encoded-full-refname>`）。切换用户的工作分支
+`refs/heads/libra/memory/branch/<encoded-full-refname>`）。切换用户的工作分支
 （通过 `libra switch`）会隐式切换被查询的作用域：
 
 ```text
 libra switch experiment
    -> agent 从 libra/memory/branch/<encoded-refs-heads-experiment> 读取 Branch 作用域，
-      并按显式 precedence 合并 refs/libra/memory/repo 的 Repo 作用域
+      并按显式 precedence 合并 refs/heads/libra/memory/repo 的 Repo 作用域
 ```
 
 这解决了 §2.1 中描述的「上下文污染」失效模式。
@@ -1425,7 +2043,7 @@ libra memory blame <path>                # 当前 head 由谁、于何时设定
 ```
 
 这些都是 Libra 既有 `log` / `diff` / `blame` 命令之上的薄封装（thin shim），
-作用域限定在 `refs/libra/memory/...`。
+作用域限定在 `refs/heads/libra/memory/...`。
 
 ### 9.3 merge 与 rebase
 
@@ -1514,7 +2132,7 @@ libra memory revoke <path-or-note-id> --reason "..."
 **Working 层（A3，四层巩固）。** 沿 §0.0.4（agentmemory 四层巩固）与 §0.2 决策，
 归并需要一条显式、有界的 **Working 摄入缓冲**：原始 observation 只在本地
 有界 intake 缓冲中作为 compiler 输入（§7.1 的 intake audit），**不写入
-`refs/libra/memory/*`，也不新增 note kind**——与「先编译，再使用」一致。
+`refs/heads/libra/memory/*`，也不新增 note kind**——与「先编译，再使用」一致。
 Working 层不是 `MemoryNote` 快照，只是 intake 到确认之间的中间态：
 
 - 只保留经 redaction 的 observation 摘要 + 来源 + 脱敏输入 HMAC + TTL；
@@ -1704,7 +2322,7 @@ session JSONL 模型，只有 Draft / Confirmed / Revoked / Superseded。Memory 
 5. 高置信度的 procedural 规则最后才保留，除非其本身就长于整个
    预算；此时它们会被替换为其路径摘要与一条 direct-get 提示。
 
-丢弃行为记录在 `ContextReceipt.dropped` 与本地有界 audit 中，以便审计；它是读取决策，不追加权威 `MemoryEvent`，避免每个 turn 都推进 memory ref。
+丢弃行为记录在 `ContextReceipt.omissions` 与本地有界 audit 中，以便审计；它是读取决策，不追加权威 `MemoryEvent`，避免每个 turn 都推进 memory ref。
 
 ## 12. CLI 命令面
 
@@ -1808,7 +2426,7 @@ MCP stdio 独占 stdin/stdout：在 stdio 模式下，**不得**输出 banner、
 - **无编译记录不落盘。** 任何入口产生的 `MemoryNote` 缺少完整 `CompileRecord`（§4.1.1）必须在写入事务第 1 步被拒绝；同幂等键的重复摄入不得产生第二条 note。这是 Phase A 的硬性退出门槛（§0.2）。
 - **注入必须留回执。** 任何 prompt 注入或引擎内召回若未能写出完整 `ContextReceipt`（§8.6），该次操作按失败处理（fail-closed）；`inspect-injection` 只从回执重放，不从当前投影反推。回执默认 local-only，未经 visibility / retention 审查不得成批越过 MCP 边界。这是 Phase C 的硬性退出门槛（§0.2）。
 - **写入只有一个 seam。** 所有 mutating Adapter 必须通过 `MemoryWriter`；任何绕过 CompileRecord、authorization、事件状态机、CAS 或投影事务而直接写 ref / tree / SQLite 的路径都属于发布阻断。worktree checkout 状态不能充当 writer lock。
-- **session view 必须冻结且可解释。** recall / injection 使用的 `ResolvedMemoryView.view_hash`、source ref OID、watermark、policy 与 code anchor 必须进入 status / receipt；branch、worktree 或 principal 改变后不得继续使用旧 view。
+- **session view 必须冻结且可解释。** `ResolvedMemoryView.view_hash` 进入 status；构成该 view 的 source heads、projection watermarks、policy hash 与 code anchor 进入 receipt，并可供 status/debug 重算对照。branch、worktree 或 principal 改变后不得继续使用旧 view。
 - **OID 不自引用。** `MemoryNote` 正文不含 `revision_oid`；写入后 OID 只出现在 event / envelope / tree path / projection。读取必须同时验证 Git OID 与 canonical `content_digest`。
 - **权威历史线性。** 每个 memory ref 只接受 first-parent 单父 commit 与严格递增 `event_seq`；跨 ref merge/cherry-pick 必须经语义 writer 重新追加，不能直接导入任意 Git merge DAG。
 - **投影不可越权。** prompt 注入、MCP 只读返回与 CLI recall 都必须先解析 actor、repo、branch、worktree 和 namespace policy；`private:<actor-ref>` 只能被同一 actor 或授权 reviewer 读取。
@@ -1844,17 +2462,17 @@ agent 捕获使用的 `2026050303_agent_capture.sql` 迁移属于同一模式，
 - `memory_classifier_cache`（§5.2，可选，带 TTL）
 - `memory_embedding_cache`（§8.7，可选向量通道缓存，可丢弃）
 - `memory_access_stats`（§5.2，本地账本，不参与 rebuild）
-- `memory_context_receipt`（§8.6，账本类：append-only、豁免 rebuild、按保留策略有界修剪）
+- `context_selection_receipt`（§8.6，共享账本：append-only、豁免 rebuild、按保留策略有界修剪）
 
-只有 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 可由 `libra memory rebuild` 从 `refs/libra/memory/...` 重建。classifier cache 与 embedding cache 可直接丢弃；access stats 与 receipt 是本地账本，不参与 rebuild。
+只有 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 可由 `libra memory rebuild` 从 `refs/heads/libra/memory/...` 重建。classifier cache 与 embedding cache 可直接丢弃；access stats 与 receipt 是本地账本，不参与 rebuild。
 
-协调 namespace（§19.3）的**路径占用索引**（§19.4 claim 跨 task 重叠检查）属于可重建投影：它由 `coordination.*` 活 claim 的规范化 `body` 路径范围派生，随 `refs/libra/memory/...` 事件重放重建，删除后可随 rebuild 恢复；其结构与实体索引同模式（见 §19.4 设计边界的索引规模与性能预算）。`CoordinationView`（§19.5）是读取时对该索引的投影视图，不新增独立存储。
+协调 namespace（§19.3）的**路径占用索引**（§19.4 claim 跨 task 重叠检查）属于可重建投影：它由 `coordination.*` 活 claim 的规范化 `body` 路径范围派生，随 `refs/heads/libra/memory/...` 事件重放重建，删除后可随 rebuild 恢复；其结构与实体索引同模式（见 §19.4 设计边界的索引规模与性能预算）。`CoordinationView`（§19.5）是读取时对该索引的投影视图，不新增独立存储。
 
 值得一提的是模式选择上的对比：Memory 的投影表用 SeaORM entity 建模（与同样可
 重建的 `ai_index_*` 投影同模式），而外部捕获的 `agent_session` /
 `agent_checkpoint` / `agent_usage_stats` 是**故意**采用 raw-SQL、不配 entity 的。
 Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身就是 git 真源的
-可重建投影。`memory_access_stats` 与 `memory_context_receipt` 是例外：二者与
+可重建投影。`memory_access_stats` 与 `context_selection_receipt` 是例外：二者与
 `agent_*` 同为本地账本，沿 raw-SQL 账本模式访问（§5.2、§8.6）。
 
 ## 15. 分阶段路线图
@@ -1864,7 +2482,7 @@ Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身
 - 在 `src/internal/ai/memory/` 中定义 `MemoryNote` / `MemoryEvent`
   的 Rust 类型。
 - 建立唯一的 `MemoryWriter` Module 与 Adapter contract；Phase A 的 CLI 写入只通过该 seam，writer 内部完成对象持久化、事件序号、CAS 与投影事务。
-- 对 repo memory ref（`refs/libra/memory/repo`）的写入 / 读取；每个 commit 单父、`event_seq` 连续、CAS 有界重试。
+- 对 repo memory ref（`refs/heads/libra/memory/repo`）的写入 / 读取；每个 commit 单父、`event_seq` 连续、CAS 有界重试。
 - SQLite 投影（§5.2）+ Sea-ORM entity：
   `memory_head`、`memory_path_summary`、`memory_note_index`、
   `memory_revision_index`、`memory_link_index`、`memory_entity_index`、
@@ -1874,7 +2492,8 @@ Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身
   `materialize` 生成 §5.5 的只读、脱敏 Markdown 投影，`consolidate` 触发一次排期归并（§10.5）。
 - 不引入分类器——调用方必须自行提供 `namespace` 与 `path`。
 - `CompileRecord` 类型与写入侧强制校验（§4.1.1）：所有入口必须携带
-  编译记录，幂等键在 `(scope, namespace)` 内去重。
+  编译记录；默认在 `(scope, namespace, path)` Cell 内去重，只有
+  Consolidation / Onboard 可显式使用 Namespace 级跨路径去重。
 
 退出门槛：所有 Phase A 写入 Adapter 都无法绕过 `MemoryWriter`；路径聚合与 `memory status` 可用；物化投影对同一 `view_hash` 产生相同 manifest / 文件集合，且不可见正文不落盘、raw HTML 默认禁用、frontmatter 与 URL 经转义 / 净化；投影重建在语义行、watermark、排序与 canonical digest 上稳定；OID 无自引用；损坏点阻止对应 scope watermark 前进；**每条已写入 note 都携带完整编译记录，
 缺失即拒绝写入，同幂等键重复摄入不产生新 note——硬性门槛，见 §0.2**；**写路径成本探针**：单条 note 写入（blob + event + commit + ref CAS + 投影表事务）的端到端延迟与新增对象数量有确定预算，并纳入 §16 的确定性探针，防止投影写放大失控。
@@ -1893,9 +2512,12 @@ Memory 之所以对齐 `ai_index_*` 的 SeaORM 模式，是因为它的表本身
   idempotency 当作语义去重。
 - 带「编辑后投影」（redacted projection）语义的 `forget` API。
 
-退出门槛：任何未经评审、形似 secret、外部不可信、或处于隔离（quarantine）
-状态的 note，都不能进入 prompt 注入；entity alias 歧义不能触发静默合并；
-Working 缓冲有 TTL / auto-evict；任何 Draft→Confirmed 都经 Trust Gate（§7.5.1）。
+退出门槛：普通知识流中任何未经评审、形似 secret、外部不可信、或处于隔离
+（quarantine）状态的 note，都不能进入 prompt 注入；entity alias 歧义不能触发
+静默合并；Working 缓冲有 TTL / auto-evict；普通知识的任何 Draft→Confirmed
+都经 Trust Gate（§7.5.1）。M2 Episode 不经过 Draft 晋升：它按 §4.1.3 的授权
+来源前提与确定性研发历程准入自动 Confirmed，trust/confidence 仅作为来源与认识论
+标签保存。
 
 ### Phase C — 分类、召回与注入（2–3 周）
 
@@ -1905,7 +2527,7 @@ Working 缓冲有 TTL / auto-evict；任何 Draft→Confirmed 都经 Trust Gate�
   两跳查询；授权先于图扩展，每个 target 重新鉴权。
 - prompt 期注入（§11.7），使用 `ProjectMemory` 与
   `MemoryAnchor` 预算分段。
-- `ContextReceipt` 产出与 `memory_context_receipt` 账本（§8.6）：
+- `ContextSelectionReceiptV1` 产出与 `context_selection_receipt` 账本（§8.6）：
   注入与引擎内召回写不出完整回执即按失败处理。
 - 用于可观测性的 `libra memory inspect-injection`（从回执重放）与
   **`libra code --debug-memory`（G14，Phase C 硬交付）**：每 turn 逐字打印
@@ -2052,7 +2674,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 - 注入回执：每次注入与引擎内召回都写出 `ContextReceipt`；固定 `as_of`
   快照重放选择得到相同 selected 集合与 bundle hash；缺失快照返回
   stale / non-reproducible；删除全部投影表并 rebuild 后回执账本不受
-  影响、也不被重建；预算丢弃只进入 `ContextReceipt.dropped` 与按
+  影响、也不被重建；预算丢弃只进入 `ContextReceipt.omissions` 与按
   `receipt_id` 互链的本地 audit，不追加 `PromptTrimmed` 权威事件。
 - onboarding：cold、warm 与 meta-only 刷新产出确定性的路径，且不会改写
   无关的 namespace。
@@ -2102,7 +2724,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 
 > 本节曾于 2026-08-10 拆分为独立文档 `docs/development/tracing/memory-coordination.md`，现合并回本文（2026-08-10）。与主 Memory 设计共享的所有原语、约束与验收口径以本文为准。
 
-本设计为本文（主 Memory 设计）的**相邻但正交**扩展：多个 Agent 在同一仓库中**并行执行开发工作**时，通过 Memory 通道相互通信与协调。它与持久知识共享同一套基础设施（`MemoryWriter` seam、`refs/libra/memory/*`、事件系统、CAS、Working 缓冲），但语义、生命周期与授权目标不同。本设计**不新增存储层、不新增第二套并发机制**，完全构建在本文 §3（概念模型）/ §4（对象模型）/ §5（存储布局）之上：一个保留 namespace（`coordination`）+ 一个 `MemoryCoordinator` 入口 + 一个 `CoordinationView` 投影，并复用 Working 缓冲（§10.5）与 Trust Gate（§7.5.1）。`CompileRecord.origin` 相应新增 `Coordinator` 值（§4.1.1 的 additive 扩展）。
+本设计为本文（主 Memory 设计）的**相邻但正交**扩展：多个 Agent 在同一仓库中**并行执行开发工作**时，通过 Memory 通道相互通信与协调。它与持久知识共享同一套基础设施（`MemoryWriter` seam、`refs/heads/libra/memory/*`、事件系统、CAS、Working 缓冲），但语义、生命周期与授权目标不同。本设计**不新增存储层、不新增第二套并发机制**，完全构建在本文 §3（概念模型）/ §4（对象模型）/ §5（存储布局）之上：一个保留 namespace（`coordination`）+ 一个 `MemoryCoordinator` 入口 + 一个 `CoordinationView` 投影，并复用 Working 缓冲（§10.5）与 Trust Gate（§7.5.1）。`CompileRecord.origin` 相应新增 `Coordinator` 值（§4.1.1 的 additive 扩展）。
 
 ### 19.1 开发者问题
 
@@ -2157,7 +2779,7 @@ coordination.conflicts.<encoded-tag>      # 变更面冲突声明（accretive，
 | `body` | 有界正文：声明的文件/路径范围、移交的交付物摘要、进度的一行状态 |
 | `evidence_refs` | 移交/冲突可选引用 commit OID / Run / Evidence |
 
-**存储位置（与 §19.2 / §19.4 / §19.5 / §19.7 / §19.8 一致）。** 协调条目（claim / release / handoff / progress / conflict-declare / sync-point）**直接写入共享 memory ref**（`refs/libra/memory/...` 下 Repo scope 的 `coordination` namespace，经 `MemoryWriter.MemoryCoordinator` 与 ref CAS），**不是** Working 缓冲中的 ephemeral 状态：
+**存储位置（与 §19.2 / §19.4 / §19.5 / §19.7 / §19.8 一致）。** 协调条目（claim / release / handoff / progress / conflict-declare / sync-point）**直接写入共享 memory ref**（`refs/heads/libra/memory/...` 下 Repo scope 的 `coordination` namespace，经 `MemoryWriter.MemoryCoordinator` 与 ref CAS），**不是** Working 缓冲中的 ephemeral 状态：
 
 - 短 TTL 只控制 `CoordinationView` 的可见性与默认召回排除（§19.6）；历史事件与 note 保留在 ref 上可 `libra memory log` 审计（§10.7），这也满足 §19.8「从 refs 可重建」的验收。
 - Working 缓冲（§10.5）只承接**巩固（consolidation）**的输入与输出：归并作业读取近期协调条目 + 原始 observation 摘要，产出候选 semantic / procedural note 并经 Trust Gate 确认；协调条目本身不落 Working 缓冲。若 claim / handoff 只存在本地缓冲，跨进程不可见、`CoordinationView` 只能看到本地声明、单写者赢也无法跨进程由 CAS 保证——那将整体破坏 §19.1 的协调目标。
@@ -2234,7 +2856,7 @@ MEM-06 **不新增存储层、不新增第二套并发机制**，完全构建在
 - **过期不毒化**：claim 的 TTL 过期后从 `CoordinationView` 排除，历史仍在 `log` 可审计；不因过期条目拒绝新 claim。
 - **冲突声明**：两个 agent 并行改重叠路径，`conflict_declare` 触发 `contradicts` 链接并进入隔离；`CoordinationView` 显示未解冲突。
 - **不越权**：`SecretLike` / `Confidential` 不进协调通道；`actor` 不信任自报。
-- **无第二真源**：协调条目直接写入共享 memory ref、仍从 `refs/libra/memory/*` 可重建；Working 缓冲只承载 consolidation 输入/输出、可丢弃；`MemoryCoordinator` 不绕过 `MemoryWriter`。
+- **无第二真源**：协调条目直接写入共享 memory ref、仍从 `refs/heads/libra/memory/*` 可重建；Working 缓冲只承载 consolidation 输入/输出、可丢弃；`MemoryCoordinator` 不绕过 `MemoryWriter`。
 - **与并行工作区衔接**：跨 worktree（§9.1 / [`libra-worktree-architecture.md`](../libra-worktree-architecture.md)）的 agent 都能读到同一 repo 级协调（Repo scope 共享），worktree 级协调按需隔离。
 
 ### 19.9 分阶段与优先级
@@ -2293,7 +2915,7 @@ MEM-06 依赖 MEM-01（存储/隐私）与 MEM-03（Trust Gate / 巩固），建
 
 ### 20.3 保留的强项（不修改）
 
-1. Snapshot/Event/Projection 三层模型 + `refs/libra/memory/*` 线性历史 + CAS 并发（§0.1、§4）。
+1. Snapshot/Event/Projection 三层模型 + `refs/heads/libra/memory/*` 线性历史 + CAS 并发（§0.1、§4）。
 2. CompileRecord / ContextReceipt 的确定性可重放承诺（§0.2、§8.6）。
 3. 分层 scope（Actor→Worktree→Branch→Repo→Global）与 fail-closed 读取（§3.4）。
 4. 遗忘/脱敏语义、MCP C9 门禁、`SecretLike` 边界（§10.6、§13）。

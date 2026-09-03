@@ -8591,33 +8591,24 @@ async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
     let db = main.join(".libra").join("libra.db");
     let db_url = format!("sqlite://{}?mode=rwc", db.display());
 
-    // Use the real down migration rather than deleting its ledger row. W4's
-    // schema adds physical columns/triggers, so merely removing the version
-    // would turn the next ordinary migration run into a duplicate-column
-    // failure instead of representing a repository that is genuinely behind.
+    // Use the real down migration rather than deleting its ledger row. The
+    // newest Memory receipt migration creates physical tables, so undoing it
+    // represents a repository that is genuinely one migration behind.
     let conn = Database::connect(&db_url)
         .await
         .expect("open repository db");
-    // Registry-derived for the same reason as the capability-marker case
-    // above: everything registered above 2026073101 rolls back with it.
-    let mut expected_rolled_back: Vec<i64> = libra::internal::db::migration::builtin_migrations()
-        .into_iter()
-        .map(|migration| migration.version)
-        .filter(|version| *version > 2026073101)
-        .collect();
-    expected_rolled_back.reverse();
     assert_eq!(
         builtin_runner()
             .expect("builtin runner")
-            .rollback_to(&conn, 2026073101)
+            .rollback_to(&conn, 2026082502)
             .await
             .expect("roll back newest migration"),
-        expected_rolled_back
+        vec![2026082503]
     );
     conn.close().await.expect("close repository db");
     assert!(
-        sqlite_max_schema_version(&db) < 2026080401,
-        "2026080401 must be the NEWEST migration for this test to leave one \
+        sqlite_max_schema_version(&db) < 2026082503,
+        "2026082503 must be the NEWEST migration for this test to leave one \
          pending — retarget it at the new newest migration"
     );
     let before = std::fs::read(&db).expect("db before");

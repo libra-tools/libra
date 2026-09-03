@@ -90,6 +90,15 @@ structured report is always present.
 | `128` | `LBR-REPO-001` | `repo` | Not inside a Libra repository | running repo commands outside `.libra` |
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata |
 | `128` | `LBR-REPO-003` | `repo` | Repository state blocks the operation | no commits yet, detached state mismatch, missing configured remote |
+| `128` | `LBR-MEMORY-001` | `repo` | Repository Memory digest key is missing, invalid, or cannot be decrypted | missing encrypted `memory.keyed_digest.v1`, duplicate/plaintext entry, unsupported generation, unavailable repository vault key, or cached/persisted key mismatch |
+| `128` | `LBR-MEMORY-002` | `repo` | Memory proposal or bounded source exceeds the persisted contract | unsupported schema, malformed Episode envelope, non-canonical payload, or a required source fact exceeding its hard limit |
+| `128` | `LBR-MEMORY-003` | `repo` | Memory source or writer policy rejected the operation | authenticated repository/target mismatch, unreachable pinned source, non-local scope, or unknown repository digest key ID |
+| `128` | `LBR-MEMORY-004` | `repo` | Memory evidence, authority, or its rebuildable projection is corrupt | source manifest/fragment mismatch, invalid manifest, merge commit on the linear Memory ref, broken revision ancestry, or projection watermark mismatch; rebuild diagnostics may include a bounded `details.damage_point` |
+| `128` | `LBR-MEMORY-005` | `repo` | Memory storage could not be opened, inspected, or updated atomically | repository database permission/integrity failure, local object write failure, SQLite companion failure, or exhausted bounded ref-conflict retries |
+| `128` | `LBR-MEMORY-PROJECTION-STALE` | `repo` | Memory projection does not match the pinned repository Memory ref | the ref advanced after a frozen read, the projection is missing, or another replay won the transaction |
+| `129` | `LBR-MEMORY-QUERY-INVALID` | `cli` | Memory search query or structured filter is invalid | empty/invalid FTS expression, out-of-range limit, incomplete root pair, invalid path, or inverted time range |
+| `128` | `LBR-MEMORY-NOT-FOUND` | `repo` | Requested Memory note or revision is absent from the frozen view | unknown note UUID, unknown revision OID, or no current confirmed revision |
+| `128` | `LBR-MEMORY-FTS-UNAVAILABLE` | `repo` | Linked SQLite does not provide the required FTS5 capability | a custom or incorrectly linked Libra build without `ENABLE_FTS5` |
 | `128` | `LBR-WORKTREE-001` | `repo` | Pagination cursor is malformed, foreign, or expired | `libra worktree doctor --cursor <garbage>` |
 | `128` | `LBR-WORKTREE-002` | `repo` | A worktree/workspace scope is corrupt or unreadable, so the diagnosis would be incomplete | `libra worktree doctor` where a `workspace_record` row or the worktree registry cannot be read |
 | `128` | `LBR-CONFIG-001` | `config` | Global config DB schema is newer than this Libra binary supports | `pull`, `push`, `fetch`, `clone`, or `cloud` would otherwise silently ignore global storage config |
@@ -174,6 +183,7 @@ structured report is always present.
 | `LBR-CLI-002` | Invalid or missing CLI arguments |
 | `LBR-CLI-003` | Invalid object, revision, pathspec, or move target |
 | `LBR-ADD-001` | `libra add` matched no paths and nothing already staged |
+| `LBR-MEMORY-QUERY-INVALID` | The Memory search query or structured filter is invalid; fix the query, paired root flags, path, time range, or result limit |
 
 ### Repository
 
@@ -182,6 +192,14 @@ structured report is always present.
 | `LBR-REPO-001` | Not inside a Libra repository |
 | `LBR-REPO-002` | Repository metadata is corrupt or incompatible |
 | `LBR-REPO-003` | Repository state blocks the operation |
+| `LBR-MEMORY-001` | Repository Memory digest key is missing, invalid, or cannot be decrypted; restore the original encrypted entry or repair the repository vault before writing new Memory data |
+| `LBR-MEMORY-002` | The Memory proposal or required source exceeds the persisted contract; regenerate it with supported schemas, canonical fields, and the configured source limits |
+| `LBR-MEMORY-003` | The Memory source or proposal failed repository policy; use the authenticated repository, trusted target, reachable pinned source, and current digest key |
+| `LBR-MEMORY-004` | Memory evidence, authority, and projection disagree or contain invalid history; stop writes and rebuild or repair the source/projection before retrying |
+| `LBR-MEMORY-005` | Memory storage could not be opened, inspected, or updated atomically; inspect local storage permissions/integrity and retry, using `libra memory rebuild` for a known pending schema migration |
+| `LBR-MEMORY-PROJECTION-STALE` | The Memory projection is not current for the pinned ref; freeze a new view or rebuild/advance the projection before reading it |
+| `LBR-MEMORY-NOT-FOUND` | The requested Memory note or revision is not present in the frozen view; search again or remove the historical revision selector |
+| `LBR-MEMORY-FTS-UNAVAILABLE` | The linked SQLite build lacks FTS5; install an official Libra build with bundled SQLite FTS5 support |
 | `LBR-WORKTREE-001` | The pagination cursor is malformed or expired; drop it and re-read the first page |
 | `LBR-WORKTREE-002` | A worktree/workspace scope is corrupt or unreadable; repair it before trusting any diagnostic report |
 

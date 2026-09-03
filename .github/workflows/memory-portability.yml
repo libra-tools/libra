@@ -1,0 +1,83 @@
+name: Memory SQLite portability
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  memory-fts5-probe:
+    name: memory-fts5-probe (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - platform: windows-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      LIBRA_SKIP_WEB_BUILD: "1"
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      MATRIX_TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout reviewed head
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up release Rust target
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Verify tested commit
+        shell: bash
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::checked out $actual_sha but expected reviewed head $EXPECTED_SHA"
+            exit 1
+          fi
+
+      - name: Select Perl for vendored OpenSSL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $selected = $null
+          $candidates = Get-Command perl.exe -All -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Source -Unique
+          foreach ($candidate in $candidates) {
+            & $candidate -MLocale::Maketext::Simple -e "1" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $selected = $candidate
+              break
+            }
+          }
+          if (-not $selected) {
+            throw "No Perl installation with Locale::Maketext::Simple is available"
+          }
+          "OPENSSL_SRC_PERL=$selected" >> $env:GITHUB_ENV
+
+      - name: Probe release-linked FTS5
+        shell: bash
+        run: |
+          cargo test --locked --release \
+            --features keyring \
+            --target "$MATRIX_TARGET" \
+            --test fts5_capability_test -- --nocapture

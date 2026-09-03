@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::{
     command::status,
     internal::{
+        ai::linear_ref::OwnedRefSpec,
         branch::{Branch, is_locked_branch},
         config::ConfigKv,
         db::get_db_conn_instance,
@@ -127,6 +128,17 @@ pub enum OpOutput {
         new_op_id: String,
         /// Human-readable restore confirmation.
         message: String,
+        /// Canonical local-only refs omitted from an old operation snapshot.
+        skipped_owned_refs: Vec<String>,
+    },
+    #[serde(rename = "restore-preview")]
+    RestorePreview {
+        target_op_id: String,
+        head_kind: String,
+        head_target: String,
+        restored_refs: Vec<String>,
+        pruned_refs: Vec<String>,
+        skipped_owned_refs: Vec<String>,
     },
 }
 
@@ -338,13 +350,40 @@ fn restore_keep_set(graph: &OperationGraphRecord) -> HashSet<String> {
     let mut keep: HashSet<String> = graph
         .refs
         .iter()
-        .filter(|r| r.ref_kind == "branch" && r.ref_remote.is_none())
+        .filter(|r| {
+            r.ref_kind == "branch"
+                && r.ref_remote.is_none()
+                && !operation_restore_excludes_ref(&r.ref_name)
+        })
         .map(|r| r.ref_name.clone())
         .collect();
     if graph.view.head_kind == "branch" {
         keep.insert(graph.view.head_target.clone());
     }
     keep
+}
+
+fn operation_restore_excludes_ref(name: &str) -> bool {
+    OwnedRefSpec::for_storage_name(name).is_some_and(|spec| !spec.policy().operation_snapshot)
+}
+
+fn skipped_owned_refs(graph: &OperationGraphRecord) -> Vec<String> {
+    let mut skipped: Vec<String> = graph
+        .refs
+        .iter()
+        .filter(|record| {
+            record.ref_kind == "branch"
+                && record.ref_remote.is_none()
+                && operation_restore_excludes_ref(&record.ref_name)
+        })
+        .map(|record| record.ref_name.clone())
+        .collect();
+    if graph.view.head_kind == "branch" && operation_restore_excludes_ref(&graph.view.head_target) {
+        skipped.push(graph.view.head_target.clone());
+    }
+    skipped.sort();
+    skipped.dedup();
+    skipped
 }
 
 /// List the local branches that an `op restore` would prune for the given
@@ -395,6 +434,7 @@ async fn handle_op_restore(
     let target_op_id = resolve_op_ref(&db, &repo_id, &op_ref).await?;
     let target_graph = load_operation_graph(&db, &target_op_id).await?;
     let target_op = target_graph.operation.clone();
+    let skipped_owned_refs = skipped_owned_refs(&target_graph);
 
     // plan-20260714 W0 (§C.11, ADR-0714-08): restoring rewrites THIS
     // worktree's HEAD, index and working tree from a snapshot. Doing that
@@ -509,6 +549,34 @@ async fn handle_op_restore(
     }
 
     if dry_run {
+        let restored_refs: Vec<String> = target_graph
+            .refs
+            .iter()
+            .filter(|record| {
+                !(record.ref_kind == "branch"
+                    && record.ref_remote.is_none()
+                    && operation_restore_excludes_ref(&record.ref_name))
+            })
+            .map(|record| record.ref_name.clone())
+            .collect();
+        let keep = restore_keep_set(&target_graph);
+        let pruned = local_branches_to_prune(&db, &keep)
+            .await
+            .map_err(|e| CliError::fatal(format!("failed to inspect branches: {e}")))?;
+        if output.is_json() {
+            return emit_json_data(
+                "op",
+                &OpOutput::RestorePreview {
+                    target_op_id,
+                    head_kind: target_graph.view.head_kind.clone(),
+                    head_target: target_graph.view.head_target.clone(),
+                    restored_refs,
+                    pruned_refs: pruned,
+                    skipped_owned_refs,
+                },
+                output,
+            );
+        }
         let short_id = &target_op_id[..8.min(target_op_id.len())];
         println!(
             "Would restore to operation {} ({})",
@@ -519,17 +587,20 @@ async fn handle_op_restore(
             target_graph.view.head_target, target_graph.view.head_kind
         );
         println!("Refs that would be restored:");
-        for ref_rec in &target_graph.refs {
+        for ref_rec in target_graph
+            .refs
+            .iter()
+            .filter(|record| restored_refs.contains(&record.ref_name))
+        {
             println!(
                 "  {}: {}",
                 ref_rec.ref_name,
                 &ref_rec.target_oid[..7.min(ref_rec.target_oid.len())]
             );
         }
-        let keep = restore_keep_set(&target_graph);
-        let pruned = local_branches_to_prune(&db, &keep)
-            .await
-            .map_err(|e| CliError::fatal(format!("failed to inspect branches: {e}")))?;
+        for name in &skipped_owned_refs {
+            println!("  Skipping Libra-owned local ref: {name}");
+        }
         if pruned.is_empty() {
             println!("No branches would be pruned.");
         } else {
@@ -554,7 +625,10 @@ async fn handle_op_restore(
         let mut affected: Vec<String> = target_graph
             .refs
             .iter()
-            .filter(|r| r.ref_kind == "branch")
+            .filter(|r| {
+                r.ref_kind == "branch"
+                    && !(r.ref_remote.is_none() && operation_restore_excludes_ref(&r.ref_name))
+            })
             .map(|r| r.ref_name.clone())
             .collect();
         affected.extend(pruned);
@@ -595,7 +669,13 @@ async fn handle_op_restore(
 
     let result = with_operation_log(restore_meta, OperationScope::default(), move |txn| {
         Box::pin(async move {
-            let new_head = if restore_graph.view.head_kind == "branch" {
+            let new_head = if restore_graph.view.head_kind == "branch"
+                && operation_restore_excludes_ref(&restore_graph.view.head_target)
+            {
+                Head::current_result_with_conn(txn)
+                    .await
+                    .map_err(|e| DbErr::Custom(e.to_string()))?
+            } else if restore_graph.view.head_kind == "branch" {
                 Head::Branch(restore_graph.view.head_target.clone())
             } else {
                 Head::Detached(
@@ -608,7 +688,10 @@ async fn handle_op_restore(
                 .map_err(|e| DbErr::Custom(e.to_string()))?;
 
             for ref_rec in &restore_graph.refs {
-                if ref_rec.ref_kind == "branch" {
+                if ref_rec.ref_kind == "branch"
+                    && !(ref_rec.ref_remote.is_none()
+                        && operation_restore_excludes_ref(&ref_rec.ref_name))
+                {
                     Branch::update_branch_with_conn(
                         txn,
                         &ref_rec.ref_name,
@@ -647,6 +730,7 @@ async fn handle_op_restore(
             &target_op_id[..8.min(target_op_id.len())],
             target_op.description
         ),
+        skipped_owned_refs: skipped_owned_refs.clone(),
     };
 
     if output.is_json() {
@@ -660,6 +744,9 @@ async fn handle_op_restore(
             _ => unreachable!(),
         }
     );
+    for name in &skipped_owned_refs {
+        println!("Skipped Libra-owned local ref: {name}");
+    }
     println!(
         "New operation recorded: {}",
         &result.op_id[..8.min(result.op_id.len())]
@@ -797,6 +884,7 @@ mod tests {
             "libra/intent".to_string(),
             "libra/src".to_string(),
             "libra/target".to_string(),
+            "libra/memory/repo".to_string(),
             "keep".to_string(),
             "ephemeral".to_string(),
         ];
@@ -804,6 +892,13 @@ mod tests {
         // Only the ordinary, view-absent branch is a prune candidate; every
         // locked branch and every `libra/`-namespaced internal ref is protected.
         assert_eq!(pruned, vec!["ephemeral".to_string()]);
+    }
+
+    #[test]
+    fn restore_skips_only_exact_memory_ref_from_legacy_views() {
+        assert!(operation_restore_excludes_ref("libra/memory/repo"));
+        assert!(!operation_restore_excludes_ref("libra/memory/repo-user"));
+        assert!(!operation_restore_excludes_ref("feature/memory"));
     }
 
     /// A branch in the keep set is never a prune candidate even if it shares a

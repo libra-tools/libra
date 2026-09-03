@@ -17,8 +17,13 @@ libra push [OPTIONS] [<repository> [<refspec>...]]
 remote. When invoked without arguments it pushes the current branch to its configured
 upstream remote. When a `repository` and one or more `refspec` values are given, all
 refspecs are validated before any network write and then sent in one receive-pack
-request. `--tags` pushes all local tags, and `--mirror` mirrors local branch/tag refs
+request. `--all` pushes all ordinary local branches, `--tags` pushes all local tags,
+and `--mirror` mirrors ordinary local branch/tag refs
 to the remote, including deletion of remote-only refs.
+
+The repository-local Memory authority (`refs/heads/libra/memory/repo`) never
+participates in ordinary push, `--all`, or `--mirror`. An explicit source,
+destination, or deletion refspec naming it is rejected before object transfer.
 
 The command negotiates with the remote to determine which objects are missing, packs them
 into a single pack file, and sends the pack along with a ref-update request. If the remote
@@ -54,11 +59,11 @@ global storage config for that run.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
-| `<repository>` | Remote name (e.g. `origin`). Required when `<refspec>`, `--tags`, or `--mirror` is used. | `libra push origin main` |
+| `<repository>` | Remote name (e.g. `origin`). Required when `<refspec>`, `--all`, `--tags`, or `--mirror` is used. | `libra push origin main` |
 | `<refspec>...` | Local ref, `<src>:<dst>` mapping, or `:<dst>` deletion. Multiple values are sent as one update set. | `libra push origin main feature:release` |
 | `-u`, `--set-upstream` | Set the upstream tracking branch after a successful single branch push. | `libra push -u origin feature-x` |
 | `-f`, `--force` | Allow non-fast-forward updates that overwrite remote history. | `libra push --force origin main` |
-| `-d`, `--delete` | Delete the named remote refs (each `<refspec>` is rewritten to a `:<ref>` deletion). Requires at least one ref; conflicts with `--set-upstream`/`--tags`/`--mirror`. | `libra push -d origin feature-x` |
+| `-d`, `--delete` | Delete the named remote refs (each `<refspec>` is rewritten to a `:<ref>` deletion). Requires at least one ref; conflicts with `--set-upstream`/`--tags`/`--all`/`--mirror`. | `libra push -d origin feature-x` |
 | `--force-with-lease[=<ref>[:<expect>]]` | Allow a non-fast-forward update only if the remote ref still matches the expected OID (the tracking-ref OID by default, or an explicit `<expect>`). Conflicts with `--force`. | `libra push --force-with-lease origin main` |
 | `--force-if-includes` | With `--force-with-lease` (All/Ref forms): additionally require the remote-tracking tip to be integrated locally (reachable from the pushed branch's reflog). Silent no-op with the exact lease form or without a lease (Git parity). |
 | `--thin` | Send REF_DELTA entries against server-known bases (the advertised old tips) — smaller packs on large-blob edits; the server completes them (`index-pack --fix-thin`). Self-contained packs remain the default (unlike git). |
@@ -67,6 +72,7 @@ global storage config for that run.
 | `--porcelain` | Machine-readable output: a `To <url>` header then `<flag>\t<from>:<to>\t<summary>` per ref. Conflicts with `--json`/`--machine`. | `libra push --porcelain origin main` |
 | `-n`, `--dry-run` | Perform negotiation and object collection but skip the actual upload. Reports what would be pushed. | `libra push --dry-run` |
 | `--tags` | Push all local `refs/tags/*` refs. Existing identical remote tags are skipped. | `libra push --tags origin` |
+| `--all` | Push every ordinary local `refs/heads/*` branch. Libra-owned local-only Memory is excluded. | `libra push --all origin` |
 | `--mirror` | Mirror local `refs/heads/*` and `refs/tags/*` to the remote, deleting remote-only branch/tag refs. Use with `--dry-run` to preview. | `libra push --mirror --dry-run origin` |
 | `--json` | Emit structured JSON envelope to stdout (global flag). | `libra push --json` |
 | `--machine` | Compact single-line JSON; suppresses progress (global flag). | `libra push --machine` |
@@ -88,6 +94,7 @@ libra push origin main feature:release
 libra push origin :stale-branch
 libra push origin refs/tags/v1.0:refs/tags/v1.0
 libra push --tags origin
+libra push --all origin
 libra push --mirror --dry-run origin
 libra push --json
 ```
