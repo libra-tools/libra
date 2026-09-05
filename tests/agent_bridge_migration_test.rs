@@ -6,7 +6,9 @@
 //! row exists (never deleting acked events/evidence) and only drops the tables
 //! on an empty database.
 
-use libra::internal::db::migration::{builtin_runner, run_builtin_migrations};
+use libra::internal::db::migration::{
+    MigrationError, MigrationRunner, builtin_migrations, run_builtin_migrations,
+};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
 const BRIDGE_TABLES: &[&str] = &[
@@ -16,6 +18,16 @@ const BRIDGE_TABLES: &[&str] = &[
     "agent_bridge_checkpoint",
     "agent_bridge_link",
 ];
+
+fn builtin_runner() -> Result<MigrationRunner, MigrationError> {
+    let mut runner = MigrationRunner::new();
+    runner.extend(
+        builtin_migrations()
+            .into_iter()
+            .filter(|migration| migration.version < 2026090101),
+    )?;
+    Ok(runner)
+}
 
 async fn table_exists(db: &sea_orm::DatabaseConnection, table: &str) -> bool {
     let rows = db

@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use libra::internal::db::migration::{
-    Migration, MigrationError, MigrationRunner, builtin_migrations, builtin_runner,
-    run_builtin_migrations,
+    Migration, MigrationError, MigrationRunner, builtin_migrations,
+    builtin_runner as all_builtin_runner, run_builtin_migrations as run_all_builtin_migrations,
 };
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 use tempfile::TempDir;
@@ -28,6 +28,23 @@ async fn connect(url: &str) -> DatabaseConnection {
     let mut opts = ConnectOptions::new(url.to_string());
     opts.sqlx_logging(false);
     Database::connect(opts).await.expect("connect")
+}
+
+// The migration tests below exercise historical down/up contracts. OL-02 is
+// intentionally forward-only, so keep those fixtures on the pre-v2 registry;
+// the dedicated operation_schema_v2 target covers the current tip.
+fn builtin_runner() -> Result<MigrationRunner, MigrationError> {
+    let mut runner = MigrationRunner::new();
+    runner.extend(
+        builtin_migrations()
+            .into_iter()
+            .filter(|migration| migration.version < 2026090101),
+    )?;
+    Ok(runner)
+}
+
+async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64>, MigrationError> {
+    builtin_runner()?.run_pending(conn).await
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +72,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
             2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
-            2026082401
+            2026082401, 2026090101
         ]
     );
     assert_eq!(
@@ -118,13 +135,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "approved_permission_provenance",
             "agent_bridge_capture",
             "agent_bridge_link_relations",
+            "operation_v2",
         ]
     );
 
-    let runner = builtin_runner().expect("builtin registry must build clean");
+    let runner = all_builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 57);
-    assert_eq!(runner.max_registered_version(), Some(2026082401));
+    assert_eq!(runner.len(), 58);
+    assert_eq!(runner.max_registered_version(), Some(2026090101));
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,12 +1152,12 @@ async fn establish_connection_auto_upgrades_stale_schema() {
     let path = dir.path().join("stale.db");
     let path_str = path.to_str().unwrap();
     let conn = create_database(path_str).await.unwrap();
-
-    let runner = builtin_runner().expect("builtin runner builds clean");
-    runner
-        .rollback_to(&conn, 2026050601)
-        .await
-        .expect("roll back latest migration");
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
+    ))
+    .await
+    .expect("remove the v2 version claim to simulate a stale connection");
     conn.close().await.unwrap();
 
     // Opening the connection now applies any pending migrations automatically,
@@ -1149,10 +1167,10 @@ async fn establish_connection_auto_upgrades_stale_schema() {
         .expect("ordinary connect should auto-upgrade a stale schema");
 
     let raw = connect(&format!("sqlite://{}", path.display())).await;
-    let latest = builtin_runner()
+    let latest = all_builtin_runner()
         .expect("builtin runner builds clean")
         .max_registered_version();
-    let current = builtin_runner()
+    let current = all_builtin_runner()
         .expect("builtin runner builds clean")
         .current_version_readonly(&raw)
         .await
@@ -1194,7 +1212,7 @@ async fn describe_schema_versions(conn: &DatabaseConnection) -> Vec<String> {
 async fn run_builtin_migrations_applies_current_builtin_registry() {
     let (_dir, url, _path) = fresh_db_url();
     let conn = connect(&url).await;
-    let applied = run_builtin_migrations(&conn)
+    let applied = run_all_builtin_migrations(&conn)
         .await
         .expect("run_builtin_migrations");
     assert_eq!(
@@ -1208,7 +1226,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
             2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
-            2026082401
+            2026082401, 2026090101
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -2259,7 +2277,7 @@ async fn rebase_state_migration_preserves_active_row_from_lazy_shape() {
     .await
     .expect("legacy in-progress row");
 
-    run_builtin_migrations(&conn).await.expect("migrations");
+    run_all_builtin_migrations(&conn).await.expect("migrations");
 
     assert!(column_exists(&conn, "rebase_state", "worktree_id").await);
     assert!(
@@ -2526,7 +2544,7 @@ async fn bisect_state_migration_preserves_active_row_from_lazy_shape() {
     .await
     .expect("stale + newest lazy rows");
 
-    run_builtin_migrations(&conn).await.expect("migrations");
+    run_all_builtin_migrations(&conn).await.expect("migrations");
 
     assert!(column_exists(&conn, "bisect_state", "worktree_id").await);
     assert!(
@@ -3693,8 +3711,8 @@ async fn gc_object_source_inventory_covers_every_oid_column() {
     // Semantic OID columns the name heuristic cannot flag — pinned by hand;
     // each must be inventoried too.
     for (table, column) in [
-        ("operation_view", "head_target"),
-        ("operation_view_workspace", "pointer_value"),
+        ("legacy_operation_view", "head_target"),
+        ("legacy_operation_view_workspace", "pointer_value"),
         ("object_index", "o_id"),
         ("metadata_kv", "value"),
     ] {
@@ -5058,7 +5076,7 @@ async fn approved_permission_old_reader_rejects_migrated_schema() {
         .await
         .expect("read tip")
         .expect("applied tip");
-    assert_eq!(current, 2026082401);
+    assert_eq!(current, 2026090101);
     // An old binary whose registry tip is still 2026080403 would see this
     // repository as UnsupportedFuture. Prove the refuse path on repository
     // DBs (not global config.db) by planting a version above this binary.

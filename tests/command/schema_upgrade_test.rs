@@ -2,7 +2,9 @@
 
 use std::{path::Path, time::Duration};
 
-use libra::internal::db::migration::builtin_runner;
+use libra::internal::db::migration::{
+    MigrationError, MigrationRunner, builtin_migrations, builtin_runner as current_builtin_runner,
+};
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 use tempfile::tempdir;
 
@@ -18,18 +20,103 @@ async fn connect_raw_repo_db(repo: &Path) -> DatabaseConnection {
         .expect("connect raw repository database")
 }
 
+/// Reconstruct the real pre-OL-02 operation shape for rollback fixtures.
+/// Production v2 is intentionally forward-only, so a fixture that exercises
+/// older migration downs must not run those downs against the v2 `operation`
+/// table and pretend that it is v1.
+async fn restore_v1_operation_shape(conn: &DatabaseConnection) {
+    for table in [
+        "ai_operation_link",
+        "change_predecessor",
+        "change_revision",
+        "change_identity",
+        "operation_journal",
+        "operation_head",
+        "operation_parent",
+        "operation",
+    ] {
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("DROP TABLE IF EXISTS `{table}`"),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("drop v2 fixture table {table}: {error}"));
+    }
+    for trigger in [
+        "legacy_operation_scope_provenance_domain_insert",
+        "legacy_operation_scope_provenance_domain_update",
+        "legacy_operation_scope_kind_domain_insert",
+        "legacy_operation_scope_kind_domain_update",
+    ] {
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("DROP TRIGGER IF EXISTS {trigger}"),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("drop v2 fixture trigger {trigger}: {error}"));
+    }
+    for index in [
+        "idx_legacy_operation_repo_order",
+        "idx_legacy_operation_dedup_scope",
+        "idx_legacy_operation_control_slot",
+        "idx_legacy_operation_parent_parent",
+        "idx_legacy_operation_view_repo_created",
+    ] {
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("DROP INDEX IF EXISTS {index}"),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("drop v2 fixture index {index}: {error}"));
+    }
+    for (legacy, v1) in [
+        ("legacy_operation", "operation"),
+        ("legacy_operation_parent", "operation_parent"),
+        ("legacy_operation_view", "operation_view"),
+        ("legacy_operation_view_ref", "operation_view_ref"),
+        (
+            "legacy_operation_view_workspace",
+            "operation_view_workspace",
+        ),
+    ] {
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("ALTER TABLE `{legacy}` RENAME TO `{v1}`"),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("restore {legacy} as {v1}: {error}"));
+    }
+}
+
 async fn stale_repo_at_approved_permission() -> tempfile::TempDir {
     let repo = tempdir().expect("create repository root");
     init_repo_via_cli(repo.path());
 
     let conn = connect_raw_repo_db(repo.path()).await;
-    let runner = builtin_runner().expect("built-in migration registry");
+    let runner = historical_builtin_runner().expect("historical migration registry");
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
+    ))
+    .await
+    .expect("remove forward-only v2 version marker before rollback fixture");
+    restore_v1_operation_shape(&conn).await;
     runner
         .rollback_to(&conn, 2026050601)
         .await
         .expect("roll back latest migration");
     conn.close().await.expect("close raw connection");
     repo
+}
+
+fn historical_builtin_runner() -> Result<MigrationRunner, MigrationError> {
+    let mut runner = MigrationRunner::new();
+    runner.extend(
+        builtin_migrations()
+            .into_iter()
+            .filter(|migration| migration.version < 2026090101),
+    )?;
+    Ok(runner)
 }
 
 async fn max_schema_version(conn: &DatabaseConnection) -> Option<i64> {
@@ -80,7 +167,7 @@ async fn normal_command_auto_upgrades_stale_schema() {
     assert_cli_success(&output, "libra status on a stale-schema repository");
 
     let conn = connect_raw_repo_db(repo.path()).await;
-    let latest = builtin_runner()
+    let latest = current_builtin_runner()
         .expect("built-in migration registry")
         .max_registered_version();
     assert_eq!(

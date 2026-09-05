@@ -38,6 +38,8 @@
 //! Future CEXes only touch the runner — no new `ensure_*` helpers should be
 //! added.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement, TransactionTrait};
@@ -640,7 +642,11 @@ async fn apply_one_migration_guarded(
                     )));
                 }
                 apply_migration_compatibility(txn, version, name).await?;
-                txn.execute_raw(Statement::from_string(backend, up)).await?;
+                if version == OPERATION_V2_MIGRATION_VERSION {
+                    apply_operation_v2_migration(txn, up).await?;
+                } else {
+                    txn.execute_raw(Statement::from_string(backend, up)).await?;
+                }
                 if version == 2026072902 && history != RegistryLinkedHistory::Never {
                     // The registry witness the migration's SQL cannot see
                     // (§C.9): a linked worktree removed before this upgrade
@@ -665,6 +671,373 @@ async fn apply_one_migration_guarded(
             sea_orm::TransactionError::Transaction(db) => MigrationError::Database(db),
         })?;
     Ok(inserted)
+}
+
+/// The operation-log migration is the one exception to the static-DDL path.
+///
+/// The active v1 operation wrapper must keep working during the OL-02..04
+/// foundation window, so old rows are copied into an explicit legacy_*
+/// namespace before the v2 tables are created. The copy, validation, source
+/// removal, and version claim all share the runner transaction. A failure
+/// therefore rolls back both data and schema, while a fresh v2 database simply
+/// receives empty legacy tables for the still-active v1 reader/writer.
+async fn apply_operation_v2_migration(
+    txn: &sea_orm::DatabaseTransaction,
+    canonical_sql: &str,
+) -> Result<(), DbErr> {
+    let operation_exists = sqlite_table_exists(txn, "operation").await?;
+    let operation_columns = if operation_exists {
+        sqlite_table_columns(txn, "operation").await?
+    } else {
+        BTreeSet::new()
+    };
+    let operation_is_v1 = operation_columns.contains("view_id");
+    if operation_exists && !operation_is_v1 && !operation_columns.contains("format_version") {
+        return Err(DbErr::Custom(
+            "operation table has neither the v1 view_id nor the v2 format_version shape"
+                .to_string(),
+        ));
+    }
+
+    if operation_is_v1 {
+        if sqlite_table_exists(txn, "legacy_operation").await? {
+            return Err(DbErr::Custom(
+                "legacy_operation already exists while the v1 operation table is present"
+                    .to_string(),
+            ));
+        }
+        for required in [
+            "op_id",
+            "repo_id",
+            "view_id",
+            "command_name",
+            "description",
+            "actor",
+            "start_ts",
+            "status",
+        ] {
+            if !operation_columns.contains(required) {
+                return Err(DbErr::Custom(format!(
+                    "v1 operation table is missing required column {required}"
+                )));
+            }
+        }
+
+        txn.execute_raw(Statement::from_string(
+            txn.get_database_backend(),
+            legacy_operation_staging_ddl(),
+        ))
+        .await?;
+        let expression = |column: &str, fallback: &str| {
+            if operation_columns.contains(column) {
+                column.to_string()
+            } else {
+                fallback.to_string()
+            }
+        };
+        let insert = format!(
+            "INSERT INTO legacy_operation__staging (
+             op_id, repo_id, view_id, command_name, description, actor, args_digest,
+             start_ts, end_ts, status, worktree_id, scope_provenance, restorable,
+             control_slot, claim_owner, scope_kind) SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+             COALESCE({}, ''), COALESCE({}, 'unknown'), COALESCE({}, 1), {}, {},
+             COALESCE({}, 'unknown') FROM operation",
+            expression("op_id", "''"),
+            expression("repo_id", "''"),
+            expression("view_id", "''"),
+            expression("command_name", "''"),
+            expression("description", "''"),
+            expression("actor", "''"),
+            expression("args_digest", "NULL"),
+            expression("start_ts", "0"),
+            expression("end_ts", "NULL"),
+            expression("status", "''"),
+            expression("worktree_id", "NULL"),
+            expression("scope_provenance", "NULL"),
+            expression("restorable", "NULL"),
+            expression("control_slot", "NULL"),
+            expression("claim_owner", "NULL"),
+            expression("scope_kind", "NULL"),
+        );
+        txn.execute_raw(Statement::from_string(txn.get_database_backend(), insert))
+            .await?;
+        validate_copy(
+            txn,
+            "operation",
+            "legacy_operation__staging",
+            &[
+                "op_id",
+                "repo_id",
+                "view_id",
+                "command_name",
+                "description",
+                "actor",
+            ],
+        )
+        .await?;
+        txn.execute_raw(Statement::from_string(
+            txn.get_database_backend(),
+            "DROP TABLE operation; ALTER TABLE legacy_operation__staging RENAME TO legacy_operation;",
+        ))
+        .await?;
+    }
+
+    let parent_exists = sqlite_table_exists(txn, "operation_parent").await?;
+    if parent_exists {
+        let parent_columns = sqlite_table_columns(txn, "operation_parent").await?;
+        if !parent_columns.contains("ordinal") {
+            copy_legacy_table(
+                txn,
+                "operation_parent",
+                "legacy_operation_parent",
+                "CREATE TABLE legacy_operation_parent__staging (op_id TEXT NOT NULL, parent_op_id TEXT NOT NULL, PRIMARY KEY (op_id, parent_op_id));",
+                "INSERT INTO legacy_operation_parent__staging (op_id, parent_op_id) SELECT op_id, parent_op_id FROM operation_parent;",
+                &["op_id", "parent_op_id"],
+            )
+            .await?;
+        }
+    }
+    copy_legacy_table_if_present(
+        txn,
+        "operation_view",
+        "legacy_operation_view",
+        "CREATE TABLE legacy_operation_view__staging (view_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, head_kind TEXT NOT NULL, head_target TEXT NOT NULL, created_at INTEGER NOT NULL);",
+        "INSERT INTO legacy_operation_view__staging (view_id, repo_id, head_kind, head_target, created_at) SELECT view_id, repo_id, head_kind, head_target, created_at FROM operation_view;",
+        &["view_id", "repo_id", "head_kind", "head_target"],
+    )
+    .await?;
+    copy_legacy_table_if_present(
+        txn,
+        "operation_view_ref",
+        "legacy_operation_view_ref",
+        "CREATE TABLE legacy_operation_view_ref__staging (view_id TEXT NOT NULL, ref_kind TEXT NOT NULL, ref_name TEXT NOT NULL, ref_remote TEXT NOT NULL, target_oid TEXT NOT NULL, PRIMARY KEY (view_id, ref_kind, ref_name, ref_remote));",
+        "INSERT INTO legacy_operation_view_ref__staging (view_id, ref_kind, ref_name, ref_remote, target_oid) SELECT view_id, ref_kind, ref_name, ref_remote, target_oid FROM operation_view_ref;",
+        &["view_id", "ref_kind", "ref_name", "target_oid"],
+    )
+    .await?;
+    copy_legacy_table_if_present(
+        txn,
+        "operation_view_workspace",
+        "legacy_operation_view_workspace",
+        "CREATE TABLE legacy_operation_view_workspace__staging (view_id TEXT NOT NULL, pointer_kind TEXT NOT NULL, pointer_value TEXT NOT NULL, PRIMARY KEY (view_id, pointer_kind));",
+        "INSERT INTO legacy_operation_view_workspace__staging (view_id, pointer_kind, pointer_value) SELECT view_id, pointer_kind, pointer_value FROM operation_view_workspace;",
+        &["view_id", "pointer_kind", "pointer_value"],
+    )
+    .await?;
+
+    txn.execute_raw(Statement::from_string(
+        txn.get_database_backend(),
+        legacy_operation_namespace_ddl(),
+    ))
+    .await?;
+    txn.execute_raw(Statement::from_string(
+        txn.get_database_backend(),
+        canonical_sql.to_string(),
+    ))
+    .await?;
+    Ok(())
+}
+
+const OPERATION_V2_MIGRATION_VERSION: i64 = 2026090101;
+
+fn legacy_operation_staging_ddl() -> String {
+    "CREATE TABLE legacy_operation__staging (
+     op_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, view_id TEXT NOT NULL,
+     command_name TEXT NOT NULL, description TEXT NOT NULL, actor TEXT NOT NULL,
+     args_digest TEXT, start_ts INTEGER NOT NULL, end_ts INTEGER, status TEXT NOT NULL,
+     worktree_id TEXT NOT NULL DEFAULT '', scope_provenance TEXT NOT NULL DEFAULT 'unknown',
+     restorable INTEGER NOT NULL DEFAULT 1, control_slot TEXT, claim_owner TEXT,
+     scope_kind TEXT NOT NULL DEFAULT 'unknown');"
+        .to_string()
+}
+
+fn legacy_operation_namespace_ddl() -> String {
+    "CREATE TABLE IF NOT EXISTS legacy_operation (
+     op_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, view_id TEXT NOT NULL,
+     command_name TEXT NOT NULL, description TEXT NOT NULL, actor TEXT NOT NULL,
+     args_digest TEXT, start_ts INTEGER NOT NULL, end_ts INTEGER, status TEXT NOT NULL,
+     worktree_id TEXT NOT NULL DEFAULT '', scope_provenance TEXT NOT NULL DEFAULT 'unknown',
+     restorable INTEGER NOT NULL DEFAULT 1, control_slot TEXT, claim_owner TEXT,
+     scope_kind TEXT NOT NULL DEFAULT 'unknown');
+     CREATE INDEX IF NOT EXISTS idx_legacy_operation_repo_order
+       ON legacy_operation(repo_id, end_ts DESC, start_ts DESC, op_id DESC);
+     CREATE INDEX IF NOT EXISTS idx_legacy_operation_dedup_scope
+       ON legacy_operation(repo_id, worktree_id, command_name, args_digest, status, end_ts);
+     CREATE UNIQUE INDEX IF NOT EXISTS idx_legacy_operation_control_slot
+       ON legacy_operation(repo_id, worktree_id)
+       WHERE status = 'running' AND control_slot IS NOT NULL;
+     CREATE TRIGGER IF NOT EXISTS legacy_operation_scope_provenance_domain_insert
+       BEFORE INSERT ON legacy_operation
+       FOR EACH ROW WHEN NEW.scope_provenance NOT IN ('declared', 'unknown')
+       BEGIN
+         SELECT RAISE(ABORT, 'legacy_operation.scope_provenance must be either declared or unknown');
+       END;
+     CREATE TRIGGER IF NOT EXISTS legacy_operation_scope_provenance_domain_update
+       BEFORE UPDATE OF scope_provenance ON legacy_operation
+       FOR EACH ROW WHEN NEW.scope_provenance NOT IN ('declared', 'unknown')
+       BEGIN
+         SELECT RAISE(ABORT, 'legacy_operation.scope_provenance must be either declared or unknown');
+       END;
+     CREATE TRIGGER IF NOT EXISTS legacy_operation_scope_kind_domain_insert
+       BEFORE INSERT ON legacy_operation
+       FOR EACH ROW WHEN NEW.scope_kind NOT IN ('main', 'linked', 'repository', 'unknown')
+       BEGIN
+         SELECT RAISE(ABORT, 'legacy_operation.scope_kind must be main, linked, repository or unknown');
+       END;
+     CREATE TRIGGER IF NOT EXISTS legacy_operation_scope_kind_domain_update
+       BEFORE UPDATE OF scope_kind ON legacy_operation
+       FOR EACH ROW WHEN NEW.scope_kind NOT IN ('main', 'linked', 'repository', 'unknown')
+       BEGIN
+         SELECT RAISE(ABORT, 'legacy_operation.scope_kind must be main, linked, repository or unknown');
+       END;
+     CREATE TABLE IF NOT EXISTS legacy_operation_parent (
+       op_id TEXT NOT NULL, parent_op_id TEXT NOT NULL,
+       PRIMARY KEY (op_id, parent_op_id));
+     CREATE INDEX IF NOT EXISTS idx_legacy_operation_parent_parent
+       ON legacy_operation_parent(parent_op_id, op_id);
+     CREATE TABLE IF NOT EXISTS legacy_operation_view (
+       view_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, head_kind TEXT NOT NULL,
+       head_target TEXT NOT NULL, created_at INTEGER NOT NULL);
+     CREATE INDEX IF NOT EXISTS idx_legacy_operation_view_repo_created
+       ON legacy_operation_view(repo_id, created_at DESC);
+     CREATE TABLE IF NOT EXISTS legacy_operation_view_ref (
+       view_id TEXT NOT NULL, ref_kind TEXT NOT NULL, ref_name TEXT NOT NULL,
+       ref_remote TEXT NOT NULL, target_oid TEXT NOT NULL,
+       PRIMARY KEY (view_id, ref_kind, ref_name, ref_remote));
+     CREATE TABLE IF NOT EXISTS legacy_operation_view_workspace (
+       view_id TEXT NOT NULL, pointer_kind TEXT NOT NULL, pointer_value TEXT NOT NULL,
+       PRIMARY KEY (view_id, pointer_kind));"
+        .to_string()
+}
+
+async fn copy_legacy_table_if_present(
+    txn: &sea_orm::DatabaseTransaction,
+    source: &str,
+    target: &str,
+    staging_ddl: &str,
+    insert_sql: &str,
+    keys: &[&str],
+) -> Result<(), DbErr> {
+    if sqlite_table_exists(txn, source).await? {
+        copy_legacy_table(txn, source, target, staging_ddl, insert_sql, keys).await?;
+    }
+    Ok(())
+}
+
+async fn copy_legacy_table(
+    txn: &sea_orm::DatabaseTransaction,
+    source: &str,
+    target: &str,
+    staging_ddl: &str,
+    insert_sql: &str,
+    keys: &[&str],
+) -> Result<(), DbErr> {
+    if sqlite_table_exists(txn, target).await? {
+        return Err(DbErr::Custom(format!(
+            "{target} already exists while {source} still needs migration"
+        )));
+    }
+    let staging = format!("{target}__staging");
+    txn.execute_raw(Statement::from_string(
+        txn.get_database_backend(),
+        format!("DROP TABLE IF EXISTS {staging}; {staging_ddl}"),
+    ))
+    .await?;
+    txn.execute_raw(Statement::from_string(
+        txn.get_database_backend(),
+        insert_sql.to_string(),
+    ))
+    .await?;
+    validate_copy(txn, source, &staging, keys).await?;
+    txn.execute_raw(Statement::from_string(
+        txn.get_database_backend(),
+        format!("DROP TABLE {source}; ALTER TABLE {staging} RENAME TO {target};"),
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn validate_copy(
+    txn: &sea_orm::DatabaseTransaction,
+    source: &str,
+    staging: &str,
+    keys: &[&str],
+) -> Result<(), DbErr> {
+    let source_count = count_rows(txn, source, None).await?;
+    let staging_count = count_rows(txn, staging, None).await?;
+    if source_count != staging_count {
+        return Err(DbErr::Custom(format!(
+            "copy-first migration row-count mismatch for {source}: source={source_count}, staging={staging_count}"
+        )));
+    }
+    let invalid_predicate = keys
+        .iter()
+        .map(|key| format!("COALESCE(TRIM({key}), '') = ''"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if count_rows(txn, staging, Some(&invalid_predicate)).await? != 0 {
+        return Err(DbErr::Custom(format!(
+            "copy-first migration found an empty key in {source}"
+        )));
+    }
+    let key_predicate = keys
+        .iter()
+        .map(|key| format!("s.{key} = t.{key}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let source_missing = count_rows(
+        txn,
+        &format!(
+            "{source} AS s WHERE NOT EXISTS (SELECT 1 FROM {staging} AS t WHERE {key_predicate})"
+        ),
+        None,
+    )
+    .await?;
+    let staging_missing = count_rows(
+        txn,
+        &format!(
+            "{staging} AS t WHERE NOT EXISTS (SELECT 1 FROM {source} AS s WHERE {key_predicate})"
+        ),
+        None,
+    )
+    .await?;
+    if source_missing != 0 || staging_missing != 0 {
+        return Err(DbErr::Custom(format!(
+            "copy-first migration key-set mismatch for {source}: source_missing={source_missing}, staging_missing={staging_missing}"
+        )));
+    }
+    Ok(())
+}
+
+async fn sqlite_table_exists<C: ConnectionTrait>(conn: &C, name: &str) -> Result<bool, DbErr> {
+    Ok(conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            [name.into()],
+        ))
+        .await?
+        .is_some())
+}
+
+async fn sqlite_table_columns<C: ConnectionTrait>(
+    conn: &C,
+    table: &str,
+) -> Result<BTreeSet<String>, DbErr> {
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("PRAGMA table_info('{table}')"),
+        ))
+        .await?;
+    let mut columns = BTreeSet::new();
+    for row in rows {
+        let name: String = row
+            .try_get_by_index(1)
+            .map_err(|error| DbErr::Custom(format!("cannot decode {table} column: {error}")))?;
+        columns.insert(name);
+    }
+    Ok(columns)
 }
 
 /// Install additive columns that SQLite cannot express idempotently in a SQL
@@ -1403,6 +1776,15 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations.sql"),
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations_down.sql"),
         ),
+        // OL-02..04 foundation: v2 schema, canonical manifests, and the
+        // durable store are landed together. The migration is forward-only;
+        // legacy rows remain under legacy_* until the later runtime cutover.
+        Migration {
+            version: OPERATION_V2_MIGRATION_VERSION,
+            name: "operation_v2",
+            up: include_str!("../../../sql/migrations/2026090101_operation_v2.sql"),
+            down: None,
+        },
     ]
 }
 
@@ -1850,9 +2232,12 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 57);
+        assert_eq!(runner.len(), 58);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026082401));
+        assert_eq!(
+            runner.max_registered_version(),
+            Some(OPERATION_V2_MIGRATION_VERSION)
+        );
     }
 
     #[test]

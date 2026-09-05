@@ -35,35 +35,35 @@ use crate::{
 
 /// `--help` examples shown in `libra worktree --help` output.
 pub const WORKTREE_EXAMPLES: &str = "\
-EXAMPLES:
-    libra worktree add ../feature-x                Create a linked worktree (detached at
-                                                   the source commit)
-    libra worktree add ../fix-1 hotfix             Check the existing branch `hotfix` out
-    libra worktree add --detach ../probe v1.2.0    Detached worktree at a commit-ish
-    libra worktree add -b topic ../topic main      Create branch `topic` from `main` and
-                                                   check it out
-    libra worktree list                            List every registered worktree
-    libra worktree list --porcelain                Machine-readable worktree list
-    libra worktree lock ../feature-x --reason wip  Lock a worktree to prevent prune/remove
-    libra worktree unlock ../feature-x             Release the lock
-    libra worktree move ../old ../new              Rename a worktree
-    libra worktree prune                           Drop entries whose paths vanished
-    libra worktree remove ../feature-x             Unregister, keep the directory on disk
-    libra worktree remove ../feature-x --delete-dir
-                                                   Unregister and delete the directory
-                                                   (refused on a dirty worktree)
-    libra worktree repair --confirm                Fix stale or duplicate registry rows
-    libra worktree repair --confirm ../feature-x   Restore that worktree's gitdir identity
-                                                   from the registry (registry v2)
-    libra worktree repair --migrate-layout --confirm
-                                                   Migrate every legacy shared-.libra
-                                                   symlink worktree to the isolated layout
-    libra worktree repair --migrate-layout --dry-run
-                                                   Report what would be migrated (read-only)
-    libra worktree doctor                          Read-only diagnostics of per-worktree
-                                                   scopes and Agent workspaces (paginated)
-    libra --json worktree doctor --limit 20        One machine-readable page
-    libra worktree doctor ws-3f0c                  Diagnose a single workspace scope";
+ EXAMPLES:
+     libra worktree add ../feature-x                Create a linked worktree (detached at
+                                                    the source commit)
+     libra worktree add ../fix-1 hotfix             Check the existing branch `hotfix` out
+     libra worktree add --detach ../probe v1.2.0    Detached worktree at a commit-ish
+     libra worktree add -b topic ../topic main      Create branch `topic` from `main` and
+                                                    check it out
+     libra worktree list                            List every registered worktree
+     libra worktree list --porcelain                Machine-readable worktree list
+     libra worktree lock ../feature-x --reason wip  Lock a worktree to prevent prune/remove
+     libra worktree unlock ../feature-x             Release the lock
+     libra worktree move ../old ../new              Rename a worktree
+     libra worktree prune                           Drop entries whose paths vanished
+     libra worktree remove ../feature-x             Unregister, keep the directory on disk
+     libra worktree remove ../feature-x --delete-dir
+                                                    Unregister and delete the directory
+                                                    (refused on a dirty worktree)
+     libra worktree repair --confirm                Fix stale or duplicate registry rows
+     libra worktree repair --confirm ../feature-x   Restore that worktree's gitdir identity
+                                                    from the registry (registry v2)
+     libra worktree repair --migrate-layout --confirm
+                                                    Migrate every legacy shared-.libra
+                                                    symlink worktree to the isolated layout
+     libra worktree repair --migrate-layout --dry-run
+                                                    Report what would be migrated (read-only)
+     libra worktree doctor                          Read-only diagnostics of per-worktree
+                                                    scopes and Agent workspaces (paginated)
+     libra --json worktree doctor --limit 20        One machine-readable page
+     libra worktree doctor ws-3f0c                  Diagnose a single workspace scope";
 
 /// Manage multiple working trees attached to this repository.
 //
@@ -188,11 +188,11 @@ pub enum WorktreeSubcommand {
         /// workspace. Requires a workspace id and --confirm; the default
         /// doctor command remains strictly read-only.
         #[clap(
-            long,
-            value_name = "SESSION_ID",
-            requires = "workspace_id",
-            conflicts_with_all = ["limit", "cursor"]
-        )]
+             long,
+             value_name = "SESSION_ID",
+             requires = "workspace_id",
+             conflicts_with_all = ["limit", "cursor"]
+         )]
         adopt_capture_session: Option<String>,
         /// Copy the repository's common `info/exclude`/`info/attributes`
         /// (main's `.libra/info/*`) into ONE linked worktree's local gitdir
@@ -200,48 +200,48 @@ pub enum WorktreeSubcommand {
         /// only to main; adoption is explicit and per-worktree, never
         /// automatic). Requires --confirm.
         #[clap(
-            long,
-            value_name = "WORKTREE_PATH",
-            conflicts_with_all = [
-                "workspace_id", "limit", "cursor", "adopt_capture_session",
-                "adopt_approved_project", "clear_approved_project"
-            ]
-        )]
+             long,
+             value_name = "WORKTREE_PATH",
+             conflicts_with_all = [
+                 "workspace_id", "limit", "cursor", "adopt_capture_session",
+                 "adopt_approved_project", "clear_approved_project"
+             ]
+         )]
         adopt_info_to: Option<String>,
         /// Delete the repository's common `.libra/info/exclude` and
         /// `info/attributes` (explicit clear for rules that should no longer
         /// apply anywhere). Requires --confirm.
         #[clap(
-            long,
-            conflicts_with_all = [
-                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
-                "adopt_approved_project", "clear_approved_project"
-            ]
-        )]
+             long,
+             conflicts_with_all = [
+                 "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                 "adopt_approved_project", "clear_approved_project"
+             ]
+         )]
         clear_common_info: bool,
         /// Re-home Always approvals whose opaque `project_id` is not the
         /// current `libra.repoid` onto the canonical repository identity
         /// (plan-20260715 W4-07). Migrations never do this; requires
         /// --confirm.
         #[clap(
-            long,
-            value_name = "LEGACY_PROJECT_ID",
-            conflicts_with_all = [
-                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
-                "clear_common_info", "clear_approved_project"
-            ]
-        )]
+             long,
+             value_name = "LEGACY_PROJECT_ID",
+             conflicts_with_all = [
+                 "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                 "clear_common_info", "clear_approved_project"
+             ]
+         )]
         adopt_approved_project: Option<String>,
         /// Delete Always approvals under a legacy (non-canonical) `project_id`
         /// without adopting them. Requires --confirm.
         #[clap(
-            long,
-            value_name = "LEGACY_PROJECT_ID",
-            conflicts_with_all = [
-                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
-                "clear_common_info", "adopt_approved_project"
-            ]
-        )]
+             long,
+             value_name = "LEGACY_PROJECT_ID",
+             conflicts_with_all = [
+                 "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                 "clear_common_info", "adopt_approved_project"
+             ]
+         )]
         clear_approved_project: Option<String>,
         /// Confirm a mutating doctor action (capture-scope adoption,
         /// info-file adoption, common-info clearing, or approved_permission
@@ -489,7 +489,7 @@ impl WorktreeState {
         if has_v2_keys && has_v1_keys {
             return Err(
                 "registry mixes v2 (`schema_version`/`entries`) and legacy v1 (`worktrees`) \
-                 keys; refusing the ambiguous file"
+                  keys; refusing the ambiguous file"
                     .to_string(),
             );
         }
@@ -1073,7 +1073,7 @@ pub(crate) async fn reject_bare_repository_without_migrations() -> CliResult<()>
         .map_err(|source| {
             CliError::fatal(format!(
                 "cannot open the repository database without applying migrations to classify \
-                 this repository: {source}"
+                  this repository: {source}"
             ))
             .with_stable_code(StableErrorCode::IoReadFailed)
         })?;
@@ -1112,7 +1112,7 @@ fn reject_bare_repository_impl(
     if is_bare {
         return Err(CliError::fatal(format!(
             "this is a bare repository ('{}'): it has no working trees, so the \
-             `worktree` command family is unavailable here",
+              `worktree` command family is unavailable here",
             storage.display()
         ))
         .with_stable_code(StableErrorCode::RepoStateInvalid));
@@ -1160,7 +1160,7 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             .map_err(|source| {
                 CliError::fatal(format!(
                     "cannot open the repository database before touching the worktree \
-                     registry: {source}"
+                      registry: {source}"
                 ))
                 .with_stable_code(StableErrorCode::IoReadFailed)
             })?;
@@ -1321,9 +1321,9 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                 if !yes {
                     return Err(WorktreeError::OperationBlocked(format!(
                         "--resolve-identity detaches '{path}' from the registry — its files and \
-                         scoped state are kept, and every command inside it will fail closed \
-                         until you re-add it or run `remove --delete-dir`; re-run with --yes to \
-                         confirm"
+                          scoped state are kept, and every command inside it will fail closed \
+                          until you re-add it or run `remove --delete-dir`; re-run with --yes to \
+                          confirm"
                     ))
                     .into_cli_error());
                 }
@@ -1512,7 +1512,7 @@ pub(crate) async fn begin_repair_operation(
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint(
                 "another control action is running or just completed in this worktree; wait for \
-                 it to finish, or inspect it with `libra op log`",
+                  it to finish, or inspect it with `libra op log`",
             )
     })
 }
@@ -1541,7 +1541,7 @@ pub(crate) async fn finish_repair_operation<T>(
         .with_stable_code(StableErrorCode::IoWriteFailed)
         .with_hint(
             "the repair's effects stand; inspect the unclosed record with `libra op log`, \
-             and re-run the repair once the operation log is writable again",
+              and re-run the repair once the operation log is writable again",
         ));
     }
     result
@@ -1591,7 +1591,7 @@ async fn adopted_scope_settings_present(
     // `sparse_view_meta`, so counting patterns alone would miss it.
     let sparse_enabled = count(
         "SELECT COUNT(*) FROM `sparse_view_meta` \
-         WHERE `worktree_id` = '' AND `enabled` <> 0",
+          WHERE `worktree_id` = '' AND `enabled` <> 0",
     )
     .await?;
     if sparse_enabled > 0 {
@@ -1643,7 +1643,7 @@ async fn resolve_identity_collision(path: &str) -> WorktreeResult<String> {
     if claimants < 2 {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{target_key}' is the only live entry claiming identity '{identity}' — there is \
-             no collision to resolve here"
+              no collision to resolve here"
         )));
     }
 
@@ -1700,9 +1700,9 @@ async fn resolve_identity_collision(path: &str) -> WorktreeResult<String> {
     }
     Ok(format!(
         "Detached '{target_key}' from the registry (identity '{identity}'). Its files and \
-         scoped state are kept and every command inside it now fails closed; the remaining \
-         claimant owns the identity again. Finish with `libra worktree remove --delete-dir \
-         {target_key}`, or `libra worktree add {target_key}` to re-attach it."
+          scoped state are kept and every command inside it now fails closed; the remaining \
+          claimant owns the identity again. Finish with `libra worktree remove --delete-dir \
+          {target_key}`, or `libra worktree add {target_key}` to re-attach it."
     ))
 }
 
@@ -1813,9 +1813,9 @@ fn load_state() -> WorktreeResult<WorktreeState> {
     if let Some(conflict) = state.identity_conflict() {
         return Err(WorktreeError::OperationBlocked(format!(
             "the worktree registry is ambiguous: {conflict}. Run `libra worktree doctor` to see \
-             which entries collide, then \
-             `libra worktree repair <path> --resolve-identity --yes` to unregister the one you \
-             do not want (the directory is left on disk)"
+              which entries collide, then \
+              `libra worktree repair <path> --resolve-identity --yes` to unregister the one you \
+              do not want (the directory is left on disk)"
         )));
     }
     Ok(state)
@@ -1847,8 +1847,8 @@ fn load_state_impl(heal_identity_invariants: bool) -> WorktreeResult<WorktreeSta
         return Err(WorktreeError::StateCorrupt {
             path: path.clone(),
             source: "registry file exists but is EMPTY (torn write?); restore it from a \
-                     backup, or delete it to let the next worktree command reinitialize \
-                     a fresh registry"
+                      backup, or delete it to let the next worktree command reinitialize \
+                      a fresh registry"
                 .to_string(),
         });
     }
@@ -2007,8 +2007,8 @@ fn load_state_readonly_at(path: &std::path::Path) -> WorktreeResult<WorktreeStat
         return Err(WorktreeError::StateCorrupt {
             path: path.clone(),
             source: "registry file exists but is EMPTY (torn write?); restore it from a \
-                     backup, or delete it to let the next worktree command reinitialize \
-                     a fresh registry"
+                      backup, or delete it to let the next worktree command reinitialize \
+                      a fresh registry"
                 .to_string(),
         });
     }
@@ -2312,7 +2312,7 @@ async fn add_worktree(
                 if target_spec.is_some() || detach || new_branch.is_some() {
                     return Err(WorktreeError::InvalidTarget(format!(
                         "'{}' is a detached worktree; re-attaching resumes its own \
-                         HEAD — drop the branch/commit arguments (then switch inside it)",
+                          HEAD — drop the branch/commit arguments (then switch inside it)",
                         canonical_target.display()
                     )));
                 }
@@ -2321,7 +2321,7 @@ async fn add_worktree(
             WorktreeEntryState::Tombstone => {
                 return Err(WorktreeError::OperationBlocked(format!(
                     "'{}' is a tombstone (scoped cleanup pending); run `libra worktree \
-                     repair --confirm` first, then add",
+                      repair --confirm` first, then add",
                     canonical_target.display()
                 )));
             }
@@ -2329,7 +2329,7 @@ async fn add_worktree(
                 if target_spec.is_some() || detach || new_branch.is_some() {
                     return Err(WorktreeError::InvalidTarget(format!(
                         "'{}' is already a registered worktree; switch branches inside \
-                         it instead",
+                          it instead",
                         canonical_target.display()
                     )));
                 }
@@ -2388,7 +2388,7 @@ async fn add_worktree(
         {
             return Err(WorktreeError::OperationBlocked(format!(
                 "branch '{name}' already exists; -B/--force are not supported — pick a new \
-                 name or check the existing branch out with `worktree add <path> {name}`"
+                  name or check the existing branch out with `worktree add <path> {name}`"
             )));
         }
         let start = match &target_spec {
@@ -2421,13 +2421,13 @@ async fn add_worktree(
                         Err(error) => {
                             return Err(WorktreeError::IoRead(format!(
                                 "cannot verify whether branch '{spec}' is checked out: \
-                                 {error}"
+                                  {error}"
                             )));
                         }
                         Ok(Some(scope)) => {
                             return Err(WorktreeError::OperationBlocked(format!(
                                 "branch '{spec}' is already checked out at worktree \
-                                 '{scope}'; use --detach to share its tip read-only"
+                                  '{scope}'; use --detach to share its tip read-only"
                             )));
                         }
                         Ok(None) => {}
@@ -2439,9 +2439,9 @@ async fn add_worktree(
                 let commit = util::get_commit_base(spec).await.map_err(|error| {
                     WorktreeError::InvalidTarget(format!(
                         "'{spec}' is neither a local branch nor a resolvable commit \
-                         ({error}); Libra does not create branches from remote-tracking \
-                         names automatically (Git's DWIM is deferred) — use `-b {spec} \
-                         <path> <remote>/{spec}` explicitly"
+                          ({error}); Libra does not create branches from remote-tracking \
+                          names automatically (Git's DWIM is deferred) — use `-b {spec} \
+                          <path> <remote>/{spec}` explicitly"
                     ))
                 })?;
                 AddCheckout::Detached(commit)
@@ -2501,7 +2501,7 @@ async fn add_worktree(
         .map_err(|e| {
             WorktreeError::IoWrite(format!(
                 "cannot register worktree '{}': failed to clear stale scoped rows for its \
-                 instance id: {e}",
+                  instance id: {e}",
                 target.display()
             ))
         })?;
@@ -2607,7 +2607,7 @@ async fn add_worktree(
                         let _ = journal_resolve(&db, add_journal_id).await;
                         return Err(WorktreeError::OperationBlocked(format!(
                             "branch '{name}' is already checked out at worktree \
-                             '{scope}'; use --detach to share its tip read-only"
+                              '{scope}'; use --detach to share its tip read-only"
                         )));
                     }
                     Ok(None) => {}
@@ -2868,10 +2868,10 @@ async fn warn_on_case_probe_mismatch(target: &std::path::Path) {
     if probed != persisted {
         eprintln!(
             "warning: this worktree's filesystem is case-{} but the repository's persisted \
-             core.ignorecase is {persisted} (probed from the main worktree at init); \
-             case-collision guards here may misjudge until the per-worktree config overlay \
-             lands (plan-20260714 W4). Set core.ignorecase explicitly if this repository \
-             spans differing filesystems.",
+              core.ignorecase is {persisted} (probed from the main worktree at init); \
+              case-collision guards here may misjudge until the per-worktree config overlay \
+              lands (plan-20260714 W4). Set core.ignorecase explicitly if this repository \
+              spans differing filesystems.",
             if probed { "insensitive" } else { "sensitive" }
         );
     }
@@ -2890,7 +2890,7 @@ async fn reattach_worktree(
     let Some(expected_id) = state.entries[index].worktree_id.clone() else {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot re-attach '{}': the registry entry has no persisted worktree id; run \
-             `libra worktree repair --confirm` first",
+              `libra worktree repair --confirm` first",
             target.display()
         )));
     };
@@ -2902,7 +2902,7 @@ async fn reattach_worktree(
     if current_id.as_deref() != Some(expected_id.as_str()) {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot re-attach '{}': its gitdir identity ({}) does not match the registry's \
-             persisted id ({expected_id}); run `libra worktree repair --confirm {}` first",
+              persisted id ({expected_id}); run `libra worktree repair --confirm {}` first",
             target.display(),
             current_id.as_deref().unwrap_or("missing"),
             target.display()
@@ -2936,7 +2936,7 @@ async fn reattach_worktree(
     if !commondir_ok {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot re-attach '{}': its commondir pointer is missing, corrupt, or targets a \
-             different repository's storage; run `libra worktree repair --confirm {}` first",
+              different repository's storage; run `libra worktree repair --confirm {}` first",
             target.display(),
             target.display()
         )));
@@ -2976,8 +2976,8 @@ async fn reattach_worktree(
     {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot re-attach '{}': identity '{identity}' is already claimed by another ACTIVE \
-             worktree. Run `libra worktree doctor`, then \
-             `libra worktree repair <path> --resolve-identity --yes` on the one you do not want",
+              worktree. Run `libra worktree doctor`, then \
+              `libra worktree repair <path> --resolve-identity --yes` on the one you do not want",
             state.entries[index].path
         )));
     }
@@ -2991,7 +2991,7 @@ async fn reattach_worktree(
             // Journal kept: repair finishes lifting the marker.
             return Err(WorktreeError::IoWrite(format!(
                 "cannot remove the detached marker '{}' (run `libra worktree repair \
-                 --confirm` to finish the re-attach): {error}",
+                  --confirm` to finish the re-attach): {error}",
                 marker.display()
             )));
         }
@@ -3077,9 +3077,9 @@ async fn lifecycle_upsert(
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?) \
-         ON CONFLICT(worktree_id) DO UPDATE SET state = excluded.state, \
-         path = excluded.path, updated_at = excluded.updated_at",
+          VALUES (?, ?, ?, ?, ?) \
+          ON CONFLICT(worktree_id) DO UPDATE SET state = excluded.state, \
+          path = excluded.path, updated_at = excluded.updated_at",
         [
             worktree_id.into(),
             state.into(),
@@ -3179,7 +3179,7 @@ async fn journal_append(
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
-             VALUES (?, ?, ?, ?)",
+              VALUES (?, ?, ?, ?)",
             [
                 op.into(),
                 worktree_id.into(),
@@ -3608,19 +3608,19 @@ pub(crate) async fn collect_worktree_scope_report(
         match entry.layout {
             "legacy-symlink" => findings.push(
                 "uses the pre-isolation shared-`.libra` symlink layout; mutations here are \
-                 refused because they would move the MAIN worktree's HEAD/index. Migrate with \
-                 `libra worktree repair --migrate-layout --confirm <path>` from the main \
-                 worktree."
+                  refused because they would move the MAIN worktree's HEAD/index. Migrate with \
+                  `libra worktree repair --migrate-layout --confirm <path>` from the main \
+                  worktree."
                     .to_string(),
             ),
             "missing" => findings.push(
                 "the registered directory is gone; `libra worktree prune` removes entries whose \
-                 path is confirmed missing."
+                  path is confirmed missing."
                     .to_string(),
             ),
             "corrupt" => findings.push(
                 "the worktree's `.libra` metadata could not be read; `libra worktree repair \
-                 --confirm <path>` restores its identity from the registry."
+                  --confirm <path>` restores its identity from the registry."
                     .to_string(),
             ),
             _ => {}
@@ -3628,22 +3628,22 @@ pub(crate) async fn collect_worktree_scope_report(
         if !identity_registered && entry.layout != "missing" {
             findings.push(
                 "this worktree's identity is not one the registry knows, so mutations here are \
-                 refused; `libra worktree repair --confirm <path>` restores it from the \
-                 registry's persisted id."
+                  refused; `libra worktree repair --confirm <path>` restores it from the \
+                  registry's persisted id."
                     .to_string(),
             );
         }
         if entry.state == "detached_from_registry" {
             findings.push(
                 "detached from the registry: re-attach with `libra worktree add <path>`, or \
-                 finish the removal with `libra worktree remove --delete-dir <path>`."
+                  finish the removal with `libra worktree remove --delete-dir <path>`."
                     .to_string(),
             );
         }
         if entry.state == "tombstone" {
             findings.push(
                 "a removal did not finish cleaning up; `libra worktree repair --confirm` \
-                 retries it."
+                  retries it."
                     .to_string(),
             );
         }
@@ -3661,20 +3661,20 @@ pub(crate) async fn collect_worktree_scope_report(
             match adopted_scope_settings_present(conn).await {
                 Ok(Some(kinds)) => findings.push(format!(
                     "this worktree holds {kinds} that may have been adopted from a linked \
-                     worktree removed before the scope migration — their provenance cannot be \
-                     established (§C.4.3). Review them with `libra layer list` / \
-                     `libra sparse-view list`; `libra layer remove <name>` and \
-                     `libra sparse-view clear` drop the ones that are not yours. No file in the \
-                     working tree is affected either way."
+                      worktree removed before the scope migration — their provenance cannot be \
+                      established (§C.4.3). Review them with `libra layer list` / \
+                      `libra sparse-view list`; `libra layer remove <name>` and \
+                      `libra sparse-view clear` drop the ones that are not yours. No file in the \
+                      working tree is affected either way."
                 )),
                 Ok(None) => {}
                 // Fail closed (§C.13): a diagnostic that could not look must say
                 // so, not report "nothing to see".
                 Err(error) => findings.push(format!(
                     "this repository has linked-worktree history, and whether it holds \
-                     layer/sparse settings of unknown provenance COULD NOT BE DETERMINED: \
-                     {error}. Treat the answer as unknown until the repository database is \
-                     readable."
+                      layer/sparse settings of unknown provenance COULD NOT BE DETERMINED: \
+                      {error}. Treat the answer as unknown until the repository database is \
+                      readable."
                 )),
             }
         }
@@ -3698,10 +3698,10 @@ pub(crate) async fn collect_worktree_scope_report(
             if !common_info.is_empty() {
                 findings.push(format!(
                     "common info file(s) {} apply ONLY to this main worktree since W0 \
-                     (info files are worktree-local; linked worktrees read their own \
-                     `.libra/info/*`). Copy them into one linked worktree with \
-                     `libra worktree doctor --adopt-info-to <path> --confirm`, or delete \
-                     them with `libra worktree doctor --clear-common-info --confirm`.",
+                      (info files are worktree-local; linked worktrees read their own \
+                      `.libra/info/*`). Copy them into one linked worktree with \
+                      `libra worktree doctor --adopt-info-to <path> --confirm`, or delete \
+                      them with `libra worktree doctor --clear-common-info --confirm`.",
                     common_info
                         .iter()
                         .map(|name| format!("info/{name}"))
@@ -3722,9 +3722,9 @@ pub(crate) async fn collect_worktree_scope_report(
         {
             findings.push(format!(
                 "this identity ('{id}') is claimed by {} entries ({}); every worktree MUTATION \
-                 is refused until one is unregistered — \
-                 `libra worktree repair <path> --resolve-identity --yes` on the one you do not \
-                 want. Ordinary remove cannot do it: it needs the same loader that is refusing.",
+                  is refused until one is unregistered — \
+                  `libra worktree repair <path> --resolve-identity --yes` on the one you do not \
+                  want. Ordinary remove cannot do it: it needs the same loader that is refusing.",
                 other.len(),
                 other.join(", ")
             ));
@@ -3822,7 +3822,7 @@ fn adopt_common_info_files(target: &str) -> CliResult<String> {
     ) {
         return Err(CliError::command_usage(format!(
             "'{target}' is not a linked worktree of this repository (no `.libra/commondir`); \
-             --adopt-info-to copies INTO a linked worktree's own gitdir"
+              --adopt-info-to copies INTO a linked worktree's own gitdir"
         )));
     }
     let target_common = crate::utils::util::try_get_storage_path(Some(target_path.clone()))
@@ -3834,7 +3834,7 @@ fn adopt_common_info_files(target: &str) -> CliResult<String> {
     if target_common != common {
         return Err(CliError::command_usage(format!(
             "'{target}' belongs to a DIFFERENT repository (its common storage is '{}'); \
-             refusing to copy this repository's info files there",
+              refusing to copy this repository's info files there",
             target_common.display()
         )));
     }
@@ -3900,7 +3900,7 @@ fn adopt_common_info_files(target: &str) -> CliResult<String> {
     if copied.is_empty() && skipped.is_empty() {
         return Ok(
             "nothing to adopt: the common storage has no info/exclude or \
-                   info/attributes"
+                    info/attributes"
                 .to_string(),
         );
     }
@@ -3997,8 +3997,8 @@ async fn list_worktrees(
     if schema_version != 2 {
         return Err(CliError::failure(format!(
             "unsupported worktree list schema version {schema_version}: the shipped shape is \
-             version 2 (worktree_id/layout/epoch fields); the pre-identity v1 shape gained \
-             those fields in place and no frozen v1 remains to serve"
+              version 2 (worktree_id/layout/epoch fields); the pre-identity v1 shape gained \
+              those fields in place and no frozen v1 remains to serve"
         ))
         .with_exit_code(129)
         .with_stable_code(StableErrorCode::CliInvalidArguments));
@@ -4239,8 +4239,8 @@ async fn stale_fence_capture_finding(
                 DbBackend::Sqlite,
                 format!(
                     "SELECT COUNT(*) AS n FROM {table} \
-                     WHERE scope_state = 'scoped' AND workspace_id = ? \
-                       AND workspace_fence <> ?"
+                      WHERE scope_state = 'scoped' AND workspace_id = ? \
+                        AND workspace_fence <> ?"
                 ),
                 [
                     record.workspace_id.clone().into(),
@@ -4256,9 +4256,9 @@ async fn stale_fence_capture_finding(
             "capture_rows_stale_fence",
             format!(
                 "{stale} scoped capture row(s) carry an earlier lease fence of this \
-                 workspace; their owner claims are immutable, so capture/import/export \
-                 writes for those provider sessions fail closed under the current fence — \
-                 the rows remain readable provenance"
+                  workspace; their owner claims are immutable, so capture/import/export \
+                  writes for those provider sessions fail closed under the current fence — \
+                  the rows remain readable provenance"
             ),
         )
     })
@@ -4295,8 +4295,8 @@ fn diagnose_workspace(
             "foreign_repository_identity",
             format!(
                 "the record was written under repository identity {} but this repository is \
-                 now {current_repo_id}; it is invisible to the normal listings and blocks new \
-                 workspace registrations until it is settled",
+                  now {current_repo_id}; it is invisible to the normal listings and blocks new \
+                  workspace registrations until it is settled",
                 record.repo_id
             ),
         ));
@@ -4312,7 +4312,7 @@ fn diagnose_workspace(
             "lease_expired",
             format!(
                 "the lease deadline passed (expires_at {}, now {now_ms}); the lease still \
-                 belongs to its owner until it is explicitly reclaimed",
+                  belongs to its owner until it is explicitly reclaimed",
                 record.lease_expires_at.unwrap_or_default()
             ),
         ));
@@ -4340,7 +4340,7 @@ fn diagnose_workspace(
                         "registry_path_mismatch",
                         format!(
                             "the registry entry for this scope lives at '{}' but the workspace \
-                             record claims '{}'",
+                              record claims '{}'",
                             entry.path, record.path
                         ),
                     ));
@@ -4351,14 +4351,14 @@ fn diagnose_workspace(
                         findings.push(ScopeDiagnostic::warning(
                             "registry_entry_detached",
                             "the worktree was unregistered with `worktree remove` (keep-dir); \
-                             commands inside it fail closed until it is re-added",
+                              commands inside it fail closed until it is re-added",
                         ));
                     }
                     WorktreeEntryState::Tombstone => {
                         findings.push(ScopeDiagnostic::warning(
                             "registry_entry_tombstoned",
                             "the worktree directory was deleted but its scoped rows are still \
-                             pending cleanup; `libra worktree repair --confirm` retries it",
+                              pending cleanup; `libra worktree repair --confirm` retries it",
                         ));
                     }
                 }
@@ -4371,7 +4371,7 @@ fn diagnose_workspace(
                         "scope_layout_legacy_symlink",
                         format!(
                             "'{}' still uses the pre-isolation shared-`.libra` symlink layout; \
-                             migrate it with `libra worktree repair --migrate-layout --confirm`",
+                              migrate it with `libra worktree repair --migrate-layout --confirm`",
                             entry.path
                         ),
                     )),
@@ -4448,7 +4448,7 @@ async fn adopt_or_clear_legacy_approved_project(
                 .map_err(|init_error| {
                     CliError::fatal(format!(
                         "cannot initialize libra.repoid before approved_permission recovery: \
-                         {init_error}"
+                          {init_error}"
                     ))
                 })?;
             begin_repair_operation(action, Some(legacy_project_id)).await?
@@ -4463,7 +4463,7 @@ async fn adopt_or_clear_legacy_approved_project(
                 .map_err(|error| {
                     CliError::fatal(format!(
                         "cannot clear approved_permission project_id '{legacy_project_id}': \
-                             {error}"
+                              {error}"
                     ))
                 })?;
             Ok(serde_json::json!({
@@ -4477,7 +4477,7 @@ async fn adopt_or_clear_legacy_approved_project(
                 .map_err(|error| {
                     CliError::fatal(format!(
                         "cannot adopt approved_permission project_id '{legacy_project_id}': \
-                             {error}"
+                              {error}"
                     ))
                 })?;
             Ok(serde_json::json!({
@@ -4506,7 +4506,7 @@ async fn adopt_or_clear_legacy_approved_project(
     } else {
         println!(
             "adopted {} approved_permission row(s) from legacy project_id '{legacy_project_id}' \
-             onto libra.repoid",
+              onto libra.repoid",
             payload["rows_affected"]
         );
     }
@@ -4526,7 +4526,7 @@ async fn adopt_legacy_capture_scope(
     if !confirm {
         return Err(CliError::command_usage(
             "legacy capture adoption changes persistent ownership; re-run with --confirm after \
-             verifying the workspace and session",
+              verifying the workspace and session",
         ));
     }
     let db_path = crate::utils::path::database();
@@ -4551,7 +4551,7 @@ async fn adopt_legacy_capture_scope(
     if !record.state.holds_identity() || record.lease_owner.is_none() || record.lease_fence <= 0 {
         return Err(CliError::fatal(format!(
             "workspace '{workspace_id}' has no live lease fence; refuse to attribute capture \
-             state to a released, orphaned, or unleased scope"
+              state to a released, orphaned, or unleased scope"
         )));
     }
     if record
@@ -4560,7 +4560,7 @@ async fn adopt_legacy_capture_scope(
     {
         return Err(CliError::fatal(format!(
             "workspace '{workspace_id}' lease has expired; refuse to attribute capture state \
-             until its owner renews or an explicit reclaim issues a new fence"
+              until its owner renews or an explicit reclaim issues a new fence"
         )));
     }
     let identity = RepoIdentity::resolve(&conn).await.map_err(|error| {
@@ -4573,36 +4573,36 @@ async fn adopt_legacy_capture_scope(
         .await
         .map_err(|error| CliError::fatal(format!("begin capture-scope adoption: {error}")))?;
     let legacy = txn
-        .query_one_raw(Statement::from_sql_and_values(
-            txn.get_database_backend(),
-            "SELECT agent_kind, provider_session_id FROM (
-                 SELECT 0 AS match_priority, agent_kind, provider_session_id FROM agent_session
-                  WHERE scope_state = 'legacy_unknown' AND session_id = ?
-                 UNION ALL
-                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_session
-                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
-                 UNION ALL
-                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_export_job
-                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
-                 UNION ALL
-                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_import_identity
-                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
-             ) ORDER BY match_priority LIMIT 1",
-            [
-                session_id.into(),
-                session_id.into(),
-                session_id.into(),
-                session_id.into(),
-            ],
-        ))
-        .await
-        .map_err(|error| CliError::fatal(format!("read legacy capture session: {error}")))?
-        .ok_or_else(|| {
-            CliError::fatal(format!(
-                "capture session identifier '{session_id}' has no legacy unscoped capture row; \
-                 doctor adoption accepts an agent session id or an orphan provider session id"
-            ))
-        })?;
+         .query_one_raw(Statement::from_sql_and_values(
+             txn.get_database_backend(),
+             "SELECT agent_kind, provider_session_id FROM (
+                  SELECT 0 AS match_priority, agent_kind, provider_session_id FROM agent_session
+                   WHERE scope_state = 'legacy_unknown' AND session_id = ?
+                  UNION ALL
+                  SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_session
+                   WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+                  UNION ALL
+                  SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_export_job
+                   WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+                  UNION ALL
+                  SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_import_identity
+                   WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+              ) ORDER BY match_priority LIMIT 1",
+             [
+                 session_id.into(),
+                 session_id.into(),
+                 session_id.into(),
+                 session_id.into(),
+             ],
+         ))
+         .await
+         .map_err(|error| CliError::fatal(format!("read legacy capture session: {error}")))?
+         .ok_or_else(|| {
+             CliError::fatal(format!(
+                 "capture session identifier '{session_id}' has no legacy unscoped capture row; \
+                  doctor adoption accepts an agent session id or an orphan provider session id"
+             ))
+         })?;
     let agent_kind: String = legacy
         .try_get_by("agent_kind")
         .map_err(|error| CliError::fatal(format!("decode legacy capture agent kind: {error}")))?;
@@ -4614,15 +4614,15 @@ async fn adopt_legacy_capture_scope(
         .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 FROM (
-                 SELECT provider_session_id FROM agent_session
-                  WHERE provider_session_id = ? AND scope_state = 'scoped'
-                 UNION ALL
-                 SELECT provider_session_id FROM agent_export_job
-                  WHERE provider_session_id = ? AND scope_state = 'scoped'
-                 UNION ALL
-                 SELECT provider_session_id FROM agent_import_identity
-                  WHERE provider_session_id = ? AND scope_state = 'scoped'
-             ) LIMIT 1",
+                  SELECT provider_session_id FROM agent_session
+                   WHERE provider_session_id = ? AND scope_state = 'scoped'
+                  UNION ALL
+                  SELECT provider_session_id FROM agent_export_job
+                   WHERE provider_session_id = ? AND scope_state = 'scoped'
+                  UNION ALL
+                  SELECT provider_session_id FROM agent_import_identity
+                   WHERE provider_session_id = ? AND scope_state = 'scoped'
+              ) LIMIT 1",
             [
                 provider_session_id.clone().into(),
                 provider_session_id.clone().into(),
@@ -4637,7 +4637,7 @@ async fn adopt_legacy_capture_scope(
         txn.rollback().await.ok();
         return Err(CliError::fatal(format!(
             "provider session '{provider_session_id}' already has a scoped capture claim; \
-             refusing to merge a legacy row into it"
+              refusing to merge a legacy row into it"
         )));
     }
     let target_repo_id = identity.as_str().to_string();
@@ -4647,16 +4647,16 @@ async fn adopt_legacy_capture_scope(
         .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "UPDATE agent_session
-             SET repo_id = ?, worktree_id = ?, workspace_id = ?, workspace_fence = ?,
-                 scope_state = 'scoped'
-             WHERE provider_session_id = ? AND scope_state = 'legacy_unknown'
-               AND EXISTS (
-                   SELECT 1 FROM workspace_record
-                   WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
-                     AND state IN ('provisioning', 'active', 'releasing')
-                     AND lease_owner IS NOT NULL
-                     AND lease_expires_at > (unixepoch('now') * 1000)
-               )",
+              SET repo_id = ?, worktree_id = ?, workspace_id = ?, workspace_fence = ?,
+                  scope_state = 'scoped'
+              WHERE provider_session_id = ? AND scope_state = 'legacy_unknown'
+                AND EXISTS (
+                    SELECT 1 FROM workspace_record
+                    WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                      AND state IN ('provisioning', 'active', 'releasing')
+                      AND lease_owner IS NOT NULL
+                      AND lease_expires_at > (unixepoch('now') * 1000)
+                )",
             [
                 target_repo_id.clone().into(),
                 target_worktree_id.clone().into(),
@@ -4674,16 +4674,16 @@ async fn adopt_legacy_capture_scope(
     for table in ["agent_export_job", "agent_import_identity"] {
         let sql = format!(
             "UPDATE {table}
-             SET repo_id = ?, worktree_id = ?, workspace_id = ?, workspace_fence = ?,
-                 scope_state = 'scoped'
-             WHERE provider_session_id = ? AND scope_state = 'legacy_unknown'
-               AND EXISTS (
-                   SELECT 1 FROM workspace_record
-                   WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
-                     AND state IN ('provisioning', 'active', 'releasing')
-                     AND lease_owner IS NOT NULL
-                     AND lease_expires_at > (unixepoch('now') * 1000)
-               )"
+              SET repo_id = ?, worktree_id = ?, workspace_id = ?, workspace_fence = ?,
+                  scope_state = 'scoped'
+              WHERE provider_session_id = ? AND scope_state = 'legacy_unknown'
+                AND EXISTS (
+                    SELECT 1 FROM workspace_record
+                    WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                      AND state IN ('provisioning', 'active', 'releasing')
+                      AND lease_owner IS NOT NULL
+                      AND lease_expires_at > (unixepoch('now') * 1000)
+                )"
         );
         adopted_rows += txn
             .execute_raw(Statement::from_sql_and_values(
@@ -4708,7 +4708,7 @@ async fn adopt_legacy_capture_scope(
         txn.rollback().await.ok();
         return Err(CliError::fatal(
             "capture-scope adoption was fenced out because the target workspace changed; rerun \
-             doctor and choose the current live workspace",
+              doctor and choose the current live workspace",
         ));
     }
     let actor = env::var("LIBRA_ACTOR")
@@ -4717,9 +4717,9 @@ async fn adopt_legacy_capture_scope(
     txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
         "INSERT INTO agent_workspace_scope_audit (
-            audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id,
-            workspace_id, workspace_fence, actor, created_at
-         ) VALUES (?, 'adopt_legacy_capture_scope', ?, ?, ?, ?, ?, ?, ?, ?)",
+             audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id,
+             workspace_id, workspace_fence, actor, created_at
+          ) VALUES (?, 'adopt_legacy_capture_scope', ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             uuid::Uuid::new_v4().to_string().into(),
             agent_kind.into(),
@@ -4751,8 +4751,8 @@ async fn adopt_legacy_capture_scope(
     }
     if !output.quiet {
         println!(
-            "adopted legacy capture session {} into workspace {} at lease fence {}",
-            payload.session_id, payload.workspace_id, payload.workspace_fence
+            "adopted legacy capture session into workspace {} at lease fence {}",
+            payload.workspace_id, payload.workspace_fence
         );
     }
     Ok(())
@@ -4767,12 +4767,12 @@ async fn legacy_capture_scope_exists(conn: &sea_orm::DatabaseConnection) -> CliR
         .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT 1 FROM (
-                 SELECT 1 FROM agent_session WHERE scope_state = 'legacy_unknown'
-                 UNION ALL
-                 SELECT 1 FROM agent_export_job WHERE scope_state = 'legacy_unknown'
-                 UNION ALL
-                 SELECT 1 FROM agent_import_identity WHERE scope_state = 'legacy_unknown'
-             ) LIMIT 1"
+                  SELECT 1 FROM agent_session WHERE scope_state = 'legacy_unknown'
+                  UNION ALL
+                  SELECT 1 FROM agent_export_job WHERE scope_state = 'legacy_unknown'
+                  UNION ALL
+                  SELECT 1 FROM agent_import_identity WHERE scope_state = 'legacy_unknown'
+              ) LIMIT 1"
                 .to_string(),
         ))
         .await;
@@ -4800,8 +4800,8 @@ fn print_legacy_capture_scope_guidance(output: &OutputConfig, legacy_exists: boo
     if legacy_exists && !output.is_json() && !output.quiet {
         println!(
             "legacy capture scope: unscoped capture rows exist and are intentionally excluded \
-             from new writes; inspect the session and adopt only its verified owner with \
-             `libra worktree doctor <workspace-id> --adopt-capture-session <session-id> --confirm`"
+              from new writes; inspect the session and adopt only its verified owner with \
+              `libra worktree doctor <workspace-id> --adopt-capture-session <session-id> --confirm`"
         );
     }
 }
@@ -4813,8 +4813,8 @@ fn print_legacy_approved_project_guidance(output: &OutputConfig, legacy_ids: &[S
     let listed = legacy_ids.join(", ");
     let message = format!(
         "legacy approved_permission project_id(s): {listed}; they are invisible to the runtime \
-         until adopted with `libra worktree doctor --adopt-approved-project <id> --confirm` or \
-         removed with `libra worktree doctor --clear-approved-project <id> --confirm`"
+          until adopted with `libra worktree doctor --adopt-approved-project <id> --confirm` or \
+          removed with `libra worktree doctor --clear-approved-project <id> --confirm`"
     );
     if output.is_json() {
         // Keep the frozen worktree.doctor JSON page schema untouched; surface
@@ -4859,7 +4859,7 @@ pub(crate) async fn run_worktree_doctor(
     if workspace_id.is_some() && (limit.is_some() || cursor.is_some()) {
         return Err(CliError::command_usage(
             "`libra worktree doctor <workspace-id>` diagnoses one scope and takes no \
-             --limit/--cursor; drop the id for the paginated view",
+              --limit/--cursor; drop the id for the paginated view",
         ));
     }
 
@@ -4906,7 +4906,7 @@ pub(crate) async fn run_worktree_doctor(
         .ok_or_else(|| {
             CliError::fatal(format!(
                 "no workspace matches id '{workspace_id}'; list them with \
-                     `libra worktree doctor`"
+                      `libra worktree doctor`"
             ))
             .with_stable_code(StableErrorCode::CliInvalidTarget)
         })?;
@@ -5000,7 +5000,7 @@ async fn doctor_repo_identity(conn: &sea_orm::DatabaseConnection) -> CliResult<S
         .map_err(|error| {
             doctor_scope_corrupt(format!(
                 "cannot read this repository's identity, so workspace records cannot be \
-                 attributed: {error}"
+                  attributed: {error}"
             ))
         })
 }
@@ -5225,7 +5225,7 @@ async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMove
         }) {
             return Err(WorktreeError::OperationBlocked(format!(
                 "'{}' has an unfinished layout migration; run `libra worktree repair \
-                 --confirm` first",
+                  --confirm` first",
                 src_path.display()
             )));
         }
@@ -5434,7 +5434,7 @@ async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
             if mirror_failed {
                 tracing::warn!(
                     "prune left a tombstone whose mirror write failed; the journal row \
-                     stays pending for `worktree repair`"
+                      stays pending for `worktree repair`"
                 );
             } else if let Err(error) = journal_resolve(&db, journal_id).await {
                 tracing::warn!(
@@ -5509,7 +5509,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     if detect_entry_layout(&target, false) == "legacy-symlink" {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' uses the legacy shared-.libra symlink layout; run `libra worktree \
-             repair --migrate-layout --confirm {}` first",
+              repair --migrate-layout --confirm {}` first",
             target.display(),
             target.display()
         )));
@@ -5525,7 +5525,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
         let lease_error = |error: crate::internal::workspace::WorkspaceError| {
             WorktreeError::OperationBlocked(format!(
                 "cannot verify agent workspace leases for '{}': {error}; refusing to \
-                 remove until the workspace store is readable",
+                  remove until the workspace store is readable",
                 target.display()
             ))
         };
@@ -5551,7 +5551,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
         if let Some(record) = by_path.into_iter().chain(by_id).find(unexpired) {
             return Err(WorktreeError::OperationBlocked(format!(
                 "'{}' is held by live agent workspace '{}' (lease fence {}); release the \
-                 lease or let it expire before removing the worktree",
+                  lease or let it expire before removing the worktree",
                 target.display(),
                 record.workspace_id,
                 record.lease_fence
@@ -5562,7 +5562,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     if entry_state == WorktreeEntryState::Tombstone {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' is a tombstone (directory already deleted, scoped cleanup pending); run \
-             `libra worktree repair --confirm` to retry the cleanup",
+              `libra worktree repair --confirm` to retry the cleanup",
             target.display()
         )));
     }
@@ -5593,7 +5593,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' has an in-progress rebase/cherry-pick/bisect; finish or abort it there \
-             first",
+              first",
             target.display()
         )));
     }
@@ -5631,7 +5631,7 @@ async fn remove_worktree_detach(
     let Some(worktree_id) = worktree_id else {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot detach '{}': its stable worktree id is unknown; run `libra worktree \
-             repair --confirm` first",
+              repair --confirm` first",
             target.display()
         )));
     };
@@ -5988,14 +5988,14 @@ async fn migrate_layout_run(
     if !crate::command::unmerged::collect(&shared_index).is_empty() {
         return Err(WorktreeError::OperationBlocked(
             "the shared index has unmerged (conflict) entries; resolve or abort the \
-             conflict in the main worktree first"
+              conflict in the main worktree first"
                 .to_string(),
         ));
     }
     if scoped_state_active(&db, "").await {
         return Err(WorktreeError::OperationBlocked(
             "an in-progress rebase/cherry-pick/bisect is active in the main worktree; \
-             finish or abort it first"
+              finish or abort it first"
                 .to_string(),
         ));
     }
@@ -6058,7 +6058,7 @@ async fn migrate_one_worktree(
     let worktree_id = state.entries[index].worktree_id.clone().ok_or_else(|| {
         WorktreeError::OperationBlocked(format!(
             "registry entry '{}' has no persisted worktree id; run `libra worktree repair \
-                 --confirm` first",
+                  --confirm` first",
             target.display()
         ))
     })?;
@@ -6075,7 +6075,7 @@ async fn migrate_one_worktree(
     }) {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' has an unresolved earlier migration journal; run `libra worktree \
-             repair --confirm` to settle it, then retry",
+              repair --confirm` to settle it, then retry",
             target.display()
         )));
     }
@@ -6164,7 +6164,7 @@ async fn migrate_one_worktree(
             let _ = fs::remove_file(&backup);
             return Err(WorktreeError::IoWrite(format!(
                 "cannot durably record the backup link ({error}); migration aborted with \
-                 the legacy link untouched"
+                  the legacy link untouched"
             )));
         }
         fs::remove_file(&gitdir).map_err(|e| {
@@ -6189,7 +6189,7 @@ async fn migrate_one_worktree(
         |error| {
             WorktreeError::OperationBlocked(format!(
                 "installed gitdir failed identity validation ({error}); materials kept — \
-                 investigate, then rerun `worktree repair --confirm`"
+                  investigate, then rerun `worktree repair --confirm`"
             ))
         },
     )?;
@@ -6219,7 +6219,7 @@ async fn migrate_one_worktree(
             fs::remove_file(&backup).map_err(|error| {
                 WorktreeError::IoWrite(format!(
                     "migrated, but the legacy backup '{}' could not be removed: {error}; \
-                     remove it and rerun `worktree repair --confirm`",
+                      remove it and rerun `worktree repair --confirm`",
                     backup.display()
                 ))
             })?;
@@ -6228,7 +6228,7 @@ async fn migrate_one_worktree(
         _ => {
             return Err(WorktreeError::OperationBlocked(format!(
                 "'{}' is no longer the expected legacy symlink; not deleting it — \
-                 investigate, then rerun `worktree repair --confirm`",
+                  investigate, then rerun `worktree repair --confirm`",
                 backup.display()
             )));
         }
@@ -6302,7 +6302,7 @@ async fn verify_migrated_worktree(
     if seen != Some(head_commit) {
         return Err(WorktreeError::OperationBlocked(format!(
             "verification failed: '{}' resolves HEAD to {:?}, expected {head_commit}; \
-             materials kept — rerun `worktree repair --confirm`",
+              materials kept — rerun `worktree repair --confirm`",
             target.display(),
             seen
         )));
@@ -6310,7 +6310,7 @@ async fn verify_migrated_worktree(
     if !target.join(util::ROOT_DIR).join("index").exists() {
         return Err(WorktreeError::OperationBlocked(format!(
             "verification failed: '{}' has no private index; materials kept — rerun \
-             `worktree repair --confirm`",
+              `worktree repair --confirm`",
             target.display()
         )));
     }
@@ -6413,7 +6413,7 @@ fn write_detached_marker(target: &Path, worktree_id: &str) -> WorktreeResult<()>
         &marker,
         format!(
             "{worktree_id}\nremoved from the worktree registry; re-add or delete this \
-             directory\n"
+              directory\n"
         )
         .as_bytes(),
         true,
@@ -6501,8 +6501,8 @@ fn refuse_active_sidecar_state(gitdir: &Path, action: &str) -> WorktreeResult<()
             Ok(_) => {
                 return Err(WorktreeError::OperationBlocked(format!(
                     "'{}' holds in-progress state ({name}); conclude the merge/revert \
-                     (or run any `libra stash` command there to finish a journaled \
-                     rollback) before {action}",
+                      (or run any `libra stash` command there to finish a journaled \
+                      rollback) before {action}",
                     gitdir.display()
                 )));
             }
@@ -6579,7 +6579,7 @@ fn render_remove_worktree(result: &WorktreeRemoveOutput, output: &OutputConfig) 
     if result.tombstone {
         println!(
             "Deleted worktree directory '{}', but the scoped-state cleanup failed — a \
-             tombstone entry remains; run `libra worktree repair --confirm` to retry.",
+              tombstone entry remains; run `libra worktree repair --confirm` to retry.",
             result.path
         );
     } else if result.disk_directory_deleted {
@@ -6590,8 +6590,8 @@ fn render_remove_worktree(result: &WorktreeRemoveOutput, output: &OutputConfig) 
     } else {
         println!(
             "Detached worktree '{}' from the registry. Directory and its state kept on \
-             disk (frozen); re-add it with `libra worktree add` or delete it with \
-             `--delete-dir`.",
+              disk (frozen); re-add it with `libra worktree add` or delete it with \
+              `--delete-dir`.",
             result.path
         );
     }
@@ -6690,8 +6690,8 @@ async fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepair
     {
         return Err(WorktreeError::OperationBlocked(
             "the worktree registry still uses the legacy v1 format with no persisted \
-             identities; run `libra worktree repair --confirm` (no argument) once to upgrade \
-             it, then retry"
+              identities; run `libra worktree repair --confirm` (no argument) once to upgrade \
+              it, then retry"
                 .to_string(),
         ));
     }
@@ -6712,16 +6712,16 @@ async fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepair
     if entry.state == WorktreeEntryState::Tombstone {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' is a tombstone (its directory was already deleted; only scoped-row \
-             cleanup is pending) — run the no-arg `libra worktree repair --confirm` to \
-             retry the cleanup instead of re-stamping identity into a recreated directory",
+              cleanup is pending) — run the no-arg `libra worktree repair --confirm` to \
+              retry the cleanup instead of re-stamping identity into a recreated directory",
             target.display()
         )));
     }
     let Some(stable_id) = entry.worktree_id.clone() else {
         return Err(WorktreeError::OperationBlocked(format!(
             "the registry entry for '{}' predates registry v2 and carries no persisted \
-             worktree id; run the no-arg `libra worktree repair --confirm` once to upgrade \
-             the registry, then retry",
+              worktree id; run the no-arg `libra worktree repair --confirm` once to upgrade \
+              the registry, then retry",
             target.display()
         )));
     };
@@ -6732,7 +6732,7 @@ async fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepair
     if detect_entry_layout(&target, false) == "legacy-symlink" {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' uses the legacy shared-.libra symlink layout; run `libra worktree \
-             repair --migrate-layout --confirm {}` first",
+              repair --migrate-layout --confirm {}` first",
             target.display(),
             target.display()
         )));
@@ -6780,8 +6780,8 @@ async fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepair
                         // never-re-home rule.
                         return Err(WorktreeError::OperationBlocked(format!(
                             "'{}' already points at a different common storage ('{}'); \
-                             refusing to re-home the worktree — remove and re-add it if \
-                             this is intended",
+                              refusing to re-home the worktree — remove and re-add it if \
+                              this is intended",
                             commondir_path.display(),
                             existing_resolved.display()
                         )));
@@ -6968,7 +6968,7 @@ async fn recover_pending_intents(
                         resolve_row = false;
                         notes.push(format!(
                             "cannot determine whether '{path}' still exists ({error}); \
-                             journal kept for the next repair"
+                              journal kept for the next repair"
                         ));
                     }
                     if matches!(presence, PathPresence::Missing) {
@@ -6998,14 +6998,14 @@ async fn recover_pending_intents(
                                             resolve_row = false;
                                             notes.push(format!(
                                                 "tombstone mirror write for '{path}' failed \
-                                                 ({mirror_error}); journal kept for the \
-                                                 next repair"
+                                                  ({mirror_error}); journal kept for the \
+                                                  next repair"
                                             ));
                                         }
                                         *changed = true;
                                         notes.push(format!(
                                             "remove of '{path}' left a tombstone (cleanup \
-                                             failed again: {error})"
+                                              failed again: {error})"
                                         ));
                                     }
                                 }
@@ -7019,7 +7019,7 @@ async fn recover_pending_intents(
                                     resolve_row = false;
                                     notes.push(format!(
                                         "scoped cleanup for the removed '{path}' failed \
-                                         ({error}); journal kept for the next repair"
+                                          ({error}); journal kept for the next repair"
                                     ));
                                 }
                             }
@@ -7036,12 +7036,12 @@ async fn recover_pending_intents(
                             resolve_row = false;
                             notes.push(format!(
                                 "could not re-freeze detached '{path}' ({error}); journal \
-                                 kept for the next repair"
+                                  kept for the next repair"
                             ));
                         }
                         notes.push(format!(
                             "interrupted `remove --delete-dir` of '{path}' rolled back \
-                             (directory still present; nothing was deleted by repair)"
+                              (directory still present; nothing was deleted by repair)"
                         ));
                     }
                 } else {
@@ -7061,9 +7061,9 @@ async fn recover_pending_intents(
                             resolve_row = false;
                             notes.push(format!(
                                 "interrupted detach of '{path}' NOT rolled forward: the \
-                                 worktree has in-progress sequencer/bisect state that \
-                                 started after the crash; finish or abort it, rerun \
-                                 `libra worktree remove {path}`, then repair"
+                                  worktree has in-progress sequencer/bisect state that \
+                                  started after the crash; finish or abort it, rerun \
+                                  `libra worktree remove {path}`, then repair"
                             ));
                         } else if let Some(id_str) = entry_id.as_deref().or(worktree_id.as_deref())
                         {
@@ -7078,14 +7078,14 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "lifecycle mirror write for '{path}' failed ({error}); \
-                                     journal kept for the next repair"
+                                      journal kept for the next repair"
                                 ));
                             }
                             if let Err(error) = write_detached_marker(Path::new(&path), id_str) {
                                 resolve_row = false;
                                 notes.push(format!(
                                     "could not freeze detached '{path}' ({error}); journal \
-                                     kept for the next repair"
+                                      kept for the next repair"
                                 ));
                             }
                         }
@@ -7126,8 +7126,8 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "re-attach of '{path}' not completed: the directory's \
-                                     identity no longer matches the registry entry; \
-                                     journal kept — investigate, then rerun repair"
+                                      identity no longer matches the registry entry; \
+                                      journal kept — investigate, then rerun repair"
                                 ));
                             }
                             WorktreeEntryState::Active => {
@@ -7140,8 +7140,8 @@ async fn recover_pending_intents(
                                         resolve_row = false;
                                         notes.push(format!(
                                             "could not lift the marker while completing \
-                                             the re-attach of '{path}' ({error}); journal \
-                                             kept for the next repair"
+                                              the re-attach of '{path}' ({error}); journal \
+                                              kept for the next repair"
                                         ));
                                     }
                                 }
@@ -7159,15 +7159,15 @@ async fn recover_pending_intents(
                             WorktreeEntryState::DetachedFromRegistry => {
                                 notes.push(format!(
                                     "stale re-attach intent for '{path}' rolled back — \
-                                     the entry is (still or again) detached and stays \
-                                     frozen; rerun `libra worktree add {path}` to \
-                                     re-attach it"
+                                      the entry is (still or again) detached and stays \
+                                      frozen; rerun `libra worktree add {path}` to \
+                                      re-attach it"
                                 ));
                             }
                             WorktreeEntryState::Tombstone => {
                                 notes.push(format!(
                                     "stale re-attach intent for '{path}' resolved — the \
-                                     entry is now a tombstone"
+                                      entry is now a tombstone"
                                 ));
                             }
                         }
@@ -7207,8 +7207,8 @@ async fn recover_pending_intents(
                                     resolve_row = false;
                                     notes.push(format!(
                                         "cannot acquire the branch-attach lock to roll \
-                                         back branch '{name}' ({error}); journal kept for \
-                                         the next repair"
+                                          back branch '{name}' ({error}); journal kept for \
+                                          the next repair"
                                     ));
                                 }
                                 Ok(_attach_lock) => {
@@ -7221,47 +7221,47 @@ async fn recover_pending_intents(
                                             resolve_row = false;
                                             notes.push(format!(
                                                 "cannot verify whether branch '{name}' is \
-                                                 attached ({error}); not deleting it — \
-                                                 journal kept for the next repair"
+                                                  attached ({error}); not deleting it — \
+                                                  journal kept for the next repair"
                                             ));
                                         }
                                         Ok(Some(scope)) => {
                                             resolve_row = false;
                                             notes.push(format!(
                                                 "branch '{name}' from an interrupted \
-                                                 `worktree add -b` is checked out at \
-                                                 worktree '{scope}'; not deleting it — \
-                                                 journal kept, resolve manually"
+                                                  `worktree add -b` is checked out at \
+                                                  worktree '{scope}'; not deleting it — \
+                                                  journal kept, resolve manually"
                                             ));
                                         }
                                         Ok(None) => {
                                             match Branch::delete_branch_if_tip_result(name, &start)
-                                            .await
-                                        {
-                                Ok(crate::internal::branch::ConditionalDeleteOutcome::Deleted) => {
-                                    notes.push(format!(
-                                        "rolled back branch '{name}' from an interrupted \
-                                         `worktree add -b`"
-                                    ));
-                                }
-                                Ok(crate::internal::branch::ConditionalDeleteOutcome::NotFound) => {
-                                }
-                                Ok(crate::internal::branch::ConditionalDeleteOutcome::TipMoved) => {
-                                    resolve_row = false;
-                                    notes.push(format!(
-                                        "branch '{name}' from an interrupted `worktree add \
-                                         -b` has NEW commits; not deleting it — journal \
-                                         kept, resolve manually"
-                                    ));
-                                }
-                                Err(error) => {
-                                    resolve_row = false;
-                                    notes.push(format!(
-                                        "could not roll back branch '{name}' ({error}); \
-                                         journal kept for the next repair"
-                                    ));
-                                }
-                                        }
+                                             .await
+                                         {
+                                 Ok(crate::internal::branch::ConditionalDeleteOutcome::Deleted) => {
+                                     notes.push(format!(
+                                         "rolled back branch '{name}' from an interrupted \
+                                          `worktree add -b`"
+                                     ));
+                                 }
+                                 Ok(crate::internal::branch::ConditionalDeleteOutcome::NotFound) => {
+                                 }
+                                 Ok(crate::internal::branch::ConditionalDeleteOutcome::TipMoved) => {
+                                     resolve_row = false;
+                                     notes.push(format!(
+                                         "branch '{name}' from an interrupted `worktree add \
+                                          -b` has NEW commits; not deleting it — journal \
+                                          kept, resolve manually"
+                                     ));
+                                 }
+                                 Err(error) => {
+                                     resolve_row = false;
+                                     notes.push(format!(
+                                         "could not roll back branch '{name}' ({error}); \
+                                          journal kept for the next repair"
+                                     ));
+                                 }
+                                         }
                                         }
                                     }
                                 }
@@ -7271,7 +7271,7 @@ async fn recover_pending_intents(
                             resolve_row = false;
                             notes.push(format!(
                                 "interrupted `worktree add -b {name}' journal has an \
-                                 unparsable start tip; journal kept — resolve manually"
+                                  unparsable start tip; journal kept — resolve manually"
                             ));
                         }
                     }
@@ -7285,14 +7285,14 @@ async fn recover_pending_intents(
                             let _ = lifecycle_delete(db, id_str).await;
                             notes.push(format!(
                                 "rolled back interrupted add of '{path}' (scoped rows \
-                                 swept; any partial directory was left in place)"
+                                  swept; any partial directory was left in place)"
                             ));
                         }
                         Err(error) => {
                             resolve_row = false;
                             notes.push(format!(
                                 "sweep for the unpublished add of '{path}' failed \
-                                 ({error}); journal kept for the next repair"
+                                  ({error}); journal kept for the next repair"
                             ));
                         }
                     }
@@ -7307,14 +7307,14 @@ async fn recover_pending_intents(
                     resolve_row = false;
                     notes.push(format!(
                         "cannot determine whether '{src}' still exists ({error}); journal \
-                         kept for the next repair"
+                          kept for the next repair"
                     ));
                 }
                 if let PathPresence::Unknown(error) = &dest_presence {
                     resolve_row = false;
                     notes.push(format!(
                         "cannot determine whether '{dest}' exists ({error}); journal kept \
-                         for the next repair"
+                          for the next repair"
                     ));
                 }
                 let src_exists = matches!(src_presence, PathPresence::Present);
@@ -7347,15 +7347,15 @@ async fn recover_pending_intents(
                             resolve_row = false;
                             notes.push(format!(
                                 "interrupted move '{src}' -> '{dest}' carries no worktree \
-                                 id; journal kept — investigate manually"
+                                  id; journal kept — investigate manually"
                             ));
                         }
                         _ if dest_taken_by_other || src_taken_by_other => {
                             resolve_row = false;
                             notes.push(format!(
                                 "interrupted move '{src}' -> '{dest}': another registry \
-                                 entry now occupies one of the paths; journal kept — \
-                                 resolve manually, then rerun repair"
+                                  entry now occupies one of the paths; journal kept — \
+                                  resolve manually, then rerun repair"
                             ));
                         }
                         Some(idx) if state.entries[idx].path == dest => {
@@ -7370,9 +7370,9 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "interrupted move '{src}' -> '{dest}': the directory \
-                                     at the source no longer carries this worktree's \
-                                     identity; journal kept — resolve manually, then \
-                                     rerun repair"
+                                      at the source no longer carries this worktree's \
+                                      identity; journal kept — resolve manually, then \
+                                      rerun repair"
                                 ));
                             } else if src_exists && dest_missing {
                                 // Registry updated, rename never happened:
@@ -7388,22 +7388,22 @@ async fn recover_pending_intents(
                                         *changed = true;
                                         notes.push(format!(
                                             "rolled back interrupted move '{src}' -> \
-                                             '{dest}' (rename failed: {error})"
+                                              '{dest}' (rename failed: {error})"
                                         ));
                                     }
                                 }
                             } else if src_missing && dest_exists {
                                 notes.push(format!(
                                     "interrupted move '{src}' -> '{dest}' was already \
-                                     complete"
+                                      complete"
                                 ));
                             } else {
                                 resolve_row = false;
                                 notes.push(format!(
                                     "interrupted move '{src}' -> '{dest}' is ambiguous \
-                                     (src present: {src_exists}, dest present: \
-                                     {dest_exists}); journal kept — resolve the \
-                                     directories manually, then rerun repair"
+                                      (src present: {src_exists}, dest present: \
+                                      {dest_exists}); journal kept — resolve the \
+                                      directories manually, then rerun repair"
                                 ));
                             }
                         }
@@ -7415,9 +7415,9 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "interrupted move '{src}' -> '{dest}': the directory \
-                                     at the destination does not carry this worktree's \
-                                     identity; journal kept — resolve manually, then \
-                                     rerun repair"
+                                      at the destination does not carry this worktree's \
+                                      identity; journal kept — resolve manually, then \
+                                      rerun repair"
                                 ));
                             } else if src_missing && dest_exists {
                                 // Directory moved but the registry write was
@@ -7426,20 +7426,20 @@ async fn recover_pending_intents(
                                 *changed = true;
                                 notes.push(format!(
                                     "finished registry update for interrupted move \
-                                     '{src}' -> '{dest}'"
+                                      '{src}' -> '{dest}'"
                                 ));
                             } else if src_exists && dest_missing {
                                 notes.push(format!(
                                     "interrupted move '{src}' -> '{dest}' never started; \
-                                     nothing to do"
+                                      nothing to do"
                                 ));
                             } else {
                                 resolve_row = false;
                                 notes.push(format!(
                                     "interrupted move '{src}' -> '{dest}' is ambiguous \
-                                     (src present: {src_exists}, dest present: \
-                                     {dest_exists}); journal kept — resolve the \
-                                     directories manually, then rerun repair"
+                                      (src present: {src_exists}, dest present: \
+                                      {dest_exists}); journal kept — resolve the \
+                                      directories manually, then rerun repair"
                                 ));
                             }
                         }
@@ -7448,16 +7448,16 @@ async fn recover_pending_intents(
                             let elsewhere = state.entries[idx].path.clone();
                             notes.push(format!(
                                 "interrupted move '{src}' -> '{dest}': its worktree is \
-                                 now registered at '{elsewhere}'; journal kept — \
-                                 investigate manually"
+                                  now registered at '{elsewhere}'; journal kept — \
+                                  investigate manually"
                             ));
                         }
                         None => {
                             resolve_row = false;
                             notes.push(format!(
                                 "interrupted move '{src}' -> '{dest}': no registry entry \
-                                 carries its worktree id; journal kept — investigate \
-                                 manually, then rerun repair"
+                                  carries its worktree id; journal kept — investigate \
+                                  manually, then rerun repair"
                             ));
                         }
                     }
@@ -7473,7 +7473,7 @@ async fn recover_pending_intents(
                             resolve_row = false;
                             notes.push(format!(
                                 "cannot determine whether '{path}' still exists ({error}); \
-                                 journal kept for the next repair"
+                                  journal kept for the next repair"
                             ));
                             continue;
                         }
@@ -7502,14 +7502,14 @@ async fn recover_pending_intents(
                                             resolve_row = false;
                                             notes.push(format!(
                                                 "tombstone mirror write for '{path}' failed \
-                                                 ({mirror_error}); journal kept for the \
-                                                 next repair"
+                                                  ({mirror_error}); journal kept for the \
+                                                  next repair"
                                             ));
                                         }
                                         *changed = true;
                                         notes.push(format!(
                                             "prune of '{path}' left a tombstone (cleanup \
-                                             failed: {error})"
+                                              failed: {error})"
                                         ));
                                         false
                                     }
@@ -7565,13 +7565,13 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "cannot remove the backup link '{}' ({remove_error}); \
-                                     journal kept",
+                                      journal kept",
                                     backup.display()
                                 ));
                             } else {
                                 notes.push(format!(
                                     "rolled back interrupted layout migration of '{}' \
-                                     (legacy link untouched)",
+                                      (legacy link untouched)",
                                     path.display()
                                 ));
                             }
@@ -7585,7 +7585,7 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "cannot remove the backup link '{}' ({remove_error}); \
-                                     journal kept",
+                                      journal kept",
                                     backup.display()
                                 ));
                             }
@@ -7596,13 +7596,13 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "cannot remove the prepared dir '{}' ({error}); \
-                                     journal kept",
+                                      journal kept",
                                     prepared.display()
                                 ));
                             } else {
                                 notes.push(format!(
                                     "rolled back interrupted layout migration of '{}' \
-                                     (legacy link untouched)",
+                                      (legacy link untouched)",
                                     path.display()
                                 ));
                             }
@@ -7624,7 +7624,7 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "cannot remove the backup link '{}' ({remove_error}); \
-                                     journal kept",
+                                      journal kept",
                                     backup.display()
                                 ));
                             }
@@ -7635,13 +7635,13 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "cannot remove the prepared dir '{}' ({error}); \
-                                     journal kept",
+                                      journal kept",
                                     prepared.display()
                                 ));
                             } else {
                                 notes.push(format!(
                                     "rolled back interrupted layout migration of '{}' \
-                                     (legacy link untouched)",
+                                      (legacy link untouched)",
                                     path.display()
                                 ));
                             }
@@ -7650,8 +7650,8 @@ async fn recover_pending_intents(
                             resolve_row = false;
                             notes.push(format!(
                                 "prepared artifact '{}' does not carry this journal's \
-                                 marker; journal kept — investigate manually, nothing \
-                                 was deleted",
+                                  marker; journal kept — investigate manually, nothing \
+                                  was deleted",
                                 prepared.display()
                             ));
                         }
@@ -7666,7 +7666,7 @@ async fn recover_pending_intents(
                         resolve_row = false;
                         notes.push(format!(
                             "cannot finish installing the migrated gitdir for '{}' \
-                             ({error}); journal kept",
+                              ({error}); journal kept",
                             path.display()
                         ));
                     } else {
@@ -7681,7 +7681,7 @@ async fn recover_pending_intents(
                             // journal row stays pending by construction.
                             notes.push(format!(
                                 "installed gitdir for '{}' failed identity validation \
-                                 ({error}); journal kept — investigate manually",
+                                  ({error}); journal kept — investigate manually",
                                 path.display()
                             ));
                             if *changed {
@@ -7712,7 +7712,7 @@ async fn recover_pending_intents(
                                 resolve_row = false;
                                 notes.push(format!(
                                     "layout migration of '{}' still incomplete ({error}); \
-                                     journal kept",
+                                      journal kept",
                                     path.display()
                                 ));
                             }
@@ -7757,7 +7757,7 @@ async fn recover_pending_intents(
                             resolve_row = false;
                             notes.push(format!(
                                 "layout migration of '{}' still incomplete ({error}); \
-                                 journal kept",
+                                  journal kept",
                                 path.display()
                             ));
                         }
@@ -7766,8 +7766,8 @@ async fn recover_pending_intents(
                     resolve_row = false;
                     notes.push(format!(
                         "interrupted layout migration of '{}': on-disk state matches no \
-                         known stage (identity check failed); journal kept — investigate \
-                         manually, nothing was deleted",
+                          known stage (identity check failed); journal kept — investigate \
+                          manually, nothing was deleted",
                         path.display()
                     ));
                 }
@@ -7779,7 +7779,7 @@ async fn recover_pending_intents(
                 resolve_row = false;
                 notes.push(format!(
                     "unknown intent op '{other}' (id {id}); journal kept — rerun repair \
-                     with the binary that recorded it"
+                      with the binary that recorded it"
                 ));
             }
         }
@@ -7827,7 +7827,7 @@ async fn finish_migration_recovery(
             if fs::canonicalize(backup).ok().as_deref() != Some(canonical_storage.as_path()) {
                 return Err(format!(
                     "backup '{}' does not resolve to this repository's storage; not \
-                     touching it",
+                      touching it",
                     backup.display()
                 ));
             }
@@ -7870,7 +7870,7 @@ async fn retry_tombstones(
             pending += 1;
             notes.push(format!(
                 "tombstone '{path}': a directory now exists at that path; not adopting it \
-                 — remove or rename it, then rerun repair"
+                  — remove or rename it, then rerun repair"
             ));
             index += 1;
             continue;
@@ -7892,7 +7892,7 @@ async fn retry_tombstones(
                 pending += 1;
                 notes.push(format!(
                     "tombstone '{path}': scoped cleanup failed again ({error}); will retry \
-                     on the next repair"
+                      on the next repair"
                 ));
                 index += 1;
             }
@@ -7937,7 +7937,7 @@ async fn reconcile_lifecycle(
                         }
                         Err(error) => notes.push(format!(
                             "FAILED to restore the detached marker for '{}' ({error}); the \
-                             directory is NOT frozen — rerun repair after fixing the cause",
+                              directory is NOT frozen — rerun repair after fixing the cause",
                             entry.path
                         )),
                     }
@@ -7974,7 +7974,7 @@ async fn reconcile_lifecycle(
                     } else {
                         notes.push(format!(
                             "active '{}' carries a detached marker but its gitdir identity \
-                             does not match; leaving it frozen — investigate manually",
+                              does not match; leaving it frozen — investigate manually",
                             entry.path
                         ));
                     }
@@ -8023,15 +8023,15 @@ async fn reconcile_lifecycle(
                     )),
                     Err(error) => notes.push(format!(
                         "FAILED to clear the resolved migration marker from '{}' \
-                         ({error}); the worktree stays frozen — fix the cause and rerun \
-                         repair",
+                          ({error}); the worktree stays frozen — fix the cause and rerun \
+                          repair",
                         entry.path
                     )),
                 }
             } else {
                 notes.push(format!(
                     "'{}' carries a migration marker with no pending journal but its \
-                     install identity cannot be verified; leaving it frozen",
+                      install identity cannot be verified; leaving it frozen",
                     entry.path
                 ));
             }
@@ -8069,7 +8069,7 @@ pub(crate) fn render_repair_worktrees(
         if result.tombstones_pending > 0 {
             println!(
                 "{} tombstone(s) still pending; rerun `libra worktree repair --confirm` \
-                 after addressing the notes above",
+                  after addressing the notes above",
                 result.tombstones_pending
             );
         }
@@ -8086,13 +8086,13 @@ mod tests {
     #[test]
     fn registry_parse_accepts_v2_shape() {
         let data = br#"{
-            "schema_version": 2,
-            "entries": [
-                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
-                {"path": "/w", "is_main": false, "locked": false, "lock_reason": null,
-                 "worktree_id": "abc123"}
-            ]
-        }"#;
+             "schema_version": 2,
+             "entries": [
+                 {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
+                 {"path": "/w", "is_main": false, "locked": false, "lock_reason": null,
+                  "worktree_id": "abc123"}
+             ]
+         }"#;
         let state = WorktreeState::parse(data).expect("v2 parses");
         assert_eq!(state.schema_version, REGISTRY_SCHEMA_VERSION);
         assert_eq!(state.entries.len(), 2);
@@ -8103,11 +8103,11 @@ mod tests {
     #[test]
     fn registry_parse_upgrades_v1_shape_in_memory() {
         let data = br#"{
-            "worktrees": [
-                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
-                {"path": "/w", "is_main": false, "locked": true, "lock_reason": "keep"}
-            ]
-        }"#;
+             "worktrees": [
+                 {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
+                 {"path": "/w", "is_main": false, "locked": true, "lock_reason": "keep"}
+             ]
+         }"#;
         let state = WorktreeState::parse(data).expect("v1 upgrades in memory");
         assert_eq!(state.schema_version, REGISTRY_SCHEMA_VERSION);
         assert_eq!(state.entries.len(), 2);
@@ -8127,12 +8127,12 @@ mod tests {
         // v2 marker + malformed entries + a plausible legacy array: must NOT
         // fall back to reading the stale v1 array.
         let hybrid = br#"{
-            "schema_version": 2,
-            "entries": "corrupt",
-            "worktrees": [
-                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null}
-            ]
-        }"#;
+             "schema_version": 2,
+             "entries": "corrupt",
+             "worktrees": [
+                 {"path": "/m", "is_main": true, "locked": false, "lock_reason": null}
+             ]
+         }"#;
         assert!(WorktreeState::parse(hybrid).is_err());
 
         // Valid v2 alongside a stray legacy array is ambiguous — refused,
@@ -8160,10 +8160,10 @@ mod tests {
         assert!(err.contains("exactly one main"), "{err}");
 
         let sole_linked = br#"{
-            "worktrees": [
-                {"path": "/w", "is_main": false, "locked": false, "lock_reason": null}
-            ]
-        }"#;
+             "worktrees": [
+                 {"path": "/w", "is_main": false, "locked": false, "lock_reason": null}
+             ]
+         }"#;
         assert!(WorktreeState::parse(sole_linked).is_err());
     }
 
@@ -8172,22 +8172,22 @@ mod tests {
     #[test]
     fn registry_parse_requires_exactly_one_main() {
         let zero_main = br#"{
-            "schema_version": 2,
-            "entries": [
-                {"path": "/w", "is_main": false, "locked": false, "lock_reason": null,
-                 "worktree_id": "abc123"}
-            ]
-        }"#;
+             "schema_version": 2,
+             "entries": [
+                 {"path": "/w", "is_main": false, "locked": false, "lock_reason": null,
+                  "worktree_id": "abc123"}
+             ]
+         }"#;
         let err = WorktreeState::parse(zero_main).expect_err("zero mains fail closed");
         assert!(err.contains("exactly one main"), "{err}");
 
         let two_mains = br#"{
-            "schema_version": 2,
-            "entries": [
-                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
-                {"path": "/n", "is_main": true, "locked": false, "lock_reason": null}
-            ]
-        }"#;
+             "schema_version": 2,
+             "entries": [
+                 {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
+                 {"path": "/n", "is_main": true, "locked": false, "lock_reason": null}
+             ]
+         }"#;
         let err = WorktreeState::parse(two_mains).expect_err("two mains fail closed");
         assert!(err.contains("exactly one main"), "{err}");
     }
@@ -8198,22 +8198,22 @@ mod tests {
     #[test]
     fn registry_parse_enforces_v2_identity_invariants() {
         let linked_without_id = br#"{
-            "schema_version": 2,
-            "entries": [
-                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
-                {"path": "/w", "is_main": false, "locked": false, "lock_reason": null}
-            ]
-        }"#;
+             "schema_version": 2,
+             "entries": [
+                 {"path": "/m", "is_main": true, "locked": false, "lock_reason": null},
+                 {"path": "/w", "is_main": false, "locked": false, "lock_reason": null}
+             ]
+         }"#;
         let err = WorktreeState::parse(linked_without_id).expect_err("missing id fails closed");
         assert!(err.contains("missing its persisted worktree_id"), "{err}");
 
         let main_with_id = br#"{
-            "schema_version": 2,
-            "entries": [
-                {"path": "/m", "is_main": true, "locked": false, "lock_reason": null,
-                 "worktree_id": "oops"}
-            ]
-        }"#;
+             "schema_version": 2,
+             "entries": [
+                 {"path": "/m", "is_main": true, "locked": false, "lock_reason": null,
+                  "worktree_id": "oops"}
+             ]
+         }"#;
         let err = WorktreeState::parse(main_with_id).expect_err("main id fails closed");
         assert!(err.contains("must not carry a worktree_id"), "{err}");
     }
@@ -8240,7 +8240,7 @@ mod tests {
         // v2 is still READ and promoted in memory — its entries simply carry
         // no service-fence generations yet.
         let v2 = br#"{"schema_version": 2, "entries":
-            [{"path": "/w", "is_main": true, "locked": false}]}"#;
+             [{"path": "/w", "is_main": true, "locked": false}]}"#;
         let parsed = WorktreeState::parse(v2).expect("a v2 registry is read");
         assert_eq!(
             parsed.schema_version, REGISTRY_SCHEMA_VERSION,
@@ -8328,11 +8328,11 @@ mod tests {
             .await
             .expect("in-memory db");
         for sql in [
-            "CREATE TABLE operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
-            "CREATE TABLE operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
+            "CREATE TABLE legacy_operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
+            "CREATE TABLE legacy_operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
             "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0);",
-            "CREATE TABLE operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
-            "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
+            "CREATE TABLE legacy_operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
+            "CREATE TABLE legacy_operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
             "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)",
         ] {
             db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
@@ -8354,7 +8354,7 @@ mod tests {
         // Fault injection: the close cannot write its outcome row.
         db.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "DROP TABLE operation".to_string(),
+            "DROP TABLE legacy_operation".to_string(),
         ))
         .await
         .expect("drop the operation table");
@@ -8405,8 +8405,8 @@ mod tests {
             callers,
             vec!["match tokio::task::spawn_blocking(acquire_registry_lock).await {"],
             "the blocking registry acquisition grew a caller outside \
-             `acquire_registry_lock_async`: take it on the blocking pool \
-             instead (plan-20260714 W1)"
+              `acquire_registry_lock_async`: take it on the blocking pool \
+              instead (plan-20260714 W1)"
         );
     }
 }

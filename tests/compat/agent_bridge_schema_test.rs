@@ -25,9 +25,17 @@ fn bridge_migrations_are_registered_and_link_relations_is_the_latest() {
         "2026081801_agent_bridge_capture must stay registered"
     );
     assert_eq!(
-        runner.max_registered_version(),
+        builtin_migrations()
+            .iter()
+            .filter(|migration| migration.version <= BRIDGE_LINK_RELATIONS_VERSION)
+            .map(|migration| migration.version)
+            .max(),
         Some(BRIDGE_LINK_RELATIONS_VERSION),
-        "2026082401_agent_bridge_link_relations must be the latest registered migration"
+        "2026082401_agent_bridge_link_relations must remain the latest bridge migration"
+    );
+    assert!(
+        runner.max_registered_version() > Some(BRIDGE_LINK_RELATIONS_VERSION),
+        "newer foundation migrations may follow the bridge migration"
     );
 }
 

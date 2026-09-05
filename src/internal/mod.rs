@@ -32,6 +32,8 @@ pub mod deps;
 pub mod dirty;
 pub mod head;
 pub mod layer;
+pub mod legacy_operation;
+pub mod legacy_operation_model;
 pub mod log;
 pub mod maintenance_lock;
 pub mod merge_base;

@@ -10,53 +10,53 @@ use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statemen
 /// Create the operation-layer SQLite schema used by the service tests.
 async fn create_operation_schema(db: &DatabaseConnection) {
     let ddl = [
-        "CREATE TABLE IF NOT EXISTS operation(\
-            op_id TEXT PRIMARY KEY,\
-            repo_id TEXT NOT NULL,\
-            view_id TEXT NOT NULL,\
-            command_name TEXT NOT NULL,\
-            description TEXT NOT NULL,\
-            actor TEXT NOT NULL,\
-            args_digest TEXT,\
-            start_ts INTEGER NOT NULL,\
-            end_ts INTEGER,\
-            status TEXT NOT NULL,\
-            worktree_id TEXT NOT NULL DEFAULT '',
-            scope_provenance TEXT NOT NULL DEFAULT 'declared',
-            restorable INTEGER NOT NULL DEFAULT 1,
-            control_slot TEXT,
-            claim_owner TEXT,
-            scope_kind TEXT NOT NULL DEFAULT 'main'\
-        );",
-        "CREATE TABLE IF NOT EXISTS operation_parent(\
-            op_id TEXT NOT NULL,\
-            parent_op_id TEXT NOT NULL,\
-            PRIMARY KEY (op_id, parent_op_id)\
-        );",
-        "CREATE TABLE IF NOT EXISTS operation_view(\
-            view_id TEXT PRIMARY KEY,\
-            repo_id TEXT NOT NULL,\
-            head_kind TEXT NOT NULL,\
-            head_target TEXT NOT NULL,\
-            created_at INTEGER NOT NULL\
-        );",
-        "CREATE TABLE IF NOT EXISTS operation_view_ref(\
-            view_id TEXT NOT NULL,\
-            ref_kind TEXT NOT NULL,\
-            ref_name TEXT NOT NULL,\
-            ref_remote TEXT NOT NULL,\
-            target_oid TEXT NOT NULL,\
-            PRIMARY KEY (view_id, ref_kind, ref_name, ref_remote)\
-        );",
-        "CREATE TABLE IF NOT EXISTS operation_view_workspace(\
-            view_id TEXT NOT NULL,\
-            pointer_kind TEXT NOT NULL,\
-            pointer_value TEXT NOT NULL,\
-            PRIMARY KEY (view_id, pointer_kind)\
-        );",
-        "CREATE INDEX IF NOT EXISTS idx_operation_repo_end_ts ON operation(repo_id, end_ts DESC);",
-        "CREATE INDEX IF NOT EXISTS idx_operation_parent_parent ON operation_parent(parent_op_id, op_id);",
-        "CREATE INDEX IF NOT EXISTS idx_operation_view_repo_created ON operation_view(repo_id, created_at DESC);",
+        "CREATE TABLE IF NOT EXISTS legacy_operation(\
+             op_id TEXT PRIMARY KEY,\
+             repo_id TEXT NOT NULL,\
+             view_id TEXT NOT NULL,\
+             command_name TEXT NOT NULL,\
+             description TEXT NOT NULL,\
+             actor TEXT NOT NULL,\
+             args_digest TEXT,\
+             start_ts INTEGER NOT NULL,\
+             end_ts INTEGER,\
+             status TEXT NOT NULL,\
+             worktree_id TEXT NOT NULL DEFAULT '',
+             scope_provenance TEXT NOT NULL DEFAULT 'declared',
+             restorable INTEGER NOT NULL DEFAULT 1,
+             control_slot TEXT,
+             claim_owner TEXT,
+             scope_kind TEXT NOT NULL DEFAULT 'main'\
+         );",
+        "CREATE TABLE IF NOT EXISTS legacy_operation_parent(\
+             op_id TEXT NOT NULL,\
+             parent_op_id TEXT NOT NULL,\
+             PRIMARY KEY (op_id, parent_op_id)\
+         );",
+        "CREATE TABLE IF NOT EXISTS legacy_operation_view(\
+             view_id TEXT PRIMARY KEY,\
+             repo_id TEXT NOT NULL,\
+             head_kind TEXT NOT NULL,\
+             head_target TEXT NOT NULL,\
+             created_at INTEGER NOT NULL\
+         );",
+        "CREATE TABLE IF NOT EXISTS legacy_operation_view_ref(\
+             view_id TEXT NOT NULL,\
+             ref_kind TEXT NOT NULL,\
+             ref_name TEXT NOT NULL,\
+             ref_remote TEXT NOT NULL,\
+             target_oid TEXT NOT NULL,\
+             PRIMARY KEY (view_id, ref_kind, ref_name, ref_remote)\
+         );",
+        "CREATE TABLE IF NOT EXISTS legacy_operation_view_workspace(\
+             view_id TEXT NOT NULL,\
+             pointer_kind TEXT NOT NULL,\
+             pointer_value TEXT NOT NULL,\
+             PRIMARY KEY (view_id, pointer_kind)\
+         );",
+        "CREATE INDEX IF NOT EXISTS idx_legacy_operation_repo_end_ts ON legacy_operation(repo_id, end_ts DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_operation_parent_parent ON legacy_operation_parent(parent_op_id, op_id);",
+        "CREATE INDEX IF NOT EXISTS idx_operation_view_repo_created ON legacy_operation_view(repo_id, created_at DESC);",
     ];
 
     for sql in ddl {
@@ -147,23 +147,23 @@ async fn duplicate_constraints_are_enforced_for_view_refs_and_workspace() {
 
     let ref_insert = Statement::from_string(
         DbBackend::Sqlite,
-        "INSERT INTO operation_view_ref(view_id, ref_kind, ref_name, ref_remote, target_oid) VALUES ('view_dup', 'branch', 'main', '', 'oid-1');",
+        "INSERT INTO legacy_operation_view_ref(view_id, ref_kind, ref_name, ref_remote, target_oid) VALUES ('view_dup', 'branch', 'main', '', 'oid-1');",
     );
     db.execute_raw(ref_insert).await.unwrap();
     let duplicate_ref = Statement::from_string(
         DbBackend::Sqlite,
-        "INSERT INTO operation_view_ref(view_id, ref_kind, ref_name, ref_remote, target_oid) VALUES ('view_dup', 'branch', 'main', '', 'oid-2');",
+        "INSERT INTO legacy_operation_view_ref(view_id, ref_kind, ref_name, ref_remote, target_oid) VALUES ('view_dup', 'branch', 'main', '', 'oid-2');",
     );
     assert!(db.execute_raw(duplicate_ref).await.is_err());
 
     let workspace_insert = Statement::from_string(
         DbBackend::Sqlite,
-        "INSERT INTO operation_view_workspace(view_id, pointer_kind, pointer_value) VALUES ('view_dup', 'index', 'oid-1');",
+        "INSERT INTO legacy_operation_view_workspace(view_id, pointer_kind, pointer_value) VALUES ('view_dup', 'index', 'oid-1');",
     );
     db.execute_raw(workspace_insert).await.unwrap();
     let duplicate_workspace = Statement::from_string(
         DbBackend::Sqlite,
-        "INSERT INTO operation_view_workspace(view_id, pointer_kind, pointer_value) VALUES ('view_dup', 'index', 'oid-2');",
+        "INSERT INTO legacy_operation_view_workspace(view_id, pointer_kind, pointer_value) VALUES ('view_dup', 'index', 'oid-2');",
     );
     assert!(db.execute_raw(duplicate_workspace).await.is_err());
 }

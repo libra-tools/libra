@@ -1,14 +1,17 @@
-//! SeaORM entity for v2 operation parent edges.
+//! SeaORM entity for rewrite genealogy edges.
 
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-#[sea_orm(table_name = "operation_parent")]
+#[sea_orm(table_name = "change_predecessor")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub op_id: String,
+    pub successor_oid: String,
     #[sea_orm(primary_key, auto_increment = false)]
-    pub parent_op_id: String,
+    pub predecessor_oid: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub op_id: String,
+    pub relation_kind: String,
     pub ordinal: i32,
 }
 

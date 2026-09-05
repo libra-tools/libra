@@ -600,3 +600,11 @@ path = "tests/commit_change_id_header_spike.rs"
 # debug_assertions are independent of opt-level, so behavior is unchanged.
 [profile.dev.package."*"]
 opt-level = 2
+# OL-02..04: v2 persistence foundation targets.
+[[test]]
+name = "operation_schema_v2"
+path = "tests/operation_schema_v2.rs"
+
+[[test]]
+name = "operation_dag"
+path = "tests/operation_dag.rs"

@@ -66,14 +66,14 @@ const LOOSE_OBJECT_AGE_SECONDS: u64 = 14 * 24 * 60 * 60; // 2 weeks
 
 /// `--help` examples shown in `libra maintenance --help` output.
 pub const MAINTENANCE_EXAMPLES: &str = "\
-EXAMPLES:
-    libra maintenance run                         Run all maintenance tasks
-    libra maintenance run --task gc               Run only the garbage-collection task
-    libra maintenance run --task loose-objects    Pack old loose objects
-    libra maintenance run --dry-run               Show what would be done, without changes
-    libra maintenance register                    Register this repo for periodic maintenance
-    libra maintenance unregister                  Unregister this repo
-    libra maintenance status                      Show maintenance registration state";
+ EXAMPLES:
+     libra maintenance run                         Run all maintenance tasks
+     libra maintenance run --task gc               Run only the garbage-collection task
+     libra maintenance run --task loose-objects    Pack old loose objects
+     libra maintenance run --dry-run               Show what would be done, without changes
+     libra maintenance register                    Register this repo for periodic maintenance
+     libra maintenance unregister                  Unregister this repo
+     libra maintenance status                      Show maintenance registration state";
 
 /// Maintenance subcommands matching Git's `git maintenance` interface.
 #[derive(Subcommand, Debug)]
@@ -246,27 +246,27 @@ async fn run_tasks(
         // cannot be upgraded. The two sets are disjoint by construction, and
         // this match is exhaustive so a new task must classify itself.
         let publish_lock = match task {
-            // `prefetch` runs the ordinary fetch writer in-process: it writes
-            // objects AND publishes remote-tracking refs.
-            MaintenanceTask::Prefetch
-            // `pack-refs` rewrites the ref store. It deletes loose REF
-            // files, never object payloads, so a shared hold is the right
-            // mode for it.
-            | MaintenanceTask::PackRefs => {
-                Some(crate::internal::maintenance_lock::MaintenanceLock::shared(&repo_path)?)
-            }
-            // These take the lock themselves, in the mode each PHASE needs.
-            // `loose-objects` and `incremental-repack` both publish a pack
-            // and then UNLINK — shared for the write, exclusive for the
-            // deletion; `gc` and `cache-evict` are deletion phases outright.
-            // `commit-graph` derives a file from objects it neither
-            // publishes nor deletes.
-            MaintenanceTask::LooseObjects
-            | MaintenanceTask::IncrementalRepack
-            | MaintenanceTask::Gc
-            | MaintenanceTask::CacheEvict
-            | MaintenanceTask::CommitGraph => None,
-        };
+             // `prefetch` runs the ordinary fetch writer in-process: it writes
+             // objects AND publishes remote-tracking refs.
+             MaintenanceTask::Prefetch
+             // `pack-refs` rewrites the ref store. It deletes loose REF
+             // files, never object payloads, so a shared hold is the right
+             // mode for it.
+             | MaintenanceTask::PackRefs => {
+                 Some(crate::internal::maintenance_lock::MaintenanceLock::shared(&repo_path)?)
+             }
+             // These take the lock themselves, in the mode each PHASE needs.
+             // `loose-objects` and `incremental-repack` both publish a pack
+             // and then UNLINK — shared for the write, exclusive for the
+             // deletion; `gc` and `cache-evict` are deletion phases outright.
+             // `commit-graph` derives a file from objects it neither
+             // publishes nor deletes.
+             MaintenanceTask::LooseObjects
+             | MaintenanceTask::IncrementalRepack
+             | MaintenanceTask::Gc
+             | MaintenanceTask::CacheEvict
+             | MaintenanceTask::CommitGraph => None,
+         };
         let result = match task {
             MaintenanceTask::Gc => run_gc(&repo_path, dry_run, quiet, output).await,
             MaintenanceTask::LooseObjects => {
@@ -420,14 +420,14 @@ fn read_prune_candidate_ledger(
         Ok(meta) if meta.len() > MAX_PRUNE_LEDGER_BYTES => {
             return Err(CliError::fatal(format!(
                 "the GC prune-candidate ledger '{}' is {} bytes, past the \
-                 {MAX_PRUNE_LEDGER_BYTES}-byte cap",
+                  {MAX_PRUNE_LEDGER_BYTES}-byte cap",
                 path.display(),
                 meta.len()
             ))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint(
                 "delete it to restart the quarantine clock (this delays pruning by one grace \
-                 window; it never deletes an object)",
+                  window; it never deletes an object)",
             ));
         }
         Ok(_) => {}
@@ -513,15 +513,15 @@ fn write_prune_candidate_ledger(
     if text.len() as u64 > MAX_PRUNE_LEDGER_BYTES {
         return Err(CliError::fatal(format!(
             "the GC prune-candidate ledger would grow to {} bytes, past the \
-             {MAX_PRUNE_LEDGER_BYTES}-byte cap; '{}' was left unchanged",
+              {MAX_PRUNE_LEDGER_BYTES}-byte cap; '{}' was left unchanged",
             text.len(),
             path.display()
         ))
         .with_stable_code(StableErrorCode::RepoStateInvalid)
         .with_hint(
             "this repository has more quarantined objects than the ledger can track: run \
-             `libra gc` again after the current grace window expires so the backlog drains, \
-             or delete the ledger to restart the quarantine clock",
+              `libra gc` again after the current grace window expires so the backlog drains, \
+              or delete the ledger to restart the quarantine clock",
         ));
     }
     crate::utils::atomic_write::write_atomic(path, text.as_bytes(), false).map_err(|error| {
@@ -677,9 +677,9 @@ async fn run_gc(
                 object_index_rows_removed: 0,
                 message: format!(
                     "deferred loose-object prune: {live_ordinary} live traces-inflight \
-                     marker(s) — an agent write is in flight and may hold uncataloged \
-                     objects; the marker TTL bounds this, re-run after it completes or \
-                     expires"
+                      marker(s) — an agent write is in flight and may hold uncataloged \
+                      objects; the marker TTL bounds this, re-run after it completes or \
+                      expires"
                 ),
             });
         }
@@ -807,7 +807,7 @@ async fn run_gc(
             output,
             &format!(
                 "  {newly_quarantined} newly unreachable object(s) recorded; a later run \
-                 deletes them if they are still unreachable"
+                  deletes them if they are still unreachable"
             ),
         );
     }
@@ -868,8 +868,8 @@ async fn run_gc(
                 object_index_rows_removed: 0,
                 message: format!(
                     "deferred the deletion of {} unreachable loose object(s): another command \
-                     is still publishing objects in this repository (a long-running `libra \
-                     code` session counts). Re-run when it finishes.",
+                      is still publishing objects in this repository (a long-running `libra \
+                      code` session counts). Re-run when it finishes.",
                     prune_targets.len()
                 ),
             });
@@ -1164,7 +1164,7 @@ async fn run_loose_objects(
             object_index_rows_removed: 0,
             message: format!(
                 "packed {} loose object(s); kept the loose copies because the new pack's \
-                 directory entry could not be made durable",
+                  directory entry could not be made durable",
                 old_loose.len()
             ),
         });
@@ -1185,8 +1185,8 @@ async fn run_loose_objects(
             object_index_rows_removed: 0,
             message: format!(
                 "packed {} loose object(s), then deferred removing the loose copies: another \
-                 command is still publishing objects in this repository. The objects are safe \
-                 in the new pack — re-run when it finishes.",
+                  command is still publishing objects in this repository. The objects are safe \
+                  in the new pack — re-run when it finishes.",
                 old_loose.len()
             ),
         });
@@ -1540,7 +1540,7 @@ async fn run_incremental_repack(
             object_index_rows_removed: 0,
             message: format!(
                 "consolidated {} object(s) into a new pack, then kept the {} old pack(s): the \
-                 new pack's directory entry could not be made durable",
+                  new pack's directory entry could not be made durable",
                 all_hashes.len(),
                 packs.len()
             ),
@@ -1566,9 +1566,9 @@ async fn run_incremental_repack(
             object_index_rows_removed: 0,
             message: format!(
                 "consolidated {} object(s) into a new pack, then deferred deleting the {} old \
-                 pack(s): another command is still publishing objects in this repository. The \
-                 consolidated pack was kept (harmless duplicate data) — re-run when it \
-                 finishes.",
+                  pack(s): another command is still publishing objects in this repository. The \
+                  consolidated pack was kept (harmless duplicate data) — re-run when it \
+                  finishes.",
                 all_hashes.len(),
                 packs.len()
             ),
@@ -1596,7 +1596,7 @@ async fn run_incremental_repack(
             object_index_rows_removed: 0,
             message: format!(
                 "consolidated {} object(s) into a new pack; skipped deleting the old packs: \
-                 {refusal}",
+                  {refusal}",
                 all_hashes.len()
             ),
         });
@@ -1618,9 +1618,9 @@ async fn run_incremental_repack(
             object_index_rows_removed: 0,
             message: format!(
                 "consolidated {} object(s) into a new pack, then aborted deleting the {} old \
-                 pack(s): concurrent repository activity created new reachability roots during \
-                 the repack. The consolidated pack was kept (harmless duplicate data) — re-run \
-                 when the repository is quiescent.",
+                  pack(s): concurrent repository activity created new reachability roots during \
+                  the repack. The consolidated pack was kept (harmless duplicate data) — re-run \
+                  when the repository is quiescent.",
                 all_hashes.len(),
                 packs.len()
             ),
@@ -1684,7 +1684,7 @@ async fn run_incremental_repack(
     if kept_pinned > 0 {
         message.push_str(&format!(
             "; retained {kept_pinned} pack(s) pinned by a .keep sentinel (an in-flight or \
-             crashed fetch) — remove the stale sentinel to let a later repack reclaim them"
+              crashed fetch) — remove the stale sentinel to let a later repack reclaim them"
         ));
     }
     Ok(TaskResult {
@@ -2181,14 +2181,14 @@ fn write_scheduler_entry(
         let interval = schedule_interval_secs(schedule);
         let plist = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-<plist version=\"1.0\">\n<dict>\n    \
-<key>Label</key>\n    <string>{label}</string>\n    \
-<key>ProgramArguments</key>\n    <array>\n        <string>{exe}</string>\n        \
-<string>maintenance</string>\n        <string>run</string>\n    </array>\n    \
-<key>WorkingDirectory</key>\n    <string>{repo}</string>\n    \
-<key>StartInterval</key>\n    <integer>{interval}</integer>\n    \
-<key>RunAtLoad</key>\n    <false/>\n</dict>\n</plist>\n"
+ <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+ <plist version=\"1.0\">\n<dict>\n    \
+ <key>Label</key>\n    <string>{label}</string>\n    \
+ <key>ProgramArguments</key>\n    <array>\n        <string>{exe}</string>\n        \
+ <string>maintenance</string>\n        <string>run</string>\n    </array>\n    \
+ <key>WorkingDirectory</key>\n    <string>{repo}</string>\n    \
+ <key>StartInterval</key>\n    <integer>{interval}</integer>\n    \
+ <key>RunAtLoad</key>\n    <false/>\n</dict>\n</plist>\n"
         );
         fs::write(&path, plist)?;
         Ok(path)
@@ -2471,8 +2471,8 @@ where
                     Err(git_internal::errors::GitError::ObjectNotFound(_)) => {
                         return Err(CliError::fatal(format!(
                             "index GC root '{}' entry '{}' (stage {stage}) names object {}, \
-                             which does not exist — pruning would delete the remaining \
-                             anchors of state that is already damaged",
+                              which does not exist — pruning would delete the remaining \
+                              anchors of state that is already damaged",
                             index_path.display(),
                             entry.name,
                             entry.hash
@@ -2534,9 +2534,9 @@ pub(crate) fn worktree_index_roots(
         crate::command::worktree::run_list_worktrees_at(&storage_root.join("worktrees.json"))
             .map_err(|error| {
                 CliError::fatal(format!(
-            "cannot enumerate worktree GC roots: the worktree registry is unreadable: {error}"
-        ))
-        .with_stable_code(StableErrorCode::IoReadFailed)
+             "cannot enumerate worktree GC roots: the worktree registry is unreadable: {error}"
+         ))
+         .with_stable_code(StableErrorCode::IoReadFailed)
             })?;
     for entry in list.worktrees {
         if entry.is_main {
@@ -2553,13 +2553,13 @@ pub(crate) fn worktree_index_roots(
         if !entry.exists {
             return Err(CliError::fatal(format!(
                 "cannot enumerate worktree GC roots: registered worktree '{}' is missing on \
-                 disk — its private index (a reachability root) cannot be read",
+                  disk — its private index (a reachability root) cannot be read",
                 entry.path
             ))
             .with_stable_code(StableErrorCode::IoReadFailed)
             .with_hint(
                 "restore the worktree directory, or unregister it with `libra worktree \
-                 prune` / `libra worktree remove` first",
+                  prune` / `libra worktree remove` first",
             ));
         }
         let candidate = std::path::Path::new(&entry.path)
@@ -2757,8 +2757,8 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
         read_bound: "single file, full read",
         corruption: GcCorruptionPolicy::LenientSkip,
         note: "read_prune_candidate_ledger — the writer-vs-deleter quarantine ledger: OIDs seen \
-               unreachable, with when. Keeps nothing alive and confers no authority; losing it \
-               costs one delayed prune cycle, never an object",
+                unreachable, with when. Keeps nothing alive and confers no authority; losing it \
+                costs one delayed prune cycle, never an object",
     },
     // ── W2 §C.4.3 re-verification: file-backed roots the walk ALREADY
     // collects, which this inventory did not name. An inventory that
@@ -3080,7 +3080,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
-        location: "operation_view_ref",
+        location: "legacy_operation_view_ref",
         column: "target_oid",
         status: GcSourceStatus::TracedRoot,
         kind: GcStorageKind::SqliteColumn,
@@ -3179,7 +3179,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
-        location: "operation_view",
+        location: "legacy_operation_view",
         column: "head_target",
         status: GcSourceStatus::TracedRoot,
         kind: GcStorageKind::SqliteColumn,
@@ -3190,7 +3190,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
-        location: "operation_view_workspace",
+        location: "legacy_operation_view_workspace",
         column: "pointer_value",
         status: GcSourceStatus::TracedRoot,
         kind: GcStorageKind::SqliteColumn,
@@ -3198,6 +3198,94 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         read_bound: "full table scan, one query per collection pass",
         corruption: GcCorruptionPolicy::FailClosed,
         note: "undo view workspace pointer — rooted when it is an OID",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation",
+        column: "pre_view_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "v2 operation DAG",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 operation pre-view manifest",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation",
+        column: "post_view_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "v2 operation DAG",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 operation post-view manifest",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation",
+        column: "predecessor_map_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "v2 operation DAG",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 operation predecessor map",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation_journal",
+        column: "pre_view_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "v2 operation journal",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "in-flight v2 journal pre-view manifest",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation_journal",
+        column: "target_view_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "v2 operation journal",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "in-flight v2 journal target manifest",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "change_revision",
+        column: "commit_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "v2 change projection",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 change revision commit",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "change_predecessor",
+        column: "successor_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "v2 change genealogy",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 change genealogy successor",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "change_predecessor",
+        column: "predecessor_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "v2 change genealogy",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 change genealogy predecessor",
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
@@ -3322,8 +3410,11 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
         /// A non-empty cell MUST be a valid OID (fail closed otherwise).
         StrictOid,
         /// The cell may hold a ref/branch NAME or an OID — only an
-        /// OID-parsing value roots (names are anchored via `reference`).
+        /// OID-parsing value roots (names are anchored via repository refs).
         OidIfParses,
+        /// An operation view manifest whose workspace snapshots must be
+        /// expanded before the ordinary Git object walk.
+        V2View,
     }
     type Source = (
         &'static str,
@@ -3339,27 +3430,57 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
             CellMode::StrictOid,
         ),
         (
-            "operation_view_ref",
-            "SELECT target_oid FROM operation_view_ref",
+            "legacy_operation_view_ref",
+            "SELECT target_oid FROM legacy_operation_view_ref",
             &["target_oid"],
             CellMode::StrictOid,
         ),
         (
-            "operation_view",
-            "SELECT head_target FROM operation_view",
+            "legacy_operation_view",
+            "SELECT head_target FROM legacy_operation_view",
             &["head_target"],
             CellMode::OidIfParses,
         ),
         (
-            "operation_view_workspace",
-            "SELECT pointer_value FROM operation_view_workspace",
+            "legacy_operation_view_workspace",
+            "SELECT pointer_value FROM legacy_operation_view_workspace",
             &["pointer_value"],
             CellMode::OidIfParses,
         ),
         (
+            "operation",
+            "SELECT pre_view_oid, post_view_oid FROM operation",
+            &["pre_view_oid", "post_view_oid"],
+            CellMode::V2View,
+        ),
+        (
+            "operation",
+            "SELECT predecessor_map_oid FROM operation",
+            &["predecessor_map_oid"],
+            CellMode::StrictOid,
+        ),
+        (
+            "operation_journal",
+            "SELECT pre_view_oid, target_view_oid FROM operation_journal",
+            &["pre_view_oid", "target_view_oid"],
+            CellMode::StrictOid,
+        ),
+        (
+            "change_revision",
+            "SELECT commit_oid FROM change_revision",
+            &["commit_oid"],
+            CellMode::StrictOid,
+        ),
+        (
+            "change_predecessor",
+            "SELECT successor_oid, predecessor_oid FROM change_predecessor",
+            &["successor_oid", "predecessor_oid"],
+            CellMode::StrictOid,
+        ),
+        (
             "agent_checkpoint",
             "SELECT parent_commit, tree_oid, metadata_blob_oid, traces_commit \
-             FROM agent_checkpoint",
+              FROM agent_checkpoint",
             &[
                 "parent_commit",
                 "tree_oid",
@@ -3383,7 +3504,7 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
         (
             "workspace_record",
             "SELECT base_commit FROM workspace_record WHERE base_commit IS NOT NULL \
-             AND state IN ('provisioning', 'active', 'releasing', 'orphaned')",
+              AND state IN ('provisioning', 'active', 'releasing', 'orphaned')",
             &["base_commit"],
             CellMode::StrictOid,
         ),
@@ -3415,7 +3536,7 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
                                 let hash = parse_object_hash(trimmed).ok_or_else(|| {
                                     CliError::fatal(format!(
                                         "{table}.{column} contains invalid object id \
-                                         '{trimmed}' while computing GC roots"
+                                          '{trimmed}' while computing GC roots"
                                     ))
                                     .with_stable_code(StableErrorCode::RepoCorrupt)
                                 })?;
@@ -3425,6 +3546,17 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
                                 if let Some(hash) = parse_object_hash(trimmed) {
                                     walk_reachable(&hash, storage, boundaries, reachable)?;
                                 }
+                            }
+                            CellMode::V2View => {
+                                let hash = parse_object_hash(trimmed).ok_or_else(|| {
+                                    CliError::fatal(format!(
+                                        "{table}.{column} contains invalid object id \
+                                          '{trimmed}' while computing GC roots"
+                                    ))
+                                    .with_stable_code(StableErrorCode::RepoCorrupt)
+                                })?;
+                                walk_reachable(&hash, storage, boundaries, reachable)?;
+                                walk_v2_operation_view(&hash, storage, boundaries, reachable)?;
                             }
                         }
                     }
@@ -3455,7 +3587,7 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
         .map_err(|err| {
             CliError::fatal(format!(
                 "traces-inflight markers cannot be trusted while computing GC roots \
-                     (destructive maintenance stops): {err:#}"
+                      (destructive maintenance stops): {err:#}"
             ))
             .with_stable_code(StableErrorCode::RepoCorrupt)
         })?;
@@ -3554,7 +3686,7 @@ fn collect_worktree_sidecar_roots(
                 let hash = parse_object_hash(oid.trim()).ok_or_else(|| {
                     CliError::fatal(format!(
                         "sidecar GC root '{}' field {field} holds an invalid object id \
-                         '{oid}'",
+                          '{oid}'",
                         path.display()
                     ))
                     .with_stable_code(StableErrorCode::RepoCorrupt)
@@ -3564,8 +3696,8 @@ fn collect_worktree_sidecar_roots(
                     Err(git_internal::errors::GitError::ObjectNotFound(_)) => {
                         return Err(CliError::fatal(format!(
                             "sidecar GC root '{}' field {field} names object {hash}, which \
-                             does not exist — an in-progress operation's anchor is missing, \
-                             so the prune stops rather than deleting its remaining ones",
+                              does not exist — an in-progress operation's anchor is missing, \
+                              so the prune stops rather than deleting its remaining ones",
                             path.display()
                         ))
                         .with_stable_code(StableErrorCode::RepoCorrupt));
@@ -3573,7 +3705,7 @@ fn collect_worktree_sidecar_roots(
                     Err(error) => {
                         return Err(CliError::fatal(format!(
                             "failed to probe sidecar GC root '{}' field {field} ({hash}): \
-                             {error}",
+                              {error}",
                             path.display()
                         ))
                         .with_stable_code(StableErrorCode::IoReadFailed));
@@ -3624,7 +3756,7 @@ fn collect_worktree_sidecar_roots(
                 let replacement = parse_object_hash(content.trim()).ok_or_else(|| {
                     CliError::fatal(format!(
                         "replace ref '{}' contains invalid object id '{}' while computing GC \
-                         roots",
+                          roots",
                         path.display(),
                         content.trim()
                     ))
@@ -3703,11 +3835,11 @@ fn collect_agent_run_manifest_roots(
         scanned += 1;
         if scanned > MAX_RUN_DIRS {
             return Err(CliError::fatal(format!(
-                "more than {MAX_RUN_DIRS} agent-run directories in '{}'; the mandatory root                  scan is no longer bounded, so pruning would proceed on a partial root set",
-                runs_dir.display()
-            ))
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-            .with_hint("run `libra agent clean` to retire completed runs, then retry"));
+                 "more than {MAX_RUN_DIRS} agent-run directories in '{}'; the mandatory root                  scan is no longer bounded, so pruning would proceed on a partial root set",
+                 runs_dir.display()
+             ))
+             .with_stable_code(StableErrorCode::RepoStateInvalid)
+             .with_hint("run `libra agent clean` to retire completed runs, then retry"));
         }
         let dir = entry.path();
         if !dir.is_dir() {
@@ -3718,11 +3850,11 @@ fn collect_agent_run_manifest_roots(
             Ok(meta) => {
                 if meta.len() > MAX_MANIFEST_BYTES {
                     return Err(CliError::fatal(format!(
-                        "agent-run manifest '{}' is {} bytes, past the {MAX_MANIFEST_BYTES}-byte                          cap; its roots cannot be enumerated safely",
-                        manifest.display(),
-                        meta.len()
-                    ))
-                    .with_stable_code(StableErrorCode::RepoCorrupt));
+                         "agent-run manifest '{}' is {} bytes, past the {MAX_MANIFEST_BYTES}-byte                          cap; its roots cannot be enumerated safely",
+                         manifest.display(),
+                         meta.len()
+                     ))
+                     .with_stable_code(StableErrorCode::RepoCorrupt));
                 }
                 std::fs::read_to_string(&manifest).map_err(|error| {
                     CliError::fatal(format!(
@@ -3748,13 +3880,13 @@ fn collect_agent_run_manifest_roots(
                 // forever — it just refuses to guess.
                 return Err(CliError::fatal(format!(
                     "agent-run directory '{}' has no manifest, so the objects it may still own \
-                     cannot be enumerated; pruning would proceed on a partial root set",
+                      cannot be enumerated; pruning would proceed on a partial root set",
                     dir.display()
                 ))
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint(
                     "re-run once the agent run completes; if the run was interrupted and will \
-                     not resume, retire it with `libra agent clean` and try again",
+                      not resume, retire it with `libra agent clean` and try again",
                 ));
             }
             Err(error) => {
@@ -3785,7 +3917,7 @@ fn collect_agent_run_manifest_roots(
             .with_stable_code(StableErrorCode::RepoCorrupt)
             .with_hint(
                 "restore or delete the manifest (`libra agent doctor` reports what a run \
-                 should contain), then re-run",
+                  should contain), then re-run",
             ));
         }
 
@@ -3812,11 +3944,11 @@ fn collect_agent_run_manifest_roots(
             }
             None if finalized => {
                 return Err(CliError::fatal(format!(
-                    "agent-run manifest '{}' is finalized but has no findings_oid field; its                      evidence blob has no root and pruning would take it",
-                    manifest.display()
-                ))
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-                .with_hint("run `libra agent doctor` to reconcile the run manifests"));
+                     "agent-run manifest '{}' is finalized but has no findings_oid field; its                      evidence blob has no root and pruning would take it",
+                     manifest.display()
+                 ))
+                 .with_stable_code(StableErrorCode::RepoCorrupt)
+                 .with_hint("run `libra agent doctor` to reconcile the run manifests"));
             }
             None => {}
         }
@@ -3832,27 +3964,27 @@ fn collect_agent_run_manifest_roots(
             })?;
             if list.len() > MAX_ATTACHMENTS {
                 return Err(CliError::fatal(format!(
-                    "agent-run manifest '{}' lists {} attachments, past the                      {MAX_ATTACHMENTS} cap",
-                    manifest.display(),
-                    list.len()
-                ))
-                .with_stable_code(StableErrorCode::RepoCorrupt));
+                     "agent-run manifest '{}' lists {} attachments, past the                      {MAX_ATTACHMENTS} cap",
+                     manifest.display(),
+                     list.len()
+                 ))
+                 .with_stable_code(StableErrorCode::RepoCorrupt));
             }
             for item in list {
                 // An attachment entry exists BECAUSE something was attached.
                 // Missing, null or non-string here is corruption — skipping
                 // it would quietly surrender that attachment's only root.
                 let oid = item
-                    .get("oid")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        CliError::fatal(format!(
-                            "agent-run manifest '{}' has a manual_attach entry without a usable                              oid; its attachment has no root and pruning would take it",
-                            manifest.display()
-                        ))
-                        .with_stable_code(StableErrorCode::RepoCorrupt)
-                        .with_hint("run `libra agent doctor` to reconcile the run manifests")
-                    })?;
+                     .get("oid")
+                     .and_then(|value| value.as_str())
+                     .ok_or_else(|| {
+                         CliError::fatal(format!(
+                             "agent-run manifest '{}' has a manual_attach entry without a usable                              oid; its attachment has no root and pruning would take it",
+                             manifest.display()
+                         ))
+                         .with_stable_code(StableErrorCode::RepoCorrupt)
+                         .with_hint("run `libra agent doctor` to reconcile the run manifests")
+                     })?;
                 oids.push(oid.to_string());
             }
         }
@@ -3911,7 +4043,7 @@ async fn collect_sequencer_state_roots<C: sea_orm::ConnectionTrait>(
         let hash = parse_object_hash(trimmed).ok_or_else(|| {
             CliError::fatal(format!(
                 "{table}.{column} contains invalid object id '{trimmed}' while computing GC \
-                 roots"
+                  roots"
             ))
             .with_stable_code(StableErrorCode::RepoCorrupt)
         })?;
@@ -3971,7 +4103,7 @@ async fn collect_sequencer_state_roots<C: sea_orm::ConnectionTrait>(
     match db
         .query_all_raw(stmt_of(
             "SELECT worktree_id, onto, orig_head, current_head, todo, done, stopped_sha \
-             FROM rebase_state",
+              FROM rebase_state",
         ))
         .await
     {
@@ -4053,7 +4185,7 @@ async fn collect_sequencer_state_roots<C: sea_orm::ConnectionTrait>(
                     let oids: Vec<String> = serde_json::from_str(&json).map_err(|error| {
                         CliError::fatal(format!(
                             "bisect_state.{column} contains invalid JSON while computing GC \
-                             roots: {error}"
+                              roots: {error}"
                         ))
                         .with_stable_code(StableErrorCode::RepoCorrupt)
                     })?;
@@ -4235,6 +4367,65 @@ fn walk_reachable(
         }
     }
 
+    Ok(())
+}
+
+/// Expand a v2 operation view manifest after its blob has been rooted.
+///
+/// Git's generic blob walk intentionally treats blobs as leaves. Operation
+/// manifests are a typed exception: the repository view blob names workspace
+/// snapshot manifests, and those snapshots name trees/blobs/facets that must
+/// remain live as well. The typed recursive closure check fails closed before
+/// any prune can act on a partial graph.
+fn walk_v2_operation_view(
+    hash: &ObjectHash,
+    storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
+    reachable: &mut HashSet<ObjectHash>,
+) -> CliResult<()> {
+    let bytes = storage.get(hash).map_err(|error| {
+        CliError::fatal(format!(
+            "operation view manifest {hash} cannot be read while computing GC roots: {error}"
+        ))
+        .with_stable_code(StableErrorCode::RepoCorrupt)
+    })?;
+    let view =
+        crate::internal::operation::RepoViewV2::from_canonical_bytes(&bytes).map_err(|error| {
+            CliError::fatal(format!(
+                "operation view manifest {hash} is invalid while computing GC roots: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+    view.validate_recursive_closure(|oid| storage.get(oid).ok())
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "operation view manifest {hash} has an incomplete closure while computing GC roots: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+
+    for root in view.roots() {
+        walk_reachable(&root, storage, boundaries, reachable)?;
+    }
+    for workspace_oid in view.workspaces.values() {
+        let snapshot_bytes = storage.get(workspace_oid).map_err(|error| {
+            CliError::fatal(format!(
+                "workspace snapshot {workspace_oid} cannot be read from operation view {hash}: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+        let snapshot =
+            crate::internal::operation::WorkspaceSnapshotV2::from_canonical_bytes(&snapshot_bytes)
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                "workspace snapshot {workspace_oid} in operation view {hash} is invalid: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+        for root in snapshot.roots() {
+            walk_reachable(&root, storage, boundaries, reachable)?;
+        }
+    }
     Ok(())
 }
 
@@ -4919,8 +5110,8 @@ mod tests {
             assert!(
                 resolver_joined.contains(surface.location) || found.contains(surface.location),
                 "UnifiedResolver surface `{}` ({}) has no resolver callsite and no \
-                 literal storage-root join left in production — fix the loader or \
-                 drop the registration and the NOT_AN_OBJECT_SOURCE entry",
+                  literal storage-root join left in production — fix the loader or \
+                  drop the registration and the NOT_AN_OBJECT_SOURCE entry",
                 surface.location,
                 surface.surface
             );
@@ -4932,10 +5123,10 @@ mod tests {
             assert!(
                 inventoried || excluded,
                 "production code creates `<storage>/{name}`, which is in neither \
-                 GC_OBJECT_FILE_SOURCE_INVENTORY nor NOT_AN_OBJECT_SOURCE. Classify it: \
-                 if it can hold object ids give it a row (TracedRoot / AntiRoot / \
-                 Boundary / IndexOnly / NonRoot with the reason), otherwise add it to \
-                 the exclusion list (plan-20260714 §C.4.3)"
+                  GC_OBJECT_FILE_SOURCE_INVENTORY nor NOT_AN_OBJECT_SOURCE. Classify it: \
+                  if it can hold object ids give it a row (TracedRoot / AntiRoot / \
+                  Boundary / IndexOnly / NonRoot with the reason), otherwise add it to \
+                  the exclusion list (plan-20260714 §C.4.3)"
             );
         }
 
@@ -4955,14 +5146,14 @@ mod tests {
         assert!(
             stale.is_empty(),
             "excluded as non-object-sources, but no production code joins them onto a \
-             storage root any more — drop the entries: {stale:?}"
+              storage root any more — drop the entries: {stale:?}"
         );
         for (name, reason) in NOT_AN_OBJECT_SOURCE {
             assert!(
                 !classified.iter().any(|entry| entry == name),
                 "`{name}` is BOTH inventoried as a GC source and excluded as a \
-                 non-source — the exclusion would keep this guard green if the \
-                 inventory row were deleted. Keep one"
+                  non-source — the exclusion would keep this guard green if the \
+                  inventory row were deleted. Keep one"
             );
             assert!(
                 reason.len() > 10,

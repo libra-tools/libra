@@ -37,6 +37,75 @@ fn repo_with_feature() -> tempfile::TempDir {
     repo
 }
 
+/// Reconstruct the real pre-OL-02 operation shape for rollback fixtures.
+/// Production v2 is intentionally forward-only, so older migration downs
+/// must run against v1 tables rather than a same-named v2 table.
+async fn restore_v1_operation_shape(conn: &sea_orm::DatabaseConnection) {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    for table in [
+        "ai_operation_link",
+        "change_predecessor",
+        "change_revision",
+        "change_identity",
+        "operation_journal",
+        "operation_head",
+        "operation_parent",
+        "operation",
+    ] {
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("DROP TABLE IF EXISTS `{table}`"),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("drop v2 fixture table {table}: {error}"));
+    }
+    for trigger in [
+        "legacy_operation_scope_provenance_domain_insert",
+        "legacy_operation_scope_provenance_domain_update",
+        "legacy_operation_scope_kind_domain_insert",
+        "legacy_operation_scope_kind_domain_update",
+    ] {
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("DROP TRIGGER IF EXISTS {trigger}"),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("drop v2 fixture trigger {trigger}: {error}"));
+    }
+    for index in [
+        "idx_legacy_operation_repo_order",
+        "idx_legacy_operation_dedup_scope",
+        "idx_legacy_operation_control_slot",
+        "idx_legacy_operation_parent_parent",
+        "idx_legacy_operation_view_repo_created",
+    ] {
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("DROP INDEX IF EXISTS {index}"),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("drop v2 fixture index {index}: {error}"));
+    }
+    for (legacy, v1) in [
+        ("legacy_operation", "operation"),
+        ("legacy_operation_parent", "operation_parent"),
+        ("legacy_operation_view", "operation_view"),
+        ("legacy_operation_view_ref", "operation_view_ref"),
+        (
+            "legacy_operation_view_workspace",
+            "operation_view_workspace",
+        ),
+    ] {
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("ALTER TABLE `{legacy}` RENAME TO `{v1}`"),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("restore {legacy} as {v1}: {error}"));
+    }
+}
+
 fn abbrev_head(dir: &std::path::Path) -> String {
     String::from_utf8_lossy(&run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], dir).stdout)
         .trim()
@@ -4225,7 +4294,7 @@ fn concurrent_control_slots_are_held_per_worktree() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let rows = match sqlite_query_no_wait(
             &db,
-            "SELECT worktree_id FROM operation WHERE status = 'running' \
+            "SELECT worktree_id FROM legacy_operation WHERE status = 'running' \
              AND control_slot IS NOT NULL ORDER BY worktree_id",
         ) {
             Ok(rows) => rows,
@@ -5917,6 +5986,13 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
     // Re-open the pre-v2 window: roll back ONLY the capability marker.
     {
         let conn = Database::connect(&db_url).await.expect("connect repo db");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
+        ))
+        .await
+        .expect("remove forward-only v2 version marker before rollback fixture");
+        restore_v1_operation_shape(&conn).await;
         let rolled = builtin_runner()
             .expect("builtin runner")
             .rollback_to(&conn, 2026072304)
@@ -5933,7 +6009,7 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         let mut expected_rolled: Vec<i64> = libra::internal::db::migration::builtin_migrations()
             .into_iter()
             .map(|migration| migration.version)
-            .filter(|version| *version > 2026072304)
+            .filter(|version| *version > 2026072304 && *version < 2026090101)
             .collect();
         expected_rolled.reverse();
         assert_eq!(rolled, expected_rolled);
@@ -8584,7 +8660,7 @@ fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
 #[tokio::test]
 async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
     use libra::internal::db::migration::builtin_runner;
-    use sea_orm::Database;
+    use sea_orm::{ConnectionTrait, Database};
 
     let dir = repo_with_feature();
     let main = dir.path();
@@ -8598,12 +8674,19 @@ async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
     let conn = Database::connect(&db_url)
         .await
         .expect("open repository db");
+    conn.execute_raw(sea_orm::Statement::from_string(
+        conn.get_database_backend(),
+        "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
+    ))
+    .await
+    .expect("remove forward-only v2 version marker before rollback fixture");
+    restore_v1_operation_shape(&conn).await;
     // Registry-derived for the same reason as the capability-marker case
     // above: everything registered above 2026073101 rolls back with it.
     let mut expected_rolled_back: Vec<i64> = libra::internal::db::migration::builtin_migrations()
         .into_iter()
         .map(|migration| migration.version)
-        .filter(|version| *version > 2026073101)
+        .filter(|version| *version > 2026073101 && *version < 2026090101)
         .collect();
     expected_rolled_back.reverse();
     assert_eq!(
