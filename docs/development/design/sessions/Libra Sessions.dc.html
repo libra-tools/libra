@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--sans:"IBM Plex Sans",system-ui,sans-serif;--mono:"JetBrains Mono",ui-monospace,monospace;
+--bg:#f5f5f7;--surface:#ffffff;--surface2:#f0f0f3;--surface3:#e8e8ec;--border:#e2e2e7;--fg:#1c1c22;--fg2:#5a5a66;--fg3:#8c8c97;
+--accent:#4a56c8;--accent-soft:#eceefb;--ok:#2d7f4f;--ok-soft:#e5f3ea;--warn:#a55f00;--warn-soft:#fbf1df;--err:#b8352c;--err-soft:#fae8e6;
+--code-bg:#f3f3f6;--user-bg:#f0f1fa;--diff-add:#e6f4ea;--diff-del:#fbe9e7;--cc:#9a5b1e;--cc-soft:#f7ecdf;--cx:#1f7a70;--cx-soft:#e2f2ef;--oc:#6b4fbf;--oc-soft:#ece6f9;--shadow:0 12px 32px rgba(20,20,30,.14);color-scheme:light}
+[data-theme="dark"]{--bg:#131316;--surface:#1b1b20;--surface2:#232329;--surface3:#2c2c34;--border:#2d2d36;--fg:#e9e9ee;--fg2:#a6a6b2;--fg3:#71717d;
+--accent:#8f97ea;--accent-soft:#272b4d;--ok:#62c088;--ok-soft:#1b3326;--warn:#e0a54f;--warn-soft:#3a2d15;--err:#f07a71;--err-soft:#3f2020;
+--code-bg:#101013;--user-bg:#20223a;--diff-add:#173322;--diff-del:#3c1f1d;--cc:#e0a06a;--cc-soft:#342718;--cx:#5fc2b5;--cx-soft:#153331;--oc:#b39cf0;--oc-soft:#282040;--shadow:0 12px 32px rgba(0,0,0,.5);color-scheme:dark}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+button{font-family:inherit;font-size:inherit;cursor:pointer;color:inherit}
+input,select{font-family:inherit;color:inherit}
+*:focus-visible{outline:2px solid var(--accent);outline-offset:1px;border-radius:4px}
+pre,code{font-family:var(--mono)}
+mark{background:var(--warn-soft);color:inherit;border-radius:2px;padding:0 1px}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:var(--surface3);border-radius:8px;border:2px solid transparent;background-clip:padding-box}
+@keyframes hl{0%{background:var(--accent-soft)}70%{background:var(--accent-soft)}100%{background:transparent}}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+</style>
+</helmet>
+<div style="height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--fg);overflow:hidden;position:relative">
+
+<!-- Top bar -->
+<header style="height:52px;display:flex;align-items:center;gap:14px;padding:0 14px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;position:relative;z-index:30">
+  <button onClick="{{ toggleSidebar }}" title="Toggle session list (\)" aria-label="Toggle session list" style="width:30px;height:30px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--fg2);display:grid;place-items:center;font-size:15px;line-height:1">≡</button>
+  <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+    <div style="width:22px;height:22px;border-radius:6px;background:var(--accent);color:#fff;display:grid;place-items:center;font-weight:600;font-size:12px;font-family:var(--mono)">L</div>
+    <span style="font-weight:600;font-size:14px;letter-spacing:.01em">Libra</span>
+    <span style="color:var(--fg3);font-size:14px">Sessions</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:6px;padding:0 10px;height:30px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);font-size:12px;color:var(--fg2);flex-shrink:0">
+    <span style="font-family:var(--mono);color:var(--fg)">libra</span>
+    <span style="color:var(--fg3)">/</span>
+    <select value="{{ worktree }}" onChange="{{ setWorktree }}" aria-label="Worktree scope" style="border:0;background:transparent;font-size:12px;color:var(--fg);padding:0;outline-offset:2px">
+      <sc-for list="{{ worktreeOptions }}" as="o" hint-placeholder-count="1"><option value="{{ o.v }}">{{ o.label }}</option></sc-for>
+    </select>
+  </div>
+  <div style="flex:1;max-width:560px;position:relative;min-width:0">
+    <input ref="{{ searchRef }}" value="{{ searchQ }}" onChange="{{ onSearchInput }}" onFocus="{{ openSearch }}" placeholder="Search redacted content and readable reasoning (/)" aria-label="Full-text search" style="width:100%;box-sizing:border-box;height:30px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);padding:0 10px 0 30px;font-size:13px;color:var(--fg)">
+    <span style="position:absolute;left:10px;top:6px;color:var(--fg3);font-size:13px;pointer-events:none">⌕</span>
+    <sc-if value="{{ searchOpen }}" hint-placeholder-val="{{ false }}">
+      <div role="dialog" aria-label="Search results" style="position:absolute;top:36px;left:0;right:0;width:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow);z-index:40;animation:rise .12s ease-out">
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px;color:var(--fg2)">
+          <span>Scope</span>
+          <sc-for list="{{ searchScopes }}" as="sc" hint-placeholder-count="3">
+            <button onClick="{{ sc.select }}" style="border:1px solid {{ sc.border }};background:{{ sc.bg }};color:{{ sc.color }};border-radius:999px;padding:1px 9px;font-size:12px">{{ sc.label }}</button>
+          </sc-for>
+          <span style="margin-left:auto;color:var(--fg3)">{{ searchSummary }}</span>
+        </div>
+        <div style="max-height:420px;overflow:auto;padding:4px">
+          <sc-if value="{{ searchEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:22px;text-align:center;color:var(--fg3);font-size:13px">{{ searchEmptyText }}</div></sc-if>
+          <sc-for list="{{ searchResults }}" as="r" hint-placeholder-count="0">
+            <button onClick="{{ r.go }}" style="display:block;width:100%;text-align:left;border:0;background:transparent;border-radius:6px;padding:8px 10px" style-hover="background:var(--surface2)">
+              <div style="display:flex;gap:8px;align-items:center;font-size:12px;color:var(--fg3)">
+                <span style="color:var(--fg);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">{{ r.title }}</span>
+                <span style="color:{{ r.agentColor }};flex-shrink:0">{{ r.agent }}</span>
+                <span style="flex-shrink:0">{{ r.time }}</span>
+                <span style="margin-left:auto;flex-shrink:0;padding:0 6px;border-radius:4px;background:var(--surface2)">{{ r.type }}</span>
+              </div>
+              <div style="font-size:13px;color:var(--fg2);margin-top:2px;line-height:1.5">{{ r.pre }}<mark>{{ r.match }}</mark>{{ r.post }}</div>
+            </button>
+          </sc-for>
+        </div>
+        <div style="padding:6px 12px;border-top:1px solid var(--border);font-size:11px;color:var(--fg3)">Only stored, redacted readable projections are indexed. Ciphertext, raw hook envelopes and hidden content are excluded. Browsing and searching never trigger a historical import.</div>
+      </div>
+    </sc-if>
+  </div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:8px;flex-shrink:0">
+    <button onClick="{{ openCapture }}" title="Capture status" style="height:30px;display:flex;align-items:center;gap:7px;border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:0 10px;font-size:12px;color:var(--fg2)">
+      <span style="width:8px;height:8px;border-radius:50%;background:{{ captureDot }}"></span>{{ captureLabel }}
+    </button>
+    <button onClick="{{ openMap }}" title="Capability map and keyboard shortcuts" style="height:30px;border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:0 10px;font-size:12px;color:var(--fg2)">Capability map</button>
+    <button onClick="{{ toggleTheme }}" title="Toggle light / dark" style="height:30px;border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:0 10px;font-size:12px;color:var(--fg2)">{{ themeLabel }}</button>
+  </div>
+</header>
+
+<div style="flex:1;min-height:0;display:flex;position:relative">
+
+<!-- Session list -->
+<sc-if value="{{ sidebarOpen }}" hint-placeholder-val="{{ true }}">
+<aside style="width:300px;flex-shrink:0;border-right:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;min-height:0">
+  <div style="padding:10px 12px 8px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:5px">
+    <sc-for list="{{ filterChips }}" as="f" hint-placeholder-count="6">
+      <button onClick="{{ f.toggle }}" aria-pressed="{{ f.active }}" style="border:1px solid {{ f.border }};background:{{ f.bg }};color:{{ f.color }};border-radius:999px;padding:1px 9px;font-size:11.5px;line-height:1.6">{{ f.label }}</button>
+    </sc-for>
+  </div>
+  <div style="flex:1;overflow:auto;padding:4px 0 16px">
+    <sc-if value="{{ listEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:28px 16px;color:var(--fg3);font-size:13px;text-align:center">No sessions match the current scope</div></sc-if>
+    <sc-for list="{{ groups }}" as="g" hint-placeholder-count="2">
+      <div style="padding:12px 14px 4px;font-size:11px;font-weight:500;letter-spacing:.06em;color:var(--fg3)">{{ g.label }}</div>
+      <sc-for list="{{ g.items }}" as="it" hint-placeholder-count="2">
+        <button onClick="{{ it.select }}" aria-current="{{ it.active }}" style="display:block;width:100%;text-align:left;border:0;background:{{ it.bg }};padding:9px 14px;border-radius:0" style-hover="background:var(--surface2)">
+          <div style="font-size:13px;font-weight:500;color:var(--fg);line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">{{ it.title }}</div>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:3px;font-size:11.5px;color:var(--fg3)">
+            <span style="color:{{ it.agentColor }};font-weight:500">{{ it.agent }}</span>
+            <span>{{ it.time }}</span>
+            <span style="margin-left:auto;color:{{ it.stateColor }}">{{ it.stateLabel }}</span>
+          </div>
+          <div style="font-size:12px;color:{{ it.summaryColor }};margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ it.summary }}</div>
+        </button>
+      </sc-for>
+    </sc-for>
+  </div>
+  <div style="padding:8px 14px;border-top:1px solid var(--border);font-size:11px;color:var(--fg3)">{{ listCount }}</div>
+</aside>
+</sc-if>
+
+<!-- Main reading area -->
+<main style="flex:1;min-width:0;display:flex;flex-direction:column;min-height:0;position:relative">
+<sc-if value="{{ hasSession }}" hint-placeholder-val="{{ true }}">
+  <div style="padding:18px 28px 0;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0">
+    <div style="display:flex;align-items:flex-start;gap:16px">
+      <div style="min-width:0;flex:1">
+        <h1 style="margin:0;font-size:18px;font-weight:600;line-height:1.4;text-wrap:pretty">{{ s.title }}</h1>
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin-top:6px;font-size:12.5px;color:var(--fg2)">
+          <span style="display:inline-flex;align-items:center;gap:6px;color:{{ s.agentColor }};font-weight:500"><span style="width:7px;height:7px;border-radius:2px;background:{{ s.agentColor }}"></span>{{ s.agent }}</span>
+          <span style="font-family:var(--mono);font-size:12px">{{ s.model }}</span>
+          <sc-if value="{{ s.hasEffort }}" hint-placeholder-val="{{ false }}"><span>Reasoning effort: <span style="font-family:var(--mono);font-size:12px">{{ s.effort }}</span></span></sc-if>
+          <sc-if value="{{ s.hasSource }}" hint-placeholder-val="{{ false }}"><span>Source: {{ s.source }}</span></sc-if>
+          <span>{{ s.timeRange }}</span>
+          <span style="font-family:var(--mono);font-size:12px">libra @ {{ s.worktree }} · HEAD {{ s.head }}</span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:baseline;margin-top:6px;font-size:12.5px;color:var(--fg2)">
+          <span style="flex-shrink:0;font-size:11px;color:var(--fg3);border:1px solid var(--border);border-radius:4px;padding:0 5px">{{ s.summarySource }}</span>
+          <span style="color:{{ s.summaryColor }}">{{ s.summary }}</span>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;flex-shrink:0">
+        <button onClick="{{ openSessionInfo }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--fg2)">Session info</button>
+        <button onClick="{{ openUsage }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--fg2)">Usage</button>
+        <button onClick="{{ openCapture }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--fg2)">Capture details</button>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:4px;margin-top:12px">
+      <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="3">
+        <button onClick="{{ t.select }}" aria-selected="{{ t.active }}" style="border:0;background:transparent;padding:8px 12px;font-size:13.5px;font-weight:500;color:{{ t.color }};border-bottom:2px solid {{ t.border }};margin-bottom:-1px;border-radius:0">{{ t.label }}</button>
+      </sc-for>
+      <sc-if value="{{ isConversation }}" hint-placeholder-val="{{ false }}">
+        <div style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg3)">
+          <span>{{ turnPos }}</span>
+          <button onClick="{{ prevTurn }}" title="Previous turn (k)" style="width:26px;height:26px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--fg2);line-height:1">↑</button>
+          <button onClick="{{ nextTurn }}" title="Next turn (j)" style="width:26px;height:26px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--fg2);line-height:1">↓</button>
+        </div>
+      </sc-if>
+    </div>
+  </div>
+
+  <div style="flex:1;min-height:0;position:relative;display:flex;flex-direction:column">
+  <sc-if value="{{ showRail }}" hint-placeholder-val="{{ false }}">
+    <nav aria-label="Turn navigation" style="position:absolute;right:14px;top:14px;display:flex;flex-direction:column;gap:3px;z-index:5">
+      <sc-for list="{{ rail }}" as="r" hint-placeholder-count="3">
+        <button onClick="{{ r.go }}" title="{{ r.title }}" style="display:flex;align-items:center;gap:5px;border:1px solid {{ r.border }};background:{{ r.bg }};color:{{ r.color }};border-radius:6px;padding:1px 6px;font-size:11px;font-family:var(--mono);line-height:1.7">{{ r.tag }}<sc-if value="{{ r.flag }}" hint-placeholder-val="{{ false }}"><span style="width:6px;height:6px;border-radius:50%;background:{{ r.flagColor }}"></span></sc-if></button>
+      </sc-for>
+    </nav>
+  </sc-if>
+  <div ref="{{ contentRef }}" onScroll="{{ onScroll }}" style="flex:1;min-height:0;overflow:auto;padding:24px 28px 80px">
+  <div style="max-width:820px;margin:0 auto">
+
+  <!-- Overview -->
+  <sc-if value="{{ isOverview }}" hint-placeholder-val="{{ true }}">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+      <sc-for list="{{ statusCards }}" as="c" hint-placeholder-count="4">
+        <div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--surface)">
+          <div style="font-size:11px;color:var(--fg3);letter-spacing:.04em">{{ c.q }}</div>
+          <div style="display:flex;align-items:center;gap:7px;margin-top:4px;font-size:13.5px;font-weight:500;color:var(--fg)"><span style="width:8px;height:8px;border-radius:50%;background:{{ c.dot }};flex-shrink:0"></span>{{ c.a }}</div>
+          <div style="font-size:12px;color:var(--fg2);margin-top:2px">{{ c.d }}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <sc-if value="{{ ov.hasFinalize }}" hint-placeholder-val="{{ false }}">
+      <div style="margin-top:14px;border:1px solid var(--border);border-radius:8px;padding:12px 14px;background:var(--warn-soft);font-size:13px">
+        <div style="font-weight:500;color:var(--warn)">Finalize pending</div>
+        <div style="color:var(--fg2);margin-top:4px">Session stopped; capture finalize incomplete. Reason: {{ ov.finalize.reason }}</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:8px;font-size:12px;color:var(--fg3)">
+          <span>Last updated {{ ov.finalize.lastUpdate }}</span>
+          <button onClick="{{ ov.finalizeAction }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:3px 10px;font-size:12px;color:var(--fg)">{{ ov.finalize.action }}</button>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ ov.exporterFailed }}" hint-placeholder-val="{{ false }}">
+      <div style="margin-top:14px;border:1px solid var(--border);border-radius:8px;padding:12px 14px;background:var(--surface);font-size:13px">
+        <div style="font-weight:500;color:var(--warn)">Export unavailable — metadata only</div>
+        <div style="color:var(--fg2);margin-top:4px">{{ ov.exporter.reason }}</div>
+        <div style="color:var(--fg2);margin-top:2px">Sandbox: {{ ov.exporter.sandbox }}</div>
+        <div style="margin-top:8px;font-size:12px;color:var(--fg3)">Retained:</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
+          <sc-for list="{{ ov.exporter.kept }}" as="kp" hint-placeholder-count="3"><span style="font-size:12px;border:1px solid var(--border);border-radius:4px;padding:0 7px;color:var(--fg2)">{{ kp }}</span></sc-for>
+        </div>
+        <div style="margin-top:8px;font-size:12px;color:var(--fg3)">The session itself stopped normally; a failed export does not mean the session went wrong. Checkpoint write-back and resume are deferred, so no action is offered here.</div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ ov.hasTurns }}" hint-placeholder-val="{{ true }}">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-top:22px">
+      <section style="min-width:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500">First real question<button onClick="{{ ov.goFirst }}" style="border:0;background:transparent;color:var(--accent);font-size:12px;letter-spacing:0;padding:0">Go to conversation ›</button></div>
+        <div style="margin-top:6px;border-radius:8px;background:var(--user-bg);padding:12px 14px;font-size:13.5px;line-height:1.7;text-wrap:pretty">{{ ov.firstQuestion }}</div>
+      </section>
+      <section style="min-width:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500">Last reply<button onClick="{{ ov.goLast }}" style="border:0;background:transparent;color:var(--accent);font-size:12px;letter-spacing:0;padding:0">Go to conversation ›</button></div>
+        <div style="margin-top:6px;border:1px solid var(--border);border-radius:8px;background:var(--surface);padding:12px 14px;font-size:13.5px;line-height:1.7;max-height:260px;overflow:auto">{{ ov.lastAnswer }}</div>
+      </section>
+    </div>
+
+    <section style="margin-top:22px">
+      <div style="font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500">Key turns</div>
+      <div style="margin-top:6px;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden">
+        <sc-for list="{{ ov.keyTurns }}" as="kt" hint-placeholder-count="3">
+          <button onClick="{{ kt.go }}" style="display:flex;width:100%;align-items:baseline;gap:12px;text-align:left;border:0;background:transparent;padding:9px 14px;border-top:1px solid var(--border);font-size:13px;border-radius:0" style-hover="background:var(--surface2)">
+            <span style="font-family:var(--mono);font-size:11.5px;color:var(--fg3);flex-shrink:0;width:64px">{{ kt.tag }}</span>
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:{{ kt.color }}">{{ kt.label }}</span>
+            <sc-for list="{{ kt.markers }}" as="m" hint-placeholder-count="0"><span style="flex-shrink:0;font-size:11px;padding:0 6px;border-radius:4px;background:{{ m.bg }};color:{{ m.color }}">{{ m.label }}</span></sc-for>
+            <span style="font-size:11.5px;color:var(--fg3);flex-shrink:0">{{ kt.time }}</span>
+          </button>
+        </sc-for>
+      </div>
+    </section>
+    </sc-if>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-top:22px">
+      <section style="min-width:0">
+        <div style="font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500">Recorded verification results</div>
+        <div style="margin-top:6px;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden">
+          <sc-if value="{{ ov.noVerification }}" hint-placeholder-val="{{ false }}"><div style="padding:12px 14px;font-size:13px;color:var(--fg3)">No verification results captured (no tests run, or no reliable exit status)</div></sc-if>
+          <sc-for list="{{ ov.verification }}" as="v" hint-placeholder-count="1">
+            <button onClick="{{ v.go }}" style="display:flex;width:100%;align-items:center;gap:10px;text-align:left;border:0;background:transparent;padding:10px 14px;border-top:1px solid var(--border);border-radius:0" style-hover="background:var(--surface2)">
+              <span style="font-size:11px;padding:0 6px;border-radius:4px;background:{{ v.bg }};color:{{ v.color }};flex-shrink:0">{{ v.resultLabel }}</span>
+              <span style="font-family:var(--mono);font-size:12.5px;color:var(--fg);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">{{ v.label }}</span>
+              <span style="font-size:12px;color:var(--fg3);flex-shrink:0">{{ v.detail }}</span>
+            </button>
+          </sc-for>
+        </div>
+      </section>
+      <section style="min-width:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500">File records and linked commits<button onClick="{{ goChanges }}" style="border:0;background:transparent;color:var(--accent);font-size:12px;letter-spacing:0;padding:0">Changes view ›</button></div>
+        <div style="margin-top:6px;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden">
+          <sc-if value="{{ ov.noFiles }}" hint-placeholder-val="{{ false }}"><div style="padding:12px 14px;font-size:13px;color:var(--fg3)">No sourced file records</div></sc-if>
+          <sc-for list="{{ ov.files }}" as="f" hint-placeholder-count="2">
+            <button onClick="{{ f.open }}" style="display:flex;width:100%;align-items:center;gap:10px;text-align:left;border:0;background:transparent;padding:8px 14px;border-top:1px solid var(--border);border-radius:0" style-hover="background:var(--surface2)">
+              <span style="font-family:var(--mono);font-size:12.5px;color:var(--fg);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ f.path }}</span>
+              <span style="font-size:11.5px;color:var(--fg3);flex-shrink:0">{{ f.badge }}</span>
+            </button>
+          </sc-for>
+          <sc-for list="{{ ov.commits }}" as="c" hint-placeholder-count="0">
+            <div style="display:flex;align-items:center;gap:10px;padding:8px 14px;border-top:1px solid var(--border);font-size:12.5px">
+              <span style="font-family:var(--mono);color:var(--accent)">{{ c.sha }}</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg2)">{{ c.message }}</span>
+              <span style="font-size:11px;color:var(--fg3);flex-shrink:0">{{ c.kind }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </section>
+    </div>
+
+    <section style="margin-top:22px">
+      <div style="font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500">Capture completeness and finalize</div>
+      <div style="margin-top:6px;border:1px solid var(--border);border-radius:8px;background:var(--surface);padding:12px 14px;font-size:13px;display:flex;align-items:center;gap:12px">
+        <span style="width:8px;height:8px;border-radius:50%;background:{{ captureDot }};flex-shrink:0"></span>
+        <span style="font-weight:500">{{ s.captureLabel }}</span>
+        <span style="color:var(--fg2);flex:1;min-width:0">{{ ov.captureNote }}</span>
+        <button onClick="{{ openCapture }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:3px 10px;font-size:12px;color:var(--fg2);flex-shrink:0">Capture details</button>
+      </div>
+    </section>
+
+    <sc-if value="{{ ov.showAi }}" hint-placeholder-val="{{ false }}">
+    <section style="margin-top:22px">
+      <div style="display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500">AI semantic summary<span style="letter-spacing:0;font-weight:400;border:1px dashed var(--border);border-radius:4px;padding:0 6px;color:var(--warn)">New design idea · not a capability defined in the capture plans</span></div>
+      <div style="margin-top:6px;border:1px dashed var(--border);border-radius:8px;padding:6px 14px;font-size:13px">
+        <sc-for list="{{ ov.aiSummary }}" as="a" hint-placeholder-count="2">
+          <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0">
+            <span style="flex:1;color:var(--fg);line-height:1.6">{{ a.text }}</span>
+            <button onClick="{{ a.go }}" style="border:0;background:transparent;color:var(--accent);font-size:12px;padding:0;flex-shrink:0">Source ›</button>
+          </div>
+        </sc-for>
+        <div style="font-size:11.5px;color:var(--fg3);padding:4px 0 6px">Summaries are generated only from readable content; ciphertext is never included. Every point links back to its source message.</div>
+      </div>
+    </section>
+    </sc-if>
+  </sc-if>
+
+  <!-- Conversation -->
+  <sc-if value="{{ isConversation }}" hint-placeholder-val="{{ false }}">
+    <sc-if value="{{ cv.hasOrderNote }}" hint-placeholder-val="{{ false }}"><div style="border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:12.5px;color:var(--fg2);background:var(--surface2);margin-bottom:16px">{{ cv.orderNote }}</div></sc-if>
+    <sc-if value="{{ cv.empty }}" hint-placeholder-val="{{ false }}"><div style="padding:40px 0;text-align:center;color:var(--fg3);font-size:13px">No readable content. {{ cv.emptyReason }}</div></sc-if>
+    <sc-for list="{{ cv.turns }}" as="t" hint-placeholder-count="2">
+      <article data-mid="{{ t.id }}" data-screen-label="{{ t.tag }}" style="padding:6px 0 26px;border-radius:8px;animation:{{ t.turnAnim }}">
+        <div style="display:flex;align-items:center;gap:10px;font-size:11.5px;color:var(--fg3);padding-bottom:8px">
+          <span style="font-family:var(--mono);font-weight:500;color:var(--fg2);background:var(--surface2);border-radius:4px;padding:0 6px">{{ t.tag }}</span>
+          <span style="font-family:var(--mono)">{{ t.ref }}</span>
+          <span>{{ t.time }}</span>
+          <sc-if value="{{ t.hasRevisions }}" hint-placeholder-val="{{ false }}"><button onClick="{{ t.openRevisions }}" style="border:1px solid var(--border);background:var(--surface);border-radius:4px;padding:0 7px;font-size:11.5px;color:var(--fg2)">{{ t.revLabel }}</button></sc-if>
+          <sc-if value="{{ t.hasInjected }}" hint-placeholder-val="{{ false }}"><button onClick="{{ t.openInjected }}" style="border:1px solid var(--border);background:var(--surface);border-radius:4px;padding:0 7px;font-size:11.5px;color:var(--fg2)">{{ t.injectedLabel }}</button></sc-if>
+          <div style="flex:1;height:1px;background:var(--border)"></div>
+        </div>
+        <sc-if value="{{ t.hasUser }}" hint-placeholder-val="{{ true }}">
+          <div data-mid="{{ t.userId }}" style="border-radius:8px;background:var(--user-bg);padding:10px 14px;animation:{{ t.userAnim }}">
+            <div style="font-size:11px;color:var(--fg3);letter-spacing:.04em;margin-bottom:2px">User</div>
+            <div style="font-size:14px;line-height:1.75;white-space:pre-wrap;text-wrap:pretty">{{ t.user }}</div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ t.hasSystem }}" hint-placeholder-val="{{ false }}"><div style="font-size:12.5px;color:var(--fg3);padding:4px 2px">{{ t.system }}</div></sc-if>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+        <sc-for list="{{ t.events }}" as="e" hint-placeholder-count="2">
+
+          <sc-if value="{{ e.isReasoning }}" hint-placeholder-val="{{ false }}">
+            <div data-mid="{{ e.id }}" style="border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden;animation:{{ e.anim }}">
+              <button onClick="{{ e.toggle }}" aria-expanded="{{ e.open }}" style="display:flex;width:100%;align-items:center;gap:8px;text-align:left;border:0;background:transparent;padding:7px 12px;font-size:12.5px;border-radius:0" style-hover="background:var(--surface2)">
+                <span style="color:var(--fg3);font-size:11px;transform:rotate({{ e.chev }});display:inline-block;transition:transform .15s">›</span>
+                <span style="color:var(--fg2)">Reasoning</span>
+                <span style="font-family:var(--mono);font-size:11.5px;color:var(--fg3)">{{ e.kindLabel }}</span>
+                <span style="font-size:11.5px;color:var(--fg3)">{{ e.provider }}</span>
+                <span style="font-size:11px;padding:0 6px;border-radius:4px;background:{{ e.bg }};color:{{ e.color }};flex-shrink:0">{{ e.statusLabel }}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg3);font-size:12px">{{ e.preview }}</span>
+              </button>
+              <sc-if value="{{ e.open }}" hint-placeholder-val="{{ false }}">
+                <div style="border-top:1px solid var(--border);padding:10px 14px;font-size:13px;line-height:1.7">
+                  <sc-if value="{{ e.hasText }}" hint-placeholder-val="{{ false }}"><div style="white-space:pre-wrap;color:var(--fg2)">{{ e.text }}</div></sc-if>
+                  <sc-if value="{{ e.isSummaryKind }}" hint-placeholder-val="{{ false }}"><div style="margin-top:6px;font-size:11.5px;color:var(--fg3)">A provider reasoning summary, not the full thought process.</div></sc-if>
+                  <sc-if value="{{ e.isArchived }}" hint-placeholder-val="{{ false }}">
+                    <div style="display:grid;grid-template-columns:auto 1fr;gap:3px 14px;font-size:12.5px;color:var(--fg2)">
+                      <span style="color:var(--fg3)">Source type</span><span style="font-family:var(--mono);font-size:12px">{{ e.kindLabel }}</span>
+                      <span style="color:var(--fg3)">Size</span><span>{{ e.meta.size }}</span>
+                      <span style="color:var(--fg3)">Integrity</span><span>{{ e.meta.integrity }} · {{ e.meta.hash }}</span>
+                      <span style="color:var(--fg3)">Archived at</span><span>{{ e.meta.archivedAt }}</span>
+                    </div>
+                    <div style="margin-top:8px;font-size:11.5px;color:var(--fg3)">Normal reading queries safe metadata only. No decryptor exists today, so no decrypt action is offered; ciphertext never enters content, search, copy or summaries. Controlled export lives under advanced details and follows existing authorization and audit requirements.</div>
+                  </sc-if>
+                  <sc-if value="{{ e.isNotPresent }}" hint-placeholder-val="{{ false }}"><div style="color:var(--fg3)">Not provided by the source.</div></sc-if>
+                  <div style="margin-top:8px"><button onClick="{{ e.openDetail }}" style="border:0;background:transparent;color:var(--accent);font-size:12px;padding:0">Reasoning source details ›</button></div>
+                </div>
+              </sc-if>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ e.isTool }}" hint-placeholder-val="{{ false }}">
+            <button data-mid="{{ e.id }}" onClick="{{ e.openDetail }}" style="display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:1px solid {{ e.border }};border-radius:8px;background:var(--surface);padding:7px 12px;font-size:12.5px;animation:{{ e.anim }}" style-hover="background:var(--surface2)">
+              <span style="font-family:var(--mono);font-weight:500;color:var(--fg);flex-shrink:0">{{ e.name }}</span>
+              <span style="font-family:var(--mono);font-size:12px;color:var(--fg2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ e.inputLine }}</span>
+              <span style="font-size:11px;padding:0 6px;border-radius:4px;background:{{ e.bg }};color:{{ e.color }};flex-shrink:0">{{ e.statusLabel }}</span>
+              <span style="color:var(--fg3);font-size:12px">›</span>
+            </button>
+          </sc-if>
+
+          <sc-if value="{{ e.isToolGroup }}" hint-placeholder-val="{{ false }}">
+            <div style="border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden">
+              <button onClick="{{ e.toggle }}" aria-expanded="{{ e.open }}" style="display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;background:transparent;padding:7px 12px;font-size:12.5px;border-radius:0" style-hover="background:var(--surface2)">
+                <span style="color:var(--fg3);font-size:11px;transform:rotate({{ e.chev }});display:inline-block;transition:transform .15s">›</span>
+                <span style="font-family:var(--mono);font-weight:500;color:var(--fg)">{{ e.name }}</span>
+                <span style="color:var(--fg2)">× {{ e.count }}</span>
+                <span style="font-size:11px;padding:0 6px;border-radius:4px;background:var(--ok-soft);color:var(--ok)">All succeeded</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg3);font-size:12px;font-family:var(--mono)">{{ e.preview }}</span>
+              </button>
+              <sc-if value="{{ e.open }}" hint-placeholder-val="{{ false }}">
+                <div style="border-top:1px solid var(--border);display:flex;flex-direction:column">
+                  <sc-for list="{{ e.items }}" as="ti" hint-placeholder-count="2">
+                    <button data-mid="{{ ti.id }}" onClick="{{ ti.openDetail }}" style="display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:0;border-top:1px solid var(--border);background:transparent;padding:6px 12px 6px 30px;font-size:12.5px;border-radius:0;animation:{{ ti.anim }}" style-hover="background:var(--surface2)">
+                      <span style="font-family:var(--mono);font-size:12px;color:var(--fg2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ ti.inputLine }}</span>
+                      <span style="font-size:11px;padding:0 6px;border-radius:4px;background:{{ ti.bg }};color:{{ ti.color }}">{{ ti.statusLabel }}</span>
+                    </button>
+                  </sc-for>
+                </div>
+              </sc-if>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ e.isAssistant }}" hint-placeholder-val="{{ false }}">
+            <div data-mid="{{ e.id }}" style="padding:6px 2px 2px;animation:{{ e.anim }};border-radius:8px">
+              <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--fg3);letter-spacing:.04em;margin-bottom:2px"><span style="color:{{ e.agentColor }};font-weight:500">{{ e.agent }}</span><span style="font-family:var(--mono);letter-spacing:0">{{ e.model }}</span></div>
+              <div style="font-size:14px;line-height:1.75">{{ e.body }}</div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ e.isEvent }}" hint-placeholder-val="{{ false }}">
+            <button data-mid="{{ e.id }}" onClick="{{ e.openDetail }}" style="display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:4px 0;font-size:12.5px;text-align:left">
+              <span style="flex:1;height:1px;background:var(--border)"></span>
+              <span style="padding:2px 10px;border-radius:999px;border:1px solid {{ e.border }};background:{{ e.bg }};color:{{ e.color }};font-weight:500">{{ e.title }}</span>
+              <span style="flex:1;height:1px;background:var(--border)"></span>
+            </button>
+          </sc-if>
+
+          <sc-if value="{{ e.isSubagent }}" hint-placeholder-val="{{ false }}">
+            <div data-mid="{{ e.id }}" style="border:1px solid var(--border);border-radius:8px;background:var(--surface);padding:9px 12px;display:flex;align-items:center;gap:10px;font-size:12.5px;animation:{{ e.anim }}">
+              <span style="color:var(--fg2)">Subagent</span>
+              <span style="font-family:var(--mono);font-weight:500;color:var(--fg)">{{ e.name }}</span>
+              <span style="font-size:11px;padding:0 6px;border-radius:4px;background:var(--surface2);color:var(--fg2)">{{ e.bodyLabel }}</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg3);font-size:12px">{{ e.lifecycle }}</span>
+              <button onClick="{{ e.openDetail }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:2px 9px;font-size:12px;color:var(--fg2);flex-shrink:0">{{ e.actionLabel }}</button>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ e.isDisplay }}" hint-placeholder-val="{{ false }}">
+            <div style="font-size:12px;color:var(--fg3);padding:2px 12px">{{ e.summary }}</div>
+          </sc-if>
+
+          <sc-if value="{{ e.isUnsupported }}" hint-placeholder-val="{{ false }}">
+            <div data-mid="{{ e.id }}" style="border:1px solid var(--border);border-radius:8px;background:var(--warn-soft);padding:8px 12px;font-size:12.5px">
+              <span style="color:var(--warn);font-weight:500">Unsupported content shape</span>
+              <span style="font-family:var(--mono);font-size:12px;color:var(--fg2);margin-left:8px">{{ e.shape }}</span>
+              <div style="color:var(--fg2);margin-top:2px;font-size:12px">{{ e.detail }}</div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ e.isRedacted }}" hint-placeholder-val="{{ false }}">
+            <div style="border:1px dashed var(--border);border-radius:8px;padding:8px 12px;font-size:12.5px;color:var(--fg3)">{{ e.reason }}</div>
+          </sc-if>
+
+        </sc-for>
+        </div>
+      </article>
+    </sc-for>
+  </sc-if>
+
+  <!-- Changes -->
+  <sc-if value="{{ isChanges }}" hint-placeholder-val="{{ false }}">
+    <div style="font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500">File records ({{ ch.fileCount }})</div>
+    <sc-if value="{{ ch.noFiles }}" hint-placeholder-val="{{ false }}"><div style="margin-top:6px;border:1px solid var(--border);border-radius:8px;padding:14px;font-size:13px;color:var(--fg3);background:var(--surface)">No sourced file records。</div></sc-if>
+    <sc-for list="{{ ch.files }}" as="f" hint-placeholder-count="2">
+      <div style="margin-top:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden">
+        <div style="display:flex;align-items:center;gap:10px;padding:9px 14px;font-size:12.5px;flex-wrap:wrap">
+          <span style="font-family:var(--mono);font-weight:500;color:var(--fg)">{{ f.path }}</span>
+          <span style="color:var(--fg3)">{{ f.source }}</span>
+          <button onClick="{{ f.goRef }}" style="margin-left:auto;border:0;background:transparent;color:var(--accent);font-size:12px;padding:0">Go to source ›</button>
+        </div>
+        <sc-if value="{{ f.hasDiff }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;gap:14px;padding:6px 14px;border-top:1px solid var(--border);background:var(--surface2);font-size:11.5px;color:var(--fg3);font-family:var(--mono)"><span>− {{ f.from }}</span><span>+ {{ f.to }}</span><span style="margin-left:auto;font-family:var(--sans)">Historical snapshot diff · new design</span></div>
+          <div style="border-top:1px solid var(--border);font-family:var(--mono);font-size:12.5px;line-height:1.65;overflow:auto">
+            <sc-for list="{{ f.diff }}" as="l" hint-placeholder-count="4">
+              <div style="display:flex;background:{{ l.bg }};color:{{ l.color }}"><span style="width:26px;flex-shrink:0;text-align:center;color:var(--fg3);user-select:none">{{ l.sign }}</span><pre style="margin:0;white-space:pre;padding-right:14px">{{ l.s }}</pre></div>
+            </sc-for>
+          </div>
+        </sc-if>
+        <sc-if value="{{ f.hasNote }}" hint-placeholder-val="{{ false }}"><div style="padding:6px 14px 9px;border-top:1px solid var(--border);font-size:12px;color:var(--fg3)">{{ f.note }}</div></sc-if>
+      </div>
+    </sc-for>
+
+    <div style="font-size:11px;letter-spacing:.06em;color:var(--fg3);font-weight:500;margin-top:26px">Commit links</div>
+    <div style="margin-top:6px;border:1px solid var(--border);border-radius:8px;background:var(--surface);padding:4px 14px;font-size:13px">
+      <div style="display:grid;grid-template-columns:110px 1fr;gap:4px 14px;padding:8px 0;border-bottom:1px solid var(--border)">
+        <span style="color:var(--fg3)">HEAD at capture</span><span style="font-family:var(--mono);font-size:12.5px">{{ s.head }} <span style="font-family:var(--sans);color:var(--fg3);font-size:12px">— the commit the workspace sat on when the session started; not this session’s output</span></span>
+      </div>
+      <sc-if value="{{ ch.noCommits }}" hint-placeholder-val="{{ false }}"><div style="padding:10px 0;color:var(--fg3);font-size:12.5px">No reliable session ↔ commit link.</div></sc-if>
+      <sc-for list="{{ ch.commits }}" as="c" hint-placeholder-count="0">
+        <div style="display:grid;grid-template-columns:110px 1fr;gap:4px 14px;padding:10px 0;border-bottom:1px solid var(--border)">
+          <span style="color:var(--fg3)">Linked commit</span>
+          <span><span style="font-family:var(--mono);font-size:12.5px;color:var(--accent)">{{ c.sha }}</span> <span style="color:var(--fg)">{{ c.message }}</span> <span style="font-size:11px;color:var(--fg3);border:1px solid var(--border);border-radius:4px;padding:0 5px;margin-left:4px">{{ c.kind }}</span></span>
+          <span style="color:var(--fg3)">Other linked sessions</span>
+          <span style="display:flex;flex-wrap:wrap;gap:6px">
+            <sc-if value="{{ c.noShared }}" hint-placeholder-val="{{ false }}"><span style="color:var(--fg3);font-size:12.5px">None</span></sc-if>
+            <sc-for list="{{ c.shared }}" as="sh" hint-placeholder-count="0"><button onClick="{{ sh.go }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:1px 8px;font-size:12px;color:var(--fg2)"><span style="color:{{ sh.agentColor }}">{{ sh.agent }}</span> · {{ sh.title }}</button></sc-for>
+          </span>
+          <span style="color:var(--fg3)">Change attribution</span><span style="color:var(--fg2);font-size:12.5px">{{ c.attribution }}</span>
+        </div>
+      </sc-for>
+      <div style="padding:8px 0;font-size:11.5px;color:var(--fg3)">One commit may link to several sessions; the link alone does not prove any single agent made all the changes.</div>
+    </div>
+  </sc-if>
+
+  </div>
+  </div>
+  </div>
+
+  <sc-if value="{{ newContent }}" hint-placeholder-val="{{ false }}">
+    <button onClick="{{ jumpNew }}" style="position:absolute;left:50%;bottom:20px;transform:translateX(-50%);border:1px solid var(--border);background:var(--surface);box-shadow:var(--shadow);border-radius:999px;padding:6px 14px;font-size:12.5px;color:var(--fg);animation:rise .2s ease-out">New content arrived · jump to end</button>
+  </sc-if>
+</sc-if>
+<sc-if value="{{ noSession }}" hint-placeholder-val="{{ false }}"><div style="flex:1;display:grid;place-items:center;color:var(--fg3);font-size:13px">Select a session on the left</div></sc-if>
+</main>
+
+<!-- Detail drawer -->
+<sc-if value="{{ drawerOpen }}" hint-placeholder-val="{{ false }}">
+<sc-if value="{{ narrow }}" hint-placeholder-val="{{ false }}"><div onClick="{{ closeDrawer }}" style="position:absolute;inset:0;background:rgba(0,0,0,.25);z-index:15"></div></sc-if>
+<aside role="dialog" aria-label="{{ d.title }}" style="width:400px;max-width:90vw;flex-shrink:0;border-left:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;min-height:0;position:{{ drawerPos }};right:0;top:0;bottom:0;z-index:20;box-shadow:{{ drawerShadow }};animation:rise .15s ease-out">
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-shrink:0">
+    <div style="min-width:0">
+      <div style="font-size:11px;color:var(--fg3);letter-spacing:.06em">{{ d.kindLabel }}</div>
+      <div style="font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ d.title }}</div>
+    </div>
+    <button onClick="{{ closeDrawer }}" aria-label="Close" style="margin-left:auto;width:28px;height:28px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--fg2);line-height:1;font-size:15px">×</button>
+  </div>
+  <div style="flex:1;overflow:auto;padding:14px 16px 24px;font-size:13px;line-height:1.65">
+
+    <sc-if value="{{ d.isTool }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:11px;padding:0 6px;border-radius:4px;background:{{ d.bg }};color:{{ d.color }}">{{ d.statusLabel }}</span><span style="font-size:12px;color:var(--fg3)">Basis: {{ d.basis }}</span></div>
+      <div style="margin-top:14px;display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--fg3);letter-spacing:.06em">Input<button onClick="{{ d.copyInput }}" style="border:0;background:transparent;color:var(--accent);font-size:12px;letter-spacing:0;padding:0">Copy</button></div>
+      <pre style="margin:4px 0 0;padding:10px 12px;background:var(--code-bg);border:1px solid var(--border);border-radius:6px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--fg)">{{ d.input }}</pre>
+      <div style="margin-top:14px;display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--fg3);letter-spacing:.06em">Output<button onClick="{{ d.copyOutput }}" style="border:0;background:transparent;color:var(--accent);font-size:12px;letter-spacing:0;padding:0">Copy</button></div>
+      <pre style="margin:4px 0 0;padding:10px 12px;background:var(--code-bg);border:1px solid var(--border);border-radius:6px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--fg2);max-height:320px;overflow:auto">{{ d.output }}</pre>
+      <sc-if value="{{ d.hasFile }}" hint-placeholder-val="{{ false }}"><div style="margin-top:14px;display:flex;align-items:center;gap:8px;font-size:12.5px"><span style="color:var(--fg3)">File</span><span style="font-family:var(--mono);font-size:12px">{{ d.file }}</span><button onClick="{{ d.goFile }}" style="margin-left:auto;border:0;background:transparent;color:var(--accent);font-size:12px;padding:0">View in Changes ›</button></div></sc-if>
+      <div style="margin-top:14px;font-size:11.5px;color:var(--fg3)">Historical commands are for viewing and copying only and cannot be re-run here. Tool status comes only from reliable capture fields or execution evidence.</div>
+    </sc-if>
+
+    <sc-if value="{{ d.isReasoning }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:11px;padding:0 6px;border-radius:4px;background:{{ d.bg }};color:{{ d.color }}">{{ d.statusLabel }}</span><span style="font-family:var(--mono);font-size:12px;color:var(--fg2)">{{ d.kindLabel }}</span><span style="font-size:12px;color:var(--fg3)">{{ d.provider }}</span></div>
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin-top:14px;font-size:12.5px;color:var(--fg2)">
+        <span style="color:var(--fg3)">Status code</span><span style="font-family:var(--mono);font-size:12px">{{ d.status }}</span>
+        <span style="color:var(--fg3)">Belongs to</span><span>{{ d.turnTag }}</span>
+        <span style="color:var(--fg3)">Size</span><span>{{ d.meta.size }}</span>
+        <sc-if value="{{ d.isArchived }}" hint-placeholder-val="{{ false }}"><span style="color:var(--fg3)">Integrity</span><span>{{ d.meta.integrity }} · <span style="font-family:var(--mono);font-size:12px">{{ d.meta.hash }}</span></span><span style="color:var(--fg3)">Archived at</span><span>{{ d.meta.archivedAt }}</span></sc-if>
+      </div>
+      <sc-if value="{{ d.hasText }}" hint-placeholder-val="{{ false }}"><div style="margin-top:14px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Redacted text</div><div style="margin-top:4px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;white-space:pre-wrap;color:var(--fg2)">{{ d.text }}</div></sc-if>
+      <div style="margin-top:14px;font-size:12px;color:var(--fg2);line-height:1.6">{{ d.explain }}</div>
+      <sc-if value="{{ d.isArchived }}" hint-placeholder-val="{{ false }}"><div style="margin-top:12px;padding:10px 12px;border:1px dashed var(--border);border-radius:6px;font-size:12px;color:var(--fg3)">Advanced details · controlled export: requires existing authorization and writes an audit entry. No execution path in this prototype.</div></sc-if>
+    </sc-if>
+
+    <sc-if value="{{ d.isFile }}" hint-placeholder-val="{{ false }}">
+      <div style="font-family:var(--mono);font-size:13px;word-break:break-all">{{ d.path }}</div>
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin-top:12px;font-size:12.5px;color:var(--fg2)">
+        <span style="color:var(--fg3)">Source</span><span>{{ d.source }}</span>
+        <span style="color:var(--fg3)">Historical snapshot</span><span>{{ d.snapshotLabel }}</span>
+      </div>
+      <sc-if value="{{ d.hasNote }}" hint-placeholder-val="{{ false }}"><div style="margin-top:10px;font-size:12px;color:var(--fg3)">{{ d.note }}</div></sc-if>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button onClick="{{ d.goRef }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--fg)">Go to related tool call</button>
+        <button onClick="{{ d.goChanges }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--fg)">View in Changes</button>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ d.isRevisions }}" hint-placeholder-val="{{ false }}">
+      <div style="font-size:12.5px;color:var(--fg2)">Repeat captures and revisions of the same turn. The current effective version is shown by default.</div>
+      <div style="margin-top:10px;display:flex;flex-direction:column;gap:6px">
+        <sc-for list="{{ d.revisions }}" as="rv" hint-placeholder-count="2">
+          <div style="border:1px solid {{ rv.border }};border-radius:6px;padding:8px 12px;background:{{ rv.bg }}">
+            <div style="display:flex;align-items:center;gap:8px;font-size:12.5px"><span style="font-family:var(--mono);font-size:12px">{{ rv.id }}</span><span style="color:var(--fg3)">{{ rv.time }}</span><span style="margin-left:auto;font-size:11px;color:{{ rv.color }}">{{ rv.label }}</span></div>
+            <sc-if value="{{ rv.hasNote }}" hint-placeholder-val="{{ false }}"><div style="font-size:12px;color:var(--fg3);margin-top:2px">{{ rv.note }}</div></sc-if>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ d.isInjected }}" hint-placeholder-val="{{ false }}">
+      <div style="font-size:12.5px;color:var(--fg2)">Environment context and instructions injected by Codex. These are not real questions, never become the session title, and never create fake turns.</div>
+      <sc-for list="{{ d.injected }}" as="inj" hint-placeholder-count="2">
+        <div style="margin-top:12px;font-size:11px;color:var(--fg3);letter-spacing:.06em;font-family:var(--mono)">{{ inj.label }}</div>
+        <pre style="margin:4px 0 0;padding:10px 12px;background:var(--code-bg);border:1px solid var(--border);border-radius:6px;font-size:12px;line-height:1.6;white-space:pre-wrap;color:var(--fg2)">{{ inj.text }}</pre>
+      </sc-for>
+    </sc-if>
+
+    <sc-if value="{{ d.isEvent }}" hint-placeholder-val="{{ false }}">
+      <div style="font-size:12.5px;color:var(--fg2)">{{ d.detail }}</div>
+      <sc-if value="{{ d.isPermission }}" hint-placeholder-val="{{ false }}"><div style="margin-top:10px;font-size:12px;color:var(--fg3)">Permission requests and elicitations are shown as historical events and cannot be answered inside Libra.</div></sc-if>
+    </sc-if>
+
+    <sc-if value="{{ d.isSubagent }}" hint-placeholder-val="{{ false }}">
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12.5px;color:var(--fg2)">
+        <span style="color:var(--fg3)">Lifecycle</span><span>{{ d.lifecycle }}</span>
+        <span style="color:var(--fg3)">Content</span><span>{{ d.bodyLabel }}</span>
+        <span style="color:var(--fg3)">Attribution</span><span>{{ d.relation }}</span>
+      </div>
+      <sc-if value="{{ d.hasBody }}" hint-placeholder-val="{{ false }}">
+        <div style="margin-top:14px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Subsession content</div>
+        <div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">
+          <sc-for list="{{ d.body }}" as="b" hint-placeholder-count="2">
+            <sc-if value="{{ b.isTool }}" hint-placeholder-val="{{ false }}">
+              <button onClick="{{ b.openDetail }}" style="display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:1px solid var(--border);border-radius:6px;background:var(--surface);padding:6px 10px;font-size:12px" style-hover="background:var(--surface2)"><span style="font-family:var(--mono);font-weight:500">{{ b.name }}</span><span style="font-family:var(--mono);color:var(--fg2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ b.inputLine }}</span><span style="font-size:11px;padding:0 6px;border-radius:4px;background:{{ b.bg }};color:{{ b.color }}">{{ b.statusLabel }}</span></button>
+            </sc-if>
+            <sc-if value="{{ b.isAssistant }}" hint-placeholder-val="{{ false }}"><div style="font-size:13px;padding:2px 4px">{{ b.body }}</div></sc-if>
+          </sc-for>
+        </div>
+        <div style="margin-top:14px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Subagent usage (excluded from the main total)</div>
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:2px 14px;margin-top:4px;font-size:12.5px;color:var(--fg2);font-family:var(--mono)"><span style="font-family:var(--sans);color:var(--fg3)">Input</span><span>{{ d.usage.input }}</span><span style="font-family:var(--sans);color:var(--fg3)">Output</span><span>{{ d.usage.output }}</span><span style="font-family:var(--sans);color:var(--fg3)">Reasoning</span><span>{{ d.usage.reasoning }}</span><span style="font-family:var(--sans);color:var(--fg3)">Calls</span><span>{{ d.usage.calls }}</span></div>
+      </sc-if>
+      <div style="margin-top:14px"><button onClick="{{ d.goBack }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--fg)">Back to the main session turn</button></div>
+    </sc-if>
+
+    <sc-if value="{{ d.isUsage }}" hint-placeholder-val="{{ false }}">
+      <div style="display:grid;grid-template-columns:1fr auto;gap:6px 14px;font-size:13px">
+        <sc-for list="{{ d.rows }}" as="u" hint-placeholder-count="6"><span style="color:var(--fg2)">{{ u.label }}</span><span style="font-family:var(--mono);font-size:12.5px;color:{{ u.color }};text-align:right">{{ u.value }}</span></sc-for>
+      </div>
+      <sc-if value="{{ d.hasSub }}" hint-placeholder-val="{{ false }}">
+        <div style="margin-top:14px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Subagent usage · {{ d.subNote }}</div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:4px 14px;font-size:13px;margin-top:4px">
+          <sc-for list="{{ d.subRows }}" as="u" hint-placeholder-count="3"><span style="color:var(--fg2)">{{ u.label }}</span><span style="font-family:var(--mono);font-size:12.5px;text-align:right">{{ u.value }}</span></sc-for>
+        </div>
+      </sc-if>
+      <div style="margin-top:14px;font-size:12px;color:var(--fg3);line-height:1.6">{{ d.usageNote }}</div>
+    </sc-if>
+
+    <sc-if value="{{ d.isSession }}" hint-placeholder-val="{{ false }}">
+      <div style="font-size:11px;color:var(--fg3);letter-spacing:.06em">Session ID</div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:4px"><code style="font-size:12px;word-break:break-all;flex:1;color:var(--fg)">{{ d.sessionId }}</code><button onClick="{{ d.copyId }}" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:3px 9px;font-size:12px;color:var(--fg2);flex-shrink:0">Copy</button></div>
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:5px 14px;margin-top:14px;font-size:12.5px;color:var(--fg2)">
+        <sc-for list="{{ d.rows }}" as="u" hint-placeholder-count="6"><span style="color:var(--fg3)">{{ u.label }}</span><span style="word-break:break-all">{{ u.value }}</span></sc-for>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ d.isCapture }}" hint-placeholder-val="{{ false }}">
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:12.5px;color:var(--fg2)">
+        <sc-for list="{{ d.rows }}" as="u" hint-placeholder-count="4"><span style="color:var(--fg3)">{{ u.label }}</span><span style="color:{{ u.color }}">{{ u.value }}</span></sc-for>
+      </div>
+      <sc-if value="{{ d.isCC }}" hint-placeholder-val="{{ false }}">
+        <div style="margin-top:16px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Hook event coverage · {{ d.hooks.baseline }}</div>
+        <div style="margin-top:4px;font-size:12.5px;color:var(--fg2)">Installed {{ d.hooks.installed }} · actually observed {{ d.hooks.observed }}. "Installed" only means the listener is in place; it does not mean everything was captured completely.</div>
+        <sc-for list="{{ d.hookGroups }}" as="hg" hint-placeholder-count="3">
+          <div style="margin-top:12px;font-size:12px;font-weight:500;color:var(--fg)">{{ hg.name }}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px">
+            <sc-for list="{{ hg.items }}" as="hi" hint-placeholder-count="3"><span title="{{ hi.statusLabel }}" style="font-family:var(--mono);font-size:11px;padding:1px 7px;border-radius:4px;background:{{ hi.bg }};color:{{ hi.color }};border:1px solid {{ hi.border }}">{{ hi.name }}</span></sc-for>
+          </div>
+        </sc-for>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:12px;font-size:11.5px;color:var(--fg3)"><sc-for list="{{ d.hookLegend }}" as="lg" hint-placeholder-count="4"><span style="display:inline-flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:2px;background:{{ lg.bg }};border:1px solid {{ lg.border }}"></span>{{ lg.label }}</span></sc-for></div>
+        <div style="margin-top:16px;font-size:11px;color:var(--fg3);letter-spacing:.06em">FileChanged watch list (literal)</div>
+        <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px"><sc-for list="{{ d.fileScope }}" as="fs" hint-placeholder-count="2"><span style="font-family:var(--mono);font-size:11.5px;border:1px solid var(--border);border-radius:4px;padding:0 7px">{{ fs }}</span></sc-for></div>
+        <div style="margin-top:4px;font-size:12px;color:var(--fg3)">Coverage is limited to the list above and does not represent all workspace changes. Subagent relationships are linked only when the source supports it, otherwise marked "attribution unconfirmed".</div>
+      </sc-if>
+      <sc-if value="{{ d.isCX }}" hint-placeholder-val="{{ false }}">
+        <sc-if value="{{ d.hasFinalize }}" hint-placeholder-val="{{ false }}">
+          <div style="margin-top:16px;padding:10px 12px;border-radius:6px;background:var(--warn-soft);font-size:12.5px"><div style="font-weight:500;color:var(--warn)">Finalize pending</div><div style="color:var(--fg2);margin-top:2px">{{ d.finalize.reason }}</div><div style="color:var(--fg3);margin-top:4px;font-size:12px">Last updated {{ d.finalize.lastUpdate }}</div><button onClick="{{ d.finalizeAction }}" style="margin-top:8px;border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:3px 10px;font-size:12px;color:var(--fg)">{{ d.finalize.action }}</button></div>
+        </sc-if>
+        <div style="margin-top:16px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Capture reconciliation</div>
+        <div style="margin-top:4px;font-size:12.5px;color:var(--fg2)">Reconciliation runs on demand and is not re-run when you switch sessions.</div>
+        <button onClick="{{ d.openReconcile }}" style="margin-top:8px;border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--fg)">Open reconciliation</button>
+        <div style="margin-top:16px;font-size:12px;color:var(--fg3)">Inferring tool errors is a deferred capability; tool status comes from captured fields such as exit codes, never from output keywords.</div>
+      </sc-if>
+      <sc-if value="{{ d.isOC }}" hint-placeholder-val="{{ false }}">
+        <div style="margin-top:16px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Exporter</div>
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin-top:4px;font-size:12.5px;color:var(--fg2)">
+          <sc-for list="{{ d.exporterRows }}" as="u" hint-placeholder-count="3"><span style="color:var(--fg3)">{{ u.label }}</span><span style="color:{{ u.color }}">{{ u.value }}</span></sc-for>
+        </div>
+        <sc-if value="{{ d.hasParts }}" hint-placeholder-val="{{ false }}"><div style="margin-top:10px;font-size:12px;color:var(--fg3)">{{ d.partsNote }}</div></sc-if>
+        <div style="margin-top:16px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Deferred (not simulated here)</div>
+        <div style="margin-top:4px;font-size:12.5px;color:var(--fg2)">Subsession attribution and subagent token attribution; writing checkpoints back into the OpenCode database and resuming a session.</div>
+      </sc-if>
+    </sc-if>
+
+    <sc-if value="{{ d.isReconcile }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:10px 12px;border-radius:6px;background:var(--surface2);font-size:13px"><div style="font-weight:500;color:var(--warn)">Reconciliation unavailable</div><div style="color:var(--fg2);margin-top:2px">{{ d.rec.reason }}</div><div style="color:var(--fg3);margin-top:4px;font-size:12px">Unavailable does not mean zero gaps or 100% complete.</div></div>
+      <div style="margin-top:14px;font-size:11px;color:var(--fg3);letter-spacing:.06em">Last successful reconciliation · {{ d.rec.lastRun }}</div>
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin-top:4px;font-size:12.5px;color:var(--fg2)">
+        <span style="color:var(--fg3)">Time range</span><span>{{ d.rec.range }}</span>
+        <span style="color:var(--fg3)">Repo / worktree</span><span style="font-family:var(--mono);font-size:12px">libra · {{ d.rec.worktree }}</span>
+        <span style="color:var(--fg3)">Captured</span><span>{{ d.rec.imported }}</span>
+        <span style="color:var(--fg3)">Not captured</span><span>{{ d.rec.notImported }}</span>
+      </div>
+      <div style="margin-top:12px;font-size:12px;color:var(--fg3)">Non-imported sessions show only approved metadata. Importing is a separate explicit action that browsing and searching never trigger.</div>
+    </sc-if>
+
+  </div>
+</aside>
+</sc-if>
+
+</div>
+
+<!-- Capability map -->
+<sc-if value="{{ mapOpen }}" hint-placeholder-val="{{ false }}">
+  <div onClick="{{ closeMap }}" style="position:absolute;inset:0;background:rgba(0,0,0,.3);z-index:50;display:grid;place-items:center;padding:24px">
+    <div onClick="{{ stop }}" role="dialog" aria-label="Capability map" style="width:min(960px,100%);max-height:100%;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow);padding:20px 24px;animation:rise .15s ease-out">
+      <div style="display:flex;align-items:center;gap:10px"><h2 style="margin:0;font-size:15px;font-weight:600">Interface capability → plan basis → data required → display when missing</h2><button onClick="{{ closeMap }}" aria-label="Close" style="margin-left:auto;width:28px;height:28px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--fg2);font-size:15px;line-height:1">×</button></div>
+      <div style="font-size:12px;color:var(--fg3);margin-top:4px">RG = reasoning retention contract · CX = Codex capture plan · CC = Claude Code hook plan · OG = OpenCode capture plan. Rows marked "new design" are interface additions, not capabilities defined in the capture plans. All data is mocked.</div>
+      <div style="display:grid;grid-template-columns:1.1fr 1.3fr 1.2fr 1fr;gap:0;margin-top:14px;font-size:12.5px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+        <div style="padding:7px 10px;background:var(--surface2);color:var(--fg3);font-size:11px;letter-spacing:.05em">Interface capability</div><div style="padding:7px 10px;background:var(--surface2);color:var(--fg3);font-size:11px;letter-spacing:.05em">Plan basis</div><div style="padding:7px 10px;background:var(--surface2);color:var(--fg3);font-size:11px;letter-spacing:.05em">Data required</div><div style="padding:7px 10px;background:var(--surface2);color:var(--fg3);font-size:11px;letter-spacing:.05em">Display when missing</div>
+        <sc-for list="{{ capMap }}" as="row" hint-placeholder-count="6">
+          <div style="padding:7px 10px;border-top:1px solid var(--border);color:{{ row.color }};font-weight:500">{{ row.a }}</div><div style="padding:7px 10px;border-top:1px solid var(--border);color:var(--fg2)">{{ row.b }}</div><div style="padding:7px 10px;border-top:1px solid var(--border);color:var(--fg2)">{{ row.c }}</div><div style="padding:7px 10px;border-top:1px solid var(--border);color:var(--fg2)">{{ row.d }}</div>
+        </sc-for>
+      </div>
+      <div style="margin-top:14px;font-size:12px;color:var(--fg3);display:flex;flex-wrap:wrap;gap:6px 18px"><span>Keyboard:</span><span><kbd style="font-family:var(--mono)">/</kbd> search</span><span><kbd style="font-family:var(--mono)">j</kbd> / <kbd style="font-family:var(--mono)">k</kbd> next / previous turn</span><span><kbd style="font-family:var(--mono)">1 2 3</kbd> Overview / Conversation / Changes</span><span><kbd style="font-family:var(--mono)">\</kbd> session list</span><span><kbd style="font-family:var(--mono)">Esc</kbd> close</span></div>
+    </div>
+  </div>
+</sc-if>
+
+<sc-if value="{{ toastOpen }}" hint-placeholder-val="{{ false }}">
+  <div role="status" style="position:absolute;left:50%;bottom:22px;transform:translateX(-50%);background:var(--fg);color:var(--bg);border-radius:8px;padding:7px 14px;font-size:12.5px;z-index:60;box-shadow:var(--shadow);animation:rise .15s ease-out">{{ toast }}</div>
+</sc-if>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;defaultTheme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;light&quot;,&quot;dark&quot;],&quot;default&quot;:&quot;light&quot;,&quot;tsType&quot;:&quot;'light' | 'dark'&quot;,&quot;section&quot;:&quot;Appearance&quot;},&quot;showAiSummary&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Overview&quot;},&quot;simulateNewContent&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Conversation&quot;}}">
+class Component extends DCLogic {
+  state = { data: null, sid: 's-cc-arch', view: 'overview', sidebarOpen: true, agents: [], statuses: [], dates: [], worktree: 'all',
+    theme: null, drawer: null, expanded: {}, searchOpen: false, q: '', scope: 'all', hl: null, toast: null, newContent: false, narrow: false, activeTurn: null, mapOpen: false };
+  contentRef = React.createRef(); searchRef = React.createRef(); pos = {}; jump = null;
+
+  componentDidMount() {
+    import('./libra-data.js').then(m => { this.DATA = m; this.setState({ data: m.SESSIONS }); setTimeout(() => this.buildGroupMap(), 0); });
+    const theme = this.props.defaultTheme ?? 'light';
+    this.setState({ theme }); document.documentElement.setAttribute('data-theme', theme);
+    this.onResize = () => { const w = window.innerWidth; this.setState(s => ({ narrow: w < 1200, sidebarOpen: w < 900 ? false : s.sidebarOpen })); };
+    this.onResize(); window.addEventListener('resize', this.onResize);
+    this.onKey = e => {
+      const tag = (e.target.tagName || '').toLowerCase(); const typing = tag === 'input' || tag === 'select' || tag === 'textarea';
+      if (e.key === 'Escape') { this.setState({ drawer: null, searchOpen: false, mapOpen: false }); if (typing) e.target.blur(); return; }
+      if (typing) return;
+      if (e.key === '/') { e.preventDefault(); this.searchRef.current && this.searchRef.current.focus(); }
+      else if (e.key === 'j') this.stepTurn(1); else if (e.key === 'k') this.stepTurn(-1);
+      else if (e.key === '\\') this.setState(s => ({ sidebarOpen: !s.sidebarOpen }));
+      else if (e.key === '1' || e.key === '2' || e.key === '3') this.setView(['overview', 'conversation', 'changes'][+e.key - 1]);
+    };
+    window.addEventListener('keydown', this.onKey);
+    if (this.props.simulateNewContent) this.newTimer = setTimeout(() => this.setState({ newContent: true }), 7000);
+  }
+  componentWillUnmount() { window.removeEventListener('resize', this.onResize); window.removeEventListener('keydown', this.onKey); clearTimeout(this.newTimer); }
+  // Corrective loop: re-apply the target position for ~600 ms so a re-render or remount cannot strand it.
+  // id → wrapper id of the merged tool group that hides it (items only mount when the group is expanded)
+  groupOf(id) { if (!this.groups) this.buildGroupMap(); return this.groups[id]; }
+  buildGroupMap() { const map = {}; (this.state.data || []).forEach(s => s.turns.forEach(t => this.groupEvents(t.events || []).forEach(e => { if (e.k === 'toolgroup') e.items.forEach(it => { map[it.id] = e.id; }); }))); this.groups = map; }
+  scrollTo(id) { const gid = this.groupOf(id); if (gid && !this.state.expanded[gid]) this.setState(s => ({ expanded: { ...s.expanded, [gid]: true } }));
+    this.jumpTarget = id; this.pendingJump = id; clearInterval(this.jumpTimer);
+    this.setState({ hl: id }); clearTimeout(this.hlTimer); this.hlTimer = setTimeout(() => this.setState({ hl: null }), 2600);
+    let n = 0, hits = 0; const step = () => { if (this.jumpTarget !== id) { clearInterval(this.jumpTimer); return; }
+      const el = this.contentRef.current; const t = el && el.querySelector(`[data-mid="${id}"]`);
+      if (t) { hits++; const off = t.getBoundingClientRect().top - el.getBoundingClientRect().top - 20; if (Math.abs(off) > 2) el.scrollTop += off; }
+      n++;
+      // keep polling while the target has not appeared yet (session/view switch), then correct for a few more ticks
+      if ((hits >= 15) || n >= 60) { clearInterval(this.jumpTimer); this.pendingJump = null; } };
+    step(); this.jumpTimer = setInterval(step, 40); }
+  restore() { if (this.pendingJump) return; const el = this.contentRef.current; if (el) el.scrollTop = this.pos[this.key()] || 0; }
+  key() { return this.state.sid + ':' + this.state.view; }
+  session() { return (this.state.data || []).find(s => s.id === this.state.sid); }
+  after(fn) { setTimeout(fn, 0); }
+  setView(view) { const changed = view !== this.state.view; this.setState({ view }); if (changed) this.after(() => this.restore()); }
+  selectSession(sid) { const changed = sid !== this.state.sid; this.activeIdx = null; this.setState({ sid, drawer: null, activeTurn: null }); if (changed) this.after(() => this.restore()); }
+  goTo(sid, mid, view = 'conversation', expandId) {
+    const tgt = (this.state.data || []).find(x => x.id === sid); const ti = tgt ? tgt.turns.findIndex(t => t.id === mid || (t.events || []).some(e => e.id === mid || (e.body || []).some(b => b.id === mid)) || t.id + '-u' === mid) : -1;
+    if (ti >= 0) this.activeIdx = ti;
+    this.setState(s => ({ sid, view, searchOpen: false, activeTurn: ti >= 0 ? tgt.turns[ti].id : s.activeTurn, expanded: expandId ? { ...s.expanded, [expandId]: true } : s.expanded })); this.after(() => this.scrollTo(mid));
+  }
+  stepTurn(d) { const s = this.session(); if (!s || this.state.view !== 'conversation' || !s.turns.length) return;
+    const ids = s.turns.map(t => t.id); const cur = this.activeIdx != null && ids[this.activeIdx] ? this.activeIdx : ids.indexOf(this.state.activeTurn);
+    const i = Math.min(ids.length - 1, Math.max(0, (cur < 0 ? (d > 0 ? -1 : 0) : cur) + d)); this.activeIdx = i;
+    this.setState({ activeTurn: ids[i] }); this.scrollTo(ids[i]); }
+  toast(msg) { this.setState({ toast: msg }); clearTimeout(this.toastTimer); this.toastTimer = setTimeout(() => this.setState({ toast: null }), 1800); }
+  copy(text) { try { navigator.clipboard.writeText(text); } catch (e) {} this.toast('Copied'); }
+  toggle(id) { this.setState(s => ({ expanded: { ...s.expanded, [id]: !s.expanded[id] } })); }
+  openDrawer(kind, payload) { this.setState({ drawer: { kind, payload } }); }
+
+  // Formatting
+  fmtTime(iso, long) { const [d, t] = iso.split('T'); const hm = t.slice(0, 5); if (long) return `${d} ${hm}`;
+    const T = this.DATA.TODAY; if (d === T) return hm; const y = new Date(T); y.setDate(y.getDate() - 1); if (d === y.toISOString().slice(0, 10)) return 'Yesterday ' + hm; return new Date(d + 'T00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); }
+  group(iso) { const d = iso.slice(0, 10), T = this.DATA.TODAY; if (d === T) return 'today'; const y = new Date(T); y.setDate(y.getDate() - 1); return d === y.toISOString().slice(0, 10) ? 'yesterday' : 'earlier'; }
+  agentColor(a) { return a === 'Claude Code' ? 'var(--cc)' : a === 'Codex' ? 'var(--cx)' : 'var(--oc)'; }
+  num(v) { return typeof v === 'number' ? v.toLocaleString('en-US') : (v == null ? 'Unknown' : String(v)); }
+  toneOf(t) { return { ok: ['var(--ok)', 'var(--ok-soft)'], warn: ['var(--warn)', 'var(--warn-soft)'], err: ['var(--err)', 'var(--err-soft)'], neutral: ['var(--fg2)', 'var(--surface2)'], accent: ['var(--accent)', 'var(--accent-soft)'] }[t]; }
+  toolStatus(st) { return { ok: ['Succeeded', 'ok'], failed: ['Failed', 'err'], denied: ['Permission denied', 'err'], unknown: ['Result unknown', 'neutral'] }[st] || ['Result unknown', 'neutral']; }
+  rStatus(st) { return { provider_visible: ['Provider-readable content', 'accent'], encrypted_unavailable: ['Provider-encrypted, not readable now', 'warn'], opaque_archived: ['Encrypted content archived, not readable now', 'neutral'], not_present: ['Not provided by source', 'neutral'], unsupported_shape: ['Unsupported content shape', 'warn'] }[st]; }
+  rKind(k) { return { thinking: 'thinking', reasoning_text: 'reasoning text', reasoning_summary: 'Provider reasoning summary', signature: 'thinking.signature', redacted_thinking: 'redacted_thinking' }[k] || k; }
+  rExplain(st) { return { provider_visible: 'The provider returned readable reasoning text in its response. This is the redacted version stored at capture time; thinking, reasoning text and reasoning summary are labelled separately and never conflated.',
+    encrypted_unavailable: 'The provider returned encrypted content. This is a limit on reading it, not a capture failure; whether it was stored is answered by the archive status.',
+    opaque_archived: 'The encrypted content is archived intact, but there is no decryptor today. Only safe metadata such as source, size and integrity digest is shown; invisible reasoning is never guessed or generated.',
+    not_present: 'The source did not provide this kind of content. This is a neutral state, not a gap or a failure.', unsupported_shape: 'An unsupported content shape was found; the affected block is shown as locally incomplete.' }[st]; }
+  captureTone(c) { return { complete: 'ok', finalize_pending: 'warn', partial: 'warn', metadata_only: 'neutral' }[c] || 'neutral'; }
+
+  // Markdown → elements
+  inline(t) { const parts = t.split(/(`[^`]+`|\*\*[^*]+\*\*)/g); return parts.map((p, i) => p.startsWith('`') ? React.createElement('code', { key: i, style: { fontSize: '12.5px', background: 'var(--code-bg)', border: '1px solid var(--border)', borderRadius: 4, padding: '0 4px' } }, p.slice(1, -1)) : p.startsWith('**') ? React.createElement('strong', { key: i, style: { fontWeight: 600 } }, p.slice(2, -2)) : p); }
+  md(src) { if (!src) return null; const L = src.split('\n'); const out = []; let i = 0, k = 0; const h = React.createElement;
+    while (i < L.length) { const l = L[i];
+      if (l.startsWith('```')) { const buf = []; i++; while (i < L.length && !L[i].startsWith('```')) buf.push(L[i++]); i++; const code = buf.join('\n');
+        out.push(h('div', { key: k++, style: { position: 'relative', margin: '8px 0' } }, h('pre', { style: { margin: 0, padding: '10px 12px', background: 'var(--code-bg)', border: '1px solid var(--border)', borderRadius: 6, fontSize: '12.5px', lineHeight: 1.6, overflow: 'auto', color: 'var(--fg)' } }, code),
+          h('button', { onClick: () => this.copy(code), style: { position: 'absolute', top: 6, right: 6, border: '1px solid var(--border)', background: 'var(--surface)', borderRadius: 4, padding: '1px 7px', fontSize: 11, color: 'var(--fg2)' } }, 'Copy'))); continue; }
+      if (l.startsWith('|')) { const rows = []; while (i < L.length && L[i].startsWith('|')) rows.push(L[i++]); const cells = r => r.split('|').slice(1, -1).map(c => c.trim()); const head = cells(rows[0]); const body = rows.slice(2).map(cells);
+        out.push(h('div', { key: k++, style: { overflow: 'auto', margin: '8px 0' } }, h('table', { style: { borderCollapse: 'collapse', fontSize: '13px', width: '100%' } }, h('thead', null, h('tr', null, head.map((c, j) => h('th', { key: j, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--fg2)', fontWeight: 500, whiteSpace: 'nowrap' } }, this.inline(c))))),
+          h('tbody', null, body.map((r, ri) => h('tr', { key: ri }, r.map((c, j) => h('td', { key: j, style: { padding: '6px 10px', borderBottom: '1px solid var(--border)', verticalAlign: 'top' } }, this.inline(c))))))))); continue; }
+      if (/^[-*] /.test(l)) { const items = []; while (i < L.length && /^[-*] /.test(L[i])) items.push(L[i++].slice(2)); out.push(h('ul', { key: k++, style: { margin: '6px 0', paddingLeft: 22 } }, items.map((it, j) => h('li', { key: j, style: { margin: '2px 0' } }, this.inline(it))))); continue; }
+      if (!l.trim()) { i++; continue; }
+      const buf = []; while (i < L.length && L[i].trim() && !/^(```|\||[-*] )/.test(L[i])) buf.push(L[i++]); out.push(h('p', { key: k++, style: { margin: '6px 0', textWrap: 'pretty' } }, this.inline(buf.join(' '))));
+    } return out; }
+
+  // Event projection
+  evView(ev, turn, s, idx) { const st = this.state; const id = ev.id || `${turn.id}-e${idx}`; const anim = st.hl === id ? 'hl 2.6s ease-out' : 'none'; const base = { id, anim, isReasoning: false, isTool: false, isToolGroup: false, isAssistant: false, isEvent: false, isSubagent: false, isDisplay: false, isUnsupported: false, isRedacted: false };
+    if (ev.k === 'reasoning') { const [statusLabel, tone] = this.rStatus(ev.status); const [color, bg] = this.toneOf(tone); const open = !!st.expanded[id]; const archived = ev.status === 'opaque_archived' || ev.status === 'encrypted_unavailable';
+      const preview = ev.text ? ev.text.slice(0, 70) : archived ? `${ev.meta.size || ''} · ${ev.meta.integrity || ''}` : ev.status === 'not_present' ? '' : ev.shape || '';
+      return { ...base, isReasoning: true, kindLabel: this.rKind(ev.kind), provider: ev.provider, statusLabel, color, bg, preview, open, chev: open ? '90deg' : '0deg', hasText: !!ev.text, text: ev.text, isSummaryKind: ev.kind === 'reasoning_summary', isArchived: archived, isNotPresent: ev.status === 'not_present', meta: ev.meta || {}, toggle: () => this.toggle(id), openDetail: e => { e && e.stopPropagation(); this.openDrawer('reasoning', { ev, turn }); } }; }
+    if (ev.k === 'tool') return { ...base, ...this.toolView(ev, turn) };
+    if (ev.k === 'toolgroup') { const open = !!st.expanded[id]; return { ...base, id, isToolGroup: true, name: ev.name, count: ev.items.length, open, chev: open ? '90deg' : '0deg', preview: ev.items.map(t => t.input).join(' · '), items: ev.items.map(t => this.toolView(t, turn)), toggle: () => this.toggle(id) }; }
+    if (ev.k === 'assistant') return { ...base, isAssistant: true, agent: s.agent, agentColor: this.agentColor(s.agent), model: ev.model || (turn.model || s.models[s.models.length - 1] || ''), body: this.md(ev.md) };
+    if (ev.k === 'event') { const tone = ev.kind === 'finalize' ? 'warn' : ev.kind === 'compaction' ? 'neutral' : ev.kind === 'interrupt' ? 'err' : 'accent'; const [color, bg] = this.toneOf(tone); return { ...base, isEvent: true, title: ev.title, color, bg, border: bg, openDetail: () => this.openDrawer('event', { ev, turn }) }; }
+    if (ev.k === 'subagent') return { ...base, isSubagent: true, name: ev.name, lifecycle: ev.lifecycle, bodyLabel: ev.hasBody ? 'Subsession content available' : 'Lifecycle record only', actionLabel: ev.hasBody ? 'View subsession content' : 'Details', openDetail: () => this.openDrawer('subagent', { ev, turn }) };
+    if (ev.k === 'display') return { ...base, isDisplay: true, summary: ev.summary };
+    if (ev.k === 'unsupported') return { ...base, isUnsupported: true, shape: ev.shape, detail: ev.detail };
+    if (ev.k === 'redacted') return { ...base, isRedacted: true, reason: ev.reason };
+    return base; }
+  toolView(ev, turn) { const [statusLabel, tone] = this.toolStatus(ev.status); const [color, bg] = this.toneOf(tone); return { id: ev.id, isTool: true, anim: this.state.hl === ev.id ? 'hl 2.6s ease-out' : 'none', name: ev.name, inputLine: (ev.input || '').split('\n')[0], statusLabel, color, bg, border: tone === 'err' ? 'var(--err)' : 'var(--border)', openDetail: () => this.openDrawer('tool', { ev, turn }) }; }
+  groupEvents(evs) { const out = []; let i = 0; while (i < evs.length) { const e = evs[i]; if (e.k === 'tool' && e.status === 'ok') { let j = i; while (j < evs.length && evs[j].k === 'tool' && evs[j].status === 'ok' && evs[j].name === e.name) j++; if (j - i >= 2) { out.push({ k: 'toolgroup', id: e.id + '-grp', name: e.name, items: evs.slice(i, j) }); i = j; continue; } } out.push(e); i++; } return out; }
+  findTurnOf(s, mid) { return s.turns.find(t => t.id === mid || t.id + '-u' === mid || (t.events || []).some(e => e.id === mid || (e.body || []).some(b => b.id === mid))); }
+  tagOf(t) { return t.cp ? t.cp : `T${t.n}`; }
+
+  renderVals() {
+    const st = this.state, data = st.data || []; const s = this.session(); const noop = () => {};
+    const worktrees = [...new Set(data.map(x => x.worktree))];
+    const visible = data.filter(x => (st.worktree === 'all' || x.worktree === st.worktree) && (!st.agents.length || st.agents.includes(x.agent)) && (!st.statuses.length || st.statuses.includes(x.status.capture)) && (!st.dates.length || st.dates.includes(this.group(x.start))));
+    const sorted = [...visible].sort((a, b) => b.start.localeCompare(a.start));
+    const groupLabels = { today: 'Today', yesterday: 'Yesterday', earlier: 'Earlier' };
+    const groups = ['today', 'yesterday', 'earlier'].map(g => ({ label: groupLabels[g], items: sorted.filter(x => this.group(x.start) === g).map(x => { const tone = this.captureTone(x.status.capture); return { id: x.id, title: x.title, agent: x.agent, agentColor: this.agentColor(x.agent), time: this.fmtTime(x.start), summary: x.summary || 'No summary', summaryColor: x.summary ? 'var(--fg3)' : 'var(--fg3)', active: x.id === st.sid, bg: x.id === st.sid ? 'var(--accent-soft)' : 'transparent', stateLabel: x.status.capture === 'complete' ? '' : x.status.captureLabel, stateColor: this.toneOf(tone)[0], select: () => this.selectSession(x.id) }; }) })).filter(g => g.items.length);
+    const chip = (label, active, toggle) => ({ label, active, toggle, border: active ? 'var(--accent)' : 'var(--border)', bg: active ? 'var(--accent-soft)' : 'transparent', color: active ? 'var(--accent)' : 'var(--fg2)' });
+    const tog = (k, v) => () => this.setState(x => ({ [k]: x[k].includes(v) ? x[k].filter(y => y !== v) : [...x[k], v] }));
+    const filterChips = [...['Claude Code', 'Codex', 'OpenCode'].map(a => chip(a, st.agents.includes(a), tog('agents', a))), ...[['today', 'Today'], ['yesterday', 'Yesterday'], ['earlier', 'Earlier']].map(([v, l]) => chip(l, st.dates.includes(v), tog('dates', v))), ...[['complete', 'Capture complete'], ['finalize_pending', 'Finalize pending'], ['partial', 'Incomplete'], ['metadata_only', 'Metadata only']].map(([v, l]) => chip(l, st.statuses.includes(v), tog('statuses', v)))];
+
+    // Search
+    const q = st.q.trim().toLowerCase(); let searchResults = [];
+    if (q) { const scopeSessions = data.filter(x => st.worktree === 'all' || x.worktree === st.worktree);
+      const add = (x, t, type, text, mid, expandId) => { const i = text.toLowerCase().indexOf(q); if (i < 0 || searchResults.length > 40) return; const a = Math.max(0, i - 36); searchResults.push({ title: x.title, agent: x.agent, agentColor: this.agentColor(x.agent), time: this.fmtTime(x.start), type, pre: (a > 0 ? '…' : '') + text.slice(a, i), match: text.slice(i, i + q.length), post: text.slice(i + q.length, i + q.length + 60), go: () => this.goTo(x.id, mid, 'conversation', expandId) }); };
+      scopeSessions.forEach(x => x.turns.forEach(t => { if (st.scope !== 'reasoning') { if (t.user) add(x, t, 'User message', t.user, t.id + '-u'); }
+        (t.events || []).forEach((e, i) => { const id = e.id || `${t.id}-e${i}`; if (e.k === 'reasoning' && e.status === 'provider_visible' && e.text && st.scope !== 'body') add(x, t, 'Readable reasoning', e.text, id, id);
+          if (st.scope === 'reasoning') return; if (e.k === 'assistant') add(x, t, 'Agent reply', e.md.replace(/[`*|#]/g, ''), id); if (e.k === 'tool') add(x, t, 'Tool command', e.input, id); }); })); }
+    const searchScopes = [['all', 'All'], ['body', 'Content only'], ['reasoning', 'Readable reasoning only']].map(([v, l]) => { const a = st.scope === v; return { label: l, select: () => this.setState({ scope: v }), border: a ? 'var(--accent)' : 'var(--border)', bg: a ? 'var(--accent-soft)' : 'transparent', color: a ? 'var(--accent)' : 'var(--fg2)' }; });
+
+    // Session header
+    const sv = s ? { title: s.title, agent: s.agent, agentColor: this.agentColor(s.agent), model: s.model, hasEffort: !!s.reasoningEffort, effort: s.reasoningEffort, hasSource: !!s.source, source: s.source, timeRange: `${this.fmtTime(s.start, true)} – ${s.end.slice(11, 16)}`, worktree: s.worktree, head: s.head, summarySource: s.summary ? s.summarySource : 'No summary', summary: s.summary || 'This legacy session has no summary; identify it by agent and time.', summaryColor: s.summary ? 'var(--fg2)' : 'var(--fg3)', captureLabel: s.status.captureLabel } : {};
+    const capTone = s ? this.captureTone(s.status.capture) : 'neutral';
+    const tabs = [['overview', 'Overview'], ['conversation', 'Conversation'], ['changes', 'Changes']].map(([v, l]) => ({ label: l, active: st.view === v, color: st.view === v ? 'var(--fg)' : 'var(--fg3)', border: st.view === v ? 'var(--accent)' : 'transparent', select: () => this.setView(v) }));
+
+    // Overview
+    let ov = {}, statusCards = [];
+    if (s) { const allAssist = s.turns.flatMap(t => t.events.filter(e => e.k === 'assistant').map(e => ({ e, t }))); const last = allAssist[allAssist.length - 1]; const firstT = s.turns.find(t => t.user);
+      const readTone = s.status.readable === 'readable' ? 'ok' : s.status.readable === 'none' ? 'neutral' : 'warn';
+      statusCards = [{ q: 'Is the session still running?', a: s.status.runningLabel, d: s.end ? `Ended at ${s.end.slice(11, 16)}` : '', dot: 'var(--fg3)' }, { q: 'Is capture and archiving done?', a: s.status.captureLabel, d: s.status.capture === 'complete' ? 'Content captured and archived' : s.status.capture === 'finalize_pending' ? 'Session stopped, finalize pending' : s.status.capture === 'partial' ? 'Some turns or blocks are missing' : 'Content was not exported', dot: this.toneOf(capTone)[0] }, { q: 'Can the stored content be read?', a: s.status.readableLabel, d: s.status.readable === 'partial' ? 'Ciphertext is labelled per block; readable parts are unaffected' : s.status.readable === 'readable' ? 'Every block is readable' : 'No readable content', dot: this.toneOf(readTone)[0] }, { q: 'What evidence can be checked?', a: s.status.evidence, d: s.verification.length ? 'See verification results and their source tool calls' : 'No test or commit evidence captured', dot: s.verification.length ? (s.verification.every(v => v.result === 'passed') ? 'var(--ok)' : 'var(--err)') : 'var(--fg3)' }];
+      const markersOf = t => t.events.flatMap(e => e.k === 'tool' && e.status === 'failed' ? [['Tool failed', 'err']] : e.k === 'tool' && e.status === 'unknown' ? [['Result unknown', 'neutral']] : e.k === 'event' && e.kind === 'model_switch' ? [['Model switch', 'accent']] : e.k === 'event' && e.kind === 'compaction' ? [['Compaction', 'neutral']] : e.k === 'event' && e.kind === 'finalize' ? [['Completion event missing', 'warn']] : e.k === 'subagent' ? [['Subagent', 'accent']] : e.k === 'unsupported' ? [['Unknown shape', 'warn']] : e.k === 'reasoning' && e.status === 'opaque_archived' ? [['Archived ciphertext', 'neutral']] : []).map(([label, tone]) => ({ label, color: this.toneOf(tone)[0], bg: this.toneOf(tone)[1] }));
+      ov = { hasTurns: s.turns.length > 0, hasFinalize: !!s.status.finalize, finalize: s.status.finalize || {}, finalizeAction: () => this.toast('Finalize re-run requested (simulated)'), exporterFailed: !!(s.exporter && !s.exporter.trusted), exporter: s.exporter || {},
+        firstQuestion: firstT ? firstT.user : '', goFirst: () => firstT && this.goTo(s.id, firstT.id + '-u'), lastAnswer: last ? this.md(last.e.md) : null, goLast: () => last && this.goTo(s.id, last.e.id),
+        keyTurns: s.turns.map(t => ({ tag: this.tagOf(t), time: t.time, label: t.user || t.system || (t.events[0] && t.events[0].title) || '', color: t.user ? 'var(--fg)' : 'var(--fg3)', markers: markersOf(t), go: () => this.goTo(s.id, t.id) })),
+        noVerification: !s.verification.length, verification: s.verification.map(v => ({ label: v.label, detail: v.detail, resultLabel: v.result === 'passed' ? 'Passed' : 'Failed', color: this.toneOf(v.result === 'passed' ? 'ok' : 'err')[0], bg: this.toneOf(v.result === 'passed' ? 'ok' : 'err')[1], go: () => this.goTo(s.id, v.ref) })),
+        noFiles: !s.files.length && !s.commits.length, files: s.files.map(f => ({ path: f.path, badge: f.hasDiff ? 'Comparable diff' : 'Path / single snapshot', open: () => this.openDrawer('file', { f }) })), commits: s.commits.map(c => ({ sha: c.sha, message: c.message, kind: c.kind })),
+        captureNote: s.agent === 'Claude Code' ? `${s.hooks.installed}/33 hooks installed, ${s.hooks.observed} event types actually observed; installed does not mean everything was captured.` : s.agent === 'Codex' ? (s.status.finalize ? 'The trailing usage delta and completion event still need to be written.' : 'Every turn has a turn_id and a completion event.') : (s.exporter && s.exporter.trusted ? `Export took ${s.exporter.duration}; ${s.exporter.parts.projected} of ${s.exporter.parts.recognized} parts were projected into content.` : 'Export unavailable — metadata only。'),
+        showAi: (this.props.showAiSummary ?? true) && !!s.aiSummary, aiSummary: (s.aiSummary || []).map(a => ({ text: a.text, go: () => this.goTo(s.id, a.ref) })) }; }
+
+    // Conversation
+    let cv = {}, rail = [], showRail = false;
+    if (s) { const turns = s.turns.map(t => ({ id: t.id, tag: this.tagOf(t), ref: t.turnId || 'no turn_id', time: t.time, hasUser: !!t.user, user: t.user, userId: t.id + '-u', userAnim: st.hl === t.id + '-u' || st.hl === t.id ? 'hl 2.6s ease-out' : 'none', turnAnim: st.hl === t.id && !t.user ? 'hl 2.6s ease-out' : 'none', hasSystem: !t.user && !!t.system, system: t.system,
+        hasRevisions: !!(t.revisions && t.revisions.length > 1), revLabel: t.revisions ? `${t.revisions.length} revisions · showing current` : '', openRevisions: () => this.openDrawer('revisions', { t }), hasInjected: !!(t.injected && t.injected.length), injectedLabel: t.injected ? `${t.injected.length} injected items · not counted as questions` : '', openInjected: () => this.openDrawer('injected', { t }),
+        events: this.groupEvents(t.events).map((e, i) => this.evView(e, t, s, i)) }));
+      cv = { turns, hasOrderNote: !!s.orderNote, orderNote: s.orderNote, empty: !s.turns.length, emptyReason: s.exporter && !s.exporter.trusted ? s.exporter.reason : '' };
+      showRail = st.view === 'conversation' && s.turns.length > 1;
+      rail = s.turns.map(t => { const bad = t.events.some(e => (e.k === 'tool' && e.status !== 'ok') || e.k === 'unsupported' || (e.k === 'event' && e.kind === 'finalize')); const act = st.activeTurn === t.id; return { tag: this.tagOf(t).replace('checkpoint ', 'cp'), title: t.user || t.system || '', flag: bad, flagColor: 'var(--err)', border: act ? 'var(--accent)' : 'var(--border)', bg: act ? 'var(--accent-soft)' : 'var(--surface)', color: act ? 'var(--accent)' : 'var(--fg3)', go: () => { this.activeIdx = s.turns.indexOf(t); this.setState({ activeTurn: t.id }); this.scrollTo(t.id); } }; }); }
+    const turnIdx = s ? s.turns.findIndex(t => t.id === st.activeTurn) : -1;
+
+    // Changes
+    let ch = {};
+    if (s) { const sessionById = id => data.find(x => x.id === id);
+      ch = { fileCount: s.files.length, noFiles: !s.files.length, files: s.files.map(f => ({ path: f.path, source: f.source, hasDiff: !!f.hasDiff, from: f.from, to: f.to, hasNote: !!f.note, note: f.note, goRef: () => this.goTo(s.id, f.ref), diff: (f.diff || []).map(l => ({ s: l.s, sign: l.t === 'c' ? '' : l.t, bg: l.t === '+' ? 'var(--diff-add)' : l.t === '-' ? 'var(--diff-del)' : 'transparent', color: l.t === 'c' ? 'var(--fg2)' : 'var(--fg)' })) })),
+        noCommits: !s.commits.length, commits: s.commits.map(c => ({ sha: c.sha, message: c.message, kind: c.kind, attribution: c.attribution, noShared: !c.sharedWith.length, shared: c.sharedWith.map(id => { const o = sessionById(id); return o ? { title: o.title, agent: o.agent, agentColor: this.agentColor(o.agent), go: () => this.setState({ sid: o.id, view: 'changes', drawer: null }) } : null; }).filter(Boolean) })) }; }
+
+    // Drawer
+    let d = {}; const dr = st.drawer;
+    if (dr && s) { const p = dr.payload; const kindLabels = { tool: 'Tool call', reasoning: 'Reasoning source', file: 'File record', revisions: 'Revisions', injected: 'Injected content', event: 'Event', subagent: 'Subagent', usage: 'Usage', session: 'Session info', capture: 'Capture details', reconcile: 'Reconciliation' };
+      d = { kindLabel: kindLabels[dr.kind], isTool: dr.kind === 'tool', isReasoning: dr.kind === 'reasoning', isFile: dr.kind === 'file', isRevisions: dr.kind === 'revisions', isInjected: dr.kind === 'injected', isEvent: dr.kind === 'event', isSubagent: dr.kind === 'subagent', isUsage: dr.kind === 'usage', isSession: dr.kind === 'session', isCapture: dr.kind === 'capture', isReconcile: dr.kind === 'reconcile', title: '' };
+      if (dr.kind === 'tool') { const ev = p.ev; const [statusLabel, tone] = this.toolStatus(ev.status); const [color, bg] = this.toneOf(tone); Object.assign(d, { title: `${ev.name} · ${this.tagOf(p.turn)}`, statusLabel, color, bg, basis: ev.basis, input: ev.input, output: ev.output, hasFile: !!ev.file, file: ev.file, copyInput: () => this.copy(ev.input), copyOutput: () => this.copy(ev.output), goFile: () => this.setState({ view: 'changes', drawer: null }) }); }
+      if (dr.kind === 'reasoning') { const ev = p.ev; const [statusLabel, tone] = this.rStatus(ev.status); const [color, bg] = this.toneOf(tone); Object.assign(d, { title: `${this.rKind(ev.kind)} · ${this.tagOf(p.turn)}`, statusLabel, color, bg, kindLabel: this.rKind(ev.kind), provider: ev.provider, status: ev.status, turnTag: `${this.tagOf(p.turn)} · ${p.turn.time}`, meta: { size: (ev.meta && ev.meta.size) || '—', integrity: ev.meta && ev.meta.integrity, hash: ev.meta && ev.meta.hash, archivedAt: ev.meta && ev.meta.archivedAt }, isArchived: ev.status === 'opaque_archived' || ev.status === 'encrypted_unavailable', hasText: !!ev.text, text: ev.text, explain: this.rExplain(ev.status) }); }
+      if (dr.kind === 'file') { const f = p.f; Object.assign(d, { title: f.path.split('/').pop(), path: f.path, source: f.source, snapshotLabel: f.hasDiff ? `${f.from} → ${f.to}` : 'No comparable version', hasNote: !!f.note, note: f.note, goRef: () => this.goTo(s.id, f.ref), goChanges: () => this.setState({ view: 'changes', drawer: null }) }); }
+      if (dr.kind === 'revisions') Object.assign(d, { title: `Revisions of ${this.tagOf(p.t)}`, revisions: p.t.revisions.map(r => ({ id: r.id, time: r.time, label: r.label, hasNote: !!r.note, note: r.note, border: r.current ? 'var(--accent)' : 'var(--border)', bg: r.current ? 'var(--accent-soft)' : 'transparent', color: r.current ? 'var(--accent)' : 'var(--fg3)' })) });
+      if (dr.kind === 'injected') Object.assign(d, { title: `Injected content in ${this.tagOf(p.t)}`, injected: p.t.injected });
+      if (dr.kind === 'event') Object.assign(d, { title: p.ev.title, detail: p.ev.detail, isPermission: p.ev.kind === 'permission' || p.ev.kind === 'elicitation' });
+      if (dr.kind === 'subagent') { const ev = p.ev; Object.assign(d, { title: ev.name, lifecycle: ev.lifecycle, bodyLabel: ev.hasBody ? 'Subsession content available' : 'Lifecycle record only', relation: ev.hasBody ? 'Supported by source (parent turn_id explicit)' : 'Attribution unconfirmed', hasBody: !!ev.hasBody, usage: { input: this.num(ev.usage && ev.usage.input), output: this.num(ev.usage && ev.usage.output), reasoning: this.num(ev.usage && ev.usage.reasoning), calls: this.num(ev.usage && ev.usage.calls) }, body: (ev.body || []).map(b => b.k === 'tool' ? { ...this.toolView(b, p.turn), isAssistant: false } : { isTool: false, isAssistant: true, body: this.md(b.md) }), goBack: () => this.goTo(s.id, p.turn.id) }); }
+      if (dr.kind === 'usage') { const u = s.usage; const row = (label, v) => ({ label, value: this.num(v), color: typeof v === 'number' ? 'var(--fg)' : 'var(--fg3)' }); Object.assign(d, { title: 'Usage · main session', rows: [row('Input tokens', u.input), row('Cache read', u.cacheRead), row('Cache write', u.cacheWrite), row('Output tokens', u.output), row('Reasoning tokens', u.reasoning), row('Calls', u.calls), { label: 'Cost', value: u.cost != null ? `$${u.cost.toFixed(2)}` : 'Unknown', color: u.cost != null ? 'var(--fg)' : 'var(--fg3)' }], hasSub: !!u.subagent, subNote: u.subagentIncluded ? 'included in the total' : 'not included in the total above', subRows: u.subagent ? [row('Input tokens', u.subagent.input), row('Output tokens', u.subagent.output), row('Reasoning tokens', u.subagent.reasoning), row('Calls', u.subagent.calls)] : [], usageNote: [u.costNote, u.note, s.agent === 'Codex' ? 'Codex cumulative usage is computed as deltas and never double-counted.' : '', 'Whether reasoning tokens are included in output tokens follows each source\u2019s own convention; values are never summed across providers. Unknown values read \u201cUnknown\u201d and are never zero-filled.'].filter(Boolean).join(' ') }); }
+      if (dr.kind === 'session') Object.assign(d, { title: s.title, sessionId: s.sessionId, copyId: () => this.copy(s.sessionId), rows: [{ label: 'Agent', value: `${s.agent} ${s.agentVersion}` }, { label: 'Model', value: s.models.length ? s.models.join(' → ') : 'Unknown' }, ...(s.source ? [{ label: 'Source', value: s.source }] : []), { label: 'Start', value: this.fmtTime(s.start, true) }, { label: 'End', value: this.fmtTime(s.end, true) }, { label: 'Repo / worktree', value: `libra · ${s.worktree}` }, { label: 'HEAD at capture', value: s.head }, { label: 'Title source', value: s.titleSource }, { label: 'Summary source', value: s.summary ? s.summarySource : 'No summary' }] });
+      if (dr.kind === 'capture') { const cT = this.toneOf(capTone)[0]; const hookTone = { observed: ['Actually observed', 'ok'], installed: ['Installed', 'neutral'], mismatch: ['Version mismatch', 'warn'], unsupported: ['Not supported yet', 'neutral'] };
+        Object.assign(d, { title: `${s.agent} capture details`, isCC: s.agent === 'Claude Code', isCX: s.agent === 'Codex', isOC: s.agent === 'OpenCode',
+          rows: [{ label: 'Session', value: s.status.runningLabel, color: 'var(--fg2)' }, { label: 'Capture & archive', value: s.status.captureLabel, color: cT }, { label: 'Readability', value: s.status.readableLabel, color: 'var(--fg2)' }, { label: 'Evidence', value: s.status.evidence, color: 'var(--fg2)' }, { label: 'Agent version', value: s.agentVersion, color: 'var(--fg2)' }] });
+        if (s.hooks) Object.assign(d, { hooks: s.hooks, hookGroups: s.hooks.groups.map(g => ({ name: g.name, items: g.items.map(([name, stt]) => { const [statusLabel, tone] = hookTone[stt]; const [color, bg] = this.toneOf(tone); return { name, statusLabel, color: stt === 'installed' ? 'var(--fg2)' : stt === 'unsupported' ? 'var(--fg3)' : color, bg: stt === 'unsupported' ? 'transparent' : bg, border: stt === 'unsupported' ? 'var(--border)' : bg }; }) })), hookLegend: Object.entries(hookTone).map(([k, [label, tone]]) => ({ label, bg: k === 'unsupported' ? 'transparent' : this.toneOf(tone)[1], border: k === 'unsupported' ? 'var(--border)' : this.toneOf(tone)[1] })), fileScope: s.hooks.fileChangedScope });
+        if (s.agent === 'Codex') Object.assign(d, { hasFinalize: !!s.status.finalize, finalize: s.status.finalize || {}, finalizeAction: () => this.toast('Finalize re-run requested (simulated)'), openReconcile: () => this.openDrawer('reconcile', {}) });
+        if (s.exporter) { const x = s.exporter; Object.assign(d, { exporterRows: [{ label: 'Trust', value: x.trusted ? 'Trusted' : x.reason, color: x.trusted ? 'var(--ok)' : 'var(--warn)' }, { label: 'Sandbox', value: x.sandbox, color: 'var(--fg2)' }, { label: 'Duration', value: x.duration, color: 'var(--fg2)' }, { label: 'Stop state', value: s.status.runningLabel, color: 'var(--fg2)' }, { label: 'Content capture', value: s.status.captureLabel, color: cT }, ...(x.parts ? [{ label: 'Part projection', value: `${x.parts.projected} / ${x.parts.recognized} projected`, color: 'var(--fg2)' }] : [])], hasParts: !!x.parts, partsNote: x.parts && x.parts.note }); } }
+      if (dr.kind === 'reconcile') { const r = s.reconcile || { reason: 'No reconciliation data' }; Object.assign(d, { title: 'Codex capture reconciliation', rec: { ...r, worktree: st.worktree === 'all' ? 'All' : st.worktree } }); } }
+
+    const capMap = (this.DATA ? this.DATA.CAPABILITY_MAP : []).map(([a, b, c, dd]) => ({ a, b, c, d: dd, color: a.includes('new design') ? 'var(--warn)' : 'var(--fg)' }));
+    return {
+      searchRef: this.searchRef, contentRef: this.contentRef, onScroll: e => { this.pos[this.key()] = e.target.scrollTop; },
+      toggleSidebar: () => this.setState(x => ({ sidebarOpen: !x.sidebarOpen })), sidebarOpen: st.sidebarOpen,
+      worktree: st.worktree, worktreeOptions: [{ v: 'all', label: 'All worktrees' }, ...worktrees.map(w => ({ v: w, label: w }))], setWorktree: e => this.setState({ worktree: e.target.value }),
+      searchQ: st.q, onSearchInput: e => this.setState({ q: e.target.value, searchOpen: true }), openSearch: () => this.setState({ searchOpen: true }), searchOpen: st.searchOpen, searchScopes, searchResults, searchEmpty: !searchResults.length, searchEmptyText: q ? 'No matches' : 'Type to search sessions in the current repo / worktree scope', searchSummary: q ? `${searchResults.length} matches` : '',
+      openCapture: () => this.openDrawer('capture', {}), captureDot: this.toneOf(capTone)[0], captureLabel: s ? s.status.captureLabel : 'Capture status', openMap: () => this.setState({ mapOpen: true }), closeMap: () => this.setState({ mapOpen: false }), mapOpen: st.mapOpen, stop: e => e.stopPropagation(), capMap,
+      toggleTheme: () => { const next = st.theme === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', next); this.setState({ theme: next }); }, themeLabel: st.theme === 'dark' ? 'Light' : 'Dark',
+      filterChips, groups, listEmpty: !sorted.length && !!data.length, listCount: `${sorted.length} / ${data.length} sessions · mock data`,
+      hasSession: !!s, noSession: !!data.length && !s, s: sv, tabs, isOverview: st.view === 'overview', isConversation: st.view === 'conversation', isChanges: st.view === 'changes',
+      openSessionInfo: () => this.openDrawer('session', {}), openUsage: () => this.openDrawer('usage', {}), goChanges: () => this.setView('changes'),
+      turnPos: s && s.turns.length ? (turnIdx >= 0 ? `${turnIdx + 1} / ${s.turns.length}` : `${s.turns.length} turns`) : '', prevTurn: () => this.stepTurn(-1), nextTurn: () => this.stepTurn(1),
+      statusCards, ov, cv, ch, rail, showRail, newContent: st.newContent && st.view === 'conversation', jumpNew: () => { const el = this.contentRef.current; if (el) el.scrollTop = el.scrollHeight; this.setState({ newContent: false }); },
+      drawerOpen: !!dr && !!s, closeDrawer: () => this.setState({ drawer: null }), d, narrow: st.narrow, drawerPos: st.narrow ? 'absolute' : 'relative', drawerShadow: st.narrow ? 'var(--shadow)' : 'none',
+      toastOpen: !!st.toast, toast: st.toast,
+    };
+  }
+}
+</script>
+</body>
+</html>
