@@ -48,6 +48,20 @@ libra merge --restart
 
 标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；二进制与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
 
+### 目录/文件冲突（D/F 冲突）
+
+一侧保留（或修改）**文件** `foo`、另一侧把 `foo` 变成**目录**（删除文件并在 `foo/` 下新增路径）时，两者无法共用一个路径。Libra 遵循 Git recursive 策略（`merge-ort.c` 的 `unique_path`）：目录保留 `foo`，文件按持有它的分支写到唯一名字下——文件在我方时为 `foo~HEAD`，在对方时为 `foo~<branch>`（分支名中的 `/` 替换为 `_`）；该名字已被本次合并的任一输入或其结果占用——无论占用者是文件还是目录，仅 merge base 有过的路径也算，与 Git `unique_path` 检查的集合一致——时追加 `_0`、`_1`……。合并以冲突停止（`LBR-CONFLICT-002`），并先打印 Git 的提示行：
+
+```text
+CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD instead.
+```
+
+被移走的文件就是未合并路径：索引在新名字下记录文件所在侧的 stage 2（我方）或 stage 3（对方），若 merge base 在 `foo` 处跟踪的是文件则再记 stage 1；没有 stage 0 条目，`merge-state.json` 的 `conflicted_paths` 列出的是新名字。目录内容照常合并。与 Git 相同有两种形态：仅一侧*新增*的文件是纯粹的 file/directory 冲突——原样写到新名字，`--dry-run` 报为 `file-directory`；merge base 已跟踪、且文件侧*修改过*的文件是一个只是换了位置的 modify/delete 冲突——新名字下带 base（stage 1）与修改侧，`--dry-run` 报为 `modify-delete` 并附 `original_path`，同时打印 Git 的第二行（`CONFLICT (modify/delete): foo~HEAD deleted in <branch> and modified in HEAD.  Version HEAD of foo~HEAD left in tree.`），文件按该行所说原样留在新名字下。一侧未动、另一侧换成目录的文件则是普通的干净删除：无冲突、无提示。只含*空* tree 的目录仅在 merge base 在该路径上什么都没有时才算挡路——Git 会把这样的新目录原样采纳；base 已有该路径时 Git 会遍历该目录、发现没有文件，于是文件留在原地（普通 modify/delete）。两种情形均与 `git merge` 对人工构造 tree 的实测一致。`--json`/`--machine` 下不打印这些提示：stdout 保持机器可读，冲突由 stderr 上的错误信封承载。策略选项（`-X ours` / `-X theirs`）只裁决内容 hunk：目录之下的 modify/delete 仍是冲突，与 Git 一致。合并绝不*穿过*工作树里的符号链接写入或删除——被忽略的 `foo -> 别处` 挡在要写的 `foo/…` 前面、或压在合并要删除的已跟踪文件之上时，整个合并在任何改动前被拒绝；恰好占着移位文件名字的符号链接则被文件替换，而*已跟踪*的符号链接 `foo` 让位给目录 `foo/` 时像普通文件一样移到 `foo~HEAD`。只有当前已跟踪的路径才会被删除：碰巧沿用历史名字的未跟踪文件会留下。若要保留被移走的文件，编辑它、用 `libra add foo~…` 暂存后 `libra merge --continue`；或运行 `libra merge --abort`：它把 `foo` 恢复为合并前的样子，并同时移除被移走的副本与合并创建的目录（合并腾空的目录会被清理，嵌套的 `foo/a/` 不会挡住文件回位）。目前无法「丢弃」被移走的文件：`libra rm` 不接受未合并路径，只能用 `--abort` 得到不含该文件的结果（Git 用 `git rm foo~HEAD` 解决这一情形）。
+
+合并后**空无一物**的目录（其下每个条目都被文件侧删除、另一侧未动）不算挡路：文件留在原路径，与 Git 一致。递归的交叉合并折叠（见上）内部同样适用该规则且不询问用户：文件在虚拟祖先中移到 `foo~Temporary merge branch 1`（或 `2`），与 Git 在 `call_depth > 0` 时完全一致，因此祖先 tree 永远不会在同一名字下同时持有 blob 与子树。
+
+此处只处理两侧**已跟踪**内容之间的冲突。工作树里会被合并覆盖的**未跟踪** `foo` 或 `foo~HEAD` 由既有的 untracked-overwrite 检查预先拒绝；**被忽略**的文件一律视为可弃并被替换——无论它占着这些名字，还是挡在合并要创建的目录位置上（会被替换成目录）；与 `git merge` 的处理完全一致，因此不要把重要内容放在会被合并写入的被忽略路径上。rename 检测引起的冲突在 rename 支持落地前不在范围内。
+
 ### 子模块（`160000` gitlink 条目）
 
 Libra 定位 monorepo 客户端，永不合并 submodule 内容。三路合并对 gitlink 分两档处理：
@@ -72,7 +86,7 @@ Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`the
 
 ### `--dry-run`（Libra 扩展）
 
-`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，脏工作树也可预演（注意预演不校验工作树干净度，真实合并仍可能拒绝）。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`），真实合并的输出不含这两个键（schema 冻结）。
+`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，脏工作树也可预演（注意预演不校验工作树干净度，真实合并仍可能拒绝）。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`、`conflicted_paths` 与 `conflict_kinds`——每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content` / `modify-delete` / `file-directory`，`original_path` 仅目录/文件移位时出现并记录原路径，此时 `path` 是文件将被写到的带 `~` 后缀的名字），真实合并的输出不含这些键（schema 冻结）。
 
 ### `--restart`（Libra 扩展，移植 Lore `branch merge restart`）
 
@@ -212,7 +226,7 @@ Merge aborted.
 
 `-s ours` 使用 `strategy: "ours"`、`files_changed: 0` 并报告两个 parent。已经最新的合并使用 `strategy: "already-up-to-date"`、`commit: null`、`files_changed: 0` 和 `up_to_date: true`。
 
-`--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。
+`--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。 `--dry-run` 额外带 `dry_run`、`would_conflict`、`conflicted_paths` 与 `conflict_kinds`（每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content`、`modify-delete` 或 `file-directory`；`original_path` 仅在目录/文件移位时出现，记录文件原来的路径，此时 `path` 与 `conflicted_paths` 里都是带 `~` 后缀的目标名）。
 
 ## 参数对比：Libra vs Git vs jj
 

@@ -289,12 +289,31 @@ pub(crate) struct PullMergeSummary {
     /// `conflicted_paths`). Absent from JSON for every real merge.
     #[serde(default, skip_serializing_if = "is_false")]
     pub would_conflict: bool,
+    /// `--dry-run` only: the category of every would-be conflict (MG-04), so a
+    /// caller can tell a `file-directory` collision — with the path the file
+    /// would be moved to — from a `content` or `modify-delete` conflict. Absent
+    /// whenever empty (schema-additive; every real merge omits it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_kinds: Vec<ConflictReport>,
     /// Autostash outcome (lore.md §1.8): `applied` (re-applied cleanly),
     /// `stashed` (re-apply conflicted; entry promoted to the stash list), or
     /// `kept` (held while merge state persists, e.g. `--no-commit`). Absent
     /// whenever autostash was off or the tree was clean (schema-additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostash: Option<String>,
+}
+
+/// One would-be conflict in a `--dry-run` summary (MG-04).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ConflictReport {
+    /// The path that will be unmerged — for a D/F collision, the path the file
+    /// is moved to.
+    pub path: String,
+    /// `content` | `modify-delete` | `file-directory`.
+    pub kind: String,
+    /// D/F only: the colliding path the directory keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
 }
 
 pub(crate) type MergeOutput = PullMergeSummary;
@@ -1812,6 +1831,7 @@ async fn run_merge_for_pull_inner(
             continued: false,
             dry_run: options.dry_run,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     };
@@ -1844,6 +1864,7 @@ async fn run_merge_for_pull_inner(
             continued: false,
             dry_run: options.dry_run,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -1866,6 +1887,7 @@ async fn run_merge_for_pull_inner(
             continued: false,
             dry_run: options.dry_run,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -2005,6 +2027,7 @@ async fn perform_ours_merge(
             continued: false,
             dry_run: true,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -2022,6 +2045,7 @@ async fn perform_ours_merge(
             continued: false,
             dry_run: false,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -2052,6 +2076,7 @@ async fn perform_ours_merge(
             continued: false,
             dry_run: false,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -2095,6 +2120,7 @@ async fn perform_ours_merge(
         continued: false,
         dry_run: false,
         would_conflict: false,
+        conflict_kinds: Vec::new(),
         autostash: None,
     })
 }
@@ -2131,8 +2157,8 @@ async fn perform_three_way_merge(
         )
         .await;
     }
-    let (our_items, our_gitlinks) = commit_tree_split(&current_commit)?;
-    let (their_items, their_gitlinks) = commit_tree_split(&target_commit)?;
+    let (our_items, our_gitlinks) = commit_tree_split_for_merge(&current_commit)?;
+    let (their_items, their_gitlinks) = commit_tree_split_for_merge(&target_commit)?;
     report_tree_walk_stats("flat", None);
     // ADR-MG-01 fail-closed gate: refuse before the first write (this runs
     // ahead of the `--dry-run` report as well, so the preview is honest) if any
@@ -2148,7 +2174,7 @@ async fn perform_three_way_merge(
     // one, which reports conflicts the recursion resolves.
     let (base_items, mut virtual_blobs) = match base_commits.as_slice() {
         [] => (HashMap::new(), VirtualBlobs::new()),
-        [base] => (commit_tree_items(base)?, VirtualBlobs::new()),
+        [base] => (commit_tree_split_for_merge(base)?.0, VirtualBlobs::new()),
         bases => {
             // A conflict INSIDE the virtual ancestor is rendered with the
             // configured style, exactly as Git renders one at any call depth.
@@ -2202,12 +2228,26 @@ async fn perform_three_way_merge(
     // the FIRST write (no merge state, index, worktree, HEAD, or reflog
     // mutation; no conflict markers). The conflict-style config is consulted
     // only for the multi-base fold above, whose ancestor content depends on it.
+    // Git reports conflicts in path order (`process_entries` walks sorted
+    // paths), and the unique-name suffixes follow that order too.
+    merge_result
+        .conflicts
+        .sort_by(|(left, _), (right, _)| left.cmp(right));
+    let placements = conflict_placements(
+        &merge_result.conflicts,
+        &df_occupied_names_if_needed(
+            &[&base_items, &our_items, &their_items],
+            &merge_result.merged_items,
+            &merge_result.conflicts,
+        ),
+        upstream,
+    );
     if options.dry_run {
-        let conflicted_paths: Vec<String> = merge_result
-            .conflicts
+        let conflicted_paths: Vec<String> = placements
             .iter()
-            .map(|(path, _)| path.display().to_string())
+            .map(|(path, _, _)| path.display().to_string())
             .collect();
+        let conflict_kinds = conflict_reports(&placements);
         let would_conflict = !conflicted_paths.is_empty();
         return Ok(PullMergeSummary {
             strategy: "three-way".to_string(),
@@ -2221,6 +2261,7 @@ async fn perform_three_way_merge(
             continued: false,
             dry_run: true,
             would_conflict,
+            conflict_kinds,
             autostash: None,
         });
     }
@@ -2258,12 +2299,16 @@ async fn perform_three_way_merge(
             ours: current_commit.id,
             theirs: target_commit.id,
             merged_items: merge_result.merged_items,
-            conflicts: merge_result.conflicts,
+            placements: placements.clone(),
             base_items,
             our_items,
             their_items,
             conflict_style,
         })?;
+        // Announced only now: the writer's preflight (untracked collisions,
+        // symlink traversal, directory takeover) may still refuse the merge,
+        // and Git prints nothing when it does.
+        announce_df_conflicts(&placements, upstream, options.output);
         // rerere: record the preimage of each merge conflict just written and
         // replay a recorded resolution if one matches. A no-op unless
         // `rerere.enabled`; staging of a replayed file follows `rerere.autoUpdate`
@@ -2280,6 +2325,19 @@ async fn perform_three_way_merge(
     let paths_to_write = worktree_paths_to_write(&merge_result.merged_items);
     let gitlink_paths: Vec<PathBuf> = passthrough_gitlinks.keys().cloned().collect();
     ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+    // The flattening path commits and moves HEAD before it checks out, so a
+    // write (or removal) it would refuse — through an ignored symlinked
+    // directory — must be refused HERE, before its first write, as the
+    // incremental path's checkout-first order does inherently. A tracked
+    // symlink the result removes is allowed on the way to the paths written
+    // after its removal (a symlink `foo` replaced by the directory `foo/`).
+    let flat_removals: Vec<PathBuf> = current_index
+        .tracked_files()
+        .into_iter()
+        .filter(|path| !merge_result.merged_items.contains_key(path))
+        .filter(|path| !is_gitlink_index_path(&current_index, path).unwrap_or(false))
+        .collect();
+    refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &flat_removals)?;
 
     let tree_id = create_tree_from_items_map(&merge_result.merged_items)
         .map_err(PullMergeError::TreeCreate)?;
@@ -2301,6 +2359,7 @@ async fn perform_three_way_merge(
             continued: false,
             dry_run: false,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -2337,6 +2396,7 @@ async fn perform_three_way_merge(
             continued: false,
             dry_run: false,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -2351,11 +2411,15 @@ async fn perform_three_way_merge(
         // on the reset-time guard would detect the collision too late and
         // leave a partially completed merge.
         ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+        // A hook may also plant an IGNORED symlink (invisible to the untracked
+        // scan) where the merge writes: recheck the traversal too, before HEAD.
+        refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &flat_removals)?;
         let message = run_merge_message_hooks(&resolved_message, options.output).await?;
         switch::ensure_clean_status(options.output)
             .await
             .map_err(|_| PullMergeError::DirtyWorktree)?;
         ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+        refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &flat_removals)?;
         message
     } else {
         resolved_message
@@ -2386,6 +2450,7 @@ async fn perform_three_way_merge(
         continued: false,
         dry_run: false,
         would_conflict: false,
+        conflict_kinds: Vec::new(),
         autostash: None,
     })
 }
@@ -2439,7 +2504,11 @@ struct MergeConflictInput {
     ours: ObjectHash,
     theirs: ObjectHash,
     merged_items: HashMap<PathBuf, MergeTreeEntry>,
-    conflicts: Vec<(PathBuf, ConflictKind)>,
+    /// Where each conflict is unmerged (MG-04: a D/F file at its unique name)
+    /// — computed ONCE by the engine, while it still saw every directory
+    /// entry and every input path, and used for the announcement, the
+    /// unmerged-path list, the stages and the working-tree writes alike.
+    placements: Vec<(PathBuf, ConflictKind, Option<PathBuf>)>,
     base_items: HashMap<PathBuf, MergeTreeEntry>,
     our_items: HashMap<PathBuf, MergeTreeEntry>,
     their_items: HashMap<PathBuf, MergeTreeEntry>,
@@ -2451,11 +2520,12 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     let current_index =
         Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
 
-    let conflict_paths: Vec<PathBuf> = input
-        .conflicts
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect();
+    // MG-04: a D/F conflict's file is placed at its `unique_path`; every other
+    // conflict stays at its own path. `placements` is the single source for
+    // the unmerged path list, the untracked-collision check, the index stages
+    // and the working-tree writes below.
+    let placements = input.placements;
+    let conflict_paths: Vec<PathBuf> = placements.iter().map(|(path, _, _)| path.clone()).collect();
     let paths_to_write: Vec<PathBuf> = worktree_paths_to_write(&input.merged_items)
         .into_iter()
         .chain(conflict_paths.iter().cloned())
@@ -2467,8 +2537,18 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         .map(|(path, _)| path.clone())
         .collect();
     ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
-
     let conflict_set: HashSet<PathBuf> = conflict_paths.iter().cloned().collect();
+    // What this merge REMOVES: tracked now, absent from the result. Nothing
+    // else is ever unlinked — a path only the history knew (untracked or
+    // recreated since) is not the merge's to delete.
+    let removals: Vec<PathBuf> = current_index
+        .tracked_files()
+        .into_iter()
+        .filter(|path| !conflict_set.contains(path) && !input.merged_items.contains_key(path))
+        .filter(|path| !is_gitlink_index_path(&current_index, path).unwrap_or(false))
+        .collect();
+    refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
+
     let workdir = util::working_dir();
     let marker_eol = conflict_marker_eol();
     let theirs_abbrev = short_object_id(&input.theirs);
@@ -2477,15 +2557,47 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     for (path, entry) in &input.merged_items {
         add_blob_index_entry(&mut index, path, *entry, 0)?;
     }
-    for path in &conflict_paths {
-        if let Some(entry) = input.base_items.get(path) {
-            add_blob_index_entry(&mut index, path, *entry, 1)?;
+    for (path, kind, original) in &placements {
+        // A moved modify/delete conflict is still looked up where the sides
+        // HAD the file; its stages are written at the moved path.
+        let source = original.as_ref().unwrap_or(path);
+        if let ConflictKind::FileDirectory {
+            file,
+            file_side,
+            base_file,
+            ..
+        } = kind
+        {
+            // Git's stage layout for the moved file (`merge-ort.c:4100-4198`):
+            // the file's own side carries it, the base's FILE (if any) is
+            // stage 1, and every directory-side stage is zeroed — absent here.
+            if let Some(base_file) = base_file {
+                add_blob_index_entry(&mut index, path, *base_file, 1)?;
+            }
+            let stage = match file_side {
+                MergeSide::Ours => 2,
+                MergeSide::Theirs => 3,
+            };
+            add_blob_index_entry(&mut index, path, *file, stage)?;
+            continue;
         }
-        if let Some(entry) = input.our_items.get(path) {
-            add_blob_index_entry(&mut index, path, *entry, 2)?;
+        // An empty-directory marker (the flat view's `Tree` entry) is not a
+        // stage: a base that held an empty `foo/` next to two added files
+        // `foo` is an add/add conflict with no stage 1.
+        let stage_entry = |items: &HashMap<PathBuf, MergeTreeEntry>| {
+            items
+                .get(source)
+                .copied()
+                .filter(|entry| entry.mode != TreeItemMode::Tree)
+        };
+        if let Some(entry) = stage_entry(&input.base_items) {
+            add_blob_index_entry(&mut index, path, entry, 1)?;
         }
-        if let Some(entry) = input.their_items.get(path) {
-            add_blob_index_entry(&mut index, path, *entry, 3)?;
+        if let Some(entry) = stage_entry(&input.our_items) {
+            add_blob_index_entry(&mut index, path, entry, 2)?;
+        }
+        if let Some(entry) = stage_entry(&input.their_items) {
+            add_blob_index_entry(&mut index, path, entry, 3)?;
         }
     }
 
@@ -2511,6 +2623,24 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         return Err(PullMergeError::IndexSave(error.to_string()));
     }
 
+    // Remove what the result no longer has BEFORE writing what it has: a D/F
+    // collision turns our file `foo` into the directory `foo/` (MG-04), and
+    // `foo/bar.txt` cannot be created while the file is still there. (The
+    // same order `reset_workdir_tracked_only` uses.)
+    for path in &removals {
+        let full_path = workdir.join(path);
+        // `symlink_metadata` so a DANGLING tracked link is removed too.
+        if fs::symlink_metadata(&full_path).is_ok_and(|meta| !meta.is_dir()) {
+            fs::remove_file(&full_path).map_err(|error| {
+                PullMergeError::WorkdirReset(format!(
+                    "failed to remove {}: {error}",
+                    path.display()
+                ))
+            })?;
+            prune_empty_parents(&workdir, path);
+        }
+    }
+
     for (path, entry) in &input.merged_items {
         // Submodule working trees are not materialized by Libra: a pass-through
         // gitlink is an index/tree fact only (ADR-MG-01).
@@ -2524,29 +2654,28 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
                 path.display()
             ))
         })?;
-        write_workdir_file(&workdir, path, &blob.data).map_err(PullMergeError::WorkdirReset)?;
+        write_workdir_entry(&workdir, path, entry.mode, &blob.data)
+            .map_err(PullMergeError::WorkdirReset)?;
     }
 
-    let mut tracked_paths: HashSet<PathBuf> = current_index.tracked_files().into_iter().collect();
-    tracked_paths.extend(input.base_items.keys().cloned());
-    tracked_paths.extend(input.our_items.keys().cloned());
-    tracked_paths.extend(input.their_items.keys().cloned());
-    for path in tracked_paths {
-        if conflict_set.contains(&path) || input.merged_items.contains_key(&path) {
-            continue;
-        }
-        let full_path = workdir.join(&path);
-        if full_path.exists() {
-            fs::remove_file(&full_path).map_err(|error| {
+    for (path, kind, original) in &placements {
+        // A moved file is left in the tree verbatim — Git's "Version HEAD of
+        // foo~HEAD left in tree" — whether it is a one-sided add or the
+        // surviving side of a modify/delete conflict.
+        if original.is_some()
+            && let Some(entry) = moved_file_content(kind)
+        {
+            let blob: Blob = load_object(&entry.hash).map_err(|error| {
                 PullMergeError::WorkdirReset(format!(
-                    "failed to remove {}: {error}",
+                    "failed to load moved blob {} for '{}': {error}",
+                    entry.hash,
                     path.display()
                 ))
             })?;
+            write_workdir_entry(&workdir, path, entry.mode, &blob.data)
+                .map_err(PullMergeError::WorkdirReset)?;
+            continue;
         }
-    }
-
-    for (path, kind) in &input.conflicts {
         write_conflict_markers(
             &workdir,
             path,
@@ -2559,6 +2688,96 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     }
 
     Ok(())
+}
+
+/// The entry a D/F-moved conflict leaves at its unique path: the file itself,
+/// with its mode (a moved symbolic link stays a symbolic link, as Git's
+/// checkout of `foo~HEAD` does).
+fn moved_file_content(kind: &ConflictKind) -> Option<MergeTreeEntry> {
+    match kind {
+        ConflictKind::FileDirectory { file, .. } => Some(*file),
+        ConflictKind::OursModifiedTheirsDeleted { ours } => Some(MergeTreeEntry {
+            hash: *ours,
+            mode: TreeItemMode::Blob,
+        }),
+        ConflictKind::TheirsModifiedOursDeleted { theirs } => Some(MergeTreeEntry {
+            hash: *theirs,
+            mode: TreeItemMode::Blob,
+        }),
+        ConflictKind::BothChanged { .. } => None,
+    }
+}
+
+/// Write a tracked entry into the working tree with its TYPE and MODE: a
+/// symbolic link as a link (Unix), an executable as `0755`, anything else as
+/// `0644`. Every merge write goes through here — the conflict path's merged
+/// files, the D/F-moved entries and the checkout in
+/// [`reset_workdir_tracked_only`] — because the write REPLACES the directory
+/// entry (a hard-linked alias keeps the old content, as Git leaves it), which
+/// also means the new file's mode has to be set explicitly rather than
+/// inherited from whatever was there before.
+fn write_workdir_entry(
+    workdir: &Path,
+    relative: &Path,
+    mode: TreeItemMode,
+    content: &[u8],
+) -> Result<(), String> {
+    if mode == TreeItemMode::Link {
+        return write_workdir_symlink(workdir, relative, content);
+    }
+    write_workdir_file(workdir, relative, content)?;
+    apply_file_mode(&workdir.join(relative), mode)
+}
+
+/// A symbolic link, target bytes verbatim (never UTF-8 validated). Windows has
+/// no symlinks here: the target text is left in a file, as `checkout` does.
+fn write_workdir_symlink(workdir: &Path, relative: &Path, content: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        refuse_symlink_components(workdir, relative)?;
+        let full = workdir.join(relative);
+        if let Some(parent) = full.parent() {
+            // Same ancestor rule as the file writer: an ignored file standing
+            // where a directory must go is replaced (Codex R10).
+            clear_ancestor_files(workdir, relative)?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        }
+        clear_write_target(&full)?;
+        std::os::unix::fs::symlink(OsStr::from_bytes(content), &full).map_err(|error| {
+            format!(
+                "failed to create the symbolic link {}: {error}",
+                full.display()
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        write_workdir_file(workdir, relative, content)
+    }
+}
+
+/// `0755` for an executable entry, `0644` otherwise (Unix; a no-op elsewhere).
+/// Explicit because every write creates the file anew.
+fn apply_file_mode(path: &Path, mode: TreeItemMode) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bits = if mode == TreeItemMode::BlobExecutable {
+            0o755
+        } else {
+            0o644
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(bits))
+            .map_err(|error| format!("failed to chmod {}: {error}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
 }
 
 /// Whether THIS worktree has a merge in progress — the request-scoped sidecar
@@ -2693,6 +2912,7 @@ async fn run_merge_continue(
         continued: true,
         dry_run: false,
         would_conflict: false,
+        conflict_kinds: Vec::new(),
         autostash,
     };
     if !skip_hooks {
@@ -2727,6 +2947,32 @@ async fn restore_pre_merge_state(
             detail: error.to_string(),
         })?;
     reset_index_and_workdir_to_tree(&original_commit.tree_id)?;
+    // MG-04: a D/F conflict placed a file at `<path>~<branch>` — a path the
+    // pre-merge tree never tracked, so the reset above leaves it behind. Every
+    // recorded conflict path the restored index does not track is such a
+    // moved file (a content conflict's path is tracked and was just restored).
+    let restored =
+        Index::load(path::index()).map_err(|error| MergeError::IndexLoad(error.to_string()))?;
+    let workdir = util::working_dir();
+    for conflicted in &state.conflicted_paths {
+        let relative = PathBuf::from(conflicted);
+        if restored.get(path_to_index_key(&relative)?, 0).is_some() {
+            continue;
+        }
+        let full = workdir.join(&relative);
+        // `is_file()` FOLLOWS symlinks: a moved DANGLING link (or one pointing
+        // at a directory) would be left behind, and the restored index does
+        // not track it, so nothing else would ever remove it.
+        if fs::symlink_metadata(&full).is_ok_and(|meta| !meta.is_dir()) {
+            fs::remove_file(&full).map_err(|error| {
+                MergeError::WorkdirReset(format!(
+                    "failed to remove the moved conflict file {}: {error}",
+                    relative.display()
+                ))
+            })?;
+            prune_empty_parents(&workdir, &relative);
+        }
+    }
     MergeState::cleanup()?;
     Ok(orig_head)
 }
@@ -2833,6 +3079,7 @@ async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeErro
         continued: false,
         dry_run: false,
         would_conflict: false,
+        conflict_kinds: Vec::new(),
         autostash,
     })
 }
@@ -3147,7 +3394,13 @@ pub(crate) fn ensure_gitlinks_uniform_across_inputs(
 
 /// The gitlink entries of `commit`'s tree.
 pub(crate) fn commit_gitlink_entries(commit: &Commit) -> Result<GitlinkEntries, PullMergeError> {
-    commit_tree_split(commit).map(|(_, gitlinks)| gitlinks)
+    // Through the FALLIBLE flattener: a missing or corrupt nested tree must
+    // come back as an error, not as `TreeExt::load`'s panic (MG-04 R6).
+    let tree: Tree = load_object(&commit.tree_id).map_err(|error| PullMergeError::TreeLoad {
+        tree_id: commit.tree_id.to_string(),
+        detail: error.to_string(),
+    })?;
+    Ok(split_gitlink_entries(flat_items_with_empty_dirs(&tree)?).1)
 }
 
 /// Collect the gitlink entries of a commit's tree without flattening the
@@ -3190,6 +3443,73 @@ fn commit_tree_split(
 
 fn commit_tree_items(commit: &Commit) -> Result<HashMap<PathBuf, MergeTreeEntry>, PullMergeError> {
     commit_tree_split(commit).map(|(items, _)| items)
+}
+
+/// The flat merge engine's view of a commit's tree: every leaf, plus every
+/// EMPTY subtree as a `TreeItemMode::Tree` entry (MG-04). Git's traversal sees
+/// such a directory (`dirmask`), and it counts as "in the way" of a file at the
+/// same path — verified against `git merge` with a crafted empty `foo/bar`
+/// tree: `foo` still moves to `foo~HEAD`. The shared flattener drops empty
+/// subtrees, which is why the two engines disagreed. The entries exist for the
+/// D/F decision only: [`merge_tree_items`] strips them from its result (the
+/// flat path never rebuilds empty trees — registered in MG-03). Reads mirror
+/// the shared flattener (`Tree::load` for nested trees).
+fn commit_tree_split_for_merge(
+    commit: &Commit,
+) -> Result<(HashMap<PathBuf, MergeTreeEntry>, GitlinkEntries), PullMergeError> {
+    let tree: Tree = load_object(&commit.tree_id).map_err(|error| PullMergeError::TreeLoad {
+        tree_id: commit.tree_id.to_string(),
+        detail: error.to_string(),
+    })?;
+    Ok(split_gitlink_entries(flat_items_with_empty_dirs(&tree)?))
+}
+
+/// Fallible on purpose: `TreeExt::load` PANICS on a missing or corrupt object,
+/// and this runs on the production merge path, so a damaged repository must
+/// come back as [`PullMergeError::TreeLoad`] instead of aborting the process.
+fn flat_items_with_empty_dirs(
+    tree: &Tree,
+) -> Result<Vec<(PathBuf, ObjectHash, TreeItemMode)>, PullMergeError> {
+    let mut items = Vec::new();
+    for item in &tree.tree_items {
+        if item.mode != TreeItemMode::Tree {
+            items.push((PathBuf::from(&item.name), item.id, item.mode));
+            continue;
+        }
+        let sub_tree = Tree::try_load(&item.id).ok_or_else(|| PullMergeError::TreeLoad {
+            tree_id: item.id.to_string(),
+            detail: format!("failed to read the tree for '{}'", item.name),
+        })?;
+        if sub_tree.tree_items.is_empty() {
+            items.push((PathBuf::from(&item.name), item.id, TreeItemMode::Tree));
+            continue;
+        }
+        items.extend(
+            flat_items_with_empty_dirs(&sub_tree)?
+                .into_iter()
+                .map(|(path, hash, mode)| (PathBuf::from(&item.name).join(path), hash, mode)),
+        );
+    }
+    Ok(items)
+}
+
+/// An EMPTY directory entry at the very path another side holds a file is not
+/// "beneath" that file: it contributes no leaf, so — like Git's "directory
+/// merges to nothing" — the file sides alone decide. Only entries strictly
+/// beneath a file make a directory "in the way" ([`directory_is_in_the_way`]).
+fn sides_without_empty_dir_beside_file<'a>(
+    base: Option<&'a MergeTreeEntry>,
+    ours: Option<&'a MergeTreeEntry>,
+    theirs: Option<&'a MergeTreeEntry>,
+) -> [Option<&'a MergeTreeEntry>; 3] {
+    let sides = [base, ours, theirs];
+    let has_file = sides
+        .iter()
+        .any(|entry| entry.is_some_and(|entry| entry.mode != TreeItemMode::Tree));
+    if !has_file {
+        return sides;
+    }
+    sides.map(|entry| entry.filter(|entry| entry.mode != TreeItemMode::Tree))
 }
 
 async fn current_head_name() -> Result<String, PullMergeError> {
@@ -3275,6 +3595,32 @@ enum ConflictKind {
     TheirsModifiedOursDeleted {
         theirs: ObjectHash,
     },
+    /// A directory/file (D/F) collision (MG-04, Git `merge-ort.c:4100-4198`):
+    /// one side has a FILE at this path, the other a DIRECTORY whose contents
+    /// survive the merge. The directory keeps the path; the file is written
+    /// to `<path>~<branch>` (`unique_path`) and recorded there with its own
+    /// stages, exactly as Git does.
+    FileDirectory {
+        /// The file the merge moves (the file side's entry).
+        file: MergeTreeEntry,
+        /// Which side holds the file (the other side holds the directory).
+        file_side: MergeSide,
+        /// The merge base's FILE at this path, if it had one — stage 1 at the
+        /// moved name. Never a directory.
+        base_file: Option<MergeTreeEntry>,
+        /// Git's modify/delete shape: the base had the file, the file side
+        /// changed it and the directory side deleted it — reported as
+        /// `modify-delete` and announced with Git's second line. Kept a
+        /// conflict even under `-X ours/theirs`, as Git does (verified).
+        modify_delete: bool,
+    },
+}
+
+/// Which merge input a D/F file came from.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum MergeSide {
+    Ours,
+    Theirs,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -3828,10 +4174,10 @@ fn fold_merge_bases(
     let first_commit = load_merge_commit(first)?;
     let mut folded_ids = vec![*first];
     let mut timestamp = first_commit.committer.timestamp;
-    let mut items = commit_tree_items(&first_commit)?;
+    let mut items = commit_tree_split_for_merge(&first_commit)?.0;
     for next in rest {
         let next_commit = load_merge_commit(next)?;
-        let next_items = commit_tree_items(&next_commit)?;
+        let next_items = commit_tree_split_for_merge(&next_commit)?.0;
         let sub_bases = merge_bases_of_folded(&folded_ids, next)?;
         let sub_items = fold_merge_bases(
             &sub_bases,
@@ -3881,9 +4227,11 @@ fn merge_virtual_items(
 
     let mut merged = HashMap::new();
     for path in all_paths {
-        let base = base_items.get(&path);
-        let ours = our_items.get(&path);
-        let theirs = their_items.get(&path);
+        let [base, ours, theirs] = sides_without_empty_dir_beside_file(
+            base_items.get(&path),
+            our_items.get(&path),
+            their_items.get(&path),
+        );
         let resolution = {
             let mut context = TreeMergeContext {
                 persist_merged_blobs: persist,
@@ -3910,7 +4258,90 @@ fn merge_virtual_items(
             merged.insert(path, entry);
         }
     }
+    // MG-04 inside the fold (Git at `call_depth > 0`): a file whose path is
+    // also a directory in the result cannot go into one tree; Git moves it to
+    // `unique_path(path, "Temporary merge branch N")` and keeps folding — no
+    // user is asked. Without the move the ancestor tree would carry a blob and
+    // a subtree under one name.
+    relocate_virtual_df_files(&mut merged, base_items, our_items, their_items);
+    // Empty-directory markers stay in the ancestor: the outer merge must see
+    // that the base HAD a directory there (Codex R3), and
+    // `create_tree_from_items_map` writes such an entry verbatim.
     Ok(merged)
+}
+
+/// Git's D/F rule inside a recursive merge (`merge-ort.c:4120-4198` under
+/// `call_depth`): the directory keeps the path and the file moves to
+/// `unique_path`, labelled after the temporary branch that held it —
+/// `Temporary merge branch 1` for the fold's ours, `2` for its theirs. The
+/// "in the way" test is the outer merge's ([`directory_is_in_the_way`]).
+fn relocate_virtual_df_files(
+    merged: &mut HashMap<PathBuf, MergeTreeEntry>,
+    base_items: &HashMap<PathBuf, MergeTreeEntry>,
+    our_items: &HashMap<PathBuf, MergeTreeEntry>,
+    their_items: &HashMap<PathBuf, MergeTreeEntry>,
+) {
+    let file_at = |items: &HashMap<PathBuf, MergeTreeEntry>, path: &PathBuf| {
+        items
+            .get(path)
+            .copied()
+            .filter(|entry| entry.mode != TreeItemMode::Tree)
+    };
+    let mut entries: Vec<(PathBuf, MergeTreeEntry)> = merged
+        .iter()
+        .map(|(path, entry)| (path.clone(), *entry))
+        .collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut base_paths: Vec<&PathBuf> = base_items.keys().collect();
+    base_paths.sort();
+    let mut no_subtrees = |_: &ObjectHash| Ok(false);
+    let mut moves: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut drops: Vec<PathBuf> = Vec::new();
+    for (path, _) in &entries {
+        let label = match (file_at(our_items, path), file_at(their_items, path)) {
+            (Some(_), None) => VIRTUAL_OURS_LABEL,
+            (None, Some(_)) => VIRTUAL_THEIRS_LABEL,
+            _ => continue,
+        };
+        let at = base_paths.partition_point(|candidate| candidate.as_path() < path.as_path());
+        let base_present = base_paths
+            .get(at)
+            .is_some_and(|candidate| candidate.starts_with(path));
+        // The fold's maps hold leaves and empty-directory markers only, so no
+        // subtree ever needs reading here.
+        let file_survives = merged
+            .get(path)
+            .is_some_and(|entry| entry.mode != TreeItemMode::Tree);
+        if !file_survives {
+            continue;
+        }
+        if directory_is_in_the_way(path, &entries, base_present, &mut no_subtrees).unwrap_or(false)
+        {
+            moves.push((path.clone(), label));
+        } else {
+            // Empty-only entries beneath a surviving file would put a blob and
+            // a subtree under one name in the ancestor tree.
+            drops.push(path.clone());
+        }
+    }
+    for path in drops {
+        merged.retain(|other, _| other == &path || !other.starts_with(&path));
+    }
+    if moves.is_empty() {
+        return;
+    }
+    // The same occupancy as the outer merge: every input path (a name only
+    // the base had, deleted by both folded sides, still counts), every result
+    // path, and their ancestors.
+    let mut taken = df_occupied_names(&[base_items, our_items, their_items], merged, &[]);
+    for (path, label) in moves {
+        let Some(entry) = merged.remove(&path) else {
+            continue;
+        };
+        let target = unique_df_path(&path, label, &taken);
+        taken.insert(target.clone());
+        merged.insert(target, entry);
+    }
 }
 
 /// Turn a conflict inside the fold into an ancestor entry (see
@@ -4255,6 +4686,11 @@ struct IncrementalMergeResult {
     /// had there — `(path, ours' entry if any, adopted entry)` — recorded at
     /// adoption time so the ADR-MG-01 scan never looks anything up again.
     adopted_from_theirs: Vec<(PathBuf, Option<WalkEntry>, WalkEntry)>,
+    /// Paths that are a FILE on one side and a DIRECTORY on another —
+    /// `(path, side holding the file, base's file if any)` — resolved into
+    /// D/F conflicts by [`resolve_df_conflicts`] once the whole result is known
+    /// (only a directory whose contents SURVIVE is "in the way").
+    df_candidates: Vec<DfCandidate>,
 }
 
 /// Read one directory of each side (where present) into name-keyed maps.
@@ -4393,6 +4829,23 @@ fn incremental_merge_walk(
             let file_sides =
                 [base, ours, theirs].map(|entry| entry.filter(|entry| !entry.is_tree()));
             resolve_walk_leaf(&path, file_sides, context, out)?;
+            // MG-04: remember which SIDE holds the file; whether the directory
+            // is actually in the way is decided once the result is complete.
+            let file = match (file_sides[1], file_sides[2]) {
+                (Some(ours), None) => Some((MergeSide::Ours, ours.leaf())),
+                (None, Some(theirs)) => Some((MergeSide::Theirs, theirs.leaf())),
+                _ => None,
+            };
+            if let Some((file_side, file)) = file {
+                out.df_candidates.push(DfCandidate {
+                    path,
+                    file_side,
+                    file,
+                    base_file: file_sides[0].map(WalkEntry::leaf),
+                    // Anything at all on the base side — file or directory.
+                    base_present: base.is_some(),
+                });
+            }
             continue;
         }
 
@@ -4634,6 +5087,7 @@ fn incremental_merge_trees(
         conflicts: Vec::new(),
         changed_paths: 0,
         adopted_from_theirs: Vec::new(),
+        df_candidates: Vec::new(),
     };
     incremental_merge_walk(source, Path::new(""), sides, context, &mut out)?;
     // `files_changed` for adopted subtrees: one pruned diff each, against what
@@ -4645,7 +5099,447 @@ fn incremental_merge_trees(
         out.changed_paths += scan.changed_leaves;
     }
     out.adopted_from_theirs = adopted;
+    let candidates = std::mem::take(&mut out.df_candidates);
+    // A carried subtree beneath a collision has to be read to know whether it
+    // holds a file at all (only collisions pay this).
+    let mut has_file = |id: &ObjectHash| subtree_holds_a_file(source, id);
+    let delta = resolve_df_conflicts(
+        &mut out.merged,
+        &mut out.conflicts,
+        candidates,
+        &mut has_file,
+    )?;
+    out.changed_paths = out.changed_paths.saturating_add_signed(delta);
     Ok((out, passthrough))
+}
+
+/// A path that is a FILE on one side and a DIRECTORY on the other — recorded
+/// by both engines while they still see the directory's entries, and settled
+/// by [`resolve_df_conflicts`] once the result is complete.
+#[derive(Debug, Clone)]
+struct DfCandidate {
+    path: PathBuf,
+    /// The side holding the file (the other side holds the directory).
+    file_side: MergeSide,
+    /// That side's file entry.
+    file: MergeTreeEntry,
+    /// The merge base's FILE at this path, if it had one (never a directory).
+    base_file: Option<MergeTreeEntry>,
+    /// Whether the merge base had ANY entry at or under this path — a file, a
+    /// directory, anything. Git's traversal defers a directory that is new
+    /// relative to the base and adopts its tree verbatim, which makes even an
+    /// empty-only subtree "in the way"; a directory the base already had is
+    /// traversed, and one that merges to nothing is not in the way. See
+    /// [`resolve_df_conflicts`].
+    base_present: bool,
+}
+
+/// Whether a directory is still "in the way" of the file at the same path
+/// (`merge-ort.c:4100-4198`: `ci->merged.result.mode != 0`), measured against
+/// real `git merge` (git@3cb9185f6) on crafted trees:
+///
+/// * a surviving FILE beneath the path — the ordinary case — is in the way;
+/// * a subtree that contributes no file is in the way only when the merge base
+///   had NOTHING at that path: Git defers such a new directory and adopts its
+///   tree verbatim (`collect_merge_info_callback`'s
+///   `possible_trivial_merges`), so the directory survives even holding only
+///   empty trees (verified: base ∅ + ours adds file `foo` + theirs adds
+///   `foo/bar` = empty tree → `foo~HEAD`; with `foo` a file in the base and
+///   edited by ours → plain `CONFLICT (modify/delete): foo`, no relocation);
+/// * a directory-side entry that is itself an empty tree at the file's own
+///   path is not "beneath" it and never in the way (verified: clean merge).
+///
+/// `subtree_has_file` reads a carried subtree (the incremental engine keeps
+/// whole subtrees as `TreeItemMode::Tree` entries); the flattening engine's
+/// only tree entries are empty-directory markers, so it answers `false`.
+fn directory_is_in_the_way(
+    path: &Path,
+    entries: &[(PathBuf, MergeTreeEntry)],
+    base_present: bool,
+    subtree_has_file: &mut dyn FnMut(&ObjectHash) -> Result<bool, PullMergeError>,
+) -> Result<bool, PullMergeError> {
+    let start = entries.partition_point(|(candidate, _)| candidate.as_path() < path);
+    let mut trees = Vec::new();
+    for (entry_path, entry) in &entries[start..] {
+        if entry_path == path {
+            continue;
+        }
+        if !entry_path.starts_with(path) {
+            break;
+        }
+        if entry.mode != TreeItemMode::Tree {
+            return Ok(true);
+        }
+        trees.push(entry.hash);
+    }
+    if trees.is_empty() {
+        return Ok(false);
+    }
+    if !base_present {
+        // Git adopts a new directory's tree verbatim, empty subtrees included.
+        return Ok(true);
+    }
+    for id in trees {
+        if subtree_has_file(&id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// MG-04 post-pass shared by both engines, run while the result still lists
+/// every directory entry (empty-directory markers, carried subtrees): a
+/// candidate whose directory is still in the way ([`directory_is_in_the_way`])
+/// becomes a [`ConflictKind::FileDirectory`]. The three shapes Git
+/// distinguishes:
+///
+/// * the path's own resolution is a modify/delete conflict — Git relocates
+///   FIRST and runs the modify/delete branch on the moved entry
+///   (`:4120-4198`, then `:4374`), so the kind becomes `modify_delete`;
+/// * the file survived on its own (a one-sided add, or `-X` favoured it) —
+///   Git's "added on one side" under `df_conflict` is not clean;
+/// * the file side changed it and `-X` favoured the deletion — Git keeps
+///   modify/delete a conflict regardless of `-X` (verified), so the
+///   path-level conflict is re-raised at the moved name.
+///
+/// Returns the change-count delta for the incremental engine (which counts as
+/// it walks): a kept file moved out of the result is one more change when
+/// ours held it, one less when theirs added it — exactly what the flat
+/// engine's `count_item_map_changes(ours, merged)` sees over its final map.
+fn resolve_df_conflicts(
+    merged: &mut HashMap<PathBuf, MergeTreeEntry>,
+    conflicts: &mut Vec<(PathBuf, ConflictKind)>,
+    candidates: Vec<DfCandidate>,
+    subtree_has_file: &mut dyn FnMut(&ObjectHash) -> Result<bool, PullMergeError>,
+) -> Result<isize, PullMergeError> {
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    // One sorted view of the result and one lookup for the modify/delete slots
+    // — the candidate list can grow with the tree, so neither may be rescanned
+    // per candidate.
+    let mut entries: Vec<(PathBuf, MergeTreeEntry)> = merged
+        .iter()
+        .map(|(path, entry)| (path.clone(), *entry))
+        .collect();
+    for (path, kind) in conflicts.iter() {
+        entries.push((
+            path.clone(),
+            match kind {
+                ConflictKind::FileDirectory { file, .. } => *file,
+                // Only the KIND matters for the "is a file beneath" test.
+                _ => MergeTreeEntry {
+                    hash: ObjectHash::new(&[0u8; 20]),
+                    mode: TreeItemMode::Blob,
+                },
+            },
+        ));
+    }
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let modify_delete_slots: HashMap<PathBuf, usize> = conflicts
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, kind))| {
+            matches!(
+                kind,
+                ConflictKind::OursModifiedTheirsDeleted { .. }
+                    | ConflictKind::TheirsModifiedOursDeleted { .. }
+            )
+        })
+        .map(|(slot, (path, _))| (path.clone(), slot))
+        .collect();
+    let mut delta: isize = 0;
+    for candidate in candidates {
+        let DfCandidate {
+            path,
+            file_side,
+            file,
+            base_file,
+            base_present,
+        } = candidate;
+        if !directory_is_in_the_way(&path, &entries, base_present, subtree_has_file)? {
+            // The file stays. Anything still recorded BENEATH it contributes no
+            // file (that is what "not in the way" means), so it is an
+            // empty-only subtree: dropping it keeps a blob and a subtree from
+            // sharing one name in the result tree. The flattening engine drops
+            // every marker for the same reason; neither path ever rebuilds an
+            // empty directory (registered in MG-03).
+            if merged
+                .get(&path)
+                .is_some_and(|entry| entry.mode != TreeItemMode::Tree)
+            {
+                merged.retain(|other, _| other == &path || !other.starts_with(&path));
+            }
+            continue;
+        }
+        let modified_vs_base = base_file.is_some_and(|base| base != file);
+        let kind = |modify_delete: bool| ConflictKind::FileDirectory {
+            file,
+            file_side,
+            base_file,
+            modify_delete,
+        };
+        if let Some(&slot) = modify_delete_slots.get(&path) {
+            conflicts[slot].1 = kind(true);
+        } else if merged
+            .get(&path)
+            .is_some_and(|entry| entry.mode != TreeItemMode::Tree)
+        {
+            merged.remove(&path);
+            delta += match file_side {
+                MergeSide::Ours => 1,
+                MergeSide::Theirs => -1,
+            };
+            conflicts.push((path, kind(modified_vs_base)));
+        } else if modified_vs_base {
+            conflicts.push((path, kind(true)));
+        }
+    }
+    Ok(delta)
+}
+
+/// Whether a tree holds any non-tree entry, at any depth.
+fn subtree_holds_a_file(
+    source: &mut dyn TreeSource,
+    root: &ObjectHash,
+) -> Result<bool, PullMergeError> {
+    let mut stack = vec![*root];
+    while let Some(id) = stack.pop() {
+        for item in &source.tree(&id)?.tree_items {
+            if item.mode == TreeItemMode::Tree {
+                stack.push(item.id);
+            } else {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Every name the merge result occupies: each path AND each of its ancestor
+/// directories — Git's `opt->priv->paths` holds directory entries too, so an
+/// existing `foo~HEAD/bar` makes `foo~HEAD` taken and the moved file becomes
+/// `foo~HEAD_0` (verified against `git merge`).
+fn occupied_names<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> HashSet<PathBuf> {
+    let mut taken = HashSet::new();
+    for path in paths {
+        let mut current: Option<&Path> = Some(path.as_path());
+        while let Some(prefix) = current {
+            if prefix.as_os_str().is_empty() || !taken.insert(prefix.to_path_buf()) {
+                break;
+            }
+            current = prefix.parent();
+        }
+    }
+    taken
+}
+
+/// Git's `unique_path`: `<path>~<branch>` with `/` in the branch name flattened
+/// to `_`, plus `_<n>` while the name is taken by another path (or directory)
+/// of the merge.
+fn unique_df_path(path: &Path, branch: &str, taken: &HashSet<PathBuf>) -> PathBuf {
+    let flattened: String = branch
+        .chars()
+        .map(|c| if c == '/' { '_' } else { c })
+        .collect();
+    let base = format!("{}~{flattened}", path.display());
+    let mut candidate = PathBuf::from(&base);
+    let mut suffix = 0;
+    while taken.contains(&candidate) {
+        candidate = PathBuf::from(format!("{base}_{suffix}"));
+        suffix += 1;
+    }
+    candidate
+}
+
+/// The branch label a D/F file is renamed after: `HEAD` for ours, the merged
+/// ref's name for theirs — the labels the conflict markers already use.
+fn df_branch_label(file_side: MergeSide, upstream: &str) -> String {
+    match file_side {
+        MergeSide::Ours => "HEAD".to_string(),
+        MergeSide::Theirs => upstream.to_string(),
+    }
+}
+
+/// Where each conflict will be unmerged: a D/F file at its `unique_path`,
+/// every other conflict at its own path. Also the `(path, kind, original)`
+/// triples the `--dry-run` summary reports. `occupied` is what Git's
+/// `unique_path` treats as taken — see [`df_occupied_names`].
+fn conflict_placements(
+    conflicts: &[(PathBuf, ConflictKind)],
+    occupied: &HashSet<PathBuf>,
+    upstream: &str,
+) -> Vec<(PathBuf, ConflictKind, Option<PathBuf>)> {
+    let mut taken = occupied.clone();
+    let mut placed = Vec::with_capacity(conflicts.len());
+    for (path, kind) in conflicts {
+        match df_file_side(kind) {
+            Some(file_side) => {
+                let target = unique_df_path(path, &df_branch_label(file_side, upstream), &taken);
+                taken.insert(target.clone());
+                placed.push((target, *kind, Some(path.clone())));
+            }
+            None => placed.push((path.clone(), *kind, None)),
+        }
+    }
+    placed
+}
+
+/// Every name Git's `unique_path` treats as taken (`opt->priv->paths` holds
+/// every INPUT path — a path deleted on both sides included: a `foo~HEAD` only
+/// the base had still yields `foo~HEAD_0`, verified — every result path, and
+/// all their ancestor directories).
+fn df_occupied_names(
+    inputs: &[&HashMap<PathBuf, MergeTreeEntry>],
+    merged: &HashMap<PathBuf, MergeTreeEntry>,
+    conflicts: &[(PathBuf, ConflictKind)],
+) -> HashSet<PathBuf> {
+    occupied_names(
+        inputs
+            .iter()
+            .flat_map(|items| items.keys())
+            .chain(merged.keys())
+            .chain(conflicts.iter().map(|(path, _)| path)),
+    )
+}
+
+/// [`df_occupied_names`], but only when a relocation will actually consult it
+/// — every other conflict keeps its own path, so a merge without a D/F
+/// collision pays nothing.
+fn df_occupied_names_if_needed(
+    inputs: &[&HashMap<PathBuf, MergeTreeEntry>],
+    merged: &HashMap<PathBuf, MergeTreeEntry>,
+    conflicts: &[(PathBuf, ConflictKind)],
+) -> HashSet<PathBuf> {
+    if !conflicts
+        .iter()
+        .any(|(_, kind)| matches!(kind, ConflictKind::FileDirectory { .. }))
+    {
+        return HashSet::new();
+    }
+    df_occupied_names(inputs, merged, conflicts)
+}
+
+/// The incremental engine's occupancy: only a merge with a D/F relocation
+/// needs the inputs' paths, and then it enumerates them — leaves and
+/// directories, empty ones included — through the walk's source, which
+/// already caches every tree the walk and the gate opened.
+fn incremental_df_occupancy(
+    source: &mut dyn TreeSource,
+    roots: [Option<ObjectHash>; 3],
+    merged: &HashMap<PathBuf, MergeTreeEntry>,
+    conflicts: &[(PathBuf, ConflictKind)],
+) -> Result<HashSet<PathBuf>, PullMergeError> {
+    let mut names = occupied_names(merged.keys().chain(conflicts.iter().map(|(path, _)| path)));
+    if !conflicts
+        .iter()
+        .any(|(_, kind)| matches!(kind, ConflictKind::FileDirectory { .. }))
+    {
+        return Ok(names);
+    }
+    for root in roots.into_iter().flatten() {
+        let mut stack = vec![(PathBuf::new(), root)];
+        while let Some((prefix, id)) = stack.pop() {
+            let tree = source.tree(&id)?;
+            for item in &tree.tree_items {
+                let path = prefix.join(&item.name);
+                if item.mode == TreeItemMode::Tree {
+                    stack.push((path.clone(), item.id));
+                }
+                names.insert(path);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Which side's file a conflict moves for: only a [`ConflictKind::FileDirectory`]
+/// moves (every relocation, modify/delete included, is settled into that kind
+/// by [`resolve_df_conflicts`]).
+fn df_file_side(kind: &ConflictKind) -> Option<MergeSide> {
+    match kind {
+        ConflictKind::FileDirectory { file_side, .. } => Some(*file_side),
+        _ => None,
+    }
+}
+
+fn conflict_kind_name(kind: &ConflictKind) -> &'static str {
+    match kind {
+        ConflictKind::BothChanged { .. } => "content",
+        ConflictKind::OursModifiedTheirsDeleted { .. }
+        | ConflictKind::TheirsModifiedOursDeleted { .. } => "modify-delete",
+        ConflictKind::FileDirectory {
+            modify_delete: true,
+            ..
+        } => "modify-delete",
+        ConflictKind::FileDirectory { .. } => "file-directory",
+    }
+}
+
+/// The `--dry-run` summary's view of the conflicts.
+fn conflict_reports(
+    placements: &[(PathBuf, ConflictKind, Option<PathBuf>)],
+) -> Vec<ConflictReport> {
+    placements
+        .iter()
+        .map(|(path, kind, original)| ConflictReport {
+            path: path.display().to_string(),
+            kind: conflict_kind_name(kind).to_string(),
+            original_path: original.as_ref().map(|p| p.display().to_string()),
+        })
+        .collect()
+}
+
+/// Git's messages for a D/F collision, printed once per moved file — the
+/// file/directory line and, when the moved entry is a modify/delete conflict,
+/// Git's modify/delete line for the MOVED name (`merge-ort.c:4374`; verified
+/// against `git merge`). Human output only: `--json`/`--machine` keep stdout
+/// machine-clean and report the conflict through the error envelope.
+fn announce_df_conflicts(
+    placements: &[(PathBuf, ConflictKind, Option<PathBuf>)],
+    upstream: &str,
+    output: &OutputConfig,
+) {
+    if output.is_json() {
+        return;
+    }
+    for (target, kind, original) in placements {
+        let Some(original) = original else {
+            continue;
+        };
+        let Some(file_side) = df_file_side(kind) else {
+            continue;
+        };
+        info_println!(
+            output,
+            "CONFLICT (file/directory): directory in the way of {} from {}; moving it to {} instead.",
+            original.display(),
+            df_branch_label(file_side, upstream),
+            target.display()
+        );
+        let (deleted_in, modified_in) = match (kind, file_side) {
+            (
+                ConflictKind::FileDirectory {
+                    modify_delete: true,
+                    ..
+                },
+                MergeSide::Ours,
+            ) => (upstream, "HEAD"),
+            (
+                ConflictKind::FileDirectory {
+                    modify_delete: true,
+                    ..
+                },
+                MergeSide::Theirs,
+            ) => ("HEAD", upstream),
+            _ => continue,
+        };
+        info_println!(
+            output,
+            "CONFLICT (modify/delete): {target} deleted in {deleted_in} and modified in {modified_in}.  Version {modified_in} of {target} left in tree.",
+            target = target.display()
+        );
+    }
 }
 
 /// ADR-MG-01 over three trees WITHOUT flattening them: the read-only gate the
@@ -4765,7 +5659,7 @@ async fn perform_incremental_three_way_merge(
         .map(|(dir, _, _)| dir.clone())
         .collect();
     let mut merged_items = walk.merged;
-    let conflicts = walk.conflicts;
+    let mut conflicts = walk.conflicts;
 
     if options.dry_run {
         // A real merge's checkout reads every tree the result carries and
@@ -4789,11 +5683,23 @@ async fn perform_incremental_three_way_merge(
         } else {
             probe_carried_trees_readable(&mut source, &merged_items)?;
         }
+        conflicts.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let placements = conflict_placements(
+            &conflicts,
+            &incremental_df_occupancy(
+                &mut source,
+                [base_tree, Some(ours_tree), Some(theirs_tree)],
+                &merged_items,
+                &conflicts,
+            )?,
+            upstream,
+        );
         report_incremental_walk_stats();
-        let conflicted_paths: Vec<String> = conflicts
+        let conflicted_paths: Vec<String> = placements
             .iter()
-            .map(|(path, _)| path.display().to_string())
+            .map(|(path, _, _)| path.display().to_string())
             .collect();
+        let conflict_kinds = conflict_reports(&placements);
         let would_conflict = !conflicted_paths.is_empty();
         return Ok(PullMergeSummary {
             strategy: "three-way".to_string(),
@@ -4807,6 +5713,7 @@ async fn perform_incremental_three_way_merge(
             continued: false,
             dry_run: true,
             would_conflict,
+            conflict_kinds,
             autostash: None,
         });
     }
@@ -4838,6 +5745,17 @@ async fn perform_incremental_three_way_merge(
         // entries name what was actually merged (a replaced root included).
         let (our_items, _) = split_gitlink_entries(tree_leaves(&mut source, ours_tree)?);
         let (their_items, _) = split_gitlink_entries(tree_leaves(&mut source, theirs_tree)?);
+        conflicts.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let placements = conflict_placements(
+            &conflicts,
+            &incremental_df_occupancy(
+                &mut source,
+                [base_tree, Some(ours_tree), Some(theirs_tree)],
+                &merged_items,
+                &conflicts,
+            )?,
+            upstream,
+        );
         report_incremental_walk_stats();
         write_conflicted_merge_state(MergeConflictInput {
             head_name,
@@ -4849,12 +5767,16 @@ async fn perform_incremental_three_way_merge(
             ours: current_commit.id,
             theirs: target_commit.id,
             merged_items,
-            conflicts,
+            placements: placements.clone(),
             base_items,
             our_items,
             their_items,
             conflict_style,
         })?;
+        // Announced only now: the writer's preflight (untracked collisions,
+        // symlink traversal, directory takeover) may still refuse the merge,
+        // and Git prints nothing when it does.
+        announce_df_conflicts(&placements, upstream, options.output);
         if let Err(error) = crate::command::rerere::auto_update(false).await {
             tracing::warn!("rerere auto-update after merge conflict failed: {error}");
         }
@@ -4899,6 +5821,7 @@ async fn perform_incremental_three_way_merge(
             continued: false,
             dry_run: false,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -4931,6 +5854,7 @@ async fn perform_incremental_three_way_merge(
             continued: false,
             dry_run: false,
             would_conflict: false,
+            conflict_kinds: Vec::new(),
             autostash: None,
         });
     }
@@ -4999,6 +5923,7 @@ async fn perform_incremental_three_way_merge(
         continued: false,
         dry_run: false,
         would_conflict: false,
+        conflict_kinds: Vec::new(),
         autostash: None,
     })
 }
@@ -5109,12 +6034,12 @@ fn merge_tree_items(
     let mut merged_items = HashMap::new();
     let mut conflicts = Vec::new();
     for path in all_paths {
-        match resolve_three_way(
+        let [base, ours, theirs] = sides_without_empty_dir_beside_file(
             base_items.get(&path),
             our_items.get(&path),
             their_items.get(&path),
-            context,
-        )? {
+        );
+        match resolve_three_way(base, ours, theirs, context)? {
             MergeResolution::Use(hash) => {
                 merged_items.insert(path, hash);
             }
@@ -5122,6 +6047,70 @@ fn merge_tree_items(
             MergeResolution::Conflict(kind) => conflicts.push((path, kind)),
         }
     }
+
+    // MG-04: every path that is a file on exactly one side while entries exist
+    // beneath it (in the result or in any input) is a D/F candidate; the
+    // post-pass decides whether the directory really survives. Component-wise
+    // path order puts every `foo/...` entry directly after `foo`, so one sorted
+    // pass finds them without a quadratic scan. A candidate is recorded even
+    // when the file's own resolution deleted it (a strategy option may have),
+    // and an empty-directory marker never counts as a file.
+    let side_file = |items: &HashMap<PathBuf, MergeTreeEntry>, path: &PathBuf| {
+        items
+            .get(path)
+            .copied()
+            .filter(|entry| entry.mode != TreeItemMode::Tree)
+    };
+    let mut ordered: Vec<&PathBuf> = merged_items
+        .keys()
+        .chain(conflicts.iter().map(|(path, _)| path))
+        .chain(our_items.keys())
+        .chain(their_items.keys())
+        .collect();
+    ordered.sort();
+    ordered.dedup();
+    let mut candidates: Vec<DfCandidate> = ordered
+        .windows(2)
+        .filter(|pair| pair[1].starts_with(pair[0]))
+        .filter_map(|pair| {
+            let path = pair[0];
+            let (file_side, file) = match (side_file(our_items, path), side_file(their_items, path))
+            {
+                (Some(file), None) => (MergeSide::Ours, file),
+                (None, Some(file)) => (MergeSide::Theirs, file),
+                _ => return None,
+            };
+            Some(DfCandidate {
+                path: path.clone(),
+                file_side,
+                file,
+                base_file: side_file(base_items, path),
+                // Filled in below, once (and only if) there is a candidate.
+                base_present: false,
+            })
+        })
+        .collect();
+    if !candidates.is_empty() {
+        let mut base_paths: Vec<&PathBuf> = base_items.keys().collect();
+        base_paths.sort();
+        for candidate in &mut candidates {
+            let at = base_paths.partition_point(|path| path.as_path() < candidate.path.as_path());
+            candidate.base_present = base_paths
+                .get(at)
+                .is_some_and(|path| path.starts_with(&candidate.path));
+        }
+    }
+    // The flattening engine's only tree entries are empty-directory markers.
+    let mut no_subtrees = |_: &ObjectHash| Ok(false);
+    resolve_df_conflicts(
+        &mut merged_items,
+        &mut conflicts,
+        candidates,
+        &mut no_subtrees,
+    )?;
+    // Empty-directory entries served the D/F decision; the flat result is
+    // leaves only (it never rebuilds empty trees — registered in MG-03).
+    merged_items.retain(|_, entry| entry.mode != TreeItemMode::Tree);
 
     Ok(ThreeWayMergeResult {
         merged_items,
@@ -5137,7 +6126,17 @@ fn count_item_map_changes(
     paths.extend(after.keys().cloned());
     paths
         .into_iter()
-        .filter(|path| before.get(path) != after.get(path))
+        .filter(|path| {
+            // An empty-directory marker (MG-04's flat view) is not a file: it
+            // reads as ABSENT, so an empty directory turning into a file is
+            // one added file, and a marker on both sides is no change.
+            let file = |entry: Option<&MergeTreeEntry>| {
+                entry
+                    .copied()
+                    .filter(|entry| entry.mode != TreeItemMode::Tree)
+            };
+            file(before.get(path)) != file(after.get(path))
+        })
         .count()
 }
 
@@ -5218,11 +6217,242 @@ fn ensure_no_untracked_conflicts(
 fn write_workdir_file(workdir: &Path, relative: &Path, content: &[u8]) -> Result<(), String> {
     let file_path = workdir.join(relative);
     if let Some(parent) = file_path.parent() {
+        clear_ancestor_files(workdir, relative)?;
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     }
+    // Never write THROUGH a symbolic link: an ignored `foo -> /elsewhere` is
+    // invisible to the untracked scan and would redirect the write outside the
+    // working tree. A symlink sitting exactly at the path is replaced by the
+    // file (as a checkout replaces it).
+    refuse_symlink_components(workdir, relative)?;
+    clear_write_target(&file_path)?;
     fs::write(&file_path, content)
         .map_err(|error| format!("failed to write {}: {error}", file_path.display()))
+}
+
+/// Remove a plain FILE standing where a directory of `relative` must go — the
+/// only shape that reaches here is an IGNORED file (an untracked, non-ignored
+/// one refuses the merge in `ensure_no_untracked_conflicts`, a tracked one is
+/// in this merge's removals, and a symlinked component was refused by
+/// `refuse_symlink_components`). Git replaces such a file with the directory;
+/// without this `create_dir_all` fails mid-write, and on the flattening path
+/// that happens after HEAD has already moved.
+fn clear_ancestor_files(workdir: &Path, relative: &Path) -> Result<(), String> {
+    let mut ancestors: Vec<&Path> = relative.ancestors().skip(1).collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let full = workdir.join(ancestor);
+        match fs::symlink_metadata(&full) {
+            Ok(meta) if !meta.is_dir() && !meta.file_type().is_symlink() => {
+                fs::remove_file(&full).map_err(|error| {
+                    format!(
+                        "failed to replace the file {} with a directory: {error}",
+                        ancestor.display()
+                    )
+                })?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Make `full` writable as a file or a link: a symbolic link there is
+/// unlinked (never followed), and a directory is taken over when it holds
+/// nothing but (nested) empty directories — MG-04's `foo/` giving way back to
+/// the file `foo`, whose tracked files were removed just before, and whose
+/// non-empty case the write preflight already refused.
+fn clear_write_target(full: &Path) -> Result<(), String> {
+    let Ok(meta) = fs::symlink_metadata(full) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        return fs::remove_file(full).map_err(|error| {
+            format!(
+                "failed to replace symbolic link {}: {error}",
+                full.display()
+            )
+        });
+    }
+    if meta.is_dir() {
+        return remove_empty_dir_tree(full).map_err(|error| {
+            format!(
+                "failed to replace directory {} with a file: {error}",
+                full.display()
+            )
+        });
+    }
+    // A regular file is UNLINKED, never truncated in place: Git replaces the
+    // directory entry (verified — after `git merge` rewrites a tracked file
+    // its inode changes and a hard-linked alias elsewhere keeps the old
+    // content and mode), so writing through the old inode would corrupt such
+    // an alias and keep stale permissions.
+    fs::remove_file(full).map_err(|error| format!("failed to replace {}: {error}", full.display()))
+}
+
+/// Refuse to write `relative` if any directory on its way is a symbolic link
+/// (Git: "beyond a symbolic link"). Checked with `symlink_metadata`, never
+/// following the link.
+fn refuse_symlink_components(workdir: &Path, relative: &Path) -> Result<(), String> {
+    let mut current = relative.parent();
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        if fs::symlink_metadata(workdir.join(dir)).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(format!(
+                "refusing to write '{}' through the symbolic link '{}'",
+                relative.display(),
+                dir.display()
+            ));
+        }
+        current = dir.parent();
+    }
+    Ok(())
+}
+
+/// The same check over every path a merge is about to write OR remove, run
+/// BEFORE the first mutation so a refused merge leaves nothing behind. A
+/// symlink on the way is tolerated only when it is itself one of the tracked
+/// paths this merge removes (a symlink `foo` giving way to the directory
+/// `foo/`): removals run first, so by the time `foo/bar` is written the link
+/// is gone. Any other symlink — an ignored `gone -> /elsewhere` above a
+/// historical `gone/file`, say — would make a removal unlink an external file
+/// or a write land outside the working tree, and refuses the merge.
+fn refuse_symlink_traversal(
+    workdir: &Path,
+    writes: &[PathBuf],
+    removals: &[PathBuf],
+) -> Result<(), PullMergeError> {
+    let removed: HashSet<&PathBuf> = removals.iter().collect();
+    let mut cleared: HashSet<PathBuf> = HashSet::new();
+    for path in writes.iter().chain(removals) {
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            if dir.as_os_str().is_empty() || cleared.contains(dir) {
+                break;
+            }
+            if !removed.contains(&dir.to_path_buf())
+                && fs::symlink_metadata(workdir.join(dir))
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err(PullMergeError::WorkdirReset(format!(
+                    "refusing to touch '{}' through the symbolic link '{}'",
+                    path.display(),
+                    dir.display()
+                )));
+            }
+            cleared.insert(dir.to_path_buf());
+            current = dir.parent();
+        }
+    }
+    // A path the merge writes as a FILE while the working tree has a directory
+    // there (MG-04: `foo/` giving way back to the file `foo`) is taken over
+    // only when nothing but this merge's own removals lives inside it —
+    // checked here, before the first mutation, instead of failing mid-write.
+    for path in writes {
+        let full = workdir.join(path);
+        if !fs::symlink_metadata(&full).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        if let Some(blocker) = directory_content_outside(&full, workdir, &removed)? {
+            return Err(PullMergeError::WorkdirReset(format!(
+                "refusing to replace directory '{}' with a file: '{}' is in the way",
+                path.display(),
+                blocker.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The first entry under `dir` that this merge is not going to remove, as a
+/// path relative to `workdir` (`None` when the directory holds nothing else).
+/// Never follows a symbolic link.
+fn directory_content_outside(
+    dir: &Path,
+    workdir: &Path,
+    removed: &HashSet<&PathBuf>,
+) -> Result<Option<PathBuf>, PullMergeError> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current).map_err(|error| {
+            PullMergeError::WorkdirReset(format!(
+                "failed to inspect {}: {error}",
+                current.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                PullMergeError::WorkdirReset(format!(
+                    "failed to inspect {}: {error}",
+                    current.display()
+                ))
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                PullMergeError::WorkdirReset(format!(
+                    "failed to inspect {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                stack.push(entry.path());
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(workdir)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| entry.path());
+            if !removed.contains(&relative) {
+                return Ok(Some(relative));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Remove a directory that holds nothing but (nested) empty directories —
+/// what `foo/a/` looks like once its tracked files are gone. Any file inside
+/// is an error: nothing untracked is ever deleted here.
+fn remove_empty_dir_tree(dir: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "{} is a symbolic link",
+            dir.display()
+        )));
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            remove_empty_dir_tree(&entry.path())?;
+        } else {
+            return Err(std::io::Error::other(format!(
+                "{} is not empty ({} is in the way)",
+                dir.display(),
+                entry.path().display()
+            )));
+        }
+    }
+    fs::remove_dir(dir)
+}
+
+/// After a tracked file is removed, drop the directories it leaves empty (up
+/// to, not including, the working tree root) — as Git's checkout does. A
+/// directory that still holds anything stays.
+fn prune_empty_parents(workdir: &Path, relative: &Path) {
+    let mut current = relative.parent();
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() || fs::remove_dir(workdir.join(dir)).is_err() {
+            break;
+        }
+        current = dir.parent();
+    }
 }
 
 fn conflict_marker_eol() -> &'static str {
@@ -5274,6 +6504,13 @@ fn write_conflict_markers(
                 commit_abbrev
             )
             .into_bytes()
+        }
+        // The directory kept the original path; `path` here is already the
+        // file's `unique_path`, and its content is written verbatim — Git
+        // moves the file, it does not mark it up.
+        ConflictKind::FileDirectory { file, .. } => {
+            let blob: Blob = load_object(&file.hash).map_err(|error| error.to_string())?;
+            blob.data
         }
     };
     write_workdir_file(workdir, path, &content)
@@ -5511,6 +6748,18 @@ fn reset_workdir_tracked_only(
     }
 
     let new_tracked_paths: HashSet<_> = new_index.tracked_files().into_iter().collect();
+    let writes: Vec<PathBuf> = new_tracked_paths
+        .iter()
+        .filter(|path| !is_gitlink_index_path(new_index, path).unwrap_or(false))
+        .cloned()
+        .collect();
+    let removals: Vec<PathBuf> = current_index
+        .tracked_files()
+        .into_iter()
+        .filter(|path| !new_tracked_paths.contains(path))
+        .filter(|path| !is_gitlink_index_path(current_index, path).unwrap_or(false))
+        .collect();
+    refuse_symlink_traversal(&workdir, &writes, &removals)?;
     for path_buf in current_index.tracked_files() {
         if !new_tracked_paths.contains(&path_buf) {
             // A submodule directory is not Libra's to delete, and a gitlink can
@@ -5519,11 +6768,15 @@ fn reset_workdir_tracked_only(
             if is_gitlink_index_path(current_index, &path_buf)? {
                 continue;
             }
-            let full_path = workdir.join(path_buf);
-            if full_path.exists() {
+            let full_path = workdir.join(&path_buf);
+            // `exists()` FOLLOWS symlinks, so a dangling tracked link would
+            // survive and then block the write of a path beneath it (MG-04: a
+            // tracked symlink `foo` giving way to the directory `foo/`).
+            if fs::symlink_metadata(&full_path).is_ok() {
                 fs::remove_file(&full_path).map_err(|error| {
                     PullMergeError::WorkdirReset(format!("failed to remove file: {error}"))
                 })?;
+                prune_empty_parents(&workdir, &path_buf);
             }
         }
     }
@@ -5541,8 +6794,13 @@ fn reset_workdir_tracked_only(
                     path_buf.display()
                 ))
             })?;
-            write_workdir_file(&workdir, &path_buf, &blob.data)
-                .map_err(PullMergeError::WorkdirReset)?;
+            write_workdir_entry(
+                &workdir,
+                &path_buf,
+                index_mode_to_tree_item_mode(entry.mode)?,
+                &blob.data,
+            )
+            .map_err(PullMergeError::WorkdirReset)?;
         }
     }
     Ok(())
@@ -6921,7 +8179,13 @@ mod tree {
             for item in &tree.tree_items {
                 let path = prefix.join(&item.name);
                 if item.mode == TreeItemMode::Tree {
-                    stack.push((path, item.id));
+                    // Like `flat_items_with_empty_dirs`: an empty subtree is
+                    // kept as a directory marker for the D/F decision.
+                    if graph.tree(&item.id).expect("tree").tree_items.is_empty() {
+                        out.push((path, item.id, TreeItemMode::Tree));
+                    } else {
+                        stack.push((path, item.id));
+                    }
                 } else {
                     out.push((path, item.id, item.mode));
                 }
@@ -6997,6 +8261,83 @@ mod tree {
     ) -> HashMap<PathBuf, MergeTreeEntry> {
         super::expand_adopted_subtrees(graph, &mut merged).expect("expand");
         merged
+    }
+
+    /// MG-04, verified against real `git merge` (git@3cb9185f6) on crafted
+    /// trees: an empty-only subtree is "in the way" of the file at the same
+    /// path only when the merge base had NOTHING there — Git defers such a new
+    /// directory and adopts its tree verbatim. With the base holding a file at
+    /// that path, Git traverses the directory, finds no file and leaves the
+    /// file where it is (plain modify/delete). Both walks must agree.
+    #[test]
+    fn an_empty_subtree_is_in_the_way_only_when_the_base_had_nothing_there() {
+        let mut graph = CountingTrees::default();
+        let dir_side = dir(&[
+            ("keep.txt", Node::Blob(1)),
+            ("foo", dir(&[("bar", dir(&[]))])),
+        ]);
+        let theirs = build(&mut graph, &dir_side).0;
+
+        // (1) base has NOTHING at `foo`; ours adds the file → relocation.
+        let base = build(&mut graph, &dir(&[("keep.txt", Node::Blob(1))])).0;
+        let ours = build(
+            &mut graph,
+            &dir(&[("keep.txt", Node::Blob(1)), ("foo", Node::Blob(2))]),
+        )
+        .0;
+        let (flat_merged, flat_conflicts, _) =
+            flat_merge(&mut graph, Some(base), ours, theirs).expect("flat");
+        let (inc, _) = incremental(&mut graph, Some(base), ours, theirs).expect("incremental");
+        assert_eq!(flat_conflicts, vec![PathBuf::from("foo")]);
+        let mut inc_conflicts: Vec<PathBuf> =
+            inc.conflicts.iter().map(|(p, _)| p.clone()).collect();
+        inc_conflicts.sort();
+        assert_eq!(inc_conflicts, vec![PathBuf::from("foo")]);
+        assert!(matches!(
+            inc.conflicts[0].1,
+            super::ConflictKind::FileDirectory {
+                file_side: super::MergeSide::Ours,
+                base_file: None,
+                modify_delete: false,
+                ..
+            }
+        ));
+        assert!(!flat_merged.contains_key(Path::new("foo")));
+        assert!(!expanded(&mut graph, inc.merged).contains_key(Path::new("foo")));
+
+        // (2) base HAS a file at `foo` and ours edits it → no relocation, the
+        // ordinary modify/delete conflict stays at `foo`.
+        let base = build(
+            &mut graph,
+            &dir(&[("keep.txt", Node::Blob(1)), ("foo", Node::Blob(3))]),
+        )
+        .0;
+        let (flat_merged, flat_conflicts, _) =
+            flat_merge(&mut graph, Some(base), ours, theirs).expect("flat");
+        let (inc, _) = incremental(&mut graph, Some(base), ours, theirs).expect("incremental");
+        assert_eq!(flat_conflicts, vec![PathBuf::from("foo")]);
+        assert!(matches!(
+            inc.conflicts[0].1,
+            super::ConflictKind::OursModifiedTheirsDeleted { .. }
+        ));
+        assert!(!flat_merged.contains_key(Path::new("foo")));
+        assert!(!expanded(&mut graph, inc.merged).contains_key(Path::new("foo")));
+
+        // (3) an empty directory at the file's OWN path is not beneath it:
+        // clean, the file survives on both walks.
+        let base = build(&mut graph, &dir(&[("keep.txt", Node::Blob(1))])).0;
+        let theirs_empty = build(
+            &mut graph,
+            &dir(&[("keep.txt", Node::Blob(1)), ("foo", dir(&[]))]),
+        )
+        .0;
+        let (flat_merged, flat_conflicts, _) =
+            flat_merge(&mut graph, Some(base), ours, theirs_empty).expect("flat");
+        let (inc, _) =
+            incremental(&mut graph, Some(base), ours, theirs_empty).expect("incremental");
+        assert!(flat_conflicts.is_empty() && inc.conflicts.is_empty());
+        assert!(flat_merged.contains_key(Path::new("foo")));
+        assert!(expanded(&mut graph, inc.merged).contains_key(Path::new("foo")));
     }
 
     /// A deep subtree shared by base, ours and theirs, plus one file each side
@@ -7540,5 +8881,417 @@ mod tree {
             "reads {} are not a fraction of the {total_trees} trees the flattening path opens",
             graph.reads
         );
+    }
+}
+
+#[cfg(test)]
+mod df {
+    //! MG-04: directory/file collisions.
+    use std::collections::HashMap;
+
+    use git_internal::internal::object::blob::Blob;
+
+    use super::*;
+
+    fn file(content: &str) -> MergeTreeEntry {
+        MergeTreeEntry {
+            hash: Blob::from_content(content).id,
+            mode: TreeItemMode::Blob,
+        }
+    }
+
+    fn marker(byte: u8) -> MergeTreeEntry {
+        MergeTreeEntry {
+            hash: ObjectHash::new(&[byte; 20]),
+            mode: TreeItemMode::Tree,
+        }
+    }
+
+    fn items(entries: &[(&str, MergeTreeEntry)]) -> HashMap<PathBuf, MergeTreeEntry> {
+        entries
+            .iter()
+            .map(|(path, entry)| (PathBuf::from(path), *entry))
+            .collect()
+    }
+
+    fn candidate(path: &str, base_file: Option<MergeTreeEntry>, base_present: bool) -> DfCandidate {
+        DfCandidate {
+            path: PathBuf::from(path),
+            file_side: MergeSide::Ours,
+            file: file("ours\n"),
+            base_file,
+            base_present,
+        }
+    }
+
+    /// No subtree ever needs reading in these fixtures.
+    fn no_subtrees() -> impl FnMut(&ObjectHash) -> Result<bool, PullMergeError> {
+        |_| Ok(false)
+    }
+
+    fn resolve(
+        merged: &mut HashMap<PathBuf, MergeTreeEntry>,
+        conflicts: &mut Vec<(PathBuf, ConflictKind)>,
+        candidates: Vec<DfCandidate>,
+    ) -> isize {
+        let mut reader = no_subtrees();
+        resolve_df_conflicts(merged, conflicts, candidates, &mut reader).expect("resolve")
+    }
+
+    #[test]
+    fn unique_df_path_flattens_the_branch_and_suffixes_taken_names() {
+        let mut taken = HashSet::new();
+        assert_eq!(
+            unique_df_path(Path::new("dir/foo"), "topic/x", &taken),
+            PathBuf::from("dir/foo~topic_x")
+        );
+        taken.insert(PathBuf::from("foo~HEAD"));
+        taken.insert(PathBuf::from("foo~HEAD_0"));
+        assert_eq!(
+            unique_df_path(Path::new("foo"), "HEAD", &taken),
+            PathBuf::from("foo~HEAD_1")
+        );
+    }
+
+    /// The rule measured against real `git merge` (see
+    /// [`directory_is_in_the_way`]): a file beneath the path always blocks it;
+    /// an empty-only subtree blocks it only when the base had nothing there;
+    /// an entry AT the path itself is not beneath it.
+    #[test]
+    fn a_directory_is_in_the_way_exactly_as_git_decides() {
+        let mut reader = no_subtrees();
+        let with_file = [
+            (PathBuf::from("foo"), file("f\n")),
+            (PathBuf::from("foo/bar.txt"), file("b\n")),
+        ];
+        let empty_only = [
+            (PathBuf::from("foo"), file("f\n")),
+            (PathBuf::from("foo/bar"), marker(7)),
+        ];
+        let at_the_path = [(PathBuf::from("foo"), file("f\n"))];
+        for (entries, base_present, expected) in [
+            (&with_file[..], true, true),
+            (&with_file[..], false, true),
+            // Base had a file (or anything) at `foo`: Git traverses the
+            // directory, finds no file, and leaves the file where it is.
+            (&empty_only[..], true, false),
+            // Base had nothing: Git adopts the new subtree verbatim.
+            (&empty_only[..], false, true),
+            (&at_the_path[..], false, false),
+        ] {
+            assert_eq!(
+                directory_is_in_the_way(Path::new("foo"), entries, base_present, &mut reader)
+                    .expect("decide"),
+                expected,
+                "entries {entries:?}, base_present {base_present}"
+            );
+        }
+    }
+
+    /// A carried subtree (the incremental engine's `TreeItemMode::Tree` entry)
+    /// beneath a collision is read to see whether it holds a file.
+    #[test]
+    fn a_carried_subtree_is_read_to_decide_whether_it_holds_a_file() {
+        let entries = [
+            (PathBuf::from("foo"), file("f\n")),
+            (PathBuf::from("foo/sub"), marker(9)),
+        ];
+        let mut reads = Vec::new();
+        let mut holds = |id: &ObjectHash| {
+            reads.push(*id);
+            Ok(true)
+        };
+        assert!(
+            directory_is_in_the_way(Path::new("foo"), &entries, true, &mut holds).expect("decide")
+        );
+        assert_eq!(
+            reads,
+            vec![marker(9).hash],
+            "only the subtree beneath is read"
+        );
+        let mut empty = |_: &ObjectHash| Ok(false);
+        assert!(
+            !directory_is_in_the_way(Path::new("foo"), &entries, true, &mut empty).expect("decide")
+        );
+    }
+
+    /// A modify/delete conflict under a surviving directory is settled into a
+    /// `modify_delete` file/directory conflict (Git: D/F relocation runs
+    /// before the modify/delete branch, so `foo~HEAD` carries stages 1 and 2)
+    /// and PLACED at the unique name; a modify/delete with no directory
+    /// beneath it stays where it is.
+    #[test]
+    fn modify_delete_under_a_surviving_directory_moves_and_keeps_its_report_kind() {
+        let base = file("base\n");
+        let ours = file("edited\n");
+        let mut merged = items(&[("foo/bar.txt", file("b\n")), ("foo~HEAD", file("x\n"))]);
+        let mut conflicts = vec![
+            (
+                PathBuf::from("foo"),
+                ConflictKind::OursModifiedTheirsDeleted { ours: ours.hash },
+            ),
+            (
+                PathBuf::from("other.txt"),
+                ConflictKind::TheirsModifiedOursDeleted {
+                    theirs: file("t\n").hash,
+                },
+            ),
+        ];
+        resolve(
+            &mut merged,
+            &mut conflicts,
+            vec![DfCandidate {
+                path: PathBuf::from("foo"),
+                file_side: MergeSide::Ours,
+                file: ours,
+                base_file: Some(base),
+                base_present: true,
+            }],
+        );
+        assert!(matches!(
+            conflicts[0].1,
+            ConflictKind::FileDirectory {
+                file_side: MergeSide::Ours,
+                modify_delete: true,
+                base_file: Some(b),
+                file: f,
+            } if b == base && f == ours
+        ));
+        let occupied = df_occupied_names(&[], &merged, &conflicts);
+        let placed = conflict_placements(&conflicts, &occupied, "feature");
+        assert_eq!(placed.len(), 2);
+        // `foo~HEAD` is taken by the merge result, so the suffix kicks in.
+        assert_eq!(placed[0].0, PathBuf::from("foo~HEAD_0"));
+        assert_eq!(placed[0].2.as_deref(), Some(Path::new("foo")));
+        // No directory beneath `other.txt`: it stays where it is.
+        assert_eq!(placed[1].0, PathBuf::from("other.txt"));
+        assert!(placed[1].2.is_none());
+        let reports = conflict_reports(&placed);
+        assert_eq!(reports[0].kind, "modify-delete");
+        assert_eq!(reports[1].kind, "modify-delete");
+        assert!(reports[1].original_path.is_none());
+    }
+
+    /// `-X ours/theirs` does not settle a modify/delete under a directory:
+    /// whether the favoured resolution kept the edited file or dropped it, the
+    /// post-pass re-raises Git's conflict at the moved name (verified against
+    /// `git merge -X theirs` / `-X ours`).
+    #[test]
+    fn a_favoured_modify_delete_under_a_directory_stays_a_conflict() {
+        let base = file("base\n");
+        let ours = file("edited\n");
+        let candidate = || DfCandidate {
+            path: PathBuf::from("foo"),
+            file_side: MergeSide::Ours,
+            file: ours,
+            base_file: Some(base),
+            base_present: true,
+        };
+        // `-X theirs`: the deletion won, `foo` is gone from the result.
+        let mut merged = items(&[("foo/bar.txt", file("b\n"))]);
+        let mut conflicts = Vec::new();
+        resolve(&mut merged, &mut conflicts, vec![candidate()]);
+        assert!(matches!(
+            conflicts.as_slice(),
+            [(
+                _,
+                ConflictKind::FileDirectory {
+                    modify_delete: true,
+                    ..
+                }
+            )]
+        ));
+        // `-X ours`: the edited file won and sits in the result.
+        let mut merged = items(&[("foo/bar.txt", file("b\n")), ("foo", ours)]);
+        let mut conflicts = Vec::new();
+        resolve(&mut merged, &mut conflicts, vec![candidate()]);
+        assert!(!merged.contains_key(Path::new("foo")));
+        assert!(matches!(
+            conflicts.as_slice(),
+            [(
+                _,
+                ConflictKind::FileDirectory {
+                    modify_delete: true,
+                    ..
+                }
+            )]
+        ));
+        // Untouched file (equal to the base) replaced by a directory: a clean
+        // deletion, never re-raised.
+        let mut merged = items(&[("foo/bar.txt", file("b\n"))]);
+        let mut conflicts = Vec::new();
+        resolve(
+            &mut merged,
+            &mut conflicts,
+            vec![DfCandidate {
+                path: PathBuf::from("foo"),
+                file_side: MergeSide::Ours,
+                file: base,
+                base_file: Some(base),
+                base_present: true,
+            }],
+        );
+        assert!(conflicts.is_empty());
+    }
+
+    /// Git's `unique_path` treats a DIRECTORY named `foo~HEAD` as taken, and
+    /// so is every INPUT path even when the merge deleted it (verified against
+    /// `git merge`: the file becomes `foo~HEAD_0` in both cases).
+    #[test]
+    fn placements_treat_occupied_directories_and_deleted_inputs_as_taken() {
+        let merged = items(&[
+            ("foo/bar.txt", file("b\n")),
+            ("foo~HEAD/deep/bar.txt", file("t\n")),
+        ]);
+        let conflicts = vec![(
+            PathBuf::from("foo"),
+            ConflictKind::FileDirectory {
+                file: file("f\n"),
+                file_side: MergeSide::Ours,
+                base_file: None,
+                modify_delete: false,
+            },
+        )];
+        let occupied = df_occupied_names(&[], &merged, &conflicts);
+        let placed = conflict_placements(&conflicts, &occupied, "feature");
+        assert_eq!(placed[0].0, PathBuf::from("foo~HEAD_0"));
+        let mut names = occupied_names(merged.keys());
+        assert!(names.remove(Path::new("foo~HEAD")) && names.remove(Path::new("foo~HEAD/deep")));
+        assert!(names.remove(Path::new("foo")) && !names.contains(Path::new("")));
+
+        // A `foo~HEAD` only the base had — deleted on both sides, absent from
+        // the result — still occupies its name.
+        let base = items(&[("foo", file("base\n")), ("foo~HEAD", file("gone\n"))]);
+        let merged = items(&[("foo/bar.txt", file("b\n"))]);
+        let occupied = df_occupied_names(&[&base], &merged, &conflicts);
+        let placed = conflict_placements(&conflicts, &occupied, "feature");
+        assert_eq!(placed[0].0, PathBuf::from("foo~HEAD_0"));
+
+        // Nothing to relocate: the occupancy set is never even built.
+        let plain = vec![(
+            PathBuf::from("foo"),
+            ConflictKind::OursModifiedTheirsDeleted {
+                ours: file("f\n").hash,
+            },
+        )];
+        assert!(df_occupied_names_if_needed(&[&base], &merged, &plain).is_empty());
+        assert!(!df_occupied_names_if_needed(&[&base], &merged, &conflicts).is_empty());
+    }
+
+    /// Codex R3: the post-pass is linear in the candidate count — one slot
+    /// lookup, one sorted view of the result — not a per-candidate walk of the
+    /// conflict list. Thousands of independent file/directory collisions
+    /// resolve in one pass and every one of them moves.
+    #[test]
+    fn resolve_df_conflicts_scales_linearly_with_the_candidate_count() {
+        const N: usize = 4000;
+        let mut merged = HashMap::new();
+        let mut candidates = Vec::with_capacity(N);
+        for i in 0..N {
+            let content = format!("{i}\n");
+            merged.insert(PathBuf::from(format!("d{i}")), file(&content));
+            merged.insert(PathBuf::from(format!("d{i}/leaf.txt")), file("leaf\n"));
+            candidates.push(DfCandidate {
+                path: PathBuf::from(format!("d{i}")),
+                file_side: MergeSide::Ours,
+                file: file(&content),
+                base_file: None,
+                base_present: false,
+            });
+        }
+        let mut conflicts = Vec::new();
+        let delta = resolve(&mut merged, &mut conflicts, candidates);
+        assert_eq!(conflicts.len(), N);
+        assert_eq!(delta, N as isize);
+        assert_eq!(merged.len(), N, "only the leaves remain");
+    }
+
+    /// The post-pass moves a file only when the directory is in the way, and
+    /// reports the delta the incremental engine adds to `files_changed`.
+    #[test]
+    fn resolve_df_conflicts_moves_only_when_the_directory_is_in_the_way() {
+        let mut merged = items(&[("foo", file("f\n")), ("foo/bar.txt", file("b\n"))]);
+        let mut conflicts = Vec::new();
+        let delta = resolve(
+            &mut merged,
+            &mut conflicts,
+            vec![candidate("foo", None, false)],
+        );
+        assert_eq!(delta, 1, "ours' kept file left the result");
+        assert!(!merged.contains_key(Path::new("foo")));
+        assert!(matches!(
+            conflicts.as_slice(),
+            [(
+                path,
+                ConflictKind::FileDirectory {
+                    file_side: MergeSide::Ours,
+                    base_file: None,
+                    modify_delete: false,
+                    ..
+                }
+            )] if path == Path::new("foo")
+        ));
+
+        // Nothing beneath it: the file stays, no conflict, no delta.
+        let mut merged = items(&[("foo", file("f\n"))]);
+        let mut conflicts = Vec::new();
+        let delta = resolve(
+            &mut merged,
+            &mut conflicts,
+            vec![candidate("foo", None, false)],
+        );
+        assert!(merged.contains_key(Path::new("foo")) && conflicts.is_empty() && delta == 0);
+
+        // An empty-only subtree the BASE already had: not in the way.
+        let mut merged = items(&[("foo", file("f\n")), ("foo/bar", marker(3))]);
+        let mut conflicts = Vec::new();
+        resolve(
+            &mut merged,
+            &mut conflicts,
+            vec![candidate("foo", Some(file("base\n")), true)],
+        );
+        assert!(merged.contains_key(Path::new("foo")) && conflicts.is_empty());
+    }
+
+    /// Inside the fold nobody is asked: the file is moved under the temporary
+    /// branch label so the ancestor tree never holds a blob and a subtree
+    /// under one name (`merge-ort.c:4120-4198` at `call_depth > 0`), and the
+    /// occupancy covers names only an input had.
+    #[test]
+    fn relocate_virtual_df_files_uses_the_temporary_branch_labels() {
+        let base = items(&[("keep.txt", file("k\n"))]);
+        let ours = items(&[("keep.txt", file("k\n")), ("foo", file("file\n"))]);
+        let theirs = items(&[("keep.txt", file("k\n")), ("foo/bar.txt", file("bar\n"))]);
+        let mut merged = items(&[
+            ("keep.txt", file("k\n")),
+            ("foo", file("file\n")),
+            ("foo/bar.txt", file("bar\n")),
+        ]);
+        relocate_virtual_df_files(&mut merged, &base, &ours, &theirs);
+        let mut paths: Vec<String> = merged.keys().map(|p| p.display().to_string()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "foo/bar.txt".to_string(),
+                "foo~Temporary merge branch 1".to_string(),
+                "keep.txt".to_string()
+            ]
+        );
+
+        // The mirror image labels the file after the fold's theirs, and a name
+        // only the base had pushes the relocation to `_0`.
+        let base = items(&[
+            ("keep.txt", file("k\n")),
+            ("foo~Temporary merge branch 2", file("gone\n")),
+        ]);
+        let mut merged = items(&[
+            ("keep.txt", file("k\n")),
+            ("foo", file("file\n")),
+            ("foo/bar.txt", file("bar\n")),
+        ]);
+        relocate_virtual_df_files(&mut merged, &base, &theirs, &ours);
+        assert!(merged.contains_key(Path::new("foo~Temporary merge branch 2_0")));
+        assert!(merged.contains_key(Path::new("foo/bar.txt")));
     }
 }

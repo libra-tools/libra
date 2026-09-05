@@ -383,6 +383,67 @@ async fn test_pull_diverged_remote_creates_three_way_merge() {
     assert!(local_repo.path().join("local.txt").exists());
 }
 
+/// MG-04 (Codex R1): pull inherits merge's directory/file handling; under
+/// `--json` the human announcement stays off stdout, the conflict is the
+/// `LBR-CONFLICT-002` envelope on stderr, and the moved file is in place.
+#[test]
+fn test_pull_df_conflict_json_keeps_stdout_clean() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("failed to create local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "initial pull",
+    );
+
+    // Remote: README.md becomes a directory.
+    git(&["rm", "-q", "README.md"], &work_dir);
+    fs::create_dir_all(work_dir.join("README.md")).expect("remote dir");
+    fs::write(work_dir.join("README.md/inside.txt"), "dir\n").expect("remote dir file");
+    git(&["add", "README.md"], &work_dir);
+    git(&["commit", "-m", "README becomes a directory"], &work_dir);
+    git(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    // Local: edit the file.
+    fs::write(local_repo.path().join("README.md"), "edited locally\n").expect("local edit");
+    assert_cli_success(
+        &run_libra_command(&["add", "README.md"], local_repo.path()),
+        "stage local edit",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "local edit", "--no-verify"],
+            local_repo.path(),
+        ),
+        "commit local edit",
+    );
+
+    let output = run_libra_command(&["--json", "pull"], local_repo.path());
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "stdout must stay machine-clean: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error = parse_json_stderr(&output.stderr);
+    assert_eq!(error["error_code"], "LBR-CONFLICT-002");
+    assert!(local_repo.path().join("README.md").is_dir());
+    assert_eq!(
+        fs::read_to_string(local_repo.path().join("README.md~HEAD")).expect("moved file"),
+        "edited locally\n"
+    );
+}
+
 /// `pull --squash` integrates the diverged upstream into the index/worktree but
 /// does not commit, move HEAD, or record merge state; the staged result then
 /// finalizes as an ordinary single-parent commit.

@@ -5401,3 +5401,2040 @@ fn merge_tree_walk_conflicted_dry_run_matches_the_real_conflict_path_under_a_dan
         "the conflict is in the working tree"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MG-04: directory/file (D/F) collisions.
+// ---------------------------------------------------------------------------
+
+/// The D/F fixture: one side keeps (edits, or adds) a FILE `foo`, the other
+/// side replaces it with a DIRECTORY `foo/` with content. `dir_on_theirs`
+/// picks which side grows the directory; `file_in_base` says whether the
+/// merge base already tracked the file (modify/delete + D/F, Git's stages 1+2)
+/// or the file is a one-sided add (pure D/F, stage 2 only). Returns the repo
+/// on `main` with `feature` ready to merge.
+///
+/// Libra's `checkout` cannot flip a path between file and directory yet
+/// (pre-existing, registered in the dev doc), so every switch between the two
+/// sides goes through the `root` branch, which tracks neither.
+fn create_df_conflict_repo(dir_on_theirs: bool, file_in_base: bool) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "other.txt", "0\n", "root");
+    assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+    if file_in_base {
+        commit_file(p, "foo", "base file\n", "base with file foo");
+    }
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    let make_dir = |p: &Path| {
+        if file_in_base {
+            assert_cli_success(&run_libra_command(&["rm", "foo"], p), "drop the file");
+        }
+        std::fs::create_dir_all(p.join("foo")).expect("mkdir foo");
+        std::fs::write(p.join("foo/bar.txt"), "inside the directory\n").expect("bar");
+        assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add dir");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "foo becomes a directory", "--no-verify"],
+                p,
+            ),
+            "dir commit",
+        );
+    };
+    let edit_file = |p: &Path| commit_file(p, "foo", "edited file\n", "foo edited");
+    let switch = |p: &Path, branch: &str| {
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", branch], p), "checkout");
+    };
+    if dir_on_theirs {
+        edit_file(p);
+        switch(p, "feature");
+        make_dir(p);
+    } else {
+        make_dir(p);
+        switch(p, "feature");
+        edit_file(p);
+    }
+    switch(p, "main");
+    repo
+}
+
+/// Run a merge and require Libra's CONFLICT exit — not the 128 an I/O failure
+/// also carries — returning the output for further assertions.
+fn merge_expecting_conflict(p: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let output = run_libra_command_with_stdin_and_env(args, p, "", env);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "a D/F collision conflicts.\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-002", "{stderr}");
+    output
+}
+
+fn index_stage_lines(p: &Path, path: &str) -> Vec<String> {
+    let out = run_libra_command(&["ls-files", "-s"], p);
+    assert_cli_success(&out, "ls-files -s");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.ends_with(&format!("\t{path}")))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// G1 + G3 + G5 + G6: ours EDITED the file, theirs made the DIRECTORY. The
+/// directory keeps `foo`; our file is moved to `foo~HEAD` and recorded there
+/// as Git records it — the D/F relocation runs first, then the modify/delete
+/// branch, so `foo~HEAD` carries the base on stage 1 and ours on stage 2
+/// (git@3cb9185f6 merge-ort.c:4100-4198 then :4374; verified against
+/// `git merge`: `100644 … 1 foo~HEAD` / `100644 … 2 foo~HEAD`), and the merge
+/// prints Git's `CONFLICT (file/directory)` line.
+#[test]
+fn merge_df_conflict_file_on_ours_is_moved_to_head_suffix() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    let output = run_libra_command(&["merge", "feature"], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "a D/F collision conflicts: {stderr}"
+    );
+    assert_eq!(report.error_code, "LBR-CONFLICT-002");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains(
+            "CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD instead."
+        ),
+        "Git's message: {stdout}"
+    );
+    assert!(p.join("foo").is_dir(), "the directory keeps the path");
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo/bar.txt")).expect("dir content"),
+        "inside the directory\n"
+    );
+    assert!(
+        stdout.contains(
+            "CONFLICT (modify/delete): foo~HEAD deleted in feature and modified in HEAD.  Version HEAD of foo~HEAD left in tree."
+        ),
+        "Git's modify/delete line for the MOVED name: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~HEAD")).expect("moved file"),
+        "edited file\n",
+        "our version is left verbatim at the unique path, as Git's line says"
+    );
+    assert!(!p.join("foo").is_file() && index_stage_lines(p, "foo").is_empty());
+    let stages = index_stage_lines(p, "foo~HEAD");
+    assert!(
+        stages.iter().any(|l| l.contains(" 2\t")) && stages.iter().any(|l| l.contains(" 1\t")),
+        "stage 2 (ours) and stage 1 (the base's file), nothing at stage 0/3: {stages:?}"
+    );
+    assert!(
+        !stages
+            .iter()
+            .any(|l| l.contains(" 0\t") || l.contains(" 3\t")),
+        "no stage 0/3 for the moved file: {stages:?}"
+    );
+    let state = read_merge_state(p);
+    assert_eq!(
+        state["conflicted_paths"],
+        serde_json::json!(["foo~HEAD"]),
+        "the unmerged path is the moved file"
+    );
+}
+
+/// G2 + G4: ours made the DIRECTORY, theirs edited the FILE — the file is moved
+/// to `foo~<branch>` on stage 3.
+#[test]
+fn merge_df_conflict_file_on_theirs_is_moved_to_branch_suffix() {
+    let repo = create_df_conflict_repo(false, true);
+    let p = repo.path();
+    let output = merge_expecting_conflict(p, &["merge", "feature"], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains(
+            "CONFLICT (file/directory): directory in the way of foo from feature; moving it to foo~feature instead."
+        ),
+        "{stdout}"
+    );
+    assert!(p.join("foo").is_dir());
+    assert!(
+        stdout.contains(
+            "CONFLICT (modify/delete): foo~feature deleted in HEAD and modified in feature.  Version feature of foo~feature left in tree."
+        ),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~feature")).expect("moved file"),
+        "edited file\n"
+    );
+    let stages = index_stage_lines(p, "foo~feature");
+    assert!(
+        stages.iter().any(|l| l.contains(" 3\t")) && stages.iter().any(|l| l.contains(" 1\t")),
+        "stage 3 (theirs) and stage 1 (base): {stages:?}"
+    );
+    assert_eq!(
+        read_merge_state(p)["conflicted_paths"],
+        serde_json::json!(["foo~feature"])
+    );
+}
+
+/// G7 + G8: `--abort` restores the pre-merge file `foo`, removes the directory
+/// the merge created and the moved `foo~HEAD`, and leaves no merge state.
+#[test]
+fn merge_df_conflict_abort_restores_the_file_and_removes_the_moved_copy() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    let head_before = head_commit(p);
+    merge_expecting_conflict(p, &["merge", "feature"], &[]);
+    assert!(p.join("foo~HEAD").exists() && p.join("foo").is_dir());
+
+    assert_cli_success(&run_libra_command(&["merge", "--abort"], p), "abort");
+    assert_eq!(head_commit(p), head_before);
+    assert!(p.join("foo").is_file(), "foo is a file again");
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo")).expect("foo"),
+        "edited file\n"
+    );
+    assert!(!p.join("foo~HEAD").exists(), "the moved copy is cleaned up");
+    assert!(!p.join(".libra").join("merge-state.json").exists());
+    let status = run_libra_command(&["status", "--short"], p);
+    assert_cli_success(&status, "status");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+        "clean after abort: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+/// The moved file resolves like any unmerged path: staging it lets
+/// `--continue` finish, and the merge commit carries BOTH the directory and
+/// the moved file.
+#[test]
+fn merge_df_conflict_continue_after_staging_the_moved_file() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    merge_expecting_conflict(p, &["merge", "feature"], &[]);
+    assert_cli_success(
+        &run_libra_command(&["add", "foo~HEAD"], p),
+        "stage the moved file",
+    );
+    assert_cli_success(&run_libra_command(&["merge", "--continue"], p), "continue");
+    let listing = run_libra_command(&["ls-tree", "-r", "HEAD"], p);
+    assert_cli_success(&listing, "ls-tree");
+    let listing = String::from_utf8_lossy(&listing.stdout).to_string();
+    assert!(
+        listing.contains("\tfoo/bar.txt") && listing.contains("\tfoo~HEAD"),
+        "{listing}"
+    );
+}
+
+/// Both walks reach the same D/F verdict (the collision pass is shared).
+#[test]
+fn merge_df_conflict_is_identical_on_the_flat_walk() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    // The complete `--dry-run` summaries agree, `files_changed` included
+    // (Codex R3: the incremental count is adjusted when the post-pass moves a
+    // kept file out of the result).
+    let summaries: Vec<serde_json::Value> = [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ]
+    .iter()
+    .map(|env| {
+        let out = run_libra_command_with_stdin_and_env(
+            &["--json", "merge", "--dry-run", "feature"],
+            p,
+            "",
+            env,
+        );
+        assert_eq!(out.status.code(), Some(1));
+        parse_json_stdout(&out)["data"].clone()
+    })
+    .collect();
+    assert_eq!(
+        summaries[0], summaries[1],
+        "both walks preview the same summary"
+    );
+    assert_eq!(
+        summaries[0]["files_changed"], 2,
+        "foo gone from the result + foo/bar.txt"
+    );
+    let output = merge_expecting_conflict(
+        p,
+        &["merge", "feature"],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")],
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("moving it to foo~HEAD instead."),
+        "the flat walk prints the same line"
+    );
+    assert!(p.join("foo").is_dir() && p.join("foo~HEAD").is_file());
+    let stages = index_stage_lines(p, "foo~HEAD");
+    assert!(stages.iter().any(|l| l.contains(" 1	")) && stages.iter().any(|l| l.contains(" 2	")));
+    assert_eq!(
+        read_merge_state(p)["conflicted_paths"],
+        serde_json::json!(["foo~HEAD"])
+    );
+}
+
+/// Pure D/F (no file in the base): ours ADDED `foo`, theirs added `foo/`. Git
+/// records only our side at `foo~HEAD` (stage 2, no stage 1) and prints just
+/// the file/directory line — verified against `git merge`: `AU foo~HEAD`.
+#[test]
+fn merge_df_conflict_added_file_is_moved_with_only_its_own_stage() {
+    let repo = create_df_conflict_repo(true, false);
+    let p = repo.path();
+    let output = merge_expecting_conflict(p, &["merge", "feature"], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains(
+            "CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD instead."
+        ),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~HEAD")).expect("moved file"),
+        "edited file\n",
+        "a one-sided add is written verbatim"
+    );
+    let stages = index_stage_lines(p, "foo~HEAD");
+    assert_eq!(stages.len(), 1, "{stages:?}");
+    assert!(stages[0].contains(" 2\t"), "stage 2 only: {stages:?}");
+    assert!(p.join("foo").is_dir());
+}
+
+/// An UNCHANGED file replaced by a directory on the other side is a clean
+/// deletion, with no D/F message — verified against `git merge` on a divergent
+/// history (`Merge made by the 'ort' strategy`, `delete mode 100644 foo`).
+#[test]
+fn merge_df_unchanged_file_replaced_by_a_directory_merges_cleanly() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "other.txt", "0\n", "root");
+    assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+    commit_file(p, "foo", "base file\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    commit_file(p, "other.txt", "ours\n", "unrelated");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    assert_cli_success(&run_libra_command(&["rm", "foo"], p), "rm");
+    std::fs::create_dir_all(p.join("foo")).expect("dir");
+    std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+    assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "dir", "--no-verify"], p),
+        "dir",
+    );
+    // `checkout` cannot flip foo/ back into a file: go through the hub.
+    assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    let out = run_libra_command(&["merge", "feature"], p);
+    assert_cli_success(&out, "clean");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("CONFLICT"),
+        "no D/F message on a clean deletion"
+    );
+    assert!(p.join("foo").is_dir() && p.join("foo/bar.txt").is_file());
+    assert!(index_stage_lines(p, "foo").is_empty());
+}
+
+/// A directory that merges to NOTHING is not in the way: the file stays put
+/// (Git: "directory no longer in the way"). Ours deletes `foo/` entirely,
+/// theirs adds file `foo` — a plain one-sided add, no conflict.
+#[test]
+fn merge_df_conflict_is_not_raised_when_the_directory_merges_to_nothing() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("foo")).expect("dir");
+    std::fs::write(p.join("foo/bar.txt"), "x\n").expect("bar");
+    assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base with dir", "--no-verify"], p),
+        "base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    // ours: delete the directory
+    std::fs::remove_dir_all(p.join("foo")).expect("rm dir");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage removal");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "drop foo/", "--no-verify"], p),
+        "ours",
+    );
+    // theirs: also delete the directory and add file foo
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    std::fs::remove_dir_all(p.join("foo")).expect("rm dir");
+    std::fs::write(p.join("foo"), "now a file\n").expect("file");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "foo is a file", "--no-verify"], p),
+        "theirs",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    assert_cli_success(&run_libra_command(&["merge", "feature"], p), "clean merge");
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo")).expect("foo"),
+        "now a file\n"
+    );
+}
+
+/// Codex MG-04 R1 (occupied name + nested directory), verified against
+/// `git merge`: a tracked `foo~HEAD/` directory occupies the name, so the moved
+/// file becomes `foo~HEAD_0`; the directory in the way is nested
+/// (`foo/a/bar.txt`), and both `--restart` and `--abort` must put the file
+/// `foo` back where `foo/a/` stood — the emptied directories are pruned rather
+/// than left to block the write.
+#[test]
+fn merge_df_conflict_occupied_name_and_nested_directory_restart_and_abort() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "other.txt", "0\n", "root");
+    assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+    std::fs::create_dir_all(p.join("foo~HEAD")).expect("dir");
+    std::fs::write(p.join("foo~HEAD/bar.txt"), "taken\n").expect("taken");
+    std::fs::write(p.join("foo"), "base file\n").expect("foo");
+    assert_cli_success(
+        &run_libra_command(&["add", "foo", "foo~HEAD/bar.txt"], p),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    commit_file(p, "foo", "edited file\n", "ours edit");
+    assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    assert_cli_success(&run_libra_command(&["rm", "foo"], p), "rm");
+    std::fs::create_dir_all(p.join("foo/a")).expect("nested");
+    std::fs::write(p.join("foo/a/bar.txt"), "nested\n").expect("nested file");
+    assert_cli_success(
+        &run_libra_command(&["add", "foo/a/bar.txt"], p),
+        "add nested",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "nested dir", "--no-verify"], p),
+        "dir",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    let head_before = head_commit(p);
+
+    let out = merge_expecting_conflict(p, &["merge", "feature"], &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains(
+            "CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD_0 instead."
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "CONFLICT (modify/delete): foo~HEAD_0 deleted in feature and modified in HEAD.  Version HEAD of foo~HEAD_0 left in tree."
+        ),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~HEAD_0")).expect("moved"),
+        "edited file\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~HEAD/bar.txt")).expect("occupying dir"),
+        "taken\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo/a/bar.txt")).expect("nested"),
+        "nested\n"
+    );
+    let stages = index_stage_lines(p, "foo~HEAD_0");
+    assert!(
+        stages.iter().any(|l| l.contains(" 1\t")) && stages.iter().any(|l| l.contains(" 2\t")),
+        "{stages:?}"
+    );
+    assert_eq!(
+        read_merge_state(p)["conflicted_paths"],
+        serde_json::json!(["foo~HEAD_0"])
+    );
+
+    // `--restart` re-runs from a restored tree and hits the same collision.
+    let restart = merge_expecting_conflict(p, &["merge", "--restart"], &[]);
+    assert!(String::from_utf8_lossy(&restart.stdout).contains("moving it to foo~HEAD_0 instead."));
+    assert!(p.join("foo~HEAD_0").is_file() && p.join("foo/a/bar.txt").is_file());
+    assert_eq!(
+        read_merge_state(p)["conflicted_paths"],
+        serde_json::json!(["foo~HEAD_0"])
+    );
+
+    assert_cli_success(&run_libra_command(&["merge", "--abort"], p), "abort");
+    assert_eq!(head_commit(p), head_before);
+    assert!(
+        p.join("foo").is_file(),
+        "foo is the file again (foo/a/ was pruned)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo")).expect("foo"),
+        "edited file\n"
+    );
+    assert!(!p.join("foo~HEAD_0").exists());
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~HEAD/bar.txt")).expect("kept"),
+        "taken\n"
+    );
+    let status = run_libra_command(&["status", "--short"], p);
+    assert_cli_success(&status, "status");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+/// Codex MG-04 R1: under `--json` the D/F announcement must not reach stdout —
+/// the conflict travels in the error envelope on stderr, and the merge state is
+/// still written.
+#[test]
+fn merge_df_conflict_json_keeps_stdout_machine_clean() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    let output = merge_expecting_conflict(p, &["--json", "merge", "feature"], &[]);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "stdout must stay machine-clean: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(p.join("foo~HEAD").is_file() && p.join("foo").is_dir());
+    assert_eq!(
+        read_merge_state(p)["conflicted_paths"],
+        serde_json::json!(["foo~HEAD"])
+    );
+}
+
+/// MG-04, verified against real `git merge` (git@3cb9185f6 + `git mktree`):
+/// a directory holding nothing but an EMPTY tree is "in the way" of the file
+/// at the same path only when the merge base had nothing there.
+///
+/// * base has `foo` as a file and ours edits it → Git traverses the new
+///   directory, finds no file, and reports a plain
+///   `CONFLICT (modify/delete): foo` with stages 1 + 2 at `foo` itself;
+/// * base has nothing at `foo` and ours adds it → Git defers the new
+///   directory and adopts its tree verbatim, so the file moves to `foo~HEAD`.
+///
+/// Both walks must agree on both shapes.
+#[test]
+fn merge_df_conflict_empty_subtree_follows_gits_base_presence_rule() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        // (1) the base tracks the file: no relocation.
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        commit_file(p, "foo", "base file\n", "base with file foo");
+        let theirs = craft_commit_with_empty_dir(p, &head_commit(p), true, Some("bar"));
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/feature", &theirs], p),
+            "refs/heads/feature",
+        );
+        commit_file(p, "foo", "edited file\n", "ours edits foo");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            !stdout.contains("file/directory"),
+            "walk {env:?}: an empty-only subtree the base already had is not in the way: {stdout}"
+        );
+        assert!(
+            !p.join("foo~HEAD").exists(),
+            "walk {env:?}: nothing was moved"
+        );
+        let stages = index_stage_lines(p, "foo");
+        assert!(
+            stages.iter().any(|l| l.contains(" 1\t")) && stages.iter().any(|l| l.contains(" 2\t")),
+            "walk {env:?}: the modify/delete stays at `foo`: {stages:?}"
+        );
+        assert_eq!(
+            read_merge_state(p)["conflicted_paths"],
+            serde_json::json!(["foo"])
+        );
+
+        // (2) the base has nothing at `foo`: Git relocates the added file.
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        let theirs = craft_commit_with_empty_dir(p, &head_commit(p), false, Some("bar"));
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/feature", &theirs], p),
+            "refs/heads/feature",
+        );
+        commit_file(p, "foo", "added file\n", "ours adds foo");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains(
+                "CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD instead."
+            ),
+            "walk {env:?}: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo~HEAD")).expect("moved file"),
+            "added file\n"
+        );
+        let stages = index_stage_lines(p, "foo~HEAD");
+        assert_eq!(stages.len(), 1, "walk {env:?}: stage 2 only: {stages:?}");
+        assert!(stages[0].contains(" 2\t"), "walk {env:?}: {stages:?}");
+        assert!(index_stage_lines(p, "foo").is_empty(), "walk {env:?}");
+    }
+}
+
+/// Codex MG-04 R2, verified against `git merge`: a `foo~HEAD` only the merge
+/// base had — deleted on both sides, absent from the result — still occupies
+/// its name (Git's `unique_path` consults every input path), so the moved file
+/// becomes `foo~HEAD_0`. Both walks.
+#[test]
+fn merge_df_conflict_deleted_input_path_still_occupies_its_name() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        std::fs::write(p.join("foo"), "base file\n").expect("foo");
+        std::fs::write(p.join("foo~HEAD"), "gone\n").expect("foo~HEAD");
+        assert_cli_success(&run_libra_command(&["add", "foo", "foo~HEAD"], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "foo~HEAD"], p),
+            "ours drops foo~HEAD",
+        );
+        commit_file(p, "foo", "edited file\n", "ours edit + drop");
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "foo", "foo~HEAD"], p),
+            "theirs drops both",
+        );
+        std::fs::create_dir_all(p.join("foo")).expect("dir");
+        std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+        assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add dir");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "dir", "--no-verify"], p),
+            "dir",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        // An UNTRACKED `foo~HEAD` recreated since is not the merge's to delete
+        // (Codex R3): only paths tracked NOW and absent from the result go.
+        std::fs::write(p.join("foo~HEAD"), "untracked\n").expect("untracked");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("moving it to foo~HEAD_0 instead."),
+            "walk {env:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo~HEAD_0")).expect("moved"),
+            "edited file\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo~HEAD")).expect("untracked survives"),
+            "untracked\n",
+            "walk {env:?}: a path the merge never tracked is left alone"
+        );
+        assert_eq!(
+            read_merge_state(p)["conflicted_paths"],
+            serde_json::json!(["foo~HEAD_0"])
+        );
+    }
+}
+
+/// Codex MG-04 R2, verified against `git merge -X theirs` / `-X ours`: a
+/// strategy option settles content hunks, not a modify/delete under a
+/// directory — the edited file still moves to `foo~HEAD` with stages 1 + 2
+/// and both lines, whichever side `-X` favours.
+#[test]
+fn merge_df_conflict_strategy_option_keeps_the_modify_delete_conflict() {
+    for favour in ["theirs", "ours"] {
+        let repo = create_df_conflict_repo(true, true);
+        let p = repo.path();
+        let output = merge_expecting_conflict(p, &["merge", "-X", favour, "feature"], &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("moving it to foo~HEAD instead.")
+                && stdout.contains(
+                    "CONFLICT (modify/delete): foo~HEAD deleted in feature and modified in HEAD."
+                ),
+            "-X {favour}: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo~HEAD")).expect("moved file"),
+            "edited file\n",
+            "-X {favour}: the edited version is kept, not discarded"
+        );
+        let stages = index_stage_lines(p, "foo~HEAD");
+        assert!(
+            stages.iter().any(|l| l.contains(" 1\t")) && stages.iter().any(|l| l.contains(" 2\t")),
+            "-X {favour}: {stages:?}"
+        );
+        assert!(p.join("foo").is_dir());
+    }
+}
+
+/// Codex MG-04 R2: an IGNORED symlink sitting where the moved file goes is
+/// invisible to the untracked scan; the write must replace the link itself,
+/// never follow it out of the working tree.
+#[cfg(unix)]
+#[test]
+fn merge_df_conflict_replaces_an_ignored_symlink_at_the_moved_name() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(outside.path().join("target.txt"), "outside\n").expect("target");
+    // The ignore rule is committed on main (the fixture tracks `.libraignore`,
+    // so a bare edit would count as a dirty worktree).
+    std::fs::write(p.join(".libraignore"), "foo~HEAD\n").expect("ignore");
+    assert_cli_success(
+        &run_libra_command(&["add", ".libraignore"], p),
+        "add ignore",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ignore foo~HEAD", "--no-verify"], p),
+        "commit ignore",
+    );
+    std::os::unix::fs::symlink(outside.path().join("target.txt"), p.join("foo~HEAD"))
+        .expect("symlink");
+
+    merge_expecting_conflict(p, &["merge", "feature"], &[]);
+    let meta = std::fs::symlink_metadata(p.join("foo~HEAD")).expect("moved file");
+    assert!(
+        meta.file_type().is_file(),
+        "the link was replaced by the file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~HEAD")).expect("moved file"),
+        "edited file\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("target.txt")).expect("outside"),
+        "outside\n",
+        "nothing was written through the link"
+    );
+}
+
+/// Codex MG-04 R2: a merge never writes THROUGH a symlinked directory (Git:
+/// "beyond a symbolic link"). An ignored `foo -> <outside>` would redirect
+/// `foo/bar.txt`; the merge is refused before HEAD, index or the outside
+/// directory change — on both walks.
+#[cfg(unix)]
+#[test]
+fn merge_refuses_to_write_through_an_ignored_symlinked_directory() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        commit_file(p, "other.txt", "ours\n", "unrelated");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::create_dir_all(p.join("foo")).expect("dir");
+        std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+        assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "dir", "--no-verify"], p),
+            "dir",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(p.join(".libraignore"), "foo\n").expect("ignore");
+        assert_cli_success(
+            &run_libra_command(&["add", ".libraignore"], p),
+            "add ignore",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ignore foo", "--no-verify"], p),
+            "commit ignore",
+        );
+        std::os::unix::fs::symlink(outside.path(), p.join("foo")).expect("symlink");
+        let head_before = head_commit(p);
+
+        let output = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert!(
+            !output.status.success(),
+            "walk {env:?}: the merge must be refused"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("symbolic link"), "walk {env:?}: {stderr}");
+        assert_eq!(head_commit(p), head_before, "walk {env:?}: HEAD untouched");
+        assert!(
+            !outside.path().join("bar.txt").exists(),
+            "walk {env:?}: nothing was written outside the working tree"
+        );
+        assert!(
+            index_stage_lines(p, "foo/bar.txt").is_empty(),
+            "walk {env:?}: index untouched"
+        );
+        assert!(!p.join(".libra").join("merge-state.json").exists());
+    }
+}
+
+/// Build a commit whose root tree holds an EMPTY directory `foo` next to the
+/// blobs of `parent`'s tree — a shape no working tree can produce, crafted
+/// through the plumbing. Returns the commit id.
+fn craft_commit_with_empty_dir(
+    p: &Path,
+    parent: &str,
+    drop_foo_blob: bool,
+    nested: Option<&str>,
+) -> String {
+    let raw = |hex: &str| -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect()
+    };
+    let hash_tree = |bytes: &[u8], name: &str| -> String {
+        let path = p.join(name);
+        std::fs::write(&path, bytes).expect("tree bytes");
+        let out = run_libra_command(&["hash-object", "-t", "tree", "-w", "--literally", name], p);
+        assert_cli_success(&out, "hash-object tree");
+        std::fs::remove_file(&path).expect("cleanup");
+        stdout_trimmed(&out)
+    };
+    let empty = hash_tree(b"", ".empty-tree");
+    // The parent's leaves (blobs at the root only in these fixtures).
+    let listing = run_libra_command(&["ls-tree", parent], p);
+    assert_cli_success(&listing, "ls-tree");
+    let mode_of = |meta: &str| meta.split_whitespace().next().expect("mode").to_string();
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let (meta, name) = line.split_once('\t').expect("ls-tree line");
+        if name == "foo" {
+            // The crafted tree provides `foo` itself (as the directory below);
+            // whatever the parent had there — a blob or a directory — is
+            // replaced.
+            assert!(
+                drop_foo_blob || mode_of(meta) == "040000",
+                "`foo` is replaced"
+            );
+            continue;
+        }
+        let mut parts = meta.split_whitespace();
+        let mode = parts.next().expect("mode");
+        let _kind = parts.next();
+        let id = parts.next().expect("id");
+        assert_ne!(mode, "040000", "fixture roots hold blobs beside `foo` only");
+        let mut entry = format!("{} {name}\0", mode.trim_start_matches('0')).into_bytes();
+        entry.extend(raw(id));
+        entries.push((name.to_string(), entry));
+    }
+    // `nested`: `foo/` holds one EMPTY subtree under that name (a directory
+    // that contributes no file); `None` makes `foo` itself the empty tree.
+    let foo_tree = if let Some(name) = nested {
+        let mut child = format!("40000 {name}\0").into_bytes();
+        child.extend(raw(&empty));
+        hash_tree(&child, ".foo-tree")
+    } else {
+        empty.clone()
+    };
+    let mut foo_entry = b"40000 foo\0".to_vec();
+    foo_entry.extend(raw(&foo_tree));
+    // Git orders tree entries by name, a directory as `name/`.
+    entries.push(("foo/".to_string(), foo_entry));
+    entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let root: Vec<u8> = entries.into_iter().flat_map(|(_, bytes)| bytes).collect();
+    let root = hash_tree(&root, ".root-tree");
+    let out = run_libra_command(
+        &[
+            "commit-tree",
+            &root,
+            "-p",
+            parent,
+            "-m",
+            "crafted empty dir",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "commit-tree");
+    stdout_trimmed(&out)
+}
+
+/// Codex MG-04 R3: an empty `foo/` in the BASE next to two different files
+/// `foo` added on either side is an add/add conflict — stages 2 and 3, no
+/// stage 1 (the base's directory marker is not a file) — on both walks.
+#[test]
+fn merge_add_add_conflict_over_an_empty_base_directory_has_no_stage_1() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        let base = craft_commit_with_empty_dir(p, &head_commit(p), false, None);
+        for branch in ["main", "feature"] {
+            assert_cli_success(
+                &run_libra_command(&["update-ref", &format!("refs/heads/{branch}"), &base], p),
+                "branch at the crafted base",
+            );
+        }
+        commit_file(p, "foo", "a\n", "ours adds foo");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(p, "foo", "b\n", "theirs adds foo");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stages = index_stage_lines(p, "foo");
+        assert!(
+            stages.iter().any(|l| l.contains(" 2\t")) && stages.iter().any(|l| l.contains(" 3\t")),
+            "walk {env:?}: {stages:?}"
+        );
+        assert!(
+            !stages.iter().any(|l| l.contains(" 1\t")),
+            "walk {env:?}: the base's empty directory is not a stage: {stages:?}"
+        );
+        assert_eq!(
+            read_merge_state(p)["conflicted_paths"],
+            serde_json::json!(["foo"])
+        );
+    }
+}
+
+/// Codex MG-04 R3 (P2): an empty base directory turning into a file on one
+/// side is one added file — both walks count it, and the merge is clean.
+#[test]
+fn merge_empty_directory_turning_into_a_file_counts_one_change() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        let base = craft_commit_with_empty_dir(p, &head_commit(p), false, None);
+        for branch in ["main", "feature"] {
+            assert_cli_success(
+                &run_libra_command(&["update-ref", &format!("refs/heads/{branch}"), &base], p),
+                "branch at the crafted base",
+            );
+        }
+        commit_file(p, "other.txt", "ours\n", "unrelated");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(p, "foo", "now a file\n", "theirs adds foo");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let preview = run_libra_command_with_stdin_and_env(
+            &["--json", "merge", "--dry-run", "feature"],
+            p,
+            "",
+            env,
+        );
+        assert_cli_success(&preview, "dry-run");
+        let data = parse_json_stdout(&preview)["data"].clone();
+        assert_eq!(data["files_changed"], 1, "walk {env:?}: {data}");
+        assert!(data["would_conflict"].is_null());
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo")).expect("foo"),
+            "now a file\n"
+        );
+    }
+}
+
+/// Codex MG-04 R3: a TRACKED symlink `foo` on ours giving way to theirs'
+/// directory `foo/` is a legitimate transition — the link is one of the paths
+/// the merge removes, so the write of `foo/bar.txt` is allowed, and the link
+/// moves to `foo~HEAD` (stage 2, mode 120000) like any D/F file. Both walks.
+#[cfg(unix)]
+#[test]
+fn merge_df_conflict_tracked_symlink_gives_way_to_a_directory() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::os::unix::fs::symlink("other.txt", p.join("foo")).expect("symlink");
+        assert_cli_success(&run_libra_command(&["add", "foo"], p), "add link");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours: symlink foo", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::create_dir_all(p.join("foo")).expect("dir");
+        std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+        assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add dir");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs: dir foo", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("moving it to foo~HEAD instead."),
+            "walk {env:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            p.join("foo").is_dir() && p.join("foo/bar.txt").is_file(),
+            "walk {env:?}"
+        );
+        let stages = index_stage_lines(p, "foo~HEAD");
+        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
+        assert!(
+            stages[0].starts_with("120000") && stages[0].contains(" 2\t"),
+            "walk {env:?}: the link itself is what moved: {stages:?}"
+        );
+        // Git checks out a real link at the moved name, not its target text.
+        let moved = std::fs::symlink_metadata(p.join("foo~HEAD")).expect("moved link");
+        assert!(
+            moved.file_type().is_symlink(),
+            "walk {env:?}: a symlink moved as a symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(p.join("foo~HEAD")).expect("link target"),
+            std::path::PathBuf::from("other.txt"),
+            "walk {env:?}"
+        );
+    }
+}
+
+/// Codex MG-04 R3: a tracked `gone/file` the merge removes, while the working
+/// tree's `gone` is an IGNORED symlink to a directory outside the repository:
+/// unlinking through the link would delete an external file, so the merge is
+/// refused before anything changes — both walks.
+#[cfg(unix)]
+#[test]
+fn merge_refuses_to_unlink_a_tracked_file_through_an_ignored_symlinked_directory() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        std::fs::write(p.join("other.txt"), "0\n").expect("other");
+        std::fs::create_dir_all(p.join("gone")).expect("dir");
+        std::fs::write(p.join("gone/file"), "keep\n").expect("file");
+        assert_cli_success(
+            &run_libra_command(&["add", "other.txt", "gone/file"], p),
+            "add",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+            "root",
+        );
+        std::fs::write(p.join(".libraignore"), "gone\n").expect("ignore");
+        assert_cli_success(
+            &run_libra_command(&["add", ".libraignore"], p),
+            "add ignore",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ignore gone", "--no-verify"], p),
+            "ignore",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        commit_file(p, "other.txt", "ours\n", "unrelated");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "gone/file"], p),
+            "theirs drops it",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "drop gone/file", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("file"), "keep\n").expect("external file");
+        std::fs::remove_dir_all(p.join("gone")).expect("drop the real dir");
+        std::os::unix::fs::symlink(outside.path(), p.join("gone")).expect("symlink");
+        let head_before = head_commit(p);
+
+        let output = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert!(!output.status.success(), "walk {env:?}: refused");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("symbolic link"), "walk {env:?}: {stderr}");
+        assert_eq!(head_commit(p), head_before, "walk {env:?}: HEAD untouched");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("file")).expect("external file"),
+            "keep\n",
+            "walk {env:?}: nothing outside the working tree was unlinked"
+        );
+        assert!(!p.join(".libra").join("merge-state.json").exists());
+    }
+}
+
+/// Codex MG-04 R3: a hook that plants an IGNORED symlink where the merge will
+/// write is caught by the post-hook traversal recheck — before HEAD moves on
+/// the flat walk, and inherently before HEAD on the incremental walk. Both
+/// hook checkpoints, both walks.
+#[cfg(unix)]
+#[test]
+fn merge_refuses_a_hook_planted_ignored_symlink_before_head_moves() {
+    use std::os::unix::fs::PermissionsExt;
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        for hook_name in ["pre-merge-commit", "commit-msg"] {
+            let repo = create_committed_repo_via_cli();
+            let p = repo.path();
+            commit_file(p, "top.txt", "0\n", "root");
+            assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+            // The ignore rule is ours only, so theirs can still stage the path.
+            std::fs::write(p.join(".libraignore"), "newdir\n").expect("ignore");
+            assert_cli_success(
+                &run_libra_command(&["add", ".libraignore"], p),
+                "add ignore",
+            );
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", "ignore newdir", "--no-verify"], p),
+                "ignore",
+            );
+            commit_file(p, "top.txt", "ours\n", "ours edit");
+            assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+            commit_file(
+                p,
+                "newdir/sub/leaf.txt",
+                "theirs\n",
+                "theirs adds a subtree",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+            let outside = tempfile::tempdir().expect("outside");
+            let hooks = p.join(".libra").join("hooks");
+            std::fs::create_dir_all(&hooks).expect("hooks dir");
+            let hook = hooks.join(hook_name);
+            std::fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\nln -s '{}' \"$LIBRA_WORK_TREE/newdir\"\n",
+                    outside.path().display()
+                ),
+            )
+            .expect("write hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let head_before = head_commit(p);
+
+            let output = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+            assert!(
+                !output.status.success(),
+                "walk {env:?} hook {hook_name}: refused"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("symbolic link"),
+                "walk {env:?} hook {hook_name}: {stderr}"
+            );
+            assert_eq!(
+                head_commit(p),
+                head_before,
+                "walk {env:?} hook {hook_name}: HEAD"
+            );
+            assert!(
+                !outside.path().join("sub").exists(),
+                "walk {env:?} hook {hook_name}: nothing written outside"
+            );
+            assert!(!p.join(".libra").join("merge-state.json").exists());
+        }
+    }
+}
+
+/// Codex MG-04 pre-review: a tracked DANGLING symlink `foo` giving way to
+/// theirs' directory `foo/` must merge cleanly — the removal test may not
+/// follow the link (`exists()` does), or the write of `foo/bar.txt` fails
+/// after the flat engine has already moved HEAD. Verified against
+/// `git merge`: `delete mode 120000 foo` / `create mode 100644 foo/bar.txt`.
+#[cfg(unix)]
+#[test]
+fn merge_dangling_tracked_symlink_gives_way_to_a_directory_cleanly() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        // The hub must predate both shapes: `checkout` cannot flip a path
+        // between a directory and a file/symlink (registered residual).
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        std::os::unix::fs::symlink("does-not-exist", p.join("foo")).expect("dangling link");
+        assert_cli_success(&run_libra_command(&["add", "foo"], p), "add link");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base: dangling link", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        commit_file(p, "other.txt", "ours\n", "ours unrelated");
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "foo"], p),
+            "theirs drops the link",
+        );
+        std::fs::create_dir_all(p.join("foo")).expect("dir");
+        std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+        assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add dir");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs: dir foo", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo/bar.txt")).expect("dir content"),
+            "bar\n",
+            "walk {env:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(p.join("foo"))
+                .expect("foo")
+                .is_dir(),
+            "walk {env:?}: the dangling link gave way"
+        );
+        let status = run_libra_command(&["status", "--short"], p);
+        assert_cli_success(&status, "status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "walk {env:?}: HEAD, index and worktree agree: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+}
+
+/// Codex MG-04 pre-review: when the merge is REFUSED at the moved name (an
+/// untracked `foo~HEAD` would be overwritten) nothing was moved, so — as in
+/// Git — no `CONFLICT (file/directory)` line is printed and no merge state is
+/// left behind.
+#[test]
+fn merge_df_conflict_refused_at_the_moved_name_announces_nothing() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    let head_before = head_commit(p);
+    std::fs::write(p.join("foo~HEAD"), "untracked\n").expect("untracked");
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    assert!(!output.status.success(), "refused");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        !stdout.contains("CONFLICT"),
+        "nothing was moved, so nothing is announced: {stdout}"
+    );
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-002", "{stderr}");
+    assert!(
+        stderr.contains("foo~HEAD"),
+        "the collision is named: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before);
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~HEAD")).expect("untracked survives"),
+        "untracked\n"
+    );
+    assert!(p.join("foo").is_file(), "our file is untouched");
+    assert!(!p.join(".libra").join("merge-state.json").exists());
+}
+
+/// Codex MG-04 pre-review: a directory that must become a FILE while IGNORED
+/// content lives inside it is refused BEFORE the merge mutates anything —
+/// the takeover only ever removes this merge's own tracked files.
+#[test]
+fn merge_refuses_to_replace_a_directory_holding_ignored_content() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        std::fs::write(p.join(".libraignore"), "foo/keep.log\n").expect("ignore");
+        std::fs::create_dir_all(p.join("foo")).expect("dir");
+        std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+        assert_cli_success(
+            &run_libra_command(&["add", ".libraignore", "foo/bar.txt"], p),
+            "add",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base: dir foo", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        commit_file(p, "other.txt", "ours\n", "ours unrelated");
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "foo/bar.txt"], p),
+            "drop the dir",
+        );
+        std::fs::write(p.join("foo"), "now a file\n").expect("file");
+        assert_cli_success(&run_libra_command(&["add", "foo"], p), "add file");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs: foo is a file", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        // An ignored build artefact inside the directory the merge must replace.
+        std::fs::write(p.join("foo/keep.log"), "ignored\n").expect("ignored file");
+        let head_before = head_commit(p);
+
+        let output = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert!(!output.status.success(), "walk {env:?}: refused");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("foo/keep.log"),
+            "walk {env:?}: the blocker is named: {stderr}"
+        );
+        assert_eq!(head_commit(p), head_before, "walk {env:?}: HEAD untouched");
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo/keep.log")).expect("ignored file survives"),
+            "ignored\n",
+            "walk {env:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo/bar.txt")).expect("tracked file survives"),
+            "bar\n",
+            "walk {env:?}: refused before any removal"
+        );
+    }
+}
+
+/// Codex MG-04 pre-review: with more than one conflict the unmerged paths,
+/// the announcement and the `--dry-run` report follow path order, as Git's
+/// sorted `process_entries` output does — the relocated path included.
+#[test]
+fn merge_df_conflict_paths_are_reported_in_path_order() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    // A second, ordinary content conflict on a path sorting BEFORE `foo`.
+    // (Every switch goes through the `root` hub: `checkout` cannot flip `foo`
+    // between a file and a directory.)
+    commit_file(p, "a-shared.txt", "ours\n", "ours edits a-shared");
+    assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "a-shared.txt", "theirs\n", "theirs edits a-shared");
+    assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+    let preview = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
+    assert_eq!(preview.status.code(), Some(1));
+    let json = parse_json_stdout(&preview);
+    assert_eq!(
+        json["data"]["conflicted_paths"],
+        serde_json::json!(["a-shared.txt", "foo~HEAD"]),
+        "{json}"
+    );
+    merge_expecting_conflict(p, &["merge", "feature"], &[]);
+    assert_eq!(
+        read_merge_state(p)["conflicted_paths"],
+        serde_json::json!(["a-shared.txt", "foo~HEAD"])
+    );
+}
+
+/// Codex MG-04 R4: a tracked symlink whose target is not valid UTF-8 relocates
+/// byte-for-byte (link targets are raw bytes), and an EMPTY directory standing
+/// at the moved name is taken over rather than failing after the merge state
+/// was written. Both walks.
+#[cfg(unix)]
+#[test]
+fn merge_df_conflict_moves_a_non_utf8_symlink_over_an_empty_directory() {
+    use std::os::unix::ffi::OsStrExt;
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        let target = std::ffi::OsStr::from_bytes(&[0xff, 0xfe, b'A']);
+        std::os::unix::fs::symlink(target, p.join("foo")).expect("weird link");
+        assert_cli_success(&run_libra_command(&["add", "foo"], p), "add link");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base: non-utf8 link", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        commit_file(p, "other.txt", "ours\n", "ours unrelated");
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "foo"], p),
+            "theirs drops the link",
+        );
+        std::fs::create_dir_all(p.join("foo")).expect("dir");
+        std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+        assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add dir");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs: dir foo", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        // Ours also EDITED the link, so it must move instead of being deleted.
+        std::fs::remove_file(p.join("foo")).expect("drop the link");
+        let edited = std::ffi::OsStr::from_bytes(&[0xff, 0xfe, b'B']);
+        std::os::unix::fs::symlink(edited, p.join("foo")).expect("edited link");
+        assert_cli_success(&run_libra_command(&["add", "foo"], p), "stage the edit");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours: retarget the link", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+        // An EMPTY directory already sits where the link will move.
+        std::fs::create_dir_all(p.join("foo~HEAD")).expect("empty dir at the moved name");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("moving it to foo~HEAD instead."),
+            "walk {env:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let moved = std::fs::read_link(p.join("foo~HEAD")).expect("moved link");
+        assert_eq!(
+            moved.as_os_str().as_bytes(),
+            &[0xff, 0xfe, b'B'],
+            "walk {env:?}: the raw target survives"
+        );
+        let stages = index_stage_lines(p, "foo~HEAD");
+        assert!(
+            stages.iter().any(|line| line.starts_with("120000")),
+            "walk {env:?}: {stages:?}"
+        );
+    }
+}
+
+/// Codex MG-04 R4, verified against `git merge`: an IGNORED file standing at
+/// the moved name is expendable — Git replaces it (only *untracked,
+/// non-ignored* files refuse the merge), and Libra follows.
+#[test]
+fn merge_df_conflict_replaces_an_ignored_file_at_the_moved_name_like_git() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    std::fs::write(p.join(".libraignore"), "foo~HEAD\n").expect("ignore");
+    assert_cli_success(
+        &run_libra_command(&["add", ".libraignore"], p),
+        "add ignore",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ignore the moved name", "--no-verify"], p),
+        "commit ignore",
+    );
+    std::fs::write(p.join("foo~HEAD"), "expendable\n").expect("ignored file");
+
+    let output = merge_expecting_conflict(p, &["merge", "feature"], &[]);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("moving it to foo~HEAD instead."),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~HEAD")).expect("moved file"),
+        "edited file\n",
+        "as in Git, an ignored file at the moved name is replaced"
+    );
+}
+
+/// Codex MG-04 R5: `--abort` removes a moved DANGLING symlink. The restored
+/// index does not track the moved name, so nothing else would ever clean it
+/// up, and `is_file()` follows the link and reports false for a dangling one.
+#[cfg(unix)]
+#[test]
+fn merge_df_conflict_abort_removes_a_moved_dangling_symlink() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        std::os::unix::fs::symlink("does-not-exist", p.join("foo")).expect("dangling link");
+        assert_cli_success(&run_libra_command(&["add", "foo"], p), "add link");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base: dangling link", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        // Ours retargets the link, so it must MOVE rather than be deleted.
+        std::fs::remove_file(p.join("foo")).expect("drop");
+        std::os::unix::fs::symlink("still-missing", p.join("foo")).expect("retarget");
+        assert_cli_success(&run_libra_command(&["add", "foo"], p), "stage retarget");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours: retarget", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "foo"], p),
+            "theirs drops the link",
+        );
+        std::fs::create_dir_all(p.join("foo")).expect("dir");
+        std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+        assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add dir");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs: dir foo", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        let head_before = head_commit(p);
+
+        merge_expecting_conflict(p, &["merge", "feature"], env);
+        assert!(
+            std::fs::symlink_metadata(p.join("foo~HEAD"))
+                .expect("moved link")
+                .file_type()
+                .is_symlink(),
+            "walk {env:?}"
+        );
+        assert_cli_success(&run_libra_command(&["merge", "--abort"], p), "abort");
+        assert_eq!(head_commit(p), head_before, "walk {env:?}");
+        assert!(
+            std::fs::symlink_metadata(p.join("foo~HEAD")).is_err(),
+            "walk {env:?}: the moved dangling link is cleaned up"
+        );
+        let status = run_libra_command(&["status", "--short"], p);
+        assert_cli_success(&status, "status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "walk {env:?}: clean after abort: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+}
+
+/// Codex MG-04 R5, verified against `git merge`: rewriting a tracked file
+/// REPLACES the directory entry (a new inode), so a hard link to the old
+/// content elsewhere keeps its own bytes instead of being truncated in place.
+#[cfg(unix)]
+#[test]
+fn merge_replaces_the_directory_entry_of_a_rewritten_file() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "tracked.txt", "base\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    commit_file(p, "other.txt", "ours\n", "ours unrelated");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "tracked.txt", "theirs\n", "theirs rewrites it");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    let alias_dir = tempfile::tempdir().expect("alias dir");
+    let alias = alias_dir.path().join("alias.txt");
+    std::fs::hard_link(p.join("tracked.txt"), &alias).expect("hard link");
+
+    assert_cli_success(&run_libra_command(&["merge", "feature"], p), "clean merge");
+    assert_eq!(
+        std::fs::read_to_string(p.join("tracked.txt")).expect("merged file"),
+        "theirs\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&alias).expect("alias"),
+        "base\n",
+        "the merge replaced the entry instead of truncating the shared inode"
+    );
+}
+
+/// Codex MG-04 R6: the flat engine's own flattener (which keeps empty
+/// subtrees as markers) must report a missing nested tree as repository
+/// corruption instead of panicking, and refuse before HEAD moves.
+#[test]
+fn merge_flat_walk_reports_a_missing_nested_tree_instead_of_panicking() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "top.txt", "0\n", "root");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    commit_file(p, "ours.txt", "ours\n", "ours edit");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(
+        p,
+        "newdir/sub/leaf.txt",
+        "theirs\n",
+        "theirs adds a subtree",
+    );
+    let nested = run_libra_command(&["rev-parse", "HEAD:newdir/sub"], p);
+    assert_cli_success(&nested, "rev-parse the nested tree");
+    let nested_id = stdout_trimmed(&nested);
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    let object = p
+        .join(".libra")
+        .join("objects")
+        .join(&nested_id[..2])
+        .join(&nested_id[2..]);
+    assert!(object.exists(), "loose object: {}", object.display());
+    std::fs::remove_file(&object).expect("simulate corruption");
+    let head_before = head_commit(p);
+
+    let output = run_libra_command_with_stdin_and_env(
+        &["merge", "feature"],
+        p,
+        "",
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")],
+    );
+    assert!(!output.status.success(), "the merge is refused");
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(
+        report.error_code, "LBR-REPO-002",
+        "a missing tree is repository corruption, not a panic: {stderr}"
+    );
+    assert!(
+        stderr.contains(&nested_id),
+        "the unreadable tree is named: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before, "HEAD never moved");
+    assert!(!p.join("newdir").exists());
+}
+
+/// Codex MG-04 R7: every merge write carries the entry's TYPE and MODE — a
+/// tracked symlink stays a symlink and an executable keeps `0755` — on the
+/// clean path, through `--abort`, and on both walks. (This also closes the
+/// residual MG-03 registered: merge's checkout writer used to leave the
+/// executable bit and symlink targets to whatever was already on disk.)
+#[cfg(unix)]
+#[test]
+fn merge_preserves_symlinks_and_executable_bits_when_it_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "target.txt", "target\n", "root");
+        std::fs::write(p.join("tool.sh"), "#!/bin/sh\necho ours\n").expect("tool");
+        std::fs::set_permissions(p.join("tool.sh"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        std::os::unix::fs::symlink("target.txt", p.join("link")).expect("symlink");
+        assert_cli_success(&run_libra_command(&["add", "tool.sh", "link"], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base: link + script", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        commit_file(p, "ours.txt", "ours\n", "ours unrelated");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        // Theirs rewrites the script (same mode) so the merge must write it.
+        std::fs::write(p.join("tool.sh"), "#!/bin/sh\necho theirs\n").expect("tool");
+        assert_cli_success(&run_libra_command(&["add", "tool.sh"], p), "add tool");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "theirs rewrites the script", "--no-verify"],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        // A mode-only change is invisible to `status` (a pre-existing gap), so
+        // the merge still runs — and its write must restore `0755` from the
+        // entry rather than inherit whatever is on disk.
+        std::fs::set_permissions(p.join("tool.sh"), std::fs::Permissions::from_mode(0o600))
+            .expect("chmod down");
+
+        assert_cli_success(
+            &run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env),
+            "clean merge",
+        );
+        let script = std::fs::metadata(p.join("tool.sh")).expect("script");
+        assert_eq!(
+            script.permissions().mode() & 0o777,
+            0o755,
+            "walk {env:?}: the executable bit is written, not inherited"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("tool.sh")).expect("script"),
+            "#!/bin/sh\necho theirs\n"
+        );
+        let link = std::fs::symlink_metadata(p.join("link")).expect("link");
+        assert!(
+            link.file_type().is_symlink(),
+            "walk {env:?}: a tracked symlink is written as a symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(p.join("link")).expect("target"),
+            std::path::PathBuf::from("target.txt"),
+            "walk {env:?}"
+        );
+        let listing = run_libra_command(&["ls-files", "-s"], p);
+        assert_cli_success(&listing, "ls-files");
+        let listing = String::from_utf8_lossy(&listing.stdout).to_string();
+        assert!(
+            listing.contains("100755") && listing.contains("120000"),
+            "walk {env:?}: the index keeps both modes: {listing}"
+        );
+    }
+}
+
+/// Codex MG-04 R8: when the directory is NOT in the way (an empty-only
+/// subtree the base already had) the surviving file must not end up beside a
+/// leftover subtree entry — the result tree would carry a blob and a directory
+/// under one name. Theirs REPLACES the base's empty `foo/bar` with an equally
+/// empty `foo/baz`, so the incremental walk records a fresh subtree beneath
+/// the file ours keeps. Both walks must produce the same tree: only `foo`.
+#[test]
+fn merge_keeps_only_the_file_when_an_empty_subtree_is_not_in_the_way() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        let root = head_commit(p);
+        // base: `foo/` holding one empty subtree; ours: a file at `foo`.
+        let base = craft_commit_with_empty_dir(p, &root, false, Some("bar"));
+        for branch in ["main", "feature"] {
+            assert_cli_success(
+                &run_libra_command(&["update-ref", &format!("refs/heads/{branch}"), &base], p),
+                "branch at the crafted base",
+            );
+        }
+        commit_file(p, "foo", "ours file\n", "ours puts a file at foo");
+        // theirs: the same shape with a DIFFERENT empty subtree name.
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        let theirs = craft_commit_with_empty_dir(p, &base, false, Some("baz"));
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/feature", &theirs], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        let listing = run_libra_command(&["ls-tree", "-r", "-t", "HEAD"], p);
+        assert_cli_success(&listing, "ls-tree");
+        let listing = String::from_utf8_lossy(&listing.stdout).to_string();
+        let foo_entries: Vec<&str> = listing
+            .lines()
+            .filter(|line| line.ends_with("\tfoo") || line.contains("\tfoo/"))
+            .collect();
+        assert_eq!(
+            foo_entries.len(),
+            1,
+            "walk {env:?}: exactly one entry at `foo`, and it is the file: {foo_entries:?}"
+        );
+        assert!(
+            foo_entries[0].starts_with("100644") && foo_entries[0].ends_with("\tfoo"),
+            "walk {env:?}: {foo_entries:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo")).expect("foo"),
+            "ours file\n",
+            "walk {env:?}"
+        );
+    }
+}
+
+/// Codex MG-04 R9, verified against `git merge`: an IGNORED regular file
+/// standing where a merged directory must go is replaced by that directory
+/// (git: `create mode 100644 foo/bar.txt`, `foo` becomes a directory). Without
+/// clearing it, `create_dir_all` fails mid-write — and on the flat engine that
+/// happens after HEAD has already moved.
+#[test]
+fn merge_replaces_an_ignored_file_standing_where_a_directory_must_go() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        std::fs::write(p.join(".libraignore"), "foo\n").expect("ignore");
+        assert_cli_success(
+            &run_libra_command(&["add", ".libraignore"], p),
+            "add ignore",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ignore foo", "--no-verify"], p),
+            "ignore",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        commit_file(p, "other.txt", "ours\n", "ours unrelated");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::create_dir_all(p.join("foo")).expect("dir");
+        std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+        // A tracked SYMLINK beneath the same directory: its writer takes the
+        // other branch and needs the same ancestor rule (Codex R10).
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("bar.txt", p.join("foo/link")).expect("link");
+        #[cfg(unix)]
+        let staged = ["add", "-f", "foo/bar.txt", "foo/link"];
+        #[cfg(not(unix))]
+        let staged = ["add", "-f", "foo/bar.txt"];
+        assert_cli_success(&run_libra_command(&staged, p), "add the ignored path");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "theirs adds foo/bar.txt", "--no-verify"],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        // `main` never had `foo/`, so checkout already removed it; put an
+        // IGNORED file exactly where the merge must create the directory.
+        let _ = std::fs::remove_dir_all(p.join("foo"));
+        std::fs::write(p.join("foo"), "expendable\n").expect("ignored file in the way");
+        let head_before = head_commit(p);
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_ne!(
+            head_commit(p),
+            head_before,
+            "walk {env:?}: the merge completed"
+        );
+        assert!(
+            p.join("foo").is_dir(),
+            "walk {env:?}: the ignored file gave way to the directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("foo/bar.txt")).expect("merged file"),
+            "bar\n",
+            "walk {env:?}"
+        );
+        let status = run_libra_command(&["status", "--short"], p);
+        assert_cli_success(&status, "status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "walk {env:?}: HEAD, index and worktree agree: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+}
+
+/// G9 + G10: `--dry-run` reports a D/F collision as a conflict (exit 1) and the
+/// JSON names its category, the path the file would move to, and the original.
+#[test]
+fn merge_dry_run_reports_a_df_conflict_with_its_kind() {
+    let repo = create_df_conflict_repo(true, true);
+    let p = repo.path();
+    let head_before = head_commit(p);
+    let out = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
+    assert_eq!(out.status.code(), Some(1), "would-conflict preview exits 1");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert_eq!(json["data"]["would_conflict"], true);
+    assert_eq!(
+        json["data"]["conflicted_paths"],
+        serde_json::json!(["foo~HEAD"])
+    );
+    assert_eq!(
+        json["data"]["conflict_kinds"],
+        serde_json::json!([{"path": "foo~HEAD", "kind": "modify-delete", "original_path": "foo"}]),
+        "an edited file under a directory is Git's modify/delete at the moved path: {json}"
+    );
+    assert_eq!(head_commit(p), head_before);
+    assert!(!p.join("foo~HEAD").exists(), "a preview writes nothing");
+    assert!(p.join("foo").is_file(), "the working tree is untouched");
+    assert!(!p.join(".libra").join("merge-state.json").exists());
+
+    // A one-sided add under a directory is the pure file/directory kind.
+    let repo = create_df_conflict_repo(true, false);
+    let p = repo.path();
+    let out = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
+    assert_eq!(out.status.code(), Some(1));
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["conflict_kinds"],
+        serde_json::json!([{"path": "foo~HEAD", "kind": "file-directory", "original_path": "foo"}]),
+        "{json}"
+    );
+    assert!(!p.join("foo~HEAD").exists() && p.join("foo").is_file());
+}
+
+/// The category field also distinguishes ordinary conflicts.
+#[test]
+fn merge_dry_run_reports_content_conflict_kind() {
+    let temp_repo = create_diverged_repo_for_conflict();
+    let p = temp_repo.path();
+    let out = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
+    assert_eq!(out.status.code(), Some(1));
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["conflict_kinds"],
+        serde_json::json!([{"path": "shared.txt", "kind": "content"}]),
+        "{json}"
+    );
+}
+
+/// A D/F collision INSIDE the recursive fold (criss-cross whose two bases
+/// disagree about `foo` being a file or a directory) is settled the way Git
+/// settles it at `call_depth > 0`: the file moves to
+/// `foo~Temporary merge branch N` in the virtual ancestor, so the outer merge
+/// sees an ancestor that never had a file at `foo` — our re-created `foo`
+/// survives as a one-sided add instead of being "deleted by theirs".
+#[test]
+fn merge_crisscross_df_collision_inside_the_fold_moves_the_file_like_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "base.txt", "root\n", "root");
+    // Codex R3: names only the ROOT had — deleted by both folded sides — still
+    // occupy the fold's temporary-branch names (Git's `unique_path` consults
+    // every input), so the relocated file must take `…_0` in the ancestor.
+    // Both labels are planted because the fold's ours/theirs order follows the
+    // bases' ids.
+    for label in ["1", "2"] {
+        std::fs::write(
+            p.join(format!("foo~Temporary merge branch {label}")),
+            "gone\n",
+        )
+        .expect("planted name");
+    }
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "add",
+                "foo~Temporary merge branch 1",
+                "foo~Temporary merge branch 2",
+            ],
+            p,
+        ),
+        "add planted",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "plant temporary names", "--no-verify"], p),
+        "plant",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+    // a: file `foo`; b: directory `foo/`. (Switching between them goes through
+    // `root`: `checkout` cannot flip a path between file and directory yet.)
+    assert_cli_success(&run_libra_command(&["checkout", "-b", "a"], p), "a");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "rm",
+                "foo~Temporary merge branch 1",
+                "foo~Temporary merge branch 2",
+            ],
+            p,
+        ),
+        "a drops the planted names",
+    );
+    commit_file(p, "foo", "file\n", "a: file foo");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    assert_cli_success(&run_libra_command(&["checkout", "-b", "b"], p), "b");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "rm",
+                "foo~Temporary merge branch 1",
+                "foo~Temporary merge branch 2",
+            ],
+            p,
+        ),
+        "b drops the planted names",
+    );
+    std::fs::create_dir_all(p.join("foo")).expect("dir");
+    std::fs::write(p.join("foo/bar.txt"), "bar\n").expect("bar");
+    assert_cli_success(&run_libra_command(&["add", "foo/bar.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "b: dir foo", "--no-verify"], p),
+        "b commit",
+    );
+    // Criss-cross: x = a + b (D/F resolved by keeping foo~HEAD), y = b + a.
+    for (from, tip, other, moved) in [("a", "x", "b", "foo~HEAD"), ("b", "y", "a", "foo~a")] {
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", from], p), "from");
+        assert_cli_success(&run_libra_command(&["checkout", "-b", tip], p), "tip");
+        // The criss-cross merges themselves hit the D/F collision.
+        merge_expecting_conflict(p, &["merge", other], &[]);
+        assert_cli_success(&run_libra_command(&["add", moved], p), "stage moved");
+        assert_cli_success(&run_libra_command(&["merge", "--continue"], p), "continue");
+    }
+    // x': drop the directory and put the file back at `foo`.
+    assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "x");
+    assert_cli_success(&run_libra_command(&["rm", "foo/bar.txt"], p), "rm dir file");
+    assert_cli_success(&run_libra_command(&["rm", "foo~HEAD"], p), "rm moved");
+    let _ = std::fs::remove_dir(p.join("foo"));
+    std::fs::write(p.join("foo"), "file\n").expect("file again");
+    // x' also re-adds the planted names: against a correct ancestor (which
+    // holds `…_0`, not these names) they are one-sided adds; against a wrong
+    // one they would be modify/delete conflicts.
+    for label in ["1", "2"] {
+        std::fs::write(p.join(format!("foo~Temporary merge branch {label}")), "x\n")
+            .expect("re-add");
+    }
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "add",
+                "foo",
+                "foo~Temporary merge branch 1",
+                "foo~Temporary merge branch 2",
+            ],
+            p,
+        ),
+        "stage",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "x: file foo again", "--no-verify"], p),
+        "x commit",
+    );
+    // y': an unrelated edit so y is not an ancestor of x.
+    assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+    assert_cli_success(&run_libra_command(&["checkout", "y"], p), "y");
+    commit_file(p, "base.txt", "y\n", "y edit");
+    assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "x");
+
+    let out = run_libra_command(&["merge", "y"], p);
+    assert_cli_success(&out, "the outer merge is clean");
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo")).expect("foo"),
+        "file\n",
+        "the file we re-created is a one-sided add against the virtual ancestor"
+    );
+    assert!(!p.join("foo").is_dir());
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo~a")).expect("foo~a"),
+        "file\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("base.txt")).expect("base"),
+        "y\n"
+    );
+    for label in ["1", "2"] {
+        assert_eq!(
+            std::fs::read_to_string(p.join(format!("foo~Temporary merge branch {label}")))
+                .expect("re-added name"),
+            "x\n",
+            "the fold took `…_0` for its relocation, leaving this name to x'"
+        );
+    }
+    let parents = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+    assert_cli_success(&parents, "cat-file");
+    assert_eq!(
+        String::from_utf8_lossy(&parents.stdout)
+            .lines()
+            .filter(|l| l.starts_with("parent "))
+            .count(),
+        2
+    );
+}

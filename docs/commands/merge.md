@@ -60,6 +60,20 @@ For a merge with **several merge bases** the value is read before the merge runs
 
 The config is honored by both `libra merge` and `libra cherry-pick` for line-level text conflicts. Binary and modify/delete conflicts keep their two-part whole-file presentation (Git also emits no base block there), and `libra rebase` currently renders whole-file markers without a base block regardless of this setting.
 
+### Directory/file collisions (D/F conflicts)
+
+When one side keeps (or edits) a **file** `foo` while the other side turns `foo` into a **directory** — deleting the file and adding paths beneath `foo/` — the two cannot share one path. Libra follows Git's recursive strategy (`merge-ort.c`, `unique_path`): the directory keeps `foo`, and the file is written under a unique name derived from the branch that holds it — `foo~HEAD` when the file is ours, `foo~<branch>` (with `/` in the branch name replaced by `_`) when it is theirs; if that name is already used by any input of the merge or by its result — as a file *or* as a directory, and a path only the merge base had counts too, exactly the set Git's `unique_path` checks — `_0`, `_1`, … is appended. The merge stops as a conflict (`LBR-CONFLICT-002`) and prints Git's line first:
+
+```text
+CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD instead.
+```
+
+The moved file is the unmerged path: the index records it at the new name with the file's own side on stage 2 (ours) or stage 3 (theirs) and, when the merge base tracked a file at `foo`, that file on stage 1; there is no stage 0 entry, and `merge-state.json` lists the new name in `conflicted_paths`. The directory's contents merge normally. Two shapes exist, both as in Git: a file only one side *added* is a pure file/directory conflict — written verbatim at the new name, reported as `file-directory` by `--dry-run`; a file the merge base tracked and the file side *edited* is a modify/delete conflict that merely moves — the new name carries the base (stage 1) and the editing side, `--dry-run` reports it as `modify-delete` with `original_path`, Git's second line is printed too (`CONFLICT (modify/delete): foo~HEAD deleted in <branch> and modified in HEAD.  Version HEAD of foo~HEAD left in tree.`), and the file is left verbatim at the new name, as that line says. A file one side left untouched while the other replaced it with a directory is a plain clean deletion: no conflict, no message. A directory holding nothing but *empty* trees counts as in the way only when the merge base had nothing at that path — Git adopts such a new directory verbatim, while a directory the base already had is traversed, found to contain no file, and leaves the file where it is (a plain modify/delete). Both cases match `git merge` on crafted trees. Under `--json`/`--machine` none of these lines is printed: stdout stays machine-clean and the conflict is the error envelope on stderr. A strategy option (`-X ours` / `-X theirs`) settles content hunks only: a modify/delete under a directory stays a conflict, as in Git. The merge never writes or deletes *through* a symbolic link in the working tree — an ignored `foo -> elsewhere` standing where `foo/…` must be written, or above a tracked file the merge removes, refuses the whole merge before anything changes — while a symlink sitting exactly where the moved file goes is replaced by the file, and a *tracked* symlink `foo` giving way to a directory `foo/` moves to `foo~HEAD` like any file. Only paths the merge tracks right now are ever removed: an untracked file that happens to carry a historical name stays. Resolve it by editing the `foo~…` file if you want to keep it, staging it with `libra add foo~…` and running `libra merge --continue`; or run `libra merge --abort`, which restores `foo` as it was before the merge and removes both the moved copy and the directory the merge created (directories the merge emptied are pruned, so a nested `foo/a/` never blocks the file's return). Discarding the moved file instead of keeping it is not yet possible: `libra rm` does not accept an unmerged path, so the only way to end up without it is `--abort` (Git resolves that case with `git rm foo~HEAD`).
+
+A directory that merges to *nothing* (every entry beneath it was deleted by the file's side and untouched by the other) is not in the way: the file keeps its path, as in Git. Inside a recursive criss-cross fold (see above) the same rule applies without asking: the file moves to `foo~Temporary merge branch 1` (or `2`) in the virtual ancestor, exactly as Git does at `call_depth > 0`, so the ancestor tree never holds a blob and a subtree under one name.
+
+Only collisions between the two sides' *tracked* contents are handled here. An **untracked** `foo` or `foo~HEAD` in the working tree that the merge would overwrite is refused up front by the existing untracked-overwrite check. An **ignored** file is expendable and gets replaced, exactly as `git merge` treats it — whether it sits at one of these names or where the merge has to create a directory. If you keep something precious under an ignore rule at a path a merge may write, it is not protected. Collisions created by rename detection are out of scope until rename support lands.
+
 ### History-changing merge defaults
 
 When the corresponding CLI flag is absent, Libra reads these Git-compatible defaults through the local → global → system cascade:
@@ -174,9 +188,9 @@ Outcomes and exit codes:
 | Fast-forward possible | `Would fast-forward` | 0 |
 | Already up to date | `Already up to date.` | 0 |
 | Clean three-way/ours merge | `Would merge cleanly by the '<strategy>' strategy.` | 0 |
-| Would conflict | `Would conflict in: <paths>` | 1 |
+| Would conflict | `Would conflict in: <paths>` (a directory/file collision is listed under the `~`-suffixed name the file would be moved to) | 1 |
 
-The would-conflict exit of 1 is an outcome signal (like `merge-file` and `diff --exit-code`), deliberately distinct from the 128 a *real* conflicting merge exits with — the preview itself succeeded. With `--json`/`--machine` the summary carries `"dry_run": true` and, when conflicting, `"would_conflict": true` plus `conflicted_paths`; both keys are absent from every real merge's output (frozen schema).
+The would-conflict exit of 1 is an outcome signal (like `merge-file` and `diff --exit-code`), deliberately distinct from the 128 a *real* conflicting merge exits with — the preview itself succeeded. With `--json`/`--machine` the summary carries `"dry_run": true` and, when conflicting, `"would_conflict": true` plus `conflicted_paths` and `conflict_kinds` — one `{"path", "kind", "original_path"?}` object per conflicted path, `kind` being `content`, `modify-delete` or `file-directory`, with `original_path` present only for a directory/file move (the path the file held before; `path` is then the `~`-suffixed name it would be written to, and `conflicted_paths` lists that same name). All of these keys are absent from every real merge's output (frozen schema).
 
 ## Human Output
 
@@ -239,7 +253,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 
 `-s ours` uses `strategy: "ours"`, `files_changed: 0`, and reports both parents. Already-up-to-date merges use `strategy: "already-up-to-date"`, `commit: null`, `files_changed: 0`, and `up_to_date: true`.
 
-`--abort` sets `aborted: true`; `--continue` sets `continued: true`. Conflict failures return an error envelope on stderr with `LBR-CONFLICT-002`.
+`--abort` sets `aborted: true`; `--continue` sets `continued: true`. Conflict failures return an error envelope on stderr with `LBR-CONFLICT-002`. `--dry-run` adds `dry_run`, `would_conflict`, `conflicted_paths` and `conflict_kinds` (see Dry Run).
 
 ## Parameter Comparison: Libra vs Git vs jj
 
