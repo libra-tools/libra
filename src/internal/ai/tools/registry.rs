@@ -288,6 +288,8 @@ impl ToolRegistry {
 
         let mutates_state = handler.is_mutating(&invocation).await;
         let requires_network = handler.requires_network(&invocation).await;
+        let operation_class = operation_class_for_tool(&tool_name, mutates_state);
+        tracing::debug!(?operation_class, tool = %tool_name, "classified Agent tool operation surface");
 
         if let Some(hardening) = &self.hardening {
             let operation = ToolOperation::tool(tool_name.clone(), mutates_state, requires_network);
@@ -432,6 +434,25 @@ fn is_read_only_or_semantic_tool(tool_name: &str) -> bool {
             | "list_tool_invocations"
             | "list_provenances"
     )
+}
+
+/// Central Agent-tool census used by the gateway before handler dispatch.
+/// Read-only tools are never recorded; shell and external VCS calls require
+/// before/after verification; every other mutating tool is conservatively a
+/// Libra-state mutation until it is assigned a narrower owner.
+pub fn operation_class_for_tool(
+    tool_name: &str,
+    mutates_state: bool,
+) -> crate::internal::operation::MutationClass {
+    use crate::internal::operation::MutationClass;
+    if !mutates_state || is_read_only_or_semantic_tool(tool_name) {
+        return MutationClass::ReadOnly;
+    }
+    match tool_name {
+        "shell" | "run_libra_vcs" | "exec" => MutationClass::ExternalOrUnknown,
+        "apply_patch" | "write_file" | "edit_file" => MutationClass::WorkspaceMutation,
+        _ => MutationClass::LibraStateMutation,
+    }
 }
 
 fn rebase_payload_path_aliases(

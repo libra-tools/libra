@@ -625,3 +625,7 @@ path = "tests/sequencer_snapshot_roundtrip.rs"
 [[test]]
 name = "operation_command_coverage"
 path = "tests/operation_command_coverage.rs"
+
+[[test]]
+name = "agent_shell_operation"
+path = "tests/agent_shell_operation.rs"

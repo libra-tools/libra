@@ -1909,6 +1909,35 @@ fn command_mutates_worktree_state(command: &Commands) -> bool {
     command_scope(command).mutates_worktree_state()
 }
 
+/// Map the already-exhaustive CLI scope census onto the operation-log v2
+/// mutation classes. `command_scope` remains the authority for coverage: a
+/// newly added `Commands` variant must still be classified there before this
+/// adapter can compile and run.
+fn operation_class_for_command(
+    command: &Commands,
+) -> crate::internal::operation::MutationClass {
+    use crate::internal::operation::MutationClass;
+    match command {
+        Commands::Merge(_)
+        | Commands::Rebase(_)
+        | Commands::CherryPick(_)
+        | Commands::Revert(_)
+        | Commands::Am(_)
+        | Commands::Bisect(_) => MutationClass::SequencerMutation,
+        Commands::Worktree(_)
+        | Commands::SparseView(_)
+        | Commands::Layer(_)
+        | Commands::Dirty(_)
+        | Commands::Automation(_)
+        | Commands::Agent(_) => MutationClass::LibraStateMutation,
+        _ => match command_scope(command) {
+            CommandScope::ReadOnly => MutationClass::ReadOnly,
+            CommandScope::Worktree => MutationClass::WorkspaceMutation,
+            CommandScope::Repository | CommandScope::Composite => MutationClass::RepoMutation,
+        },
+    }
+}
+
 /// Does this command hold the SHARED maintenance lock for its whole run
 /// (plan-20260714 §C.4.3 writer-vs-deleter)?
 ///
@@ -2549,6 +2578,12 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    // OL-09 census seam: every concrete CLI command is classified before any
+    // dispatch-specific mutation code runs. The actual operation transaction
+    // is owned by the command/Agent boundary; keeping this call at the
+    // central parse seam prevents a new surface from bypassing classification.
+    let operation_class = operation_class_for_command(&args.command);
+    tracing::debug!(?operation_class, "classified CLI operation mutation surface");
     if let Commands::Diff(diff_args) = &mut args.command {
         command::diff::record_algorithm_selector_events(diff_args, &utf8_argv);
     }

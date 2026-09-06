@@ -19,6 +19,11 @@
 |---|---|---|---|
 | `operation_schema_v2` | 1 | OL-02 fresh/legacy schema convergence, idempotence, and rollback guards | `src/internal/db/migration.rs`, `sql/migrations/2026090101_operation_v2.sql` |
 | `operation_dag` | 1 | OL-04 v2 operation, journal, and op-head CAS persistence | `src/internal/operation/store.rs` |
+| `workspace_snapshot_roundtrip` | 1 | OL-06 canonical WorkspaceSnapshotV2 manifest round-trip and completeness contract | `src/internal/operation/snapshot.rs`, `src/internal/operation/view.rs` |
+| `index_snapshot_roundtrip` | 1 | OL-07 raw index facet preserves byte-exact index state and restore policy | `src/internal/operation/facets.rs` |
+| `sequencer_snapshot_roundtrip` | 1 | OL-07 sequencer facet registration and restore-policy contract | `src/internal/operation/facets.rs`, `src/internal/sequencer/` |
+| `operation_command_coverage` | 1 | OL-08 mutation census and fail-closed command classification | `src/internal/operation/middleware.rs`, `src/cli.rs` |
+| `agent_shell_operation` | 1 | OL-09 Agent shell/external boundary requires verified before/after evidence | `src/internal/ai/tools/registry.rs`, `src/internal/operation/middleware.rs` |
 | `commit_change_id_header_spike` | 1 | OL-00 real-Git Change ID header vs sidecar-only compatibility spike | `docs/development/internal/operation-log-working-copy-change-id.md` |
 | `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema, confirmed legacy-capture adoption, W4-08 linked-worktree `libra code`/`automation` enablement, and the W5-08 `graph_machine_survives_tui_removal` breaking guard (interactive graph entry refused with a migration hint; `--json`/`--machine` wire intact) | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs`, `tests/command/code_agent_linked_guard_test.rs` |
 | `compat_stash_subcommand_surface` | 1 | Guards `libra stash` subcommand surface vs. git CLI | `src/command/stash.rs` |
