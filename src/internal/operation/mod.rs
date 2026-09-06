@@ -3,6 +3,7 @@
 pub mod facet;
 pub mod store;
 pub mod view;
+pub mod working_copy;
 
 // OL-15 removes this compatibility service. Re-exporting it keeps existing
 // command integrations source-compatible while all new code uses v2 types.
@@ -17,5 +18,6 @@ pub use store::{
 pub use view::{
     CapturePolicy, Completeness, HeadState, RepoViewV2, WorkspaceId, WorkspaceSnapshotV2,
 };
+pub use working_copy::{PinnedRequestScope, PointerError, Staleness, WorkspaceStatePointer};
 
 pub use crate::internal::legacy_operation::*;
