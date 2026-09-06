@@ -60,7 +60,7 @@ CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to f
 
 合并后**空无一物**的目录（其下每个条目都被文件侧删除、另一侧未动）不算挡路：文件留在原路径，与 Git 一致。递归的交叉合并折叠（见上）内部同样适用该规则且不询问用户：文件在虚拟祖先中移到 `foo~Temporary merge branch 1`（或 `2`），与 Git 在 `call_depth > 0` 时完全一致，因此祖先 tree 永远不会在同一名字下同时持有 blob 与子树。
 
-此处只处理两侧**已跟踪**内容之间的冲突。工作树里会被合并覆盖的**未跟踪** `foo` 或 `foo~HEAD` 由既有的 untracked-overwrite 检查预先拒绝；**被忽略**的文件一律视为可弃并被替换——无论它占着这些名字，还是挡在合并要创建的目录位置上（会被替换成目录）；与 `git merge` 的处理完全一致，因此不要把重要内容放在会被合并写入的被忽略路径上。rename 检测引起的冲突在 rename 支持落地前不在范围内。
+此处只处理两侧**已跟踪**内容之间的冲突。工作树里会被合并覆盖的**未跟踪** `foo` 或 `foo~HEAD` 由既有的 untracked-overwrite 检查预先拒绝；**被忽略**的文件一律视为可弃并被替换——无论它占着这些名字，还是挡在合并要创建的目录位置上（会被替换成目录）；与 `git merge` 的处理完全一致，因此不要把重要内容放在会被合并写入的被忽略路径上。改名已会被检测（见下文「重命名」），但由改名*引发*的碰撞——改名目标正是挡路的目录，或该目录里的文件是改名源——目前仍按普通的「一删一增」处理。
 
 ### 子模块（`160000` gitlink 条目）
 
@@ -80,9 +80,25 @@ Libra 定位 monorepo 客户端，永不合并 submodule 内容。三路合并�
 
 Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`theirs` 以外的 strategy option，或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
 
+### 重命名
+
+一侧改名、另一侧原地修改同一个文件时，合并把它们当作同一个文件：Libra 对合并的每一侧各跑一次重命名检测（base→ours 与 base→theirs，与 `diff`/`status` 同一套引擎），另一侧的修改会跟随文件落到新路径。冲突同样呈现在新路径上，stage 1 记录 merge base 在*原*路径上的内容。
+
+`merge.renames` 可关闭检测（回退到 `diff.renames`；设为 `false` 时改名重新表现为一删一增），`merge.renameLimit` 限制每侧参与昂贵相似度阶段的新增/删除路径数（回退到 `diff.renameLimit`，默认 **7000**）。`0` 及任何负数都表示「用默认值」而非「不限」。Git 对它真正支持的取值（`0` 与它自己的「未设置」哨兵 `-1`）行为相同，但**小于 `-1` 的值会触发 Git 内部断言并让进程 abort**；Libra 有意不复刻这一崩溃，而是把所有非正值都当作默认值接受。只有非整数才是错误。超限时合并照常完成：精确改名仍会配对，并打印一条 notice 说明其余部分被跳过。Libra 的超限判据是**逐侧**的——任一侧超过阈值即跳过昂贵阶段；Git 则按整个矩阵判断，并且只统计本次合并真正需要的源，因此在某些形态下 Git 仍会继续检测而 Libra 已经停下。
+
+两个键都按**严格**方式读取：无法解析的值会在写入任何东西之前让合并失败——也早于 `--autostash` 保存你的改动。该检查的触发时机与 Git 解析这两个键的时机完全一致：快进、already-up-to-date、`-s ours`，以及**可快进**历史上的 `--squash` / `--no-commit` 都不受该值影响而正常成功；同一历史加 `--no-ff` 则是真合并，会失败。
+
+改名是把同一样东西换个名字，因此两端必须是**同类**条目。如果对侧把原路径上的文件换成了符号链接，对改名而言那就是一次删除，合并按删除处理，而不会把链接搬到新路径上。
+
+「目标被占用」只看**合并后仍然存在**的内容：merge base 有、但两侧都删掉的路径不算占用；对侧只是原样承接自 base 的路径同样不算——改名侧必然已经清空了目标之下的内容，这些路径会被合并删掉。两种情形改名都照常成立，`git merge` 亦然。真正挡路的是对侧在那里**新增或修改**过的内容：它会以自身条目或冲突的形式幸存下来。
+
+改名目标嵌在该文件*原路径之下*（`old` 改名为 `old/new`）并不构成冲突：改名本身就腾出了这个名字，因此改名成立，另一侧的修改跟随文件落到 `old/new`。`git merge` 与 `git merge-tree --messages` 对该形态同样干净合并，不打印 `CONFLICT (file/directory)`。
+
+Libra 尚未裁决的形态会打印 notice 并按「未检测到改名」合并——两侧都改名（改到同一路径或不同路径）、改名源被对侧删除、改名目标已被其它侧占用。目录级改名完全不推断。这些情形在结果里就是普通的删除与新增。
+
 ### 会改变历史的 merge 默认值
 
-未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。解析后的消息会记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前以 `LBR-CLI-002` 或 `LBR-IO-001` 失败；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
+未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。解析后的消息会记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
 
 ### `--dry-run`（Libra 扩展）
 

@@ -72,7 +72,61 @@ The moved file is the unmerged path: the index records it at the new name with t
 
 A directory that merges to *nothing* (every entry beneath it was deleted by the file's side and untouched by the other) is not in the way: the file keeps its path, as in Git. Inside a recursive criss-cross fold (see above) the same rule applies without asking: the file moves to `foo~Temporary merge branch 1` (or `2`) in the virtual ancestor, exactly as Git does at `call_depth > 0`, so the ancestor tree never holds a blob and a subtree under one name.
 
-Only collisions between the two sides' *tracked* contents are handled here. An **untracked** `foo` or `foo~HEAD` in the working tree that the merge would overwrite is refused up front by the existing untracked-overwrite check. An **ignored** file is expendable and gets replaced, exactly as `git merge` treats it — whether it sits at one of these names or where the merge has to create a directory. If you keep something precious under an ignore rule at a path a merge may write, it is not protected. Collisions created by rename detection are out of scope until rename support lands.
+Only collisions between the two sides' *tracked* contents are handled here. An **untracked** `foo` or `foo~HEAD` in the working tree that the merge would overwrite is refused up front by the existing untracked-overwrite check. An **ignored** file is expendable and gets replaced, exactly as `git merge` treats it — whether it sits at one of these names or where the merge has to create a directory. If you keep something precious under an ignore rule at a path a merge may write, it is not protected. Renames are detected (see "Renames" below), but a collision *created* by a rename — a rename whose destination is the directory in the way, or the source of one — is left to the ordinary delete-plus-add handling for now.
+
+### Renames
+
+A file one side renamed while the other side changed it in place merges as one
+file: Libra runs rename detection once per side of the merge (base to ours and
+base to theirs, the same engine `diff` and `status` use), and the other side's
+change follows the file to its new path. A conflict is presented at the new
+path too, with the merge base's version of the *original* path on stage 1.
+
+`merge.renames` turns detection off (falling back to `diff.renames`; `false`
+makes a rename look like a delete plus an add again), and `merge.renameLimit`
+caps how many added or deleted paths each side may have before the expensive
+similarity stage is skipped (falling back to `diff.renameLimit`, default 7000).
+A value of `0` or less means that default rather than "no cap". Git does the
+same for the values it supports — `0` and `-1`, its own "unset" sentinel — but
+anything below `-1` trips an assertion inside Git and aborts the process, which
+Libra deliberately does not reproduce: it accepts every non-positive value and
+uses the default. Only a value that is not an integer at all is an error.
+Past the cap the merge still completes: exact renames are still paired and a
+notice says the rest was skipped. Libra applies the cap per side — it skips the
+expensive stage once either side exceeds it — where Git compares the whole
+matrix and counts only the sources the merge actually needs, so Git keeps
+detecting in some shapes where Libra stops.
+
+Both keys are read strictly: a value neither can parse fails the merge before
+anything is written, including before `--autostash` saves your changes. That
+check runs exactly where Git parses these keys, so a fast-forward, an
+already-up-to-date merge, `-s ours`, and `--squash` or `--no-commit` over a
+fast-forwardable history all succeed regardless of the value, while `--no-ff`
+on that same history is a real merge and fails.
+
+A rename is a move of one thing into another name, so both ends must be the
+same kind of entry. If the other side replaced the file at the old path with a
+symbolic link, that is a deletion as far as the rename is concerned, and the
+merge reports it as such rather than carrying the link to the new path.
+
+A destination is "occupied" only by what survives the merge. A path the merge
+base held but neither side kept is gone, and so is one the other side merely
+carries unchanged from the base, because the renaming side had to clear the
+destination to put a file there. In both cases the rename is used, as
+`git merge` does. What does stand in the way is content the other side added or
+changed there, which survives as its own entry or as a conflict.
+
+A destination nested beneath the renamed file's own former path — `old`
+renamed to `old/new` — is not a collision at all: the rename itself frees the
+name, so the rename is used and the other side's edit follows the file to
+`old/new`. `git merge` and `git merge-tree --messages` both merge that shape
+cleanly, with no `CONFLICT (file/directory)` line.
+
+Shapes Libra does not yet arbitrate report a notice and merge as if the rename
+had not been detected — both sides renaming the same file (to the same path or
+to different ones), a rename whose source the other side deleted, and a rename
+whose destination another side already occupies. Directory renames are not
+inferred at all. All of these are ordinary deletes and adds in the result.
 
 ### History-changing merge defaults
 
@@ -82,7 +136,7 @@ When the corresponding CLI flag is absent, Libra reads these Git-compatible defa
 - `merge.log=true|false|<n>` appends up to 20 (for `true`) or `<n>` target-side commit subjects to the generated merge message. `--log[=<n>]` and `--no-log` override config and are last-one-wins; bare `--log` means 20. An explicit `-m` suppresses config-only `merge.log`, while an explicit `--log` still appends the shortlog to the custom message. The resolved message is recorded in merge state, so a merge finished later with `merge --continue` commits with the same message and shortlog.
 - `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on the resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
 
-Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation (`LBR-CLI-002` or `LBR-IO-001`). Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`).
+Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation: an unusable value is `LBR-CLI-002` for `merge.ff` and `merge.verifySignatures` and `LBR-REPO-003` for `merge.autostash`, `merge.conflictStyle`, `merge.renames` and `merge.renameLimit`, while a value that cannot be read at all is `LBR-IO-001`. Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`).
 
 ### Submodules (`160000` gitlink entries)
 
