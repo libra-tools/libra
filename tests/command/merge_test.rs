@@ -7228,6 +7228,3092 @@ fn merge_replaces_an_ignored_file_standing_where_a_directory_must_go() {
     }
 }
 
+/// MG-05 fixture: the base tracks `old.txt`; ours renames it to `new.txt`
+/// (optionally editing it), theirs edits it in place. Returns the repo on
+/// `main` with `feature` ready to merge.
+fn create_rename_repo(our_edit: Option<&str>, their_edit: &str) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    commit_file(p, "old.txt", base, "base tracks old.txt");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    std::fs::rename(p.join("old.txt"), p.join("new.txt")).expect("rename");
+    if let Some(content) = our_edit {
+        std::fs::write(p.join("new.txt"), content).expect("our edit");
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "-A", "."], p),
+        "stage the rename",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours renames old.txt", "--no-verify"], p),
+        "ours",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "old.txt", their_edit, "theirs edits old.txt");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    repo
+}
+
+/// G1 + G2: one side renames, the other edits the same file — the merge is
+/// clean and the result carries the other side's edit at the NEW path, on
+/// both walks (Git: `detect_regular_renames` + `process_renames`).
+#[test]
+fn merge_rename_with_other_side_edit_merges_at_the_new_path() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let their = "line1\nline2 edited\nline3\nline4\nline5\nline6\nline7\nline8\n";
+        let repo = create_rename_repo(None, their);
+        let p = repo.path();
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("new.txt")).expect("merged file"),
+            their,
+            "walk {env:?}: the other side's edit followed the rename"
+        );
+        assert!(
+            !p.join("old.txt").exists(),
+            "walk {env:?}: the source is gone"
+        );
+        let listing = run_libra_command(&["ls-files", "-s"], p);
+        assert_cli_success(&listing, "ls-files");
+        let listing = String::from_utf8_lossy(&listing.stdout).to_string();
+        assert!(
+            listing.contains("\tnew.txt") && !listing.contains("\told.txt"),
+            "walk {env:?}: {listing}"
+        );
+    }
+}
+
+/// G3 + G4 + G5: both sides changed the renamed file in conflicting ways —
+/// the conflict is presented at the NEW path, with stage 1 holding the base's
+/// content from the ORIGINAL path and stages 2/3 the two sides.
+#[test]
+fn merge_rename_conflict_is_presented_at_the_new_path() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let ours = "line1\nours\nline3\nline4\nline5\nline6\nline7\nline8\n";
+        let theirs = "line1\ntheirs\nline3\nline4\nline5\nline6\nline7\nline8\n";
+        let repo = create_rename_repo(Some(ours), theirs);
+        let p = repo.path();
+        let output = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+        assert_eq!(output.status.code(), Some(128), "walk {env:?}: {stderr}");
+        assert_eq!(report.error_code, "LBR-CONFLICT-002");
+        let markers = std::fs::read_to_string(p.join("new.txt")).expect("conflicted file");
+        assert!(
+            markers.contains("<<<<<<<") && markers.contains("ours") && markers.contains("theirs"),
+            "walk {env:?}: markers at the new path: {markers}"
+        );
+        let stages = index_stage_lines(p, "new.txt");
+        assert_eq!(stages.len(), 3, "walk {env:?}: {stages:?}");
+        assert!(index_stage_lines(p, "old.txt").is_empty(), "walk {env:?}");
+        // Stage 1 is the base blob — the content the ORIGINAL path had.
+        let base_blob = {
+            let out = run_libra_command(&["rev-parse", "main~1:old.txt"], p);
+            assert_cli_success(&out, "rev-parse the base blob");
+            stdout_trimmed(&out)
+        };
+        assert!(
+            stages
+                .iter()
+                .any(|line| line.contains(&base_blob) && line.contains(" 1\t")),
+            "walk {env:?}: stage 1 keeps the base content: {stages:?}"
+        );
+        assert_eq!(
+            read_merge_state(p)["conflicted_paths"],
+            serde_json::json!(["new.txt"]),
+            "walk {env:?}"
+        );
+        // `--abort` puts the pre-merge state back.
+        assert_cli_success(&run_libra_command(&["merge", "--abort"], p), "abort");
+        assert!(p.join("new.txt").is_file() && !p.join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(p.join("new.txt")).expect("restored"),
+            ours,
+            "walk {env:?}"
+        );
+    }
+}
+
+/// G7: both sides rename the same file to DIFFERENT paths. MG-05 does not
+/// arbitrate that (MG-06 turns it into a rename/rename conflict): the merge
+/// says so and proceeds as if neither rename had been detected.
+#[test]
+fn merge_divergent_renames_report_a_notice_and_skip_detection() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
+    commit_file(p, "old.txt", base, "base tracks old.txt");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    std::fs::rename(p.join("old.txt"), p.join("ours.txt")).expect("our rename");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+        "ours",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    std::fs::rename(p.join("old.txt"), p.join("theirs.txt")).expect("their rename");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "theirs renames", "--no-verify"], p),
+        "theirs",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+    let out = run_libra_command(&["merge", "feature"], p);
+    assert_cli_success(&out, "the merge still completes");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("was renamed to") && stdout.contains("on the other side"),
+        "the divergent renames are reported: {stdout}"
+    );
+    // Without rename detection both destinations are plain one-sided adds.
+    assert!(p.join("ours.txt").is_file() && p.join("theirs.txt").is_file());
+    assert!(!p.join("old.txt").exists());
+}
+
+/// The notices are human output only: `--json` keeps stdout machine-clean.
+#[test]
+fn merge_rename_notices_stay_out_of_json_output() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
+    commit_file(p, "old.txt", base, "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    std::fs::rename(p.join("old.txt"), p.join("ours.txt")).expect("rename");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+        "ours",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    std::fs::rename(p.join("old.txt"), p.join("theirs.txt")).expect("rename");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "theirs renames", "--no-verify"], p),
+        "theirs",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+    let out = run_libra_command(&["--json", "merge", "feature"], p);
+    assert_cli_success(&out, "merge");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["ok"], true,
+        "stdout is exactly the JSON envelope: {json}"
+    );
+}
+
+/// `merge.renames=false` turns detection off: the rename becomes a delete
+/// plus an add again, so the other side's edit conflicts as a modify/delete.
+#[test]
+fn merge_renames_config_false_disables_detection() {
+    let their = "line1\nline2 edited\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let repo = create_rename_repo(None, their);
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "false"], p),
+        "merge.renames=false",
+    );
+    let output = run_libra_command(&["merge", "feature"], p);
+    assert_eq!(output.status.code(), Some(128), "modify/delete conflict");
+    assert!(
+        !index_stage_lines(p, "old.txt").is_empty(),
+        "the conflict stays at the original path"
+    );
+}
+
+/// A rename whose destination lands inside a subtree the pruned walk adopts
+/// wholesale is still detected: the candidates come from the diffs the walk
+/// already runs for `files_changed`, so both walks agree.
+#[test]
+fn merge_rename_into_an_adopted_subtree_is_detected_on_both_walks() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        let base = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
+        commit_file(p, "old.txt", base, "base tracks old.txt");
+        commit_file(
+            p,
+            "shared/keep.txt",
+            "keep\n",
+            "a subtree ours never touches",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        // Ours only edits the file, so `shared/` stays identical to the base
+        // and theirs' version of it is adopted verbatim by the pruned walk.
+        commit_file(
+            p,
+            "old.txt",
+            "alpha\nbeta edited\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n",
+            "ours edits old.txt",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::create_dir_all(p.join("shared")).expect("dir");
+        std::fs::rename(p.join("old.txt"), p.join("shared/moved.txt")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "theirs moves it into shared/",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("shared/moved.txt")).expect("moved file"),
+            "alpha\nbeta edited\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n",
+            "walk {env:?}: ours' edit followed the rename into the adopted subtree"
+        );
+        assert!(!p.join("old.txt").exists(), "walk {env:?}");
+    }
+}
+
+/// G6 at the production entry: past `merge.renameLimit` the inexact stage is
+/// skipped, the merge still completes, the notice says so in human output —
+/// and `--json` stays machine-clean.
+#[test]
+fn merge_rename_limit_reports_a_notice_and_still_merges() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // One exact rename plus two inexact candidates per side, so that after the
+    // exact stage each side is still over a limit of 1.
+    commit_file(p, "exact.txt", "exactly the same\n", "base: exact source");
+    for index in 0..2 {
+        commit_file(
+            p,
+            &format!("similar-{index}.txt"),
+            &format!("aaaa\nbbbb\ncccc\ndddd{index}\n"),
+            "base: inexact source",
+        );
+    }
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    std::fs::rename(p.join("exact.txt"), p.join("exact-moved.txt")).expect("rename");
+    for index in 0..2 {
+        std::fs::rename(
+            p.join(format!("similar-{index}.txt")),
+            p.join(format!("similar-moved-{index}.txt")),
+        )
+        .expect("rename");
+        std::fs::write(
+            p.join(format!("similar-moved-{index}.txt")),
+            format!("aaaa\nbbbb\ncccc\nchanged{index}\n"),
+        )
+        .expect("edit");
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "-A", "."], p),
+        "stage the renames",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "ours renames three files", "--no-verify"],
+            p,
+        ),
+        "ours",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    // Theirs EDITS the exactly-renamed file (Codex R14 P2): if the exact pair
+    // were dropped along with the inexact stage, this would be a modify/delete
+    // conflict rather than a clean merge, so the assertions below actually
+    // establish that the exact rename survived the limit.
+    commit_file(
+        p,
+        "exact.txt",
+        "exactly the same, edited\n",
+        "theirs edits the exactly-renamed file",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renameLimit", "1"], p),
+        "merge.renameLimit=1",
+    );
+
+    let out = run_libra_command(&["merge", "feature"], p);
+    assert_cli_success(&out, "the merge completes despite the limit");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("skipped inexact rename detection") && stdout.contains("merge.renameLimit"),
+        "the degradation is reported: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("exact-moved.txt")).expect("the exactly-renamed file"),
+        "exactly the same, edited\n",
+        "the exact pair survived the limit and the edit followed it: {stdout}"
+    );
+    assert!(
+        index_stage_lines(p, "exact.txt").is_empty(),
+        "nothing is left at the old path"
+    );
+
+    // The same shape under `--json`: nothing but the envelope on stdout.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "exact.txt", "exactly the same\n", "base");
+    for index in 0..2 {
+        commit_file(
+            p,
+            &format!("similar-{index}.txt"),
+            &format!("aaaa\nbbbb\ncccc\ndddd{index}\n"),
+            "base",
+        );
+    }
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    std::fs::rename(p.join("exact.txt"), p.join("exact-moved.txt")).expect("rename");
+    for index in 0..2 {
+        std::fs::rename(
+            p.join(format!("similar-{index}.txt")),
+            p.join(format!("similar-moved-{index}.txt")),
+        )
+        .expect("rename");
+    }
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+        "ours",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "unrelated.txt", "theirs\n", "theirs");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renameLimit", "1"], p),
+        "merge.renameLimit=1",
+    );
+    let out = run_libra_command(&["--json", "merge", "feature"], p);
+    assert_cli_success(&out, "merge");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["ok"], true,
+        "stdout is exactly the JSON envelope: {json}"
+    );
+}
+
+/// A config value Git rejects is an error here too, before anything is merged.
+#[test]
+fn merge_rejects_an_invalid_rename_config() {
+    let repo = create_rename_repo(
+        None,
+        "line1\nline2 edited\nline3\nline4\nline5\nline6\nline7\nline8\n",
+    );
+    let p = repo.path();
+    let head_before = head_commit(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "wat"], p),
+        "merge.renames=wat",
+    );
+    let output = run_libra_command(&["merge", "feature"], p);
+    assert!(
+        !output.status.success(),
+        "an unparseable value fails closed"
+    );
+    let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
+    assert!(stderr.contains("merge.renames"), "{stderr}");
+    assert_eq!(head_commit(p), head_before);
+
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "true"], p),
+        "merge.renames=true",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renameLimit", "not-a-number"], p),
+        "merge.renameLimit=not-a-number",
+    );
+    let output = run_libra_command(&["merge", "feature"], p);
+    assert!(
+        !output.status.success(),
+        "a non-integer limit fails closed, as Git's `bad numeric config value` does"
+    );
+    let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
+    assert!(stderr.contains("merge.renameLimit"), "{stderr}");
+    assert_eq!(head_commit(p), head_before);
+
+    // Git starts `merge.renameLimit` at -1 and maps every value <= 0 onto its
+    // 7000 default (merge-ort.c:3452-3453, :5504), so a negative value is not
+    // an error — measured: `git -c merge.renameLimit=0` still detects the
+    // renames a 30-path merge needs.
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renameLimit", "--", "-3"], p),
+        "merge.renameLimit=-3",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], p),
+        "a negative limit means Git's default, not a refusal",
+    );
+}
+
+/// The two walks report the SAME `files_changed` for a rename, in both
+/// directions (Codex MG-05 R1: the pruned walk used to add one unconditionally).
+#[test]
+fn merge_rename_files_changed_agrees_across_walks_in_both_directions() {
+    let their_edit = "line1\nline2 edited\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    for ours_renames in [true, false] {
+        let mut summaries = Vec::new();
+        for env in [
+            &[][..],
+            &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+        ] {
+            let repo = if ours_renames {
+                create_rename_repo(None, their_edit)
+            } else {
+                // Mirror image: theirs renames, ours edits in place.
+                let repo = create_committed_repo_via_cli();
+                let p = repo.path();
+                let base = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
+                commit_file(p, "old.txt", base, "base");
+                assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+                commit_file(p, "old.txt", their_edit, "ours edits in place");
+                assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+                std::fs::rename(p.join("old.txt"), p.join("new.txt")).expect("rename");
+                assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+                assert_cli_success(
+                    &run_libra_command(&["commit", "-m", "theirs renames", "--no-verify"], p),
+                    "theirs",
+                );
+                assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+                repo
+            };
+            let p = repo.path();
+            let out = run_libra_command_with_stdin_and_env(
+                &["--json", "merge", "--dry-run", "feature"],
+                p,
+                "",
+                env,
+            );
+            assert_cli_success(&out, "dry-run");
+            let mut data = parse_json_stdout(&out)["data"].clone();
+            // Each walk runs in its own fixture, so the commit ids differ by
+            // construction; everything the merge DECIDED must not.
+            if let Some(object) = data.as_object_mut() {
+                object.remove("old_commit");
+                object.remove("commit");
+            }
+            summaries.push(data);
+        }
+        assert_eq!(
+            summaries[0], summaries[1],
+            "ours_renames={ours_renames}: both walks preview the same summary"
+        );
+        assert_eq!(
+            summaries[0]["files_changed"], 1,
+            "ours_renames={ours_renames}: a rename is one changed path, as Git's diffstat renders it"
+        );
+    }
+}
+
+/// Codex MG-05 R2, verified against `git merge`: a rename plus a mode change
+/// on one side and a content edit on the other merges cleanly and keeps
+/// `100755` — Git resolves content and mode independently.
+#[cfg(unix)]
+#[test]
+fn merge_rename_with_mode_change_merges_cleanly_and_keeps_the_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::rename(p.join("old.txt"), p.join("new.txt")).expect("rename");
+        std::fs::set_permissions(p.join("new.txt"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames and chmods", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(
+            p,
+            "old.txt",
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "theirs edits",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("new.txt")).expect("merged file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the edit followed the rename"
+        );
+        let stages = index_stage_lines(p, "new.txt");
+        assert!(
+            stages.iter().any(|line| line.starts_with("100755")),
+            "walk {env:?}: the executable bit survives: {stages:?}"
+        );
+    }
+}
+
+/// Codex MG-05 R2, verified against `git merge`: when the rename's
+/// destination is a DIRECTORY on the other side, the rename is not used —
+/// the file/directory collision takes over and the file moves to `new~HEAD`.
+#[test]
+fn merge_rename_into_a_directory_falls_back_to_the_df_collision() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::rename(p.join("old.txt"), p.join("new")).expect("rename to `new`");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames old.txt to new", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::create_dir_all(p.join("new")).expect("dir");
+        std::fs::write(p.join("new/child.txt"), "child\n").expect("child");
+        assert_cli_success(&run_libra_command(&["add", "new/child.txt"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "theirs adds new/child.txt", "--no-verify"],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains(
+                "CONFLICT (file/directory): directory in the way of new from HEAD; moving it to new~HEAD instead."
+            ),
+            "walk {env:?}: {stdout}"
+        );
+        assert!(p.join("new").is_dir(), "walk {env:?}");
+        let stages = index_stage_lines(p, "new~HEAD");
+        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
+        assert!(stages[0].contains(" 2\t"), "walk {env:?}: {stages:?}");
+    }
+}
+
+/// Codex MG-05 R6 claimed that a rename whose destination nests *below* its own
+/// former path must raise Git's file/directory conflict and leave the other
+/// side's edit at `old~HEAD`. Measured against upstream Git — both
+/// `git merge-tree --write-tree --messages` on plumbing-built commits and a real
+/// `git merge` in a worktree — that shape merges cleanly, using the rename and
+/// carrying the edit to `old/new`. The finding was recorded as not reproducible;
+/// this test pins the measured parity on both walks.
+#[test]
+fn merge_rename_into_a_subdirectory_of_its_own_path_merges_cleanly() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "old"], p), "drop the file");
+        std::fs::create_dir_all(p.join("old")).expect("dir");
+        std::fs::write(p.join("old/new"), "a\nb\nc\nd\ne\nf\ng\nh\n").expect("write");
+        assert_cli_success(&run_libra_command(&["add", "old/new"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames old to old/new", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(
+            p,
+            "old",
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "theirs edits old",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("old/new")).expect("merged file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the edit followed the rename"
+        );
+        assert!(
+            p.join("old").is_dir(),
+            "walk {env:?}: the destination directory stands"
+        );
+        let stages = index_stage_lines(p, "old/new");
+        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
+        assert!(stages[0].contains(" 0\t"), "walk {env:?}: {stages:?}");
+        assert!(
+            index_stage_lines(p, "old").is_empty(),
+            "walk {env:?}: nothing is left at the old path"
+        );
+    }
+}
+
+/// Codex MG-05 R2: a rename whose destination the other side ALSO added (an
+/// add/add conflict there) must not be used — the other side's content must
+/// not vanish. Both walks.
+#[test]
+fn merge_rename_onto_a_path_the_other_side_added_keeps_both_sides() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::rename(p.join("old.txt"), p.join("new.txt")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(p, "new.txt", "theirs own file\n", "theirs adds new.txt");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("which another side already occupies"),
+            "walk {env:?}: the declined rename is reported: {stdout}"
+        );
+        let markers = std::fs::read_to_string(p.join("new.txt")).expect("conflicted file");
+        assert!(
+            markers.contains("theirs own file"),
+            "walk {env:?}: theirs' content is not discarded: {markers}"
+        );
+        let stages = index_stage_lines(p, "new.txt");
+        assert!(
+            stages.iter().any(|line| line.contains(" 2\t"))
+                && stages.iter().any(|line| line.contains(" 3\t")),
+            "walk {env:?}: an add/add conflict keeps both sides: {stages:?}"
+        );
+    }
+}
+
+/// Codex MG-05 R2: a rename INTO a subtree the pruned walk carries whole must
+/// not leave that subtree's tree entry beside the new leaf — the written tree
+/// has exactly one entry per name.
+#[test]
+fn merge_rename_into_a_carried_subtree_writes_one_tree_entry() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base file");
+        commit_file(
+            p,
+            "shared/keep.txt",
+            "keep\n",
+            "a subtree ours never touches",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        commit_file(
+            p,
+            "old.txt",
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "ours edits the file",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::rename(p.join("old.txt"), p.join("shared/moved.txt")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "theirs moves it into shared/",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        assert_cli_success(
+            &run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env),
+            "clean merge",
+        );
+        let listing = run_libra_command(&["ls-tree", "HEAD"], p);
+        assert_cli_success(&listing, "ls-tree");
+        let listing = String::from_utf8_lossy(&listing.stdout).to_string();
+        let shared_rows = listing
+            .lines()
+            .filter(|line| line.ends_with("\tshared"))
+            .count();
+        assert_eq!(
+            shared_rows, 1,
+            "walk {env:?}: one entry per name: {listing}"
+        );
+        let recursive = run_libra_command(&["ls-tree", "-r", "HEAD"], p);
+        assert_cli_success(&recursive, "ls-tree -r");
+        let recursive = String::from_utf8_lossy(&recursive.stdout).to_string();
+        assert!(
+            recursive.contains("\tshared/keep.txt") && recursive.contains("\tshared/moved.txt"),
+            "walk {env:?}: {recursive}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("shared/moved.txt")).expect("moved file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: ours' edit followed the rename"
+        );
+    }
+}
+
+/// Codex MG-05 R3, verified against `git merge` on a crafted tree: an EMPTY
+/// directory at the rename's destination is not in the way — Git uses the
+/// rename and lands the other side's edit at the new path. Both walks.
+#[test]
+fn merge_rename_destination_with_an_empty_directory_still_uses_the_rename() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        let base = head_commit(p);
+        // Theirs edits `old.txt` AND adds an empty tree at `new` — a shape only
+        // the plumbing can build.
+        let edited = {
+            let out = run_libra_command_with_stdin(
+                &["hash-object", "-w", "--stdin"],
+                p,
+                "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            );
+            assert_cli_success(&out, "hash-object");
+            stdout_trimmed(&out)
+        };
+        let theirs = {
+            assert_cli_success(
+                &run_libra_command(
+                    &[
+                        "update-index",
+                        "--cacheinfo",
+                        &format!("100644,{edited},old.txt"),
+                    ],
+                    p,
+                ),
+                "stage theirs' edit",
+            );
+            let tree = run_libra_command(&["write-tree"], p);
+            assert_cli_success(&tree, "write-tree");
+            let tree = stdout_trimmed(&tree);
+            // Splice an empty `new` tree into that root.
+            let empty = {
+                std::fs::write(p.join(".empty"), b"").expect("empty");
+                let out = run_libra_command(
+                    &["hash-object", "-t", "tree", "-w", "--literally", ".empty"],
+                    p,
+                );
+                assert_cli_success(&out, "empty tree");
+                std::fs::remove_file(p.join(".empty")).expect("cleanup");
+                stdout_trimmed(&out)
+            };
+            let listing = run_libra_command(&["ls-tree", &tree], p);
+            assert_cli_success(&listing, "ls-tree");
+            let mut bytes: Vec<(String, Vec<u8>)> = Vec::new();
+            for line in String::from_utf8_lossy(&listing.stdout).lines() {
+                let (meta, name) = line.split_once('\t').expect("ls-tree line");
+                let mut parts = meta.split_whitespace();
+                let mode = parts.next().expect("mode");
+                let _kind = parts.next();
+                let id = parts.next().expect("id");
+                let mut entry = format!("{} {name}\0", mode.trim_start_matches('0')).into_bytes();
+                entry.extend(
+                    (0..id.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&id[i..i + 2], 16).expect("hex")),
+                );
+                bytes.push((name.to_string(), entry));
+            }
+            let mut new_entry = b"40000 new\0".to_vec();
+            new_entry.extend(
+                (0..empty.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&empty[i..i + 2], 16).expect("hex")),
+            );
+            bytes.push(("new/".to_string(), new_entry));
+            bytes.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            let root: Vec<u8> = bytes.into_iter().flat_map(|(_, entry)| entry).collect();
+            std::fs::write(p.join(".root"), &root).expect("root bytes");
+            let out = run_libra_command(
+                &["hash-object", "-t", "tree", "-w", "--literally", ".root"],
+                p,
+            );
+            assert_cli_success(&out, "root tree");
+            std::fs::remove_file(p.join(".root")).expect("cleanup");
+            let root = stdout_trimmed(&out);
+            let out = run_libra_command(
+                &[
+                    "commit-tree",
+                    &root,
+                    "-p",
+                    &base,
+                    "-m",
+                    "theirs edits and adds an empty new/",
+                ],
+                p,
+            );
+            assert_cli_success(&out, "commit-tree");
+            stdout_trimmed(&out)
+        };
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/feature", &theirs], p),
+            "refs/heads/feature",
+        );
+        // Put the index back and make ours' rename.
+        assert_cli_success(&run_libra_command(&["reset", "--hard", &base], p), "reset");
+        std::fs::rename(p.join("old.txt"), p.join("new")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames old.txt to new", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge — an empty directory is not in the way");
+        assert_eq!(
+            std::fs::read_to_string(p.join("new")).expect("merged file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the rename was used and the edit followed it"
+        );
+        assert!(index_stage_lines(p, "old.txt").is_empty(), "walk {env:?}");
+    }
+}
+
+/// Codex MG-05 R4, verified with `git merge-tree`: a rename whose destination
+/// REPLACES an empty-tree marker inside a subtree is still detected — Git
+/// merges cleanly and the other side's edit follows the file to its new path.
+/// Both walks.
+#[test]
+fn merge_rename_onto_an_empty_marker_inside_a_subtree_is_detected() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base file");
+        // The base also holds `shared/sub` as an EMPTY tree — plumbing only.
+        let base_parent = head_commit(p);
+        let raw = |hex: &str| -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let hash_tree = |bytes: &[u8], name: &str| -> String {
+            std::fs::write(p.join(name), bytes).expect("tree bytes");
+            let out =
+                run_libra_command(&["hash-object", "-t", "tree", "-w", "--literally", name], p);
+            assert_cli_success(&out, "hash-object tree");
+            std::fs::remove_file(p.join(name)).expect("cleanup");
+            stdout_trimmed(&out)
+        };
+        let empty = hash_tree(b"", ".empty");
+        let mut shared_empty = b"40000 sub\0".to_vec();
+        shared_empty.extend(raw(&empty));
+        let shared_empty = hash_tree(&shared_empty, ".shared-empty");
+        let listing = run_libra_command(&["ls-tree", &base_parent], p);
+        assert_cli_success(&listing, "ls-tree");
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut old_blob = String::new();
+        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+            let (meta, name) = line.split_once('\t').expect("ls-tree line");
+            let mut parts = meta.split_whitespace();
+            let mode = parts.next().expect("mode");
+            let _kind = parts.next();
+            let id = parts.next().expect("id");
+            if name == "old.txt" {
+                old_blob = id.to_string();
+            }
+            let mut entry = format!("{} {name}\0", mode.trim_start_matches('0')).into_bytes();
+            entry.extend(raw(id));
+            entries.push((name.to_string(), entry));
+        }
+        let with_shared = |entries: &[(String, Vec<u8>)], shared: &str, drop_old: bool| -> String {
+            let mut all: Vec<(String, Vec<u8>)> = entries
+                .iter()
+                .filter(|(name, _)| !(drop_old && name == "old.txt"))
+                .cloned()
+                .collect();
+            let mut shared_entry = b"40000 shared\0".to_vec();
+            shared_entry.extend(raw(shared));
+            all.push(("shared/".to_string(), shared_entry));
+            all.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            let bytes: Vec<u8> = all.into_iter().flat_map(|(_, entry)| entry).collect();
+            hash_tree(&bytes, ".root")
+        };
+        let base_tree = with_shared(&entries, &shared_empty, false);
+        let base = {
+            let out = run_libra_command(
+                &[
+                    "commit-tree",
+                    &base_tree,
+                    "-m",
+                    "base with empty shared/sub",
+                ],
+                p,
+            );
+            assert_cli_success(&out, "commit-tree");
+            stdout_trimmed(&out)
+        };
+        // Theirs: `old.txt` becomes the FILE `shared/sub`.
+        let mut shared_file = b"100644 sub\0".to_vec();
+        shared_file.extend(raw(&old_blob));
+        let shared_file = hash_tree(&shared_file, ".shared-file");
+        let theirs_tree = with_shared(&entries, &shared_file, true);
+        let theirs = {
+            let out = run_libra_command(
+                &[
+                    "commit-tree",
+                    &theirs_tree,
+                    "-p",
+                    &base,
+                    "-m",
+                    "theirs moves old.txt to shared/sub",
+                ],
+                p,
+            );
+            assert_cli_success(&out, "commit-tree");
+            stdout_trimmed(&out)
+        };
+        for (branch, commit) in [("main", &base), ("feature", &theirs)] {
+            assert_cli_success(
+                &run_libra_command(&["update-ref", &format!("refs/heads/{branch}"), commit], p),
+                "update-ref",
+            );
+        }
+        assert_cli_success(&run_libra_command(&["reset", "--hard", &base], p), "reset");
+        // Ours edits the file in place.
+        commit_file(
+            p,
+            "old.txt",
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "ours edits old.txt",
+        );
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("shared/sub")).expect("moved file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the edit followed the rename onto the empty marker"
+        );
+        assert!(!p.join("old.txt").exists(), "walk {env:?}");
+    }
+}
+
+/// Codex MG-05 R5: a rename whose destination has an UNMERGED path beneath it
+/// must be declined — the conflicted file has to survive. Base has `new/child`
+/// and `old.txt`; ours deletes the child and renames `old.txt` to `new`;
+/// theirs edits the child. Both walks.
+#[test]
+fn merge_rename_onto_a_path_with_a_conflict_beneath_is_declined() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base file");
+        commit_file(p, "new/child.txt", "child base\n", "base directory");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        // Ours: delete the child, then rename the file onto `new`.
+        assert_cli_success(
+            &run_libra_command(&["rm", "new/child.txt"], p),
+            "drop the child",
+        );
+        std::fs::rename(p.join("old.txt"), p.join("new")).expect("rename onto new");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours renames onto new", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(
+            p,
+            "new/child.txt",
+            "child edited\n",
+            "theirs edits the child",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("CONFLICT (file/directory)"),
+            "walk {env:?}: the D/F pass takes over: {stdout}"
+        );
+        // The conflicted child must still be there — the rename must not have
+        // been applied over it.
+        assert!(
+            p.join("new/child.txt").exists() || !index_stage_lines(p, "new/child.txt").is_empty(),
+            "walk {env:?}: the unmerged child survives"
+        );
+        assert!(
+            p.join("new~HEAD").exists(),
+            "walk {env:?}: ours' file moved out of the directory's way"
+        );
+    }
+}
+
+/// Codex MG-05 R5: an unparseable rename config is rejected BEFORE a
+/// criss-cross merge folds its virtual ancestor, so the refused command
+/// leaves no objects behind.
+#[test]
+fn merge_rejects_rename_config_before_folding_a_virtual_ancestor() {
+    let repo = create_crisscross_repo();
+    let p = repo.path();
+    let head_before = head_commit(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "wat"], p),
+        "merge.renames=wat",
+    );
+    let before = loose_object_ids(p);
+    let output = run_libra_command(&["merge", "y"], p);
+    assert!(!output.status.success(), "the merge is refused");
+    let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
+    assert!(stderr.contains("merge.renames"), "{stderr}");
+    assert_eq!(head_commit(p), head_before);
+    assert_eq!(
+        loose_object_ids(p),
+        before,
+        "no virtual-ancestor objects were written before the refusal"
+    );
+}
+
+/// Codex R7 P1: the strict rename config must be refused before `--autostash`
+/// writes a stash commit, a durable sidecar and resets the worktree — the
+/// mutation Codex R5's virtual-ancestor fix did not cover. The refusal leaves
+/// the object store, the gitdir and the dirty worktree exactly as they were.
+#[test]
+fn merge_rejects_rename_config_before_autostash_touches_the_repository() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "f.txt", "a\nb\nc\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    commit_file(p, "f.txt", "a\nb\nc\nours\n", "ours");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "f.txt", "theirs\na\nb\nc\n", "theirs");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "not-a-bool"], p),
+        "merge.renames=not-a-bool",
+    );
+    std::fs::write(p.join("f.txt"), "a\nb\nc\nours\ndirty\n").expect("dirty the tree");
+
+    let head_before = head_commit(p);
+    let before = loose_object_ids(p);
+    let output = run_libra_command(&["merge", "--autostash", "feature"], p);
+    assert!(!output.status.success(), "the merge is refused");
+    let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
+    assert!(stderr.contains("merge.renames"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        !stdout.contains("Created autostash") && !stderr.contains("Created autostash"),
+        "no autostash was created: {stdout} / {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before);
+    assert_eq!(
+        loose_object_ids(p),
+        before,
+        "no autostash objects were written before the refusal"
+    );
+    assert!(
+        !p.join(".libra/merge-autostash.json").exists(),
+        "no held-autostash sidecar was left behind"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("f.txt")).expect("worktree"),
+        "a\nb\nc\nours\ndirty\n",
+        "the dirty worktree was not reset"
+    );
+}
+
+/// Codex R8 P1: the refusal must also precede the STALE-sidecar recovery,
+/// which promotes a leftover autostash into the shared stash list and deletes
+/// its sidecar — a mutation that ran before the config was validated.
+#[test]
+fn merge_rejects_rename_config_before_recovering_a_stale_autostash() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "f.txt", "a\nb\nc\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    commit_file(p, "f.txt", "a\nOURS\nc\n", "ours");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "f.txt", "a\nTHEIRS\nc\n", "theirs");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+    // A leftover held-autostash sidecar with no merge in progress: exactly what
+    // the recovery promotes. Any commit object serves as the held commit; the
+    // point is that nothing may touch it while the config is unusable.
+    let held = head_commit(p);
+    let sidecar = p.join(".libra/merge-autostash.json");
+    std::fs::write(
+        &sidecar,
+        format!("{{\n  \"owner_scope\": \"\",\n  \"stash_commit\": \"{held}\"\n}}\n"),
+    )
+    .expect("write the stale sidecar");
+    let before = std::fs::read_to_string(&sidecar).expect("sidecar");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "not-a-bool"], p),
+        "merge.renames=not-a-bool",
+    );
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    assert!(!output.status.success(), "the merge is refused");
+    let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
+    assert!(stderr.contains("merge.renames"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).expect("sidecar"),
+        before,
+        "the stale sidecar was neither promoted nor deleted"
+    );
+    let stash = run_libra_command(&["stash", "list"], p);
+    assert!(
+        String::from_utf8_lossy(&stash.stdout).trim().is_empty(),
+        "nothing was promoted into the stash list: {:?}",
+        String::from_utf8_lossy(&stash.stdout)
+    );
+}
+
+/// Codex R8 P1: `--squash` and `--no-commit` over a FAST-FORWARDABLE history
+/// only reach the three-way engine because they skip the fast-forward branch;
+/// Git takes its own fast-forward path there and never parses the rename
+/// config. Measured on git 2.50.1 with `merge.renames=not-a-bool`:
+/// `git merge --squash` and `git merge --no-commit` print "Updating ..
+/// Fast-forward" and succeed, while `git merge --no-ff` on the same history
+/// fails with `fatal: bad boolean config value`.
+#[test]
+fn merge_squash_over_a_fast_forwardable_history_ignores_the_rename_config() {
+    for flag in ["--squash", "--no-commit"] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "f.txt", "a\n", "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(p, "f.txt", "a\nb\n", "ahead");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        assert_cli_success(
+            &run_libra_command(&["config", "merge.renames", "not-a-bool"], p),
+            "merge.renames=not-a-bool",
+        );
+        assert_cli_success(
+            &run_libra_command(&["merge", flag, "feature"], p),
+            &format!("{flag} over a fast-forwardable history is not refused"),
+        );
+    }
+
+    // `--no-ff` on the same history IS a real merge, and Git fails there.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "f.txt", "a\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "f.txt", "a\nb\n", "ahead");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "not-a-bool"], p),
+        "merge.renames=not-a-bool",
+    );
+    let output = run_libra_command(&["merge", "--no-ff", "-m", "m", "feature"], p);
+    assert!(
+        !output.status.success(),
+        "--no-ff is a real merge and is refused, as Git refuses it"
+    );
+    let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
+    assert!(stderr.contains("merge.renames"), "{stderr}");
+}
+
+/// The same strict config must NOT be read where Git never parses it: measured
+/// on git 2.50.1 with `merge.renames = not-a-bool`, a fast-forward merge
+/// succeeds (as does an already-up-to-date one, and `-s ours`), because only a
+/// real three-way merge reaches the rename machinery.
+#[test]
+fn merge_ignores_an_invalid_rename_config_on_a_fast_forward() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "f.txt", "a\nb\nc\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "t.txt", "t\n", "theirs");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "not-a-bool"], p),
+        "merge.renames=not-a-bool",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], p),
+        "the fast-forward is not refused",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], p),
+        "already up to date is not refused",
+    );
+}
+
+/// Codex R15: an empty tree beneath the destination is in the way only where
+/// MG-04's base-presence rule puts it there. When the merge base HAD something
+/// at that path, Git traverses the directory, finds no file, and merges
+/// cleanly. Measured on git 2.50.1 with base holding `old` and `new/gone`, ours
+/// deleting `new/gone` and renaming `old` to `new`, and theirs editing `old`
+/// and replacing `new/gone` with an empty `new/sub`: `git merge-tree
+/// --write-tree --messages` exits 0 with no messages. Contrast
+/// `merge_rename_onto_a_nested_empty_directory_is_declined`, where the base had
+/// nothing at `new` and Git raises the collision.
+#[test]
+fn merge_rename_onto_an_emptied_directory_the_base_had_is_used() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base file");
+        std::fs::create_dir_all(p.join("new")).expect("dir");
+        std::fs::write(p.join("new/gone"), "gone\n").expect("gone");
+        assert_cli_success(&run_libra_command(&["add", "new/gone"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base adds new/gone", "--no-verify"], p),
+            "base",
+        );
+        let base = head_commit(p);
+        let hex_bytes = |id: &str| -> Vec<u8> {
+            (0..id.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&id[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let write_tree_bytes = |bytes: &[u8], label: &str| -> String {
+            std::fs::write(p.join(".tree"), bytes).expect("tree bytes");
+            let out = run_libra_command(
+                &["hash-object", "-t", "tree", "-w", "--literally", ".tree"],
+                p,
+            );
+            assert_cli_success(&out, label);
+            std::fs::remove_file(p.join(".tree")).expect("cleanup");
+            stdout_trimmed(&out)
+        };
+        let edited = {
+            let out = run_libra_command_with_stdin(
+                &["hash-object", "-w", "--stdin"],
+                p,
+                "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            );
+            assert_cli_success(&out, "hash-object");
+            stdout_trimmed(&out)
+        };
+        // Theirs: `old` edited, and `new` now holds ONLY an empty `sub` tree.
+        let empty = write_tree_bytes(&[], "empty tree");
+        let mut sub = b"40000 sub\0".to_vec();
+        sub.extend(hex_bytes(&empty));
+        let nested = write_tree_bytes(&sub, "new/ tree");
+        let other_id = {
+            let out = run_libra_command(&["rev-parse", &format!("{base}:other.txt")], p);
+            assert_cli_success(&out, "other.txt id");
+            stdout_trimmed(&out)
+        };
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        let push = |name: &str, mode: &str, id: &str, entries: &mut Vec<(String, Vec<u8>)>| {
+            let mut entry = format!("{mode} {name}\0").into_bytes();
+            entry.extend(hex_bytes(id));
+            let key = if mode == "40000" {
+                format!("{name}/")
+            } else {
+                name.to_string()
+            };
+            entries.push((key, entry));
+        };
+        push("new", "40000", &nested, &mut entries);
+        push("old", "100644", &edited, &mut entries);
+        push("other.txt", "100644", &other_id, &mut entries);
+        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let root: Vec<u8> = entries.into_iter().flat_map(|(_, entry)| entry).collect();
+        let root = write_tree_bytes(&root, "root tree");
+        let theirs = {
+            let out = run_libra_command(
+                &[
+                    "commit-tree",
+                    &root,
+                    "-p",
+                    &base,
+                    "-m",
+                    "theirs edits old and empties new/",
+                ],
+                p,
+            );
+            assert_cli_success(&out, "commit-tree");
+            stdout_trimmed(&out)
+        };
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/feature", &theirs], p),
+            "refs/heads/feature",
+        );
+        assert_cli_success(&run_libra_command(&["reset", "--hard", &base], p), "reset");
+        assert_cli_success(&run_libra_command(&["rm", "new/gone"], p), "drop new/gone");
+        std::fs::rename(p.join("old"), p.join("new")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "ours deletes new/gone and renames old to new",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "ours",
+        );
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge — the base had that directory");
+        assert_eq!(
+            std::fs::read_to_string(p.join("new")).expect("merged file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the rename was used and the edit followed it"
+        );
+        assert!(index_stage_lines(p, "old").is_empty(), "walk {env:?}");
+    }
+}
+
+/// Codex R16/R17: after the rename fix-up resolves a destination, a collision
+/// candidate the WALK recorded for that same path is stale — settling it puts
+/// the pre-rename blob back and drops the resolved content from every stage.
+/// Base holds files `old` and `d`; ours replaces both with `d/new` (the rename);
+/// theirs edits `old` and replaces `d` with an empty `d/new/sub`. Git merges
+/// cleanly with the edit at `d/new`.
+#[test]
+fn merge_rename_destination_is_not_re_settled_as_a_collision() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base old");
+        commit_file(p, "d", "a file at d\n", "base d");
+        let base = head_commit(p);
+        let hex_bytes = |id: &str| -> Vec<u8> {
+            (0..id.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&id[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let write_tree_bytes = |bytes: &[u8], label: &str| -> String {
+            std::fs::write(p.join(".tree"), bytes).expect("tree bytes");
+            let out = run_libra_command(
+                &["hash-object", "-t", "tree", "-w", "--literally", ".tree"],
+                p,
+            );
+            assert_cli_success(&out, label);
+            std::fs::remove_file(p.join(".tree")).expect("cleanup");
+            stdout_trimmed(&out)
+        };
+        let edited = {
+            let out = run_libra_command_with_stdin(
+                &["hash-object", "-w", "--stdin"],
+                p,
+                "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            );
+            assert_cli_success(&out, "hash-object");
+            stdout_trimmed(&out)
+        };
+        // theirs: `d` becomes a directory holding only an empty `new/sub`.
+        let empty = write_tree_bytes(&[], "empty tree");
+        let mut sub = b"40000 sub\0".to_vec();
+        sub.extend(hex_bytes(&empty));
+        let new_tree = write_tree_bytes(&sub, "d/new tree");
+        let mut new_entry = b"40000 new\0".to_vec();
+        new_entry.extend(hex_bytes(&new_tree));
+        let d_tree = write_tree_bytes(&new_entry, "d tree");
+        let other_id = {
+            let out = run_libra_command(&["rev-parse", &format!("{base}:other.txt")], p);
+            assert_cli_success(&out, "other.txt id");
+            stdout_trimmed(&out)
+        };
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for (name, mode, id) in [
+            ("d", "40000", d_tree.as_str()),
+            ("old", "100644", edited.as_str()),
+            ("other.txt", "100644", other_id.as_str()),
+        ] {
+            let mut entry = format!("{mode} {name}\0").into_bytes();
+            entry.extend(hex_bytes(id));
+            let key = if mode == "40000" {
+                format!("{name}/")
+            } else {
+                name.to_string()
+            };
+            entries.push((key, entry));
+        }
+        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let root: Vec<u8> = entries.into_iter().flat_map(|(_, entry)| entry).collect();
+        let root = write_tree_bytes(&root, "root tree");
+        let theirs = {
+            let out = run_libra_command(&["commit-tree", &root, "-p", &base, "-m", "theirs"], p);
+            assert_cli_success(&out, "commit-tree");
+            stdout_trimmed(&out)
+        };
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/feature", &theirs], p),
+            "refs/heads/feature",
+        );
+        assert_cli_success(&run_libra_command(&["reset", "--hard", &base], p), "reset");
+        assert_cli_success(&run_libra_command(&["rm", "d"], p), "drop the file d");
+        std::fs::create_dir_all(p.join("d")).expect("dir");
+        std::fs::rename(p.join("old"), p.join("d/new")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames old to d/new", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        // Git merges this cleanly with the edit at `d/new`, and both walks must
+        // agree with it — a weaker "the blob is on SOME stage" assertion let the
+        // two engines disagree here for a whole round (Codex R18).
+        assert_cli_success(
+            &out,
+            &format!("walk {env:?}: clean merge, as git merges it: {stdout} / {stderr}"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("d/new")).expect("merged file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the rename was used and the edit followed it"
+        );
+        let stages = index_stage_lines(p, "d/new");
+        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
+        assert!(
+            stages[0].contains(" 0\t") && stages[0].contains(&edited),
+            "walk {env:?}: the edit is at stage 0: {stages:?}"
+        );
+        assert!(
+            index_stage_lines(p, "old").is_empty(),
+            "walk {env:?}: nothing is left at the old path"
+        );
+    }
+}
+
+/// Codex R20: `files_changed` for an INCOMING rename, counted the way Git's
+/// diffstat counts it, and identical across preview, `--no-commit` and
+/// `--continue` on both walks. Two shapes, both measured on git 2.50.1:
+///
+///  * theirs renames `old` to `new` AND edits a line while ours touches an
+///    unrelated file — `1 file changed`, rendered `old => new`, because the pair
+///    still reads as a rename;
+///  * ours first deletes most of `old` so HEAD-to-result similarity drops below
+///    the threshold — `2 files changed`, a delete and a create, because the pair
+///    no longer reads as a rename at all.
+///
+/// The earlier carriers put the rename on OURS (already in HEAD) or made theirs
+/// perform a pure move, so neither exercised this accounting.
+#[test]
+fn merge_incoming_rename_files_changed_matches_git_across_modes() {
+    for (label, ours_truncates, expected) in [("edited", false, 1), ("low-similarity", true, 2)] {
+        for env in [
+            &[][..],
+            &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+        ] {
+            let full: String = (0..12).map(|n| format!("line {n}\n")).collect();
+            let build = |p: &std::path::Path| {
+                std::fs::write(p.join("old"), &full).expect("old");
+                std::fs::write(p.join("unrelated.txt"), "u\n").expect("unrelated");
+                assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+                assert_cli_success(
+                    &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+                    "base",
+                );
+                assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+                if ours_truncates {
+                    // Drop most of the file so the surviving pair is no longer
+                    // similar enough to read as a rename.
+                    let tail: String = (8..12).map(|n| format!("line {n}\n")).collect();
+                    std::fs::write(p.join("old"), tail).expect("ours truncates");
+                } else {
+                    std::fs::write(p.join("unrelated.txt"), "ours change\n").expect("ours");
+                }
+                assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+                assert_cli_success(
+                    &run_libra_command(&["commit", "-m", "ours", "--no-verify"], p),
+                    "ours",
+                );
+                assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+                std::fs::rename(p.join("old"), p.join("new")).expect("theirs renames");
+                let edited: String = (0..12)
+                    .map(|n| {
+                        if (9..12).contains(&n) {
+                            format!("EDITED {n}\n")
+                        } else {
+                            format!("line {n}\n")
+                        }
+                    })
+                    .collect();
+                std::fs::write(p.join("new"), edited).expect("theirs edits");
+                assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+                assert_cli_success(
+                    &run_libra_command(&["commit", "-m", "theirs", "--no-verify"], p),
+                    "theirs",
+                );
+                assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+            };
+
+            // Preview.
+            let repo = create_committed_repo_via_cli();
+            let p = repo.path();
+            build(p);
+            let preview = run_libra_command_with_stdin_and_env(
+                &["--json", "merge", "--dry-run", "feature"],
+                p,
+                "",
+                env,
+            );
+            assert_cli_success(&preview, "dry-run");
+            let json = parse_json_stdout(&preview);
+            assert_eq!(
+                json["data"]["files_changed"], expected,
+                "{label} walk {env:?}: preview counts it as git does: {json}"
+            );
+
+            // `--no-commit`, then `--continue`: the same number, twice.
+            let repo = create_committed_repo_via_cli();
+            let p = repo.path();
+            build(p);
+            let staged = run_libra_command_with_stdin_and_env(
+                &["--json", "merge", "--no-commit", "feature"],
+                p,
+                "",
+                env,
+            );
+            assert_cli_success(&staged, "no-commit");
+            let json = parse_json_stdout(&staged);
+            assert_eq!(
+                json["data"]["files_changed"], expected,
+                "{label} walk {env:?}: --no-commit agrees: {json}"
+            );
+            let finished = run_libra_command_with_stdin_and_env(
+                &["--json", "merge", "--continue"],
+                p,
+                "",
+                env,
+            );
+            assert_cli_success(&finished, "continue");
+            let json = parse_json_stdout(&finished);
+            assert_eq!(
+                json["data"]["files_changed"], expected,
+                "{label} walk {env:?}: --continue agrees: {json}"
+            );
+        }
+    }
+}
+
+/// Codex R21: the empty-blob exclusion belongs to DETECTION, not to reporting.
+/// Git turns rename detection off for empty blobs while merging
+/// (`rename_empty = 0`), but its diffstat is an ordinary diff and pairs them as
+/// usual — so with ours emptying `old` and theirs purely renaming it to `new`,
+/// `git merge` still reports `1 file changed`. Reusing the merge's snapshot at
+/// finalize time made `--continue` report 2 where the preview reported 1.
+#[test]
+fn merge_files_changed_pairs_an_emptied_rename_when_reporting() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let build = |p: &std::path::Path| {
+            commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+            commit_file(p, "unrelated.txt", "u\n", "base unrelated");
+            assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+            std::fs::write(p.join("old"), "").expect("ours empties old");
+            assert_cli_success(&run_libra_command(&["add", "old"], p), "stage");
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", "ours empties old", "--no-verify"], p),
+                "ours",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+            std::fs::rename(p.join("old"), p.join("new")).expect("theirs renames");
+            assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", "theirs renames", "--no-verify"], p),
+                "theirs",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        };
+
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        build(p);
+        let preview = run_libra_command_with_stdin_and_env(
+            &["--json", "merge", "--dry-run", "feature"],
+            p,
+            "",
+            env,
+        );
+        assert_cli_success(&preview, "dry-run");
+        assert_eq!(
+            parse_json_stdout(&preview)["data"]["files_changed"],
+            1,
+            "walk {env:?}: the preview counts the rename once, as git does"
+        );
+
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        build(p);
+        assert_cli_success(
+            &run_libra_command_with_stdin_and_env(&["merge", "--no-commit", "feature"], p, "", env),
+            "no-commit",
+        );
+        let finished =
+            run_libra_command_with_stdin_and_env(&["--json", "merge", "--continue"], p, "", env);
+        assert_cli_success(&finished, "continue");
+        assert_eq!(
+            parse_json_stdout(&finished)["data"]["files_changed"],
+            1,
+            "walk {env:?}: --continue agrees with the preview"
+        );
+    }
+}
+
+/// Codex R20: finalizing a merge must never fail because of the rename
+/// configuration. `merge -s ours` bypasses detection entirely, and Git's
+/// `--continue` (a plain commit) never parses `merge.renames` at all — yet the
+/// count added for R18 parsed it, so staging a move before `--continue` failed
+/// the command with LBR-REPO-003. The count is a report: an unusable value now
+/// falls back to the plain number.
+#[test]
+fn merge_continue_survives_an_unusable_rename_config() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "old", "a\nb\nc\n", "base");
+    commit_file(p, "f.txt", "x\n", "base f");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    commit_file(p, "o.txt", "o\n", "ours");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "t.txt", "t\n", "theirs");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "not-a-bool"], p),
+        "merge.renames=not-a-bool",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["merge", "-s", "ours", "--no-commit", "feature"], p),
+        "-s ours ignores the rename config, as git does",
+    );
+    // The user stages a move before finishing — the staged result no longer
+    // equals HEAD, which is what defeated the first version of the guard.
+    std::fs::rename(p.join("old"), p.join("moved")).expect("move a tracked file");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage the move");
+    assert_cli_success(
+        &run_libra_command(&["merge", "--continue"], p),
+        "the merge finalizes; the count never fails the command",
+    );
+}
+
+/// Codex R19: an empty-directory marker at a PREFIX of the destination does not
+/// make the base "hold something" there. Base holds `old` and an EMPTY tree `d`;
+/// ours renames `old` to `d/new`; theirs edits `old` and adds an empty
+/// `d/new/sub`. Git 2.50.1 conflicts, and so must both walks — accepting
+/// markers through the prefix test let the flattening walk commit a rename git
+/// refuses. The companion case, where `d` is a FILE, is
+/// `merge_rename_destination_is_not_re_settled_as_a_collision`.
+#[test]
+fn merge_rename_under_an_empty_base_directory_is_declined() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base old");
+        let seed = head_commit(p);
+        let hex_bytes = |id: &str| -> Vec<u8> {
+            (0..id.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&id[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let write_tree_bytes = |bytes: &[u8], label: &str| -> String {
+            std::fs::write(p.join(".tree"), bytes).expect("tree bytes");
+            let out = run_libra_command(
+                &["hash-object", "-t", "tree", "-w", "--literally", ".tree"],
+                p,
+            );
+            assert_cli_success(&out, label);
+            std::fs::remove_file(p.join(".tree")).expect("cleanup");
+            stdout_trimmed(&out)
+        };
+        let id_of = |rev: &str| -> String {
+            let out = run_libra_command(&["rev-parse", rev], p);
+            assert_cli_success(&out, "rev-parse");
+            stdout_trimmed(&out)
+        };
+        let empty = write_tree_bytes(&[], "empty tree");
+        let old_id = id_of(&format!("{seed}:old"));
+        let other_id = id_of(&format!("{seed}:other.txt"));
+        let root_bytes = |entries: Vec<(&str, &str, String)>| -> Vec<u8> {
+            let mut rows: Vec<(String, Vec<u8>)> = entries
+                .into_iter()
+                .map(|(name, mode, id)| {
+                    let mut entry = format!("{mode} {name}\0").into_bytes();
+                    entry.extend(hex_bytes(&id));
+                    let key = if mode == "40000" {
+                        format!("{name}/")
+                    } else {
+                        name.to_string()
+                    };
+                    (key, entry)
+                })
+                .collect();
+            rows.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            rows.into_iter().flat_map(|(_, entry)| entry).collect()
+        };
+        // BASE: `old`, an EMPTY tree at `d`, and `other.txt`.
+        let base_root = write_tree_bytes(
+            &root_bytes(vec![
+                ("d", "40000", empty.clone()),
+                ("old", "100644", old_id.clone()),
+                ("other.txt", "100644", other_id.clone()),
+            ]),
+            "base root",
+        );
+        let base = {
+            let out = run_libra_command(&["commit-tree", &base_root, "-p", &seed, "-m", "base"], p);
+            assert_cli_success(&out, "commit-tree base");
+            stdout_trimmed(&out)
+        };
+        // THEIRS: `old` edited, and `d` holding only an empty `new/sub`.
+        let edited = {
+            let out = run_libra_command_with_stdin(
+                &["hash-object", "-w", "--stdin"],
+                p,
+                "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            );
+            assert_cli_success(&out, "hash-object");
+            stdout_trimmed(&out)
+        };
+        let mut sub = b"40000 sub\0".to_vec();
+        sub.extend(hex_bytes(&empty));
+        let new_tree = write_tree_bytes(&sub, "d/new tree");
+        let mut new_entry = b"40000 new\0".to_vec();
+        new_entry.extend(hex_bytes(&new_tree));
+        let d_tree = write_tree_bytes(&new_entry, "d tree");
+        let theirs_root = write_tree_bytes(
+            &root_bytes(vec![
+                ("d", "40000", d_tree),
+                ("old", "100644", edited),
+                ("other.txt", "100644", other_id.clone()),
+            ]),
+            "theirs root",
+        );
+        let theirs = {
+            let out = run_libra_command(
+                &["commit-tree", &theirs_root, "-p", &base, "-m", "theirs"],
+                p,
+            );
+            assert_cli_success(&out, "commit-tree theirs");
+            stdout_trimmed(&out)
+        };
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/feature", &theirs], p),
+            "refs/heads/feature",
+        );
+        // OURS: `old` renamed to `d/new`.
+        let ours_d = write_tree_bytes(
+            &{
+                let mut bytes = b"100644 new\0".to_vec();
+                bytes.extend(hex_bytes(&old_id));
+                bytes
+            },
+            "ours d tree",
+        );
+        let ours_root = write_tree_bytes(
+            &root_bytes(vec![
+                ("d", "40000", ours_d),
+                ("other.txt", "100644", other_id),
+            ]),
+            "ours root",
+        );
+        let ours = {
+            let out = run_libra_command(&["commit-tree", &ours_root, "-p", &base, "-m", "ours"], p);
+            assert_cli_success(&out, "commit-tree ours");
+            stdout_trimmed(&out)
+        };
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/main", &ours], p),
+            "refs/heads/main",
+        );
+        assert_cli_success(&run_libra_command(&["reset", "--hard", &ours], p), "reset");
+
+        // `merge_expecting_conflict` already pins exit 128 + LBR-CONFLICT-002.
+        // What matters here is that the rename was NOT used: the edited content
+        // must not have followed it to the destination.
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stages = index_stage_lines(p, "d/new");
+        assert!(
+            !stages.iter().any(|line| line.contains(" 0\t")),
+            "walk {env:?}: the rename was refused, as git refuses it: \
+             {stages:?} / {stdout}"
+        );
+    }
+}
+
+/// Codex R16: SEVERAL departing siblings must empty their directory together.
+/// With `new/child` and `new/second` both renamed away, neither one alone makes
+/// `new` empty, so a "does any other entry remain" test answers yes for both
+/// and neither release fires. Counting occupants fixes it. Git merges this
+/// cleanly with all three edits; both walks must too.
+#[test]
+fn merge_three_renames_emptying_one_directory_all_apply() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        let old_body: String = (1..=8).map(|n| format!("a{n}\n")).collect();
+        let child_body: String = (1..=8).map(|n| format!("p{n}\n")).collect();
+        let second_body: String = (1..=8).map(|n| format!("q{n}\n")).collect();
+        std::fs::write(p.join("old"), &old_body).expect("old");
+        std::fs::create_dir_all(p.join("new")).expect("dir");
+        std::fs::write(p.join("new/child"), &child_body).expect("child");
+        std::fs::write(p.join("new/second"), &second_body).expect("second");
+        assert_cli_success(
+            &run_libra_command(&["add", "old", "new/child", "new/second"], p),
+            "stage",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "old", "new/child", "new/second"], p),
+            "drop",
+        );
+        let _ = std::fs::remove_dir(p.join("new"));
+        std::fs::write(p.join("new"), &old_body).expect("new");
+        std::fs::write(p.join("z"), &child_body).expect("z");
+        std::fs::write(p.join("w"), &second_body).expect("w");
+        assert_cli_success(&run_libra_command(&["add", "new", "z", "w"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames all three", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::write(p.join("old"), old_body.replace("a2\n", "a2 EDIT\n")).expect("edit old");
+        std::fs::write(p.join("new/child"), child_body.replace("p2\n", "p2 EDIT\n"))
+            .expect("edit child");
+        std::fs::write(
+            p.join("new/second"),
+            second_body.replace("q2\n", "q2 EDIT\n"),
+        )
+        .expect("edit second");
+        assert_cli_success(
+            &run_libra_command(&["add", "old", "new/child", "new/second"], p),
+            "stage",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "theirs edits all three", "--no-verify"],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge — the three renames empty the directory");
+        for (file, body, marker) in [
+            ("new", &old_body, "a2 EDIT"),
+            ("z", &child_body, "p2 EDIT"),
+            ("w", &second_body, "q2 EDIT"),
+        ] {
+            let got = std::fs::read_to_string(p.join(file)).expect("merged file");
+            assert!(
+                got.contains(marker),
+                "walk {env:?}: {file} carries theirs' edit: {got:?} (base {body:?})"
+            );
+        }
+        assert!(index_stage_lines(p, "old").is_empty(), "walk {env:?}");
+    }
+}
+
+/// Codex R16: a rename BLOCKED at its destination never happens, so its source
+/// stays — and that can block a further rename that was counting on it moving.
+/// Releasing every source once and deciding once accepted both, which left a
+/// file and a directory sharing the name `new` in the index (`ls-files` failed
+/// with EISDIR). The decision is now a fixed point: both walks decline both
+/// renames, agree exactly, and keep every side's content on a stage.
+#[test]
+fn merge_a_blocked_rename_keeps_its_source_occupied() {
+    let mut results = Vec::new();
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        let old_body: String = (1..=8).map(|n| format!("a{n}\n")).collect();
+        let child_body: String = (1..=8).map(|n| format!("p{n}\n")).collect();
+        std::fs::write(p.join("old"), &old_body).expect("old");
+        std::fs::create_dir_all(p.join("new")).expect("dir");
+        std::fs::write(p.join("new/child"), &child_body).expect("child");
+        assert_cli_success(&run_libra_command(&["add", "old", "new/child"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "old", "new/child"], p), "drop");
+        let _ = std::fs::remove_dir(p.join("new"));
+        std::fs::write(p.join("new"), &old_body).expect("new");
+        std::fs::write(p.join("z"), &child_body).expect("z");
+        assert_cli_success(&run_libra_command(&["add", "new", "z"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "ours renames old to new and new/child to z",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::write(p.join("old"), old_body.replace("a2\n", "a2 EDIT\n")).expect("edit old");
+        std::fs::write(p.join("new/child"), child_body.replace("p2\n", "p2 EDIT\n"))
+            .expect("edit child");
+        // Theirs occupies `z`, so `new/child` cannot move — and `old` therefore
+        // cannot move onto `new` either.
+        std::fs::write(p.join("z"), "theirs own z\n").expect("z");
+        assert_cli_success(
+            &run_libra_command(&["add", "old", "new/child", "z"], p),
+            "stage",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "theirs edits both and adds z",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let _ = merge_expecting_conflict(p, &["merge", "feature"], env);
+        // The index is well formed: no file and directory share `new`.
+        let listing = run_libra_command(&["ls-files", "-s"], p);
+        assert_cli_success(&listing, "ls-files still works");
+        let mut stages: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .filter(|line| !line.contains("libraignore"))
+            .map(|line| line.to_string())
+            .collect();
+        stages.sort();
+        assert!(
+            !stages.iter().any(|line| line.ends_with("\tnew")),
+            "walk {env:?}: no file sits at `new` while `new/child` is unmerged: {stages:?}"
+        );
+        // Theirs' edit to the blocked rename's source survives on a stage.
+        let old_stages = index_stage_lines(p, "old");
+        assert!(
+            old_stages.iter().any(|line| line.contains(" 3\t")),
+            "walk {env:?}: theirs' edit to `old` is kept: {old_stages:?}"
+        );
+        results.push(stages);
+    }
+    assert_eq!(
+        results[0], results[1],
+        "the two walks agree exactly on the blocked chain"
+    );
+}
+
+/// Codex R15: two renames can free each other's destination. Ours renames both
+/// `old` to `new` and `new/child` to `z`, so nothing is left under `new` for
+/// the first rename to collide with. Measured on git 2.50.1 with theirs editing
+/// BOTH sources: a clean merge that keeps both edits. Treating a path a rename
+/// moves away as occupancy left a spurious modify/delete conflict at `old`.
+#[test]
+fn merge_two_renames_that_free_each_other_both_apply() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        let old_body = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        let child_body = "p1\np2\np3\np4\np5\np6\np7\np8\n";
+        std::fs::write(p.join("old"), old_body).expect("old");
+        std::fs::create_dir_all(p.join("new")).expect("dir");
+        std::fs::write(p.join("new/child"), child_body).expect("child");
+        assert_cli_success(&run_libra_command(&["add", "old", "new/child"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "old", "new/child"], p), "drop");
+        let _ = std::fs::remove_dir(p.join("new"));
+        std::fs::write(p.join("new"), old_body).expect("new");
+        std::fs::write(p.join("z"), child_body).expect("z");
+        assert_cli_success(&run_libra_command(&["add", "new", "z"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "ours renames old to new and new/child to z",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::write(p.join("old"), old_body.replace("b\n", "b EDIT\n")).expect("edit old");
+        std::fs::write(p.join("new/child"), child_body.replace("p2\n", "p2 EDIT\n"))
+            .expect("edit child");
+        assert_cli_success(&run_libra_command(&["add", "old", "new/child"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs edits both", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge — each rename frees the other");
+        assert_eq!(
+            std::fs::read_to_string(p.join("new")).expect("new"),
+            old_body.replace("b\n", "b EDIT\n"),
+            "walk {env:?}: the first rename carried theirs' edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("z")).expect("z"),
+            child_body.replace("p2\n", "p2 EDIT\n"),
+            "walk {env:?}: the second rename carried theirs' edit"
+        );
+        assert!(index_stage_lines(p, "old").is_empty(), "walk {env:?}");
+    }
+}
+
+/// Codex R14: an empty tree AT the rename destination is not in the way, but
+/// one BENEATH it is — it makes the destination a real directory, and MG-04's
+/// rule adopts a directory the base did not have verbatim. Measured on
+/// git 2.50.1 with theirs editing `old` and adding `new/sub` as an empty tree:
+/// `git merge-tree --messages` reports
+/// `CONFLICT (file/directory): directory in the way of new` and relocates the
+/// file to `new~<branch>`. The occupancy set had excluded every empty marker,
+/// so the flattening walk used the rename and committed cleanly.
+#[test]
+fn merge_rename_onto_a_nested_empty_directory_is_declined() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        let base = head_commit(p);
+        let hex_bytes = |id: &str| -> Vec<u8> {
+            (0..id.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&id[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let write_tree_bytes = |bytes: &[u8], label: &str| -> String {
+            std::fs::write(p.join(".tree"), bytes).expect("tree bytes");
+            let out = run_libra_command(
+                &["hash-object", "-t", "tree", "-w", "--literally", ".tree"],
+                p,
+            );
+            assert_cli_success(&out, label);
+            std::fs::remove_file(p.join(".tree")).expect("cleanup");
+            stdout_trimmed(&out)
+        };
+        let edited = {
+            let out = run_libra_command_with_stdin(
+                &["hash-object", "-w", "--stdin"],
+                p,
+                "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            );
+            assert_cli_success(&out, "hash-object");
+            stdout_trimmed(&out)
+        };
+        // `new` is a tree holding one entry, `sub`, which is the EMPTY tree.
+        let empty = write_tree_bytes(&[], "empty tree");
+        let mut sub = b"40000 sub\0".to_vec();
+        sub.extend(hex_bytes(&empty));
+        let nested = write_tree_bytes(&sub, "new/ tree");
+
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "update-index",
+                    "--cacheinfo",
+                    &format!("100644,{edited},old.txt"),
+                ],
+                p,
+            ),
+            "stage theirs' edit",
+        );
+        let tree = run_libra_command(&["write-tree"], p);
+        assert_cli_success(&tree, "write-tree");
+        let tree = stdout_trimmed(&tree);
+        let listing = run_libra_command(&["ls-tree", &tree], p);
+        assert_cli_success(&listing, "ls-tree");
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+            let (meta, name) = line.split_once('\t').expect("ls-tree line");
+            let mut parts = meta.split_whitespace();
+            let mode = parts.next().expect("mode");
+            let _kind = parts.next();
+            let id = parts.next().expect("id");
+            let mut entry = format!("{} {name}\0", mode.trim_start_matches('0')).into_bytes();
+            entry.extend(hex_bytes(id));
+            entries.push((name.to_string(), entry));
+        }
+        let mut new_entry = b"40000 new\0".to_vec();
+        new_entry.extend(hex_bytes(&nested));
+        entries.push(("new/".to_string(), new_entry));
+        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let root: Vec<u8> = entries.into_iter().flat_map(|(_, entry)| entry).collect();
+        let root = write_tree_bytes(&root, "root tree");
+        let theirs = {
+            let out = run_libra_command(
+                &[
+                    "commit-tree",
+                    &root,
+                    "-p",
+                    &base,
+                    "-m",
+                    "theirs edits old.txt and adds an empty new/sub",
+                ],
+                p,
+            );
+            assert_cli_success(&out, "commit-tree");
+            stdout_trimmed(&out)
+        };
+        assert_cli_success(
+            &run_libra_command(&["update-ref", "refs/heads/feature", &theirs], p),
+            "refs/heads/feature",
+        );
+        assert_cli_success(&run_libra_command(&["reset", "--hard", &base], p), "reset");
+        std::fs::rename(p.join("old.txt"), p.join("new")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames old.txt to new", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("CONFLICT (file/directory)"),
+            "walk {env:?}: the nested empty directory is in the way: {stdout}"
+        );
+        assert!(
+            !index_stage_lines(p, "new~HEAD").is_empty(),
+            "walk {env:?}: the renamed file was relocated, as git relocates it"
+        );
+    }
+}
+
+/// FIX-MG05-02 (Codex R13, pre-existing — the released v0.22.15 reproduces it):
+/// the criss-cross fold is a merge, so it has to detect renames like any other.
+/// Without that the virtual ancestor keeps the OLD path while both sides carry
+/// the new one, and the outer merge compares each side against a base that has
+/// nothing at the renamed path — silently resurrecting content one side had
+/// deliberately reverted. Measured on git 2.50.1: with bases `A` (renames `old`
+/// to `new`) and `B` (edits line 2), ours merging both and reverting B's edit
+/// and theirs merging both and editing line 7, Git keeps the revert.
+#[test]
+fn merge_criss_cross_fold_detects_renames_and_keeps_a_revert() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let original: String = (1..=8).map(|n| format!("line{n}\n")).collect();
+    let b_edit = original.replace("line2", "B edit");
+    let reverted = original.clone();
+    let d_edit = b_edit.replace("line7", "D edit");
+
+    std::fs::write(p.join("old"), &original).expect("write old");
+    assert_cli_success(&run_libra_command(&["add", "old"], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    for branch in ["a", "b"] {
+        assert_cli_success(&run_libra_command(&["branch", branch], p), "branch");
+    }
+    // A renames the file.
+    assert_cli_success(&run_libra_command(&["checkout", "a"], p), "a");
+    std::fs::rename(p.join("old"), p.join("new")).expect("rename");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A renames old to new", "--no-verify"], p),
+        "A",
+    );
+    // B edits line 2 at the old path.
+    assert_cli_success(&run_libra_command(&["checkout", "b"], p), "b");
+    commit_file(p, "old", &b_edit, "B edits line 2");
+
+    // C = merge(A, B), then revert B's edit.
+    assert_cli_success(&run_libra_command(&["checkout", "a"], p), "a");
+    assert_cli_success(&run_libra_command(&["branch", "c"], p), "branch c");
+    assert_cli_success(&run_libra_command(&["checkout", "c"], p), "c");
+    assert_cli_success(
+        &run_libra_command(&["merge", "b", "-m", "C merges", "--no-verify"], p),
+        "C merges",
+    );
+    commit_file(p, "new", &reverted, "C reverts B's edit");
+
+    // D = merge(B, A), then edit line 7.
+    assert_cli_success(&run_libra_command(&["checkout", "b"], p), "b");
+    assert_cli_success(&run_libra_command(&["branch", "d"], p), "branch d");
+    assert_cli_success(&run_libra_command(&["checkout", "d"], p), "d");
+    assert_cli_success(
+        &run_libra_command(&["merge", "a", "-m", "D merges", "--no-verify"], p),
+        "D merges",
+    );
+    commit_file(p, "new", &d_edit, "D edits line 7");
+
+    assert_cli_success(&run_libra_command(&["checkout", "c"], p), "c");
+    assert_cli_success(
+        &run_libra_command(&["merge", "d", "-m", "final", "--no-verify"], p),
+        "the criss-cross merge is clean",
+    );
+    let merged = std::fs::read_to_string(p.join("new")).expect("merged file");
+    assert!(
+        merged.contains("line2") && !merged.contains("B edit"),
+        "the revert survives the fold, as it does in git: {merged:?}"
+    );
+    assert!(
+        merged.contains("D edit"),
+        "the other side's edit is still applied: {merged:?}"
+    );
+}
+
+/// Codex R13: Git turns rename detection OFF for EMPTY blobs when it merges
+/// (`merge-ort.c:3449`, `rename_empty = 0`) — every empty file matches every
+/// other, so an emptied placeholder would pair with anything. Measured on
+/// git 2.50.1: base holds an empty `old`, ours moves it to an empty `new`,
+/// theirs fills `old`; Git stops at `CONFLICT (modify/delete)` and keeps
+/// theirs' content on `old`. Pairing them carried that content to `new`,
+/// deleted `old` and exited 0. `diff` and `status` keep Git's own default.
+#[test]
+fn merge_does_not_pair_empty_blobs_as_renames() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "other");
+        std::fs::write(p.join("old"), "").expect("empty old");
+        assert_cli_success(&run_libra_command(&["add", "old"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "base adds an empty old", "--no-verify"],
+                p,
+            ),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::rename(p.join("old"), p.join("new")).expect("move the empty file");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours moves it to new", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(p, "old", "now it has content\n", "theirs fills old");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let _ = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let old_stages = index_stage_lines(p, "old");
+        assert_eq!(old_stages.len(), 2, "walk {env:?}: {old_stages:?}");
+        assert!(
+            old_stages.iter().any(|line| line.contains(" 3\t")),
+            "walk {env:?}: theirs' content survives at the old path: {old_stages:?}"
+        );
+        let new_stages = index_stage_lines(p, "new");
+        assert_eq!(new_stages.len(), 1, "walk {env:?}: {new_stages:?}");
+        assert!(
+            new_stages[0].contains("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"),
+            "walk {env:?}: the moved file is still empty: {new_stages:?}"
+        );
+    }
+}
+
+/// Codex R13 P2: holding the rename notices until the write preflight must not
+/// silence `--dry-run`, which writes nothing and so has no preflight to wait
+/// for. A preview reports the same rename decisions the real merge would make;
+/// `--json` stays machine-clean as always.
+#[test]
+fn merge_dry_run_reports_rename_notices() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "other");
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::rename(p.join("old.txt"), p.join("ours.txt")).expect("ours renames");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::rename(p.join("old.txt"), p.join("theirs.txt")).expect("theirs renames");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "theirs renames elsewhere", "--no-verify"],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let preview =
+            run_libra_command_with_stdin_and_env(&["merge", "--dry-run", "feature"], p, "", env);
+        assert_cli_success(&preview, "the preview succeeds");
+        let stdout = String::from_utf8_lossy(&preview.stdout).to_string();
+        assert!(
+            stdout.contains("was renamed to"),
+            "walk {env:?}: the preview reports the declined rename: {stdout}"
+        );
+
+        let json = run_libra_command_with_stdin_and_env(
+            &["merge", "--dry-run", "--json", "feature"],
+            p,
+            "",
+            env,
+        );
+        assert_cli_success(&json, "the json preview succeeds");
+        let json_out = String::from_utf8_lossy(&json.stdout).to_string();
+        assert!(
+            !json_out.contains("notice:"),
+            "walk {env:?}: json stdout stays machine-clean: {json_out}"
+        );
+    }
+}
+
+/// Codex R12 P2: a merge the writer's preflight refuses prints NO rename
+/// decision, exactly as it prints no file/directory line (MG-04 set that rule).
+/// The notices are held until the preflight has passed.
+#[test]
+fn a_refused_merge_prints_no_rename_notice() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "other");
+        commit_file(p, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::rename(p.join("old.txt"), p.join("ours.txt")).expect("ours renames");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::rename(p.join("old.txt"), p.join("theirs.txt")).expect("theirs renames");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "theirs renames elsewhere", "--no-verify"],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        // An untracked file the merge would overwrite: the preflight refuses.
+        std::fs::write(p.join("theirs.txt"), "untracked precious\n").expect("untracked");
+
+        let output = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert!(
+            !output.status.success(),
+            "walk {env:?}: the merge is refused"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            !stdout.contains("notice:") && !stderr.contains("was renamed to"),
+            "walk {env:?}: a refused merge announces no rename decision: {stdout} / {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("theirs.txt")).expect("untracked file"),
+            "untracked precious\n",
+            "walk {env:?}: the untracked file is untouched"
+        );
+    }
+}
+
+/// FIX-MG05-01 (Codex R12, pre-existing — reproduced on the released v0.22.15
+/// binary): `-X ours` / `-X theirs` settle CONTENT hunks only. Applying them to
+/// a modify/delete resolved the pair in favour of the DELETION, so the other
+/// side's edit was destroyed by a merge that exited 0 and recorded nothing.
+/// Measured on git 2.50.1 in both directions and with both options: the merge
+/// stops at `CONFLICT (modify/delete)` and keeps the modified content on its
+/// stage. Both walks, both options, both directions.
+#[test]
+fn strategy_option_never_resolves_a_modify_delete() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        for option in ["ours", "theirs"] {
+            // Both directions: whichever side holds the edit, that edit must
+            // survive — as content, not merely as a stage number.
+            for ours_deletes in [true, false] {
+                let repo = create_committed_repo_via_cli();
+                let p = repo.path();
+                commit_file(p, "other.txt", "o\n", "other");
+                commit_file(p, "f.txt", "a\nb\nc\n", "base");
+                assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+                if ours_deletes {
+                    assert_cli_success(&run_libra_command(&["rm", "f.txt"], p), "ours deletes");
+                    assert_cli_success(
+                        &run_libra_command(&["commit", "-m", "ours deletes", "--no-verify"], p),
+                        "ours",
+                    );
+                    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+                    commit_file(p, "f.txt", "a\nEDITED\nc\n", "theirs edits");
+                } else {
+                    commit_file(p, "f.txt", "a\nEDITED\nc\n", "ours edits");
+                    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+                    assert_cli_success(&run_libra_command(&["rm", "f.txt"], p), "theirs deletes");
+                    assert_cli_success(
+                        &run_libra_command(&["commit", "-m", "theirs deletes", "--no-verify"], p),
+                        "theirs",
+                    );
+                }
+                assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+                let args = ["merge", "-X", option, "feature"];
+                let _ = merge_expecting_conflict(p, &args, env);
+                let stages = index_stage_lines(p, "f.txt");
+                let where_edit = if ours_deletes { " 3\t" } else { " 2\t" };
+                assert_eq!(
+                    stages.len(),
+                    2,
+                    "walk {env:?} -X {option} ours_deletes={ours_deletes}: {stages:?}"
+                );
+                assert!(
+                    stages.iter().any(|line| line.contains(" 1\t")),
+                    "walk {env:?} -X {option} ours_deletes={ours_deletes}: base stage: {stages:?}"
+                );
+                let edit = stages
+                    .iter()
+                    .find(|line| line.contains(where_edit))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "walk {env:?} -X {option} ours_deletes={ours_deletes}: \
+                             the modified side survives: {stages:?}"
+                        )
+                    });
+                // The surviving stage really carries the EDIT, and the worktree
+                // keeps it too — a stage number alone would not have caught the
+                // deletion this test exists for.
+                assert!(
+                    !edit.contains("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"),
+                    "walk {env:?} -X {option}: the surviving stage is not empty: {edit}"
+                );
+                // The edit survives in the worktree too. Libra frames a
+                // modify/delete with conflict markers where Git leaves the
+                // modified file verbatim ("Version <side> of f.txt left in
+                // tree"); that framing predates this card — the released
+                // v0.22.15 does the same — and belongs to the conflict
+                // presentation axis, so the assertion is on the content being
+                // RETAINED, which is what the data-loss fix is about.
+                let worktree = std::fs::read_to_string(p.join("f.txt")).expect("worktree file");
+                assert!(
+                    worktree.contains("EDITED"),
+                    "walk {env:?} -X {option} ours_deletes={ours_deletes}: \
+                     the edited content is retained in the worktree: {worktree:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The same rule under MG-04's directory/file relocation, which is the shape
+/// Codex R12 reported: base `old` + `new/child`, ours renaming `old` to `new`
+/// and deleting `new/child`, theirs modifying `new/child`. With `-X ours` the
+/// modify/delete used to be resolved away, which also emptied the directory and
+/// so removed the collision — the merge committed only `new` and both the
+/// other side's edit and the conflict vanished. Git keeps `new/child` on
+/// stages 1 and 3 and relocates the file to `new~HEAD`.
+#[test]
+fn strategy_option_keeps_a_modify_delete_under_a_relocated_directory() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base file");
+        std::fs::create_dir_all(p.join("new")).expect("dir");
+        std::fs::write(p.join("new/child"), "payload\n").expect("child");
+        assert_cli_success(&run_libra_command(&["add", "new/child"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base adds new/child", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "old", "new/child"], p), "drop");
+        std::fs::write(p.join("new"), "a\nb\nc\nd\ne\nf\ng\nh\n").expect("write new");
+        assert_cli_success(&run_libra_command(&["add", "new"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "ours renames old to new and deletes new/child",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::write(p.join("new/child"), "payload edited\n").expect("edit child");
+        assert_cli_success(&run_libra_command(&["add", "new/child"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "theirs edits new/child", "--no-verify"],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let output = merge_expecting_conflict(p, &["merge", "-X", "ours", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("CONFLICT (file/directory)"),
+            "walk {env:?}: the collision is still reported: {stdout}"
+        );
+        let child = index_stage_lines(p, "new/child");
+        assert_eq!(child.len(), 2, "walk {env:?}: {child:?}");
+        assert!(
+            child.iter().any(|line| line.contains(" 3\t")),
+            "walk {env:?}: theirs' edit survives: {child:?}"
+        );
+        let moved = index_stage_lines(p, "new~HEAD");
+        assert_eq!(moved.len(), 1, "walk {env:?}: {moved:?}");
+        assert!(moved[0].contains(" 2\t"), "walk {env:?}: {moved:?}");
+    }
+}
+
+/// Adversarial pre-review: inside a subtree BOTH sides changed identically,
+/// the walk recorded the BASE entry as "the other side's entry", so a rename
+/// whose source the other side ALSO deleted escaped the rename/delete check and
+/// the pruned walk accepted it silently while the flattening engine declined it
+/// with a notice. Git reports `CONFLICT (rename/delete)` for this shape, which
+/// MG-06 owns; MG-05 must at least decline it the same way on both walks.
+#[test]
+fn merge_rename_whose_source_both_sides_deleted_is_declined_on_both_walks() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        let body: String = (0..40).map(|n| format!("src line {n}\n")).collect();
+        std::fs::create_dir_all(p.join("sub")).expect("sub");
+        std::fs::write(p.join("sub/src"), &body).expect("sub/src");
+        std::fs::write(p.join("sub/keep"), "keep\n").expect("sub/keep");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "sub/src"], p), "ours drops it");
+        std::fs::write(p.join("dest"), &body).expect("dest");
+        assert_cli_success(&run_libra_command(&["add", "dest"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "ours renames sub/src to dest",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "sub/src"], p), "theirs drops it");
+        std::fs::write(p.join("unrelated.txt"), "u\n").expect("unrelated");
+        assert_cli_success(&run_libra_command(&["add", "unrelated.txt"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "theirs deletes sub/src too", "--no-verify"],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            stdout.contains("deleted on the other side"),
+            "walk {env:?}: both walks report the rename/delete deferral: {stdout}"
+        );
+    }
+}
+
+/// Adversarial pre-review, shape A: a destination directory the OTHER side
+/// merely carries UNCHANGED from the base is not in the way — the renaming
+/// side necessarily deleted everything under it, so the merge deletes it.
+/// Measured on git 2.50.1 (`git merge-tree --write-tree --messages` and a real
+/// `git merge`) with base `old` + `new/child`, ours renaming `old` to `new`
+/// and deleting `new/child`, theirs editing `old`: a clean merge holding only
+/// `new` with the edit. The flattening engine used to decline the rename here
+/// and conflict at `old` while the pruned walk merged.
+#[test]
+fn merge_rename_onto_a_directory_the_merge_deletes_is_used() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base file");
+        std::fs::create_dir_all(p.join("new")).expect("dir");
+        std::fs::write(p.join("new/child"), "payload\n").expect("child");
+        assert_cli_success(&run_libra_command(&["add", "new/child"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base adds new/child", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "old", "new/child"], p), "drop");
+        std::fs::write(p.join("new"), "a\nb\nc\nd\ne\nf\ng\nh\n").expect("write new");
+        assert_cli_success(&run_libra_command(&["add", "new"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "ours renames old to new and deletes new/child",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        commit_file(
+            p,
+            "old",
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "theirs edits old and leaves new/child alone",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("new")).expect("merged file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the edit followed the rename"
+        );
+        let stages = index_stage_lines(p, "new");
+        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
+        assert!(stages[0].contains(" 0\t"), "walk {env:?}: {stages:?}");
+        assert!(
+            index_stage_lines(p, "old").is_empty(),
+            "walk {env:?}: nothing is left at the old path"
+        );
+    }
+}
+
+/// Adversarial pre-review: a rename whose source the other side replaced with a
+/// SYMLINK is a type change, which Git treats as a delete — it reports
+/// `CONFLICT (modify/delete)` and keeps the renamed file's content. Accepting
+/// the pair instead let the symlink be remapped onto the new path, where the
+/// three-way match took it as the only change and the file's content vanished
+/// from a merge that exited 0. Both walks lost it; both must now keep it.
+#[test]
+fn merge_rename_whose_source_became_a_symlink_keeps_the_content() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "other");
+        commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::rename(p.join("old"), p.join("new")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames old to new", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::remove_file(p.join("old")).expect("remove old");
+        std::os::unix::fs::symlink("other.txt", p.join("old")).expect("symlink");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "theirs replaces old with a symlink",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let output = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("deleted on the other side"),
+            "walk {env:?}: the type change is reported as a delete: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("new")).expect("the renamed file"),
+            "a\nb\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the renamed file's content survives"
+        );
+        let stages = index_stage_lines(p, "new");
+        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
+        assert!(
+            stages[0].contains("100644") && stages[0].contains(" 0\t"),
+            "walk {env:?}: it is still a regular file: {stages:?}"
+        );
+    }
+}
+
+/// Adversarial pre-review: an accepted rename can move the last file out of a
+/// directory the other side replaced with a file, and the collision then does
+/// not exist. Measured on git 2.50.1: base `dir/y` + `new/child`, ours editing
+/// `new/child`, theirs renaming `dir/y` to `new` and `new/child` to `a` — a
+/// clean merge holding `a` and a plain file `new`. The pruned walk settled its
+/// D/F collisions at the end of the walk, before the rename fix-up, and
+/// reported `new~theirs`; the flattening engine and Git did not.
+#[test]
+fn merge_rename_that_empties_a_directory_leaves_no_df_conflict() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "z\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        std::fs::create_dir_all(p.join("dir")).expect("dir");
+        std::fs::create_dir_all(p.join("new")).expect("new");
+        let long: String = (0..14).map(|n| format!("y line {n}\n")).collect();
+        let child: String = (0..8).map(|n| format!("child line {n}\n")).collect();
+        std::fs::write(p.join("dir/y"), &long).expect("dir/y");
+        std::fs::write(p.join("new/child"), &child).expect("new/child");
+        assert_cli_success(
+            &run_libra_command(&["add", "dir/y", "new/child"], p),
+            "stage",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::write(p.join("new/child"), child.replace("child line 5", "OURS")).expect("edit");
+        assert_cli_success(&run_libra_command(&["add", "new/child"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours edits new/child", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "dir/y", "new/child"], p), "drop");
+        std::fs::write(p.join("new"), long.replace("y line 5", "THEIRS")).expect("new file");
+        std::fs::write(p.join("a"), &child).expect("a");
+        assert_cli_success(&run_libra_command(&["add", "new", "a"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "theirs renames dir/y to new and new/child to a",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            !stdout.contains("file/directory"),
+            "walk {env:?}: the emptied directory is not in the way: {stdout}"
+        );
+        assert!(
+            p.join("new").is_file(),
+            "walk {env:?}: the plain file stands at new"
+        );
+        let stages = index_stage_lines(p, "new");
+        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
+        assert!(stages[0].contains(" 0\t"), "walk {env:?}: {stages:?}");
+        assert!(
+            index_stage_lines(p, "a").len() == 1,
+            "walk {env:?}: the other rename landed too"
+        );
+    }
+}
+
+/// Codex R7 P1: a destination the merge BASE occupied but that neither side
+/// kept is not in the way — only what SURVIVES the merge is. Measured on
+/// git 2.50.1 (`git merge-tree --write-tree --messages` and a real `git merge`)
+/// with base `old` + `dir/other`, both sides deleting `dir/other`, ours
+/// renaming `old` to `dir` and theirs editing `old`: a clean merge holding only
+/// `dir` with the edit. The flattening engine consulted the base as well and
+/// conflicted here while the pruned walk merged; both walks now agree with Git.
+#[test]
+fn merge_rename_onto_a_path_only_the_base_occupied_is_used() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        commit_file(p, "old", "a\nb\nc\nd\ne\nf\ng\nh\n", "base file");
+        std::fs::create_dir_all(p.join("dir")).expect("dir");
+        std::fs::write(p.join("dir/other"), "other\n").expect("dir/other");
+        assert_cli_success(&run_libra_command(&["add", "dir/other"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base adds dir/other", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        assert_cli_success(&run_libra_command(&["rm", "old", "dir/other"], p), "drop");
+        std::fs::write(p.join("dir"), "a\nb\nc\nd\ne\nf\ng\nh\n").expect("write dir");
+        assert_cli_success(&run_libra_command(&["add", "dir"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "ours deletes dir/other and renames old to dir",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        assert_cli_success(
+            &run_libra_command(&["rm", "dir/other"], p),
+            "drop dir/other",
+        );
+        commit_file(
+            p,
+            "old",
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "theirs deletes dir/other and edits old",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_cli_success(&out, "clean merge");
+        assert_eq!(
+            std::fs::read_to_string(p.join("dir")).expect("merged file"),
+            "a\nb edited\nc\nd\ne\nf\ng\nh\n",
+            "walk {env:?}: the edit followed the rename"
+        );
+        let stages = index_stage_lines(p, "dir");
+        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
+        assert!(stages[0].contains(" 0\t"), "walk {env:?}: {stages:?}");
+        assert!(
+            index_stage_lines(p, "old").is_empty(),
+            "walk {env:?}: nothing is left at the old path"
+        );
+    }
+}
+
+/// The rename result is the same through every merge mode: the preview says
+/// what the real merge does, `--squash` and `--no-commit` stage it, and
+/// `--abort` after a conflicting rename restores the pre-merge state.
+#[test]
+fn merge_rename_is_consistent_across_dry_run_squash_and_no_commit() {
+    let their = "line1\nline2 edited\nline3\nline4\nline5\nline6\nline7\nline8\n";
+
+    // --dry-run: clean preview, nothing written.
+    let repo = create_rename_repo(None, their);
+    let p = repo.path();
+    let head_before = head_commit(p);
+    let preview = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
+    assert_cli_success(&preview, "dry-run");
+    let json = parse_json_stdout(&preview);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert!(json["data"]["would_conflict"].is_null(), "{json}");
+    assert_eq!(json["data"]["files_changed"], 1, "one path changed: {json}");
+    assert_eq!(head_commit(p), head_before);
+    assert!(!p.join(".libra").join("merge-state.json").exists());
+
+    // --squash: the renamed result is staged, HEAD stays put.
+    let repo = create_rename_repo(None, their);
+    let p = repo.path();
+    let head_before = head_commit(p);
+    assert_cli_success(
+        &run_libra_command(&["merge", "--squash", "feature"], p),
+        "squash",
+    );
+    assert_eq!(head_commit(p), head_before, "squash never moves HEAD");
+    assert_eq!(
+        std::fs::read_to_string(p.join("new.txt")).expect("merged file"),
+        their
+    );
+
+    // --no-commit: same result staged, finished with `--continue`.
+    let repo = create_rename_repo(None, their);
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-commit", "feature"], p),
+        "no-commit",
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("new.txt")).expect("merged file"),
+        their
+    );
+    // `--continue` reports the SAME `files_changed` the preview did: it compares
+    // the pre-merge tree with the index, where a rename looks like a delete plus
+    // an add, so without rename-aware counting it said 2 where the preview said
+    // 1 (Codex R18).
+    let finish = run_libra_command(&["--json", "merge", "--continue"], p);
+    assert_cli_success(&finish, "continue");
+    let json = parse_json_stdout(&finish);
+    assert_eq!(
+        json["data"]["files_changed"], 1,
+        "the finalized merge counts the rename once, as the preview did: {json}"
+    );
+    let listing = run_libra_command(&["ls-tree", "-r", "HEAD"], p);
+    assert_cli_success(&listing, "ls-tree");
+    let listing = String::from_utf8_lossy(&listing.stdout).to_string();
+    assert!(
+        listing.contains("\tnew.txt") && !listing.contains("\told.txt"),
+        "{listing}"
+    );
+}
+
 /// G9 + G10: `--dry-run` reports a D/F collision as a conflict (exit 1) and the
 /// JSON names its category, the path the file would move to, and the original.
 #[test]

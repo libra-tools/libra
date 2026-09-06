@@ -1086,6 +1086,12 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::InvalidConflictStyle(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
+        merge::PullMergeError::InvalidRenameConfig { .. } => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint("set merge.renames to true/false and merge.renameLimit to an integer"),
+        merge::PullMergeError::RenameConfigRead { .. } => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        }
         merge::PullMergeError::ConflictStyleRead(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
