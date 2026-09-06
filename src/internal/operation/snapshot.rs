@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    facet::RestorePolicy,
+    facet::{FacetCaptureCtx, FacetError},
+    facets::registry_for_scope,
     view::{CapturePolicy, Completeness, HeadState, WorkspaceSnapshotV2, WORKSPACE_SNAPSHOT_SCHEMA_VERSION},
     PinnedRequestScope,
 };
@@ -74,6 +75,8 @@ pub enum SnapshotError {
     Object(String),
     #[error("snapshot manifest is invalid: {0}")]
     View(#[from] super::view::ViewError),
+    #[error("state facet capture failed: {0}")]
+    Facet(#[from] FacetError),
     #[error("HEAD could not be read: {0}")]
     Head(#[from] io::Error),
 }
@@ -156,12 +159,15 @@ impl WorkspaceSnapshotter {
         for entry in index.tracked_entries(0) {
             tracked_names.insert(entry.name.clone());
         }
+        let mut complete = started.elapsed() <= self.timeout;
         for relative in all_files {
             if started.elapsed() > self.timeout {
-                return Err(ScanError::Budget("scan timeout".to_string()));
+                complete = false;
+                break;
             }
             if tracked.len() + untracked.len() >= self.max_files {
-                return Err(ScanError::Budget("file-count limit".to_string()));
+                complete = false;
+                break;
             }
             let relative = relative_worktree_path(
                 &path_to_bytes(&self.scope.worktree_root),
@@ -169,11 +175,19 @@ impl WorkspaceSnapshotter {
                 false,
             )?;
             let key = relative.to_string_lossy().replace('\\', "/");
-            let oid = self.hash_file(&relative)?;
+            let oid = match self.hash_file(&relative) {
+                Ok(oid) => oid,
+                Err(ScanError::Unstable(_)) => {
+                    complete = false;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let content_len = fs::metadata(self.scope.worktree_root.join(&relative))?.len();
             bytes = bytes.saturating_add(content_len);
             if bytes > self.max_bytes {
-                return Err(ScanError::Budget("byte limit".to_string()));
+                complete = false;
+                break;
             }
             if tracked_names.contains(&key) {
                 tracked.insert(key, oid);
@@ -182,7 +196,7 @@ impl WorkspaceSnapshotter {
             }
         }
 
-        let completeness = if tracked_names.iter().all(|name| tracked.contains_key(name)) {
+        let completeness = if complete && tracked_names.iter().all(|name| tracked.contains_key(name)) {
             Completeness::Full
         } else {
             Completeness::Partial
@@ -203,6 +217,32 @@ impl WorkspaceSnapshotter {
         let raw_index_oid = put_blob(&storage, &index_bytes)?;
         let index = Index::load(self.scope.gitdir.join("index"))
             .map_err(|error| SnapshotError::Object(error.to_string()))?;
+        let registry = registry_for_scope(
+            self.scope.clone(),
+            storage.clone(),
+        )?;
+        let facet_ctx = FacetCaptureCtx {
+            repo_id: None,
+            workspace_id: Some(workspace_id(&self.scope)),
+        };
+        let facet_names = [
+            super::FacetName::from("index"),
+            super::FacetName::from("sequencer"),
+            super::FacetName::from("sparse"),
+        ];
+        let captures = facet_names
+            .iter()
+            .map(|name| registry.capture(name, &facet_ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        registry.validate_captures(&captures)?;
+        let sparse_facet_oid = captures
+            .iter()
+            .find(|capture| capture.facet.as_str() == "sparse")
+            .and_then(|capture| capture.payload_oid);
+        let sequencer_facet_oid = captures
+            .iter()
+            .find(|capture| capture.facet.as_str() == "sequencer")
+            .and_then(|capture| capture.payload_oid);
         let index_tree_oid = put_tree(&storage, &tree_from_index(&index, &scan.tracked)?)?;
         let working_copy_tree_oid = index_tree_oid;
         let untracked_manifest = UntrackedManifest {
@@ -220,16 +260,12 @@ impl WorkspaceSnapshotter {
             raw_index_blob_oid: raw_index_oid,
             working_copy_tree_oid,
             untracked_manifest_oid: untracked_oid,
-            sparse_facet_oid: None,
-            sequencer_facet_oid: None,
+            sparse_facet_oid,
+            sequencer_facet_oid,
             worktree_generation: self.pointer.generation,
             capture_policy: self.capture_policy,
             completeness: scan.completeness,
-            facet_restore_policies: BTreeMap::from([
-                (super::FacetName::from("index"), RestorePolicy::AutoRestore),
-                (super::FacetName::from("sequencer"), RestorePolicy::AutoRestore),
-                (super::FacetName::from("sparse"), RestorePolicy::Rebuild),
-            ]),
+            facet_restore_policies: registry.policies(&captures),
         };
         let manifest = snapshot.to_canonical_bytes()?;
         let snapshot_oid = put_blob(&storage, &manifest)?;

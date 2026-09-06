@@ -175,7 +175,11 @@ impl StateFacet for SparseFacet {
         let scope = self.scope.clone();
         run_async(async move {
             let _pin = WorktreeScope::override_scope(scope.workdir.clone());
-            SparseViewStore::replace(&scope.scope, &patterns).await
+            SparseViewStore::replace(&scope.scope, &patterns).await?;
+            if value.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+                SparseViewStore::disable(&scope.scope).await?;
+            }
+            Ok::<_, String>(())
         }).map_err(FacetError::Restore)?
             .map_err(FacetError::Restore)?;
         Ok(())
