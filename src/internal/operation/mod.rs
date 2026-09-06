@@ -2,6 +2,7 @@
 
 pub mod facet;
 pub mod facets;
+pub mod middleware;
 pub mod store;
 pub mod view;
 pub mod working_copy;
@@ -23,5 +24,9 @@ pub use view::{
 };
 pub use working_copy::{PinnedRequestScope, PointerError, Staleness, WorkspaceStatePointer};
 pub use snapshot::{ScanError, ScanResult, SnapshotError, SnapshotOutcome, WorkspaceSnapshotter};
+pub use middleware::{
+    classify_command, run_with_operation, ClassificationError, MutationClass, OperationError,
+    OperationFuture, OperationResult, OperationTxn,
+};
 
 pub use crate::internal::legacy_operation::*;
