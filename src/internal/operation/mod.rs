@@ -1,6 +1,7 @@
 //! Version 2 operation-log primitives.
 
 pub mod facet;
+pub mod facets;
 pub mod store;
 pub mod view;
 pub mod working_copy;
@@ -12,6 +13,7 @@ pub use facet::{
     FacetCapture, FacetCaptureCtx, FacetDiff, FacetError, FacetName, FacetRegistry,
     FacetRestoreCtx, RestorePolicy, StateFacet,
 };
+pub use facets::{registry_for_scope, RawIndexFacet, SequencerFacet, SparseFacet};
 pub use store::{
     JournalEntry, JournalPhase, OpHeadsView, OperationKind, OperationMetaV2, OperationStatusV2,
     OperationStoreV2, OperationV2, StoreError,
