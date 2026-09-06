@@ -18,6 +18,10 @@ libra init [OPTIONS] [DIRECTORY]
 
 在已初始化的仓库中再次运行 `libra init` 是安全的：与 `git init` 一致，它会就地重新初始化，打印 `Reinitialized existing Libra repository in <path>`，补齐缺失的标准布局（模板、目录）并重新应用 `--shared`，同时完整保留现有数据库——配置、`HEAD`、refs、对象、vault 与仓库 id 均不受影响。当 `--initial-branch`/`--object-format` 与现有仓库不一致时会被忽略（并给出警告）；`--from-git-repository` 在已初始化的仓库上会被拒绝。
 
+不能把用户级 Libra home（`LIBRA_HOME`，默认 `~/.libra`）作为仓库存储根。该目录保存用户状态；全局配置保存在 `~/.libra/config.db`（或 `LIBRA_CONFIG_GLOBAL_DB` 指定的位置）。当这两个目录不同时，两者都受保护。检查同样适用于尚不存在的目录、路径别名和 linked worktree 的 `commondir` 目标。
+
+仓库发现会忽略 home 中遗留的 `libra.db`，因此从用户主目录初始化项目时会读取真正的全局配置。打开旧仓库或全局配置数据库时，迁移会自动补建缺失的旧版 `config` 表，保留已有配置；被忽略的 home `libra.db` 文件保持原样。
+
 ## 选项
 
 ### `[DIRECTORY]`
@@ -234,7 +238,8 @@ jj（`jj git init`）包装 Git 后端，不创建自己的对象存储；它将
 |----------|-----------|------|------|
 | 无效参数（错误分支名、错误格式） | `LBR-CLI-002` | 129 | 因参数而异 |
 | `init.defaultBranch` 为空或无效 | `LBR-CLI-002` | 129 | 修复 local/global 值或使用 `--initial-branch <name>` |
-| local/global 默认配置不可读 | `LBR-IO-001` | 128 | 修复配置数据库或使用 `--initial-branch <name>` |
+| local/global 默认配置不可读 | `LBR-IO-001` | 128 | 修复错误中列出的数据库，或使用 `--initial-branch <name>`；`libra config --global` 无法修复仓库的本地数据库 |
+| 仓库存储根为用户级 Libra home | `LBR-CLI-002` | 129 | 选择独立项目目录，例如 `libra init <project>` |
 | 在已初始化仓库上使用 `--from-git-repository` | `LBR-CLI-002` | 129 | "convert into a fresh directory instead" |
 | 找不到源 Git 仓库 | `LBR-IO-001` | 128 | -- |
 | 源不是有效 Git 仓库 | `LBR-CLI-003` | 129 | "a valid Git repository must contain HEAD, config, and objects" |

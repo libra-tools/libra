@@ -1254,7 +1254,7 @@ pub async fn locate_env_for_target(
 ///   sandbox a global config without touching `$HOME`).
 /// - Falls back to `~/.libra/config.db`. Returns `None` if no home directory
 ///   can be discovered (rare, but possible inside containers).
-fn global_config_path() -> Option<std::path::PathBuf> {
+pub(crate) fn global_config_path() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB") {
         return Some(std::path::PathBuf::from(p));
     }
@@ -1916,6 +1916,22 @@ async fn read_config_entry_from_db_path_case_insensitive(
         return Ok(Some(ConfigKvEntry::from_model(entry)));
     }
 
+    // A database missing the legacy `config` table entirely has no legacy rows
+    // by construction. Probing first keeps a store whose bootstrap omitted the
+    // table from failing every lookup with `no such table: config` (which made
+    // `libra init` unusable from `$HOME`, where the config cascade reads the
+    // home DB as the local scope).
+    let has_legacy_table = crate::internal::db::sqlite_schema_contains(&conn, "table", "config")
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect legacy config schema in database '{}'",
+                db_path.display()
+            )
+        })?;
+    if !has_legacy_table {
+        return Ok(None);
+    }
     let legacy_entries = config::Entity::find()
         .order_by_desc(config::Column::Id)
         .all(&conn)
@@ -2850,6 +2866,96 @@ mod tests {
             !format!("{error:#}").contains("newer than this Libra binary"),
             "corruption must not be classified as future schema: {error:#}"
         );
+    }
+
+    /// The legacy `config`-table fallback answers "no value" — not
+    /// `no such table: config` — when the store lacks the legacy table
+    /// entirely. A store that still carries the table keeps serving its
+    /// legacy rows through the same reader.
+    #[tokio::test]
+    async fn legacy_config_fallback_tolerates_missing_table() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let latest = crate::internal::db::migration::latest_builtin_schema_version()
+            .expect("read latest schema version")
+            .expect("built-in migrations have a latest version");
+
+        // A store whose bootstrap omitted the legacy table: full canonical DB,
+        // then `config` dropped and the schema version pinned at latest so the
+        // migrating open cannot silently re-create it.
+        let missing_table_db = temp.path().join("missing-legacy.db");
+        {
+            let conn =
+                crate::internal::db::create_database(missing_table_db.to_str().expect("utf8 path"))
+                    .await
+                    .expect("create config db");
+            conn.execute_raw(Statement::from_string(
+                conn.get_database_backend(),
+                "DROP TABLE `config`",
+            ))
+            .await
+            .expect("drop legacy table");
+            conn.close().await.expect("close config db");
+        }
+        // Pin the schema version at latest IN PLACE (the db already exists, so
+        // `create_database` refuses it): the migrating open must not re-create
+        // the dropped table through the self-heal migration.
+        {
+            let conn = crate::internal::db::open_connection_without_schema_management(
+                missing_table_db.to_str().expect("utf8 path"),
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect("open db to pin schema version");
+            conn.execute_raw(Statement::from_string(
+                conn.get_database_backend(),
+                "DELETE FROM `schema_versions`",
+            ))
+            .await
+            .expect("clear schema versions");
+            conn.execute_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "INSERT INTO `schema_versions` (`version`, `name`, `applied_at`) VALUES (?, ?, ?)",
+                [
+                    latest.into(),
+                    "test_missing_legacy_table".into(),
+                    "2026-09-06T00:00:00Z".into(),
+                ],
+            ))
+            .await
+            .expect("pin schema version");
+            conn.close().await.expect("close db");
+        }
+
+        let entry = read_config_entry_from_db_path_case_insensitive(
+            &missing_table_db,
+            "init.defaultBranch",
+        )
+        .await
+        .expect("a missing legacy table means no legacy rows, not a lookup failure");
+        assert!(entry.is_none(), "no legacy table must read as no value");
+
+        // Control: a store that still carries the legacy table keeps serving
+        // legacy rows (NULL subsection matches Git's section.variable keys).
+        let legacy_db = temp.path().join("with-legacy.db");
+        {
+            let conn = crate::internal::db::create_database(legacy_db.to_str().expect("utf8 path"))
+                .await
+                .expect("create config db");
+            conn.execute_raw(Statement::from_string(
+                conn.get_database_backend(),
+                "INSERT INTO `config` (`configuration`, `name`, `key`, `value`) \
+                 VALUES ('init', NULL, 'defaultBranch', 'legacy-main')",
+            ))
+            .await
+            .expect("insert legacy row");
+            conn.close().await.expect("close config db");
+        }
+
+        let entry =
+            read_config_entry_from_db_path_case_insensitive(&legacy_db, "init.defaultBranch")
+                .await
+                .expect("legacy rows remain readable");
+        assert_eq!(entry.map(|entry| entry.value), Some("legacy-main".into()));
     }
 
     /// Helper for the fresh-conn cascade matrix: a config DB with one

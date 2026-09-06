@@ -663,7 +663,7 @@ fn ai_projection_sql() -> io::Result<&'static str> {
     Ok(sql)
 }
 
-async fn sqlite_schema_contains(
+pub(crate) async fn sqlite_schema_contains(
     conn: &DatabaseConnection,
     entry_type: &str,
     name: &str,

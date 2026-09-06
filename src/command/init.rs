@@ -29,7 +29,7 @@ use crate::{
         convert,
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, ProgressMode, emit_json_data},
-        util::{DATABASE, ROOT_DIR, cur_dir},
+        util::{DATABASE, ROOT_DIR, cur_dir, is_global_libra_home},
     },
 };
 
@@ -134,9 +134,13 @@ impl From<InitError> for CliError {
                 "failed to read config '{key}': {detail}"
             ))
             .with_stable_code(StableErrorCode::IoReadFailed)
-            .with_hint(format!(
-                "fix or remove the unreadable config with 'libra config --global {key} <name>'"
-            )),
+            .with_hint(
+                "pass the value explicitly to bypass this config lookup (e.g. 'libra init -b <name>' \
+                 for the initial branch), or repair the config database named in the error above; \
+                 'libra config --global' only changes the global config database and cannot \
+                 repair a repository's local database"
+                    .to_string(),
+            ),
             InitError::SourcePathNotFound { path } => {
                 // Intent: conversion cannot read the requested source path; the
                 // repository state is unchanged, so classify as a read failure.
@@ -542,6 +546,23 @@ async fn run_init_internal(
         .map(|path| resolve_template_path(&current_dir, path))
         .transpose()?;
     let shared_mode = parse_shared_mode(args.shared.as_deref())?;
+
+    // The Libra home (`$LIBRA_HOME`, default `~/.libra`) holds per-user state
+    // — global config (`config.db`), vault keys, binaries. A repository whose
+    // storage root IS the home would mix repo data into that state, so refuse
+    // before the reinit check (an existing home `libra.db` artifact would
+    // otherwise be "reinitialized" as a repository).
+    if is_global_libra_home(&root_dir) {
+        return Err(invalid_argument(
+            format!(
+                "refusing to initialize a Libra repository at '{}': this is the Libra home \
+                 directory, which stores global configuration and per-user state; repository \
+                 data must live in a dedicated project directory's '.libra/'",
+                root_dir.display()
+            ),
+            Some("choose a project subdirectory, e.g. 'libra init <project>'".to_string()),
+        ));
+    }
 
     if is_reinit(&target_dir, args.bare) {
         // Git-style safe re-initialization: top-up the standard layout and re-apply

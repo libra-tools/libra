@@ -1403,6 +1403,17 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations.sql"),
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations_down.sql"),
         ),
+        // Self-heal stores missing the legacy `config` table (#472): the
+        // bootstrap schema always defined it, but stores created by builds
+        // whose bootstrap omitted it failed every legacy-config reader with
+        // `no such table: config`. Idempotent DDL matching the bootstrap
+        // shape exactly; down preserves this bootstrap-owned table and its data.
+        sql_migration(
+            2026090601,
+            "legacy_config_table",
+            include_str!("../../../sql/migrations/2026090601_legacy_config_table.sql"),
+            include_str!("../../../sql/migrations/2026090601_legacy_config_table_down.sql"),
+        ),
     ]
 }
 
@@ -1850,9 +1861,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 57);
+        assert_eq!(runner.len(), 58);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026082401));
+        assert_eq!(runner.max_registered_version(), Some(2026090601));
     }
 
     #[test]

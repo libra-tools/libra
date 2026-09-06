@@ -35,6 +35,22 @@ configuration, `HEAD`, refs, objects, vault, and repository id are otherwise unt
 differ from the existing repository, and `--from-git-repository` is rejected on an
 already-initialized repository.
 
+Initializing a repository whose storage root is the Libra home itself (`$LIBRA_HOME`,
+default `~/.libra`) is refused. The Libra home stores per-user state — the global
+config database (`~/.libra/config.db`), vault keys, and binaries — and must never mix
+in repository data, which lives in a project's own `.libra/libra.db` (or a dedicated
+bare repository directory).
+If `LIBRA_HOME` and the global config location differ, both directories are reserved.
+This also applies to linked worktree `commondir` targets and to paths whose `.libra`
+directory does not exist yet. Repository discovery never treats these directories
+as a repository, even if a stray
+`libra.db` exists there, so commands run from the home directory resolve configuration
+through the global scope instead of reading the home database as repo-local config.
+
+Opening an older repository or global config database automatically recreates a missing
+legacy `config` table without changing existing configuration. The ignored home
+`libra.db` artifact is left untouched; commands no longer open it as a repository.
+
 ## Options
 
 ### `[DIRECTORY]`
@@ -310,7 +326,8 @@ Every `InitError` variant maps to an explicit `StableErrorCode`.
 |----------|-----------|------|------|
 | Invalid argument (bad branch name, bad format) | `LBR-CLI-002` | 129 | varies by argument |
 | Empty or invalid `init.defaultBranch` | `LBR-CLI-002` | 129 | fix the local/global value or use `--initial-branch <name>` |
-| Unreadable local/global default config | `LBR-IO-001` | 128 | fix the config database or pass `--initial-branch <name>` |
+| Unreadable local/global default config | `LBR-IO-001` | 128 | pass `--initial-branch <name>` to bypass the lookup, or repair the config database named in the error (`libra config --global` cannot repair a repository's local database) |
+| Storage root is the Libra home (`~/.libra`) | `LBR-CLI-002` | 129 | "choose a project subdirectory, e.g. `libra init <project>`" |
 | `--from-git-repository` on an already-initialized repo | `LBR-CLI-002` | 129 | "convert into a fresh directory instead" |
 | Source Git repository not found | `LBR-IO-001` | 128 | -- |
 | Source is not a valid Git repository | `LBR-CLI-003` | 129 | "a valid Git repository must contain HEAD, config, and objects" |

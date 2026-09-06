@@ -157,7 +157,31 @@ pub fn cur_dir() -> PathBuf {
     }
 }
 
+/// Whether `path` is reserved for per-user state rather than repository storage.
+/// The upgrade home and global config directory can differ when overridden;
+/// neither may be adopted because of a stray `libra.db`. Resolve existing
+/// ancestors too, so a not-yet-created home behind a symlink is still reserved.
+pub fn is_global_libra_home(path: &Path) -> bool {
+    let config_dir = crate::internal::config::global_config_path()
+        .and_then(|db| db.parent().map(Path::to_path_buf));
+    let path = canonicalize_deepest_existing(path).unwrap_or_else(|_| path.to_path_buf());
+    [
+        crate::internal::upgrade::home::resolve_libra_home().ok(),
+        config_dir,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|home| canonicalize_deepest_existing(&home).unwrap_or(home) == path)
+}
+
 fn is_valid_storage_dir(path: &Path) -> bool {
+    // The Libra home must be refused before the `libra.db` check: adopting it
+    // made repository discovery read global-side files as repo-local config,
+    // failing commands with `no such table: config` on home DBs that lack the
+    // legacy `config` table.
+    if is_global_libra_home(path) {
+        return false;
+    }
     if path.join(DATABASE).exists() {
         return true;
     }
@@ -397,6 +421,9 @@ pub fn find_git_repository(path: Option<&Path>) -> Option<GitRepositoryLocation>
 /// database-less local gitdir where "not found" masquerades as "no
 /// configuration".
 fn is_terminal_common_storage(path: &Path) -> bool {
+    if is_global_libra_home(path) {
+        return false;
+    }
     // `symlink_metadata`, not `exists()`: a DANGLING `commondir` symlink is
     // still a commondir marker — `exists()` follows the link and reports the
     // marker absent, which would bless a non-terminal (corrupt) target. And
@@ -607,6 +634,19 @@ pub(crate) fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// Preserve why discovery skipped user storage while retaining NotFound semantics.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{workdir:?} is not a libra repository; '{}' is the global Libra home, \
+     reserved for per-user state rather than repository storage; \
+     use a dedicated project directory (e.g. 'libra init <project>')",
+    home.display()
+)]
+pub(crate) struct GlobalHomeNotRepository {
+    workdir: PathBuf,
+    home: PathBuf,
+}
+
 /// Resolve `(common_storage, workdir, worktree_gitdir)` for a path.
 /// - `worktree_gitdir`: the LOCAL `.libra` for this working tree (holds the
 ///   private `index` and `worktree_id`).
@@ -615,9 +655,15 @@ pub(crate) fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
 fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
     let mut path = path.clone().unwrap_or_else(cur_dir);
     let orig = path.clone();
+    let mut skipped_home = None;
 
     loop {
         let standard_repo = path.join(ROOT_DIR);
+        if standard_repo.join(DATABASE).exists() && is_global_libra_home(&standard_repo) {
+            skipped_home = Some(standard_repo.clone());
+        } else if path.join(DATABASE).exists() && is_global_libra_home(&path) {
+            skipped_home = Some(path.clone());
+        }
         if standard_repo.is_dir() && is_valid_storage_dir(&standard_repo) {
             // unwrap_or is safe here: if canonicalize fails, we use the original path
             let gitdir = fs::canonicalize(&standard_repo).unwrap_or(standard_repo);
@@ -625,15 +671,27 @@ fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBu
             return Ok((common, path.clone(), gitdir));
         }
 
-        if path.join(DATABASE).exists() && path.join("objects").exists() {
+        if path.join(DATABASE).exists()
+            && path.join("objects").exists()
+            && !is_global_libra_home(&path)
+        {
             return Ok((path.clone(), path.clone(), path.clone()));
         }
 
         if !path.pop() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{orig:?} is not a libra repository"),
-            ));
+            return Err(match skipped_home {
+                Some(home) => io::Error::new(
+                    io::ErrorKind::NotFound,
+                    GlobalHomeNotRepository {
+                        workdir: orig,
+                        home,
+                    },
+                ),
+                None => io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{orig:?} is not a libra repository"),
+                ),
+            });
         }
     }
 }
@@ -3992,6 +4050,67 @@ mod test {
         assert!(
             !err.to_string().contains("not a libra repository"),
             "it must be a CORRUPTION refusal, not a 'no repository' answer: {err}"
+        );
+    }
+
+    /// The global Libra home is NEVER repository storage: a stray `libra.db`
+    /// in `$LIBRA_HOME` (the artifact of a command once run from `$HOME`) must
+    /// not let discovery adopt the home as a repository. Adopting it routed
+    /// the config cascade's LOCAL scope at `~/.libra/libra.db`, so `libra init`
+    /// failed with `no such table: config` on home DBs lacking the legacy
+    /// `config` table — and the printed `libra config --global` hint could
+    /// never fix it (global config lives in `~/.libra/config.db`).
+    #[test]
+    #[serial]
+    fn test_global_libra_home_is_never_repository_storage() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join(ROOT_DIR);
+        fs::create_dir_all(&home).unwrap();
+        // Artifact: the home carries a database, exactly like a storage dir.
+        fs::write(home.join(DATABASE), b"").unwrap();
+
+        let _env = test::ScopedEnvVar::set("LIBRA_HOME", &home);
+        assert!(
+            is_global_libra_home(&home),
+            "the resolved LIBRA_HOME itself must be recognized"
+        );
+        assert!(
+            !is_valid_storage_dir(&home),
+            "the Libra home is never a valid storage dir, even with a libra.db in it"
+        );
+        let err = try_get_storage_path(Some(temp.path().to_path_buf()))
+            .expect_err("discovery must not adopt the Libra home as a repository");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "the walk must climb PAST the home and answer 'no repository', not resolve it: {err}"
+        );
+
+        // Control: a real repository next to the home still resolves normally.
+        let repo_root = temp.path().join("repo");
+        let repo_gitdir = repo_root.join(ROOT_DIR);
+        fs::create_dir_all(&repo_gitdir).unwrap();
+        fs::write(repo_gitdir.join(DATABASE), b"").unwrap();
+        assert!(is_valid_storage_dir(&repo_gitdir));
+        // Discovery canonicalizes the accepted gitdir (tmpdir paths may sit
+        // behind a symlink), so compare against the canonical form too.
+        let expected_gitdir = fs::canonicalize(&repo_gitdir).unwrap_or(repo_gitdir.clone());
+        let (storage, workdir) = try_get_paths(Some(repo_root.clone())).unwrap();
+        assert_eq!(storage, expected_gitdir);
+        assert_eq!(workdir, repo_root);
+    }
+
+    #[test]
+    fn global_home_not_repository_display_is_actionable() {
+        let error = GlobalHomeNotRepository {
+            workdir: PathBuf::from("outside"),
+            home: PathBuf::from(".libra"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "\"outside\" is not a libra repository; '.libra' is the global Libra home, \
+             reserved for per-user state rather than repository storage; \
+             use a dedicated project directory (e.g. 'libra init <project>')"
         );
     }
 

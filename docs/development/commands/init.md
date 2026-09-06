@@ -6,7 +6,7 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。新仓库初始化已支持；对已有 Libra 仓库执行安全 re-init/top-up 已实现（保留 DB，补齐布局，`InitOutput.reinitialized=true`，banner 改为 `Reinitialized existing ...`）。`--shared` 支持 `false`/`umask`/`true`/`group`/`all`/`world`/`everybody` 与 4 位八进制 numeric mode；numeric mode 在副作用前校验目录可遍历性，不满足时以 `LBR-CLI-002` fail-closed 且不创建 `.libra`。省略 `-b/--initial-branch` 时按 local → global → system 读取 `init.defaultBranch`（变量名大小写不敏感；本地/全局加密值先解密），未配置时回退到 `main`；本地/全局空值、非法分支名和读取失败分别在布局写入前返回 `LBR-CLI-002` 或 `LBR-IO-001`（例外：schema 比二进制新的全局配置库在一次性警告后被跳过，见 `LBR-CONFIG-001`，2026-07-15 P0-12 回归修复），system scope 读取失败/不支持时跳过。`--from-git-repository` 使用并报告源 `HEAD` 分支，不使用配置默认值。
+- 兼容级别：`partial`。新仓库初始化已支持；对已有 Libra 仓库执行安全 re-init/top-up 已实现（保留 DB，补齐布局，`InitOutput.reinitialized=true`，banner 改为 `Reinitialized existing ...`）。`--shared` 支持 `false`/`umask`/`true`/`group`/`all`/`world`/`everybody` 与 4 位八进制 numeric mode；numeric mode 在副作用前校验目录可遍历性，不满足时以 `LBR-CLI-002` fail-closed 且不创建 `.libra`。省略 `-b/--initial-branch` 时按 local → global → system 读取 `init.defaultBranch`（变量名大小写不敏感；本地/全局加密值先解密），未配置时回退到 `main`；本地/全局空值、非法分支名和读取失败分别在布局写入前返回 `LBR-CLI-002` 或 `LBR-IO-001`（例外：schema 比二进制新的全局配置库在一次性警告后被跳过，见 `LBR-CONFIG-001`，2026-07-15 P0-12 回归修复），system scope 读取失败/不支持时跳过。`--from-git-repository` 使用并报告源 `HEAD` 分支，不使用配置默认值。存储根目录解析为 Libra home（`$LIBRA_HOME`，默认 `~/.libra`）时以 `LBR-CLI-002` 拒绝初始化（#472：home 是全局配置/用户状态目录，仓库数据只允许落在项目自身的 `.libra/libra.db`；仓库发现同样不会把 home 误认作仓库）。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -61,6 +61,7 @@ flowchart TD
 | ✅ 已实现 | 安全重新初始化（在已存在仓库上再次 `init`） | `git init` 风格：打印 `Reinitialized existing{bare} Libra repository in ...`、补齐缺失标准布局（模板/目录）、重应用 `--shared`，并完整保留现有数据库（config/HEAD/refs/objects/vault/repoid）。`reinitialize_existing()` 用 `get_db_conn_instance_for_path` 连接现有 DB，从 config/HEAD 读回身份/格式填充 `InitOutput`（`reinitialized=true`）。`--from-git-repository` 在已初始化仓库上拒绝；`--initial-branch`/`--object-format` 与现有不符则忽略并 warn。带回归测试。 |
 | ✅ 已实现 | `--shared` 配置持久化与 numeric fail-closed | `true`/`group` 规范化为 `group`，`all`/`world`/`everybody` 规范化为 `all`，numeric mode 保留原始八进制文本，均写入 `core.sharedRepository`。numeric mode 要求 owner `rwx`，且 group/other 若有 read/write 必须有 execute；否则在创建 `.libra` 前返回 `LBR-CLI-002`。带回归测试 `compat_init_shared_mode`。 |
 | ✅ 已实现 | `init.defaultBranch` | CLI 未传 `-b/--initial-branch` 时，新仓库按 local → global → system 级联读取 `init.defaultBranch`（变量名大小写不敏感并保留空值，本地/全局加密值先解密）；CLI 显式分支优先；配置缺失回退到 `main`；本地/全局空值/非法分支返回 `LBR-CLI-002`，读取失败返回 `LBR-IO-001`（例外：schema 比二进制新的全局配置库在一次性警告后被跳过，见 `LBR-CONFIG-001`），system scope 失败/不支持时跳过。Git 转换从实际 `HEAD` 报告分支，不使用默认值。带回归测试 `compat_config_defaults_semantics`、`compat_config_defaults_edge_cases`。 |
+| ✅ 已实现 | Libra home 与仓库存储严格分离（#472） | 全局配置只存 `~/.libra/config.db`；仓库数据只存 `<repo>/.libra/libra.db`。`run_init_internal` 在 reinit 检测前拒绝存储根目录解析为 Libra home（`$LIBRA_HOME`，默认 `~/.libra`）的初始化（`LBR-CLI-002`）；仓库发现（`is_valid_storage_dir` / `try_get_paths_full`）跳过 Libra home，即使其中残留 `libra.db` 也不会被当作仓库读取（修复 home 下 `libra init` 报 `no such table: config`）。legacy `config` 表缺失时级联回退读取按"无值"处理（迁移 `2026090601_legacy_config_table` 在打开时自愈补表）。带回归测试 `test_global_libra_home_is_never_repository_storage`、`legacy_config_fallback_tolerates_missing_table`、`init_from_home_ignores_libra_home_artifact_and_honors_global_config`、`init_refuses_to_initialize_inside_the_libra_home`。 |
 
 ## 维护要求
 

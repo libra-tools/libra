@@ -1392,7 +1392,14 @@ fn repo_not_found_error(path: Option<&Path>) -> CliError {
 /// its own remedy (re-add/repair) and must reach the user verbatim.
 fn repo_resolution_error(error: std::io::Error, path: Option<&Path>) -> CliError {
     if error.kind() == std::io::ErrorKind::NotFound {
-        return repo_not_found_error(path);
+        let mut cli_error = repo_not_found_error(path);
+        if error
+            .get_ref()
+            .is_some_and(|detail| detail.is::<utils::util::GlobalHomeNotRepository>())
+        {
+            cli_error = cli_error.with_priority_hint(error.to_string());
+        }
+        return cli_error;
     }
     CliError::fatal(error.to_string())
         .with_stable_code(utils::error::StableErrorCode::RepoStateInvalid)
