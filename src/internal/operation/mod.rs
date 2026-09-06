@@ -4,12 +4,13 @@ pub mod facet;
 pub mod store;
 pub mod view;
 pub mod working_copy;
+pub mod snapshot;
 
 // OL-15 removes this compatibility service. Re-exporting it keeps existing
 // command integrations source-compatible while all new code uses v2 types.
 pub use facet::{
     FacetCapture, FacetCaptureCtx, FacetDiff, FacetError, FacetName, FacetRegistry,
-    FacetRestoreCtx, RestorePolicy,
+    FacetRestoreCtx, RestorePolicy, StateFacet,
 };
 pub use store::{
     JournalEntry, JournalPhase, OpHeadsView, OperationKind, OperationMetaV2, OperationStatusV2,
@@ -19,5 +20,6 @@ pub use view::{
     CapturePolicy, Completeness, HeadState, RepoViewV2, WorkspaceId, WorkspaceSnapshotV2,
 };
 pub use working_copy::{PinnedRequestScope, PointerError, Staleness, WorkspaceStatePointer};
+pub use snapshot::{ScanError, ScanResult, SnapshotError, SnapshotOutcome, WorkspaceSnapshotter};
 
 pub use crate::internal::legacy_operation::*;
