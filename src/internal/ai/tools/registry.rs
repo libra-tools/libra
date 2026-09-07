@@ -44,7 +44,10 @@ pub trait ToolHandler: Send + Sync {
     /// Returns `true` if the tool invocation *might* mutate the environment.
     /// This function should be defensive and return `true` if there's any doubt.
     async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
-        false
+        // The operation boundary is fail-closed: a handler that has not
+        // opted into a narrower read-only classification is treated as
+        // potentially mutating.
+        true
     }
 
     /// Returns `true` if the invocation requires direct network access.
@@ -288,6 +291,128 @@ impl ToolRegistry {
 
         let mutates_state = handler.is_mutating(&invocation).await;
         let requires_network = handler.requires_network(&invocation).await;
+        let operation_class = operation_class_for_tool(&tool_name, mutates_state);
+        tracing::debug!(?operation_class, tool = %tool_name, "classified Agent tool operation surface");
+
+        // Repository-backed Agent mutations use the same durable v2 boundary
+        // as the CLI. Read-only tools remain direct, while a tool invoked from
+        // a repository that cannot resolve a pinned scope keeps the existing
+        // non-repository behavior (external tools are still subject to the
+        // hardening policy below).
+        if mutates_state
+            && let Some(scope) =
+                crate::internal::worktree_scope::RequestScope::resolve(self.working_dir.clone())
+        {
+            let operation_handler = handler.clone();
+            let operation_hardening = self.hardening.clone();
+            let operation_working_dir = self.working_dir.clone();
+            let operation_aliases = self.path_aliases.clone();
+            let operation_tool_name = tool_name.clone();
+            let operation_meta = crate::internal::operation::OperationMetaV2 {
+                command_name: Some(format!("agent.tool.{operation_tool_name}")),
+                description: Some("Agent tool mutation".to_string()),
+                ..Default::default()
+            };
+            let outcome = crate::internal::operation::run_with_operation(
+                &scope,
+                operation_meta,
+                operation_class,
+                move |_txn| async move {
+                    let result = if let Some(hardening) = operation_hardening {
+                        let operation = ToolOperation::tool(
+                            operation_tool_name.clone(),
+                            mutates_state,
+                            requires_network,
+                        );
+                        let decision = hardening.decide(&operation);
+                        hardening
+                            .append_audit(
+                                format!("tool_boundary.{}", operation_tool_name),
+                                format!(
+                                    "decision={} approval_required={} reason={} payload={}",
+                                    if decision.allowed { "allow" } else { "deny" },
+                                    decision.approval_required,
+                                    decision.reason,
+                                    invocation.log_payload()
+                                ),
+                            )
+                            .await
+                            .map_err(|error| {
+                                crate::internal::operation::OperationError::Mutation(format!(
+                                    "failed to persist tool boundary audit event: {error}"
+                                ))
+                            })?;
+                        if !decision.allowed {
+                            return Err(crate::internal::operation::OperationError::Mutation(
+                                decision.reason,
+                            ));
+                        }
+                        let result = operation_handler.handle(invocation).await.map(|output| {
+                            redact_workspace_paths_in_output(
+                                output,
+                                &operation_working_dir,
+                                &operation_aliases,
+                            )
+                        });
+                        let summary = match &result {
+                            Ok(output) => format!(
+                                "success={} output={}",
+                                output.is_success(),
+                                output.log_preview()
+                            ),
+                            Err(error) => format!("error={error}"),
+                        };
+                        hardening
+                            .append_audit(format!("tool_result.{}", operation_tool_name), summary)
+                            .await
+                            .map_err(|error| {
+                                crate::internal::operation::OperationError::Mutation(format!(
+                                    "failed to persist tool result audit event: {error}"
+                                ))
+                            })?;
+                        hardening.flush_audit().await.map_err(|error| {
+                            crate::internal::operation::OperationError::Mutation(format!(
+                                "failed to flush tool audit sink: {error}"
+                            ))
+                        })?;
+                        result.map_err(|error| {
+                            crate::internal::operation::OperationError::Mutation(error.to_string())
+                        })?
+                    } else {
+                        operation_handler
+                            .handle(invocation)
+                            .await
+                            .map(|output| {
+                                redact_workspace_paths_in_output(
+                                    output,
+                                    &operation_working_dir,
+                                    &operation_aliases,
+                                )
+                            })
+                            .map_err(|error| {
+                                crate::internal::operation::OperationError::Mutation(
+                                    error.to_string(),
+                                )
+                            })?
+                    };
+                    Ok(result)
+                },
+            )
+            .await;
+            return match outcome {
+                Ok(result) => Ok(result.value),
+                Err(error) => Err(ToolError::ExecutionFailed(error.to_string())),
+            };
+        }
+
+        if operation_class == crate::internal::operation::MutationClass::ExternalOrUnknown
+            && self.hardening.is_none()
+        {
+            return Err(ToolError::ExecutionFailed(
+                "external or unknown mutation requires a repository scope and post-snapshot verification"
+                    .to_string(),
+            ));
+        }
 
         if let Some(hardening) = &self.hardening {
             let operation = ToolOperation::tool(tool_name.clone(), mutates_state, requires_network);
@@ -432,6 +557,25 @@ fn is_read_only_or_semantic_tool(tool_name: &str) -> bool {
             | "list_tool_invocations"
             | "list_provenances"
     )
+}
+
+/// Central Agent-tool census used by the gateway before handler dispatch.
+/// Read-only tools are never recorded; shell and external VCS calls require
+/// before/after verification; every other mutating tool is conservatively a
+/// Libra-state mutation until it is assigned a narrower owner.
+pub fn operation_class_for_tool(
+    tool_name: &str,
+    mutates_state: bool,
+) -> crate::internal::operation::MutationClass {
+    use crate::internal::operation::MutationClass;
+    if !mutates_state || is_read_only_or_semantic_tool(tool_name) {
+        return MutationClass::ReadOnly;
+    }
+    match tool_name {
+        "shell" | "run_libra_vcs" | "exec" => MutationClass::ExternalOrUnknown,
+        "apply_patch" | "write_file" | "edit_file" => MutationClass::WorkspaceMutation,
+        _ => MutationClass::LibraStateMutation,
+    }
 }
 
 fn rebase_payload_path_aliases(

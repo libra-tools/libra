@@ -386,6 +386,22 @@ impl OperationStoreV2 {
         RepoViewV2::from_canonical_bytes(&bytes).map_err(StoreError::View)
     }
 
+    /// Store one immutable content-addressed object for a view facet.
+    ///
+    /// View publication uses this narrow seam for the refs facet; callers
+    /// cannot mutate the store's backend or bypass the object hash check.
+    pub(crate) fn write_blob(
+        &self,
+        oid: &ObjectHash,
+        bytes: &[u8],
+        object_type: ObjectType,
+    ) -> Result<(), StoreError> {
+        self.storage
+            .put(oid, bytes, object_type)
+            .map_err(|error| StoreError::Object(error.to_string()))?;
+        Ok(())
+    }
+
     pub async fn write_operation(&self, operation: &OperationV2) -> Result<(), StoreError> {
         if self.repo_id.is_empty() {
             return Err(StoreError::Validation(
@@ -454,6 +470,64 @@ impl OperationStoreV2 {
             }
         }
         txn.commit().await?;
+        Ok(())
+    }
+
+    /// Move a persisted operation to its terminal status after publication
+    /// succeeds or a later CAS/publish step fails.
+    pub async fn update_operation_status(
+        &self,
+        op_id: &str,
+        status: OperationStatusV2,
+    ) -> Result<(), StoreError> {
+        if self.repo_id.is_empty() || op_id.is_empty() {
+            return Err(StoreError::Validation(
+                "operation status update requires repository and operation ids".to_string(),
+            ));
+        }
+        let updated = self
+            .db
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE operation SET status = ?, end_ts = ? WHERE repo_id = ? AND op_id = ?",
+                [
+                    status.to_string().into(),
+                    Utc::now().timestamp_millis().into(),
+                    self.repo_id.clone().into(),
+                    op_id.to_string().into(),
+                ],
+            ))
+            .await?;
+        if updated.rows_affected() == 0 {
+            return Err(StoreError::NotFound(op_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Attach the immutable post-view to a still-running operation before
+    /// publication.  Keeping the row Running until head CAS and pointer
+    /// advancement complete lets recovery distinguish an interrupted publish
+    /// from a successful operation.
+    pub async fn update_operation_post_view(
+        &self,
+        op_id: &str,
+        post_view_oid: &ObjectHash,
+    ) -> Result<(), StoreError> {
+        let updated = self
+            .db
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE operation SET post_view_oid = ? WHERE repo_id = ? AND op_id = ?",
+                [
+                    post_view_oid.to_string().into(),
+                    self.repo_id.clone().into(),
+                    op_id.to_string().into(),
+                ],
+            ))
+            .await?;
+        if updated.rows_affected() == 0 {
+            return Err(StoreError::NotFound(op_id.to_string()));
+        }
         Ok(())
     }
 
@@ -704,6 +778,52 @@ impl OperationStoreV2 {
             ))
             .await?;
         rows.into_iter().map(journal_from_row).collect()
+    }
+
+    /// Remove a reservation whose before/after snapshots are identical.  A
+    /// no-op intentionally has no Operation row, so leaving its journal entry
+    /// behind would make recovery treat a successful no-op as an unfinished
+    /// mutation.
+    pub async fn delete_journal(&self, journal_id: &str) -> Result<(), StoreError> {
+        if journal_id.is_empty() {
+            return Err(StoreError::Validation(
+                "journal id cannot be empty".to_string(),
+            ));
+        }
+        self.db
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM operation_journal WHERE journal_id = ?",
+                [journal_id.to_string().into()],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Remove a reserved operation when the before/after full views are
+    /// identical.  No-op commands intentionally leave neither an operation
+    /// row nor its parent/journal reservation.
+    pub async fn delete_operation(&self, op_id: &str) -> Result<(), StoreError> {
+        if op_id.is_empty() {
+            return Err(StoreError::Validation(
+                "operation id cannot be empty".to_string(),
+            ));
+        }
+        let txn = begin_write_transaction(&self.db).await?;
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM operation_parent WHERE op_id = ?",
+            [op_id.to_string().into()],
+        ))
+        .await?;
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM operation WHERE repo_id = ? AND op_id = ?",
+            [self.repo_id.clone().into(), op_id.to_string().into()],
+        ))
+        .await?;
+        txn.commit().await?;
+        Ok(())
     }
 }
 

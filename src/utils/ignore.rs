@@ -226,6 +226,18 @@ pub fn should_ignore(path: &Path, policy: IgnorePolicy, index: &Index) -> bool {
     should_ignore_with_workdir(path, policy, index, &workdir, &layers)
 }
 
+/// Scope-aware counterpart for bounded scanners that operate on a pinned
+/// worktree without changing the process CWD (notably Agent tool gateways).
+pub(crate) fn should_ignore_at(
+    path: &Path,
+    policy: IgnorePolicy,
+    index: &Index,
+    workdir: &Path,
+) -> bool {
+    let layers = crate::internal::layer::ExclusionSnapshot::for_request();
+    should_ignore_with_workdir(path, policy, index, workdir, &layers)
+}
+
 /// Applies [`should_ignore`] over an iterator of workdir paths and returns the retained list.
 pub fn filter_workdir_paths<I>(paths: I, policy: IgnorePolicy, index: &Index) -> Vec<PathBuf>
 where

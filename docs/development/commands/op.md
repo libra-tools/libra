@@ -24,6 +24,23 @@ extension rather than a Git command. The current public surface supports:
 - Operation tables are part of the bootstrap schema and are also ensured by the
   explicit database upgrade path for older repositories.
 
+## Operation Log v2 mutation boundary
+
+The M2/M3 implementation uses the sidecar-only working-copy pointer and does
+not add a `change-id` commit header, rewrite Git commit OIDs, bump versions, or
+create release artifacts. The operation middleware classifies every mutation
+surface as one of `WorkspaceMutation`, `RepoMutation`, `SequencerMutation`,
+`LibraStateMutation`, `ExternalOrUnknown`, `ReadOnly`, or `InternalWorker`.
+Unknown classifications fail closed; read-only commands and internal workers
+do not create operations. Agent shell and external VCS tools must provide
+verified before/after evidence before they can be admitted.
+
+The v2 snapshot facets capture the raw index byte-for-byte together with
+sequencer and sparse-view state. `WorkspaceSnapshotV2` excludes ignored files
+by default and records bounded scans as partial rather than presenting an
+incomplete snapshot as complete. The focused contracts are registered in
+`tests/INDEX.md`; the full restore engine remains OL-10.
+
 ## Current Behavior
 
 - `op log` lists operations by repository with pagination and exact command
