@@ -15,20 +15,21 @@ use std::{os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 use base64::Engine as _;
 use libra::internal::upgrade::{
-    flow::{DecisionContext, SkipReason, UpgradeDecision, decide_from_envelope},
+    flow::{DecisionContext, FlowError, SkipReason, UpgradeDecision, decide_from_envelope},
     lock::InstallDir,
     manifest::{ReleaseVersion, SIGNATURE_DOMAIN_PREFIX, verify_envelope_bytes},
     marker::{
         InstallMarker, OFFICIAL_INSTALL_SOURCE, TARGET_BINARY_NAME, official_marker_for_target,
     },
     platform::Platform,
-    state::{UpgradeState, evaluate_manifest},
+    state::{StateRejection, UpgradeState, evaluate_manifest},
     trusted_keys::{TrustedKey, test_injection},
     txn::{self, CANDIDATE_NAME, OldTarget, TxnError, TxnOutcome},
 };
 use sha2::Digest as _;
 
 const SEED: [u8; 32] = [7u8; 32];
+const NEXT_GENERATION_SEED: [u8; 32] = [8u8; 32];
 /// Inside the payload lifetime `[2026-07-01, 2026-09-29)` (published_at is
 /// 1_782_864_000; this is a few minutes later).
 const GOOD_DATE: i64 = 1_782_864_100;
@@ -40,6 +41,17 @@ fn keypair() -> ring::signature::Ed25519KeyPair {
 fn pubkey() -> [u8; 32] {
     use ring::signature::KeyPair;
     keypair().public_key().as_ref().try_into().unwrap()
+}
+
+fn pubkey_for(seed: &[u8; 32]) -> [u8; 32] {
+    use ring::signature::KeyPair;
+
+    ring::signature::Ed25519KeyPair::from_seed_unchecked(seed)
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .try_into()
+        .unwrap()
 }
 
 /// Install the test trust key once (idempotent; first call wins).
@@ -65,13 +77,21 @@ fn artifact(platform: &str, version: &str) -> serde_json::Value {
 }
 
 fn payload(version: &str, control: u64) -> serde_json::Value {
+    payload_with_generation(version, control, 1)
+}
+
+fn payload_with_generation(
+    version: &str,
+    control: u64,
+    min_key_generation: u32,
+) -> serde_json::Value {
     serde_json::json!({
         "channel": "stable",
         "version": version,
         "control_revision": control,
         "published_at": "2026-07-01T00:00:00Z",
         "expires_at": "2026-09-29T00:00:00Z",
-        "min_key_generation": 1,
+        "min_key_generation": min_key_generation,
         "paused": false,
         "revoked_versions": [],
         "artifacts": [
@@ -84,19 +104,42 @@ fn payload(version: &str, control: u64) -> serde_json::Value {
 }
 
 fn envelope(payload: &serde_json::Value) -> Vec<u8> {
+    envelope_with_signers(payload, &[("test-key-1", SEED)])
+}
+
+fn envelope_with_signers(payload: &serde_json::Value, signers: &[(&str, [u8; 32])]) -> Vec<u8> {
     let payload_bytes = serde_json::to_vec(payload).unwrap();
     let mut message = SIGNATURE_DOMAIN_PREFIX.to_vec();
     message.extend_from_slice(&payload_bytes);
-    let sig = keypair().sign(&message);
+    let signatures: Vec<_> = signers
+        .iter()
+        .map(|(key_id, seed)| {
+            let keypair = ring::signature::Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
+            let signature = keypair.sign(&message);
+            serde_json::json!({
+                "key_id": key_id,
+                "signature": base64::engine::general_purpose::STANDARD.encode(signature.as_ref()),
+            })
+        })
+        .collect();
     serde_json::to_vec(&serde_json::json!({
         "schema_version": 1,
         "payload": base64::engine::general_purpose::STANDARD.encode(&payload_bytes),
-        "signatures": [{
-            "key_id": "test-key-1",
-            "signature": base64::engine::general_purpose::STANDARD.encode(sig.as_ref()),
-        }],
+        "signatures": signatures,
     }))
     .unwrap()
+}
+
+fn decision_context<'a>(state: &'a UpgradeState, trust: &'a [TrustedKey]) -> DecisionContext<'a> {
+    DecisionContext {
+        state,
+        https_date: Some(GOOD_DATE),
+        local_now: GOOD_DATE,
+        trust,
+        platform: Some(Platform::DarwinArm64),
+        installed_version: ReleaseVersion::parse("1.0.0").unwrap(),
+        installed_at_rfc3339: "2026-07-17T00:00:00Z",
+    }
 }
 
 fn owned_dir() -> (tempfile::TempDir, InstallDir) {
@@ -133,9 +176,15 @@ fn upgrade_full_verify_and_decide_installs_newer() {
 
 #[test]
 fn upgrade_release_binary_has_no_test_trust_root() {
-    // The production trust table (compiled without the test override) is empty
-    // — proven here by verifying an otherwise-valid envelope against it fails.
+    // The production table may contain ceremony keys, but test-only signing
+    // material is never a production trust root.
     let env = envelope(&payload("2.0.0", 5));
+    assert!(!libra::internal::upgrade::trusted_keys::PRODUCTION_TRUSTED_KEYS.is_empty());
+    assert!(
+        libra::internal::upgrade::trusted_keys::PRODUCTION_TRUSTED_KEYS
+            .iter()
+            .all(|key| key.key_id != "test-key-1")
+    );
     assert!(
         verify_envelope_bytes(
             &env,
@@ -143,6 +192,102 @@ fn upgrade_release_binary_has_no_test_trust_root() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn upgrade_persisted_generation_floor_selects_new_signer_and_rejects_lower_policy() {
+    let trust = vec![
+        TrustedKey {
+            key_id: "old-key",
+            ed25519_pubkey: pubkey_for(&SEED),
+            not_before: 0,
+            not_after: 4_102_444_800,
+            generation: 1,
+        },
+        TrustedKey {
+            key_id: "new-key",
+            ed25519_pubkey: pubkey_for(&NEXT_GENERATION_SEED),
+            not_before: 0,
+            not_after: 4_102_444_800,
+            generation: 2,
+        },
+    ];
+    let state = UpgradeState {
+        generation_floor: 2,
+        ..Default::default()
+    };
+    let old_only = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 1),
+        &[("old-key", SEED)],
+    );
+    assert!(matches!(
+        decide_from_envelope(&decision_context(&state, &trust), &old_only),
+        Err(FlowError::State(
+            StateRejection::SignerGenerationBelowFloor {
+                offered: 1,
+                floor: 2,
+                ..
+            }
+        ))
+    ));
+
+    // The old signature deliberately appears first. Filtering by the durable
+    // floor must select the generation-2 signature rather than reject a
+    // valid dual-signed rotation envelope.
+    let dual_signed = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 2),
+        &[("old-key", SEED), ("new-key", NEXT_GENERATION_SEED)],
+    );
+    let UpgradeDecision::Install(plan) =
+        decide_from_envelope(&decision_context(&state, &trust), &dual_signed).unwrap()
+    else {
+        panic!("expected a generation-2 dual-signed manifest to install");
+    };
+    assert_eq!(plan.marker.manifest_key_id, "new-key");
+
+    let lower_policy = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 1),
+        &[("new-key", NEXT_GENERATION_SEED)],
+    );
+    assert!(matches!(
+        decide_from_envelope(&decision_context(&state, &trust), &lower_policy),
+        Err(FlowError::State(StateRejection::GenerationFloorRollback {
+            offered: 1,
+            floor: 2,
+        }))
+    ));
+}
+
+#[test]
+fn upgrade_persisted_floor_reports_effective_floor_when_no_key_qualifies() {
+    // Persisted floor 3, only a generation-1 key in trust, manifest
+    // min_key_generation 2: the eligible-set pass finds no key and the
+    // full-table retry rejects on the weaker signed/compile-time floor (2).
+    // The surfaced error must carry the EFFECTIVE three-source floor (3).
+    let trust = vec![TrustedKey {
+        key_id: "old-key",
+        ed25519_pubkey: pubkey_for(&SEED),
+        not_before: 0,
+        not_after: 4_102_444_800,
+        generation: 1,
+    }];
+    let state = UpgradeState {
+        generation_floor: 3,
+        ..Default::default()
+    };
+    let env = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 2),
+        &[("old-key", SEED)],
+    );
+    assert!(matches!(
+        decide_from_envelope(&decision_context(&state, &trust), &env),
+        Err(FlowError::Manifest(
+            libra::internal::upgrade::manifest::ManifestError::KeyGenerationBelowFloor {
+                floor: 3,
+                manifest_min: 2,
+            }
+        ))
+    ));
 }
 
 #[test]
@@ -160,7 +305,10 @@ fn upgrade_windows_is_explicitly_unsupported() {
     };
     assert!(matches!(
         decide_from_envelope(&ctx, &env).unwrap(),
-        UpgradeDecision::Skip(SkipReason::UnsupportedPlatform(Platform::WindowsAmd64))
+        UpgradeDecision::Skip {
+            reason: SkipReason::UnsupportedPlatform(Platform::WindowsAmd64),
+            ..
+        }
     ));
 }
 
@@ -301,6 +449,7 @@ fn upgrade_present_txn_commit_then_marker_is_official() {
         marker_for("2.0.0", b"NEW"),
         UpgradeState::default(),
         &pass,
+        None,
     )
     .unwrap();
     assert_eq!(outcome, TxnOutcome::Installed);
@@ -338,6 +487,7 @@ fn upgrade_present_probe_failure_rolls_back_and_restores_marker() {
         marker_for("2.0.0", b"NEW"),
         UpgradeState::default(),
         &fail,
+        None,
     )
     .unwrap();
     assert_eq!(outcome, TxnOutcome::RolledBack);
@@ -361,4 +511,209 @@ fn upgrade_present_probe_failure_rolls_back_and_restores_marker() {
 fn upgrade_platform_matrix_is_the_release_matrix() {
     assert_eq!(Platform::RELEASE_MATRIX.len(), 4);
     assert!(Path::new(env!("CARGO_BIN_EXE_libra")).exists());
+}
+
+// ── manual `libra upgrade` core (check → floors → revalidate → transact) ─────
+
+use libra::internal::upgrade::{
+    orchestrator::{ManualCheckOutcome, ManualInstallReport, manual_test_hooks},
+    state::read_state,
+};
+
+/// Make `dir` an official install: a target named `libra` plus a marker
+/// whose platform/sha256/size validate against it (§A.2).
+fn seed_official_install(dir: &InstallDir, root: &std::path::Path) {
+    let bytes = b"manual-flow fake target binary";
+    std::fs::write(root.join(TARGET_BINARY_NAME), bytes).unwrap();
+    libra::internal::upgrade::marker::write_marker(
+        dir,
+        &marker_for(env!("CARGO_PKG_VERSION"), bytes),
+    )
+    .unwrap();
+}
+
+/// Without a validating official marker the manual core refuses before any
+/// state or decision work — the §A.2 gate is inside the shared core, so the
+/// hooks (and this test) exercise the REAL gate.
+#[tokio::test]
+async fn manual_check_without_a_marker_is_not_official() {
+    let trust = install_test_trust();
+    let (guard, _dir) = owned_dir();
+    let outcome = manual_test_hooks::manual_check_from_parts(
+        guard.path().canonicalize().unwrap().as_path(),
+        Platform::DarwinArm64,
+        &envelope(&payload("99.0.0", 7)),
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        &trust,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ManualCheckOutcome::NotOfficialInstall));
+}
+
+/// The check must persist the accepted manifest's monotone floors BEFORE
+/// returning `Available` — the confirmation window is unbounded, and a
+/// concurrent process must see the new control floor at once.
+#[tokio::test]
+async fn manual_check_persists_floors_before_offering_the_install() {
+    let trust = install_test_trust();
+    let (guard, dir) = owned_dir();
+    seed_official_install(&dir, &guard.path().canonicalize().unwrap());
+    let env = envelope(&payload("99.0.0", 7));
+
+    let outcome = manual_test_hooks::manual_check_from_parts(
+        guard.path().canonicalize().unwrap().as_path(),
+        Platform::DarwinArm64,
+        &env,
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        &trust,
+    )
+    .await
+    .expect("check succeeds");
+    let ManualCheckOutcome::Available(upgrade) = outcome else {
+        panic!("a newer signed version must be offered");
+    };
+    assert_eq!(upgrade.latest().to_string(), "99.0.0");
+    // Floors are already durable, without install() or any decline step.
+    let state = read_state(&dir).unwrap();
+    assert_eq!(
+        state.max_control_revision, 7,
+        "accepted control revision must be durable at Available time"
+    );
+}
+
+/// A pause published during the confirmation window wins: install() (here
+/// its injected-envelope core) re-decides and refuses the stale plan.
+#[tokio::test]
+async fn manual_install_recheck_honours_a_pause_published_meanwhile() {
+    let trust = install_test_trust();
+    let (guard, dir) = owned_dir();
+    let root = guard.path().canonicalize().unwrap();
+    seed_official_install(&dir, &root);
+    let offer = envelope(&payload("99.0.0", 7));
+    let outcome = manual_test_hooks::manual_check_from_parts(
+        &root,
+        Platform::DarwinArm64,
+        &offer,
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        &trust,
+    )
+    .await
+    .unwrap();
+    let ManualCheckOutcome::Available(upgrade) = outcome else {
+        panic!("offer expected");
+    };
+
+    let mut paused = payload("99.0.0", 8);
+    paused["paused"] = serde_json::json!(true);
+    let report = manual_test_hooks::install_with_envelope_and_candidate(
+        *upgrade,
+        &envelope(&paused),
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        b"never-used".to_vec(),
+        &trust,
+    )
+    .await
+    .expect("recheck path must not error");
+    match report {
+        ManualInstallReport::ControlChanged { detail } => {
+            assert!(detail.contains("PAUSED"), "detail must say why: {detail}");
+        }
+        other => panic!("a pause must refuse the stale plan, got {other:?}"),
+    }
+    // The pause round's floors advanced too.
+    assert_eq!(read_state(&dir).unwrap().max_control_revision, 8);
+}
+
+/// With the §A.5 lock held by another process, the manual install reports
+/// `NotApplied` (and errors nothing) — floors were already persisted.
+#[tokio::test]
+async fn manual_install_reports_not_applied_while_the_lock_is_held() {
+    let trust = install_test_trust();
+    let (guard, dir) = owned_dir();
+    let root = guard.path().canonicalize().unwrap();
+    seed_official_install(&dir, &root);
+    let offer = envelope(&payload("99.0.0", 7));
+    let outcome = manual_test_hooks::manual_check_from_parts(
+        &root,
+        Platform::DarwinArm64,
+        &offer,
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        &trust,
+    )
+    .await
+    .unwrap();
+    let ManualCheckOutcome::Available(upgrade) = outcome else {
+        panic!("offer expected");
+    };
+
+    let _held = dir.try_lock().unwrap().expect("lock acquired by the test");
+    let report = manual_test_hooks::install_with_envelope_and_candidate(
+        *upgrade,
+        &offer,
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        b"candidate-bytes".to_vec(),
+        &trust,
+    )
+    .await
+    .expect("lock contention is not an error");
+    assert_eq!(report, ManualInstallReport::NotApplied);
+}
+
+/// Skip reasons map onto the friendly outcome vocabulary.
+#[tokio::test]
+async fn manual_check_maps_paused_and_revoked_to_their_outcomes() {
+    let trust = install_test_trust();
+
+    let (guard, dir_a) = owned_dir();
+    seed_official_install(&dir_a, &guard.path().canonicalize().unwrap());
+    let mut paused = payload("99.0.0", 3);
+    paused["paused"] = serde_json::json!(true);
+    let outcome = manual_test_hooks::manual_check_from_parts(
+        guard.path().canonicalize().unwrap().as_path(),
+        Platform::DarwinArm64,
+        &envelope(&paused),
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        &trust,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ManualCheckOutcome::Paused { .. }));
+
+    let (guard2, dir_b) = owned_dir();
+    seed_official_install(&dir_b, &guard2.path().canonicalize().unwrap());
+    let mut revoked = payload("99.0.0", 3);
+    revoked["revoked_versions"] = serde_json::json!(["99.0.0"]);
+    let outcome = manual_test_hooks::manual_check_from_parts(
+        guard2.path().canonicalize().unwrap().as_path(),
+        Platform::DarwinArm64,
+        &envelope(&revoked),
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        &trust,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ManualCheckOutcome::RevokedLatest { .. }));
+
+    let (guard3, dir_c) = owned_dir();
+    seed_official_install(&dir_c, &guard3.path().canonicalize().unwrap());
+    let outcome = manual_test_hooks::manual_check_from_parts(
+        guard3.path().canonicalize().unwrap().as_path(),
+        Platform::DarwinArm64,
+        &envelope(&payload("0.0.1", 3)),
+        Some(GOOD_DATE),
+        GOOD_DATE,
+        &trust,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ManualCheckOutcome::UpToDate { .. }));
 }

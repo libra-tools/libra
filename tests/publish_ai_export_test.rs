@@ -316,7 +316,7 @@ fn publish_ai_export_test_maps_history_storage_types_to_reference_types() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn publish_ai_export_test_collects_snapshot_and_event_objects_from_history() {
     let (temp, storage, history) = setup_history_repo().await;
     let _keep_temp = temp;
@@ -395,7 +395,7 @@ async fn publish_ai_export_test_collects_snapshot_and_event_objects_from_history
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn publish_ai_export_test_redacts_sensitive_history_payload_fields() {
     let (temp, storage, history) = setup_history_repo().await;
     let _keep_temp = temp;

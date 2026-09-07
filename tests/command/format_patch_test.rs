@@ -29,7 +29,6 @@ fn repo_with_commits(num: usize) -> tempfile::TempDir {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn basic_range_produces_patch_files() {
     let repo = repo_with_commits(3);
     let out_dir = tempdir().unwrap();
@@ -71,7 +70,6 @@ fn basic_range_produces_patch_files() {
 }
 
 #[test]
-#[serial]
 fn single_commit_defaults_to_head_range() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -90,7 +88,6 @@ fn single_commit_defaults_to_head_range() {
 }
 
 #[test]
-#[serial]
 fn numbered_flag_produces_numbered_files() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -118,7 +115,6 @@ fn numbered_flag_produces_numbered_files() {
 }
 
 #[test]
-#[serial]
 fn cover_letter_generates_template() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -149,7 +145,6 @@ fn cover_letter_generates_template() {
 }
 
 #[test]
-#[serial]
 fn subject_prefix_flag() {
     let repo = repo_with_commits(1);
     let out_dir = tempdir().unwrap();
@@ -181,7 +176,6 @@ fn subject_prefix_flag() {
 }
 
 #[test]
-#[serial]
 fn reroll_count_adds_version() {
     let repo = repo_with_commits(1);
     let out_dir = tempdir().unwrap();
@@ -213,7 +207,6 @@ fn reroll_count_adds_version() {
 }
 
 #[test]
-#[serial]
 fn signoff_adds_trailer() {
     let repo = repo_with_commits(1);
     let out_dir = tempdir().unwrap();
@@ -244,7 +237,6 @@ fn signoff_adds_trailer() {
 }
 
 #[test]
-#[serial]
 fn stdout_output_prints_all_patches() {
     let repo = repo_with_commits(2);
 
@@ -267,7 +259,6 @@ fn stdout_output_prints_all_patches() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn notes_appends_block_after_separator() {
     let repo = repo_with_commits(2);
     // Attach a multi-line note to the tip commit.
@@ -300,7 +291,6 @@ fn notes_appends_block_after_separator() {
 }
 
 #[test]
-#[serial]
 fn notes_custom_ref_uses_parenthesized_header() {
     let repo = repo_with_commits(2);
     let note = run_libra_command(
@@ -342,7 +332,6 @@ fn notes_custom_ref_uses_parenthesized_header() {
 }
 
 #[test]
-#[serial]
 fn notes_malformed_ref_is_a_usage_error() {
     let repo = repo_with_commits(2);
 
@@ -394,7 +383,6 @@ fn notes_malformed_ref_is_a_usage_error() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn attach_wraps_patch_in_mime_multipart() {
     let repo = repo_with_commits(1);
     let out = run_libra_command(
@@ -436,7 +424,6 @@ fn attach_wraps_patch_in_mime_multipart() {
 }
 
 #[test]
-#[serial]
 fn inline_uses_inline_content_disposition() {
     let repo = repo_with_commits(1);
     let out = run_libra_command(
@@ -456,7 +443,6 @@ fn inline_uses_inline_content_disposition() {
 }
 
 #[test]
-#[serial]
 fn attach_and_inline_are_mutually_exclusive() {
     let repo = repo_with_commits(1);
     let out = run_libra_command(
@@ -478,7 +464,6 @@ fn attach_and_inline_are_mutually_exclusive() {
 }
 
 #[test]
-#[serial]
 fn no_attach_stays_plain_text() {
     let repo = repo_with_commits(1);
     let out = run_libra_command(&["format-patch", "--stdout", "HEAD~1..HEAD"], repo.path());
@@ -499,7 +484,6 @@ fn no_attach_stays_plain_text() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn json_output_returns_patch_records() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -531,7 +515,6 @@ fn json_output_returns_patch_records() {
 }
 
 #[test]
-#[serial]
 fn json_output_includes_cover_letter_record() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -569,7 +552,6 @@ fn json_output_includes_cover_letter_record() {
 }
 
 #[test]
-#[serial]
 fn subject_header_sanitizes_control_characters() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("header.txt"), "header\n").unwrap();
@@ -613,7 +595,6 @@ fn subject_header_sanitizes_control_characters() {
 }
 
 #[test]
-#[serial]
 fn thread_flag_adds_message_id() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -645,7 +626,6 @@ fn thread_flag_adds_message_id() {
 }
 
 #[test]
-#[serial]
 fn no_thread_suppresses_headers() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -677,7 +657,6 @@ fn no_thread_suppresses_headers() {
 }
 
 #[test]
-#[serial]
 fn in_reply_to_applies_to_first_patch() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -711,7 +690,6 @@ fn in_reply_to_applies_to_first_patch() {
 }
 
 #[test]
-#[serial]
 fn keep_subject_retains_bracket_prefix() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("test.txt"), "data\n").unwrap();
@@ -748,7 +726,6 @@ fn keep_subject_retains_bracket_prefix() {
 }
 
 #[test]
-#[serial]
 fn no_stat_suppresses_diffstat() {
     let repo = repo_with_commits(1);
     let out_dir = tempdir().unwrap();
@@ -783,7 +760,6 @@ fn no_stat_suppresses_diffstat() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn empty_range_reports_error() {
     let repo = create_committed_repo_via_cli();
     // Asking for a range where the two sides are the same yields no patches
@@ -792,7 +768,6 @@ fn empty_range_reports_error() {
 }
 
 #[test]
-#[serial]
 fn not_in_repo_reports_error() {
     let tmp = tempdir().unwrap();
     let output = run_libra_command(&["format-patch"], tmp.path());
@@ -805,7 +780,6 @@ fn not_in_repo_reports_error() {
 }
 
 #[test]
-#[serial]
 fn invalid_revision_reports_error() {
     let repo = create_committed_repo_via_cli();
     let output = run_libra_command(&["format-patch", "nonexistent-branch..HEAD"], repo.path());
@@ -813,7 +787,6 @@ fn invalid_revision_reports_error() {
 }
 
 #[test]
-#[serial]
 fn start_number_offsets_file_names() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -844,7 +817,6 @@ fn start_number_offsets_file_names() {
 }
 
 #[test]
-#[serial]
 fn merge_commits_are_skipped() {
     let repo = create_committed_repo_via_cli();
     // Create a branch with its own commit, then merge it
@@ -888,7 +860,6 @@ fn merge_commits_are_skipped() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn full_index_flag_outputs_full_hash() {
     // full-index is accepted as a flag — the underlying diff output
     // is handled by the libra diff engine; we verify the flag parses.
@@ -909,7 +880,6 @@ fn full_index_flag_outputs_full_hash() {
 }
 
 #[test]
-#[serial]
 fn suffix_changes_patch_filename_extension() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -947,7 +917,6 @@ fn suffix_changes_patch_filename_extension() {
 }
 
 #[test]
-#[serial]
 fn zero_commit_zeroes_the_envelope_hash() {
     let repo = repo_with_commits(1);
 
@@ -992,7 +961,6 @@ fn zero_commit_zeroes_the_envelope_hash() {
 }
 
 #[test]
-#[serial]
 fn signature_controls_patch_footer() {
     let repo = repo_with_commits(1);
 
@@ -1033,7 +1001,6 @@ fn signature_controls_patch_footer() {
 }
 
 #[test]
-#[serial]
 fn numbered_files_uses_bare_sequence_numbers() {
     let repo = repo_with_commits(2);
     let out_dir = tempdir().unwrap();
@@ -1087,7 +1054,6 @@ fn numbered_files_uses_bare_sequence_numbers() {
 }
 
 #[test]
-#[serial]
 fn signature_file_sets_the_footer() {
     let repo = repo_with_commits(1);
     let sig = repo.path().join("sig.txt");
@@ -1112,7 +1078,6 @@ fn signature_file_sets_the_footer() {
 }
 
 #[test]
-#[serial]
 fn encode_email_headers_q_encodes_nonascii_subject() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("f.txt"), "x\n").unwrap();
@@ -1158,7 +1123,6 @@ fn encode_email_headers_q_encodes_nonascii_subject() {
 }
 
 #[test]
-#[serial]
 fn encode_email_headers_splits_long_words_under_75_chars() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("g.txt"), "x\n").unwrap();
@@ -1203,7 +1167,6 @@ fn encode_email_headers_splits_long_words_under_75_chars() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn recipient_headers_to_and_cc() {
     let repo = repo_with_commits(1);
 
@@ -1305,7 +1268,6 @@ fn recipient_headers_to_and_cc() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn from_header_rewrites_author() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -1420,7 +1382,6 @@ fn from_header_rewrites_author() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn base_records_base_commit_and_prerequisite_patch_ids() {
     // create_committed_repo_via_cli gives 1 commit; +3 → 4 commits total.
     let repo = repo_with_commits(3);
@@ -1457,7 +1418,6 @@ fn base_records_base_commit_and_prerequisite_patch_ids() {
 }
 
 #[test]
-#[serial]
 fn base_multi_file_prerequisite_patch_id_matches_git() {
     // A prerequisite commit that touches TWO files exercises Git's stable
     // patch-id combiner (byte-wise add-with-carry, NOT XOR). The patch-id is
@@ -1490,7 +1450,6 @@ fn base_multi_file_prerequisite_patch_id_matches_git() {
 }
 
 #[test]
-#[serial]
 fn base_prerequisites_skip_merge_commits() {
     // base -> main2 -> merge(feat) -> tip. With base at the root and the series =
     // tip, the prerequisites are main2 + feat — the MERGE commit is skipped, like
@@ -1541,7 +1500,6 @@ fn base_prerequisites_skip_merge_commits() {
 }
 
 #[test]
-#[serial]
 fn base_with_attach_emits_trailer_in_patch_part() {
     let repo = repo_with_commits(3);
     let p = repo.path();
@@ -1571,7 +1529,6 @@ fn base_with_attach_emits_trailer_in_patch_part() {
 }
 
 #[test]
-#[serial]
 fn base_direct_parent_has_no_prerequisites() {
     let repo = repo_with_commits(3);
     let p = repo.path();
@@ -1590,7 +1547,6 @@ fn base_direct_parent_has_no_prerequisites() {
 }
 
 #[test]
-#[serial]
 fn base_on_non_ancestor_fails() {
     let repo = repo_with_commits(3);
     let p = repo.path();
@@ -1615,7 +1571,6 @@ fn base_on_non_ancestor_fails() {
 }
 
 #[test]
-#[serial]
 fn base_auto_is_rejected() {
     let repo = repo_with_commits(3);
     let out = run_libra_command(
@@ -1631,7 +1586,6 @@ fn base_auto_is_rejected() {
 }
 
 #[test]
-#[serial]
 fn base_with_cover_letter_lands_on_cover() {
     let repo = repo_with_commits(3);
     let p = repo.path();

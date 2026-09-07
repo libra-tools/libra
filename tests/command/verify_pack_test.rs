@@ -99,7 +99,6 @@ fn corrupt_v1_index_with_duplicate_first_entry(idx_path: &Path) {
 }
 
 #[test]
-#[serial]
 fn verify_pack_accepts_generated_v1_index() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());
@@ -125,7 +124,6 @@ fn verify_pack_accepts_generated_v1_index() {
 }
 
 #[test]
-#[serial]
 fn verify_pack_uses_repository_hash_kind_for_sha256_indexes() {
     let repo = tempfile::tempdir().expect("create repo");
     init_sha256_repo_via_cli(repo.path());
@@ -158,7 +156,6 @@ fn verify_pack_uses_repository_hash_kind_for_sha256_indexes() {
 }
 
 #[test]
-#[serial]
 fn verify_pack_accepts_absolute_index_path_outside_repository() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());
@@ -183,7 +180,6 @@ fn verify_pack_accepts_absolute_index_path_outside_repository() {
 }
 
 #[test]
-#[serial]
 fn verify_pack_accepts_sha256_index_path_outside_repository() {
     let repo = tempfile::tempdir().expect("create repo");
     init_sha256_repo_via_cli(repo.path());
@@ -216,7 +212,7 @@ fn verify_pack_accepts_sha256_index_path_outside_repository() {
 }
 
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn verify_pack_rejects_duplicate_object_ids_even_with_valid_index_checksum() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());
@@ -242,7 +238,6 @@ fn verify_pack_rejects_duplicate_object_ids_even_with_valid_index_checksum() {
 }
 
 #[test]
-#[serial]
 fn verify_pack_accepts_generated_v2_index_with_verbose_objects() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());
@@ -292,7 +287,6 @@ fn verify_pack_accepts_generated_v2_index_with_verbose_objects() {
 }
 
 #[test]
-#[serial]
 fn verify_pack_json_reports_counts_and_hashes() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());
@@ -328,7 +322,6 @@ fn verify_pack_json_reports_counts_and_hashes() {
 }
 
 #[test]
-#[serial]
 fn verify_pack_rejects_corrupt_index_entry() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());
@@ -358,7 +351,6 @@ fn verify_pack_rejects_corrupt_index_entry() {
 }
 
 #[test]
-#[serial]
 fn verify_pack_reports_missing_pack_as_read_error() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());

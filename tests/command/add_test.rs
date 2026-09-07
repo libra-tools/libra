@@ -23,7 +23,7 @@ use super::*;
 /// Scenario: smoke test for the simplest staging path — create one file,
 /// run `add`, and confirm the path appears in the staged "new" set.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_single_file() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -60,7 +60,7 @@ async fn test_add_single_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_reports_marker_registration_failure_without_panicking() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -143,7 +143,7 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_dispatches_vcs_automation_history() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -190,7 +190,7 @@ async fn test_add_dispatches_vcs_automation_history() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_dry_run_does_not_dispatch_vcs_automation_history() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -237,7 +237,7 @@ async fn test_add_dry_run_does_not_dispatch_vcs_automation_history() {
 /// listed file. Guards against accidental short-circuiting after the first
 /// path.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_multiple_files() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -299,7 +299,7 @@ async fn test_add_multiple_files() {
 /// file even though no pathspec is supplied. Locks in the recursive
 /// scan behavior of `-A`.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_all_flag() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -358,7 +358,7 @@ async fn test_add_all_flag() {
 /// file ceases to show as modified (it was restaged) while the untracked
 /// file remains in the "new" set.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_update_flag() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -449,7 +449,7 @@ async fn test_add_update_flag() {
 /// `ignored_*.txt` and `ignore_dir/**` remain hidden in both staged and
 /// committed change lists. Pins ignore-glob semantics.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_with_ignore_patterns() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -546,7 +546,7 @@ async fn test_add_with_ignore_patterns() {
 /// that path is tracked, subsequent edits flow through without `--force`.
 /// Validates the "force once, stay tracked" promise.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_force_tracks_ignored_file() {
     let repo = tempdir().unwrap();
     test::setup_with_new_libra_in(repo.path()).await;
@@ -666,7 +666,7 @@ async fn test_add_force_tracks_ignored_file() {
 /// ignored directory. Path separators are normalized to forward slashes
 /// for cross-platform comparison. Pins the directory-level force semantic.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_force_dot_includes_ignored_directory() {
     let repo = tempdir().unwrap();
     test::setup_with_new_libra_in(repo.path()).await;
@@ -744,7 +744,7 @@ async fn test_add_force_dot_includes_ignored_directory() {
 /// i.e. the file is detected as untracked in the working tree, confirming
 /// it was not staged.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_dry_run() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -783,7 +783,7 @@ async fn test_add_dry_run() {
 /// call. Boundary condition: the in-process API does not surface CLI exit
 /// codes, so the assertion is on side effects only.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_without_path_should_error() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -824,7 +824,7 @@ async fn test_add_without_path_should_error() {
 /// Pins the post-condition: the bogus path never appears in
 /// `changes_to_be_committed().new`.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_nonexistent_file_should_error() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -863,7 +863,7 @@ async fn test_add_nonexistent_file_should_error() {
 /// duplicate index entries. Pins the idempotency invariant of the staging
 /// pipeline.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_duplicate_file_should_not_duplicate_index() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -911,7 +911,7 @@ async fn test_add_duplicate_file_should_not_duplicate_index() {
 /// Scenario: zero-byte files must be stageable. Regression guard against
 /// "non-empty content required" assumptions in the blob hashing path.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_empty_file() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -951,7 +951,7 @@ async fn test_add_empty_file() {
 /// their full repository-relative path. Path separators are normalized to
 /// `/` so the test passes on Windows.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_sub_directory_file() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -995,7 +995,7 @@ async fn test_add_sub_directory_file() {
 /// `--pathspec-from-file` (newline-separated) stages only the listed paths and
 /// merges with any pathspecs passed on the command line.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -1039,7 +1039,7 @@ async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
 
 /// `--pathspec-from-file` with `--pathspec-file-nul` reads a NUL-separated list.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_pathspec_from_file_nul_stages_listed_paths() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -1121,7 +1121,7 @@ fn test_add_dry_run_short_n_and_d_alias() {
 /// `--chmod=+x` sets the executable bit (index mode 100755) on the matched
 /// file and `--chmod=-x` clears it (100644), without changing the blob.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_chmod_sets_and_clears_exec_bit() {
     let dir = tempdir().unwrap();
     test::setup_with_new_libra_in(dir.path()).await;
@@ -1161,7 +1161,7 @@ async fn test_add_chmod_sets_and_clears_exec_bit() {
 
 /// An invalid `--chmod` value is a usage error (exit 129), not a panic.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_chmod_invalid_value_errors() {
     let dir = tempdir().unwrap();
     test::setup_with_new_libra_in(dir.path()).await;
@@ -1179,7 +1179,7 @@ async fn test_add_chmod_invalid_value_errors() {
 /// `--renormalize` re-stages tracked files and never stages an untracked file
 /// (it implies `-u`).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_renormalize_only_tracked() {
     let dir = tempdir().unwrap();
     test::setup_with_new_libra_in(dir.path()).await;
@@ -1216,7 +1216,7 @@ async fn test_add_renormalize_only_tracked() {
 /// `--renormalize` stages the deletion of a tracked file removed from the
 /// working tree.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_renormalize_stages_tracked_deletion() {
     let dir = tempdir().unwrap();
     test::setup_with_new_libra_in(dir.path()).await;
@@ -1249,7 +1249,7 @@ async fn test_add_renormalize_stages_tracked_deletion() {
 /// `--dry-run --ignore-missing` skips a pathspec that does not exist instead of
 /// failing; `--ignore-missing` without `--dry-run` is rejected (Git requires it).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_ignore_missing_dry_run_skips() {
     let dir = tempdir().unwrap();
     test::setup_with_new_libra_in(dir.path()).await;
@@ -1278,7 +1278,7 @@ async fn test_add_ignore_missing_dry_run_skips() {
 /// Regression: a chmod-only change (same blob, new mode) is detected by
 /// `status` as staged and can be committed — the committed tree carries 100755.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_chmod_only_change_is_committable() {
     let dir = tempdir().unwrap();
     test::setup_with_new_libra_in(dir.path()).await;
@@ -1323,7 +1323,7 @@ async fn test_add_chmod_only_change_is_committable() {
 /// `--json --dry-run --ignore-missing` exposes the skipped pathspec as a
 /// machine-readable `missing` list (not just a stderr warning).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_ignore_missing_json_exposes_skipped() {
     let dir = tempdir().unwrap();
     test::setup_with_new_libra_in(dir.path()).await;
@@ -1351,7 +1351,7 @@ async fn test_add_ignore_missing_json_exposes_skipped() {
 /// `--exit-code-on-warning` must honor an `--ignore-missing` skip: a skipped
 /// pathspec is a warning, so the process exits non-zero under that contract.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_add_ignore_missing_triggers_warning_exit() {
     let dir = tempdir().unwrap();
     test::setup_with_new_libra_in(dir.path()).await;

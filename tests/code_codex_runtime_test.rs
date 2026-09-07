@@ -430,7 +430,7 @@ async fn mock_codex_ws_server_handles_initialize_and_thread_start_round_trip() -
 /// Code UI runtime then connect to the mock WebSocket endpoint.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_provider_codex_boots_against_mock_app_server() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
@@ -515,7 +515,7 @@ fn libra_code_provider_codex_boots_against_mock_app_server() -> Result<()> {
 /// and becomes visible through the MCP history index.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_provider_codex_persists_thread_started_notification() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let thread_id = "wave-9-codex-persisted-thread";
@@ -591,7 +591,7 @@ fn libra_code_provider_codex_persists_thread_started_notification() -> Result<()
 /// responds to the surfaced interaction.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_provider_codex_waits_for_user_before_execution_approval_resolve() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
@@ -693,7 +693,7 @@ fn libra_code_provider_codex_waits_for_user_before_execution_approval_resolve() 
 /// registerable after the first response is forwarded (no auto-decline).
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_provider_codex_registers_sequential_approvals_on_same_turn() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
@@ -814,7 +814,7 @@ fn libra_code_provider_codex_registers_sequential_approvals_on_same_turn() -> Re
 /// the known app-server turn, and free the sidecar so a later submit works.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_provider_codex_cancel_during_pending_approval_interrupts_turn() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
@@ -922,7 +922,7 @@ fn libra_code_provider_codex_cancel_during_pending_approval_interrupts_turn() ->
 /// interrupts using the nested turn id.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_provider_codex_cancel_after_turn_started_interrupts_turn() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
@@ -1003,7 +1003,7 @@ fn libra_code_provider_codex_cancel_after_turn_started_interrupts_turn() -> Resu
 /// id later arrives, interrupt is dispatched off the WS reader (no deadlock).
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_provider_codex_cancel_before_turn_started_interrupts_when_started_arrives()
 -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
@@ -1195,7 +1195,7 @@ fn codex_events_normalized_into_runtime_envelope() {
 /// snapshot without panicking on the unknown method.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_provider_codex_normalizes_failed_turn_and_unknown_notification() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {

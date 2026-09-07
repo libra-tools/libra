@@ -45,6 +45,8 @@ Libra 与现有 Git 生态兼容，并支持主流 AI 编程工具。开发者�
 
 ```bash
 # macOS / Linux（推荐）
+# 安装器先验证 Ed25519 签名的 release manifest 及二进制 sha256/size 再安装；
+# 信任模型见 docs/installation.zh-CN.md。
 curl -fsSL https://download.libra.tools/install.sh | sh
 
 # Homebrew（macOS）

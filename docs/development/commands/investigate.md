@@ -9,8 +9,9 @@ investigator，按 `--agent` 顺序——把首批三个外部 CLI（`claude-cod
 可审计的 run 目录。绝不把 A7 review 的并发扇入模型套到 investigate 上
 （plan.md:996）。每个 run 要么收敛到 terminal state
 （`quorum`/`max_turns`/`cancelled`/`timeout`/`error`），要么 PAUSE
-（`stalled`/`agent_failure`）并可 `continue` 续跑。任何 mutation（`fix`）在内部
-fix bridge 落地前稳定 unsupported（`LBR-AGENT-010`），绝不伪装成功。
+（`stalled`/`agent_failure`）并可 `continue` 续跑。`fix` 校验已有 run 后只向活跃、
+获授权的 Code runtime 提交固定可信请求；它复用 `review --fix` 的同一条 serialized
+runtime 与全部安全 gate，不读取或转发 investigation 的不可信内容。
 
 ## 对比 Git 与兼容性
 
@@ -126,11 +127,13 @@ spotlit prompt 重新构造 argv。
 - **untrusted findings**：`findings.md` 为 provenance=untrusted 的 raw-redacted
   文本；`show`（人类与 JSON 输出均是）必经 `render_untrusted_findings` 剥离
   ANSI/终端控制序列后才渲染。
-- **`fix` unsupported**：无内部 serialized fix bridge 源码锚点前，`investigate fix`
-  稳定返回 `LBR-AGENT-010`（`AgentFixBridgeUnavailable`，与 A7 review `--fix`
-  同一语义）；由于 topic 恒为 untrusted seed，mutating fix 另需显式 approval——
-  bridge 落地后未授权的 untrusted-seed mutation 返回 `LBR-AGENT-011`
-  （`AgentUntrustedSeedForMutation`）。两个错误消息都说明 read-only 可用与前置条件。
+- **`fix` 复用受控 bridge**：`investigate fix` 校验 run 存在后，调用 A7
+  `review --fix` 的共享 controller lifecycle 与 runtime helper，提交编译期固定的
+  `INVESTIGATE_FIX_ADMISSION_MESSAGE`。topic、stances、findings、attachments、run id
+  均不进入请求，也不新建 mutation queue、hardening 表或 approval 表。无活跃/授权
+  runtime 返回 `LBR-AGENT-010`；任何 `ReviewFixInput::UntrustedSeed` 在 control
+  discovery 前返回 `LBR-AGENT-011`。后续 plan/approval/sandbox/network/ACL/tool gate
+  以及 patch/repair 投影完全由既有 Code runtime 执行。
 
 ### 可观测性
 
@@ -162,5 +165,6 @@ libra investigate clean --all
 
 ## 还未实现的功能
 
-- `investigate fix`（内部 AgentRuntime fix bridge；Code 阶段源码锚点 +
-  approval/sandbox/tool gate 测试为前置；现由 plan-20260714 Part D PD-01 跟踪）。
+- 无 `investigate fix` bridge 残留；未来若要让 investigation findings 驱动 mutation，
+  必须另立设计并重新经过 provenance、redaction、approval、sandbox 与 tool gate，不能
+  扩大当前固定请求的信任边界。

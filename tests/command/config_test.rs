@@ -30,7 +30,7 @@ async fn exec_config(args: Vec<&str>) -> CliResult<()> {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cli_config_global_without_repo() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
@@ -46,7 +46,7 @@ async fn test_cli_config_global_without_repo() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cli_config_list_global_without_repo() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
@@ -60,7 +60,7 @@ async fn test_cli_config_list_global_without_repo() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_cli_config_system_read_write() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
@@ -87,7 +87,7 @@ async fn test_cli_config_system_read_write() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_cascade_system_is_lowest_precedence() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -151,7 +151,7 @@ async fn test_config_cascade_system_is_lowest_precedence() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cli_config_local_requires_repo() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
@@ -163,7 +163,7 @@ async fn test_cli_config_local_requires_repo() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_system_scope_roundtrip_and_vault_rejection() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -227,7 +227,7 @@ async fn test_config_system_scope_roundtrip_and_vault_rejection() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_config_import_global_from_git() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
@@ -279,7 +279,7 @@ async fn test_config_import_global_from_git() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_import_local_from_git_repository() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -370,7 +370,7 @@ impl ScopedConfigPathGuard {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_get_failed() {
     let temp_path = tempdir().unwrap();
     // start a new libra repository in a temporary directory
@@ -391,7 +391,7 @@ async fn test_config_get_failed() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_get_all() {
     let temp_path = tempdir().unwrap();
     // start a new libra repository in a temporary directory
@@ -409,7 +409,7 @@ async fn test_config_get_all() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_get_all_with_default() {
     let temp_path = tempdir().unwrap();
     let global_db_dir = tempdir().unwrap();
@@ -430,7 +430,7 @@ async fn test_config_get_all_with_default() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_get() {
     let temp_path = tempdir().unwrap();
     // start a new libra repository in a temporary directory
@@ -448,7 +448,7 @@ async fn test_config_get() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_get_with_default() {
     let temp_path = tempdir().unwrap();
     // start a new libra repository in a temporary directory
@@ -461,7 +461,7 @@ async fn test_config_get_with_default() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_list() {
     let temp_path = tempdir().unwrap();
     // start a new libra repository in a temporary directory
@@ -489,7 +489,7 @@ async fn test_config_list() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_list_name_only() {
     let temp_path = tempdir().unwrap();
     // start a new libra repository in a temporary directory
@@ -518,7 +518,7 @@ async fn test_config_list_name_only() {
 
 // New tests for scope functionality
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_scope_local_default() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -534,7 +534,7 @@ async fn test_config_scope_local_default() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_scope_global() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -572,7 +572,7 @@ async fn test_config_scope_global() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_config_scope_system_errors() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -639,7 +639,7 @@ async fn test_config_scope_system_errors() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_config_system_rejected_vault_write_does_not_create_db() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -669,7 +669,7 @@ async fn test_config_system_rejected_vault_write_does_not_create_db() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_config_system_rename_into_vault_namespace_rejected() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -709,7 +709,7 @@ async fn test_config_system_rename_into_vault_namespace_rejected() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_config_system_set_rejected_when_existing_row_is_encrypted() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -760,7 +760,7 @@ async fn test_config_system_set_rejected_when_existing_row_is_encrypted() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_scope_explicit_local() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -782,7 +782,7 @@ async fn test_config_scope_explicit_local() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_scope_isolation() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -810,7 +810,7 @@ async fn test_config_scope_isolation() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_get_reveal_decrypt_failure_returns_error() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -834,7 +834,7 @@ async fn test_config_get_reveal_decrypt_failure_returns_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_get_cascaded_global_read_failure_returns_error() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -852,7 +852,7 @@ async fn test_config_get_cascaded_global_read_failure_returns_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_add_rejects_implicit_encryption_mixed_with_existing_plaintext() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -896,7 +896,7 @@ async fn test_config_add_rejects_implicit_encryption_mixed_with_existing_plainte
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_set_encrypt_plaintext_mutex_is_command_usage_error() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -928,7 +928,7 @@ async fn test_config_set_encrypt_plaintext_mutex_is_command_usage_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_set_stdin_with_positional_value_is_command_usage_error() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -953,7 +953,7 @@ async fn test_config_set_stdin_with_positional_value_is_command_usage_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_set_plaintext_on_vault_internal_key_is_failure() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -987,7 +987,7 @@ async fn test_config_set_plaintext_on_vault_internal_key_is_failure() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_memory_keyed_digest_is_owner_managed() {
     use libra::internal::config::ConfigKv;
 
@@ -1147,7 +1147,7 @@ async fn test_config_memory_keyed_digest_is_owner_managed() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_config_set_read_failure_does_not_silently_skip_existing_state_check() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1193,7 +1193,7 @@ async fn test_config_set_read_failure_does_not_silently_skip_existing_state_chec
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_config_set_missing_value_uses_protected_input_when_existing_key_is_encrypted() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1223,7 +1223,7 @@ async fn test_config_set_missing_value_uses_protected_input_when_existing_key_is
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_list_defaults_to_local_scope_without_global_entries() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1263,7 +1263,7 @@ async fn test_config_list_defaults_to_local_scope_without_global_entries() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_list_ssh_keys_outputs_configured_public_keys() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1308,7 +1308,7 @@ async fn test_config_list_ssh_keys_outputs_configured_public_keys() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_list_gpg_keys_outputs_configured_key_namespaces() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1357,7 +1357,7 @@ async fn test_config_list_gpg_keys_outputs_configured_key_namespaces() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_generate_ssh_key_replaces_vault_generate_ssh_key_flow() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1405,7 +1405,7 @@ async fn test_config_generate_ssh_key_replaces_vault_generate_ssh_key_flow() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_generate_global_ssh_key_is_rejected_without_local_side_effects() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1467,7 +1467,7 @@ async fn test_config_generate_global_ssh_key_is_rejected_without_local_side_effe
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_generate_ssh_key_rejects_invalid_remote_name_as_command_usage() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1495,7 +1495,7 @@ async fn test_config_generate_ssh_key_rejects_invalid_remote_name_as_command_usa
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_generate_ssh_key_rejects_unknown_remote_with_invalid_target_code() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1522,7 +1522,7 @@ async fn test_config_generate_ssh_key_rejects_unknown_remote_with_invalid_target
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_generate_gpg_key_replaces_vault_generate_gpg_key_flow() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1573,7 +1573,7 @@ async fn test_config_generate_gpg_key_replaces_vault_generate_gpg_key_flow() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_generate_global_gpg_key_is_rejected_without_local_side_effects() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1631,7 +1631,7 @@ async fn test_config_generate_global_gpg_key_is_rejected_without_local_side_effe
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_generate_gpg_key_rejects_invalid_usage() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1656,7 +1656,7 @@ async fn test_config_generate_gpg_key_rejects_invalid_usage() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_config_scope_path_logic() {
     // Test the path logic for different scopes without executing config operations
 
@@ -1677,7 +1677,7 @@ async fn test_config_scope_path_logic() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_config_cross_platform_paths() {
     // Test that all scopes return appropriate paths for the current platform
 
@@ -1718,7 +1718,7 @@ async fn test_config_cross_platform_paths() {
 /// warning and returns `Ok` with `config_*` set to `None`, letting init
 /// fall back to env vars / "Libra User" defaults.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn resolve_user_identity_sources_tolerates_corrupt_global_db() {
     use libra::internal::config::{LocalIdentityTarget, resolve_user_identity_sources};
 
@@ -1764,7 +1764,7 @@ async fn resolve_user_identity_sources_tolerates_corrupt_global_db() {
 /// so a per-process override like `GEMINI_API_KEY=B libra push` always wins.
 /// Local vault is the fallback when env is unset.
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn resolve_env_for_target_process_env_overrides_local_vault() {
     use libra::internal::config::{ConfigKv, LocalIdentityTarget, resolve_env_for_target};
 
@@ -1813,7 +1813,7 @@ async fn resolve_env_for_target_process_env_overrides_local_vault() {
 /// commands that can run outside a Libra worktree (provider/bootstrap path).
 /// process env > global vault.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn resolve_env_for_target_process_env_overrides_global_vault() {
     use libra::internal::{
         config::{ConfigKv, LocalIdentityTarget, resolve_env_for_target},
@@ -1862,7 +1862,7 @@ async fn resolve_env_for_target_process_env_overrides_global_vault() {
 /// Process env remains the final fallback when neither local nor global Vault
 /// supplies the key.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn resolve_env_sync_falls_back_to_process_env_when_vault_missing() {
     use libra::internal::config::resolve_env_sync;
 
@@ -1885,7 +1885,7 @@ async fn resolve_env_sync_falls_back_to_process_env_when_vault_missing() {
 /// `resolve_env_for_target` already downgrades that to `tracing::warn!`),
 /// matching the v0.17.515 / v0.17.534 fallback contract.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn resolve_env_sync_returns_none_when_no_layer_supplies_value() {
     use libra::internal::config::resolve_env_sync;
 
@@ -1911,7 +1911,7 @@ async fn resolve_env_sync_returns_none_when_no_layer_supplies_value() {
 /// supports — that previously dumped a panic to stderr. `get_best_effort` must
 /// degrade gracefully instead.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn get_best_effort_returns_err_outside_repository() {
     use libra::internal::config::ConfigKv;
 
@@ -1931,7 +1931,7 @@ async fn get_best_effort_returns_err_outside_repository() {
 /// value just like `get`, confirming the non-panicking wrapper still resolves
 /// the per-repo database correctly.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn get_best_effort_reads_value_inside_repository() {
     use libra::internal::config::ConfigKv;
 
@@ -1954,7 +1954,7 @@ async fn get_best_effort_reads_value_inside_repository() {
 /// keys under the section, a missing section is exit 128, and renaming to the
 /// same name is rejected (exit 2) so the move cannot delete what it just wrote.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_remove_and_rename_section() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -2053,7 +2053,7 @@ async fn test_config_remove_and_rename_section() {
 /// section that already has keys is rejected (exit 128) so no merge/flag
 /// ambiguity can occur.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_section_ops_exact_git_semantics() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -2105,7 +2105,7 @@ async fn test_config_section_ops_exact_git_semantics() {
 /// `--rename-section` preserves multi-value order (each value is re-added under
 /// the new key in its original insertion order).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_rename_section_preserves_multivalue_order() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -2152,7 +2152,7 @@ async fn test_config_rename_section_preserves_multivalue_order() {
 /// `--get`/`--get-all`, and `key\nvalue\0` records for `--get-regexp`/`--list`
 /// (`key\0` with `--name-only`).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_null_terminated_output() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -2221,7 +2221,7 @@ async fn test_config_null_terminated_output() {
 /// int k/m/g multipliers, and `~` path expansion. Invalid values error, and
 /// the flags are rejected outside get modes / for an unknown type.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_typed_get() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -2324,7 +2324,7 @@ async fn test_config_typed_get() {
 /// invalid value errors without storing, and `--type` with a non-get/non-set
 /// mode is still rejected.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_config_typed_set() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -2646,7 +2646,7 @@ fn test_config_upgrade_mode_corrupt_file_is_strict_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -2897,7 +2897,7 @@ fn test_config_upgrade_mode_unreadable_file_uses_upgrade_code() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_config_upgrade_mode_isolated_by_global_db_override() {
     // A test environment that isolates the global config DB via
     // LIBRA_CONFIG_GLOBAL_DB (without setting LIBRA_HOME) must also isolate
@@ -2933,7 +2933,6 @@ async fn test_config_upgrade_mode_isolated_by_global_db_override() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[serial]
 fn config_bare_read_single_value() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -2955,7 +2954,6 @@ fn config_bare_read_single_value() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_multi_value_last_wins() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -2979,7 +2977,6 @@ fn config_bare_read_multi_value_last_wins() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_missing_key_exit1() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -2995,7 +2992,6 @@ fn config_bare_read_missing_key_exit1() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_missing_key_error_code() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3014,7 +3010,6 @@ fn config_bare_read_missing_key_error_code() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_sensitive_key_keeps_interactive_set() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3037,7 +3032,6 @@ fn config_bare_read_sensitive_key_keeps_interactive_set() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_upgrade_namespace_fail_closed() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3056,7 +3050,6 @@ fn config_bare_read_upgrade_namespace_fail_closed() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_scope_cascade() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3087,7 +3080,6 @@ fn config_bare_read_scope_cascade() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_output_shape_human() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3110,7 +3102,6 @@ fn config_bare_read_output_shape_human() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_output_shape_json() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3143,7 +3134,6 @@ fn config_bare_read_output_shape_json() {
 }
 
 #[test]
-#[serial]
 fn config_bare_read_output_shape_machine() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3181,7 +3171,7 @@ fn config_bare_read_output_shape_machine() {
 /// explicit assignment (`config set <key>` / `--add`) may draw that inference
 /// now; see `handle_set`.
 #[test]
-#[serial]
+#[serial(env)]
 fn config_bare_read_encrypted_is_redacted() {
     const SENTINEL: &str = "ct101-plaintext-sentinel-must-never-print";
 
@@ -3244,7 +3234,6 @@ fn config_bare_read_encrypted_is_redacted() {
 /// newline termination, so `config -z <key>` emitted `v\n` where
 /// `config -z get <key>` emitted `v\0`.
 #[test]
-#[serial]
 fn config_bare_read_null_terminated_matches_get() {
     let temp = tempdir().unwrap();
     let p = temp.path();
@@ -3271,7 +3260,6 @@ fn config_bare_read_null_terminated_matches_get() {
 /// notice a value leaking into the message. Seed one and check all three
 /// output shapes, on both streams.
 #[test]
-#[serial]
 fn config_bare_read_sensitive_key_never_leaks_value() {
     const SENTINEL: &str = "ct101-protected-sentinel-must-never-print";
 
@@ -3321,7 +3309,7 @@ fn config_bare_read_sensitive_key_never_leaks_value() {
 /// error. Drive it on a real pty instead, which is what the plan's manual
 /// evidence item called for.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn config_bare_read_protected_key_interactive_pty() {
     const SENTINEL: &str = "ct101-typed-sentinel-must-not-echo";
 

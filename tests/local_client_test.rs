@@ -31,7 +31,7 @@ use tempfile::tempdir;
 /// Acts as a regression guard against leaking CWD changes on protocol errors.
 /// `#[serial]` because two `ChangeDirGuard` instances live in this test.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn discovery_reference_restores_current_dir_after_error() {
     let caller_dir = tempdir().unwrap();
     let repo_dir = tempdir().unwrap();

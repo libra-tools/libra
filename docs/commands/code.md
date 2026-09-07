@@ -37,9 +37,9 @@ The live version graph is in Web Code UI; `libra graph --json` remains the agent
 | Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | Path for the per-process local automation token. In `write` mode, Unix/macOS files must be regular files with `0600` permissions. With `--control stdio`, overrides the worktree default token path (still independent of `--control-info-file`); overly permissive modes fail closed (`CONTROL_TOKEN_PERMS`). |
 | Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | Path for non-secret local endpoint discovery metadata. Written atomically at `0600` on Unix/macOS in launch modes. Never contains token material. With `--control stdio`, this is the **read** discovery path for `baseUrl` only (explicit `--control-url` overrides). Custom info paths do **not** relocate the default token — pass `--control-token-file` when the token is not under the worktree `code/` directory. |
 | Control URL | | `--control-url <URL>` | (discovered) | Base URL of an existing Code UI control endpoint (e.g. `http://127.0.0.1:3000`). Only valid with `--control stdio`. When omitted, discovered from `--control-info-file`. Must be a literal loopback IP. |
-| Provider | | `--provider` | `gemini` | AI provider backend (see Provider Backends below). |
+| Provider | | `--provider` | *(none — resolved at startup)* | AI provider backend (see Provider Backends below). Without it, the provider is resolved from the `--agent` binding, then the resumed thread's recorded provider (with `--resume`), then the persisted `code.defaultProvider` config key, then credential detection (a resume or config hit skips detection); zero configured keys exit 128, several exit 129. |
 | Model | | `--model` | provider default | Provider-specific model ID. |
-| Agent profile | | `--agent <NAME>` | none | Select an agent profile by name. When the profile carries a structured `model: provider/model[@variant]` binding, that binding wins atomically -- provider, model ID, and variant all come from the profile, and a separately supplied `--model` is ignored to avoid hybrid pairs; profiles without a structured binding fall back to the CLI defaults. Profiles resolve through the three-tier hierarchy (project `.libra/agents/`, user `~/.config/libra/agents/`, embedded). Unknown or non-primary-eligible profiles are rejected. |
+| Agent profile | | `--agent <NAME>` | none | Select an agent profile by name. When the profile carries a structured `model: provider/model[@variant]` binding, that binding wins atomically -- provider, model ID, and variant all come from the profile, and a separately supplied `--model` is ignored to avoid hybrid pairs; profiles without a structured binding fall back to the CLI defaults. When a binding is in effect, the startup banner, UI snapshot, and usage records are all labeled with that effective provider. Profiles resolve through the three-tier hierarchy (project `.libra/agents/`, user `~/.config/libra/agents/`, embedded). Unknown or non-primary-eligible profiles are rejected. |
 | Temperature | | `--temperature` | provider default | Sampling temperature for generation. |
 | Ollama thinking | | `--ollama-thinking` / `--thinking` | `OLLAMA_THINK`, then `off` | Ollama thinking mode: `auto`, `off`, `on`, `low`, `medium`, or `high`. |
 | Ollama compact tools | | `--ollama-compact-tools` | `OLLAMA_COMPACT_TOOLS`, then off | Sends compact tool schemas for remote/cloud Ollama endpoints that reject complex JSON schemas. |
@@ -49,7 +49,7 @@ The live version graph is in Web Code UI; `libra graph --json` remains the agent
 | Kimi thinking | | `--kimi-thinking <enabled\|disabled>` | model default | Sends Kimi's `thinking` object when using `--provider kimi`. |
 | Kimi stream | | `--kimi-stream <true\|false>` | `true` (Kimi) | Sends Kimi's `stream` boolean when using `--provider kimi`; defaults to streaming. Rejected for non-Kimi providers. |
 | Context | | `--context` | none | Operating context: `dev` (alias `development`), `review` (alias `code-review`), `research` (alias `explore`). |
-| Resume | | `--resume <THREAD_ID>` | none | Resume a canonical Libra thread by thread ID. |
+| Resume | | `--resume <THREAD_ID>` | none | Resume a canonical Libra thread by thread ID. Without an explicit provider the thread's recorded provider/model are inherited; an explicit selection that disagrees with the record warns on stderr and proceeds. |
 | Approval policy | | `--approval-policy` | `on-request` | Tool approval policy (see Approval Policies below). |
 | Approval TTL | | `--approval-ttl <SECS>` | `300` | Seconds that a granted approval stays reusable for matching commands before the agent is prompted again. Overrides the project config `[approval] ttl_seconds` in `.libra/config.toml`; relevant to the prompting policies. |
 | Network access | | `--network-access <allow\|deny>` | `deny` | Default network policy for shell/gate. Only the default `deny` is accepted: `--network-access allow` is rejected in every mode until the Plan network-policy gate owns per-execution sandbox network (approve network in Plan review instead). |
@@ -79,7 +79,13 @@ For Codex app-server linkage, model forwarding, credentials ownership, and persi
 
 DeepSeek requests can opt into provider-specific fields with `--deepseek-thinking enabled --deepseek-reasoning-effort high --deepseek-stream true`; these flags are rejected for non-DeepSeek providers.
 Kimi requests default to the selected model's thinking behavior; use `--kimi-thinking disabled` for K2.6/K2.5 runs where lower latency or official web-search compatibility matters. Libra preserves Kimi `reasoning_content` across tool-call turns when the provider returns it.
-For normal runs, store provider keys in `vault.env.<NAME>`; Libra checks repo-local Vault, then global Vault, then the process environment. Use `--env-file .env.test` for live tests that need an explicit dotenv override. On the default Web launch, `--env-file`, `--context`, `--approval-policy`, and `--approval-ttl` apply to non-Codex providers (env-file values still override process env/Vault). Managed Web `--provider codex` still rejects `--env-file`, `--approval-ttl`, and `--resume` because those surfaces are not wired into the Codex app-server path; bare `libra code --provider codex --resume <thread_id>` is likewise rejected with a usage error plus a migration hint (the legacy TUI resume driver was removed in W5-06). MCP `--stdio` continues to reject the Web-only flags.
+`--provider` has no default: the effective provider is resolved once at startup — explicit `--provider` first, then the `--agent` binding's provider (a disagreement between the two is a usage error), then — with `--resume <thread_id>` — the resumed thread's recorded provider, then the persisted `code.defaultProvider` config key (repo-local over global) — and with none of those sources set `libra code` falls back to credential detection over the six configurable providers (codex and ollama never auto-select): zero configured keys exits 128 (`LBR-AUTH-001`) with the checked chain, every one-line key-configuration command, and the credential-free alternatives (`--provider codex`, `--provider ollama --model <name>`); exactly one configured key auto-selects that provider and prints a one-line reason (provider id, env var name, hit layer — never the value) to stderr; two or more exit 129 (`LBR-CLI-002`) listing the id-sorted candidates with their hit layers. `--model` without a provider from the flags, the binding, the resumed thread's record, or `code.defaultProvider` is rejected before detection (the pairing cannot be inferred). A candidate counts as configured only when its key holds a non-empty (after trimming whitespace) value in `--env-file` (default Web launch), the process environment, the repo-local vault, or the global vault; an empty or whitespace-only value is a miss at that layer and the lookup keeps descending to the next one. `--stdio` and `--control stdio` never resolve a provider; passing `--provider` with `--stdio` is rejected.
+
+To stop typing `--provider` every run, persist a default: `libra config set --global code.defaultProvider <id>` (valid ids: `anthropic`, `codex`, `deepseek`, `gemini`, `kimi`, `ollama`, `openai`, `zhipu`; a repo-local `libra config set code.defaultProvider <id>` overrides the global value). The key lives in the `libra config` SQLite database only — it is unrelated to the `[code.*]` profile sections of `agents.toml`, and neither carrier reads or falls back to the other. A configured default skips credential detection entirely and pairs with `--model` like an explicit flag; if its provider lacks a credential the run fails with that provider's own missing-key error (exit 128). An unset or empty value falls through to detection; an unrecognized id exits 129 (`LBR-CLI-002`) listing the valid ids — without echoing the stored value.
+
+A resumed thread remembers its origin: sessions record the effective provider and model ids in the session metadata when they first boot (ids only — never credentials), and `--resume <thread_id>` without an explicit provider inherits that recorded provider — and, when `--model` is absent, the recorded model — ahead of `code.defaultProvider` and credential detection, so history is not silently fed to a different model. An explicit `--provider` (or `--agent` binding) that disagrees with the record prints a stderr warning naming both ids and continues (`--machine` gets a structured `provider_resume_mismatch` event instead of prose). Sessions created before this recording simply resolve through the remaining chain.
+
+For normal runs, store provider keys in `vault.env.<NAME>` (e.g. `libra config set --global vault.env.GEMINI_API_KEY <value>` — the same command the missing-credential error recommends); Libra resolves credentials in this order: `--env-file` values (available on the default Web launch only), then the process environment, then repo-local Vault, then global Vault. Use `--env-file .env.test` for live tests that need an explicit dotenv override. On the default Web launch, `--env-file`, `--context`, `--approval-policy`, and `--approval-ttl` apply to non-Codex providers (env-file values still override process env/Vault). Managed Web `--provider codex` still rejects `--env-file`, `--approval-ttl`, and `--resume` because those surfaces are not wired into the Codex app-server path; bare `libra code --provider codex --resume <thread_id>` is likewise rejected with a usage error plus a migration hint (the legacy TUI resume driver was removed in W5-06). MCP `--stdio` continues to reject the Web-only flags.
 
 Ollama requests stream `/api/chat` responses by default and add a per-request `request_id` to debug logs. They also default to `think:false` so reasoning-capable local models do not spend several minutes generating hidden reasoning before tool calls. Use `--ollama-thinking high` for a single run, or set `OLLAMA_THINK=true`, `low`, `medium`, `high`, or `auto` as the environment default. `auto` omits the `think` field and lets Ollama decide. Use `--ollama-compact-tools` or `OLLAMA_COMPACT_TOOLS=true` when a remote/cloud Ollama endpoint accepts simple tools but returns 503 for Libra's full tool schema payload.
 
@@ -100,7 +106,7 @@ The stdio client speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and maps 
 | JSON-RPC method | HTTP equivalent |
 |-----------------|-----------------|
 | `session.get` | `GET /api/code/session` |
-| `events.subscribe` | `GET /api/code/events` as JSON-RPC notifications |
+| `events.subscribe` | `GET /api/code/events?wire=2&cursor=<last>`; accepts optional params `{ "cursor": <last acknowledged v2 cursor> }` and acknowledges `{ subscribed, requestedWire, requestedCursor }` before forwarding events. `requestedWire` is the requested version, not a negotiated-version guarantee. Omitting params is the cursor-0 initial bootstrap. On `WIRE_V2_RESYNC_REQUIRED`, the client fetches `/session`, emits one enriched `resync` notification whose data includes `snapshot`, then reconnects at the server-provided `durableTail`. Exact `409 WIRE_V2_CURSOR_AHEAD` means the cursor belongs to a later/different session; the client emits the same snapshot recovery with code `WIRE_V2_CURSOR_AHEAD`, drops that cursor, and restarts v2 from 0. An exact `503 WIRE_V2_REQUIRES_DURABLE_SESSION` is terminal: the legacy `?wire=1` fallback was removed in 0.22.0 together with the server-side v1 wire — the error (with removal guidance) surfaces to the caller. |
 | `diagnostics.get` | `GET /api/code/diagnostics` |
 | `controller.attach` | `POST /api/code/controller/attach` |
 | `controller.detach` | `POST /api/code/controller/detach` |
@@ -113,6 +119,23 @@ The stdio client speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and maps 
 | `goal.cancel` | `POST /api/code/goal/cancel` |
 
 Malformed JSON maps to JSON-RPC `-32700`. Unknown methods map to `-32601`. Invalid params map to `-32602`. HTTP 4xx/5xx errors map to `-32000` with `data.status` and `data.code`, preserving Libra errors such as `INVALID_CONTROL_TOKEN`, `INVALID_CONTROLLER_TOKEN`, `CONTROLLER_CONFLICT`, and `INTERACTION_NOT_ACTIVE`.
+
+Automation that performs side effects from v2 notifications must persist the
+last acknowledged `params.data.cursor`, must deduplicate by `eventId`, and must
+pass that cursor to the next `events.subscribe` for the same `sessionId`.
+Cursors are session-scoped: after a session restart/change, discard the old
+cursor (the client also recovers exact `WIRE_V2_CURSOR_AHEAD` by snapshot plus
+cursor-0 restart). Omitting the cursor intentionally replays retained durable
+history from 0 and is only for initial bootstrap; treating replayed
+notifications as new actions can repeat downstream effects.
+
+A `resync` notification marks a workflow-event gap: events in
+`(lastCursor, durableTail]` are skipped when the client reconnects at
+`durableTail`. Its attached session snapshot represents current projected
+state; it does not reconstruct the skipped workflow kinds. Consumers must
+reconcile their state from that snapshot/`session.get`, must not assume cursor
+continuity across resync, and must not use this notification stream as an
+exactly-once side-effect log.
 
 ### Web Browser Control
 
@@ -130,7 +153,7 @@ The browser server-side endpoints are tagged in the `code_router()` audit matrix
 - `POST /api/code/control/cancel` — loopback + `X-Code-Controller-Token`. `Automation` leases also require `X-Libra-Control-Token`.
 - `POST /api/code/task/dispatch` — loopback + `X-Code-Controller-Token`; user-initiated sub-agent dispatch requires an active controller write lease (browser or automation). Automation leases additionally require `X-Libra-Control-Token`.
 - `POST /api/code/goal/start`, `POST /api/code/goal/cancel` — loopback + `X-Code-Controller-Token`; goal mutation requires the active controller lease.
-- `POST /api/code/skills/activate`, `POST /api/code/session/resume` — loopback + `X-Code-Controller-Token` on the write router (256 KiB body limit); both require an active controller write lease. Automation leases additionally require `X-Libra-Control-Token`. Resume refuses busy and indeterminate snapshots, and currently fail-closes with `SESSION_RESUME_REQUIRES_RESTART` after proving the target thread is loadable (in-process AgentRuntime swap is not available yet). Skill activate fail-closes with `SKILL_ACTIVATION_UNSUPPORTED` after discoverability validation until a provider-consumed activation path exists.
+- `POST /api/code/skills/activate`, `POST /api/code/session/resume` — loopback + `X-Code-Controller-Token` on the write router (256 KiB body limit); both require an active controller write lease. Automation leases additionally require `X-Libra-Control-Token`. Resume refuses busy and indeterminate snapshots, and currently fail-closes with `SESSION_RESUME_REQUIRES_RESTART` after proving the target thread is loadable (in-process AgentRuntime swap is not available yet). Skill activate hands a validated activation to the live in-process provider (DF-07); sessions without one (read-only, managed Codex) fail closed with `SKILL_ACTIVATION_UNSUPPORTED`.
 
 Browser write requests share the same 256 KiB body limit and audit-sink wiring as automation control. The browser persists the lease only in memory; reloading the page drops the lease and the next write reattaches.
 
@@ -265,15 +288,13 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 
 | Selection | Mechanism |
 |---|---|
-| Explicit v1 | `?wire=1` or `?wire=v1` |
+| Explicit v1 | **Removed in 0.22.0** — `?wire=1` / `?wire=v1` return `400 INVALID_WIRE_VERSION` with removal guidance (`v0.21.29` was the last release serving wire v1) |
 | Explicit v2 | `?wire=2` or `?wire=v2` |
 | Accept hint | `Accept: text/event-stream;libra-wire=2` (query `wire=` wins if both are set) |
-| Default (unspecified) | **v1** for clients that omit `wire` / `libra-wire`. The built-in SPA (W3-09) always requests `?wire=2`. |
+| Default (unspecified) | The server defaults to **v2** for clients that omit `wire` / `libra-wire` (DF-06; `v0.21.27` was the last release defaulting to v1). The built-in SPA (W3-09) and `libra code --control stdio` automation client explicitly request `?wire=2`. |
 | Illegal values | fail-closed `400 INVALID_WIRE_VERSION` |
 
-**SSE v1** (default): `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and
-`data`. Event `type` is `session_updated`, `status_changed`, or
-`controller_changed`; `session_updated` carries a full `CodeUiSessionSnapshot`.
+**SSE v1** (removed): the full-snapshot `CodeUiEventEnvelope` stream (`seq`/`type`/`at`/`data` records with `session_updated` / `status_changed` / `controller_changed` events) was physically removed in 0.22.0 after the DEFER-08 bake completed. Clients that still need it must stay on `v0.21.29`; the snapshot bootstrap on v2 is one `GET /api/code/session` fetch.
 
 **SSE wire v2**: `code_workflow` events with camelCase `cursor` (durable W1-06
 workflow sequence), `eventId`, `kind`, `at`, and minimal `payload`. Reconnect with
@@ -416,25 +437,38 @@ replay therefore cannot reopen that gate.
 
 ### SSE v1 compatibility window (DEFER-08)
 
-v1 snapshot SSE remains supported through at least one successful public patch
-release after wire v2 becomes the default and the built-in frontend/automation
-clients have migrated. Physical removal of v1 is **not** part of plan-20260715;
-see DEFER-08 / ADR-CODE-08. Removal preconditions (checklist; all required):
+**Completed — v1 was physically removed in 0.22.0** (plan-20260824 DF-08,
+ADR-DF-03). The checklist below is the historical record of the bake this
+removal required; `v0.21.29` was the last release serving wire v1, and
+clients that cannot consume v2 must stay on it.
 
-1. Built-in frontend migrated to v2 (W3-09 evidence): the SPA
+1. [x] Built-in frontend migrated to v2 (W3-09 evidence): the SPA
    opens `GET /api/code/events?wire=2` from `sse-resilience` (`wrapClientForSseResilience`),
    reconnects with `cursor` from the wire, and treats `event: resync` /
    `WIRE_V2_RESYNC_REQUIRED` as one explicit snapshot pull (W2-15 UI). Cursor/seq
    are never invented client-side.
-2. Built-in automation clients migrated to v2.
-3. Compat / matrix tests consume v2 by default.
-4. Release notes name the last v1-supporting version and the upgrade path.
-5. At least one successful public patch release after (1)–(4) while v1 still works.
+2. [x] Built-in automation clients migrated to v2 (DF-05 evidence):
+   `libra code --control stdio` appends `?wire=2&cursor=<last>` for
+   `events.subscribe`, lets callers resume from an acknowledged cursor, and
+   handles `WIRE_V2_RESYNC_REQUIRED` / `WIRE_V2_CURSOR_AHEAD` with explicit
+   snapshot reconciliation and bounded reconnect behavior.
+3. [x] Compat / matrix tests consume v2 by default (DF-05 evidence; the two
+   explicit-v1 compatibility cases were deleted with the wire in DF-08 — a
+   fixture-shape guard now rejects any v1 `openEvents` step).
+4. [x] Release notes name the last v1-supporting version and the upgrade path
+   (DF-08 evidence: the 0.22.0 CHANGELOG entry names `v0.21.29` and the v2
+   consumption path).
+5. [x] At least one successful public patch release after (1)–(4) while v1
+   still works (DEP-02 evidence: `v0.21.29` — released after the DF-06 default
+   switch with default wire=v2 and explicit v1 still served; annotated tag on
+   origin. `gh release view` is unavailable against this repository's
+   non-GitHub remote, so the tag + release pipeline is the recorded evidence,
+   the same convention as DF-03..DF-07).
 
 
 `GET /api/code/threads` returns `{ items, nextOffset? }`. Each item has `id`, optional `title`, `archived`, optional `currentIntentId`, optional `workingDir`, `createdAt`, and `updatedAt`. `workingDir` is omitted until ThreadProjection persists a per-thread cwd (do not invent the server cwd for linked-worktree threads). `limit` defaults to 50 and clamps to 200; malformed `limit` or `offset` returns `INVALID_QUERY_PARAM`.
 
-`GET /api/code/skills?provider=<slug>&skill=<name>` returns curated A0-07 `{ items: [{ name, provider }] }`. An unknown `provider` slug returns `INVALID_SKILL_PROVIDER` (same contract as activate); omit `provider` to list all curated providers. `POST /api/code/skills/activate` accepts `{ provider, name }`; after discoverability validation it currently returns `SKILL_ACTIVATION_UNSUPPORTED` until an in-process provider activation path exists.
+`GET /api/code/skills?provider=<slug>&skill=<name>` returns curated A0-07 `{ items: [{ name, provider }] }`. An unknown `provider` slug returns `INVALID_SKILL_PROVIDER` (same contract as activate); omit `provider` to list all curated providers. `POST /api/code/skills/activate` accepts `{ provider, name }`; after discoverability validation the activation is queued for the live in-process provider and acknowledged with `{ accepted, provider, name, pending, consumedOn: "next-plain-turn" }` — the next plain (non-slash, non-empty) turn's provider input carries the activation context (appended after the user text; tool permissions are never widened, and duplicate activations keep one pending slot). Slash/control turns leave activations pending. Unknown `provider` / undiscoverable `name` keep their stable 400 codes; sessions without a live in-process provider (read-only view, managed Codex Web) fail closed with `SKILL_ACTIVATION_UNSUPPORTED`.
 
 Code UI API errors use `{ error: { code, message } }`:
 
@@ -447,7 +481,7 @@ Code UI API errors use `{ error: { code, message } }`:
 | `INVALID_BROWSER_BOOTSTRAP` | 403 | `X-Libra-Browser-Bootstrap` does not match this Libra Code session. |
 | `RATE_LIMITED` | 429 | Per-session write budget exhausted; retry after the rate-limit window (see `Retry-After` / wait for window recovery). |
 | `REDACTION_FAILED` | 500 | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the response omits unredacted payload; restart `libra code` or retry after fixing redactor configuration. |
-| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` wire negotiation received an illegal `wire` / `libra-wire` value (only `1`/`v1` and `2`/`v2` are accepted). |
+| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` wire negotiation received an illegal `wire` / `libra-wire` value (only `2`/`v2` is accepted; `1`/`v1` was removed in 0.22.0 and the error names the last serving release). |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | 503 | SSE wire v2 requires a SessionStore-backed workflow hub (mounted today for default Web headless persistence; managed Codex Web does not yet expose one). |
 | `WIRE_V2_CURSOR_AHEAD` | 409 | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (an ahead cursor would permanently skip live events). |
 | `WIRE_V2_RESYNC_REQUIRED` | SSE `resync` then close | Transport backlog exceeded (1,024 events / 8 MiB); fetch snapshot and reconnect with `cursor=<durableTail>`. |
@@ -481,7 +515,7 @@ Code UI API errors use `{ error: { code, message } }`:
 | `THREAD_GRAPH_UNAVAILABLE` | 500 | Indexed thread graph could not be loaded (database, projection, or overlay failure). |
 | `INVALID_SKILL_PROVIDER` | 400 | The requested skill provider is not an A0-07 agent slug. |
 | `SKILL_NOT_DISCOVERABLE` | 400 | The requested skill is not curated for that provider. |
-| `SKILL_ACTIVATION_UNSUPPORTED` | 422 | Skill is discoverable, but in-process activation is not available yet. |
+| `SKILL_ACTIVATION_UNSUPPORTED` | 422 | Skill is discoverable, but this session has no live in-process provider to consume the activation (read-only view, managed Codex Web). |
 | `SESSION_RESUME_BUSY` | 409 | A thinking or tool-running session cannot be replaced. |
 | `SESSION_RESUME_NOT_FOUND` | 404 | No matching session exists under this working directory. |
 | `SESSION_RESUME_REQUIRES_RESTART` | 422 | Target thread is loadable, but in-process AgentRuntime swap is not available; restart with `libra code --resume <threadId>`. |
@@ -518,7 +552,10 @@ The `web_search` tool requires the session network policy to allow outbound acce
 ## Common Commands
 
 ```bash
-# Start a Web Code UI session with default Gemini provider
+# Start a Web Code UI session (provider resolved at startup:
+# --provider flag, --agent binding, the resumed thread's record (with
+# --resume), the persisted code.defaultProvider config key, then
+# single-credential auto-selection)
 libra code
 
 # Start with Anthropic Claude
@@ -629,7 +666,7 @@ The Web Code UI is the primary (and only interactive) collaborative surface. The
 
 ### Why multiple AI provider support?
 
-Different providers excel at different tasks and have different cost/latency profiles. Gemini is the default for its generous free tier and fast response times. Anthropic Claude excels at careful reasoning and code review. Local Ollama support enables fully offline development. By abstracting behind a `CompletionClient` trait, adding a new provider requires only implementing the trait without touching the session, tool, or web UI layers.
+Different providers excel at different tasks and have different cost/latency profiles. There is no baked-in default provider: the effective provider is resolved at startup (explicit flag, `--agent` binding, a resumed thread's recorded provider, the persisted `code.defaultProvider` config key, or single-credential auto-selection). Anthropic Claude excels at careful reasoning and code review. Local Ollama support enables fully offline development. By abstracting behind a `CompletionClient` trait, adding a new provider requires only implementing the trait without touching the session, tool, or web UI layers.
 
 ### Why MCP integration?
 

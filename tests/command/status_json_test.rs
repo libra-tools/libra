@@ -85,7 +85,7 @@ fn json_status_clean_repo_schema() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn json_status_includes_upstream_tracking_info() {
     let repo = create_committed_repo();
 

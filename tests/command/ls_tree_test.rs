@@ -88,7 +88,6 @@ fn blob_hash_for(repo: &std::path::Path, path: &str) -> String {
 }
 
 #[test]
-#[serial]
 fn ls_tree_default_lists_root_entries() {
     let repo = setup_ls_tree_repo();
 
@@ -103,7 +102,6 @@ fn ls_tree_default_lists_root_entries() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_from_subdirectory_defaults_to_current_directory() {
     let repo = setup_ls_tree_repo();
     let src_dir = repo.path().join("src");
@@ -119,7 +117,6 @@ fn ls_tree_from_subdirectory_defaults_to_current_directory() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_full_name_from_subdirectory_keeps_repository_paths() {
     let repo = setup_ls_tree_repo();
     let src_dir = repo.path().join("src");
@@ -134,7 +131,6 @@ fn ls_tree_full_name_from_subdirectory_keeps_repository_paths() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_full_tree_from_subdirectory_lists_repository_root() {
     let repo = setup_ls_tree_repo();
     let src_dir = repo.path().join("src");
@@ -149,7 +145,6 @@ fn ls_tree_full_tree_from_subdirectory_lists_repository_root() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_subdirectory_path_filter_is_current_directory_relative() {
     let repo = setup_ls_tree_repo();
     let src_dir = repo.path().join("src");
@@ -167,7 +162,6 @@ fn ls_tree_subdirectory_path_filter_is_current_directory_relative() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_accepts_branch_treeish() {
     let repo = setup_ls_tree_repo();
     let branch = run_libra_command(&["branch", "topic"], repo.path());
@@ -180,7 +174,6 @@ fn ls_tree_accepts_branch_treeish() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_accepts_tag_treeish() {
     let repo = setup_ls_tree_repo();
     let tag = run_libra_command(&["tag", "v1.0"], repo.path());
@@ -193,7 +186,6 @@ fn ls_tree_accepts_tag_treeish() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_accepts_direct_tree_hash() {
     let repo = setup_ls_tree_repo();
     let tree = root_tree_hash(repo.path());
@@ -205,7 +197,6 @@ fn ls_tree_accepts_direct_tree_hash() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_recursive_lists_nested_entries_without_parent_trees() {
     let repo = setup_ls_tree_repo();
 
@@ -219,7 +210,6 @@ fn ls_tree_recursive_lists_nested_entries_without_parent_trees() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_recursive_t_includes_tree_entries() {
     let repo = setup_ls_tree_repo();
 
@@ -233,7 +223,6 @@ fn ls_tree_recursive_t_includes_tree_entries() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_directory_filter_lists_one_level_by_default() {
     let repo = setup_ls_tree_repo();
 
@@ -247,7 +236,6 @@ fn ls_tree_directory_filter_lists_one_level_by_default() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_directory_filter_recurses_when_requested() {
     let repo = setup_ls_tree_repo();
 
@@ -260,7 +248,6 @@ fn ls_tree_directory_filter_recurses_when_requested() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_d_on_directory_outputs_entry_only() {
     let repo = setup_ls_tree_repo();
 
@@ -273,7 +260,6 @@ fn ls_tree_d_on_directory_outputs_entry_only() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_d_recursive_path_lists_nested_tree_entries() {
     let repo = setup_ls_tree_repo();
 
@@ -288,7 +274,6 @@ fn ls_tree_d_recursive_path_lists_nested_tree_entries() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_d_without_path_lists_tree_entries_only() {
     let repo = setup_ls_tree_repo();
 
@@ -301,7 +286,6 @@ fn ls_tree_d_without_path_lists_tree_entries_only() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_long_includes_blob_size_and_tree_dash() {
     let repo = setup_ls_tree_repo();
 
@@ -314,7 +298,6 @@ fn ls_tree_long_includes_blob_size_and_tree_dash() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_z_uses_nul_terminated_records() {
     let repo = setup_ls_tree_repo();
 
@@ -326,7 +309,6 @@ fn ls_tree_z_uses_nul_terminated_records() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_name_only_prints_paths() {
     let repo = setup_ls_tree_repo();
 
@@ -340,7 +322,6 @@ fn ls_tree_name_only_prints_paths() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_name_status_is_path_only_alias() {
     let repo = setup_ls_tree_repo();
 
@@ -354,7 +335,6 @@ fn ls_tree_name_status_is_path_only_alias() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_object_only_honors_abbrev_width() {
     let repo = setup_ls_tree_repo();
 
@@ -374,7 +354,6 @@ fn ls_tree_object_only_honors_abbrev_width() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_handles_space_and_unicode_paths() {
     let repo = setup_ls_tree_repo();
 
@@ -388,7 +367,6 @@ fn ls_tree_handles_space_and_unicode_paths() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
 fn ls_tree_reports_executable_file_mode() {
     let repo = setup_ls_tree_repo();
 
@@ -400,7 +378,7 @@ fn ls_tree_reports_executable_file_mode() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(cwd)]
 fn ls_tree_reports_symlink_as_blob_mode() {
     let repo = setup_ls_tree_repo();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -424,7 +402,6 @@ fn ls_tree_reports_symlink_as_blob_mode() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_json_lists_entries() {
     let repo = setup_ls_tree_repo();
 
@@ -439,7 +416,6 @@ fn ls_tree_json_lists_entries() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_json_recursive_path_lists_nested_entry() {
     let repo = setup_ls_tree_repo();
 
@@ -456,7 +432,6 @@ fn ls_tree_json_recursive_path_lists_nested_entry() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_invalid_treeish_fails() {
     let repo = setup_ls_tree_repo();
 
@@ -467,7 +442,6 @@ fn ls_tree_invalid_treeish_fails() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_blob_treeish_fails() {
     let repo = setup_ls_tree_repo();
     let blob = blob_hash_for(repo.path(), "README.md");
@@ -479,7 +453,6 @@ fn ls_tree_blob_treeish_fails() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_rev_path_blob_target_errors_as_not_a_tree() {
     let repo = setup_ls_tree_repo();
 
@@ -497,7 +470,6 @@ fn ls_tree_rev_path_blob_target_errors_as_not_a_tree() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_missing_path_fails() {
     let repo = setup_ls_tree_repo();
 
@@ -508,7 +480,6 @@ fn ls_tree_missing_path_fails() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_invalid_abbrev_width_fails() {
     let repo = setup_ls_tree_repo();
 
@@ -519,7 +490,6 @@ fn ls_tree_invalid_abbrev_width_fails() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_rejects_conflicting_output_modes() {
     let repo = setup_ls_tree_repo();
 
@@ -532,7 +502,6 @@ fn ls_tree_rejects_conflicting_output_modes() {
 }
 
 #[test]
-#[serial]
 fn ls_tree_json_error_uses_structured_envelope() {
     let repo = setup_ls_tree_repo();
 
@@ -546,7 +515,7 @@ fn ls_tree_json_error_uses_structured_envelope() {
 }
 
 #[test]
-#[serial]
+#[serial(cwd)]
 fn ls_tree_empty_tree_hash_outputs_nothing() {
     let repo = setup_ls_tree_repo();
     let _guard = ChangeDirGuard::new(repo.path());

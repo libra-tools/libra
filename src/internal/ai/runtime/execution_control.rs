@@ -216,8 +216,10 @@ impl ExecutionControlService {
     }
 
     /// Validate an activation against the A0-07 curated registry. Activation
-    /// has no separate persistence: the invoked provider emits the next
-    /// `SkillEvent`, which A0-07 projects from checkpoint metadata.
+    /// has no separate persistence: the Code UI adapter queues the validated
+    /// activation for the next plain turn's provider input (DF-07), and the
+    /// invoked provider emits the next `SkillEvent`, which A0-07 projects
+    /// from checkpoint metadata.
     pub fn skill_activate(&self, activation: &CodeSkillActivation) -> Result<()> {
         let kind = AgentKind::from_cli_slug(&activation.provider).ok_or_else(|| {
             anyhow!(

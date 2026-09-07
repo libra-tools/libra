@@ -235,6 +235,340 @@ pub fn lstat_beneath(root: &fs::File, rel: &Path) -> io::Result<RawLstat> {
     lstat_beneath_platform(root, rel)
 }
 
+/// Open a regular file beneath an already-pinned root without following any
+/// symlink. The returned descriptor, rather than the pathname, is the source
+/// for all subsequent reads so a rename/replacement cannot redirect them.
+pub fn open_file_beneath(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    if rel.is_absolute() || is_root_rel(rel) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path must be a non-empty relative path",
+        ));
+    }
+    reject_dotdot(rel)?;
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path has no final component",
+        )
+    })?;
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent)?,
+        None => dup_file(root)?,
+    };
+    open_file_in_dir(&directory, name, root)
+}
+
+/// Read a regular file beneath an already-pinned root. This is used for
+/// attributes and other metadata inputs that must not be re-discovered by
+/// pathname after the root has been pinned.
+pub fn read_file_beneath(root: &fs::File, rel: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_file_beneath(root, rel)?;
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Read a symlink's target bytes relative to a pinned root and parent
+/// descriptor. This never follows the symlink or reopens it by pathname.
+pub fn read_symlink_beneath(root: &fs::File, rel: &Path) -> io::Result<Vec<u8>> {
+    if rel.is_absolute() || is_root_rel(rel) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath symlink path must be a non-empty relative path",
+        ));
+    }
+    reject_dotdot(rel)?;
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath symlink path has no final component",
+        )
+    })?;
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent)?,
+        None => dup_file(root)?,
+    };
+    read_symlink_in_dir(&directory, name, root)
+}
+
+fn open_file_in_dir(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    root: &fs::File,
+) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let _ = root;
+        let c_name = component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "beneath file path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::HANDLE;
+
+        let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
+        let directory_path = final_path_name(directory.as_raw_handle() as HANDLE)?;
+        let file = open_windows_nofollow(&directory_path.join(name), false, false, true)?;
+        assert_handle_beneath(&file, &root_path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "beneath file path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (directory, name, root);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "beneath file open unsupported on this platform",
+        ))
+    }
+}
+
+fn read_symlink_in_dir(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    root: &fs::File,
+) -> io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        let _ = root;
+        let c_name = component_cstring(name)?;
+        let mut target = vec![0u8; 256];
+        loop {
+            let size = unsafe {
+                libc::readlinkat(
+                    directory.as_raw_fd(),
+                    c_name.as_ptr(),
+                    target.as_mut_ptr().cast(),
+                    target.len(),
+                )
+            };
+            if size < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let size = size as usize;
+            if size < target.len() {
+                target.truncate(size);
+                return Ok(target);
+            }
+            let next = target.len().saturating_mul(2);
+            if next <= target.len() || next > 16 * 1024 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "beneath symlink target is too large",
+                ));
+            }
+            target.resize(next, 0);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::HANDLE;
+
+        let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
+        let directory_path = final_path_name(directory.as_raw_handle() as HANDLE)?;
+        let file = open_windows_nofollow(&directory_path.join(name), true, false, false)?;
+        assert_handle_beneath(&file, &root_path)?;
+        read_windows_symlink_target(&file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (directory, name, root);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "beneath symlink read unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "DeviceIoControl"]
+    fn beneath_device_io_control(
+        device: windows_sys::Win32::Foundation::HANDLE,
+        control_code: u32,
+        input_buffer: *const core::ffi::c_void,
+        input_size: u32,
+        output_buffer: *mut core::ffi::c_void,
+        output_size: u32,
+        bytes_returned: *mut u32,
+        overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+/// Read a Windows symlink or junction target from its already-open reparse
+/// handle.  The target is metadata, not a pathname to follow; the caller
+/// hashes these bytes as Git's symlink blob content.
+#[cfg(windows)]
+fn read_windows_symlink_target(file: &fs::File) -> io::Result<Vec<u8>> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    const FSCTL_GET_REPARSE_POINT: u32 = 589_992;
+    const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xa000_000c;
+    let mut buffer = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    let mut bytes_returned = 0u32;
+    let succeeded = unsafe {
+        beneath_device_io_control(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let returned = usize::try_from(bytes_returned).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record length overflow",
+        )
+    })?;
+    let record = buffer.get(..returned).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record is larger than the receive buffer",
+        )
+    })?;
+    let read_u16 = |offset: usize| -> io::Result<usize> {
+        let end = offset.checked_add(2).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Windows reparse field overflow")
+        })?;
+        let bytes = record.get(offset..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows reparse record is truncated",
+            )
+        })?;
+        Ok(usize::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+    };
+    let tag_end = 4usize;
+    let tag_bytes = record.get(..tag_end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record is truncated",
+        )
+    })?;
+    let tag = u32::from_le_bytes([tag_bytes[0], tag_bytes[1], tag_bytes[2], tag_bytes[3]]);
+    let data_len = read_u16(4)?;
+    let record_len = 8usize.checked_add(data_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record length overflow",
+        )
+    })?;
+    let record = record.get(..record_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record data is truncated",
+        )
+    })?;
+    let path_buffer_offset = match tag {
+        IO_REPARSE_TAG_SYMLINK if data_len >= 12 => 20usize,
+        IO_REPARSE_TAG_MOUNT_POINT if data_len >= 8 => 16usize,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported Windows reparse tag",
+            ));
+        }
+    };
+    let substitute_offset = read_u16(8)?;
+    let substitute_len = read_u16(10)?;
+    let print_offset = read_u16(12)?;
+    let print_len = read_u16(14)?;
+    if substitute_offset % 2 != 0
+        || substitute_len % 2 != 0
+        || print_offset % 2 != 0
+        || print_len % 2 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse target has an unaligned UTF-16 range",
+        ));
+    }
+    let range = |offset: usize, len: usize| -> io::Result<&[u8]> {
+        let start = path_buffer_offset.checked_add(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows reparse target overflow",
+            )
+        })?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows reparse target overflow",
+            )
+        })?;
+        record.get(start..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows reparse target is outside the record",
+            )
+        })
+    };
+    let target_bytes = if print_len != 0 {
+        range(print_offset, print_len)?
+    } else {
+        range(substitute_offset, substitute_len)?
+    };
+    let mut wide = Vec::with_capacity(target_bytes.len() / 2);
+    for chunk in target_bytes.chunks_exact(2) {
+        wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    if target_bytes.len() % 2 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse target has an odd UTF-16 byte length",
+        ));
+    }
+    Ok(std::ffi::OsString::from_wide(&wide)
+        .to_string_lossy()
+        .as_bytes()
+        .to_vec())
+}
+
 /// Marker presence (`.libra` / `.git`) via no-follow lookup under `rel`.
 pub fn marker_present_beneath(root: &fs::File, rel: &Path) -> io::Result<bool> {
     let dir = open_beneath(root, rel)?;
@@ -298,7 +632,7 @@ fn read_regular_file_in_dir(dir: &fs::File, name: &std::ffi::OsStr) -> io::Resul
 
         use windows_sys::Win32::Foundation::HANDLE;
         let dir_path = final_path_name(dir.as_raw_handle() as HANDLE)?;
-        let file = open_windows_nofollow(&dir_path.join(name), false, false)?;
+        let file = open_windows_nofollow(&dir_path.join(name), false, false, true)?;
         let root_path = final_path_name(dir.as_raw_handle() as HANDLE)?;
         assert_handle_beneath(&file, &strip_nt_prefix_path(&root_path))?;
         let meta = file.metadata()?;
@@ -933,7 +1267,7 @@ fn open_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
 
 #[cfg(windows)]
 fn open_windows_dir_nofollow(path: &Path) -> io::Result<fs::File> {
-    open_windows_nofollow(path, false, true)
+    open_windows_nofollow(path, false, true, false)
 }
 
 /// Open `path` with `FILE_FLAG_OPEN_REPARSE_POINT` (final component only).
@@ -945,6 +1279,7 @@ fn open_windows_nofollow(
     path: &Path,
     allow_reparse_leaf: bool,
     require_dir: bool,
+    read_data: bool,
 ) -> io::Result<fs::File> {
     use std::{
         os::windows::io::{AsRawHandle, FromRawHandle},
@@ -956,14 +1291,16 @@ fn open_windows_nofollow(
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
-            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            GetFileInformationByHandle, OPEN_EXISTING, SYNCHRONIZE,
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING, SYNCHRONIZE,
         },
     };
 
     let wide = wide_path(path)?;
     let desired_access = if require_dir {
         FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    } else if read_data {
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
     } else {
         // Leaf lstat must not demand FILE_READ_DATA (aliased with
         // FILE_LIST_DIRECTORY) — attribute-only ACLs previously worked via
@@ -1181,7 +1518,7 @@ fn lstat_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<RawLstat> {
     };
     let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
     let dir_path = final_path_name(dir.as_raw_handle() as HANDLE)?;
-    let file = open_windows_nofollow(&dir_path.join(name), true, false)?;
+    let file = open_windows_nofollow(&dir_path.join(name), true, false, false)?;
     assert_handle_beneath(&file, &root_path)?;
     drop(dir);
     RawLstat::from_metadata(&file.metadata()?)
@@ -1198,7 +1535,7 @@ fn fstatat_nofollow(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLst
 
         use windows_sys::Win32::Foundation::HANDLE;
         let dir_path = final_path_name(dir.as_raw_handle() as HANDLE)?;
-        let file = open_windows_nofollow(&dir_path.join(name), true, false)?;
+        let file = open_windows_nofollow(&dir_path.join(name), true, false, false)?;
         assert_handle_beneath(&file, &dir_path)?;
         RawLstat::from_metadata(&file.metadata()?)
     }

@@ -25,7 +25,6 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 /// plan-20260714 W0 hard gate: `fsck --heal` discovery walks only
 /// refs/reflogs/index roots — it does not cover every worktree's private
 /// index, sequencer rows or sidecars, so it fails closed on a repository
@@ -89,7 +88,6 @@ fn test_fsck_heal_refused_with_linked_worktrees() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck on an empty repository passes successfully.
 /// Verifies the basic happy path for newly initialized repositories.
 fn test_fsck_empty_repo_passes() {
@@ -105,7 +103,6 @@ fn test_fsck_empty_repo_passes() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck on a repository with commits passes successfully.
 /// Verifies the basic happy path for normal repositories.
 fn test_fsck_repo_with_commit_passes() {
@@ -120,7 +117,6 @@ fn test_fsck_repo_with_commit_passes() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck --verbose outputs progress information.
 /// Verifies that the verbose flag produces expected output.
 fn test_fsck_verbose_output() {
@@ -141,7 +137,6 @@ fn test_fsck_verbose_output() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck --root reports root commits.
 /// Verifies that the --root flag correctly identifies root commits.
 fn test_fsck_root_shows_root_commit() {
@@ -162,7 +157,6 @@ fn test_fsck_root_shows_root_commit() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck --tags reports tagged commits.
 /// Verifies that the --tags flag correctly lists tags.
 fn test_fsck_tags_reports_tags() {
@@ -190,7 +184,6 @@ fn test_fsck_tags_reports_tags() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck --dangling detects dangling commits.
 /// Verifies that dangling objects are properly detected.
 fn test_fsck_dangling_shows_only_commits() {
@@ -221,7 +214,6 @@ fn test_fsck_dangling_shows_only_commits() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck --connectivity-only validates object graph.
 /// Verifies that connectivity check passes on healthy repos.
 fn test_fsck_connectivity_only_passes() {
@@ -236,7 +228,6 @@ fn test_fsck_connectivity_only_passes() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck returns exit code 0 on success.
 /// Verifies the correct exit code for successful validation.
 fn test_fsck_exit_code_zero_on_success() {
@@ -256,7 +247,6 @@ fn test_fsck_exit_code_zero_on_success() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 /// Tests fsck with empty object ID argument.
 /// Verifies that fsck handles empty string argument correctly.
 fn test_fsck_with_empty_object_id() {
@@ -272,7 +262,6 @@ fn test_fsck_with_empty_object_id() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with invalid object ID format (too short).
 /// Verifies that fsck rejects short hash formats.
 fn test_fsck_with_short_invalid_object_id() {
@@ -292,7 +281,6 @@ fn test_fsck_with_short_invalid_object_id() {
 }
 
 #[test]
-#[serial]
 /// Tests global --json fsck errors stay in the structured CLI envelope instead
 /// of bypassing the dispatcher through a process exit.
 fn test_fsck_json_invalid_object_id_returns_structured_error() {
@@ -320,7 +308,6 @@ fn test_fsck_json_invalid_object_id_returns_structured_error() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with invalid object ID format (non-hex characters).
 /// Verifies that fsck rejects non-hexadecimal characters.
 fn test_fsck_with_non_hex_object_id() {
@@ -340,7 +327,6 @@ fn test_fsck_with_non_hex_object_id() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with oversized object ID (longer than valid hash).
 /// Verifies that fsck handles overly long hash strings.
 fn test_fsck_with_oversized_object_id() {
@@ -356,7 +342,6 @@ fn test_fsck_with_oversized_object_id() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with mixed-case object ID.
 /// Verifies that fsck handles mixed-case hex strings correctly.
 fn test_fsck_with_mixed_case_object_id() {
@@ -389,7 +374,6 @@ fn test_fsck_with_mixed_case_object_id() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with zero hash (all zeros).
 /// Verifies that fsck handles the null object ID correctly.
 fn test_fsck_with_zero_hash() {
@@ -405,7 +389,6 @@ fn test_fsck_with_zero_hash() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck --unreachable with no unreachable objects.
 /// Verifies that fsck handles empty result sets correctly.
 fn test_fsck_unreachable_empty() {
@@ -420,7 +403,6 @@ fn test_fsck_unreachable_empty() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck --no-dangling suppresses dangling output.
 /// Verifies that the flag properly filters output.
 fn test_fsck_no_dangling_suppresses_output() {
@@ -450,7 +432,6 @@ fn test_fsck_no_dangling_suppresses_output() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with multiple object ID arguments.
 /// Verifies that fsck rejects multiple arguments (only one OBJECT allowed).
 fn test_fsck_with_multiple_object_ids() {
@@ -477,7 +458,6 @@ fn test_fsck_with_multiple_object_ids() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck on repository with only root commit.
 /// Verifies minimal repository structure.
 fn test_fsck_single_commit_repo() {
@@ -501,7 +481,6 @@ fn test_fsck_single_commit_repo() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 /// Tests fsck outside a repository returns fatal error.
 /// Verifies that fsck properly reports error when not in a repository.
 fn test_fsck_outside_repository() {
@@ -521,7 +500,6 @@ fn test_fsck_outside_repository() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with corrupted object file.
 /// Verifies that fsck detects and reports corrupted objects.
 fn test_fsck_corrupted_object() {
@@ -569,7 +547,6 @@ fn delete_commit_object(repo: &std::path::Path, commit_hash: &str) -> std::path:
 }
 
 #[test]
-#[serial]
 /// `fsck --heal` on a repository with a missing object but no durable tier
 /// configured must report the object as unrecoverable, must NOT fabricate it,
 /// and must still exit non-zero (the integrity issue persists).
@@ -606,7 +583,6 @@ fn test_fsck_heal_local_only_reports_unrecoverable() {
 }
 
 #[test]
-#[serial]
 /// Regression: `fsck --heal` must NOT treat *packed* objects as missing.
 /// `collect_heal_candidates` classifies "missing" via `local.exist` (which
 /// consults pack indexes), not the loose-only object inventory. After packing
@@ -648,7 +624,6 @@ fn test_fsck_heal_does_not_flag_packed_objects_as_missing() {
 }
 
 #[test]
-#[serial]
 /// `fsck --heal <OBJECT>` must attempt to heal the explicitly-named object even
 /// when it is not reachable from refs/reflogs/index. With no durable tier the
 /// object is reported unrecoverable (proving it was seeded and attempted, not
@@ -675,7 +650,6 @@ fn test_fsck_heal_explicit_absent_object_is_attempted() {
 }
 
 #[test]
-#[serial]
 /// `--json fsck --heal` embeds a structured heal report.
 fn test_fsck_heal_json_includes_report() {
     let repo = create_committed_repo_via_cli();
@@ -704,7 +678,7 @@ fn test_fsck_heal_json_includes_report() {
 }
 
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 /// Tests fsck rejects annotated tag objects that are syntactically valid UTF-8
 /// but missing required tag headers.
 fn test_fsck_rejects_tag_object_missing_tagger() {
@@ -745,7 +719,6 @@ fn test_fsck_rejects_tag_object_missing_tagger() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with missing object file.
 /// Verifies that fsck detects and reports missing objects.
 fn test_fsck_missing_object() {
@@ -779,7 +752,6 @@ fn test_fsck_missing_object() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with invalid reflog reference.
 /// Verifies that fsck handles broken reflog entries.
 fn test_fsck_invalid_reflog_reference() {
@@ -800,7 +772,6 @@ fn test_fsck_invalid_reflog_reference() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with broken HEAD reference.
 /// Note: HEAD pointing to non-existent branch doesn't cause failure,
 /// only prints a notice. Test verifies graceful handling.
@@ -832,7 +803,6 @@ fn test_fsck_broken_head_reference() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with SHA-256 repository missing object.
 /// Verifies that fsck detects missing objects in SHA-256 repos.
 fn test_fsck_sha256_missing_object() {
@@ -860,7 +830,6 @@ fn test_fsck_sha256_missing_object() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck reports unreachable commits with --unreachable flag.
 /// Verifies proper error reporting for unreachable objects.
 fn test_fsck_unreachable_commit_reports() {
@@ -890,7 +859,6 @@ fn test_fsck_unreachable_commit_reports() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck exit code is non-zero on corruption.
 /// Verifies proper exit code behavior on errors.
 fn test_fsck_exit_code_nonzero_on_error() {
@@ -915,7 +883,6 @@ fn test_fsck_exit_code_nonzero_on_error() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with invalid flags returns usage error.
 /// Verifies that fsck properly reports invalid flag errors.
 fn test_fsck_invalid_flag() {
@@ -937,7 +904,6 @@ fn test_fsck_invalid_flag() {
 }
 
 #[test]
-#[serial]
 /// Tests fsck with broken tag reference.
 /// Verifies that fsck handles broken tag refs correctly.
 fn test_fsck_broken_tag_reference() {
@@ -1004,7 +970,7 @@ fn store_strict_commit(repo: &std::path::Path, email: &str, tz: &str) -> String 
 /// `--strict` flags a commit whose author/committer email lacks `@`; the default
 /// (non-strict) check does not.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_strict_commit_bad_email() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -1028,7 +994,7 @@ fn test_strict_commit_bad_email() {
 /// `--strict` flags a commit whose timezone is out of range; the default check
 /// does not.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_strict_commit_bad_timezone() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -1052,7 +1018,7 @@ fn test_strict_commit_bad_timezone() {
 /// `--strict` flags a tree whose entries are not in Git's canonical sort order;
 /// the default check does not.
 #[test]
-#[serial]
+#[serial(hash_kind)]
 fn test_strict_tree_unsorted() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -1120,7 +1086,6 @@ fn install_pack_fixture(repo: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
-#[serial]
 fn fsck_full_passes_on_a_valid_pack() {
     let repo = tempdir().expect("repo");
     init_repo_via_cli(repo.path());
@@ -1140,7 +1105,6 @@ fn fsck_full_passes_on_a_valid_pack() {
 }
 
 #[test]
-#[serial]
 fn fsck_full_reports_corrupt_pack_without_panicking() {
     let repo = tempdir().expect("repo");
     init_repo_via_cli(repo.path());
@@ -1174,7 +1138,6 @@ fn fsck_full_reports_corrupt_pack_without_panicking() {
 }
 
 #[test]
-#[serial]
 fn fsck_full_reports_corrupt_index() {
     let repo = tempdir().expect("repo");
     init_repo_via_cli(repo.path());
@@ -1197,7 +1160,6 @@ fn fsck_full_reports_corrupt_index() {
 }
 
 #[test]
-#[serial]
 fn fsck_full_detects_mismatched_index() {
     let repo = tempdir().expect("repo");
     init_repo_via_cli(repo.path());
@@ -1224,7 +1186,6 @@ fn fsck_full_detects_mismatched_index() {
 }
 
 #[test]
-#[serial]
 fn fsck_full_json_verbose_emits_clean_json() {
     let repo = tempdir().expect("repo");
     init_repo_via_cli(repo.path());

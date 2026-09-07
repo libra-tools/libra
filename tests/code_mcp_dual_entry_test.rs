@@ -221,20 +221,23 @@ fn mcp_result_text(value: &Value) -> String {
 
 #[cfg(feature = "test-provider")]
 fn event_payload_transcript_contains(payload: &Value, needle: &str) -> bool {
-    payload
-        .pointer("/data/transcript")
-        .and_then(Value::as_array)
-        .is_some_and(|transcript| {
-            transcript.iter().any(|entry| {
-                let matches = |key: &str| {
-                    entry
-                        .get(key)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value.contains(needle))
-                };
-                matches("content") || matches("title")
-            })
-        })
+    // DF-08: the v1 full-snapshot envelope is gone — match the v2
+    // `code_workflow` transcript_upsert projection payload instead.
+    let is_transcript_upsert = payload.get("kind").and_then(Value::as_str)
+        == Some("code_ui_projection_delta:transcript_upsert");
+    if !is_transcript_upsert {
+        return false;
+    }
+    let Some(entry) = payload.pointer("/payload/payload") else {
+        return false;
+    };
+    let matches = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains(needle))
+    };
+    matches("content") || matches("title")
 }
 
 #[cfg(feature = "test-provider")]
@@ -251,7 +254,7 @@ fn wait_for_sse_transcript(
             continue;
         };
         last_event = format!("event={} data={}", event.event, event.data);
-        if event.event != "session_updated" {
+        if event.event != "code_workflow" {
             continue;
         }
         let payload: Value = serde_json::from_str(&event.data)
@@ -313,7 +316,7 @@ fn wait_for_mcp_task(
 ///     break automation.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_writes_mcp_url_into_control_info_file() -> Result<()> {
     let session = CodeSession::spawn(CodeSessionOptions::new(
         "code-mcp-control-info",
@@ -417,7 +420,7 @@ fn libra_code_web_only_flag_is_rejected_at_arg_parse() -> Result<()> {
 /// proving both surfaces are reachable on the SAME process.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()> {
     let session = CodeSession::spawn(CodeSessionOptions::new(
         "code-mcp-dual-reachability",
@@ -499,7 +502,7 @@ fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()>
 /// roadmap work rather than an overclaimed test assertion.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> {
     let mut session = CodeSession::spawn(CodeSessionOptions::new(
         "code-mcp-web-message-consistency",
@@ -515,6 +518,8 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
         .context("build MCP consistency client")?;
     let mcp_session_id = mcp_initialize(&client, &mcp_url)?;
 
+    // DF-08 removed the v1 wire: this dual-entry assertion now observes the
+    // v2 `code_workflow` transcript_upsert projection on the default wire.
     let mut events = session.open_event_stream()?;
     session.attach_automation("code-mcp-web-message-consistency")?;
 
@@ -548,13 +553,15 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
 /// pins the reverse direction from the web→MCP case above:
 ///
 ///   1. initialize an MCP client against the runtime's `mcpUrl`;
-///   2. subscribe to web SSE before writing;
-///   3. call MCP `tools/call create_task`;
-///   4. assert the web SSE `session_updated` snapshot contains a
-///      transcript entry for the MCP-created task.
+///   2. call MCP `tools/call create_task`;
+///   3. poll the web `/session` snapshot until it shows a transcript
+///      entry for the MCP-created task (DF-08: out-of-band writes do not
+///      append durable `code_workflow` events, and the v1 SSE snapshot
+///      stream this test used to watch was removed — snapshot fetch is
+///      the v2-era observability contract).
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
     let session = CodeSession::spawn(CodeSessionOptions::new(
         "code-mcp-write-web-sse",
@@ -569,8 +576,11 @@ fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
         .build()
         .context("build MCP consistency client")?;
     let mcp_session_id = mcp_initialize(&client, &mcp_url)?;
-    let mut events = session.open_event_stream()?;
-
+    // DF-08: the v1 snapshot envelope this assertion used to watch was
+    // removed, and an MCP task write does not append a durable
+    // `code_workflow` transcript event — the v2-era observability contract
+    // for out-of-band writes is the session snapshot (the same
+    // snapshot-fetch doctrine v2 resync uses). Poll it instead.
     let marker = "mcp-originated-create-task-marker";
     let title = format!("MCP task {marker}");
     let value = mcp_call_tool(
@@ -591,7 +601,32 @@ fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
         "MCP create_task should return the created task id; got:\n{result_text}",
     );
 
-    let _payload = wait_for_sse_transcript(&mut events, marker, Duration::from_secs(10))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = session.snapshot()?;
+        let seen = snapshot
+            .pointer("/transcript")
+            .and_then(Value::as_array)
+            .is_some_and(|transcript| {
+                transcript.iter().any(|entry| {
+                    ["content", "title"].iter().any(|key| {
+                        entry
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value.contains(marker))
+                    })
+                })
+            });
+        if seen {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for the web session snapshot to show the MCP-created task: {snapshot}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     Ok(())
 }
 
@@ -846,7 +881,7 @@ fn http_tool_names(
 /// are driven over the real stdio transport in one session.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down() -> Result<()> {
     let repo = init_stdio_repo()?;
 
@@ -957,7 +992,7 @@ fn libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down() -> Resul
 /// dual-entry regression this test guards.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn mcp_http_and_stdio_expose_identical_tool_set() -> Result<()> {
     // HTTP side — reuse the harness-spawned `libra code` MCP HTTP transport.
     let session = CodeSession::spawn(CodeSessionOptions::new(

@@ -74,11 +74,11 @@ branch-policy 层（1.13），本项刻意零执行——避免 lore.md §3.6 �
 
 ### revision 作用域（1.10 第二增量）
 
-- 双层模型：不可变 trailer 块（`internal::log::trailer`，`get` 以 requested-key-as-recognized 强化混合块合格；`list` 用普通规则——文档化不对称）+ 可变 notes 层 `refs/notes/metadata`（每提交一个版本化 JSON 文档 `{version:1, entries:{key:{value,type}}}`，BTreeMap 确定性序列化，全文档 ≤ MAX_VALUE_LEN；损坏/未知版本 → 指名 ref+OID 的可操作错误 + 修复提示）。notes 优先（唯一可变层须能覆盖烤入的 trailer）；key 两层均 ASCII 大小写不敏感（trailer 约定，分支/repo 仍精确——`validate_key` 注释已同步）。写只走 notes 层（`notes::add(force=true)` 读改写；并发写可丢更新——v1 文档化限制；清空文档时 `notes::remove` 的 CAS 未命中映射为重试提示错误）。`list` 合并序：key 大小写不敏感排序，同 key note 先于 trailer，trailer 重复项保持消息序；`--prefix` 在本作用域大小写不敏感。protect/archive 通知仍仅限 branch 作用域（revision 上是普通键，1.13 不消费）。本作用域使 metadata 成为 object-touching 命令：已移入 cli.rs 的 hash-kind preflight（sha256 仓库正确散列；出仓错误由 preflight 统一给出）。「revision 用 trailers/notes」为 lore.md:204 对 §3.6:268 统一表红线的显式豁免（不开新表、单一属主 API）；本增量无收敛/替换（lore.md:272 空满足——无被替换物，无需只读兼容窗口）。
+- 双层模型：不可变 trailer 块（`internal::log::trailer`，`get` 以 requested-key-as-recognized 强化混合块合格；`list` 用普通规则——文档化不对称）+ 可变 notes 层 `refs/notes/metadata`（每提交一个版本化 JSON 文档 `{version:1, entries:{key:{value,type}}}`，BTreeMap 确定性序列化，全文档 ≤ MAX_VALUE_LEN；损坏/未知版本 → 指名 ref+OID 的可操作错误 + 修复提示）。notes 优先（唯一可变层须能覆盖烤入的 trailer）；key 两层均 ASCII 大小写不敏感（trailer 约定，分支/repo 仍精确——`validate_key` 注释已同步）。写只走 notes 层（`notes::add(force=true)` 读改写；并发写可丢更新——v1 文档化限制；清空文档时 `notes::remove` 的 CAS 未命中映射为重试提示错误）。`list` 合并序：key 大小写不敏感排序，同 key note 先于 trailer，trailer 重复项保持消息序；`--prefix` 在本作用域大小写不敏感。protect/archive 通知仍仅限 branch 作用域（revision 上是普通键，1.13 不消费）。本作用域使 metadata 成为 object-touching 命令：已移入 cli.rs 的 hash-kind preflight（sha256 仓库正确散列；出仓错误由 preflight 统一给出）。「revision 用 trailers/notes」为 `gap/lore.md` §3.2 的 1.10 typed metadata 行（现 `:229`）对 §3.6「typed metadata｜repo=`config_kv`，其余走统一 metadata 表」红线（现 `:295`）的显式豁免（不开新表、单一属主 API）；本增量无收敛/替换（同 §3.6「退役策略」段，现 `:299` 空满足——无被替换物，无需只读兼容窗口）。
 
 ### file 作用域：延后（独立设计轮）
 
-- 现状：仓库无任何 side-tree 机制（全库 grep 仅计划行与注释）；lore.md:204「file 用 side-tree」与 §3.6:268「其余走统一 metadata 表」互相矛盾，须先裁决。廉价路线（metadata_kv `scope='file'`）亦有未解的路径生命周期语义（mv/rm/restore 级联、规范化、存在性检查）且无现成钩子。本项记录矛盾与设计草图，file 作用域待独立设计轮 + LEP 门禁。
+- 现状：仓库无任何 side-tree 机制（全库 grep 仅计划行与注释）；`gap/lore.md` §3.2 的 1.10 行（现 `:229`）「file 用 side-tree」与 §3.6（现 `:295`）「其余走统一 metadata 表」互相矛盾，须先裁决。廉价路线（metadata_kv `scope='file'`）亦有未解的路径生命周期语义（mv/rm/restore 级联、规范化、存在性检查）且无现成钩子。本项记录矛盾与设计草图，file 作用域待独立设计轮 + LEP 门禁。
 
 ## 实现历史
 

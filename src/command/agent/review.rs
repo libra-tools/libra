@@ -278,6 +278,46 @@ fn fix_bridge_unavailable_error() -> CliError {
     .with_stable_code(StableErrorCode::AgentFixBridgeUnavailable)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ControlledFixCommand {
+    Review,
+    Investigate,
+}
+
+impl ControlledFixCommand {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Review => "review --fix",
+            Self::Investigate => "investigate fix",
+        }
+    }
+
+    fn unavailable_error(self) -> CliError {
+        match self {
+            Self::Review => fix_bridge_unavailable_error(),
+            Self::Investigate => CliError::fatal(
+                "investigate fix requires an active authorized internal AgentRuntime. Start \
+                 `libra code --control write` in this repository, then retry; the \
+                 investigation remains read-only via `libra investigate show <run_id>`",
+            )
+            .with_stable_code(StableErrorCode::AgentFixBridgeUnavailable),
+        }
+    }
+
+    fn untrusted_seed_error(self) -> CliError {
+        match self {
+            Self::Review => untrusted_seed_for_mutation_error(),
+            Self::Investigate => CliError::fatal(
+                "untrusted investigation topic or findings cannot enter a mutating workflow; \
+                 inspect them with `libra investigate show <run_id>`. `investigate fix` \
+                 submits only a fixed request and requires the active Code runtime's normal \
+                 plan and approval gates",
+            )
+            .with_stable_code(StableErrorCode::AgentUntrustedSeedForMutation),
+        }
+    }
+}
+
 /// External-agent seeds are never allowed through the review-fix bridge.
 fn untrusted_seed_for_mutation_error() -> CliError {
     CliError::fatal(
@@ -287,32 +327,51 @@ fn untrusted_seed_for_mutation_error() -> CliError {
     .with_stable_code(StableErrorCode::AgentUntrustedSeedForMutation)
 }
 
-fn map_fix_bridge_error(error: ReviewFixBridgeError) -> CliError {
+fn map_fix_bridge_error(command: ControlledFixCommand, error: ReviewFixBridgeError) -> CliError {
     match error {
-        ReviewFixBridgeError::Unavailable => fix_bridge_unavailable_error(),
-        ReviewFixBridgeError::UntrustedSeed => untrusted_seed_for_mutation_error(),
+        ReviewFixBridgeError::Unavailable => command.unavailable_error(),
+        ReviewFixBridgeError::UntrustedSeed => command.untrusted_seed_error(),
         ReviewFixBridgeError::ApprovalDenied => CliError::fatal(
-            "review --fix was denied at a tool-approval gate; no patch was applied",
+            format!(
+                "{} was denied at a tool-approval gate; no patch was applied",
+                command.label()
+            ),
         )
         .with_stable_code(StableErrorCode::AgentFixExecutionDenied),
         ReviewFixBridgeError::SandboxDenied => CliError::fatal(
-            "review --fix was denied at a sandbox-approval gate; no patch was applied",
+            format!(
+                "{} was denied at a sandbox-approval gate; no patch was applied",
+                command.label()
+            ),
         )
         .with_stable_code(StableErrorCode::AgentFixExecutionDenied),
         ReviewFixBridgeError::ExecutionFailed
         | ReviewFixBridgeError::MutationBeforeDenial
         | ReviewFixBridgeError::TimedOut
         | ReviewFixBridgeError::InvalidInteractionResponse => CliError::fatal(format!(
-            "review --fix did not complete cleanly: {error}; inspect the active `libra code` session and worktree before retrying"
+            "{} did not complete cleanly: {error}; inspect the active `libra code` session and worktree before retrying",
+            command.label()
         ))
         .with_stable_code(StableErrorCode::AgentFixExecutionFailed),
     }
 }
 
+pub(crate) async fn drive_controlled_fix(
+    command: ControlledFixCommand,
+    working_dir: &std::path::Path,
+    input: ReviewFixInput,
+) -> CliResult<ReviewFixExecutionOutcome> {
+    execute_review_fix(working_dir, input, &TerminalReviewFixResponder { command })
+        .await
+        .map_err(|error| map_fix_bridge_error(command, error))
+}
+
 /// Terminal-only adapter for a review-fix controller lease. It never invents
 /// a decision: every option or user-input answer is read from the foreground
 /// user and is then re-validated by the Code runtime.
-struct TerminalReviewFixResponder;
+struct TerminalReviewFixResponder {
+    command: ControlledFixCommand,
+}
 
 #[async_trait::async_trait]
 impl ReviewFixInteractionResponder for TerminalReviewFixResponder {
@@ -321,7 +380,8 @@ impl ReviewFixInteractionResponder for TerminalReviewFixResponder {
         interaction: ReviewFixInteraction,
     ) -> Result<ReviewFixInteractionResponse, String> {
         eprintln!(
-            "\nreview --fix needs your decision: {}",
+            "\n{} needs your decision: {}",
+            self.command.label(),
             interaction.kind.as_str()
         );
         if let Some(title) = interaction.title.as_deref() {
@@ -614,13 +674,12 @@ async fn run(args: ReviewRunCliArgs, output: &OutputConfig) -> CliResult<()> {
                 "cannot resolve the working directory for controlled review --fix execution: {error}"
             ))
         })?;
-        let outcome = execute_review_fix(
+        let outcome = drive_controlled_fix(
+            ControlledFixCommand::Review,
             &working_dir,
             ReviewFixInput::TrustedAdmission,
-            &TerminalReviewFixResponder,
         )
-        .await
-        .map_err(map_fix_bridge_error)?;
+        .await?;
         let (execution, patch_applied) = match outcome {
             ReviewFixExecutionOutcome::PatchApplied => ("patch_applied", true),
             ReviewFixExecutionOutcome::RepairRequired { patch_applied } => {

@@ -28,6 +28,25 @@ lock API.
 
 Unlike Git, which requires a separate `git-lfs` extension installed as a smudge/clean filter, Libra integrates LFS natively. The LFS client, pointer file parsing, and attribute management are built into the `libra` binary. No additional installation or filter configuration is needed.
 
+## Optional FastCDC transfers
+
+Build both Libra and Mega (`mono`) with `--features fastcdc` to enable the optional
+media transport, and save a host-scoped Mono Bearer access token with
+`libra auth login`. Both builds default to feature OFF. The LFS URL retains the
+repository path (`<repo>.git/info/lfs`); capability discovery uses
+`libra/media/v1/capabilities` below that URL. Set `libra config lfs.fastcdc false`
+to disable the extension in a repository.
+
+Host-only HTTP remotes retain the legacy root LFS endpoints (for example,
+`http://localhost:8000/locks`). Use a repository path for scoped FastCDC transfers.
+
+Normal LFS uploads send missing chunks and finalize a verified full object;
+downloads reuse verified local chunks. Standard LFS pointers remain unchanged,
+and unsupported remotes or missing manifests use full-object LFS. Mega isolates
+the extension by authenticated user and repository path; this is not a complete
+repository ACL implementation. See [`libra media`](media.md) for the transfer
+flow and current retention, quota, and maintenance limitations.
+
 ## Options
 
 `libra lfs` has no top-level options. All functionality is accessed through subcommands documented below.

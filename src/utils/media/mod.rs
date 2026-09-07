@@ -1,16 +1,14 @@
-//! FastCDC LFS media chunking — CLIENT substrate (lore.md §6).
+//! FastCDC LFS media chunking and authenticated Mega transport (lore.md §6).
 //!
 //! This module is the honest v1 of lore.md §6 "LFS FastCDC chunking": a
 //! strictly feature-gated (`fastcdc`, default OFF) **client** layer that
 //! content-defines chunks of a media object, builds a versioned manifest,
 //! stores chunks in a local content-addressed store, reassembles + verifies,
 //! and negotiates a remote's chunked-vs-standard-LFS capability with an airtight
-//! safe fallback. It ships ZERO real cross-machine chunked transfer: the
-//! Libra-aware media SERVER (§6.5–6.8 endpoints, chunk upload/download,
-//! manifest finalize, GC/fsck/heal, and every §6.7 anti-side-channel guarantee)
-//! is a separate deliverable that is honestly FROZEN in lore.md §6 — against
-//! every reachable remote today the capability probe resolves to standard Git
-//! LFS fallback.
+//! safe fallback. [`transfer`] connects the feature-enabled LFS upload/download
+//! paths to Mega's opt-in media server. Shared repository ACLs, server-side GC,
+//! obliteration, and byte-range hydration remain separate work; see the media
+//! command documentation for the current owner/repository isolation boundary.
 //!
 //! ## Invariants (load-bearing)
 //!
@@ -33,6 +31,7 @@ pub mod chunk_store;
 pub mod chunker;
 pub mod manifest;
 pub mod negotiate;
+pub mod transfer;
 
 use ring::digest::{Context, SHA256};
 

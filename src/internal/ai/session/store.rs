@@ -811,6 +811,52 @@ impl SessionStore {
     }
 }
 
+/// plan-20260825 PS-05: metadata key recording the provider that drove the
+/// session. Holds the canonical provider id only — never credentials.
+pub const SESSION_PROVIDER_METADATA_KEY: &str = "provider";
+/// plan-20260825 PS-05: metadata key recording the model id paired with
+/// [`SESSION_PROVIDER_METADATA_KEY`].
+pub const SESSION_MODEL_METADATA_KEY: &str = "model";
+
+impl SessionState {
+    /// The provider id recorded for this session, if any (PS-05).
+    pub fn recorded_provider_id(&self) -> Option<&str> {
+        self.metadata
+            .get(SESSION_PROVIDER_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// The model id recorded for this session, if any (PS-05).
+    pub fn recorded_model_id(&self) -> Option<&str> {
+        self.metadata
+            .get(SESSION_MODEL_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// Record the session's provider/model provenance, insert-if-absent:
+    /// an existing record is the thread's history and is never overwritten
+    /// (a later explicit override must not rewrite where the thread came
+    /// from). Returns whether anything was written. Ids only (GC-PS-01).
+    pub fn record_provider_provenance(&mut self, provider_id: &str, model_id: &str) -> bool {
+        let mut wrote = false;
+        if !self.metadata.contains_key(SESSION_PROVIDER_METADATA_KEY) {
+            self.metadata.insert(
+                SESSION_PROVIDER_METADATA_KEY.to_string(),
+                serde_json::json!(provider_id),
+            );
+            wrote = true;
+        }
+        if !self.metadata.contains_key(SESSION_MODEL_METADATA_KEY) {
+            self.metadata.insert(
+                SESSION_MODEL_METADATA_KEY.to_string(),
+                serde_json::json!(model_id),
+            );
+            wrote = true;
+        }
+        wrote
+    }
+}
+
 fn session_matches_thread_id(session: &SessionState, thread_id: &str) -> bool {
     if session.id == thread_id {
         return true;
@@ -1277,5 +1323,32 @@ mod tests {
         let store = SessionStore::new(tmp.path());
 
         assert!(store.load_latest().unwrap().is_none());
+    }
+
+    /// plan-20260825 PS-05: provenance recording is insert-if-absent — the
+    /// first write lands both ids, a second write with different values
+    /// changes nothing (the thread's origin is never rewritten), and the
+    /// typed readers round-trip through save/load.
+    #[test]
+    fn test_record_provider_provenance_is_insert_if_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path());
+
+        let mut session = SessionState::new("/project/dir");
+        assert_eq!(session.recorded_provider_id(), None);
+        assert_eq!(session.recorded_model_id(), None);
+
+        assert!(session.record_provider_provenance("zhipu", "glm-test"));
+        assert!(
+            !session.record_provider_provenance("gemini", "other-model"),
+            "an existing record must never be overwritten"
+        );
+        assert_eq!(session.recorded_provider_id(), Some("zhipu"));
+        assert_eq!(session.recorded_model_id(), Some("glm-test"));
+
+        store.save(&session).unwrap();
+        let loaded = store.load(&session.id).unwrap();
+        assert_eq!(loaded.recorded_provider_id(), Some("zhipu"));
+        assert_eq!(loaded.recorded_model_id(), Some("glm-test"));
     }
 }

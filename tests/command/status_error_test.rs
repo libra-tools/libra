@@ -75,7 +75,7 @@ fn status_json_error_keeps_stdout_clean() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn status_corrupt_head_reference_returns_repo_corrupt() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());

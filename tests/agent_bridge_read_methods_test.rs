@@ -222,8 +222,17 @@ async fn checkpoint_show_missing_is_error_not_empty() {
 /// for the live-repository behaviour). With no working repository in scope —
 /// which is exactly this in-memory context — it fails closed with a scope
 /// error, never an empty diff that a caller could mistake for "no changes".
+///
+/// The diff service discovers the repository from the process cwd, so the
+/// test must PARK the cwd in an empty tempdir: run from a real checkout (a
+/// live `.libra` work-dir) the bridge would otherwise escape into the outer
+/// repository and return its diff. CI checkouts carry no `.libra`, which
+/// masked exactly that escape.
 #[tokio::test]
+#[serial_test::serial(cwd)]
 async fn diff_get_without_a_repository_fails_closed_on_scope() {
+    let outside = tempfile::tempdir().expect("tempdir");
+    let _cwd = libra::utils::test::ChangeDirGuard::new(outside.path());
     let c = ctx().await;
     let err = read_dispatch(
         &c,

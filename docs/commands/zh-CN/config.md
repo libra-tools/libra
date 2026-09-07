@@ -379,6 +379,19 @@ libra config list --gpg-keys
 - `--global` 使用 `~/.libra/config.db`
 - `--system` 使用 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）；级联优先级最低，写入通常需要提升权限，且该作用域拒绝 vault 加密密钥（见设计动机）
 
+## `code.defaultProvider` 键
+
+`libra code` 在启动时一次性解析生效 provider；`code.defaultProvider` 是该阶梯中的持久化槽位（显式 `--provider` → `--agent` 绑定 → 被恢复线程记录的 provider（`--resume`）→ **`code.defaultProvider`** → 凭据探测）：
+
+```bash
+libra config set --global code.defaultProvider deepseek   # global 默认
+libra config set code.defaultProvider zhipu               # repo-local 覆盖
+libra config get code.defaultProvider
+libra config unset --global code.defaultProvider
+```
+
+合法取值即 `libra code --provider` 接受的 provider id：`anthropic`、`codex`、`deepseek`、`gemini`、`kimi`、`ollama`、`openai`、`zhipu`。配置命中时跳过凭据探测；未设置或空值下探到探测；无法识别的 id 使 `libra code` 以 129（`LBR-CLI-002`）退出并列出合法取值，且不回显已存储的值。该键只存放于本 SQLite config 数据库——与 `agents.toml` 的 `[code.*]` profile 段（`[code.multi_agent]`、`[code.goal]` 等）无关，两个载体互不回退。完整解析阶梯见 [code.md](code.md)。
+
 ## 保留命名空间 `upgrade.*`
 
 自动升级配置是保留命名空间，存储在

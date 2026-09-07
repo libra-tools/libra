@@ -25,7 +25,7 @@ use libra::{
 use super::*;
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_add_creates_entry() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -50,7 +50,7 @@ async fn test_remote_add_creates_entry() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_add_duplicate_name_returns_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -98,7 +98,7 @@ async fn test_remote_add_duplicate_name_returns_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_add_cold_config_flags() {
     use libra::internal::{db::get_db_conn_instance, model::reference};
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -251,7 +251,7 @@ async fn test_remote_add_cold_config_flags() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_remove_deletes_entry() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -280,7 +280,7 @@ async fn test_remote_remove_deletes_entry() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_remove_deletes_vault_ssh_keys() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -330,7 +330,7 @@ async fn test_remote_remove_deletes_vault_ssh_keys() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_rename_updates_branch_tracking() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -393,7 +393,7 @@ async fn test_remote_rename_updates_branch_tracking() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_rename_cascades_vault_ssh_keys() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -460,7 +460,7 @@ async fn test_remote_rename_cascades_vault_ssh_keys() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_rename_refuses_existing_target_vault_ssh_namespace() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -538,7 +538,7 @@ async fn test_remote_rename_refuses_existing_target_vault_ssh_namespace() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_configkv_rename_refuses_existing_target_vault_ssh_namespace_without_partial_mutation()
 {
     let repo_dir = tempdir().unwrap();
@@ -607,7 +607,7 @@ async fn test_configkv_rename_refuses_existing_target_vault_ssh_namespace_withou
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_rename_conflict_returns_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -642,7 +642,7 @@ async fn test_remote_rename_conflict_returns_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_url_add_appends_fetch_url() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -684,7 +684,7 @@ async fn test_remote_set_url_add_appends_fetch_url() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_url_delete_removes_matching_url() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -733,7 +733,7 @@ async fn test_remote_set_url_delete_removes_matching_url() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_url_push_and_get_pushurl_entries() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -786,7 +786,7 @@ async fn test_remote_set_url_push_and_get_pushurl_entries() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_url_all_replaces_all_fetch_urls() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -945,7 +945,7 @@ fn test_remote_get_url_json_output_is_structured() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_prune_removes_stale_branches() {
     let temp_root = tempdir().unwrap();
     let remote_dir = temp_root.path().join("remote.git");
@@ -1147,7 +1147,7 @@ async fn test_remote_prune_removes_stale_branches() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_prune_dry_run_previews_changes() {
     let temp_root = tempdir().unwrap();
     let remote_dir = temp_root.path().join("remote.git");
@@ -1365,7 +1365,7 @@ fn test_remote_add_duplicate_name_returns_conflict_error_code() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_prune_does_not_report_success_when_delete_fails() {
     if skip_permission_denied_test_if_root(
         "test_remote_prune_does_not_report_success_when_delete_fails",
@@ -1501,7 +1501,7 @@ async fn test_remote_prune_does_not_report_success_when_delete_fails() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_url_delete_no_match_returns_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -1547,7 +1547,7 @@ async fn test_remote_set_url_delete_no_match_returns_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_prune_nonexistent_remote_returns_structured_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -1628,7 +1628,7 @@ fn test_remote_set_url_delete_no_match_returns_error_code_cli() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_remove_works_after_deleting_last_url() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -1729,7 +1729,6 @@ fn test_remote_help_lists_examples_banner() {
 // ── show <name> (detailed, offline) ───────────────────────────────────────
 
 #[tokio::test]
-#[serial]
 async fn test_remote_show_no_args_lists_remotes() {
     let repo = tempdir().expect("failed to create repo");
     init_repo_via_cli(repo.path());
@@ -1783,7 +1782,6 @@ async fn test_remote_show_no_args_lists_remotes() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remote_show_detail_json_output_is_structured() {
     let repo = tempdir().expect("failed to create repo");
     init_repo_via_cli(repo.path());
@@ -1832,7 +1830,6 @@ async fn test_remote_show_detail_json_output_is_structured() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remote_show_detail_human_output() {
     let repo = tempdir().expect("failed to create repo");
     init_repo_via_cli(repo.path());
@@ -1861,7 +1858,6 @@ async fn test_remote_show_detail_human_output() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remote_show_nonexistent_remote_returns_error() {
     let repo = tempdir().expect("failed to create repo");
     init_repo_via_cli(repo.path());
@@ -1879,7 +1875,6 @@ async fn test_remote_show_nonexistent_remote_returns_error() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remote_show_detail_json_with_pushurl_fallback() {
     let repo = tempdir().expect("failed to create repo");
     init_repo_via_cli(repo.path());
@@ -1901,7 +1896,6 @@ async fn test_remote_show_detail_json_with_pushurl_fallback() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remote_show_detail_redacts_credentials() {
     let repo = tempdir().expect("failed to create repo");
     init_repo_via_cli(repo.path());
@@ -1971,7 +1965,7 @@ async fn fetch_refspecs() -> Vec<String> {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_branches_overwrites() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -1996,7 +1990,7 @@ async fn test_remote_set_branches_overwrites() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_branches_add_appends() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -2032,7 +2026,7 @@ async fn test_remote_set_branches_add_appends() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_branches_unknown_remote_errors() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -2053,7 +2047,7 @@ async fn test_remote_set_branches_unknown_remote_errors() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_branches_invalid_branch_rejected() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -2075,7 +2069,7 @@ async fn test_remote_set_branches_invalid_branch_rejected() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_head_delete_idempotent() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -2099,7 +2093,7 @@ async fn test_remote_set_head_delete_idempotent() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_set_head_missing_branch_errors() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -2187,7 +2181,7 @@ fn setup_bare_git_remote(root: &Path, extra_branches: &[&str]) -> PathBuf {
 /// `tracked` (on both), `new` (remote-only, not yet fetched), `stale`
 /// (locally tracked, gone from the remote). It also reports the live HEAD.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_remote_show_online_classifies_tracked_new_stale() {
     let temp_root = tempdir().unwrap();
     let remote_dir = setup_bare_git_remote(temp_root.path(), &["feature1"]);
@@ -2236,7 +2230,7 @@ async fn test_remote_show_online_classifies_tracked_new_stale() {
 /// reported with the `cached` status and `queried = false`. (Pins the offline
 /// path against the new online default.)
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_remote_show_no_query_stays_offline() {
     let temp_root = tempdir().unwrap();
     let remote_dir = setup_bare_git_remote(temp_root.path(), &["feature1"]);
@@ -2268,7 +2262,6 @@ async fn test_remote_show_no_query_stays_offline() {
 /// Online `remote show` against an unreachable remote fails with a hint to use
 /// `--no-query`.
 #[tokio::test]
-#[serial]
 async fn test_remote_show_online_unreachable_hints_no_query() {
     let temp_root = tempdir().unwrap();
     let repo = temp_root.path().join("libra_repo");
@@ -2295,7 +2288,7 @@ async fn test_remote_show_online_unreachable_hints_no_query() {
 /// `remote set-head --auto` queries the remote, resolves its HEAD branch, and
 /// writes the cached remote HEAD (provided that branch has been fetched).
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_remote_set_head_auto_resolves_from_remote() {
     let temp_root = tempdir().unwrap();
     let remote_dir = setup_bare_git_remote(temp_root.path(), &[]);
@@ -2329,7 +2322,7 @@ async fn test_remote_set_head_auto_resolves_from_remote() {
 /// `set-head --auto` resolves the remote HEAD but fails if that branch has not
 /// been fetched (no remote-tracking ref yet) — with the "fetch first" hint.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_remote_set_head_auto_requires_fetched_branch() {
     let temp_root = tempdir().unwrap();
     let remote_dir = setup_bare_git_remote(temp_root.path(), &[]);
@@ -2378,7 +2371,6 @@ fn test_remote_set_branches_json_schema() {
 }
 
 #[test]
-#[serial]
 fn remote_update_resolves_and_fetches_configured_remotes() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -2446,7 +2438,6 @@ fn remote_add_fetch_flag_registers_then_attempts_fetch() {
 }
 
 #[test]
-#[serial]
 fn remote_update_prune_flag_is_wired() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -2489,7 +2480,7 @@ fn remote_update_prune_flag_is_wired() {
 /// deletes the stale refs. (The thin text/JSON renderer just iterates the same
 /// pruned entries.)
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn remote_update_prune_removes_stale_tracking_branches() {
     let temp_root = tempdir().unwrap();
     let remote_dir = temp_root.path().join("remote.git");
@@ -2630,7 +2621,7 @@ async fn remote_update_prune_removes_stale_tracking_branches() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_remote_add_mirror_writes_marker_and_conflicts_with_track() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;

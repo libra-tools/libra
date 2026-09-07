@@ -461,8 +461,10 @@ async fn opencode_export_binary_trust_revalidates() {
 }
 
 /// opencode_export_oversize_session_degrades: an over-cap export terminates
-/// the child (RLIMIT_FSIZE) and degrades to metadata-only — no truncated
-/// content claim, the write still succeeds.
+/// the child (the 16 MiB stdout poll on every OS; Linux additionally holds
+/// the strict RLIMIT_FSIZE write cap — FIX-SBX-01 keeps macOS at a coarse 8
+/// GiB disk backstop) and degrades to metadata-only — no truncated content
+/// claim, the write still succeeds.
 #[tokio::test]
 async fn opencode_export_oversize_session_degrades() {
     // 32 MiB of zeros — well past the 16 MiB cap.
@@ -482,4 +484,146 @@ async fn opencode_export_oversize_session_degrades() {
         .await;
     let n: i64 = claims[0].try_get_by("n").unwrap();
     assert_eq!(n, 0, "oversize content must not produce an export claim");
+}
+
+/// SBX-04: seatbelt-gated fake exporter (does **not** use `BridgeRepo::init`'s
+/// `trusted_bwrap_available()` early return). Four-piece: export succeeds,
+/// store dir is writable, host path write outside the store is denied,
+/// network is denied.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn opencode_export_seatbelt_fake_exporter() {
+    use libra::internal::ai::observed_agents::opencode_export::{
+        ExportLimits, run_export_subprocess_sandboxed,
+    };
+
+    assert!(
+        std::path::Path::new("/usr/bin/sandbox-exec").is_file(),
+        "sandbox-exec must be present (DEP-SBX-02); this test must not skip"
+    );
+
+    // Child-reentry: pin + extra_ro_bind read process HOME/XDG. Mutating
+    // those in this binary races parallel tests (set_var is not thread-safe).
+    // The parent spawns this test binary with the fixture env instead.
+    const CHILD_EXPORTER: &str = "LIBRA_SBX04_SEATBELT_EXPORTER";
+    if let Ok(child_exporter) = std::env::var(CHILD_EXPORTER) {
+        let out = run_export_subprocess_sandboxed(
+            std::path::Path::new(&child_exporter),
+            "sess-seatbelt",
+            ExportLimits::default(),
+        )
+        .await
+        .expect("seatbelt sandboxed export must succeed");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            r#"{"info":{},"messages":[]}"#
+        );
+        return;
+    }
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let xdg = tmp.path().join("xdg");
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(xdg.join("opencode")).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let outside = home.join("outside-store");
+    let store_probe = xdg.join("opencode").join("probe");
+    let host_tmp = std::path::PathBuf::from(format!(
+        "/private/tmp/libra-sbx05-seatbelt-deny-{}",
+        std::process::id()
+    ));
+    let scratch_probe = std::path::PathBuf::from(format!(
+        "/tmp/opencode/libra-sbx-fix-probe-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&host_tmp);
+    let _ = std::fs::remove_file(&scratch_probe);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
+    let port = listener.local_addr().expect("addr").port();
+    listener.set_nonblocking(true).expect("nonblocking accept");
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accepted_flag = accepted.clone();
+    let stop_flag = stop.clone();
+    let accept_thread = std::thread::spawn(move || {
+        while !stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok(_) => {
+                    accepted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let exporter = bin_dir.join("fake-opencode");
+    let body = format!(
+        r#"touch "{store}" || {{ echo store-unwritable >&2; exit 4; }}
+if echo x > "{outside}"; then echo host-write-open >&2; exit 5; fi
+if echo x > "{host_tmp}"; then echo host-tmp-open >&2; exit 8; fi
+touch "{scratch}" || {{ echo scratch-unwritable >&2; exit 9; }}
+command -v python3 >/dev/null || {{ echo python3-missing >&2; exit 7; }}
+if python3 -c "import socket; socket.create_connection(('127.0.0.1', {port}), 1)"; then
+  echo net-open >&2; exit 6
+fi
+printf '{{"info":{{}},"messages":[]}}'
+"#,
+        store = store_probe.display(),
+        outside = outside.display(),
+        host_tmp = host_tmp.display(),
+        scratch = scratch_probe.display(),
+        port = port,
+    );
+    std::fs::write(&exporter, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&exporter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let exe = std::env::current_exe().expect("current test binary");
+    let child = Command::new(&exe)
+        .arg("opencode_export_seatbelt_fake_exporter")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_EXPORTER, &exporter)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg)
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("spawn seatbelt child");
+    assert!(
+        child.status.success(),
+        "seatbelt child export failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        child.status,
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr),
+    );
+    assert!(
+        store_probe.exists(),
+        "exporter must be able to write inside the store"
+    );
+    assert!(
+        !outside.exists(),
+        "write outside the store must be denied by seatbelt"
+    );
+    assert!(
+        !host_tmp.exists(),
+        "write to host /private/tmp sibling must stay denied (not a host-/tmp bind)"
+    );
+    assert!(
+        scratch_probe.exists(),
+        "exporter must be able to write inside /tmp/opencode (FIX-SBX-01 narrow scratch)"
+    );
+    let _ = std::fs::remove_file(&host_tmp);
+    let _ = std::fs::remove_file(&scratch_probe);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = accept_thread.join();
+    assert!(
+        !accepted.load(std::sync::atomic::Ordering::SeqCst),
+        "seatbelt must deny connect to the local listener (network not confined would accept)"
+    );
 }

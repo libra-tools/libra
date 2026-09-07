@@ -213,7 +213,7 @@ fn test_rev_list_rejects_tag_object_that_points_to_tree() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rev_list_accepts_fully_qualified_remote_tracking_ref() {
     let repo = tempdir().expect("failed to create repository root");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -942,7 +942,7 @@ fn test_rev_list_count_objects_includes_objects() {
 /// entries — Git omits submodule pointers from object enumeration — while still
 /// listing the sibling blob.
 #[test]
-#[serial]
+#[serial(hash_kind)]
 fn test_rev_list_objects_skips_gitlinks() {
     use git_internal::internal::object::{
         ObjectTrait,
@@ -1010,7 +1010,7 @@ fn test_rev_list_objects_skips_gitlinks() {
 /// commit's tree references a subtree that is missing/corrupt — an
 /// object-enumeration plumbing command must not emit an incomplete closure.
 #[test]
-#[serial]
+#[serial(hash_kind)]
 fn test_rev_list_objects_errors_on_corrupt_subtree() {
     use git_internal::internal::object::{
         ObjectTrait,

@@ -86,6 +86,7 @@ fn dev_context_filter_keeps_all_registered_tools() {
         "update_plan",
         "submit_intent_draft",
         "submit_plan_draft",
+        "submit_task_complete",
     ] {
         assert!(
             allowed.iter().any(|name| name == required),

@@ -11,7 +11,6 @@ use sea_orm::{ActiveModelTrait, Set};
 use super::*;
 
 #[test]
-#[serial]
 fn test_restore_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["restore", "."], temp.path());
@@ -24,7 +23,6 @@ fn test_restore_cli_outside_repository_returns_fatal_128() {
 }
 
 #[test]
-#[serial]
 fn test_restore_source_head_unborn_returns_error_without_falling_back() {
     let repo = tempdir().expect("failed to create repository root");
     init_repo_via_cli(repo.path());
@@ -48,7 +46,6 @@ fn test_restore_source_head_unborn_returns_error_without_falling_back() {
 }
 
 #[test]
-#[serial]
 fn test_restore_missing_pathspec_returns_cli_invalid_target() {
     let repo = create_committed_repo_via_cli();
 
@@ -65,7 +62,6 @@ fn test_restore_missing_pathspec_returns_cli_invalid_target() {
 }
 
 #[test]
-#[serial]
 fn test_restore_pathspec_from_file_restores_listed_paths() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -99,7 +95,7 @@ fn test_restore_pathspec_from_file_restores_listed_paths() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_restore_source_does_not_fall_back_from_unborn_branch_to_hash_prefix() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -146,7 +142,6 @@ async fn test_restore_source_does_not_fall_back_from_unborn_branch_to_hash_prefi
 // ── Positive paths: worktree / staged / JSON / confirmation ─────────────
 
 #[test]
-#[serial]
 fn test_restore_worktree_overwrites_modification_with_committed_blob() {
     let repo = create_committed_repo_via_cli();
     std::fs::write(repo.path().join("tracked.txt"), "modified\n")
@@ -170,7 +165,6 @@ fn test_restore_worktree_overwrites_modification_with_committed_blob() {
 }
 
 #[test]
-#[serial]
 fn test_restore_staged_resets_index_entry_to_head() {
     let repo = create_committed_repo_via_cli();
 
@@ -218,7 +212,6 @@ fn test_restore_staged_resets_index_entry_to_head() {
 }
 
 #[test]
-#[serial]
 fn test_restore_json_envelope_reports_restored_files() {
     let repo = create_committed_repo_via_cli();
     std::fs::write(repo.path().join("tracked.txt"), "modified\n")
@@ -268,7 +261,6 @@ fn test_restore_json_envelope_reports_restored_files() {
 }
 
 #[test]
-#[serial]
 fn test_restore_quiet_suppresses_confirmation_but_still_restores() {
     let repo = create_committed_repo_via_cli();
     std::fs::write(repo.path().join("tracked.txt"), "modified\n")
@@ -294,7 +286,6 @@ fn test_restore_quiet_suppresses_confirmation_but_still_restores() {
 // ── Locked-branch guard ─────────────────────────────────────────────────
 
 #[test]
-#[serial]
 fn test_restore_source_refuses_locked_intent_branch() {
     let repo = create_committed_repo_via_cli();
     std::fs::write(repo.path().join("tracked.txt"), "modified\n")
@@ -327,7 +318,6 @@ fn test_restore_source_refuses_locked_intent_branch() {
 }
 
 #[test]
-#[serial]
 fn test_restore_source_refuses_locked_branch_with_revision_suffix() {
     // is_locked_revision strips `~1` / `^` / `@{0}` so users cannot
     // end-run the guard with `traces~1` or similar.
@@ -354,7 +344,7 @@ fn test_restore_source_refuses_locked_branch_with_revision_suffix() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_restore_worktree_refuses_ai_managed_current_branch() {
     let repo = create_committed_repo_via_cli();
     {
@@ -559,7 +549,6 @@ fn create_modify_delete_conflict(theirs_deletes: bool) -> tempfile::TempDir {
 }
 
 #[test]
-#[serial]
 fn test_restore_ours_writes_stage2_blob() {
     let repo = create_conflicted_repo();
     let out = run_libra_command(&["restore", "--ours", "tracked.txt"], repo.path());
@@ -575,7 +564,6 @@ fn test_restore_ours_writes_stage2_blob() {
 }
 
 #[test]
-#[serial]
 fn test_restore_theirs_writes_stage3_blob() {
     let repo = create_conflicted_repo();
     let out = run_libra_command(&["restore", "--theirs", "tracked.txt"], repo.path());
@@ -595,7 +583,6 @@ fn test_restore_theirs_writes_stage3_blob() {
 // (no-overlay) mode, exactly like `git restore` (lore.md 1.2 Git-fidelity fix).
 
 #[test]
-#[serial]
 fn test_restore_theirs_modify_delete_removes_worktree_file() {
     // theirs (feature) deleted tracked.txt → stage 3 absent.
     let repo = create_modify_delete_conflict(true);
@@ -612,7 +599,6 @@ fn test_restore_theirs_modify_delete_removes_worktree_file() {
 }
 
 #[test]
-#[serial]
 fn test_restore_theirs_modify_delete_removes_empty_worktree_directory() {
     let repo = create_modify_delete_conflict(true);
     let path = repo.path().join("tracked.txt");
@@ -628,7 +614,6 @@ fn test_restore_theirs_modify_delete_removes_empty_worktree_directory() {
 }
 
 #[test]
-#[serial]
 fn test_restore_theirs_modify_delete_refuses_nonempty_worktree_directory() {
     let repo = create_modify_delete_conflict(true);
     let path = repo.path().join("tracked.txt");
@@ -650,7 +635,6 @@ fn test_restore_theirs_modify_delete_refuses_nonempty_worktree_directory() {
 }
 
 #[test]
-#[serial]
 fn test_restore_ours_delete_modify_removes_worktree_file() {
     // ours (main) deleted tracked.txt → stage 2 absent.
     let repo = create_modify_delete_conflict(false);
@@ -667,7 +651,6 @@ fn test_restore_ours_delete_modify_removes_worktree_file() {
 }
 
 #[test]
-#[serial]
 fn test_restore_theirs_modify_delete_json_reports_deleted() {
     // The deletion is agent-facing: it must appear in deleted_files, not restored_files.
     let repo = create_modify_delete_conflict(true);
@@ -697,7 +680,6 @@ fn test_restore_theirs_modify_delete_json_reports_deleted() {
 }
 
 #[test]
-#[serial]
 fn test_restore_overlay_missing_stage_errors() {
     // Overlay mode never removes paths, so a missing stage is an error (exit 128),
     // matching Git's overlay-mode `does not have their version`.
@@ -720,7 +702,6 @@ fn test_restore_overlay_missing_stage_errors() {
 }
 
 #[test]
-#[serial]
 fn test_restore_short_aliases_2_3() {
     let repo = create_conflicted_repo();
     assert_cli_success(
@@ -742,7 +723,6 @@ fn test_restore_short_aliases_2_3() {
 }
 
 #[test]
-#[serial]
 fn test_restore_unmerged_path_blocks_with_exit_128() {
     let repo = create_conflicted_repo();
     let out = run_libra_command(&["--json", "restore", "tracked.txt"], repo.path());
@@ -761,7 +741,6 @@ fn test_restore_unmerged_path_blocks_with_exit_128() {
 }
 
 #[test]
-#[serial]
 fn test_restore_ignore_unmerged_skips_block() {
     let repo = create_conflicted_repo();
     let before = std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap();
@@ -787,7 +766,6 @@ fn test_restore_ignore_unmerged_skips_block() {
 }
 
 #[test]
-#[serial]
 fn test_restore_ignore_unmerged_exact_deleted_path_is_noop() {
     // Regression: when the only matched pathspec is an unmerged path whose
     // worktree file has been deleted, `--ignore-unmerged` must skip it cleanly
@@ -815,7 +793,6 @@ fn test_restore_ignore_unmerged_exact_deleted_path_is_noop() {
 }
 
 #[test]
-#[serial]
 fn test_restore_ours_keeps_index_unmerged() {
     let repo = create_conflicted_repo();
     assert_cli_success(
@@ -828,7 +805,6 @@ fn test_restore_ours_keeps_index_unmerged() {
 }
 
 #[test]
-#[serial]
 fn test_restore_ours_staged_rejected_by_clap() {
     let repo = create_committed_repo_via_cli();
     let out = run_libra_command(
@@ -840,7 +816,6 @@ fn test_restore_ours_staged_rejected_by_clap() {
 }
 
 #[test]
-#[serial]
 fn test_restore_conflict_flags_mutually_exclusive() {
     let repo = create_committed_repo_via_cli();
     let path = repo.path();
@@ -889,7 +864,6 @@ fn repo_with_extra_over_parent() -> tempfile::TempDir {
 }
 
 #[test]
-#[serial]
 fn test_restore_overlay_keeps_files_absent_from_source() {
     let repo = repo_with_extra_over_parent();
     let p = repo.path();
@@ -903,7 +877,6 @@ fn test_restore_overlay_keeps_files_absent_from_source() {
 }
 
 #[test]
-#[serial]
 fn test_restore_default_removes_files_absent_from_source() {
     let repo = repo_with_extra_over_parent();
     let p = repo.path();
@@ -948,7 +921,6 @@ fn restore_index_and_worktree(repo: &Path, source: &str) -> std::process::Output
 }
 
 #[test]
-#[serial]
 fn test_restore_removes_empty_materialized_gitlink_directory() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -986,7 +958,6 @@ fn test_restore_removes_empty_materialized_gitlink_directory() {
 }
 
 #[test]
-#[serial]
 fn test_restore_replaces_empty_materialized_gitlink_with_blob() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -1031,7 +1002,6 @@ fn test_restore_replaces_empty_materialized_gitlink_with_blob() {
 }
 
 #[test]
-#[serial]
 fn test_restore_refuses_nonempty_gitlink_before_mutating_other_paths() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -1086,7 +1056,6 @@ fn test_restore_refuses_nonempty_gitlink_before_mutating_other_paths() {
 }
 
 #[test]
-#[serial]
 fn test_restore_overlay_no_overlay_toggle_last_wins() {
     // `--no-overlay --overlay` → overlay wins → keep.
     let repo = repo_with_extra_over_parent();
@@ -1134,7 +1103,6 @@ fn test_restore_overlay_no_overlay_toggle_last_wins() {
 }
 
 #[test]
-#[serial]
 fn test_restore_staged_overlay_keeps_index_entry_absent_from_source() {
     // Index overlay: `--staged --overlay` must not unstage/remove an index entry
     // that is absent from the source.
@@ -1162,7 +1130,6 @@ fn test_restore_staged_overlay_keeps_index_entry_absent_from_source() {
 }
 
 #[test]
-#[serial]
 fn test_restore_overlay_recreates_source_path_missing_from_worktree() {
     // Overlay must still CREATE a source path that is missing from the worktree;
     // it only suppresses removal of paths absent from the source.
@@ -1179,7 +1146,6 @@ fn test_restore_overlay_recreates_source_path_missing_from_worktree() {
 }
 
 #[test]
-#[serial]
 fn test_restore_staged_overlay_adds_source_path_missing_from_index() {
     // Overlay --staged must still ADD a source path that is missing from the
     // index (it only suppresses removal of index entries absent from source).
@@ -1217,7 +1183,6 @@ fn test_restore_staged_overlay_adds_source_path_missing_from_index() {
 }
 
 #[test]
-#[serial]
 fn test_restore_overlay_recreates_deleted_tracked_directory() {
     // A directory pathspec whose tracked files were all deleted from the
     // worktree must be recreated (the pathspec expands to its source files via
@@ -1259,7 +1224,6 @@ fn test_restore_overlay_recreates_deleted_tracked_directory() {
 }
 
 #[test]
-#[serial]
 fn test_restore_merge_rewrites_conflict_markers() {
     // `restore --merge` rebuilds the conflict markers in the working tree from
     // the index stages (ours = stage 2, theirs = stage 3), leaving the index
@@ -1322,7 +1286,6 @@ fn test_restore_merge_rewrites_conflict_markers() {
 }
 
 #[test]
-#[serial]
 fn test_restore_merge_replaces_empty_worktree_directory() {
     let repo = create_conflicted_repo();
     let path = repo.path().join("tracked.txt");
@@ -1337,7 +1300,6 @@ fn test_restore_merge_replaces_empty_worktree_directory() {
 }
 
 #[test]
-#[serial]
 fn test_restore_diff3_rejects_nonempty_directory_before_mutating_any_path() {
     let repo = create_two_path_conflicted_repo();
     let first = repo.path().join("a-first.txt");

@@ -3,8 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serial_test::serial;
-
 use super::{assert_cli_success, init_repo_via_cli, run_libra_command};
 
 fn packs_dir() -> PathBuf {
@@ -47,7 +45,6 @@ fn build_index(repo: &Path, pack_path: &Path, version: &str) -> PathBuf {
 }
 
 #[test]
-#[serial]
 fn verify_pack_stat_only_reports_non_delta_summary() {
     let repo = tempfile::tempdir().expect("create repo");
     init_repo_via_cli(repo.path());

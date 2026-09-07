@@ -285,7 +285,7 @@ exec sh -c "$remote_cmd"
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_push_force_flag_parsing() {
     let temp_repo = init_temp_repo();
     let temp_path = temp_repo.path();
@@ -301,7 +301,7 @@ async fn test_push_force_flag_parsing() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_push_file_remote_fails_without_reflog() {
     // local file remotes are not supported; ensure we fail loudly and avoid reflog writes
     let remote_dir = tempfile::tempdir().unwrap();
@@ -394,7 +394,7 @@ async fn test_push_file_remote_fails_without_reflog() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Test pushing to an invalid remote repository with timeout
 async fn test_push_invalid_remote() {
     if std::env::var("LIBRA_TEST_GITHUB_TOKEN").map_or(true, |v| v.is_empty()) {
@@ -479,7 +479,7 @@ async fn test_push_invalid_remote() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_push_force_with_local_changes() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -616,7 +616,7 @@ async fn test_push_force_with_local_changes() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_explicit_refspec_uses_destination_branch_name() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -720,7 +720,7 @@ fn test_push_explicit_refspec_uses_destination_branch_name() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_merge_commit_to_git_remote_succeeds() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -857,7 +857,7 @@ fn test_push_merge_commit_to_git_remote_succeeds() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1107,7 +1107,7 @@ fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_explicit_tag_refspec_uses_tag_namespace() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1172,7 +1172,7 @@ fn test_push_explicit_tag_refspec_uses_tag_namespace() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_mirror_non_dry_run_deletes_remote_only_ref() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1268,7 +1268,7 @@ fn test_push_mirror_non_dry_run_deletes_remote_only_ref() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_json_with_set_upstream_keeps_structured_output_clean() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1326,7 +1326,7 @@ fn test_push_json_with_set_upstream_keeps_structured_output_clean() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_set_upstream_when_remote_is_already_up_to_date() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1418,7 +1418,7 @@ fn test_push_set_upstream_when_remote_is_already_up_to_date() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_machine_success_is_single_json_line() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1480,7 +1480,7 @@ fn test_push_machine_success_is_single_json_line() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(env)]
 fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1678,7 +1678,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_push_ssh_remote_via_fake_ssh() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1796,7 +1796,7 @@ async fn test_push_ssh_remote_via_fake_ssh() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_push_ssh_host_key_failure_is_reported() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -2027,7 +2027,7 @@ fn interop_setup(
 /// unpack-objects below it), with a fixture guaranteeing a real delta win.
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_push_thin_roundtrip_real_git_both_unpack_paths() {
     for unpack_limit in ["1", "10000"] {
         let temp_root = tempfile::tempdir().expect("temp root");
@@ -2106,7 +2106,7 @@ async fn test_push_thin_roundtrip_real_git_both_unpack_paths() {
 /// stock git does not advertise push-options; atomic can be disabled.
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_push_capability_degrades_clean_against_real_git() {
     let temp_root = tempfile::tempdir().expect("temp root");
     let (remote_dir, local_dir, ssh_script) = interop_setup(temp_root.path());
@@ -2173,7 +2173,7 @@ async fn test_push_capability_degrades_clean_against_real_git() {
 /// hook dumps $GIT_PUSH_OPTION_*).
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_push_options_roundtrip_real_git() {
     use std::os::unix::fs::PermissionsExt;
     let temp_root = tempfile::tempdir().expect("temp root");
@@ -2223,7 +2223,7 @@ async fn test_push_options_roundtrip_real_git() {
 /// the tracking tip was never integrated, accepted after integration.
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_push_force_if_includes_matrix_real_git() {
     let temp_root = tempfile::tempdir().expect("temp root");
     let (remote_dir, local_dir, ssh_script) = interop_setup(temp_root.path());

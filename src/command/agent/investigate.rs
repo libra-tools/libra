@@ -19,17 +19,18 @@
 //! - investigators run in an isolated workspace, never the repo worktree;
 //! - the topic is an untrusted seed — redacted + spotlit before any prompt
 //!   injection, ANSI-stripped before display;
-//! - `investigate fix` fails closed with `LBR-AGENT-010` until the internal
-//!   AgentRuntime fix bridge lands; a mutation driven by an untrusted seed
-//!   without explicit approval maps to `LBR-AGENT-011`.
+//! - `investigate fix` submits only a fixed trusted request through the same
+//!   controlled AgentRuntime helper as `review --fix`; the run's untrusted
+//!   topic, findings, stances, attachments, and id never enter that request.
 
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use super::checkpoint::{
-    PAGE_SCHEMA_VERSION, decode_page_cursor, encode_page_cursor, resolve_page_limit,
+use super::{
+    checkpoint::{PAGE_SCHEMA_VERSION, decode_page_cursor, encode_page_cursor, resolve_page_limit},
+    review::{ControlledFixCommand, drive_controlled_fix},
 };
 use crate::{
     internal::{
@@ -42,6 +43,7 @@ use crate::{
                 is_launchable_investigator, render_untrusted_findings, run_investigate,
             },
             run_admission::{self, RejectedAdmission},
+            runtime::{ReviewFixExecutionOutcome, ReviewFixInput},
         },
         head::Head,
     },
@@ -73,8 +75,10 @@ EXAMPLES:
     libra investigate clean --all                             Remove every finished run directory
     libra investigate attach <run_id> <file>                  Attach an external file to a run (provenance=manual)
 
-    `libra investigate fix` is not supported yet: it requires the internal
-    AgentRuntime fix bridge and fails with LBR-AGENT-010 until that lands.";
+    libra investigate fix <run_id>                         Prepare a controlled fix through an active Code runtime
+
+    `libra investigate fix` never injects the investigation topic or findings;
+    without an active authorized Code runtime it fails with LBR-AGENT-010.";
 
 // ---------------------------------------------------------------------------
 // Clap surface (agent.md §5 exact)
@@ -107,9 +111,8 @@ pub enum InvestigateSubcommand {
     /// Remove investigate run directories.
     #[command(about = "Remove finished investigate run directories")]
     Clean(InvestigateCleanArgs),
-    /// Apply investigation findings via the internal fix bridge (not
-    /// available yet — fails with LBR-AGENT-010).
-    #[command(about = "Apply investigation findings via the fix bridge (unsupported yet)")]
+    /// Prepare a controlled fix through the active internal Code runtime.
+    #[command(about = "Prepare a controlled fix through the active Code runtime")]
     Fix(InvestigateFixArgs),
     /// Attach an external file to a run's audit chain (provenance=manual).
     #[command(
@@ -280,45 +283,6 @@ async fn attach(args: InvestigateAttachArgs, output: &OutputConfig) -> CliResult
         );
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Error helpers (LBR-AGENT-010 / 011)
-// ---------------------------------------------------------------------------
-
-/// The stable `investigate fix` refusal (plan.md:1002 / card A8): the
-/// internal serialized fix bridge has no source anchor yet, so the verb
-/// fails closed with `LBR-AGENT-010` — never fakes success. Shares the
-/// exact semantic `review --fix` uses (A7 owns the code; A8 reuses it).
-fn fix_bridge_unavailable_error() -> CliError {
-    CliError::fatal(
-        "investigate fix requires the internal AgentRuntime fix bridge, which has \
-         not landed yet; the investigation stays read-only — its findings remain \
-         available via `libra investigate show <run_id>`. `fix` will only be \
-         enabled once the internal serialized fix bridge (with approval/sandbox/\
-         tool gates) exists.",
-    )
-    .with_stable_code(StableErrorCode::AgentFixBridgeUnavailable)
-}
-
-/// The untrusted-seed-for-mutation refusal (plan.md:1002 / card A8): an
-/// investigation topic is always an untrusted seed, so once the fix bridge
-/// exists, driving a MUTATING fix from that seed without explicit approval
-/// must fail closed with `LBR-AGENT-011` BEFORE the bridge is entered. The
-/// bridge being unavailable means `fix` currently returns `LBR-AGENT-010`
-/// first (the dominant precondition, matching the read-only acceptance);
-/// this helper (and its message) pins the 011 semantic so the gate is ready
-/// the moment the bridge lands. Exercised by the mapping unit test.
-#[allow(dead_code)]
-fn untrusted_seed_for_mutation_error() -> CliError {
-    CliError::fatal(
-        "the investigation topic is untrusted seed content and cannot drive a \
-         mutating fix workflow without explicit approval; the read-only \
-         investigation is available (`libra investigate show <run_id>`). A future \
-         mutating fix must be authorized explicitly (provenance=untrusted seeds \
-         never auto-enter a mutating workflow).",
-    )
-    .with_stable_code(StableErrorCode::AgentUntrustedSeedForMutation)
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,17 +1054,56 @@ async fn clean(args: InvestigateCleanArgs, output: &OutputConfig) -> CliResult<(
 }
 
 // ---------------------------------------------------------------------------
-// fix (unsupported: LBR-AGENT-010 until the fix bridge lands)
+// fix (shared controlled AgentRuntime helper)
 // ---------------------------------------------------------------------------
 
-async fn fix(args: InvestigateFixArgs, _output: &OutputConfig) -> CliResult<()> {
-    // The internal serialized fix bridge has no source anchor yet, so the
-    // verb fails closed unconditionally with LBR-AGENT-010. Once the bridge
-    // lands, the untrusted-seed gate (LBR-AGENT-011) fires first for any run
-    // whose topic is untrusted (always) and lacks explicit approval — see
-    // `untrusted_seed_for_mutation_error`.
-    let _ = &args.run_id;
-    Err(fix_bridge_unavailable_error())
+async fn fix(args: InvestigateFixArgs, output: &OutputConfig) -> CliResult<()> {
+    let store = open_store()?;
+    store
+        .load_state(&args.run_id)
+        .map_err(|error| map_store_error("failed to read investigate run state", error))?
+        .ok_or_else(|| run_not_found(&args.run_id))?;
+
+    let working_dir = std::env::current_dir().map_err(|error| {
+        CliError::fatal(format!(
+            "cannot resolve the working directory for controlled investigate fix execution: {error}"
+        ))
+    })?;
+    let outcome = drive_controlled_fix(
+        ControlledFixCommand::Investigate,
+        &working_dir,
+        ReviewFixInput::TrustedInvestigateAdmission,
+    )
+    .await?;
+    let (execution, patch_applied) = match outcome {
+        ReviewFixExecutionOutcome::PatchApplied => ("patch_applied", true),
+        ReviewFixExecutionOutcome::RepairRequired { patch_applied } => {
+            ("repair_required", patch_applied)
+        }
+    };
+    if output.is_json() {
+        let payload = serde_json::json!({
+            "schema_version": PAGE_SCHEMA_VERSION,
+            "run_id": args.run_id,
+            "admitted": true,
+            "execution": execution,
+            "patch_applied": patch_applied,
+        });
+        return emit_json_data("investigate_fix_execution", &payload, output);
+    }
+    if !output.quiet {
+        match outcome {
+            ReviewFixExecutionOutcome::PatchApplied => println!(
+                "investigate fix applied a patch through the active AgentRuntime for run {}",
+                args.run_id
+            ),
+            ReviewFixExecutionOutcome::RepairRequired { patch_applied } => println!(
+                "investigate fix reached the AgentRuntime repair state for run {}; patch applied before failure: {patch_applied}",
+                args.run_id
+            ),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1132,16 +1135,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fix_maps_to_lbr_agent_010_with_readonly_and_precondition_message() {
-        let error = fix_bridge_unavailable_error();
+    #[tokio::test]
+    async fn fix_maps_to_lbr_agent_010_with_readonly_and_precondition_message() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let error = drive_controlled_fix(
+            ControlledFixCommand::Investigate,
+            temp.path(),
+            ReviewFixInput::TrustedInvestigateAdmission,
+        )
+        .await
+        .expect_err("a missing runtime must fail closed");
         assert_eq!(
             error.stable_code(),
             StableErrorCode::AgentFixBridgeUnavailable
         );
         assert_eq!(error.stable_code().as_str(), "LBR-AGENT-010");
         let text = error.to_string();
-        assert!(text.contains("fix bridge"), "{text}");
+        assert!(
+            text.contains("active authorized internal AgentRuntime"),
+            "{text}"
+        );
         assert!(text.contains("read-only"), "{text}");
         assert!(
             text.contains("investigate show"),
@@ -1149,9 +1162,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn untrusted_seed_mutation_maps_to_lbr_agent_011() {
-        let error = untrusted_seed_for_mutation_error();
+    #[tokio::test]
+    async fn untrusted_seed_mutation_maps_to_lbr_agent_011() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let error = drive_controlled_fix(
+            ControlledFixCommand::Investigate,
+            temp.path(),
+            ReviewFixInput::UntrustedSeed,
+        )
+        .await
+        .expect_err("untrusted content must fail before runtime discovery");
         assert_eq!(
             error.stable_code(),
             StableErrorCode::AgentUntrustedSeedForMutation

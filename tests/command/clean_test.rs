@@ -13,7 +13,7 @@ use libra::utils::path;
 use super::*;
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests dry-run mode does not delete files.
 async fn test_clean_dry_run_keeps_files() {
     let test_dir = tempdir().unwrap();
@@ -38,7 +38,7 @@ async fn test_clean_dry_run_keeps_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests force mode deletes untracked files.
 async fn test_clean_force_removes_files() {
     let test_dir = tempdir().unwrap();
@@ -63,7 +63,7 @@ async fn test_clean_force_removes_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests requiring -f or -n to proceed.
 async fn test_clean_requires_flag() {
     let test_dir = tempdir().unwrap();
@@ -89,7 +89,7 @@ async fn test_clean_requires_flag() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean does not remove tracked files.
 async fn test_clean_force_keeps_tracked_files() {
     let test_dir = tempdir().unwrap();
@@ -131,7 +131,7 @@ async fn test_clean_force_keeps_tracked_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean removes untracked files in subdirectories.
 async fn test_clean_force_removes_nested_untracked() {
     let test_dir = tempdir().unwrap();
@@ -158,7 +158,7 @@ async fn test_clean_force_removes_nested_untracked() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean respects ignore rules for untracked files.
 async fn test_clean_force_respects_ignore_rules() {
     let test_dir = tempdir().unwrap();
@@ -202,7 +202,7 @@ async fn test_clean_force_respects_ignore_rules() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean removes multiple untracked files but keeps tracked files.
 async fn test_clean_force_multiple_untracked_with_tracked() {
     let test_dir = tempdir().unwrap();
@@ -248,7 +248,7 @@ async fn test_clean_force_multiple_untracked_with_tracked() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean handles missing index by treating all files as untracked.
 async fn test_clean_force_with_missing_index() {
     let test_dir = tempdir().unwrap();
@@ -277,7 +277,7 @@ async fn test_clean_force_with_missing_index() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean reports a fatal error for a corrupted index and keeps files.
 async fn test_clean_force_with_corrupted_index_returns_fatal_128() {
     let test_dir = tempdir().unwrap();
@@ -304,7 +304,7 @@ async fn test_clean_force_with_corrupted_index_returns_fatal_128() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 /// Tests dry-run output format.
 async fn test_clean_dry_run_output_format() {
     let test_dir = tempdir().unwrap();
@@ -326,7 +326,7 @@ async fn test_clean_dry_run_output_format() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 /// Tests that -f and -n together behave like dry-run (no deletion).
 async fn test_clean_force_and_dry_run_prefers_dry_run() {
     let test_dir = tempdir().unwrap();
@@ -370,7 +370,7 @@ fn test_clean_force_json_reports_deleted_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean can handle relatively long file paths.
 async fn test_clean_force_with_long_path() {
     let test_dir = tempdir().unwrap();
@@ -398,7 +398,7 @@ async fn test_clean_force_with_long_path() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean does not delete files outside the workdir via symlinked directories.
 async fn test_clean_force_does_not_follow_symlink_dirs() {
     let test_dir = tempdir().unwrap();
@@ -427,7 +427,7 @@ async fn test_clean_force_does_not_follow_symlink_dirs() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests clean reports a fatal error when deletion is denied.
 async fn test_clean_force_permission_error_returns_io_exit_code() {
     if skip_permission_denied_test_if_root("test_clean_force_permission_error_returns_io_exit_code")
@@ -465,7 +465,7 @@ async fn test_clean_force_permission_error_returns_io_exit_code() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clean_json_dry_run_lists_candidates() {
     let repo = tempdir().unwrap();
     test::setup_with_new_libra_in(repo.path()).await;
@@ -488,7 +488,7 @@ async fn test_clean_json_dry_run_lists_candidates() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests -d flag removes untracked directories.
 async fn test_clean_d_flag_removes_untracked_dirs() {
     let test_dir = tempdir().unwrap();
@@ -515,7 +515,7 @@ async fn test_clean_d_flag_removes_untracked_dirs() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests -d flag does not remove directories with tracked files.
 async fn test_clean_d_flag_keeps_dirs_with_tracked_files() {
     let test_dir = tempdir().unwrap();
@@ -563,7 +563,7 @@ async fn test_clean_d_flag_keeps_dirs_with_tracked_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests -x flag removes ignored files.
 async fn test_clean_x_flag_removes_ignored_files() {
     let test_dir = tempdir().unwrap();
@@ -610,7 +610,7 @@ async fn test_clean_x_flag_removes_ignored_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests -X flag removes only ignored files.
 async fn test_clean_x_flag_removes_only_ignored_files() {
     let test_dir = tempdir().unwrap();
@@ -657,7 +657,7 @@ async fn test_clean_x_flag_removes_only_ignored_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --exclude flag excludes matching patterns.
 async fn test_clean_exclude_flag_excludes_patterns() {
     let test_dir = tempdir().unwrap();
@@ -685,7 +685,7 @@ async fn test_clean_exclude_flag_excludes_patterns() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --exclude with multiple patterns.
 async fn test_clean_exclude_multiple_patterns() {
     let test_dir = tempdir().unwrap();
@@ -715,7 +715,7 @@ async fn test_clean_exclude_multiple_patterns() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests -x and -X together returns an error.
 async fn test_clean_x_and_x_together_returns_error() {
     let test_dir = tempdir().unwrap();
@@ -736,7 +736,7 @@ async fn test_clean_x_and_x_together_returns_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests -d with dry-run shows directories that would be removed.
 async fn test_clean_d_dry_run_shows_directories() {
     let test_dir = tempdir().unwrap();
@@ -758,7 +758,7 @@ async fn test_clean_d_dry_run_shows_directories() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests -d with -x removes ignored directories.
 async fn test_clean_dx_removes_ignored_directories() {
     let test_dir = tempdir().unwrap();
@@ -802,7 +802,7 @@ async fn test_clean_dx_removes_ignored_directories() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests pathspec limits cleaning to the matching file.
 async fn test_clean_pathspec_matches_single_file() {
     let test_dir = tempdir().unwrap();
@@ -830,7 +830,7 @@ async fn test_clean_pathspec_matches_single_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests pathspec limits cleaning to files under a matching directory prefix.
 async fn test_clean_pathspec_matches_directory_prefix() {
     let test_dir = tempdir().unwrap();
@@ -861,7 +861,7 @@ async fn test_clean_pathspec_matches_directory_prefix() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests pathspec matching nothing cleans nothing.
 async fn test_clean_pathspec_matches_nothing_cleans_nothing() {
     let test_dir = tempdir().unwrap();
@@ -887,7 +887,7 @@ async fn test_clean_pathspec_matches_nothing_cleans_nothing() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests pathspec with -d removes a matching untracked directory.
 async fn test_clean_pathspec_with_d_removes_matching_dir() {
     let test_dir = tempdir().unwrap();
@@ -916,7 +916,7 @@ async fn test_clean_pathspec_with_d_removes_matching_dir() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests pathspec filtering shows only matching paths in dry-run JSON output.
 async fn test_clean_pathspec_dry_run_json_filters_candidates() {
     let repo = tempdir().unwrap();

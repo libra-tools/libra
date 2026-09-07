@@ -122,63 +122,71 @@ pub fn format_pointer_string(oid: &str, size: u64) -> String {
 /// - like `https://git-server.com/foo/bar.git/info/lfs`
 /// - support ssh & https & git@ format
 fn generate_git_lfs_server_url(mut url: String) -> String {
-    if url.ends_with('/') {
-        url.pop();
-    }
-    if !url.ends_with(".git") {
-        url.push_str(".git");
-    }
-    url.push_str("/info/lfs");
-
+    let ssh_url = url.starts_with("ssh://");
     if url.starts_with("git@") {
         // git@git-server.com:foo/bar.git
-        url = "https://".to_string() + &url[4..].replace(":", "/");
-    } else if url.starts_with("ssh://") {
+        let remote = &url[4..];
+        let separator = if remote.starts_with('[') {
+            remote.find("]:").map(|index| index + 1)
+        } else {
+            remote.find(':')
+        };
+        if let Some(separator) = separator {
+            url = format!(
+                "https://{}/{}",
+                &remote[..separator],
+                &remote[separator + 1..]
+            );
+        }
+    } else if ssh_url {
         // ssh://git-server.com/foo/bar.git
         url = "https://".to_string() + &url[6..];
     }
 
-    url
+    let Ok(mut parsed) = Url::parse(&url) else {
+        return url;
+    };
+    if ssh_url {
+        // SSH usernames/passwords are not HTTP credentials. Leaving `git@`
+        // here would also suppress the host-scoped HTTP token lookup.
+        // INVARIANT: a parsed HTTPS URL with a host supports userinfo setters.
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+    }
+    let path = parsed.path().trim_end_matches('/');
+    let path = if path.ends_with("/info/lfs") {
+        path.to_owned()
+    } else if path.is_empty() {
+        "/info/lfs".to_owned()
+    } else if path.ends_with(".git") {
+        format!("{path}/info/lfs")
+    } else {
+        format!("{path}.git/info/lfs")
+    };
+    parsed.set_path(&path);
+    parsed.set_fragment(None);
+    parsed.to_string()
 }
 
 /// Generate Mono LFS Server Url from repo Url.
-/// - Just get domain with port
-/// ### Example
-/// https://github.com/git-lfs/git-lfs/blob/main/docs/api/locking.md -> https://github.com
-///
-/// http://localhost:8000/xxx/yyy -> http://localhost:8000
-///
-/// Falls back to the original URL string if parsing fails or the URL has no
-/// host (e.g. `file:///path`). Callers will then either accept the literal
-/// URL or surface a downstream error.
+/// Preserve repository scope for Mega's standard `/info/lfs` router.
+/// Example: `http://localhost:8000/project/demo` becomes
+/// `http://localhost:8000/project/demo.git/info/lfs`.
+/// A host-only HTTP remote keeps the legacy root LFS endpoints.
 fn generate_mono_lfs_server_url(url: String) -> String {
-    let parsed = match Url::parse(&url) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::warn!(
-                url = %url,
-                error = %err,
-                "failed to re-parse remote URL while deriving mono LFS URL; using as-is"
-            );
-            return url;
-        }
-    };
-    let Some(host) = parsed.host() else {
-        tracing::warn!(
-            url = %url,
-            "remote URL has no host; using as-is for mono LFS URL"
-        );
-        return url;
-    };
-    match parsed.port() {
-        None => format!("{}://{host}", parsed.scheme()),
-        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+    if let Ok(mut parsed) = Url::parse(&url)
+        && matches!(parsed.scheme(), "http" | "https")
+        && parsed.path().trim_end_matches('/').is_empty()
+    {
+        parsed.set_fragment(None);
+        return parsed.to_string();
     }
+    generate_git_lfs_server_url(url)
 }
 
 /// Generate LFS Server Url from repo Url.
 /// - Automatically detect git or mono repo by domain
-/// - Caution: without trailing slash `/`
+/// - Callers normalize the trailing slash before joining endpoint paths.
 pub fn generate_lfs_server_url(url_str: String) -> String {
     let url = match Url::parse(&url_str) {
         Ok(url) => url,
@@ -502,6 +510,29 @@ mod tests {
 
         let url = "ssh://github.com/libra-tools/mega.git".to_owned();
         assert_eq!(generate_lfs_server_url(url), LFS_SERVER_URL);
+
+        let url = "ssh://git@github.com/libra-tools/mega.git".to_owned();
+        assert_eq!(generate_lfs_server_url(url), LFS_SERVER_URL);
+    }
+
+    #[test]
+    fn lfs_url_preserves_query_and_only_removes_ssh_credentials() {
+        assert_eq!(
+            generate_lfs_server_url(
+                "ssh://git:unused@host.example:8443/repo.git/?tenant=one#ref".to_owned()
+            ),
+            "https://host.example:8443/repo.git/info/lfs?tenant=one"
+        );
+        assert_eq!(
+            generate_lfs_server_url(
+                "https://user:token@host.example/repo.git/info/lfs/?tenant=one".to_owned()
+            ),
+            "https://user:token@host.example/repo.git/info/lfs?tenant=one"
+        );
+        assert_eq!(
+            generate_lfs_server_url("git@[::1]:project/demo.git".to_owned()),
+            "https://[::1]/project/demo.git/info/lfs"
+        );
     }
 
     #[test]
@@ -509,7 +540,7 @@ mod tests {
         const LFS_SERVER_URL: &str = "https://gitmono.com/libra-tools/mega.git/info/lfs";
         assert_eq!(
             generate_lfs_server_url(LFS_SERVER_URL.to_owned()),
-            "https://gitmono.com"
+            LFS_SERVER_URL
         );
         const LOCAL_LFS_SERVER_URL: &str = "http://localhost:8000/xxx/yyy";
         assert_eq!(
@@ -518,8 +549,19 @@ mod tests {
         );
         assert_eq!(
             generate_lfs_server_url(LOCAL_LFS_SERVER_URL.to_owned()),
-            "http://localhost:8000"
+            "http://localhost:8000/xxx/yyy.git/info/lfs"
         );
+        for (remote, expected) in [
+            ("http://127.0.0.1:8000", "http://127.0.0.1:8000/"),
+            ("http://localhost:8000/", "http://localhost:8000/"),
+            ("https://gitmono.com", "https://gitmono.com/"),
+            (
+                "http://[::1]:8000/?tenant=one#ref",
+                "http://[::1]:8000/?tenant=one",
+            ),
+        ] {
+            assert_eq!(generate_lfs_server_url(remote.to_owned()), expected);
+        }
     }
 
     #[test]

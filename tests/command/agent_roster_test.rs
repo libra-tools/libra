@@ -290,7 +290,7 @@ fn agent_list_surfaces_hook_state_inspection_errors() {
 /// by an older binary) can still be removed, the removal is idempotent, and
 /// `add gemini` stays rejected afterwards.
 #[test]
-#[serial]
+#[serial(cwd)]
 fn agent_remove_gemini_uninstalls_legacy_hooks_idempotent() {
     let temp = tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
@@ -343,7 +343,7 @@ fn agent_remove_gemini_uninstalls_legacy_hooks_idempotent() {
 /// Removing gemini strips only the Libra-managed entries — user-authored
 /// hook entries and unrelated settings keys survive verbatim.
 #[test]
-#[serial]
+#[serial(cwd)]
 fn agent_remove_preserves_user_hook_entries() {
     let temp = tempdir().expect("tempdir");
     let repo = temp.path().join("repo");

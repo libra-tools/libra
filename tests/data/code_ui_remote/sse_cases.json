@@ -12,30 +12,6 @@
   },
   "cases": [
     {
-      "name": "sse_initial_connect_replays_session_updated_with_full_snapshot",
-      "priority": "P0",
-      "steps": [
-        {
-          "name": "open stream",
-          "op": "openEvents",
-          "stream": "events",
-          "timeoutMs": 5000
-        },
-        {
-          "name": "first event is initial snapshot",
-          "op": "expectEvent",
-          "stream": "events",
-          "event": "session_updated",
-          "expect": {
-            "assertions": [
-              "event_data_has_transcript_array",
-              "event_data_has_controller"
-            ]
-          }
-        }
-      ]
-    },
-    {
       "name": "sse_emits_status_changed_when_submit_starts_thinking",
       "priority": "P0",
       "steps": [
@@ -70,7 +46,7 @@
           "name": "status changed to thinking",
           "op": "collectEventsUntil",
           "stream": "events",
-          "event": "status_changed",
+          "event": "code_workflow",
           "timeoutMs": 5000,
           "expect": {
             "assertions": [
@@ -81,7 +57,7 @@
       ]
     },
     {
-      "name": "sse_emits_session_updated_after_assistant_completion",
+      "name": "sse_emits_code_workflow_after_assistant_completion",
       "priority": "P0",
       "steps": [
         {
@@ -115,7 +91,7 @@
           "name": "completion event",
           "op": "collectEventsUntil",
           "stream": "events",
-          "event": "session_updated",
+          "event": "code_workflow",
           "timeoutMs": 10000,
           "expect": {
             "assertions": [
@@ -126,64 +102,7 @@
       ]
     },
     {
-      "name": "sse_emits_controller_changed_on_attach_and_detach",
-      "priority": "P0",
-      "steps": [
-        {
-          "name": "open stream",
-          "op": "openEvents",
-          "stream": "events",
-          "timeoutMs": 5000
-        },
-        {
-          "name": "attach automation",
-          "op": "attach",
-          "kind": "automation",
-          "clientId": "sse-controller",
-          "auth": "valid_control",
-          "expect": {
-            "status": 200,
-            "saveToken": "current"
-          }
-        },
-        {
-          "name": "controller changed to automation",
-          "op": "collectEventsUntil",
-          "stream": "events",
-          "event": "controller_changed",
-          "timeoutMs": 5000,
-          "expect": {
-            "assertions": [
-              "event_data_controller_kind_automation"
-            ]
-          }
-        },
-        {
-          "name": "detach automation",
-          "op": "detach",
-          "clientId": "sse-controller",
-          "token": "current",
-          "auth": "valid_control",
-          "expect": {
-            "status": 200
-          }
-        },
-        {
-          "name": "controller changed away from automation",
-          "op": "collectEventsUntil",
-          "stream": "events",
-          "event": "controller_changed",
-          "timeoutMs": 5000,
-          "expect": {
-            "assertions": [
-              "event_data_controller_kind_none"
-            ]
-          }
-        }
-      ]
-    },
-    {
-      "name": "sse_two_concurrent_subscribers_receive_status_changed",
+      "name": "sse_two_concurrent_subscribers_receive_code_workflow",
       "priority": "P1",
       "steps": [
         {
@@ -223,7 +142,7 @@
           "name": "stream A sees thinking",
           "op": "collectEventsUntil",
           "stream": "a",
-          "event": "status_changed",
+          "event": "code_workflow",
           "timeoutMs": 5000,
           "expect": {
             "assertions": [
@@ -235,7 +154,7 @@
           "name": "stream B sees thinking",
           "op": "collectEventsUntil",
           "stream": "b",
-          "event": "status_changed",
+          "event": "code_workflow",
           "timeoutMs": 5000,
           "expect": {
             "assertions": [
@@ -285,9 +204,9 @@
         },
         {
           "name": "initial replay has completed transcript",
-          "op": "expectEvent",
+          "op": "collectEventsUntil",
           "stream": "new",
-          "event": "session_updated",
+          "event": "code_workflow",
           "expect": {
             "assertions": [
               "event_transcript_contains:fake assistant: hello from the Web harness"

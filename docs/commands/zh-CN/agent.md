@@ -118,7 +118,7 @@ libra --json agent rpc list
 支持及当前可用状态；默认版本 1 的 payload 保持原有字段集合，不会隐式
 增加扩展字段。OpenCode 的 `transcript_discoverable` 明确为 unsupported（不支持
 批量发现）；显式 ID 的 `importable`/`export_bridge` 可用性取决于受信任离线
-exporter 与 sandbox。启用该 exporter 的方式：先注册包含已核验 `opencode`
+exporter 与 sandbox。macOS 经 seatbelt（`sandbox-exec`）启用内容捕获（store 可写、主机写与网络被拒）；seatbelt 存在弃用风险。读隔离不对称（macOS 不限制读，与 Linux bwrap 默认拒绝读不同）。`sandbox-exec` 不可用时 fail-closed 降级 metadata-only。启用该 exporter 的方式：先注册包含已核验 `opencode`
 二进制的目录，再固定它——`libra agent rpc trust --dir <path>`，然后
 `libra agent rpc trust opencode`。两步都不会打开 external-RPC 表面
 （`agent.external_agents.enabled` 保持不变）；二进制只从已注册受信目录解析，

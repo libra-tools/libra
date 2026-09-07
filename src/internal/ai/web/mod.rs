@@ -11,7 +11,7 @@ pub mod sse_wire;
 pub mod web_admission;
 pub mod write_guards;
 
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 pub use agent_runtime_adapter::AgentRuntimeCodeUiAdapter;
 use anyhow::Context;
@@ -40,7 +40,7 @@ use self::{
         CodeUiGoalCancelRequest, CodeUiGoalStartRequest, CodeUiInteractionResponse,
         CodeUiMessageRequest, CodeUiRuntimeHandle, CodeUiSessionResumeRequest, CodeUiSessionStatus,
         CodeUiSkillActivateRequest, CodeUiTaskDispatchRequest,
-        browser_controller_token_from_headers, ensure_session_updated_event,
+        browser_controller_token_from_headers,
     },
     write_guards::{
         SessionWriteRateLimiter, ensure_trusted_browser_origin, trusted_loopback_origins,
@@ -1116,38 +1116,9 @@ async fn code_events_handler(
     })?;
 
     match wire {
-        sse_wire::CodeUiSseWireVersion::V1 => {
-            let runtime = code_ui_runtime(&state)?;
-            let redactor = state.secret_redactor.clone();
-            let current_snapshot = runtime.snapshot().await;
-            let initial_event = ensure_session_updated_event(&current_snapshot)?;
-            let receiver = runtime.subscribe();
-
-            let initial_redactor = redactor.clone();
-            let initial_stream = stream::once(async move {
-                Ok::<Event, Infallible>(code_ui_event_to_sse(
-                    initial_event,
-                    initial_redactor.as_ref(),
-                ))
-            });
-            let updates = BroadcastStream::new(receiver).filter_map(move |message| {
-                let runtime = runtime.clone();
-                let redactor = redactor.clone();
-                async move {
-                    code_ui_broadcast_event_or_recovery(&runtime, message)
-                        .await
-                        .map(|event| {
-                            Ok::<Event, Infallible>(code_ui_event_to_sse(event, redactor.as_ref()))
-                        })
-                }
-            });
-            Ok(Sse::new(initial_stream.chain(updates))
-                .keep_alive(KeepAlive::new())
-                .into_response())
-        }
         sse_wire::CodeUiSseWireVersion::V2 => {
-            // `cursor` is v2-only; ignore it on v1 so legacy clients with stray
-            // query params keep working.
+            // v2 is the only wire since DF-08 removed the v1 snapshot
+            // stream (0.22.0); `wire=1` already failed closed above.
             let cursor =
                 sse_wire::parse_code_events_cursor(&query).map_err(|message| WebApiError {
                     status: StatusCode::BAD_REQUEST,
@@ -1407,18 +1378,6 @@ fn code_ui_wire_v2_resync_sse(reason: &str, last_cursor: u64, durable_tail: u64)
         })
 }
 
-async fn code_ui_broadcast_event_or_recovery(
-    runtime: &Arc<CodeUiRuntimeHandle>,
-    message: Result<code_ui::CodeUiEventEnvelope, BroadcastStreamRecvError>,
-) -> Option<code_ui::CodeUiEventEnvelope> {
-    match message {
-        Ok(event) => Some(event),
-        Err(BroadcastStreamRecvError::Lagged(_)) => {
-            ensure_session_updated_event(&runtime.snapshot().await).ok()
-        }
-    }
-}
-
 async fn code_diagnostics_handler(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<WebAppState>,
@@ -1653,19 +1612,28 @@ async fn code_skill_activate_handler(
             retry_after_secs: None,
         });
         }
-        // Discoverability is confirmed, but there is still no in-process
-        // activation path that persists a selection or notifies the live
-        // provider. Fail closed instead of returning accepted:true with no
-        // observable effect — providers emit SkillEvent when they consume a
-        // skill on a later turn.
-        Err(WebApiError {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            code: "SKILL_ACTIVATION_UNSUPPORTED".to_string(),
-            message: format!(
-                "skill '{name}' is discoverable for '{provider}', but in-process skill activation is not available yet; the provider emits SkillEvent when it consumes the skill on a later turn"
-            ),
-            retry_after_secs: None,
-        })
+        // DF-07: hand the validated activation to the in-process provider —
+        // the adapter queues it and the next plain turn's provider input
+        // carries the activation context (tool permissions unchanged).
+        // Adapters without a live in-process provider (read-only, managed
+        // Codex) keep the stable fail-closed default and map to 422.
+        match runtime.adapter().activate_skill(provider, name).await {
+            Ok(ack) => Ok(serde_json::json!({
+                "accepted": true,
+                "provider": ack.provider,
+                "name": ack.name,
+                "pending": ack.pending,
+                "consumedOn": "next-plain-turn",
+            })),
+            Err(error) => Err(WebApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "SKILL_ACTIVATION_UNSUPPORTED".to_string(),
+                message: format!(
+                    "skill '{name}' is discoverable for '{provider}', but this session cannot activate it in-process: {error}"
+                ),
+                retry_after_secs: None,
+            }),
+        }
     }
     .await;
     append_control_audit(
@@ -2310,30 +2278,6 @@ async fn enforce_code_write_identity_gates(
         ensure_browser_origin_for_write(state, headers)?;
     }
     ensure_session_write_rate_limit(state, runtime).await
-}
-
-fn code_ui_event_to_sse(event: code_ui::CodeUiEventEnvelope, redactor: &SecretRedactor) -> Event {
-    // W3-12: never emit an unredacted snapshot on the SSE wire. If
-    // redaction/serialization fails, drop payload data (fail closed).
-    match project_json_for_wire(&event, redactor) {
-        Ok(projected) => Event::default()
-            .event(event.event_type.as_str())
-            .json_data(projected)
-            .unwrap_or_else(|_| code_ui_redaction_failed_sse(event.event_type)),
-        Err(_) => code_ui_redaction_failed_sse(event.event_type),
-    }
-}
-
-fn code_ui_redaction_failed_sse(event_type: code_ui::CodeUiEventType) -> Event {
-    Event::default()
-        .event(event_type.as_str())
-        .json_data(serde_json::json!({
-            "error": {
-                "code": "REDACTION_FAILED",
-                "message": "session event omitted because secret redaction failed"
-            }
-        }))
-        .unwrap_or_else(|_| Event::default().event(event_type.as_str()))
 }
 
 fn ensure_loopback_api_request(remote_addr: SocketAddr) -> Result<(), WebApiError> {
@@ -3664,25 +3608,6 @@ mod tests {
         assert!(!html.contains("<script"), "remote notice must be zero JS");
     }
 
-    #[tokio::test]
-    async fn sse_lag_recovers_with_full_session_snapshot_event() {
-        let runtime = test_code_ui_runtime().await;
-
-        let event =
-            code_ui_broadcast_event_or_recovery(&runtime, Err(BroadcastStreamRecvError::Lagged(3)))
-                .await
-                .expect("lagged receiver should produce recovery event");
-
-        assert_eq!(
-            event.event_type,
-            crate::internal::ai::web::code_ui::CodeUiEventType::SessionUpdated
-        );
-        assert_eq!(event.seq, 0);
-        let snapshot = crate::internal::ai::web::code_ui::snapshot_from_event(&event)
-            .expect("recovery event should contain full snapshot");
-        assert_eq!(snapshot.provider.provider, "test");
-    }
-
     /// Wave 3 / PR 3 §5.6 — control-audit `client_id` field
     /// redaction. The plan calls out "client_id 80 字符上限、控制
     /// 字符替换" — `sanitized_audit_client_id` enforces both, plus
@@ -4014,8 +3939,146 @@ mod tests {
         assert_eq!(value["error"]["code"], "INVALID_SKILL_PROVIDER");
     }
 
+    /// DF-07 (terra R1): the public activate contract end to end — success
+    /// acknowledgment shape from an adapter with a live in-process
+    /// activation path, plus the two stable 400s for an unknown provider
+    /// slug and an undiscoverable name (which never reach the adapter).
     #[tokio::test]
-    async fn code_skill_activate_rejects_discoverable_skill_without_activation_effect() {
+    async fn code_skill_activate_http_contract_success_and_stable_400s() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        use super::code_ui::{
+            CodeUiCommandAdapter, CodeUiInteractionResponse, CodeUiReadModel,
+            CodeUiSkillActivationAck, ReadOnlyCodeUiAdapter,
+        };
+
+        /// Read-only shell whose `activate_skill` acks like a live adapter.
+        struct AckingSkillAdapter(Arc<ReadOnlyCodeUiAdapter>);
+        #[async_trait::async_trait]
+        impl CodeUiReadModel for AckingSkillAdapter {
+            fn session(&self) -> Arc<CodeUiSession> {
+                self.0.session()
+            }
+        }
+        #[async_trait::async_trait]
+        impl CodeUiCommandAdapter for AckingSkillAdapter {
+            fn capabilities(&self) -> CodeUiCapabilities {
+                self.0.capabilities()
+            }
+            async fn submit_message(&self, _text: String) -> anyhow::Result<()> {
+                Err(anyhow::anyhow!("not under test"))
+            }
+            async fn respond_interaction(
+                &self,
+                _interaction_id: &str,
+                _response: CodeUiInteractionResponse,
+            ) -> anyhow::Result<()> {
+                Err(anyhow::anyhow!("not under test"))
+            }
+            async fn activate_skill(
+                &self,
+                provider: &str,
+                name: &str,
+            ) -> anyhow::Result<CodeUiSkillActivationAck> {
+                Ok(CodeUiSkillActivationAck {
+                    provider: provider.to_string(),
+                    name: name.to_string(),
+                    pending: 1,
+                })
+            }
+        }
+
+        let session = CodeUiSession::new(initial_snapshot(
+            "/tmp/libra",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        ));
+        let adapter = Arc::new(AckingSkillAdapter(ReadOnlyCodeUiAdapter::new(
+            session,
+            CodeUiCapabilities::default(),
+        )));
+        let runtime =
+            CodeUiRuntimeHandle::build(adapter, true, CodeUiInitialController::Unclaimed).await;
+        let attach = runtime
+            .attach_browser_controller("browser-skill-ack")
+            .await
+            .expect("browser controller should attach");
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: Some(runtime),
+                automation_control_token: None,
+                browser_bootstrap_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let activate = |body: &'static str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/skills/activate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "http://127.0.0.1:4317")
+                .header("X-Code-Controller-Token", attach.controller_token.clone())
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(activate(r#"{"provider":"claude-code","name":"/review"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["accepted"], true);
+        assert_eq!(value["provider"], "claude-code");
+        assert_eq!(value["name"], "/review");
+        assert_eq!(value["pending"], 1);
+        assert_eq!(value["consumedOn"], "next-plain-turn");
+
+        let response = app
+            .clone()
+            .oneshot(activate(r#"{"provider":"not-an-agent","name":"/review"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "INVALID_SKILL_PROVIDER");
+
+        let response = app
+            .clone()
+            .oneshot(activate(
+                r#"{"provider":"claude-code","name":"/not-a-skill"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "SKILL_NOT_DISCOVERABLE");
+    }
+
+    /// DF-07: activation is delegated to the adapter; a session whose
+    /// adapter has no live in-process provider (here: the read-only
+    /// adapter) still fails closed with the stable 422 — never a silent
+    /// `accepted:true` without an observable effect. The live-provider
+    /// consumption path is pinned by
+    /// `command::code::tests::skill_activation_context_reaches_the_provider_request`.
+    #[tokio::test]
+    async fn code_skill_activate_without_inprocess_provider_still_fails_closed() {
         use axum::extract::connect_info::MockConnectInfo;
 
         let session = CodeUiSession::new(initial_snapshot(
@@ -4305,17 +4368,26 @@ mod tests {
         let illegal_value: serde_json::Value = serde_json::from_slice(&illegal_body).unwrap();
         assert_eq!(illegal_value["error"]["code"], "INVALID_WIRE_VERSION");
 
-        // v1 must ignore stray/non-numeric cursor query params (v2-only field).
-        let v1_stray_cursor = Request::builder()
+        // DF-08: explicit v1 is a stable 400 naming the removal — the
+        // snapshot stream is physically gone.
+        let removed_v1 = Request::builder()
             .method(Method::GET)
-            .uri("/events?wire=1&cursor=not-a-number")
+            .uri("/events?wire=1")
             .body(Body::empty())
             .unwrap();
-        let v1_response = app.clone().oneshot(v1_stray_cursor).await.unwrap();
-        assert_eq!(
-            v1_response.status(),
-            StatusCode::OK,
-            "v1 must ignore invalid cursor query values"
+        let removed_response = app.clone().oneshot(removed_v1).await.unwrap();
+        assert_eq!(removed_response.status(), StatusCode::BAD_REQUEST);
+        let removed_body = to_bytes(removed_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let removed_value: serde_json::Value = serde_json::from_slice(&removed_body).unwrap();
+        assert_eq!(removed_value["error"]["code"], "INVALID_WIRE_VERSION");
+        assert!(
+            removed_value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("removed in 0.22.0"),
+            "removal guidance expected: {removed_value}"
         );
 
         let no_hub = code_router()
@@ -4337,7 +4409,7 @@ mod tests {
             .uri("/events?wire=2")
             .body(Body::empty())
             .unwrap();
-        let missing_response = no_hub.oneshot(missing).await.unwrap();
+        let missing_response = no_hub.clone().oneshot(missing).await.unwrap();
         assert_eq!(missing_response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let missing_body = to_bytes(missing_response.into_body(), usize::MAX)
             .await
@@ -4347,6 +4419,77 @@ mod tests {
             missing_value["error"]["code"],
             "WIRE_V2_REQUIRES_DURABLE_SESSION"
         );
+
+        // DF-06: the omitted-wire default is v2, so without a durable hub
+        // the omission now fails closed exactly like explicit v2.
+        let missing_default = Request::builder()
+            .method(Method::GET)
+            .uri("/events")
+            .body(Body::empty())
+            .unwrap();
+        let missing_default_response = no_hub.oneshot(missing_default).await.unwrap();
+        assert_eq!(
+            missing_default_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "omitted wire must route to v2 (and its durable-hub requirement)"
+        );
+        let missing_default_body = to_bytes(missing_default_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let missing_default_value: serde_json::Value =
+            serde_json::from_slice(&missing_default_body).unwrap();
+        assert_eq!(
+            missing_default_value["error"]["code"],
+            "WIRE_V2_REQUIRES_DURABLE_SESSION"
+        );
+
+        // DF-06: with a hub, both a bare `/events` and an Accept header
+        // without `libra-wire` stream v2 `code_workflow` frames.
+        async fn sse_prefix(response: axum::response::Response) -> String {
+            use futures_util::StreamExt;
+            let mut stream = response.into_body().into_data_stream();
+            let mut collected = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                match timeout(Duration::from_millis(200), stream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        collected.extend_from_slice(&chunk);
+                        if String::from_utf8_lossy(&collected).contains("event: code_workflow") {
+                            break;
+                        }
+                    }
+                    Ok(Some(Err(error))) => panic!("SSE body error: {error}"),
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+            String::from_utf8(collected).expect("utf8 SSE body")
+        }
+        for omitted in [
+            Request::builder()
+                .method(Method::GET)
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/events")
+                .header(header::ACCEPT, "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(omitted).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = sse_prefix(response).await;
+            assert!(
+                body.contains("event: code_workflow"),
+                "omitted wire must stream the v2 delta envelope (DF-06): {body}"
+            );
+            assert!(
+                !body.contains("session_updated"),
+                "omitted wire must not fall back to the v1 snapshot stream: {body}"
+            );
+        }
 
         let request = Request::builder()
             .method(Method::GET)

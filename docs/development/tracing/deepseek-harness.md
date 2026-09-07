@@ -29,8 +29,9 @@ DeepSeek Harness 的公开定位是“一切皆插件”：模型、工具、技
 本文档中标为“提议契约”或“待实现”的接口不是当前已存在的 Libra API。
 **Libra 侧的 bridge 已不在此列**：`libra agent bridge --stdio` 与 protocol v1 的全部 20 个
 method 自 `v0.21.1` 起已实现并发布（plan-20260818 LB-01..LB-07），下文凡描述 bridge 行为处
-均为现状而非目标态；仍属目标态的是 TypeScript 侧的 `@libra/dsh-bundle` 与 Harness profile。
-跨仓库发布顺序固定为 **`REL-LB-01`（Rust bridge + authoritative schema/fixture）→ `REL-TS-01`（`@libra/dsh-bundle`）**；不得用 TypeScript 自造第二份 server schema。
+均为现状而非目标态；TypeScript 侧的 `@libra-tools/dsh-bundle` 与 Harness profile 已由兄弟仓
+`REL-TS-01`（2026-08-24）发布到 npm。
+跨仓库发布顺序固定为 **`REL-LB-01`（Rust bridge + authoritative schema/fixture）→ `REL-TS-01`（`@libra-tools/dsh-bundle`）**；不得用 TypeScript 自造第二份 server schema。
 
 ### 1.1 事实源边界
 
@@ -55,7 +56,7 @@ flowchart LR
     WORKSPACE[@libra/dsh-workspace]
     CONTEXT[@libra/dsh-context]
     UI[@libra/dsh-ui]
-    BUNDLE[@libra/dsh-bundle]
+    BUNDLE[@libra-tools/dsh-bundle]
     BRIDGE[libra agent bridge --stdio<br/>JSON-RPC NDJSON]
     LIBRA[Libra Rust Runtime]
 
@@ -78,26 +79,26 @@ flowchart LR
 通过 JSON-RPC NDJSON 将 session、workspace、checkpoint、evidence 和 provenance
 操作发送给 Libra 的 Agent ingress/runtime。
 
-逻辑上按能力拆分，但 **v1 只对外发布一个 npm 包 `@libra/dsh-bundle`**（内部 `packages/{protocol,bridge-client,session,tools,workspace,context,ui}` 分层，可独立启停）。稳定后再拆独立 npm 子包；不要在 bridge schema 未冻结时增加多包发布面。
+逻辑上按能力拆分，但 **v1 只对外发布一个 npm 包 `@libra-tools/dsh-bundle`**（内部 `packages/{protocol,bridge-client,session,tools,workspace,context,ui}` 分层，内部 package 使用 `@libra/dsh-*` 私有名，可独立启停）。稳定后再拆独立 npm 子包；不要在 bridge schema 未冻结时增加多包发布面。
 
 | 逻辑包 / 内部 package | 责任 |
 | --- | --- |
-| `packages/tools`（逻辑名 `@libra/dsh-tools`） | 模型可见的高层 VCS、checkpoint、历史和 review 工具 |
-| `packages/session`（逻辑名 `@libra/dsh-session`） | Harness session/event 到 Libra 的批量投影、outbox 和断点续传 |
-| `packages/workspace`（逻辑名 `@libra/dsh-workspace`） | session/subagent 与 Libra worktree、workspace lease 的绑定 |
-| `packages/context`（逻辑名 `@libra/dsh-context`） | Libra skill、历史摘要、decision 和 evidence 的按需上下文 |
-| `packages/ui`（逻辑名 `@libra/dsh-ui`） | checkpoint、diff、commit、evidence 的 Harness UI 卡片 |
-| `@libra/dsh-bundle`（唯一 v1 发布物） | 可直接启用的 Harness profile/bundle，并启动 bridge child |
+| `packages/tools`（内部名 `@libra/dsh-tools`） | 模型可见的高层 VCS、checkpoint、历史和 review 工具 |
+| `packages/session`（内部名 `@libra/dsh-session`） | Harness session/event 到 Libra 的批量投影、outbox 和断点续传 |
+| `packages/workspace`（内部名 `@libra/dsh-workspace`） | session/subagent 与 Libra worktree、workspace lease 的绑定 |
+| `packages/context`（内部名 `@libra/dsh-context`） | Libra skill、历史摘要、decision 和 evidence 的按需上下文 |
+| `packages/ui`（内部名 `@libra/dsh-ui`） | checkpoint、diff、commit、evidence 的 Harness UI 卡片 |
+| `@libra-tools/dsh-bundle`（唯一 v1 发布物） | 可直接启用的 Harness profile/bundle，并启动 bridge child |
 
 ## 3. 第一阶段：Agent Bridge 能力插件
 
 Harness 不直接访问 Libra 数据库，也不再以旧的工具服务器传输作为标准写入路径。Libra 侧的
-bridge 已就绪；仍待实现的是由 `@libra/dsh-bundle` 启动这个受 Libra 管理的 JSON-RPC NDJSON
+bridge 已就绪；由 `@libra-tools/dsh-bundle` 启动这个受 Libra 管理的 JSON-RPC NDJSON
 bridge（TypeScript 侧 `REL-TS-01`）：
 
 ```yaml
 - id: libra
-  name: '@libra/dsh-bundle'
+  name: '@libra-tools/dsh-bundle'
   config:
     bridge:
       protocol: jsonrpc-ndjson
@@ -318,7 +319,7 @@ profile，而不是假设 Harness 已经内置 Libra 专用 profile。
 | --- | --- |
 | `web` | status、diff、history、checkpoint、session capture |
 | `headless` | status、diff、checkpoint、evidence capture；结束时输出可审计结果摘要 |
-| 自定义 `libra` profile | 完整的 `@libra/dsh-bundle`，包括 session bridge、workspace lease 和 UI/context 适配 |
+| 自定义 `libra` profile | 完整的 `@libra-tools/dsh-bundle`，包括 session bridge、workspace lease 和 UI/context 适配 |
 | Code Mode（`ctx.codeRuntime`，与 profile 正交） | 提供 `libra` SDK facade，允许在程序中组合查询和批量记录 |
 
 历史和决策上下文必须按需注入，不能将完整 transcript 每轮塞入 system prompt。所有进入模型的 Libra context 都必须通过 Harness 的 `agent.inject()` 或正式 prompt section 写入 session log，并受 token 预算和 compaction 约束。

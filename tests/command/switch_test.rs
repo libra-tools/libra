@@ -63,7 +63,7 @@ fn test_switch_create_agent_traces_branch_is_blocked() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_switch_existing_agent_traces_branch_is_blocked() {
     let repo = create_committed_repo_via_cli();
     {
@@ -185,7 +185,7 @@ fn test_switch_orphan_keeps_head_unborn_until_first_commit() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_switch_json_track_output_stays_clean() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -223,7 +223,7 @@ async fn test_switch_json_track_output_stays_clean() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_switch_track_human_output_keeps_tracking_message() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -256,7 +256,7 @@ async fn test_switch_track_human_output_keeps_tracking_message() {
 /// Default-on DWIM guess: `libra switch <name>` with no local branch but a
 /// unique remote-tracking branch creates a local tracking branch and switches.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_switch_guess_creates_tracking_branch() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -296,7 +296,7 @@ async fn test_switch_guess_creates_tracking_branch() {
 /// `--no-guess` disables the DWIM behaviour: a remote-only name is rejected as
 /// not-found instead of being auto-created.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_switch_no_guess_rejects_remote_only_branch() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -336,7 +336,7 @@ async fn test_switch_no_guess_rejects_remote_only_branch() {
 /// `checkout.guess=false` disables guessing when neither flag is supplied; an
 /// explicit `--guess` still overrides the config back on.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_switch_guess_config_disables_then_flag_overrides() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -377,7 +377,7 @@ async fn test_switch_guess_config_disables_then_flag_overrides() {
 /// When several remotes carry the guessed name the switch is blocked as
 /// ambiguous, but `checkout.defaultRemote` breaks the tie.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_switch_guess_ambiguous_resolved_by_default_remote() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -596,7 +596,7 @@ async fn test_switch_function() {
     }
 }
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests the core functionality of the switch command module.
 /// Validates branch switching operations and working directory status checks.
 async fn test_parts_of_switch_module_function() {
@@ -666,7 +666,7 @@ fn test_switch_create_branch_from_valid_commit() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_switch_track_sets_upstream() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -735,7 +735,7 @@ async fn test_switch_track_sets_upstream() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests basic HEAD detachment capabilities with simple reference paths.
 /// Validates relative references (HEAD^, HEAD~), numeric references (HEAD^1, HEAD~1),
 /// and complex reference combinations (HEAD^^^, HEAD~~~, HEAD^~^~).
@@ -936,7 +936,7 @@ async fn create_commit_tree() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 // Comprehensive tests for HEAD reference navigation using Git-style paths
 // Validates support for ^ (parent selection), ~ (ancestry traversal), and their combinations
 async fn test_detach_head_extra() {
@@ -1036,7 +1036,6 @@ async fn switch_to_branch(branch_test: String) {
 }
 
 #[test]
-#[serial]
 fn test_switch_force_discards_local_changes() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();

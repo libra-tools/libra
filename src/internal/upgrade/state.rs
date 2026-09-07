@@ -10,28 +10,36 @@
 //!   revision — a lower revision is always rejected, an equal revision is
 //!   accepted only byte-identical (digest match), so a pre-revocation
 //!   envelope cannot be replayed after a revocation was seen;
+//! - `generation_floor`: highest accepted manifest `min_key_generation` — a
+//!   later manifest can neither lower that policy floor nor use a signer
+//!   generation below it;
 //! - `trusted_time_floor`: monotone time floor advanced ONLY in the same
 //!   atomic write as a fully validated acceptance (§A.6: invalid envelopes
 //!   or bogus future `Date` headers must never poison time state);
 //! - success cooldown and failure backoff for online-check throttling.
 //!
 //! All decision logic here is PURE (explicit clock inputs); the durable
-//! read/write is a small serialization layer using the same atomic-write +
-//! `0600` discipline as the settings file. Locked, directory-fd-relative
-//! access arrives with the install-lock slice (§A.5).
+//! read/write is a small serialization layer using the validated install
+//! directory's fd-relative atomic-write + `0600` operations (§A.5).
 
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::manifest::{ReleaseVersion, VerifiedManifest};
+use super::{
+    lock::{InstallDir, InstallDirError},
+    manifest::{ReleaseVersion, VerifiedManifest},
+};
 
 /// State file name inside the install directory (regular file, `0600`,
 /// no-follow discipline enforced by the locked accessors of §A.5).
 pub const STATE_FILE_NAME: &str = ".libra-upgrade-state.json";
+
+/// Monotone acceptance-floors side file. Written under its own micro-lock
+/// (never the main upgrade lock) so an accepted manifest's floors can be
+/// made durable even while an install holds the main lock; `read_state`
+/// folds it into every read.
+pub const FLOORS_FILE_NAME: &str = ".libra-upgrade-floors.json";
 
 /// Grace applied around the HTTPS `Date` and the local clock (§A.6: 300 s).
 pub const TIME_SLACK_SECONDS: i64 = 300;
@@ -61,7 +69,7 @@ pub struct ArtifactIdentity {
 }
 
 /// Durable anti-rollback / control / throttle state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradeState {
     #[serde(default)]
     pub schema_version: u32,
@@ -77,6 +85,11 @@ pub struct UpgradeState {
     /// Hex sha256 of the payload accepted at `max_control_revision`.
     #[serde(default)]
     pub control_envelope_digest: Option<String>,
+    /// Highest accepted manifest `min_key_generation`. This is monotone and
+    /// defaults to zero when reading a state file written before this field
+    /// existed, preserving the prior fail-closed key-policy baseline.
+    #[serde(default)]
+    pub generation_floor: u32,
     /// Monotone trusted time floor (unix seconds).
     #[serde(default)]
     pub trusted_time_floor: i64,
@@ -102,6 +115,18 @@ pub enum StateRejection {
          different payload (digest mismatch)"
     )]
     ControlRevisionForked { revision: u64 },
+    #[error(
+        "manifest min_key_generation {offered} is below the persisted generation floor {floor}"
+    )]
+    GenerationFloorRollback { offered: u32, floor: u32 },
+    #[error(
+        "manifest signer key '{key_id}' generation {offered} is below the persisted generation floor {floor}"
+    )]
+    SignerGenerationBelowFloor {
+        key_id: String,
+        offered: u32,
+        floor: u32,
+    },
     #[error("manifest version {offered} is below the accepted {accepted}")]
     VersionRollback {
         offered: ReleaseVersion,
@@ -162,11 +187,22 @@ pub fn evaluate_manifest(
         });
     }
     if manifest.control_revision == state.max_control_revision
-        && state.max_control_revision > 0
+        && state.control_envelope_digest.is_some()
         && state.control_envelope_digest.as_deref() != Some(digest_hex.as_str())
     {
         return Err(StateRejection::ControlRevisionForked {
             revision: manifest.control_revision,
+        });
+    }
+
+    // A signed manifest can raise the key-generation policy, but can never
+    // lower the policy that a previous accepted manifest established. The
+    // flow filters candidate signing keys against this same persisted floor
+    // before calling this function.
+    if manifest.min_key_generation < state.generation_floor {
+        return Err(StateRejection::GenerationFloorRollback {
+            offered: manifest.min_key_generation,
+            floor: state.generation_floor,
         });
     }
 
@@ -216,6 +252,7 @@ pub fn evaluate_manifest(
     // advance in ONE durable write (performed by the caller under the lock).
     let mut new_state = state.clone();
     new_state.schema_version = 1;
+    new_state.generation_floor = state.generation_floor.max(manifest.min_key_generation);
     new_state.trusted_time_floor = state
         .trusted_time_floor
         .max(manifest.published_at)
@@ -281,6 +318,67 @@ pub fn local_clock_permits_cached_install(state: &UpgradeState, local_now: i64) 
     local_now >= state.trusted_time_floor - TIME_SLACK_SECONDS
 }
 
+/// Merge every monotone, verification-derived anti-rollback advance from an
+/// `accepted` snapshot onto `current`, without touching cooldown/backoff.
+///
+/// Used when the install of a cryptographically ACCEPTED manifest fails
+/// (pre-probe failure, post-probe rollback, aborted fresh install): the
+/// manifest was verified even though its artifact never became the target,
+/// so the generation floor, trusted time floor, control-revision ceiling and
+/// max-seen identity must survive the failure — otherwise a later manifest
+/// signed by a leaked lower-generation key would be accepted again.
+pub fn merge_acceptance_floors(current: &UpgradeState, accepted: &UpgradeState) -> UpgradeState {
+    let mut state = current.clone();
+    state.schema_version = 1;
+    state.generation_floor = state.generation_floor.max(accepted.generation_floor);
+    state.trusted_time_floor = state.trusted_time_floor.max(accepted.trusted_time_floor);
+    if accepted.max_control_revision > state.max_control_revision {
+        state.max_control_revision = accepted.max_control_revision;
+        state.control_envelope_digest = accepted.control_envelope_digest.clone();
+    } else if accepted.max_control_revision == state.max_control_revision
+        && state.control_envelope_digest.is_none()
+        && accepted.control_envelope_digest.is_some()
+    {
+        // Revision-equal (notably revision 0, which is also the default):
+        // a recorded digest must survive the merge, otherwise a different
+        // same-revision payload would bypass the fork check.
+        state.control_envelope_digest = accepted.control_envelope_digest.clone();
+    }
+    let current_max = state.max_seen.as_deref().and_then(ReleaseVersion::parse);
+    let accepted_max = accepted.max_seen.as_deref().and_then(ReleaseVersion::parse);
+    match (current_max, accepted_max) {
+        (None, Some(_)) => {
+            state.max_seen = accepted.max_seen.clone();
+            for (platform, identity) in &accepted.artifact_identity {
+                state
+                    .artifact_identity
+                    .insert(platform.clone(), identity.clone());
+            }
+        }
+        (Some(current_version), Some(accepted_version)) => {
+            if accepted_version > current_version {
+                state.max_seen = accepted.max_seen.clone();
+                for (platform, identity) in &accepted.artifact_identity {
+                    state
+                        .artifact_identity
+                        .insert(platform.clone(), identity.clone());
+                }
+            } else if accepted_version == current_version {
+                // Same version: fill identities the current state is missing,
+                // but never replace ones it already pinned.
+                for (platform, identity) in &accepted.artifact_identity {
+                    state
+                        .artifact_identity
+                        .entry(platform.clone())
+                        .or_insert_with(|| identity.clone());
+                }
+            }
+        }
+        (_, None) => {}
+    }
+    state
+}
+
 /// Next failure backoff (§A.6: doubling, capped at 1 h, using the same
 /// trusted upper bound for sanity). Returns the state to persist.
 pub fn register_failure_backoff(state: &UpgradeState, local_now: i64) -> UpgradeState {
@@ -313,7 +411,7 @@ pub enum StateStoreError {
     Unreadable {
         path: PathBuf,
         #[source]
-        source: io::Error,
+        source: InstallDirError,
     },
     /// Corrupt anti-rollback state is FATAL for the upgrade cycle: silently
     /// resetting it would erase the rollback/replay protections, so the
@@ -327,51 +425,308 @@ pub enum StateStoreError {
     WriteFailed {
         path: PathBuf,
         #[source]
-        source: io::Error,
+        source: InstallDirError,
     },
 }
 
-/// Read the state file inside `install_dir`. Missing file → default state.
-/// Corrupt file → error (fail closed; see [`StateStoreError::Corrupt`]).
-pub fn read_state(install_dir: &Path) -> Result<UpgradeState, StateStoreError> {
-    let path = install_dir.join(STATE_FILE_NAME);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(UpgradeState::default()),
-        Err(err) => return Err(StateStoreError::Unreadable { path, source: err }),
+/// Read the state file inside `install_dir` and fold in the monotone floors
+/// side file. Missing files → default state. A corrupt main OR side file →
+/// error (fail closed; see [`StateStoreError::Corrupt`]).
+pub fn read_state(install_dir: &InstallDir) -> Result<UpgradeState, StateStoreError> {
+    let path = install_dir.path().join(STATE_FILE_NAME);
+    let Some(bytes) =
+        install_dir
+            .read_file(STATE_FILE_NAME)
+            .map_err(|source| StateStoreError::Unreadable {
+                path: path.clone(),
+                source,
+            })?
+    else {
+        let base = UpgradeState::default();
+        return Ok(match read_floors_file(install_dir)? {
+            Some(floors) => merge_acceptance_floors(&base, &floors),
+            None => base,
+        });
     };
-    serde_json::from_slice(&bytes).map_err(|err| StateStoreError::Corrupt {
-        path,
-        detail: err.to_string(),
+    let base: UpgradeState =
+        serde_json::from_slice(&bytes).map_err(|err| StateStoreError::Corrupt {
+            path,
+            detail: err.to_string(),
+        })?;
+    Ok(match read_floors_file(install_dir)? {
+        Some(floors) => merge_acceptance_floors(&base, &floors),
+        None => base,
     })
+}
+
+/// Raw side-file read; `Ok(None)` when it does not exist.
+fn read_floors_file(install_dir: &InstallDir) -> Result<Option<UpgradeState>, StateStoreError> {
+    let path = install_dir.path().join(FLOORS_FILE_NAME);
+    let Some(bytes) =
+        install_dir
+            .read_file(FLOORS_FILE_NAME)
+            .map_err(|source| StateStoreError::Unreadable {
+                path: path.clone(),
+                source,
+            })?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|err| StateStoreError::Corrupt {
+            path,
+            detail: err.to_string(),
+        })
+}
+
+/// Per-leg bounded wait for the floors micro-lock (two legs total). Sized
+/// against the fence's read+journal window; test builds shrink it so the
+/// main-lock fallback is exercisable without a 30-second test.
+#[cfg(not(test))]
+const FLOORS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(test)]
+const FLOORS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Durably record an ACCEPTED manifest's monotone floors (§A.6/§A.7
+/// anti-rollback) through TWO independent channels:
+///
+/// 1. The floors side file, under its own micro-lock (holders: one atomic
+///    read-merge-write, or the txn commit fence's read + journal write).
+/// 2. If the micro-lock stays held past both bounded waits, a fallback
+///    merge into the MAIN state file under a bounded MAIN-lock try — a
+///    stalled micro-lock holder that is not an installer does not hold the
+///    main lock, so the floors land anyway.
+///
+/// Only when BOTH locks are wedged (a stall on this very filesystem, where
+/// any durable-write protocol would hit the same fsync wall) does this
+/// return an error — and callers must be LOUD about it: these floors are
+/// exactly the state that rejects a replayed older-but-valid signed
+/// manifest. The detached worker still lands the side-file merge if the
+/// holder resumes. `read_state` folds the side file into every view.
+pub fn record_acceptance_floors(
+    install_dir: &InstallDir,
+    accepted: &UpgradeState,
+) -> Result<(), StateStoreError> {
+    // Fast path: a few non-blocking probes. Holders only ever perform one
+    // atomic read-merge-write, so this wins almost always.
+    const FAST_ATTEMPTS: u32 = 4;
+    let path = install_dir.path().join(FLOORS_FILE_NAME);
+    for attempt in 0..FAST_ATTEMPTS {
+        let lock = install_dir
+            .try_lock_floors()
+            .map_err(|source| StateStoreError::Unreadable {
+                path: path.clone(),
+                source,
+            })?;
+        if let Some(_lock) = lock {
+            return merge_floors_locked_rmw(install_dir, accepted);
+        }
+        if attempt + 1 < FAST_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    // Contended: take the KERNEL-QUEUED blocking lock on a worker thread —
+    // unlike repeated probes it cannot be starved by a stream of short-lived
+    // holders — and wait a bounded moment for it, so an externally-stalled
+    // holder (SIGSTOP mid-write) can never wedge a user command. Every write
+    // stays lock-serialized (never unlocked), so the persisted floors can
+    // never regress. On timeout this returns an error (the caller treats it
+    // as non-fatal and the next check re-derives the floors); if the stalled
+    // holder later resumes, the detached worker still lands the merge under
+    // the lock — a safe, monotone bonus, not the guarantee.
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<(), StateStoreError>>(1);
+    let dir_path = install_dir.path().to_path_buf();
+    let accepted_snapshot = accepted.clone();
+    let spawned = std::thread::Builder::new()
+        .name("libra-upgrade-floors".into())
+        .spawn(move || {
+            let merge = || -> Result<(), StateStoreError> {
+                let dir = InstallDir::open_validated(&dir_path).map_err(|source| {
+                    StateStoreError::Unreadable {
+                        path: dir_path.join(FLOORS_FILE_NAME),
+                        source,
+                    }
+                })?;
+                let _lock =
+                    dir.lock_floors_blocking()
+                        .map_err(|source| StateStoreError::Unreadable {
+                            path: dir.path().join(FLOORS_FILE_NAME),
+                            source,
+                        })?;
+                merge_floors_locked_rmw(&dir, &accepted_snapshot)
+            };
+            let _ = sender.send(merge());
+        });
+    if spawned.is_err() {
+        // Thread creation failed (resource exhaustion): fail soft, never
+        // panic in the user's command path.
+        return Err(StateStoreError::WriteFailed {
+            path,
+            source: InstallDirError::Io {
+                name: FLOORS_FILE_NAME.to_string(),
+                detail: "could not spawn the floors-merge worker".into(),
+            },
+        });
+    }
+    // 15 s + one 15 s second chance: sized against the commit fence
+    // (txn.rs), which holds the floors lock only across ONE state read plus
+    // ONE journal write + fsync (the commit tail runs unfenced under the
+    // PostProbePassed recovery contract).
+    let outcome = match receiver.recv_timeout(FLOORS_LOCK_WAIT) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => receiver.recv_timeout(FLOORS_LOCK_WAIT),
+        other => other,
+    };
+    match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            // INDEPENDENT fallback channel: merge into the MAIN state file
+            // under the MAIN upgrade lock instead. A stalled floors-lock
+            // holder that is not an installer does not hold the main lock,
+            // so this lands the floors anyway. If BOTH locks are wedged the
+            // stall is on this very filesystem — where no durable-write
+            // protocol can promise persistence either (any spill/pending
+            // file needs the same fsync) — and the caller must FAIL LOUDLY
+            // rather than pretend: the floors are anti-replay state, and a
+            // silently dropped floor would let an older still-valid signed
+            // manifest be accepted again.
+            match install_dir.try_lock() {
+                Ok(Some(_main_guard)) => {
+                    let current = read_state(install_dir)?;
+                    let merged = merge_acceptance_floors(&current, accepted);
+                    if merged != current {
+                        write_state(install_dir, &merged)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(StateStoreError::WriteFailed {
+                    path,
+                    source: InstallDirError::Io {
+                        name: FLOORS_FILE_NAME.to_string(),
+                        detail: "floors micro-lock stayed held past the bounded wait and the \
+                                 main-lock fallback was unavailable; this attempt's floors were \
+                                 not persisted"
+                            .into(),
+                    },
+                }),
+            }
+        }
+    }
+}
+
+/// One locked read-merge-write of the floors side file. The caller (or the
+/// worker thread) already holds the floors micro-lock.
+fn merge_floors_locked_rmw(
+    install_dir: &InstallDir,
+    accepted: &UpgradeState,
+) -> Result<(), StateStoreError> {
+    let current = read_floors_file(install_dir)?.unwrap_or_default();
+    let merged = merge_acceptance_floors(&current, accepted);
+    if merged == current {
+        return Ok(());
+    }
+    write_floors_file(install_dir, &merged)
+}
+
+fn write_floors_file(
+    install_dir: &InstallDir,
+    floors: &UpgradeState,
+) -> Result<(), StateStoreError> {
+    let path = install_dir.path().join(FLOORS_FILE_NAME);
+    let mut bytes = serde_json::to_vec_pretty(floors).map_err(|err| StateStoreError::Corrupt {
+        path: path.clone(),
+        detail: format!("cannot serialize floors: {err}"),
+    })?;
+    bytes.push(b'\n');
+    install_dir
+        .write_file_atomic(FLOORS_FILE_NAME, &bytes, 0o600)
+        .map_err(|source| StateStoreError::WriteFailed { path, source })
 }
 
 /// Atomically persist `state` inside `install_dir` (`0600` on Unix). The
 /// §A.5 lock and directory-fd discipline wrap this call.
-pub fn write_state(install_dir: &Path, state: &UpgradeState) -> Result<(), StateStoreError> {
-    let path = install_dir.join(STATE_FILE_NAME);
-    let write_failed = |err: io::Error| StateStoreError::WriteFailed {
+pub fn write_state(install_dir: &InstallDir, state: &UpgradeState) -> Result<(), StateStoreError> {
+    let path = install_dir.path().join(STATE_FILE_NAME);
+    let write_failed = |source: InstallDirError| StateStoreError::WriteFailed {
         path: path.clone(),
-        source: err,
+        source,
     };
     let mut bytes = serde_json::to_vec_pretty(state).map_err(|err| StateStoreError::Corrupt {
         path: path.clone(),
         detail: format!("cannot serialize state: {err}"),
     })?;
     bytes.push(b'\n');
-    crate::utils::atomic_write::write_atomic(&path, &bytes, true).map_err(write_failed)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(write_failed)?;
-    }
+    install_dir
+        .write_file_atomic(STATE_FILE_NAME, &bytes, 0o600)
+        .map_err(write_failed)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use crate::internal::upgrade::{manifest::VerifiedArtifact, platform::Platform};
+
+    /// With the floors micro-lock wedged past both bounded waits, the
+    /// accepted floors land through the INDEPENDENT main-lock fallback —
+    /// the anti-replay state survives a stalled side-file holder.
+    #[cfg(unix)]
+    #[test]
+    fn floors_fallback_lands_in_main_state_when_the_micro_lock_is_wedged() {
+        let temp = tempfile::tempdir().expect("test fixture operation should succeed");
+        let dir = validated_dir(&temp);
+        let _wedge = dir
+            .try_lock_floors()
+            .expect("test fixture operation should succeed")
+            .expect("floors lock free in a fresh dir");
+        let accepted = UpgradeState {
+            max_control_revision: 42,
+            generation_floor: 3,
+            ..UpgradeState::default()
+        };
+        record_acceptance_floors(&dir, &accepted)
+            .expect("fallback via the main lock must persist the floors");
+        let state = read_state(&dir).expect("test fixture operation should succeed");
+        assert_eq!(state.max_control_revision, 42);
+        assert_eq!(state.generation_floor, 3);
+    }
+
+    /// Only when BOTH locks are wedged does persistence fail — and it fails
+    /// with an error, never silently.
+    #[cfg(unix)]
+    #[test]
+    fn floors_persistence_errors_when_both_locks_are_wedged() {
+        let temp = tempfile::tempdir().expect("test fixture operation should succeed");
+        let dir = validated_dir(&temp);
+        let _floors = dir
+            .try_lock_floors()
+            .expect("test fixture operation should succeed")
+            .expect("floors lock free");
+        let _main = dir
+            .try_lock()
+            .expect("test fixture operation should succeed")
+            .expect("main lock free");
+        let accepted = UpgradeState {
+            max_control_revision: 7,
+            ..UpgradeState::default()
+        };
+        assert!(record_acceptance_floors(&dir, &accepted).is_err());
+    }
+
+    #[cfg(unix)]
+    fn validated_dir(temp: &tempfile::TempDir) -> InstallDir {
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("test fixture operation should succeed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test fixture operation should succeed");
+        InstallDir::open_validated(&path).expect("test fixture operation should succeed")
+    }
 
     fn manifest(version: &str, control: u64, digest_byte: u8) -> VerifiedManifest {
         let published_at = 1_000_000;
@@ -411,6 +766,7 @@ mod tests {
         let s = &accepted.new_state;
         assert_eq!(s.max_seen.as_deref(), Some("1.2.3"));
         assert_eq!(s.max_control_revision, 5);
+        assert_eq!(s.generation_floor, 1);
         assert_eq!(
             s.control_envelope_digest.as_deref(),
             Some(hex::encode([7u8; 32]).as_str())
@@ -455,6 +811,211 @@ mod tests {
         // Same revision, identical payload → idempotent acceptance.
         assert!(
             evaluate_manifest(&state, &manifest("1.2.3", 5, 7), Some(GOOD_DATE), GOOD_DATE).is_ok()
+        );
+    }
+
+    #[test]
+    fn revision_zero_with_an_accepted_digest_still_rejects_a_fork() {
+        let state = UpgradeState {
+            control_envelope_digest: Some(hex::encode([7u8; 32])),
+            ..UpgradeState::default()
+        };
+        assert_eq!(
+            evaluate_manifest(&state, &manifest("1.2.3", 0, 9), Some(GOOD_DATE), GOOD_DATE)
+                .unwrap_err(),
+            StateRejection::ControlRevisionForked { revision: 0 }
+        );
+    }
+
+    #[test]
+    fn merge_acceptance_floors_advances_monotone_fields_only() {
+        let mut current = UpgradeState {
+            generation_floor: 1,
+            trusted_time_floor: 500,
+            max_control_revision: 4,
+            control_envelope_digest: Some("old-digest".into()),
+            max_seen: Some("1.5.0".into()),
+            backoff_not_before: Some(10_000),
+            backoff_seconds: 120,
+            next_success_check_not_before: Some(20_000),
+            ..UpgradeState::default()
+        };
+        current.artifact_identity.insert(
+            "linux-amd64".into(),
+            ArtifactIdentity {
+                sha256: "b".repeat(64),
+                size: 1,
+            },
+        );
+        let mut accepted = UpgradeState {
+            generation_floor: 3,
+            trusted_time_floor: 900,
+            max_control_revision: 6,
+            control_envelope_digest: Some("new-digest".into()),
+            max_seen: Some("2.0.0".into()),
+            ..UpgradeState::default()
+        };
+        accepted.artifact_identity.insert(
+            "linux-amd64".into(),
+            ArtifactIdentity {
+                sha256: "c".repeat(64),
+                size: 2,
+            },
+        );
+
+        let merged = merge_acceptance_floors(&current, &accepted);
+        assert_eq!(merged.generation_floor, 3);
+        assert_eq!(merged.trusted_time_floor, 900);
+        assert_eq!(merged.max_control_revision, 6);
+        assert_eq!(
+            merged.control_envelope_digest.as_deref(),
+            Some("new-digest")
+        );
+        assert_eq!(merged.max_seen.as_deref(), Some("2.0.0"));
+        assert_eq!(merged.artifact_identity["linux-amd64"].size, 2);
+        // Cooldown/backoff stay exactly as `current` had them.
+        assert_eq!(merged.backoff_not_before, Some(10_000));
+        assert_eq!(merged.backoff_seconds, 120);
+        assert_eq!(merged.next_success_check_not_before, Some(20_000));
+
+        // The reverse direction must not regress anything.
+        let regressed = merge_acceptance_floors(&accepted, &current);
+        assert_eq!(regressed.generation_floor, 3);
+        assert_eq!(regressed.trusted_time_floor, 900);
+        assert_eq!(regressed.max_control_revision, 6);
+        assert_eq!(
+            regressed.control_envelope_digest.as_deref(),
+            Some("new-digest")
+        );
+        assert_eq!(regressed.max_seen.as_deref(), Some("2.0.0"));
+        assert_eq!(regressed.artifact_identity["linux-amd64"].size, 2);
+    }
+
+    #[test]
+    fn merge_acceptance_floors_keeps_equal_revision_digest_and_unions_identities() {
+        // Revision 0 (the default) with a recorded digest must survive a merge
+        // onto a digest-less state, or a different revision-0 payload would
+        // bypass the fork check.
+        let accepted = UpgradeState {
+            control_envelope_digest: Some("rev0-digest".into()),
+            ..UpgradeState::default()
+        };
+        let merged = merge_acceptance_floors(&UpgradeState::default(), &accepted);
+        assert_eq!(merged.max_control_revision, 0);
+        assert_eq!(
+            merged.control_envelope_digest.as_deref(),
+            Some("rev0-digest")
+        );
+
+        // An existing digest at the same revision is never replaced.
+        let current = UpgradeState {
+            control_envelope_digest: Some("kept".into()),
+            ..UpgradeState::default()
+        };
+        assert_eq!(
+            merge_acceptance_floors(&current, &accepted)
+                .control_envelope_digest
+                .as_deref(),
+            Some("kept")
+        );
+
+        // Same max_seen version: missing identities are filled, pinned ones
+        // are preserved.
+        let mut current = UpgradeState {
+            max_seen: Some("2.0.0".into()),
+            ..UpgradeState::default()
+        };
+        current.artifact_identity.insert(
+            "linux-amd64".into(),
+            ArtifactIdentity {
+                sha256: "b".repeat(64),
+                size: 1,
+            },
+        );
+        let mut accepted = UpgradeState {
+            max_seen: Some("2.0.0".into()),
+            ..UpgradeState::default()
+        };
+        accepted.artifact_identity.insert(
+            "linux-amd64".into(),
+            ArtifactIdentity {
+                sha256: "c".repeat(64),
+                size: 9,
+            },
+        );
+        accepted.artifact_identity.insert(
+            "darwin-arm64".into(),
+            ArtifactIdentity {
+                sha256: "d".repeat(64),
+                size: 7,
+            },
+        );
+        let merged = merge_acceptance_floors(&current, &accepted);
+        assert_eq!(merged.artifact_identity["linux-amd64"].size, 1);
+        assert_eq!(merged.artifact_identity["darwin-arm64"].size, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_floor_recorders_serialize_and_never_regress() {
+        let temp = tempfile::tempdir().expect("test directory must be created");
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("test directory must canonicalize");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test directory permissions must be set");
+
+        // Many writers racing with mixed floors: every write is a
+        // lock-serialized read-merge-write, so the final persisted floor is
+        // exactly the maximum ever accepted — no lost update, no regression.
+        let mut handles = Vec::new();
+        for floor in [5u32, 7, 3, 6, 2, 7, 4, 1] {
+            let dir_path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let dir = InstallDir::open_validated(&dir_path).expect("thread dir must validate");
+                let accepted = UpgradeState {
+                    generation_floor: floor,
+                    ..UpgradeState::default()
+                };
+                record_acceptance_floors(&dir, &accepted)
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("recorder thread must not panic")
+                .expect("uncontended-scale recording must succeed");
+        }
+        let dir = InstallDir::open_validated(&path).expect("dir must validate");
+        assert_eq!(
+            read_state(&dir)
+                .expect("state must be readable")
+                .generation_floor,
+            7
+        );
+    }
+
+    #[test]
+    fn generation_floor_is_monotone_and_legacy_state_defaults_to_zero() {
+        let legacy: UpgradeState = serde_json::from_str(r#"{"schema_version":1}"#)
+            .expect("legacy state fixture must deserialize");
+        assert_eq!(legacy.generation_floor, 0);
+
+        let mut raised = manifest("1.2.3", 5, 7);
+        raised.min_key_generation = 2;
+        let state = evaluate_manifest(&legacy, &raised, Some(GOOD_DATE), GOOD_DATE)
+            .expect("raised generation fixture must be accepted")
+            .new_state;
+        assert_eq!(state.generation_floor, 2);
+
+        let lower = manifest("1.2.4", 6, 8);
+        assert_eq!(
+            evaluate_manifest(&state, &lower, Some(GOOD_DATE), GOOD_DATE).unwrap_err(),
+            StateRejection::GenerationFloorRollback {
+                offered: 1,
+                floor: 2,
+            }
         );
     }
 
@@ -595,37 +1156,51 @@ mod tests {
         assert!(!backoff_defers(&damaged, 1_000));
     }
 
+    #[cfg(unix)]
     #[test]
     fn state_store_roundtrip_missing_and_corrupt() {
-        let dir = tempfile::tempdir().expect("test fixture operation should succeed");
+        let temp = tempfile::tempdir().expect("test fixture operation should succeed");
+        let dir = validated_dir(&temp);
         // Missing → default.
-        let state = read_state(dir.path()).expect("test fixture operation should succeed");
+        let state = read_state(&dir).expect("test fixture operation should succeed");
         assert_eq!(state.max_control_revision, 0);
+        assert_eq!(state.generation_floor, 0);
         // Roundtrip.
         let m = manifest("1.2.3", 5, 7);
         let accepted = evaluate_manifest(&state, &m, Some(GOOD_DATE), GOOD_DATE)
             .expect("test fixture operation should succeed");
-        write_state(dir.path(), &accepted.new_state)
-            .expect("test fixture operation should succeed");
-        let reread = read_state(dir.path()).expect("test fixture operation should succeed");
+        write_state(&dir, &accepted.new_state).expect("test fixture operation should succeed");
+        let reread = read_state(&dir).expect("test fixture operation should succeed");
         assert_eq!(reread.max_control_revision, 5);
+        assert_eq!(reread.generation_floor, 1);
         assert_eq!(reread.max_seen.as_deref(), Some("1.2.3"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dir.path().join(STATE_FILE_NAME))
-                .expect("test fixture operation should succeed")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
+        assert!(matches!(
+            dir.stat_entry(STATE_FILE_NAME),
+            Ok(Some(super::super::lock::EntryKind::Regular {
+                mode: 0o600,
+                ..
+            }))
+        ));
         // Corrupt → hard error, never a silent reset.
-        fs::write(dir.path().join(STATE_FILE_NAME), b"{ nope")
+        dir.write_file_atomic(STATE_FILE_NAME, b"{ nope", 0o600)
             .expect("test fixture operation should succeed");
         assert!(matches!(
-            read_state(dir.path()),
+            read_state(&dir),
             Err(StateStoreError::Corrupt { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_refuses_a_symlinked_state_file() {
+        let temp = tempfile::tempdir().expect("test fixture operation should succeed");
+        let dir = validated_dir(&temp);
+        std::os::unix::fs::symlink("/etc/passwd", temp.path().join(STATE_FILE_NAME))
+            .expect("test fixture operation should succeed");
+
+        assert!(matches!(
+            read_state(&dir),
+            Err(StateStoreError::Unreadable { .. })
         ));
     }
 

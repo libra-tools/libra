@@ -53,7 +53,7 @@ fn run_generation_case(case_name: &str) -> Result<()> {
 macro_rules! generation_case {
     ($name:ident) => {
         #[test]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_generation_case(stringify!($name))
         }

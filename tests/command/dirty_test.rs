@@ -312,7 +312,7 @@ fn json_check_dirty_stale_fallback_warning() {
 /// stolen with the structured `dirty_cache_lock_stolen` warning — JSON rides
 /// `data.warnings[]` with a clean stderr, and 9≻1 arbitration applies.
 #[test]
-#[serial]
+#[serial(cwd)]
 fn scan_lock_stolen_warning() {
     let repo = dirty_repo();
     let p = repo.path();
@@ -402,7 +402,7 @@ fn scan_lock_stolen_warning() {
 /// zero stderr — even when a stolen-lock warning is pending (EPIPE maps to a
 /// silent exit, so neither the renderer nor the wrapper fallback may write).
 #[test]
-#[serial]
+#[serial(cwd)]
 fn scan_stale_lock_broken_pipe_stays_silent() {
     use std::process::Stdio;
     let repo = dirty_repo();
@@ -454,7 +454,7 @@ fn scan_stale_lock_broken_pipe_stays_silent() {
 /// lands inside the widened read→re-verify window, and the fallback carries
 /// `dirty_cache_concurrent_invalidate` in JSON warnings with clean stderr.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn json_check_dirty_concurrent_invalidate_warning() {
     use std::process::Stdio;
     let repo = dirty_repo();
@@ -489,7 +489,6 @@ fn json_check_dirty_concurrent_invalidate_warning() {
 /// `--cached` sees only its own scope, and a linked scan never invalidates
 /// or prunes the main worktree's snapshot.
 #[test]
-#[serial]
 fn linked_dirty_cache_rows_and_meta_isolated() {
     let repo = dirty_repo();
     let main = repo.path();
@@ -551,7 +550,6 @@ fn linked_dirty_cache_rows_and_meta_isolated() {
 /// W1 §C.4.1.1: `libra dirty <path>` (manual mark) in a linked worktree
 /// writes only that scope's rows — the main worktree's list stays clean.
 #[test]
-#[serial]
 fn linked_dirty_mark_is_scoped() {
     let repo = dirty_repo();
     let main = repo.path();

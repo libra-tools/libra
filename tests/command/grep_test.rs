@@ -60,7 +60,7 @@ async fn add_and_commit(message: &str, pathspec: Vec<String>) {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_working_tree_searches_only_tracked_files() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -96,7 +96,7 @@ async fn test_grep_working_tree_searches_only_tracked_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_untracked_searches_untracked_non_ignored_files() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -150,7 +150,6 @@ async fn test_grep_untracked_searches_untracked_non_ignored_files() {
 }
 
 #[test]
-#[serial]
 fn test_grep_no_index_searches_filesystem_without_repository() {
     // `--no-index` works with no `.libra` present and greps the filesystem recursively.
     let dir = tempdir().expect("failed to create temp dir");
@@ -198,7 +197,7 @@ fn test_grep_no_index_searches_filesystem_without_repository() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_no_index_searches_ignored_files_inside_repo() {
     // Inside a repository, `--no-index` searches every file, including ignored ones
     // (it does not honor ignore rules), unlike a normal grep.
@@ -233,7 +232,7 @@ async fn test_grep_no_index_searches_ignored_files_inside_repo() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_after_context_marks_context_lines() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -266,7 +265,7 @@ async fn test_grep_after_context_marks_context_lines() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_perl_regexp_is_rejected() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -285,7 +284,7 @@ async fn test_grep_perl_regexp_is_rejected() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_tree_head_searches_committed_content() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -320,7 +319,7 @@ async fn test_grep_tree_head_searches_committed_content() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_tree_accepts_branch_revisions() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -391,7 +390,7 @@ async fn test_grep_tree_accepts_branch_revisions() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_word_regexp_preserves_regex_semantics() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -415,7 +414,7 @@ async fn test_grep_word_regexp_preserves_regex_semantics() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_tree_reports_invalid_revision() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -439,7 +438,7 @@ async fn test_grep_tree_reports_invalid_revision() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_byte_offset_reports_zero_based_match_offset() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -462,7 +461,7 @@ async fn test_grep_byte_offset_reports_zero_based_match_offset() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_tree_skips_large_blob_files() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -484,7 +483,7 @@ async fn test_grep_tree_skips_large_blob_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_reports_total_files_as_number_of_matched_files() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -512,7 +511,7 @@ async fn test_grep_reports_total_files_as_number_of_matched_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_count_reports_matching_lines_per_file() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -538,7 +537,7 @@ async fn test_grep_count_reports_matching_lines_per_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_files_without_matches_uses_plural_json_field() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -568,7 +567,7 @@ async fn test_grep_files_without_matches_uses_plural_json_field() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_multiple_regexp_patterns_match_any() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -591,7 +590,7 @@ async fn test_grep_multiple_regexp_patterns_match_any() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_reads_patterns_from_file() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -615,7 +614,7 @@ async fn test_grep_reads_patterns_from_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_invalid_pattern_file_returns_structured_error() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -640,7 +639,7 @@ async fn test_grep_invalid_pattern_file_returns_structured_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_tree_large_blob_emits_warning_in_json() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -670,7 +669,7 @@ async fn test_grep_tree_large_blob_emits_warning_in_json() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_working_tree_symlink_emits_warning_and_skips_target() {
     use std::os::unix::fs::symlink;
 
@@ -699,7 +698,7 @@ async fn test_grep_working_tree_symlink_emits_warning_and_skips_target() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_returns_nonzero_when_no_matches_found() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -718,7 +717,7 @@ async fn test_grep_returns_nonzero_when_no_matches_found() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_all_match_requires_all_patterns_in_same_file() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -758,7 +757,7 @@ async fn test_grep_all_match_requires_all_patterns_in_same_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_all_match_is_based_on_positive_pattern_presence_even_with_invert() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -837,7 +836,7 @@ fn test_grep_help_lists_examples_banner() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_default_output_is_unchanged() {
     // Regression guard: with none of the new grouping flags, output is exactly
     // the historical `path:[lineno:]content` form, sorted by path.
@@ -858,7 +857,7 @@ async fn test_grep_default_output_is_unchanged() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_heading_groups_matches_under_file_name() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -895,7 +894,7 @@ async fn test_grep_heading_groups_matches_under_file_name() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_break_inserts_blank_line_between_files() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -926,7 +925,7 @@ async fn test_grep_break_inserts_blank_line_between_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_heading_and_break_combine() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -946,7 +945,7 @@ async fn test_grep_heading_and_break_combine() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_heading_with_context_keeps_group_separator() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -965,7 +964,7 @@ async fn test_grep_heading_with_context_keeps_group_separator() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_null_separates_fields_with_nul_byte() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -1015,7 +1014,7 @@ async fn test_grep_null_separates_fields_with_nul_byte() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_null_with_context_uses_nul_and_literal_separator() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -1034,7 +1033,7 @@ async fn test_grep_null_with_context_uses_nul_and_literal_separator() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_no_match_emits_no_output() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -1061,7 +1060,7 @@ async fn test_grep_no_match_emits_no_output() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_max_count_and_only_matching() {
     let repo = tempdir().expect("repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -1126,7 +1125,7 @@ async fn test_grep_max_count_and_only_matching() {
 /// the search root when no pathspec is given) `grep` descends, matching Git: a
 /// file directly inside the pathspec directory is depth 0.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_grep_max_depth_limits_directory_descent() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;

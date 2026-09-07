@@ -111,7 +111,7 @@ fn default_web_with_non_gemini_provider_parses() {
     ] {
         let parsed = parse(&["--provider", provider])
             .unwrap_or_else(|e| panic!("default Web --provider {provider} must parse: {e}"));
-        assert_ne!(parsed.provider, CodeProvider::Gemini);
+        assert_ne!(parsed.provider, Some(CodeProvider::Gemini));
     }
 }
 
@@ -132,7 +132,7 @@ fn default_web_with_provider_tuning_flags_parse() {
         "high",
     ])
     .expect("default Web provider-tuning flags must parse");
-    assert_eq!(parsed.provider, CodeProvider::Ollama);
+    assert_eq!(parsed.provider, Some(CodeProvider::Ollama));
     assert_eq!(parsed.model.as_deref(), Some("llama3"));
     assert_eq!(
         parsed.api_base.as_deref(),
@@ -293,7 +293,18 @@ async fn default_web_no_tty_and_sigterm_clean_shutdown() {
     // Let the child bind ephemeral ports (`--port 0` / `--mcp-port 0`) and
     // discover the URL from stdout. Pre-bind+drop races with parallel tests.
     let child = Command::new(libra_bin)
-        .args(["code", "--port", "0", "--mcp-port", "0"])
+        // PS-02 (ADR-PS-01): bare `libra code` no longer defaults to gemini;
+        // the provider is explicit here because this test's subject is the
+        // no-TTY web boot + SIGTERM shutdown, not provider resolution.
+        .args([
+            "code",
+            "--provider",
+            "gemini",
+            "--port",
+            "0",
+            "--mcp-port",
+            "0",
+        ])
         .current_dir(repo_path)
         .env("HOME", &home_dir)
         .env("XDG_CONFIG_HOME", &config_home)

@@ -11,7 +11,6 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
-#[serial]
 fn test_revert_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["revert", "HEAD"], temp.path());
@@ -31,7 +30,7 @@ fn test_revert_cli_outside_repository_returns_fatal_128() {
 /// 4. Revert HEAD (C3) - should restore 1.txt and remove 2.txt
 /// 5. Find C2 and revert it - should restore 1.txt to original content
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_basic_revert() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -224,7 +223,7 @@ async fn test_basic_revert() {
 /// Test revert with no-commit flag
 /// This test verifies that the --no-commit flag stages changes without creating a commit
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_revert_no_commit() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -343,7 +342,7 @@ async fn test_revert_no_commit() {
 /// Test reverting root commit
 /// Root commits have no parents, so reverting them should create an empty repository state
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_revert_root_commit() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -440,7 +439,7 @@ async fn test_revert_root_commit() {
 /// succeed, HEAD must advance to a new commit whose parent is the root and
 /// whose tree is Git's canonical empty tree.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_revert_root_commit_creates_empty_tree_commit() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -537,7 +536,6 @@ async fn test_revert_root_commit_creates_empty_tree_commit() {
 }
 
 #[test]
-#[serial]
 fn test_revert_json_output_reports_files_changed() {
     let repo = create_committed_repo_via_cli();
     let tracked_path = repo.path().join("tracked.txt");
@@ -568,7 +566,6 @@ fn test_revert_json_output_reports_files_changed() {
 }
 
 #[test]
-#[serial]
 fn test_revert_no_rerere_autoupdate_is_accepted_noop() {
     let repo = create_committed_repo_via_cli();
     let tracked_path = repo.path().join("tracked.txt");
@@ -589,7 +586,6 @@ fn test_revert_no_rerere_autoupdate_is_accepted_noop() {
 }
 
 #[test]
-#[serial]
 fn test_revert_signoff_adds_trailer() {
     let repo = create_committed_repo_via_cli();
     let tracked_path = repo.path().join("tracked.txt");
@@ -625,7 +621,6 @@ fn test_revert_signoff_adds_trailer() {
 }
 
 #[test]
-#[serial]
 fn test_revert_multiple_commits_in_one_invocation() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -664,7 +659,6 @@ fn test_revert_multiple_commits_in_one_invocation() {
 }
 
 #[test]
-#[serial]
 fn test_revert_multiple_commits_rejects_no_commit() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -706,7 +700,6 @@ fn setup_revert_conflict() -> (tempfile::TempDir, String) {
 }
 
 #[test]
-#[serial]
 fn test_revert_conflict_then_continue() {
     let (repo, c2) = setup_revert_conflict();
     let p = repo.path();
@@ -744,7 +737,6 @@ fn test_revert_conflict_then_continue() {
 }
 
 #[test]
-#[serial]
 fn test_revert_conflict_then_abort() {
     let (repo, c2) = setup_revert_conflict();
     let p = repo.path();
@@ -767,7 +759,7 @@ fn test_revert_conflict_then_abort() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_revert_json_output_skips_noop_paths_in_files_changed() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -823,7 +815,7 @@ async fn test_revert_json_output_skips_noop_paths_in_files_changed() {
 /// Test error cases for revert command
 /// This ensures the command handles invalid input gracefully
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_revert_errors() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -889,7 +881,6 @@ fn build_revert_merge_repo() -> tempfile::TempDir {
 }
 
 #[test]
-#[serial]
 fn test_revert_merge_without_mainline_errors_128() {
     let repo = build_revert_merge_repo();
     let out = run_libra_command(&["revert", "HEAD"], repo.path());
@@ -902,7 +893,6 @@ fn test_revert_merge_without_mainline_errors_128() {
 }
 
 #[test]
-#[serial]
 fn test_revert_merge_with_mainline_removes_feature_side() {
     let repo = build_revert_merge_repo();
     let p = repo.path();
@@ -919,7 +909,6 @@ fn test_revert_merge_with_mainline_removes_feature_side() {
 }
 
 #[test]
-#[serial]
 fn test_revert_mainline_on_non_merge_errors_128() {
     let repo = create_committed_repo_via_cli();
     let out = run_libra_command(&["revert", "-m", "1", "HEAD"], repo.path());
@@ -932,7 +921,6 @@ fn test_revert_mainline_on_non_merge_errors_128() {
 }
 
 #[test]
-#[serial]
 fn test_revert_mainline_out_of_range_errors_128() {
     let repo = build_revert_merge_repo();
     let out = run_libra_command(&["revert", "-m", "5", "HEAD"], repo.path());
@@ -976,7 +964,6 @@ fn revert_no_edit_is_accepted() {
 /// and commits the edited result; `--edit` and `--no-edit` are mutually
 /// exclusive. (Uses `core.editor` so no process-global env is touched.)
 #[test]
-#[serial]
 fn test_revert_edit_opens_editor() {
     let repo = tempdir().expect("repo dir");
     let p = repo.path();
@@ -1048,7 +1035,6 @@ fn test_revert_edit_opens_editor() {
 /// `revert --continue`, the editor opens again (via `RevertState.edit`) and the
 /// edited message is committed.
 #[test]
-#[serial]
 fn test_revert_edit_carried_through_continue() {
     let repo = tempdir().expect("repo dir");
     let p = repo.path();
@@ -1116,7 +1102,6 @@ fn test_revert_edit_carried_through_continue() {
 /// tree and HEAD unchanged (the message is resolved before the worktree is
 /// mutated), and must NOT leave a stray in-progress revert.
 #[test]
-#[serial]
 fn test_revert_edit_failure_leaves_worktree_clean() {
     let repo = tempdir().expect("repo dir");
     let p = repo.path();
@@ -1183,7 +1168,6 @@ fn test_revert_edit_failure_leaves_worktree_clean() {
 /// A failing editor during `revert --continue` must leave `revert-state.json`
 /// in place so the revert stays recoverable (`--abort`/retry).
 #[test]
-#[serial]
 fn test_revert_edit_failure_during_continue_keeps_state() {
     let repo = tempdir().expect("repo dir");
     let p = repo.path();
@@ -1283,7 +1267,6 @@ fn setup_conflict_then_clean(p: &std::path::Path) -> (String, String) {
 /// remaining commit c3 must ALSO be reverted (regression: previously the pending
 /// commits behind a conflict were silently dropped).
 #[test]
-#[serial]
 fn test_revert_continue_drains_remaining_commits() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");
@@ -1317,7 +1300,6 @@ fn test_revert_continue_drains_remaining_commits() {
 /// `revert --skip` discards the current (conflicted) commit and continues with
 /// the remaining ones: c2 stays un-reverted, c3 is reverted.
 #[test]
-#[serial]
 fn test_revert_skip_continues_with_remaining() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");
@@ -1354,7 +1336,6 @@ fn test_revert_skip_continues_with_remaining() {
 /// `revert --skip` when nothing remains after the skipped commit clears the
 /// in-progress state and creates no commit (HEAD unchanged).
 #[test]
-#[serial]
 fn test_revert_skip_with_nothing_remaining() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");
@@ -1432,7 +1413,6 @@ fn setup_conflict_then_merge(p: &std::path::Path) -> (String, String) {
 /// `revert` resolves every commit spec up front: a bad ref later in the list
 /// fails before any revert is applied (no partial work, no in-progress state).
 #[test]
-#[serial]
 fn test_revert_rejects_bad_ref_up_front() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");
@@ -1460,7 +1440,6 @@ fn test_revert_rejects_bad_ref_up_front() {
 /// The pending queue persists resolved commit IDs, not the raw refs, so a ref
 /// that moves during the conflict pause cannot change what gets reverted.
 #[test]
-#[serial]
 fn test_revert_remaining_persists_resolved_ids() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");
@@ -1487,7 +1466,7 @@ fn test_revert_remaining_persists_resolved_ids() {
 /// `--continue` (here a merge commit needing `-m`) must clear the state, so the
 /// already-finished conflict is not left lingering as in-progress.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_revert_continue_clears_state_on_drain_error() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");
@@ -1523,7 +1502,7 @@ fn test_revert_continue_clears_state_on_drain_error() {
 /// Regression (skip side): a non-conflict drain error after `--skip` must also
 /// clear the state.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_revert_skip_clears_state_on_drain_error() {
     use super::run_libra_command;
     let repo = tempdir().expect("repo");

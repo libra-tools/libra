@@ -1,0 +1,888 @@
+# generated — do not edit
+# regenerate: sh tests/NEXTEST_GROUPS.sh  (source of truth: tests/SERIAL_REGISTRY.tsv)
+# plan-20260827 NP-01 / ADR-NP-01: union external-resource mutual-exclusion group.
+# plan-20260827 NP-02: profiles carry runner behavior only (groups/threads/junit);
+# Cargo features and env always travel with the command line.
+
+[test-groups.external]
+max-threads = 1
+
+[profile.default.junit]
+path = "junit.xml"
+
+# test-provider scenario runs (base.yml provider section): overrides are
+# inherited from profile.default. test-threads = 1 preserves the CI
+# section's --test-threads=1 semantic verbatim: provider scenario tests
+# are calibrated for single-threaded timing (lease-release sleeps).
+
+[profile.test-provider]
+test-threads = 1
+junit = { path = "junit.xml" }
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_approval_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_generation_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_lease_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_model_generation_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_security_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_sse_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_state_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)agent_object_gc_findings_reachability$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)agent_push_after_prune_requires_force_rewrite_and_lease_protects$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)agent_push_writes_private_agent_traces_ref$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)agent_skill_search$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)agent_workspace_list_paginates_and_shows$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)basic_chat_submit_updates_transcript$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)blame_rejects_sha1_length_on_sha256_repo$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)blame_root_flag_is_accepted_noop$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)blame_runs_with_sha1$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)blame_runs_with_sha256$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)browser_attach_rejected_when_control_disabled$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)browser_cancel_turn_aborts_in_flight_turn_without_automation_token$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)browser_expired_controller_token_is_rejected_and_releases_snapshot$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)browser_oversized_message_returns_payload_too_large$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)browser_same_client_reconnect_renews_existing_lease$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)browser_static_app_loads_and_submit_updates_snapshot$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)browser_unknown_interaction_id_is_rejected_without_state_change$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)browser_write_appends_redacted_control_audit$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)cancel_running_turn_returns_session_to_idle$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)catalog_insert_is_idempotent_across_crash_retries$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)check_dirty_modified_row_content_hash_failure_is_blocked_and_kept$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)checkpoint_restore_honours_the_fence_and_restores_the_worktree$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)checkpoint_without_a_commit_cannot_be_restored$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)cloud_full_workflow_end_to_end$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)cloud_sync_name_conflict$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)cloud_tombstone_propagates_for_agent_capture$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)code_session_sigterm_exits_and_releases_ports$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)code_session_starts_web_and_cleans_control_files$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)commit_create_commits_the_index_and_replays_idempotently$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)commit_create_refuses_on_head_drift$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)commit_create_waits_for_a_deletion_phase_before_publishing$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)config_bare_read_protected_key_interactive_pty$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)content_hash_format_and_recompute$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)d1_batch$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)d1_connection$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)d1_ensure_table$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)d1_upsert_and_query$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)default_control_paths_reject_second_live_instance$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)default_control_paths_restart_after_stale_pid_takeover$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)diff_get_rejects_untyped_selectors$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)diff_get_reports_real_worktree_changes_and_is_path_scoped$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)dirty_mark_rejected_in_multi_worktree_repo$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)fsck_heal_restores_object_from_durable_tier$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)fuse_repair_failure_closes_the_shared_audit_row_failed$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)fuse_repair_shares_one_audit_boundary_with_core_repair$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)index_pack_stdin_requires_explicit_output_path$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)index_pack_stdin_writes_pack_and_index_and_reports_json_paths$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)json_check_dirty_concurrent_invalidate_warning$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_provider_codex_boots_against_mock_app_server$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_provider_codex_cancel_after_turn_started_interrupts_turn$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_provider_codex_cancel_before_turn_started_interrupts_when_started_arrives$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_provider_codex_cancel_during_pending_approval_interrupts_turn$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_provider_codex_normalizes_failed_turn_and_unknown_notification$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_provider_codex_persists_thread_started_notification$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_provider_codex_registers_sequential_approvals_on_same_turn$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_provider_codex_waits_for_user_before_execution_approval_resolve$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_serves_both_web_and_mcp_transports_on_same_process$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)libra_code_writes_mcp_url_into_control_info_file$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)local_capture_smoke_claude_code$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)local_capture_smoke_codex$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)local_capture_smoke_opencode$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)local_capture_smoke_opencode_macos$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)manifest_roles_oids_and_lengths_match_actual_blobs$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)mcp_created_task_is_observable_through_web_sse$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)mcp_http_and_stdio_expose_identical_tool_set$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)memory_public_cli_lifecycle_after_agent_terminal$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)metadata_model_field_prefers_event_model$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)oversized_message_is_rejected_before_reaching_runtime$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)perf_session_snapshot_serialises_100k_entry_transcript_under_200ms$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)perf_sse_broadcast_delivers_1k_events_in_monotonic_seq_order$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)perf_sse_http_stream_survives_configured_soak_duration$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)perf_threads_endpoint_handles_10_concurrent_readers_within_2s$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_empty_revision_note_is_typed_and_preserves_authority$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_head_drift_survives_resume_and_requires_explicit_modify$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_metadata_only_drift_warns_but_exact_execute_recheck_succeeds$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_modify_next_plain_text_opens_replacement_plan_gate$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_network_allow_enters_runtime_queue$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_network_allow_returns_conflict_and_preserves_pending_gate$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_network_policy_survives_web_resume_and_can_be_denied$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_repository_replacement_after_modify_keeps_revision_note_retryable$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_repository_replacement_blocks_modify_and_preserves_gate$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_workflow_intent_review_cancel_clears_review_interaction$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_workflow_intent_review_confirm_transitions_session_past_review$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_workflow_intent_review_modify_clears_review_interaction$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)plan_workflow_intent_review_survives_resume_and_can_be_confirmed$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)projection_resolver_load_for_resume_rebuilds_and_classifies_planning_review$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)projection_resolver_rebuilds_and_loads_thread_query_indexes$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)projection_resolver_rebuilds_missing_thread_projection_from_history$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)publish_ai_export_test_collects_snapshot_and_event_objects_from_history$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)publish_ai_export_test_redacts_sensitive_history_payload_fields$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)publish_live_gate_prerequisites_are_explicit$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)r2_connection_basic$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)resume_after_sigterm_mid_turn_restores_latest_submitted_message$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)resume_with_chat_session_id_restores_prior_transcript$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)resume_with_unknown_non_uuid_thread_id_surfaces_session_not_found$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)resume_with_unknown_uuid_thread_id_surfaces_session_not_found$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)review_run_refuses_unlaunchable_reviewers_without_residue$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)second_browser_attach_with_different_client_returns_conflict$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_automation_attach_omitted_kind_without_origin_succeeds$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_automation_write_body_size_too_large_is_413_payload_too_large$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_browser_message_cross_site_origin_is_403_origin_required$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_browser_message_missing_origin_is_403_origin_required$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_browser_write_body_size_too_large_is_413_payload_too_large$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_browser_write_cross_site_origin_is_403_origin_required$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_browser_write_missing_origin_is_403_origin_required$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_browser_write_trusted_loopback_origin_succeeds$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)security_session_rate_limit_triggers_and_recovers$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)service_end_to_end_events_marks_and_fault_recovery$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)sse_slow_consumer$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)state_cancel_while_executing_tool_settles_running_tool_call$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)state_detach_while_thinking_allows_turn_to_settle$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)subagent_scope_row_persists_linkage_and_is_idempotent$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)successful_ingest_clears_its_inflight_marker$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)takeover_reports_its_own_fence_even_if_another_lands_immediately_after$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_ai_flow_r2$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_annotation_lines_tag$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_basic_tag_creation$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_blame_empty_file_returns_empty_result$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_blame_json_assigns_lines_to_introducing_commits$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_blame_json_line_range_filters_output$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_blame_json_three_commit_chain_attributes_each_line$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_blame_regex_line_range$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_clone_fetches_all_tags_by_default$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_config_cross_platform_paths$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_config_scope_path_logic$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_delete_tag$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_fetch_default_auto_follows_reachable_tags$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_fetch_prune_dry_run_previews_without_deleting$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_fetch_prune_removes_stale_tracking_refs$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_fetch_tags_creates_local_tags_and_is_idempotent$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_fetch_tags_does_not_clobber_existing_local_tag$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_fetch_tags_dry_run_previews_without_writing$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_fetch_tags_force_clobbers_conflicting_local_tag$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_author_committer_atoms$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_color_atom$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_commit_graph_atoms$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_contents_and_body_atoms$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_date_atoms$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_date_format_modifiers$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_format_and_json$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_format_short_atoms$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_head_marker_atom$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_lists_heads$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_objectname_short_n$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_points_at_matches_direct_and_peeled_tag_targets$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_push_atom$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_refname_lstrip_rstrip$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_sort_and_count$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_sort_version_refname$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_subject_atom$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_subject_with_percent_paren_is_literal$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_tagger_atoms$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_unknown_sort_rejects$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_upstream_atom$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_worktreepath_across_worktrees$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_for_each_ref_worktreepath_atom$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_force_tag$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_force_tag_store_failure_preserves_existing_ref$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_fsck_rejects_tag_object_missing_tagger$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_incremental_repack_consolidates_with_linked_worktree_roots$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_internal_create_returns_metadata_for_annotated_tag$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_list_tags$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_log_only_trailers_display_and_errors$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_log_positional_parent_dir_path_not_misclassified$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_log_positional_symmetric_and_exclusion_divergent$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_log_trailer_filter_and_json$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_merge_dry_run_clean_three_way_writes_no_objects$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_push_thin_roundtrip_real_git_both_unpack_paths$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_revert_continue_clears_state_on_drain_error$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_revert_skip_clears_state_on_drain_error$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_default_shows_both$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_exists_json_reports_checked_ref$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_exists_missing_ref_uses_git_exit_code_two$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_exists_success_is_silent_in_human_mode$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_hash_only$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_head_exempt_from_pattern_filter$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_includes_head$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_json_lists_refs$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_json_lists_remote_tracking_refs$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_lists_branch$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_lists_remote_tracking_refs$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_lists_tag$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_pattern_match$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_pattern_no_match$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_surfaces_corrupt_branch_storage$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_surfaces_corrupt_tag_storage$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_verify_exact_ref_outputs_matching_ref$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_verify_head_accepts_head_refname$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_show_ref_verify_short_name_is_not_exact_ref$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_strict_commit_bad_email$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_strict_commit_bad_timezone$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)test_tag_with_message$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)unknown_interaction_id_is_rejected_without_state_change$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)v1_fixture_checkpoint_remains_readable_via_checkpoint_show$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)verify_pack_rejects_duplicate_object_ids_even_with_valid_index_checksum$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)web_message_turn_is_observable_through_sse_and_mcp_task_list$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_adopts_and_clears_legacy_approved_project$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_adopts_legacy_capture_with_confirmation_and_audit$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_adopts_orphan_legacy_provider_session$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_corrupt_scope_fails_closed$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_default_invocation_is_readonly$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_json_schema_and_pagination_stable$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_mutations_require_confirmation_and_emit_audit$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_prefers_catalog_session_id_over_provider_id_collision$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_refuses_capture_adoption_to_an_expired_lease$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)worktree_doctor_reports_scope_diagnostics$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)writer_emits_all_six_e4_libra_entries$/)'
+test-group = 'external'

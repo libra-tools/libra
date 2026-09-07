@@ -34,7 +34,6 @@ async fn setup_reset_user_identity() {
 }
 
 #[test]
-#[serial]
 fn test_reset_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["reset", "HEAD"], temp.path());
@@ -264,7 +263,7 @@ fn test_reset_onto_locked_branch_rejects_traces_suffix() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reset_refuses_ai_managed_current_branch() {
     let repo = create_committed_repo_via_cli();
     {
@@ -488,7 +487,7 @@ fn test_reset_json_hard_with_pathspec_returns_usage_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reset_corrupt_head_reference_returns_repo_corrupt() {
     let repo = create_committed_repo_via_cli();
     let target_commit = {
@@ -529,7 +528,7 @@ async fn test_reset_corrupt_head_reference_returns_repo_corrupt() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reset_corrupt_target_branch_returns_repo_corrupt() {
     // Use a non-locked branch as the target. Libra now refuses to `reset`
     // onto locked branches (`main`, `intent`, `traces`) — see
@@ -570,7 +569,7 @@ async fn test_reset_corrupt_target_branch_returns_repo_corrupt() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reset_pathspec_surfaces_subtree_corruption_as_repo_corrupt() {
     let repo = create_committed_repo_via_cli();
     fs::create_dir_all(repo.path().join("dir")).unwrap();
@@ -620,7 +619,7 @@ async fn test_reset_pathspec_surfaces_subtree_corruption_as_repo_corrupt() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
     if skip_permission_denied_test_if_root(
         "test_reset_hard_io_failure_rolls_back_index_and_keeps_head",
@@ -1037,7 +1036,7 @@ async fn setup_test_state() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests soft reset: only moves HEAD pointer, preserves index and working directory
 async fn test_reset_soft() {
     let temp_path = tempdir().unwrap();
@@ -1087,7 +1086,7 @@ async fn test_reset_soft() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests mixed reset: moves HEAD and resets index, preserves working directory
 async fn test_reset_mixed() {
     let temp_path = tempdir().unwrap();
@@ -1141,7 +1140,7 @@ async fn test_reset_mixed() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests hard reset: moves HEAD, resets index and working directory
 async fn test_reset_hard() {
     let temp_path = tempdir().unwrap();
@@ -1213,7 +1212,7 @@ async fn test_reset_hard() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
     let temp_path = tempdir().unwrap();
     let _guard = ChangeDirGuard::new(temp_path.path());
@@ -1309,7 +1308,7 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additions() {
     let temp_path = tempdir().unwrap();
     let _guard = ChangeDirGuard::new(temp_path.path());
@@ -1410,7 +1409,7 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
     let temp_path = tempdir().unwrap();
     let _guard = ChangeDirGuard::new(temp_path.path());
@@ -1534,7 +1533,7 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests reset with HEAD~ syntax
 async fn test_reset_with_head_reference() {
     let temp_path = tempdir().unwrap();
@@ -1578,7 +1577,7 @@ async fn test_reset_with_head_reference() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests reset on a branch (should move branch pointer, not create detached HEAD)
 async fn test_reset_on_branch() {
     let temp_path = tempdir().unwrap();
@@ -1630,7 +1629,7 @@ async fn test_reset_on_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests reset --hard skips and preserves ignored directories and their contents
 async fn test_reset_hard_skips_ignored_directories() {
     let temp_path = tempdir().unwrap();

@@ -393,7 +393,7 @@ async fn projection_resolver_query_indexes_diagnose_missing_live_context_frame_l
 ///
 /// `#[serial]` because `ChangeDirGuard` mutates process CWD.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn projection_resolver_rebuilds_missing_thread_projection_from_history() {
     let (_dir, storage, history, db_conn) = setup_projection_history().await;
     let actor = ActorRef::human("projection-rebuild").unwrap();
@@ -431,7 +431,7 @@ async fn projection_resolver_rebuilds_missing_thread_projection_from_history() {
 /// consumers that need cheap `intent -> task` lookups without treating stale rows as
 /// writable runtime state.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn projection_resolver_rebuilds_and_loads_thread_query_indexes() {
     let (_dir, storage, history, db_conn) = setup_projection_history().await;
     let actor = ActorRef::human("projection-query-index").unwrap();
@@ -484,7 +484,7 @@ async fn projection_resolver_rebuilds_and_loads_thread_query_indexes() {
 /// history has no selected plan yet, so resume must reopen the planning review rather
 /// than advancing the scheduler on an implicit stale bundle.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn projection_resolver_load_for_resume_rebuilds_and_classifies_planning_review() {
     let (_dir, storage, history, db_conn) = setup_projection_history().await;
     let actor = ActorRef::human("projection-resume").unwrap();

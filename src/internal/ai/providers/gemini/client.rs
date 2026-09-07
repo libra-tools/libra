@@ -99,7 +99,7 @@ impl Client {
     ///
     /// Differs from [`Self::from_env`] in two ways:
     ///
-    /// 1. The lookup honours the `libra config --global add
+    /// 1. The lookup honours the `libra config set --global
     ///    vault.env.GEMINI_API_KEY <…>` setting, so users who configured the
     ///    key once via the CLI no longer need to re-export it in every shell.
     /// 2. The error surface is `anyhow::Error`, so callers can attach context

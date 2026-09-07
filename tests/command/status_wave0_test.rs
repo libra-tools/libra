@@ -72,7 +72,7 @@ fn fs_supports_non_utf8_names(dir: &Path) -> bool {
 }
 
 #[test]
-#[serial]
+#[serial(cwd)]
 fn porcelain_v2_unmerged_u_line() {
     let repo = create_repo_with_committed_file("conflict.txt", "base\n");
     let _guard = ChangeDirGuard::new(repo.path());
@@ -109,7 +109,7 @@ fn porcelain_v2_unmerged_u_line() {
 }
 
 #[test]
-#[serial]
+#[serial(cwd)]
 fn resolved_conflict_with_stage0_emits_no_u_line() {
     let repo = create_repo_with_committed_file("conflict.txt", "base\n");
     let _guard = ChangeDirGuard::new(repo.path());
@@ -135,7 +135,7 @@ fn resolved_conflict_with_stage0_emits_no_u_line() {
 }
 
 #[test]
-#[serial]
+#[serial(cwd)]
 fn unmerged_stage_presence_to_xy_mapping() {
     // Exercises the seven Git unmerged stage-presence combinations through the
     // public `--short` surface (stage 1 = base, 2 = ours, 3 = theirs).
@@ -2438,7 +2438,7 @@ fn short_rename_keeps_staged_source_component() {
 /// fabricated "clean" for a modified file (the observed CHANGELOG.md
 /// incident) while diff's stricter shortcut still caught it.
 #[test]
-#[serial]
+#[serial(cwd)]
 fn racily_clean_entry_is_content_compared_not_trusted() {
     let repo = create_repo_with_committed_file("base.txt", "base\n");
     let _guard = ChangeDirGuard::new(repo.path());
@@ -2488,7 +2488,7 @@ fn racily_clean_entry_is_content_compared_not_trusted() {
 /// rename detection would otherwise consume it into a `2` record whose
 /// only truthful spelling is the `u` row (2026-08-06 R0-5 review).
 #[test]
-#[serial]
+#[serial(cwd)]
 fn unmerged_path_never_pairs_as_a_staged_rename_source() {
     let body = "same content on either side of the would-be rename\n";
     let repo = create_repo_with_committed_file("conflict.txt", body);
@@ -2576,7 +2576,7 @@ fn porcelain_v2_staged_deletion_spells_absent_sides_as_zero() {
 /// (2026-08-06 R0-5 review).
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(cwd)]
 fn porcelain_v2_unmerged_row_from_subdirectory_keeps_real_worktree_mode() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2789,7 +2789,7 @@ fn cluster_stops_at_value_option() {
 /// ride the returned envelope only (§B.4.3 isolation contract; the internal
 /// design keeps the global tracker on the CLI delivery path exclusively).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn api_warning_no_global_exit_pollution() {
     use libra::utils::test::ChangeDirGuard;
 
@@ -2819,7 +2819,7 @@ async fn api_warning_no_global_exit_pollution() {
 /// cross-talk or global-tracker mutation. (The API is same-cwd by design —
 /// both calls target the same repository.)
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn api_warning_concurrent_isolated() {
     use libra::utils::test::ChangeDirGuard;
 
@@ -2850,7 +2850,7 @@ async fn api_warning_concurrent_isolated() {
 /// Warnings survive await points inside and between API calls (no
 /// thread_local storage that a task migration could drop).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn api_warning_survives_await() {
     use libra::utils::test::ChangeDirGuard;
 
@@ -4094,7 +4094,6 @@ fn tracked_scan_eacces_partial_json() {
 /// §B.3.3 dirty-cache guard: an I/O-blocked `--scan` writes NOTHING — the
 /// previous snapshot survives verbatim.
 #[test]
-#[serial]
 fn ioblocked_scan_does_not_replace_dirty_cache() {
     let repo = create_repo_with_committed_file("plain.txt", "content\n");
     fs::write(repo.path().join("cached-new.txt"), "snapshot row\n").unwrap();
@@ -4132,7 +4131,6 @@ fn ioblocked_scan_does_not_replace_dirty_cache() {
 /// §B.3.3 dirty-cache guard: `--check-dirty` never prunes a NEW row or
 /// confirms a DELETED row whose path merely became unreadable.
 #[test]
-#[serial]
 fn check_dirty_ioblocked_does_not_mutate_cache() {
     let repo = create_repo_with_committed_file("plain.txt", "content\n");
     fs::create_dir(repo.path().join("sub")).unwrap();
@@ -4172,7 +4170,7 @@ fn check_dirty_ioblocked_does_not_mutate_cache() {
 /// in `io_blocked[]`, and the cache row is not rewritten, metadata
 /// included (proven by a full-row DB snapshot, not just the visible list).
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 #[cfg(unix)]
 fn check_dirty_modified_row_content_hash_failure_is_blocked_and_kept() {
     use std::os::unix::fs::PermissionsExt;

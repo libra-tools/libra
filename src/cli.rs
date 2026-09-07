@@ -62,8 +62,8 @@ Command Groups:
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
-  AI And Automation       code, automation, usage, graph, sandbox, agent, review, investigate, service
-  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
+  AI And Automation       code, automation, usage, graph, sandbox, agent, memory, review, investigate, service
+  Maintenance And Plumbing fsck, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
   error-codes  Print the stable CLI error code table (`libra help error-codes`)
@@ -391,6 +391,11 @@ enum Commands {
         after_help = command::logfile::LOGFILE_EXAMPLES
     )]
     Logfile(command::logfile::LogfileArgs),
+    #[command(
+        about = "Check the signed release channel and upgrade libra itself (Libra extension)",
+        after_help = command::upgrade::UPGRADE_EXAMPLES
+    )]
+    Upgrade(command::upgrade::UpgradeArgs),
     #[command(
         about = "Inspect the tiered-storage / LRU cache configuration",
         after_help = command::cache::CACHE_EXAMPLES
@@ -1497,6 +1502,9 @@ fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<C
         | Commands::Completions(_)
         // `logfile` only inspects env-derived tracing configuration.
         | Commands::Logfile(_)
+        // `upgrade` manages the INSTALLED BINARY next to the executable; it
+        // never reads or writes repository state and works outside a repo.
+        | Commands::Upgrade(_)
         // `auth` manages host-global tokens in the GLOBAL store; it works
         // outside a repository and touches no objects.
         | Commands::Auth(_)
@@ -1877,6 +1885,7 @@ fn command_scope(command: &Commands) -> CommandScope {
         Commands::Status(_)
         | Commands::Log(_)
         | Commands::Logfile(_)
+        | Commands::Upgrade(_)
         | Commands::LsFiles(_)
         | Commands::LsTree(_)
         | Commands::LsRemote(_)
@@ -2379,6 +2388,10 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    crate::internal::upgrade::orchestrator::AUTO_ADVISORY_SUPPRESSED.store(
+        output.is_json() || output.quiet,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let report = run_auto_upgrade_check(local_now).await;
     if output.is_json() || output.quiet {
         return;
@@ -2391,7 +2404,9 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
         }
         AutoUpgradeReport::RolledBack => {
             utils::error::emit_advisory_warning(
-                "an auto-upgrade failed its self-check and was rolled back to the current version",
+                "an auto-upgrade attempt was rolled back (self-check failure, a superseding \
+                 publisher control decision, or policy-lock contention); the current version \
+                 is unchanged",
             );
         }
         AutoUpgradeReport::Skipped => {}
@@ -2716,8 +2731,12 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // exist), check for and install a newer signed release. It is fully
     // isolated — it never returns an error and never trips
     // `--exit-code-on-warning` — so it cannot affect the user's command; it
-    // is inert (no I/O) until keys are provisioned.
-    run_auto_upgrade_check_hook(&output).await;
+    // is inert (no I/O) until keys are provisioned. The explicit `libra
+    // upgrade` command is exempt: it runs the same pipeline itself, and a
+    // background install racing the interactive one would be confusing.
+    if !matches!(args.command, Commands::Upgrade(_)) {
+        run_auto_upgrade_check_hook(&output).await;
+    }
 
     // Dispatch is captured as a Result so both success and early `?` failures can
     // await the queue without blocking the caller's Tokio executor thread.
@@ -2802,6 +2821,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::Log(cmd_args) => command::log::execute_safe(cmd_args, &output).await?,
             Commands::Logfile(cmd_args) => {
                 command::logfile::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Upgrade(cmd_args) => {
+                command::upgrade::execute_safe(cmd_args, &output).await?
             }
             Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
             Commands::Layer(cmd_args) => command::layer::execute_safe(cmd_args, &output).await?,

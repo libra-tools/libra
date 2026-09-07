@@ -474,7 +474,7 @@ fn default_web_env_file_precedence() {
         "openai",
     ])
     .expect("default Web must accept --env-file");
-    assert_eq!(parsed.provider, CodeProvider::Openai);
+    assert_eq!(parsed.provider, Some(CodeProvider::Openai));
     assert_eq!(
         parsed.env_file.as_deref(),
         Some(Path::new(env_path.as_os_str()))

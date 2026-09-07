@@ -298,7 +298,7 @@ const SMALL_TRANSCRIPT: &[u8] =
 /// the events file is `events/lifecycle.jsonl`, and metadata.json carries
 /// schema_version 2 plus the `model` field.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn writer_emits_all_six_e4_libra_entries() {
     let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
     let row = repo.ingest_session("sess-e4-shape", json!({})).await;
@@ -383,7 +383,7 @@ async fn writer_emits_all_six_e4_libra_entries() {
 /// A model carried by the triggering event lands in metadata.json instead
 /// of "unknown".
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn metadata_model_field_prefers_event_model() {
     let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
     let row = repo
@@ -400,7 +400,7 @@ async fn metadata_model_field_prefers_event_model() {
 /// Every manifest role's `path` resolves in the tree to a blob whose OID
 /// and byte length match the manifest declaration.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn manifest_roles_oids_and_lengths_match_actual_blobs() {
     let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
     let row = repo.ingest_session("sess-e4-manifest", json!({})).await;
@@ -471,7 +471,7 @@ async fn manifest_roles_oids_and_lengths_match_actual_blobs() {
 /// newline, and recomputes exactly from the coverage roles' bytes in
 /// manifest-declared order. The reader helper also accepts legacy bare hex.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn content_hash_format_and_recompute() {
     let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
     let row = repo.ingest_session("sess-e4-hash", json!({})).await;
@@ -527,7 +527,7 @@ async fn content_hash_format_and_recompute() {
 /// the logical transcript role; the parts reassemble byte-identically; and
 /// the content hash covers the logical (reassembled) stream.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn chunking_large_transcript_splits_line_safe() {
     // ~40 bytes per line × 40 lines ≈ 1.6 KiB, threshold 256 → ≥ 6 chunks.
     let mut transcript = Vec::new();
@@ -652,7 +652,7 @@ fn chunking_oversize_single_line_is_hard_error() {
 /// of the exact same row (the `ON CONFLICT(checkpoint_id)` backstop) both
 /// leave exactly one row.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn catalog_insert_is_idempotent_across_crash_retries() {
     let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
     let row = repo.ingest_session("sess-idem", json!({})).await;
@@ -753,7 +753,7 @@ async fn catalog_insert_is_idempotent_across_crash_retries() {
 /// path leaves NULL, dedupes idempotently by `traces_commit`, and coexists
 /// with the parent `committed` row so the two stay distinguishable by scope.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn subagent_scope_row_persists_linkage_and_is_idempotent() {
     let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
     // Parent committed checkpoint the subagent links back to.
@@ -928,7 +928,7 @@ async fn inflight_marker_lifecycle_and_expiry() {
 /// `load_metadata_blob` flow keeps accepting v1 checkpoints.
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn v1_fixture_checkpoint_remains_readable_via_checkpoint_show() {
     use std::process::{Command, Stdio};
 
@@ -1050,7 +1050,7 @@ async fn v1_fixture_checkpoint_remains_readable_via_checkpoint_show() {
 /// End-to-end: a successful checkpoint ingest leaves NO in-flight marker
 /// behind (written before stage (a), cleared after stage (d)).
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn successful_ingest_clears_its_inflight_marker() {
     let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
     let row = repo.ingest_session("sess-marker-e2e", json!({})).await;

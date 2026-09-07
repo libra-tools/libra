@@ -49,16 +49,16 @@ fn run_state_case(case_name: &str) -> Result<()> {
 macro_rules! state_case {
     ($name:ident) => {
         #[test]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_state_case(stringify!($name))
         }
     };
 }
 
-// Wave 7 — full P1 state matrix. The P2 tool-phase case is
-// deferred per the JSON `notes` block; flip it on once the tool
-// fixture stabilises.
+// Wave 7 — full P1 state matrix plus the deterministic P2 tool-phase
+// compatibility case. DF-05 wires the latter so its explicit v1 event-name
+// contract cannot drift when the shared OpenEvents default changes.
 #[cfg(feature = "test-provider")]
 state_case!(state_two_clients_attach_serial_ok_after_detach);
 #[cfg(feature = "test-provider")]
@@ -73,10 +73,12 @@ state_case!(state_payload_at_256_kib_boundary_is_accepted);
 state_case!(state_payload_at_257_kib_returns_413);
 #[cfg(feature = "test-provider")]
 state_case!(state_payload_at_drain_limit_1_mib_returns_413_without_hanging);
+#[cfg(feature = "test-provider")]
+state_case!(state_tool_call_fixture_reaches_tool_phase_or_deferred_l1);
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn state_detach_while_thinking_allows_turn_to_settle() -> Result<()> {
     let client_id = "state-detach-thinking";
     let mut session = CodeSession::spawn(CodeSessionOptions::new(
@@ -110,7 +112,7 @@ fn state_detach_while_thinking_allows_turn_to_settle() -> Result<()> {
 
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn state_cancel_while_executing_tool_settles_running_tool_call() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("state-cancel-executing-tool", fixture("slow_shell_tool"))

@@ -45,6 +45,30 @@ pub struct MediaChunkStore {
 }
 
 impl MediaChunkStore {
+    pub fn put_manifest(&self, manifest: &MediaManifest) -> Result<(), MediaStoreError> {
+        let path = self
+            .root
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("manifests")
+            .join(format!("{}.json", manifest.media_oid));
+        let io_error = |source| MediaStoreError::Io {
+            path: path.display().to_string(),
+            source,
+        };
+        manifest
+            .validate()
+            .map_err(|e| io_error(std::io::Error::other(e.to_string())))?;
+        let json = manifest
+            .to_json()
+            .map_err(|e| io_error(std::io::Error::other(e.to_string())))?;
+        atomic_write::write_atomic(&path, json.as_bytes(), atomic_write::sync_data_enabled())
+            .map_err(io_error)
+    }
+    /// Use an explicit private cache root (also useful for independent clients).
+    pub fn at(root: PathBuf) -> Self {
+        Self { root }
+    }
     /// Open the store at the repo's media-chunks root (created lazily on write).
     pub fn open() -> Self {
         Self {
@@ -63,14 +87,18 @@ impl MediaChunkStore {
     /// correct bytes rather than silently trusted. Writes RAW bytes (no Git
     /// header, no zlib) via the crash-safe temp+rename discipline.
     pub fn put_chunk(&self, bytes: &[u8]) -> Result<String, MediaStoreError> {
+        if bytes.len() > super::chunker::MAX_SIZE {
+            return Err(MediaStoreError::Io {
+                path: self.root.display().to_string(),
+                source: std::io::Error::other("chunk exceeds FastCDC size limit"),
+            });
+        }
         let chunk_hash = sha256_hex(bytes);
         let path = self.chunk_path(&chunk_hash);
         if path.exists() {
             // Content-addressed: if the stored bytes still hash to `chunk_hash`
             // it is already durably present; otherwise fall through to rewrite.
-            if let Ok(existing) = std::fs::read(&path)
-                && sha256_hex(&existing) == chunk_hash
-            {
+            if self.get_chunk(&chunk_hash).is_ok() {
                 return Ok(chunk_hash);
             }
         }
@@ -96,7 +124,26 @@ impl MediaChunkStore {
             return Err(MediaStoreError::InvalidHash(chunk_hash.to_string()));
         }
         let path = self.chunk_path(chunk_hash);
-        let bytes = match std::fs::read(&path) {
+        if path
+            .metadata()
+            .is_ok_and(|m| m.len() > super::chunker::MAX_SIZE as u64)
+        {
+            return Err(MediaStoreError::Io {
+                path: path.display().to_string(),
+                source: std::io::Error::other("cached chunk exceeds FastCDC size limit"),
+            });
+        }
+        let bytes = match std::fs::File::open(&path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(super::chunker::MAX_SIZE as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > super::chunker::MAX_SIZE {
+                return Err(std::io::Error::other(
+                    "cached chunk exceeds FastCDC size limit",
+                ));
+            }
+            Ok(bytes)
+        }) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(MediaStoreError::Missing(chunk_hash.to_string()));
@@ -140,59 +187,51 @@ pub fn reassemble(
         source: std::io::Error::other(e.to_string()),
     })?;
 
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| MediaStoreError::Io {
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
-    // Write + verify into a sibling temp; only rename over `dest` after the
-    // media_oid verifies. EVERY error path (io / missing chunk / corrupt chunk /
-    // digest mismatch / rename failure) removes the temp so no partial bytes
-    // survive — the contract is "temp cleaned on any error".
-    let tmp = dest.with_extension("libra-media-tmp");
-    let build = || -> Result<(), MediaStoreError> {
-        let mut digest = Context::new(&SHA256);
-        let file = std::fs::File::create(&tmp).map_err(|source| MediaStoreError::Io {
-            path: tmp.display().to_string(),
-            source,
-        })?;
-        let mut writer = std::io::BufWriter::new(file);
-        for entry in &manifest.chunks {
-            let bytes = store.get_chunk(&entry.chunk_hash)?;
-            digest.update(&bytes);
-            writer
-                .write_all(&bytes)
-                .map_err(|source| MediaStoreError::Io {
-                    path: tmp.display().to_string(),
-                    source,
-                })?;
-        }
-        writer.flush().map_err(|source| MediaStoreError::Io {
-            path: tmp.display().to_string(),
-            source,
-        })?;
-        drop(writer);
-        let actual = hex::encode(digest.finish().as_ref());
-        if actual != manifest.media_oid {
-            return Err(MediaStoreError::MediaOidMismatch {
-                expected: manifest.media_oid.clone(),
-                actual,
-            });
-        }
-        Ok(())
+    let io_error = |source| MediaStoreError::Io {
+        path: dest.display().to_string(),
+        source,
     };
-    if let Err(e) = build() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, dest).map_err(|source| {
-        let _ = std::fs::remove_file(&tmp);
-        MediaStoreError::Io {
-            path: dest.display().to_string(),
-            source,
+    // A leaf such as `asset.bin` has an empty parent. Resolve it before passing
+    // it to the atomic writer, which requires a real staging/target directory.
+    let target = std::path::absolute(dest).map_err(io_error)?;
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let mut writer = match std::fs::metadata(&target) {
+        Ok(metadata) => crate::utils::atomic_stream::StreamingAtomicFile::new_in_with_permissions(
+            parent,
+            atomic_write::sync_data_enabled(),
+            metadata.permissions(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::utils::atomic_stream::StreamingAtomicFile::new_in(
+                parent,
+                atomic_write::sync_data_enabled(),
+            )
         }
-    })?;
+        Err(error) => return Err(io_error(error)),
+    }
+    .map_err(io_error)?;
+    let mut digest = Context::new(&SHA256);
+    for entry in &manifest.chunks {
+        let bytes = store.get_chunk(&entry.chunk_hash)?;
+        if bytes.len() as u64 != entry.length {
+            return Err(io_error(std::io::Error::other(
+                "chunk length does not match manifest",
+            )));
+        }
+        digest.update(&bytes);
+        writer.write_all(&bytes).map_err(io_error)?;
+    }
+    let actual = hex::encode(digest.finish().as_ref());
+    if actual != manifest.media_oid {
+        return Err(MediaStoreError::MediaOidMismatch {
+            expected: manifest.media_oid.clone(),
+            actual,
+        });
+    }
+    writer.persist(&target).map_err(io_error)?;
     Ok(())
 }
 
@@ -205,6 +244,12 @@ pub fn read_span(
     length: u64,
 ) -> Result<Vec<u8>, MediaStoreError> {
     use std::io::{Seek, SeekFrom};
+    if length > super::chunker::MAX_SIZE as u64 {
+        return Err(MediaStoreError::Io {
+            path: "<media file>".into(),
+            source: std::io::Error::other("chunk exceeds FastCDC size limit"),
+        });
+    }
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| MediaStoreError::Io {
             path: "<media file>".to_string(),

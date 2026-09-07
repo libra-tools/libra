@@ -34,7 +34,7 @@ fn test_cherry_pick_cli_outside_repository_returns_fatal_128() {
 /// 3. Switch back to master branch
 /// 4. Cherry-pick feature commits to master
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_basic_cherry_pick() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -283,7 +283,7 @@ async fn test_basic_cherry_pick() {
 
 /// Test cherry-pick with automatic commit
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cherry_pick_with_commit() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -440,7 +440,7 @@ async fn test_cherry_pick_with_commit() {
 
 /// Test cherry-pick multiple commits
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cherry_pick_multiple_commits() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -619,7 +619,7 @@ async fn test_cherry_pick_multiple_commits() {
 
 /// Test error cases for cherry-pick
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cherry_pick_errors() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -637,7 +637,7 @@ async fn test_cherry_pick_errors() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cherry_pick_x_appends_source_line_to_commit_message() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -684,7 +684,6 @@ async fn test_cherry_pick_x_appends_source_line_to_commit_message() {
 }
 
 #[test]
-#[serial]
 fn test_cherry_pick_invalid_commit_returns_cli_invalid_target() {
     let repo = create_committed_repo_via_cli();
 
@@ -701,7 +700,7 @@ fn test_cherry_pick_invalid_commit_returns_cli_invalid_target() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cherry_pick_merge_commit_rejection_uses_invalid_arguments_code() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -728,7 +727,7 @@ async fn test_cherry_pick_merge_commit_rejection_uses_invalid_arguments_code() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cherry_pick_json_output() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -771,7 +770,7 @@ async fn test_cherry_pick_json_output() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Verify cherry-pick behavior under SHA-256: accepts 64-hex commit ids, rejects SHA-1 length.
 async fn test_cherry_pick_sha256_hash_handling() {
     let temp_path = tempdir().unwrap();
@@ -1443,7 +1442,7 @@ fn cherry_pick_machine_emits_ndjson() {
 /// `CherryPickState` round-trips through the SQLite `cherry_pick_state` table
 /// and clears cleanly (mirrors `RebaseState`).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn cherry_pick_state_roundtrip_persists_and_clears() {
     use std::str::FromStr;
 
@@ -1857,7 +1856,6 @@ fn cherry_pick_continue_on_wrong_branch_rejected() {
 
 /// A malformed `todo` OID in the persisted state surfaces as an error, never a panic.
 #[tokio::test]
-#[serial]
 async fn cherry_pick_malformed_todo_oid_errors_not_panics() {
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 
@@ -2185,7 +2183,7 @@ fn cherry_pick_resume_nonconflict_error_keeps_accurate_state() {
 /// replay: `drop` skips it (HEAD unchanged), `stop` (default) halts, `keep`
 /// records the empty commit. An invalid mode is a usage error.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_cherry_pick_empty_modes() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -2272,7 +2270,6 @@ async fn test_cherry_pick_empty_modes() {
 /// the sequencer state, so a LATER commit in the sequence that becomes redundant
 /// is dropped (not stopped on) when the resume reaches it.
 #[test]
-#[serial]
 fn cherry_pick_empty_drop_survives_conflict_resume() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();

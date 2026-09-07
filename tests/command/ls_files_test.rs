@@ -87,7 +87,6 @@ fn stdout_nul_fields(output: &Output) -> Vec<String> {
 }
 
 #[test]
-#[serial]
 fn ls_files_help_is_visible_and_renders_examples() {
     let repo = create_committed_repo_via_cli();
 
@@ -102,7 +101,6 @@ fn ls_files_help_is_visible_and_renders_examples() {
 }
 
 #[test]
-#[serial]
 fn ls_files_defaults_to_cached_listing() {
     let repo = setup_ls_files_repo();
 
@@ -124,7 +122,6 @@ fn ls_files_defaults_to_cached_listing() {
 }
 
 #[test]
-#[serial]
 fn ls_files_modified_lists_only_modified_tracked_paths() {
     let repo = setup_ls_files_repo();
 
@@ -135,7 +132,6 @@ fn ls_files_modified_lists_only_modified_tracked_paths() {
 }
 
 #[test]
-#[serial]
 fn ls_files_deleted_lists_only_missing_tracked_paths() {
     let repo = setup_ls_files_repo();
 
@@ -146,7 +142,6 @@ fn ls_files_deleted_lists_only_missing_tracked_paths() {
 }
 
 #[test]
-#[serial]
 fn ls_files_others_lists_untracked_paths_without_ignore_filtering() {
     let repo = setup_ls_files_repo();
 
@@ -165,7 +160,6 @@ fn ls_files_others_lists_untracked_paths_without_ignore_filtering() {
 }
 
 #[test]
-#[serial]
 fn ls_files_exclude_standard_honors_libraignore_for_others() {
     let repo = setup_ls_files_repo();
 
@@ -185,7 +179,6 @@ fn ls_files_exclude_standard_honors_libraignore_for_others() {
 }
 
 #[test]
-#[serial]
 fn ls_files_stage_and_short_alias_render_same_stage_output() {
     let repo = setup_ls_files_repo();
 
@@ -206,7 +199,6 @@ fn ls_files_stage_and_short_alias_render_same_stage_output() {
 }
 
 #[test]
-#[serial]
 fn ls_files_json_uses_standard_envelope() {
     let repo = setup_ls_files_repo();
 
@@ -228,7 +220,6 @@ fn ls_files_json_uses_standard_envelope() {
 }
 
 #[test]
-#[serial]
 fn ls_files_pathspec_filters_to_an_exact_file() {
     let repo = setup_ls_files_repo();
 
@@ -242,7 +233,6 @@ fn ls_files_pathspec_filters_to_an_exact_file() {
 }
 
 #[test]
-#[serial]
 fn ls_files_pathspec_filters_to_a_directory_prefix() {
     let repo = setup_ls_files_repo();
 
@@ -259,7 +249,6 @@ fn ls_files_pathspec_filters_to_a_directory_prefix() {
 }
 
 #[test]
-#[serial]
 fn ls_files_others_pathspec_lists_untracked_paths_under_directory() {
     let repo = setup_ls_files_repo();
 
@@ -276,7 +265,6 @@ fn ls_files_others_pathspec_lists_untracked_paths_under_directory() {
 }
 
 #[test]
-#[serial]
 fn ls_files_others_exclude_standard_honors_libraignore_for_directory_pathspec() {
     let repo = setup_ls_files_repo();
 
@@ -296,7 +284,6 @@ fn ls_files_others_exclude_standard_honors_libraignore_for_directory_pathspec() 
 }
 
 #[test]
-#[serial]
 fn ls_files_pathspec_is_resolved_from_nested_current_dir() {
     let repo = setup_ls_files_repo();
     let nested_cwd = repo.path().join("nested-cwd");
@@ -315,7 +302,6 @@ fn ls_files_pathspec_is_resolved_from_nested_current_dir() {
 }
 
 #[test]
-#[serial]
 fn ls_files_pathspec_accepts_chinese_names() {
     let repo = setup_ls_files_repo();
 
@@ -326,7 +312,6 @@ fn ls_files_pathspec_accepts_chinese_names() {
 }
 
 #[test]
-#[serial]
 fn ls_files_pathspec_accepts_special_character_names() {
     let repo = setup_ls_files_repo();
 
@@ -343,7 +328,6 @@ fn ls_files_pathspec_accepts_special_character_names() {
 }
 
 #[test]
-#[serial]
 fn ls_files_stage_output_respects_pathspecs() {
     let repo = setup_ls_files_repo();
 
@@ -361,7 +345,6 @@ fn ls_files_stage_output_respects_pathspecs() {
 }
 
 #[test]
-#[serial]
 fn ls_files_empty_pathspec_result_is_allowed_without_error_unmatch() {
     let repo = setup_ls_files_repo();
 
@@ -379,7 +362,6 @@ fn ls_files_empty_pathspec_result_is_allowed_without_error_unmatch() {
 }
 
 #[test]
-#[serial]
 fn ls_files_z_outputs_nul_delimited_records() {
     let repo = setup_ls_files_repo();
 
@@ -406,7 +388,6 @@ fn ls_files_z_outputs_nul_delimited_records() {
 }
 
 #[test]
-#[serial]
 fn ls_files_error_unmatch_fails_for_missing_pathspec() {
     let repo = setup_ls_files_repo();
 
@@ -425,7 +406,6 @@ fn ls_files_error_unmatch_fails_for_missing_pathspec() {
 }
 
 #[test]
-#[serial]
 fn ls_files_error_unmatch_fails_when_any_pathspec_is_missing() {
     let repo = setup_ls_files_repo();
 
@@ -447,7 +427,6 @@ fn ls_files_error_unmatch_fails_when_any_pathspec_is_missing() {
 }
 
 #[test]
-#[serial]
 fn ls_files_pathspec_rejects_paths_outside_repo() {
     let repo = setup_ls_files_repo();
     let nested_cwd = repo.path().join("nested-cwd");
@@ -469,7 +448,6 @@ fn ls_files_pathspec_rejects_paths_outside_repo() {
 }
 
 #[test]
-#[serial]
 fn ls_files_rejects_z_with_json_output() {
     let repo = setup_ls_files_repo();
 
@@ -486,7 +464,6 @@ fn ls_files_rejects_z_with_json_output() {
 }
 
 #[test]
-#[serial]
 fn ls_files_rejects_z_with_machine_output() {
     let repo = setup_ls_files_repo();
 

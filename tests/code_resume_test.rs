@@ -150,7 +150,7 @@ fn expect_resume_spawn_failure(case_name: &str, thread_id: &str) -> Result<(Stri
 /// way down to `SessionStore::load_for_thread_id`.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn resume_with_unknown_uuid_thread_id_surfaces_session_not_found() -> Result<()> {
     let phantom_thread_id = "00000000-1111-2222-3333-444455556666";
     let (process, libra) =
@@ -173,7 +173,7 @@ fn resume_with_unknown_uuid_thread_id_surfaces_session_not_found() -> Result<()>
 /// uses.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn resume_with_unknown_non_uuid_thread_id_surfaces_session_not_found() -> Result<()> {
     let bad_thread_id = "not-a-uuid-at-all";
     let (process, libra) = expect_resume_spawn_failure("code-resume-bad-format", bad_thread_id)?;
@@ -204,7 +204,7 @@ fn resume_with_unknown_non_uuid_thread_id_surfaces_session_not_found() -> Result
 /// sessions ARE saved across runs with no plan-workflow binding.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn resume_with_chat_session_id_restores_prior_transcript() -> Result<()> {
     let case_name = "code-resume-happy-path";
     let user_message = "ping-resume-happy-path";
@@ -286,7 +286,7 @@ fn resume_with_chat_session_id_restores_prior_transcript() -> Result<()> {
 /// proves the latest submitted user turn is still present.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn resume_after_sigterm_mid_turn_restores_latest_submitted_message() -> Result<()> {
     let case_name = "code-resume-sigterm-mid-turn";
     let user_message = "slow-resume-mid-turn";

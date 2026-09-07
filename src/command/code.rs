@@ -516,9 +516,15 @@ pub struct CodeArgs {
     #[arg(long = "control-url", value_name = "URL")]
     pub control_url: Option<String>,
 
-    /// AI provider backend
-    #[arg(long, value_enum, default_value_t = CodeProvider::Gemini)]
-    pub provider: CodeProvider,
+    /// AI provider backend. No default: the effective provider is resolved
+    /// at startup — `--provider` → `--agent` binding → the resumed
+    /// thread's recorded provider (with `--resume`) → the persisted
+    /// `code.defaultProvider` config key → credential detection (a resume
+    /// or config hit skips detection; zero configured keys exit 128,
+    /// several exit 129) — and written back here, so `None` after parsing
+    /// means "not explicitly chosen" (plan-20260825 ADR-PS-05).
+    #[arg(long, value_enum)]
+    pub provider: Option<CodeProvider>,
 
     /// Model id (provider-specific)
     #[arg(long)]
@@ -679,7 +685,7 @@ pub struct CodeArgs {
 /// notice that the review gate has been disabled.
 pub(crate) fn effective_plan_mode(args: &CodeArgs) -> bool {
     args.plan_mode
-        .unwrap_or(matches!(args.provider, CodeProvider::Codex))
+        .unwrap_or(matches!(args.provider, Some(CodeProvider::Codex)))
 }
 
 // ---------------------------------------------------------------------------
@@ -722,8 +728,487 @@ fn warn_deprecated_mcp_stdio() {
 /// Returns [`CliError`] for invalid mode combinations, provider credential
 /// failures, network bind failures, Codex app-server startup failures, or
 /// terminal/session initialization failures. Error classification follows
+/// Post-resolution accessor: every consumer past the ADR-PS-05 entry
+/// resolution reads the written-back provider through this. Reaching it with
+/// `None` is a programmer error (a consumer ran before resolution or on the
+/// `--stdio`/`--control stdio` paths that never resolve).
+pub(crate) fn resolved_provider(args: &CodeArgs) -> CodeProvider {
+    // INVARIANT: every caller sits on the default-Web path, downstream of
+    // the resolve_provider_at_entry() write-back in execute(); the
+    // `--stdio`/`--control stdio` paths that keep `None` never reach these
+    // consumers (they reject or ignore provider flags in validate_mode_args).
+    args.provider
+        .expect("provider must be resolved at execute() entry (ADR-PS-05)")
+}
+
+/// Pure ADR-PS-05 priority ladder, slots 1 and 2: an explicit `--provider`
+/// wins; otherwise a mappable `--agent` binding provider id; both present
+/// and disagreeing is a usage conflict. `Ok(None)` means "no source yet" —
+/// the caller falls through to the later slots (PS-05 resume metadata,
+/// PS-03 `code.defaultProvider`, then the PS-06 credential detection).
+fn resolve_provider_from_sources(
+    explicit: Option<CodeProvider>,
+    binding_provider_id: Option<&str>,
+) -> CliResult<Option<CodeProvider>> {
+    let binding = binding_provider_id.and_then(|id| {
+        PROVIDER_SPECS
+            .iter()
+            .find(|spec| spec.id == id)
+            .map(|spec| spec.provider)
+    });
+    match (explicit, binding) {
+        (Some(flag), Some(bound)) if flag != bound => Err(CliError::command_usage(format!(
+            "--provider {flag:?} conflicts with the --agent binding's provider '{}'; \
+             drop one of them",
+            binding_provider_id.unwrap_or_default()
+        ))),
+        (Some(flag), _) => Ok(Some(flag)),
+        (None, Some(bound)) => Ok(Some(bound)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// PS-03: the persisted default-provider key in the `libra config` SQLite
+/// database (repo-local overrides global). Unrelated to the `[code.*]`
+/// profile sections of `agents.toml` — neither carrier falls back to the
+/// other.
+const DEFAULT_PROVIDER_CONFIG_KEY: &str = "code.defaultProvider";
+
+/// PS-03 slot-4 verdict over the raw `code.defaultProvider` value: absent
+/// falls through (the cascaded reader already treats present-but-empty as
+/// absent), a provider id resolves, anything else is a usage error. The
+/// error never echoes the stored value: a secret pasted into the wrong key
+/// must not round-trip into an error line (GC-PS-01).
+fn config_slot_outcome(raw: Option<&str>) -> CliResult<Option<CodeProvider>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match provider_spec_by_id(raw.trim()) {
+        Some(spec) => Ok(Some(spec.provider)),
+        None => Err(CliError::command_usage(invalid_default_provider_message())),
+    }
+}
+
+/// ADR-PS-03 a-mode message for an unrecognized `code.defaultProvider`
+/// value: conclusion, the full legal id domain, copy-pasteable fix/clear
+/// commands, and how to inspect what is stored — without printing it.
+fn invalid_default_provider_message() -> String {
+    let mut ids: Vec<&str> = PROVIDER_SPECS.iter().map(|spec| spec.id).collect();
+    ids.sort_unstable();
+    [
+        format!("the {DEFAULT_PROVIDER_CONFIG_KEY} config key holds an unrecognized provider id"),
+        String::new(),
+        format!("Valid values: {}", ids.join(", ")),
+        String::new(),
+        "Fix or clear the key:".to_string(),
+        format!("    libra config set --global {DEFAULT_PROVIDER_CONFIG_KEY} <id>"),
+        format!("    libra config unset --global {DEFAULT_PROVIDER_CONFIG_KEY}"),
+        String::new(),
+        "Inspect the stored value:".to_string(),
+        format!("    libra config get {DEFAULT_PROVIDER_CONFIG_KEY}"),
+    ]
+    .join("\n")
+}
+
+/// PS-03 slot-4 read: cascade `code.defaultProvider` from the SESSION
+/// target's repo config (`--repo` / `--cwd` aware, same routing as the
+/// PS-06 detection) down to the global config, then judge the value.
+async fn config_default_provider(working_dir: &std::path::Path) -> CliResult<Option<CodeProvider>> {
+    use crate::internal::config::{LocalIdentityTarget, read_cascaded_config_value};
+    let local_db = crate::utils::util::try_get_storage_path(Some(working_dir.to_path_buf()))
+        .ok()
+        .map(|storage| storage.join(crate::utils::util::DATABASE));
+    let local_target = match &local_db {
+        Some(db) => LocalIdentityTarget::ExplicitDb(db),
+        None => LocalIdentityTarget::None,
+    };
+    let raw = read_cascaded_config_value(local_target, DEFAULT_PROVIDER_CONFIG_KEY)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "reading the {DEFAULT_PROVIDER_CONFIG_KEY} config key failed: {error:#}"
+            ))
+        })?;
+    config_slot_outcome(raw.as_deref())
+}
+
+/// PS-05: load the session targeted by `--resume <thread_id>` for
+/// provenance reads at entry-resolution time. Every miss — not resuming,
+/// an empty id, no storage root, or no matching session — returns `None`
+/// so the caller falls through; the real resume path later surfaces its
+/// own errors for genuinely broken ids.
+fn resume_session_snapshot(args: &CodeArgs, working_dir: &std::path::Path) -> Option<SessionState> {
+    let thread_id = args.resume.as_deref()?.trim();
+    if thread_id.is_empty() {
+        return None;
+    }
+    let storage_root = resolve_storage_root(working_dir)?;
+    let store = SessionStore::from_storage_path(&storage_root);
+    store
+        .load_for_thread_id(thread_id, &working_dir.to_string_lossy())
+        .ok()
+        .flatten()
+}
+
+/// PS-05 slot-3 read: the recorded provider (and model) provenance of the
+/// thread being resumed. `None` when there is nothing usable — including a
+/// recorded id outside the capability table, which is logged and ignored
+/// rather than fatal (AC: metadata-less sessions keep resolving through
+/// the remaining ADR-PS-05 chain).
+fn resume_recorded_provenance(
+    args: &CodeArgs,
+    working_dir: &std::path::Path,
+) -> Option<(CodeProvider, Option<String>)> {
+    let session = resume_session_snapshot(args, working_dir)?;
+    let recorded = session.recorded_provider_id()?;
+    let Some(spec) = provider_spec_by_id(recorded) else {
+        // The stored value is unvalidated data (it could even be a
+        // mistakenly pasted secret): log only the fixed category and the
+        // session identity — never the value itself (GC-PS-01).
+        tracing::warn!(
+            session_id = %session.id,
+            "resumed session records an unrecognized provider id; ignoring the provenance"
+        );
+        return None;
+    };
+    Some((
+        spec.provider,
+        session.recorded_model_id().map(str::to_string),
+    ))
+}
+
+/// PS-05: an explicit provider selection (flag or `--agent` binding) that
+/// disagrees with the resumed thread's recorded provider gets a stderr
+/// warning — the thread's history was produced under another provider —
+/// and the run continues. Ids only (GC-PS-01); machine surfaces get a
+/// structured event instead of prose (ADR-PS-03 rule five).
+fn warn_on_resume_provider_mismatch(
+    args: &CodeArgs,
+    working_dir: &std::path::Path,
+    decided: CodeProvider,
+    output: &OutputConfig,
+) {
+    if args.resume.is_none() {
+        return;
+    }
+    let Some((recorded, _)) = resume_recorded_provenance(args, working_dir) else {
+        return;
+    };
+    if recorded == decided {
+        return;
+    }
+    let id_for = |provider: CodeProvider| {
+        PROVIDER_SPECS
+            .iter()
+            .find(|spec| spec.provider == provider)
+            .map(|spec| spec.id.to_string())
+            .unwrap_or_else(|| format!("{provider:?}").to_lowercase())
+    };
+    let recorded_id = id_for(recorded);
+    let using_id = id_for(decided);
+    let thread_id = args.resume.as_deref().unwrap_or_default();
+    if output.is_json() {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "provider_resume_mismatch",
+                "thread_id": thread_id,
+                "recorded": recorded_id,
+                "using": using_id,
+            })
+        );
+    } else {
+        let lines = [
+            format!(
+                "warning: thread '{thread_id}' was recorded with provider \
+                 '{recorded_id}', but '{using_id}' was explicitly selected; \
+                 continuing with '{using_id}'"
+            ),
+            String::new(),
+            format!("The thread's history was produced under '{recorded_id}'."),
+            "To keep the recorded pairing, drop the explicit selection:".to_string(),
+            format!("    libra code --resume {thread_id}"),
+        ];
+        eprintln!("{}", lines.join("\n"));
+    }
+}
+
+/// One auto-selection candidate from the PS-06 credential detection: the
+/// capability row plus where its key was found. Never carries the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetectedCandidate {
+    pub(crate) provider: CodeProvider,
+    pub(crate) id: &'static str,
+    pub(crate) api_key_env: &'static str,
+    /// Display name of the hit layer (`--env-file`, or an
+    /// `EnvHitLayer::as_str` value). Never the credential itself.
+    pub(crate) layer: &'static str,
+}
+
+/// Pure PS-06/PS-03 zero/one/many composition over slots 1-2, the
+/// persisted `code.defaultProvider` slot, and detection — the spec oracle
+/// for `provider_detection` / `provider_config_key`: `detect` is only
+/// invoked when no earlier source decided (the "explicit means zero
+/// probes" contract), the config slot sits between the flag/binding slots
+/// and the `--model` pairing guard exactly as the real entry orders them,
+/// and the outcome goes through the same `three_state_outcome` the real
+/// entry uses. The entry itself short-circuits structurally (see
+/// `resolve_provider_at_entry`), so production no longer calls this.
+#[cfg(test)]
+fn resolve_provider_with_detection(
+    explicit: Option<CodeProvider>,
+    binding_provider_id: Option<&str>,
+    config_value: Option<&str>,
+    model_without_provider: bool,
+    detect: impl FnOnce() -> CliResult<Vec<DetectedCandidate>>,
+) -> CliResult<(CodeProvider, Option<DetectedCandidate>)> {
+    if let Some(decided) = resolve_provider_from_sources(explicit, binding_provider_id)? {
+        return Ok((decided, None));
+    }
+    if let Some(decided) = config_slot_outcome(config_value)? {
+        return Ok((decided, None));
+    }
+    if model_without_provider {
+        return Err(CliError::command_usage(
+            "--model without --provider is ambiguous: a model id cannot pick \
+             its provider, and credential detection cannot infer the pairing.\n\
+             \n\
+             Pass the pair explicitly:\n\
+                 libra code --provider <id> --model <name>",
+        ));
+    }
+    three_state_outcome(detect()?)
+}
+
+/// Shared PS-06 verdict over a detected candidate set — the single place
+/// where zero/one/many becomes an outcome, used by both the pure
+/// composition above (unit-tested) and the real entry point (which
+/// short-circuits structurally before ever detecting).
+fn three_state_outcome(
+    mut candidates: Vec<DetectedCandidate>,
+) -> CliResult<(CodeProvider, Option<DetectedCandidate>)> {
+    candidates.sort_by_key(|c| c.id);
+    match candidates.len() {
+        0 => Err(CliError::auth(credential_zero_state_message())),
+        1 => {
+            let only = candidates[0];
+            Ok((only.provider, Some(only)))
+        }
+        _ => Err(CliError::command_usage(ambiguous_candidates_message(
+            &candidates,
+        ))),
+    }
+}
+
+/// PS-06 zero-candidate outcome (LBR-AUTH-001): the a-mode message names
+/// the checked chain, every configurable provider with its one-line key
+/// command, and the credential-free alternatives.
+fn credential_zero_state_message() -> String {
+    let mut lines = vec![
+        "no provider credentials configured".to_string(),
+        String::new(),
+        "Checked in order: --env-file (default Web launch), process environment, \
+         repo-local vault, global vault"
+            .to_string(),
+        String::new(),
+        "Store a provider key (any one enables that provider):".to_string(),
+    ];
+    for spec in PROVIDER_SPECS {
+        if let Some(env) = spec.api_key_env
+            && spec.key_required
+        {
+            lines.push(format!(
+                "    libra config set --global vault.env.{env} <value>"
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Run without credentials:".to_string());
+    lines.push("    libra code --provider codex".to_string());
+    lines.push("    libra code --provider ollama --model <name>".to_string());
+    lines.join("\n")
+}
+
+/// PS-06 many-candidate outcome (LBR-CLI-002): candidates in provider-id
+/// order, each with its env var and hit layer — never the value.
+fn ambiguous_candidates_message(candidates: &[DetectedCandidate]) -> String {
+    let mut lines = vec![
+        "multiple provider credentials are configured; pick one explicitly".to_string(),
+        String::new(),
+        "Configured candidates:".to_string(),
+    ];
+    for candidate in candidates {
+        lines.push(format!(
+            "    {}  ({} in {})",
+            candidate.id, candidate.api_key_env, candidate.layer
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Run with one of them:".to_string());
+    for candidate in candidates {
+        lines.push(format!("    libra code --provider {}", candidate.id));
+    }
+    lines.push(String::new());
+    lines.push("Or persist a default:".to_string());
+    lines.push(format!(
+        "    libra config set --global {DEFAULT_PROVIDER_CONFIG_KEY} <id>"
+    ));
+    lines.join("\n")
+}
+
+/// ADR-PS-05 entry resolution: runs in `execute()` after the working-dir
+/// preflight and before `validate_mode_args`, then writes the result back to
+/// `args.provider`. `--stdio` / `--control stdio` never call this. When the
+/// PS-06 credential detection auto-selects the only candidate, the reason
+/// (provider id, env var, hit layer — never the value) goes to stderr;
+/// stdout stays untouched.
+async fn resolve_provider_at_entry(
+    args: &mut CodeArgs,
+    working_dir: &std::path::Path,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let binding = resolve_agent_binding_override(args, working_dir)?;
+    // Slots 1-2 short-circuit BEFORE any env-file read or credential probe:
+    // the explicit-means-zero-probes contract is structural here, not only
+    // unit-tested (PS-06 terra R1).
+    if let Some(decided) = resolve_provider_from_sources(
+        args.provider,
+        binding.as_ref().map(|b| b.provider_id.as_str()),
+    )? {
+        // PS-05: an explicit selection that disagrees with the resumed
+        // thread's recorded provider warns and proceeds — never fatal.
+        warn_on_resume_provider_mismatch(args, working_dir, decided, output);
+        args.provider = Some(decided);
+        return Ok(());
+    }
+    // Slot 3 (PS-05, ADR-PS-05): a resumed thread inherits its recorded
+    // provider — and, when `--model` is absent, its recorded model — from
+    // the session metadata, ahead of the persisted config default, the
+    // --model pairing guard, and detection. A session without the record
+    // (pre-PS-05 threads) or an unresolvable thread id simply falls
+    // through to the remaining slots — never fatal here; the real resume
+    // path surfaces its own errors later.
+    if let Some((recorded_provider, recorded_model)) = resume_recorded_provenance(args, working_dir)
+    {
+        args.provider = Some(recorded_provider);
+        if args.model.is_none() {
+            args.model = recorded_model;
+        }
+        return Ok(());
+    }
+    // Slot 4 (PS-03, ADR-PS-05): the persisted `code.defaultProvider`
+    // config key — session-target repo config first, then global. A valid
+    // hit resolves like an explicit provider (credential detection never
+    // runs), an invalid value is a usage error rather than a silent
+    // fallthrough, and the slot precedes the --model pairing guard because
+    // a persisted default determines the pairing just as a flag would.
+    if let Some(decided) = config_default_provider(working_dir).await? {
+        args.provider = Some(decided);
+        return Ok(());
+    }
+    // The --model pairing guard also precedes env-file IO and detection.
+    if args.model.is_some() {
+        return Err(CliError::command_usage(
+            "--model without --provider is ambiguous: a model id cannot pick \
+             its provider, and credential detection cannot infer the pairing.\n\
+             \n\
+             Pass the pair explicitly:\n\
+                 libra code --provider <id> --model <name>",
+        ));
+    }
+    // Only now: the env file participates in detection as its own layer,
+    // mirroring the provider_env_value_with_lookup chain the factory uses.
+    let env_file = load_code_env_file(args.env_file.as_deref())?;
+    let candidates = detect_provider_candidates(&env_file, working_dir).await?;
+    let (resolved, auto) = three_state_outcome(candidates)?;
+    if let Some(candidate) = auto {
+        if output.is_json() {
+            // ADR-PS-03 ⑤: machine surfaces get a structured event, never
+            // decorative prose. stderr keeps stdout's contract clean.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "provider_auto_selected",
+                    "provider": candidate.id,
+                    "api_key_env": candidate.api_key_env,
+                    "layer": candidate.layer,
+                })
+            );
+        } else {
+            eprintln!(
+                "provider '{}' auto-selected: {} found in {}",
+                candidate.id, candidate.api_key_env, candidate.layer
+            );
+        }
+    }
+    args.provider = Some(resolved);
+    Ok(())
+}
+
+/// PS-06 credential probe over the ADR-PS-02 table: for every
+/// `auto_selectable` row, report whether its key exists and where.
+/// `codex`/`ollama` are excluded by the table itself. The `--env-file`
+/// layer is checked first, then the shared process-env → repo vault →
+/// global vault chain (`locate_env_for_target`).
+async fn detect_provider_candidates(
+    env_file: &CodeEnvFile,
+    working_dir: &std::path::Path,
+) -> CliResult<Vec<DetectedCandidate>> {
+    use crate::internal::config::{LocalIdentityTarget, locate_env_for_target};
+    // The repo-local layer must be the SESSION target's vault (`--repo` /
+    // `--cwd` aware), not whatever repository the process cwd happens to be
+    // in (PS-06 terra R2: A-with-gemini running `--repo B` must not select
+    // A's provider for B's session).
+    let local_db = crate::utils::util::try_get_storage_path(Some(working_dir.to_path_buf()))
+        .ok()
+        .map(|storage| storage.join(crate::utils::util::DATABASE));
+    let mut out = Vec::new();
+    for spec in PROVIDER_SPECS {
+        if !spec.auto_selectable {
+            continue;
+        }
+        let Some(env) = spec.api_key_env else {
+            continue;
+        };
+        // An empty value is "not configured" at every layer (terra R4): it
+        // can never authenticate, so it must not win auto-selection nor
+        // shadow the zero-candidate guidance.
+        if env_file.get(env).is_some_and(|v| !v.trim().is_empty()) {
+            out.push(DetectedCandidate {
+                provider: spec.provider,
+                id: spec.id,
+                api_key_env: env,
+                layer: "--env-file",
+            });
+            continue;
+        }
+        let local_target = match &local_db {
+            Some(db) => LocalIdentityTarget::ExplicitDb(db),
+            None => LocalIdentityTarget::None,
+        };
+        let located = locate_env_for_target(env, local_target)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "credential detection failed while checking {env}: {error:#}"
+                ))
+            })?;
+        if let Some((value, layer)) = located
+            && !value.trim().is_empty()
+        {
+            out.push(DetectedCandidate {
+                provider: spec.provider,
+                id: spec.id,
+                api_key_env: env,
+                layer: layer.as_str(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// `docs/development/cli-error-contract-design.md`.
-pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute(mut args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
     // Client-only control shim (W4-02) + control-info discovery (W4-10): no
     // worktree gate, no Web/MCP boot, no auto-start / port scan.
     if args.control == ControlMode::Stdio {
@@ -773,6 +1258,14 @@ pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
     // and fail-close when that target is unregistered or unreadable.
     let session_workdir = resolve_code_preflight_working_dir(&args)?;
     crate::command::require_registered_worktree_scope("libra code", &session_workdir)?;
+    // plan-20260825 PS-02 (ADR-PS-05): resolve the effective provider once at
+    // the entry and write it back; every later consumer (plan-mode default,
+    // web runtime dispatch, banner, factory, usage labels, flag gates) reads
+    // the resolved value. `--stdio` keeps `None` — it never builds a
+    // completion provider and rejects an explicit `--provider` below.
+    if !args.stdio {
+        resolve_provider_at_entry(&mut args, &session_workdir, output).await?;
+    }
     validate_mode_args(&args, output).map_err(CliError::command_usage)?;
     if args.stdio {
         execute_stdio(&args).await
@@ -1203,79 +1696,82 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     let mcp_server = init_mcp_server(&working_dir).await;
 
     let mut managed_codex_server = ManagedCodexBootstrapGuard::new(None);
-    let code_ui_runtime =
-        if web_only_runtime_kind(args.provider) == WebOnlyRuntimeKind::ManagedCodexAppServer {
-            let server =
-                start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
-            if let Err(error) = check_process_terminate(&process_terminate) {
-                let shutdown_error =
-                    shutdown_code_lifecycle(None, None, None, None, Some(server), None)
-                        .await
-                        .err();
-                if let Some(shutdown_error) = shutdown_error {
-                    return Err(error.with_detail("shutdown", shutdown_error.to_string()));
-                }
-                return Err(error);
+    let code_ui_runtime = if web_only_runtime_kind(resolved_provider(args))
+        == WebOnlyRuntimeKind::ManagedCodexAppServer
+    {
+        let server =
+            start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
+        if let Err(error) = check_process_terminate(&process_terminate) {
+            let shutdown_error =
+                shutdown_code_lifecycle(None, None, None, None, Some(server), None)
+                    .await
+                    .err();
+            if let Some(shutdown_error) = shutdown_error {
+                return Err(error.with_detail("shutdown", shutdown_error.to_string()));
             }
-            println!("Starting Libra Code Web UI with Codex provider");
-            println!("Working directory: {}", working_dir.display());
-            println!("Codex WebSocket: {}", server.ws_url);
-            println!("Codex app-server: auto-started");
-            println!("{}", browser_control_banner_line(browser_control));
-            let ws_url = server.ws_url.clone();
-            managed_codex_server = ManagedCodexBootstrapGuard::new(Some(server));
+            return Err(error);
+        }
+        println!("Starting Libra Code Web UI with Codex provider");
+        println!("Working directory: {}", working_dir.display());
+        println!("Codex WebSocket: {}", server.ws_url);
+        println!("Codex app-server: auto-started");
+        println!("{}", browser_control_banner_line(browser_control));
+        let ws_url = server.ws_url.clone();
+        managed_codex_server = ManagedCodexBootstrapGuard::new(Some(server));
 
-            start_codex_code_ui_runtime(
-                args,
-                &working_dir,
-                &ws_url,
-                mcp_server.clone(),
-                browser_control == BrowserControlMode::Loopback,
-                CodeUiInitialController::Unclaimed,
-            )
-            .await?
-        } else {
-            // §C.4.1: refuse rather than mint a phantom `<working_dir>/.libra`.
-            let storage_root = require_storage_root(&working_dir)?;
-            let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
-            session_store
-                .rebuild_thread_session_index()
-                .map_err(|error| {
-                    CliError::io(format!(
-                        "failed to rebuild the Code thread→session index under '{}': {error}",
-                        storage_root.display()
-                    ))
-                })?;
-            let session_state =
-                load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
-            // All accepted non-Codex web-only providers now route through the
-            // headless runtime (C2 relaxed the web-only provider gate).
-            // Construction errors propagate via `?`; the read-only placeholder
-            // below is only the `Ok(None)` (not-wired) fallback — reached when
-            // the builder declines a provider (today only `Codex`, which is
-            // routed away before this branch), so it is defensive fail-closed
-            // code rather than a live path.
-            match build_non_codex_headless_runtime(
-                args,
-                &working_dir,
-                &env_file,
-                session_store,
-                session_state,
-                browser_control == BrowserControlMode::Loopback,
-                mcp_server.clone(),
-            )
-            .await?
-            {
-                Some(runtime) => {
-                    println!("Starting Libra Code Web UI in headless mode");
-                    println!("Working directory: {}", working_dir.display());
-                    println!("Provider: {:?}", args.provider);
-                    println!("{}", browser_control_banner_line(browser_control));
-                    runtime
-                }
-                None => build_placeholder_web_code_ui_runtime(args, &working_dir).await,
+        start_codex_code_ui_runtime(
+            args,
+            &working_dir,
+            &ws_url,
+            mcp_server.clone(),
+            browser_control == BrowserControlMode::Loopback,
+            CodeUiInitialController::Unclaimed,
+        )
+        .await?
+    } else {
+        // §C.4.1: refuse rather than mint a phantom `<working_dir>/.libra`.
+        let storage_root = require_storage_root(&working_dir)?;
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        session_store
+            .rebuild_thread_session_index()
+            .map_err(|error| {
+                CliError::io(format!(
+                    "failed to rebuild the Code thread→session index under '{}': {error}",
+                    storage_root.display()
+                ))
+            })?;
+        let session_state =
+            load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
+        // All accepted non-Codex web-only providers now route through the
+        // headless runtime (C2 relaxed the web-only provider gate).
+        // Construction errors propagate via `?`; the read-only placeholder
+        // below is only the `Ok(None)` (not-wired) fallback — reached when
+        // the builder declines a provider (today only `Codex`, which is
+        // routed away before this branch), so it is defensive fail-closed
+        // code rather than a live path.
+        match build_non_codex_headless_runtime(
+            args,
+            &working_dir,
+            &env_file,
+            session_store,
+            session_state,
+            browser_control == BrowserControlMode::Loopback,
+            mcp_server.clone(),
+        )
+        .await?
+        {
+            Some((runtime, effective_provider)) => {
+                println!("Starting Libra Code Web UI in headless mode");
+                println!("Working directory: {}", working_dir.display());
+                // PS-04: same line format, but the value is the provider
+                // the factory actually dispatched on.
+                println!("Provider: {effective_provider:?}");
+                println!("{}", browser_control_banner_line(browser_control));
+                runtime
             }
-        };
+            None => build_placeholder_web_code_ui_runtime(args, &working_dir).await,
+        }
+    };
     mcp_server.set_code_ui_session(code_ui_runtime.adapter().session());
 
     if let Err(error) = check_process_terminate(&process_terminate) {
@@ -1577,8 +2073,12 @@ fn provider_env_value_with_lookup(
     key: &str,
     lookup: impl FnOnce(&str) -> Option<String>,
 ) -> Option<String> {
+    // Empty env-file values are a MISS that falls through to the lookup
+    // chain (terra R5) — returning them early would diverge from detection
+    // and from the per-source rule in locate_env_for_target.
     env_file
         .get(key)
+        .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .or_else(|| lookup(key))
 }
@@ -1668,7 +2168,7 @@ fn build_any_completion_model_for_args(
         // fall back to the libra config DB (repo-local + global
         // `vault.env.<name>`) via the sync resolver. Phase 5 from_env →
         // resolve_env call-site cutover: users who configured an API key
-        // once via `libra config --global add vault.env.GEMINI_API_KEY <…>`
+        // once via `libra config set --global vault.env.GEMINI_API_KEY <…>`
         // no longer need to re-export it in every shell.
         //
         // The DB read may fail (e.g. stale global config schema); we treat
@@ -1676,8 +2176,10 @@ fn build_any_completion_model_for_args(
         // path falls through to its existing "API key not set" error,
         // matching the v0.17.534 fallback semantics. Hard schema-mismatch
         // chains are still surfaced via `tracing::warn!` inside
-        // `resolve_env_for_target`.
-        match crate::internal::config::resolve_env_sync(key) {
+        // `resolve_env_for_target`. The repo-local layer targets the
+        // SESSION working dir (`--repo`/`--cwd` aware) so the factory and
+        // the PS-06 detection read the same vault (terra R2).
+        match crate::internal::config::resolve_env_sync_for_dir(key, working_dir) {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(
@@ -1719,6 +2221,153 @@ fn resolve_provider_api_base(
     }
 }
 
+/// Default model id for a CLI provider (plan-20260825 PS-01: extracted from
+/// the factory closure so the ADR-PS-02 capability-table test can assert the
+/// `needs_explicit_model` column against these exact branches). Ollama errors
+/// when `--model` is omitted (no sensible local default); the rest fall back
+/// to a flagship model constant.
+fn cli_default_model(provider: CodeProvider) -> CliResult<String> {
+    Ok(match provider {
+        CodeProvider::Gemini => GEMINI_2_5_FLASH.to_string(),
+        CodeProvider::Openai => GPT_4O_MINI.to_string(),
+        CodeProvider::Anthropic => CLAUDE_3_5_SONNET.to_string(),
+        CodeProvider::Deepseek => "deepseek-chat".to_string(),
+        CodeProvider::Kimi => KIMI_K2_6.to_string(),
+        CodeProvider::Zhipu => GLM_5.to_string(),
+        CodeProvider::Ollama => {
+            return Err(CliError::command_usage(
+                "--model is required when using --provider ollama \
+                 (e.g. --model llama3.2)",
+            ));
+        }
+        #[cfg(feature = "test-provider")]
+        CodeProvider::Fake => FAKE_DEFAULT_MODEL.to_string(),
+        CodeProvider::Codex => unreachable!("Codex filtered above"),
+    })
+}
+
+/// plan-20260825 ADR-PS-02: the provider capability table is the single
+/// source of truth for the API-key env-var mapping and for user-facing
+/// credential enumeration. PS-01 drives the env lookup and the missing-key
+/// message from it; PS-02/PS-06 will consume `auto_selectable` for
+/// zero/one/many credential auto-selection (candidates = rows with
+/// `key_required && credential configured`; `codex`/`ollama` never
+/// auto-select but must appear in the credential-free block of the
+/// zero-candidate message).
+pub(crate) struct ProviderSpec {
+    pub(crate) provider: CodeProvider,
+    pub(crate) id: &'static str,
+    pub(crate) api_key_env: Option<&'static str>,
+    pub(crate) key_required: bool,
+    // Exercised by the cli_default_model consistency test; kept as the
+    // ADR-PS-02 table contract for model-requirement enumeration (no
+    // production reader yet — ollama is already excluded from
+    // auto-selection via `auto_selectable`).
+    #[allow(dead_code)]
+    pub(crate) needs_explicit_model: bool,
+    pub(crate) auto_selectable: bool,
+}
+
+pub(crate) const PROVIDER_SPECS: &[ProviderSpec] = &[
+    ProviderSpec {
+        provider: CodeProvider::Gemini,
+        id: crate::internal::ai::providers::runtime::provider_id::GEMINI,
+        api_key_env: Some("GEMINI_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Openai,
+        id: crate::internal::ai::providers::runtime::provider_id::OPENAI,
+        api_key_env: Some("OPENAI_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Anthropic,
+        id: crate::internal::ai::providers::runtime::provider_id::ANTHROPIC,
+        api_key_env: Some("ANTHROPIC_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Deepseek,
+        id: crate::internal::ai::providers::runtime::provider_id::DEEPSEEK,
+        api_key_env: Some("DEEPSEEK_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Kimi,
+        id: crate::internal::ai::providers::runtime::provider_id::KIMI,
+        api_key_env: Some("MOONSHOT_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Zhipu,
+        id: crate::internal::ai::providers::runtime::provider_id::ZHIPU,
+        api_key_env: Some("ZHIPU_API_KEY"),
+        key_required: true,
+        needs_explicit_model: false,
+        auto_selectable: true,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Ollama,
+        id: crate::internal::ai::providers::runtime::provider_id::OLLAMA,
+        api_key_env: Some("OLLAMA_API_KEY"),
+        key_required: false,
+        needs_explicit_model: true,
+        auto_selectable: false,
+    },
+    ProviderSpec {
+        provider: CodeProvider::Codex,
+        id: "codex",
+        api_key_env: None,
+        key_required: false,
+        needs_explicit_model: false,
+        auto_selectable: false,
+    },
+];
+
+/// Look up a capability row by canonical provider id. The `fake`
+/// test-provider is deliberately absent (cfg-gated); callers treat a miss
+/// as "no API key env" which preserves the pre-table behavior.
+pub(crate) fn provider_spec_by_id(id: &str) -> Option<&'static ProviderSpec> {
+    PROVIDER_SPECS.iter().find(|spec| spec.id == id)
+}
+
+/// ADR-PS-03 "a-mode" missing-credential message: conclusion first, the
+/// checked lookup chain, a copy-pasteable recommended command block, then
+/// the credential-free alternatives (ADR-PS-02 requires codex/ollama here).
+/// Never prints key material.
+fn missing_api_key_message(env_var: &str, provider_id: &str) -> String {
+    // Built line-by-line: `\` string continuations strip the next line's
+    // leading whitespace, which silently ate the mandatory four-space
+    // command indentation on the first attempt.
+    [
+        format!("{env_var} is not configured for provider '{provider_id}'"),
+        String::new(),
+        "Checked in order: --env-file (default Web launch), process environment, \
+         repo-local vault, global vault"
+            .to_string(),
+        String::new(),
+        "Configure the key (recommended):".to_string(),
+        format!("    libra config set --global vault.env.{env_var} <value>"),
+        format!("    export {env_var}=<value>"),
+        String::new(),
+        "Run without credentials:".to_string(),
+        "    libra code --provider codex".to_string(),
+        "    libra code --provider ollama --model <name>".to_string(),
+    ]
+    .join("\n")
+}
+
 fn build_any_completion_model_for_args_with_lookup(
     args: &CodeArgs,
     env_file: &CodeEnvFile,
@@ -1738,7 +2387,7 @@ fn build_any_completion_model_for_args_with_lookup(
 
     // 1. Map `--provider` to the canonical provider id string (the factory's
     //    dispatch key). Codex bypasses this helper entirely.
-    let mut provider_id_str = match args.provider {
+    let mut provider_id_str = match resolved_provider(args) {
         CodeProvider::Gemini => provider_id::GEMINI.to_string(),
         CodeProvider::Openai => provider_id::OPENAI.to_string(),
         CodeProvider::Anthropic => provider_id::ANTHROPIC.to_string(),
@@ -1759,30 +2408,6 @@ fn build_any_completion_model_for_args_with_lookup(
         }
     };
 
-    // 2. Resolve the default model id from the CLI provider. Ollama errors
-    //    if `--model` is omitted (no sensible local default); the rest fall
-    //    back to a flagship model constant. Honored only when the agent
-    //    override does not supply a binding model id below.
-    let cli_default_model = |provider: CodeProvider| -> CliResult<String> {
-        Ok(match provider {
-            CodeProvider::Gemini => GEMINI_2_5_FLASH.to_string(),
-            CodeProvider::Openai => GPT_4O_MINI.to_string(),
-            CodeProvider::Anthropic => CLAUDE_3_5_SONNET.to_string(),
-            CodeProvider::Deepseek => "deepseek-chat".to_string(),
-            CodeProvider::Kimi => KIMI_K2_6.to_string(),
-            CodeProvider::Zhipu => GLM_5.to_string(),
-            CodeProvider::Ollama => {
-                return Err(CliError::command_usage(
-                    "--model is required when using --provider ollama \
-                     (e.g. --model llama3.2)",
-                ));
-            }
-            #[cfg(feature = "test-provider")]
-            CodeProvider::Fake => FAKE_DEFAULT_MODEL.to_string(),
-            CodeProvider::Codex => unreachable!("Codex filtered above"),
-        })
-    };
-
     let mut variant: Option<String> = None;
     // 3. OC-Phase 2 P2.4: apply `--agent <name>` override atomically.
     //    When the profile carries a structured binding, all three of
@@ -1796,7 +2421,7 @@ fn build_any_completion_model_for_args_with_lookup(
     } else {
         match args.model.clone() {
             Some(m) => m,
-            None => cli_default_model(args.provider)?,
+            None => cli_default_model(resolved_provider(args))?,
         }
     };
 
@@ -1804,18 +2429,16 @@ fn build_any_completion_model_for_args_with_lookup(
     //    agent override flows through to env-var lookup).
     let resolve_env = |key: &str| provider_env_value_with_lookup(env_file, key, &env_lookup);
 
-    let api_key = match provider_id_str.as_str() {
-        provider_id::GEMINI => resolve_env("GEMINI_API_KEY"),
-        provider_id::OPENAI => resolve_env("OPENAI_API_KEY"),
-        provider_id::ANTHROPIC => resolve_env("ANTHROPIC_API_KEY"),
-        provider_id::DEEPSEEK => resolve_env("DEEPSEEK_API_KEY"),
-        provider_id::KIMI => resolve_env("MOONSHOT_API_KEY"),
-        provider_id::ZHIPU => resolve_env("ZHIPU_API_KEY"),
-        provider_id::OLLAMA => resolve_env("OLLAMA_API_KEY"),
-        #[cfg(feature = "test-provider")]
-        provider_id::FAKE => None,
-        _ => None,
-    };
+    // ADR-PS-02: env-var mapping is table-driven; a spec miss (unknown id,
+    // or the cfg-gated `fake` provider) means "no API key env" exactly like
+    // the match arms this replaced.
+    let api_key = provider_spec_by_id(&provider_id_str)
+        .and_then(|spec| spec.api_key_env)
+        .and_then(resolve_env)
+        // Empty keys are "not configured" (terra R4): fall into the
+        // provider's missing-key a-mode error instead of authenticating
+        // with an empty string.
+        .filter(|value| !value.trim().is_empty());
 
     let api_base = resolve_provider_api_base(&provider_id_str, args.api_base.clone(), resolve_env);
 
@@ -1876,16 +2499,11 @@ fn build_any_completion_model_for_args_with_lookup(
                      (set --api-base https://ollama.com or OLLAMA_BASE_URL=https://ollama.com)",
                     )
                 } else {
-                    // Name the missing variable AND how to configure it, so
-                    // the user has an actionable next step rather than a bare
-                    // "not set" (C3 criterion: missing-key errors must say
-                    // which env var and how to set it). Mirrors the
-                    // vault-aware resolution chain in
-                    // `build_any_completion_model_for_args`.
-                    CliError::auth(format!(
-                        "{env_var} is not set; export {env_var} or store it with \
-                         `libra config --global add vault.env.{env_var} <value>`"
-                    ))
+                    // plan-20260825 PS-01 (ADR-PS-03 a-mode): conclusion,
+                    // checked chain, copy-pasteable recommended commands,
+                    // credential-free alternatives. Replaces the old hint
+                    // that named a nonexistent config subcommand.
+                    CliError::auth(missing_api_key_message(env_var, &provider_id_str))
                 }
             }
             ProviderFactoryError::BuildFailed { reason, .. } => CliError::io(reason),
@@ -1941,7 +2559,7 @@ fn resolve_agent_binding_override(
 }
 
 fn completion_thinking_for_args(args: &CodeArgs) -> Option<CompletionThinking> {
-    completion_thinking_for_provider(args.provider, args)
+    completion_thinking_for_provider(resolved_provider(args), args)
 }
 
 /// Provider-explicit variant of [`completion_thinking_for_args`] used by the
@@ -1959,7 +2577,7 @@ fn completion_thinking_for_provider(
 }
 
 fn completion_reasoning_effort_for_args(args: &CodeArgs) -> Option<CompletionReasoningEffort> {
-    completion_reasoning_effort_for_provider(args.provider, args)
+    completion_reasoning_effort_for_provider(resolved_provider(args), args)
 }
 
 /// Provider-explicit variant of [`completion_reasoning_effort_for_args`].
@@ -1976,7 +2594,7 @@ fn completion_reasoning_effort_for_provider(
 }
 
 fn completion_stream_for_args(args: &CodeArgs) -> Option<bool> {
-    completion_stream_for_provider(args.provider, args)
+    completion_stream_for_provider(resolved_provider(args), args)
 }
 
 /// Provider-explicit variant of [`completion_stream_for_args`].
@@ -2678,6 +3296,7 @@ async fn build_headless_web_code_ui_runtime<M>(
     session_bootstrap: HeadlessWebSessionBootstrap,
     model: M,
     model_name: String,
+    effective_provider_id: String,
     approval_channels: HeadlessApprovalChannels,
     browser_write_enabled: bool,
     mcp_server: Arc<LibraMcpServer>,
@@ -2729,7 +3348,28 @@ where
         exec_approval_tx,
         exec_approval_rx,
     } = approval_channels;
-    let provider_name = format!("{:?}", args.provider).to_lowercase();
+    // PS-04: every observable label (UI snapshot, usage records, subagent
+    // runtime, system preamble) derives from the provider id the factory
+    // actually dispatched on, not from `args.provider` — so an `--agent`
+    // binding override can never mislabel the session.
+    let provider_name = effective_provider_id;
+    // PS-05: record the session's provider/model provenance under the
+    // writer lease, insert-if-absent — an existing record is the thread's
+    // history and a later override must not rewrite it. Ids only, never
+    // credentials (GC-PS-01). The write is best-effort: a failure is
+    // logged and the session boots without a durable record (the next
+    // boot retries) — provenance must never block the session itself.
+    let mut session_state = session_state;
+    if session_state.record_provider_provenance(&provider_name, &model_name)
+        && let Err(error) = session_store.save(&session_state)
+    {
+        tracing::warn!(
+            session_id = %session_state.id,
+            %error,
+            "failed to persist provider provenance; continuing without it"
+        );
+    }
+    let session_state = session_state;
     let provider = CodeUiProviderInfo {
         provider: provider_name.clone(),
         model: Some(model_name.clone()),
@@ -2821,9 +3461,15 @@ where
     } else {
         None
     };
-    let preamble = system_preamble(working_dir, args.context, args.provider, Some(&model_name))
-        .map_err(CliError::failure)?;
-    let preserve_reasoning_content = preserve_reasoning_content_for_provider(args.provider);
+    let preamble = system_preamble(
+        working_dir,
+        args.context,
+        effective_code_provider(args, &provider_name),
+        Some(&model_name),
+    )
+    .map_err(CliError::failure)?;
+    let preserve_reasoning_content =
+        preserve_reasoning_content_for_provider(resolved_provider(args));
     let temperature = args.temperature;
     let thinking = completion_thinking_for_args(args);
     let reasoning_effort = completion_reasoning_effort_for_args(args);
@@ -2954,11 +3600,11 @@ async fn build_non_codex_headless_runtime(
     session_state: SessionState,
     browser_write_enabled: bool,
     mcp_server: Arc<LibraMcpServer>,
-) -> CliResult<Option<Arc<CodeUiRuntimeHandle>>> {
+) -> CliResult<Option<(Arc<CodeUiRuntimeHandle>, CodeProvider)>> {
     let (exec_approval_tx, exec_approval_rx) =
         tokio::sync::mpsc::unbounded_channel::<ExecApprovalRequest>();
 
-    match args.provider {
+    match resolved_provider(args) {
         CodeProvider::Gemini
         | CodeProvider::Openai
         | CodeProvider::Anthropic
@@ -2966,9 +3612,13 @@ async fn build_non_codex_headless_runtime(
         | CodeProvider::Kimi
         | CodeProvider::Zhipu
         | CodeProvider::Ollama => {
-            let (model, model_name, _) =
+            // PS-04: the factory's returned provider id is the effective
+            // dispatch key (an `--agent` binding may override the CLI
+            // slots); it drives every label from here on.
+            let (model, model_name, effective_provider_id) =
                 build_any_completion_model_for_args(args, env_file, working_dir)?;
-            Ok(Some(
+            let effective_provider = effective_code_provider(args, &effective_provider_id);
+            Ok(Some((
                 build_headless_web_code_ui_runtime(
                     args,
                     working_dir,
@@ -2978,6 +3628,7 @@ async fn build_non_codex_headless_runtime(
                     },
                     model,
                     model_name,
+                    effective_provider_id,
                     HeadlessApprovalChannels {
                         exec_approval_tx,
                         exec_approval_rx,
@@ -2986,16 +3637,18 @@ async fn build_non_codex_headless_runtime(
                     mcp_server,
                 )
                 .await?,
-            ))
+                effective_provider,
+            )))
         }
         // Codex is handled by `start_codex_code_ui_runtime` in `execute_web_only`;
         // it must never enter this dispatcher.
         CodeProvider::Codex => Ok(None),
         #[cfg(feature = "test-provider")]
         CodeProvider::Fake => {
-            let (model, model_name, _) =
+            let (model, model_name, effective_provider_id) =
                 build_any_completion_model_for_args(args, env_file, working_dir)?;
-            Ok(Some(
+            let effective_provider = effective_code_provider(args, &effective_provider_id);
+            Ok(Some((
                 build_headless_web_code_ui_runtime(
                     args,
                     working_dir,
@@ -3005,6 +3658,7 @@ async fn build_non_codex_headless_runtime(
                     },
                     model,
                     model_name,
+                    effective_provider_id,
                     HeadlessApprovalChannels {
                         exec_approval_tx,
                         exec_approval_rx,
@@ -3013,9 +3667,21 @@ async fn build_non_codex_headless_runtime(
                     mcp_server,
                 )
                 .await?,
-            ))
+                effective_provider,
+            )))
         }
     }
+}
+
+/// PS-04: map the factory's effective provider id back to the enum for
+/// enum-typed label consumers (startup banner, system preamble). The
+/// cfg-gated `fake` row is deliberately absent from the capability table,
+/// so an unknown id falls back to the entry-resolved value — which the
+/// ADR-PS-05 entry resolution already aligned with any `--agent` binding.
+fn effective_code_provider(args: &CodeArgs, effective_provider_id: &str) -> CodeProvider {
+    provider_spec_by_id(effective_provider_id)
+        .map(|spec| spec.provider)
+        .unwrap_or_else(|| resolved_provider(args))
 }
 
 async fn build_placeholder_web_code_ui_runtime(
@@ -3037,10 +3703,10 @@ async fn build_placeholder_web_code_ui_runtime(
     let mut snapshot = initial_snapshot(
         working_dir.to_string_lossy().to_string(),
         CodeUiProviderInfo {
-            provider: format!("{:?}", args.provider).to_lowercase(),
+            provider: format!("{:?}", resolved_provider(args)).to_lowercase(),
             model: args.model.clone(),
             mode: Some("web".to_string()),
-            managed: matches!(args.provider, CodeProvider::Codex),
+            managed: matches!(args.provider, Some(CodeProvider::Codex)),
         },
         capabilities.clone(),
     );
@@ -4193,7 +4859,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         // Web resume has not landed (W4-01 residual), so bare
         // `--provider codex --resume` must fail closed with a migration hint
         // instead of silently starting a fresh, unresumed Web session.
-        if args.provider == CodeProvider::Codex && args.resume.is_some() {
+        if args.provider == Some(CodeProvider::Codex) && args.resume.is_some() {
             return Err(
                 "--resume is not supported with --provider=codex: the legacy TUI resume driver was removed in the W5 breaking release and managed Codex Web resume has not landed yet; start a new session with `libra code --provider codex` (omit --resume), or resume the thread with a non-Codex provider"
                     .to_string(),
@@ -4202,13 +4868,13 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         // Managed Codex web owns its own credential/approval surface; these
         // Legacy/headless flags are accepted for non-Codex web but must not be
         // silently ignored under Codex.
-        if args.provider == CodeProvider::Codex && args.env_file.is_some() {
+        if args.provider == Some(CodeProvider::Codex) && args.env_file.is_some() {
             return Err(
                 "--env-file is not supported with the Web Code UI and --provider=codex; remove --env-file or use a non-Codex headless provider"
                     .to_string(),
             );
         }
-        if args.provider == CodeProvider::Codex && args.approval_ttl.is_some() {
+        if args.provider == Some(CodeProvider::Codex) && args.approval_ttl.is_some() {
             return Err(
                 "--approval-ttl is not supported with the Web Code UI and --provider=codex; remove --approval-ttl or use a non-Codex headless provider"
                     .to_string(),
@@ -4279,7 +4945,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         ensure_loopback_control_host_for_validation(&args.host)?;
     }
 
-    if args.provider != CodeProvider::Codex {
+    if args.provider != Some(CodeProvider::Codex) {
         if args.codex_port.is_some() {
             return Err("--codex-port is only supported with --provider=codex".to_string());
         }
@@ -4291,7 +4957,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         }
     }
 
-    if args.provider == CodeProvider::Codex && args.api_base.is_some() {
+    if args.provider == Some(CodeProvider::Codex) && args.api_base.is_some() {
         return Err("--api-base is not supported with --provider=codex".to_string());
     }
     if let Some(base_url) = args.api_base.as_deref() {
@@ -4322,43 +4988,43 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         ));
     }
 
-    if args.provider != CodeProvider::Ollama && args.ollama_thinking.is_some() {
+    if args.provider != Some(CodeProvider::Ollama) && args.ollama_thinking.is_some() {
         return Err(
             "--ollama-thinking/--thinking is only supported with --provider=ollama".to_string(),
         );
     }
 
-    if args.provider != CodeProvider::Ollama && args.ollama_compact_tools {
+    if args.provider != Some(CodeProvider::Ollama) && args.ollama_compact_tools {
         return Err("--ollama-compact-tools is only supported with --provider=ollama".to_string());
     }
 
-    if args.provider != CodeProvider::Deepseek && args.deepseek_thinking.is_some() {
+    if args.provider != Some(CodeProvider::Deepseek) && args.deepseek_thinking.is_some() {
         return Err("--deepseek-thinking is only supported with --provider=deepseek".to_string());
     }
 
-    if args.provider != CodeProvider::Deepseek && args.deepseek_reasoning_effort.is_some() {
+    if args.provider != Some(CodeProvider::Deepseek) && args.deepseek_reasoning_effort.is_some() {
         return Err(
             "--deepseek-reasoning-effort is only supported with --provider=deepseek".to_string(),
         );
     }
 
-    if args.provider != CodeProvider::Deepseek && args.deepseek_stream.is_some() {
+    if args.provider != Some(CodeProvider::Deepseek) && args.deepseek_stream.is_some() {
         return Err(
             "--deepseek-stream/--stream is only supported with --provider=deepseek".to_string(),
         );
     }
 
-    if args.provider != CodeProvider::Kimi && args.kimi_thinking.is_some() {
+    if args.provider != Some(CodeProvider::Kimi) && args.kimi_thinking.is_some() {
         return Err("--kimi-thinking is only supported with --provider=kimi".to_string());
     }
 
-    if args.provider != CodeProvider::Kimi && args.kimi_stream.is_some() {
+    if args.provider != Some(CodeProvider::Kimi) && args.kimi_stream.is_some() {
         return Err("--kimi-stream is only supported with --provider=kimi".to_string());
     }
 
     #[cfg(feature = "test-provider")]
     {
-        if args.provider == CodeProvider::Fake {
+        if args.provider == Some(CodeProvider::Fake) {
             if std::env::var_os("LIBRA_ENABLE_TEST_PROVIDER").is_none() {
                 return Err(
                     "--provider=fake is test-only; set LIBRA_ENABLE_TEST_PROVIDER=1 to use it"
@@ -4443,7 +5109,7 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_launch: bool) -> Result
     // rejection in `validate_mode_args` (invoked after this helper), so
     // mismatched flags and `--api-base` under Codex are still rejected there.
     if !web_launch {
-        reject_mode_flag(args.provider != CodeProvider::Gemini, "--provider", mode)?;
+        reject_mode_flag(args.provider.is_some(), "--provider", mode)?;
         reject_mode_flag(args.model.is_some(), "--model", mode)?;
         reject_mode_flag(args.temperature.is_some(), "--temperature", mode)?;
         reject_mode_flag(args.api_base.is_some(), "--api-base", mode)?;
@@ -4494,6 +5160,904 @@ mod tests {
         path::{Path, PathBuf},
         sync::Arc,
     };
+
+    /// plan-20260825 PS-01: the ADR-PS-03 a-mode missing-credential message
+    /// must be copy-paste executable — the recommended command is the real
+    /// `config set --global` shape, the extinct add-style hint never
+    /// reappears (assembled dynamically below so this file cannot trip the
+    /// zero-hit guard itself), command lines are four-space indented, and the ADR-PS-02
+    /// credential-free alternatives (codex / ollama with an explicit model)
+    /// are present. No key material beyond the env-var NAME is printed.
+    #[test]
+    fn missing_api_key_message_is_executable() {
+        let msg = super::missing_api_key_message("GEMINI_API_KEY", "gemini");
+        assert!(
+            msg.starts_with("GEMINI_API_KEY is not configured for provider 'gemini'"),
+            "first line must be the conclusion without a command: {msg}"
+        );
+        assert!(
+            msg.contains("Checked in order: --env-file (default Web launch), process environment, repo-local vault, global vault"),
+            "lookup chain missing: {msg}"
+        );
+        assert!(
+            msg.contains("    libra config set --global vault.env.GEMINI_API_KEY <value>"),
+            "recommended command must be the executable config set form: {msg}"
+        );
+        let extinct = format!("config --global {}", "add");
+        assert!(
+            !msg.contains(&extinct),
+            "the nonexistent add subcommand must never reappear: {msg}"
+        );
+        assert!(
+            msg.contains("    libra code --provider codex")
+                && msg.contains("    libra code --provider ollama --model <name>"),
+            "credential-free alternatives missing: {msg}"
+        );
+    }
+
+    /// plan-20260825 PS-02 (ADR-PS-05 slots 1-2): explicit `--provider`
+    /// wins, a mappable `--agent` binding fills in when the flag is absent,
+    /// a disagreement between the two is a usage conflict, and no source
+    /// falls through (`Ok(None)`) to the PS-06 detection slot.
+    #[test]
+    fn provider_resolution_entry() {
+        use super::{CodeProvider, resolve_provider_from_sources};
+
+        assert_eq!(
+            resolve_provider_from_sources(Some(CodeProvider::Kimi), Some("gemini")).ok(),
+            None,
+            "flag vs binding disagreement must be a usage conflict"
+        );
+        assert_eq!(
+            resolve_provider_from_sources(Some(CodeProvider::Kimi), Some("kimi")).unwrap(),
+            Some(CodeProvider::Kimi)
+        );
+        assert_eq!(
+            resolve_provider_from_sources(Some(CodeProvider::Zhipu), None).unwrap(),
+            Some(CodeProvider::Zhipu),
+            "explicit flag stands alone"
+        );
+        assert_eq!(
+            resolve_provider_from_sources(None, Some("anthropic")).unwrap(),
+            Some(CodeProvider::Anthropic),
+            "binding fills in when the flag is absent"
+        );
+        assert_eq!(
+            resolve_provider_from_sources(None, None).unwrap(),
+            None,
+            "no source falls through to detection (PS-06)"
+        );
+    }
+
+    fn candidate(
+        provider: CodeProvider,
+        id: &'static str,
+        env: &'static str,
+        layer: &'static str,
+    ) -> super::DetectedCandidate {
+        super::DetectedCandidate {
+            provider,
+            id,
+            api_key_env: env,
+            layer,
+        }
+    }
+
+    /// plan-20260825 PS-06: the zero/one/many outcomes of credential
+    /// detection, the zero-probe contract for explicit selection, the
+    /// `--model`-without-provider guard, and the redaction rule (messages
+    /// carry provider id / env var / layer, never a value).
+    #[test]
+    fn provider_detection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::{CodeProvider, resolve_provider_with_detection};
+
+        // Explicit selection must not probe at all.
+        let probes = AtomicUsize::new(0);
+        let (chosen, auto) =
+            resolve_provider_with_detection(Some(CodeProvider::Zhipu), None, None, false, || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            })
+            .unwrap();
+        assert_eq!((chosen, auto), (CodeProvider::Zhipu, None));
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "explicit --provider must short-circuit detection"
+        );
+
+        // --model without any provider source is ambiguous before detection.
+        let err =
+            resolve_provider_with_detection(None, None, None, true, || Ok(vec![])).unwrap_err();
+        assert!(
+            err.to_string().contains("--model without --provider"),
+            "{err}"
+        );
+
+        // Zero candidates: auth error with the checked chain, every
+        // configurable key command, and the credential-free block.
+        let err =
+            resolve_provider_with_detection(None, None, None, false, || Ok(vec![])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no provider credentials configured"), "{msg}");
+        assert!(msg.contains("Checked in order:"), "{msg}");
+        for env in [
+            "GEMINI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MOONSHOT_API_KEY",
+            "ZHIPU_API_KEY",
+        ] {
+            assert!(
+                msg.contains(&format!(
+                    "    libra config set --global vault.env.{env} <value>"
+                )),
+                "{env} missing: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("    libra code --provider codex")
+                && msg.contains("    libra code --provider ollama --model <name>"),
+            "credential-free alternatives missing: {msg}"
+        );
+
+        // One candidate: auto-selected, and the announcement payload names
+        // id/env/layer only.
+        let only = candidate(
+            CodeProvider::Deepseek,
+            "deepseek",
+            "DEEPSEEK_API_KEY",
+            "global vault",
+        );
+        let (chosen, auto) =
+            resolve_provider_with_detection(None, None, None, false, || Ok(vec![only])).unwrap();
+        assert_eq!(chosen, CodeProvider::Deepseek);
+        assert_eq!(auto, Some(only));
+
+        // Many candidates: usage error, id-sorted, layer shown, value never.
+        let a = candidate(
+            CodeProvider::Kimi,
+            "kimi",
+            "MOONSHOT_API_KEY",
+            "process environment",
+        );
+        let b = candidate(
+            CodeProvider::Gemini,
+            "gemini",
+            "GEMINI_API_KEY",
+            "--env-file",
+        );
+        let err = resolve_provider_with_detection(None, None, None, false, || Ok(vec![a, b]))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multiple provider credentials are configured"),
+            "{msg}"
+        );
+        let gemini_at = msg
+            .find("    gemini  (GEMINI_API_KEY in --env-file)")
+            .unwrap();
+        let kimi_at = msg
+            .find("    kimi  (MOONSHOT_API_KEY in process environment)")
+            .unwrap();
+        assert!(gemini_at < kimi_at, "candidates must be id-sorted: {msg}");
+        assert!(
+            msg.contains("    libra code --provider gemini")
+                && msg.contains("    libra code --provider kimi"),
+            "per-candidate commands missing: {msg}"
+        );
+        assert!(
+            !msg.contains("secret") && !msg.to_lowercase().contains("value:"),
+            "no value material may leak: {msg}"
+        );
+        assert!(
+            msg.contains("    libra config set --global code.defaultProvider <id>"),
+            "the persistent-default alternative must be offered (PS-03): {msg}"
+        );
+    }
+
+    /// plan-20260825 PS-03: the `code.defaultProvider` slot — value
+    /// domain, ladder position (after flags/binding, before the --model
+    /// guard and detection), and the no-echo usage error.
+    #[test]
+    fn provider_config_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::{CodeProvider, config_slot_outcome, resolve_provider_with_detection};
+
+        // Every capability-table id is a legal value and maps to its own
+        // provider; surrounding whitespace is tolerated.
+        for spec in super::PROVIDER_SPECS {
+            let padded = format!("  {}  ", spec.id);
+            assert_eq!(
+                config_slot_outcome(Some(&padded)).unwrap(),
+                Some(spec.provider),
+                "id '{}' must resolve",
+                spec.id
+            );
+        }
+        // Absent falls through (empty never reaches here: the cascaded
+        // reader returns None for present-but-empty values).
+        assert_eq!(config_slot_outcome(None).unwrap(), None);
+
+        // An unrecognized value is a usage error whose a-mode message
+        // lists the full sorted domain and copy-pasteable fixes — and
+        // never echoes the stored value (GC-PS-01: it could be a secret
+        // pasted into the wrong key).
+        let err = config_slot_outcome(Some("sk-SENTINEL")).unwrap_err();
+        let msg = err.to_string();
+        let first_line = msg.lines().next().unwrap();
+        assert!(
+            first_line.contains("code.defaultProvider")
+                && first_line.contains("unrecognized provider id"),
+            "conclusion-first a-mode line expected: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "Valid values: anthropic, codex, deepseek, gemini, kimi, ollama, openai, zhipu"
+            ),
+            "the full sorted id domain must be listed: {msg}"
+        );
+        assert!(
+            msg.contains("    libra config set --global code.defaultProvider <id>")
+                && msg.contains("    libra config unset --global code.defaultProvider")
+                && msg.contains("    libra config get code.defaultProvider"),
+            "fix/clear/inspect commands must be copy-pasteable: {msg}"
+        );
+        assert!(
+            !msg.contains("sk-SENTINEL"),
+            "the stored value must never be echoed: {msg}"
+        );
+
+        // Ladder position: a config hit resolves without a single
+        // detection probe, even when --model is present (a persisted
+        // default determines the pairing just as a flag would).
+        let probes = AtomicUsize::new(0);
+        let (chosen, auto) =
+            resolve_provider_with_detection(None, None, Some("deepseek"), true, || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            })
+            .unwrap();
+        assert_eq!((chosen, auto), (CodeProvider::Deepseek, None));
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "a config hit must skip credential detection"
+        );
+
+        // Explicit --provider outranks the config slot.
+        let (chosen, _) = resolve_provider_with_detection(
+            Some(CodeProvider::Zhipu),
+            None,
+            Some("deepseek"),
+            false,
+            || Ok(vec![]),
+        )
+        .unwrap();
+        assert_eq!(chosen, CodeProvider::Zhipu);
+
+        // An invalid config value fails the resolution even though
+        // detection would have found candidates — never a silent skip.
+        let err = resolve_provider_with_detection(None, None, Some("nonsense"), false, || {
+            panic!("detection must not run after an invalid config value")
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognized provider id"),
+            "{err}"
+        );
+    }
+
+    /// plan-20260825 PS-04: observable labels follow the factory's
+    /// effective provider id — for every capability-table row the id maps
+    /// back to its own enum regardless of what `args.provider` says, and
+    /// only an id outside the table (the cfg-gated `fake`) falls back to
+    /// the entry-resolved value.
+    #[test]
+    fn provider_labels() {
+        use super::effective_code_provider;
+
+        // The flag deliberately disagrees with the id under test: the id
+        // must win, proving labels cannot be skewed by `args.provider`.
+        for spec in super::PROVIDER_SPECS {
+            let mut args = base_args();
+            args.provider = Some(if matches!(spec.provider, CodeProvider::Zhipu) {
+                CodeProvider::Gemini
+            } else {
+                CodeProvider::Zhipu
+            });
+            assert_eq!(
+                effective_code_provider(&args, spec.id),
+                spec.provider,
+                "label for id '{}' must follow the factory id",
+                spec.id
+            );
+        }
+
+        // Unknown id (not in the table): fall back to the entry-resolved
+        // provider — the only case where `args.provider` drives the label.
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Deepseek);
+        assert_eq!(
+            effective_code_provider(&args, "not-a-provider-id"),
+            CodeProvider::Deepseek
+        );
+    }
+
+    /// plan-20260825 PS-04 (terra R1): cross-surface pin over a REAL turn.
+    /// Boot the headless runtime, submit one message against the canned
+    /// chat-completions stub, and assert that the banner enum, the UI
+    /// snapshot label, and the usage rows the recorder persisted all carry
+    /// the same effective provider. Run twice:
+    /// - with an `--agent` binding whose provider deliberately disagrees
+    ///   with `args.provider` (possible here because the entry resolution
+    ///   is bypassed) — every face must follow the binding, and
+    /// - without `--agent` — every face must follow `args.provider`.
+    ///
+    /// A regression of ANY face (snapshot, usage, banner) back to a skewed
+    /// source fails one of the two scenarios.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_labels_ui_and_usage_follow_the_effective_provider() {
+        for with_binding in [true, false] {
+            let (base_url, _captured, server) = start_chat_completions_stub().await;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let storage_root = tmp.path().join(".libra");
+            std::fs::create_dir_all(&storage_root).unwrap();
+            let db_path = storage_root.join(crate::utils::util::DATABASE);
+            // Real schema (the same bootstrap `libra init` runs) so the
+            // usage recorder actually persists rows.
+            crate::internal::db::create_database(&db_path.display().to_string())
+                .await
+                .expect("bootstrap storage schema");
+
+            let mut args = base_args();
+            let mut env_file = CodeEnvFile::default();
+            args.api_base = Some(base_url);
+            if with_binding {
+                write_agent_profile(
+                    tmp.path(),
+                    "labeler",
+                    "---\nname: labeler\ndescription: Label probe\ntools: []\n\
+                     model: deepseek/deepseek-chat\n---\nYou label.",
+                );
+                // Deliberate skew: the flag says gemini, the binding says
+                // deepseek — the labels must follow the binding.
+                args.provider = Some(CodeProvider::Gemini);
+                args.agent = Some("labeler".to_string());
+            } else {
+                args.provider = Some(CodeProvider::Deepseek);
+                args.model = Some("deepseek-chat".to_string());
+            }
+            env_file
+                .values
+                .insert("DEEPSEEK_API_KEY".to_string(), "test-key".to_string());
+
+            let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+            let session_state = SessionState::new(&tmp.path().to_string_lossy());
+            let (runtime, effective_provider) = build_non_codex_headless_runtime(
+                &args,
+                tmp.path(),
+                &env_file,
+                session_store,
+                session_state,
+                false,
+                init_mcp_server(tmp.path()).await,
+            )
+            .await
+            .expect("headless runtime must build")
+            .expect("provider is supported in the headless path");
+
+            assert_eq!(
+                effective_provider,
+                CodeProvider::Deepseek,
+                "banner face (with_binding={with_binding})"
+            );
+            let snapshot = runtime.snapshot().await;
+            assert_eq!(
+                snapshot.provider.provider, "deepseek",
+                "UI snapshot face (with_binding={with_binding})"
+            );
+            assert_eq!(snapshot.provider.model.as_deref(), Some("deepseek-chat"));
+
+            // One real turn: the adapter enqueues, the worker completes
+            // against the stub, and the recorder persists labeled rows.
+            runtime
+                .adapter()
+                .submit_message("hello".to_string())
+                .await
+                .expect("submit message");
+            let recorder = UsageRecorder::new(
+                establish_connection(db_path.to_str().expect("utf8 db path"))
+                    .await
+                    .expect("open usage connection"),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut aggregates = Vec::new();
+            while std::time::Instant::now() < deadline {
+                aggregates = recorder
+                    .query()
+                    .aggregate_by_model()
+                    .await
+                    .expect("aggregate usage rows");
+                if !aggregates.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            assert!(
+                !aggregates.is_empty(),
+                "the turn must record usage rows (with_binding={with_binding})"
+            );
+            for row in &aggregates {
+                assert_eq!(
+                    row.provider, "deepseek",
+                    "usage face must carry the effective provider \
+                     (with_binding={with_binding}): {row:?}"
+                );
+                assert_eq!(row.model, "deepseek-chat", "usage model face: {row:?}");
+            }
+            server.abort();
+        }
+    }
+
+    /// plan-20260824 DF-07: an activated, discoverable A0-07 skill must be
+    /// consumed by the next plain turn — the provider request that turn
+    /// sends carries the activation context — and must NOT leak into any
+    /// later turn (consumed exactly once). Driven through the real headless
+    /// runtime against the canned chat-completions stub.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skill_activation_context_reaches_the_provider_request() {
+        let (base_url, captured, server) = start_chat_completions_stub().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage_root = tmp.path().join(".libra");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        crate::internal::db::create_database(
+            &storage_root
+                .join(crate::utils::util::DATABASE)
+                .display()
+                .to_string(),
+        )
+        .await
+        .expect("bootstrap storage schema");
+
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Deepseek);
+        args.model = Some("deepseek-chat".to_string());
+        args.api_base = Some(base_url);
+        let mut env_file = CodeEnvFile::default();
+        env_file
+            .values
+            .insert("DEEPSEEK_API_KEY".to_string(), "test-key".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        let session_state = SessionState::new(&tmp.path().to_string_lossy());
+        let (runtime, _effective) = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &env_file,
+            session_store,
+            session_state,
+            false,
+            init_mcp_server(tmp.path()).await,
+        )
+        .await
+        .expect("headless runtime must build")
+        .expect("deepseek is supported in the headless path");
+
+        let ack = runtime
+            .adapter()
+            .activate_skill("claude-code", "/review")
+            .await
+            .expect("discoverable skill must activate on the live adapter");
+        assert_eq!(
+            (ack.provider.as_str(), ack.name.as_str()),
+            ("claude-code", "/review")
+        );
+        assert_eq!(ack.pending, 1);
+
+        runtime
+            .adapter()
+            .submit_message("please review my change".to_string())
+            .await
+            .expect("submit first turn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let first_turn_len = loop {
+            let bodies = captured.lock().await;
+            if !bodies.is_empty()
+                && bodies
+                    .iter()
+                    .any(|body| body.to_string().contains("please review my change"))
+            {
+                break bodies.len();
+            }
+            drop(bodies);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first turn must reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        {
+            let bodies = captured.lock().await;
+            let serialized: Vec<String> = bodies.iter().map(|b| b.to_string()).collect();
+            assert!(
+                serialized
+                    .iter()
+                    .any(|body| body.contains("[skill activation]")
+                        && body.contains("/review")
+                        && body.contains("claude-code")),
+                "the activation context must reach the provider request: {serialized:?}"
+            );
+        }
+
+        // Second plain turn: retry past SESSION_BUSY until the worker frees,
+        // then its provider request must NOT carry the consumed activation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match runtime
+                .adapter()
+                .submit_message("second message".to_string())
+                .await
+            {
+                Ok(()) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(error) => panic!("second turn never admitted: {error}"),
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let bodies = captured.lock().await;
+            let second: Vec<String> = bodies[first_turn_len..]
+                .iter()
+                .map(|b| b.to_string())
+                .filter(|body| body.contains("second message"))
+                .collect();
+            if !second.is_empty() {
+                assert!(
+                    second
+                        .iter()
+                        .all(|body| !body.contains("[skill activation]")),
+                    "a consumed activation must not re-inject on later turns: {second:?}"
+                );
+                break;
+            }
+            drop(bodies);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second turn must reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        server.abort();
+    }
+
+    /// plan-20260824 DF-07 (terra R4): admission + `commandId` idempotent
+    /// retry through the real headless runtime. The durable identity is
+    /// the raw text (the activation block rides execution-only provider
+    /// context), so resending the exact `{text, commandId}` after the
+    /// composed turn completed must acknowledge idempotently — never a
+    /// payload conflict, never a second provider execution.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skill_activation_admission_command_retry_is_idempotent() {
+        let (base_url, captured, server) = start_chat_completions_stub().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage_root = tmp.path().join(".libra");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        crate::internal::db::create_database(
+            &storage_root
+                .join(crate::utils::util::DATABASE)
+                .display()
+                .to_string(),
+        )
+        .await
+        .expect("bootstrap storage schema");
+
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Deepseek);
+        args.model = Some("deepseek-chat".to_string());
+        args.api_base = Some(base_url);
+        let mut env_file = CodeEnvFile::default();
+        env_file
+            .values
+            .insert("DEEPSEEK_API_KEY".to_string(), "test-key".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        let session_state = SessionState::new(&tmp.path().to_string_lossy());
+        let (runtime, _effective) = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &env_file,
+            session_store,
+            session_state,
+            false,
+            init_mcp_server(tmp.path()).await,
+        )
+        .await
+        .expect("headless runtime must build")
+        .expect("deepseek is supported in the headless path");
+
+        runtime
+            .adapter()
+            .activate_skill("claude-code", "/review")
+            .await
+            .expect("activate /review");
+        runtime
+            .adapter()
+            .submit_message_with_command_id("please review x".to_string(), Some("c1".to_string()))
+            .await
+            .expect("submit c1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let first_count = loop {
+            let bodies = captured.lock().await;
+            let matching = bodies
+                .iter()
+                .filter(|body| body.to_string().contains("please review x"))
+                .count();
+            if matching > 0
+                && bodies
+                    .iter()
+                    .any(|body| body.to_string().contains("[skill activation]"))
+            {
+                break bodies.len();
+            }
+            drop(bodies);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the composed c1 turn must reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+
+        // Resend the exact same {text, commandId} until the turn settles.
+        // The invariant under test: the durable comparison happens on the
+        // RAW text, so a retry is answered by the command-status contract
+        // (Ok while pending/succeeded, COMMAND_ALREADY_TERMINAL once the
+        // canned-stub turn lands failed) — NEVER a payload conflict, which
+        // is what leaking the composed input into the identity produced.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match runtime
+                .adapter()
+                .submit_message_with_command_id(
+                    "please review x".to_string(),
+                    Some("c1".to_string()),
+                )
+                .await
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        !message.to_lowercase().contains("payload"),
+                        "the raw-identity retry must never be a payload conflict: {message}"
+                    );
+                    if message.contains("COMMAND_ALREADY_TERMINAL") {
+                        // Terminal answer from the durable status contract —
+                        // exactly the raw-identity match this test pins.
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "retry never acknowledged: {message}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let bodies = captured.lock().await;
+        let review_requests = bodies
+            .iter()
+            .filter(|body| body.to_string().contains("please review x"))
+            .count();
+        let first_review_requests = bodies[..first_count]
+            .iter()
+            .filter(|body| body.to_string().contains("please review x"))
+            .count();
+        assert_eq!(
+            review_requests, first_review_requests,
+            "retries must not re-execute the provider turn"
+        );
+        server.abort();
+    }
+
+    /// plan-20260824 DF-07 (terra R2): a durable-persistence failure after
+    /// admission (the provider is guaranteed not to start) must NOT spend
+    /// the pending activation — the next successful plain turn still
+    /// delivers it to the provider. Failure is injected by making the
+    /// session's events log read-only across the failing submit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skill_activation_survives_persistence_failure_before_provider_start() {
+        let (base_url, captured, server) = start_chat_completions_stub().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage_root = tmp.path().join(".libra");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        crate::internal::db::create_database(
+            &storage_root
+                .join(crate::utils::util::DATABASE)
+                .display()
+                .to_string(),
+        )
+        .await
+        .expect("bootstrap storage schema");
+
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Deepseek);
+        args.model = Some("deepseek-chat".to_string());
+        args.api_base = Some(base_url);
+        let mut env_file = CodeEnvFile::default();
+        env_file
+            .values
+            .insert("DEEPSEEK_API_KEY".to_string(), "test-key".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        let session_state = SessionState::new(&tmp.path().to_string_lossy());
+        let session_id = session_state.id.clone();
+        let (runtime, _effective) = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &env_file,
+            session_store,
+            session_state,
+            false,
+            init_mcp_server(tmp.path()).await,
+        )
+        .await
+        .expect("headless runtime must build")
+        .expect("deepseek is supported in the headless path");
+
+        runtime
+            .adapter()
+            .activate_skill("claude-code", "/review")
+            .await
+            .expect("activate /review");
+
+        // Inject: the session events log becomes read-only, so the durable
+        // user-message write fails after worker admission but before the
+        // executor start gate opens.
+        let events_path = storage_root
+            .join("sessions")
+            .join(&session_id)
+            .join("events.jsonl");
+        assert!(events_path.exists(), "events log must exist after boot");
+        let mut readonly = std::fs::metadata(&events_path).unwrap().permissions();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&events_path, readonly).unwrap();
+
+        let failed = runtime
+            .adapter()
+            .submit_message("first try".to_string())
+            .await;
+        let error = failed.expect_err("the persistence failure must fail the submit");
+        // The read-only log surfaces at the earliest durable write on the
+        // admission path (worker intent persistence, or the later
+        // user-message record — both are pre-provider-start exits that
+        // share the same restore semantics).
+        assert!(
+            error.to_string().contains("no turn was started"),
+            "unexpected failure shape: {error}"
+        );
+
+        let mut writable = std::fs::metadata(&events_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+        std::fs::set_permissions(&events_path, writable).unwrap();
+
+        // The activation must have been restored: the next successful plain
+        // turn's provider request still carries it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match runtime
+                .adapter()
+                .submit_message("after recovery".to_string())
+                .await
+            {
+                Ok(()) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("recovery submit never admitted: {error}"),
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let bodies = captured.lock().await;
+            let recovered: Vec<String> = bodies
+                .iter()
+                .map(|body| body.to_string())
+                .filter(|body| body.contains("after recovery"))
+                .collect();
+            if !recovered.is_empty() {
+                assert!(
+                    recovered
+                        .iter()
+                        .any(|body| body.contains("[skill activation]") && body.contains("/review")),
+                    "the restored activation must ride the recovered turn: {recovered:?}"
+                );
+                break;
+            }
+            drop(bodies);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the recovered turn must reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        server.abort();
+    }
+
+    /// plan-20260825 PS-05 (terra R1): the provenance write is best-effort
+    /// — with the session's `<id>.json` save path blocked (a directory
+    /// squats on it), the headless runtime must still boot and label
+    /// correctly instead of aborting the session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provenance_write_failure_does_not_block_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage_root = tmp.path().join(".libra");
+        let sessions_dir = storage_root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut args = base_args();
+        args.provider = Some(CodeProvider::Ollama);
+        args.model = Some("llama3.2".to_string());
+        let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
+        let mut session_state = SessionState::new(&tmp.path().to_string_lossy());
+        // Make the provenance `save` fail without touching the lease or
+        // the event log: give the session a thread id and squat a
+        // DIRECTORY on its thread-index entry, so `save`'s
+        // `record_thread_session_index` read errors ("is a directory").
+        // Only UUID thread ids are indexed on disk, so inject one.
+        let injected_thread = "11111111-1111-4111-8111-111111111111";
+        session_state
+            .metadata
+            .insert("thread_id".to_string(), serde_json::json!(injected_thread));
+        std::fs::create_dir_all(sessions_dir.join(".thread_index").join(injected_thread)).unwrap();
+        // Self-check: the injection really breaks `save` (otherwise this
+        // test would pass vacuously).
+        assert!(
+            session_store.save(&session_state).is_err(),
+            "the thread-index squat must make SessionStore::save fail"
+        );
+
+        let (runtime, effective_provider) = build_non_codex_headless_runtime(
+            &args,
+            tmp.path(),
+            &CodeEnvFile::default(),
+            session_store,
+            session_state,
+            false,
+            init_mcp_server(tmp.path()).await,
+        )
+        .await
+        .expect("a failed provenance write must not abort the boot")
+        .expect("Ollama is a supported headless provider");
+        assert_eq!(effective_provider, CodeProvider::Ollama);
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.provider.provider, "ollama");
+    }
+
+    /// plan-20260825 PS-01 (ADR-PS-02): the capability table's
+    /// `needs_explicit_model` column must agree with `cli_default_model`'s
+    /// error branches — exactly the providers without a default model id
+    /// (today: ollama) may set it. Codex never reaches the factory helper,
+    /// so its row is exempt from the comparison.
+    #[test]
+    fn provider_spec_table_matches_default_model_branches() {
+        for spec in super::PROVIDER_SPECS {
+            if matches!(spec.provider, super::CodeProvider::Codex) {
+                continue;
+            }
+            let default_model_errors = super::cli_default_model(spec.provider).is_err();
+            assert_eq!(
+                default_model_errors, spec.needs_explicit_model,
+                "capability row for '{}' disagrees with cli_default_model",
+                spec.id
+            );
+        }
+    }
 
     use axum::{Json, Router, extract::Request, routing::post};
     use serde_json::{Value, json};
@@ -4578,7 +6142,9 @@ mod tests {
             control_token_file: None,
             control_info_file: None,
             control_url: None,
-            provider: CodeProvider::Gemini,
+            // None mirrors a bare parse: PS-02 removed the clap default,
+            // and stdio-family tests must not trip the explicitness gate.
+            provider: None,
             model: None,
             temperature: None,
             ollama_thinking: None,
@@ -4727,7 +6293,7 @@ mod tests {
     #[test]
     fn accepts_resume_in_non_codex_web_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.resume = Some("thread-id".to_string());
         assert!(
             validate_mode_args(&args, &OutputConfig::default()).is_ok(),
@@ -4762,7 +6328,7 @@ mod tests {
     #[test]
     fn rejects_env_file_and_approval_ttl_for_managed_codex_web() {
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         args.env_file = Some(PathBuf::from(".env.test"));
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -4771,7 +6337,7 @@ mod tests {
         );
 
         let mut ttl_args = base_args();
-        ttl_args.provider = CodeProvider::Codex;
+        ttl_args.provider = Some(CodeProvider::Codex);
         ttl_args.approval_ttl = Some(42);
         let err = validate_mode_args(&ttl_args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -4813,7 +6379,7 @@ mod tests {
             .expect("persist headless session");
 
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.resume = Some("headless-thread".to_string());
         let restored =
             load_or_create_headless_web_session_state(&args, &working_dir, &session_store)
@@ -5035,7 +6601,7 @@ mod tests {
         ];
         for provider in providers {
             let mut args = base_args();
-            args.provider = provider;
+            args.provider = Some(provider);
             assert!(
                 validate_mode_args(&args, &OutputConfig::default()).is_ok(),
                 "web-only must accept --provider {provider:?}"
@@ -5048,7 +6614,7 @@ mod tests {
     #[test]
     fn accepts_model_api_base_and_temperature_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.model = Some("llama3".to_string());
         args.api_base = Some("http://127.0.0.1:11434/v1".to_string());
         args.temperature = Some(0.2);
@@ -5060,7 +6626,7 @@ mod tests {
     #[test]
     fn accepts_matching_provider_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.ollama_thinking = Some(OllamaThinkingArg::High);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5071,7 +6637,7 @@ mod tests {
     #[test]
     fn accepts_matching_deepseek_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Deepseek;
+        args.provider = Some(CodeProvider::Deepseek);
         args.deepseek_thinking = Some(DeepSeekThinkingArg::Enabled);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5079,7 +6645,7 @@ mod tests {
     #[test]
     fn accepts_matching_kimi_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Kimi;
+        args.provider = Some(CodeProvider::Kimi);
         args.kimi_thinking = Some(KimiThinkingArg::Enabled);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5091,7 +6657,7 @@ mod tests {
     fn rejects_out_of_range_temperature() {
         for bad in [2.5_f64, -0.1, f64::NAN, 3.0] {
             let mut args = base_args();
-            args.provider = CodeProvider::Ollama;
+            args.provider = Some(CodeProvider::Ollama);
             args.temperature = Some(bad);
             let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
             assert!(
@@ -5102,7 +6668,7 @@ mod tests {
         // Boundary values are accepted.
         for good in [0.0_f64, 2.0, 1.0] {
             let mut args = base_args();
-            args.provider = CodeProvider::Ollama;
+            args.provider = Some(CodeProvider::Ollama);
             args.temperature = Some(good);
             assert!(
                 validate_mode_args(&args, &OutputConfig::default()).is_ok(),
@@ -5117,7 +6683,7 @@ mod tests {
     #[test]
     fn rejects_mismatched_provider_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Deepseek;
+        args.provider = Some(CodeProvider::Deepseek);
         args.ollama_thinking = Some(OllamaThinkingArg::High);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -5130,7 +6696,7 @@ mod tests {
     #[test]
     fn rejects_api_base_under_codex_in_web_only_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         args.api_base = Some("http://127.0.0.1:8080".to_string());
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -5173,7 +6739,7 @@ mod tests {
         // provider != gemini
         let mut args = base_args();
         args.stdio = true;
-        args.provider = CodeProvider::Openai;
+        args.provider = Some(CodeProvider::Openai);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
             err.contains("--provider") && err.contains("--stdio"),
@@ -5325,7 +6891,7 @@ mod tests {
 
         for case in cases {
             let mut args = base_args();
-            args.provider = case.provider;
+            args.provider = Some(case.provider);
             args.browser_control = case.explicit;
             args.host = case.host.to_string();
 
@@ -5418,7 +6984,7 @@ mod tests {
         args.control = ControlMode::Stdio;
         args.control_url = Some("http://127.0.0.1:3000".to_string());
         args.control_token_file = Some(PathBuf::from("token"));
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
             err.contains("--provider") && err.contains("--control stdio"),
@@ -5668,7 +7234,7 @@ no_cache_unknown_network = true
     #[test]
     fn effective_plan_mode_defaults_to_true_for_codex() {
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         assert!(effective_plan_mode(&args));
     }
 
@@ -5685,7 +7251,7 @@ no_cache_unknown_network = true
         ];
         for provider in providers {
             let mut args = base_args();
-            args.provider = provider;
+            args.provider = Some(provider);
             assert!(
                 !effective_plan_mode(&args),
                 "expected plan_mode=false default for provider {provider:?}"
@@ -5696,14 +7262,14 @@ no_cache_unknown_network = true
     #[test]
     fn effective_plan_mode_respects_explicit_user_value() {
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         args.plan_mode = Some(false);
         assert!(
             !effective_plan_mode(&args),
             "explicit --plan-mode=false must override the codex default"
         );
 
-        args.provider = CodeProvider::Gemini;
+        args.provider = Some(CodeProvider::Gemini);
         args.plan_mode = Some(true);
         assert!(
             effective_plan_mode(&args),
@@ -5716,7 +7282,7 @@ no_cache_unknown_network = true
     #[test]
     fn rejects_explicit_plan_mode_true_for_non_codex_provider() {
         let mut args = base_args();
-        args.provider = CodeProvider::Gemini;
+        args.provider = Some(CodeProvider::Gemini);
         args.plan_mode = Some(true);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(err.contains("--plan-mode"));
@@ -5725,7 +7291,7 @@ no_cache_unknown_network = true
     #[test]
     fn accepts_explicit_plan_mode_false_for_non_codex_provider() {
         let mut args = base_args();
-        args.provider = CodeProvider::Gemini;
+        args.provider = Some(CodeProvider::Gemini);
         args.plan_mode = Some(false);
         validate_mode_args(&args, &OutputConfig::default()).unwrap();
     }
@@ -5759,7 +7325,7 @@ no_cache_unknown_network = true
     #[test]
     fn accepts_anthropic_provider_in_default_web_mode() {
         let mut args = base_args();
-        args.provider = CodeProvider::Anthropic;
+        args.provider = Some(CodeProvider::Anthropic);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
 
@@ -5773,7 +7339,7 @@ no_cache_unknown_network = true
     #[test]
     fn accepts_ollama_thinking_for_ollama_provider() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.ollama_thinking = Some(OllamaThinkingArg::High);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5788,7 +7354,7 @@ no_cache_unknown_network = true
     #[test]
     fn accepts_ollama_compact_tools_for_ollama_provider() {
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.ollama_compact_tools = true;
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -5810,7 +7376,7 @@ no_cache_unknown_network = true
         ])
         .unwrap();
 
-        assert_eq!(args.provider, CodeProvider::Deepseek);
+        assert_eq!(args.provider, Some(CodeProvider::Deepseek));
         assert_eq!(args.deepseek_thinking, Some(DeepSeekThinkingArg::Enabled));
         assert_eq!(
             args.deepseek_reasoning_effort,
@@ -5877,7 +7443,7 @@ no_cache_unknown_network = true
         ])
         .unwrap();
 
-        assert_eq!(args.provider, CodeProvider::Kimi);
+        assert_eq!(args.provider, Some(CodeProvider::Kimi));
         assert_eq!(args.kimi_thinking, Some(KimiThinkingArg::Disabled));
         assert_eq!(
             completion_thinking_for_args(&args),
@@ -5890,7 +7456,7 @@ no_cache_unknown_network = true
     fn defaults_kimi_stream_for_kimi_provider() {
         let args = CodeArgs::try_parse_from(["libra", "--provider", "kimi"]).unwrap();
 
-        assert_eq!(args.provider, CodeProvider::Kimi);
+        assert_eq!(args.provider, Some(CodeProvider::Kimi));
         assert_eq!(args.kimi_stream, None);
         assert_eq!(completion_stream_for_args(&args), Some(true));
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
@@ -5902,7 +7468,7 @@ no_cache_unknown_network = true
             CodeArgs::try_parse_from(["libra", "--provider", "kimi", "--kimi-stream", "false"])
                 .unwrap();
 
-        assert_eq!(args.provider, CodeProvider::Kimi);
+        assert_eq!(args.provider, Some(CodeProvider::Kimi));
         assert_eq!(args.kimi_stream, Some(false));
         assert_eq!(completion_stream_for_args(&args), Some(false));
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
@@ -5958,7 +7524,7 @@ no_cache_unknown_network = true
         std::fs::write(&cwd_file, "not a directory").unwrap();
 
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         args.cwd = Some(cwd_file.clone());
 
         let err = resolve_code_preflight_working_dir(&args).unwrap_err();
@@ -6480,7 +8046,7 @@ no_cache_unknown_network = true
 
         for (provider, model, api_base, expected_env) in cases {
             let mut args = base_args();
-            args.provider = *provider;
+            args.provider = Some(*provider);
             args.model = model.map(str::to_string);
             args.api_base = api_base.map(str::to_string);
             let err = build_any_completion_model_for_args_with_lookup(
@@ -6496,7 +8062,9 @@ no_cache_unknown_network = true
                 "expected {expected_env} in missing-key error for {provider:?}, got: {msg}"
             );
             assert!(
-                msg.contains("is not set") || msg.contains("is required"),
+                msg.contains("is not configured")
+                    || msg.contains("is not set")
+                    || msg.contains("is required"),
                 "missing-key error should be readable and actionable for {provider:?}, got: {msg}"
             );
             // C3 criterion: the error must also explain HOW to configure the
@@ -6517,7 +8085,7 @@ no_cache_unknown_network = true
         let (base_url, captured, server) = start_chat_completions_stub().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Deepseek;
+        args.provider = Some(CodeProvider::Deepseek);
         args.model = Some("deepseek-chat".to_string());
         args.api_base = Some(base_url);
         let mut env_file = CodeEnvFile::default();
@@ -6553,7 +8121,7 @@ no_cache_unknown_network = true
     async fn headless_ollama_reuses_provider_factory_bootstrap() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Ollama;
+        args.provider = Some(CodeProvider::Ollama);
         args.model = Some("llama3.2".to_string());
         let session_store = Arc::new(SessionStore::from_storage_path(&tmp.path().join(".libra")));
         let session_state = SessionState::new(&tmp.path().to_string_lossy());
@@ -6570,6 +8138,8 @@ no_cache_unknown_network = true
         .await
         .expect("headless Ollama should build through ProviderFactory")
         .expect("Ollama is the supported non-Codex headless provider");
+        let (runtime, effective_provider) = runtime;
+        assert_eq!(effective_provider, CodeProvider::Ollama);
         let snapshot = runtime.snapshot().await;
 
         assert_eq!(snapshot.provider.provider, "ollama");
@@ -6581,7 +8151,7 @@ no_cache_unknown_network = true
     async fn headless_provider_boot_uses_the_shared_env_file_lookup() {
         let tmp = tempfile::TempDir::new().expect("temporary workspace");
         let mut args = base_args();
-        args.provider = CodeProvider::Openai;
+        args.provider = Some(CodeProvider::Openai);
         args.model = Some("gpt-test".to_string());
         let mut env_file = CodeEnvFile::default();
         env_file
@@ -6602,6 +8172,8 @@ no_cache_unknown_network = true
         .await
         .expect("headless OpenAI should use the shared provider factory")
         .expect("OpenAI is a supported non-Codex headless provider");
+        let (runtime, effective_provider) = runtime;
+        assert_eq!(effective_provider, CodeProvider::Openai);
         let snapshot = runtime.snapshot().await;
 
         assert_eq!(snapshot.provider.provider, "openai");
@@ -6613,7 +8185,7 @@ no_cache_unknown_network = true
     async fn headless_non_ollama_provider_reuses_provider_factory_bootstrap() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Fake;
+        args.provider = Some(CodeProvider::Fake);
         let fixture_path = tmp.path().join("fake-fixture.json");
         args.fake_fixture = Some({
             std::fs::write(
@@ -6638,6 +8210,8 @@ no_cache_unknown_network = true
         .await
         .expect("headless Fake should build through ProviderFactory")
         .expect("Fake provider is now supported in headless provider factory path");
+        let (runtime, effective_provider) = runtime;
+        assert_eq!(effective_provider, CodeProvider::Fake);
         let snapshot = runtime.snapshot().await;
 
         assert_eq!(snapshot.provider.provider, "fake");
@@ -6691,7 +8265,7 @@ no_cache_unknown_network = true
     async fn build_non_codex_headless_runtime_excludes_codex_provider() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Codex;
+        args.provider = Some(CodeProvider::Codex);
         let session_store = Arc::new(SessionStore::from_storage_path(&tmp.path().join(".libra")));
         let session_state = SessionState::new(&tmp.path().to_string_lossy());
 
@@ -6733,7 +8307,7 @@ no_cache_unknown_network = true
              body",
         );
         let mut args = base_args();
-        args.provider = CodeProvider::Gemini;
+        args.provider = Some(CodeProvider::Gemini);
         args.model = Some("gemini-2.0-flash".to_string()); // would-be hybrid
         args.agent = Some("planner".to_string());
         let env_file = CodeEnvFile::default();
@@ -6776,7 +8350,7 @@ no_cache_unknown_network = true
         ];
         for (provider, expected_model, expected_provider_id) in cases {
             let mut args = base_args();
-            args.provider = *provider;
+            args.provider = Some(*provider);
             args.model = None;
             let (_model, model_name, provider_id) =
                 build_any_completion_model_for_args_with_lookup(
@@ -6799,7 +8373,7 @@ no_cache_unknown_network = true
         // Ollama has no sensible local default — omitting `--model` must be a
         // usage error, not a silent fallback.
         let mut ollama = base_args();
-        ollama.provider = CodeProvider::Ollama;
+        ollama.provider = Some(CodeProvider::Ollama);
         ollama.model = None;
         let err = build_any_completion_model_for_args_with_lookup(
             &ollama,
@@ -6824,7 +8398,7 @@ no_cache_unknown_network = true
         let (base_url, captured, server) = start_chat_completions_stub().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut args = base_args();
-        args.provider = CodeProvider::Openai;
+        args.provider = Some(CodeProvider::Openai);
         args.model = Some("gpt-4o-mini".to_string());
         // No CLI --api-base; the base URL must come from the env-file.
         args.api_base = None;

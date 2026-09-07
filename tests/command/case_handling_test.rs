@@ -34,7 +34,7 @@ fn skip_case_twin_fixture_on_case_insensitive_host(p: &std::path::Path, scenario
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn status_sync_wrappers_honor_core_ignorecase_override() {
     let repo = case_repo();
     let p = repo.path();

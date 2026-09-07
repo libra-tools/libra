@@ -29,7 +29,8 @@ use crate::internal::ai::{
         handlers::{
             ApplyPatchHandler, GrepFilesHandler, ListDirHandler, PlanHandler, ReadFileHandler,
             RequestUserInputHandler, SearchFilesHandler, ShellHandler, SubmitIntentDraftHandler,
-            SubmitPlanDraftHandler, WebSearchHandler, register_semantic_handlers,
+            SubmitPlanDraftHandler, SubmitTaskCompleteHandler, WebSearchHandler,
+            register_semantic_handlers,
         },
     },
 };
@@ -126,7 +127,8 @@ impl CodeAgentServicesBuilder {
                 Arc::new(RequestUserInputHandler::new(user_input_tx)),
             )
             .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
-            .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler));
+            .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
+            .register("submit_task_complete", Arc::new(SubmitTaskCompleteHandler));
 
         CodeAgentServices {
             profile: CodeAgentLaunchProfile::WebHeadless,

@@ -129,7 +129,7 @@ fn service_rejects_non_loopback_hosts_and_outside_repo() {
 }
 
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn service_end_to_end_events_marks_and_fault_recovery() {
     let repo = service_repo();
     let p = repo.path();
@@ -245,7 +245,7 @@ fn service_end_to_end_events_marks_and_fault_recovery() {
 /// multi-worktree repository — the dirty cache is per-worktree and the
 /// caller's scope is unknown. A corrupt registry rejects too (fail closed).
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn dirty_mark_rejected_in_multi_worktree_repo() {
     let repo = service_repo();
     let main = repo.path();

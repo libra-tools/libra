@@ -33,7 +33,6 @@ fn status_short(repo: &Path) -> String {
 }
 
 #[test]
-#[serial]
 fn test_stash_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["stash", "push"], temp.path());
@@ -46,7 +45,7 @@ fn test_stash_cli_outside_repository_returns_fatal_128() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_no_changes() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -98,7 +97,7 @@ async fn test_stash_push_no_changes() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_no_changes_json_output() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -149,7 +148,7 @@ async fn test_stash_push_no_changes_json_output() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_and_pop() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -230,7 +229,7 @@ async fn test_stash_push_and_pop() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_and_pop_preserves_dotfiles() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -414,7 +413,7 @@ fn test_stash_pop_reports_index_load_failure_without_dropping_stash() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_list() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -541,7 +540,7 @@ fn test_stash_list_malformed_reflog_entry_returns_io_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_drop() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -609,7 +608,7 @@ async fn test_stash_drop() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_drop_missing_reflog_returns_no_stash_found() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -671,7 +670,7 @@ async fn test_stash_drop_missing_reflog_returns_no_stash_found() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_json_output() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1240,7 +1239,7 @@ fn test_stash_branch_refuses_existing_branch() {
 /// name-occupied instead of letting the lossy branch lookup downgrade it to
 /// "missing" and overwrite the row.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_branch_refuses_corrupt_existing_branch() {
     let repo = create_committed_repo_via_cli();
     {
@@ -1371,7 +1370,7 @@ fn stash_no_include_untracked_countermands_u() {
 /// the stashed change while preserving a further edit made to the untouched
 /// path (exercising the working-tree-as-ours apply).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_pathspec_stashes_only_matched() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1435,7 +1434,7 @@ async fn test_stash_push_pathspec_stashes_only_matched() {
 /// A directory pathspec selects every changed file beneath it; files outside the
 /// directory are left dirty.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_pathspec_directory() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1483,7 +1482,7 @@ async fn test_stash_push_pathspec_directory() {
 /// A pathspec that matches no tracked path is a usage error (exit 128,
 /// `LBR-...` invalid-target), not an internal-invariant panic.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_pathspec_no_match_errors() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1514,7 +1513,7 @@ async fn test_stash_push_pathspec_no_match_errors() {
 /// by an unrelated edit then `pop` must preserve that unrelated edit rather than
 /// silently reverting it to HEAD.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_pop_preserves_unrelated_uncommitted_change() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1558,7 +1557,7 @@ async fn test_stash_pop_preserves_unrelated_uncommitted_change() {
 /// then DELETING an unrelated tracked file, `pop` must keep the deletion rather
 /// than silently resurrecting the file from the stash snapshot.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_pop_preserves_unrelated_deletion() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1601,7 +1600,7 @@ async fn test_stash_pop_preserves_unrelated_deletion() {
 /// HEAD) is still stashed by a pathspec push — the no-op check must consider the
 /// index overlay, not only the working tree.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_pathspec_stashes_staged_only_change() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1645,7 +1644,7 @@ async fn test_stash_push_pathspec_stashes_staged_only_change() {
 
 /// `stash push -- .` (the root pathspec) selects every tracked change.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_pathspec_dot_matches_all() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1683,7 +1682,7 @@ async fn test_stash_push_pathspec_dot_matches_all() {
 /// `-u`/`-a`/`-k` combined with a pathspec are rejected (exit 129) rather than
 /// silently ignored.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_stash_push_pathspec_rejects_options() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;

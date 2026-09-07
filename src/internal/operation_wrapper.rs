@@ -695,6 +695,7 @@ mod claim_owner_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pid_that_does_not_exist_is_gone() {
         let Some(machine) = claim_machine_identity() else {

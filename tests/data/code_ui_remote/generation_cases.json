@@ -107,7 +107,7 @@
           "name": "observe tool or session update",
           "op": "collectEventsUntil",
           "stream": "events",
-          "event": "session_updated",
+          "event": "code_workflow",
           "timeoutMs": 10000,
           "expect": {
             "assertions": [

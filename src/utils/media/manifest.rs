@@ -21,6 +21,8 @@ use super::{
 
 /// Manifest schema version (bumped on an incompatible on-disk change).
 pub const MANIFEST_VERSION: u32 = 1;
+pub const MAX_MANIFEST_SIZE: usize = 10 * 1024 * 1024;
+pub const MAX_CHUNKS: usize = 8192;
 
 /// One chunk entry in the manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +140,9 @@ impl MediaManifest {
 
     /// Parse + fully validate a manifest from JSON text.
     pub fn from_json(text: &str) -> Result<Self, ManifestError> {
+        if text.len() > MAX_MANIFEST_SIZE {
+            return Err(ManifestError::Invalid("manifest exceeds size limit".into()));
+        }
         let manifest: MediaManifest =
             serde_json::from_str(text).map_err(|e| ManifestError::Serde(e.to_string()))?;
         manifest.validate()?;
@@ -149,10 +154,36 @@ impl MediaManifest {
         serde_json::to_string_pretty(self).map_err(|e| ManifestError::Serde(e.to_string()))
     }
 
+    /// Protocol identity shared with Mega. Provenance and the fallback pointer
+    /// do not change the identity of the frozen content-defined chunk layout.
+    pub fn id(&self) -> Result<String, ManifestError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(&(
+            self.version,
+            &self.algorithm,
+            &self.hash_algorithm,
+            &self.media_oid,
+            self.media_size,
+            &self.chunks,
+        ))
+        .map_err(|error| ManifestError::Serde(error.to_string()))?;
+        Ok(super::sha256_hex(&bytes))
+    }
+
     /// Validate the frozen invariants: version/algorithm/hash, a 64-hex
     /// `media_oid`, first-chunk-offset-0, contiguity, and that the chunk lengths
     /// sum to `media_size`. Returns an actionable error on any violation.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.chunks.len() > MAX_CHUNKS
+            || self
+                .fallback_oid
+                .as_ref()
+                .is_some_and(|oid| oid != &self.media_oid)
+        {
+            return Err(ManifestError::Invalid(
+                "too many chunks or mismatched fallback_oid".into(),
+            ));
+        }
         if self.version != MANIFEST_VERSION {
             return Err(ManifestError::Invalid(format!(
                 "unsupported manifest version {} (this binary supports {MANIFEST_VERSION})",
@@ -179,6 +210,11 @@ impl MediaManifest {
         }
         let mut expected_offset = 0u64;
         for (i, c) in self.chunks.iter().enumerate() {
+            if c.length == 0 || c.length > chunker::MAX_SIZE as u64 || c.checksum.is_some() {
+                return Err(ManifestError::Invalid(format!(
+                    "chunk {i} has invalid length or unsupported checksum"
+                )));
+            }
             if c.offset != expected_offset {
                 return Err(ManifestError::Invalid(format!(
                     "chunk {i} offset {} breaks contiguity (expected {expected_offset})",
@@ -204,7 +240,9 @@ impl MediaManifest {
                     c.encoded_length, c.length
                 )));
             }
-            expected_offset += c.length;
+            expected_offset = expected_offset
+                .checked_add(c.length)
+                .ok_or_else(|| ManifestError::Invalid("chunk offset overflow".into()))?;
         }
         if expected_offset != self.media_size {
             return Err(ManifestError::Invalid(format!(
@@ -263,6 +301,19 @@ mod tests {
         assert_eq!(m, back);
         // checksum:None is omitted from the wire form (frozen-schema hygiene).
         assert!(!json.contains("checksum"));
+    }
+
+    #[test]
+    fn rejects_zero_oversize_chunks_and_mismatched_fallback() {
+        for length in [0, u64::MAX, chunker::MAX_SIZE as u64 + 1] {
+            let mut m = sample();
+            m.chunks[0].length = length;
+            m.chunks[0].encoded_length = length;
+            assert!(m.validate().is_err());
+        }
+        let mut m = sample();
+        m.fallback_oid = Some("f".repeat(64));
+        assert!(m.validate().is_err());
     }
 
     #[test]

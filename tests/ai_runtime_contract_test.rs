@@ -4938,3 +4938,176 @@ mod cex_00_5 {
         assert_eq!(snap.snapshot_kind(), cloned.snapshot_kind());
     }
 }
+
+/// plan-20260824 DF-07 (terra R2/R4): direct durable-command coverage on
+/// the raw-identity contract. The activation block rides
+/// `TurnRequest::provider_context` (merged only at the executor handoff),
+/// so the durable hash is always the raw text: a command submitted BEFORE
+/// an activation stays idempotent when retried AFTER it (the R4 repro), a
+/// composed command's own retry is equally idempotent, and neither retry
+/// re-executes or loses the pending activation.
+#[tokio::test(flavor = "multi_thread")]
+async fn skill_activation_direct_durable_retry_is_idempotent_on_raw_identity() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExecutionControlService,
+            InMemoryAuditSink, PrincipalContext, PrincipalRole, RuntimeCommandDurability,
+            RuntimeExecutionContext, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
+            SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        },
+        session::SessionJsonlStore,
+        web::{
+            AgentRuntimeCodeUiAdapter,
+            code_ui::{
+                CodeUiCapabilities, CodeUiCommandAdapter, CodeUiProviderInfo, CodeUiSession,
+                initial_snapshot,
+            },
+        },
+    };
+    use tokio::sync::Mutex;
+
+    struct RecordingExecutor {
+        inputs: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl RuntimeTurnExecutor for RecordingExecutor {
+        async fn execute(
+            &self,
+            request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.inputs.lock().await.push(request.input);
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "done".to_string(),
+            })
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(RecordingExecutor {
+        inputs: inputs.clone(),
+    });
+    let tool_boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "df07-direct-durable".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let store = SessionJsonlStore::new(temp.path().join("session"));
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(executor, tool_boundary).with_durability(
+            RuntimeCommandDurability::new(store.clone()),
+            "df07-repo",
+            "df07-principal",
+        ),
+    );
+
+    let session = CodeUiSession::new(initial_snapshot(
+        temp.path().to_string_lossy(),
+        CodeUiProviderInfo {
+            provider: "test".to_string(),
+            model: Some("test-model".to_string()),
+            mode: None,
+            managed: false,
+        },
+        CodeUiCapabilities::default(),
+    ));
+    let adapter = AgentRuntimeCodeUiAdapter::new(
+        session,
+        CodeUiCapabilities::default(),
+        handle.clone(),
+        "session",
+        Arc::new(ExecutionControlService::new("session", None, None).expect("execution control")),
+        None,
+        Some(RuntimeCommandDurability::new(store)),
+    );
+
+    let submit_with_retry_on_busy = |text: &'static str, command: &'static str| {
+        let adapter = adapter.clone();
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match adapter
+                    .submit_message_with_command_id(text.to_string(), Some(command.to_string()))
+                    .await
+                {
+                    Ok(()) => break Ok(()),
+                    Err(error) => {
+                        let message = error.to_string();
+                        if message.contains("already active")
+                            && std::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        break Err(error);
+                    }
+                }
+            }
+        }
+    };
+
+    // cmd-1 BEFORE any activation: the executor sees the raw text.
+    submit_with_retry_on_busy("plain message", "cmd-1")
+        .await
+        .expect("submit cmd-1");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while inputs.lock().await.is_empty() {
+        assert!(std::time::Instant::now() < deadline, "cmd-1 must execute");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(inputs.lock().await[0], "plain message");
+
+    // Activate, then retry cmd-1 with the SAME raw text (the R4 repro):
+    // raw identity matches the durable record, so the retry acknowledges
+    // idempotently — no payload conflict, no re-execution.
+    adapter
+        .activate_skill("claude-code", "/review")
+        .await
+        .expect("activate /review");
+    submit_with_retry_on_busy("plain message", "cmd-1")
+        .await
+        .expect("cmd-1 retry after activation must stay idempotent");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        inputs.lock().await.len(),
+        1,
+        "the idempotent retry must not re-execute"
+    );
+
+    // The activation survived the acknowledged retry and rides the next
+    // fresh plain turn as execution-only context appended to the raw text.
+    submit_with_retry_on_busy("next task", "cmd-2")
+        .await
+        .expect("submit cmd-2");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while inputs.lock().await.len() < 2 {
+        assert!(std::time::Instant::now() < deadline, "cmd-2 must execute");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let composed = inputs.lock().await[1].clone();
+    assert!(
+        composed.starts_with("next task") && composed.contains("'/review'"),
+        "the provider input is raw text plus the activation block: {composed}"
+    );
+
+    // A composed command's own retry is idempotent on the same raw
+    // identity — again no conflict and no re-execution.
+    submit_with_retry_on_busy("next task", "cmd-2")
+        .await
+        .expect("composed cmd-2 retry must stay idempotent");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        inputs.lock().await.len(),
+        2,
+        "the composed command retry must not re-execute"
+    );
+    worker.abort();
+}

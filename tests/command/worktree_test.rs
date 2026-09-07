@@ -21,7 +21,6 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
-#[serial]
 fn test_worktree_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["worktree", "list"], temp.path());
@@ -133,7 +132,7 @@ fn assert_worktree_error(output: &std::process::Output, error_code: &str) -> Cli
 /// the default, and an unsupported version is refused with LBR-CLI-002 —
 /// never answered with a shape lie.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_list_schema_version_surface() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -182,7 +181,7 @@ async fn test_worktree_list_schema_version_surface() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_list_json_outputs_structured_entries() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -236,7 +235,7 @@ async fn test_worktree_list_json_outputs_structured_entries() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_list_machine_outputs_single_json_line() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -260,7 +259,7 @@ async fn test_worktree_list_machine_outputs_single_json_line() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_add_json_reports_created_path() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -285,7 +284,7 @@ async fn test_worktree_add_json_reports_created_path() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_lock_unlock_structured_outputs_report_state() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -345,7 +344,7 @@ async fn test_worktree_lock_unlock_structured_outputs_report_state() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_move_json_reports_source_and_destination() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -386,7 +385,7 @@ async fn test_worktree_move_json_reports_source_and_destination() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_prune_machine_reports_pruned_paths() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -420,7 +419,7 @@ async fn test_worktree_prune_machine_reports_pruned_paths() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_repair_json_reports_changed_state() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -461,7 +460,6 @@ async fn test_worktree_repair_json_reports_changed_state() {
 
 #[cfg(unix)]
 #[test]
-#[serial]
 fn test_worktree_umount_json_reports_cleanup() {
     let temp = tempdir().expect("create temp dir");
     let cleanup_root = temp
@@ -510,7 +508,7 @@ fn test_worktree_umount_json_reports_cleanup() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_lock_json_no_such_worktree_reports_invalid_target() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -541,7 +539,7 @@ async fn test_worktree_lock_json_no_such_worktree_reports_invalid_target() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_remove_machine_rejects_main_with_stable_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -573,7 +571,7 @@ async fn test_worktree_remove_machine_rejects_main_with_stable_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_remove_json_rejects_locked_with_stable_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -607,7 +605,7 @@ async fn test_worktree_remove_json_rejects_locked_with_stable_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_move_machine_destination_exists_reports_conflict() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -651,7 +649,7 @@ async fn test_worktree_move_machine_destination_exists_reports_conflict() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_add_json_rejects_storage_path_as_invalid_target() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -688,7 +686,7 @@ async fn test_worktree_add_json_rejects_storage_path_as_invalid_target() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_list_json_corrupt_state_reports_repo_corrupt() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -717,7 +715,7 @@ async fn test_worktree_list_json_corrupt_state_reports_repo_corrupt() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree add` creates a linked directory with a `.libra` storage link.
 async fn test_worktree_add_creates_linked_directory() {
     let repo_dir = tempdir().unwrap();
@@ -743,7 +741,7 @@ async fn test_worktree_add_creates_linked_directory() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree add` stores a stable canonical path even if input uses a missing parent plus `..`.
 async fn test_worktree_add_normalizes_missing_parent_with_dotdot() {
     let repo_dir = tempdir().unwrap();
@@ -786,7 +784,7 @@ async fn test_worktree_add_normalizes_missing_parent_with_dotdot() {
 /// is, and both key on this resolution).
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_worktree_add_resolves_dotdot_through_symlinked_parent() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -827,7 +825,7 @@ async fn test_worktree_add_resolves_dotdot_through_symlinked_parent() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Adding with `../` must still allow later `lock/unlock/remove .` from inside that worktree.
 async fn test_worktree_add_parent_relative_then_operate_with_dot_from_linked_worktree() {
     let root_dir = tempdir().unwrap();
@@ -854,7 +852,7 @@ async fn test_worktree_add_parent_relative_then_operate_with_dot_from_linked_wor
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Adding the same path via `../...` and absolute form should deduplicate to one canonical entry.
 async fn test_worktree_add_parent_relative_and_absolute_path_are_equivalent() {
     let root_dir = tempdir().unwrap();
@@ -887,7 +885,7 @@ async fn test_worktree_add_parent_relative_and_absolute_path_are_equivalent() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Symlink inputs should be canonicalized to the real target path.
 async fn test_worktree_add_symlink_path_is_canonicalized_to_real_path() {
     let root_dir = tempdir().unwrap();
@@ -933,7 +931,7 @@ async fn test_worktree_add_symlink_path_is_canonicalized_to_real_path() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Adding once through a symlinked parent and once through the real path should not create duplicates.
 async fn test_worktree_add_symlink_and_real_path_are_deduplicated() {
     let root_dir = tempdir().unwrap();
@@ -972,7 +970,7 @@ async fn test_worktree_add_symlink_and_real_path_are_deduplicated() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Adding into an existing non-empty directory is rejected and preserves local files.
 async fn test_worktree_add_rejects_existing_non_empty_directory() {
     let repo_dir = tempdir().unwrap();
@@ -1032,7 +1030,7 @@ async fn test_worktree_add_rejects_existing_non_empty_directory() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Duplicate `worktree add` should not recreate a missing directory when the path is already registered.
 async fn test_worktree_add_duplicate_registered_path_does_not_create_directory() {
     let repo_dir = tempdir().unwrap();
@@ -1066,7 +1064,7 @@ async fn test_worktree_add_duplicate_registered_path_does_not_create_directory()
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// If population fails after writing the link file, `worktree add` rolls back partial artifacts.
 async fn test_worktree_add_rolls_back_link_on_restore_failure() {
     let repo_dir = tempdir().unwrap();
@@ -1125,7 +1123,7 @@ async fn test_worktree_add_rolls_back_link_on_restore_failure() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// If state persistence fails after restore, rollback removes partially restored files in an existing target.
 async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
     if skip_permission_denied_test_if_root(
@@ -1218,7 +1216,7 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Cross-filesystem moves should fail cleanly and keep registry/state unchanged when test env provides separate devices.
 async fn test_worktree_move_across_filesystems_rolls_back_when_supported() {
     let repo_dir = tempdir().unwrap();
@@ -1266,7 +1264,7 @@ async fn test_worktree_move_across_filesystems_rolls_back_when_supported() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Corrupted `worktrees.json` should fail commands gracefully without mutating state or creating directories.
 async fn test_worktree_corrupted_state_file_is_handled_without_side_effects() {
     let repo_dir = tempdir().unwrap();
@@ -1305,7 +1303,7 @@ async fn test_worktree_corrupted_state_file_is_handled_without_side_effects() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Basic lock/unlock/remove happy path for a non-main worktree.
 async fn test_worktree_lock_unlock_and_remove() {
     let repo_dir = tempdir().unwrap();
@@ -1330,7 +1328,7 @@ async fn test_worktree_lock_unlock_and_remove() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Creating a worktree must not disturb existing staged changes in the index.
 async fn test_worktree_add_does_not_reset_index() {
     let repo_dir = tempdir().unwrap();
@@ -1401,7 +1399,7 @@ async fn test_worktree_add_does_not_reset_index() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// New worktree population should use `HEAD` content instead of staged index-only updates.
 async fn test_worktree_add_populates_from_head_not_staged_index() {
     let repo_dir = tempdir().unwrap();
@@ -1460,7 +1458,7 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree list` should include both main and added worktrees and be read-only.
 async fn test_worktree_list_includes_main_and_added_worktrees() {
     let repo_dir = tempdir().unwrap();
@@ -1490,7 +1488,7 @@ async fn test_worktree_list_includes_main_and_added_worktrees() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moving an unlocked, non-main worktree updates both the filesystem and state.
 async fn test_worktree_move_moves_unlocked_non_main_worktree() {
     let repo_dir = tempdir().unwrap();
@@ -1535,7 +1533,7 @@ async fn test_worktree_move_moves_unlocked_non_main_worktree() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moving the main worktree is rejected without creating or registering a destination.
 async fn test_worktree_move_main_is_rejected_without_side_effects() {
     let repo_dir = tempdir().unwrap();
@@ -1584,7 +1582,7 @@ async fn test_worktree_move_main_is_rejected_without_side_effects() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moving a locked worktree is rejected without changing its path or lock state.
 async fn test_worktree_move_locked_is_rejected_without_side_effects() {
     let repo_dir = tempdir().unwrap();
@@ -1632,7 +1630,7 @@ async fn test_worktree_move_locked_is_rejected_without_side_effects() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moving a worktree onto an existing worktree path is rejected without mutation.
 async fn test_worktree_move_rejects_duplicate_destination() {
     let repo_dir = tempdir().unwrap();
@@ -1673,7 +1671,7 @@ async fn test_worktree_move_rejects_duplicate_destination() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moving a worktree into `.libra` storage is rejected without mutating filesystem or state.
 async fn test_worktree_move_rejects_destination_inside_storage() {
     let repo_dir = tempdir().unwrap();
@@ -1715,7 +1713,7 @@ async fn test_worktree_move_rejects_destination_inside_storage() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree prune` removes missing non-main worktrees from the registry.
 async fn test_worktree_prune_removes_missing_non_main_worktrees() {
     let repo_dir = tempdir().unwrap();
@@ -1749,7 +1747,7 @@ async fn test_worktree_prune_removes_missing_non_main_worktrees() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree prune` keeps locked worktrees even when their directories are missing.
 async fn test_worktree_prune_keeps_locked_worktrees() {
     let repo_dir = tempdir().unwrap();
@@ -1785,7 +1783,7 @@ async fn test_worktree_prune_keeps_locked_worktrees() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Removing a locked worktree is rejected without changing state or directory.
 async fn test_worktree_remove_locked_is_rejected_without_side_effects() {
     let repo_dir = tempdir().unwrap();
@@ -1823,7 +1821,7 @@ async fn test_worktree_remove_locked_is_rejected_without_side_effects() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree repair` removes duplicate entries that point to the same path.
 async fn test_worktree_repair_deduplicates_entries() {
     let repo_dir = tempdir().unwrap();
@@ -1866,7 +1864,7 @@ async fn test_worktree_repair_deduplicates_entries() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree repair` persists main-flag fixes even when there are no duplicate paths.
 async fn test_worktree_repair_persists_main_flag_fix_without_duplicates() {
     let repo_dir = tempdir().unwrap();
@@ -1906,7 +1904,7 @@ async fn test_worktree_repair_persists_main_flag_fix_without_duplicates() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// The main worktree flag remains unique and anchored to the original repo root.
 async fn test_worktree_main_flag_remains_single_and_stable() {
     let repo_dir = tempdir().unwrap();
@@ -1942,7 +1940,7 @@ async fn test_worktree_main_flag_remains_single_and_stable() {
 // ── C5 surface tests: `worktree remove --delete-dir` ──────────────────────────────────────
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Default `worktree remove` (no flag) preserves the directory on disk.
 async fn test_worktree_remove_default_keeps_disk_directory() {
     let repo_dir = tempdir().unwrap();
@@ -1983,7 +1981,7 @@ async fn test_worktree_remove_default_keeps_disk_directory() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree remove --json` reports that the registry entry was removed while the directory remained.
 async fn test_worktree_remove_json_reports_kept_directory() {
     let repo_dir = tempdir().unwrap();
@@ -2023,7 +2021,7 @@ async fn test_worktree_remove_json_reports_kept_directory() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree remove --delete-dir` removes both the registry entry and the
 /// on-disk directory when the worktree is clean.
 async fn test_worktree_remove_with_delete_dir_clean_path() {
@@ -2054,7 +2052,7 @@ async fn test_worktree_remove_with_delete_dir_clean_path() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree remove --delete-dir --machine` reports single-line JSON and deletes the directory.
 async fn test_worktree_remove_machine_reports_deleted_directory() {
     let repo_dir = tempdir().unwrap();
@@ -2103,7 +2101,7 @@ async fn test_worktree_remove_machine_reports_deleted_directory() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// `worktree remove --delete-dir` refuses dirty worktrees and leaves both disk and registry intact.
 async fn test_worktree_remove_with_delete_dir_dirty_path_is_rejected() {
     let repo_dir = tempdir().unwrap();

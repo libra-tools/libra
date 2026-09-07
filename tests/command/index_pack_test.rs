@@ -162,7 +162,6 @@ fn decode_pack_expected(pack_path: &Path, kind: HashKind) -> Result<ExpectedPack
 }
 
 #[test]
-#[serial]
 fn test_index_pack_cli_missing_file_returns_fatal_128() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -183,7 +182,7 @@ fn test_index_pack_cli_missing_file_returns_fatal_128() {
 }
 
 #[test]
-#[serial]
+#[serial(cwd)]
 fn test_index_pack_json_output_reports_generated_index() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());

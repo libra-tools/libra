@@ -116,7 +116,7 @@ fn test_remove_machine_dry_run_reports_single_json_line_without_side_effects() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests the basic remove functionality by removing a single file
 async fn test_remove_single_file() {
     let test_dir = tempdir().unwrap();
@@ -197,7 +197,7 @@ async fn test_remove_single_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests removing a file with --cached flag, which only removes from the index but keeps the file
 async fn test_remove_cached() {
     let test_dir = tempdir().unwrap();
@@ -256,7 +256,7 @@ async fn test_remove_cached() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests recursive removal of a directory
 async fn test_remove_directory_recursive() {
     let test_dir = tempdir().unwrap();
@@ -351,7 +351,7 @@ async fn test_remove_directory_recursive() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests attempting to remove a directory without -r flag should fail
 async fn test_remove_directory_without_recursive() {
     let test_dir = tempdir().unwrap();
@@ -410,7 +410,7 @@ async fn test_remove_directory_without_recursive() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests removing a file that does not exist in the index
 async fn test_remove_untracked_file() {
     let test_dir = tempdir().unwrap();
@@ -446,7 +446,7 @@ async fn test_remove_untracked_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests removing a file that has been modified after being added to the index
 async fn test_remove_modified_file() {
     let test_dir = tempdir().unwrap();
@@ -524,7 +524,7 @@ async fn test_remove_modified_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests removing multiple files at once
 async fn test_remove_multiple_files() {
     let test_dir = tempdir().unwrap();
@@ -585,7 +585,7 @@ async fn test_remove_multiple_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests the --dry-run flag which shows what would be removed without actually removing anything
 async fn test_remove_dry_run() {
     let test_dir = tempdir().unwrap();
@@ -658,7 +658,7 @@ async fn test_remove_dry_run() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --dry-run with --cached flag
 async fn test_remove_dry_run_cached() {
     let test_dir = tempdir().unwrap();
@@ -714,7 +714,7 @@ async fn test_remove_dry_run_cached() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --dry-run with recursive directory removal
 async fn test_remove_dry_run_recursive() {
     let test_dir = tempdir().unwrap();
@@ -782,7 +782,7 @@ async fn test_remove_dry_run_recursive() {
     );
 }
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --ignore-unmatch with recursive directory removal
 async fn test_remove_ignore_unmatch() {
     let test_dir = tempdir().unwrap();
@@ -839,7 +839,7 @@ async fn test_remove_ignore_unmatch() {
     assert!(file2.exists(), "File 2 should still exist");
 }
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests rm --pathspec-from-file with newline-separated file
 async fn test_remove_pathspec_from_file_newline() {
     let test_dir = tempdir().unwrap();
@@ -889,7 +889,7 @@ async fn test_remove_pathspec_from_file_newline() {
     assert!(file2.exists(), "file2.txt should still exist");
 }
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests rm --pathspec-from-file with NUL-separated file
 async fn test_remove_pathspec_from_file_nul() {
     let test_dir = tempdir().unwrap();
@@ -941,7 +941,7 @@ async fn test_remove_pathspec_from_file_nul() {
     assert!(file2.exists(), "file2.txt should still exist");
 }
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests rm --pathspec-from-file with --ignore-unmatch
 async fn test_remove_pathspec_from_file_ignore_unmatch() {
     let test_dir = tempdir().unwrap();

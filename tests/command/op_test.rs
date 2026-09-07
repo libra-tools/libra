@@ -650,7 +650,7 @@ fn test_op_restore_dirty_worktree_is_rejected_without_recording_new_operation() 
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Verifies that `op restore --force` proceeds on a dirty worktree and records history.
 async fn test_op_restore_force_allows_dirty_worktree_and_emits_confirmation() {
     let repo = create_committed_repo_via_cli();
@@ -745,7 +745,7 @@ fn test_op_command_smoke_flow_covers_first_batch_chain() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Verifies that JSON restore updates HEAD and refs while recording a new restore operation.
 async fn test_op_restore_json_records_new_operation_and_restores_head_and_branch_ref() {
     let repo = create_committed_repo_via_cli();
@@ -824,7 +824,7 @@ async fn test_op_restore_json_records_new_operation_and_restores_head_and_branch
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Legacy operation views may contain Memory, but restore must preserve its authority and watermark.
 async fn op_restore_preserves_memory_ref_and_projection_watermark() {
     let repo = create_committed_repo_via_cli();

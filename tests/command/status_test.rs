@@ -33,7 +33,6 @@ fn output_porcelain(
 }
 
 #[test]
-#[serial]
 fn test_status_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
 
@@ -47,7 +46,7 @@ fn test_status_cli_outside_repository_returns_fatal_128() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --ignored flag: ignored files appear in outputs
 async fn test_status_ignored_outputs() {
     let test_dir = tempdir().unwrap();
@@ -121,7 +120,7 @@ async fn test_status_ignored_outputs() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Ensures `status` refuses to run inside a bare repository.
 async fn test_status_rejects_bare_repository() {
     let temp_path = tempdir().unwrap();
@@ -168,7 +167,7 @@ fn create_commit_args(message: &str) -> CommitArgs {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests the file status detection functionality with respect to ignore patterns.
 /// Verifies that files matching patterns in .libraignore are properly excluded from status reports.
 async fn test_changes_to_be_staged() {
@@ -339,7 +338,7 @@ fn test_output_porcelain_format() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests the --porcelain flag for machine-readable output format.
 /// Verifies that the output matches Git's porcelain format specification.
 async fn test_status_porcelain() {
@@ -501,7 +500,7 @@ fn test_output_short_format() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests the -s (--short) flag for short format output.
 /// Verifies that the output matches Git's short format specification.
 async fn test_status_short_format() {
@@ -626,7 +625,7 @@ async fn test_status_short_format() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests porcelain v2 output: branch info, tracked changes, and untracked files.
 async fn test_status_porcelain_v2_basic() {
     let test_dir = tempdir().unwrap();
@@ -710,7 +709,7 @@ async fn test_status_porcelain_v2_basic() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests porcelain v2 branch metadata uses the real HEAD oid and upstream counts.
 async fn test_status_porcelain_v2_branch_metadata_includes_upstream_counts() {
     let test_dir = tempdir().unwrap();
@@ -786,7 +785,7 @@ async fn test_status_porcelain_v2_branch_metadata_includes_upstream_counts() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests porcelain v2 with --untracked-files=no hides untracked and ignored entries.
 async fn test_status_porcelain_v2_untracked_files_no() {
     let test_dir = tempdir().unwrap();
@@ -849,7 +848,7 @@ async fn test_status_porcelain_v2_untracked_files_no() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests porcelain v2 with --untracked-files=all retains untracked output.
 async fn test_status_porcelain_v2_untracked_files_all() {
     let test_dir = tempdir().unwrap();
@@ -904,7 +903,7 @@ async fn test_status_porcelain_v2_untracked_files_all() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --untracked-files=no hides untracked and ignored entries.
 async fn test_status_untracked_files_no() {
     let test_dir = tempdir().unwrap();
@@ -968,7 +967,7 @@ async fn test_status_untracked_files_no() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_status_untracked_files_no_skips_untracked_directory_scan() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1002,7 +1001,7 @@ async fn test_status_untracked_files_no_skips_untracked_directory_scan() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_status_normal_reports_untracked_directory_without_descending() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1060,7 +1059,7 @@ async fn test_status_normal_reports_untracked_directory_without_descending() {
 /// directories containing only a nested `.libra` (e.g. test harnesses'
 /// `.libra-test-home/`), breaking every clean-tree assertion downstream.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_status_hides_untracked_directory_with_only_skiplisted_content() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -1099,7 +1098,7 @@ async fn test_status_hides_untracked_directory_with_only_skiplisted_content() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_status_normal_untracked_directories_are_sorted() {
     let test_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(test_dir.path()).await;
@@ -1134,7 +1133,7 @@ async fn test_status_normal_untracked_directories_are_sorted() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --untracked-files=all retains untracked output (same as normal for now).
 async fn test_status_untracked_files_all() {
     let test_dir = tempdir().unwrap();
@@ -1189,7 +1188,7 @@ async fn test_status_untracked_files_all() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests status in a newly initialized empty repository
 /// Verifies the initial state message for empty repositories
 async fn test_status_empty_repository() {
@@ -1220,7 +1219,7 @@ async fn test_status_empty_repository() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests status with mixed staged and unstaged changes
 /// Verifies proper separation of staged vs working directory changes
 async fn test_status_mixed_changes() {
@@ -1288,7 +1287,7 @@ async fn test_status_mixed_changes() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests status after file deletion
 /// Verifies that deleted files are properly detected and reported
 async fn test_status_deleted_files() {
@@ -1351,7 +1350,7 @@ async fn test_status_deleted_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests status with subdirectory structure
 /// Verifies that status works correctly with nested directory structures
 async fn test_status_with_subdirectories() {
@@ -1445,7 +1444,7 @@ async fn test_status_with_subdirectories() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests status verbose output format
 /// Verifies that verbose mode provides additional information when requested
 async fn test_status_verbose_output() {
@@ -1512,7 +1511,7 @@ async fn test_status_verbose_output() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --short --branch combination output
 /// Verifies that branch info is displayed in short format when --branch flag is enabled.
 async fn test_status_short_format_with_branch() {
@@ -1581,7 +1580,7 @@ async fn test_status_short_format_with_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --porcelain --branch combination output
 /// Verifies that branch info is displayed in porcelain format when --branch flag is enabled.
 async fn test_status_porcelain_format_with_branch() {
@@ -1650,7 +1649,7 @@ async fn test_status_porcelain_format_with_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --show-stash output when stash exists
 /// Verifies that stash count info is displayed in standard mode when --show-stash flag is enabled
 async fn test_status_show_stash_with_existing_stash() {
@@ -1802,7 +1801,7 @@ async fn test_status_show_stash_with_existing_stash() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --show-stash output when no stash exists
 /// Verifies that stash info is not displayed when no stash is present
 async fn test_status_show_stash_without_stash() {
@@ -1863,7 +1862,7 @@ async fn test_status_show_stash_without_stash() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests --branch output in detached HEAD state
 /// Verifies that branch info shows detached HEAD status correctly
 async fn test_status_branch_detached_head() {
@@ -1966,7 +1965,7 @@ async fn test_status_branch_detached_head() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests porcelain v2 output shows actual file modes and hashes.
 /// Verifies:
 /// - New files have mH=000000 and zero hash for hH
@@ -2131,7 +2130,7 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests porcelain v2 output shows 100755 for executable files.
 async fn test_status_porcelain_v2_executable_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -2207,7 +2206,7 @@ async fn test_status_porcelain_v2_executable_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests porcelain v2 output for deleted files shows correct modes.
 async fn test_status_porcelain_v2_deleted_file() {
     let test_dir = tempdir().unwrap();
@@ -2295,7 +2294,7 @@ async fn test_status_porcelain_v2_deleted_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests status command after adding a file
 ///
 /// Verifies that the status command correctly reports added files with proper formatting
@@ -2381,7 +2380,6 @@ async fn test_status_after_add() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn test_add_success_summary_output() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2402,7 +2400,6 @@ fn test_add_success_summary_output() {
 }
 
 #[test]
-#[serial]
 fn test_add_quiet_suppresses_output() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2423,7 +2420,6 @@ fn test_add_quiet_suppresses_output() {
 }
 
 #[test]
-#[serial]
 fn test_add_verbose_shows_per_file_listing() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2445,7 +2441,6 @@ fn test_add_verbose_shows_per_file_listing() {
 }
 
 #[test]
-#[serial]
 fn test_add_nothing_specified_exit_129() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2464,7 +2459,6 @@ fn test_add_nothing_specified_exit_129() {
 }
 
 #[test]
-#[serial]
 fn test_add_dry_run_output() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2493,7 +2487,6 @@ fn test_add_dry_run_output() {
 }
 
 #[test]
-#[serial]
 fn test_status_porcelain_z_uses_null_terminator() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2519,7 +2512,6 @@ fn test_status_porcelain_z_uses_null_terminator() {
 }
 
 #[test]
-#[serial]
 fn test_status_short_z_uses_null_terminator() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2540,7 +2532,6 @@ fn test_status_short_z_uses_null_terminator() {
 }
 
 #[test]
-#[serial]
 fn test_status_branch_no_ahead_behind_suppresses_counts() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2578,7 +2569,6 @@ fn test_status_branch_no_ahead_behind_suppresses_counts() {
 }
 
 #[test]
-#[serial]
 fn test_status_column_aligns_labels() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2619,7 +2609,6 @@ fn test_status_column_aligns_labels() {
 }
 
 #[test]
-#[serial]
 fn test_status_find_renames_detects_content_rename() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2664,7 +2653,6 @@ fn test_status_find_renames_detects_content_rename() {
 }
 
 #[test]
-#[serial]
 fn test_status_find_renames_honors_threshold() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2701,7 +2689,6 @@ fn test_status_find_renames_honors_threshold() {
 }
 
 #[test]
-#[serial]
 fn test_status_renames_and_no_renames_toggle_detection() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -2906,7 +2893,7 @@ fn untracked_files_short_flag_parses_like_git() {
 /// P1-05d: the `/api/repo/status` envelope honors the same resolved
 /// `status.*` defaults (and fail-closed validation) as `status --json`.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn api_status_envelope_honors_status_config_defaults() {
     use libra::internal::config::ConfigKv;
 

@@ -134,7 +134,7 @@ async fn create_linear_commits(count: usize) -> Vec<String> {
 /// `in_progress` state with empty `bad` and `good` slots. Pins the initial
 /// state shape.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_start_creates_state() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -165,7 +165,7 @@ async fn test_bisect_start_creates_state() {
 /// immediately check out a midpoint commit (`state.current` populated).
 /// Confirms the binary search seeding behaviour.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_start_with_bad_and_good() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -199,7 +199,7 @@ async fn test_bisect_start_with_bad_and_good() {
 /// the search to the single middle commit, which becomes `state.current`.
 /// Locks in the bisection convergence path.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_mark_bad_then_good() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -243,7 +243,7 @@ async fn test_bisect_mark_bad_then_good() {
 /// the current commit as ground truth. Confirms the algorithm terminates
 /// and exits the bisect session cleanly.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_find_first_bad_commit() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -301,7 +301,7 @@ async fn test_bisect_find_first_bad_commit() {
 /// HEAD-restore behaviour after a session is started and `bad`/`good`
 /// have moved HEAD off the original tip.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_reset() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -351,7 +351,7 @@ async fn test_bisect_reset() {
 /// checkout. Otherwise a storage-corruption bug can be hidden behind a
 /// successful reset.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_reset_surfaces_corrupt_original_branch_storage() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -384,7 +384,7 @@ async fn test_bisect_reset_surfaces_corrupt_original_branch_storage() {
 /// `state.skipped` and advance to a different commit. Locks in the skip
 /// behaviour for untestable commits.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_skip() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -426,7 +426,7 @@ async fn test_bisect_skip() {
 /// session. Smoke-tests the log subcommand path (the actual log content is
 /// not asserted here).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_log() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -452,7 +452,7 @@ async fn test_bisect_log() {
 /// Scenario: starting a second bisect session while one is active must
 /// return an error. Pins the "single active session" invariant.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_start_already_in_progress_fails() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -483,7 +483,7 @@ async fn test_bisect_start_already_in_progress_fails() {
 /// Scenario: `bad`, `good`, and `skip` must all return errors when no
 /// bisect session has been started. Pins the no-implicit-session contract.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_operations_without_session_fails() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -572,7 +572,7 @@ fn test_bisect_help_lists_run_and_view() {
 /// (LBR-BISECT-001) so callers can distinguish "no bisect" from a transient
 /// failure.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_view_without_session_errors() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -592,7 +592,7 @@ async fn test_bisect_view_without_session_errors() {
 
 /// `bisect view` during an active session prints state without erroring.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_view_inside_active_session() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -624,7 +624,7 @@ async fn test_bisect_view_inside_active_session() {
 /// `--json bisect view` must emit a single clean command envelope without
 /// human progress lines on stdout.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_json_view_outputs_clean_envelope() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -669,7 +669,7 @@ async fn test_bisect_json_view_outputs_clean_envelope() {
 /// `bisect run` without an active session must reject with `BisectNotActive`.
 /// The user must `bisect start` (with bounds) before automation kicks in.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_run_without_session_errors() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -694,7 +694,7 @@ async fn test_bisect_run_without_session_errors() {
 /// but good/bad bounds have not selected a candidate yet.
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_run_without_bounds_does_not_spawn_command() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -739,7 +739,7 @@ async fn test_bisect_run_without_bounds_does_not_spawn_command() {
 /// non-recoverable exit code through `BisectRunFailed` (LBR-BISECT-002).
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_run_propagates_fatal_exit_code() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -778,7 +778,7 @@ async fn test_bisect_run_propagates_fatal_exit_code() {
 /// though the run internally marks multiple commits.
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_bisect_machine_run_outputs_single_json_line() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;

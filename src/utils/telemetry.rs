@@ -1,7 +1,8 @@
 //! OTLP trace export (lore.md §1.7) — compiled ONLY with `--features otlp`;
 //! the default binary contains none of this module.
 //!
-//! PRIVACY ALLOWLIST (lore.md:725, enforced STRUCTURALLY): only the vetted
+//! PRIVACY ALLOWLIST (lore.md §7.9 "OTLP telemetry span（1.7）" row, `:787`
+//! as of 2026-08-27; enforced STRUCTURALLY): only the vetted
 //! `libra::telemetry` target is exported — a per-layer `Targets` filter means
 //! no other span or event in the codebase can leak, whatever it carries. The
 //! one exported span holds the canonical subcommand name, the duration, and

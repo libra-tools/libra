@@ -148,7 +148,11 @@ the default version 1 payload remains shape-compatible and never gains those
 fields implicitly. OpenCode reports `transcript_discoverable` unsupported
 because batch discovery is unavailable; explicit-ID `importable` and
 `export_bridge` availability depend on its trusted offline exporter/sandbox.
-To enable the exporter, register the directory containing the verified
+On macOS the sandboxed export uses seatbelt (`sandbox-exec`; deprecated by
+Apple and may be removed) so store writes and network are denied outside the
+OpenCode data dir; host read is not confined (global `file-read*`), unlike
+Linux bubblewrap default-deny. If `sandbox-exec` is missing the export fails
+closed and degrades to metadata-only. To enable the exporter, register the directory containing the verified
 `opencode` binary and then pin it: `libra agent rpc trust --dir <path>`
 followed by `libra agent rpc trust opencode`. Neither step opens the
 external-RPC surface (`agent.external_agents.enabled` stays untouched); the

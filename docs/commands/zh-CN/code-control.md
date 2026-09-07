@@ -18,7 +18,15 @@ endpoint：
 
 JSON-RPC 方法（`controller.attach`、`message.submit`、`events.subscribe`、
 `diagnostics.get` 等）与 JSON-RPC 错误映射不变，见
-[`code.md`](code.md) 的「本地自动化控制」一节。请勿把 `--control stdio` 与
+[`code.md`](code.md) 的「本地自动化控制」一节。`events.subscribe` 会显式请求
+SSE wire v2，并接受最后确认的可选 cursor（`?wire=2&cursor=<last>`）；省略参数为
+cursor-0 bootstrap，cursor 仅在同一 session 内有效。v2 resync 会拉取一次
+session snapshot，再从服务端提供的 durable tail 重连；这表示存在 workflow-event
+gap，消费者必须对账 snapshot state，并按 event ID 去重副作用。Ahead cursor 会在
+同类 snapshot 恢复后被丢弃，v2 从 0 重启。若服务端没有 durable session store 并返回
+`WIRE_V2_REQUIRES_DURABLE_SESSION`，该错误即为终态：遗留的 v1 回退已随服务端
+v1 wire 在 0.22.0 删除（服务端未指定版本的默认值自 DF-06 起即为 v2）。
+请勿把 `--control stdio` 与
 弃用的 MCP-only `libra code --stdio` 传输混同（tools/resources；独立的
 `libra mcp --stdio` 计划在 W5 之后，DEFER-02）。
 

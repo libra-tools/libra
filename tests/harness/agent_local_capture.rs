@@ -31,10 +31,11 @@
 //!   under `~/.local/share/opencode` / `~/.config/opencode`); the
 //!   Libra-managed plugin is *project-local*
 //!   (`<repo>/.opencode/plugin/libra-hooks.js`), so nothing user-level is
-//!   touched. Its plugin envelopes are lifecycle-only (no transcript
-//!   path — agent.md「OpenCode 安装流程契约」), so checkpoints pin an
-//!   empty transcript snapshot with `extraction.present=false` as the
-//!   current documented contract.
+//!   touched. Plugin envelopes stay lifecycle-only. **Linux** checkpoints
+//!   pin an empty transcript snapshot with `extraction.present=false`
+//!   (A6.5 metadata-only). **macOS** (SBX-04/05) enables the export
+//!   bridge under seatbelt, so the same idle path records
+//!   `extraction.present=true` and a non-empty transcript snapshot.
 //!
 //! ## Evidence discipline (plan.md §0.3.1)
 //!
@@ -502,9 +503,20 @@ impl SmokeAgent {
             );
         }
         self.assert_hooks_pinned();
+        // macOS SBX-04/05: content capture requires a trusted exporter
+        // (tracing/agent.md §5). Linux A6.5 keeps the untrusted
+        // metadata-only contract — do not register trust there.
+        #[cfg(target_os = "macos")]
+        if slug == "opencode" {
+            self.trust_opencode_exporter();
+        }
         self.summary.insert(
             "install".into(),
-            json!({ "installed": true, "hook_commands_pinned": true }),
+            json!({
+                "installed": true,
+                "hook_commands_pinned": true,
+                "opencode_exporter_trusted": cfg!(target_os = "macos") && slug == "opencode",
+            }),
         );
 
         // §0.3.4: one minimal real non-interactive session.
@@ -553,6 +565,28 @@ impl SmokeAgent {
             "[{slug}] local capture smoke ok (session {session_id}, libra sha256 {})",
             &self.libra_sha256[..12]
         );
+    }
+
+    /// Register the real `opencode` binary as the DR-04b export-bridge
+    /// trusted exporter (repo config). Required for macOS content capture.
+    #[cfg(target_os = "macos")]
+    fn trust_opencode_exporter(&self) {
+        let binary = self
+            .agent_binary
+            .as_ref()
+            .expect("opencode binary resolved in preflight");
+        let dir = binary.parent().unwrap_or_else(|| {
+            panic!(
+                "opencode binary {} has no parent directory",
+                binary.display()
+            )
+        });
+        let dir_s = dir
+            .to_str()
+            .unwrap_or_else(|| panic!("opencode trusted-dir {} is not UTF-8", dir.display()));
+        self.libra_ok(&["config", "set", "agent.external_agents.enabled", "true"]);
+        self.libra_ok(&["agent", "rpc", "trust", "--dir", dir_s]);
+        self.libra_ok(&["agent", "rpc", "trust", "opencode"]);
     }
 
     /// Seed pre-existing user provider config so install/uninstall can
@@ -847,11 +881,12 @@ impl SmokeAgent {
         // Transcript-derived facts differ per agent: claude/codex hook
         // envelopes carry the agent's on-disk transcript path, so the
         // snapshot is captured and extraction (token summary) must run.
-        // The opencode plugin cannot cheaply provide one (lifecycle-only
-        // envelopes — agent.md「OpenCode 安装流程契约」event mapping), so
-        // its pinned current contract is the fail-open skip: an empty
-        // transcript role plus `extraction.present=false/partial=true`
-        // with the documented warning.
+        // OpenCode plugin envelopes stay lifecycle-only (agent.md「OpenCode
+        // 安装流程契约」). Linux A6.5 pins the fail-open skip
+        // (`extraction.present=false/partial=true` + documented warning).
+        // macOS SBX-04/05 enables the seatbelt export bridge, so the idle
+        // path must record content capture (`present=true` + non-empty
+        // transcript). Both branches stay in source (`linux_a65_criteria_unchanged`).
         let extraction = &metadata["extraction"];
         let transcript_bytes = show["data"]["layout"]["transcript"]["parts"]
             .as_array()
@@ -860,28 +895,47 @@ impl SmokeAgent {
             .filter_map(|part| part["byte_len"].as_u64())
             .sum::<u64>();
         if slug == "opencode" {
-            assert_eq!(
-                extraction["present"],
-                json!(false),
-                "{slug}: lifecycle-only capture must record the extraction skip: {show}"
-            );
-            assert_eq!(
-                extraction["partial"],
-                json!(true),
-                "{slug}: skipped extraction must be marked partial: {show}"
-            );
-            let warned = extraction["warnings"].as_array().is_some_and(|warnings| {
-                warnings.iter().any(|warning| {
-                    warning
-                        .as_str()
-                        .unwrap_or_default()
-                        .contains("no raw transcript available")
-                })
-            });
-            assert!(
-                warned,
-                "{slug}: the extraction skip must carry the documented warning: {show}"
-            );
+            #[cfg(not(target_os = "macos"))]
+            {
+                assert_eq!(
+                    extraction["present"],
+                    json!(false),
+                    "{slug}: lifecycle-only capture must record the extraction skip: {show}"
+                );
+                assert_eq!(
+                    extraction["partial"],
+                    json!(true),
+                    "{slug}: skipped extraction must be marked partial: {show}"
+                );
+                let warned = extraction["warnings"].as_array().is_some_and(|warnings| {
+                    warnings.iter().any(|warning| {
+                        warning
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("no raw transcript available")
+                    })
+                });
+                assert!(
+                    warned,
+                    "{slug}: the extraction skip must carry the documented warning: {show}"
+                );
+            }
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(
+                    extraction["present"],
+                    json!(true),
+                    "{slug}: macOS seatbelt export must capture content: {show}"
+                );
+                assert!(
+                    extraction["token_usage"].is_object(),
+                    "{slug}: macOS export capture must carry the token summary: {show}"
+                );
+                assert!(
+                    transcript_bytes > 0,
+                    "{slug}: macOS export transcript snapshot must not be empty: {show}"
+                );
+            }
         } else {
             assert_eq!(
                 extraction["present"],

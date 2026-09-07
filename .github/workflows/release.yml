@@ -5,9 +5,21 @@ on:
     tags:
       - 'v*' # Trigger when pushing tags starting with v, e.g., v1.0.0
 
+env:
+  # All uploads and the publish call go through the Backend release API
+  # (UP-01 design §5.2): OIDC-authenticated, no long-term storage
+  # credentials anywhere in this workflow (GC-UP01-1).
+  LIBRA_RELEASE_API_BASE: 'https://libra.tools'
+
 jobs:
   build-and-upload:
     runs-on: ${{ matrix.target.runner }}
+    permissions:
+      contents: read
+      id-token: write # only to obtain short-term upload URLs from the broker
+    # Per-leg environments: the broker derives the write scope from this
+    # claim, so each leg can only presign its OWN platform's objects.
+    environment: release-artifacts-${{ matrix.target.os }}-${{ matrix.target.arch }}
     strategy:
       fail-fast: true # if it is set to true, then one job failed the other jobs will be cancelled  together.
       matrix:
@@ -20,18 +32,18 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
 
       - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: stable
           target: ${{ matrix.target.rust }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: "22"
 
@@ -49,19 +61,19 @@ jobs:
           sudo apt-get update
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ matrix.target.rust }}-${{ hashFiles('**/Cargo.lock') }}
@@ -72,7 +84,6 @@ jobs:
       # passes an explicit feature list; this guard fails the release if the
       # test feature is ever spliced into the release build command.
       - name: Reject test-upgrade feature in release build
-        if: matrix.target.os != 'windows'
         shell: bash
         run: |
           if grep -nE -- '--features[^\n]*test-upgrade' .github/workflows/release.yml; then
@@ -98,12 +109,14 @@ jobs:
           # Make binary executable
           chmod +x build/$BINARY_NAME
 
-          # Generate sha256 for Homebrew tap updates and CDN verification
+          # Generate sha256 for Homebrew tap updates and CDN verification,
+          # plus the byte size the publish job binds into the signed manifest.
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "build/$BINARY_NAME" | awk '{print $1}' > "build/$BINARY_NAME.sha256"
           else
             shasum -a 256 "build/$BINARY_NAME" | awk '{print $1}' > "build/$BINARY_NAME.sha256"
           fi
+          wc -c < "build/$BINARY_NAME" | tr -d '[:space:]' > "build/$BINARY_NAME.size"
 
           echo "Built binary: $BINARY_NAME"
 
@@ -112,7 +125,9 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME
-          $binaryName = "${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          # This is the public release-contract name, including the separate
+          # suffixless object consumed by signed manifests.
+          $binaryName = "libra-windows-amd64"
 
           Write-Output "Building $binaryName for target ${{ matrix.target.rust }}..."
 
@@ -121,70 +136,203 @@ jobs:
 
           # Create build directory and copy binary
           New-Item -ItemType Directory -Force -Path "build" | Out-Null
-          Copy-Item "target\${{ matrix.target.rust }}\release\${{ matrix.component }}.exe" "build\$binaryName.exe"
+          $sourceBinary = "target\${{ matrix.target.rust }}\release\${{ matrix.component }}.exe"
+          $sourceHash = (Get-FileHash -Algorithm SHA256 $sourceBinary).Hash.ToLowerInvariant()
+          Copy-Item $sourceBinary "build\$binaryName.exe"
+          # The signed-manifest URL grammar has no `.exe` suffix. Publish a
+          # byte-identical second name and verify both copied release objects.
+          Copy-Item "build\$binaryName.exe" "build\$binaryName"
+          $exeHash = (Get-FileHash -Algorithm SHA256 "build\$binaryName.exe").Hash.ToLowerInvariant()
+          $suffixlessHash = (Get-FileHash -Algorithm SHA256 "build\$binaryName").Hash.ToLowerInvariant()
+          if ($sourceHash -ne $exeHash -or $sourceHash -ne $suffixlessHash) {
+            throw "Windows release copies do not match the built executable"
+          }
+          Set-Content -NoNewline -Path "build\$binaryName.sha256" -Value $exeHash
+          # The upload loop reads "<file>.sha256" per file; give the .exe its
+          # own (byte-identical) sidecar so both binaries resolve digests.
+          Set-Content -NoNewline -Path "build\$binaryName.exe.sha256" -Value $exeHash
+          Set-Content -NoNewline -Path "build\$binaryName.size" -Value ((Get-Item "build\$binaryName").Length)
 
           Write-Output "Built binary: $binaryName"
 
-      - name: Upload to Cloudflare R2 (Unix)
+      - name: Upload release objects via the credential broker (Unix)
         if: matrix.target.os != 'windows'
         shell: bash
         env:
-          RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          RCLONE_CONFIG_R2_ACL: private
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
-          # Install rclone
-          if [[ "${{ matrix.target.os }}" == "darwin" ]]; then
-            brew install rclone
-          else
-            curl https://rclone.org/install.sh | sudo bash
-          fi
+          set -euo pipefail
+          # 1. Per-object {key,size,sha256} list for everything in build/.
+          objects="$(cd build && for f in *; do
+            case "$f" in
+              *.sha256|*.size) sha="$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | awk '{print $1}')" ;;
+              *) sha="$(cat "$f.sha256")" ;;
+            esac
+            [[ "$f" == *.size ]] && continue
+            jq -n --arg key "libra/releases/${GITHUB_REF_NAME}/$f" \
+              --arg sha "$sha" --argjson size "$(wc -c < "$f" | tr -d '[:space:]')" \
+              '{object_key: $key, sha256: $sha, size: $size}'
+          done | jq -s '.')"
 
-          # Upload binaries to R2
-          rclone copy ./build/ r2:${{ secrets.R2_BUCKET_NAME }}/libra/releases/${{ github.ref_name }}/ -v
+          body="$(jq -n --arg tag "$GITHUB_REF_NAME" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg workflow_sha "${GITHUB_WORKFLOW_SHA}" --arg commit_sha "${GITHUB_SHA}" \
+            --argjson objects "$objects" \
+            '{tag: $tag, run_id: $run_id, run_attempt: $run_attempt,
+              workflow_sha: $workflow_sha, commit_sha: $commit_sha, objects: $objects}')"
 
-          echo "Upload completed for ${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          # 2+3. OIDC mint + credential exchange (design §5.2 broker steps
+          # 1-4), retried on 5xx: each attempt mints a FRESH token — a jti is
+          # one-time, so reusing the previous token would be a replay 401.
+          # 4xx is a real rejection and fails immediately.
+          response=""
+          for attempt in 1 2 3; do
+            oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-upload" \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
+            [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
+            code="$(curl -sS -o credential-response.json -w '%{http_code}' \
+              -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/upload-credential" \
+              -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
+              --data-binary "$body")" || code=000
+            case "$code" in
+              2??) response="$(cat credential-response.json)"; break ;;
+              5??|000)
+                echo "::warning::credential broker returned HTTP ${code} (attempt ${attempt}/3)"
+                cat credential-response.json 2>/dev/null || true
+                [ "$attempt" -lt 3 ] && sleep $((attempt * 15)) ;;
+              *)
+                echo "::error::credential broker rejected the request with HTTP ${code}"
+                cat credential-response.json 2>/dev/null || true
+                exit 1 ;;
+            esac
+          done
+          [ -n "$response" ] || { echo "::error::credential broker unavailable after 3 attempts"; exit 1; }
 
-      - name: Upload Homebrew sha256 artifact
+          # 4. Upload each object with the exact signed headers. A 412 means
+          #    the immutable object already exists: forward-fix with a new tag.
+          echo "$response" | jq -c '.objects[]' | while read -r entry; do
+            key="$(echo "$entry" | jq -r '.object_key')"
+            url="$(echo "$entry" | jq -r '.url')"
+            checksum="$(echo "$entry" | jq -r '.headers["x-amz-checksum-sha256"]')"
+            file="build/$(basename "$key")"
+            code="$(curl -sS -o /tmp/put-response -w '%{http_code}' -X PUT "$url" \
+              -H "If-None-Match: *" -H "x-amz-checksum-sha256: ${checksum}" \
+              -T "$file")"
+            if [ "$code" = "412" ]; then
+              echo "::error::object ${key} already exists (immutable release prefix); publish a NEW tag instead of re-running"
+              exit 1
+            fi
+            if [ "$code" != "200" ]; then
+              echo "::error::upload of ${key} failed with HTTP ${code}"
+              cat /tmp/put-response || true
+              exit 1
+            fi
+            echo "uploaded ${key}"
+          done
+
+      - name: Upload release sha256 artifact
         if: matrix.target.os != 'windows'
-        continue-on-error: true
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: homebrew-sha256-${{ matrix.target.os }}-${{ matrix.target.arch }}
-          path: build/${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.sha256
+          path: |
+            build/${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.sha256
+            build/${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.size
           if-no-files-found: error
 
-      - name: Upload to Cloudflare R2 (Windows)
+      - name: Upload Windows release sha256 artifact
+        if: matrix.target.os == 'windows'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: homebrew-sha256-windows-amd64
+          path: |
+            build/libra-windows-amd64.sha256
+            build/libra-windows-amd64.size
+          if-no-files-found: error
+
+      - name: Upload release objects via the credential broker (Windows)
         if: matrix.target.os == 'windows'
         shell: pwsh
         env:
-          RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          RCLONE_CONFIG_R2_ACL: private
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
-          # Install rclone via choco
-          choco install rclone -y
+          $ErrorActionPreference = "Stop"
+          $objects = @()
+          foreach ($f in Get-ChildItem build -File) {
+            if ($f.Name.EndsWith(".size")) { continue }
+            if ($f.Name.EndsWith(".sha256")) {
+              $sha = (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLowerInvariant()
+            } else {
+              $sha = (Get-Content -Raw "$($f.FullName).sha256").Trim()
+            }
+            $objects += @{ object_key = "libra/releases/$($env:GITHUB_REF_NAME)/$($f.Name)"; sha256 = $sha; size = $f.Length }
+          }
+          $body = @{
+            tag = $env:GITHUB_REF_NAME
+            run_id = "$($env:GITHUB_RUN_ID)"
+            run_attempt = "$($env:GITHUB_RUN_ATTEMPT)"
+            workflow_sha = $env:GITHUB_WORKFLOW_SHA
+            commit_sha = $env:GITHUB_SHA
+            objects = $objects
+          } | ConvertTo-Json -Depth 5
 
-          # Upload binaries to R2
-          rclone copy ./build/ r2:${{ secrets.R2_BUCKET_NAME }}/libra/releases/${{ github.ref_name }}/ -v
+          # OIDC mint + credential exchange, retried on 5xx with a FRESH token
+          # per attempt (a jti is one-time; reusing one would replay-401).
+          $response = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $oidc = Invoke-RestMethod -Uri "$($env:ACTIONS_ID_TOKEN_REQUEST_URL)&audience=libra-release-upload" `
+              -Headers @{ Authorization = "Bearer $($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN)" }
+            if (-not $oidc.value) { throw "no OIDC token" }
+            try {
+              $response = Invoke-RestMethod -Method Post `
+                -Uri "$($env:LIBRA_RELEASE_API_BASE)/api/internal/release/upload-credential" `
+                -Headers @{ Authorization = "Bearer $($oidc.value)"; "Content-Type" = "application/json" } `
+                -Body $body
+              break
+            } catch {
+              $status = $null
+              if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch {} }
+              if ($status -ge 500 -or $null -eq $status) {
+                Write-Warning "credential broker returned HTTP $status (attempt $attempt/3)"
+                if ($attempt -lt 3) { Start-Sleep -Seconds ($attempt * 15); continue }
+              }
+              throw
+            }
+          }
+          if ($null -eq $response) { throw "credential broker unavailable after 3 attempts" }
 
-          Write-Output "Upload completed for ${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          foreach ($entry in $response.objects) {
+            $file = Join-Path "build" (Split-Path $entry.object_key -Leaf)
+            $headers = @{
+              "If-None-Match" = "*"
+              "x-amz-checksum-sha256" = $entry.headers."x-amz-checksum-sha256"
+            }
+            try {
+              Invoke-WebRequest -Method Put -Uri $entry.url -InFile $file -Headers $headers -UseBasicParsing | Out-Null
+            } catch {
+              $status = $null
+              if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch {} }
+              if ($status -eq 412) {
+                throw "object $($entry.object_key) already exists (immutable release prefix); publish a NEW tag instead of re-running"
+              }
+              throw "upload of $($entry.object_key) failed: $($_.Exception.Message)"
+            }
+            Write-Output "uploaded $($entry.object_key)"
+          }
 
   upload-install-scripts:
     needs: build-and-upload
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # only to obtain short-term upload URLs from the broker
+    environment: release-installers
     concurrency:
       group: libra-release-install-scripts
       cancel-in-progress: false
     steps:
       - name: Checkout tagged commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.ref }}
 
@@ -250,30 +398,66 @@ jobs:
           refuse_older_cdn "https://download.libra.tools/install.sh" "install.sh"
           refuse_older_cdn "https://download.libra.tools/install.ps1" "install.ps1"
 
-      - name: Upload install.sh and install.ps1 to R2 root
+      - name: Upload install.sh and install.ps1 via the credential broker
         shell: bash
         env:
-          RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          RCLONE_CONFIG_R2_ACL: private
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          rclone_version="1.75.0"
-          rclone_sha256="aa2804e08f48250e71009c727124b6341cd0288465804a9a09d14663cabafbaa"
-          rclone_zip="rclone-v${rclone_version}-linux-amd64.zip"
-          curl -fsSL --connect-timeout 10 --max-time 120 -o "$rclone_zip" \
-            "https://github.com/rclone/rclone/releases/download/v${rclone_version}/${rclone_zip}"
-          echo "${rclone_sha256}  ${rclone_zip}" | sha256sum -c -
-          unzip -q "$rclone_zip"
-          rclone_bin="$PWD/rclone-v${rclone_version}-linux-amd64/rclone"
-          chmod +x "$rclone_bin"
-          "$rclone_bin" copyto ./install.sh "r2:${{ secrets.R2_BUCKET_NAME }}/install.sh" \
-            --header-upload "Cache-Control: public, max-age=15" -v
-          "$rclone_bin" copyto ./install.ps1 "r2:${{ secrets.R2_BUCKET_NAME }}/install.ps1" \
-            --header-upload "Cache-Control: public, max-age=15" -v
+          objects="$(for f in install.sh install.ps1; do
+            jq -n --arg key "$f" \
+              --arg sha "$(sha256sum "$f" | awk '{print $1}')" \
+              --argjson size "$(wc -c < "$f" | tr -d '[:space:]')" \
+              '{object_key: $key, sha256: $sha, size: $size}'
+          done | jq -s '.')"
+          body="$(jq -n --arg tag "$GITHUB_REF_NAME" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg workflow_sha "${GITHUB_WORKFLOW_SHA}" --arg commit_sha "${GITHUB_SHA}" \
+            --argjson objects "$objects" \
+            '{tag: $tag, run_id: $run_id, run_attempt: $run_attempt,
+              workflow_sha: $workflow_sha, commit_sha: $commit_sha, objects: $objects}')"
+          # 5xx-retried with a FRESH OIDC token per attempt (one-time jti).
+          response=""
+          for attempt in 1 2 3; do
+            oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-upload" \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
+            [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
+            code="$(curl -sS -o credential-response.json -w '%{http_code}' \
+              -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/upload-credential" \
+              -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
+              --data-binary "$body")" || code=000
+            case "$code" in
+              2??) response="$(cat credential-response.json)"; break ;;
+              5??|000)
+                echo "::warning::credential broker returned HTTP ${code} (attempt ${attempt}/3)"
+                cat credential-response.json 2>/dev/null || true
+                [ "$attempt" -lt 3 ] && sleep $((attempt * 15)) ;;
+              *)
+                echo "::error::credential broker rejected the request with HTTP ${code}"
+                cat credential-response.json 2>/dev/null || true
+                exit 1 ;;
+            esac
+          done
+          [ -n "$response" ] || { echo "::error::credential broker unavailable after 3 attempts"; exit 1; }
+
+          # Bucket-root installers are OVERWRITTEN each release by design, so
+          # the broker signs no If-None-Match for this scope. Cache-Control is
+          # object metadata, not a signed header.
+          echo "$response" | jq -c '.objects[]' | while read -r entry; do
+            key="$(echo "$entry" | jq -r '.object_key')"
+            url="$(echo "$entry" | jq -r '.url')"
+            checksum="$(echo "$entry" | jq -r '.headers["x-amz-checksum-sha256"]')"
+            code="$(curl -sS -o /tmp/put-response -w '%{http_code}' -X PUT "$url" \
+              -H "x-amz-checksum-sha256: ${checksum}" \
+              -H "Cache-Control: public, max-age=15" \
+              -T "$key")"
+            if [ "$code" != "200" ]; then
+              echo "::error::upload of ${key} failed with HTTP ${code}"
+              cat /tmp/put-response || true
+              exit 1
+            fi
+            echo "uploaded ${key}"
+          done
 
       - name: Verify CDN installer versions
         shell: bash
@@ -288,7 +472,11 @@ jobs:
             while [[ "$attempt" -le 16 ]]; do
               body="$(curl -fsSL --connect-timeout 10 --max-time 30 \
                 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url")" || true
-              if printf '%s\n' "$body" | grep -Fq "$needle"; then
+              # Herestring, NOT a pipeline: under pipefail, `printf | grep -q`
+              # dies of printf's SIGPIPE (grep exits at first match) once the
+              # body outgrows the pipe buffer, failing the check forever even
+              # though the needle is present.
+              if grep -Fq -- "$needle" <<<"$body"; then
                 echo "CDN $url matches $GITHUB_REF_NAME"
                 return 0
               fi
@@ -310,21 +498,21 @@ jobs:
       actions: read
     steps:
       - name: Download darwin arm64 sha256 artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         continue-on-error: true
         with:
           name: homebrew-sha256-darwin-arm64
           path: homebrew-sha256/darwin-arm64
 
       - name: Download linux amd64 sha256 artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         continue-on-error: true
         with:
           name: homebrew-sha256-linux-amd64
           path: homebrew-sha256/linux-amd64
 
       - name: Download linux arm64 sha256 artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         continue-on-error: true
         with:
           name: homebrew-sha256-linux-arm64
@@ -444,7 +632,7 @@ jobs:
       # already-up-to-date paths must publish it, and the latter exits early.
       - name: Upload the formula commit sha
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: formula-commit-sha
           path: formula-commit-sha.txt
@@ -453,6 +641,7 @@ jobs:
   verify-homebrew-formula:
     needs: update-homebrew-tap
     runs-on: macos-latest
+    permissions: {}
     steps:
       - name: Install and verify Homebrew formula
         shell: bash
@@ -497,3 +686,107 @@ jobs:
             echo
             echo "Verified $expected_version from libra-tools/libra."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  request-stable-manifest:
+    needs: build-and-upload
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # to prove this run's identity to the publish endpoint
+      contents: read
+    environment: release-publish
+    concurrency:
+      group: libra-release-manifest
+      cancel-in-progress: false
+    steps:
+      # All four per-leg digest artifacts are REQUIRED: a missing platform
+      # must fail the publish, never sign a partial matrix (design §5.2).
+      - name: Download linux amd64 digest artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: homebrew-sha256-linux-amd64
+          path: digests/linux-amd64
+
+      - name: Download linux arm64 digest artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: homebrew-sha256-linux-arm64
+          path: digests/linux-arm64
+
+      - name: Download darwin arm64 digest artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: homebrew-sha256-darwin-arm64
+          path: digests/darwin-arm64
+
+      - name: Download windows amd64 digest artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: homebrew-sha256-windows-amd64
+          path: digests/windows-amd64
+
+      - name: Request the signed stable manifest
+        shell: bash
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          read_sha() {
+            local value
+            value="$(tr -d '[:space:]' < "$1")"
+            [[ "$value" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 in $1"; exit 1; }
+            printf '%s' "$value"
+          }
+          read_size() {
+            local value
+            value="$(tr -d '[:space:]' < "$1")"
+            [[ "$value" =~ ^[0-9]+$ ]] || { echo "::error::bad size in $1"; exit 1; }
+            printf '%s' "$value"
+          }
+
+          artifacts="$(for platform in linux-amd64 linux-arm64 darwin-arm64 windows-amd64; do
+            jq -n --arg platform "$platform" \
+              --arg sha "$(read_sha "digests/${platform}/libra-${platform}.sha256")" \
+              --argjson size "$(read_size "digests/${platform}/libra-${platform}.size")" \
+              '{platform: $platform, sha256: $sha, size: $size}'
+          done | jq -s '.')"
+
+          body="$(jq -n --arg version "$version" --arg tag "$GITHUB_REF_NAME" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg workflow_sha "${GITHUB_WORKFLOW_SHA}" --arg commit_sha "${GITHUB_SHA}" \
+            --argjson artifacts "$artifacts" \
+            '{version: $version, tag: $tag, artifacts: $artifacts,
+              run_id: $run_id, run_attempt: $run_attempt,
+              workflow_sha: $workflow_sha, commit_sha: $commit_sha}')"
+
+          # 5xx-retried with a FRESH OIDC token per attempt (one-time jti).
+          # The server treats a same-run retry after a landed-but-unmarked
+          # write as a replay and returns the original 200 (B1-04
+          # reconcileOwnPending), so retrying publish is safe by design.
+          code=000
+          for attempt in 1 2 3; do
+            oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-publish" \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
+            [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
+            code="$(curl -sS -o publish-response.json -w '%{http_code}' \
+              -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/publish" \
+              -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
+              --data-binary "$body")" || code=000
+            echo "publish HTTP ${code} (attempt ${attempt}/3)"
+            cat publish-response.json 2>/dev/null || true
+            case "$code" in
+              2??) break ;;
+              5??|000) [ "$attempt" -lt 3 ] && sleep $((attempt * 15)) ;;
+              *) break ;;
+            esac
+          done
+          case "$code" in
+            2??) ;;
+            *)
+              echo "::error::publish returned HTTP ${code}; the release is unsigned and clients will not upgrade"
+              exit 1
+              ;;
+          esac
+          jq -e '.control_revision and .version and .payload_digest and .signer_key_id' \
+            publish-response.json > /dev/null

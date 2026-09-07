@@ -12,7 +12,7 @@ SQLite 表构成的**咨询性**快照，加速 agent/工具的 status 路径。
 
 - 兼容级别：`intentionally-different`。Git 无此表面（最近机制为 index stat
   cache 与 fsmonitor，均为内部件）。`status --cached` 与 Git 的 `--cached`
-  （=索引）无关——命名沿自 lore.md:151，文档显著标注。
+  （=索引）无关——命名沿自 `gap/lore.md` §3.0.1「样例（1.1 dirty-set）」（2026-08-27 复核现 `:176`），文档显著标注。
 - 三个 status flag 互斥，且与 `--porcelain`/`--short`/`--ignored` 冲突
   （可能过期的 porcelain 流不得喂 Git-porcelain 解析器）。
 

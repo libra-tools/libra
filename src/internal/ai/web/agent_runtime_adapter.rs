@@ -76,6 +76,100 @@ pub struct AgentRuntimeCodeUiAdapter {
     lifecycle_shutdown: Arc<Mutex<Option<Weak<dyn CodeUiLifecycleShutdown>>>>,
     /// In-memory session/TTL approval cache to drop on lease takeover (W4-13).
     approval_store: Arc<Mutex<Option<Arc<Mutex<ApprovalStore>>>>>,
+    /// DF-07: A0-07 skill activations pending consumption by the next plain
+    /// turn (session-scoped, ids only — never skill contents/credentials).
+    pending_skills: Arc<Mutex<PendingSkillContext>>,
+}
+
+/// DF-07: session-scoped pending skill activations. Consumption happens
+/// only at the definitive provider-turn seam (right before
+/// `runtime.submit`, after every admission/routing guard); the composed
+/// block travels as [`TurnRequest::provider_context`] — execution-only —
+/// so raw text remains the sole durable/retry identity everywhere (terra
+/// R4: no payload cache is needed for idempotency, and a retry with the
+/// same raw text is idempotent no matter what context either attempt
+/// carried). Failed pre-provider exits restore the consumed set.
+#[derive(Default)]
+pub(crate) struct PendingSkillContext {
+    /// `(provider, name)` in activation order, deduplicated.
+    active: Vec<(String, String)>,
+}
+
+/// One provider-turn context composition: the execution-only context block
+/// plus what [`PendingSkillContext::restore`] gives back when the
+/// submission fails before the provider runs.
+pub(crate) struct ComposedSkillContext {
+    pub(crate) context: String,
+    consumed: Vec<(String, String)>,
+}
+
+impl PendingSkillContext {
+    /// Compose the execution-only activation context for an admitted plain
+    /// turn, consuming the active set. Returns `None` — and consumes
+    /// nothing — when there is nothing pending or the text is slash/empty
+    /// (callers already route those away from this seam; this is defense
+    /// in depth).
+    pub(crate) fn compose_context(&mut self, text: &str) -> Option<ComposedSkillContext> {
+        let trimmed = text.trim();
+        if self.active.is_empty() || trimmed.is_empty() || trimmed.starts_with('/') {
+            return None;
+        }
+        let mut lines = vec![
+            "[skill activation] The operator activated these provider skills for this \
+             session; consume them on this turn when relevant. Tool permissions are \
+             unchanged by activation:"
+                .to_string(),
+        ];
+        for (provider, name) in &self.active {
+            lines.push(format!("- '{name}' ({provider})"));
+        }
+        let consumed = std::mem::take(&mut self.active);
+        Some(ComposedSkillContext {
+            context: lines.join("\n"),
+            consumed,
+        })
+    }
+
+    /// Give a failed submission's consumed activations back (in front, so
+    /// activation order is preserved). Deduplicated against anything
+    /// re-activated while the failed turn was in flight — the pending set
+    /// holds at most one slot per `(provider, name)` (terra R5).
+    pub(crate) fn restore(&mut self, outcome: ComposedSkillContext) {
+        if outcome.consumed.is_empty() {
+            return;
+        }
+        let mut restored = outcome.consumed;
+        for entry in std::mem::take(&mut self.active) {
+            if !restored.contains(&entry) {
+                restored.push(entry);
+            }
+        }
+        restored.dedup();
+        self.active = restored;
+    }
+
+    /// Record one validated activation; duplicates keep their original slot.
+    /// Returns the pending count.
+    fn record(&mut self, provider: &str, name: &str) -> usize {
+        if !self.active.iter().any(|(p, n)| p == provider && n == name) {
+            self.active.push((provider.to_string(), name.to_string()));
+        }
+        self.active.len()
+    }
+}
+
+impl super::web_admission::WebCodeUiAdmission {
+    /// DF-07: bind the adapter's pending-skill state so the admission path
+    /// composes the provider input at its own submit seam.
+    pub(crate) fn bind_pending_skills(&self, pending: Arc<Mutex<PendingSkillContext>>) {
+        // Poison recovery is safe: the slot only holds a binding pointer, so
+        // adopting the inner value can never observe a torn state. Never
+        // panic on a production path (GC-11).
+        *self
+            .pending_skills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending);
+    }
 }
 
 impl AgentRuntimeCodeUiAdapter {
@@ -113,6 +207,10 @@ impl AgentRuntimeCodeUiAdapter {
         durability: Option<RuntimeCommandDurability>,
         web_admission: Option<Arc<WebCodeUiAdmission>>,
     ) -> Arc<Self> {
+        let pending_skills = Arc::new(Mutex::new(PendingSkillContext::default()));
+        if let Some(admission) = web_admission.as_ref() {
+            admission.bind_pending_skills(pending_skills.clone());
+        }
         Arc::new(Self {
             session,
             capabilities,
@@ -125,6 +223,7 @@ impl AgentRuntimeCodeUiAdapter {
             web_admission,
             lifecycle_shutdown: Arc::new(Mutex::new(None)),
             approval_store: Arc::new(Mutex::new(None)),
+            pending_skills,
         })
     }
 
@@ -236,6 +335,13 @@ impl AgentRuntimeCodeUiAdapter {
     pub fn skill_activate(&self, activation: &CodeSkillActivation) -> Result<()> {
         self.execution_control.skill_activate(activation)
     }
+
+    /// Test-provider-only view of the still-pending activations, so race
+    /// regressions can assert restore semantics without a provider turn.
+    #[cfg(feature = "test-provider")]
+    pub async fn pending_skill_activations_for_test(&self) -> Vec<(String, String)> {
+        self.pending_skills.lock().await.active.clone()
+    }
 }
 
 #[async_trait]
@@ -249,6 +355,27 @@ impl CodeUiReadModel for AgentRuntimeCodeUiAdapter {
 impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
     fn capabilities(&self) -> CodeUiCapabilities {
         self.capabilities.clone()
+    }
+
+    /// DF-07: validate against the A0-07 curated registry (unknown provider
+    /// or undiscoverable name fail closed there) and queue the activation
+    /// for the next plain turn. No new registry, no widened tools.
+    async fn activate_skill(
+        &self,
+        provider: &str,
+        name: &str,
+    ) -> Result<super::code_ui::CodeUiSkillActivationAck> {
+        self.execution_control
+            .skill_activate(&CodeSkillActivation {
+                provider: provider.to_string(),
+                name: name.to_string(),
+            })?;
+        let pending = self.pending_skills.lock().await.record(provider, name);
+        Ok(super::code_ui::CodeUiSkillActivationAck {
+            provider: provider.to_string(),
+            name: name.to_string(),
+            pending,
+        })
     }
 
     async fn submit_message(&self, text: String) -> Result<()> {
@@ -307,17 +434,31 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
                 return Err(Self::map_runtime_error(error));
             }
         };
-        if let Err(error) = self
-            .runtime
-            .submit(TurnRequest::new(
-                self.runtime_session_id.clone(),
-                turn_id.clone(),
-                text,
-                true,
-            ))
-            .await
-        {
+        // DF-07: definitive provider-turn seam for the direct path — every
+        // guard passed and the slot is reserved. The raw text is the turn's
+        // durable identity; the activation block rides as execution-only
+        // provider context, and a rejected submission restores it.
+        let composed = self.pending_skills.lock().await.compose_context(&text);
+        let mut turn_request = TurnRequest::new(
+            self.runtime_session_id.clone(),
+            turn_id.clone(),
+            text.clone(),
+            true,
+        );
+        if let Some(composed) = composed.as_ref() {
+            turn_request = turn_request.with_provider_context(composed.context.clone());
+        }
+        if let Err(error) = self.runtime.submit(turn_request).await {
+            if let Some(composed) = composed {
+                self.pending_skills.lock().await.restore(composed);
+            }
             self.rollback_active_turn(&turn_id).await;
+            // A terminal idempotent retry of a succeeded command is an
+            // acknowledgement, not a failure (terra R2); the consumed
+            // activations were already restored above.
+            if let RuntimeWorkerError::IdempotentCommand { ack_ok: true, .. } = &error {
+                return Ok(());
+            }
             return Err(Self::map_runtime_error(error));
         }
         self.spawn_release_watcher(stream, turn_id);
@@ -466,5 +607,106 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
             self.session.clear_pending_tool_interactions().await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingSkillContext;
+
+    /// DF-07: plain turns compose+consume the context block at the submit
+    /// seam, slash/empty text passes through (defense in depth — routing
+    /// already keeps those away), and duplicates hold one slot. The block
+    /// never contains the user text: it rides `TurnRequest::provider_context`
+    /// while the raw text stays the durable identity.
+    #[test]
+    fn pending_skill_context_composes_only_plain_text() {
+        let mut ctx = PendingSkillContext::default();
+        assert_eq!(ctx.record("claude-code", "/review"), 1);
+        assert_eq!(ctx.record("claude-code", "/review"), 1, "dedup");
+        assert_eq!(ctx.record("codex", "/plan"), 2);
+
+        assert!(ctx.compose_context("/help").is_none());
+        assert!(ctx.compose_context("   ").is_none());
+        assert_eq!(ctx.active.len(), 2, "still pending after control text");
+
+        let composed = ctx
+            .compose_context("review my diff")
+            .expect("plain text composes");
+        assert!(
+            composed.context.contains("[skill activation]")
+                && composed.context.contains("- '/review' (claude-code)")
+                && composed.context.contains("- '/plan' (codex)"),
+            "activation block must list the consumed set: {}",
+            composed.context
+        );
+        assert!(
+            !composed.context.contains("review my diff"),
+            "the block is context-only; raw text stays the identity"
+        );
+        assert!(ctx.active.is_empty(), "consumed at the seam");
+        assert!(
+            ctx.compose_context("next message").is_none(),
+            "a later turn must not re-inject"
+        );
+    }
+
+    /// DF-07 (terra R1/R3): a failed submission restores the consumed set
+    /// in order, and the next successful plain turn still carries it.
+    #[test]
+    fn pending_skill_context_restores_on_failed_submission() {
+        let mut ctx = PendingSkillContext::default();
+        ctx.record("claude-code", "/review");
+        ctx.record("codex", "/plan");
+        let composed = ctx.compose_context("do it").expect("composes");
+        assert!(ctx.active.is_empty());
+
+        ctx.restore(composed);
+        assert_eq!(
+            ctx.active,
+            vec![
+                ("claude-code".to_string(), "/review".to_string()),
+                ("codex".to_string(), "/plan".to_string())
+            ],
+            "restore must reinstate the consumed set in order"
+        );
+        let retried = ctx.compose_context("do it").expect("recomposes");
+        assert!(
+            retried.context.contains("'/review'") && retried.context.contains("'/plan'"),
+            "the next successful attempt still carries the activations"
+        );
+    }
+
+    /// DF-07 (terra R5): a skill re-activated while its consumed turn was
+    /// still in flight must hold ONE pending slot after the failed turn
+    /// restores — never a duplicate context line.
+    #[test]
+    fn pending_skill_context_restore_dedupes_against_reactivation() {
+        let mut ctx = PendingSkillContext::default();
+        ctx.record("claude-code", "/review");
+        let composed = ctx.compose_context("do it").expect("composes");
+        // Re-activate the same skill while the turn is in flight…
+        assert_eq!(ctx.record("claude-code", "/review"), 1);
+        ctx.record("codex", "/review");
+        // …then the turn fails before the provider starts.
+        ctx.restore(composed);
+        assert_eq!(
+            ctx.active,
+            vec![
+                ("claude-code".to_string(), "/review".to_string()),
+                ("codex".to_string(), "/review".to_string())
+            ],
+            "restore must keep one ordered slot per (provider, name)"
+        );
+        let recomposed = ctx.compose_context("retry").expect("recomposes");
+        assert_eq!(
+            recomposed
+                .context
+                .matches("- '/review' (claude-code)")
+                .count(),
+            1,
+            "no duplicate context lines: {}",
+            recomposed.context
+        );
     }
 }

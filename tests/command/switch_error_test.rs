@@ -155,7 +155,7 @@ fn remote_branch_not_found_returns_fetch_hint() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn got_remote_branch_suggests_track() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -323,7 +323,7 @@ fn internal_branch_blocked_returns_cli_invalid_target() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn branch_already_exists_with_track_returns_conflict() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());

@@ -285,7 +285,23 @@ synthetic_change_id =
     )
 ```
 
-同一个legacy commit在不同机器和重复导入时会得到相同Change ID。域分隔字符串和object format用于避免跨协议复用，并同时支持SHA-1与SHA-256 Git仓库。该commit第一次在Libra中被rewrite后，新revision继承这个synthetic Change ID，并将其写入Libra sidecar；是否同时写入commit header由Git兼容性验证决定。
+同一个legacy commit在不同机器和重复导入时会得到相同Change ID。域分隔字符串和object format用于避免跨协议复用，并同时支持SHA-1与SHA-256 Git仓库。该commit第一次在Libra中被rewrite后，新revision继承这个synthetic Change ID，并将其写入Libra sidecar。根据 OL-00 spike 结论，Libra 不写入 commit header；已有合法 `change-id` header 仅可作为导入兼容信息读取。详见 [`change-id-header-spike.md`](change-id-header-spike.md)。
+
+#### OL-00 spike 结论（2026-08-25）
+
+OL-00 使用真实 Git 临时仓库验证了带 `change-id` header 的 commit 可以被 Git 读取、通过 fsck，并经本地 push/clone 保留；同时验证了 sidecar-only 路径的 Git object closure 可枚举且不改变 commit object。该证据足以确认 Git 互操作性，但不足以把未知 header 的跨工具 rewrite 行为当作 Libra 写入协议。
+
+因此，Libra 的 canonical 写入路径冻结为 **sidecar-only**：新建和 rewrite 不修改 commit object，不写 `change-id` header；导入既有 commit 时可以读取合法 header 并记录 `origin=header`，但没有 header 时仍使用本节定义的 synthetic Change ID。OL-00 的完整测试与限制见 [`change-id-header-spike.md`](change-id-header-spike.md)。
+
+#### OL-01 只读 Worktree I/O 抽取落地记录（2026-08-29）
+
+OL-01 已在 `codex/ol-01-worktree-io` 分支完成本地实现，基线为 `upstream/main` 的 `995fc1fa`。`src/internal/worktree_io/` 现在是 status 之外可复用的内部只读边界：`protocol` 定义 `IoRequest`/`IoEvent`、frame codec、平台路径编码、请求预算和 lexical validation；`executor` 提供 `WorktreeIo`、`IoLimits`、`CancellationToken`、typed outcome/error、稳定排序的 bounded pool，以及 helper process-group kill/reap/recycle。executor 保持 8 个并发、64 个 pending、8 MiB frame 的既有上限；byte/frame/entry 限制仍由 request/protocol 和流式 handler 强制。
+
+能力类型保持分离：`WorktreeRootCapability` 只接受绝对、词法 canonical 的 root 和严格 relative path；`ObjectStoreCapability` 只用于 local-only object read。wire 两端的 request validation 只检查 root/path/OID/size 的词法和格式，不因校验而探测文件系统；parent status session 与长寿命 helper 按 root 复用一次昂贵的 sealed capability，root key 变化时重新 seal。每次 worktree 文件/目录读取仍通过 `beneath::open_root` 及 no-follow beneath 操作，以保留符号链接逃逸和 TOCTOU 的 fail-closed 防护。helper 不提供写操作，也不持有 ODB、SQLite 或 refs 写权限；object-store 读取不创建目录、不 hydration。
+
+`status_io_worker` 目前只是兼容适配层，但仍承载 handler、root session、deadline glue，并保留原有 crate-internal `deadline_*`、hidden worker entry、数据类型和输出路径，因此 status CLI 输出没有行为变化。partial/checkpoint、fail-closed、cache protection、timeout/cancellation、object read 和 rename 语义均由既有 status 路径继续负责；OL-01 不改变 OL-00 关于 `change-id-header-spike.md` 的结论，也不改动该文件。
+
+本地落地提交为 `7a98b01a`（worker 契约测试）、`814a385b`（只读 protocol/capability）、`ea15cd6b`（bounded executor）、`7173adaa`（status 接入及 seal 缓存性能修复）和 `0efa4623`（stable 1.98 暴露的 `upstream/main` 既有测试 lint 兼容修复：两处 `collapsible_if` 与三个未使用 import，纯机械、无行为变化）。在同一 runner、5000 files、3 次 warmup、10 次正式运行下，status benchmark 从 clean `198.605 ms / 34,963,456 B`、dirty `203.079 ms / 35,299,328 B` 变为 clean `202.626 ms / 35,078,144 B`、dirty `202.620 ms / 35,430,400 B`，通过本卡性能阈值。stable `1.98`/nightly `1.100` 下，`internal::worktree_io` 为 13/13、`status_io_worker` 为 10/10，`cargo test --test command_test status` 为 289 passed / 0 failed / 2781 filtered（287.67s），`cargo test --test compat_serial_registry` 为 18/18，另有 12 个精确 status/diff 回归均通过；stable clippy `RUSTUP_TOOLCHAIN=stable LIBRA_SKIP_WEB_BUILD=1 cargo clippy --all-targets --all-features -- -D warnings` 通过，fmt 已通过。独立 `gpt-5.6-sol` 高推理强度 review、最终 upstream sync/retest、push/PR 尚待完成；本轮未运行全量 `cargo test --all`，不在本轮用户要求范围。
 
 新逻辑变更不能使用内容哈希生成Change ID，因为amend、rebase、修改message或tree都会改变哈希，正好破坏“逻辑身份稳定”这一目标。Commit OID继续负责内容完整性，Change ID只负责逻辑身份。
 
@@ -879,12 +895,12 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 
 | 阶段 | 落点（写集） | 验证入口 | 决策门 |
 |---|---|---|---|
-| 0 设计冻结 | 第 5 节结构体/函数定稿；CID-00 header spike | `cargo test --test commit_change_id_header_spike` | Gate-0：ADR 冻结、header go/no-go |
+| 0 设计冻结 | 第 5 节结构体/函数定稿；OL-00 header spike | `cargo test --test commit_change_id_header_spike` | Gate-0：ADR 冻结、sidecar-only 写入决策；已有 header 仅作导入兼容 |
 | 1 持久化与 I/O 底座 | `src/internal/worktree_io/`、`operation/{store,view,facet}.rs`、`db.rs` v2 schema（替换 v1 表与 model） | `cargo test internal::operation::store`；`cargo test --test operation_dag`；status 零回归 benchmark | Gate-1：对象格式、journal phase、I/O 协议冻结 |
 | 2 完整快照 | `operation/{snapshot,working_copy}.rs`、HEAD/refs/index/sequencer/sparse facet adapter | `cargo test --test workspace_snapshot_roundtrip`；`--test index_snapshot_roundtrip`；`--test sequencer_snapshot_roundtrip` | Gate-2：facet restore policy、untracked/ignored/large-file 政策 |
 | 3 CLI + Agent 全修改记录 | `operation/middleware.rs`、`src/cli.rs` classification、`ai/tools/*` gateway | `cargo test --test operation_command_coverage`；`--test agent_shell_operation`；census zero-unclassified guard | Gate-3：shadow mismatch、失败 operation、lease takeover |
 | 4 可逆用户工作流 | `operation/{restore,undo,doctor}.rs`、`src/command/op.rs` 新子命令 | `cargo test --test operation_restore_faults`；`--test op_undo_redo`；crash matrix | Gate-4：crash/数据安全 review、秒级 SLO、机器接口冻结 |
-| 5 稳定逻辑身份 | `change/{identity,store,resolve}.rs`、commit serialization adapter | `cargo test internal::change::identity`；`--test change_id_resolution` | Gate-5：Change ID 格式、legacy synthetic、header/sidecar 一致 |
+| 5 稳定逻辑身份 | `change/{identity,store,resolve}.rs`、commit serialization adapter | `cargo test internal::change::identity`；`--test change_id_resolution` | Gate-5：Change ID 格式、legacy synthetic、sidecar 投影与既有 header 导入语义 |
 | 6 Rewrite 与 Agent 逻辑链接 | `change/{builder,genealogy}.rs`、commit/rebase/cherry-pick/squash 调用点、`ai_operation_link` | `cargo test --test change_genealogy_rebase`；`--test change_genealogy_squash_split` | Gate-6：relation 语义、hook/Git 兼容、AI FileHistoryStore 读取迁移（非 operation v1） |
 | 7 并发与 Web 展示 | `operation/store.rs` 多 head reconcile、独立 Operation/Change read model | `cargo test --test operation_restore_multi_worktree`；web graph tests | Gate-7：multihead fallback、redaction、bounded graph |
 | 8 移除 v1 与 GA | 删除 v1 代码/表/命令路径（`operation_wrapper.rs`、`operation_view*` 与 v1 model、v1 `op` 分支）、文档与测试收口 | `rg 'operation_wrapper|operation_view|restorable' src` 零命中；签名 release | Gate-8：v1 代码移除完成、默认值、retention 批准 |

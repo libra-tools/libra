@@ -184,7 +184,7 @@ fn test_reflog_delete_json_missing_selector_reports_invalid_target() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reflog_show_with_filters() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -254,7 +254,7 @@ async fn test_reflog_show_with_filters() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reflog_show_invalid_date() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -287,7 +287,7 @@ async fn test_reflog_show_invalid_date() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reflog_show_with_author_filter() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -337,7 +337,7 @@ async fn test_reflog_show_with_author_filter() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reflog_show_with_number_limit() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -387,7 +387,7 @@ async fn test_reflog_show_with_number_limit() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reflog_show_with_combined_filters() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -446,7 +446,7 @@ async fn test_reflog_show_with_combined_filters() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reflog_show_with_patch() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -485,7 +485,7 @@ async fn test_reflog_show_with_patch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_reflog_show_with_stat() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -556,7 +556,6 @@ fn test_reflog_help_lists_examples_banner() {
 // ── reflog expire ─────────────────────────────────────────────────────────
 
 #[test]
-#[serial]
 fn test_reflog_expire_no_refs_exits_128() {
     // Intentional difference from Git's silent no-op: an explicit error.
     let repo = create_committed_repo_via_cli();
@@ -570,7 +569,6 @@ fn test_reflog_expire_no_refs_exits_128() {
 }
 
 #[test]
-#[serial]
 fn test_reflog_expire_invalid_date_reports_cli_002() {
     let repo = create_committed_repo_via_cli();
     let output = run_libra_command(
@@ -584,7 +582,6 @@ fn test_reflog_expire_invalid_date_reports_cli_002() {
 }
 
 #[test]
-#[serial]
 fn test_reflog_expire_all_dry_run_no_change() {
     let repo = create_committed_repo_via_cli();
 
@@ -609,7 +606,6 @@ fn test_reflog_expire_all_dry_run_no_change() {
 }
 
 #[test]
-#[serial]
 fn test_reflog_expire_json_envelope_and_prunes() {
     let repo = create_committed_repo_via_cli();
 

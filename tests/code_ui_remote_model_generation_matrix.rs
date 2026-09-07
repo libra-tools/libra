@@ -83,7 +83,7 @@ macro_rules! model_generation_case {
     ($name:ident) => {
         #[test]
         #[ignore = "L3 live model; run with LIBRA_RUN_LIVE=1 + .env.test (DEEPSEEK_API_KEY)"]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_model_generation_case(stringify!($name))
         }

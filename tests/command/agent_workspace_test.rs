@@ -41,7 +41,7 @@ async fn seed_workspaces(repo: &Path, count: usize) -> Vec<String> {
 /// Keyset pagination walks every record exactly once; the state filter
 /// and per-record shape are stable schema v1.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn agent_workspace_list_paginates_and_shows() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());

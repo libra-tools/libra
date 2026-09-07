@@ -110,7 +110,7 @@ fn push_remote_commit(
 }
 
 #[test]
-#[serial]
+#[serial(env)]
 fn json_pull_fast_forward_returns_structured_data() {
     let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
 
@@ -149,7 +149,7 @@ fn json_pull_fast_forward_returns_structured_data() {
 }
 
 #[test]
-#[serial]
+#[serial(env)]
 fn json_pull_already_up_to_date_returns_structured_data() {
     let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
 
@@ -183,7 +183,7 @@ fn json_pull_already_up_to_date_returns_structured_data() {
 }
 
 #[test]
-#[serial]
+#[serial(env)]
 fn machine_pull_emits_single_json_line() {
     let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
 
@@ -216,7 +216,7 @@ fn machine_pull_emits_single_json_line() {
 }
 
 #[test]
-#[serial]
+#[serial(env)]
 fn json_pull_follow_up_fast_forward_reports_old_and_new_commits() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 

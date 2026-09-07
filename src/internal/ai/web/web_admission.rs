@@ -219,6 +219,13 @@ pub struct WebCodeUiAdmission {
     /// Serializes the full prepare/respond/park transition for one runtime
     /// interaction so retries cannot revoke another request's durable gate.
     pub(crate) interaction_transition: Arc<Mutex<()>>,
+    /// DF-07: adapter-bound pending skill activations. Composed into the
+    /// provider-facing turn input at this admission's submit seam only —
+    /// revision notes, transcripts, durable intents, and retry identity
+    /// keep the raw user text. `None` until the adapter binds it.
+    pub(crate) pending_skills: Arc<
+        std::sync::Mutex<Option<Arc<Mutex<super::agent_runtime_adapter::PendingSkillContext>>>>,
+    >,
 }
 
 pub(crate) struct WebCodeUiAdmissionInit {
@@ -270,6 +277,7 @@ impl WebCodeUiAdmission {
             runtime_session_id,
             working_dir,
             phase1_tx,
+            pending_skills: Arc::new(std::sync::Mutex::new(None)),
             interaction_transition,
         })
     }
@@ -618,6 +626,25 @@ impl WebCodeUiAdmission {
         Ok(true)
     }
 
+    /// DF-07: give consumed skill activations back on any exit where the
+    /// provider is guaranteed not to run the composed turn (submit failure,
+    /// pre-start cancellation, durable-persistence failure). Poison
+    /// recovery is safe: the outer slot only holds a binding pointer.
+    async fn restore_composed_skills(
+        &self,
+        composed: Option<super::agent_runtime_adapter::ComposedSkillContext>,
+    ) {
+        let Some(composed) = composed else { return };
+        let bound = self
+            .pending_skills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(pending) = bound {
+            pending.lock().await.restore(composed);
+        }
+    }
+
     pub(crate) async fn submit_message_with_command_id(
         &self,
         runtime: &AgentRuntimeHandle,
@@ -948,15 +975,42 @@ impl WebCodeUiAdmission {
         *self.pre_start_turn.lock().await =
             Some((runtime_turn_id.clone(), pre_start_state.clone()));
 
-        let submission = runtime
-            .submit(TurnRequest::new(
-                self.runtime_session_id.clone(),
-                runtime_turn_id.clone(),
-                text.clone(),
-                true,
-            ))
-            .await;
+        // DF-07: definitive provider-turn seam — routing decided this text
+        // is a real provider turn (revision notes and control paths have
+        // already returned above), the slot is reserved, and a failed
+        // submission restores the consumed activations. Only the
+        // provider-facing input is composed; the durable intent, the
+        // transcript user entry, and `in_flight.input` keep the raw text.
+        let mut composed_skills = if mode == WebTurnMode::PlanPhase0 && claiming_revision.is_none()
+        {
+            let bound = self
+                .pending_skills
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            match bound {
+                Some(pending) => pending.lock().await.compose_context(&text),
+                None => None,
+            }
+        } else {
+            None
+        };
+        // The raw text is the turn's durable identity (the worker hashes
+        // it); the activation block rides as execution-only provider
+        // context, so identical `(commandId, raw text)` retries stay
+        // idempotent no matter what context either attempt carried.
+        let mut turn_request = TurnRequest::new(
+            self.runtime_session_id.clone(),
+            runtime_turn_id.clone(),
+            text.clone(),
+            true,
+        );
+        if let Some(composed) = composed_skills.as_ref() {
+            turn_request = turn_request.with_provider_context(composed.context.clone());
+        }
+        let submission = runtime.submit(turn_request).await;
         if let Err(error) = submission {
+            self.restore_composed_skills(composed_skills.take()).await;
             *slot = None;
             if let Some((pending, claim)) = claiming_revision.as_ref() {
                 match self.persistence.as_ref().map(|persistence| {
@@ -1112,6 +1166,10 @@ impl WebCodeUiAdmission {
                 // gate and release it after cancellation. Do not retain the
                 // admission lock while waiting for that completion.
                 drop(slot);
+                // DF-07 (terra R2/R3): the provider never starts past this
+                // point — restore FIRST, before any fallible cleanup, so an
+                // error path cannot skip it.
+                self.restore_composed_skills(composed_skills.take()).await;
                 self.cancel_gated_runtime_turn(runtime, &runtime_turn_id, completion_for_rollback)
                     .await?;
                 self.rearm_cancelled_revision_if_present(session, claiming_revision.as_ref())
@@ -1130,6 +1188,10 @@ impl WebCodeUiAdmission {
             // projection and must not publish a fresh Thinking turn.
             pre_start_state.store(PRE_START_CANCELLED, Ordering::Release);
             drop(slot);
+            // DF-07 (terra R2/R3): cancelled before the executor start gate
+            // opened — restore FIRST so a failed terminal persist cannot
+            // skip it.
+            self.restore_composed_skills(composed_skills.take()).await;
             self.settle_cancelled_before_start(
                 session,
                 user_entry,
@@ -1159,6 +1221,9 @@ impl WebCodeUiAdmission {
             // Do not open the tool gate; replace the just-published streaming
             // entry with the one terminal no-tool result.
             drop(slot);
+            // DF-07 (terra R2/R3): cancellation won before the start gate —
+            // restore FIRST so a failed terminal persist cannot skip it.
+            self.restore_composed_skills(composed_skills.take()).await;
             self.settle_cancelled_before_start(
                 session,
                 user_entry,

@@ -249,7 +249,7 @@ fn test_log_skip_omits_leading_commits() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_corrupt_head_reference_returns_repo_corrupt() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -300,7 +300,7 @@ fn test_log_json_output_includes_commit_list() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_quiet_does_not_initialize_pager() {
     if cfg!(windows) {
         return;
@@ -364,7 +364,7 @@ fn test_log_invalid_decorate_uses_command_usage_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_decorate_no_skips_corrupt_reference_map() {
     let repo = create_committed_repo_via_cli();
 
@@ -404,7 +404,7 @@ async fn test_log_decorate_no_skips_corrupt_reference_map() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_patch_fails_when_commit_blob_is_missing() {
     let repo = create_committed_repo_via_cli();
 
@@ -439,7 +439,7 @@ async fn test_log_patch_fails_when_commit_blob_is_missing() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_quiet_patch_fails_when_commit_blob_is_missing() {
     let repo = create_committed_repo_via_cli();
 
@@ -474,7 +474,7 @@ async fn test_log_quiet_patch_fails_when_commit_blob_is_missing() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_quiet_stat_respects_selected_history_range() {
     let repo = create_committed_repo_via_cli();
 
@@ -623,7 +623,7 @@ fn test_log_json_total_reflects_filtered_scope() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests retrieval of commits reachable from a specific commit hash
 async fn test_get_reachable_commits() {
     let temp_path = tempdir().unwrap();
@@ -637,7 +637,7 @@ async fn test_get_reachable_commits() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests log command execution functionality
 async fn test_execute_log() {
     let temp_path = tempdir().unwrap();
@@ -763,7 +763,7 @@ async fn create_test_commit_tree() -> String {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests log command with --oneline parameter
 async fn test_log_oneline() {
     let temp_path = tempdir().unwrap();
@@ -802,7 +802,7 @@ async fn test_log_oneline() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests log -p (patch) without pathspec: create A -> commit -> create B -> commit -> assert diffs contain both A and B contents
 async fn test_log_patch_no_pathspec() {
     let temp_path = tempdir().unwrap();
@@ -929,7 +929,7 @@ async fn test_log_patch_no_pathspec() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests log -p with a specific pathspec: commit contains A and B, but log -p A should only include A
 async fn test_log_patch_with_pathspec() {
     let temp_path = tempdir().unwrap();
@@ -1067,7 +1067,7 @@ async fn collect_combined_diff_for_commits(count: usize, paths: Vec<std::path::P
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_stat() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1161,7 +1161,7 @@ async fn test_log_stat() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1273,7 +1273,7 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_stat_with_modifications() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1360,7 +1360,7 @@ async fn test_log_stat_with_modifications() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests log command with commit hash abbreviation parameters
 async fn test_log_abbrev_params() {
     let temp_path = tempdir().unwrap();
@@ -1496,7 +1496,7 @@ async fn test_log_abbrev_params() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_graph() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1518,7 +1518,7 @@ async fn test_log_graph() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_graph_simple_chain() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1602,7 +1602,7 @@ async fn test_log_graph_simple_chain() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_stat_and_graph_combined() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1692,7 +1692,7 @@ fn count_commit_lines(output: &str) -> usize {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_short_number_flag_equivalent_to_number() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1715,7 +1715,7 @@ async fn test_log_short_number_flag_equivalent_to_number() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_short_number_flag_multi_digit() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1736,7 +1736,7 @@ async fn test_log_short_number_flag_multi_digit() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Ensure `log -- -2` treats `-2` as a pathspec, not as `-n 2`.
 async fn test_log_double_dash_disables_short_number_rewrite() {
     let temp_path = tempdir().unwrap();
@@ -1820,7 +1820,7 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Ensure `log` rewrite does not trigger when `log` is a positional path for another subcommand.
 async fn test_add_with_log_path_does_not_trigger_log_rewrite() {
     let temp_path = tempdir().unwrap();
@@ -1848,7 +1848,7 @@ async fn test_add_with_log_path_does_not_trigger_log_rewrite() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Ensure `libra -- log -2` treats `log` as the subcommand and rewrites `-2` correctly.
 async fn test_log_short_number_flag_with_double_dash_before_subcommand() {
     let temp_path = tempdir().unwrap();
@@ -2021,7 +2021,7 @@ fn test_graph_with_grep() {
 
 // Integration test: verify actual filtering behavior
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_grep_filtering() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2179,7 +2179,7 @@ async fn test_log_grep_filtering() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_reverse_outputs_oldest_first() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2243,7 +2243,7 @@ async fn test_log_reverse_outputs_oldest_first() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_range_excludes_start_commit() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2307,7 +2307,7 @@ async fn test_log_range_excludes_start_commit() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_all_includes_branches() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2403,7 +2403,7 @@ async fn test_log_all_includes_branches() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_follow_detects_rename() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2468,7 +2468,7 @@ async fn test_log_follow_detects_rename() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_line_range_flag_accepted() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2993,7 +2993,7 @@ async fn commit_file(path: &str, content: &str, message: &str) -> String {
 /// pathspec — matching Git's `log [<revision>...] [<path>...]` (previously these
 /// only worked via the `--range` flag).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_positional_revision_range() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -3048,7 +3048,7 @@ async fn test_log_positional_revision_range() {
 /// is rejected as ambiguous (matching Git's refusal to guess); `--range`
 /// disambiguates.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_log_positional_ambiguous_rev_and_path_errors() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -3078,7 +3078,7 @@ async fn test_log_positional_ambiguous_rev_and_path_errors() {
 /// the full ancestor closure of the excluded side, verified on a DIVERGENT
 /// history (a regression guard for both the symmetric-range and exclusion fixes).
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_log_positional_symmetric_and_exclusion_divergent() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -3133,7 +3133,7 @@ fn test_log_positional_symmetric_and_exclusion_divergent() {
 /// A pathspec that merely contains `..` (a parent-directory path) is NOT
 /// misclassified as a revision range — it falls back to a pathspec filter.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_log_positional_parent_dir_path_not_misclassified() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -3207,7 +3207,7 @@ fn trailer_repo() -> tempfile::TempDir {
 }
 
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_log_trailer_filter_and_json() {
     let repo = trailer_repo();
     let p = repo.path();
@@ -3268,7 +3268,7 @@ fn test_log_trailer_filter_and_json() {
 }
 
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_log_only_trailers_display_and_errors() {
     let repo = trailer_repo();
     let p = repo.path();

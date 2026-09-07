@@ -15,7 +15,7 @@ use tempfile::tempdir;
 use super::*;
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_open_remote_origin() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -75,7 +75,7 @@ async fn test_open_remote_origin() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_open_no_remote() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;

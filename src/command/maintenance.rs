@@ -4992,6 +4992,10 @@ mod tests {
                 "info",
                 "ignore/attributes sources (§C.4.1.1), no object ids",
             ),
+            (
+                "attributes",
+                "leaf literal of the `info/attributes` source; the parent `info` directory is the actual storage-relative path",
+            ),
             ("hooks", "hook scripts"),
             ("code", "`libra code` control/session surface (§C.4.1.1)"),
             ("service", "service control files (§C.4.1.1)"),

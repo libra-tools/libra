@@ -3,9 +3,8 @@
 //! The honest, feature-gated (`fastcdc`) v1 CLIENT surface: chunk a media file,
 //! inspect/validate a manifest, reassemble+verify from the local chunk store,
 //! and probe a remote's chunked-LFS capability with the §6.4 safe-fallback
-//! decision. It ships NO real cross-machine chunked transfer — the Libra-aware
-//! media server (§6.5–6.8) is frozen; against every reachable remote the probe
-//! resolves to standard Git LFS. This module is only the CLI surface; all logic
+//! decision. Feature-enabled LFS transfers can use Mega's authenticated media
+//! endpoints, with standard LFS fallback. This module is only the CLI surface; all logic
 //! lives in [`crate::utils::media`].
 
 use clap::{Parser, Subcommand};
@@ -39,8 +38,8 @@ NOTES:
     FastCDC media chunking is a feature-gated Libra extension (lore.md §6). The
     media_oid is always SHA-256 of the full file (standard-LFS-compatible), and
     chunks live in a private .libra/media store outside the Git object graph.
-    Cross-machine chunked transfer requires a Libra-aware media server that is
-    not yet available; every real remote falls back to standard Git LFS.";
+    Cross-machine chunked transfer requires Mega built with --features fastcdc
+    and a stored access token. Other remotes fall back to standard Git LFS.";
 
 #[derive(Parser, Debug)]
 #[command(after_help = MEDIA_EXAMPLES)]

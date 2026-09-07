@@ -2,7 +2,9 @@
 
 本文是 `docs/development/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。
 
-**模板版本:** `v2.1`（2026-08-21 起生效；相对 v2 的规范性变更：ER-08 / C 组改为「每张会发版任务卡完成后 `patch + 1`（patch 位无上限）、版本面五处同步、禁止手改 `Cargo.lock`、提交后经 `gh` 触发 `release.yml` 发布到 Cloudflare」；G-07a 不得再以「收口时一次 bump」推迟版本号）。
+**模板版本:** `v2.2`（2026-08-27 起生效；相对 v2.1 的规范性变更：新增 **ER-13 测试执行分层** —— 任务卡执行阶段默认只跑本卡相关 focused 测试，只有命中 ER-13 全量触发条件（`T-1` 跨切面表面 / `T-2` 发布点与聚合卡 / `T-3` 删除重命名公开 surface / `T-4` 共享测试基建 / `T-5` 显式要求 / `T-6` 信号不足）的卡才在 C 组第 ④ 步跑 `cargo test --all`；全部任务卡完成后必须跑一次全量收口门并修复其暴露的全部 Bug。fmt 与 clippy 两门不受分层影响，任何会推送的卡都必须跑。本次同批同步 `CLAUDE.md`「Quality Acceptance Criteria」与 `AGENTS.md`「Testing Guidelines」。
+
+**历史版本 — v2.1**（2026-08-21 起生效；相对 v2 的规范性变更：ER-08 / C 组改为「每张会发版任务卡完成后 `patch + 1`（patch 位无上限）、版本面五处同步、禁止手改 `Cargo.lock`、提交后经 `gh` 触发 `release.yml` 发布到 Cloudflare」；G-07a 不得再以「收口时一次 bump」推迟版本号）。
 
 ### 模板版本与迁移政策
 
@@ -10,6 +12,7 @@
 - 生效日期之前成稿的计划按**增量迁移**：只有本次被新增或做规范性修改的任务卡需要满足本版 `G-*` 与新增字段；未触碰的卡保持原样，不构成违规，也不要求整份回填。
 - 存量计划若仍按「批量发布组收口时一次 bump」执行，必须在修订历史登记一行例外，并在下次触碰该 `REL-*` 时迁到本版 ER-08（每卡 `patch + 1` + `gh` 发布）。
 - 存量计划整份迁移是一次独立的计划工作，必须单独立卡；不得作为其它任务的附带产物。
+- ER-13 的测试分层是**放宽**而不是收紧：存量计划继续每卡跑全量不构成违规，无需回填。一旦某份计划改按 ER-13 只跑 focused，就必须同时具备两件事——每张会推送的卡有 `Full-suite trigger` 字段，且「完成判据」里的全量收口门（含修复全量暴露 Bug 的要求）已写入；缺任一项不得降级。
 - 若某份存量计划因迁移成本暂时保留与本版冲突的口径（例如旧的 clippy 命令行、L/XL 卡），在该计划的「修订历史」登记一行例外与预期迁移时机即可。
 
 ## 使用规则
@@ -20,6 +23,7 @@
 - 每个任务卡必须能交给 Agent 独立执行：范围明确、依赖明确、文件落点明确、验收标准明确、验证命令明确。
 - 每个任务卡必须满足「任务卡粒度规则」全部 `G-*` 条款：单一可独立恢复的行为轴、条目与规模在上限内、默认一张卡一个发布切片。粒度不合格的卡不得进入开工态，必须先拆分或合并。
 - 涉及公开命令、配置、schema、错误码、存储格式、网络协议、Agent 数据、迁移、权限或安全边界的计划，必须包含测试、文档、回滚和兼容处理。
+- 测试成本按阶段分层（ER-13）：任务卡执行阶段默认只跑与本卡相关的 focused 测试，命中 ER-13 全量触发条件或另有特定要求时才跑全量；全部任务卡完成后必须跑一次全量收口门，并修复该次全量暴露的全部 Bug。
 - 若计划使用外部项目或竞品作为参照，必须 pin 具体 revision、文件路径和核对日期；不得把浮动 `main` 当作规范。
 - 新增或重命名 `--test` target 时必须更新 `tests/INDEX.md`；`tests/compat/*` 下的文件还必须在 `Cargo.toml` 注册 `[[test]]` 并更新 `tests/compat/README.md`（未注册的 compat 文件根本不会运行）。只改动既有用例时，仅当索引行的描述失真才更新。
 - 生产代码不得新增未解释的 `unwrap()`、`expect()` 或 `panic!()`；如确属不可失败逻辑，必须有 `// INVARIANT:` 注释并在任务验收中说明。
@@ -48,6 +52,8 @@
 - **落点**：一个可枚举的代码或文档归属域，粒度为**一个具体目录**（如 `src/internal/ai/runtime/`）或**一组同名文档**（如 `docs/commands/<cmd>.md` EN+zh）。仓库根、`src/`、`tests/`、`docs/` 这类顶层目录**不算**一个落点。
 - **写集**：会被修改的文件/目录集合，分三类（G-10）——**实现写集 I**（每卡字段，决定能否并发）、**发布写集 R**（每卡字段，版本面五处 + `Cargo.lock` + artifact；不用于实现阶段的并发分组，但进入发布窗口后按 I–R / R–R 规则串行化）、**协调写集 C**（计划级，发布顺序与窗口记录，不进任务卡字段、不参与并发判定；「禁止多 Agent 并发发布」是 ER-12 的仓库级规则，不是 C 的状态）。
 - **发布切片**：一次独立的 review + 验收 + **本卡版本 bump（默认 `patch + 1`）** + 提交 + 推送 + **`gh` 触发 release（Cloudflare）**。
+- **focused 测试**：只覆盖本卡行为的测试集合 —— ER-04 A 组按本卡实际改动表面选出的命令，加上本卡 `Verification` 登记的指定用例。
+- **全量测试**：`source .env.test && cargo test --all`（L1 全量，L2/L3 未配置 env 时打印 skipped）；改动 `web/` / `worker/` 时并入各自 `package.json` scripts 的 lint / test / build。fmt 与 clippy 是独立的静态门，不计入「测试」，任何会推送的卡都必须跑（ER-13）。
 - **家族卡**：共用唯一发布点的一组子卡（G-08）。
 - **恢复模式（字段名 `Rollback mode`）**：`revert` / `forward-only` / `compensating` / `immutable-release` 四种之一（G-01）。不可逆变更用后三种表达，不要求「一次 revert 撤销」。
 
@@ -173,7 +179,7 @@
 1. **ER-01 开工前安全检查:** 运行 `libra status --short --branch`（`--branch` 才会输出 `## <branch>...<upstream>` 行；不带它只有文件状态），确认当前分支与计划指定分支一致、工作区脏状态、目标文件是否已有无关改动。若目标文件已有未确认用户改动，先报告并避免覆盖。
 2. **ER-02 先核对后实现:** 刷新本任务相关源码锚点、文档锚点、测试 target 和外部参照 revision，再决定实现、补测、补文档、关闭或降级。
 3. **ER-03 粒度门禁:** 开工前按粒度规则 `G-*` 逐条复核本任务卡，并逐字段核对该卡的 `Granularity` 摘要行。若核对后发现范围已扩大（新增行为轴、AC/Verification 超限、scope 升到 L、写集与其它在跑任务重叠），先修改计划拆卡再开工，不得在实现中静默扩张任务范围。
-4. **ER-04 每卡验收门:** 门由 **A 表面 focused 门**（按实际改动的表面）+ **B 类型门**（按 `Task type`）+ **C 发布收口门**（覆盖要求对所有非延后卡生效，执行归属见下）+ **D 远端后置门**（有不可本地复现的 CI 语义时）四组组成，**所有适用行累加**，全部通过才算验收。权威口径分层：`CLAUDE.md`「Quality Acceptance Criteria」的三门（`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all`）是**任何会推送的改动**的完成契约，模板不得削弱；任务卡指定的 focused 用例是在此之上的**附加**门，用来证明本卡行为，不是三门的替代品。`web/`、`worker/` 的命令以各自 `package.json` 的 `scripts` 为权威（本表按当前 scripts 列出，scripts 变更时以 `package.json` 为准并同批更新本表）。权威口径变更时必须同批同步 `CLAUDE.md`、`AGENTS.md`，以及**采用本模板当前版本的计划**（存量计划按「模板版本与迁移政策」处理，不因本条被追认为违规）。
+4. **ER-04 每卡验收门:** 门由 **A 表面 focused 门**（按实际改动的表面）+ **B 类型门**（按 `Task type`）+ **C 发布收口门**（覆盖要求对所有非延后卡生效，执行归属见下）+ **D 远端后置门**（有不可本地复现的 CI 语义时）四组组成，**所有适用行累加**，全部通过才算验收。权威口径分层：`CLAUDE.md`「Quality Acceptance Criteria」中的 `cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 两门是**任何会推送的改动**的完成契约，模板不得削弱、任何卡不得跳过；第三门 `source .env.test && cargo test --all` 在**计划驱动的多任务卡工作**中按 **ER-13** 分层执行 —— 执行阶段默认由本卡 A 组 focused 用例承担，只有命中 ER-13 全量触发条件的卡才在 C 组第 ④ 步跑全量，全部任务卡完成后由「完成判据」的全量收口门统一兜底并修复其暴露的 Bug。计划之外的独立改动仍按 `CLAUDE.md` 三门执行。任务卡指定的 focused 用例用来证明本卡行为；在需要跑全量的卡上它是**附加**门，不是全量的替代品。`web/`、`worker/` 的命令以各自 `package.json` 的 `scripts` 为权威（本表按当前 scripts 列出，scripts 变更时以 `package.json` 为准并同批更新本表）。权威口径变更时必须同批同步 `CLAUDE.md`、`AGENTS.md`，以及**采用本模板当前版本的计划**（存量计划按「模板版本与迁移政策」处理，不因本条被追认为违规）。
 
    **门不计入条目上限：** 本条列出的门是全局强制门，**不计入**任务卡 `Verification` 的 G-03 条目计数；`Verification` 只登记本卡特有的判据（指定用例、新增守卫、手工证据）。
 
@@ -181,18 +187,18 @@
    - `Lifecycle`（执行生命周期）：`pending` | `in-progress` | `blocked`（ER-10 的越界故障置此值）| `done`。
    - `Acceptance`（验收状态）：空 | `locally-accepted` | `remote-pending`（仅当本卡有适用的 D 组远端后置门）| `complete`。与 `CLAUDE.md` 的完成契约对齐 —— `CLAUDE.md` 规定任何 change 只有三门全绿才算 done，因此：
      - `locally-accepted` = 本卡适用的 **A 组 + B 组**门已过，但本卡的 **C 组覆盖**（自行执行或从承接卡继承，见下）尚未取得。此状态下**不得**对外报告「完成 / done」。
-     - `remote-pending` = A/B 已过且 C 组覆盖已取得（含一次三门全绿的运行，其被测树状态包含本卡最终变更），但本卡适用或继承的 **D 组**远端后置门尚未全绿。此状态同样**不得**报告完成。
+     - `remote-pending` = A/B 已过且 C 组覆盖已取得（含一次 C 组第 ④ 步收口测试门全绿的运行 —— 按 ER-13 判定为全量或 fmt + clippy + 本卡 focused —— 其被测树状态包含本卡最终变更），但本卡适用或继承的 **D 组**远端后置门尚未全绿。此状态同样**不得**报告完成。
      - `complete` = 本卡的 **A + B** 已过、**C 组覆盖**已取得、且适用或继承的 **D 组**已全绿。无 D 时 C 覆盖到手即可 `complete`；有 D（含继承的 D）时必须先经 `remote-pending`。
      - 唯一状态转移路径：A/B 通过 → `locally-accepted` → ER-05 review PASS → 取得 C 组覆盖 →（无 D：`complete`；有 D：`remote-pending` → D 全绿 → `complete`）。
    - 两者独立取值：`blocked` 卡的 `Acceptance` 可以已是 `locally-accepted` 甚至 `complete`（例如变更已被三门覆盖，但仍卡在外部前置）。`Lifecycle=done` 必须以 `Acceptance=complete` 为前提；`blocked` 必须先回到 `in-progress` 并完成剩余动作才能进入 `done`，**不允许**从 `blocked` 直接标 `done`。计划完成门另要求所有非延后任务都到 `done`（见「完成判据」）。`Granularity` 里的 `complete=yes` 是 G-02 的结构完整性判据，与本字段无关，不可混用。
 
    **C 组覆盖与执行归属（每张非延后卡都必须取得 C 覆盖，但不都自己执行）:**
    - **独立发布卡（`Release boundary = independent`）与发布点卡（`release` / `family release point`）**：自行执行完整 C 组门。
-   - **`family child`**：不 bump、不构建、不推送，**继承**其家族唯一发布点的 C 覆盖——前提是该发布点的三门运行其被测树状态包含本子卡的最终变更；同时继承该发布点适用的 D 组。家族发布点卡完成时按 ER-08 做一次 `patch + 1`（或 ADR 规定的 `minor`/`major`）并走完整 C/D。
+   - **`family child`**：不 bump、不构建、不推送，**继承**其家族唯一发布点的 C 覆盖——前提是该发布点的收口测试门运行（按 ER-13 判定为全量或 fmt + clippy + focused；家族发布点按 ER-13 `T-2` 恒定跑全量）其被测树状态包含本子卡的最终变更；同时继承该发布点适用的 D 组。家族发布点卡完成时按 ER-08 做一次 `patch + 1`（或 ADR 规定的 `minor`/`major`）并走完整 C/D。
    - **`no-release` 卡（`docs` / `audit` / `spike` / `handoff`）**：**继承**任务卡显式声明的承载发布点（或计划收口点）的 C 覆盖与其 D 组；该承载点必须在卡内写明 ID，不得留空。`no-release` 卡本身不 bump。
    - **`batch-release child`（任意 `Task type`，含 `implementation`）**：历史「推送但不发版、收口时一次 bump」形态**已被 ER-08 废止**。自 v2.1 起，凡会独立完成并推送的成员卡必须与 `independent` 一样：自行执行完整 C 组（含本卡 `patch + 1`、版本面同步、`Cargo.lock` 工具链刷新、提交、`gh` 触发 `release.yml`）；不得把版本号推迟到发布点。若一组卡仍需协调窗口，可继续登记 `REL-*`，但**不得**用 `batch-release child` 免除 bump/发布。存量计划的旧 `batch-release child` 在触碰时必须改写为 `independent` 或按上句执行完整 C 组。
    - 继承 D 组的卡同样要经过 `remote-pending`，直到被继承的 D 组证据全绿。
-   - **不存在「用零命中守卫替代三门」的通道**——零命中守卫只用于证明这类卡未改代码，不改变其在取得 C 覆盖前仍是 `locally-accepted` 的事实。
+   - **不存在「用零命中守卫替代收口门」的通道**——零命中守卫只用于证明这类卡未改代码，不改变其在取得 C 覆盖前仍是 `locally-accepted` 的事实。
 
    门分四组，全部适用者累加：**A 表面 focused 门**（按实际改动的表面，每个表面唯一命中一行，命中几行加几行）+ **B 类型门**（按 `Task type` 取一行）+ **C 发布收口门**（由会推送的卡执行，其覆盖可被 `family child` / `no-release` 卡继承）+ **D 远端后置门**（只在存在不可本地复现的 CI 语义时适用）。A/B/C 是本地可完成的门；D 只能在推送之后取得证据，因此**不阻塞** `locally-accepted` 与 ER-05 的 review 顺序。
 
@@ -240,7 +246,7 @@
    | `spike` | 产物门：结论文档或 ADR 已落盘、go/no-go 已判定、承接卡已登记；**allowlist diff 门**——`libra status --short --branch` 的全部变更必须落在本卡 `Deliverables` 声明的产物内，且生产表面零改动（至少覆盖 `src/**`、`web/src/**`、`worker/src/**`、`sql/**`、`build.rs`、`install.sh`、`Cargo.toml`/`Cargo.lock`、CI 与仓库配置），用「Verification 判定口径」的退出码模板逐条守卫 |
    | `release` | 聚合守卫（本组引入的全部新守卫用例）+ release note / 兼容证据 |
 
-   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面五处 parity 预检（ER-08）→ ② 按 ER-08 对本卡做版本 bump（默认 `patch + 1`；patch 位**无上限**，可为任意非负整数，如 `0.20.10`、`0.20.100`、`0.20.1000`）并同步版本面五处 → ③ **禁止手改 `Cargo.lock`**：在已改 `Cargo.toml` 后执行 `LIBRA_SKIP_WEB_BUILD=1 cargo build`（或本卡所需的等价 `cargo build` / `cargo check`），由 Rust 工具链刷新 `Cargo.lock`；若 lockfile 未因 bump 产生 diff，保留工具链产物即可，不得手工写入版本字符串 → ④ 在**已 bump 的状态**上跑 `CLAUDE.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ⑤ `cargo build --release` → ⑥ 安装 → ⑦ `libra add <相关路径>`（含版本面五处与工具链更新后的 `Cargo.lock`）+ `libra commit -s -m`（ER-07 的签名预检与提交后校验）→ ⑧ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑨ **发布步（默认强制，不可省略为 `N/A`，除非本卡 `Release boundary = no-release` 或 `family child`）**：用 `gh` 创建并推送与 `Cargo.toml` 一致的版本 tag / Release，从而触发 `.github/workflows/release.yml`（`on.push.tags: v*`）在 GitHub Actions 中编译最新版本并上传到 Cloudflare R2（`download.libra.tools`）。推荐命令（`VERSION` 为无 `v` 前缀的 semver，与 `Cargo.toml` 一致）：
+   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面五处 parity 预检（ER-08）→ ② 按 ER-08 对本卡做版本 bump（默认 `patch + 1`；patch 位**无上限**，可为任意非负整数，如 `0.20.10`、`0.20.100`、`0.20.1000`）并同步版本面五处 → ③ **禁止手改 `Cargo.lock`**：在已改 `Cargo.toml` 后执行 `LIBRA_SKIP_WEB_BUILD=1 cargo build`（或本卡所需的等价 `cargo build` / `cargo check`），由 Rust 工具链刷新 `Cargo.lock`；若 lockfile 未因 bump 产生 diff，保留工具链产物即可，不得手工写入版本字符串 → ④ 在**已 bump 的状态**上跑本卡**收口测试门**：`cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` **恒定必跑**；测试面按 **ER-13** 判定 —— 命中全量触发条件时跑 `source .env.test && cargo test --all`，未命中时跑本卡 A 组全部 focused 命令（同样必须在 bump 后重跑），并在卡内 `Full-suite trigger` 字段登记判定结果 → ⑤ `cargo build --release` → ⑥ 安装 → ⑦ `libra add <相关路径>`（含版本面五处与工具链更新后的 `Cargo.lock`）+ `libra commit -s -m`（ER-07 的签名预检与提交后校验）→ ⑧ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑨ **发布步（默认强制，不可省略为 `N/A`，除非本卡 `Release boundary = no-release` 或 `family child`）**：用 `gh` 创建并推送与 `Cargo.toml` 一致的版本 tag / Release，从而触发 `.github/workflows/release.yml`（`on.push.tags: v*`）在 GitHub Actions 中编译最新版本并上传到 Cloudflare R2（`download.libra.tools`）。推荐命令（`VERSION` 为无 `v` 前缀的 semver，与 `Cargo.toml` 一致）：
 
    ```bash
    VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
@@ -249,7 +255,7 @@
 
    若当前环境必须先推 tag 再补 Release 元数据，等价路径是 `libra tag "v${VERSION}"` + `libra push origin "v${VERSION}"`，随后仍用 `gh release view "v${VERSION}"` / `gh run list --workflow=release.yml` 核对流水线；**不得**只 push `main` 就宣称已发布（`release.yml` 不由 branch push 触发）。
 
-   三门必须覆盖 bump 后的最终状态——bump 与 `Cargo.lock` 工具链刷新本身可能引入格式、lint 或编译回归，`cargo build --release` 不能替代 clippy 与全量测试。
+   收口测试门必须覆盖 bump 后的最终状态——bump 与 `Cargo.lock` 工具链刷新本身可能引入格式、lint 或编译回归，`cargo build --release` 不能替代 clippy 与测试门（无论本卡按 ER-13 跑的是全量还是 focused）。
 
    **C / D 边界（唯一口径）:** C 组**截止到已验证的 branch 推送 + 已用 `gh`（或等价 tag push）触发 release 的 ref**；推送之后由远端流水线产生的一切证据——`release.yml` 多平台编译、artifact 上传到 Cloudflare R2、CDN/`download.libra.tools` 可获取性、Homebrew tap 更新、CodeQL 结果——全部归 **D 组**。任务卡必须为每个 D 组项登记：workflow 文件、job 名、**触发事件与 ref**（例如 `release.yml` = `push` `v*` tag，由 `gh release create v<version>` 触发）、以及判据。
 
@@ -298,6 +304,28 @@
     - 进入发布前重新读取 `Cargo.toml` 权威版本（ER-08 的 parity 预检），按顺序做完整套发布动作（含本卡 `patch + 1` 与 `gh` 发布）后才轮到下一张卡。
     - **禁止多 Agent 并发发布。** 本仓库当前**没有**仓库级发布锁：`libra push origin main` 推送的是本地 `main` 的整个 ref tip，无法只发布一条协调记录，也无法在 push 之外提供 CAS 仲裁；靠纯文档约定实现的 lease 无法验证，属于未经实现验证的协议。若某计划确实需要并发发布，必须先用独立 ADR + 独立计划落地一个仓库级发布锁（含原子认领、fence 校验、超时回收、崩溃恢复与测试），并在本计划以 `DEFER-*` 登记；在该机制落地并通过验收之前，一律按本条串行执行。
     - 并发实现期间仍受 I–R 约束（G-10）：发布者持有发布窗口时，其它卡不得修改 `Release write set` 内的文件。
+
+13. **ER-13 测试执行分层（执行阶段 focused，收口阶段全量）:** 计划的测试成本按阶段分层，默认**不**在每张任务卡上跑全量套件。
+
+    **执行阶段（本卡开工到本卡推送）默认口径:** 只跑与本任务相关的测试 —— ER-04 A 组按本卡实际改动表面选出的 focused 命令，加上本卡 `Verification` 登记的指定用例。`cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 不属于「测试」，**任何会推送的卡都必须跑**，不受本条豁免。不得为了省时间而缩减 A 组已命中的表面行（ER-04）。
+
+    **必须跑全量的触发条件（命中任一条，本卡 C 组第 ④ 步就跑 `source .env.test && cargo test --all`）:**
+    - `T-1` **跨切面表面**：`sql/**`、`src/cli.rs` 的命令注册或全局 flag、稳定错误码与 `docs/error-codes.md`、GC-02 意义上的单一事实源 / 共享 helper、`build.rs`、`Cargo.toml` 非版本行、`rustfmt.toml`、`.github/workflows/**`、`install.sh` / `install.ps1`。
+    - `T-2` **发布点与聚合卡**：`Task type = release`，或 `Release boundary` 为 `family release point` / `batch-release point`。
+    - `T-3` **删除或重命名公开 surface**：公开命令 / flag / schema / 错误码 / `--test` target 的删除或重命名（含 `Task type = removal` / `migration`）。
+    - `T-4` **共享测试基建**：改动 `tests/harness/`、`tests/helpers/`、`tests/command/mod.rs`，或任何被 3 个及以上 `--test` target 复用的 fixture / helper。
+    - `T-5` **显式要求**：计划正文、任务卡或用户明确要求本卡跑全量（即「特定要求」）。
+    - `T-6` **信号不足**：focused 门出现无法归因的失败，或本卡改动影响面无法用 A 组命令圈定时，先跑全量再判定。
+
+    **登记要求:** 每张会推送的卡在 `Full-suite trigger` 字段写 `none`（未命中，执行阶段只跑 focused）或 `T-<n>: <一句话依据>`；字段缺失按 `none` 处理。`T-1`–`T-4` 客观命中却写 `none`，视为验收造假，该卡验收无效。
+
+    **收口阶段（全部任务卡完成后，强制）:** 计划必须跑一次「完成判据」的**全量收口门**（fmt + clippy + `source .env.test && cargo test --all`；改动 `web/` / `worker/` 时并入各自命令），并**修复该次全量暴露的全部 Bug**：
+    - 定位到本计划改动的失败 → **前滚修复**（已推送的提交与已发布的 artifact 不得回退，按 ER-10 与 D 组失败口径处理）；修复落在某张已完成卡的行为轴内可就地补记，否则新建 `FIX-*` 卡并加一条依赖边。
+    - 判定为与本计划无关的既有失败 → 必须给出**在计划基线 commit 上同样失败**的复现证据，并登记 `FIX-*` 或 `DEFER-*`，不得以「本来就红」口头带过。
+    - 修复后必须**重跑全量直至全绿**；只重跑修复用例不算收口。
+    - 全量收口门未全绿之前，计划不得标记完成（见「完成判据」）。
+
+    **风险归属（必须知情后再采用）:** 执行阶段跳过全量意味着单卡推送与 `gh` 发布可能带入未被全量覆盖的回归，且本仓库**没有远端兜底** —— `.github/workflows/base.yml` 仅由 `pull_request` 触发（`on: pull_request`），直推 `main` 不会跑任何 CI 全量。因此这些回归只会在收口阶段的全量门暴露，并只能前滚修复。若某计划不接受该风险（例如涉及数据安全、迁移或发布通道），可在「全局工程约束」登记一条计划级例外，要求每卡都跑全量 —— 比本条更严不构成违规。
 
 ## 实施顺序
 
@@ -504,6 +532,7 @@
 - 仅用于定位符号的 `rg` 必须注明「锚点定位用，非判据」。
 - 本任务新增的 test fn / 场景过滤必须标 `(new)`，并确保其所属 `--test` target 已存在，或在同卡内注册（`tests/compat/*` 还需 `Cargo.toml` `[[test]]`）并同步 `tests/INDEX.md`。
 - `cargo test --all` 不能替代任务指定用例（ER-04）；反过来，指定用例也不能替代计划完成前的全量 L1 门（见「完成判据」）。
+- 本卡执行阶段是否需要跑全量，按 ER-13 判定并写在 `Full-suite trigger` 字段；`Verification` 只登记本卡特有判据，**不要**把 `cargo test --all` 当作本卡判据行登记（它要么由 ER-13 的触发条件带出，要么由收口阶段的全量门覆盖）。
 
 ### Task <ID>: <任务标题>
 
@@ -533,6 +562,8 @@
 - [ ] `<exact command>`
 - [ ] `<exact command>`
 - [ ] `<manual/sanitized evidence, if required>`
+
+**Full-suite trigger:** `<none（执行阶段只跑本卡 focused 测试）| T-<n>: <命中依据> | N/A（no-release / family child 等不执行 C 组的卡）>`（ER-13；不计入 `Verification` 条目上限）
 
 **Dependencies:** `<无 / 本计划 Task ID + 本卡消费的具体产物（接口、文件、测试） / 「依赖登记表」中的 DEP-ID>`（G-06）
 
@@ -567,6 +598,8 @@
 字段与规则的对应：`type`→G-11，`axis`/`recovery`→G-01，`complete`→G-02，`AC`/`VER`→G-03（分母按 G-03 的 Task type 上限表取值：代码卡与 spike 为 8，`release` 为 12，docs/audit/handoff 为 20；ER-04 的强制门不计入）。**超限只有一种合规写法**：`AC=21/20@EX-01` —— 分子超过分母时必须紧跟豁免该列的 `EX-ID`，否则审计判为不达标；一张卡可同时需要多个豁免，`exception` 用逗号分隔并逐个说明所豁免的列，`landing`/`prod-files`/`scope`→G-04，`self-contained`→G-05，`deps`→G-06，`release`→G-07/G-08，`split-from`→G-09，`writeset`→G-10，`exception`→已登记的 `EX-*`。这一行是 `G-*` 的机器可核对摘要，ER-03 开工前逐字段核对；写不出来就说明卡还没拆干净。计划级汇总见「任务卡粒度审计表」。
 
 ## 测试矩阵
+
+本表登记「本计划最终必须被覆盖到什么」，不是「每张卡都要跑完整张表」。执行阶段按 ER-13 只跑与本卡相关的行；整张表由收口阶段的全量门统一覆盖。
 
 | 类别 | 必须覆盖 | Target / command |
 |---|---|---|
@@ -641,7 +674,8 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 - [ ] 所有任务卡满足粒度规则 `G-*`：无未登记的 L 例外、无 XL 卡、无碎片卡、无未登记的合并发布例外、实现写集冲突均已消解；「任务卡粒度审计表」已填齐。
 - [ ] 所有非延后任务的 acceptance criteria 已满足，且 `Lifecycle=done` **且** `Acceptance=complete`（ER-04）。任何停在 `remote-pending` 的卡都必须先取得其 D 组远端后置门的绿色证据。任何仍为 `blocked` 的任务都必须先解除阻塞（`blocked` → `in-progress` → 完成剩余动作 → `done`）或按 `DEFER-*` 正式延后，不得带着 `blocked` 通过完成门。
 - [ ] 所有任务的 Verification 命令已运行并记录结果。
-- [ ] **计划完成门（区别于每卡 focused gate）**：`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all` 全绿（L1 全量；L2/L3 未设置 env 时打印 skipped 可接受，失败不可接受）；若本计划改动 `web/`，`pnpm --dir web lint`、`pnpm --dir web test`、`pnpm --dir web build` 已通过；改动 `worker/` 时 `pnpm --dir worker lint`、`pnpm --dir worker test`、`pnpm --dir worker test:miniflare`、`pnpm --dir worker build` 已通过；改动 feature-gated 代码时，写明实际 feature/target/env 的命令已通过（不得留未替换占位符）。
+- [ ] **计划完成门 / 全量收口门（ER-13；区别于每卡 focused gate）**：在全部任务卡完成后运行一次 —— `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all` 全绿（L1 全量；L2/L3 未设置 env 时打印 skipped 可接受，失败不可接受）；若本计划改动 `web/`，`pnpm --dir web lint`、`pnpm --dir web test`、`pnpm --dir web build` 已通过；改动 `worker/` 时 `pnpm --dir worker lint`、`pnpm --dir worker test`、`pnpm --dir worker test:miniflare`、`pnpm --dir worker build` 已通过；改动 feature-gated 代码时，写明实际 feature/target/env 的命令已通过（不得留未替换占位符）。
+- [ ] **全量收口门暴露的 Bug 已全部处理（ER-13）**：定位到本计划的失败已前滚修复，并已**重跑全量至全绿**；判定为既有失败的用例已附「计划基线 commit 上同样失败」的复现证据并登记 `FIX-*` 或 `DEFER-*`。不得带着红色全量结果通过完成门。
 - [ ] 必要的 docs/compat/error-code/test-index 更新已完成。
 - [ ] 必要的 migration、rollback、failure-recovery 验证已完成；每张卡的 `Rollback mode` 都已被实际验证或记录为不可验证的原因。
 - [ ] Codex review 最终结论为 `PASS`，P0/P1 全部关闭；仅 P2 residual risk 允许保留，且有具名接受人。

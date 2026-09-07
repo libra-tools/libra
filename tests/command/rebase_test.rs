@@ -83,7 +83,7 @@ fn test_rebase_json_no_state_subcommands_return_repo_state_code() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_json_abort_outputs_restored_branch() {
     use libra::{command::rebase::RebaseState, internal::head::Head};
 
@@ -1201,7 +1201,7 @@ fn commit_messages_from_head(start: &ObjectHash, max: usize) -> Vec<String> {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_basic_rebase() {
     use libra::internal::head::Head;
 
@@ -1492,7 +1492,7 @@ async fn test_basic_rebase() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_preserves_untracked_files() {
     use libra::internal::head::Head;
 
@@ -1691,7 +1691,7 @@ async fn test_rebase_preserves_untracked_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_already_up_to_date() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1810,7 +1810,7 @@ async fn test_rebase_already_up_to_date() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_abort_when_no_rebase_in_progress() {
     use libra::{command::rebase::RebaseState, internal::head::Head};
 
@@ -2042,7 +2042,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     use std::collections::VecDeque;
 
@@ -2310,7 +2310,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_continue_no_rebase() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2379,7 +2379,7 @@ async fn test_rebase_continue_no_rebase() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_skip_no_rebase() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2448,7 +2448,7 @@ async fn test_rebase_skip_no_rebase() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_with_conflict_and_abort() {
     use libra::{command::rebase::RebaseState, internal::head::Head};
 
@@ -2703,7 +2703,7 @@ async fn test_rebase_with_conflict_and_abort() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_binary_conflict_writes_markers() {
     use libra::command::rebase::RebaseState;
 
@@ -2937,7 +2937,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_with_conflict_and_skip() {
     use libra::command::rebase::RebaseState;
 
@@ -3209,7 +3209,7 @@ async fn test_rebase_with_conflict_and_skip() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_with_conflict_and_continue() {
     use libra::{command::rebase::RebaseState, internal::head::Head};
 
@@ -3476,7 +3476,7 @@ async fn test_rebase_with_conflict_and_continue() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_multiple_commits_partial_conflict() {
     use libra::command::rebase::RebaseState;
 
@@ -3801,7 +3801,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_state_persistence() {
     use libra::command::rebase::RebaseState;
 
@@ -4046,7 +4046,7 @@ async fn test_rebase_state_persistence() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_fast_forward_branch_behind() {
     use libra::internal::head::Head;
 
@@ -4212,7 +4212,7 @@ async fn test_rebase_fast_forward_branch_behind() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_fast_forward_blocks_dirty_workdir() {
     use libra::internal::head::Head;
 
@@ -4379,7 +4379,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
     use libra::internal::head::Head;
 
@@ -4546,7 +4546,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
     use libra::{command::rebase::RebaseState, internal::head::Head};
 
@@ -4753,7 +4753,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
     use libra::command::rebase::RebaseState;
 
@@ -4976,7 +4976,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
     use libra::command::rebase::RebaseState;
 
@@ -5215,7 +5215,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rebase_continue_requires_resolution() {
     use libra::{command::rebase::RebaseState, internal::head::Head};
 
@@ -5768,7 +5768,6 @@ fn test_rebase_help_lists_onto_and_examples() {
 }
 
 #[test]
-#[serial]
 fn test_rebase_keep_empty_is_accepted_noop_and_preserves_empty_commit() {
     // Libra's rebase keeps empty commits by default, so `--keep-empty` (which
     // explicitly requests that default) is an accepted no-op: it must not error,
@@ -5831,7 +5830,6 @@ fn test_rebase_keep_empty_is_accepted_noop_and_preserves_empty_commit() {
 }
 
 #[test]
-#[serial]
 fn test_rebase_no_keep_empty_drops_start_empty_commits() {
     // `--no-keep-empty` drops commits that are already empty in the source history
     // (no change vs their parent), while a real commit is still replayed. The
@@ -5896,7 +5894,6 @@ fn test_rebase_no_keep_empty_drops_start_empty_commits() {
 }
 
 #[test]
-#[serial]
 fn test_rebase_no_keep_empty_all_empty_range_moves_branch_to_base() {
     // When `--no-keep-empty` drops EVERY commit in the range (all start-empty),
     // the branch must still be rebased onto the advanced upstream — not left at
@@ -5998,7 +5995,6 @@ fn build_become_empty_rebase_repo() -> tempfile::TempDir {
 /// already on the new base), reporting the git-style `dropping … upstream`
 /// notice, while still replaying the genuinely-new commit.
 #[test]
-#[serial]
 fn test_rebase_empty_drop_skips_become_empty_commit() {
     let repo = build_become_empty_rebase_repo();
     let p = repo.path();
@@ -6027,7 +6023,6 @@ fn test_rebase_empty_drop_skips_become_empty_commit() {
 /// Without `--empty` (Libra's default) the become-empty commit is KEPT — an
 /// intentional divergence from Git, which drops it.
 #[test]
-#[serial]
 fn test_rebase_empty_default_keeps_become_empty_commit() {
     let repo = build_become_empty_rebase_repo();
     let p = repo.path();
@@ -6046,7 +6041,6 @@ fn test_rebase_empty_default_keeps_become_empty_commit() {
 /// `--empty=stop`/`--empty=ask` (valid Git modes Libra does not support) and any
 /// unknown value are usage errors (exit 129) naming `--empty`.
 #[test]
-#[serial]
 fn test_rebase_empty_invalid_mode_rejected() {
     let repo = build_become_empty_rebase_repo();
     let p = repo.path();
@@ -6069,7 +6063,6 @@ fn test_rebase_empty_invalid_mode_rejected() {
 /// through `RebaseState`, so a LATER commit that becomes empty is dropped when
 /// the resume reaches it (not replayed as an empty commit).
 #[test]
-#[serial]
 fn test_rebase_empty_drop_survives_conflict_resume() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -6167,7 +6160,6 @@ fn test_rebase_empty_drop_survives_conflict_resume() {
 /// rewrites history's shape, not its authorship, so the original author must
 /// survive while the committer becomes whoever ran the rebase.
 #[test]
-#[serial]
 fn test_rebase_preserves_original_author_and_stamps_current_committer() {
     let repo = tempdir().expect("failed to create temp repo");
     let repo_path = repo.path();
@@ -6229,7 +6221,6 @@ fn test_rebase_preserves_original_author_and_stamps_current_committer() {
 /// *that* commit's author (Git: the author of the first commit in the group) —
 /// not the folded commit's, and not a hardcoded placeholder.
 #[test]
-#[serial]
 fn test_rebase_autosquash_keeps_target_author_and_current_committer() {
     let repo = tempdir().expect("failed to create temp repo");
     let repo_path = repo.path();

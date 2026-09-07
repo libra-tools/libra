@@ -42,7 +42,7 @@ async fn stage_file(path: &str, content: &str) {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moves a tracked file to a new file path.
 async fn test_mv_moves_tracked_file_to_new_path() {
     let temp_path = tempdir().unwrap();
@@ -74,7 +74,7 @@ async fn test_mv_moves_tracked_file_to_new_path() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moves a tracked file into an existing destination directory.
 async fn test_mv_moves_tracked_file_into_directory() {
     let temp_path = tempdir().unwrap();
@@ -107,7 +107,7 @@ async fn test_mv_moves_tracked_file_into_directory() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Resolves mv path arguments relative to current directory when invoked from a subdirectory.
 async fn test_mv_resolves_paths_from_current_subdirectory() {
     let temp_path = tempdir().unwrap();
@@ -140,7 +140,7 @@ async fn test_mv_resolves_paths_from_current_subdirectory() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moves a directory with tracked files and updates index entries for moved files.
 async fn test_mv_moves_directory_with_tracked_files() {
     let temp_path = tempdir().unwrap();
@@ -178,7 +178,7 @@ async fn test_mv_moves_directory_with_tracked_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// When force-overwriting an already tracked destination, index should keep only the renamed destination entry.
 async fn test_mv_force_overwrites_tracked_destination_and_replaces_index_entry() {
     let temp_path = tempdir().unwrap();
@@ -212,7 +212,7 @@ async fn test_mv_force_overwrites_tracked_destination_and_replaces_index_entry()
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Refreshes destination index metadata/hash by rebuilding the entry from the moved file.
 async fn test_mv_rebuilds_index_entry_from_destination_file() {
     let temp_path = tempdir().unwrap();
@@ -251,7 +251,7 @@ async fn test_mv_rebuilds_index_entry_from_destination_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Prints a rename message when `-v` is used and move succeeds.
 async fn test_mv_verbose_prints_rename_message() {
     let temp_path = tempdir().unwrap();
@@ -282,7 +282,7 @@ async fn test_mv_verbose_prints_rename_message() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Prints dry-run messages exactly as defined in mv implementation.
 async fn test_mv_dry_run_output_matches_command_text() {
     let temp_path = tempdir().unwrap();
@@ -305,7 +305,7 @@ async fn test_mv_dry_run_output_matches_command_text() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Emits a structured success envelope for dry-run moves and leaves disk/index unchanged.
 async fn test_mv_json_dry_run_outputs_plan_without_moving_file() {
     let temp_path = tempdir().unwrap();
@@ -353,7 +353,7 @@ async fn test_mv_json_dry_run_outputs_plan_without_moving_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Emits compact single-line structured output for machine-mode successful moves.
 async fn test_mv_machine_success_outputs_single_line_json() {
     let temp_path = tempdir().unwrap();
@@ -403,7 +403,7 @@ async fn test_mv_machine_success_outputs_single_line_json() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Prints usage text when `mv` is called without enough arguments.
 async fn test_mv_usage_output_matches_command_text() {
     let temp_path = tempdir().unwrap();
@@ -428,7 +428,7 @@ async fn test_mv_usage_output_matches_command_text() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Prints the expected bad source error text for non-existent source paths.
 async fn test_mv_bad_source_output_matches_command_text() {
     let temp_path = tempdir().unwrap();
@@ -450,7 +450,7 @@ async fn test_mv_bad_source_output_matches_command_text() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Rejects source paths that escape repository boundary.
 async fn test_mv_rejects_source_path_outside_workdir() {
     let temp_path = tempdir().unwrap();
@@ -481,7 +481,7 @@ async fn test_mv_rejects_source_path_outside_workdir() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Rejects destination paths that escape repository boundary.
 async fn test_mv_rejects_destination_path_outside_workdir() {
     let temp_path = tempdir().unwrap();
@@ -515,7 +515,7 @@ async fn test_mv_rejects_destination_path_outside_workdir() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Rejects moving an untracked source file.
 async fn test_mv_rejects_untracked_source() {
     let temp_path = tempdir().unwrap();
@@ -544,7 +544,7 @@ async fn test_mv_rejects_untracked_source() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Rejects moving a path that is in conflicted (unmerged) index state.
 async fn test_mv_rejects_conflicted_source_file() {
     let temp_path = tempdir().unwrap();
@@ -592,7 +592,7 @@ async fn test_mv_rejects_conflicted_source_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Rejects multi-source moves that would map to the same target path.
 async fn test_mv_rejects_multiple_sources_with_same_target_name() {
     let temp_path = tempdir().unwrap();
@@ -624,7 +624,7 @@ async fn test_mv_rejects_multiple_sources_with_same_target_name() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_mv_skip_errors_moves_valid_sources_and_skips_invalid_sources() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -663,7 +663,7 @@ async fn test_mv_skip_errors_moves_valid_sources_and_skips_invalid_sources() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_mv_skip_errors_succeeds_when_all_sources_are_skipped() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -686,7 +686,7 @@ async fn test_mv_skip_errors_succeeds_when_all_sources_are_skipped() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_mv_skip_errors_keeps_first_source_when_targets_duplicate() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -721,7 +721,7 @@ async fn test_mv_skip_errors_keeps_first_source_when_targets_duplicate() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_mv_sparse_flag_is_accepted_as_json_noop() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -750,7 +750,7 @@ async fn test_mv_sparse_flag_is_accepted_as_json_noop() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moves a directory even when it contains only untracked files.
 async fn test_mv_moves_directory_without_tracked_files() {
     let temp_path = tempdir().unwrap();
@@ -778,7 +778,7 @@ async fn test_mv_moves_directory_without_tracked_files() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Moves tracked and untracked files together for directory sources, but updates index only for tracked paths.
 async fn test_mv_moves_mixed_directory_and_updates_only_tracked_index_entries() {
     let temp_path = tempdir().unwrap();
@@ -813,7 +813,7 @@ async fn test_mv_moves_mixed_directory_and_updates_only_tracked_index_entries() 
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Rejects moving a directory to a non-directory destination path.
 async fn test_mv_rejects_directory_to_non_directory_destination() {
     let temp_path = tempdir().unwrap();
@@ -841,7 +841,7 @@ async fn test_mv_rejects_directory_to_non_directory_destination() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Rejects moves where source and destination are the same path.
 async fn test_mv_rejects_same_source_and_destination_path() {
     let temp_path = tempdir().unwrap();
@@ -867,7 +867,7 @@ async fn test_mv_rejects_same_source_and_destination_path() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Rejects moving a directory into its own subdirectory.
 async fn test_mv_rejects_moving_directory_into_subdirectory() {
     let temp_path = tempdir().unwrap();

@@ -4202,7 +4202,7 @@ fn concurrent_control_slots_are_held_per_worktree() {
                 &["rebase", "main"],
                 &wt,
                 "",
-                &[("LIBRA_TEST", "1"), ("LIBRA_TEST_HOLD_CLAIM_MS", "3000")],
+                &[("LIBRA_TEST", "1"), ("LIBRA_TEST_HOLD_CLAIM_MS", "10000")],
             );
             format!(
                 "{}{}",
@@ -4213,16 +4213,27 @@ fn concurrent_control_slots_are_held_per_worktree() {
     }
 
     // While they are held, read the claims. Poll rather than sleep-and-hope:
-    // the hold is 3s, and we want the moment BOTH are committed.
+    // the hold is 10s, and we want the moment BOTH are committed. The probe
+    // must not inherit sqlite3's multi-second default busy timeout: under a
+    // long serial suite, one locked read could otherwise consume the complete
+    // overlap window and turn this bounded poll into a many-minute false
+    // negative.
     let db = main.join(".libra").join("libra.db");
     let mut observed = Vec::new();
-    for _ in 0..60 {
+    let mut last_probe_error = None;
+    for _ in 0..150 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let rows = sqlite_query(
+        let rows = match sqlite_query_no_wait(
             &db,
             "SELECT worktree_id FROM operation WHERE status = 'running' \
              AND control_slot IS NOT NULL ORDER BY worktree_id",
-        );
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                last_probe_error = Some(err);
+                continue;
+            }
+        };
         if rows.len() >= 2 {
             observed = rows;
             break;
@@ -4241,7 +4252,8 @@ fn concurrent_control_slots_are_held_per_worktree() {
     assert_eq!(
         observed.len(),
         2,
-        "two control claims must be held AT ONCE, one per worktree; saw {observed:?}"
+        "two control claims must be held AT ONCE, one per worktree; saw {observed:?}; \
+         last probe error: {last_probe_error:?}"
     );
     assert_ne!(
         observed[0], observed[1],
@@ -4272,6 +4284,27 @@ fn sqlite_query(db: &std::path::Path, sql: &str) -> Vec<String> {
         .filter(|line| !line.trim().is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Query without waiting on a concurrent writer so polling stays bounded.
+fn sqlite_query_no_wait(db: &std::path::Path, sql: &str) -> Result<Vec<String>, String> {
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import sqlite3\nc = sqlite3.connect({db:?}, timeout=0.0)\n\
+             c.execute('PRAGMA query_only = ON')\n\
+             print('\\n'.join(str(r[0]) for r in c.execute({sql:?}).fetchall()))"
+        ))
+        .output()
+        .map_err(|err| format!("failed to run python3 sqlite3 probe: {err}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// §C.11 W1 / §C.9: a sequencer control action is recorded in the operation
@@ -4920,7 +4953,7 @@ fn remove_gcs_private_head_rows() {
 /// prune of a missing path) purges them. The add-time strict sweep still
 /// guarantees a fresh re-add never inherits stale rows.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 fn worktree_remove_keep_dir_preserves_or_tombstones_scope() {
     let repo = repo_with_feature();
     let main = repo.path();
@@ -5271,7 +5304,7 @@ fn registry_mutators_serialize_on_worktrees_lock() {
 /// worktree at the same path: its sparse view starts disabled/empty and
 /// its layer registry starts empty.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 fn worktree_add_sweeps_stale_scope_rows() {
     let repo = repo_with_feature();
     let main = repo.path();
@@ -5340,7 +5373,7 @@ fn worktree_add_sweeps_stale_scope_rows() {
 /// repository, so the still-materialized overlay files must stay
 /// un-stageable (never-enters-commit).
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 fn worktree_remove_purges_layer_scope_rows() {
     let repo = repo_with_feature();
     let main = repo.path();

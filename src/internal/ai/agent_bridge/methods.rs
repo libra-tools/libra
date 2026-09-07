@@ -109,7 +109,7 @@ fn page_limit(params: &Option<Value>) -> (usize, Vec<Value>) {
                 let warn = if n == 0 {
                     json!({
                         "code": "limit_clamped",
-                        "message": format!("requested limit 0 is below the v1 page floor of 1; returning 1"),
+                        "message": "requested limit 0 is below the v1 page floor of 1; returning 1".to_string(),
                     })
                 } else {
                     json!({

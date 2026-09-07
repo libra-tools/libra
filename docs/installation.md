@@ -8,6 +8,35 @@ The recommended macOS/Linux installation is:
 curl -fsSL https://download.libra.tools/install.sh | sh
 ```
 
+### Trust model: the signed stable channel
+
+By default both installers resolve the version through the **Ed25519-signed
+stable manifest** (`https://download.libra.tools/libra/releases/stable/manifest-v1.json`):
+the manifest signature is verified against a public key embedded in the
+installer, and the binary download is then checked byte-for-byte against the
+signed `sha256` and `size`. Any verification failure aborts the install with
+nothing written — a compromised mirror cannot substitute a binary.
+
+Three paths deliberately do **not** verify against the signed manifest, and
+each is explicit:
+
+- **`-v <version>` / `-Version`** — pinning a historic version bypasses the
+  stable channel; the installer prints a warning.
+- **A custom mirror** (`LIBRA_BASE_URL` / `-DownloadBaseUrl`) — same warning.
+- **Transition states** — when the signed manifest does not exist yet (the
+  signature chain is not enabled) or the host cannot verify signatures
+  (`install.sh` needs OpenSSL ≥ 1.1.1 with Ed25519 support plus a sha256
+  tool; `install.ps1` ships its own verifier), the installer stops and asks
+  for explicit confirmation, or `LIBRA_ALLOW_FALLBACK=1`, before falling back
+  to the unverified legacy path. It never falls back silently.
+
+The embedded public key has **no runtime override**: no flag or environment
+variable can change the trust root of a released installer. Because the
+installer script itself is fetched from the same CDN, its whole-file
+substitution remains out of scope of this check — the out-of-band trust
+anchor (published script hashes) is tracked separately in the UP-01 design
+document.
+
 The installer places `libra` in `$LIBRA_HOME/bin` (`~/.libra/bin` by default),
 writes shell environment files, and creates the optional relative symlink:
 

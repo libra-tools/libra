@@ -42,7 +42,7 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_lists_heads() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -236,7 +236,7 @@ fn test_for_each_ref_merged_filter() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
     use libra::internal::branch::Branch;
 
@@ -330,7 +330,7 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_format_and_json() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -353,7 +353,7 @@ async fn test_for_each_ref_format_and_json() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_sort_and_count() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -370,7 +370,7 @@ async fn test_for_each_ref_sort_and_count() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_points_at_matches_direct_and_peeled_tag_targets() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -421,7 +421,7 @@ async fn test_for_each_ref_points_at_matches_direct_and_peeled_tag_targets() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_unknown_sort_rejects() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -439,7 +439,7 @@ async fn test_for_each_ref_unknown_sort_rejects() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_sort_version_refname() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -484,7 +484,7 @@ async fn test_for_each_ref_sort_version_refname() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_format_short_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -533,7 +533,7 @@ async fn test_for_each_ref_format_short_atoms() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_head_marker_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await; // checked out on main
@@ -562,7 +562,7 @@ async fn test_for_each_ref_head_marker_atom() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_upstream_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -601,7 +601,7 @@ async fn test_for_each_ref_upstream_atom() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_push_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -697,7 +697,7 @@ async fn test_for_each_ref_push_atom() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_subject_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await; // commits with subject "initial"
@@ -721,7 +721,7 @@ async fn test_for_each_ref_subject_atom() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_subject_with_percent_paren_is_literal() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -750,7 +750,7 @@ async fn test_for_each_ref_subject_with_percent_paren_is_literal() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_author_committer_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -785,7 +785,7 @@ async fn test_for_each_ref_author_committer_atoms() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_tagger_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -834,7 +834,7 @@ async fn test_for_each_ref_tagger_atoms() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_date_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -865,7 +865,7 @@ async fn test_for_each_ref_date_atoms() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_refname_lstrip_rstrip() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await; // refs/heads/main
@@ -901,7 +901,7 @@ async fn test_for_each_ref_refname_lstrip_rstrip() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_contents_and_body_atoms() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -956,7 +956,7 @@ async fn test_for_each_ref_contents_and_body_atoms() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_objectname_short_n() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -1028,7 +1028,7 @@ fn test_for_each_ref_exclude_filter() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_for_each_ref_sort_by_committerdate() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1129,7 +1129,7 @@ async fn test_for_each_ref_sort_by_committerdate() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -1245,7 +1245,7 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
 }
 
 #[tokio::test]
-#[serial]
+#[serial(hash_kind, cwd)]
 async fn test_for_each_ref_sort_peels_nested_annotated_tags() {
     use libra::{
         command::for_each_ref::MAX_TAG_PEEL_DEPTH,
@@ -1727,7 +1727,7 @@ fn test_for_each_ref_deref_objecttype_and_objectsize_atoms() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(hash_kind, cwd)]
 async fn test_for_each_ref_deref_size_errors_on_broken_tag_chain() {
     use libra::internal::{db::get_db_conn_instance, model::reference};
     use sea_orm::{ActiveModelTrait, Set};
@@ -2103,7 +2103,7 @@ fn test_for_each_ref_if_then_else_conditional() {
 /// full-vs-short prefix matching, and an annotated tag (a non-commit ref →
 /// all commit-graph atoms empty).
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_for_each_ref_commit_graph_atoms() {
     let temp = tempdir().unwrap();
     init_repo_via_cli(temp.path());
@@ -2207,7 +2207,7 @@ fn test_for_each_ref_commit_graph_atoms() {
 /// commits, tagger date for annotated tags); an inapplicable date is empty; and
 /// `:relative` produces git-style "… ago" output.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_for_each_ref_date_format_modifiers() {
     let temp = tempdir().unwrap();
     init_repo_via_cli(temp.path());
@@ -2299,7 +2299,7 @@ fn test_for_each_ref_date_format_modifiers() {
 /// `%(color:<spec>)` emits ANSI escapes when color is enabled (`--color=always`),
 /// nothing when disabled (`--color=never`), and rejects an unrecognized color.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_for_each_ref_color_atom() {
     let temp = tempdir().unwrap();
     init_repo_via_cli(temp.path());
@@ -2720,7 +2720,7 @@ fn test_for_each_ref_describe_atom() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_for_each_ref_symref_atom() {
     use libra::internal::branch::Branch;
 
@@ -2792,7 +2792,7 @@ async fn test_for_each_ref_symref_atom() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_worktreepath_atom() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;
@@ -2824,7 +2824,7 @@ async fn test_for_each_ref_worktreepath_atom() {
 /// Part C §C.3.3: `%(worktreepath)` resolves a branch to the LINKED worktree
 /// that has it checked out, even when `for-each-ref` runs in the main worktree.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_for_each_ref_worktreepath_across_worktrees() {
     let temp = tempdir().unwrap();
     setup_repo_with_commit(&temp).await;

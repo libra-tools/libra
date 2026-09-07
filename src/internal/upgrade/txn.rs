@@ -22,7 +22,7 @@ use sha2::Digest as _;
 use super::{
     lock::{EntryKind, InstallDir, InstallDirError},
     marker::{InstallMarker, MARKER_FILE_NAME, TARGET_BINARY_NAME, write_marker},
-    state::{UpgradeState, write_state},
+    state::{StateStoreError, UpgradeState, merge_acceptance_floors, read_state, write_state},
 };
 
 /// Transaction journal file name (fd-relative, `0600`).
@@ -111,6 +111,21 @@ pub enum TxnError {
 /// Injected so recovery is testable without spawning a real binary.
 pub type PostProbe<'a> = dyn Fn(&InstallDir) -> Result<bool, TxnError> + 'a;
 
+/// Commit fence (§A.6 policy): consulted AFTER the post-install probe passes
+/// and BEFORE the commit writes anything. `Ok(Some(guard))` proceeds with the
+/// guard held through the durable `PostProbePassed` journal write ONLY — the
+/// commit tail (state/marker writes, cleanup) runs after the guard drops,
+/// under the same contract crash recovery grants that journaled state — so a
+/// concurrent control write cannot land between the final policy check and
+/// the journaled decision; `Ok(None)` VETOES the commit and the
+/// transaction rolls back exactly like a failed probe. A `None` fence
+/// (recovery, tests) does NOT commit unconditionally: it goes through
+/// [`default_fence`] — the same bounded floors-lock acquisition and
+/// persisted-floor comparison — so a superseding control decision vetoes
+/// recovery commits too.
+pub type CommitFence<'a> =
+    dyn Fn(&InstallDir) -> Result<Option<super::lock::UpgradeLock>, TxnError> + 'a;
+
 fn load_txn(dir: &InstallDir) -> Result<Option<Txn>, TxnError> {
     let Some(bytes) = dir.read_file(TXN_FILE_NAME)? else {
         return Ok(None);
@@ -158,7 +173,9 @@ fn observe(dir: &InstallDir) -> Result<Layout, TxnError> {
 /// Commit: persist marker + anti-rollback state, verify identity, remove
 /// backup/candidate, fsync, then delete the txn LAST (§A.7).
 fn finish_commit(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> {
-    write_state(dir.path(), &txn.new_state).map_err(|e| TxnError::State(e.to_string()))?;
+    // Callers hold the upgrade lock through commit/recovery, so this state
+    // write cannot overwrite a newer accepted anti-rollback floor.
+    write_state(dir, &txn.new_state).map_err(|e| TxnError::State(e.to_string()))?;
     write_marker(dir, &txn.marker).map_err(|e| TxnError::Marker(e.to_string()))?;
     // Identity re-check: the committed target must be the new hash.
     let layout = observe(dir)?;
@@ -176,6 +193,24 @@ fn finish_commit(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> {
     Ok(TxnOutcome::Installed)
 }
 
+/// Persist the accepted manifest's monotone anti-rollback floors even though
+/// the install is being undone: the manifest itself WAS verified, so a later
+/// manifest signed below its `min_key_generation` must stay rejected. Runs
+/// under the caller-held §A.5 lock in both the live and recovery paths.
+fn persist_acceptance_floors_on_failure(dir: &InstallDir, txn: &Txn) -> Result<(), TxnError> {
+    let current = match read_state(dir) {
+        Ok(state) => state,
+        // A corrupt state file cannot be allowed to drop the accepted floors:
+        // rebuild from the transaction's validated snapshot (floors only ever
+        // advance from the default). Unreadable (I/O) state stays an error —
+        // overwriting a state we could not read might lose a higher floor.
+        Err(StateStoreError::Corrupt { .. }) => UpgradeState::default(),
+        Err(e) => return Err(TxnError::State(e.to_string())),
+    };
+    write_state(dir, &merge_acceptance_floors(&current, &txn.new_state))
+        .map_err(|e| TxnError::State(e.to_string()))
+}
+
 /// Roll back an upgrade: restore the backup over the target, then clean up
 /// (§A.7 RollbackIntent).
 fn finish_rollback(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> {
@@ -189,6 +224,7 @@ fn finish_rollback(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> 
             detail: "rollback intent on a fresh (Absent) install".into(),
         });
     };
+    persist_acceptance_floors_on_failure(dir, txn)?;
     let layout = observe(dir)?;
     // Restore backup → target unless the old target is already in place.
     if layout.target.as_deref() != Some(hash.as_str()) {
@@ -225,6 +261,7 @@ fn finish_rollback(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> 
 /// Abort a fresh install: remove the new target if present, then clean up
 /// (§A.7 AbortAbsentIntent).
 fn finish_abort_absent(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnError> {
+    persist_acceptance_floors_on_failure(dir, txn)?;
     let layout = observe(dir)?;
     if layout.target.as_deref() == Some(txn.new_hash.as_str()) {
         dir.remove_file(TARGET_BINARY_NAME)?;
@@ -239,14 +276,108 @@ fn finish_abort_absent(dir: &InstallDir, txn: &Txn) -> Result<TxnOutcome, TxnErr
 
 /// Post-probe the installed target and branch to commit or rollback/abort
 /// (§A.7 CandidateInstalled → …).
+/// Bounded floors-lock acquisition + policy comparison shared by the
+/// commit fence's default arm: 50 × 100 ms non-blocking probes (a stuck
+/// holder must not hang recovery), then one state read under the guard.
+/// `Ok(None)` = veto (lock unobtainable, or the transaction is superseded
+/// by a higher persisted generation/control floor).
+fn default_fence(
+    dir: &InstallDir,
+    txn_state: &UpgradeState,
+) -> Result<Option<super::lock::UpgradeLock>, TxnError> {
+    let mut guard = None;
+    for _ in 0..50 {
+        match dir.try_lock_floors() {
+            Ok(Some(g)) => {
+                guard = Some(g);
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(TxnError::State(format!("floors lock: {e}"))),
+        }
+    }
+    let Some(guard) = guard else {
+        return Ok(None);
+    };
+    let current = read_state(dir).map_err(|e| TxnError::State(e.to_string()))?;
+    if current.generation_floor > txn_state.generation_floor
+        || current.max_control_revision > txn_state.max_control_revision
+    {
+        return Ok(None);
+    }
+    Ok(Some(guard))
+}
+
 fn probe_and_resolve(
     dir: &InstallDir,
     txn: &mut Txn,
     post_probe: &PostProbe<'_>,
+    commit_fence: Option<&CommitFence<'_>>,
 ) -> Result<TxnOutcome, TxnError> {
     if post_probe(dir)? {
-        txn.state = TxnState::PostProbePassed;
-        store_txn(dir, txn)?;
+        // Policy fence. The guard (when present) is held ONLY from the
+        // final policy check through the durable `PostProbePassed` journal
+        // write — one read + one journal fsync, microseconds of I/O — and
+        // is dropped BEFORE the commit tail. Once `PostProbePassed` is
+        // durable, committing without a fence is the same contract crash
+        // recovery already has for that state.
+        //
+        // With no custom fence (recovery, tests) the bounded-LOCKED default check
+        // still compares the persisted floors against the transaction: a
+        // pause/revocation/rotation accepted while this transaction was in
+        // flight vetoes the commit instead of resurrecting a superseded
+        // plan. (Test fixtures start from default state, whose floors never
+        // exceed a transaction's own, so they are unaffected.)
+        // Both arms produce the same three-way result; the DEFAULT arm
+        // (recovery, tests) is the bounded-locked policy check — never an
+        // unconditional commit. A fence ERROR (lock/state unreadable) must
+        // not strand the transaction in CandidateInstalled: roll back FIRST
+        // so the previous binary is restored, then surface the error.
+        let fence_result = match commit_fence {
+            Some(fence) => fence(dir),
+            None => default_fence(dir, &txn.new_state),
+        };
+        let vetoed = match fence_result {
+            Ok(Some(guard)) => {
+                txn.state = TxnState::PostProbePassed;
+                store_txn(dir, txn)?;
+                drop(guard);
+                false
+            }
+            Ok(None) => true,
+            Err(error) => {
+                let undo = match txn.old_target {
+                    OldTarget::Absent => {
+                        txn.state = TxnState::AbortAbsentIntent;
+                        store_txn(dir, txn)?;
+                        finish_abort_absent(dir, txn)
+                    }
+                    OldTarget::Present { .. } => {
+                        txn.state = TxnState::RollbackIntent;
+                        store_txn(dir, txn)?;
+                        finish_rollback(dir, txn)
+                    }
+                };
+                undo?;
+                return Err(error);
+            }
+        };
+        if vetoed {
+            // Vetoed: a newer control decision superseded this plan after
+            // the probe. Undo exactly like a failed probe.
+            return match txn.old_target {
+                OldTarget::Absent => {
+                    txn.state = TxnState::AbortAbsentIntent;
+                    store_txn(dir, txn)?;
+                    finish_abort_absent(dir, txn)
+                }
+                OldTarget::Present { .. } => {
+                    txn.state = TxnState::RollbackIntent;
+                    store_txn(dir, txn)?;
+                    finish_rollback(dir, txn)
+                }
+            };
+        }
         finish_commit(dir, txn)
     } else {
         match txn.old_target {
@@ -282,6 +413,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
     match (txn.state, &txn.old_target) {
         (TxnState::Prepared, OldTarget::Absent) => {
             if layout.target.is_none() && layout.candidate.as_deref() == Some(new.as_str()) {
+                persist_acceptance_floors_on_failure(dir, &txn)?;
                 dir.remove_file(CANDIDATE_NAME)?;
                 dir.fsync_dir()?;
                 dir.remove_file(TXN_FILE_NAME)?;
@@ -291,7 +423,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
                 // rename landed but state was not yet advanced.
                 txn.state = TxnState::CandidateInstalled;
                 store_txn(dir, &txn)?;
-                probe_and_resolve(dir, &mut txn, post_probe)
+                probe_and_resolve(dir, &mut txn, post_probe, None)
             } else {
                 Err(fatal("Prepared/Absent layout unrecognized"))
             }
@@ -300,6 +432,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
             let target_old = layout.target.as_deref() == Some(hash.as_str());
             let candidate_new = layout.candidate.as_deref() == Some(new.as_str());
             if target_old && candidate_new && layout.backup.is_none() {
+                persist_acceptance_floors_on_failure(dir, &txn)?;
                 dir.remove_file(CANDIDATE_NAME)?;
                 dir.fsync_dir()?;
                 dir.remove_file(TXN_FILE_NAME)?;
@@ -309,7 +442,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
             {
                 txn.state = TxnState::BackupDurable;
                 store_txn(dir, &txn)?;
-                continue_overwrite_from_backup_durable(dir, &mut txn, post_probe)
+                continue_overwrite_from_backup_durable(dir, &mut txn, post_probe, None)
             } else {
                 Err(fatal("Prepared/Present layout unrecognized"))
             }
@@ -318,14 +451,14 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
             let candidate_new = layout.candidate.as_deref() == Some(new.as_str());
             let backup_old = layout.backup.as_deref() == Some(hash.as_str());
             if layout.target.as_deref() == Some(hash.as_str()) && candidate_new && backup_old {
-                continue_overwrite_from_backup_durable(dir, &mut txn, post_probe)
+                continue_overwrite_from_backup_durable(dir, &mut txn, post_probe, None)
             } else if layout.target.as_deref() == Some(new.as_str())
                 && layout.candidate.is_none()
                 && backup_old
             {
                 txn.state = TxnState::CandidateInstalled;
                 store_txn(dir, &txn)?;
-                probe_and_resolve(dir, &mut txn, post_probe)
+                probe_and_resolve(dir, &mut txn, post_probe, None)
             } else {
                 Err(fatal("BackupDurable layout unrecognized"))
             }
@@ -337,7 +470,7 @@ pub fn recover(dir: &InstallDir, post_probe: &PostProbe<'_>) -> Result<TxnOutcom
             if layout.target.as_deref() != Some(new.as_str()) {
                 return Err(fatal("CandidateInstalled but target is not the new hash"));
             }
-            probe_and_resolve(dir, &mut txn, post_probe)
+            probe_and_resolve(dir, &mut txn, post_probe, None)
         }
         (TxnState::PostProbePassed, _) => {
             if layout.target.as_deref() != Some(new.as_str()) {
@@ -363,17 +496,21 @@ fn continue_overwrite_from_backup_durable(
     dir: &InstallDir,
     txn: &mut Txn,
     post_probe: &PostProbe<'_>,
+    commit_fence: Option<&CommitFence<'_>>,
 ) -> Result<TxnOutcome, TxnError> {
     dir.rename_entry(CANDIDATE_NAME, TARGET_BINARY_NAME)?;
     dir.fsync_dir()?;
     txn.state = TxnState::CandidateInstalled;
     store_txn(dir, txn)?;
-    probe_and_resolve(dir, txn, post_probe)
+    probe_and_resolve(dir, txn, post_probe, commit_fence)
 }
 
 /// Drive a fresh transaction to completion. The caller has already written
 /// the verified candidate to [`CANDIDATE_NAME`] (via [`InstallDir`]) and
 /// holds the §A.5 lock. `old_target` reflects the pre-install target.
+// The transaction inputs are all independently sourced (§A.7); bundling
+// them into a struct would only add ceremony at the two call sites.
+#[allow(clippy::too_many_arguments)]
 pub fn run_install(
     dir: &InstallDir,
     old_target: OldTarget,
@@ -382,6 +519,7 @@ pub fn run_install(
     marker: InstallMarker,
     new_state: UpgradeState,
     post_probe: &PostProbe<'_>,
+    commit_fence: Option<&CommitFence<'_>>,
 ) -> Result<TxnOutcome, TxnError> {
     let mut txn = Txn {
         schema_version: 1,
@@ -401,7 +539,7 @@ pub fn run_install(
             dir.fsync_dir()?;
             txn.state = TxnState::CandidateInstalled;
             store_txn(dir, &txn)?;
-            probe_and_resolve(dir, &mut txn, post_probe)
+            probe_and_resolve(dir, &mut txn, post_probe, commit_fence)
         }
         OldTarget::Present { .. } => {
             // Upgrade: durable backup BEFORE overwrite.
@@ -409,7 +547,7 @@ pub fn run_install(
             dir.fsync_dir()?;
             txn.state = TxnState::BackupDurable;
             store_txn(dir, &txn)?;
-            continue_overwrite_from_backup_durable(dir, &mut txn, post_probe)
+            continue_overwrite_from_backup_durable(dir, &mut txn, post_probe, commit_fence)
         }
     }
 }
@@ -457,6 +595,112 @@ mod tests {
         Box::new(|_| Ok(false))
     }
 
+    /// An approving fence takes the real floors lock, journals
+    /// PostProbePassed under it, and the install commits — pinning both the
+    /// fence contract and that a dropped fence argument cannot pass review
+    /// silently (the veto twin below fails without one).
+    #[test]
+    fn fence_approval_commits_with_the_floors_lock_held() {
+        let (_g, d) = dir();
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let fence = |dd: &InstallDir| -> Result<Option<super::super::lock::UpgradeLock>, TxnError> {
+            let guard = dd
+                .try_lock_floors()
+                .expect("floors lock probe")
+                .expect("floors lock free in a fresh dir");
+            Ok(Some(guard))
+        };
+        let out = run_install(
+            &d,
+            OldTarget::Absent,
+            "1.0.0",
+            &hash(b"NEW"),
+            marker_for("1.0.0", b"NEW"),
+            UpgradeState::default(),
+            &pass(),
+            Some(&fence),
+        )
+        .expect("test fixture operation should succeed");
+        assert_eq!(out, TxnOutcome::Installed);
+    }
+
+    /// A vetoing fence rolls the upgrade back exactly like a failed probe:
+    /// the previous target is restored byte-for-byte.
+    #[test]
+    fn fence_veto_rolls_back_and_restores_the_old_target() {
+        let (_g, d) = dir();
+        d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let veto = |_: &InstallDir| -> Result<Option<super::super::lock::UpgradeLock>, TxnError> {
+            Ok(None)
+        };
+        let out = run_install(
+            &d,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+            "2.0.0",
+            &hash(b"NEW"),
+            marker_for("2.0.0", b"NEW"),
+            UpgradeState::default(),
+            &pass(),
+            Some(&veto),
+        )
+        .expect("test fixture operation should succeed");
+        assert_eq!(out, TxnOutcome::RolledBack);
+        let restored = d
+            .read_file(TARGET_BINARY_NAME)
+            .expect("test fixture operation should succeed")
+            .expect("target present");
+        assert_eq!(restored, b"OLD");
+    }
+
+    /// With no custom fence, the DEFAULT policy check still vetoes a
+    /// transaction superseded by a higher persisted control floor — this is
+    /// the crash-recovery guarantee for the CandidateInstalled window.
+    #[test]
+    fn default_fence_vetoes_a_superseded_transaction() {
+        let (_g, d) = dir();
+        d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        // A concurrent control decision already persisted revision 9.
+        let newer = UpgradeState {
+            max_control_revision: 9,
+            ..UpgradeState::default()
+        };
+        write_state(&d, &newer).expect("test fixture operation should succeed");
+        let txn_state = UpgradeState {
+            max_control_revision: 7,
+            ..UpgradeState::default()
+        };
+        let out = run_install(
+            &d,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+            "2.0.0",
+            &hash(b"NEW"),
+            marker_for("2.0.0", b"NEW"),
+            txn_state,
+            &pass(),
+            None,
+        )
+        .expect("test fixture operation should succeed");
+        assert_eq!(out, TxnOutcome::RolledBack);
+        let restored = d
+            .read_file(TARGET_BINARY_NAME)
+            .expect("test fixture operation should succeed")
+            .expect("target present");
+        assert_eq!(restored, b"OLD");
+    }
+
     #[test]
     fn fresh_install_commits() {
         let (_g, d) = dir();
@@ -470,6 +714,7 @@ mod tests {
             marker_for("1.0.0", b"NEW"),
             UpgradeState::default(),
             &pass(),
+            None,
         )
         .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::Installed);
@@ -509,6 +754,7 @@ mod tests {
             marker_for("1.0.0", b"NEW"),
             UpgradeState::default(),
             &fail(),
+            None,
         )
         .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::AbortedAbsent);
@@ -542,6 +788,7 @@ mod tests {
             marker_for("2.0.0", b"NEW"),
             UpgradeState::default(),
             &pass(),
+            None,
         )
         .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::Installed);
@@ -578,6 +825,7 @@ mod tests {
             marker_for("2.0.0", b"NEW"),
             UpgradeState::default(),
             &fail(),
+            None,
         )
         .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::RolledBack);
@@ -616,6 +864,138 @@ mod tests {
             marker: marker_for("2.0.0", b"NEW"),
             new_state: UpgradeState::default(),
         }
+    }
+
+    #[test]
+    fn rollback_and_abort_preserve_accepted_floors() {
+        use crate::internal::upgrade::state::{STATE_FILE_NAME, read_state};
+
+        // Post-probe failure → rollback: the manifest's verified floors must
+        // survive even though the install is undone.
+        let (_g, d) = dir();
+        write_state(
+            &d,
+            &UpgradeState {
+                generation_floor: 1,
+                ..UpgradeState::default()
+            },
+        )
+        .expect("test fixture operation should succeed");
+        d.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn = base_txn(
+            TxnState::CandidateInstalled,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+        );
+        txn.new_state.generation_floor = 3;
+        txn.new_state.max_control_revision = 9;
+        txn.new_state.control_envelope_digest = Some("digest-9".into());
+        journal(&d, &txn);
+        assert_eq!(
+            recover(&d, &fail()).expect("test fixture operation should succeed"),
+            TxnOutcome::RolledBack
+        );
+        let state = read_state(&d).expect("test fixture operation should succeed");
+        assert_eq!(state.generation_floor, 3);
+        assert_eq!(state.max_control_revision, 9);
+        assert_eq!(state.control_envelope_digest.as_deref(), Some("digest-9"));
+
+        // Fresh-install abort: same preservation.
+        let (_g2, d2) = dir();
+        d2.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn2 = base_txn(TxnState::CandidateInstalled, OldTarget::Absent);
+        txn2.new_state.generation_floor = 2;
+        journal(&d2, &txn2);
+        assert_eq!(
+            recover(&d2, &fail()).expect("test fixture operation should succeed"),
+            TxnOutcome::AbortedAbsent
+        );
+        assert_eq!(
+            read_state(&d2)
+                .expect("test fixture operation should succeed")
+                .generation_floor,
+            2
+        );
+
+        // Prepared-stage cleanup (crash before backup/rename) must also
+        // preserve the floors: Prepared/Absent with only a candidate…
+        let (_gp, dp) = dir();
+        dp.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn_p = base_txn(TxnState::Prepared, OldTarget::Absent);
+        txn_p.new_state.generation_floor = 5;
+        journal(&dp, &txn_p);
+        assert_eq!(
+            recover(&dp, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::AbortedAbsent
+        );
+        assert_eq!(
+            read_state(&dp)
+                .expect("test fixture operation should succeed")
+                .generation_floor,
+            5
+        );
+
+        // …and Prepared/Present with target+candidate but no backup.
+        let (_gq, dq) = dir();
+        dq.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        dq.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn_q = base_txn(
+            TxnState::Prepared,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+        );
+        txn_q.new_state.generation_floor = 6;
+        journal(&dq, &txn_q);
+        assert_eq!(
+            recover(&dq, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::NoOp
+        );
+        assert_eq!(
+            read_state(&dq)
+                .expect("test fixture operation should succeed")
+                .generation_floor,
+            6
+        );
+
+        // Corrupt state must not drop the accepted floors: it is rebuilt from
+        // the transaction's validated snapshot.
+        let (_g3, d3) = dir();
+        d3.write_file_atomic(STATE_FILE_NAME, b"{corrupt", 0o600)
+            .expect("test fixture operation should succeed");
+        d3.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
+        d3.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        let mut txn3 = base_txn(
+            TxnState::CandidateInstalled,
+            OldTarget::Present {
+                hash: hash(b"OLD"),
+                marker_snapshot: None,
+            },
+        );
+        txn3.new_state.generation_floor = 4;
+        journal(&d3, &txn3);
+        assert_eq!(
+            recover(&d3, &fail()).expect("test fixture operation should succeed"),
+            TxnOutcome::RolledBack
+        );
+        assert_eq!(
+            read_state(&d3)
+                .expect("test fixture operation should succeed")
+                .generation_floor,
+            4
+        );
     }
 
     #[test]

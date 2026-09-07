@@ -109,7 +109,7 @@ fn wait_for_session_status(session: &CodeSession, expected: &str, timeout: Durat
 #[cfg(feature = "test-provider")]
 #[test]
 #[ignore = "perf smoke; run with LIBRA_RUN_PERF=1"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn perf_threads_endpoint_handles_10_concurrent_readers_within_2s() -> Result<()> {
     if !perf_mode_enabled() {
         // The `#[ignore]` already skips by default, but check
@@ -186,7 +186,7 @@ fn perf_threads_endpoint_handles_10_concurrent_readers_within_2s() -> Result<()>
 #[cfg(feature = "test-provider")]
 #[test]
 #[ignore = "perf smoke; run with LIBRA_RUN_PERF=1"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn perf_session_snapshot_serialises_100k_entry_transcript_under_200ms() -> Result<()> {
     use chrono::Utc;
     use libra::internal::ai::web::code_ui::{
@@ -299,7 +299,7 @@ fn perf_session_snapshot_serialises_100k_entry_transcript_under_200ms() -> Resul
 #[cfg(feature = "test-provider")]
 #[test]
 #[ignore = "perf smoke; run with LIBRA_RUN_PERF=1"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn perf_sse_broadcast_delivers_1k_events_in_monotonic_seq_order() -> Result<()> {
     use libra::internal::ai::web::code_ui::{
         CodeUiCapabilities, CodeUiEventType, CodeUiProviderInfo, CodeUiSession, initial_snapshot,
@@ -412,7 +412,7 @@ fn perf_sse_broadcast_delivers_1k_events_in_monotonic_seq_order() -> Result<()> 
 #[cfg(feature = "test-provider")]
 #[test]
 #[ignore = "HTTP/SSE soak; run with LIBRA_RUN_PERF=1"]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn perf_sse_http_stream_survives_configured_soak_duration() -> Result<()> {
     if !perf_mode_enabled() {
         bail!(
@@ -431,9 +431,9 @@ fn perf_sse_http_stream_survives_configured_soak_duration() -> Result<()> {
     let mut stream = session.open_event_stream()?;
     let deadline = Instant::now() + soak_duration;
     let mut next_heartbeat = Instant::now();
-    let mut last_seq: Option<u64> = None;
+    let mut last_cursor: Option<u64> = None;
     let mut observed_events = 0usize;
-    let mut observed_post_seed_events = 0usize;
+    let mut recovered_resyncs = 0usize;
     let mut submitted_turns = 0usize;
 
     while Instant::now() < deadline {
@@ -446,43 +446,70 @@ fn perf_sse_http_stream_survives_configured_soak_duration() -> Result<()> {
         }
 
         if let Some(event) = stream.next_event(Duration::from_secs(1))? {
-            let payload: serde_json::Value = serde_json::from_str(&event.data)
-                .with_context(|| format!("failed to parse SSE payload: {}", event.data))?;
-            let seq = payload
-                .get("seq")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| anyhow::anyhow!("SSE payload missing numeric seq: {payload}"))?;
-            if let Some(previous) = last_seq
-                && seq <= previous
-            {
+            if event.event == "resync" {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&event.data).with_context(|| {
+                        format!("failed to parse v2 resync payload: {}", event.data)
+                    })?;
+                if payload.get("code").and_then(serde_json::Value::as_str)
+                    != Some("WIRE_V2_RESYNC_REQUIRED")
+                {
+                    bail!("v2 SSE soak received invalid resync payload: {payload}");
+                }
+                let durable_tail = payload
+                    .get("durableTail")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("v2 resync payload missing durableTail: {payload}")
+                    })?;
+                let _snapshot = session.snapshot()?;
+                stream = session.open_event_stream_with_wire(2, Some(durable_tail))?;
+                last_cursor = Some(durable_tail);
+                recovered_resyncs += 1;
+                continue;
+            }
+            if event.event != "code_workflow" {
                 bail!(
-                    "SSE seq regressed or repeated during soak: previous={previous}, current={}",
-                    seq,
+                    "v2 SSE soak received fatal event '{}': {}",
+                    event.event,
+                    event.data
                 );
             }
-            if let Some(previous) = last_seq
-                && previous != 0
-                && seq != previous + 1
+            let payload: serde_json::Value = serde_json::from_str(&event.data)
+                .with_context(|| format!("failed to parse SSE payload: {}", event.data))?;
+            let cursor = payload
+                .get("cursor")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("v2 SSE payload missing numeric cursor: {payload}")
+                })?;
+            if let Some(previous) = last_cursor
+                && cursor <= previous
             {
                 bail!(
-                    "SSE seq gap during soak: previous={previous}, current={seq}; expected {}",
+                    "v2 SSE cursor regressed or repeated during soak: previous={previous}, current={cursor}",
+                );
+            }
+            if let Some(previous) = last_cursor
+                && previous != 0
+                && cursor != previous + 1
+            {
+                bail!(
+                    "v2 SSE cursor gap during soak: previous={previous}, current={cursor}; expected {}",
                     previous + 1,
                 );
             }
-            last_seq = Some(seq);
+            last_cursor = Some(cursor);
             observed_events += 1;
-            if seq > 0 {
-                observed_post_seed_events += 1;
-            }
         }
     }
 
     if submitted_turns == 0 {
         bail!("SSE soak submitted no heartbeat turns; duration={soak_duration:?}");
     }
-    if observed_events == 0 || observed_post_seed_events == 0 {
+    if observed_events == 0 {
         bail!(
-            "SSE soak observed no post-seed events after {submitted_turns} submitted turns; total_events={observed_events}",
+            "v2 SSE soak observed no workflow events after {submitted_turns} submitted turns; recovered_resyncs={recovered_resyncs}",
         );
     }
 

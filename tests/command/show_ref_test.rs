@@ -49,7 +49,7 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) -> ChangeDirGuard {
 
 /// show-ref on an "empty" repo (initialized but no user commits) should list the AI branch.
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_show_ref_empty_repo() {
     let temp = tempdir().unwrap();
     test::setup_with_new_libra_in(temp.path()).await;
@@ -70,7 +70,7 @@ async fn test_show_ref_empty_repo() {
 
 /// show-ref should list refs/heads/<branch> after a commit.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_lists_branch() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -96,7 +96,7 @@ async fn test_show_ref_lists_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_json_lists_refs() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -123,7 +123,7 @@ async fn test_show_ref_json_lists_refs() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_verify_exact_ref_outputs_matching_ref() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -140,7 +140,7 @@ async fn test_show_ref_verify_exact_ref_outputs_matching_ref() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_verify_head_accepts_head_refname() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -157,7 +157,7 @@ async fn test_show_ref_verify_head_accepts_head_refname() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_verify_short_name_is_not_exact_ref() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -174,7 +174,7 @@ async fn test_show_ref_verify_short_name_is_not_exact_ref() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_exists_success_is_silent_in_human_mode() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -188,7 +188,7 @@ async fn test_show_ref_exists_success_is_silent_in_human_mode() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_exists_missing_ref_uses_git_exit_code_two() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -205,7 +205,7 @@ async fn test_show_ref_exists_missing_ref_uses_git_exit_code_two() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_exists_json_reports_checked_ref() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -223,7 +223,7 @@ async fn test_show_ref_exists_json_reports_checked_ref() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_lists_remote_tracking_refs() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -254,7 +254,7 @@ async fn test_show_ref_lists_remote_tracking_refs() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_json_lists_remote_tracking_refs() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -282,7 +282,7 @@ async fn test_show_ref_json_lists_remote_tracking_refs() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_surfaces_corrupt_branch_storage() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -316,7 +316,7 @@ async fn test_show_ref_surfaces_corrupt_branch_storage() {
 
 /// show-ref --tags should list tags after creating one.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_lists_tag() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -341,7 +341,7 @@ async fn test_show_ref_lists_tag() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_surfaces_corrupt_tag_storage() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -375,7 +375,7 @@ async fn test_show_ref_surfaces_corrupt_tag_storage() {
 
 /// show-ref --head should include HEAD.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_includes_head() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -404,7 +404,7 @@ async fn test_show_ref_includes_head() {
 
 /// show-ref --hash should output only hashes (no ref names).
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_hash_only() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -432,7 +432,7 @@ async fn test_show_ref_hash_only() {
 
 /// show-ref with a non-matching pattern should error.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_pattern_no_match() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -455,7 +455,7 @@ async fn test_show_ref_pattern_no_match() {
 
 /// show-ref with a matching pattern should filter results.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_pattern_match() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -487,7 +487,7 @@ async fn test_show_ref_pattern_match() {
 
 /// show-ref default (no flags) should show both branches and tags.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_default_shows_both() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;
@@ -512,7 +512,7 @@ async fn test_show_ref_default_shows_both() {
 
 /// show-ref --head with a non-HEAD pattern should still include HEAD.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_show_ref_head_exempt_from_pattern_filter() {
     let temp = tempdir().unwrap();
     let _guard = setup_repo_with_commit(&temp).await;

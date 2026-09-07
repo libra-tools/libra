@@ -37,7 +37,7 @@ fn run_lease_case(case_name: &str) -> Result<()> {
 macro_rules! lease_case {
     ($name:ident) => {
         #[test]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_lease_case(stringify!($name))
         }

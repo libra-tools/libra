@@ -36,7 +36,7 @@ use tempfile::tempdir;
 use super::*;
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn memory_branch_is_hidden_and_locked_across_user_mutation_commands() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -130,7 +130,7 @@ fn test_branch_json_create_output_reports_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_create_records_operation_log() {
     let repo = create_committed_repo_via_cli();
 
@@ -176,7 +176,7 @@ async fn test_branch_create_records_operation_log() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_create_mints_missing_repo_id_before_operation_log() {
     let repo = create_committed_repo_via_cli();
 
@@ -233,7 +233,7 @@ fn test_branch_create_outputs_confirmation() {
 /// plus the remote ref. Regression guard against treating "unborn" as
 /// "no branches".
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_all_shows_unborn_head_even_with_remote_refs() {
     let repo = tempdir().unwrap();
     test::setup_with_new_libra_in(repo.path()).await;
@@ -542,7 +542,7 @@ fn test_branch_set_upstream_help_is_readable() {
 ///    inherit the current HEAD hash.
 /// Also exercises `--show-current` (output not asserted, just non-panic).
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -720,7 +720,7 @@ async fn test_branch() {
 /// remote-tracking ref). Verifies the resulting branch points to the
 /// same hash that the remote ref recorded.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_create_branch_from_remote() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -790,7 +790,7 @@ async fn test_create_branch_from_remote() {
 /// form covered by the previous test). Confirms ref resolution accepts
 /// both spellings.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_create_branch_from_remote_tracking_ref() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -860,7 +860,7 @@ async fn test_create_branch_from_remote_tracking_ref() {
 /// inner block uses a guard so the corruption is applied with the test
 /// CWD set to the repo before reverting.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_create_without_base_surfaces_corrupt_head_storage() {
     let repo = create_committed_repo_via_cli();
     {
@@ -890,7 +890,7 @@ async fn test_branch_create_without_base_surfaces_corrupt_head_storage() {
 /// with the corrupt-HEAD message rather than crash or report a misleading
 /// "branch not merged" error.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_delete_safe_surfaces_corrupt_head_storage() {
     let repo = create_committed_repo_via_cli();
     let create = run_libra_command(&["branch", "topic"], repo.path());
@@ -922,7 +922,7 @@ async fn test_branch_delete_safe_surfaces_corrupt_head_storage() {
 /// `branch --show-current`. The display-only path must NOT silently
 /// succeed when HEAD storage is broken; it must surface `LBR-REPO-002`.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_show_current_surfaces_corrupt_head_storage() {
     let repo = create_committed_repo_via_cli();
     {
@@ -952,7 +952,7 @@ async fn test_branch_show_current_surfaces_corrupt_head_storage() {
 /// "stored branch reference 'broken-topic' is corrupt" message. Confirms
 /// listing validates every branch row, not only HEAD.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_list_surfaces_corrupt_reference_name() {
     let repo = create_committed_repo_via_cli();
     {
@@ -977,7 +977,7 @@ async fn test_branch_list_surfaces_corrupt_reference_name() {
 /// (e.g. `@{mega}`) must not be created. Asserts both the validator's
 /// return value and the post-condition that the branch does not exist.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_invalid_branch_name() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1014,7 +1014,7 @@ async fn test_invalid_branch_name() {
 /// the old name no longer resolves and the new name carries the same
 /// commit hash.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_rename() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1130,7 +1130,7 @@ async fn test_branch_rename() {
 /// which renames *the current* branch. Pins the HEAD-follows-rename
 /// invariant.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rename_current_branch() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1243,7 +1243,7 @@ async fn test_rename_current_branch() {
 /// exists must fail and leave both branches intact. Pins the
 /// "no overwrite without -M" guard.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rename_to_existing_branch() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1379,7 +1379,7 @@ async fn test_rename_to_existing_branch() {
 /// to stdout); the assertion is that both local (`feature_branch`) and
 /// remote (`origin/remote_branch`) refs resolve through `Branch::find_branch`.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_list_all_branches() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1501,7 +1501,7 @@ async fn test_list_all_branches() {
 /// Uses a fast-forward "merge" by directly updating `main` to the
 /// feature branch's commit. Pins the safe-delete merge gate.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_delete_safe() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1747,7 +1747,7 @@ async fn test_branch_delete_safe() {
 /// The `libra/intent` agent branch is filtered out before assertions to
 /// keep the expected sets clean.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_branch_contains_commit_filter() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -2056,7 +2056,7 @@ async fn test_branch_contains_commit_filter() {
 /// outer call must surface that error with a "failed to load commit"
 /// message. Regression guard for silent-skip bugs.
 #[test]
-#[serial]
+#[serial(cwd)]
 fn test_filter_branches_propagates_error_for_corrupt_commit() {
     use std::str::FromStr;
 

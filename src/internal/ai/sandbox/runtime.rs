@@ -419,6 +419,16 @@ fn configure_new_session(command: &mut Command) {
 #[cfg(not(unix))]
 fn configure_new_session(_command: &mut Command) {}
 
+/// Extra writable bind for export-style FD-pinned mounts (`source` may
+/// differ from `destination`, e.g. `/proc/self/fd/N` → store).
+/// The caller retains any `OwnedFd`; this type is paths only so
+/// [`ExecEnv`] can stay `Clone`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritableBind {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+}
+
 pub struct SandboxTransformRequest<'a> {
     pub spec: CommandSpec,
     pub policy: Option<&'a SandboxPolicy>,
@@ -427,6 +437,17 @@ pub struct SandboxTransformRequest<'a> {
     pub use_linux_sandbox_bwrap: bool,
     pub enforcement: SandboxEnforcement,
     pub deny_read_paths: &'a [PathBuf],
+    /// Extra host paths to `--ro-bind` (HOME / XDG / binary parent).
+    /// Empty for AgentRuntime. Seatbelt ignores this (global file-read*).
+    pub extra_ro_bind_paths: &'a [PathBuf],
+    /// Extra writable binds; empty default. Bwrap emits `--bind src dest`;
+    /// seatbelt allows `file-write*` on each destination.
+    pub writable_binds: &'a [WritableBind],
+    /// Explicit trusted bwrap path. When `Some`, Linux transform consumes
+    /// this path only — no `LIBRA_BWRAP_BINARY` / PATH rediscovery and no
+    /// `linux_sandbox_exe` helper protocol. Missing or user-writable →
+    /// [`SandboxTransformError::EnforcementFailed`].
+    pub trusted_bwrap_exe: Option<&'a Path>,
     /// Optional seccomp BPF policy file path. When set on Linux
     /// and the built-in bwrap path is selected,
     /// [`create_bwrap_command_args_with_seccomp`] adds
@@ -528,6 +549,9 @@ impl SandboxManager {
             use_linux_sandbox_bwrap,
             enforcement,
             deny_read_paths,
+            extra_ro_bind_paths,
+            writable_binds,
+            trusted_bwrap_exe,
             seccomp_policy_path,
         } = request;
         let seccomp_policy_path_for_transform = seccomp_policy_path.map(|p| p.to_path_buf());
@@ -536,8 +560,14 @@ impl SandboxManager {
         let _ = use_linux_sandbox_bwrap;
         #[cfg(not(target_os = "linux"))]
         let _ = linux_sandbox_exe;
+        #[cfg(not(target_os = "linux"))]
+        let _ = trusted_bwrap_exe;
         #[cfg(not(target_os = "macos"))]
         let _ = deny_read_paths;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = extra_ro_bind_paths;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = writable_binds;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = sandbox_policy_cwd;
 
@@ -663,6 +693,8 @@ impl SandboxManager {
                         policy,
                         sandbox_policy_cwd,
                         deny_read_paths,
+                        extra_ro_bind_paths,
+                        writable_binds,
                     );
                     let mut full = Vec::with_capacity(1 + seatbelt_args.len());
                     full.push(MACOS_PATH_TO_SEATBELT_EXECUTABLE.to_string());
@@ -678,7 +710,39 @@ impl SandboxManager {
                 #[cfg(target_os = "linux")]
                 {
                     let policy = policy.ok_or(SandboxTransformError::UnsupportedPlatform)?;
-                    if let Some(linux_sandbox_exe) = linux_sandbox_exe {
+                    if let Some(trusted) = trusted_bwrap_exe {
+                        let bwrap_path = validate_injected_trusted_bwrap(trusted)?;
+                        let seccomp_fd = if seccomp_policy_path_for_transform.is_some() {
+                            Some(SECCOMP_POLICY_FD)
+                        } else {
+                            None
+                        };
+                        let mut bwrap_args = create_bwrap_command_args_with_seccomp(
+                            command,
+                            network_access_mode,
+                            policy,
+                            sandbox_policy_cwd,
+                            deny_read_paths,
+                            extra_ro_bind_paths,
+                            writable_binds,
+                            seccomp_fd,
+                        );
+                        protected_mount_cleanup_paths =
+                            protected_mount_cleanup_paths_from_bwrap_args(&bwrap_args);
+                        let mut full = Vec::with_capacity(1 + bwrap_args.len());
+                        full.push(bwrap_path.to_string_lossy().into_owned());
+                        full.append(&mut bwrap_args);
+                        tracing::info!(
+                            bwrap = %bwrap_path.display(),
+                            seccomp = ?seccomp_policy_path_for_transform.as_deref(),
+                            "using injected trusted_bwrap_exe (no PATH / LIBRA_BWRAP_BINARY rediscovery)",
+                        );
+                        (
+                            full,
+                            Some("libra-linux-sandbox-bwrap".to_string()),
+                            SandboxType::LinuxSeccomp,
+                        )
+                    } else if let Some(linux_sandbox_exe) = linux_sandbox_exe {
                         let mut sandbox_args = create_linux_sandbox_command_args(
                             command,
                             policy,
@@ -717,6 +781,8 @@ impl SandboxManager {
                             policy,
                             sandbox_policy_cwd,
                             deny_read_paths,
+                            extra_ro_bind_paths,
+                            writable_binds,
                             seccomp_fd,
                         );
                         protected_mount_cleanup_paths =
@@ -897,6 +963,8 @@ pub fn create_bwrap_command_args(
         sandbox_policy,
         sandbox_policy_cwd,
         deny_read_paths,
+        &[],
+        &[],
         None,
     )
 }
@@ -907,12 +975,15 @@ pub fn create_bwrap_command_args(
 /// the inherited file descriptor. The caller is responsible for
 /// keeping the FD open across exec — see
 /// [`install_seccomp_policy_pre_exec`].
+#[allow(clippy::too_many_arguments)] // extra_ro_bind + writable_binds are the SBX-02 export seam
 pub fn create_bwrap_command_args_with_seccomp(
     command: Vec<String>,
     network_access_mode: NetworkAccessMode,
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     deny_read_paths: &[PathBuf],
+    extra_ro_bind_paths: &[PathBuf],
+    writable_binds: &[WritableBind],
     seccomp_fd: Option<i32>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -957,6 +1028,15 @@ pub fn create_bwrap_command_args_with_seccomp(
                 push_bwrap_read_only_subpath(&mut args, &read_only_subpath);
             }
         }
+    }
+
+    for path in extra_ro_bind_paths {
+        push_bwrap_mount(&mut args, "--ro-bind", path);
+    }
+    for bind in writable_binds {
+        args.push("--bind".to_string());
+        args.push(bind.source.to_string_lossy().into_owned());
+        args.push(bind.destination.to_string_lossy().into_owned());
     }
 
     for path in deny_read_paths {
@@ -1022,6 +1102,92 @@ fn protected_mount_cleanup_paths_from_bwrap_args(args: &[String]) -> Vec<PathBuf
         })
         .map(|window| PathBuf::from(&window[1]))
         .collect()
+}
+
+/// Validate an explicitly injected `trusted_bwrap_exe`: must resolve to a
+/// regular file whose path components are not writable by the current user.
+/// Does **not** consult `LIBRA_BWRAP_BINARY` or `PATH`.
+#[cfg(target_os = "linux")]
+fn validate_injected_trusted_bwrap(path: &Path) -> Result<PathBuf, SandboxTransformError> {
+    let canonical =
+        std::fs::canonicalize(path).map_err(|err| SandboxTransformError::EnforcementFailed {
+            reason: format!(
+                "trusted_bwrap_exe {} cannot be resolved: {err}",
+                path.display()
+            ),
+        })?;
+    let mut component: Option<&Path> = Some(canonical.as_path());
+    while let Some(current) = component {
+        let meta =
+            std::fs::metadata(current).map_err(|err| SandboxTransformError::EnforcementFailed {
+                reason: format!("trusted_bwrap_exe cannot stat {}: {err}", current.display()),
+            })?;
+        if current == canonical.as_path() && !meta.is_file() {
+            return Err(SandboxTransformError::EnforcementFailed {
+                reason: format!(
+                    "trusted_bwrap_exe {} is not a regular file",
+                    canonical.display()
+                ),
+            });
+        }
+        if injected_bwrap_modifiable_by_current_user(&meta)
+            || injected_bwrap_path_writable_effective(current)
+        {
+            return Err(SandboxTransformError::EnforcementFailed {
+                reason: format!(
+                    "trusted_bwrap_exe path component {} is writable by the current user; refusing (fail-closed)",
+                    current.display()
+                ),
+            });
+        }
+        component = current.parent();
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn injected_bwrap_modifiable_by_current_user(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode();
+    if mode & 0o022 != 0 {
+        return true;
+    }
+    // SAFETY: geteuid is always successful.
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        return meta.uid() != 0 && mode & 0o200 != 0;
+    }
+    meta.uid() == euid && mode & 0o200 != 0
+}
+
+/// POSIX ACL / LSM-aware writability: `faccessat(AT_EACCESS, W_OK)` uses the
+/// effective credentials, so an ACL grant is not missed by mode-bit checks.
+/// Errors other than EACCES/EPERM/EROFS fail **closed** (treat as writable).
+#[cfg(target_os = "linux")]
+fn injected_bwrap_path_writable_effective(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    loop {
+        // SAFETY: `c_path` is a valid C string; AT_EACCESS consults euid.
+        let rc = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                libc::W_OK,
+                libc::AT_EACCESS,
+            )
+        };
+        if rc == 0 {
+            return true;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EACCES | libc::EPERM | libc::EROFS) => return false,
+            _ => return true,
+        }
+    }
 }
 
 /// Locate `bwrap` on the host PATH and return the resolved
@@ -1121,12 +1287,22 @@ fn create_seatbelt_command_args(
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     deny_read_paths: &[PathBuf],
+    extra_ro_bind_paths: &[PathBuf],
+    writable_binds: &[WritableBind],
 ) -> Vec<String> {
     const SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
     const SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
 
+    // Extra ro-bind paths are an intent record only: seatbelt already
+    // allows global file-read*. Do not emit additional read segments.
+    let _ = extra_ro_bind_paths;
+
+    let extra_write_dests: Vec<PathBuf> = writable_binds
+        .iter()
+        .map(|bind| bind.destination.clone())
+        .collect();
     let (file_write_policy, file_write_params) =
-        build_macos_file_write_policy(sandbox_policy, sandbox_policy_cwd);
+        build_macos_file_write_policy(sandbox_policy, sandbox_policy_cwd, &extra_write_dests);
     let file_read_policy = "; allow read-only file operations\n(allow file-read*)";
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let (sensitive_read_policy, sensitive_read_params) =
@@ -1187,6 +1363,7 @@ fn build_macos_sensitive_read_policy(
 fn build_macos_file_write_policy(
     policy: &SandboxPolicy,
     cwd: &Path,
+    extra_write_dests: &[PathBuf],
 ) -> (String, Vec<(String, PathBuf)>) {
     if policy.has_full_disk_write_access() {
         return (
@@ -1228,16 +1405,30 @@ fn build_macos_file_write_policy(
         writable_folder_policies.push(format!("(require-all {} )", require_parts.join(" ")));
     }
 
+    let mut ioctl_folder_policies = Vec::new();
+    for (bind_index, dest) in extra_write_dests.iter().enumerate() {
+        let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+        let dest_param = format!("WRITABLE_BIND_{bind_index}");
+        file_write_params.push((dest_param.clone(), canonical_dest));
+        let clause = format!("(subpath (param \"{dest_param}\"))");
+        writable_folder_policies.push(clause.clone());
+        // file-ioctl only on export writable-binds (SQLite F_FULLFSYNC),
+        // never on WorkspaceWrite roots which may include host /tmp.
+        ioctl_folder_policies.push(clause);
+    }
+
     if writable_folder_policies.is_empty() {
         ("".to_string(), file_write_params)
     } else {
-        (
-            format!(
-                "(allow file-write*\n{}\n)",
-                writable_folder_policies.join(" ")
-            ),
-            file_write_params,
-        )
+        let folders = writable_folder_policies.join(" ");
+        let mut policy = format!("(allow file-write*\n{folders}\n)");
+        if !ioctl_folder_policies.is_empty() {
+            policy.push_str(&format!(
+                "\n(allow file-ioctl\n{}\n)",
+                ioctl_folder_policies.join(" ")
+            ));
+        }
+        (policy, file_write_params)
     }
 }
 
@@ -1380,6 +1571,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::BestEffort,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -1419,6 +1613,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::Required,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -1455,6 +1652,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::Required,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -1495,6 +1695,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::Required,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -1528,6 +1731,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::BestEffort,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -1567,6 +1773,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::Required,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -1833,6 +2042,8 @@ mod tests {
             &policy,
             cwd,
             &[],
+            &[],
+            &[],
             Some(SECCOMP_POLICY_FD),
         );
         let seccomp_idx = with_seccomp
@@ -1857,6 +2068,8 @@ mod tests {
             network_access_mode_for_policy(&policy),
             &policy,
             cwd,
+            &[],
+            &[],
             &[],
             None,
         );
@@ -1912,6 +2125,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::Required,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: Some(policy_file.as_path()),
         };
 
@@ -2075,6 +2291,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::Required,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -2180,6 +2399,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::BestEffort,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -2218,6 +2440,9 @@ mod tests {
             use_linux_sandbox_bwrap: false,
             enforcement: SandboxEnforcement::Required,
             deny_read_paths: &[],
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path: None,
         };
 
@@ -2532,6 +2757,581 @@ mod tests {
         assert!(
             SEATBELT_BASE_POLICY.contains("(iokit-user-client-class \"IOTTYClient\")"),
             "Seatbelt policy must deny IOTTYClient terminal user clients"
+        );
+    }
+
+    fn seam_readonly_request<'a>(
+        policy: &'a SandboxPolicy,
+        cwd: &'a Path,
+        extra: &'a [PathBuf],
+        binds: &'a [WritableBind],
+        trusted: Option<&'a Path>,
+    ) -> SandboxTransformRequest<'a> {
+        SandboxTransformRequest {
+            spec: CommandSpec::shell(
+                "echo ok",
+                cwd.to_path_buf(),
+                Some(1_000),
+                SandboxPermissions::UseDefault,
+                None,
+            ),
+            policy: Some(policy),
+            sandbox_policy_cwd: cwd,
+            linux_sandbox_exe: None,
+            use_linux_sandbox_bwrap: false,
+            enforcement: SandboxEnforcement::Required,
+            deny_read_paths: &[],
+            extra_ro_bind_paths: extra,
+            writable_binds: binds,
+            trusted_bwrap_exe: trusted,
+            seccomp_policy_path: None,
+        }
+    }
+
+    fn bwrap_bind_index(args: &[String], source: &str, dest: &str) -> Option<usize> {
+        args.windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == source && w[2] == dest)
+    }
+
+    fn bwrap_ro_bind_index(args: &[String], path: &str) -> Option<usize> {
+        args.windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == path && w[2] == path)
+    }
+
+    #[test]
+    fn seam_builders_empty_set_byte_identical() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let policy = SandboxPolicy::ReadOnly;
+        let cmd = vec!["echo".to_string(), "ok".to_string()];
+        let via_wrapper = create_bwrap_command_args(
+            cmd.clone(),
+            NetworkAccessMode::Denied,
+            &policy,
+            cwd.path(),
+            &[],
+        );
+        let via_extended = create_bwrap_command_args_with_seccomp(
+            cmd,
+            NetworkAccessMode::Denied,
+            &policy,
+            cwd.path(),
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(
+            via_wrapper, via_extended,
+            "empty extra_ro_bind/writable_binds must be a no-op on the bwrap builder"
+        );
+
+        let manager = SandboxManager::new();
+        #[cfg(target_os = "linux")]
+        let trusted = PathBuf::from("/usr/bin/true");
+        #[cfg(target_os = "linux")]
+        let trusted_ref = Some(trusted.as_path());
+        #[cfg(not(target_os = "linux"))]
+        let trusted_ref = None;
+        let env_a = manager
+            .transform(seam_readonly_request(
+                &policy,
+                cwd.path(),
+                &[],
+                &[],
+                trusted_ref,
+            ))
+            .expect("empty-set transform a");
+        let env_b = manager
+            .transform(seam_readonly_request(
+                &policy,
+                cwd.path(),
+                &[],
+                &[],
+                trusted_ref,
+            ))
+            .expect("empty-set transform b");
+        assert_eq!(env_a.command, env_b.command);
+    }
+
+    #[test]
+    fn seam_extra_ro_bind_generated() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let extra_dir = cwd.path().join("home");
+        std::fs::create_dir(&extra_dir).unwrap();
+        let extra_s = extra_dir.to_string_lossy().into_owned();
+        let extra = [extra_dir.clone()];
+        let args = create_bwrap_command_args_with_seccomp(
+            vec!["echo".into(), "ok".into()],
+            NetworkAccessMode::Denied,
+            &SandboxPolicy::ReadOnly,
+            cwd.path(),
+            &[],
+            &extra,
+            &[],
+            None,
+        );
+        assert!(
+            bwrap_ro_bind_index(&args, &extra_s).is_some(),
+            "expected --ro-bind {extra_s} {extra_s} in {args:?}"
+        );
+    }
+
+    #[test]
+    fn seam_seatbelt_read_unchanged() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let policy = SandboxPolicy::ReadOnly;
+        let extra_dir = cwd.path().join("home");
+        std::fs::create_dir(&extra_dir).unwrap();
+        let extra = [extra_dir];
+        let manager = SandboxManager::new();
+        #[cfg(target_os = "linux")]
+        let trusted = PathBuf::from("/usr/bin/true");
+        #[cfg(target_os = "linux")]
+        let trusted_ref = Some(trusted.as_path());
+        #[cfg(not(target_os = "linux"))]
+        let trusted_ref = None;
+        let empty = manager
+            .transform(seam_readonly_request(
+                &policy,
+                cwd.path(),
+                &[],
+                &[],
+                trusted_ref,
+            ))
+            .expect("empty extra");
+        let with_extra = manager
+            .transform(seam_readonly_request(
+                &policy,
+                cwd.path(),
+                &extra,
+                &[],
+                trusted_ref,
+            ))
+            .expect("extra ro-bind");
+        let count = |cmd: &[String]| {
+            cmd.iter()
+                .filter(|arg| arg.contains("(allow file-read*)"))
+                .count()
+        };
+        assert_eq!(
+            count(&empty.command),
+            count(&with_extra.command),
+            "extra_ro_bind_paths must not add seatbelt read segments"
+        );
+    }
+
+    #[test]
+    fn seam_mount_order_invariant() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let home = cwd.path().join("home");
+        let xdg = cwd.path().join("xdg");
+        let store = cwd.path().join("store");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&xdg).unwrap();
+        std::fs::create_dir(&store).unwrap();
+        let home_s = home.to_string_lossy().into_owned();
+        let xdg_s = xdg.to_string_lossy().into_owned();
+        let store_s = store.to_string_lossy().into_owned();
+        let extra = [home.clone(), xdg.clone()];
+        let binds = [WritableBind {
+            source: PathBuf::from("/proc/self/fd/7"),
+            destination: store.clone(),
+        }];
+        let args = create_bwrap_command_args_with_seccomp(
+            vec!["echo".into(), "ok".into()],
+            NetworkAccessMode::Denied,
+            &SandboxPolicy::ReadOnly,
+            cwd.path(),
+            &[],
+            &extra,
+            &binds,
+            None,
+        );
+        let home_i = bwrap_ro_bind_index(&args, &home_s).expect("HOME ro-bind");
+        let xdg_i = bwrap_ro_bind_index(&args, &xdg_s).expect("XDG ro-bind");
+        let store_i = bwrap_bind_index(&args, "/proc/self/fd/7", &store_s).expect("store bind");
+        assert!(
+            home_i < store_i && xdg_i < store_i,
+            "HOME/XDG ro-bind must precede store writable-bind; home={home_i} xdg={xdg_i} store={store_i} args={args:?}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "linux", serial_test::serial(sandbox_env))]
+    fn seam_trusted_bwrap_field_consumed() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let policy = SandboxPolicy::ReadOnly;
+        let manager = SandboxManager::new();
+        let sentinel = cwd.path().join("sentinel-bwrap");
+        std::fs::write(&sentinel, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&sentinel).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&sentinel, perms).unwrap();
+            let _guard = EnvVarGuard::set(
+                "LIBRA_BWRAP_BINARY",
+                sentinel.to_str().expect("utf8 sentinel"),
+            );
+            let trusted = PathBuf::from("/usr/bin/true");
+            let env = manager
+                .transform(seam_readonly_request(
+                    &policy,
+                    cwd.path(),
+                    &[],
+                    &[],
+                    Some(trusted.as_path()),
+                ))
+                .expect("injected trusted_bwrap_exe");
+            let canonical = std::fs::canonicalize(&trusted).unwrap();
+            assert_eq!(
+                env.command.first().map(String::as_str),
+                Some(canonical.to_string_lossy().as_ref()),
+                "transform must exec trusted_bwrap_exe, not LIBRA_BWRAP_BINARY/PATH"
+            );
+            assert!(
+                !env.command.iter().any(|a| a.contains("sentinel-bwrap")),
+                "LIBRA_BWRAP_BINARY sentinel must not appear when trusted_bwrap_exe is set"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = sentinel;
+            let env_none = manager
+                .transform(seam_readonly_request(&policy, cwd.path(), &[], &[], None))
+                .expect("macos seatbelt");
+            let env_some = manager
+                .transform(seam_readonly_request(
+                    &policy,
+                    cwd.path(),
+                    &[],
+                    &[],
+                    Some(Path::new("/usr/bin/true")),
+                ))
+                .expect("trusted_bwrap_exe ignored on seatbelt");
+            assert_eq!(
+                env_none.command, env_some.command,
+                "trusted_bwrap_exe must not change macOS seatbelt argv"
+            );
+            assert_eq!(
+                env_none.command.first().map(String::as_str),
+                Some("/usr/bin/sandbox-exec")
+            );
+        }
+    }
+
+    #[test]
+    fn seam_write_bind_tuple_source_dest() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let dest = cwd.path().join("store");
+        std::fs::create_dir(&dest).unwrap();
+        let dest_s = dest.to_string_lossy().into_owned();
+        let binds = [WritableBind {
+            source: PathBuf::from("/proc/self/fd/9"),
+            destination: dest,
+        }];
+        let args = create_bwrap_command_args_with_seccomp(
+            vec!["echo".into(), "ok".into()],
+            NetworkAccessMode::Denied,
+            &SandboxPolicy::ReadOnly,
+            cwd.path(),
+            &[],
+            &[],
+            &binds,
+            None,
+        );
+        assert!(
+            bwrap_bind_index(&args, "/proc/self/fd/9", &dest_s).is_some(),
+            "expected --bind /proc/self/fd/9 {dest_s} in {args:?}"
+        );
+        let bind_count = args.windows(3).filter(|w| w[0] == "--bind").count();
+        assert_eq!(
+            bind_count, 1,
+            "ReadOnly + one writable-bind must emit exactly one --bind"
+        );
+    }
+
+    #[test]
+    fn seam_write_bind_set_exact() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        #[cfg(target_os = "macos")]
+        let policy = SandboxPolicy::ReadOnly;
+        let store = cwd.path().join("opencode-store");
+        std::fs::create_dir(&store).unwrap();
+        let store_s = store.to_string_lossy().into_owned();
+        let binds = [WritableBind {
+            source: PathBuf::from("/proc/self/fd/3"),
+            destination: store.clone(),
+        }];
+        let args = create_bwrap_command_args_with_seccomp(
+            vec!["echo".into(), "ok".into()],
+            NetworkAccessMode::Denied,
+            &SandboxPolicy::ReadOnly,
+            cwd.path(),
+            &[],
+            &[],
+            &binds,
+            None,
+        );
+        let binds_found: Vec<_> = args
+            .windows(3)
+            .filter(|w| w[0] == "--bind")
+            .map(|w| (w[1].clone(), w[2].clone()))
+            .collect();
+        assert_eq!(
+            binds_found,
+            vec![("/proc/self/fd/3".to_string(), store_s.clone())],
+            "writable-bind set must be exactly {{store}}, no default /tmp"
+        );
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && (w[1] == "/tmp" || w[2] == "/tmp")),
+            "/tmp must not be a writable bind under ReadOnly+exact store"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let manager = SandboxManager::new();
+            let env = manager
+                .transform(seam_readonly_request(
+                    &policy,
+                    cwd.path(),
+                    &[],
+                    &binds,
+                    None,
+                ))
+                .expect("seatbelt transform");
+            let joined = env.command.join("\n");
+            assert!(
+                joined.contains("(allow file-write*"),
+                "seatbelt must emit a write allow for the store"
+            );
+            assert!(
+                env.command.iter().any(|a| a.contains("WRITABLE_BIND_0=")),
+                "seatbelt write param for store bind missing in {:?}",
+                env.command
+            );
+            assert!(
+                !joined.contains("network-outbound"),
+                "Denied network must keep the seatbelt network segment empty"
+            );
+        }
+    }
+
+    #[test]
+    fn seam_seatbelt_store_write_segment() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        #[cfg(target_os = "macos")]
+        let policy = SandboxPolicy::ReadOnly;
+        let store = cwd.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let binds = [WritableBind {
+            source: PathBuf::from("/proc/self/fd/4"),
+            destination: store.clone(),
+        }];
+        #[cfg(target_os = "macos")]
+        {
+            let manager = SandboxManager::new();
+            let env = manager
+                .transform(seam_readonly_request(
+                    &policy,
+                    cwd.path(),
+                    &[],
+                    &binds,
+                    None,
+                ))
+                .expect("seatbelt");
+            let profile = env
+                .command
+                .windows(2)
+                .find(|w| w[0] == "-p")
+                .map(|w| w[1].as_str())
+                .unwrap_or("");
+            assert!(
+                profile.contains("(allow file-write*"),
+                "missing file-write* allow: {profile}"
+            );
+            assert!(
+                profile.contains("(subpath (param \"WRITABLE_BIND_0\"))"),
+                "missing store write subpath: {profile}"
+            );
+            // The newline anchor selects the generated bind-scoped section;
+            // the base policy's single-line tty ioctl clauses must not
+            // satisfy this (they would make the check vacuous).
+            let ioctl = profile
+                .split("(allow file-ioctl\n")
+                .nth(1)
+                .expect("generated ioctl section must exist for the store bind")
+                .split("\n)")
+                .next()
+                .expect("generated ioctl section must close");
+            assert!(
+                !ioctl.contains("WRITABLE_ROOT_"),
+                "file-ioctl must not cover WorkspaceWrite roots: {profile}"
+            );
+            assert!(
+                ioctl.contains("WRITABLE_BIND_0"),
+                "file-ioctl must name the writable-bind: {profile}"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let args = create_bwrap_command_args_with_seccomp(
+                vec!["echo".into(), "ok".into()],
+                NetworkAccessMode::Denied,
+                &SandboxPolicy::ReadOnly,
+                cwd.path(),
+                &[],
+                &[],
+                &binds,
+                None,
+            );
+            let dest = store.to_string_lossy().into_owned();
+            assert!(
+                bwrap_bind_index(&args, "/proc/self/fd/4", &dest).is_some(),
+                "linux stand-in for seatbelt store write: --bind src dest in {args:?}"
+            );
+        }
+    }
+
+    /// FIX-SBX-01 R2: with a real WorkspaceWrite root in play, file-ioctl
+    /// must cover exactly the writable-binds and never the workspace roots —
+    /// and with no binds at all the ioctl section must not exist, so the
+    /// AgentRuntime WorkspaceWrite seatbelt profile stays byte-identical.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seam_seatbelt_ioctl_scoped_to_binds_only() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let root = cwd.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let store = cwd.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![root],
+            network_access: NetworkAccess::Denied,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+            allow_metadata_writes: false,
+        };
+        let manager = SandboxManager::new();
+        let profile_for = |binds: &[WritableBind]| -> String {
+            let env = manager
+                .transform(seam_readonly_request(&policy, cwd.path(), &[], binds, None))
+                .expect("seatbelt transform");
+            env.command
+                .windows(2)
+                .find(|w| w[0] == "-p")
+                .map(|w| w[1].clone())
+                .unwrap_or_default()
+        };
+
+        let binds = [WritableBind {
+            source: PathBuf::from("/proc/self/fd/4"),
+            destination: store,
+        }];
+        let with_bind = profile_for(&binds);
+        assert!(
+            with_bind.contains("WRITABLE_ROOT_0"),
+            "workspace root param must be present (non-vacuous fixture): {with_bind}"
+        );
+        // "(allow file-ioctl\n" (with the newline) is the generated
+        // bind-scoped section; the base policy's tty clauses are single-line
+        // "(allow file-ioctl (…)" and must not satisfy these assertions.
+        let ioctl = with_bind
+            .split("(allow file-ioctl\n")
+            .nth(1)
+            .expect("generated ioctl section must exist when binds are present")
+            .split("\n)")
+            .next()
+            .expect("generated ioctl section must close");
+        assert!(
+            ioctl.contains("WRITABLE_BIND_0"),
+            "file-ioctl must name the writable-bind: {with_bind}"
+        );
+        assert!(
+            !ioctl.contains("WRITABLE_ROOT_"),
+            "file-ioctl must not cover WorkspaceWrite roots: {with_bind}"
+        );
+
+        let without_bind = profile_for(&[]);
+        assert!(
+            without_bind.contains("WRITABLE_ROOT_0"),
+            "workspace root param must survive without binds: {without_bind}"
+        );
+        assert!(
+            !without_bind.contains("(allow file-ioctl\n"),
+            "no binds must mean no generated ioctl section (WorkspaceWrite \
+             profile byte-unchanged): {without_bind}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(sandbox_env)]
+    #[test]
+    fn seam_trusted_bwrap_rejects_user_writable() {
+        // The planted binary lives under a user-writable parent (tempdir).
+        // Walking ancestors is the replace-binary attack: even a 0755 leaf
+        // is untrusted if the caller can unlink/recreate it.
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let policy = SandboxPolicy::ReadOnly;
+        let fake = cwd.path().join("bwrap");
+        std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+        let manager = SandboxManager::new();
+        let err = manager
+            .transform(seam_readonly_request(
+                &policy,
+                cwd.path(),
+                &[],
+                &[],
+                Some(fake.as_path()),
+            ))
+            .expect_err("user-writable trusted_bwrap_exe must fail closed");
+        match err {
+            SandboxTransformError::EnforcementFailed { reason } => {
+                assert!(
+                    reason.contains("writable") || reason.contains("fail-closed"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected EnforcementFailed, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seam_trusted_bwrap_effective_access_uses_faccessat() {
+        // Named-user ACLs for the file owner are ignored (owner class uses
+        // owner bits). We cannot chown to another uid here, so the kernel
+        // `faccessat(AT_EACCESS, W_OK)` is pinned against known directories:
+        // world-writable `/tmp` must report writable; `/usr/bin` (0755 root)
+        // must not, unless this process is actually allowed to write it.
+        assert!(
+            injected_bwrap_path_writable_effective(Path::new("/tmp")),
+            "faccessat must report /tmp writable (covers ACL-aware W_OK)"
+        );
+        let usr_bin = Path::new("/usr/bin");
+        if usr_bin.is_dir() {
+            let euid = unsafe { libc::geteuid() };
+            if euid != 0 {
+                assert!(
+                    !injected_bwrap_path_writable_effective(usr_bin),
+                    "non-root must not have W_OK on /usr/bin"
+                );
+            }
+        }
+        assert!(
+            injected_bwrap_path_writable_effective(Path::new("/no/such/libra-sbx02-faccessat")),
+            "ENOENT and other probe errors must fail closed (treat writable)"
+        );
+        assert!(
+            injected_bwrap_path_writable_effective(Path::new("nul\0path")),
+            "interior NUL must fail closed"
         );
     }
 }

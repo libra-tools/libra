@@ -55,7 +55,7 @@ pub use proxy::{
 };
 pub use runtime::{
     CommandSpec, ExecEnv, SandboxManager, SandboxTransformError, SandboxTransformRequest,
-    SandboxType,
+    SandboxType, WritableBind,
 };
 
 /// Runtime sandbox configuration attached to a tool invocation.
@@ -1529,6 +1529,9 @@ fn build_command_from_spec(
             use_linux_sandbox_bwrap,
             enforcement,
             deny_read_paths: &deny_read_paths,
+            extra_ro_bind_paths: &[],
+            writable_binds: &[],
+            trusted_bwrap_exe: None,
             seccomp_policy_path,
         })
         .map_err(|err| {

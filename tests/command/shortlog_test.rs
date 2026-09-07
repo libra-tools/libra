@@ -38,7 +38,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serial_test::serial;
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_corrupt_head_reference_returns_repo_corrupt() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -131,7 +131,7 @@ fn test_shortlog_format_renders_custom_per_commit_line() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_revision_argument_limits_history() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -366,7 +366,7 @@ async fn create_test_commit_tree() -> String {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_basic() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -407,7 +407,7 @@ async fn test_shortlog_basic() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_numbered() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -446,7 +446,7 @@ async fn test_shortlog_numbered() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_summary() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -473,7 +473,7 @@ async fn test_shortlog_summary() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_email() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -512,7 +512,7 @@ async fn test_shortlog_email() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_combined_flags() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -587,7 +587,7 @@ async fn test_shortlog_combined_flags() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_date_filter() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -682,7 +682,7 @@ async fn test_shortlog_date_filter() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_committer_date_filter() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -726,7 +726,7 @@ async fn test_shortlog_committer_date_filter() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_no_merges_excludes_merge_commits() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -770,7 +770,7 @@ async fn test_shortlog_no_merges_excludes_merge_commits() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_committer_groups_by_committer_identity() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -825,7 +825,7 @@ async fn test_shortlog_committer_groups_by_committer_identity() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_shortlog_top_and_min_count_limit_output() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -853,7 +853,6 @@ async fn test_shortlog_top_and_min_count_limit_output() {
 }
 
 #[test]
-#[serial]
 fn group_trailer_groups_by_trailer_value() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -899,7 +898,6 @@ fn group_trailer_groups_by_trailer_value() {
 }
 
 #[test]
-#[serial]
 fn shortlog_wrap_wraps_long_subjects() {
     use std::fs;
 

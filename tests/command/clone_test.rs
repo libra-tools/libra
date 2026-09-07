@@ -168,7 +168,7 @@ fn setup_github_repo(token: &str, namespace: &str) -> GitHubTestRepo {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_branch() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -218,7 +218,7 @@ async fn test_clone_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_bare_repository() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -285,7 +285,7 @@ async fn test_clone_bare_repository() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_branch_single_branch() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -335,7 +335,7 @@ async fn test_clone_branch_single_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_default_branch() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -385,7 +385,7 @@ async fn test_clone_default_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_default_branch_single_branch() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -435,7 +435,7 @@ async fn test_clone_default_branch_single_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_to_existing_empty_dir() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -487,7 +487,7 @@ async fn test_clone_to_existing_empty_dir() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_to_existing_dir() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -540,7 +540,7 @@ async fn test_clone_to_existing_dir() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_to_dir_with_existing_file_name() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -593,7 +593,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_with_depth() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -643,7 +643,7 @@ async fn test_clone_with_depth() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_clone_with_depth_and_branch() {
     let repo = match github_test_repo_for_async_test().await {
         Some(r) => r,
@@ -736,7 +736,6 @@ fn clone_no_single_branch_countermands_single_branch() {
 }
 
 #[test]
-#[serial]
 fn no_checkout_skips_working_tree() {
     use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
 
@@ -783,7 +782,6 @@ fn no_checkout_skips_working_tree() {
 }
 
 #[test]
-#[serial]
 fn origin_flag_names_the_remote() {
     use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
 
@@ -887,7 +885,6 @@ fn origin_flag_names_the_remote() {
 /// effectively no-ops: Libra's clone of a local-path source already reads its
 /// objects directly. Cloning a local source succeeds with any of them.
 #[test]
-#[serial]
 fn test_clone_local_flag_accepted_for_local_source() {
     use super::run_libra_command;
 
@@ -954,7 +951,6 @@ fn test_clone_local_flag_accepted_for_local_source() {
 /// pure post-fetch `clone_should_reject_shallow_only_for_unrequested_shallowness`
 /// unit test covers the remaining remote-shallow decision.
 #[test]
-#[serial]
 fn test_clone_reject_shallow_rejects_local_libra_depth() {
     use super::run_libra_command;
 
@@ -1037,7 +1033,6 @@ fn test_clone_reject_shallow_rejects_local_libra_depth() {
 /// succeeds; `--reference`/`--shared` add an explanatory warning, while
 /// `--reference-if-able` (graceful) and `--dissociate` are silent.
 #[test]
-#[serial]
 fn test_clone_object_alternates_flags_are_noops() {
     use super::run_libra_command;
 
@@ -1136,7 +1131,6 @@ fn test_clone_object_alternates_flags_are_noops() {
 /// and records the `remote.origin.mirror=true` marker (but NOT an inert
 /// `+refs/*:refs/*` fetch refspec, which Libra's fetch would not honor).
 #[test]
-#[serial]
 fn test_clone_mirror_maps_all_refs_and_sets_config() {
     use super::run_libra_command;
 
@@ -1222,7 +1216,6 @@ fn test_clone_mirror_maps_all_refs_and_sets_config() {
 /// (Libra has no partial-clone/promisor support and its fetch only does `--depth`
 /// shallow), so a COMPLETE clone is performed and each given flag emits a warning.
 #[test]
-#[serial]
 fn test_clone_unsupported_fetch_optimizations_warn_and_full_clone() {
     use super::run_libra_command;
 
@@ -1305,7 +1298,6 @@ fn test_clone_unsupported_fetch_optimizations_warn_and_full_clone() {
 /// A Git clone reports the fetch transfer counts `objects_fetched` and
 /// `bytes_received` in its `--json` output (both > 0 for a non-empty source).
 #[test]
-#[serial]
 fn test_clone_json_reports_fetch_transfer_counts() {
     use super::run_libra_command;
 

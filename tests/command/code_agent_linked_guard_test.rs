@@ -48,7 +48,15 @@ fn repo_with_linked_worktree() -> (tempfile::TempDir, tempfile::TempDir) {
 fn code_linked_worktree_reaches_mode_validation() {
     let (repo, parent) = repo_with_linked_worktree();
     let wt = parent.path().join("wt");
-    let invalid_modes = ["code", "--port", "5000", "--mcp-port", "5000"];
+    let invalid_modes = [
+        "code",
+        "--provider",
+        "gemini",
+        "--port",
+        "5000",
+        "--mcp-port",
+        "5000",
+    ];
 
     let linked = run_libra_command(&invalid_modes, &wt);
     assert!(
@@ -87,6 +95,8 @@ fn code_cwd_into_linked_worktree_reaches_mode_validation() {
     let from_main = run_libra_command(
         &[
             "code",
+            "--provider",
+            "gemini",
             "--cwd",
             wt_str,
             "--port",
@@ -235,7 +245,15 @@ async fn linked_code_runtime_runs_via_resolver_after_enablement() {
     )
     .expect("repository hooks");
 
-    let invalid_modes = ["code", "--port", "5000", "--mcp-port", "5000"];
+    let invalid_modes = [
+        "code",
+        "--provider",
+        "gemini",
+        "--port",
+        "5000",
+        "--mcp-port",
+        "5000",
+    ];
     let linked_launch = run_libra_command(&invalid_modes, &wt);
     assert!(
         !linked_launch.status.success(),
@@ -438,7 +456,15 @@ fn v1_registry_linked_worktree_still_runs_after_w4() {
     let list = run_libra_command(&["automation", "list"], &wt);
     assert_cli_success(&list, "automation list on v1 registry linked worktree");
 
-    let invalid_modes = ["code", "--port", "5000", "--mcp-port", "5000"];
+    let invalid_modes = [
+        "code",
+        "--provider",
+        "gemini",
+        "--port",
+        "5000",
+        "--mcp-port",
+        "5000",
+    ];
     let linked = run_libra_command(&invalid_modes, &wt);
     let stderr = String::from_utf8_lossy(&linked.stderr);
     assert!(

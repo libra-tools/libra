@@ -52,7 +52,7 @@ async fn seed_checkpoint_for_parent(conn: &DatabaseConnection, checkpoint_id: &s
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -137,7 +137,7 @@ async fn agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only() {
 /// from the session's `committed` checkpoints, and the subagent row carries
 /// its parent-checkpoint linkage.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn agent_checkpoint_subagent_scope_listed_and_linked() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());

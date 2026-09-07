@@ -3,6 +3,12 @@
 `libra agent` is an intentionally different external-agent capture extension,
 not a Git-compatible command.
 
+OpenCode content capture on **macOS** is assembled through seatbelt
+(`sandbox-exec`) via `SandboxManager::transform`; the seatbelt backend carries
+a deprecation (**弃用**) risk if Apple removes `sandbox-exec`. See
+[`../tracing/agent.md`](../tracing/agent.md) §5 for the read-isolation
+asymmetry and fail-closed metadata-only degrade when the backend is missing.
+
 The active development contract, backlog, and compatibility guardrails live in
 [`../tracing/agent.md`](../tracing/agent.md). Keep this file as the command
 development index entry so `docs/development/commands/README.md` can list every

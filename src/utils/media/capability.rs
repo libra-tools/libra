@@ -1,13 +1,12 @@
 //! Remote media-capability probe (lore.md §6.4).
 //!
 //! GETs `<base>/libra/media/v1/capabilities` with the host-scoped bearer token,
-//! wrapped in the §0.2 bounded backoff for 429/5xx (`BasicAuth::send` attaches
-//! auth but does NOT itself retry 5xx — Codex P1). Classifies the result into a
+//! wrapped in the §0.2 bounded backoff for 429/5xx. Classifies the result into a
 //! [`ProbeOutcome`]; every ambiguity resolves to a SAFE outcome (a plain remote
-//! reads as `NoEndpoint`, so negotiation falls back to standard LFS). Against
-//! every reachable remote today — none of which expose the (frozen, unbuilt)
-//! Libra media server — the probe returns `NoEndpoint`.
+//! reads as `NoEndpoint`, so negotiation falls back to standard LFS). Discovery
+//! preserves the repository's standard LFS URL and uses a host-scoped token.
 
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 use super::negotiate::ProbeOutcome;
@@ -67,6 +66,18 @@ pub const CAPABILITIES_PATH: &str = "libra/media/v1/capabilities";
 /// non-2xx-non-5xx status yields `NoEndpoint`; a 429/5xx that survives §0.2
 /// retries yields `ServerErrorAfterBackoff`.
 pub async fn probe(base_url: &str) -> ProbeOutcome {
+    let Ok(client) = reqwest::Client::builder()
+        .redirect(crate::internal::protocol::https_client::no_downgrade_redirect_policy())
+        .build()
+    else {
+        return ProbeOutcome::NoEndpoint;
+    };
+    probe_with_client(base_url, client).await
+}
+
+/// The supplied client must refuse HTTPS-to-HTTP redirects before forwarding
+/// stored credentials. LFSClient and `probe` use the shared redirect policy.
+pub async fn probe_with_client(base_url: &str, client: reqwest::Client) -> ProbeOutcome {
     let url = match join_capabilities_url(base_url) {
         Some(u) => u,
         None => return ProbeOutcome::NoEndpoint,
@@ -79,24 +90,26 @@ pub async fn probe(base_url: &str) -> ProbeOutcome {
         },
         None => None,
     };
-    let client = reqwest::Client::new();
 
     let result: Result<ProbeOutcome, ()> = retry_idempotent(&RetryPolicy::default(), |_attempt| {
         let url = url.clone();
         let token = token.clone();
         let client = client.clone();
         async move {
-            let mut req = client.get(url).header("Accept", "application/json");
+            let mut req = client
+                .get(url)
+                .header("Accept", "application/json")
+                .timeout(std::time::Duration::from_secs(10));
             if let Some(t) = &token {
                 req = req.bearer_auth(t);
             }
             match req.send().await {
                 Ok(resp) => match classify_status(resp.status().as_u16()) {
-                    StatusClass::Success => match resp.json::<Capabilities>().await {
-                        Ok(caps) => RetryOutcome::Done(Ok(ProbeOutcome::Ok(caps))),
+                    StatusClass::Success => match decode_capabilities(resp).await {
+                        Some(caps) => RetryOutcome::Done(Ok(ProbeOutcome::Ok(caps))),
                         // A 2xx with an undecodable body is not a usable
                         // capability endpoint — fall back safely.
-                        Err(_) => RetryOutcome::Done(Ok(ProbeOutcome::NoEndpoint)),
+                        None => RetryOutcome::Done(Ok(ProbeOutcome::NoEndpoint)),
                     },
                     StatusClass::NoEndpoint => RetryOutcome::Done(Ok(ProbeOutcome::NoEndpoint)),
                     StatusClass::Retryable => RetryOutcome::Retry {
@@ -123,11 +136,29 @@ pub async fn probe(base_url: &str) -> ProbeOutcome {
     result.unwrap_or(ProbeOutcome::ServerErrorAfterBackoff)
 }
 
+async fn decode_capabilities(response: reqwest::Response) -> Option<Capabilities> {
+    let mut data = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(bytes) = stream.next().await {
+        let bytes = bytes.ok()?;
+        if bytes.len() > (16 * 1024usize).saturating_sub(data.len()) {
+            return None;
+        }
+        data.extend_from_slice(&bytes);
+    }
+    serde_json::from_slice(&data).ok()
+}
+
 /// Join the media base URL with the capabilities path, tolerating a trailing
 /// slash. Returns `None` for an unparseable base.
 fn join_capabilities_url(base_url: &str) -> Option<url::Url> {
-    let trimmed = base_url.trim_end_matches('/');
-    url::Url::parse(&format!("{trimmed}/{CAPABILITIES_PATH}")).ok()
+    let lfs_url = crate::utils::lfs::generate_lfs_server_url(base_url.to_owned());
+    let mut url = url::Url::parse(&lfs_url).ok()?;
+    url.set_path(&format!(
+        "{}/{CAPABILITIES_PATH}",
+        url.path().trim_end_matches('/')
+    ));
+    Some(url)
 }
 
 #[cfg(test)]
@@ -151,12 +182,19 @@ mod tests {
         let u = join_capabilities_url("https://host.example/repo").unwrap();
         assert_eq!(
             u.as_str(),
-            "https://host.example/repo/libra/media/v1/capabilities"
+            "https://host.example/repo.git/info/lfs/libra/media/v1/capabilities"
         );
         let u = join_capabilities_url("https://host.example/repo/").unwrap();
         assert_eq!(
             u.as_str(),
-            "https://host.example/repo/libra/media/v1/capabilities"
+            "https://host.example/repo.git/info/lfs/libra/media/v1/capabilities"
+        );
+        let u =
+            join_capabilities_url("ssh://git@host.example:8443/repo.git/info/lfs/?tenant=one#ref")
+                .unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://host.example:8443/repo.git/info/lfs/libra/media/v1/capabilities?tenant=one"
         );
         assert!(join_capabilities_url("not a url").is_none());
     }

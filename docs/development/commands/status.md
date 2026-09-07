@@ -18,6 +18,13 @@
 - 源码意图：源码模块注释说明该命令结合 ignore 策略计算 staged/unstaged/untracked 集合，并输出简洁摘要或结构化状态。
 - 执行路径：`execute_safe`、`execute_to`、`collect_status_json_envelope_for_api` 三个入口都立即委托给共享数据核心 `collect_status_data(args) -> CliResult<StatusData>`（`src/command/status.rs:259`）；`execute_to` 是薄封装，先调用 `collect_status_data` 再调用 `render_status_to_writer`。索引路径会加载、比较并刷新 `.libra/index`（只读，不回写）；对象路径会解析 revision 并读取 blob/tree/commit 等对象；引用路径只读取 SQLite refs 与 HEAD（不更新 refs/HEAD，也不写 reflog）；本命令为只读，不通过 SeaORM/SQLite 或 D1 客户端持久化元数据。
 
+### Worktree I/O executor 边界（OL-01，2026-08-29）
+
+- `src/internal/worktree_io/` 承载通用只读基础设施：`protocol` 定义 `IoRequest`/`IoEvent`、frame codec、平台路径编码、request budget 和 lexical validation；`executor` 提供 `WorktreeIo`、`IoLimits`、`CancellationToken`、typed outcome/error、稳定排序的 bounded pool，以及 helper process-group kill/reap/recycle。并发上限为 8、pending 上限为 64、frame 上限为 8 MiB；byte/frame/entry 预算仍在 request/protocol 与流式 handler 中执行。
+- `status_io_worker.rs` 仍承载 status handler、root session、deadline glue、hidden worker entry 和既有 `deadline_*`/数据类型 re-export；通用 protocol/executor 已抽取到 `src/internal/worktree_io/`。parent status session 与长寿命 helper 按 root 复用 sealed capability；wire 两端校验只做绝对 root、canonical relative path、OID/size 等词法检查，不因校验额外访问文件系统。文件/目录实际读取每次都经 `beneath::open_root` 和 no-follow beneath 操作，维持符号链接逃逸与 TOCTOU 的 fail-closed 边界。
+- object-store capability 与 worktree capability 分离。对象读取限定 local-only、no-hydration，不创建目录或写入 ODB/SQLite/refs；helper 不提供任何写操作。
+- 这是内部实现抽取，不改变 `status` CLI 参数、输出或调用方 API。读取中断仍产生 partial/checkpoint 结果并报告 `IoBlocked`；权限、符号链接/TOCTOU 逃逸、worker 错误、超时和取消继续走现有 fail-closed/cache protection 语义；object read 与 rename 逻辑保持不变。
+
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
 ```mermaid

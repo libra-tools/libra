@@ -189,7 +189,7 @@ fn stderr_is_capped_redacted_and_not_inherited() {
 /// variables and the non-secret passthrough allowlist (`PATH`, `HOME`, …)
 /// that real external CLIs need — but none of the parent's secrets.
 #[test]
-#[serial]
+#[serial(env)]
 fn spawn_clears_parent_env_and_injects_allowlist() {
     let dir = tempfile::tempdir().unwrap();
     let body = "#!/bin/sh\n\
@@ -236,7 +236,7 @@ fn spawn_clears_parent_env_and_injects_allowlist() {
 
 /// Built-in slug impersonation is skipped-and-logged at discovery.
 #[test]
-#[serial]
+#[serial(env)]
 fn discovery_skips_builtin_slug_impersonation() {
     let dir = tempfile::tempdir().unwrap();
     plant_script(dir.path(), "claude-code", "#!/bin/sh\nexit 0\n");
@@ -282,7 +282,7 @@ fn non_method_not_found_info_failure_propagates() {
 /// explicitly requested; the forbidden-name classifier and trusted-dir
 /// containment predicate are pinned here too.
 #[test]
-#[serial]
+#[serial(env)]
 fn trusted_dirs_env_allowlist_extra() {
     use libra::internal::ai::observed_agents::{env_name_is_forbidden, path_within_trusted_dirs};
 

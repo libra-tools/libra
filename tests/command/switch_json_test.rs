@@ -172,7 +172,7 @@ fn json_schema_has_all_fields() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn json_switch_track_has_tracking_fields() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -218,7 +218,7 @@ async fn json_switch_track_has_tracking_fields() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn json_switch_guess_has_tracking_fields_and_clean_stderr() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());

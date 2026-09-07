@@ -9,7 +9,7 @@ use url::Url;
 use uuid::Uuid;
 
 use super::{
-    REVIEW_FIX_ADMISSION_MESSAGE, ReviewFixBridgeError,
+    ReviewFixBridgeError,
     fix_protocol::{ReviewFixInteractionResponse, ReviewFixSessionSnapshot},
 };
 use crate::command::{
@@ -56,9 +56,12 @@ impl ReviewFixControlClient {
         })
     }
 
-    pub(super) async fn submit_admission(&self) -> Result<(), ReviewFixBridgeError> {
+    pub(super) async fn submit_admission(
+        &self,
+        admission_message: &'static str,
+    ) -> Result<(), ReviewFixBridgeError> {
         let request = CodeMessageRequest {
-            text: REVIEW_FIX_ADMISSION_MESSAGE,
+            text: admission_message,
         };
         self.post_json("/api/code/messages", &request).await
     }

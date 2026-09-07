@@ -6,8 +6,11 @@
 //!
 //! 1. the marker parses and carries
 //!    `install_source == "official_signed_manifest"`;
-//! 2. the marker's `version`/`sha256`/`size`/`platform` match the actual
-//!    target binary;
+//! 2. the marker's `sha256`/`size`/`platform` match the actual target
+//!    binary (the `version` field is informational — a binary's version is
+//!    only observable by executing it; both writers copy version and digest
+//!    out of the same VERIFIED signed manifest row, which is what binds
+//!    them);
 //! 3. the install directory passes the §A.5 ownership/permission/no-follow
 //!    validation (enforced by [`super::lock::InstallDir`]).
 //!

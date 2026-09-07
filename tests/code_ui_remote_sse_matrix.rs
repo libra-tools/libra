@@ -19,7 +19,10 @@ use anyhow::Result;
 #[cfg(feature = "test-provider")]
 use harness::CodeSession;
 #[cfg(feature = "test-provider")]
-use harness::matrix::{Case, CaseFile, build_session_options, find_case, load_case_file};
+use harness::matrix::{
+    Case, CaseFile, DEFAULT_SSE_WIRE_VERSION, Step, build_session_options, find_case,
+    load_case_file,
+};
 #[cfg(feature = "test-provider")]
 use serial_test::serial;
 
@@ -40,10 +43,47 @@ fn run_sse_case(case_name: &str) -> Result<()> {
 }
 
 #[cfg(feature = "test-provider")]
+#[test]
+fn sse_matrix_consumes_only_wire_v2() -> Result<()> {
+    // DF-08: wire v1 was removed in 0.22.0 — the fixture must not carry a
+    // single v1 case any more, and every openEvents step names v2.
+    let file_path = harness::matrix::data_path(CASE_FILE_PATH);
+    let file: CaseFile = load_case_file(&file_path)?;
+    assert_eq!(DEFAULT_SSE_WIRE_VERSION, 2);
+
+    let v2_case = find_case(
+        &file,
+        "sse_emits_status_changed_when_submit_starts_thinking",
+    )?;
+    assert!(
+        v2_case
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::OpenEvents { wire: 2, .. }))
+    );
+    for case in &file.cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        for step in case["steps"].as_array().into_iter().flatten() {
+            if step["op"] == "openEvents"
+                && let Some(wire) = step.get("wire")
+            {
+                // An omitted wire defaults to v2 in the harness; an
+                // explicit value may only name v2.
+                assert_eq!(
+                    wire, 2,
+                    "case '{name}' must not consume the removed wire v1"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-provider")]
 macro_rules! sse_case {
     ($name:ident) => {
         #[test]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_sse_case(stringify!($name))
         }
@@ -59,18 +99,13 @@ macro_rules! sse_case {
 // `Step::SubmitAndWaitIdle`) plus the multi-event
 // `assistant_content_monotonic` assertion, which lets every case
 // in `sse_cases.json` run end-to-end.
-#[cfg(feature = "test-provider")]
-sse_case!(sse_initial_connect_replays_session_updated_with_full_snapshot);
-
 // Wave 4 — remaining six P0/P1 cases.
 #[cfg(feature = "test-provider")]
 sse_case!(sse_emits_status_changed_when_submit_starts_thinking);
 #[cfg(feature = "test-provider")]
-sse_case!(sse_emits_session_updated_after_assistant_completion);
+sse_case!(sse_emits_code_workflow_after_assistant_completion);
 #[cfg(feature = "test-provider")]
-sse_case!(sse_emits_controller_changed_on_attach_and_detach);
-#[cfg(feature = "test-provider")]
-sse_case!(sse_two_concurrent_subscribers_receive_status_changed);
+sse_case!(sse_two_concurrent_subscribers_receive_code_workflow);
 #[cfg(feature = "test-provider")]
 sse_case!(sse_reconnect_initial_replay_contains_latest_transcript);
 #[cfg(feature = "test-provider")]
@@ -80,7 +115,7 @@ sse_case!(sse_streaming_fixture_transcript_content_grows_monotonically);
 /// with `event: resync`; tip-cursor reconnect continues without dup/loss.
 #[cfg(feature = "test-provider")]
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn sse_slow_consumer() -> Result<()> {
     libra::internal::ai::web::assert_sse_slow_consumer_contract().await
 }

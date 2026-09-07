@@ -149,7 +149,8 @@ impl TieredStorage {
         self.local.put(hash, data, obj_type).await?;
         if data.len() >= self.threshold {
             // Pre-trim victims INSIDE the lock, delete their files OUTSIDE
-            // it (lore.md:698 — the put/get/heal hot path must not perform
+            // it (lore.md §7.6 性能与效率预算, `:760` as of 2026-08-27 —
+            // the put/get/heal hot path must not perform
             // unlink I/O while holding the LRU mutex). Deletion stays
             // synchronous on this call (a fire-and-forget task could die at
             // process exit and silently leak past the budget).

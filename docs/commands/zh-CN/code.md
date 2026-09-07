@@ -37,9 +37,9 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 | Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | 每进程本地自动化 token 路径。在 `write` 模式下，Unix/macOS 文件必须是权限 `0600` 的普通文件。与 `--control stdio` 一起使用时可覆盖 worktree 默认 token 路径（与 `--control-info-file` 独立）；权限过宽 fail-closed（`CONTROL_TOKEN_PERMS`）。 |
 | Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | 非 secret 本地 endpoint discovery 元数据路径。launch 模式在 Unix/macOS 上以原子写 + `0600` 落盘。该文件永不包含 token 材料。与 `--control stdio` 一起使用时仅为 `baseUrl` 的 **读取** discovery 路径（显式 `--control-url` 可覆盖）。自定义 info 路径**不会**改写默认 token 位置——若 token 不在 worktree `code/` 目录下，请同时传 `--control-token-file`。 |
 | Control URL | | `--control-url <URL>` |（discovery） | 已有 Code UI control endpoint 的 base URL（例如 `http://127.0.0.1:3000`）。仅与 `--control stdio` 合法。省略时从 `--control-info-file` discovery。必须是字面 loopback IP。 |
-| Provider | | `--provider` | `gemini` | AI provider 后端（见下方 Provider Backends）。 |
+| Provider | | `--provider` | *（无默认——启动时解析）* | AI provider 后端（见下方 Provider Backends）。缺省时依次由 `--agent` 绑定、被恢复线程记录的 provider（携 `--resume` 时）、持久化配置键 `code.defaultProvider`、再到凭据探测解析（resume 或配置键命中跳过探测）；零个已配置 key 以 128 退出、多个以 129 退出。 |
 | Model | | `--model` | provider 默认值 | Provider 专用 model ID。 |
-| Agent profile | | `--agent <NAME>` | 无 | 按名称选择 agent profile。当 profile 携带结构化 `model: provider/model[@variant]` 绑定时，该绑定原子生效——provider、model ID 和 variant 全部来自 profile，单独提供的 `--model` 会被忽略以避免混搭组合；无结构化绑定的 profile 回退到 CLI 默认值。Profiles 通过三层层级解析（项目 `.libra/agents/`、用户 `~/.config/libra/agents/`、内置）。未知或非 primary-eligible profile 会被拒绝。 |
+| Agent profile | | `--agent <NAME>` | 无 | 按名称选择 agent profile。当 profile 携带结构化 `model: provider/model[@variant]` 绑定时，该绑定原子生效——provider、model ID 和 variant 全部来自 profile，单独提供的 `--model` 会被忽略以避免混搭组合；无结构化绑定的 profile 回退到 CLI 默认值。绑定生效时，启动 banner、UI 快照与 usage 记录一律以该生效 provider 打标。Profiles 通过三层层级解析（项目 `.libra/agents/`、用户 `~/.config/libra/agents/`、内置）。未知或非 primary-eligible profile 会被拒绝。 |
 | Temperature | | `--temperature` | provider 默认值 | 生成采样 temperature。 |
 | Ollama thinking | | `--ollama-thinking` / `--thinking` | `OLLAMA_THINK`，然后 `off` | Ollama thinking 模式：`auto`、`off`、`on`、`low`、`medium` 或 `high`。 |
 | Ollama compact tools | | `--ollama-compact-tools` | `OLLAMA_COMPACT_TOOLS`，然后 off | 为拒绝复杂 JSON schemas 的远程/云 Ollama endpoint 发送紧凑 tool schemas。 |
@@ -49,7 +49,7 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 | Kimi thinking | | `--kimi-thinking <enabled\|disabled>` | model 默认值 | 使用 `--provider kimi` 时发送 Kimi 的 `thinking` 对象。 |
 | Kimi stream | | `--kimi-stream <true\|false>` | `true`（Kimi） | 使用 `--provider kimi` 时发送 Kimi 的 `stream` boolean；默认流式。对非 Kimi provider 拒绝。 |
 | Context | | `--context` | 无 | 运行上下文：`dev`（别名 `development`）、`review`（别名 `code-review`）、`research`（别名 `explore`）。 |
-| Resume | | `--resume <THREAD_ID>` | 无 | 按 thread ID 恢复规范 Libra 线程。 |
+| Resume | | `--resume <THREAD_ID>` | 无 | 按 thread ID 恢复规范 Libra 线程。未显式指定 provider 时继承线程记录的 provider/model；显式指定与记录不符时向 stderr 告警并继续。 |
 | Approval policy | | `--approval-policy` | `on-request` | 工具审批策略（见下方 Approval Policies）。 |
 | Approval TTL | | `--approval-ttl <SECS>` | `300` | 已授予的审批在再次提示前对匹配命令保持可复用的秒数。覆盖 `.libra/config.toml` 中的项目配置 `[approval] ttl_seconds`；与会提示的策略相关。 |
 | Network access | | `--network-access <allow\|deny>` | `deny` | shell/gate 默认网络策略。仅接受默认的 `deny`：`--network-access allow` 在所有模式下均被拒绝，直到 Plan network-policy gate 接管每次执行的 sandbox 网络（请在 Plan review 中批准网络）。 |
@@ -79,7 +79,13 @@ libra graph --json <THREAD_ID> [--repo <PATH>]
 
 DeepSeek 请求可以通过 `--deepseek-thinking enabled --deepseek-reasoning-effort high --deepseek-stream true` 选择加入 provider 专用字段；这些标志会对非 DeepSeek provider 拒绝。
 Kimi 请求默认使用所选 model 的 thinking 行为；对于需要更低延迟或官方 Web 搜索兼容性的 K2.6/K2.5 run，使用 `--kimi-thinking disabled`。当 provider 返回 Kimi `reasoning_content` 时，Libra 会在 tool-call turns 中保留它。
-常规运行时，将 provider keys 存在 `vault.env.<NAME>` 中；Libra 先检查 repo-local Vault，再检查 global Vault，最后检查进程环境。对需要显式 dotenv 覆盖的 live tests，使用 `--env-file .env.test`。在默认 Web 启动下，非 Codex provider 支持 `--env-file`、`--context`、`--approval-policy`、`--approval-ttl`（env-file 值仍优先于进程环境/Vault）。Managed Web `--provider codex` 仍拒绝 `--env-file`、`--approval-ttl` 与 `--resume`（未接入 Codex app-server 路径）；裸 `libra code --provider codex --resume <thread_id>` 同样以 usage error 加迁移提示被拒绝（遗留 TUI resume driver 已在 W5-06 删除）；MCP `--stdio` 继续拒绝这些 Web-only flag。
+`--provider` 没有默认值：生效 provider 在启动时一次性解析——显式 `--provider` 优先，其次 `--agent` 绑定的 provider（两者不一致为 usage 错误），再次（携 `--resume <thread_id>` 时）被恢复线程记录的 provider，再次持久化配置键 `code.defaultProvider`（repo-local 覆盖 global）；四者皆无时 `libra code` 回落到对六个可配置 provider 的凭据探测（codex 与 ollama 永不被自动选中）：零个已配置 key 以 128（`LBR-AUTH-001`）退出，给出查找链、逐行 key 配置命令与免凭据备选（`--provider codex`、`--provider ollama --model <name>`）；恰一个已配置 key 自动选用该 provider，并向 stderr 打印一行理由（provider id、变量名、命中层——绝不含值）；两个及以上以 129（`LBR-CLI-002`）退出并按 id 字典序列出候选及其命中层。`--model` 在标志、绑定、被恢复线程记录与 `code.defaultProvider` 均未给出 provider 时，在进入探测前即被拒绝（配对不可推断）。候选判定口径：key 在 `--env-file`（仅默认 Web 启动）、进程环境、repo-local vault 或 global vault 任一层持有**非空（trim 后）值**才构成候选；空/全空白值在该层视为 miss 并继续向下一层下探。`--stdio` 与 `--control stdio` 不进行 provider 解析；`--stdio` 下显式传 `--provider` 会被拒绝。
+
+若不想每次手打 `--provider`，可持久化默认值：`libra config set --global code.defaultProvider <id>`（合法取值：`anthropic`、`codex`、`deepseek`、`gemini`、`kimi`、`ollama`、`openai`、`zhipu`；repo-local 的 `libra config set code.defaultProvider <id>` 覆盖 global 值）。该键只存放于 `libra config` 的 SQLite 数据库——与 `agents.toml` 的 `[code.*]` profile 段无关，两个载体互不读取、互不回退。配置命中时完全跳过凭据探测，并像显式标志一样与 `--model` 配对；若该 provider 缺凭据，则以该 provider 自身的缺 key 报错退出（128）。未设置或空值下探到凭据探测；无法识别的 id 以 129（`LBR-CLI-002`）退出并列出合法取值——不回显已存储的值。
+
+被恢复的线程记得自己的出身：会话在首次启动时把生效 provider 与 model 的 id 写入 session metadata（只有 id——绝不含凭据）；`--resume <thread_id>` 且未显式指定 provider 时继承该记录的 provider——`--model` 缺省时同时继承记录的 model——优先于 `code.defaultProvider` 与凭据探测，避免把历史消息静默喂给另一个模型。显式 `--provider`（或 `--agent` 绑定）与记录不符时向 stderr 打印列出两个 id 的告警并继续执行（`--machine` 下为结构化 `provider_resume_mismatch` 事件而非散文）。早于该记录机制创建的会话按剩余优先级链正常解析。
+
+常规运行时，将 provider keys 存在 `vault.env.<NAME>` 中（例如 `libra config set --global vault.env.GEMINI_API_KEY <value>`——与缺凭据报错推荐的命令一致）；Libra 按以下顺序解析凭据：`--env-file` 值（仅默认 Web 启动可用）→ 进程环境 → repo-local Vault → global Vault。对需要显式 dotenv 覆盖的 live tests，使用 `--env-file .env.test`。在默认 Web 启动下，非 Codex provider 支持 `--env-file`、`--context`、`--approval-policy`、`--approval-ttl`（env-file 值仍优先于进程环境/Vault）。Managed Web `--provider codex` 仍拒绝 `--env-file`、`--approval-ttl` 与 `--resume`（未接入 Codex app-server 路径）；裸 `libra code --provider codex --resume <thread_id>` 同样以 usage error 加迁移提示被拒绝（遗留 TUI resume driver 已在 W5-06 删除）；MCP `--stdio` 继续拒绝这些 Web-only flag。
 
 Ollama 请求默认流式读取 `/api/chat` 响应，并向 debug logs 添加每请求 `request_id`。它们也默认使用 `think:false`，避免具备 reasoning 能力的本地模型在 tool calls 前花数分钟生成隐藏 reasoning。单次运行使用 `--ollama-thinking high`，或将 `OLLAMA_THINK=true`、`low`、`medium`、`high` 或 `auto` 设为环境默认值。`auto` 会省略 `think` 字段并让 Ollama 决定。当远程/云 Ollama endpoint 接受简单 tools 但对 Libra 完整 tool schema payload 返回 503 时，使用 `--ollama-compact-tools` 或 `OLLAMA_COMPACT_TOOLS=true`。
 
@@ -100,7 +106,7 @@ Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方�
 | JSON-RPC 方法 | HTTP 等价接口 |
 |-----------------|-----------------|
 | `session.get` | `GET /api/code/session` |
-| `events.subscribe` | 作为 JSON-RPC 通知的 `GET /api/code/events` |
+| `events.subscribe` | 请求 `GET /api/code/events?wire=2&cursor=<last>`；接受可选参数 `{ "cursor": <最后确认的 v2 cursor> }`，先确认 `{ subscribed, requestedWire, requestedCursor }`，再转发事件。`requestedWire` 仅表示请求版本，不保证协商后的实际版本。省略参数为 cursor-0 首次 bootstrap。收到 `WIRE_V2_RESYNC_REQUIRED` 时，客户端拉取 `/session`，发出一条 data 含 `snapshot` 的增强 `resync` 通知，再从服务端给出的 `durableTail` 重连。精确的 `409 WIRE_V2_CURSOR_AHEAD` 表示 cursor 属于更晚/不同的 session；客户端会以该 code 发出同类 snapshot 恢复通知，丢弃旧 cursor，并从 0 重启 v2。精确的 `503 WIRE_V2_REQUIRES_DURABLE_SESSION` 现为终态：遗留的 `?wire=1` 回退已随服务端 v1 wire 在 0.22.0 删除——错误（含删除指引）直接上抛给调用方。 |
 | `diagnostics.get` | `GET /api/code/diagnostics` |
 | `controller.attach` | `POST /api/code/controller/attach` |
 | `controller.detach` | `POST /api/code/controller/detach` |
@@ -113,6 +119,19 @@ Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方�
 | `goal.cancel` | `POST /api/code/goal/cancel` |
 
 格式错误的 JSON 映射为 JSON-RPC `-32700`。未知方法映射为 `-32601`。无效参数映射为 `-32602`。HTTP 4xx/5xx 错误映射为带有 `data.status` 和 `data.code` 的 `-32000`，并保留 `INVALID_CONTROL_TOKEN`、`INVALID_CONTROLLER_TOKEN`、`CONTROLLER_CONFLICT` 和 `INTERACTION_NOT_ACTIVE` 等 Libra 错误。
+
+依据 v2 通知执行副作用的 automation 必须持久化最后确认的
+`params.data.cursor`，必须按 `eventId` 去重，并仅在同一 `sessionId` 的下一次
+`events.subscribe` 回传该 cursor。Cursor 是 session-scoped；session 重启/切换后
+必须丢弃旧 cursor（客户端也会用 snapshot + cursor-0 restart 恢复精确的
+`WIRE_V2_CURSOR_AHEAD`）。省略 cursor 会有意从 0 重放保留的 durable history，
+仅应用于首次 bootstrap；若把重放通知当成新动作，可能重复执行下游副作用。
+
+`resync` 通知表示 workflow-event gap：客户端从 `durableTail` 重连后不会再投递
+`(lastCursor, durableTail]` 内的事件。通知携带的 session snapshot 仅代表当前
+projection state，不能重建被跳过的 workflow kind。消费者必须用该
+snapshot/`session.get` 对账，不得假设 resync 前后 cursor 连续，也不得把此通知流
+当作 exactly-once side-effect log。
 
 ### Web Browser Control
 
@@ -130,7 +149,7 @@ Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方�
 - `POST /api/code/control/cancel` — loopback + `X-Code-Controller-Token`。`Automation` leases 也要求 `X-Libra-Control-Token`。
 - `POST /api/code/task/dispatch` — loopback + `X-Code-Controller-Token`；用户发起的 sub-agent dispatch 需要 active controller write lease（browser 或 automation）。Automation lease 额外要求 `X-Libra-Control-Token`。
 - `POST /api/code/goal/start`、`POST /api/code/goal/cancel` — loopback + `X-Code-Controller-Token`；goal mutation 需要 active controller lease。
-- `POST /api/code/skills/activate`、`POST /api/code/session/resume` — loopback + `X-Code-Controller-Token`（位于 write router，256 KiB body limit）；两者均需要 controller write lease；Automation lease 另需 `X-Libra-Control-Token`。resume 会拒绝 busy 或 `indeterminate_side_effect` snapshot；在证明目标 thread 可加载后当前 fail-closed 为 `SESSION_RESUME_REQUIRES_RESTART`（尚无 in-process AgentRuntime swap）。skill activate 在 discoverability 校验后 fail-closed 为 `SKILL_ACTIVATION_UNSUPPORTED`，直到存在 provider 消费路径。
+- `POST /api/code/skills/activate`、`POST /api/code/session/resume` — loopback + `X-Code-Controller-Token`（位于 write router，256 KiB body limit）；两者均需要 controller write lease；Automation lease 另需 `X-Libra-Control-Token`。resume 会拒绝 busy 或 `indeterminate_side_effect` snapshot；在证明目标 thread 可加载后当前 fail-closed 为 `SESSION_RESUME_REQUIRES_RESTART`（尚无 in-process AgentRuntime swap）。skill activate 在 discoverability 校验后把激活交给 live in-process provider（DF-07）；无 in-process provider 的会话（read-only、managed Codex）fail-closed 为 `SKILL_ACTIVATION_UNSUPPORTED`。
 
 浏览器写请求共享与自动化控制相同的 256 KiB body limit 和 audit-sink wiring。浏览器只在内存中持久化 lease；重新加载页面会丢弃 lease，下一次写入会重新 attach。
 
@@ -248,13 +267,13 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 
 | 选择 | 机制 |
 |---|---|
-| 显式 v1 | `?wire=1` 或 `?wire=v1` |
+| 显式 v1 | **已在 0.22.0 删除**——`?wire=1` / `?wire=v1` 返回 `400 INVALID_WIRE_VERSION` 并附删除指引（`v0.21.29` 是最后一个提供 wire v1 的版本） |
 | 显式 v2 | `?wire=2` 或 `?wire=v2` |
 | Accept 提示 | `Accept: text/event-stream;libra-wire=2`（若同时给出 query `wire=`，以 query 为准） |
-| 未指定默认 | 省略 `wire` / `libra-wire` 的客户端仍为 **v1**。内置 SPA（W3-09）始终请求 `?wire=2`。 |
+| 未指定默认 | 省略 `wire` / `libra-wire` 时，服务端默认为 **v2**（DF-06；`v0.21.27` 是最后一个默认 v1 的版本）。内置 SPA（W3-09）和 `libra code --control stdio` automation 客户端会显式请求 `?wire=2`。 |
 | 非法值 | fail-closed `400 INVALID_WIRE_VERSION` |
 
-**SSE v1**（默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
+**SSE v1**（已删除）：全量 snapshot 的 `CodeUiEventEnvelope` 流（`seq`/`type`/`at`/`data` 记录，事件 `session_updated` / `status_changed` / `controller_changed`）在 DEFER-08 烘焙完成后于 0.22.0 物理删除。仍需 v1 的客户端请停留在 `v0.21.29`；v2 下的 snapshot bootstrap 是一次 `GET /api/code/session`。
 
 **SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在 **transport** backlog 窗口内无重复、无丢事件（W3-08 / GC-CODE-12）：**1,024 条或 8 MiB**，先达者为准（`MAX_CODE_UI_TRANSPORT_BACKLOG_*`）。Code UI **projection** 热窗口是同数值、独立命名的预算（`MAX_CODE_UI_PROJECTION_EVENTS` / `MAX_CODE_UI_PROJECTION_REPLAY_BYTES`），两者不可相加。单事件 fold 只访问 suffix，不回放整段 session 历史（W3-14；10k events 下 release p95 ≤ 5 ms）。bootstrap 或慢消费者 catch-up 将超过该预算时，服务器发送 `event: resync`（`WIRE_V2_RESYNC_REQUIRED`，含 `reason` / `lastCursor` / `durableTail` / `action: fetch_snapshot`）并结束流，**不 silent drop**。客户端应拉取 session snapshot，再以 `durableTail` 重连。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的默认 Web headless（非 Codex `HeadlessCodeRuntime`）；managed `--provider codex` Web 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
 
@@ -349,21 +368,29 @@ replay 因而不会重新打开该 gate。
 
 ### SSE v1 兼容窗口（DEFER-08）
 
-在 wire v2 成为默认、且内置前端/automation 客户端完成迁移之后，v1 snapshot SSE 仍至少保留一个成功的公开 patch release。v1 的物理移除**不属于** plan-20260715；见 DEFER-08 / ADR-CODE-08。移除前置条件清单（须全部满足）：
+**已完成——v1 已在 0.22.0 物理删除**（plan-20260824 DF-08，ADR-DF-03）。下方清单是本次删除所需烘焙的历史记录；`v0.21.29` 是最后一个提供 wire v1 的版本，无法消费 v2 的客户端请停留在该版本。
 
-1. 内置前端已迁移到 v2（W3-09 证据）：SPA 经 `sse-resilience` 的
+1. [x] 内置前端已迁移到 v2（W3-09 证据）：SPA 经 `sse-resilience` 的
    `wrapClientForSseResilience` 打开 `GET /api/code/events?wire=2`，用 wire cursor
    重连，并把 `event: resync` / `WIRE_V2_RESYNC_REQUIRED` 当作一次显式 snapshot
    拉取（复用 W2-15 UI）。cursor/序号不在客户端另行编号。
-2. 内置 automation 客户端已迁移到 v2。
-3. Compat / matrix 测试默认消费 v2。
-4. Release notes 写明最后支持 v1 的版本与升级路径。
-5. 在 (1)–(4) 之后、v1 仍可用时，至少有一次成功的公开 patch release。
+2. [x] 内置 automation 客户端已迁移到 v2（DF-05 证据）：
+   `libra code --control stdio` 的 `events.subscribe` 会追加
+   `?wire=2&cursor=<last>`，允许调用方从已确认 cursor 续接，并用显式 snapshot
+   对账和有界重连处理 `WIRE_V2_RESYNC_REQUIRED` / `WIRE_V2_CURSOR_AHEAD`。
+3. [x] Compat / matrix 测试默认消费 v2（DF-05 证据；两个显式 v1 兼容用例已随
+   wire 在 DF-08 删除——夹具形态守卫现在拒绝任何 v1 `openEvents` 步骤）。
+4. [x] Release notes 写明最后支持 v1 的版本与升级路径（DF-08 证据：0.22.0 的
+   CHANGELOG 条目写明 `v0.21.29` 与 v2 消费路径）。
+5. [x] 在 (1)–(4) 之后、v1 仍可用时，至少有一次成功的公开 patch release
+   （DEP-02 证据：`v0.21.29`——在 DF-06 默认切换之后发布，默认 wire=v2 且显式
+   v1 仍可用；annotated tag 已在 origin。本仓库远端非 GitHub，`gh release view`
+   不可用，故以 tag + 发布流水线为记录证据，与 DF-03..DF-07 同口径）。
 
 
 `GET /api/code/threads` 返回 `{ items, nextOffset? }`。每个 item 有 `id`、可选 `title`、`archived`、可选 `currentIntentId`、可选 `workingDir`、`createdAt` 和 `updatedAt`。在 ThreadProjection 持久化 per-thread cwd 之前省略 `workingDir`（不要用 server cwd 冒充 linked-worktree thread）。`limit` 默认 50 并 clamp 到 200；格式错误的 `limit` 或 `offset` 返回 `INVALID_QUERY_PARAM`。
 
-`GET /api/code/skills?provider=<slug>&skill=<name>` 返回 curated A0-07 `{ items: [{ name, provider }] }`。未知 `provider` slug 返回 `INVALID_SKILL_PROVIDER`（与 activate 相同）；省略 `provider` 时列出全部 curated providers。`POST /api/code/skills/activate` 接受 `{ provider, name }`；在 discoverability 校验后当前返回 `SKILL_ACTIVATION_UNSUPPORTED`，直到存在 in-process provider activation 路径。
+`GET /api/code/skills?provider=<slug>&skill=<name>` 返回 curated A0-07 `{ items: [{ name, provider }] }`。未知 `provider` slug 返回 `INVALID_SKILL_PROVIDER`（与 activate 相同）；省略 `provider` 时列出全部 curated providers。`POST /api/code/skills/activate` 接受 `{ provider, name }`；在 discoverability 校验后激活会排队交给 live in-process provider，并以 `{ accepted, provider, name, pending, consumedOn: "next-plain-turn" }` 确认——下一条普通（非 slash、非空）turn 的 provider 输入会携带激活上下文（追加在用户文本之后；tool 权限不会因激活放宽，重复激活只保留一个 pending 槽位）。slash/控制类 turn 不消费、激活保持 pending。未知 `provider` / 不可发现 `name` 维持稳定 400 错误码；无 live in-process provider 的会话（read-only 视图、managed Codex Web）fail-closed 为 `SKILL_ACTIVATION_UNSUPPORTED`。
 
 Code UI API 错误使用 `{ error: { code, message } }`：
 
@@ -376,7 +403,7 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `INVALID_BROWSER_BOOTSTRAP` | 403 | `X-Libra-Browser-Bootstrap` 与本 Libra Code 会话不匹配。 |
 | `RATE_LIMITED` | 429 | 当前 session 写配额耗尽；等待速率窗口恢复后重试（见 `Retry-After`）。 |
 | `REDACTION_FAILED` | 500 | Session / diagnostics / SSE 投影无法应用 secret redactor（规则为空或序列化失败）。Fail-closed：响应不包含未脱敏 payload；重启 `libra code` 或修复 redactor 配置后重试。 |
-| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` 的 `wire` / `libra-wire` 取值非法（仅接受 `1`/`v1` 与 `2`/`v2`）。 |
+| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` 的 `wire` / `libra-wire` 取值非法（仅接受 `2`/`v2`；`1`/`v1` 已在 0.22.0 删除，错误信息会指明最后提供 v1 的版本）。 |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | 503 | SSE wire v2 需要 SessionStore-backed workflow hub（当前挂在默认 Web headless persistence；managed Codex Web 尚未暴露）。 |
 | `WIRE_V2_CURSOR_AHEAD` | 409 | `?cursor=` 超过 durable workflow 尾部；丢弃 cursor 并 resync（超前 cursor 会导致后续 live 事件永久跳过）。 |
 | `WIRE_V2_RESYNC_REQUIRED` | SSE `resync` 后断流 | Transport backlog 超限（1,024 条 / 8 MiB）；拉取 snapshot 并以 `cursor=<durableTail>` 重连。 |
@@ -400,7 +427,7 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `STORAGE_PATH_INVALID` / `STORAGE_ROOT_UNRESOLVED` / `STATUS_UNAVAILABLE` / `THREAD_LIST_FAILED` / `DB_UNAVAILABLE` / `USAGE_UNAVAILABLE` / `THREAD_GRAPH_STORAGE_UNAVAILABLE` / `THREAD_GRAPH_UNAVAILABLE` / `SESSION_RESUME_LOAD_FAILED` / `INTERNAL_ERROR` | 500 | 服务端 storage、status、projection、database、usage、thread graph、resume load 或 fallback internal failure。 |
 | `THREAD_GRAPH_NOT_FOUND` | 404 | 请求的 `threadId` 没有 indexed thread projection。 |
 | `INVALID_SKILL_PROVIDER` / `SKILL_NOT_DISCOVERABLE` | 400 | skill provider 不是 A0-07 slug，或 skill 对该 provider 不可发现。 |
-| `SKILL_ACTIVATION_UNSUPPORTED` | 422 | skill 可发现，但尚无 in-process activation 路径。 |
+| `SKILL_ACTIVATION_UNSUPPORTED` | 422 | skill 可发现，但本会话没有可消费激活的 live in-process provider（read-only 视图、managed Codex Web）。 |
 | `SESSION_RESUME_BUSY` | 409 | thinking 或 tool-running session 不能被替换。 |
 | `SESSION_RESUME_NOT_FOUND` | 404 | 当前工作目录下没有匹配 session。 |
 | `SESSION_RESUME_REQUIRES_RESTART` | 422 | 目标 thread 可加载，但尚无 in-process AgentRuntime swap；需用 `libra code --resume <threadId>` 重启。 |
@@ -435,7 +462,9 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 ## 常用命令
 
 ```bash
-# 使用默认 Gemini provider 启动 Web Code UI
+# 启动 Web Code UI 会话（provider 在启动时解析：--provider 旗标、
+# --agent 绑定、被恢复线程的记录（携 --resume 时）、持久化配置键
+# code.defaultProvider、再到唯一凭据自动选用）
 libra code
 
 # 使用 Anthropic Claude 启动
@@ -546,7 +575,7 @@ Web Code UI 是主要的（也是唯一的交互式）协作入口。遗留 TUI 
 
 ### 为什么支持多个 AI provider？
 
-不同 provider 擅长不同任务，并具有不同成本/延迟画像。Gemini 因慷慨的免费层和快速响应而作为默认值。Anthropic Claude 擅长谨慎 reasoning 和代码审查。本地 Ollama 支持完全离线开发。通过抽象在 `CompletionClient` trait 后面，添加新 provider 只需要实现该 trait，无需触碰 session、tool 或 Web UI 层。
+不同 provider 擅长不同任务，并具有不同成本/延迟画像。没有内置默认 provider：生效 provider 在启动时解析（显式旗标、`--agent` 绑定、被恢复线程记录的 provider、持久化配置键 `code.defaultProvider`，或唯一凭据自动选用）。Anthropic Claude 擅长谨慎 reasoning 和代码审查。本地 Ollama 支持完全离线开发。通过抽象在 `CompletionClient` trait 后面，添加新 provider 只需要实现该 trait，无需触碰 session、tool 或 Web UI 层。
 
 ### 为什么集成 MCP？
 

@@ -69,7 +69,7 @@ async fn test_switch_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests branch creation, switching and validation functionality in the checkout module.
 /// Verifies proper branch management and HEAD reference updates when switching between branches.
 async fn test_checkout_module_functions() {
@@ -126,7 +126,7 @@ async fn test_checkout_module_functions() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Same branch workflow but in a SHA-256 repository; verifies commit id length matches hash kind.
 async fn test_checkout_module_functions_sha256() {
     let temp_path = tempdir().unwrap();
@@ -182,7 +182,7 @@ async fn test_checkout_module_functions_sha256() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// In a SHA-256 repo, attempting to restore with a SHA-1 length hash should not change the worktree.
 async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
     let temp_path = tempdir().unwrap();
@@ -279,7 +279,7 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
 /// Verifies that `checkout -b` returns a [`CliError`] when the worktree has
 /// uncommitted staged changes that would be overwritten.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
     use clap::Parser;
     use libra::{
@@ -388,7 +388,7 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
 /// Checking out the current branch should be a no-op even when the worktree
 /// is dirty (Git prints "Already on ...").
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_checkout_current_branch_with_dirty_worktree_succeeds() {
     use clap::Parser;
     use libra::{
@@ -477,7 +477,7 @@ async fn test_checkout_current_branch_with_dirty_worktree_succeeds() {
 /// Switching to another branch should keep checkout-specific dirty-worktree
 /// wording even when the worktree has only unstaged changes.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_error() {
     use clap::Parser;
     use libra::{

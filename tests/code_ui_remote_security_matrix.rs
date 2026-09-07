@@ -54,7 +54,7 @@ fn run_security_case(case_name: &str) -> Result<()> {
 macro_rules! security_case {
     ($name:ident) => {
         #[test]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_security_case(stringify!($name))
         }
@@ -80,7 +80,7 @@ security_case!(security_audit_log_records_attach_with_redacted_client_id);
 /// W3-05 Origin gate: missing Origin on browser attach fails closed.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_browser_write_missing_origin_is_403_origin_required() -> Result<()> {
     let options = harness::CodeSessionOptions::new(
         "security-origin-missing",
@@ -102,7 +102,7 @@ fn security_browser_write_missing_origin_is_403_origin_required() -> Result<()> 
 /// W3-05 Origin gate: cross-site Origin is rejected.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_browser_write_cross_site_origin_is_403_origin_required() -> Result<()> {
     let options = harness::CodeSessionOptions::new(
         "security-origin-cross",
@@ -125,7 +125,7 @@ fn security_browser_write_cross_site_origin_is_403_origin_required() -> Result<(
 /// W3-05 Origin gate: trusted loopback Origin is accepted for browser attach.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_browser_write_trusted_loopback_origin_succeeds() -> Result<()> {
     let options = harness::CodeSessionOptions::new(
         "security-origin-ok",
@@ -142,7 +142,7 @@ fn security_browser_write_trusted_loopback_origin_succeeds() -> Result<()> {
 /// W3-05 Origin gate: post-attach `/messages` without Origin fails closed.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_browser_message_missing_origin_is_403_origin_required() -> Result<()> {
     let options = harness::CodeSessionOptions::new(
         "security-origin-msg-missing",
@@ -166,7 +166,7 @@ fn security_browser_message_missing_origin_is_403_origin_required() -> Result<()
 /// W3-05 Origin gate: post-attach `/messages` with cross-site Origin fails closed.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_browser_message_cross_site_origin_is_403_origin_required() -> Result<()> {
     let options = harness::CodeSessionOptions::new(
         "security-origin-msg-cross",
@@ -193,7 +193,7 @@ fn security_browser_message_cross_site_origin_is_403_origin_required() -> Result
 /// W3-05: omitted attach `kind` with control token stays automation (code-control shim).
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_automation_attach_omitted_kind_without_origin_succeeds() -> Result<()> {
     let options = harness::CodeSessionOptions::new(
         "security-attach-omit-kind",
@@ -218,7 +218,7 @@ fn security_automation_attach_omitted_kind_without_origin_succeeds() -> Result<(
 /// W3-05 per-session rate limit trips and recovers after the window.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_session_rate_limit_triggers_and_recovers() -> Result<()> {
     use std::time::Duration;
 
@@ -271,7 +271,7 @@ fn security_session_rate_limit_triggers_and_recovers() -> Result<()> {
 /// W3-05 body limit on browser write path.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_browser_write_body_size_too_large_is_413_payload_too_large() -> Result<()> {
     let options = harness::CodeSessionOptions::new(
         "security-body-browser",
@@ -294,7 +294,7 @@ fn security_browser_write_body_size_too_large_is_413_payload_too_large() -> Resu
 /// W3-05 body limit on automation write path.
 #[cfg(feature = "test-provider")]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn security_automation_write_body_size_too_large_is_413_payload_too_large() -> Result<()> {
     let options = harness::CodeSessionOptions::new(
         "security-body-automation",

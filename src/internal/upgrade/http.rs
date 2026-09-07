@@ -215,26 +215,60 @@ pub async fn download_artifact_to(
         url: url.to_string(),
         detail: e.to_string(),
     };
-    let mut gate = SizeGate::new(expected_size)?;
     let mut response = client.get(url).send().await.map_err(request_err)?;
     check_response(url, &response)?;
-    gate.check_declared(response.content_length())?;
-    let mut hasher = Sha256::new();
+    let mut verifier = StreamVerifier::new(expected_size, expected_sha256)?;
+    verifier.declared(response.content_length())?;
     while let Some(chunk) = response.chunk().await.map_err(request_err)? {
-        gate.push_chunk(chunk.len() as u64)?;
-        hasher.update(&chunk);
-        sink.write_all(&chunk)
-            .map_err(|e| UpgradeHttpError::Sink(e.to_string()))?;
+        verifier.chunk(&chunk, sink)?;
     }
-    gate.finish()?;
-    let actual = hex::encode(hasher.finalize());
-    if !actual.eq_ignore_ascii_case(expected_sha256) {
-        return Err(UpgradeHttpError::DigestMismatch {
-            expected: expected_sha256.to_ascii_lowercase(),
-            actual,
-        });
+    verifier.finish()
+}
+
+/// The size/sha256 enforcement core of an artifact download, factored out of
+/// the transport so the EXACT production verification path is unit-testable
+/// without a TLS server (the upgrade client is https-only by design).
+struct StreamVerifier {
+    gate: SizeGate,
+    hasher: Sha256,
+    expected_sha256: String,
+}
+
+impl StreamVerifier {
+    fn new(expected_size: u64, expected_sha256: &str) -> Result<Self, UpgradeHttpError> {
+        Ok(Self {
+            gate: SizeGate::new(expected_size)?,
+            hasher: Sha256::new(),
+            expected_sha256: expected_sha256.to_string(),
+        })
     }
-    Ok(())
+
+    fn declared(&mut self, content_length: Option<u64>) -> Result<(), UpgradeHttpError> {
+        self.gate.check_declared(content_length)
+    }
+
+    fn chunk(
+        &mut self,
+        chunk: &[u8],
+        sink: &mut (impl std::io::Write + Send),
+    ) -> Result<(), UpgradeHttpError> {
+        self.gate.push_chunk(chunk.len() as u64)?;
+        self.hasher.update(chunk);
+        sink.write_all(chunk)
+            .map_err(|e| UpgradeHttpError::Sink(e.to_string()))
+    }
+
+    fn finish(self) -> Result<(), UpgradeHttpError> {
+        self.gate.finish()?;
+        let actual = hex::encode(self.hasher.finalize());
+        if !actual.eq_ignore_ascii_case(&self.expected_sha256) {
+            return Err(UpgradeHttpError::DigestMismatch {
+                expected: self.expected_sha256.to_ascii_lowercase(),
+                actual,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -292,5 +326,51 @@ mod tests {
         // (redirect refusal, https_only, stalled reads) is exercised against
         // a live test server in the A-9 `upgrade_auto_test` target (§A.11).
         assert!(upgrade_http_client().is_ok());
+    }
+
+    #[test]
+    fn stream_verifier_accepts_the_exact_size_and_digest() {
+        let payload = b"artifact-bytes";
+        let digest = hex::encode(Sha256::digest(payload));
+        let mut out: Vec<u8> = Vec::new();
+        let mut v = StreamVerifier::new(payload.len() as u64, &digest).unwrap();
+        v.declared(Some(payload.len() as u64)).unwrap();
+        v.chunk(&payload[..5], &mut out).unwrap();
+        v.chunk(&payload[5..], &mut out).unwrap();
+        v.finish().unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn stream_verifier_rejects_a_digest_mismatch() {
+        let payload = b"artifact-bytes";
+        let mut out: Vec<u8> = Vec::new();
+        let mut v = StreamVerifier::new(payload.len() as u64, &"a".repeat(64)).unwrap();
+        v.chunk(payload, &mut out).unwrap();
+        assert!(matches!(
+            v.finish(),
+            Err(UpgradeHttpError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn stream_verifier_rejects_oversized_and_undersized_streams() {
+        let payload = b"artifact-bytes";
+        let digest = hex::encode(Sha256::digest(payload));
+        // One byte more than the signed size: cut off mid-stream.
+        let mut out: Vec<u8> = Vec::new();
+        let mut v = StreamVerifier::new(payload.len() as u64 - 1, &digest).unwrap();
+        assert!(v.chunk(payload, &mut out).is_err());
+        // One byte less than promised: refused at finish.
+        let mut out2: Vec<u8> = Vec::new();
+        let mut v2 = StreamVerifier::new(payload.len() as u64 + 1, &digest).unwrap();
+        v2.chunk(payload, &mut out2).unwrap();
+        assert!(v2.finish().is_err());
+    }
+
+    #[test]
+    fn stream_verifier_rejects_a_wrong_declared_length() {
+        let mut v = StreamVerifier::new(10, &"a".repeat(64)).unwrap();
+        assert!(v.declared(Some(11)).is_err());
     }
 }

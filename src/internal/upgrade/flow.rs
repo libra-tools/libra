@@ -22,7 +22,9 @@
 //! every §A.6/§A.7 branch be unit-tested deterministically.
 
 use super::{
-    manifest::{ManifestError, ReleaseVersion, VerifiedArtifact, VerifiedManifest},
+    manifest::{
+        ManifestError, ReleaseVersion, VerifiedArtifact, VerifiedManifest, verify_envelope_bytes,
+    },
     marker::{InstallMarker, OFFICIAL_INSTALL_SOURCE},
     platform::{Platform, PlatformSupport},
     state::{StateRejection, UpgradeState, evaluate_manifest},
@@ -54,8 +56,12 @@ pub enum SkipReason {
 pub enum UpgradeDecision {
     /// Install this artifact; `marker`/`new_state` are persisted on commit.
     Install(Box<InstallPlan>),
-    /// Do nothing this round.
-    Skip(SkipReason),
+    /// Do not install this round, but persist the already-accepted control
+    /// state so a later manifest cannot weaken its generation/replay policy.
+    Skip {
+        reason: SkipReason,
+        new_state: UpgradeState,
+    },
 }
 
 /// A fully-decided install: everything needed to download, verify and commit.
@@ -79,6 +85,8 @@ pub enum FlowError {
     Manifest(#[from] ManifestError),
     #[error("manifest rejected by anti-rollback/time state: {0}")]
     State(#[from] StateRejection),
+    #[error("verified manifest signer '{key_id}' is absent from the active trust table")]
+    VerifiedSignerMissing { key_id: String },
 }
 
 /// The host/clock/trust context a decision runs against (bundled so the
@@ -105,7 +113,7 @@ pub fn decide_from_envelope(
     ctx: &DecisionContext<'_>,
     envelope_bytes: &[u8],
 ) -> Result<UpgradeDecision, FlowError> {
-    let manifest = super::manifest::verify_envelope_bytes(envelope_bytes, ctx.trust)?;
+    let manifest = verify_envelope_for_persisted_floor(ctx, envelope_bytes)?;
     let accepted = evaluate_manifest(ctx.state, &manifest, ctx.https_date, ctx.local_now)?;
     Ok(decide_after_verification(
         &manifest,
@@ -115,6 +123,62 @@ pub fn decide_from_envelope(
         ctx.installed_version,
         ctx.installed_at_rfc3339,
     ))
+}
+
+/// Verify using every applicable floor without changing the manifest's
+/// on-wire contract. The manifest verifier enforces its signed minimum and
+/// the compile-time minimum; this function additionally filters candidate
+/// keys by the durable floor. If only an older signer verifies, retrying
+/// against the complete table lets us return a stable state rejection rather
+/// than collapsing the condition into an indistinguishable crypto failure.
+fn verify_envelope_for_persisted_floor(
+    ctx: &DecisionContext<'_>,
+    envelope_bytes: &[u8],
+) -> Result<VerifiedManifest, FlowError> {
+    let eligible_trust: Vec<_> = ctx
+        .trust
+        .iter()
+        .copied()
+        .filter(|key| key.generation >= ctx.state.generation_floor)
+        .collect();
+    match verify_envelope_bytes(envelope_bytes, &eligible_trust) {
+        Ok(manifest) => Ok(manifest),
+        Err(ManifestError::NoTrustedSignature) => {
+            match verify_envelope_bytes(envelope_bytes, ctx.trust) {
+                Ok(manifest) => {
+                    let signer = ctx
+                        .trust
+                        .iter()
+                        .find(|key| key.key_id == manifest.signer_key_id)
+                        .ok_or_else(|| FlowError::VerifiedSignerMissing {
+                            key_id: manifest.signer_key_id.clone(),
+                        })?;
+                    Err(StateRejection::SignerGenerationBelowFloor {
+                        key_id: signer.key_id.to_string(),
+                        offered: signer.generation,
+                        floor: ctx.state.generation_floor,
+                    }
+                    .into())
+                }
+                // The full table rejected on the signed/compile-time floor
+                // while the persisted floor is stricter still: report the
+                // EFFECTIVE (three-source max) floor, not the weaker one the
+                // pure verifier knows about.
+                Err(ManifestError::KeyGenerationBelowFloor {
+                    floor,
+                    manifest_min,
+                }) if ctx.state.generation_floor > floor => {
+                    Err(ManifestError::KeyGenerationBelowFloor {
+                        floor: ctx.state.generation_floor,
+                        manifest_min,
+                    }
+                    .into())
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The policy + selection step, split out so it is testable against a
@@ -129,30 +193,48 @@ pub fn decide_after_verification(
 ) -> UpgradeDecision {
     // Platform gate first: unsupported/absent platforms never download.
     let Some(platform) = platform else {
-        return UpgradeDecision::Skip(SkipReason::PlatformNotInMatrix);
+        return UpgradeDecision::Skip {
+            reason: SkipReason::PlatformNotInMatrix,
+            new_state,
+        };
     };
     if platform.support() == PlatformSupport::Unsupported {
-        return UpgradeDecision::Skip(SkipReason::UnsupportedPlatform(platform));
+        return UpgradeDecision::Skip {
+            reason: SkipReason::UnsupportedPlatform(platform),
+            new_state,
+        };
     }
     // Control gates: pause and self-revocation forbid any install (§A.6).
     if manifest.paused {
-        return UpgradeDecision::Skip(SkipReason::Paused);
+        return UpgradeDecision::Skip {
+            reason: SkipReason::Paused,
+            new_state,
+        };
     }
     if manifest.is_revoked(manifest.version) {
-        return UpgradeDecision::Skip(SkipReason::RevokedTarget(manifest.version));
+        return UpgradeDecision::Skip {
+            reason: SkipReason::RevokedTarget(manifest.version),
+            new_state,
+        };
     }
     // Only install something strictly newer than what is running.
     if manifest.version <= installed_version {
-        return UpgradeDecision::Skip(SkipReason::NotNewer {
-            manifest: manifest.version,
-            installed: installed_version,
-        });
+        return UpgradeDecision::Skip {
+            reason: SkipReason::NotNewer {
+                manifest: manifest.version,
+                installed: installed_version,
+            },
+            new_state,
+        };
     }
     // Artifact for our platform is guaranteed present after validation.
     let Some(artifact) = manifest.artifact_for(platform).cloned() else {
         // Defensive: validation guarantees coverage, so treat a miss as
         // "not in matrix" rather than panicking.
-        return UpgradeDecision::Skip(SkipReason::PlatformNotInMatrix);
+        return UpgradeDecision::Skip {
+            reason: SkipReason::PlatformNotInMatrix,
+            new_state,
+        };
     };
     let marker = InstallMarker {
         schema_version: 1,
@@ -215,7 +297,10 @@ mod tests {
     ) -> UpgradeDecision {
         decide_after_verification(
             m,
-            UpgradeState::default(),
+            UpgradeState {
+                generation_floor: m.min_key_generation,
+                ..UpgradeState::default()
+            },
             m.published_at,
             platform,
             ReleaseVersion::parse(installed).expect("test fixture operation should succeed"),
@@ -241,58 +326,63 @@ mod tests {
     #[test]
     fn windows_is_skipped_unsupported_even_when_newer() {
         let m = manifest("2.0.0", false, &[]);
+        let UpgradeDecision::Skip { reason, new_state } =
+            decide(&m, Some(Platform::WindowsAmd64), "1.0.0")
+        else {
+            panic!("Windows must not produce an install plan");
+        };
         assert_eq!(
-            decide(&m, Some(Platform::WindowsAmd64), "1.0.0"),
-            UpgradeDecision::Skip(SkipReason::UnsupportedPlatform(Platform::WindowsAmd64))
+            reason,
+            SkipReason::UnsupportedPlatform(Platform::WindowsAmd64)
         );
+        assert_eq!(new_state.generation_floor, 1);
     }
 
     #[test]
     fn platform_not_in_matrix_skips() {
         let m = manifest("2.0.0", false, &[]);
-        assert_eq!(
-            decide(&m, None, "1.0.0"),
-            UpgradeDecision::Skip(SkipReason::PlatformNotInMatrix)
-        );
+        let UpgradeDecision::Skip { reason, new_state } = decide(&m, None, "1.0.0") else {
+            panic!("an unknown platform must not produce an install plan");
+        };
+        assert_eq!(reason, SkipReason::PlatformNotInMatrix);
+        assert_eq!(new_state.generation_floor, 1);
     }
 
     #[test]
     fn paused_manifest_never_installs() {
         let m = manifest("2.0.0", true, &[]);
-        assert_eq!(
-            decide(&m, Some(Platform::LinuxAmd64), "1.0.0"),
-            UpgradeDecision::Skip(SkipReason::Paused)
-        );
+        let UpgradeDecision::Skip { reason, new_state } =
+            decide(&m, Some(Platform::LinuxAmd64), "1.0.0")
+        else {
+            panic!("paused manifest must not produce an install plan");
+        };
+        assert_eq!(reason, SkipReason::Paused);
+        assert_eq!(new_state.generation_floor, 1);
     }
 
     #[test]
     fn self_revoked_version_never_installs() {
         let m = manifest("2.0.0", false, &["2.0.0"]);
-        assert_eq!(
-            decide(&m, Some(Platform::LinuxAmd64), "1.0.0"),
-            UpgradeDecision::Skip(SkipReason::RevokedTarget(ReleaseVersion(2, 0, 0)))
-        );
+        let UpgradeDecision::Skip { reason, new_state } =
+            decide(&m, Some(Platform::LinuxAmd64), "1.0.0")
+        else {
+            panic!("a self-revoked manifest must not produce an install plan");
+        };
+        assert_eq!(reason, SkipReason::RevokedTarget(ReleaseVersion(2, 0, 0)));
+        assert_eq!(new_state.generation_floor, 1);
     }
 
     #[test]
     fn same_or_older_version_is_not_newer() {
         let m = manifest("2.0.0", false, &[]);
-        assert!(matches!(
-            decide(&m, Some(Platform::LinuxAmd64), "2.0.0"),
-            UpgradeDecision::Skip(SkipReason::NotNewer { .. })
-        ));
-        assert!(matches!(
-            decide(&m, Some(Platform::LinuxAmd64), "2.1.0"),
-            UpgradeDecision::Skip(SkipReason::NotNewer { .. })
-        ));
-    }
-
-    impl PartialEq for UpgradeDecision {
-        fn eq(&self, other: &Self) -> bool {
-            match (self, other) {
-                (UpgradeDecision::Skip(a), UpgradeDecision::Skip(b)) => a == b,
-                _ => false,
-            }
+        for installed in ["2.0.0", "2.1.0"] {
+            let UpgradeDecision::Skip { reason, new_state } =
+                decide(&m, Some(Platform::LinuxAmd64), installed)
+            else {
+                panic!("a non-newer manifest must not produce an install plan");
+            };
+            assert!(matches!(reason, SkipReason::NotNewer { .. }));
+            assert_eq!(new_state.generation_floor, 1);
         }
     }
 }

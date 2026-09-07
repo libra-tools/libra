@@ -217,7 +217,7 @@ async fn test_merge_fast_forward() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Test merging a remote branch
 async fn test_merge_remote_branch() {
     let temp_repo = create_committed_repo_via_cli();
@@ -264,7 +264,7 @@ async fn test_merge_remote_branch() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Test JSON output when merging a remote branch reference.
 async fn test_merge_json_remote_branch_outputs_summary() {
     let temp_repo = create_committed_repo_via_cli();
@@ -318,7 +318,7 @@ async fn test_merge_json_remote_branch_outputs_summary() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Test merging diverged branches with non-overlapping changes.
 async fn test_merge_diverged_branch_creates_two_parent_commit() {
     let temp_repo = create_committed_repo_via_cli();
@@ -523,7 +523,7 @@ fn test_merge_no_commit_then_continue() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_merge_same_file_non_overlapping_edits_merges_without_conflict() {
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
@@ -588,7 +588,6 @@ async fn test_merge_same_file_non_overlapping_edits_merges_without_conflict() {
 }
 
 #[test]
-#[serial]
 fn test_merge_diverged_nested_directory_file_survives_three_way() {
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
@@ -623,7 +622,6 @@ fn test_merge_diverged_nested_directory_file_survives_three_way() {
 }
 
 #[test]
-#[serial]
 /// Test JSON envelope for a clean three-way merge.
 fn test_merge_json_diverged_branch_outputs_three_way_summary() {
     let temp_repo = create_committed_repo_via_cli();
@@ -679,7 +677,6 @@ fn test_merge_json_diverged_branch_outputs_three_way_summary() {
 }
 
 #[test]
-#[serial]
 fn test_merge_conflict_writes_markers_status_hints_and_abort_restores() {
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
@@ -746,7 +743,7 @@ fn test_merge_conflict_writes_markers_status_hints_and_abort_restores() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_merge_continue_after_resolving_conflict_creates_two_parent_commit() {
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
@@ -809,7 +806,6 @@ async fn test_merge_continue_after_resolving_conflict_creates_two_parent_commit(
 }
 
 #[test]
-#[serial]
 fn test_merge_continue_refuses_unstaged_resolution_edits() {
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
@@ -857,7 +853,6 @@ fn test_merge_continue_refuses_unstaged_resolution_edits() {
 }
 
 #[test]
-#[serial]
 fn test_merge_dirty_worktree_refuses_before_state() {
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
@@ -890,7 +885,6 @@ fn test_merge_dirty_worktree_refuses_before_state() {
 }
 
 #[test]
-#[serial]
 fn test_merge_untracked_overwrite_refuses_before_head_update() {
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
@@ -1573,7 +1567,6 @@ fn create_diverged_repo_for_conflict() -> tempfile::TempDir {
 /// common-ancestor content between ours and the `=======` separator
 /// (lore.md §1.3); the default two-marker style stays unchanged when unset.
 #[test]
-#[serial]
 fn test_merge_conflict_diff3_markers() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
@@ -1595,7 +1588,6 @@ fn test_merge_conflict_diff3_markers() {
 /// hard error when a conflict must be rendered — never a silent fall-back to
 /// the default marker format — and nothing is written (no merge state).
 #[test]
-#[serial]
 fn test_merge_conflict_style_invalid_rejected() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
@@ -1656,7 +1648,6 @@ fn count_loose_objects(p: &Path) -> usize {
 }
 
 #[test]
-#[serial]
 fn test_merge_dry_run_fast_forward_writes_nothing() {
     let temp_repo = create_committed_repo_via_cli();
     let p = temp_repo.path();
@@ -1701,7 +1692,6 @@ fn operation_count(repo: &Path) -> u64 {
 }
 
 #[test]
-#[serial]
 fn test_merge_dry_run_already_up_to_date() {
     let temp_repo = create_committed_repo_via_cli();
     let p = temp_repo.path();
@@ -1714,7 +1704,7 @@ fn test_merge_dry_run_already_up_to_date() {
 }
 
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_merge_dry_run_clean_three_way_writes_no_objects() {
     // Divergent but non-overlapping edits: a clean three-way preview. The
     // auto-merged blob must be computed in memory only — the object store,
@@ -1758,7 +1748,6 @@ fn test_merge_dry_run_clean_three_way_writes_no_objects() {
 }
 
 #[test]
-#[serial]
 fn test_merge_dry_run_conflict_exits_1_and_writes_nothing() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
@@ -1790,7 +1779,6 @@ fn test_merge_dry_run_conflict_exits_1_and_writes_nothing() {
 }
 
 #[test]
-#[serial]
 fn test_merge_json_schema_freeze_no_dry_run_fields_on_real_merge() {
     // A REAL merge's JSON must not grow the dry_run/would_conflict keys.
     let temp_repo = create_committed_repo_via_cli();
@@ -1804,7 +1792,6 @@ fn test_merge_json_schema_freeze_no_dry_run_fields_on_real_merge() {
 }
 
 #[test]
-#[serial]
 fn test_merge_dry_run_clap_exclusions() {
     let temp_repo = create_committed_repo_via_cli();
     let p = temp_repo.path();
@@ -1833,7 +1820,6 @@ fn test_merge_dry_run_clap_exclusions() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial]
 fn test_merge_restart_regenerates_fresh_conflict() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
@@ -1866,7 +1852,6 @@ fn test_merge_restart_regenerates_fresh_conflict() {
 }
 
 #[test]
-#[serial]
 fn test_merge_restart_without_merge_in_progress_errors() {
     let temp_repo = create_committed_repo_via_cli();
     let p = temp_repo.path();
@@ -1880,7 +1865,6 @@ fn test_merge_restart_without_merge_in_progress_errors() {
 }
 
 #[test]
-#[serial]
 fn test_merge_restart_refuses_staged_no_commit_merge() {
     // `--no-commit` persists MergeState with NO conflicts; --restart must
     // refuse (it would discard the staged result and could fast-forward),
@@ -1952,7 +1936,6 @@ fn stash_list_len(p: &Path) -> usize {
 }
 
 #[test]
-#[serial]
 fn test_merge_autostash_clean_merge_reapplies() {
     let temp_repo = create_diverged_repo_clean();
     let p = temp_repo.path();
@@ -1987,7 +1970,6 @@ fn test_merge_autostash_clean_merge_reapplies() {
 }
 
 #[test]
-#[serial]
 fn test_merge_autostash_restores_staged_and_worktree_layers() {
     let temp_repo = create_diverged_repo_clean();
     let p = temp_repo.path();
@@ -2015,7 +1997,6 @@ fn test_merge_autostash_restores_staged_and_worktree_layers() {
 }
 
 #[test]
-#[serial]
 fn test_merge_autostash_conflict_holds_then_abort_restores() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
@@ -2054,7 +2035,6 @@ fn test_merge_autostash_conflict_holds_then_abort_restores() {
 }
 
 #[test]
-#[serial]
 fn test_merge_autostash_conflict_resolve_continue_reapplies() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
@@ -2081,7 +2061,6 @@ fn test_merge_autostash_conflict_resolve_continue_reapplies() {
 }
 
 #[test]
-#[serial]
 fn test_merge_autostash_restart_preserves_held_stash() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
@@ -2106,7 +2085,6 @@ fn test_merge_autostash_restart_preserves_held_stash() {
 }
 
 #[test]
-#[serial]
 fn test_merge_autostash_start_failure_restores_immediately() {
     let temp_repo = create_diverged_repo_clean();
     let p = temp_repo.path();
@@ -2125,7 +2103,6 @@ fn test_merge_autostash_start_failure_restores_immediately() {
 }
 
 #[test]
-#[serial]
 fn test_merge_autostash_config_and_validation() {
     let temp_repo = create_diverged_repo_clean();
     let p = temp_repo.path();
@@ -2182,7 +2159,7 @@ fn test_merge_autostash_config_and_validation() {
 /// silently discarded `user.name` / `user.email`. All three paths must now carry
 /// the configured identity.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_merge_commit_carries_configured_identity() {
     for (label, extra_args) in [
         ("three-way", Vec::new()),
@@ -2240,7 +2217,7 @@ async fn test_merge_commit_carries_configured_identity() {
 /// `--continue` finalizes without an editor, so `-m` is the only way to set the
 /// message of a conflicted merge. It must also carry the configured identity.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_merge_continue_accepts_message_override_and_configured_identity() {
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();

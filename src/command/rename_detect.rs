@@ -2289,7 +2289,8 @@ mod tests {
     /// budget is independent" from "the object budget is broken in the same
     /// way". Here a real repository exists, the WORKTREE budget is spent to
     /// nothing, and an object read is then required to succeed on content it
-    /// actually returns.
+    /// actually returns. The worktree fixture uses a Unix symlink.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn object_read_still_succeeds_after_the_worktree_budget_is_spent() {

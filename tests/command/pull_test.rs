@@ -118,7 +118,6 @@ fn parse_json_stderr(stderr: &[u8]) -> serde_json::Value {
 }
 
 #[test]
-#[serial]
 fn test_pull_cli_without_tracking_returns_repo_exit_code() {
     let repo = create_committed_repo_via_cli();
 
@@ -145,7 +144,6 @@ fn test_pull_cli_without_tracking_returns_repo_exit_code() {
 }
 
 #[test]
-#[serial]
 fn test_pull_cli_without_tracking_uses_single_remote_in_advice() {
     let repo = create_committed_repo_via_cli();
     let remote = tempdir().expect("failed to create remote root");
@@ -168,7 +166,6 @@ fn test_pull_cli_without_tracking_uses_single_remote_in_advice() {
 }
 
 #[test]
-#[serial]
 fn test_pull_cli_remote_not_found_returns_cli_exit_code() {
     let repo = create_committed_repo_via_cli();
 
@@ -222,7 +219,7 @@ fn test_pull_no_rebase_countermands_rebase_at_parse_time() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_fast_forward_updates_head_from_tracking_remote() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
     let remote_head = git_stdout(&["rev-parse", "HEAD"], &work_dir);
@@ -247,7 +244,7 @@ async fn test_pull_fast_forward_updates_head_from_tracking_remote() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_ff_only_fast_forward_updates_head_from_tracking_remote() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -282,7 +279,7 @@ async fn test_pull_ff_only_fast_forward_updates_head_from_tracking_remote() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_fast_forward_skips_untracked_artifacts_during_restore() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -335,7 +332,7 @@ async fn test_pull_fast_forward_skips_untracked_artifacts_during_restore() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_diverged_remote_creates_three_way_merge() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -390,7 +387,7 @@ async fn test_pull_diverged_remote_creates_three_way_merge() {
 /// does not commit, move HEAD, or record merge state; the staged result then
 /// finalizes as an ordinary single-parent commit.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_squash_stages_merge_without_committing() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -476,7 +473,7 @@ async fn test_pull_squash_stages_merge_without_committing() {
 /// committing, recording merge state so `merge --continue` finalizes the
 /// two-parent merge commit.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_no_commit_stops_before_commit_and_records_merge_state() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -560,7 +557,7 @@ async fn test_pull_no_commit_stops_before_commit_and_records_merge_state() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_ff_only_diverged_remote_rejects_without_changing_head_or_worktree() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -643,7 +640,7 @@ async fn test_pull_ff_only_diverged_remote_rejects_without_changing_head_or_work
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_detached_head_returns_repo_exit_code() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -660,7 +657,7 @@ async fn test_pull_detached_head_returns_repo_exit_code() {
 }
 
 #[test]
-#[serial]
+#[serial(env)]
 fn test_pull_quiet_suppresses_stdout() {
     let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
 
@@ -679,7 +676,7 @@ fn test_pull_quiet_suppresses_stdout() {
 }
 
 #[test]
-#[serial]
+#[serial(env)]
 fn test_pull_human_output_reports_update_range_after_follow_up_fast_forward() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -727,7 +724,6 @@ fn test_pull_human_output_reports_update_range_after_follow_up_fast_forward() {
 }
 
 #[test]
-#[serial]
 fn test_pull_json_fetch_error_includes_phase_detail() {
     let repo = create_committed_repo_via_cli();
 
@@ -755,7 +751,7 @@ fn test_pull_json_fetch_error_includes_phase_detail() {
 }
 
 #[test]
-#[serial]
+#[serial(env)]
 fn test_pull_json_diverged_remote_reports_three_way_merge() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -802,7 +798,7 @@ fn test_pull_json_diverged_remote_reports_three_way_merge() {
 }
 
 #[test]
-#[serial]
+#[serial(env)]
 fn test_pull_conflict_error_includes_merge_phase_and_hints() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -858,7 +854,7 @@ fn test_pull_conflict_error_includes_merge_phase_and_hints() {
 /// `libra pull --rebase` replays the local-only commit on top of the
 /// freshly-fetched upstream tip when the histories have diverged.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_pull_rebase_replays_local_commit_onto_diverged_upstream() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -921,7 +917,7 @@ async fn test_pull_rebase_replays_local_commit_onto_diverged_upstream() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_pull_rebase_runs_pre_rebase_before_moving_local_history() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1010,7 +1006,7 @@ async fn test_pull_rebase_runs_pre_rebase_before_moving_local_history() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_pull_rebase_already_up_to_date_reports_noop() {
     let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
 
@@ -1073,7 +1069,7 @@ fn test_pull_no_ff_conflicts_with_ff_only_at_parse_time() {
 /// `libra pull --no-ff` against a fast-forwardable upstream records a real
 /// two-parent merge commit instead of fast-forwarding HEAD to the remote tip.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_pull_no_ff_forces_merge_commit_on_fast_forwardable_history() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
 
@@ -1178,7 +1174,7 @@ fn pull_no_progress_flag_is_accepted() {
 /// its own entry by id: the linked worktree's dirty change survives the
 /// pull, and a pre-existing foreign entry on the shared stack is untouched.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_pull_rebase_autostash_in_linked_worktree_pops_only_its_own_entry() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
     let local_repo = tempdir().expect("local repo");
@@ -1271,7 +1267,7 @@ async fn test_pull_rebase_autostash_in_linked_worktree_pops_only_its_own_entry()
 /// (the pre-W2 loose-only object reads made it silently no-op with
 /// "No local changes to save").
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_stash_push_works_on_a_packed_head_from_pull() {
     let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
     let local_repo = tempdir().expect("local repo");
@@ -1309,7 +1305,7 @@ async fn test_stash_push_works_on_a_packed_head_from_pull() {
 /// repository — the five fetch packs collapse into one (old packs deleted),
 /// while history and a blob staged only in a linked worktree stay readable.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_incremental_repack_consolidates_with_linked_worktree_roots() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
     let local_repo = tempdir().expect("local repo");
@@ -1411,7 +1407,7 @@ async fn test_incremental_repack_consolidates_with_linked_worktree_roots() {
 /// success — a leaked pin would exempt every prefetched pack from repack
 /// forever.
 #[tokio::test]
-#[serial]
+#[serial(env)]
 async fn test_prefetch_releases_pack_keep_pins() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
     let local_repo = tempdir().expect("local repo");

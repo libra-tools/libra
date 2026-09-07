@@ -1,0 +1,1383 @@
+{
+  "schema_version": 1,
+  "source": "libra-backend cf B1-02 — libs/release-signing/up01-contract-vectors.ts (regenerate: pnpm exec tsx scripts/generate-up01-vectors.ts)",
+  "signing_domain": "libra-upgrade-manifest-v1\\0 (one trailing NUL byte)",
+  "test_key": {
+    "key_id": "libra-release-test-1",
+    "public_key_hex": "a8a00ded13ddafaad525fabddc13efc717b29ebed50cd6d653196057fa8f8a43",
+    "generation": 1,
+    "not_before": 1767225600,
+    "not_after": 1830297600,
+    "note": "test-only keypair; the private half is committed in up01-contract-vectors.ts and protects nothing"
+  },
+  "vectors_digest_sha256": "5c68689ae925e0fb83f030b35f451439796d0e5734a56eb813e997681706b8ba",
+  "vectors": [
+    {
+      "id": "publish-first-control-revision-1",
+      "operation": "publish",
+      "description": "First publish onto an empty stable: control_revision starts at 1, empty control fields",
+      "pre_state": null,
+      "input": {
+        "publish": {
+          "version": "0.22.1",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1785542400,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: publish starts control_revision at 1",
+      "result_payload": {
+        "channel": "stable",
+        "version": "0.22.1",
+        "control_revision": 1,
+        "published_at": "2026-08-01T00:00:00.000Z",
+        "expires_at": "2026-10-30T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.1/libra-linux-amd64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.1/libra-linux-arm64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.1/libra-darwin-arm64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.1/libra-windows-amd64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "eac1a1f598e77cb40990699bbe06f99dbac5a33dd243a2c92201688554275ba1",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjAuMjIuMSIsImNvbnRyb2xfcmV2aXNpb24iOjEsInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTEwLTMwVDAwOjAwOjAwLjAwMFoiLCJtaW5fa2V5X2dlbmVyYXRpb24iOjEsInBhdXNlZCI6ZmFsc2UsInJldm9rZWRfdmVyc2lvbnMiOltdLCJhcnRpZmFjdHMiOlt7InBsYXRmb3JtIjoibGludXgtYW1kNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjEvbGlicmEtbGludXgtYW1kNjQiLCJzaGEyNTYiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwic2l6ZSI6MTAwMDAwMH0seyJwbGF0Zm9ybSI6ImxpbnV4LWFybTY0IiwidXJsIjoiaHR0cHM6Ly9kb3dubG9hZC5saWJyYS50b29scy9saWJyYS9yZWxlYXNlcy92MC4yMi4xL2xpYnJhLWxpbnV4LWFybTY0Iiwic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEwMDAwMDF9LHsicGxhdGZvcm0iOiJkYXJ3aW4tYXJtNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjEvbGlicmEtZGFyd2luLWFybTY0Iiwic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEwMDAwMDJ9LHsicGxhdGZvcm0iOiJ3aW5kb3dzLWFtZDY0IiwidXJsIjoiaHR0cHM6Ly9kb3dubG9hZC5saWJyYS50b29scy9saWJyYS9yZWxlYXNlcy92MC4yMi4xL2xpYnJhLXdpbmRvd3MtYW1kNjQiLCJzaGEyNTYiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwic2l6ZSI6MTAwMDAwM31dfQ==",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "3yfIOnxSCwYx9tK0eYjIZZQBFb16DO+/2chCox7CXO7M8vxSIU/VLJvY2vYT44QN1xNmwecHJy3K/xa0QXx7BA=="
+          }
+        ]
+      }
+    },
+    {
+      "id": "publish-upgrade-inherits-controls",
+      "operation": "publish",
+      "description": "Version upgrade inherits paused/revoked_versions byte-for-byte and increments control_revision",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.1",
+        "control_revision": 4,
+        "published_at": "2026-08-01T00:00:00.000Z",
+        "expires_at": "2026-10-30T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": true,
+        "revoked_versions": [
+          "0.21.9",
+          "0.22.0"
+        ],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.1/libra-linux-amd64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.1/libra-linux-arm64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.1/libra-darwin-arm64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.1/libra-windows-amd64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000003
+          }
+        ]
+      },
+      "input": {
+        "publish": {
+          "version": "0.22.2",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size": 2000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size": 2000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size": 2000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size": 2000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1786147200,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: publish inherits paused and revoked_versions byte-for-byte",
+      "result_payload": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": true,
+        "revoked_versions": [
+          "0.21.9",
+          "0.22.0"
+        ],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "d19c54ba5fe244a1d4b031a377b9acd9296fcc68668225790267b3f9437ec171",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjAuMjIuMiIsImNvbnRyb2xfcmV2aXNpb24iOjUsInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMDhUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTExLTA2VDAwOjAwOjAwLjAwMFoiLCJtaW5fa2V5X2dlbmVyYXRpb24iOjEsInBhdXNlZCI6dHJ1ZSwicmV2b2tlZF92ZXJzaW9ucyI6WyIwLjIxLjkiLCIwLjIyLjAiXSwiYXJ0aWZhY3RzIjpbeyJwbGF0Zm9ybSI6ImxpbnV4LWFtZDY0IiwidXJsIjoiaHR0cHM6Ly9kb3dubG9hZC5saWJyYS50b29scy9saWJyYS9yZWxlYXNlcy92MC4yMi4yL2xpYnJhLWxpbnV4LWFtZDY0Iiwic2hhMjU2IjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsInNpemUiOjIwMDAwMDB9LHsicGxhdGZvcm0iOiJsaW51eC1hcm02NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjAuMjIuMi9saWJyYS1saW51eC1hcm02NCIsInNoYTI1NiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJzaXplIjoyMDAwMDAxfSx7InBsYXRmb3JtIjoiZGFyd2luLWFybTY0IiwidXJsIjoiaHR0cHM6Ly9kb3dubG9hZC5saWJyYS50b29scy9saWJyYS9yZWxlYXNlcy92MC4yMi4yL2xpYnJhLWRhcndpbi1hcm02NCIsInNoYTI1NiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJzaXplIjoyMDAwMDAyfSx7InBsYXRmb3JtIjoid2luZG93cy1hbWQ2NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjAuMjIuMi9saWJyYS13aW5kb3dzLWFtZDY0Iiwic2hhMjU2IjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsInNpemUiOjIwMDAwMDN9XX0=",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "Hcj8XUkoUU0ksIFWKY+aYE04cPK19k8YkoEnG9AAAUOkHpbYc4J0voSgHdpnIqIWijhogIBzJZC5LNvl27ouBg=="
+          }
+        ]
+      }
+    },
+    {
+      "id": "publish-version-regression",
+      "operation": "publish",
+      "description": "A lower version than current stable is rejected",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "publish": {
+          "version": "0.22.1",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "size": 3000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "size": 3000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "size": 3000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "size": 3000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1786233600,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "version_regression"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: publish rejects a version regression"
+    },
+    {
+      "id": "publish-same-version-idempotent",
+      "operation": "publish",
+      "description": "new == current with identical artifact identity is idempotent: nothing is re-signed",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "publish": {
+          "version": "0.22.2",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size": 2000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size": 2000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size": 2000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "size": 2000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1786233600,
+      "expected": {
+        "outcome": "idempotent"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: publish of the same version is idempotent only for identical artifacts"
+    },
+    {
+      "id": "publish-same-version-conflict",
+      "operation": "publish",
+      "description": "new == current with a different artifact identity is a conflict",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "publish": {
+          "version": "0.22.2",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "size": 2000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "size": 2000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "size": 2000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "size": 2000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1786233600,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "same_version_conflict"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: publish of the same version is idempotent only for identical artifacts"
+    },
+    {
+      "id": "publish-key-window-expiry",
+      "operation": "publish",
+      "description": "Publish whose expires_at would exceed the key's not_after is rejected before signing",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "publish": {
+          "version": "0.22.3",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "size": 4000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "size": 4000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "size": 4000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "size": 4000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1827705600,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "key_window"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: every operation enforces the full key-window precondition"
+    },
+    {
+      "id": "publish-before-not-before",
+      "operation": "publish",
+      "description": "Publish before the key's not_before is rejected",
+      "pre_state": null,
+      "input": {
+        "publish": {
+          "version": "0.22.1",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1767225599,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "key_window"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: every operation enforces the full key-window precondition"
+    },
+    {
+      "id": "renew-skip-above-60d",
+      "operation": "renew",
+      "description": "Renew skips (no write, no control_revision bump) while more than 60 days remain",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2026-07-17T00:00:00.000Z",
+        "expires_at": "2026-10-15T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "renew": {}
+      },
+      "now_seconds": 1786752000,
+      "expected": {
+        "outcome": "skip"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: renew skips above the 60-day threshold and applies at or below it"
+    },
+    {
+      "id": "renew-applied-below-60d",
+      "operation": "renew",
+      "description": "Renew at 59 days remaining: only published_at/expires_at/control_revision change",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2026-07-15T00:00:00.000Z",
+        "expires_at": "2026-10-13T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [
+          "0.21.9"
+        ],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "renew": {}
+      },
+      "now_seconds": 1786752000,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: renew changes only the time fields and control_revision",
+      "result_payload": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 6,
+        "published_at": "2026-08-15T00:00:00.000Z",
+        "expires_at": "2026-11-13T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [
+          "0.21.9"
+        ],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "5901c8f8c421d8ab56314dcc3b570c07b6057b8c5558753b39e0d04726568ee9",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjAuMjIuMiIsImNvbnRyb2xfcmV2aXNpb24iOjYsInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMTVUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTExLTEzVDAwOjAwOjAwLjAwMFoiLCJtaW5fa2V5X2dlbmVyYXRpb24iOjEsInBhdXNlZCI6ZmFsc2UsInJldm9rZWRfdmVyc2lvbnMiOlsiMC4yMS45Il0sImFydGlmYWN0cyI6W3sicGxhdGZvcm0iOiJsaW51eC1hbWQ2NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjAuMjIuMi9saWJyYS1saW51eC1hbWQ2NCIsInNoYTI1NiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJzaXplIjoyMDAwMDAwfSx7InBsYXRmb3JtIjoibGludXgtYXJtNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjIvbGlicmEtbGludXgtYXJtNjQiLCJzaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic2l6ZSI6MjAwMDAwMX0seyJwbGF0Zm9ybSI6ImRhcndpbi1hcm02NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjAuMjIuMi9saWJyYS1kYXJ3aW4tYXJtNjQiLCJzaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic2l6ZSI6MjAwMDAwMn0seyJwbGF0Zm9ybSI6IndpbmRvd3MtYW1kNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjIvbGlicmEtd2luZG93cy1hbWQ2NCIsInNoYTI1NiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJzaXplIjoyMDAwMDAzfV19",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "hx7W9DwcYAH+Ihje0FeRzpXSjG+kASr94V1I4jLb61GK+ud9w0kEouL3xe7mpaHPeqyGV3CYGcKayP7jqzz4Bg=="
+          }
+        ]
+      }
+    },
+    {
+      "id": "renew-key-window",
+      "operation": "renew",
+      "description": "Renew that would push expires_at beyond not_after is rejected (rotation required)",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2027-10-04T00:00:00.000Z",
+        "expires_at": "2027-11-22T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "renew": {}
+      },
+      "now_seconds": 1826841600,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "key_window"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: every operation enforces the full key-window precondition"
+    },
+    {
+      "id": "emergency-pause",
+      "operation": "emergency",
+      "description": "Pause flips paused=true and increments control_revision",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 5,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "emergency": {
+          "type": "pause"
+        }
+      },
+      "now_seconds": 1787356800,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: emergency pause/resume flip paused and reject no-ops",
+      "result_payload": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 6,
+        "published_at": "2026-08-22T00:00:00.000Z",
+        "expires_at": "2026-11-20T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": true,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "46f252c16d4d710a79ebea76d050fcf42cca7619f964817bf25c69f8c075aede",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjAuMjIuMiIsImNvbnRyb2xfcmV2aXNpb24iOjYsInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMjJUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTExLTIwVDAwOjAwOjAwLjAwMFoiLCJtaW5fa2V5X2dlbmVyYXRpb24iOjEsInBhdXNlZCI6dHJ1ZSwicmV2b2tlZF92ZXJzaW9ucyI6W10sImFydGlmYWN0cyI6W3sicGxhdGZvcm0iOiJsaW51eC1hbWQ2NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjAuMjIuMi9saWJyYS1saW51eC1hbWQ2NCIsInNoYTI1NiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJzaXplIjoyMDAwMDAwfSx7InBsYXRmb3JtIjoibGludXgtYXJtNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjIvbGlicmEtbGludXgtYXJtNjQiLCJzaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic2l6ZSI6MjAwMDAwMX0seyJwbGF0Zm9ybSI6ImRhcndpbi1hcm02NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjAuMjIuMi9saWJyYS1kYXJ3aW4tYXJtNjQiLCJzaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic2l6ZSI6MjAwMDAwMn0seyJwbGF0Zm9ybSI6IndpbmRvd3MtYW1kNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjIvbGlicmEtd2luZG93cy1hbWQ2NCIsInNoYTI1NiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJzaXplIjoyMDAwMDAzfV19",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "/3hI4VEGPogv9hrMKo/tu8gXQWztxIjhvcLaRSRI5ArZnxjIX1Mmg0U4tUNAJ5mekzqeAW7KJ1cbHhFzYeYbBg=="
+          }
+        ]
+      }
+    },
+    {
+      "id": "emergency-resume",
+      "operation": "emergency",
+      "description": "Resume flips paused=false and increments control_revision",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 6,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": true,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "emergency": {
+          "type": "resume"
+        }
+      },
+      "now_seconds": 1787356800,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: emergency pause/resume flip paused and reject no-ops",
+      "result_payload": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 7,
+        "published_at": "2026-08-22T00:00:00.000Z",
+        "expires_at": "2026-11-20T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "34a22b7ba84b6dd7d1a099c7e066db16d78991c8ef4631d38216e4cdb4dfb848",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjAuMjIuMiIsImNvbnRyb2xfcmV2aXNpb24iOjcsInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMjJUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTExLTIwVDAwOjAwOjAwLjAwMFoiLCJtaW5fa2V5X2dlbmVyYXRpb24iOjEsInBhdXNlZCI6ZmFsc2UsInJldm9rZWRfdmVyc2lvbnMiOltdLCJhcnRpZmFjdHMiOlt7InBsYXRmb3JtIjoibGludXgtYW1kNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjIvbGlicmEtbGludXgtYW1kNjQiLCJzaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic2l6ZSI6MjAwMDAwMH0seyJwbGF0Zm9ybSI6ImxpbnV4LWFybTY0IiwidXJsIjoiaHR0cHM6Ly9kb3dubG9hZC5saWJyYS50b29scy9saWJyYS9yZWxlYXNlcy92MC4yMi4yL2xpYnJhLWxpbnV4LWFybTY0Iiwic2hhMjU2IjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsInNpemUiOjIwMDAwMDF9LHsicGxhdGZvcm0iOiJkYXJ3aW4tYXJtNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjIvbGlicmEtZGFyd2luLWFybTY0Iiwic2hhMjU2IjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsInNpemUiOjIwMDAwMDJ9LHsicGxhdGZvcm0iOiJ3aW5kb3dzLWFtZDY0IiwidXJsIjoiaHR0cHM6Ly9kb3dubG9hZC5saWJyYS50b29scy9saWJyYS9yZWxlYXNlcy92MC4yMi4yL2xpYnJhLXdpbmRvd3MtYW1kNjQiLCJzaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic2l6ZSI6MjAwMDAwM31dfQ==",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "/uPTrxJBZCuJrzbMuiaJk/dXHDS/g1jI/A3f8ZDenyq38jsAASLzsMGhE4a83ciFTfpEly9wp8W9MHaojvapDw=="
+          }
+        ]
+      }
+    },
+    {
+      "id": "emergency-revoke-append",
+      "operation": "emergency",
+      "description": "Revoke appends to revoked_versions; version/artifacts stay immutable",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 6,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [
+          "0.21.9"
+        ],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "emergency": {
+          "type": "revoke",
+          "version": "0.22.0"
+        }
+      },
+      "now_seconds": 1787356800,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: emergency revoke appends and rejects duplicates",
+      "result_payload": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 7,
+        "published_at": "2026-08-22T00:00:00.000Z",
+        "expires_at": "2026-11-20T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [
+          "0.21.9",
+          "0.22.0"
+        ],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "4103ec89f1c84c94999fe903cb2cbe2de9d48c59d521739fab0e20c0d812323b",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjAuMjIuMiIsImNvbnRyb2xfcmV2aXNpb24iOjcsInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMjJUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTExLTIwVDAwOjAwOjAwLjAwMFoiLCJtaW5fa2V5X2dlbmVyYXRpb24iOjEsInBhdXNlZCI6ZmFsc2UsInJldm9rZWRfdmVyc2lvbnMiOlsiMC4yMS45IiwiMC4yMi4wIl0sImFydGlmYWN0cyI6W3sicGxhdGZvcm0iOiJsaW51eC1hbWQ2NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjAuMjIuMi9saWJyYS1saW51eC1hbWQ2NCIsInNoYTI1NiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJzaXplIjoyMDAwMDAwfSx7InBsYXRmb3JtIjoibGludXgtYXJtNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjIvbGlicmEtbGludXgtYXJtNjQiLCJzaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic2l6ZSI6MjAwMDAwMX0seyJwbGF0Zm9ybSI6ImRhcndpbi1hcm02NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjAuMjIuMi9saWJyYS1kYXJ3aW4tYXJtNjQiLCJzaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic2l6ZSI6MjAwMDAwMn0seyJwbGF0Zm9ybSI6IndpbmRvd3MtYW1kNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIyLjIvbGlicmEtd2luZG93cy1hbWQ2NCIsInNoYTI1NiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJzaXplIjoyMDAwMDAzfV19",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "dWxVwGt+kPNDtL9ZZEw0qBokGreH6Szsssjnx16gajk5g1BsHI58rEIht7jQdouiMW809vyX5FJAUsuZqZNRDg=="
+          }
+        ]
+      }
+    },
+    {
+      "id": "emergency-revoke-duplicate",
+      "operation": "emergency",
+      "description": "Revoking an already-revoked version is an empty operation",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 6,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [
+          "0.22.0"
+        ],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "emergency": {
+          "type": "revoke",
+          "version": "0.22.0"
+        }
+      },
+      "now_seconds": 1787356800,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "empty_emergency"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: emergency revoke appends and rejects duplicates"
+    },
+    {
+      "id": "emergency-pause-noop",
+      "operation": "emergency",
+      "description": "Pausing an already-paused manifest is an empty operation",
+      "pre_state": {
+        "channel": "stable",
+        "version": "0.22.2",
+        "control_revision": 6,
+        "published_at": "2026-08-08T00:00:00.000Z",
+        "expires_at": "2026-11-06T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": true,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-linux-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-darwin-arm64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.22.2/libra-windows-amd64",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2000003
+          }
+        ]
+      },
+      "input": {
+        "emergency": {
+          "type": "pause"
+        }
+      },
+      "now_seconds": 1787356800,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "empty_emergency"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: emergency pause/resume flip paused and reject no-ops"
+    },
+    {
+      "id": "publish-anti-vv-placeholder",
+      "operation": "publish",
+      "description": "tag=v0.20.3 placeholder contract: URL and object key carry exactly one v prefix",
+      "pre_state": null,
+      "input": {
+        "publish": {
+          "version": "0.20.3",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "size": 5000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "size": 5000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "size": 5000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "size": 5000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1785542400,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: artifact URLs and object keys never double the v prefix",
+      "asserts": {
+        "linux_amd64_url": "https://download.libra.tools/libra/releases/v0.20.3/libra-linux-amd64",
+        "linux_amd64_object_key": "libra/releases/v0.20.3/libra-linux-amd64"
+      },
+      "result_payload": {
+        "channel": "stable",
+        "version": "0.20.3",
+        "control_revision": 1,
+        "published_at": "2026-08-01T00:00:00.000Z",
+        "expires_at": "2026-10-30T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.20.3/libra-linux-amd64",
+            "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "size": 5000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.20.3/libra-linux-arm64",
+            "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "size": 5000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v0.20.3/libra-darwin-arm64",
+            "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "size": 5000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v0.20.3/libra-windows-amd64",
+            "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "size": 5000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "59a3577d8500150dfcd33c5b67364b62bb926c7905bbd8e8dd7428bcd1382e20",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjAuMjAuMyIsImNvbnRyb2xfcmV2aXNpb24iOjEsInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTEwLTMwVDAwOjAwOjAwLjAwMFoiLCJtaW5fa2V5X2dlbmVyYXRpb24iOjEsInBhdXNlZCI6ZmFsc2UsInJldm9rZWRfdmVyc2lvbnMiOltdLCJhcnRpZmFjdHMiOlt7InBsYXRmb3JtIjoibGludXgtYW1kNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIwLjMvbGlicmEtbGludXgtYW1kNjQiLCJzaGEyNTYiOiJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmIiwic2l6ZSI6NTAwMDAwMH0seyJwbGF0Zm9ybSI6ImxpbnV4LWFybTY0IiwidXJsIjoiaHR0cHM6Ly9kb3dubG9hZC5saWJyYS50b29scy9saWJyYS9yZWxlYXNlcy92MC4yMC4zL2xpYnJhLWxpbnV4LWFybTY0Iiwic2hhMjU2IjoiZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZiIsInNpemUiOjUwMDAwMDF9LHsicGxhdGZvcm0iOiJkYXJ3aW4tYXJtNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3YwLjIwLjMvbGlicmEtZGFyd2luLWFybTY0Iiwic2hhMjU2IjoiZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZiIsInNpemUiOjUwMDAwMDJ9LHsicGxhdGZvcm0iOiJ3aW5kb3dzLWFtZDY0IiwidXJsIjoiaHR0cHM6Ly9kb3dubG9hZC5saWJyYS50b29scy9saWJyYS9yZWxlYXNlcy92MC4yMC4zL2xpYnJhLXdpbmRvd3MtYW1kNjQiLCJzaGEyNTYiOiJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmIiwic2l6ZSI6NTAwMDAwM31dfQ==",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "ybZZ8Jy+JjYWpNwHD1K3CHEevBuPbZDDgUX6GugddQb91AcXMRvO4w/b+U1Qy3V92zUwxzsf+WHrKcno7MGVCA=="
+          }
+        ]
+      }
+    },
+    {
+      "id": "publish-version-beyond-u64",
+      "operation": "publish",
+      "description": "A version component above u64::MAX must be rejected exactly like the Rust parser rejects it",
+      "pre_state": null,
+      "input": {
+        "publish": {
+          "version": "18446744073709551616.0.0",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1785542400,
+      "expected": {
+        "outcome": "rejected",
+        "reason": "invalid_version"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: version components carry u64 bounds and full integer precision"
+    },
+    {
+      "id": "publish-version-above-2p53",
+      "operation": "publish",
+      "description": "A version component above 2^53 keeps full integer precision (no float rounding) end to end",
+      "pre_state": null,
+      "input": {
+        "publish": {
+          "version": "9007199254740993.0.0",
+          "artifacts": [
+            {
+              "platform": "linux-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000000
+            },
+            {
+              "platform": "linux-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000001
+            },
+            {
+              "platform": "darwin-arm64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000002
+            },
+            {
+              "platform": "windows-amd64",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "size": 1000003
+            }
+          ]
+        }
+      },
+      "now_seconds": 1785542400,
+      "expected": {
+        "outcome": "accepted"
+      },
+      "evidence": "tests/unit/release-manifest-transitions.test.ts :: version components carry u64 bounds and full integer precision",
+      "asserts": {
+        "version_round_trip": "9007199254740993.0.0"
+      },
+      "result_payload": {
+        "channel": "stable",
+        "version": "9007199254740993.0.0",
+        "control_revision": 1,
+        "published_at": "2026-08-01T00:00:00.000Z",
+        "expires_at": "2026-10-30T00:00:00.000Z",
+        "min_key_generation": 1,
+        "paused": false,
+        "revoked_versions": [],
+        "artifacts": [
+          {
+            "platform": "linux-amd64",
+            "url": "https://download.libra.tools/libra/releases/v9007199254740993.0.0/libra-linux-amd64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000000
+          },
+          {
+            "platform": "linux-arm64",
+            "url": "https://download.libra.tools/libra/releases/v9007199254740993.0.0/libra-linux-arm64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000001
+          },
+          {
+            "platform": "darwin-arm64",
+            "url": "https://download.libra.tools/libra/releases/v9007199254740993.0.0/libra-darwin-arm64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000002
+          },
+          {
+            "platform": "windows-amd64",
+            "url": "https://download.libra.tools/libra/releases/v9007199254740993.0.0/libra-windows-amd64",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size": 1000003
+          }
+        ]
+      },
+      "payload_digest_sha256": "58002baa2850572011c6feffcad14290fdf841f714de4fbe66d509c5c258bfa4",
+      "envelope": {
+        "schema_version": 1,
+        "payload": "eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjkwMDcxOTkyNTQ3NDA5OTMuMC4wIiwiY29udHJvbF9yZXZpc2lvbiI6MSwicHVibGlzaGVkX2F0IjoiMjAyNi0wOC0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6IjIwMjYtMTAtMzBUMDA6MDA6MDAuMDAwWiIsIm1pbl9rZXlfZ2VuZXJhdGlvbiI6MSwicGF1c2VkIjpmYWxzZSwicmV2b2tlZF92ZXJzaW9ucyI6W10sImFydGlmYWN0cyI6W3sicGxhdGZvcm0iOiJsaW51eC1hbWQ2NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjkwMDcxOTkyNTQ3NDA5OTMuMC4wL2xpYnJhLWxpbnV4LWFtZDY0Iiwic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEwMDAwMDB9LHsicGxhdGZvcm0iOiJsaW51eC1hcm02NCIsInVybCI6Imh0dHBzOi8vZG93bmxvYWQubGlicmEudG9vbHMvbGlicmEvcmVsZWFzZXMvdjkwMDcxOTkyNTQ3NDA5OTMuMC4wL2xpYnJhLWxpbnV4LWFybTY0Iiwic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEwMDAwMDF9LHsicGxhdGZvcm0iOiJkYXJ3aW4tYXJtNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3Y5MDA3MTk5MjU0NzQwOTkzLjAuMC9saWJyYS1kYXJ3aW4tYXJtNjQiLCJzaGEyNTYiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwic2l6ZSI6MTAwMDAwMn0seyJwbGF0Zm9ybSI6IndpbmRvd3MtYW1kNjQiLCJ1cmwiOiJodHRwczovL2Rvd25sb2FkLmxpYnJhLnRvb2xzL2xpYnJhL3JlbGVhc2VzL3Y5MDA3MTk5MjU0NzQwOTkzLjAuMC9saWJyYS13aW5kb3dzLWFtZDY0Iiwic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEwMDAwMDN9XX0=",
+        "signatures": [
+          {
+            "key_id": "libra-release-test-1",
+            "signature": "njUWg5omyrBlpRXIF4cqvyQ4MOusdO+D3IfUQh7yGdIQGhqHSaXMHPkgg/TvehUEwuUGedbAo2pSOV7sMgCkBQ=="
+          }
+        ]
+      }
+    }
+  ]
+}

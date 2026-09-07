@@ -8,6 +8,27 @@ macOS/Linux 推荐安装方式：
 curl -fsSL https://download.libra.tools/install.sh | sh
 ```
 
+### 信任模型：签名 stable 通道
+
+两个安装器的默认路径都通过 **Ed25519 签名的 stable manifest**
+（`https://download.libra.tools/libra/releases/stable/manifest-v1.json`）解析版本：
+先用内嵌于安装器的公钥验证 manifest 签名，再按签名内的 `sha256` 与 `size`
+逐字节校验下载的二进制。任何验证失败都会中止安装且不落盘——被攻破的镜像
+无法替换二进制。
+
+以下三类路径**不经过**签名 manifest 验证，且全部显式：
+
+- **`-v <version>` / `-Version`** —— 指定历史版本会绕过 stable 通道，安装器会打印告警；
+- **自定义镜像**（`LIBRA_BASE_URL` / `-DownloadBaseUrl`）—— 同样告警；
+- **过渡态** —— 签名链尚未启用（stable manifest 不存在）或主机无法验签
+  （`install.sh` 需要支持 Ed25519 的 OpenSSL ≥ 1.1.1 及 sha256 工具；
+  `install.ps1` 自带验签器）时，安装器停下并要求显式确认或
+  `LIBRA_ALLOW_FALLBACK=1` 才回退到未验证的旧路径，绝不静默降级。
+
+内嵌公钥**没有任何运行时覆盖入口**：已发布安装器的信任根无法被任何 flag
+或环境变量改变。安装脚本本身经同一 CDN 分发，脚本整体被替换不在本检查
+覆盖范围内——带外信任锚（公布脚本哈希）在 UP-01 设计稿中单独跟踪。
+
 安装器把 `libra` 放到 `$LIBRA_HOME/bin`（默认 `~/.libra/bin`），写入 shell
 环境文件，并创建可选的相对 symlink：
 

@@ -13,49 +13,83 @@
 
 use std::{
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::json;
 use tokio::time::sleep;
 
-/// Allocate a free MCP/Web port pair `(p, p+1)` on localhost.
-///
-/// Picks a random starting offset in the `[7100, 9799]` range, then linearly probes
-/// for a port pair where both `p` and `p+1` are bindable. The four-digit window
-/// matches existing local conventions and avoids ports that common services hold.
-/// Panics if no pair is free anywhere in the range — at that point the developer's
-/// machine has a problem the test cannot work around.
-fn pick_test_ports() -> (u16, u16) {
-    use std::{
-        net::TcpListener,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    // Keep ports 4-digit to match existing local assumptions and avoid common services.
-    const START: u16 = 7100;
-    const END: u16 = 9799; // web port uses +1
-    let range_len = (END - START + 1) as u128;
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_nanos();
-    let start_offset = (seed % range_len) as u16;
-
-    for i in 0..=END - START {
-        let mcp_port = START + ((start_offset + i) % (END - START + 1));
-        let Ok(mcp_listener) = TcpListener::bind(("127.0.0.1", mcp_port)) else {
-            continue;
-        };
-        let web_port = mcp_port + 1;
-        if let Ok(web_listener) = TcpListener::bind(("127.0.0.1", web_port)) {
-            drop(web_listener);
-            drop(mcp_listener);
-            return (mcp_port, web_port);
+/// Stream a child's stdout into a shared line buffer (TA-04: the server is
+/// launched with `--port 0 --mcp-port 0`, so the kernel picks free ports —
+/// no fixed range to probe, no collision window under parallel test
+/// scheduling; the ACTUAL endpoints are read back from the startup banner,
+/// which is part of the printed UX contract).
+/// SIGKILL the child on any early return/panic so failed assertions can
+/// never leak a running `libra code` server.
+struct KillChildOnDrop(Option<std::process::Child>);
+impl Drop for KillChildOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
+}
 
-    panic!("Failed to allocate free MCP/Web test ports");
+fn spawn_stdout_reader(
+    child: &mut std::process::Child,
+) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use std::io::BufRead;
+    let stdout = child.stdout.take().expect("child stdout piped");
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = std::sync::Arc::clone(&buf);
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            println!("[libra code] {line}");
+            sink.lock().expect("stdout buffer poisoned").push(line);
+        }
+    });
+    buf
+}
+
+/// Wait for both startup-banner URLs:
+/// `Libra Code server running at http://…` (query stripped) and
+/// `MCP: http://…`. Returns `(mcp_url, web_url)`.
+async fn wait_for_banner_urls(
+    lines: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> (String, String) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (mut web, mut mcp) = (None, None);
+        for line in lines.lock().expect("stdout buffer poisoned").iter() {
+            if let Some(rest) = line.trim().strip_prefix("Libra Code server running at ") {
+                let url = rest.split(['?', ' ']).next().unwrap_or(rest);
+                web = Some(url.trim_end_matches('/').to_string());
+            }
+            if let Some(rest) = line.trim().strip_prefix("MCP: ") {
+                mcp = Some(rest.trim().trim_end_matches('/').to_string());
+            }
+        }
+        if let (Some(web), Some(mcp)) = (web, mcp) {
+            return (mcp, web);
+        }
+        if let Some(status) = child.try_wait().expect("poll libra code") {
+            let seen = lines.lock().expect("stdout buffer poisoned").join("\n");
+            panic!(
+                "libra code exited before printing its endpoints: {status}\nstdout so far:\n{seen}"
+            );
+        }
+        if Instant::now() >= deadline {
+            let seen = lines.lock().expect("stdout buffer poisoned").join("\n");
+            panic!(
+                "libra code did not print its endpoint banner within {timeout:?}\nstdout so far:\n{seen}"
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Extract all `data:` values from an SSE event stream body.
@@ -149,7 +183,12 @@ async fn test_e2e_mcp_flow() {
     assert!(status.success(), "cargo build failed");
 
     let project_root = std::env::current_dir().expect("Failed to get current dir");
-    let libra_bin = project_root.join("target/debug/libra");
+    // Honor CARGO_TARGET_DIR like the sigterm case below — a hardcoded
+    // target/ path ENOENTs under an isolated target dir (PS-02 terra R1).
+    let libra_bin = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| project_root.join("target"))
+        .join("debug/libra");
 
     // Init repo
     let status = Command::new(&libra_bin)
@@ -165,17 +204,16 @@ async fn test_e2e_mcp_flow() {
     // ── 2. Start Server ────────────────────────────────────────────────────────
     // The default Web Code UI launch is headless, so the test can run without a
     // terminal. The MCP server is started by the current Web launch.
-    let (mcp_port, web_port) = pick_test_ports();
-
-    println!("Starting server on MCP port {mcp_port}, Web port {web_port}");
-
     let mut child = Command::new(&libra_bin)
+        // PS-02 (ADR-PS-01): bare `libra code` no longer defaults to gemini.
         .args([
             "code",
+            "--provider",
+            "gemini",
             "--mcp-port",
-            &mcp_port.to_string(),
+            "0",
             "--port",
-            &web_port.to_string(),
+            "0",
         ])
         .current_dir(repo_path)
         .env("HOME", &home_dir)
@@ -187,47 +225,24 @@ async fn test_e2e_mcp_flow() {
         .spawn()
         .expect("Failed to start libra code");
 
-    // Poll until the MCP server TCP listener is accepting connections (max ~30 s)
+    // The MCP URL is read back from the STDOUT BANNER; the `MCP:` line is
+    // printed after the listener binds, so seeing it means the server is up.
+    let stdout_lines = spawn_stdout_reader(&mut child);
+    // SIGKILL on any early return/panic so a banner timeout cannot leak the
+    // server process (same guard pattern as the SIGTERM case).
+    let mut child_guard = KillChildOnDrop(Some(child));
+    let (mcp_url, _web_url) = wait_for_banner_urls(
+        &stdout_lines,
+        child_guard.0.as_mut().expect("child present"),
+        Duration::from_secs(30),
+    )
+    .await;
+    println!("MCP server is ready at {mcp_url}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .no_proxy()
         .build()
         .unwrap();
-    let mcp_url = format!("http://127.0.0.1:{mcp_port}");
-
-    let mut server_ready = false;
-    let mut last_probe_error = None;
-    for _ in 0..120 {
-        sleep(Duration::from_millis(250)).await;
-        match tokio::net::TcpStream::connect(("127.0.0.1", mcp_port)).await {
-            Ok(stream) => {
-                drop(stream);
-                server_ready = true;
-                break;
-            }
-            Err(e) => {
-                last_probe_error = Some(e.to_string());
-            }
-        }
-    }
-
-    if !server_ready {
-        let _ = child.kill();
-        let output = child.wait_with_output().unwrap();
-        eprintln!(
-            "Server stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        eprintln!(
-            "Server stdout:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        panic!(
-            "MCP server did not start in time on port {mcp_port}; last TCP probe error: {}",
-            last_probe_error.unwrap_or_else(|| "<none>".to_string())
-        );
-    }
-    println!("MCP server is ready");
 
     // ── 3. MCP Handshake (Streamable HTTP transport) ───────────────────────────
     //
@@ -448,8 +463,7 @@ async fn test_e2e_mcp_flow() {
     );
 
     // ── 8. Cleanup ────────────────────────────────────────────────────────────
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child_guard);
     println!("E2E MCP flow test passed!");
 }
 
@@ -458,7 +472,7 @@ async fn test_e2e_mcp_flow() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_web_only_sigterm_releases_ports() {
-    use std::{net::TcpListener, time::Instant};
+    use std::time::Instant;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let repo_path = temp_dir.path();
@@ -489,14 +503,16 @@ async fn test_web_only_sigterm_releases_ports() {
         .expect("Failed to init repo");
     assert!(status.success(), "libra init failed");
 
-    let (mcp_port, web_port) = pick_test_ports();
     let child = Command::new(&libra_bin)
+        // PS-02 (ADR-PS-01): bare `libra code` no longer defaults to gemini.
         .args([
             "code",
+            "--provider",
+            "gemini",
             "--mcp-port",
-            &mcp_port.to_string(),
+            "0",
             "--port",
-            &web_port.to_string(),
+            "0",
         ])
         .current_dir(repo_path)
         .env("HOME", &home_dir)
@@ -509,15 +525,8 @@ async fn test_web_only_sigterm_releases_ports() {
         .expect("Failed to start libra code");
     // SIGKILL+wait on any early return/panic so failed assertions cannot leak
     // a running Web process into later tests.
-    struct KillChildOnDrop(Option<std::process::Child>);
-    impl Drop for KillChildOnDrop {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
+    let mut child = child;
+    let stdout_lines = spawn_stdout_reader(&mut child);
     let mut child_guard = KillChildOnDrop(Some(child));
 
     let client = reqwest::Client::builder()
@@ -525,7 +534,13 @@ async fn test_web_only_sigterm_releases_ports() {
         .no_proxy()
         .build()
         .unwrap();
-    let web_url = format!("http://127.0.0.1:{web_port}/");
+    let (mcp_url, web_base) = wait_for_banner_urls(
+        &stdout_lines,
+        child_guard.0.as_mut().expect("child present"),
+        Duration::from_secs(30),
+    )
+    .await;
+    let web_url = format!("{web_base}/");
     let ready_deadline = Instant::now() + Duration::from_secs(45);
     let mut ready = false;
     while Instant::now() < ready_deadline {
@@ -577,9 +592,27 @@ async fn test_web_only_sigterm_releases_ports() {
     // Natural exit succeeded — disarm the SIGKILL fallback.
     let _ = child_guard.0.take();
 
-    // Ports must be reusable immediately after graceful shutdown.
-    TcpListener::bind(("127.0.0.1", web_port))
-        .unwrap_or_else(|e| panic!("web port {web_port} still held after SIGTERM: {e}"));
-    TcpListener::bind(("127.0.0.1", mcp_port))
-        .unwrap_or_else(|e| panic!("mcp port {mcp_port} still held after SIGTERM: {e}"));
+    // TA-04: what the old rebind asserted was really "no orphaned child
+    // keeps serving". Assert that at the TCP layer: a plain connect to the
+    // old endpoints must FAIL (refused) — connecting claims nothing, so
+    // there is no bind race with other processes reusing the OS-assigned
+    // port, and a leaked listener that accepts but stalls HTTP still turns
+    // this red.
+    for url in [web_url.as_str(), mcp_url.as_str()] {
+        let hostport = url.trim_start_matches("http://").trim_end_matches('/');
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::net::TcpStream::connect(hostport),
+        )
+        .await
+        {
+            Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!(
+                "{hostport} still accepting connections after SIGTERM graceful shutdown — orphaned server?"
+            ),
+            Err(_) => panic!(
+                "{hostport} neither refused nor accepted within 3s after SIGTERM — half-dead listener?"
+            ),
+        }
+    }
 }

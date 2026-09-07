@@ -11,7 +11,7 @@ use tempfile::tempdir;
 
 use super::*;
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// A commit with no file changes should fail if `allow_empty` is false.
 /// This test verifies that the commit command rejects empty changesets
 /// when not explicitly permitted.
@@ -40,7 +40,7 @@ async fn test_execute_commit_with_empty_index_fail() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_commit_requires_configured_identity_in_strict_mode() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -114,7 +114,6 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
 }
 
 #[test]
-#[serial]
 fn test_commit_cli_without_identity_returns_auth_exit_code() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -134,7 +133,6 @@ fn test_commit_cli_without_identity_returns_auth_exit_code() {
 }
 
 #[test]
-#[serial]
 fn test_commit_cli_use_config_only_returns_auth_exit_code() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -157,7 +155,7 @@ fn test_commit_cli_use_config_only_returns_auth_exit_code() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests normal commit functionality with both `--amend` and `--allow_empty` flags.
 /// Verifies that:
 /// 1. Amending works correctly when allowed
@@ -343,7 +341,7 @@ async fn test_execute_commit() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_with_all_flag_stages_tracked_changes() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -422,7 +420,7 @@ async fn test_commit_with_all_flag_stages_tracked_changes() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_with_all_flag_records_deletions() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -501,7 +499,7 @@ async fn test_commit_with_all_flag_records_deletions() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Verifies commit and amend operations in a SHA-256 repository.
 async fn test_commit_sha256() {
     let temp_path = tempdir().unwrap();
@@ -606,7 +604,7 @@ async fn test_commit_sha256() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests that the --author parameter correctly overrides the commit author
 async fn test_commit_with_custom_author() {
     let temp_path = tempdir().unwrap();
@@ -675,7 +673,7 @@ async fn test_commit_with_custom_author() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests that the --author parameter works with --amend
 async fn test_commit_amend_with_custom_author() {
     let temp_path = tempdir().unwrap();
@@ -745,7 +743,7 @@ async fn test_commit_amend_with_custom_author() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_commit_amend_preserves_author_unless_reset() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -836,7 +834,7 @@ async fn test_commit_amend_preserves_author_unless_reset() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_empty_working_tree() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -863,7 +861,7 @@ async fn test_commit_empty_working_tree() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_with_actual_changes() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -924,7 +922,7 @@ async fn test_commit_with_actual_changes() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_amend_without_changes() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -968,7 +966,7 @@ async fn test_commit_amend_without_changes() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_signoff_persists_trailer() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1021,7 +1019,7 @@ async fn test_commit_signoff_persists_trailer() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_amend_signoff_persists_trailer() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1077,7 +1075,7 @@ async fn test_commit_amend_signoff_persists_trailer() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_amend_without_existing_commit_returns_repo_state_error() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1114,7 +1112,7 @@ async fn test_commit_amend_without_existing_commit_returns_repo_state_error() {
 /// Without explicit identity (config/env), commit should fail with the same
 /// "author identity unknown" style error as Git.
 #[tokio::test]
-#[serial]
+#[serial(env, cwd)]
 async fn test_commit_without_identity_fails_by_default() {
     use libra::internal::config::ConfigKv;
 
@@ -1230,7 +1228,7 @@ fn test_commit_help_lists_examples_banner() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_cleanup_strips_comments() {
     let temp_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_dir.path()).await;
@@ -1421,7 +1419,7 @@ fn test_commit_config_invalid_is_fatal_but_flag_overrides() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_trailer_appended() {
     let temp_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_dir.path()).await;
@@ -1459,7 +1457,7 @@ async fn test_commit_trailer_appended() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_dry_run_does_not_create_commit() {
     let temp_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_dir.path()).await;
@@ -1498,7 +1496,7 @@ async fn test_commit_dry_run_does_not_create_commit() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_reuse_message() {
     let temp_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_dir.path()).await;
@@ -1564,7 +1562,7 @@ async fn test_commit_reuse_message() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_commit_fixup_sets_subject() {
     let temp_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_dir.path()).await;

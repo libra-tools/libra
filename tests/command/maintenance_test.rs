@@ -922,7 +922,7 @@ fn loose_object_file(repo: &std::path::Path, oid: &str) -> std::path::PathBuf {
 /// blob reachable from a commit keeps both its object and its row;
 /// `--dry-run` only counts, and a second run is a no-op.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn agent_object_gc_findings_reachability() {
     let repo = create_committed_repo_via_cli();
 
@@ -1060,7 +1060,7 @@ async fn agent_object_gc_findings_reachability() {
 /// a >10k-loose-object repository completes within a generous wall-clock
 /// bound (no full-tree rescans or N+1 storage round-trips).
 #[tokio::test]
-#[serial]
+#[serial(hash_kind, cwd)]
 async fn gc_ten_thousand_objects_within_budget() {
     use libra::utils::test::ChangeDirGuard;
 

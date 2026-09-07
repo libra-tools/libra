@@ -68,7 +68,7 @@ fn run_libra_command_with_stdin_bytes(args: &[&str], cwd: &Path, stdin_body: &[u
 }
 
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn index_pack_stdin_requires_explicit_output_path() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());
@@ -87,7 +87,7 @@ fn index_pack_stdin_requires_explicit_output_path() {
 }
 
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn index_pack_stdin_writes_pack_and_index_and_reports_json_paths() {
     let repo = tempdir().unwrap();
     init_repo_via_cli(repo.path());

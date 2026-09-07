@@ -54,7 +54,7 @@ use tempfile::tempdir;
 ///
 /// `#[serial]` because `ChangeDirGuard` mutates process CWD.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_intent_flow() {
     // 1. Setup Storage and Repo Environment
     let dir = tempdir().unwrap();
@@ -174,7 +174,7 @@ async fn test_intent_flow() {
 /// snapshots live on the single history branch, while skipping ContextSnapshot
 /// writes when there is no baseline content to freeze.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn phase0_runtime_helpers_persist_intent_and_context_snapshot_conditionally() {
     let dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(dir.path());

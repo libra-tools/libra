@@ -12097,6 +12097,95 @@ async fn shutdown_during_durable_admission_cannot_republish_thinking() {
     }));
 }
 
+/// plan-20260824 DF-07 (terra R3): when shutdown wins the pre-start race
+/// AND the cancelled-turn terminal persist fails, the consumed skill
+/// activation must already have been restored — restore runs before the
+/// fallible settle, so the pending set still holds the activation for the
+/// session's next life.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_during_durable_admission_restores_pending_skill_activation() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
+    let state = SessionState::new(&workdir.path().to_string_lossy());
+    let admission_hook = HeadlessRecordUserMessageHook::new();
+    let persistence = HeadlessSessionPersistence::new(store, state)
+        .expect("attach workflow hub")
+        .with_record_user_message_hook(admission_hook.clone());
+    let fault = persistence.clone();
+    let (runtime, _, _) = build_runtime_with_persistence(
+        "basic_chat",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+    let adapter = runtime.command_adapter();
+    adapter
+        .activate_skill("claude-code", "/review")
+        .await
+        .expect("discoverable skill must activate");
+    assert_eq!(
+        adapter.pending_skill_activations_for_test().await,
+        vec![("claude-code".to_string(), "/review".to_string())]
+    );
+
+    // Plain (non-slash) message: the composition seam consumes the
+    // activation right before runtime.submit, then pauses in the durable
+    // admission write.
+    let submit_runtime = Arc::clone(&runtime);
+    let submit = tokio::spawn(async move {
+        submit_runtime
+            .submit_message("please review this change".to_string())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), admission_hook.wait_until_entered())
+        .await
+        .expect("submit must pause in the durable admission write");
+    assert!(
+        adapter
+            .pending_skill_activations_for_test()
+            .await
+            .is_empty(),
+        "the composition seam must have consumed the activation"
+    );
+    // terra R5 interleave: re-activate the same skill while the consumed
+    // turn is still in flight — after the failed turn restores, the
+    // pending set must hold exactly ONE slot for it.
+    adapter
+        .activate_skill("claude-code", "/review")
+        .await
+        .expect("re-activation while in flight");
+
+    let shutdown_runtime = Arc::clone(&runtime);
+    let shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(3), shutdown)
+        .await
+        .expect("shutdown must not wait for the paused durable admission write")
+        .expect("shutdown task must not panic")
+        .expect("shutdown must cancel the unstarted worker turn");
+
+    // Make the cancelled-turn terminal persist fail before releasing the
+    // paused admission write (terra R3's exact repro).
+    fault.fail_snapshot_persist_after_successes_for_test(0);
+    admission_hook.release();
+    let submit_result = tokio::time::timeout(Duration::from_secs(3), submit)
+        .await
+        .expect("submit must complete after the pause releases")
+        .expect("submit task must not panic");
+    assert!(
+        submit_result.is_err(),
+        "the failed terminal persist must surface to the submitter"
+    );
+    fault.clear_snapshot_persist_failure_for_test();
+
+    assert_eq!(
+        adapter.pending_skill_activations_for_test().await,
+        vec![("claude-code".to_string(), "/review".to_string())],
+        "restored exactly once despite the failed terminal persist and the in-flight re-activation (terra R5)"
+    );
+}
+
 /// A shutdown timeout during a started mutation is an indeterminate-side-effect
 /// boundary. It must be persisted before the caller receives its failure, and
 /// a late handler completion must not rewrite that state as a clean terminal

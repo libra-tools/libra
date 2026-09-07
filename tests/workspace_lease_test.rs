@@ -1106,26 +1106,13 @@ async fn reclaim_refuses_a_live_lease() {
     );
 }
 
-/// Two doctors taking over the same lease, with the window CONTROLLED: the
-/// first takeover is held open in an uncommitted transaction while the second
-/// enters `reclaim` and blocks on its write lock, then the first commits and
-/// the second proceeds.
-///
-/// The point is what each caller is handed back. Both takeovers succeed here,
-/// so a reclaim that read its new fence back with a separate SELECT could
-/// return the OTHER doctor's fence — and then release a lease it does not own.
-/// Reporting the fence from the same statement that writes it is what makes
-/// `doctor-1` see 2 and `doctor-2` see 3, every time.
-#[cfg(debug_assertions)]
+/// Pins the high-level reclaim contract across two independent connections:
+/// each expired takeover advances the fence, every superseded holder is
+/// rejected, and only the current holder can release. The failpoint test below
+/// separately covers the concurrent `RETURNING` race that distinguishes an
+/// atomic write result from a later read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial(workspace_failpoints)]
-async fn concurrent_reclaims_hand_out_only_the_fence_they_wrote() {
-    use std::sync::Arc as StdArc;
-
-    use sea_orm::TransactionTrait;
-
-    let _failpoints = FailpointGuard;
-
+async fn successive_reclaims_advance_fences_and_reject_superseded_holders() {
     let db = open_db().await;
     let path = workspace_dir(db.path.parent().expect("db parent"), "linked-a");
     let second = connect(&db.path).await;
@@ -1138,58 +1125,22 @@ async fn concurrent_reclaims_hand_out_only_the_fence_they_wrote() {
     .await
     .expect("acquire");
 
-    // Doctor 1 takes over in an OPEN transaction: the row is updated and its
-    // fence already reported, but nothing is published yet.
     let late = NOW + TTL + 1;
-    let identity = RepoIdentity::resolve(&db.conn)
-        .await
-        .expect("repository identity");
-    let txn = db.conn.begin().await.expect("begin doctor-1");
-    let first = WorkspaceStore::reclaim_expired_with_conn(
-        &txn,
-        &identity,
-        &stale.workspace_id,
-        "doctor-1",
-        TTL,
-        late,
-    )
-    .await
-    .expect("doctor-1 takes over the expired lease");
+    let first =
+        WorkspaceStore::reclaim_expired(&db.conn, &stale.workspace_id, "doctor-1", TTL, late)
+            .await
+            .expect("doctor-1 takes over the expired lease");
     assert_eq!(first.fence, 2, "the first takeover mints fence 2");
 
-    // Doctor 2 enters `reclaim` (proven by the failpoint) with a clock past
-    // the deadline doctor 1 just wrote, and blocks on the write lock.
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let entered_tx = StdArc::new(tokio::sync::Mutex::new(Some(entered_tx)));
-    test_hooks::set_before_write(Some(StdArc::new(move || {
-        let entered_tx = entered_tx.clone();
-        Box::pin(async move {
-            let signal = entered_tx.lock().await.take();
-            if let Some(tx) = signal {
-                let _ = tx.send(());
-            }
-        })
-    })));
-
     let later = late + TTL + 1;
-    let workspace_id = stale.workspace_id.clone();
-    let second_task = tokio::spawn(async move {
-        WorkspaceStore::reclaim_expired(&second, &workspace_id, "doctor-2", TTL, later).await
-    });
-    entered_rx
-        .await
-        .expect("doctor-2 reports from inside reclaim");
-
-    txn.commit().await.expect("publish doctor-1's takeover");
-    let second_lease = second_task
-        .await
-        .expect("doctor-2 task")
-        .expect("doctor-2 takes over once the deadline has passed again");
+    let second_lease =
+        WorkspaceStore::reclaim_expired(&second, &stale.workspace_id, "doctor-2", TTL, later)
+            .await
+            .expect("doctor-2 takes over once the deadline has passed again");
 
     assert_eq!(
         second_lease.fence, 3,
-        "the second takeover mints its own fence, and the first was told 2 — neither may be \
-         handed the other's"
+        "the second takeover advances the fence minted by the first"
     );
     let record = WorkspaceStore::get_with_conn(&db.conn, &stale.workspace_id)
         .await

@@ -52,12 +52,10 @@ pub async fn execute_review_fix(
     input: ReviewFixInput,
     responder: &dyn ReviewFixInteractionResponder,
 ) -> Result<ReviewFixExecutionOutcome, ReviewFixBridgeError> {
-    if input == ReviewFixInput::UntrustedSeed {
-        return Err(ReviewFixBridgeError::UntrustedSeed);
-    }
+    let admission_message = input.admission_message()?;
 
     let controller = ReviewFixControlClient::connect(working_dir).await?;
-    let execution = execute_with_controller(&controller, responder)
+    let execution = execute_with_controller(&controller, admission_message, responder)
         .await
         .map_err(normalize_active_execution_error);
     let detach = controller
@@ -69,12 +67,13 @@ pub async fn execute_review_fix(
 
 async fn execute_with_controller(
     controller: &ReviewFixControlClient,
+    admission_message: &'static str,
     responder: &dyn ReviewFixInteractionResponder,
 ) -> Result<ReviewFixExecutionOutcome, ReviewFixBridgeError> {
     let initial = controller.snapshot().await?;
     ensure_ready_for_submission(&initial)?;
     let baseline = initial.patchsets()?;
-    controller.submit_admission().await?;
+    controller.submit_admission(admission_message).await?;
 
     let deadline = Instant::now() + EXECUTION_TIMEOUT;
     let mut next_renewal = Instant::now() + CONTROLLER_RENEW_INTERVAL;

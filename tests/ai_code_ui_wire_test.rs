@@ -22,13 +22,13 @@ use libra::internal::ai::{
         code_ui::{
             CodeUiAckResponse, CodeUiApiError, CodeUiApplyToFuture, CodeUiCapabilities,
             CodeUiControllerAttachRequest, CodeUiControllerAttachResponse, CodeUiControllerKind,
-            CodeUiControllerState, CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind,
-            CodeUiInteractionOption, CodeUiInteractionRequest, CodeUiInteractionResponse,
-            CodeUiInteractionStatus, CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot,
-            CodeUiPlanStep, CodeUiProviderInfo, CodeUiSession, CodeUiSessionResumeRequest,
-            CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiSkillActivateRequest,
-            CodeUiTaskSnapshot, CodeUiThreadGraph, CodeUiThreadGraphNode, CodeUiToolCallSnapshot,
-            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, code_ui_error_codes,
+            CodeUiControllerState, CodeUiInteractionKind, CodeUiInteractionOption,
+            CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
+            CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
+            CodeUiProviderInfo, CodeUiSession, CodeUiSessionResumeRequest, CodeUiSessionSnapshot,
+            CodeUiSessionStatus, CodeUiSkillActivateRequest, CodeUiTaskSnapshot, CodeUiThreadGraph,
+            CodeUiThreadGraphNode, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
+            CodeUiTranscriptEntryKind, code_ui_error_codes,
         },
         sse_wire::CodeUiWireV2Event,
     },
@@ -293,44 +293,6 @@ fn snapshot_round_trips_through_camel_case_wire_shape() {
     assert_eq!(
         round_tripped.patchsets[0].changes[0].change_type,
         "modified"
-    );
-}
-
-/// SSE envelopes must use the same closed event-name set the browser's
-/// `CodeUiEventType` union subscribes to, and the payload must remain a typed
-/// full snapshot instead of arbitrary JSON.
-#[test]
-fn event_envelope_round_trips_typed_event_and_snapshot_payload() {
-    let snapshot = fully_populated_snapshot();
-    let event = CodeUiEventEnvelope {
-        seq: 42,
-        event_type: CodeUiEventType::ControllerChanged,
-        at: fixed_ts(),
-        data: snapshot,
-    };
-
-    let serialized = serde_json::to_value(&event).expect("event envelope must serialize");
-    assert_eq!(
-        serialized["type"],
-        Value::String("controller_changed".into())
-    );
-    assert_eq!(
-        serialized["data"]["sessionId"],
-        Value::String("session-1".into())
-    );
-    assert_eq!(
-        serialized["data"]["interactions"][0]["kind"],
-        Value::String("post_plan_choice".into())
-    );
-
-    let round_tripped: CodeUiEventEnvelope =
-        serde_json::from_value(serialized).expect("event envelope must deserialize");
-    assert_eq!(round_tripped.event_type, CodeUiEventType::ControllerChanged);
-    assert_eq!(round_tripped.data.session_id, "session-1");
-    assert_eq!(round_tripped.data.interactions.len(), 1);
-    assert_eq!(
-        round_tripped.data.interactions[0].status,
-        CodeUiInteractionStatus::Pending
     );
 }
 
@@ -1356,28 +1318,55 @@ fn code_ui_browser_resume_contract() {
 #[test]
 fn sse_wire_version_negotiation() {
     use axum::http::{HeaderMap, HeaderValue, header};
-    use libra::internal::ai::web::sse_wire::{
-        CodeEventsQuery, CodeUiSseWireVersion, parse_code_events_wire_version,
+    use libra::{
+        command::code_control::BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
+        internal::ai::web::sse_wire::{
+            CodeEventsQuery, CodeUiSseWireVersion, parse_code_events_wire_version,
+        },
     };
 
     let headers = HeaderMap::new();
     assert_eq!(
-        parse_code_events_wire_version(&CodeEventsQuery::default(), &headers).unwrap(),
-        CodeUiSseWireVersion::V1
+        BUILT_IN_CODE_EVENTS_SSE_WIRE_VERSION,
+        CodeUiSseWireVersion::V2.as_u8(),
+        "built-in automation must explicitly consume v2"
     );
-    for (raw, expected) in [
-        ("1", CodeUiSseWireVersion::V1),
-        ("v1", CodeUiSseWireVersion::V1),
-        ("2", CodeUiSseWireVersion::V2),
-        ("v2", CodeUiSseWireVersion::V2),
-    ] {
+    assert_eq!(
+        parse_code_events_wire_version(&CodeEventsQuery::default(), &headers).unwrap(),
+        CodeUiSseWireVersion::V2,
+        "DF-06: the server's omitted-wire default is v2"
+    );
+    let mut accept_without_wire = HeaderMap::new();
+    accept_without_wire.insert(
+        header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    assert_eq!(
+        parse_code_events_wire_version(&CodeEventsQuery::default(), &accept_without_wire).unwrap(),
+        CodeUiSseWireVersion::V2,
+        "DF-06: an Accept header without libra-wire keeps the v2 default"
+    );
+    for raw in ["2", "v2"] {
         let query = CodeEventsQuery {
             wire: Some(raw.into()),
             cursor: None,
         };
         assert_eq!(
             parse_code_events_wire_version(&query, &headers).unwrap(),
-            expected
+            CodeUiSseWireVersion::V2
+        );
+    }
+    // DF-08: wire v1 was removed — explicit v1 fails closed with removal
+    // guidance instead of negotiating the deleted snapshot stream.
+    for raw in ["1", "v1"] {
+        let query = CodeEventsQuery {
+            wire: Some(raw.into()),
+            cursor: None,
+        };
+        let error = parse_code_events_wire_version(&query, &headers).unwrap_err();
+        assert!(
+            error.contains("removed in 0.22.0"),
+            "removal guidance expected: {error}"
         );
     }
     assert!(
@@ -1400,7 +1389,9 @@ fn sse_wire_version_negotiation() {
         parse_code_events_wire_version(&CodeEventsQuery::default(), &accept).unwrap(),
         CodeUiSseWireVersion::V2
     );
-    assert_eq!(
+    // Query precedence over Accept still holds: the removed v1 in the
+    // query fails even though the Accept hint names the valid v2.
+    assert!(
         parse_code_events_wire_version(
             &CodeEventsQuery {
                 wire: Some("1".into()),
@@ -1408,8 +1399,7 @@ fn sse_wire_version_negotiation() {
             },
             &accept
         )
-        .unwrap(),
-        CodeUiSseWireVersion::V1,
+        .is_err(),
         "query wire must win over Accept"
     );
 }

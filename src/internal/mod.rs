@@ -59,4 +59,5 @@ pub mod tree_plumbing;
 pub mod upgrade;
 pub mod vault;
 pub mod workspace;
+pub mod worktree_io;
 pub mod worktree_scope;

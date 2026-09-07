@@ -1,7 +1,8 @@
 //! `review --fix` executes only through an active, authorized Code runtime; its
-//! no-runtime path, and all current `investigate fix` paths, stay fail-closed
-//! with stable `LBR-AGENT-010`. This command-layer guard pins their human and
-//! structured-JSON error surfaces.
+//! no-runtime paths stay fail-closed with stable `LBR-AGENT-010`. This
+//! command-layer guard pins their human and structured-JSON error surfaces.
+
+use libra::internal::ai::investigate::InvestigateRunStore;
 
 use super::{
     create_committed_repo_via_cli, parse_cli_error_stderr, run_libra_command,
@@ -11,6 +12,16 @@ use super::{
 #[test]
 fn review_investigate_fix_json_errors() {
     let repo = create_committed_repo_via_cli();
+    InvestigateRunStore::new(repo.path().join(".libra").join("sessions"))
+        .create_run(
+            "some-run-id",
+            "untrusted seed",
+            &["codex".to_string()],
+            4,
+            1,
+            "sha-seed",
+        )
+        .expect("seed investigate run");
 
     // review --fix — human surface: fatal (128) + LBR-AGENT-010.
     let out = run_libra_command(&["review", "--fix"], repo.path());
@@ -42,8 +53,7 @@ fn review_investigate_fix_json_errors() {
     assert_eq!(report.error_code, "LBR-AGENT-010");
     assert_eq!(report.exit_code, 128);
 
-    // investigate fix <run_id> — human surface (fails closed before touching
-    // the run id).
+    // investigate fix <run_id> — human no-runtime surface.
     let out = run_libra_command(&["investigate", "fix", "some-run-id"], repo.path());
     assert_eq!(
         out.status.code(),

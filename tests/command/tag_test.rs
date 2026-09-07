@@ -290,7 +290,7 @@ fn test_tag_json_delete_output_includes_deleted_hash() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_tag_json_delete_missing_target_emits_null_hash() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -424,7 +424,7 @@ fn test_tag_quiet_delete_suppresses_stdout() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_tag_delete_allows_invalid_target_hash() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -452,7 +452,7 @@ async fn test_tag_delete_allows_invalid_target_hash() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_tag_json_delete_allows_invalid_target_hash() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -689,7 +689,7 @@ fn test_tag_cli_unborn_head_returns_repo_state_error() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_tag_cli_corrupt_head_storage_returns_repo_corrupt() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -741,7 +741,7 @@ fn test_tag_json_unborn_head_returns_repo_state_error() {
 // Test cases
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_basic_tag_creation() {
     // Create an isolated temporary repository and ensure a commit exists.
     let (_temp, _guard) = setup_repo_with_commit().await;
@@ -760,7 +760,7 @@ async fn test_basic_tag_creation() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_tag_with_message() {
     // Create a tag with an annotation message (annotated tag) and verify presence.
     let (_temp, _guard) = setup_repo_with_commit_with("content", "Commit with message").await;
@@ -790,7 +790,7 @@ async fn test_tag_with_message() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_force_tag() {
     // Verify that forcing a tag replaces the ref target.
     let (_temp, _guard) = setup_repo_with_commit_with("v1", "First").await;
@@ -870,7 +870,7 @@ async fn test_force_tag() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_force_tag_store_failure_preserves_existing_ref() {
     if skip_permission_denied_test_if_root("test_force_tag_store_failure_preserves_existing_ref") {
         return;
@@ -917,7 +917,7 @@ async fn test_force_tag_store_failure_preserves_existing_ref() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_internal_create_returns_metadata_for_annotated_tag() {
     let (_temp, _guard) = setup_repo_with_commit_with("content", "Base").await;
 
@@ -940,7 +940,7 @@ async fn test_internal_create_returns_metadata_for_annotated_tag() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_list_tags() {
     // Verify listing returns created tag names.
     let (_temp, _guard) = setup_repo_with_commit_with("content", "Base").await;
@@ -958,7 +958,7 @@ async fn test_list_tags() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_delete_tag() {
     // Verify delete removes the tag ref.
     let (_temp, _guard) = setup_repo_with_commit_with("content", "Delete base").await;
@@ -994,7 +994,7 @@ async fn test_delete_tag() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_annotation_lines_tag() {
     let (_temp, _guard) = setup_repo_with_commit_with("lightweight-tag", "First").await;
 
@@ -1423,7 +1423,7 @@ fn test_tag_dash_f_read_error_and_create_only_validation() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_tag_create_only_validation_blocks_programmatic_entry() {
     // The cli.rs preflight is not the only guard: the programmatic
     // `execute_safe` entry must also reject a message source combined with a

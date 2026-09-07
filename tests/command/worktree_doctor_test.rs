@@ -147,7 +147,7 @@ fn parse_json(bytes: &[u8], what: &str) -> serde_json::Value {
 /// nothing while doing so (§C.8 W4 acceptance: default invocation is strictly
 /// read-only).
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_reports_scope_diagnostics() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -244,7 +244,7 @@ async fn worktree_doctor_reports_scope_diagnostics() {
 /// The W0 read-only skeleton contract, stated on its own: neither the human
 /// nor the JSON form of the default invocation may mutate anything.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_default_invocation_is_readonly() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -266,7 +266,7 @@ async fn worktree_doctor_default_invocation_is_readonly() {
 /// Envelope, required fields, ordering, page limits, opaque cursor and both
 /// fail-closed refusals — the frozen machine contract (§C.8, Codex R18/R19).
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_json_schema_and_pagination_stable() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -436,7 +436,7 @@ async fn worktree_doctor_json_schema_and_pagination_stable() {
 /// An unreadable scope is refused (`LBR-WORKTREE-002`) — the doctor never
 /// answers with an empty or partial diagnosis built on unknown ownership.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_corrupt_scope_fails_closed() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -457,7 +457,7 @@ async fn worktree_doctor_corrupt_scope_fails_closed() {
 /// workspace lease. It atomically converts every legacy row for the provider
 /// session and records the irreversible decision in the append-only audit.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_adopts_legacy_capture_with_confirmation_and_audit() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -627,7 +627,7 @@ async fn worktree_doctor_adopts_legacy_capture_with_confirmation_and_audit() {
 /// it is not authority to attribute capture history. Adoption must wait for a
 /// renewed or newly fenced live lease and leave the legacy row untouched.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_refuses_capture_adoption_to_an_expired_lease() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -688,7 +688,7 @@ async fn worktree_doctor_refuses_capture_adoption_to_an_expired_lease() {
 /// explicit adoption path must still make that legacy state recoverable rather
 /// than leaving it permanently blocked behind a missing `agent_session` row.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_adopts_orphan_legacy_provider_session() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -757,7 +757,7 @@ async fn worktree_doctor_adopts_orphan_legacy_provider_session() {
 /// interpreted as an unrelated provider id merely because another legacy row
 /// happens to use the same opaque string.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_prefers_catalog_session_id_over_provider_id_collision() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -970,7 +970,7 @@ fn worktree_doctor_capture_adoption_is_documented_in_both_languages() {
 /// plan-20260715 W4-07: doctor adopt/clear for legacy approved_permission
 /// project_id requires --confirm, audits, and refuses the canonical id.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_adopts_and_clears_legacy_approved_project() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
@@ -1166,7 +1166,7 @@ async fn operation_rows(repo: &Path) -> Vec<libra::internal::operation::Operatio
 /// be built without `symlink(2)`.
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
     use libra::internal::operation::OperationStatus;
 

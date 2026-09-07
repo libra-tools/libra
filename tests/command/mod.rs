@@ -434,6 +434,7 @@ mod t4_port_test;
 mod tag_test;
 mod update_index_test;
 mod update_ref_test;
+mod upgrade_cmd_test;
 mod usage_help_test;
 mod verify_pack_stat_test;
 mod verify_pack_test;

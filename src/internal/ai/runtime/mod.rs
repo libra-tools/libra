@@ -44,7 +44,10 @@ pub use event::{Event, audit_action_for};
 pub use execution_control::{
     CodeSkillActivation, CodeSkillSearch, ExecutionControlService, GoalControlError,
 };
-pub use fix_bridge::{REVIEW_FIX_ADMISSION_MESSAGE, ReviewFixBridgeError, ReviewFixInput};
+pub use fix_bridge::{
+    INVESTIGATE_FIX_ADMISSION_MESSAGE, REVIEW_FIX_ADMISSION_MESSAGE, ReviewFixBridgeError,
+    ReviewFixInput,
+};
 pub use fix_execution::{
     ReviewFixExecutionOutcome, ReviewFixInteractionResponder, execute_review_fix,
 };

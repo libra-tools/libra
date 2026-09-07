@@ -72,7 +72,7 @@ fn test_rev_parse_abbrev_ref_head_returns_branch_name() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rev_parse_abbrev_ref_remote_tracking_ref_returns_short_name() {
     let repo = tempdir().expect("failed to create repository root");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -105,7 +105,7 @@ async fn test_rev_parse_abbrev_ref_remote_tracking_ref_returns_short_name() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rev_parse_abbrev_ref_multi_segment_remote_tracking_ref_returns_short_name() {
     let repo = tempdir().expect("failed to create repository root");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -141,7 +141,7 @@ async fn test_rev_parse_abbrev_ref_multi_segment_remote_tracking_ref_returns_sho
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rev_parse_abbrev_ref_lowercase_head_resolves_branch_name() {
     let repo = tempdir().expect("failed to create repository root");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -167,7 +167,7 @@ async fn test_rev_parse_abbrev_ref_lowercase_head_resolves_branch_name() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rev_parse_abbrev_ref_refs_heads_returns_short_name() {
     let repo = tempdir().expect("failed to create repository root");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -191,7 +191,7 @@ async fn test_rev_parse_abbrev_ref_refs_heads_returns_short_name() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rev_parse_abbrev_ref_refs_remotes_returns_short_name() {
     let repo = tempdir().expect("failed to create repository root");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -227,7 +227,7 @@ async fn test_rev_parse_abbrev_ref_refs_remotes_returns_short_name() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rev_parse_abbrev_ref_prefers_exact_local_refs_remotes_name() {
     let repo = tempdir().expect("failed to create repository root");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -866,7 +866,7 @@ fn test_rev_parse_symbolic_echoes_resolvable_specs_verbatim() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_rev_parse_symbolic_full_name_remote_tracking_ref() {
     // A remote-tracking spec resolves to its full `refs/remotes/<remote>/<branch>`.
     let repo = tempdir().expect("failed to create repository root");

@@ -74,7 +74,7 @@ use uuid::Uuid;
 ///
 /// `#[serial]` because `ChangeDirGuard` mutates process CWD.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_ai_flow_local() {
     // 1. Setup Storage and Repo Environment
     let dir = tempdir().unwrap();
@@ -195,7 +195,7 @@ async fn test_ai_flow_local() {
 /// graph: one Intent, two role-split Plans, one root Task plus compiled tasks,
 /// and one root Run plus the per-task attempt Run.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn runtime_formal_writes_preserve_order_and_minimal_object_set() {
     let dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(dir.path());
@@ -356,7 +356,7 @@ async fn runtime_formal_writes_preserve_order_and_minimal_object_set() {
 /// - Artifacts are correctly stored in R2
 /// - Connectivity to the remote storage provider works as expected
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_ai_flow_r2() {
     if std::env::var("R2_ENDPOINT").map_or(true, |v| v.is_empty()) {
         eprintln!("skipped (R2_ENDPOINT not set)");

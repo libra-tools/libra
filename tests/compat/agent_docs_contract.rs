@@ -12,6 +12,8 @@ const AGENT_DOC: &str = include_str!("../../docs/development/tracing/agent.md");
 /// `restore` still resurrects erased sessions after it no longer did.
 const AGENT_CMD_DOC_EN: &str = include_str!("../../docs/commands/agent.md");
 const AGENT_CMD_DOC_ZH: &str = include_str!("../../docs/commands/zh-CN/agent.md");
+const AGENT_DEV_DOC: &str = include_str!("../../docs/development/commands/agent.md");
+const COMPATIBILITY_DOC: &str = include_str!("../../COMPATIBILITY.md");
 const CODE_COMMAND: &str = include_str!("../../src/command/code.rs");
 
 #[test]
@@ -179,6 +181,50 @@ fn agent_doc_declares_cloud_tombstone_deferred() {
         );
     }
 }
+#[test]
+fn macos_read_isolation_disclosure_pinned() {
+    // SBX-04: four disclosure surfaces must each state macOS seatbelt export,
+    // deprecation/read-isolation, and fail-closed metadata-only degrade.
+    assert!(
+        AGENT_DOC.contains("macOS")
+            && AGENT_DOC.contains("seatbelt")
+            && AGENT_DOC.contains("弃用")
+            && AGENT_DOC.contains("读隔离")
+            && AGENT_DOC.contains("不限制读")
+            && AGENT_DOC.contains("metadata-only"),
+        "tracing/agent.md §5 must disclose macOS seatbelt, 弃用, 读隔离, 不限制读, metadata-only",
+    );
+    assert!(
+        AGENT_CMD_DOC_EN.contains("macOS")
+            && AGENT_CMD_DOC_EN.contains("seatbelt")
+            && AGENT_CMD_DOC_EN.contains("not confined")
+            && AGENT_CMD_DOC_EN.contains("deprecated"),
+        "docs/commands/agent.md must disclose macOS seatbelt deprecation and read is not confined",
+    );
+    assert!(
+        AGENT_CMD_DOC_ZH.contains("macOS")
+            && AGENT_CMD_DOC_ZH.contains("seatbelt")
+            && AGENT_CMD_DOC_ZH.contains("弃用")
+            && AGENT_CMD_DOC_ZH.contains("读隔离")
+            && AGENT_CMD_DOC_ZH.contains("metadata-only"),
+        "docs/commands/zh-CN/agent.md must disclose macOS seatbelt 弃用/读隔离/metadata-only",
+    );
+    assert!(
+        AGENT_DEV_DOC.contains("macOS")
+            && AGENT_DEV_DOC.contains("seatbelt")
+            && AGENT_DEV_DOC.contains("弃用"),
+        "docs/development/commands/agent.md must disclose macOS seatbelt 弃用",
+    );
+    assert!(
+        COMPATIBILITY_DOC.contains("macOS")
+            && COMPATIBILITY_DOC.contains("seatbelt")
+            && COMPATIBILITY_DOC.contains("read")
+            && COMPATIBILITY_DOC.contains("not confined")
+            && COMPATIBILITY_DOC.contains("deprecated"),
+        "COMPATIBILITY.md agent row must disclose macOS seatbelt deprecation and read is not confined",
+    );
+}
+
 #[test]
 fn agent_doc_tracks_code_agent_runtime_source_of_truth() {
     assert!(

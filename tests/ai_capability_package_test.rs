@@ -54,7 +54,7 @@ fn write_package(dir: &Path, id: &str, body: &str, with_source: bool) {
 }
 
 #[tokio::test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 async fn package_install_list_diff_uninstall_lifecycle() {
     let repo = tempfile::tempdir().unwrap();
     setup_with_new_libra_in(repo.path()).await;
@@ -128,7 +128,7 @@ async fn package_install_list_diff_uninstall_lifecycle() {
 }
 
 #[tokio::test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 async fn package_install_auto_enables_non_mutating_but_defers_mutating() {
     let repo = tempfile::tempdir().unwrap();
     setup_with_new_libra_in(repo.path()).await;
@@ -188,7 +188,7 @@ async fn package_install_auto_enables_non_mutating_but_defers_mutating() {
 }
 
 #[tokio::test]
-#[serial_test::serial]
+#[serial_test::serial(cwd)]
 async fn package_install_rejects_tampered_content() {
     let repo = tempfile::tempdir().unwrap();
     setup_with_new_libra_in(repo.path()).await;

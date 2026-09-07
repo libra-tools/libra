@@ -17,14 +17,34 @@ use thiserror::Error;
 /// tool-approval, sandbox, and ACL decision before it may apply a patch.
 pub const REVIEW_FIX_ADMISSION_MESSAGE: &str = "Prepare a controlled review-fix plan for the current working tree. This request comes from `libra review --fix`; do not consume external reviewer findings. Do not apply a patch or run mutating tools until the user explicitly confirms the normal Code plan and every applicable approval, sandbox, network, and ACL gate. Then execute only through the Code runtime's normal controlled plan-execution path.";
 
+/// Fixed request used by `libra investigate fix`.
+///
+/// The run id, topic, findings, stance text, and attachments are deliberately
+/// absent. They are untrusted observed-agent content; the active Code runtime
+/// independently inspects the current worktree and still asks for every normal
+/// decision before mutation.
+pub const INVESTIGATE_FIX_ADMISSION_MESSAGE: &str = "Prepare a controlled investigation-fix plan for the current working tree. This request comes from `libra investigate fix`; do not consume or infer from any stored investigation topic, findings, stance, attachment, or run identifier. Inspect the worktree independently. Do not apply a patch or run mutating tools until the user explicitly confirms the normal Code plan and every applicable approval, sandbox, network, and ACL gate. Then execute only through the Code runtime's normal controlled plan-execution path.";
+
 /// Provenance classification required before any request can enter the
 /// mutating-capable Code runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewFixInput {
     /// The CLI's fixed admission request; it contains no observed-agent data.
     TrustedAdmission,
+    /// The investigate CLI's fixed request; no run content is included.
+    TrustedInvestigateAdmission,
     /// An issue, transcript, finding, or other observed external-agent seed.
     UntrustedSeed,
+}
+
+impl ReviewFixInput {
+    pub(super) fn admission_message(self) -> Result<&'static str, ReviewFixBridgeError> {
+        match self {
+            Self::TrustedAdmission => Ok(REVIEW_FIX_ADMISSION_MESSAGE),
+            Self::TrustedInvestigateAdmission => Ok(INVESTIGATE_FIX_ADMISSION_MESSAGE),
+            Self::UntrustedSeed => Err(ReviewFixBridgeError::UntrustedSeed),
+        }
+    }
 }
 
 /// Fail-closed result from the review-fix admission bridge.

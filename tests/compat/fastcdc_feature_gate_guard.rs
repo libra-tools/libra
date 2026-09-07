@@ -1,5 +1,6 @@
 //! `tests/compat/fastcdc_feature_gate_guard.rs` — pins lore.md §6's hard
-//! constraint (lore.md:293 "feature gating 必须严格"): the `fastcdc` FastCDC
+//! constraint (lore.md §4.0 "feature gating 必须严格", `:320` as of
+//! 2026-08-27): the `fastcdc` FastCDC
 //! media-chunking feature must NEVER leak into the default binary. Textual
 //! guards (always run, DEFAULT features): the feature stays out of `default`,
 //! stays a pure in-tree feature (`fastcdc = []`, no bundled deps), and every

@@ -245,7 +245,7 @@
       "fixture": {
         "path": "tests/data/code_ui_remote/provider_fixtures/tool_call_chat.json"
       },
-      "notes": "Use this only after the runner proves the fake tool-call fixture does not loop. If it is flaky, move the cancellation assertion to L1.",
+      "notes": "Registered by DF-05 for the deterministic fake tool-call fixture; DF-08 moved it to the v2 code_workflow wire — the durable stream does not record the transient executing_tool status, so reaching the post-tool follow-up completion proves the tool phase ran.",
       "steps": [
         {
           "name": "attach automation",
@@ -275,14 +275,14 @@
           }
         },
         {
-          "name": "observe executing tool",
+          "name": "observe post-tool completion",
           "op": "collectEventsUntil",
           "stream": "events",
-          "event": "status_changed",
-          "timeoutMs": 10000,
+          "event": "code_workflow",
+          "timeoutMs": 15000,
           "expect": {
             "assertions": [
-              "event_data_status_executing_tool"
+              "event_transcript_contains:fake assistant: tool follow-up complete"
             ]
           }
         }

@@ -53,7 +53,7 @@ fn run_approval_case(case_name: &str) -> Result<()> {
 macro_rules! approval_case {
     ($name:ident) => {
         #[test]
-        #[serial]
+        #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
         fn $name() -> Result<()> {
             run_approval_case(stringify!($name))
         }

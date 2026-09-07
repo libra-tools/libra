@@ -75,3 +75,6 @@ gha-creds-*.json
 
 # Integration
 target*
+
+# Stray local build artifacts (never commit compiled rlibs from ad-hoc builds)
+*.rlib

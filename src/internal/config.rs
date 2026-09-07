@@ -1127,7 +1127,9 @@ pub async fn resolve_env(name: &str) -> Result<Option<String>> {
 /// Prefer the async [`resolve_env`] when the caller is already inside an
 /// async context — that avoids the per-call thread spawn.
 pub fn resolve_env_sync(name: &str) -> anyhow::Result<Option<String>> {
-    if let Ok(val) = std::env::var(name) {
+    if let Ok(val) = std::env::var(name)
+        && !val.trim().is_empty()
+    {
         return Ok(Some(val));
     }
 
@@ -1154,6 +1156,42 @@ pub fn resolve_env_sync(name: &str) -> anyhow::Result<Option<String>> {
 /// actionable error otherwise. Provider clients use this for the
 /// API-key class of variables where missing means the provider cannot
 /// initialise.
+/// [`resolve_env_sync`] with an explicit repository directory for the
+/// repo-local layer (plan-20260825 PS-06 terra R2): the session target's
+/// vault (`--repo` / `--cwd`) participates instead of whatever repository
+/// the process cwd happens to be inside. Falls back to the global/process
+/// layers when the directory holds no repository.
+pub fn resolve_env_sync_for_dir(
+    name: &str,
+    dir: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    if let Ok(val) = std::env::var(name)
+        && !val.trim().is_empty()
+    {
+        return Ok(Some(val));
+    }
+    let local_db = crate::utils::util::try_get_storage_path(Some(dir.to_path_buf()))
+        .ok()
+        .map(|storage| storage.join(crate::utils::util::DATABASE));
+    let owned = name.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<Option<String>> {
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|err| anyhow::anyhow!("failed to create tokio runtime: {err}"))?;
+            let target = match &local_db {
+                Some(db) => LocalIdentityTarget::ExplicitDb(db),
+                None => LocalIdentityTarget::None,
+            };
+            runtime.block_on(resolve_env_for_target(&owned, target))
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv().map_err(|_| {
+        anyhow::anyhow!("resolve_env_sync_for_dir worker for '{name}' exited unexpectedly")
+    })?
+}
+
 pub fn resolve_required_env_sync(name: &str) -> anyhow::Result<String> {
     match resolve_env_sync(name)? {
         Some(value) => Ok(value),
@@ -1180,20 +1218,63 @@ pub async fn resolve_env_for_target(
     name: &str,
     local_target: LocalIdentityTarget<'_>,
 ) -> Result<Option<String>> {
+    Ok(locate_env_for_target(name, local_target)
+        .await?
+        .map(|(value, _layer)| value))
+}
+
+/// Which layer of the credential chain produced a value
+/// (plan-20260825 PS-06). Layer names are user-facing (auto-selection
+/// notes and ambiguity listings) and never carry the value itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EnvHitLayer {
+    ProcessEnvironment,
+    RepoLocalVault,
+    GlobalVault,
+}
+
+impl EnvHitLayer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnvHitLayer::ProcessEnvironment => "process environment",
+            EnvHitLayer::RepoLocalVault => "repo-local vault",
+            EnvHitLayer::GlobalVault => "global vault",
+        }
+    }
+}
+
+/// [`resolve_env_for_target`] with the hit layer attached — the priority
+/// chain is identical (process env → repo-local vault → global vault) and
+/// the resolver delegates here, so the two can never drift.
+pub async fn locate_env_for_target(
+    name: &str,
+    local_target: LocalIdentityTarget<'_>,
+) -> Result<Option<(String, EnvHitLayer)>> {
+    // An empty value can never authenticate: every source treats it as a
+    // MISS and falls through to the next layer (plan-20260825 PS-06 terra
+    // R5) — filtering only the final result would hide a usable key in a
+    // lower layer behind an empty upper one.
     // 1. System environment variable — per-process override (12-Factor)
-    if let Ok(val) = std::env::var(name) {
-        return Ok(Some(val));
+    if let Ok(val) = std::env::var(name)
+        && !val.trim().is_empty()
+    {
+        return Ok(Some((val, EnvHitLayer::ProcessEnvironment)));
     }
 
     let vault_key = format!("vault.env.{name}");
 
     // 2. Local config (vault.env.*)
-    if let Some(value) = local_env_value_for_target(local_target, &vault_key).await? {
-        return Ok(Some(value));
+    if let Some(value) = local_env_value_for_target(local_target, &vault_key).await?
+        && !value.trim().is_empty()
+    {
+        return Ok(Some((value, EnvHitLayer::RepoLocalVault)));
     }
 
     // 3. Global config — lowest priority
-    global_env_value(name, &vault_key).await
+    Ok(global_env_value(name, &vault_key)
+        .await?
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (value, EnvHitLayer::GlobalVault)))
 }
 
 /// Resolve the global config database path.
@@ -2629,6 +2710,137 @@ mod tests {
     use sea_orm::Statement;
 
     use super::*;
+
+    /// plan-20260825 PS-06: `locate_env_for_target` tags the hit layer and
+    /// `resolve_env_for_target` delegates to it, so value and layer can
+    /// never disagree. Uses the process-env layer (deterministic, no DB) and
+    /// an unset name against an isolated global DB for the miss path.
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn locate_env_reports_the_hit_layer_and_resolver_delegates() {
+        let name = "LIBRA_PS06_LOCATE_TEST_KEY";
+        // SAFETY-adjacent: serial(env) — process env is shared state.
+        unsafe { std::env::set_var(name, "layer-probe") };
+        let located = locate_env_for_target(name, LocalIdentityTarget::None)
+            .await
+            .expect("locate over process env");
+        assert_eq!(
+            located,
+            Some(("layer-probe".to_string(), EnvHitLayer::ProcessEnvironment))
+        );
+        let resolved = resolve_env_for_target(name, LocalIdentityTarget::None)
+            .await
+            .expect("resolver delegates");
+        assert_eq!(resolved.as_deref(), Some("layer-probe"));
+        unsafe { std::env::remove_var(name) };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("isolated-global.db");
+        unsafe { std::env::set_var("LIBRA_CONFIG_GLOBAL_DB", &db) };
+        let missing = locate_env_for_target(name, LocalIdentityTarget::None)
+            .await
+            .expect("miss path");
+        assert_eq!(missing, None, "unset name must locate nowhere");
+
+        // Repo-local and global layers, and local-over-global precedence
+        // (PS-06 terra R1: swapping the two labels must turn a test red).
+        let global_conn =
+            crate::internal::db::create_database(db.to_str().expect("utf8 global db path"))
+                .await
+                .expect("create isolated global db");
+        ConfigKv::set_with_conn(
+            &global_conn,
+            &format!("vault.env.{name}"),
+            "from-global",
+            false,
+        )
+        .await
+        .expect("write global vault value");
+        drop(global_conn);
+
+        let located = locate_env_for_target(name, LocalIdentityTarget::None)
+            .await
+            .expect("global layer");
+        assert_eq!(
+            located,
+            Some(("from-global".to_string(), EnvHitLayer::GlobalVault)),
+            "global vault hit must carry the GlobalVault label"
+        );
+
+        let local_db = tmp.path().join("isolated-local.db");
+        let local_conn =
+            crate::internal::db::create_database(local_db.to_str().expect("utf8 local db path"))
+                .await
+                .expect("create isolated local db");
+        ConfigKv::set_with_conn(
+            &local_conn,
+            &format!("vault.env.{name}"),
+            "from-local",
+            false,
+        )
+        .await
+        .expect("write local vault value");
+        drop(local_conn);
+
+        let located = locate_env_for_target(name, LocalIdentityTarget::ExplicitDb(&local_db))
+            .await
+            .expect("local layer");
+        assert_eq!(
+            located,
+            Some(("from-local".to_string(), EnvHitLayer::RepoLocalVault)),
+            "repo-local must win over global and carry the RepoLocalVault label"
+        );
+
+        unsafe { std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB") };
+    }
+
+    /// plan-20260825 PS-06 terra R3: the factory's sync lookup must read the
+    /// vault of the DIRECTORY it is given, not the process cwd — two sibling
+    /// repositories with different keys prove the routing at the exact
+    /// function the factory calls.
+    #[test]
+    #[serial_test::serial(env)]
+    fn resolve_env_sync_for_dir_reads_the_target_repos_vault() {
+        let name = "LIBRA_PS06_AB_FACTORY_KEY";
+        unsafe { std::env::remove_var(name) };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "LIBRA_CONFIG_GLOBAL_DB",
+                tmp.path().join("isolated-global.db"),
+            )
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        for (repo, value) in [("a", "from-repo-a"), ("b", "from-repo-b")] {
+            let storage = tmp.path().join(repo).join(".libra");
+            std::fs::create_dir_all(&storage).expect("storage dir");
+            let db = storage.join(crate::utils::util::DATABASE);
+            let conn = runtime
+                .block_on(crate::internal::db::create_database(
+                    db.to_str().expect("utf8"),
+                ))
+                .expect("create repo db");
+            runtime
+                .block_on(ConfigKv::set_with_conn(
+                    &conn,
+                    &format!("vault.env.{name}"),
+                    value,
+                    false,
+                ))
+                .expect("write repo vault value");
+        }
+        drop(runtime);
+
+        let from_a = resolve_env_sync_for_dir(name, &tmp.path().join("a")).expect("resolve A");
+        assert_eq!(from_a.as_deref(), Some("from-repo-a"));
+        let from_b = resolve_env_sync_for_dir(name, &tmp.path().join("b")).expect("resolve B");
+        assert_eq!(
+            from_b.as_deref(),
+            Some("from-repo-b"),
+            "the factory chain must follow the given directory, not the cwd"
+        );
+        unsafe { std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB") };
+    }
 
     async fn write_schema_version(db_path: &Path, version: i64) {
         let conn = crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))

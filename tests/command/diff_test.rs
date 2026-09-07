@@ -189,7 +189,7 @@ fn test_diff_non_default_algorithm_executes() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_diff_empty_output_does_not_initialize_pager() {
     if cfg!(windows) {
         return;
@@ -435,7 +435,7 @@ fn modify_file(path: &str, content: &str) {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests diff command immediately after libra init (empty repository scenario).
 /// This tests the edge case where there are no commits and no staged changes.
 async fn test_diff_after_init() {
@@ -491,7 +491,7 @@ async fn test_diff_after_init() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests the basic diff functionality between working directory and HEAD.
 async fn test_basic_diff() {
     let test_dir = tempdir().unwrap();
@@ -561,7 +561,7 @@ async fn test_basic_diff() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests diff with staged changes
 async fn test_diff_staged() {
     let test_dir = tempdir().unwrap();
@@ -661,7 +661,7 @@ async fn test_diff_staged() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests diff between two specific commits
 async fn test_diff_between_commits() {
     let test_dir = tempdir().unwrap();
@@ -779,7 +779,7 @@ async fn test_diff_between_commits() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests diff with specific file path
 async fn test_diff_with_pathspec() {
     let test_dir = tempdir().unwrap();
@@ -858,7 +858,7 @@ async fn test_diff_with_pathspec() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests diff with output to a file
 async fn test_diff_output_to_file() {
     let test_dir = tempdir().unwrap();
@@ -928,7 +928,7 @@ async fn test_diff_output_to_file() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 /// Tests diff with different algorithms
 async fn test_diff_algorithms() {
     let test_dir = tempdir().unwrap();
@@ -1867,7 +1867,6 @@ fn test_diff_ignore_blank_lines_modification_with_header_like_content_is_dropped
 /// `--relative[=<path>]` restricts the diff to a directory and strips that prefix
 /// from displayed paths (matching Git), while `--no-relative` keeps full paths.
 #[test]
-#[serial]
 fn test_diff_relative_filters_and_strips_prefix() {
     let repo = tempdir().unwrap();
     let p = repo.path();
@@ -1947,7 +1946,6 @@ fn test_diff_relative_filters_and_strips_prefix() {
 /// filename contains a space (exact-path replacement, not a ` b/` split), so the
 /// `diff --git`/`---`/`+++` headers stay consistent.
 #[test]
-#[serial]
 fn test_diff_relative_strips_space_containing_path() {
     let repo = tempdir().unwrap();
     let p = repo.path();
@@ -1977,7 +1975,6 @@ fn test_diff_relative_strips_space_containing_path() {
 /// `--relative` also strips the prefix from the `<LargeFile>` marker emitted for
 /// over-large files, so the patch output is consistent with `file.path`/`--stat`.
 #[test]
-#[serial]
 fn test_diff_relative_strips_large_file_marker() {
     let repo = tempdir().unwrap();
     let p = repo.path();

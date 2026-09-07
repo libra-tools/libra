@@ -320,7 +320,7 @@ fn add_fake_ssh_remote(local_dir: &Path, remote_dir: &Path) {
 
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn agent_push_writes_private_agent_traces_ref() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -396,7 +396,7 @@ fn agent_push_writes_private_agent_traces_ref() {
 ///    with `--force-rewrite` (the lease protects).
 #[cfg(unix)]
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn agent_push_after_prune_requires_force_rewrite_and_lease_protects() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");

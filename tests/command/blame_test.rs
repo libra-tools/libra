@@ -421,7 +421,7 @@ fn test_blame_show_email_displays_author_email() {
 /// line 1 maps to the first commit and line 2 to the second. The `date`
 /// field must be RFC3339-parseable.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_blame_json_assigns_lines_to_introducing_commits() {
     let repo = tempdir().unwrap();
     let _guard = setup_repo_with_hash(&repo, "sha1").await;
@@ -452,7 +452,7 @@ async fn test_blame_json_assigns_lines_to_introducing_commits() {
 /// line range. Asks for line 2 only and asserts the array has length 1
 /// with the expected hash and content.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_blame_json_line_range_filters_output() {
     let repo = tempdir().unwrap();
     let _guard = setup_repo_with_hash(&repo, "sha1").await;
@@ -490,7 +490,7 @@ fn test_blame_invalid_line_range_uses_stable_cli_error() {
 /// endpoint spans to the end of the file, and a non-matching regex errors — all
 /// matching `git blame -L` semantics.
 #[test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn test_blame_regex_line_range() {
     let repo = tempdir().unwrap();
     let p = repo.path();
@@ -710,7 +710,7 @@ async fn prepare_three_commit_history() -> (ObjectHash, ObjectHash, ObjectHash) 
 /// three-commit history where each commit appends one line, every blame
 /// line must be attributed to the commit that introduced it.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_blame_json_three_commit_chain_attributes_each_line() {
     let repo = tempdir().unwrap();
     let _guard = setup_repo_with_hash(&repo, "sha1").await;
@@ -736,7 +736,7 @@ async fn test_blame_json_three_commit_chain_attributes_each_line() {
 /// returns an empty result (no blame lines) in JSON mode and prints
 /// "File is empty" in human mode, rather than erroring.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_blame_empty_file_returns_empty_result() {
     let repo = tempdir().unwrap();
     let _guard = setup_repo_with_hash(&repo, "sha1").await;
@@ -790,7 +790,7 @@ async fn test_blame_empty_file_returns_empty_result() {
 /// Scenario: `blame::execute` against a SHA-1 repo must complete without
 /// panic. Smoke test for the SHA-1 code path.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn blame_runs_with_sha1() {
     let repo = tempdir().unwrap();
     let _guard = setup_repo_with_hash(&repo, "sha1").await;
@@ -819,7 +819,7 @@ async fn blame_runs_with_sha1() {
 /// without panic. Smoke test for the SHA-256 code path; pairs with the
 /// SHA-1 case to guarantee both are wired through.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn blame_runs_with_sha256() {
     let repo = tempdir().unwrap();
     let _guard = setup_repo_with_hash(&repo, "sha256").await;
@@ -848,7 +848,7 @@ async fn blame_runs_with_sha256() {
 /// SHA-256 repo must be rejected by `get_target_commit`. Format-mismatch
 /// regression guard so users do not silently get the wrong commit.
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn blame_rejects_sha1_length_on_sha256_repo() {
     let repo = tempdir().unwrap();
     let _guard = setup_repo_with_hash(&repo, "sha256").await;
@@ -929,7 +929,7 @@ fn test_blame_display_flags_long_suppress_timestamp_abbrev() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn blame_root_flag_is_accepted_noop() {
     let repo = tempdir().unwrap();
     let _guard = setup_repo_with_hash(&repo, "sha1").await;

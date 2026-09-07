@@ -172,8 +172,17 @@ impl Default for TurnStateMachine {
 pub struct TurnRequest {
     pub session_id: String,
     pub turn_id: String,
+    /// Raw request identity. Durable command intents hash EXACTLY this
+    /// field, and every retry/payload comparison uses it — execution-only
+    /// context never participates (plan-20260824 DF-07).
     pub input: String,
     pub mutating: bool,
+    /// Execution-only context appended to `input` at the executor handoff
+    /// (DF-07 skill activations). Never part of the durable identity, so a
+    /// retry with the same raw `input` stays idempotent regardless of what
+    /// context the original or the retry carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_context: Option<String>,
 }
 
 impl TurnRequest {
@@ -188,7 +197,23 @@ impl TurnRequest {
             turn_id: turn_id.into(),
             input: input.into(),
             mutating,
+            provider_context: None,
         }
+    }
+
+    /// Attach execution-only provider context (see `provider_context`).
+    pub fn with_provider_context(mut self, context: impl Into<String>) -> Self {
+        self.provider_context = Some(context.into());
+        self
+    }
+
+    /// Fold the execution-only context into `input` for the executor
+    /// handoff. Identity surfaces must never call this.
+    pub fn into_provider_request(mut self) -> Self {
+        if let Some(context) = self.provider_context.take() {
+            self.input = format!("{}\n\n{}", self.input, context);
+        }
+        self
     }
 }
 
@@ -2656,7 +2681,9 @@ impl AgentRuntimeWorker {
                 cancellation,
                 mutation_started,
             };
-            let result = executor.execute(request, context).await;
+            let result = executor
+                .execute(request.into_provider_request(), context)
+                .await;
             let _ = command_tx
                 .send(RuntimeCommand::ExecutionFinished {
                     session_id,
@@ -2702,13 +2729,14 @@ impl AgentRuntimeWorker {
             {
                 delivery.after_pre_delivery_checkpoint().await;
             }
+            let request = response.request.into_provider_request();
             let result = if let Some(delivery) = response.delivery {
                 delivery
-                    .deliver(response.request, response.interaction, context)
+                    .deliver(request, response.interaction, context)
                     .await
             } else {
                 executor
-                    .respond(response.request, response.interaction, context)
+                    .respond(request, response.interaction, context)
                     .await
             };
             let _ = command_tx

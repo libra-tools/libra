@@ -75,6 +75,63 @@ pub enum LockListError {
 
 static LFS_CLIENT: OnceCell<LFSClient> = OnceCell::const_new();
 impl LFSClient {
+    #[cfg(feature = "fastcdc")]
+    async fn media_client(
+        &self,
+        local_fallback: bool,
+    ) -> anyhow::Result<Option<crate::utils::media::transfer::MediaClient>> {
+        if crate::utils::util::try_get_storage_path(None).is_ok()
+            && let Some(value) = ConfigKv::get_best_effort("lfs.fastcdc").await?
+        {
+            match value.value.to_ascii_lowercase().as_str() {
+                "false" | "no" | "off" | "0" => return Ok(None),
+                "true" | "yes" | "on" | "1" => (),
+                _ => return Err(anyhow!("lfs.fastcdc must be a boolean")),
+            }
+        }
+        crate::utils::media::transfer::MediaClient::discover(
+            self.client.clone(),
+            &self.lfs_url,
+            local_fallback,
+        )
+        .await
+    }
+
+    #[cfg(feature = "fastcdc")]
+    async fn try_media_upload(
+        &self,
+        oid: &str,
+        size: i64,
+        file: &Path,
+        remote_has_full_object: bool,
+    ) -> Result<bool, LfsPushError> {
+        let result = async {
+            let Some(media) = self.media_client(true).await? else {
+                return Ok(false);
+            };
+            let size = u64::try_from(size).context("negative LFS object size")?;
+            if remote_has_full_object {
+                // A prior finalize may have persisted the standard object but
+                // failed before publishing the manifest. Repair it only when
+                // a complete local source is available; ordinary basic LFS
+                // skips never require opening a local object.
+                let Ok(metadata) = tokio::fs::metadata(file).await else {
+                    return Ok(false);
+                };
+                if !metadata.is_file() || metadata.len() != size {
+                    return Ok(false);
+                }
+            }
+            media.upload(oid, size, file).await
+        }
+        .await;
+        result.map_err(|error| LfsPushError {
+            path: Some(file.display().to_string()),
+            oid: Some(oid.to_owned()),
+            detail: format!("FastCDC upload failed: {error:#}"),
+        })
+    }
+
     /// Get LFSClient instance
     /// - DO NOT use `async_static!`: No IDE Code Completion & lagging
     pub async fn get() -> anyhow::Result<&'static LFSClient> {
@@ -101,30 +158,11 @@ impl ProtocolClient for LFSClient {
     /// graceful path that also handles SCP-style SSH URLs and surfaces
     /// errors with context.
     fn from_url(repo_url: &Url) -> Self {
-        // The trailing slash is MUST, or `join()` method will replace the last segment.
-        // like: Url("/info/lfs").join("objects/batch") => "/info/objects/batch"
-        let lfs_server = lfs::generate_lfs_server_url(repo_url.to_string()) + "/"; // IMPORTANT
-        let lfs_server = Url::parse(&lfs_server).expect(
-            "LFSClient::from_url: derived LFS server URL did not parse (use LFSClient::new for SCP-style)",
-        );
-        let client = Client::builder()
-            .redirect(super::https_client::no_downgrade_redirect_policy())
-            .default_headers(lfs::LFS_HEADERS.clone()) //  will be overwritten by `json()`, careful!
-            .build()
-            // INVARIANT (trait contract, see the impl doc above): the trait
-            // returns Self, so this must panic; LFSClient::new() is the
-            // fallible path.
-            .expect(
-                "LFSClient::from_url: reqwest client builder failed (likely missing TLS backend)",
-            );
-        Self {
-            // Caution: DO NOT start with `/`, or path after domain will be replaced.
-            batch_url: lfs_server
-                .join("objects/batch")
-                .expect("'objects/batch' is a valid relative URL"),
-            lfs_url: lfs_server,
-            client,
-        }
+        // INVARIANT (trait contract): this constructor cannot return errors;
+        // callers needing recovery use `from_remote_url` or `new` instead.
+        Self::from_remote_url(repo_url.as_str()).expect(
+            "LFSClient::from_url: failed to construct LFS client (use from_remote_url for errors)",
+        )
     }
 }
 
@@ -141,23 +179,7 @@ impl LFSClient {
                      `libra branch --set-upstream-to <remote>/<branch>`"
                 )
             })?;
-        // generate_lfs_server_url converts SCP-style SSH URLs (git@host:user/repo.git)
-        // to valid HTTPS URLs, so we pass the raw remote string directly instead of
-        // going through Url::parse which rejects SCP format with RelativeUrlWithoutBase.
-        let lfs_server = lfs::generate_lfs_server_url(url.clone()) + "/";
-        let lfs_server = Url::parse(&lfs_server)
-            .with_context(|| format!("failed to derive LFS server URL from remote '{url}'"))?;
-        let client = Client::builder()
-            .redirect(super::https_client::no_downgrade_redirect_policy())
-            .default_headers(lfs::LFS_HEADERS.clone())
-            .build()?;
-        Ok(Self {
-            batch_url: lfs_server
-                .join("objects/batch")
-                .expect("'objects/batch' is a valid relative URL"),
-            lfs_url: lfs_server,
-            client,
-        })
+        Self::from_remote_url(&url)
     }
 
     /// Build a client from an EXPLICIT remote URL (lore.md 2.8): the lock
@@ -165,17 +187,24 @@ impl LFSClient {
     /// `remote.origin.url`), where [`Self::new`]'s current-branch resolution
     /// would refuse.
     pub fn from_remote_url(url: &str) -> anyhow::Result<Self> {
-        let lfs_server = lfs::generate_lfs_server_url(url.to_string()) + "/";
-        let lfs_server = Url::parse(&lfs_server)
-            .with_context(|| format!("failed to derive LFS server URL from remote '{url}'"))?;
+        // Convert SCP-style SSH before parsing and append to the URL path,
+        // never after the query string. Keep the query on both endpoints.
+        let lfs_server = lfs::generate_lfs_server_url(url.to_string());
+        let mut lfs_server = Url::parse(&lfs_server).with_context(|| {
+            format!(
+                "failed to derive LFS server URL from remote '{}'",
+                crate::utils::redact::redact_url_credentials(url)
+            )
+        })?;
+        lfs_server.set_path(&format!("{}/", lfs_server.path().trim_end_matches('/')));
+        let mut batch_url = lfs_server.clone();
+        batch_url.set_path(&format!("{}objects/batch", lfs_server.path()));
         let client = Client::builder()
             .redirect(super::https_client::no_downgrade_redirect_policy())
             .default_headers(lfs::LFS_HEADERS.clone())
             .build()?;
         Ok(Self {
-            batch_url: lfs_server
-                .join("objects/batch")
-                .expect("'objects/batch' is a valid relative URL"),
+            batch_url,
             lfs_url: lfs_server,
             client,
         })
@@ -439,6 +468,13 @@ impl LFSClient {
             })?;
 
             println!("Uploading LFS file: {}", object.oid);
+            #[cfg(feature = "fastcdc")]
+            if self
+                .try_media_upload(&object.oid, object.size, file, false)
+                .await?
+            {
+                return Ok(true);
+            }
             let content_len = tokio::fs::metadata(file)
                 .await
                 .map_err(|e| LfsPushError {
@@ -494,6 +530,13 @@ impl LFSClient {
             println!("Uploaded.");
             Ok(true)
         } else {
+            #[cfg(feature = "fastcdc")]
+            if self
+                .try_media_upload(&object.oid, object.size, file, true)
+                .await?
+            {
+                return Ok(true);
+            }
             tracing::debug!("LFS file {} already exists on remote server", object.oid);
             Ok(false)
         }
@@ -601,6 +644,23 @@ impl LFSClient {
         let link = actions.get(&Action::Download).ok_or_else(|| {
             anyhow!("LFS batch download response missing 'download' action for oid {oid}")
         })?;
+
+        #[cfg(feature = "fastcdc")]
+        if let Ok(storage) = util::try_get_storage_path(None)
+            && let Some(media) = self.media_client(false).await?
+        {
+            // The public LFSClient also supports callers outside a repository;
+            // those use basic LFS instead of a repository-only cache that panics.
+            let store = crate::utils::media::chunk_store::MediaChunkStore::at(
+                storage.join("media").join("chunks"),
+            );
+            if media.download(oid, size, path.as_ref(), &store).await? {
+                if let Some((report, _)) = reporter.as_mut() {
+                    report(100.0)?;
+                }
+                return Ok(());
+            }
+        }
 
         let mut is_chunked = false;
         // Chunk API — infer that all chunks share the same size, falling back to the
@@ -715,6 +775,11 @@ impl LFSClient {
             }
             pb.finish_and_clear();
         }
+        // Tokio may still be completing the last write on its blocking pool.
+        // Do not report success until those bytes (and any write error) are visible.
+        file.flush()
+            .await
+            .context("failed to finish writing downloaded LFS object")?;
         let checksum = hex::encode(checksum.finish().as_ref());
         if checksum == oid {
             println!("Downloaded.");
@@ -727,6 +792,9 @@ impl LFSClient {
             file.set_len(0).await?; // clear
             file.seek(tokio::io::SeekFrom::Start(0)).await?; // ensure
             file.write_all(pointer.as_bytes()).await?;
+            file.flush()
+                .await
+                .context("failed to finish writing LFS fallback pointer")?;
             Err(anyhow!("Checksum mismatch, fallback to pointer file."))
         }
     }
@@ -934,6 +1002,24 @@ impl LFSClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructors_append_endpoints_before_the_query() {
+        let remote = "ssh://git@host.example:8443/project/demo.git/?tenant=one#ref";
+        let client = LFSClient::from_remote_url(remote).unwrap();
+        assert_eq!(
+            client.lfs_url.as_str(),
+            "https://host.example:8443/project/demo.git/info/lfs/?tenant=one"
+        );
+        assert_eq!(
+            client.batch_url.as_str(),
+            "https://host.example:8443/project/demo.git/info/lfs/objects/batch?tenant=one"
+        );
+        let trait_client = LFSClient::from_url(&Url::parse(remote).unwrap());
+        assert_eq!(trait_client.lfs_url, client.lfs_url);
+        assert_eq!(trait_client.batch_url, client.batch_url);
+    }
+
     #[test]
     fn test_request_vars() {
         let vars = RequestObject {
@@ -1111,11 +1197,9 @@ mod tests {
     }
 
     fn test_lfs_client(base_url: &str) -> LFSClient {
-        LFSClient {
-            batch_url: Url::parse(&format!("{base_url}objects/batch")).unwrap(),
-            lfs_url: Url::parse(base_url).unwrap(),
-            client: Client::builder().no_proxy().build().unwrap(),
-        }
+        let mut client = LFSClient::from_remote_url(base_url).unwrap();
+        client.client = Client::builder().no_proxy().build().unwrap();
+        client
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

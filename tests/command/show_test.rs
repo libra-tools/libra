@@ -287,7 +287,7 @@ fn test_show_quiet_suppresses_human_output() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_non_quiet_uses_forced_pager() {
     if cfg!(windows) {
         return;
@@ -341,7 +341,7 @@ async fn test_show_non_quiet_uses_forced_pager() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_quiet_still_validates_patch_generation() {
     use libra::command::show::{ShowArgs, execute_safe};
 
@@ -407,7 +407,7 @@ async fn test_show_quiet_still_validates_patch_generation() {
 /// Quiet --stat uses tree-level comparison (same as human --stat), so missing
 /// blob contents do not cause a failure — matching the human path semantics.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_quiet_stat_succeeds_with_missing_blob_like_human_path() {
     use libra::command::show::{ShowArgs, execute_safe};
 
@@ -462,7 +462,7 @@ async fn test_show_quiet_stat_succeeds_with_missing_blob_like_human_path() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_json_commit_refs_are_best_effort_on_corrupt_branch_metadata() {
     let repo = create_committed_repo_via_cli();
 
@@ -507,7 +507,7 @@ async fn test_show_json_commit_refs_are_best_effort_on_corrupt_branch_metadata()
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_patch_fails_when_commit_blob_is_missing() {
     let repo = create_committed_repo_via_cli();
 
@@ -662,7 +662,7 @@ fn test_show_json_commit_output_respects_pathspec_filters() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_tree_output_uses_git_modes_and_types() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
@@ -886,7 +886,7 @@ async fn test_show_nonexistent_tag() {
 /// Test that `show::execute_safe` returns a structured `CliError` for an
 /// invalid object reference when called through the API.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_execute_safe_bad_ref_returns_cli_error() {
     use libra::{
         command::show::{ShowArgs, execute_safe},
@@ -938,7 +938,7 @@ async fn test_show_execute_safe_bad_ref_returns_cli_error() {
 /// Test that `show::execute_safe` returns a structured `CliError` for an
 /// invalid `<rev>:<path>` pattern.
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_execute_safe_bad_rev_path_returns_cli_error() {
     use libra::{
         command::show::{ShowArgs, execute_safe},
@@ -1001,7 +1001,7 @@ fn test_show_machine_output_is_single_line_json() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_show_json_blob_output_includes_content() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());

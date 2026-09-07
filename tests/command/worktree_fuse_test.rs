@@ -93,7 +93,6 @@ impl Drop for FuseMountCleanup {
 }
 
 #[test]
-#[serial]
 fn test_fuse_worktree_umount_json_reports_cleanup_without_repo() {
     let temp = tempdir().expect("create temp dir");
     let cleanup_root = temp
@@ -142,7 +141,7 @@ fn test_fuse_worktree_umount_json_reports_cleanup_without_repo() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_fuse_worktree_metadata_management() {
     if !can_run_fuse_tests() {
         return;
@@ -175,7 +174,7 @@ async fn test_fuse_worktree_metadata_management() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_fuse_worktree_add_list_remove_flow() {
     if !can_run_fuse_tests() {
         return;
@@ -218,7 +217,7 @@ async fn test_fuse_worktree_add_list_remove_flow() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_fuse_worktree_list_json_includes_fuse_entry() {
     if !can_run_fuse_tests() {
         return;
@@ -259,7 +258,7 @@ async fn test_fuse_worktree_list_json_includes_fuse_entry() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_fuse_multiple_worktrees_mount_and_access() {
     if !can_run_fuse_tests() {
         return;
@@ -303,7 +302,7 @@ async fn test_fuse_multiple_worktrees_mount_and_access() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
+#[serial(cwd)]
 async fn test_fuse_worktree_parallel_add_remove() {
     if !can_run_fuse_tests() {
         return;
@@ -358,7 +357,7 @@ async fn test_fuse_worktree_parallel_add_remove() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(cwd)]
 async fn test_fuse_worktree_add_with_branch_and_create_branch() {
     if !can_run_fuse_tests() {
         return;
@@ -505,7 +504,7 @@ fn init_repo_with_commit(main: &Path) {
 /// composition only (the FUSE repair mutates `worktrees-fuse.json`).
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn fuse_repair_shares_one_audit_boundary_with_core_repair() {
     let dir = tempdir().expect("tempdir");
     let main = dir.path();
@@ -546,7 +545,7 @@ async fn fuse_repair_shares_one_audit_boundary_with_core_repair() {
 /// FUSE mutation, leaving the failure unrecorded.
 #[cfg(unix)]
 #[tokio::test]
-#[serial]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn fuse_repair_failure_closes_the_shared_audit_row_failed() {
     let dir = tempdir().expect("tempdir");
     let main = dir.path();

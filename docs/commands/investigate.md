@@ -123,13 +123,24 @@ DESC`. The JSON envelope carries `schema_version`, `items`, `next_cursor`
 
 ### `fix`
 
-`libra investigate fix <run_id>` requires the internal AgentRuntime fix
-bridge, which has not landed yet. It always fails with the stable error
-code `LBR-AGENT-010` — it never fakes success. Because the topic is an
-untrusted seed, a mutating fix additionally requires explicit approval;
-once the bridge lands, an unapproved untrusted-seed mutation fails with
-`LBR-AGENT-011`. Read-only findings stay available via
-`libra investigate show`.
+`libra investigate fix <run_id>` validates the existing investigation and
+submits a fixed trusted request to an active, authorized
+`libra code --control write` runtime. It reuses the same serialized runtime,
+plan, approval, sandbox, network, ACL, and tool gates as `libra review --fix`;
+it does not create another mutation queue. The investigation topic, stances,
+findings, attachments, and run id are never copied into the runtime request.
+The runtime independently inspects the current worktree and either reports a
+new patch or a deterministic repair-required result.
+
+If no authorized runtime is available, the command fails closed with
+`LBR-AGENT-010`. Raw untrusted seed input is rejected before runtime discovery
+with `LBR-AGENT-011`; use `libra investigate show <run_id>` to inspect the
+read-only evidence instead. Approval or sandbox denial remains a controlled
+failure (`LBR-AGENT-039`). An incomplete execution, malformed interaction
+response, timeout, or mutation observed before a later denial returns
+`LBR-AGENT-040`; inspect the active Code session and worktree before retrying.
+With `--json`, success is reported as `investigate_fix_execution` and includes
+`run_id`, `admitted`, `execution`, and `patch_applied`.
 
 ## Examples
 
@@ -180,8 +191,10 @@ code `LBR-AGENT-014` (exit 128). Raise the limit with
 - `0` — the run reached `quorum`, `max_turns`, `timeout`, or `cancelled`,
   or PAUSED (`stalled` / `agent_failure`); subcommands succeeded.
 - non-zero — usage errors, a run that ended in the `error` terminal state,
-  unknown run ids, a concurrent `continue` on a locked run, `fix`
-  (stable code `LBR-AGENT-010`), or a full run queue (`LBR-AGENT-014`).
+  unknown run ids, a concurrent `continue` on a locked run, a `fix` without an
+  authorized runtime (`LBR-AGENT-010`), with a denied controlled gate
+  (`LBR-AGENT-039`), or with incomplete controlled execution
+  (`LBR-AGENT-040`), or a full run queue (`LBR-AGENT-014`).
 
 ## See Also
 

@@ -55,7 +55,7 @@ when the object is missing.
 
 Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2-8) described in the migration section below. When this variable is unset or `0`, Libra uses the Git-standard codes shown above.
 
-Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` are normal `review --fix` CLI outcomes and exit `128`.
+Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` are normal controlled `review --fix` or `investigate fix` CLI outcomes and exit `128`.
 
 ## Migration From Fine-Grained Exit Codes
 
@@ -132,8 +132,8 @@ structured report is always present.
 | `128` | `LBR-AGENT-007` | `internal` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed | a binary floods stderr past the 64 KiB cap |
 | `128` | `LBR-AGENT-008` | `internal` | Hook envelope failed validation before checkpoint persistence | a provider hook posts malformed JSON to `libra agent hooks` |
 | `128` | `LBR-AGENT-009` | `internal` | Agent checkpoint store inconsistent across ref/DB/object-index | `agent_checkpoint` row points at a missing traces object; run `libra agent doctor` |
-| `128` | `LBR-AGENT-010` | `internal` | `review --fix` could not discover or authorize an active `libra code --control write` AgentRuntime; `investigate fix` remains unavailable pending its later bridge wiring | `libra review --fix` with no live authorized Code control session |
-| `128` | `LBR-AGENT-011` | `internal` | Untrusted seed content was rejected before it could enter the review-fix admission or a later mutating workflow | an issue-link seed attempting to drive a mutating fix |
+| `128` | `LBR-AGENT-010` | `internal` | `review --fix` or `investigate fix` could not discover or authorize an active `libra code --control write` AgentRuntime | either fix command with no live authorized Code control session |
+| `128` | `LBR-AGENT-011` | `internal` | Untrusted seed content was rejected before it could enter either controlled fix admission or another mutating workflow | an issue-link, review finding, investigation topic, stance, or finding attempting to drive a mutating fix |
 | `128` | `LBR-AGENT-012` | `internal` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed | a trusted `libra-agent-*` binary exits before answering the invoked method |
 | `128` | `LBR-AGENT-013` | `internal` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` | `libra agent checkpoint export --raw` (or equivalent) without `--allow-raw` |
 | `128` | `LBR-AGENT-014` | `internal` | A `review`/`investigate` run was refused because the shared run queue is full — more than `agent.max_concurrent_runs` runs are active and the wait queue is at its cap (10) | starting an 11th queued `libra review`/`libra investigate` run while the concurrency budget is saturated |
@@ -161,8 +161,8 @@ structured report is always present.
 | `frame` | `LBR-AGENT-036` | `internal` | Bridge request exceeded its deadline (default 30 s) | a `commit.create` that stalls past the request deadline |
 | `frame` | `LBR-AGENT-037` | `internal` | Bridge internal error (JSON-RPC `-32603`) — a database/VCS/generic failure that cannot be attributed to the peer | the bridge's SQLite store returns a transient error during `event.append` |
 | `frame` | `LBR-AGENT-038` | `internal` | Bridge mutation fence drifted — HEAD moved, or the index/worktree is dirty where the operation requires a clean one; refused **before** any write | `commit.create` with a stale `expected_head`, or `checkpoint.restore` against a dirty working tree |
-| `128` | `LBR-AGENT-039` | `internal` | `review --fix` was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied | answering `deny` to a pending tool or sandbox approval |
-| `128` | `LBR-AGENT-040` | `internal` | `review --fix` stopped without a clean patch or deterministic repair outcome; inspect the Code session and worktree | an invalid terminal response, an unexpected runtime state, a patch observed before a later denial, or controlled-execution timeout |
+| `128` | `LBR-AGENT-039` | `internal` | `review --fix` or `investigate fix` was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied | answering `deny` to a pending tool or sandbox approval |
+| `128` | `LBR-AGENT-040` | `internal` | `review --fix` or `investigate fix` stopped without a clean patch or deterministic repair outcome; inspect the Code session and worktree | an invalid terminal response, an unexpected runtime state, a patch observed before a later denial, or controlled-execution timeout |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 > **update-ref exit-code exception** — `src/command/update_ref.rs:107-113` stamps **every**
@@ -258,8 +258,8 @@ structured report is always present.
 | `LBR-AGENT-007` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed |
 | `LBR-AGENT-008` | Hook envelope failed validation before checkpoint persistence |
 | `LBR-AGENT-009` | Agent checkpoint store inconsistent across ref/DB/object-index |
-| `LBR-AGENT-010` | `review --fix` could not discover or authorize an active `libra code --control write` AgentRuntime; `investigate fix` remains unavailable pending its later bridge wiring |
-| `LBR-AGENT-011` | Untrusted seed content was rejected before it could enter the review-fix admission or a later mutating workflow |
+| `LBR-AGENT-010` | `review --fix` or `investigate fix` could not discover or authorize an active `libra code --control write` AgentRuntime |
+| `LBR-AGENT-011` | Untrusted seed content was rejected before it could enter either controlled fix admission or another mutating workflow |
 | `LBR-AGENT-012` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed |
 | `LBR-AGENT-013` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` |
 | `LBR-AGENT-014` | A `review`/`investigate` run was refused because the shared run queue is full (over `agent.max_concurrent_runs` active and the wait queue at its cap) |
@@ -335,7 +335,7 @@ failures as `-32000` with `data.status` and `data.code`.
 | `PLAN_REVISION_NOTE_REQUIRED` | `400` | The message after Plan Modify was empty or whitespace-only. Revision authority remains pending and unconsumed; send a non-empty change description or Cancel. |
 | `PLAN_REPAIR_RETRY_LIMIT_REACHED` | `409` | A plan-repair Continue request did not raise the exhausted automatic retry cap. For Code UI/control, retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |
 | `REDACTION_FAILED` | `500` | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the HTTP body or SSE payload omits unredacted content. Restart `libra code` or fix redactor configuration, then retry. |
-| `INVALID_WIRE_VERSION` | `400` | `GET /api/code/events` `wire` query / `Accept;libra-wire=` value was not `1`/`v1` or `2`/`v2`. |
+| `INVALID_WIRE_VERSION` | `400` | `GET /api/code/events` `wire` query / `Accept;libra-wire=` value was not `2`/`v2` (the only wire; `1`/`v1` was removed in 0.22.0 — the error names `v0.21.29` as the last release serving wire v1). |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | `503` | SSE wire v2 was requested but no SessionStore-backed workflow hub is mounted (today: default Web headless persistence; managed Codex Web does not yet expose one). |
 | `WIRE_V2_CURSOR_AHEAD` | `409` | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (reconnecting with an ahead cursor would permanently skip live events). |
 | `WIRE_V2_RESYNC_REQUIRED` | SSE `event: resync` then stream end | Transport backlog exceeded (1,024 events or 8 MiB, whichever first) on bootstrap or lagged catch-up. Fetch a session snapshot, then reconnect with `?wire=2&cursor=<durableTail>` — do not invent a sequencer. |
