@@ -56,6 +56,7 @@ flowchart TD
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
+| 永久非目标 | submodule / gitlink 内容合并（`_compatibility.md` D24、ADR-MG-01） | pick 的三路输入（父树 / 索引 / 被 pick 的树）经 merge/rebase/cherry-pick 共用的 `command::merge::ensure_gitlinks_not_arbitrated` 校验：任一侧与 base 不同即在任何索引/工作树写入前以 `CherryPickError::GitlinkUnsupported` → `LBR-UNSUPPORTED-001` 拒绝（消息含路径）；三侧一致时 pick 不触碰该路径，索引条目原样保留。`diff_trees` 改用 gitlink 感知的拍平（不再走 `get_plain_items` 的 stderr 警告 + 静默丢弃）。证据：`command::merge_test::merge_gitlink_cherry_pick_consumer_refuses_divergent_pointer`。 |
 | 兼容差异项 | 自定义合并策略 | 原始对照：--strategy <s>；相关参数/替代：单一内置三方合并；当前说明：显式拒绝（LBR-UNSUPPORTED-001 / 128）。后续实现时需要补对应回归测试并同步兼容矩阵。 |
 | ✅ 已实现 | 策略选项 | `-X/--strategy-option ours|theirs` 可重复且 last-wins；共享 `merge::merge_bytes_with_favor` 仅选择冲突 hunk，clean hunk 保留；整路径冲突选择对应侧；`CherryPickOpts` round-trip；`compat_noninteractive_history_controls::cherry_pick_strategy_option_is_hunk_level_and_last_wins` 固定 tree 与 parent。 |
 | ✅ 已实现 | 空提交模式 | 原始对照：`--empty=<how>`；当前说明：`--empty=stop`（默认，halt）/`drop`（跳过冗余提交，HEAD 不前进，打印 `dropping <sha> <subject> -- patch contents already upstream`）/`keep`（保留空提交，等价 `--keep-redundant-commits`）已支持。`effective_empty_mode`：`--empty` 优先，否则 `--keep-redundant-commits`→keep，缺省→stop。在任何 sequencer 分发之前校验（非法 mode → `invalid value for '--empty'`，`LBR-CLI-002`/退出 129，与 `--cleanup` 同样早校验），随 `CherryPickOpts.empty` round-trip 到 `--continue`/`--skip`。`PickOutcome{Committed,Staged,Dropped}` + `PickAccumulator{picked,dropped}` 驱动主循环与 `resume_picks`；`drop` 的 subject 经 `parse_commit_msg` 去签名取首行。带集成测试 `test_cherry_pick_empty_modes`。 |

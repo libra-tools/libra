@@ -265,6 +265,11 @@ pub enum PushError {
 
     #[error("Memory ref '{0}' is local-only and cannot use ordinary push")]
     LocalOnlyRef(String),
+    #[error("unable to delete '{name}': remote ref does not exist")]
+    DeleteRefNotFound { name: String },
+
+    #[error("dst refspec '{0}' matches more than one remote ref")]
+    AmbiguousDeleteRef(String),
 
     #[error("pushing to local file repositories is not supported")]
     UnsupportedLocalFileRemote,
@@ -374,6 +379,12 @@ impl From<PushError> for CliError {
             PushError::LocalOnlyRef(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("Memory publication will use a dedicated command in a later milestone"),
+            PushError::DeleteRefNotFound { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("check the remote's refs with 'libra ls-remote <remote>'"),
+            PushError::AmbiguousDeleteRef(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("qualify the target as refs/heads/<name> or refs/tags/<name>"),
             PushError::UnsupportedLocalFileRemote => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint(
@@ -833,6 +844,9 @@ async fn validate_local_refspecs(args: &PushArgs, current_branch: &str) -> Resul
                 normalize_destination_ref(&dst, local_ref.kind)?;
             }
             ParsedRefspec::Delete { dst } => {
+                // Remote existence/ambiguity checks happen in run_push, where
+                // the discovery refs are available; here only the syntax is
+                // validated.
                 normalize_delete_ref(&dst)?;
             }
         }
@@ -988,9 +1002,10 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
                     )?;
                 }
                 ParsedRefspec::Delete { dst } => {
-                    let remote_ref = normalize_delete_ref(&dst)?;
-                    add_delete_ref_plan(
-                        remote_ref,
+                    let target = resolve_delete_target(&dst, &remote_refs)?;
+                    add_delete_ref_plan_named(
+                        target.full_ref,
+                        &target.display,
                         &remote_refs,
                         &mut seen_remote_refs,
                         &mut plans,
@@ -1514,6 +1529,57 @@ fn ensure_not_local_only_ref(name: &str) -> Result<(), PushError> {
     Ok(())
 }
 
+/// A resolved deletion target: the fully-qualified remote ref plus the name as
+/// the user typed it (used in error messages, matching git's
+/// `unable to delete '<name>': remote ref does not exist`).
+#[derive(Debug, Clone)]
+struct DeleteTarget {
+    full_ref: String,
+    display: String,
+}
+
+/// Resolve a deletion refspec against the refs the remote actually advertises.
+///
+/// A short name is tried as `refs/heads/<name>` then `refs/tags/<name>`; a name
+/// matching both is ambiguous and refused (Git's `dst refspec matches more than
+/// one`). Fully-qualified targets are passed through unchanged (no
+/// mis-resolution or ambiguity error). Existence on the remote is enforced for
+/// every target downstream by `add_delete_ref_plan` — an unadvertised ref is
+/// refused regardless of how it was spelled.
+fn resolve_delete_target(
+    input: &str,
+    remote_refs: &HashMap<String, String>,
+) -> Result<DeleteTarget, PushError> {
+    if input.starts_with("refs/") {
+        return normalize_delete_ref(input).map(|full_ref| DeleteTarget {
+            full_ref,
+            display: input.to_string(),
+        });
+    }
+    let branch_ref = format!("refs/heads/{input}");
+    let tag_ref = format!("refs/tags/{input}");
+    let branch_matches = remote_refs.contains_key(&branch_ref);
+    let tag_matches = remote_refs.contains_key(&tag_ref);
+    match (branch_matches, tag_matches) {
+        (true, true) => Err(PushError::AmbiguousDeleteRef(input.to_string())),
+        (true, false) => Ok(DeleteTarget {
+            full_ref: branch_ref,
+            display: input.to_string(),
+        }),
+        (false, true) => Ok(DeleteTarget {
+            full_ref: tag_ref,
+            display: input.to_string(),
+        }),
+        // The short name matches nothing the remote advertises; keep the
+        // heads-qualified spelling for the downstream error message (git
+        // refuses too — "remote ref does not exist").
+        (false, false) => normalize_delete_ref(input).map(|full_ref| DeleteTarget {
+            full_ref,
+            display: input.to_string(),
+        }),
+    }
+}
+
 async fn resolve_local_ref(input: &str) -> Result<ResolvedLocalRef, PushError> {
     ensure_not_local_only_ref(input)?;
     if input.starts_with("refs/heads/") {
@@ -1788,27 +1854,28 @@ async fn collect_lease_tracking_oids(
     for plan in plans {
         let tracking_oid = if let Some(branch) = plan.update.remote_ref.strip_prefix("refs/heads/")
         {
-            // Tracking refs are stored under TWO naming conventions (clone
-            // writes short names, fetch writes full refs/remotes paths) —
-            // consult both, or a lease after a fetch-only update would see
-            // no expectation at all (pre-existing bug surfaced by the 2.10
-            // interop tests).
-            let short = Branch::find_branch_result(branch, Some(repository))
-                .await
-                .ok()
-                .flatten();
-            let full = if short.is_none() {
-                Branch::find_branch_result(
-                    &format!("refs/remotes/{repository}/{branch}"),
-                    Some(repository),
-                )
-                .await
-                .ok()
-                .flatten()
+            // Tracking refs are written under their fully-qualified
+            // `refs/remotes/<remote>/<branch>` name — probe that FIRST so a
+            // fresh row wins over a stale legacy short row (same precedence as
+            // status's `resolve_upstream_info`). The short-name probe is kept
+            // for repositories written by older binaries that stored a short
+            // row.
+            let full = Branch::find_branch_result(
+                &format!("refs/remotes/{repository}/{branch}"),
+                Some(repository),
+            )
+            .await
+            .ok()
+            .flatten();
+            let short = if full.is_none() {
+                Branch::find_branch_result(branch, Some(repository))
+                    .await
+                    .ok()
+                    .flatten()
             } else {
                 None
             };
-            short.or(full).map(|b| b.commit.to_string())
+            full.or(short).map(|b| b.commit.to_string())
         } else {
             None
         };
@@ -1881,13 +1948,26 @@ fn add_delete_ref_plan(
     seen_remote_refs: &mut HashSet<String>,
     plans: &mut Vec<RefUpdatePlan>,
 ) -> Result<(), PushError> {
+    let display = remote_ref.clone();
+    add_delete_ref_plan_named(remote_ref, &display, remote_refs, seen_remote_refs, plans)
+}
+
+fn add_delete_ref_plan_named(
+    remote_ref: String,
+    display_name: &str,
+    remote_refs: &HashMap<String, String>,
+    seen_remote_refs: &mut HashSet<String>,
+    plans: &mut Vec<RefUpdatePlan>,
+) -> Result<(), PushError> {
     if !seen_remote_refs.insert(remote_ref.clone()) {
         return Err(PushError::InvalidRefspec(format!(
             "duplicate destination ref '{remote_ref}'"
         )));
     }
     let Some(remote_hash) = remote_refs.get(&remote_ref).cloned() else {
-        return Ok(());
+        return Err(PushError::DeleteRefNotFound {
+            name: display_name.to_string(),
+        });
     };
     let old_oid = ObjectHash::from_str(&remote_hash)
         .map_err(|_| PushError::RepoState(format!("invalid remote hash: {remote_hash}")))?;
@@ -3318,6 +3398,56 @@ mod test {
         assert_eq!(hashes.len(), 4);
     }
 
+    /// Regression (#464 follow-up): `collect_lease_tracking_oids` must prefer
+    /// the fully-qualified `refs/remotes/<remote>/<branch>` row over a legacy
+    /// short row. The lease expectation gating `--force-with-lease` is read
+    /// from this collector, so a reversed probe would let a stale legacy row
+    /// (== server tip) silently accept a push that the fresh full row (== the
+    /// expected OID) must reject.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn collect_lease_tracking_oids_prefers_fully_qualified_row() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+        let db_path = repo.path().join(".libra").join("libra.db");
+
+        let full_oid = "aaaa000000000000000000000000000000000001";
+        let short_oid = "bbbb000000000000000000000000000000000002";
+        Branch::update_branch("refs/remotes/origin/main", full_oid, Some("origin"))
+            .await
+            .expect("create fully-qualified tracking row");
+        Branch::update_branch("main", short_oid, Some("origin"))
+            .await
+            .expect("create legacy short tracking row");
+
+        let plan = RefUpdatePlan {
+            update: PushRefUpdate {
+                kind: PushRefUpdateKind::Update,
+                local_ref: "refs/heads/main".to_string(),
+                remote_ref: "refs/heads/main".to_string(),
+                old_oid: Some(full_oid.to_string()),
+                new_oid: "cccc000000000000000000000000000000000003".to_string(),
+                forced: false,
+            },
+            old_oid: ObjectHash::from_str(full_oid).expect("full oid should parse"),
+            new_oid: Some(
+                ObjectHash::from_str("cccc000000000000000000000000000000000003")
+                    .expect("new oid should parse"),
+            ),
+            local_kind: Some(LocalRefKind::Branch),
+        };
+
+        let tracking = collect_lease_tracking_oids("origin", &[plan]).await;
+        assert_eq!(
+            tracking.get("refs/heads/main").map(Option::as_deref),
+            Some(Some(full_oid)),
+            "lease expectation must come from the fully-qualified row, not the legacy short row"
+        );
+
+        crate::internal::db::reset_db_conn_instance_for_path(&db_path).await;
+    }
+
     /// Regression (2026-07-05): `collect_history_commits` enqueued parents
     /// without a visited check, so every merge commit re-enqueued its
     /// shared ancestry — a merge-heavy history made the walk exponential
@@ -4033,6 +4163,127 @@ old1 new1 refs/heads/main\n"
             normalize_branch_ref("refs/libra/traces"),
             Err(PushError::InvalidRefspec(refspec)) if refspec == "refs/libra/traces"
         ));
+    }
+
+    fn remote_refs_fixture() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "refs/heads/main".to_string(),
+                "1111111111111111111111111111111111111111".to_string(),
+            ),
+            (
+                "refs/tags/v1.0".to_string(),
+                "2222222222222222222222222222222222222222".to_string(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn resolve_delete_target_short_name_prefers_advertised_namespace() {
+        let refs = remote_refs_fixture();
+        assert_eq!(
+            resolve_delete_target("v1.0", &refs).unwrap().full_ref,
+            "refs/tags/v1.0"
+        );
+        assert_eq!(
+            resolve_delete_target("main", &refs).unwrap().full_ref,
+            "refs/heads/main"
+        );
+    }
+
+    #[test]
+    fn resolve_delete_target_preserves_display_name() {
+        let refs = remote_refs_fixture();
+        let target = resolve_delete_target("v1.0", &refs).unwrap();
+        assert_eq!(target.display, "v1.0");
+        let qualified = resolve_delete_target("refs/tags/v1.0", &refs).unwrap();
+        assert_eq!(qualified.display, "refs/tags/v1.0");
+    }
+
+    #[test]
+    fn resolve_delete_target_ambiguous_short_name_rejected() {
+        let mut refs = remote_refs_fixture();
+        refs.insert(
+            "refs/heads/v1.0".to_string(),
+            "3333333333333333333333333333333333333333".to_string(),
+        );
+        assert!(matches!(
+            resolve_delete_target("v1.0", &refs),
+            Err(PushError::AmbiguousDeleteRef(name)) if name == "v1.0"
+        ));
+    }
+
+    #[test]
+    fn resolve_delete_target_fully_qualified_passes_through() {
+        let refs = HashMap::new();
+        assert_eq!(
+            resolve_delete_target("refs/heads/gone", &refs)
+                .unwrap()
+                .full_ref,
+            "refs/heads/gone"
+        );
+        assert_eq!(
+            resolve_delete_target("refs/tags/gone", &refs)
+                .unwrap()
+                .full_ref,
+            "refs/tags/gone"
+        );
+    }
+
+    #[test]
+    fn resolve_delete_target_invalid_name_rejected() {
+        let refs = HashMap::new();
+        assert!(matches!(
+            resolve_delete_target("bad..name", &refs),
+            Err(PushError::InvalidRefspec(_))
+        ));
+    }
+
+    #[test]
+    fn add_delete_ref_plan_missing_remote_ref_errors() {
+        let refs = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut plans = Vec::new();
+        let err = add_delete_ref_plan("refs/heads/nope".to_string(), &refs, &mut seen, &mut plans)
+            .expect_err("deleting an unadvertised ref must fail, not report up-to-date");
+        assert!(
+            err.to_string()
+                .contains("unable to delete 'refs/heads/nope': remote ref does not exist"),
+            "unexpected error: {err}"
+        );
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn add_delete_ref_plan_named_reports_typed_name() {
+        let refs = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut plans = Vec::new();
+        let err = add_delete_ref_plan_named(
+            "refs/tags/gone".to_string(),
+            "gone",
+            &refs,
+            &mut seen,
+            &mut plans,
+        )
+        .expect_err("unadvertised delete must name the ref as the user typed it");
+        assert!(
+            err.to_string()
+                .contains("unable to delete 'gone': remote ref does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn add_delete_ref_plan_advertised_remote_ref_plans_deletion() {
+        let refs = remote_refs_fixture();
+        let mut seen = HashSet::new();
+        let mut plans = Vec::new();
+        add_delete_ref_plan("refs/tags/v1.0".to_string(), &refs, &mut seen, &mut plans)
+            .expect("deleting an advertised tag must plan the deletion");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].update.kind, PushRefUpdateKind::Delete);
+        assert_eq!(plans[0].update.remote_ref, "refs/tags/v1.0");
     }
 
     #[test]

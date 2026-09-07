@@ -15,9 +15,30 @@ libra merge --restart
 
 `libra merge <branch>` resolves a local branch, commit hash, or remote-tracking ref such as `refs/remotes/origin/main`.
 
-If the current branch can be fast-forwarded, Libra moves the branch pointer to the target commit and restores the index and working tree. If the branches have diverged, Libra performs a single-head three-way merge using the merge base.
+If the current branch can be fast-forwarded, Libra moves the branch pointer to the target commit and restores the index and working tree. If the branches have diverged, Libra performs a single-head three-way merge using the merge base — or, when the history leaves more than one merge base, using a recursive virtual ancestor built from all of them (see below).
 
 The default three-way strategy accepts `-X ours` or `-X theirs`: only conflicting hunks/paths choose that side, while clean changes from both sides remain. This is different from `-s ours`, which always creates a two-parent merge commit (unless the target is already an ancestor) while retaining the entire current HEAD tree. Other strategies and strategy options are rejected during argument parsing.
+
+### Criss-cross histories (several merge bases)
+
+Two branches that have already merged each other leave **several** merge bases, none of them better than the others. Picking one arbitrarily reports conflicts that the history actually explains, so Libra folds them the way Git's recursive strategy does:
+
+1. The merge bases are sorted by object id and folded pairwise, left to right, each fold being itself a three-way merge (with its own merge base, recursively).
+2. The single tree that comes out — the **virtual ancestor** — is the base of the real merge.
+
+Inside the fold, decisions differ from a real merge, matching Git:
+
+- `-X ours` / `-X theirs` do **not** apply; a virtual ancestor is a synthetic input, not something you asked to bias.
+- A content conflict is not surfaced. It is recorded *as content*, with the conflict markers widened by two characters per recursion level so a nested conflict can never be read as one the outer merge produced.
+- A change/delete keeps the base version: there is no midpoint between "changed" and "gone".
+- Binary content (Git's rule: a NUL byte in the first 8000, or an input larger than 1023 MiB) is not line-merged; the ancestor keeps the base's content, or the empty blob when there is no base.
+- Symlinks — and any two sides that are different *kinds* of entry — keep the base version, which means the path is simply absent from the ancestor when there is no base.
+- The resulting file mode follows Git's rule: the other side's mode when the two agree or ours is unchanged, otherwise ours.
+- Nesting deeper than 20 levels, or more than 32 merge bases at one level — counted on the bare ids before any base is loaded, and again on the candidate ancestors collected while folding — is refused with `LBR-UNSUPPORTED-001` rather than recursed (the fold's work grows with the square of the width; a criss-cross has two). `-s ours` and `--ff-only` never fold and are never refused for width (a diverged `--ff-only` merge is refused as non-fast-forward, as always).
+
+The synthetic commit's parents are **all** the real merge bases folded so far (Git chains one two-parent virtual commit per fold step); the reachable history is the same, the object ids are not. The virtual ancestor's tree and its synthetic commit are written as ordinary loose objects, but they are **one-shot**: they are deliberately *not* recorded in the merge state, so they are not garbage-collection roots. `libra maintenance run --task gc` may reclaim them at any time, including while a conflicted merge is still in progress — nothing depends on them surviving, and `libra merge --restart` recomputes the same ancestor from the real merge bases. Consequently `merge-state.json` records a `base` only when the merge base is a single real commit.
+
+`libra merge --dry-run` previews a criss-cross merge under the same contract as any other preview — no object-store, index, working-tree, HEAD, reflog, merge-state or autostash-sidecar write: the fold keeps its blobs in memory and materializes no virtual tree or commit. (What the contract does *not* cover is repository-wide housekeeping the CLI performs before any command runs, such as the schema auto-upgrade on database open; see `docs/development/commands/merge.md`.)
 
 Histories without a common ancestor remain rejected unless `--allow-unrelated-histories` is explicit. With it, Libra uses a virtual empty merge base: disjoint root trees combine normally, overlapping additions conflict normally, and conflict state survives `--continue`, `--abort`, and `--restart` without creating a fake base object.
 
@@ -35,7 +56,77 @@ libra config merge.conflictStyle diff3
 - `diff3` — additionally emits the common-ancestor content between a `||||||| base` marker and the `=======` separator, so you can see what both sides started from.
 - Any other value — including the unimplemented `zdiff3` — is a hard error when a conflict must be rendered (exit 128), never a silent fall-back to the default style.
 
+For a merge with **several merge bases** the value is read before the merge runs rather than only when a conflict is rendered, because the recursive virtual ancestor's own content depends on it (Git does the same at every recursion depth). An invalid value therefore stops a criss-cross merge even when that merge would have come out clean.
+
 The config is honored by both `libra merge` and `libra cherry-pick` for line-level text conflicts. Binary and modify/delete conflicts keep their two-part whole-file presentation (Git also emits no base block there), and `libra rebase` currently renders whole-file markers without a base block regardless of this setting.
+
+### Directory/file collisions (D/F conflicts)
+
+When one side keeps (or edits) a **file** `foo` while the other side turns `foo` into a **directory** — deleting the file and adding paths beneath `foo/` — the two cannot share one path. Libra follows Git's recursive strategy (`merge-ort.c`, `unique_path`): the directory keeps `foo`, and the file is written under a unique name derived from the branch that holds it — `foo~HEAD` when the file is ours, `foo~<branch>` (with `/` in the branch name replaced by `_`) when it is theirs; if that name is already used by any input of the merge or by its result — as a file *or* as a directory, and a path only the merge base had counts too, exactly the set Git's `unique_path` checks — `_0`, `_1`, … is appended. The merge stops as a conflict (`LBR-CONFLICT-002`) and prints Git's line first:
+
+```text
+CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD instead.
+```
+
+The moved file is the unmerged path: the index records it at the new name with the file's own side on stage 2 (ours) or stage 3 (theirs) and, when the merge base tracked a file at `foo`, that file on stage 1; there is no stage 0 entry, and `merge-state.json` lists the new name in `conflicted_paths`. The directory's contents merge normally. Two shapes exist, both as in Git: a file only one side *added* is a pure file/directory conflict — written verbatim at the new name, reported as `file-directory` by `--dry-run`; a file the merge base tracked and the file side *edited* is a modify/delete conflict that merely moves — the new name carries the base (stage 1) and the editing side, `--dry-run` reports it as `modify-delete` with `original_path`, Git's second line is printed too (`CONFLICT (modify/delete): foo~HEAD deleted in <branch> and modified in HEAD.  Version HEAD of foo~HEAD left in tree.`), and the file is left verbatim at the new name, as that line says. A file one side left untouched while the other replaced it with a directory is a plain clean deletion: no conflict, no message. A directory holding nothing but *empty* trees counts as in the way only when the merge base had nothing at that path — Git adopts such a new directory verbatim, while a directory the base already had is traversed, found to contain no file, and leaves the file where it is (a plain modify/delete). Both cases match `git merge` on crafted trees. Under `--json`/`--machine` none of these lines is printed: stdout stays machine-clean and the conflict is the error envelope on stderr. A strategy option (`-X ours` / `-X theirs`) settles content hunks only: a modify/delete under a directory stays a conflict, as in Git. The merge never writes or deletes *through* a symbolic link in the working tree — an ignored `foo -> elsewhere` standing where `foo/…` must be written, or above a tracked file the merge removes, refuses the whole merge before anything changes — while a symlink sitting exactly where the moved file goes is replaced by the file, and a *tracked* symlink `foo` giving way to a directory `foo/` moves to `foo~HEAD` like any file. Only paths the merge tracks right now are ever removed: an untracked file that happens to carry a historical name stays. Resolve it by editing the `foo~…` file if you want to keep it, staging it with `libra add foo~…` and running `libra merge --continue`; or run `libra merge --abort`, which restores `foo` as it was before the merge and removes both the moved copy and the directory the merge created (directories the merge emptied are pruned, so a nested `foo/a/` never blocks the file's return). Discarding the moved file instead of keeping it is not yet possible: `libra rm` does not accept an unmerged path, so the only way to end up without it is `--abort` (Git resolves that case with `git rm foo~HEAD`).
+
+A directory that merges to *nothing* (every entry beneath it was deleted by the file's side and untouched by the other) is not in the way: the file keeps its path, as in Git. Inside a recursive criss-cross fold (see above) the same rule applies without asking: the file moves to `foo~Temporary merge branch 1` (or `2`) in the virtual ancestor, exactly as Git does at `call_depth > 0`, so the ancestor tree never holds a blob and a subtree under one name.
+
+Only collisions between the two sides' *tracked* contents are handled here. An **untracked** `foo` or `foo~HEAD` in the working tree that the merge would overwrite is refused up front by the existing untracked-overwrite check. An **ignored** file is expendable and gets replaced, exactly as `git merge` treats it — whether it sits at one of these names or where the merge has to create a directory. If you keep something precious under an ignore rule at a path a merge may write, it is not protected. Renames are detected (see "Renames" below), but a collision *created* by a rename — a rename whose destination is the directory in the way, or the source of one — is left to the ordinary delete-plus-add handling for now.
+
+### Renames
+
+A file one side renamed while the other side changed it in place merges as one
+file: Libra runs rename detection once per side of the merge (base to ours and
+base to theirs, the same engine `diff` and `status` use), and the other side's
+change follows the file to its new path. A conflict is presented at the new
+path too, with the merge base's version of the *original* path on stage 1.
+
+`merge.renames` turns detection off (falling back to `diff.renames`; `false`
+makes a rename look like a delete plus an add again), and `merge.renameLimit`
+caps how many added or deleted paths each side may have before the expensive
+similarity stage is skipped (falling back to `diff.renameLimit`, default 7000).
+A value of `0` or less means that default rather than "no cap". Git does the
+same for the values it supports — `0` and `-1`, its own "unset" sentinel — but
+anything below `-1` trips an assertion inside Git and aborts the process, which
+Libra deliberately does not reproduce: it accepts every non-positive value and
+uses the default. Only a value that is not an integer at all is an error.
+Past the cap the merge still completes: exact renames are still paired and a
+notice says the rest was skipped. Libra applies the cap per side — it skips the
+expensive stage once either side exceeds it — where Git compares the whole
+matrix and counts only the sources the merge actually needs, so Git keeps
+detecting in some shapes where Libra stops.
+
+Both keys are read strictly: a value neither can parse fails the merge before
+anything is written, including before `--autostash` saves your changes. That
+check runs exactly where Git parses these keys, so a fast-forward, an
+already-up-to-date merge, `-s ours`, and `--squash` or `--no-commit` over a
+fast-forwardable history all succeed regardless of the value, while `--no-ff`
+on that same history is a real merge and fails.
+
+A rename is a move of one thing into another name, so both ends must be the
+same kind of entry. If the other side replaced the file at the old path with a
+symbolic link, that is a deletion as far as the rename is concerned, and the
+merge reports it as such rather than carrying the link to the new path.
+
+A destination is "occupied" only by what survives the merge. A path the merge
+base held but neither side kept is gone, and so is one the other side merely
+carries unchanged from the base, because the renaming side had to clear the
+destination to put a file there. In both cases the rename is used, as
+`git merge` does. What does stand in the way is content the other side added or
+changed there, which survives as its own entry or as a conflict.
+
+A destination nested beneath the renamed file's own former path — `old`
+renamed to `old/new` — is not a collision at all: the rename itself frees the
+name, so the rename is used and the other side's edit follows the file to
+`old/new`. `git merge` and `git merge-tree --messages` both merge that shape
+cleanly, with no `CONFLICT (file/directory)` line.
+
+Shapes Libra does not yet arbitrate report a notice and merge as if the rename
+had not been detected — both sides renaming the same file (to the same path or
+to different ones), a rename whose source the other side deleted, and a rename
+whose destination another side already occupies. Directory renames are not
+inferred at all. All of these are ordinary deletes and adds in the result.
 
 ### History-changing merge defaults
 
@@ -45,7 +136,23 @@ When the corresponding CLI flag is absent, Libra reads these Git-compatible defa
 - `merge.log=true|false|<n>` appends up to 20 (for `true`) or `<n>` target-side commit subjects to the generated merge message. `--log[=<n>]` and `--no-log` override config and are last-one-wins; bare `--log` means 20. An explicit `-m` suppresses config-only `merge.log`, while an explicit `--log` still appends the shortlog to the custom message. The resolved message is recorded in merge state, so a merge finished later with `merge --continue` commits with the same message and shortlog.
 - `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on the resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
 
-Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation (`LBR-CLI-002` or `LBR-IO-001`). Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`).
+Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation: an unusable value is `LBR-CLI-002` for `merge.ff` and `merge.verifySignatures` and `LBR-REPO-003` for `merge.autostash`, `merge.conflictStyle`, `merge.renames` and `merge.renameLimit`, while a value that cannot be read at all is `LBR-IO-001`. Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`).
+
+### Submodules (`160000` gitlink entries)
+
+Libra is a monorepo client and never merges submodule content. A three-way merge treats gitlinks in two tiers:
+
+- **The merge would have to arbitrate the gitlink** — any side records a different commit id than the merge base, including a side that added or removed the entry. The merge is refused **before anything is written** (no merge state, no index or working-tree change, HEAD unmoved) with `LBR-UNSUPPORTED-001` naming the path:
+
+  ```
+  error: merge would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules
+  ```
+
+  Resolve the submodule pointer outside Libra, or drop the gitlink entry from the branches being merged.
+
+- **All three sides record the same commit id** — nothing has to be decided, so the pointer is carried into the merge result verbatim. (Previously such entries were silently dropped, which deleted the submodule from the merged tree.)
+
+`libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
 
 Libra still does not implement octopus merges, merge strategies other than `ours`, strategy options other than `ours`/`theirs`, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
 
@@ -135,9 +242,9 @@ Outcomes and exit codes:
 | Fast-forward possible | `Would fast-forward` | 0 |
 | Already up to date | `Already up to date.` | 0 |
 | Clean three-way/ours merge | `Would merge cleanly by the '<strategy>' strategy.` | 0 |
-| Would conflict | `Would conflict in: <paths>` | 1 |
+| Would conflict | `Would conflict in: <paths>` (a directory/file collision is listed under the `~`-suffixed name the file would be moved to) | 1 |
 
-The would-conflict exit of 1 is an outcome signal (like `merge-file` and `diff --exit-code`), deliberately distinct from the 128 a *real* conflicting merge exits with — the preview itself succeeded. With `--json`/`--machine` the summary carries `"dry_run": true` and, when conflicting, `"would_conflict": true` plus `conflicted_paths`; both keys are absent from every real merge's output (frozen schema).
+The would-conflict exit of 1 is an outcome signal (like `merge-file` and `diff --exit-code`), deliberately distinct from the 128 a *real* conflicting merge exits with — the preview itself succeeded. With `--json`/`--machine` the summary carries `"dry_run": true` and, when conflicting, `"would_conflict": true` plus `conflicted_paths` and `conflict_kinds` — one `{"path", "kind", "original_path"?}` object per conflicted path, `kind` being `content`, `modify-delete` or `file-directory`, with `original_path` present only for a directory/file move (the path the file held before; `path` is then the `~`-suffixed name it would be written to, and `conflicted_paths` lists that same name). All of these keys are absent from every real merge's output (frozen schema).
 
 ## Human Output
 
@@ -200,7 +307,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 
 `-s ours` uses `strategy: "ours"`, `files_changed: 0`, and reports both parents. Already-up-to-date merges use `strategy: "already-up-to-date"`, `commit: null`, `files_changed: 0`, and `up_to_date: true`.
 
-`--abort` sets `aborted: true`; `--continue` sets `continued: true`. Conflict failures return an error envelope on stderr with `LBR-CONFLICT-002`.
+`--abort` sets `aborted: true`; `--continue` sets `continued: true`. Conflict failures return an error envelope on stderr with `LBR-CONFLICT-002`. `--dry-run` adds `dry_run`, `would_conflict`, `conflicted_paths` and `conflict_kinds` (see Dry Run).
 
 ## Parameter Comparison: Libra vs Git vs jj
 
@@ -209,6 +316,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Branch target | `<branch>` (single target) | `<commit>...` (one or more) | N/A (use `jj new`) |
 | Fast-forward | Supported | Supported | N/A |
 | Single-head three-way | Supported | Supported | N/A |
+| Criss-cross (several merge bases) | Recursive virtual ancestor (fold order: ascending object id; max depth 20, max 32 bases per level) | Recursive virtual ancestor (`-s recursive`/`ort`, unbounded depth) | N/A |
 | Continue / abort | `--continue`, `--abort` | `--continue`, `--abort` | N/A |
 | Octopus merge | Not supported | Supported | N/A |
 | Fast-forward only | `--ff-only` | `--ff-only` | N/A |
@@ -239,6 +347,8 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Target ref cannot be resolved | `LBR-CLI-003` | 129 |
 | Failed to load merge target/current commit/tree | `LBR-REPO-002` | 128 |
 | Unrelated histories without `--allow-unrelated-histories` | `LBR-REPO-003` | 128 |
+| Three-way merge would have to arbitrate a `160000` gitlink (submodule) | `LBR-UNSUPPORTED-001` | 128 |
+| Recursive virtual ancestor would nest deeper than 20 levels or fold more than 32 bases at one level | `LBR-UNSUPPORTED-001` | 128 |
 | Unsupported `-s` / `-X` value or incompatible strategy combination | `LBR-CLI-002` | 129 |
 | `--verify-signatures`: tip unsigned, signature invalid, or vault unavailable | `LBR-REPO-003` | 128 |
 | Merge conflicts | `LBR-CONFLICT-002` | 128 |

@@ -99,6 +99,20 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | JSON | | `--json` | Emit structured JSON output. |
 | Quiet | | `--quiet` | Suppress stdout; exit code 1 if differences exist, 0 otherwise. When combined with `--output`, the file is still written. |
 
+### Working-tree scan progress
+
+The working-tree scan behind `libra diff` is a fast local read (a normal tree
+finishes in tens of milliseconds), so there is no startup progress noise: the
+`Scanning working tree ...` stderr hint only appears when the scan has actually
+been running for more than 2 seconds (very large working trees), and it is
+erased when the scan completes. Under the default `--progress=auto` the hint is
+additionally TTY-gated — stderr redirected to a file or pipe (CI logs, `2>&1`)
+never receives it, matching git's output conventions. `--progress=json` keeps
+emitting immediate `diff_scan.start` NDJSON events for machine consumers, and
+`--progress=none` suppresses everything. The hint never fires for `--staged`,
+rev-vs-rev comparisons, or `--quiet`/`--json`/`--machine` runs — it only
+describes the unstaged working-tree scan.
+
 ### Option Details
 
 **`--old` / `--new`**

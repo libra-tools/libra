@@ -1621,8 +1621,16 @@ async fn reset_working_directory_to_commit(
         .map_err(|e| object_load_error("tree", commit.tree_id.to_string(), e.to_string()))?;
 
     let workdir = util::working_dir();
-    let target_files = tree.get_plain_items();
-    let target_files_set: HashSet<_> = target_files.iter().map(|(path, _)| path.clone()).collect();
+    // `get_plain_items` omits `160000` gitlinks, so the target set must be
+    // taken with modes: otherwise a submodule the target tree still declares
+    // would look "removed" and the loop below would try to `remove_file` the
+    // submodule DIRECTORY (ADR-MG-01: submodule working trees are not Libra's
+    // to delete).
+    let target_files = tree.get_plain_items_with_mode();
+    let target_files_set: HashSet<_> = target_files
+        .iter()
+        .map(|(path, _, _)| path.clone())
+        .collect();
     let mut files_restored = 0;
 
     // Remove tracked files that should not exist in the target tree.
@@ -1701,6 +1709,16 @@ fn rebuild_index_from_tree_typed(
                     .map_err(|e| object_load_error("tree", item.id.to_string(), e.to_string()))?;
                 rebuild_index_from_tree_typed(&subtree, index, &full_path)?;
             }
+            // A `160000` gitlink records a SUBMODULE's commit id, which is not
+            // an object of THIS repository — `Blob::load` would have panicked
+            // trying to size it. Record the pointer verbatim (size 0) so the
+            // rebuilt index keeps the submodule the tree declares, matching what
+            // `ls-files`/`status` already expect of a gitlink index entry.
+            TreeItemMode::Commit => {
+                let mut entry = IndexEntry::new_from_blob(full_path, item.id, 0);
+                entry.mode = tree_item_mode_to_index_mode(item.mode)?;
+                index.add(entry);
+            }
             _ => {
                 // Add file to index - but don't modify working directory files
                 // Use the blob hash from the tree, not from working directory
@@ -1774,6 +1792,12 @@ fn restore_working_directory_from_tree_counted_typed(
                     &subtree, workdir, &full_path,
                 )?;
             }
+            // A `160000` gitlink points at a SUBMODULE's commit, which is not
+            // an object of this repository and has no working-tree file of its
+            // own: Libra never materializes submodule working trees (see
+            // `TreeExt::get_plain_items`). Restoring one is a no-op rather than
+            // a failed blob load.
+            TreeItemMode::Commit => {}
             _ => {
                 let blob = load_object::<git_internal::internal::object::blob::Blob>(&item.id)
                     .map_err(|e| object_load_error("blob", item.id.to_string(), e.to_string()))?;
@@ -2094,7 +2118,18 @@ fn get_commit_summary(commit_id: &ObjectHash) -> Result<String, ResetError> {
 
 fn tracked_paths_from_index() -> Result<HashSet<PathBuf>, ResetError> {
     let index = Index::load(path::index()).map_err(|e| ResetError::IndexLoad(e.to_string()))?;
-    Ok(index.tracked_files().into_iter().collect())
+    // `160000` gitlinks are excluded on purpose. Libra never materializes a
+    // submodule working tree (ADR-MG-01), so whatever sits at that path was not
+    // written by Libra and is not Libra's to remove — deleting it would destroy
+    // either the user's submodule checkout or an unrelated file they left
+    // there. (`tracked_paths_from_commit` gets this for free: `get_plain_items`
+    // already skips gitlinks.)
+    Ok(index
+        .tracked_entries(0)
+        .into_iter()
+        .filter(|entry| entry.mode & 0o170000 != 0o160000)
+        .map(|entry| PathBuf::from(&entry.name))
+        .collect())
 }
 
 fn tracked_paths_from_commit(commit_id: &ObjectHash) -> Result<HashSet<PathBuf>, ResetError> {

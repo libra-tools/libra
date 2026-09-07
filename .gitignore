@@ -44,6 +44,8 @@ target-codex-review/
 web/node_modules/
 web/.next/
 web/.pnpm-store/
+# Static export embedded by build.rs; generated from web/ source when required.
+web/out/
 
 # Publish Worker (Phase 6/7)
 worker/node_modules/

@@ -27,6 +27,8 @@ With `--autosquash`, commits whose subject starts with `fixup!`, `squash!`, or `
 
 Replayed commits preserve their original author — a rebase rewrites history's shape, not its authorship — while the committer becomes whoever ran the rebase, with a fresh timestamp. A fold (`fixup`, `squash`, `amend`) keeps the *target* commit's author, matching Git's rule that the author of the first commit in the group wins. If no `user.name` / `user.email` is configured, the rebase fails closed with `LBR-AUTH-001` instead of recording a placeholder identity.
 
+Submodules are never merged (see `docs/commands/merge.md`): if a replayed commit's three-way inputs record different `160000` gitlink object ids, the rebase is refused before anything is written, with `LBR-UNSUPPORTED-001` and a message naming the path (`rebase would have to merge the submodule (gitlink) entry '<path>': Libra does not support submodules`). A gitlink all three sides agree on is carried through verbatim instead of being dropped from the rewritten tree.
+
 Rebase state (the list of remaining and completed commits, the original HEAD, and the target base) is persisted in the SQLite database. Recovery-critical autostash, exec, and update-refs metadata is fsynced atomically in `.libra/rebase-aux.json` until the sequence reaches a terminal state. Legacy file-based state from older Libra versions is automatically migrated to the database on first access.
 
 ## Options
@@ -436,6 +438,7 @@ Note: jj does not stop on conflicts during rebase. Instead, conflicts are materi
 | `--skip` without rebase in progress | `LBR-REPO-003` (RepoStateInvalid) | 128 | Error indicating no rebase in progress |
 | `--skip` without stopped or pending commit | `LBR-REPO-003` (RepoStateInvalid) | 128 | Error indicating there is no commit to skip |
 | Empty or NUL-containing `--exec` command | `LBR-CLI-002` (CliInvalidArguments) | 129 | Rejected before rebase state or worktree mutation |
+| A replay input carries a `160000` gitlink (submodule) the rebase would have to arbitrate | `LBR-UNSUPPORTED-001` (Unsupported) | 128 | Refused before the autostash, the aux sidecar, the HEAD detach, or any state write |
 | Exec failure, timeout, or unavailable required sandbox | `LBR-CONFLICT-002` (ConflictOperationBlocked) | 128 | Rebase remains resumable; fix and `--continue`, or `--skip` the remaining exec commands |
 | Autostash application conflict | warning; held object promoted to `stash@{0}` | 0 | Rebase completes without losing local changes; inspect the stash |
 | Update-refs branch moved concurrently | `LBR-IO-002` (IoWriteFailed) | 128 | Ref transaction rolls back and the rebase remains resumable |

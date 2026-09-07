@@ -140,17 +140,75 @@ fn test_diff_reports_tracked_files_inside_ignored_directories() {
 }
 
 #[test]
-fn test_diff_human_worktree_diff_emits_scan_progress() {
+fn test_diff_human_scan_progress_is_deferred_and_tty_gated() {
+    // Issue #466: the `Scanning working tree ...` hint is a liveness cue, not
+    // startup noise. A fast (~30 ms) scan must print nothing — even on a TTY
+    // under auto/text — and redirected stderr (CI/`2>&1`) must never receive
+    // it, matching git's output conventions.
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("tracked.txt"), "tracked\nupdated\n").unwrap();
 
+    // Default auto mode with stderr captured (the run_libra_command pipe is
+    // not a TTY): the line must not appear at all.
     let output = run_libra_command(&["diff", "--name-only"], repo.path());
-    assert_cli_success(&output, "human worktree diff with scan progress");
+    assert_cli_success(&output, "auto redirected worktree diff");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Scanning working tree"),
-        "expected worktree scan progress on stderr, got: {stderr}"
+        !stderr.contains("Scanning working tree"),
+        "auto mode with redirected stderr must stay silent, got: {stderr}"
+    );
+
+    // Explicit --progress=text is TTY-worthy but still quiet-period deferred:
+    // a fast scan finishes before the hint would ever be shown.
+    let output = run_libra_command(&["--progress=text", "diff", "--name-only"], repo.path());
+    assert_cli_success(&output, "text progress worktree diff");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Scanning working tree"),
+        "fast scans must not emit the liveness hint (2s quiet period), got: {stderr}"
+    );
+}
+
+/// Issue #466 regression: the worktree scan runs on the blocking pool when
+/// the liveness hint is enabled (explicit `--progress=text`), and the hash
+/// kind lives in a git-internal THREAD-LOCAL seeded on the main thread. The
+/// pool thread must re-seed it, or SHA-256 repositories re-hash every
+/// stat-miss file with SHA-1 and a touched-but-identical file is spuriously
+/// reported modified. Deleting the re-seed in `race_scan_with_hint`'s
+/// spawn_blocking closure makes this test fail.
+#[test]
+fn test_diff_sha256_stat_miss_on_blocking_scan_reports_clean() {
+    let repo = tempfile::tempdir().unwrap();
+    let init = run_libra_command(&["init", "--object-format", "sha256"], repo.path());
+    assert_cli_success(&init, "init sha256 repo");
+
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("tracked.txt"), "tracked\n").unwrap();
+    let add = run_libra_command(&["add", "tracked.txt"], repo.path());
+    assert_cli_success(&add, "add tracked file");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "initial commit");
+
+    // Force a stat miss: same bytes, fresh mtime (the index stat fast-path
+    // misses, so the scan must re-hash the content on the pool thread).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let original = fs::read(repo.path().join("tracked.txt")).unwrap();
+    fs::write(repo.path().join("tracked.txt"), original).unwrap();
+
+    let output = run_libra_command(&["--progress=text", "diff", "--name-only"], repo.path());
+    assert_cli_success(&output, "sha256 diff via blocking scan");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "touched-but-identical file must not be reported modified: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Scanning working tree"),
+        "fast scan must stay silent: {stderr}"
     );
 }
 
@@ -180,11 +238,6 @@ fn test_diff_non_default_algorithm_executes() {
         String::from_utf8_lossy(&output.stdout).contains("diff --git"),
         "non-default algorithm should emit a patch: {}",
         String::from_utf8_lossy(&output.stdout)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Scanning working tree"),
-        "algorithm should reach the normal worktree scan, stderr={stderr}"
     );
 }
 

@@ -70,10 +70,30 @@ pub fn index_has_any_stage(index: &Index, path: &str) -> bool {
 /// }
 /// ```
 pub fn untracked_overwrite_path(untracked: &[PathBuf], new_index: &Index) -> Option<PathBuf> {
-    let new_tracked = new_index.tracked_files();
+    // A `160000` gitlink materializes at most as an empty DIRECTORY placeholder
+    // and Libra writes no submodule content inside it (ADR-MG-01), so untracked
+    // files *under* that path belong to the submodule's own checkout and are
+    // not something the operation would overwrite. The gitlink path ITSELF is
+    // still checked: a plain file or symlink sitting there WOULD be removed to
+    // make room for the directory (`restore::restore_target_to_file_typed`).
+    let new_tracked: Vec<(PathBuf, bool)> = new_index
+        .tracked_entries(0)
+        .into_iter()
+        .map(|entry| {
+            (
+                PathBuf::from(&entry.name),
+                entry.mode & 0o170000 == 0o160000,
+            )
+        })
+        .collect();
     for untracked_path in untracked {
-        for tracked_path in &new_tracked {
-            if paths_conflict(untracked_path, tracked_path) {
+        for (tracked_path, is_gitlink) in &new_tracked {
+            let overwritten = if *is_gitlink {
+                untracked_path == tracked_path
+            } else {
+                paths_conflict(untracked_path, tracked_path)
+            };
+            if overwritten {
                 return Some(untracked_path.clone());
             }
         }

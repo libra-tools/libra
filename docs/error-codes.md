@@ -122,7 +122,7 @@ structured report is always present.
 | `128` | `LBR-BISECT-002` | `internal` | `bisect run` command exited with code ≥ 128 or was killed by a signal | run script aborted via SIGINT, exit 130 |
 | `128` | `LBR-BISECT-003` | `repo` | `bisect run` cannot advance because no candidate commits remain | bisect already converged when `run` is invoked |
 | `129` | `LBR-ADD-001` | `cli` | `libra add` invoked with no matched paths and nothing already staged | `libra add nonexistent.txt` on an empty index |
-| `128` | `LBR-UNSUPPORTED-001` | `repo` | Operation declined because the requested mode is intentionally unsupported in this batch | requesting a Git feature explicitly declined in `docs/development/commands/_compatibility.md` |
+| `128` | `LBR-UNSUPPORTED-001` | `internal` | Operation declined because the requested mode is intentionally unsupported in this batch | requesting a Git feature explicitly declined in `docs/development/commands/_compatibility.md`, such as a `merge`/`rebase`/`cherry-pick` that would have to arbitrate a `160000` gitlink (`D24`) |
 | `128` | `LBR-AGENT-001` | `internal` | AI agent run exceeded a configured budget dimension (tokens, tool calls, wall-clock, source calls, or cost) | a sub-agent ran 500 tool calls when `max_tool_calls = 200` |
 | `128` | `LBR-AGENT-002` | `internal` | External `libra-agent-*` agents are disabled (`agent.external_agents.enabled` defaults to `false`) | `libra agent rpc invoke` before opting in to external discovery |
 | `128` | `LBR-AGENT-003` | `internal` | External agent binary negotiated an incompatible protocol version | a `libra-agent-*` binary answers `info` with an unsupported `protocol_version` |
@@ -294,7 +294,7 @@ structured report is always present.
 
 | Stable code | Meaning |
 | --- | --- |
-| `LBR-UNSUPPORTED-001` | Operation declined because the requested mode is intentionally unsupported in this batch (see `docs/development/commands/_compatibility.md`) |
+| `LBR-UNSUPPORTED-001` | Operation declined because the requested mode is intentionally unsupported in this batch (see `docs/development/commands/_compatibility.md`). Includes the ADR-MG-01 gitlink guard: a `merge`/`rebase`/`cherry-pick` whose three-way inputs record different `160000` submodule pointers is refused before any write, naming the path (`D24`) |
 
 Reportable internal failures (`CliError::internal`, explicit
 `InternalInvariant` mappings, and legacy `internal error` / `panic` /

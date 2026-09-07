@@ -95,6 +95,10 @@ Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改�
 | JSON | | `--json` | 输出结构化 JSON。 |
 | Quiet | | `--quiet` | 抑制 stdout；存在差异时退出码为 1，否则为 0。与 `--output` 组合时，文件仍会被写入。 |
 
+### 工作区扫描进度
+
+`libra diff` 背后的工作区扫描是快速的本地读取（普通树几十毫秒即可完成），因此没有启动进度噪音：`Scanning working tree ...`（扫描工作区）这一 stderr 提示仅在扫描实际运行超过 2 秒时出现（超大工作树），并在扫描完成时被擦除。默认 `--progress=auto` 下该提示还受 TTY 门控——stderr 重定向到文件或管道（CI 日志、`2>&1`）时永远不会收到该行，与 git 的输出约定一致。`--progress=json` 仍会立即发出 `diff_scan.start` NDJSON 事件供机器消费，`--progress=none` 抑制所有进度输出。该提示不会在 `--staged`、revision 对比或 `--quiet`/`--json`/`--machine` 运行中出现——它只描述未暂存的工作区扫描。
+
 ### 选项细节
 
 **`--old` / `--new`**

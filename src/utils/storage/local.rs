@@ -145,9 +145,7 @@ impl LocalStorage {
             return Ok(found);
         }
         for alternate in &self.alternates {
-            if let Some((payload, obj_type)) =
-                alternate.get_here_with_limit(hash, Some(limit))?
-            {
+            if let Some((payload, obj_type)) = alternate.get_here_with_limit(hash, Some(limit))? {
                 super::tiered::verify_fetched_object(hash, obj_type, &payload)?;
                 return Ok((payload, obj_type));
             }

@@ -467,7 +467,15 @@ graph TB
 
 ### 5.1 模块划分与文件落点
 
-当前 `src/internal/operation_wrapper.rs` 与 `src/internal/operation.rs`（`OperationService`）、`operation_view*` 三表构成 v1。本方案处于开发阶段，**不维护 v1 兼容层**：v2 直接替换 v1 的模块与 schema，v2 每阶段验证通过后即删除被替换的 v1 代码（`operation_wrapper.rs`、v1 表与 model、v1 专用命令路径），最终不存在双写或兼容 adapter。过渡期只保留最短并行窗口用于 shadow 对比，不投入长期兼容成本。
+当前 `src/internal/operation_wrapper.rs` 与 v1 `OperationService`、`operation_view*` 三表构成旧 operation 路径。最终方案仍**不维护 v1 长期兼容层或双写 adapter**；但 OL-02～OL-04 的安全基础窗口必须保持 active wrapper 可用。因此 migration 在单事务内以 copy-first 方式将 v1 表迁移到明确的 `legacy_operation*` 命名空间，再创建 v2 canonical schema；现有 v1 DAO/service 仅改为访问 legacy 表，新 `OperationStoreV2` 只访问 v2 表。OL-09/OL-15 完成 runtime cutover、回归和删除验收后，才移除 legacy 表与 v1 代码。
+
+#### ADR-OL-01b：OL-02～OL-04 legacy staging
+
+- **Status:** Accepted for the 2026-09-05 execution window
+- **Atomic migration:** migration runner 在同一 SQLite 写事务中 claim version、创建 staging 表、copy v1 行、校验行数和关键字段、删除旧 source 并 rename 为 `legacy_*`，最后创建八张 v2 表；任一步失败都回滚 version claim、staging、rename 与数据。
+- **No false genealogy:** v1 的 view/workspace 快照不能无损重建 `RepoViewV2`/`WorkspaceSnapshotV2`，因此旧行不转换成 v2 view、journal、head、change genealogy 或 AI link。无法无损映射的字段继续保留在 legacy 数据中。
+- **Runtime boundary:** 本窗口 active operation logging 继续只读写 `legacy_operation*`；v2 store/codec 只读写 v2 表；禁止 v1/v2 双写。maintenance/object-root 路径也显式使用 legacy 命名空间，避免迁移后运行时断裂。
+- **Deletion condition:** 只有 OL-09/OL-15 完成所有 CLI/Agent mutation cutover、active logging smoke、legacy 读写零命中守卫、object-root/maintenance 收口、备份与删除演练、兼容矩阵验收后，才允许单独删除 `legacy_*` 表、legacy model/service 和 fixture；在此之前不得删除或清空 legacy 数据。
 
 | 新模块/文件 | 职责 | 借鉴的 jj 实现 |
 |---|---|---|
@@ -622,9 +630,9 @@ pub struct PredecessorEdge {
 
 jj 的 `ChangeId` 是 `id_type!(ChangeId { reverse_hex() })`（`jj/lib/src/backend.rs:52-56`），`Commit` 结构自带 `change_id` 字段并在 rewrite 时默认继承（`jj/lib/src/commit_builder.rs:336-344` 的 `set_change_id` / `generate_new_change_id`）。Libra 不把 ChangeId 塞进 Git commit 对象格式（避免改动 OID），而是：随机新 ID 写入 sidecar/operation manifest；legacy import 用 `synthetic_for_commit`（`SHA-256("libra-change-id-v1\0" || object_format || commit_oid_bytes)` 前 16 字节）；`ChangeRevision` 投影记录 `(change_id, commit_oid)` 二元组，解决“一个 change 有多个 revision”的查询；`PredecessorEdge` 对应 jj `Operation.commit_predecessors`（`BTreeMap<CommitId, Vec<CommitId>>`），但加上 relation kind 以表达 squash/split/duplicate 多边语义。
 
-#### 5.2.5 SQLite v2 表结构（开发期直接替换 v1）
+#### 5.2.5 SQLite v2 表结构（legacy staging 后的 canonical schema）
 
-开发期直接替换 v1 schema：删除 `operation / operation_parent / operation_view / operation_view_ref / operation_view_workspace`（`src/internal/db.rs:557-606`）及其 SeaORM model，按下面 v2 表重建；旧仓库若需保留审计数据，用一次性导入脚本，不做长期兼容层。
+v2 schema 是最终 canonical schema。OL-02～OL-04 不直接删除仍被 active wrapper 使用的 v1 表，而是先将 `operation / operation_parent / operation_view / operation_view_ref / operation_view_workspace` 在事务内迁移为 `legacy_operation / legacy_operation_parent / legacy_operation_view / legacy_operation_view_ref / legacy_operation_view_workspace`，再按下面定义创建 v2 八表。该 staging 不是长期双写兼容层：v1 runtime 仅为本窗口访问 legacy，所有新 v2 store 写入只落 v2；legacy 删除条件由 ADR-OL-01b 规定。
 
 ```sql
 CREATE TABLE IF NOT EXISTS operation (
@@ -889,14 +897,14 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 
 ### 5.4 实现路径与阶段门
 
-实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做 Web projection。但本仓库文档明确：**开发期不维护 v1 兼容层**，v2 每阶段验证通过后即删除被替换的 v1 代码，最终不存在双写或兼容 adapter。
+实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做 Web projection。OL-02～OL-04 的落地窗口采用 ADR-OL-01b 的 legacy staging；最终仍不维护 v1 长期兼容层，OL-09/OL-15 完成切换后删除 legacy。
 
 每个阶段进入下一阶段的 Gate 必要条件：本阶段验证入口的测试全部通过（含既有 `status`/CLI 回归与 fail-closed 守卫），任一未通过不得推进，不允许把未验证代码带进下一阶段。每阶段对应具体写集与验证入口：
 
 | 阶段 | 落点（写集） | 验证入口 | 决策门 |
 |---|---|---|---|
 | 0 设计冻结 | 第 5 节结构体/函数定稿；OL-00 header spike | `cargo test --test commit_change_id_header_spike` | Gate-0：ADR 冻结、sidecar-only 写入决策；已有 header 仅作导入兼容 |
-| 1 持久化与 I/O 底座 | `src/internal/worktree_io/`、`operation/{store,view,facet}.rs`、`db.rs` v2 schema（替换 v1 表与 model） | `cargo test internal::operation::store`；`cargo test --test operation_dag`；status 零回归 benchmark | Gate-1：对象格式、journal phase、I/O 协议冻结 |
+| 1 持久化与 I/O 底座 | `src/internal/worktree_io/`、`operation/{store,view,facet}.rs`、`db.rs` v2 schema + legacy staging（替换 v1 表的 canonical 角色） | `cargo test internal::operation::store`；`cargo test --test operation_dag`；status 零回归 benchmark | Gate-1：对象格式、journal phase、I/O 协议冻结 |
 | 2 完整快照 | `operation/{snapshot,working_copy}.rs`、HEAD/refs/index/sequencer/sparse facet adapter | `cargo test --test workspace_snapshot_roundtrip`；`--test index_snapshot_roundtrip`；`--test sequencer_snapshot_roundtrip` | Gate-2：facet restore policy、untracked/ignored/large-file 政策 |
 | 3 CLI + Agent 全修改记录 | `operation/middleware.rs`、`src/cli.rs` classification、`ai/tools/*` gateway | `cargo test --test operation_command_coverage`；`--test agent_shell_operation`；census zero-unclassified guard | Gate-3：shadow mismatch、失败 operation、lease takeover |
 | 4 可逆用户工作流 | `operation/{restore,undo,doctor}.rs`、`src/command/op.rs` 新子命令 | `cargo test --test operation_restore_faults`；`--test op_undo_redo`；crash matrix | Gate-4：crash/数据安全 review、秒级 SLO、机器接口冻结 |

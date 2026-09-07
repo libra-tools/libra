@@ -389,16 +389,41 @@ mod unix_impl {
             )
         }
 
+        /// Open the floors micro-lock, retrying only Darwin's transient
+        /// `ENOENT` during the concurrent first-create window. Once one
+        /// contender creates the regular lock file, the next fd-relative
+        /// no-follow open observes and locks that same file.
+        fn open_floors_lock_file(&self) -> Result<std::fs::File, InstallDirError> {
+            const CREATE_RACE_RETRIES: u32 = 4;
+            for attempt in 0..CREATE_RACE_RETRIES {
+                match self.openat(
+                    FLOORS_LOCK_FILE_NAME,
+                    libc::O_RDWR | libc::O_CREAT,
+                    0o600 as libc::c_int,
+                ) {
+                    Ok(file) => return Ok(file),
+                    Err(InstallDirError::Io { ref detail, .. })
+                        if attempt + 1 < CREATE_RACE_RETRIES
+                            && (detail.contains("No such file")
+                                || detail.contains("(os error 2)")) =>
+                    {
+                        std::thread::yield_now();
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(InstallDirError::Io {
+                name: FLOORS_LOCK_FILE_NAME.to_string(),
+                detail: "floors lock creation retry loop ended unexpectedly".into(),
+            })
+        }
+
         /// Blocking floors micro-lock: kernel-queued, so unlike repeated
         /// non-blocking probes it cannot be starved by a stream of short-lived
         /// holders. Callers bound the wait externally (worker thread +
         /// timeout) because flock itself has none.
         pub fn lock_floors_blocking(&self) -> Result<UpgradeLock, InstallDirError> {
-            let file = self.openat(
-                FLOORS_LOCK_FILE_NAME,
-                libc::O_RDWR | libc::O_CREAT,
-                0o600 as libc::c_int,
-            )?;
+            let file = self.open_floors_lock_file()?;
             // SAFETY: flock on an owned fd.
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
             if rc != 0 {
@@ -415,11 +440,7 @@ mod unix_impl {
         /// holders only perform one atomic read-merge-write, so contention
         /// clears in milliseconds unless a holder is externally stalled.
         pub fn try_lock_floors(&self) -> Result<Option<UpgradeLock>, InstallDirError> {
-            let file = self.openat(
-                FLOORS_LOCK_FILE_NAME,
-                libc::O_RDWR | libc::O_CREAT,
-                0o600 as libc::c_int,
-            )?;
+            let file = self.open_floors_lock_file()?;
             // SAFETY: flock on an owned fd.
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc != 0 {

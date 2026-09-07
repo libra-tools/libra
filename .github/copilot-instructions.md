@@ -25,8 +25,12 @@ Do not assume the older multi-crate `engine/`, `delta/`, `transport/`, or
 - `src/command/`: one module per `libra <subcommand>`, including Git-compatible
   commands (`init`, `clone`, `add`, `commit`, `push`, `pull`, `status`, `log`,
   `show`, `diff`, `branch`, `switch`, `checkout`, `merge`, `rebase`, `stash`,
-  `worktree`, etc.) and Libra-only commands (`code`, `code-control`, `agent`,
-  `automation`, `usage`, `graph`, `sandbox`, `cloud`, `publish`, `db`).
+  `worktree`, etc.) and Libra-only commands (`code`, `agent`, `automation`,
+  `usage`, `graph`, `sandbox`, `review`, `investigate`, `cloud`, `publish`,
+  `upgrade`, `op`, `layer`, `sparse-view`, `hydrate`, `deps`, `alternates`,
+  `metadata`; `media` only with `--features fastcdc`). `code-control` and `db`
+  are not commands (`code-control` was removed in W5-01 — use
+  `libra code --control stdio`).
 - `src/internal/ai/`: AI runtime, providers, tools, MCP, session storage,
   permissions, sandboxing, context budget, goal mode, orchestration, skills, and
   web projections.
@@ -95,13 +99,23 @@ LIBRA_SKIP_WEB_BUILD=1 cargo test --all
 cargo run -- <cmd>
 ```
 
+CI's `compat-offline-core` job runs the default-feature suite (step "Run tests (L1 + L2 + L3)",
+with GitHub/DeepSeek/D1/R2 secrets injected; `required-features` targets excluded) as
+`cargo nextest run --all --no-fail-fast --retries 2` (pinned `cargo-nextest 0.9.143`;
+test groups come from the generated `.config/nextest.toml` — regenerate with
+`sh tests/NEXTEST_GROUPS.sh` after touching `tests/SERIAL_REGISTRY.tsv`).
+`cargo test --all` remains the acceptance gate.
+
 Feature-gated Rust tests:
 
 ```bash
-cargo test --features test-network --test network_remotes_test
+cargo test --features test-network --test network_remotes_test -- --test-threads=1
 cargo test --features test-live-ai --test ai_agent_test --test ai_chat_agent_test -- --test-threads=1
-cargo test --features test-live-cloud --test cloud_storage_backup_test --test publish_live_test --test storage_r2_test -- --test-threads=1
-LIBRA_ENABLE_TEST_PROVIDER=1 cargo test --features test-provider --test code_ui_scenarios --test harness_self_test -- --test-threads=1
+LIBRA_ENABLE_TEST_LIVE_CLOUD=1 cargo test --features test-live-cloud --test cloud_storage_backup_test --test publish_live_test --test storage_r2_test -- --test-threads=1
+LIBRA_ENABLE_TEST_PROVIDER=1 cargo test --features test-provider --test code_ui_scenarios --test harness_self_test -- --test-threads=1   # local-only; CI dropped this step on 2026-08-31
+cargo test --features otlp --test otlp_telemetry -- --test-threads=1
+cargo test --features keyring --test auth_keyring_backend -- --test-threads=1
+LIBRA_TEST=1 cargo test --features test-upgrade --test upgrade_auto_test --test upgrade_publish_contract_test -- --test-threads=1
 ```
 
 Web UI checks:
@@ -132,7 +146,10 @@ pnpm --dir worker build
   entry in `Cargo.toml` and update `tests/compat/README.md`.
 - CLI help and docs are part of the public contract. New visible commands/flags
   need examples, useful flag descriptions, and matching docs under
-  `docs/commands/` when user-facing.
+  `docs/commands/` when user-facing. Every visible command ships a
+  `pub const <CMD>_EXAMPLES` wired via `#[command(after_help = …)]`; the
+  `compat_help_examples_banner`, `cli::tests::root_after_help_lists_every_visible_command`,
+  and `compat_command_docs_examples_section` guards enforce this.
 - New stable error codes such as `LBR-*-NNN` must be documented in
   `docs/error-codes.md`.
 - Schema changes need SQL migrations under `sql/migrations/` or `sql/publish/`
@@ -158,25 +175,28 @@ pnpm --dir worker build
 
 ## Frontend and Worker guidance
 
-- `build.rs` embeds `web/out/` with `rust-embed`; setting
+- `build.rs` generates `web/out/`, which `src/command/web_assets.rs` embeds with `rust-embed`; setting
   `LIBRA_SKIP_WEB_BUILD=1` writes a stub output for Rust-only builds. When
-  changing `web/`, run the real `pnpm --dir web build` and keep static export
-  drift clean.
+  changing `web/`, run the real `pnpm --dir web build`; `web/out/` is generated
+  and ignored, so never add its static export to a commit.
 - The `web/` UI is an operational Code UI, not a marketing landing page. Favor
-  dense, predictable controls and existing components in `web/src/components/ui/`.
+  dense, predictable controls and existing components in `web/src/components/`.
 - The `worker/` app serves publish snapshots from D1/R2. Validate request input,
   preserve redaction and access checks, and keep wire types synchronized with the
   Rust publish pipeline.
 
 ## Git and PR workflow
 
-- This repository is intentionally used through Libra commands where practical:
+- This working tree is a Libra checkout (`.libra/`, no `.git/`), so version-control
+  operations go through Libra commands (`git` does not work here):
   `libra status`, `libra add`, `libra commit -a -s -m "<scope>: ..."`,
   `libra push origin <branch>`.
 - Commit messages should use short conventional summaries such as
   `feat(status): support porcelain v2` or `fix(push): record tracking reflog`.
 - Commits are expected to be DCO-signed and PGP-signed:
-  `git commit -S -s -m "scope: message"` when using git directly.
+  `libra commit -s -m "scope: message"` (`-s` adds the DCO trailer; Git's `-S` is
+  not exposed — GPG signing comes from the repository vault key via
+  `vault.signing` / `commit.gpgSign`, see `--no-gpg-sign` in `libra commit --help`).
 - PR descriptions should list intent, linked issues, user-visible behavior,
   tests run, and compatibility or migration impact.
 

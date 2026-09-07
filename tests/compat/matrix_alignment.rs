@@ -1137,16 +1137,21 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
 }
 
 #[test]
-fn web_build_job_checks_static_export_drift_inline() {
+fn web_build_job_enforces_ignored_static_export_lifecycle() {
     let workflow = read_repo_file(".github/workflows/base.yml");
     assert_contains(
         &workflow,
-        "git status --porcelain -- web/out",
+        "test -f web/out/index.html",
         ".github/workflows/base.yml",
     );
     assert_contains(
         &workflow,
-        "web/out has untracked, staged, or unstaged files after the static export build.",
+        "git ls-files --error-unmatch -- web/out",
+        ".github/workflows/base.yml",
+    );
+    assert_contains(
+        &workflow,
+        "git check-ignore -q web/out/index.html",
         ".github/workflows/base.yml",
     );
     assert!(

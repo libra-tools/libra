@@ -13,7 +13,13 @@ use git_internal::{
     hash::ObjectHash,
     internal::{
         index::{Index, IndexEntry},
-        object::{ObjectTrait, blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
+        object::{
+            ObjectTrait,
+            blob::Blob,
+            commit::Commit,
+            tree::{Tree, TreeItemMode},
+            types::ObjectType,
+        },
     },
 };
 use sea_orm::ConnectionTrait;
@@ -100,6 +106,12 @@ enum CherryPickError {
     #[error("unsupported cherry-pick option: {0}")]
     Unsupported(String),
 
+    /// The pick's three-way inputs carry a gitlink the cherry-pick would have
+    /// to arbitrate. Refused before any index/worktree write (ADR-MG-01) rather
+    /// than silently dropped from the picked change set.
+    #[error("{0}")]
+    GitlinkUnsupported(String),
+
     #[error("commit {0} is empty (its change set is empty)")]
     EmptyCommit(String),
 
@@ -151,7 +163,7 @@ impl CherryPickError {
             Self::InvalidMainline(_) => StableErrorCode::CliInvalidArguments,
             Self::InvalidCleanup(_) => StableErrorCode::CliInvalidArguments,
             Self::InvalidEmpty(_) => StableErrorCode::CliInvalidArguments,
-            Self::Unsupported(_) => StableErrorCode::Unsupported,
+            Self::Unsupported(_) | Self::GitlinkUnsupported(_) => StableErrorCode::Unsupported,
             Self::EmptyCommit(_) => StableErrorCode::CliInvalidArguments,
             Self::RedundantCommit(_) => StableErrorCode::CliInvalidArguments,
             Self::EmptyMessage(_) => StableErrorCode::CliInvalidArguments,
@@ -194,6 +206,14 @@ impl From<CherryPickError> for CliError {
             CherryPickError::Unsupported(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("this Git option is not supported by libra cherry-pick"),
+            CherryPickError::GitlinkUnsupported(_) => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint(
+                    "submodule merging is a permanent non-goal; resolve the submodule pointer outside Libra",
+                )
+                .with_hint(
+                    "or drop the gitlink entry from the commits involved so no submodule decision is needed",
+                ),
             CherryPickError::EmptyCommit(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("use --allow-empty to cherry-pick an empty commit"),
@@ -255,6 +275,9 @@ enum CherryPickSingleError {
     InvalidConflictStyle(String),
     /// `merge.conflictStyle` config-store read failure.
     ConflictStyleRead(String),
+    /// The pick's three-way inputs carry a gitlink the cherry-pick would have to
+    /// arbitrate — refused before any index/worktree write (ADR-MG-01).
+    GitlinkUnsupported(String),
 }
 
 /// Serializable snapshot of the commit-modifier options for a cherry-pick
@@ -661,6 +684,9 @@ fn map_single_error(err: CherryPickSingleError, commit_label: &str) -> CherryPic
         CherryPickSingleError::SaveFailed(r) => CherryPickError::SaveFailed(r),
         CherryPickSingleError::InvalidConflictStyle(v) => CherryPickError::InvalidConflictStyle(v),
         CherryPickSingleError::ConflictStyleRead(r) => CherryPickError::ConflictStyleRead(r),
+        CherryPickSingleError::GitlinkUnsupported(detail) => {
+            CherryPickError::GitlinkUnsupported(detail)
+        }
     }
 }
 
@@ -817,6 +843,10 @@ async fn run_cherry_pick(
     let opts_json = serde_json::to_string(&CherryPickOpts::from_args(&args))
         .map_err(|e| CherryPickError::SaveFailed(format!("failed to serialize options: {e}")))?;
 
+    // ADR-MG-01: refuse the whole sequence before the first pick mutates the
+    // index, the working tree, or HEAD.
+    preflight_pick_gitlinks(&commit_ids, &args).await?;
+
     let mut acc = PickAccumulator::default();
     for (i, commit_id) in commit_ids.iter().enumerate() {
         match cherry_pick_single_commit(commit_id, &args, output).await {
@@ -891,6 +921,125 @@ fn opts_json_with_conflict_flag(opts_json: &str, stopped_on_conflict: bool) -> S
     }
 }
 
+/// ADR-MG-01 gate for a WHOLE cherry-pick sequence, ahead of its first write.
+///
+/// The per-pick guard inside `cherry_pick_single_commit` runs after earlier
+/// picks have already been committed and after `resume_picks` has persisted the
+/// sequencer row, so a later refusal would leave the sequence half-applied.
+/// This asks the conservative whole-sequence question first: every input tree of
+/// every pick, plus the index the picks land on, must record the same pointer
+/// for a given gitlink path (`merge::ensure_gitlinks_uniform_across_inputs`).
+/// Resolution failures are deliberately NOT reported here (an unresolvable
+/// object, an out-of-range `-m`): `cherry_pick_single_commit` owns those
+/// messages, and a preflight that failed first would change them. Only a
+/// gitlink refusal escapes.
+async fn preflight_pick_gitlinks(
+    commit_ids: &[ObjectHash],
+    args: &CherryPickArgs,
+) -> Result<(), CherryPickError> {
+    let mut inputs: Vec<merge::GitlinkEntries> = Vec::new();
+    // Mirror the HEAD *and the index* the sequence will actually see. `--ff`
+    // eligibility is judged exactly as `cherry_pick_single_commit` judges it:
+    // an eligible pick fast-forwards, adopting the picked tree wholesale
+    // (deciding nothing) while REPLACING the index — so the "ours" side of any
+    // later pick is that tree, not the index we started from. A pick that
+    // replays creates a new commit, after which no later pick can fast-forward.
+    let mut simulated_head = Head::current_commit().await;
+    let index = Index::load(path::index())
+        .map_err(|e| CherryPickError::LoadObject(format!("failed to load current index: {e}")))?;
+    let mut simulated_ours = merge::index_gitlink_entries(&index);
+    // Every early exit below stops modelling FURTHER picks — it must never
+    // discard the picks already modelled, or a divergent pointer in an earlier
+    // pick would escape the gate and be applied before the per-pick guard
+    // refused it.
+    macro_rules! stop_modelling {
+        () => {
+            return decide_pick_gitlinks(&inputs)
+        };
+    }
+    for commit_id in commit_ids {
+        let Ok(commit) = load_object::<Commit>(commit_id) else {
+            stop_modelling!();
+        };
+        let parent_count = commit.parent_commit_ids.len();
+        if args.ff
+            && !args.no_commit
+            && !args.append_source
+            && !args.signoff
+            && !args.edit
+            && args.mainline.is_none()
+            && parent_count == 1
+            && simulated_head == Some(commit.parent_commit_ids[0])
+        {
+            let Ok(adopted) = merge::commit_gitlink_entries(&commit) else {
+                stop_modelling!();
+            };
+            simulated_head = Some(*commit_id);
+            simulated_ours = adopted;
+            continue;
+        }
+        // The diff base, honoring `-m <n>` exactly as the pick does. Any shape
+        // the pick would reject as a usage error leaves the preflight silent.
+        let base_parent = match (parent_count, args.mainline) {
+            (0, None) => None,
+            (1, None) => Some(commit.parent_commit_ids[0]),
+            (n, Some(m)) if n > 1 && m >= 1 && m <= n => Some(commit.parent_commit_ids[m - 1]),
+            _ => stop_modelling!(),
+        };
+        // A root commit diffs against the CANONICAL EMPTY TREE, which declares
+        // no gitlink at all — so a submodule the picked commit does declare is
+        // an addition the pick would have to arbitrate. Modelling that as an
+        // empty base is what makes the refusal land here rather than mid-sequence.
+        let base_gitlinks = match base_parent {
+            Some(parent_id) => {
+                let Ok(parent) = load_object::<Commit>(&parent_id) else {
+                    stop_modelling!();
+                };
+                let Ok(parent_gitlinks) = merge::commit_gitlink_entries(&parent) else {
+                    stop_modelling!();
+                };
+                parent_gitlinks
+            }
+            None => merge::GitlinkEntries::new(),
+        };
+        // `--allow-empty` precedence: a pick whose change set is empty is
+        // rejected as `EmptyCommit` BEFORE the pick's own gitlink gate runs, so
+        // the preflight must not overtake that error.
+        let parent_tree_id = match base_parent {
+            Some(parent_id) => match load_object::<Commit>(&parent_id) {
+                Ok(parent) => parent.tree_id,
+                Err(_) => stop_modelling!(),
+            },
+            None => ObjectHash::from_type_and_data(ObjectType::Tree, &[]),
+        };
+        if commit.tree_id == parent_tree_id && !args.allow_empty {
+            stop_modelling!();
+        }
+        let Ok(picked) = merge::commit_gitlink_entries(&commit) else {
+            stop_modelling!();
+        };
+        inputs.push(simulated_ours.clone());
+        inputs.push(picked.clone());
+        inputs.push(base_gitlinks);
+        // Whatever this pick produces, the uniform gate below requires it to
+        // agree with `picked` — so that is the "ours" side the next pick sees.
+        simulated_ours = picked;
+        simulated_head = None;
+    }
+    decide_pick_gitlinks(&inputs)
+}
+
+/// Verdict over the inputs modelled so far. An empty set means no pick performs
+/// a three-way apply at all (every one fast-forwards), so there is nothing to
+/// arbitrate.
+fn decide_pick_gitlinks(inputs: &[merge::GitlinkEntries]) -> Result<(), CherryPickError> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    merge::ensure_gitlinks_uniform_across_inputs("cherry-pick", inputs)
+        .map_err(|refusal| CherryPickError::GitlinkUnsupported(refusal.to_string()))
+}
+
 async fn resume_picks(
     head_name: &str,
     head_orig: ObjectHash,
@@ -900,6 +1049,10 @@ async fn resume_picks(
     output: &OutputConfig,
     acc: &mut PickAccumulator,
 ) -> Result<(), CherryPickError> {
+    // Before the first `pending.save()` below: a gitlink refusal must not leave
+    // the sequencer row advanced onto a pick that can never run (ADR-MG-01).
+    let remaining: Vec<ObjectHash> = todo.iter().copied().collect();
+    preflight_pick_gitlinks(&remaining, opts_args).await?;
     while let Some(commit_id) = todo.pop_front() {
         // Persist the position BEFORE attempting each commit so that whatever
         // happens — clean success, conflict, or a non-conflict hard error — the
@@ -1232,6 +1385,19 @@ async fn cherry_pick_single_commit(
             current_index.get_hash(key, 0).map(|h| (p.clone(), h))
         })
         .collect();
+
+    // ADR-MG-01 fail-closed gate, shared with `merge` and `rebase`: a submodule
+    // pointer that diverged between the parent, the picked commit and the index
+    // stops the pick before anything is written. Pointers all three sides agree
+    // on need no action — the pick only rewrites paths it changes, so the
+    // existing index entry is carried through untouched.
+    merge::ensure_gitlinks_not_arbitrated(
+        "cherry-pick",
+        &merge::tree_gitlink_entries(&parent_tree),
+        &merge::index_gitlink_entries(&current_index),
+        &merge::tree_gitlink_entries(&their_tree),
+    )
+    .map_err(|refusal| CherryPickSingleError::GitlinkUnsupported(refusal.to_string()))?;
 
     let mut conflicts: Vec<ConflictEntry> = Vec::new();
     for (path, their_hash, base_hash) in diff_trees(&their_tree, &parent_tree) {
@@ -1582,13 +1748,19 @@ async fn create_cherry_pick_commit(
     Ok(commit.id)
 }
 
+/// Paths whose blob content differs between the picked commit and its parent.
+///
+/// Gitlinks are excluded on purpose: submodule content is never merged
+/// (ADR-MG-01), and a diverged one is already refused by
+/// [`merge::ensure_gitlinks_not_arbitrated`] before this runs, so anything left
+/// here is a pointer all three sides agree on and needs no index change.
 fn diff_trees(
     theirs: &Tree,
     base: &Tree,
 ) -> Vec<(PathBuf, Option<ObjectHash>, Option<ObjectHash>)> {
     let mut diffs = Vec::new();
-    let their_items: HashMap<_, _> = theirs.get_plain_items().into_iter().collect();
-    let base_items: HashMap<_, _> = base.get_plain_items().into_iter().collect();
+    let their_items = mergeable_tree_items(theirs);
+    let base_items = mergeable_tree_items(base);
 
     let all_paths: HashSet<_> = their_items.keys().chain(base_items.keys()).collect();
 
@@ -1600,6 +1772,17 @@ fn diff_trees(
         }
     }
     diffs
+}
+
+/// Flatten a tree to its non-gitlink entries. Unlike `TreeExt::get_plain_items`
+/// this drops submodule pointers silently rather than warning on stderr: the
+/// ADR-MG-01 guard has already decided whether they are acceptable.
+fn mergeable_tree_items(tree: &Tree) -> HashMap<PathBuf, ObjectHash> {
+    tree.get_plain_items_with_mode()
+        .into_iter()
+        .filter(|(_, _, mode)| *mode != TreeItemMode::Commit)
+        .map(|(path, hash, _)| (path, hash))
+        .collect()
 }
 
 /// Resolve a divergent cherry-pick path using the same hunk-level side
@@ -1791,6 +1974,12 @@ fn reset_workdir_tracked_only(
 
     for path_buf in current_index.tracked_files() {
         if !new_tracked_paths.contains(&path_buf) {
+            // A submodule directory is not Libra's to unlink, and a gitlink can
+            // only leave the index through a decision the ADR-MG-01 guard has
+            // already refused.
+            if is_gitlink_entry(current_index, path_to_utf8(&path_buf)?) {
+                continue;
+            }
             let full_path = workdir.join(path_buf);
             if full_path.exists() {
                 fs::remove_file(&full_path).map_err(|e| {
@@ -1806,6 +1995,13 @@ fn reset_workdir_tracked_only(
     for path_buf in new_index.tracked_files() {
         let path_str = path_to_utf8(&path_buf)?;
         if let Some(entry) = new_index.get(path_str, 0) {
+            // A gitlink names a SUBMODULE's commit, which is not an object of
+            // this repository — loading it as a blob would panic — and Libra
+            // materializes no submodule working tree. The pointer stays an
+            // index/tree fact only (ADR-MG-01).
+            if is_submodule_index_mode(entry.mode) {
+                continue;
+            }
             let blob = git_internal::internal::object::blob::Blob::load(&entry.hash);
             let target_path = workdir.join(path_str);
             if let Some(parent) = target_path.parent() {
@@ -1825,6 +2021,18 @@ fn reset_workdir_tracked_only(
         }
     }
     Ok(())
+}
+
+/// Whether an index stat mode records a `160000` gitlink (submodule) entry.
+fn is_submodule_index_mode(mode: u32) -> bool {
+    mode & 0o170000 == 0o160000
+}
+
+/// Whether `path` is recorded at stage 0 of `index` as a gitlink.
+fn is_gitlink_entry(index: &Index, path: &str) -> bool {
+    index
+        .get(path, 0)
+        .is_some_and(|entry| is_submodule_index_mode(entry.mode))
 }
 
 fn path_to_utf8(path: &Path) -> Result<&str, CherryPickSingleError> {
@@ -1995,6 +2203,16 @@ mod tests {
             CherryPickError::Unsupported("--cleanup".to_string()).to_string(),
             "unsupported cherry-pick option: --cleanup",
         );
+        // ADR-MG-01: the refusal forwards the shared guard's wording verbatim
+        // so `merge`, `rebase` and `cherry-pick` read identically.
+        assert_eq!(
+            CherryPickError::GitlinkUnsupported(
+                "cherry-pick would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules"
+                    .to_string(),
+            )
+            .to_string(),
+            "cherry-pick would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules",
+        );
         assert_eq!(
             CherryPickError::EmptyCommit("abc123".to_string()).to_string(),
             "commit abc123 is empty (its change set is empty)",
@@ -2078,6 +2296,10 @@ mod tests {
         );
         assert_eq!(
             CherryPickError::Unsupported("--cleanup".to_string()).stable_code(),
+            StableErrorCode::Unsupported,
+        );
+        assert_eq!(
+            CherryPickError::GitlinkUnsupported("vendor".to_string()).stable_code(),
             StableErrorCode::Unsupported,
         );
         assert_eq!(

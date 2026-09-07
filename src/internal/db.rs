@@ -558,56 +558,6 @@ const BOOTSTRAP_SQL: &str = include_str!("../../sql/sqlite_20260309_init.sql");
 /// Phase 0 AI runtime contract migration; safe to run repeatedly.
 const AI_RUNTIME_CONTRACT_MIGRATION_SQL: &str =
     include_str!("../../sql/sqlite_20260415_ai_runtime_contract.sql");
-const OPERATION_SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS `operation` (
-    `op_id` TEXT PRIMARY KEY,
-    `repo_id` TEXT NOT NULL,
-    `view_id` TEXT NOT NULL,
-    `command_name` TEXT NOT NULL,
-    `description` TEXT NOT NULL,
-    `actor` TEXT NOT NULL,
-    `args_digest` TEXT,
-    `start_ts` INTEGER NOT NULL,
-    `end_ts` INTEGER,
-    `status` TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_operation_repo_order
-    ON `operation`(`repo_id`, `end_ts` DESC, `start_ts` DESC, `op_id` DESC);
-
-CREATE TABLE IF NOT EXISTS `operation_parent` (
-    `op_id` TEXT NOT NULL,
-    `parent_op_id` TEXT NOT NULL,
-    PRIMARY KEY (`op_id`, `parent_op_id`)
-);
-CREATE INDEX IF NOT EXISTS idx_operation_parent_parent
-    ON `operation_parent`(`parent_op_id`, `op_id`);
-
-CREATE TABLE IF NOT EXISTS `operation_view` (
-    `view_id` TEXT PRIMARY KEY,
-    `repo_id` TEXT NOT NULL,
-    `head_kind` TEXT NOT NULL,
-    `head_target` TEXT NOT NULL,
-    `created_at` INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_operation_view_repo_created
-    ON `operation_view`(`repo_id`, `created_at` DESC);
-
-CREATE TABLE IF NOT EXISTS `operation_view_ref` (
-    `view_id` TEXT NOT NULL,
-    `ref_kind` TEXT NOT NULL,
-    `ref_name` TEXT NOT NULL,
-    `ref_remote` TEXT NOT NULL,
-    `target_oid` TEXT NOT NULL,
-    PRIMARY KEY (`view_id`, `ref_kind`, `ref_name`, `ref_remote`)
-);
-
-CREATE TABLE IF NOT EXISTS `operation_view_workspace` (
-    `view_id` TEXT NOT NULL,
-    `pointer_kind` TEXT NOT NULL,
-    `pointer_value` TEXT NOT NULL,
-    PRIMARY KEY (`view_id`, `pointer_kind`)
-);
-"#;
 const AI_PROJECTION_SCHEMA_START: &str = "-- BEGIN AI PROJECTION SCHEMA";
 /// Marker delimiting the end of the AI projection schema inside `BOOTSTRAP_SQL`.
 const AI_PROJECTION_SCHEMA_END: &str = "-- END AI PROJECTION SCHEMA";
@@ -695,14 +645,14 @@ async fn ensure_config_kv_schema(conn: &DatabaseConnection) -> Result<(), IOErro
 
     let backend = conn.get_database_backend();
     let ddl = r#"
-CREATE TABLE IF NOT EXISTS `config_kv` (
-    `id` INTEGER PRIMARY KEY AUTOINCREMENT,
-    `key` TEXT NOT NULL,
-    `value` TEXT NOT NULL,
-    `encrypted` INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_config_kv_key ON config_kv(`key`);
-"#;
+ CREATE TABLE IF NOT EXISTS `config_kv` (
+     `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+     `key` TEXT NOT NULL,
+     `value` TEXT NOT NULL,
+     `encrypted` INTEGER NOT NULL DEFAULT 0
+ );
+ CREATE INDEX IF NOT EXISTS idx_config_kv_key ON config_kv(`key`);
+ "#;
     conn.execute_raw(Statement::from_string(backend, ddl))
         .await
         .map_err(|err| IOError::other(format!("Failed to create config_kv table: {err}")))?;
@@ -755,14 +705,6 @@ pub async fn ensure_ai_runtime_contract_schema(conn: &DatabaseConnection) -> Res
     Ok(())
 }
 
-async fn ensure_operation_schema(conn: &DatabaseConnection) -> Result<(), IOError> {
-    let backend = conn.get_database_backend();
-    conn.execute_raw(Statement::from_string(backend, OPERATION_SCHEMA_SQL))
-        .await
-        .map_err(|err| IOError::other(format!("Failed to apply operation schema: {err}")))?;
-    Ok(())
-}
-
 async fn connect_database(db_path: &str) -> io::Result<DatabaseConnection> {
     let normalized_path = normalize_path_for_sqlite(db_path);
     let mut option = ConnectOptions::new(format!("sqlite://{normalized_path}"));
@@ -794,9 +736,6 @@ async fn apply_database_schema_upgrades(
                 "Failed to ensure AI runtime contract schema: {err}"
             ))
         })?;
-    ensure_operation_schema(conn)
-        .await
-        .map_err(|err| IOError::other(format!("Failed to ensure operation schema: {err}")))?;
     // CEX-12.5: apply every migration registered in
     // `migration::builtin_migrations`. The runner is idempotent — on a
     // fresh DB or a legacy DB it ensures the `schema_versions` tracking
@@ -880,9 +819,9 @@ mod tests {
     #[test]
     fn memory_core_old_reader_rejects_migrated_schema() {
         assert_eq!(
-            classify_schema_compatibility(Some(2026082501), Some(2026082401)),
+            classify_schema_compatibility(Some(2026090701), Some(2026082401)),
             SchemaCompatibility::UnsupportedFuture {
-                current_version: 2026082501,
+                current_version: 2026090701,
                 latest_version: Some(2026082401),
             }
         );
@@ -891,10 +830,10 @@ mod tests {
     #[test]
     fn memory_fts_old_reader_rejects_migrated_schema() {
         assert_eq!(
-            classify_schema_compatibility(Some(2026082502), Some(2026082501)),
+            classify_schema_compatibility(Some(2026090702), Some(2026090701)),
             SchemaCompatibility::UnsupportedFuture {
-                current_version: 2026082502,
-                latest_version: Some(2026082501),
+                current_version: 2026090702,
+                latest_version: Some(2026090701),
             }
         );
     }
@@ -902,10 +841,10 @@ mod tests {
     #[test]
     fn context_receipt_old_reader_rejects_migrated_schema() {
         assert_eq!(
-            classify_schema_compatibility(Some(2026082503), Some(2026082502)),
+            classify_schema_compatibility(Some(2026090703), Some(2026090702)),
             SchemaCompatibility::UnsupportedFuture {
-                current_version: 2026082503,
-                latest_version: Some(2026082502),
+                current_version: 2026090703,
+                latest_version: Some(2026090702),
             }
         );
     }
@@ -1039,7 +978,7 @@ mod tests {
         cached
             .execute_unprepared(
                 "INSERT INTO schema_versions (version, name, applied_at) \
-                 VALUES (2126010101, 'from-the-future', datetime('now'))",
+                  VALUES (2126010101, 'from-the-future', datetime('now'))",
             )
             .await
             .expect("plant a future version");

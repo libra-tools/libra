@@ -73,7 +73,7 @@ Use these **exact** invocations (they are enforced by CI and the project’s AGE
 - Code UI/automation tests (require the hidden test provider):
   `--features test-provider` + `LIBRA_ENABLE_TEST_PROVIDER=1` + `--test-threads=1`
 - Web embed verification (the one CI job that may **not** skip the web build):
-  `pnpm --dir web install --frozen-lockfile && pnpm --dir web lint && pnpm --dir web build`, then `git status --porcelain -- web/out` (must be empty; compat-web-check inlines this drift check)
+  `pnpm --dir web install --frozen-lockfile && pnpm --dir web lint && pnpm --dir web test && pnpm --dir web build`, then `cargo check --lib` against the generated `WebAssets` (compat-web-check also asserts `web/out/` is untracked and ignored — never commit the static export)
 - Worker checks (inside `worker/`):
   `pnpm lint && pnpm test && pnpm test:miniflare && pnpm build`
 - Required consistency check before PRs that touch surfaces (de-scripted — there is no helper script directory):
@@ -108,17 +108,17 @@ When you add or change a visible command:
 ## Test layering & gating (L1/L2/L3)
 
 - **L1 (default)**: pure deterministic tests — `cargo test --all`.
-- **L2 (network)**: requires `LIBRA_TEST_GITHUB_TOKEN` + namespace; gate with `env_var_is_set` helper + early `eprintln!("skipped (...)")`.
+- **L2 (network)**: requires `LIBRA_TEST_GITHUB_TOKEN` + namespace; gate with the `env_is_present` helper + early `eprintln!("skipped (...)")`.
 - **L3 (live AI / cloud)**: real API keys or D1/R2/S3 creds; same gating pattern. Never let missing secrets cause test failures.
 
-Mark tests `#[serial]` (from `serial_test`) if they mutate global process state (cwd, env, ports, global config DB, …).
+Mark tests with a keyed `serial_test` lane — `#[serial(cwd)]`, `#[serial(env)]`, `#[serial(hash_kind)]`, or a named external key — for the process-wide resource they touch (cwd, env, ports, global config DB, …); every `global`/`lane:*` annotation needs a row in `tests/SERIAL_REGISTRY.tsv` (`compat_serial_registry` fails on drift) and `.config/nextest.toml` is regenerated with `sh tests/NEXTEST_GROUPS.sh`.
 
 Use `tempfile::tempdir()` + `utils::test::ChangeDirGuard` (or the helpers in `tests/command/mod.rs`) so that `HOME`, `XDG_CONFIG_HOME`, `LIBRA_CONFIG_GLOBAL_DB`, `LANG` etc. are isolated.
 
 ## When you are lost
 
-- Read the root files first: `AGENTS.md` (authoritative for agents), `Claude.md`, `COMPATIBILITY.md`.
-- The single best “how do I even run this” file for contributors is `Claude.md` (build commands, test layers, Cargo features, environment variables).
+- Read the root files first: `AGENTS.md` (authoritative for agents), `CLAUDE.md`, `COMPATIBILITY.md`.
+- The single best “how do I even run this” file for contributors is `CLAUDE.md` (build commands, test layers, Cargo features, environment variables).
 - For the AI runtime contract and future phases, see `docs/development/tracing/agent.md`.
 
 Activate this skill (`/skill libra`) at the start of any session that will read or modify a libra repository or the libra source tree itself. It gives you the correct mental model and the exact incantations the project expects.

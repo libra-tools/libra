@@ -4,8 +4,6 @@ pub(crate) mod options;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
-use std::time::Duration;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -14,14 +12,15 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::Parser;
 use colored::Colorize;
 use git_internal::{
     Diff,
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
     internal::{
         index::{Index, IndexEntry, Time},
         object::{
@@ -725,7 +724,6 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     let pickaxe = parse_diff_pickaxe(&args).map_err(CliError::from)?;
     let word_diff = resolve_word_diff_options(&args)?;
     let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
-    emit_worktree_scan_progress(&args, output);
     let mut result = run_diff(&args, output, &config, pickaxe.as_ref(), &diff_algorithm)
         .await
         .map_err(CliError::from)?;
@@ -2199,30 +2197,155 @@ fn apply_pickaxe(
     Ok(())
 }
 
-fn emit_worktree_scan_progress(args: &DiffArgs, output: &OutputConfig) {
-    if output.quiet || output.is_json() || args.staged || args.new.is_some() {
-        return;
+/// The scan-progress line is only a liveness cue: `diff` is a fast local read
+/// (a normal tree finishes in tens of milliseconds) and git shows no progress
+/// for diff at all (#466). Emit nothing for quick scans; surface the line only
+/// after the scan has genuinely been running a while (very large working
+/// trees, cf. #372), and erase it when the scan completes so it never lingers
+/// in scrollback.
+const WORKTREE_SCAN_QUIET_PERIOD: Duration = Duration::from_secs(2);
+
+/// A deferred single-line liveness hint for the worktree scan.
+///
+/// The hint is gated on the progress mode only (auto resolves to Text on a
+/// TTY and None when stderr is redirected — the TTY check lives in
+/// `OutputConfig::resolve`). The old unconditional startup print also skipped
+/// `--quiet`/`--staged`/`--new`; that suppression is restored by the caller
+/// constructing the hint only for the unstaged working-tree comparison.
+struct WorktreeScanHint {
+    enabled: bool,
+    done: bool,
+    shown: bool,
+    /// Test-only sink override: `None` in production writes to stderr.
+    #[cfg(test)]
+    sink_override: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+    /// Test-only TTY simulation for the sink override.
+    #[cfg(test)]
+    test_tty: Option<bool>,
+}
+
+impl WorktreeScanHint {
+    fn start(output: &OutputConfig) -> Self {
+        let enabled = match output.progress {
+            // `--progress=json` is an explicit machine opt-in served by the
+            // immediate `diff_scan.start` event; the text hint must not
+            // double-report there.
+            ProgressMode::Json => false,
+            ProgressMode::Text => true,
+            // Auto resolves to Text on a TTY and None otherwise (redirected
+            // stderr/CI must never receive the line — #466); None stays off.
+            ProgressMode::None => false,
+        };
+        Self {
+            enabled,
+            done: false,
+            shown: false,
+            #[cfg(test)]
+            sink_override: None,
+            #[cfg(test)]
+            test_tty: None,
+        }
     }
 
-    match output.progress {
-        ProgressMode::Text => eprintln!("Scanning working tree ..."),
-        ProgressMode::Json => {
-            let event = serde_json::json!({
-                "event": "diff_scan.start",
-                "task": "Scanning working tree",
-            });
-            eprintln!("{event}");
+    /// Reveal the hint mid-scan. On a TTY the line is drawn without a
+    /// trailing newline so the cursor stays on it and finish() can erase it;
+    /// with stderr redirected (explicit `--progress=text` through a pipe or
+    /// file) it is a single plain text line ending in a newline — escape
+    /// bytes never enter captured logs.
+    fn reveal(&mut self) {
+        if self.enabled && !self.done && !self.shown {
+            self.write_hint_line("Scanning working tree ...");
+            self.shown = true;
         }
-        // OutputConfig resolves `--progress=auto` to None when stderr is not a
-        // TTY. `diff` still emits this one-line startup signal for auto mode so
-        // large ignored trees do not look hung in captured/non-interactive runs.
-        ProgressMode::None
-            if output.progress_preference != crate::utils::output::ProgressPreference::None =>
-        {
-            eprintln!("Scanning working tree ...")
-        }
-        ProgressMode::None => {}
     }
+
+    /// Erase the hint line so a completed scan leaves no residue on the
+    /// terminal; a no-op when it was never shown or stderr is redirected.
+    fn finish(&mut self) {
+        self.done = true;
+        if self.shown {
+            self.write_hint_line("");
+        }
+        self.shown = false;
+    }
+
+    fn write_hint_line(&self, text: &str) {
+        #[cfg(test)]
+        if let Some(sink) = &self.sink_override {
+            let is_terminal = matches!(
+                self.test_tty,
+                Some(tty) if tty
+            );
+            write_scan_hint_line_into(
+                &mut *sink.lock().expect("test sink lock"),
+                text,
+                is_terminal,
+            );
+            return;
+        }
+        write_scan_hint_line(text, io::stderr().is_terminal());
+    }
+}
+
+impl Drop for WorktreeScanHint {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Restore the calling thread's previous hash kind on drop (Drop-guard
+/// version of git-internal's `set_hash_kind`, which is test-only there).
+struct SetHashKindGuard {
+    previous: HashKind,
+}
+
+impl Drop for SetHashKindGuard {
+    fn drop(&mut self) {
+        set_hash_kind(self.previous);
+    }
+}
+
+fn write_scan_hint_line(text: &str, is_terminal: bool) {
+    write_scan_hint_line_into(&mut io::stderr(), text, is_terminal);
+}
+
+/// Race the blocking-pool scan handle against the quiet period. On a fast
+/// scan the completed handle's result is taken from the timeout (the
+/// JoinHandle is NEVER awaited twice); on a slow scan the hint is revealed
+/// first and the same handle is awaited to completion. Separated from
+/// `run_diff` so the slow-scan Err arm is deterministically testable with a
+/// short quiet period instead of the production 2-second value.
+async fn race_scan_with_hint<T>(
+    scan_handle: &mut tokio::task::JoinHandle<T>,
+    quiet_period: Duration,
+    hint: &mut WorktreeScanHint,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+{
+    match tokio::time::timeout(quiet_period, &mut *scan_handle).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            hint.reveal();
+            scan_handle.await
+        }
+    }
+}
+
+fn write_scan_hint_line_into<W: std::io::Write>(sink: &mut W, text: &str, is_terminal: bool) {
+    if is_terminal {
+        // `\r` + EL (erase line) redraws the single line in place; an empty
+        // `text` therefore erases the previously shown hint. No trailing
+        // newline: the cursor stays on the line until the next rewrite.
+        let _ = write!(sink, "\r\x1b[2K{text}");
+    } else if text.is_empty() {
+        // Nothing to erase in a redirected stream.
+        return;
+    } else {
+        // Redirected explicit text mode: bare line + newline, no escapes.
+        let _ = writeln!(sink, "{text}");
+    }
+    let _ = sink.flush();
 }
 
 async fn run_diff(
@@ -2236,8 +2359,89 @@ async fn run_diff(
     tracing::debug!("diff args: {:?}", args);
     let index = Index::load(path::index()).map_err(|e| DiffError::IndexLoad(e.to_string()))?;
 
+    // `--progress=json` keeps immediate NDJSON scan events for machine
+    // consumers. Gate matches the old startup print: --json output, --quiet,
+    // --staged, and rev-vs-rev comparisons never emit scan progress (#466).
+    let scan_progress_eligible =
+        !output.is_json() && !output.quiet && !args.staged && args.new.is_none();
+    if matches!(output.progress, ProgressMode::Json) && scan_progress_eligible {
+        let event = serde_json::json!({
+            "event": "diff_scan.start",
+            "task": "Scanning working tree",
+        });
+        eprintln!("{event}");
+    }
+    // The deferred text hint only guards the real worktree scan (the unstaged
+    // new side): a HEAD/index/rev load is not what the line describes.
+    let mut scan_hint = if scan_progress_eligible {
+        WorktreeScanHint::start(output)
+    } else {
+        WorktreeScanHint {
+            enabled: false,
+            done: true,
+            shown: false,
+            #[cfg(test)]
+            sink_override: None,
+            #[cfg(test)]
+            test_tty: None,
+        }
+    };
+    // The unstaged worktree scan is pure synchronous index/worktree I/O with
+    // no await point, so a plain `tokio::time::timeout` around an inline
+    // future could never fire mid-scan (the future completes in one poll).
+    // Run it on the blocking pool and race its handle against the quiet
+    // period: a fast scan wins silently; a slow one lets the timer reveal
+    // the hint mid-scan, and the SAME handle is awaited afterwards — the
+    // scan runs exactly once and a huge tree is never truncated (#466,
+    // cf. #372). `finish()` erases the hint when the scan completes.
     let old_side = resolve_diff_side(&args.old, args.staged, false, &index).await?;
-    let new_side = resolve_diff_side(&args.new, args.staged, true, &index).await?;
+    let (new_side, index) = if scan_hint.enabled {
+        // `Index` is not `Clone`; move it into the blocking task through an
+        // `Arc` and take it back out afterwards.
+        // The hash kind lives in a git-internal THREAD-LOCAL seeded by the
+        // `core.objectformat` preflight on the main thread; blocking-pool
+        // threads start at the default (SHA-1). Capture the kind here and
+        // re-seed it inside the task, or SHA-256 repositories would have
+        // every stat-miss file re-hashed with the wrong algorithm.
+        let hash_kind = get_hash_kind();
+        let shared_index = Arc::new(index);
+        let mut scan_handle = {
+            let index = Arc::clone(&shared_index);
+            tokio::task::spawn_blocking(move || {
+                // Re-seed this pool thread's thread-local (defaults to SHA-1).
+                // Restored via `Drop` so a panicking scan cannot leave the
+                // wrong kind behind (mirrors `HashKindGuard`, which is
+                // test-only in git-internal).
+                let _kind_guard = SetHashKindGuard {
+                    previous: get_hash_kind(),
+                };
+                set_hash_kind(hash_kind);
+                resolve_worktree_side(&index)
+            })
+        };
+        let side =
+            race_scan_with_hint(&mut scan_handle, WORKTREE_SCAN_QUIET_PERIOD, &mut scan_hint)
+                .await
+                .map_err(|error| DiffError::FileRead {
+                    path: "working tree scan".to_string(),
+                    detail: format!("worktree scan task panicked or was cancelled: {error}"),
+                })??;
+        scan_hint.finish();
+        // The handle has completed, so this task owns the last reference;
+        // recover the index for the later unmerged-paths pass. (If the
+        // runtime somehow kept a task-side clone alive, fall back to a fresh
+        // empty index — apply_unmerged_worktree_diff then no-ops on an empty
+        // stage-0 set rather than misreporting.)
+        let index = match Arc::try_unwrap(shared_index) {
+            Ok(index) => index,
+            // Unreachable: the completed scan was the only other reference.
+            Err(_) => Index::new(),
+        };
+        (side, index)
+    } else {
+        let side = resolve_diff_side(&args.new, args.staged, true, &index).await?;
+        (side, index)
+    };
 
     let pathspecs =
         PathspecSet::from_workdir(&args.pathspec, &util::cur_dir(), &util::working_dir())
@@ -3224,6 +3428,23 @@ fn get_worktree_modes(files: &[PathBuf]) -> Result<HashMap<PathBuf, u32>, DiffEr
         .collect()
 }
 
+/// The unstaged working-tree side: pure synchronous index/worktree reads
+/// (no `.await`), so it must run on the blocking pool to keep the async
+/// runtime responsive while a large tree is scanned (#372) and to let the
+/// `WorktreeScanHint` timer actually win the race on slow scans (#466).
+fn resolve_worktree_side(index: &Index) -> Result<DiffSide, DiffError> {
+    let files = get_worktree_diff_files(index)?;
+    let blobs = get_files_blobs(&files, index, IgnorePolicy::Respect)?;
+    let modes = get_worktree_modes(&files)?;
+    Ok(DiffSide {
+        label: "working tree".to_string(),
+        worktree_entries: blobs.iter().cloned().collect(),
+        blobs,
+        modes,
+        is_worktree: true,
+    })
+}
+
 async fn resolve_diff_side(
     source: &Option<String>,
     staged: bool,
@@ -3255,16 +3476,7 @@ async fn resolve_diff_side(
                 is_worktree: false,
             })
         } else {
-            let files = get_worktree_diff_files(index)?;
-            let blobs = get_files_blobs(&files, index, IgnorePolicy::Respect)?;
-            let modes = get_worktree_modes(&files)?;
-            Ok(DiffSide {
-                label: "working tree".to_string(),
-                worktree_entries: blobs.iter().cloned().collect(),
-                blobs,
-                modes,
-                is_worktree: true,
-            })
+            resolve_worktree_side(index)
         }
     } else if staged {
         match Head::current_commit().await {
@@ -6770,6 +6982,182 @@ mod test {
 
     use super::*;
     use crate::utils::test;
+
+    // Issue #466 unit coverage: the hint is TTY-gated via auto resolution,
+    // shows at most once, and is inert after finish(). The reveal/erase
+    // mechanics are tested through the `write_scan_hint_line` seam against
+    // buffers, never the real stderr.
+    fn make_output(progress: ProgressMode) -> OutputConfig {
+        OutputConfig {
+            progress,
+            ..OutputConfig::default()
+        }
+    }
+
+    #[test]
+    fn worktree_scan_hint_disabled_for_auto_without_tty() {
+        // Under the repo's acceptance gate (`cargo test --all` run in a real
+        // terminal) stderr CAN be a TTY, so auto may resolve to Text. Assert
+        // only the invariant: the resolved mode and the hint agree.
+        let config = OutputConfig::resolve(None, false, false, "auto", false, false, "auto");
+        let expected_enabled = config.progress == ProgressMode::Text;
+        let mut hint = WorktreeScanHint::start(&config);
+        assert_eq!(hint.enabled, expected_enabled);
+        hint.reveal();
+        assert_eq!(hint.shown, expected_enabled);
+        hint.finish();
+    }
+
+    #[test]
+    fn worktree_scan_hint_shows_once_and_finishes_clean() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hint = WorktreeScanHint {
+            enabled: true,
+            done: false,
+            shown: false,
+            sink_override: Some(Arc::clone(&sink)),
+            test_tty: Some(true),
+        };
+
+        hint.reveal();
+        assert!(hint.shown);
+        // Repeat reveals are single-shot.
+        hint.reveal();
+        assert!(hint.shown);
+
+        hint.finish();
+        assert!(!hint.shown);
+        assert!(hint.done, "finish must latch done");
+        // After finish the hint stays inert.
+        hint.reveal();
+        assert!(!hint.shown);
+        hint.finish();
+
+        // TTY stream: reveal line, then the erase rewrites it in place; the
+        // final buffer must be exactly one erase sequence (no residue).
+        let out = sink.lock().expect("test sink lock").clone();
+        let mut expected = b"\r\x1b[2KScanning working tree ...".to_vec();
+        expected.extend_from_slice(b"\r\x1b[2K");
+        assert_eq!(
+            out, expected,
+            "TTY reveal+erase must leave only the erase sequence"
+        );
+    }
+
+    #[test]
+    fn worktree_scan_hint_redirected_text_gets_bare_line_and_no_ansi() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hint = WorktreeScanHint {
+            enabled: true,
+            done: false,
+            shown: false,
+            sink_override: Some(Arc::clone(&sink)),
+            test_tty: Some(false),
+        };
+        hint.reveal();
+        hint.finish();
+        let out = sink.lock().expect("test sink lock").clone();
+        assert_eq!(
+            out,
+            b"Scanning working tree ...\n".to_vec(),
+            "redirected stderr must receive the bare line only, no ANSI escapes"
+        );
+    }
+
+    #[test]
+    fn worktree_scan_hint_disabled_for_json_mode() {
+        // JSON consumers get the immediate diff_scan.start event instead; the
+        // deferred text hint must not double-report in JSON mode.
+        let mut hint = WorktreeScanHint::start(&make_output(ProgressMode::Json));
+        assert!(!hint.enabled);
+        hint.reveal();
+        assert!(!hint.shown);
+    }
+
+    #[test]
+    fn worktree_scan_hint_disabled_for_explicit_none() {
+        let mut hint = WorktreeScanHint::start(&make_output(ProgressMode::None));
+        assert!(!hint.enabled);
+        hint.reveal();
+        assert!(!hint.shown);
+    }
+
+    #[test]
+    fn scan_hint_line_uses_ansi_on_tty_and_plain_text_when_redirected() {
+        // TTY: single-line redraw with no trailing newline (so the erase can
+        // rewrite it), and the erase rewrites the same line.
+        let mut tty: Vec<u8> = Vec::new();
+        write_scan_hint_line_into(&mut tty, "Scanning working tree ...", true);
+        assert_eq!(tty, b"\r\x1b[2KScanning working tree ...");
+        let mut tty_erase: Vec<u8> = Vec::new();
+        write_scan_hint_line_into(&mut tty_erase, "", true);
+        assert_eq!(tty_erase, b"\r\x1b[2K");
+
+        // Redirected: bare line + newline, no escape bytes; erase is a no-op.
+        let mut redirected: Vec<u8> = Vec::new();
+        write_scan_hint_line_into(&mut redirected, "Scanning working tree ...", false);
+        assert_eq!(redirected, b"Scanning working tree ...\n");
+        let mut redirected_erase: Vec<u8> = Vec::new();
+        write_scan_hint_line_into(&mut redirected_erase, "", false);
+        assert!(redirected_erase.is_empty());
+    }
+
+    #[tokio::test]
+    async fn race_scan_with_hint_fast_scan_is_silent_and_single_poll() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hint = WorktreeScanHint {
+            enabled: true,
+            done: false,
+            shown: false,
+            sink_override: Some(Arc::clone(&sink)),
+            test_tty: Some(false),
+        };
+        // A scan that completes immediately: the Ok arm must take the result
+        // out of the timeout without ever awaiting the completed handle
+        // again (a second poll would panic).
+        let mut handle = tokio::task::spawn_blocking(|| 42_u8);
+        // The production 2 s quiet period is used deliberately: the blocking
+        // task finishes in microseconds, so the race is deterministic
+        // regardless of runner load (a longer timer only delays completion
+        // until the handle resolves).
+        let result = race_scan_with_hint(&mut handle, Duration::from_secs(2), &mut hint)
+            .await
+            .expect("fast scan should succeed");
+        assert_eq!(result, 42);
+        assert!(!hint.shown, "fast scan must stay silent");
+        assert!(sink.lock().expect("test sink lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn race_scan_with_hint_slow_scan_reveals_once_and_completes() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hint = WorktreeScanHint {
+            enabled: true,
+            done: false,
+            shown: false,
+            sink_override: Some(Arc::clone(&sink)),
+            test_tty: Some(false),
+        };
+        // A scan that completes only after real time passes the (short) test
+        // quiet period: the Err arm must reveal the hint, then await the
+        // SAME handle (one scan, no re-run, no truncation). The quiet period
+        // (200 ms) is far below the blocking sleep (1200 ms) so the timer
+        // deterministically wins.
+        let mut handle = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            7_u8
+        });
+        let result = race_scan_with_hint(&mut handle, Duration::from_millis(200), &mut hint)
+            .await
+            .expect("slow scan should complete");
+        assert_eq!(result, 7);
+        assert!(hint.shown, "slow scan must reveal the hint");
+        // Redirected stderr simulation: exactly one bare line, no ANSI.
+        assert_eq!(
+            sink.lock().expect("test sink lock").clone(),
+            b"Scanning working tree ...\n".to_vec()
+        );
+    }
 
     #[test]
     fn regex_word_diff_matches_git_delimiter_and_whole_line_semantics() {

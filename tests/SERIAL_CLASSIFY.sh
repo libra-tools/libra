@@ -71,7 +71,8 @@
 set -eu
 ROOT="${SERIAL_CLASSIFY_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$ROOT" || { echo "FAIL: cannot reach the repository root" >&2; exit 2; }
-[ -f COMPATIBILITY.md ] && { [ -d .libra ] || [ -e .git ]; } || { echo "FAIL: not at the repository root" >&2; exit 2; }
+# Source-only Docker/CI exports intentionally omit repository metadata.
+[ -f COMPATIBILITY.md ] && { [ -d .libra ] || [ -e .git ] || { [ -f Cargo.toml ] && [ -f src/lib.rs ]; }; } || { echo "FAIL: not at the repository root" >&2; exit 2; }
 
 python3 - <<'CLASSIFY_PY'
 import os, re, sys, time

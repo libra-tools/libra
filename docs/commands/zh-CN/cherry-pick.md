@@ -25,6 +25,8 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 自动提交的 cherry-pick 会保留源提交的 author metadata（姓名、邮箱、author date 与时区）。committer 使用当前身份/日期，并遵循 `GIT_COMMITTER_*` 覆盖。带签名的源提交会先剥离 `gpgsig` 消息块，再执行消息清理与 trailer 追加，因此签名块不会成为重放后的 subject。
 
+子模块永不参与合并（见 `docs/commands/zh-CN/merge.md`）：若本次 pick 的三路输入（父提交树 / 当前索引 / 被 pick 的树）中 `160000` gitlink 记录的 object id 不一致，cherry-pick 会在写入任何内容之前被拒绝，错误码 `LBR-UNSUPPORTED-001`，消息包含路径（`cherry-pick would have to merge the submodule (gitlink) entry '<path>': Libra does not support submodules`）。三侧一致的 gitlink 则原样保留，不再被丢弃。
+
 当某提交无法干净应用时，Libra 执行三方 apply（base = 父提交树，ours = 当前索引，theirs = 被 pick 的树），并把未解决的发散路径写入索引（stage 1/2/3）与工作树（行级冲突标记，与 Git 一致）。`-X ours/theirs` 可只解决重叠 hunk 而保留 clean 变更。进行中的序列持久化到统一 SQLite `sequence_state` 表，因此你可以解决剩余冲突后用 `--continue` 续作、用 `--skip` 丢弃冲突提交，或用 `--abort`/`--quit` 撤销整个序列。cherry-pick 序列进行期间，其他 sequencer 操作被阻止（`LBR-CONFLICT-002`）。
 
 ## 选项
@@ -287,7 +289,7 @@ Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一�
 | `LBR-REPO-003` | HEAD detached、`--continue`/`--skip`/`--abort`/`--quit` 时没有进行中的 cherry-pick，或 `--continue` 在错误的分支上 | 切换到分支 / 先发起 cherry-pick / 切回序列所在分支 |
 | `LBR-CLI-003` | 无法解析提交引用 | 使用 `libra log` 查找有效提交引用 |
 | `LBR-CLI-002` | merge commit 未带 `-m`、`-m` 越界、非法 `--cleanup`/`--empty` mode、空提交未带 `--allow-empty`、冗余提交未带 `--keep-redundant-commits`/`--empty=drop`/`--empty=keep`，或空消息未带 `--allow-empty-message` | 使用提示中指明的标志 |
-| `LBR-UNSUPPORTED-001` | 传入了不支持的自定义 `--strategy` | 去掉 `--strategy`；内置应用支持 `-X ours/theirs`，但不支持自定义策略 |
+| `LBR-UNSUPPORTED-001` | 传入了不支持的自定义 `--strategy`，**或** pick 序列的输入中存在需要裁决的 `160000` gitlink（submodule） | 去掉 `--strategy`；gitlink 情形请在 Libra 之外解决 submodule 指针，或从相关提交中移除该条目——拒绝发生在任何索引/工作树/状态写入之前 |
 | `LBR-CONFLICT-001` | Cherry-pick 期间发生冲突（三方冲突，或未跟踪文件会被覆盖） | 解决冲突并 `libra add` 后用 `libra cherry-pick --continue`（或 `--skip`/`--abort`/`--quit`） |
 | `LBR-CONFLICT-002` | cherry-pick 进行中时启动了 `merge`/`rebase`，或在进行中的序列上又发起新的 pick | 先完成或取消该 cherry-pick |
 | `LBR-IO-001` | 无法加载对象或 cherry-pick 状态 | 检查仓库完整性并重试 |

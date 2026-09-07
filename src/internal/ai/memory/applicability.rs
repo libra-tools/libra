@@ -94,9 +94,7 @@ pub(crate) struct RepositoryCodeHistory {
 impl RepositoryCodeHistory {
     pub(crate) fn new(repository_path: &Path) -> Self {
         Self {
-            storage: LocalStorage::open_no_create_with_alternates(
-                repository_path.join("objects"),
-            ),
+            storage: LocalStorage::open_no_create_with_alternates(repository_path.join("objects")),
         }
     }
 

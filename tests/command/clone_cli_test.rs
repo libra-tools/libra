@@ -650,6 +650,12 @@ impl Drop for MockD1Server {
 }
 
 fn handle_mock_d1_request(mut stream: TcpStream, data: &MockD1Data) {
+    // On macOS an accepted stream inherits O_NONBLOCK from the non-blocking
+    // listener; restore blocking mode or `read` below fails with WouldBlock
+    // before the request bytes ever arrive.
+    stream
+        .set_nonblocking(false)
+        .expect("mock D1 stream should return to blocking mode");
     let request = read_http_request(&mut stream);
     let body = request
         .split("\r\n\r\n")

@@ -690,12 +690,14 @@ async fn test_fetch_ssh_remote_via_fake_ssh() {
 
     let ssh_log = fs::read_to_string(&log_path).expect("failed to read fake ssh log");
     assert!(
-        ssh_log.contains("StrictHostKeyChecking=yes"),
-        "SSH command should enforce strict host key checking, log:\n{ssh_log}"
+        !ssh_log.contains("StrictHostKeyChecking="),
+        "default must defer host key checking to the user's ssh_config (git parity), \
+         log:\n{ssh_log}"
     );
     assert!(
-        !ssh_log.contains("StrictHostKeyChecking=accept-new"),
-        "SSH command must not use accept-new by default, log:\n{ssh_log}"
+        ssh_log.contains("BatchMode=yes"),
+        "headless runs must enable BatchMode so ssh fails fast instead of prompting, \
+         log:\n{ssh_log}"
     );
 }
 
@@ -822,7 +824,8 @@ async fn test_fetch_ssh_respects_strict_host_key_checking_config_casing() {
     );
     assert!(
         !ssh_log.contains("StrictHostKeyChecking=yes"),
-        "configured mode should override default strict host key checking, log:\n{ssh_log}"
+        "configured mode should override the default (which injects no option), \
+         log:\n{ssh_log}"
     );
 }
 

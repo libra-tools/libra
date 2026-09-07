@@ -25,6 +25,14 @@ first commit is an ancestor of the second.
 
 Each `<commit>` may be a branch, tag, `HEAD`, or an object id.
 
+The search paints down from both commits at once over a committer-date priority
+queue (the same shape as Git's `paint_down_to_common`): one combined traversal
+carrying both sides' marks, instead of a separate full walk per side followed by
+another per common ancestor. A commit can be visited again as it picks up the
+second side's mark, so "one traversal" means one pass over the graph, not one
+visit per commit. Results are unchanged — committer dates only decide visit
+order, so a history with skewed or identical dates yields the same bases.
+
 ## Options
 
 | Option | Description | Example |
@@ -63,6 +71,6 @@ libra diff main...feature
 | Ancestry test | `libra merge-base --is-ancestor a b` | `git merge-base --is-ancestor a b` |
 
 Deferred (not yet exposed): more than two commits and `--octopus` /
-`--independent` / `--fork-point`. (The `log` / `rebase` internals still use their
-own first-found walk; migrating them onto this shared LCA is a tracked
-follow-up.)
+`--independent` / `--fork-point`. `merge`, `rebase`, `am` and `diff A...B` all
+compute through this shared LCA; only `log A...B` still has its own reachable-set
+implementation, and migrating it is a tracked follow-up.

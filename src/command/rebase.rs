@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli_error,
-    command::{load_object, save_object, status, switch},
+    command::{load_object, merge, save_object, status, switch},
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
@@ -899,6 +899,9 @@ pub enum ReplayErrorKind {
     WorkdirReset,
     /// No `user.name` / `user.email` to sign the replayed commit's committer with.
     IdentityMissing,
+    /// A replayed commit's three-way inputs carry a gitlink the rebase would
+    /// have to arbitrate — refused fail-closed (ADR-MG-01).
+    GitlinkUnsupported,
 }
 
 impl ReplayErrorKind {
@@ -920,6 +923,7 @@ impl ReplayErrorKind {
             ReplayErrorKind::IndexSave => "index_save",
             ReplayErrorKind::WorkdirReset => "workdir_reset",
             ReplayErrorKind::IdentityMissing => "identity_missing",
+            ReplayErrorKind::GitlinkUnsupported => "gitlink_unsupported",
         }
     }
 
@@ -942,6 +946,7 @@ impl ReplayErrorKind {
             | ReplayErrorKind::IndexSave
             | ReplayErrorKind::WorkdirReset => StableErrorCode::IoWriteFailed,
             ReplayErrorKind::IdentityMissing => StableErrorCode::AuthMissingCredentials,
+            ReplayErrorKind::GitlinkUnsupported => StableErrorCode::Unsupported,
         }
     }
 }
@@ -1177,6 +1182,10 @@ pub(crate) enum RebaseError {
     OntoResolve { onto: String, detail: String },
     #[error("no common ancestor found")]
     NoCommonAncestor,
+    /// A replay input carries a gitlink the rebase would have to arbitrate —
+    /// refused before the first write (ADR-MG-01).
+    #[error("{0}")]
+    GitlinkUnsupported(String),
     #[error("invalid --exec command: {0}")]
     InvalidExec(String),
     #[error(
@@ -1277,6 +1286,14 @@ impl From<RebaseError> for CliError {
             | RebaseError::OntoResolve { .. }
             | RebaseError::NoCommonAncestor => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
+            RebaseError::GitlinkUnsupported(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::Unsupported)
+                .with_hint(
+                    "submodule merging is a permanent non-goal; resolve the submodule pointer outside Libra",
+                )
+                .with_hint(
+                    "or drop the gitlink entry from the commits being replayed so no submodule decision is needed",
+                ),
             RebaseError::InvalidExec(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("pass a non-empty shell command without NUL bytes"),
@@ -1512,6 +1529,18 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
         run_pre_rebase_hook(upstream, args.branch.as_deref(), output)
             .await
             .map_err(CliError::from)?;
+        // ADR-MG-01: refuse a submodule-arbitrating replay before
+        // `prepare_rebase_aux` writes the autostash / aux sidecar and resets
+        // the working tree.
+        preflight_rebase_gitlinks(
+            upstream,
+            args.onto.as_deref(),
+            args.branch.as_deref(),
+            args.fork_point,
+            args.no_keep_empty,
+        )
+        .await
+        .map_err(CliError::from)?;
         prepare_rebase_aux(&args).await.map_err(CliError::from)?;
         // `git rebase --onto <newbase> <upstream> <branch>` form: check out the
         // named branch first (no-op when it is already current), so the rest of
@@ -2485,6 +2514,133 @@ async fn reflog_fork_point(
     Ok(best)
 }
 
+/// ADR-MG-01 gate for `rebase`, ahead of every mutation the start path makes —
+/// the `--autostash` stash commit + worktree reset, the aux sidecar, the branch
+/// switch, the HEAD detach, and the state claim.
+///
+/// The per-replay guard in `replay_commit_with_conflict_detection` cannot serve
+/// here: a step's "ours" side only exists once the previous steps have been
+/// applied, so a refusal there arrives after HEAD has already moved. This asks
+/// the conservative whole-sequence question instead — every input tree of the
+/// replay must record the same pointer for a given gitlink path
+/// (`merge::ensure_gitlinks_uniform_across_inputs`).
+///
+/// Resolution failures are deliberately NOT reported here: `run_rebase_start`
+/// owns those error messages, and a preflight that fails first would change
+/// them. Only a gitlink refusal escapes.
+pub(crate) async fn preflight_gitlinks_for_pull(upstream: &str) -> Result<(), RebaseError> {
+    preflight_rebase_gitlinks(upstream, None, None, false, false).await
+}
+
+async fn preflight_rebase_gitlinks(
+    upstream: &str,
+    onto: Option<&str>,
+    branch: Option<&str>,
+    fork_point: bool,
+    no_keep_empty: bool,
+) -> Result<(), RebaseError> {
+    let head_id = match branch {
+        // `rebase --onto <newbase> <upstream> <branch>` checks `<branch>` out
+        // first, so THAT is the branch whose commits will be replayed.
+        Some(branch) => match resolve_branch_or_commit(branch).await {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        },
+        None => match Head::current_commit().await {
+            Some(id) => id,
+            None => return Ok(()),
+        },
+    };
+    let Ok(upstream_id) = resolve_branch_or_commit(upstream).await else {
+        return Ok(());
+    };
+    let newbase_id = match onto {
+        Some(target) => match resolve_branch_or_commit(target).await {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        },
+        None => upstream_id,
+    };
+    let Ok(Some(ordinary_base)) = crate::internal::merge_base::merge_base(&head_id, &upstream_id)
+    else {
+        return Ok(());
+    };
+    let base_id = if fork_point {
+        match reflog_fork_point(upstream, upstream_id, head_id).await {
+            Ok(found) => found.unwrap_or(ordinary_base),
+            Err(_) => return Ok(()),
+        }
+    } else {
+        ordinary_base
+    };
+    // Both of `run_rebase_start`'s short-circuits decide nothing, so neither may
+    // be pre-empted by a gitlink refusal: `base_id == head_id` fast-forwards
+    // onto the upstream tree wholesale, and `base_id == upstream_id` means the
+    // upstream is already an ancestor (already up to date) — with no `--onto`
+    // there is nothing to move.
+    if onto.is_none() && (base_id == head_id || base_id == upstream_id) {
+        return Ok(());
+    }
+    let Ok(mut commits) = collect_commits_to_replay(&base_id, &head_id).await else {
+        return Ok(());
+    };
+    if no_keep_empty {
+        // `--no-keep-empty` prunes already-empty commits from the replay list
+        // BEFORE any of them is replayed, so they are not inputs at all. The
+        // verdict is normally unchanged — an empty commit's tree equals its
+        // first parent's, which stays an input — except when EVERY commit is
+        // pruned: then nothing is replayed and nothing may be refused.
+        let mut kept = Vec::with_capacity(commits.len());
+        for commit_id in commits {
+            if !commit_starts_empty(&commit_id).await {
+                kept.push(commit_id);
+            }
+        }
+        commits = kept;
+    }
+    if commits.is_empty() {
+        return Ok(());
+    }
+
+    // The inputs of the actual replay: the landing tree the first step merges
+    // onto, and — for each replayed commit — its own tree plus its FIRST
+    // parent's tree, which is the base
+    // `replay_commit_with_conflict_detection` diffs against. Any other parent
+    // of a merge commit is never a three-way input, so including it would
+    // refuse rebases that arbitrate nothing.
+    let mut inputs = Vec::with_capacity(1 + commits.len() * 2);
+    match commit_gitlinks(&newbase_id) {
+        Ok(gitlinks) => inputs.push(gitlinks),
+        Err(_) => return Ok(()),
+    }
+    for commit_id in &commits {
+        let Ok(commit) = load_object::<Commit>(commit_id) else {
+            return Ok(());
+        };
+        match commit_gitlinks(commit_id) {
+            Ok(gitlinks) => inputs.push(gitlinks),
+            Err(_) => return Ok(()),
+        }
+        let Some(parent_id) = commit.parent_commit_ids.first() else {
+            // A root commit has no base tree to diff against; the replay
+            // refuses it separately (`ReplayErrorKind::MissingParent`).
+            return Ok(());
+        };
+        match commit_gitlinks(parent_id) {
+            Ok(gitlinks) => inputs.push(gitlinks),
+            Err(_) => return Ok(()),
+        }
+    }
+    merge::ensure_gitlinks_uniform_across_inputs("rebase", &inputs)
+        .map_err(|refusal| RebaseError::GitlinkUnsupported(refusal.to_string()))
+}
+
+/// The gitlink entries of `commit_id`'s tree, for the replay preflight.
+fn commit_gitlinks(commit_id: &ObjectHash) -> Result<merge::GitlinkEntries, String> {
+    let commit: Commit = load_object(commit_id).map_err(|error| error.to_string())?;
+    merge::commit_gitlink_entries(&commit).map_err(|error| error.to_string())
+}
+
 async fn run_rebase_start(
     upstream: &str,
     onto: Option<&str>,
@@ -2572,6 +2728,14 @@ async fn run_rebase_start(
         rebuild_index_from_tree(&upstream_tree, &mut index, "")
             .map_err(RebaseError::IndexRebuild)?;
         rebase_worktree_guard_structured(&index, "fast-forward rebase").await?;
+        // The worktree is materialized AFTER the ref and index move below, so
+        // anything that materialization would refuse has to be caught here —
+        // otherwise the branch ends up ahead of the working tree. Most visibly:
+        // a submodule directory the upstream tree no longer declares
+        // (ADR-MG-01), which `restore` refuses to replace when it is non-empty.
+        crate::command::restore::preflight_worktree_restore_to_commit(&upstream_id)
+            .await
+            .map_err(|error| RebaseError::WorktreeStatus(error.to_string()))?;
 
         let fast_forward_action = ReflogAction::Rebase {
             state: "fast-forward".to_string(),
@@ -2845,6 +3009,11 @@ pub(crate) async fn run_rebase_for_pull(
     output: &OutputConfig,
 ) -> Result<PullRebaseSummary, RebaseError> {
     run_pre_rebase_hook(upstream, None, output).await?;
+    // ADR-MG-01: `pull --rebase` is a second entry into the replay. `pull` calls
+    // `preflight_gitlinks_for_pull` BEFORE its own autostash push, so the gate
+    // has already run by the time we get here; repeating it costs one cheap
+    // history walk and keeps this entry correct on its own.
+    preflight_rebase_gitlinks(upstream, None, None, false, false).await?;
     // `pull --rebase` keeps Libra's default (keep become-empty commits).
     let output = run_rebase_start(
         upstream,
@@ -3741,6 +3910,11 @@ fn write_rebase_workdir_entry(
     path: &Path,
     entry: RebaseTreeEntry,
 ) -> Result<(), String> {
+    // Submodule pointers never reach the working tree (ADR-MG-01): the commit
+    // object belongs to the submodule, so loading it as a blob would fail.
+    if entry.mode == TreeItemMode::Commit {
+        return Ok(());
+    }
     let blob: Blob = load_object(&entry.hash).map_err(|error| {
         format!(
             "failed to load blob {} for worktree path '{}': {error}",
@@ -3839,27 +4013,38 @@ struct RebaseTreeEntry {
     mode: TreeItemMode,
 }
 
+/// Flatten each tree into its mergeable entries, the gitlinks it carries, and
+/// the union of the mergeable paths.
+///
+/// Gitlinks are split out rather than dropped: submodule content is never
+/// merged (ADR-MG-01), but the pointers still have to reach
+/// [`merge::ensure_gitlinks_not_arbitrated`] so a diverged one is refused and
+/// an agreed-on one survives into the replayed tree.
 fn collect_tree_items_and_paths<'a>(
     trees: impl IntoIterator<Item = &'a Tree>,
-) -> (Vec<HashMap<PathBuf, RebaseTreeEntry>>, HashSet<PathBuf>) {
+) -> (
+    Vec<HashMap<PathBuf, RebaseTreeEntry>>,
+    Vec<merge::GitlinkEntries>,
+    HashSet<PathBuf>,
+) {
     let mut items = Vec::new();
+    let mut gitlinks = Vec::new();
     let mut all_paths = HashSet::new();
     for tree in trees {
-        let map: HashMap<PathBuf, RebaseTreeEntry> = tree
-            .get_plain_items_with_mode()
-            .into_iter()
-            .filter_map(|(path, hash, mode)| {
-                if mode == TreeItemMode::Commit {
-                    None
-                } else {
-                    Some((path, RebaseTreeEntry { hash, mode }))
-                }
-            })
-            .collect();
+        let mut map: HashMap<PathBuf, RebaseTreeEntry> = HashMap::new();
+        let mut links = merge::GitlinkEntries::new();
+        for (path, hash, mode) in tree.get_plain_items_with_mode() {
+            if mode == TreeItemMode::Commit {
+                links.insert(path, hash);
+            } else {
+                map.insert(path, RebaseTreeEntry { hash, mode });
+            }
+        }
         all_paths.extend(map.keys().cloned());
         items.push(map);
+        gitlinks.push(links);
     }
-    (items, all_paths)
+    (items, gitlinks, all_paths)
 }
 
 #[cfg(test)]
@@ -3927,6 +4112,13 @@ mod tests {
             StableErrorCode::ConflictOperationBlocked
         );
 
+        // A gitlink the replay would have to arbitrate is a DECLINED feature
+        // (ADR-MG-01), not an IO or corruption failure.
+        assert_eq!(
+            ReplayErrorKind::GitlinkUnsupported.stable_code(),
+            StableErrorCode::Unsupported
+        );
+
         // Write/save side failures all surface as IO write failed.
         for kind in [
             ReplayErrorKind::ConflictMarker,
@@ -3963,6 +4155,10 @@ mod tests {
         assert_eq!(ReplayErrorKind::IndexRebuild.as_str(), "index_rebuild");
         assert_eq!(ReplayErrorKind::IndexSave.as_str(), "index_save");
         assert_eq!(ReplayErrorKind::WorkdirReset.as_str(), "workdir_reset");
+        assert_eq!(
+            ReplayErrorKind::GitlinkUnsupported.as_str(),
+            "gitlink_unsupported"
+        );
     }
 
     /// Pin the `Display` format for the static-message `RebaseError`
@@ -4007,6 +4203,16 @@ mod tests {
             }
             .to_string(),
             "untracked working tree file would be overwritten by rebase: scratch.txt",
+        );
+        // ADR-MG-01: the refusal forwards the shared guard's wording verbatim
+        // so `merge`, `rebase` and `cherry-pick` read identically.
+        assert_eq!(
+            RebaseError::GitlinkUnsupported(
+                "rebase would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules"
+                    .to_string(),
+            )
+            .to_string(),
+            "rebase would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules",
         );
         assert_eq!(
             RebaseError::UpstreamResolve {
@@ -4297,8 +4503,12 @@ mod tests {
         ])
         .expect("tree2");
 
-        let (items, all_paths) = collect_tree_items_and_paths([&tree1, &tree2]);
+        let (items, gitlinks, all_paths) = collect_tree_items_and_paths([&tree1, &tree2]);
         assert_eq!(items.len(), 2);
+        assert!(
+            gitlinks.iter().all(|links| links.is_empty()),
+            "trees without gitlinks must produce empty gitlink maps"
+        );
 
         let expected_first: HashMap<PathBuf, RebaseTreeEntry> = HashMap::from([
             (
@@ -4466,8 +4676,19 @@ mod tests {
             index_mode_to_tree_item_mode(0o120000).expect("symlink"),
             TreeItemMode::Link
         );
-        assert!(tree_item_mode_to_index_mode(TreeItemMode::Commit).is_err());
-        assert!(index_mode_to_tree_item_mode(0o160000).is_err());
+        // ADR-MG-01: gitlinks round-trip as `160000` instead of failing. Only a
+        // pass-through pointer (identical on all three sides) ever reaches these
+        // conversions — an arbitrated one is refused by
+        // `merge::ensure_gitlinks_not_arbitrated` before the replay writes
+        // anything — so the mapping preserves the submodule the tree declares.
+        assert_eq!(
+            tree_item_mode_to_index_mode(TreeItemMode::Commit).expect("gitlink"),
+            0o160000
+        );
+        assert_eq!(
+            index_mode_to_tree_item_mode(0o160000).expect("gitlink"),
+            TreeItemMode::Commit
+        );
     }
 
     #[tokio::test]
@@ -4559,6 +4780,10 @@ mod tests {
         assert_eq!(ReplayErrorKind::IndexRebuild.to_string(), "index_rebuild");
         assert_eq!(ReplayErrorKind::IndexSave.to_string(), "index_save");
         assert_eq!(ReplayErrorKind::WorkdirReset.to_string(), "workdir_reset");
+        assert_eq!(
+            ReplayErrorKind::GitlinkUnsupported.to_string(),
+            "gitlink_unsupported"
+        );
     }
 }
 
@@ -4798,11 +5023,29 @@ async fn replay_commit_with_conflict_detection(
         };
 
     // Get all items from each tree and a union of their paths.
-    let (tree_items, all_paths) =
+    let (tree_items, tree_gitlinks, all_paths) =
         collect_tree_items_and_paths([&base_tree, &their_tree, &our_tree]);
     let base_items = &tree_items[0];
     let their_items = &tree_items[1];
     let our_items = &tree_items[2];
+    // ADR-MG-01 fail-closed gate, shared with `merge` and `cherry-pick`: a
+    // gitlink the replay would have to arbitrate stops the rebase before any
+    // index/worktree write; one all three sides agree on passes through into
+    // the replayed tree instead of being silently dropped.
+    let passthrough_gitlinks = match merge::ensure_gitlinks_not_arbitrated(
+        "rebase",
+        &tree_gitlinks[0],
+        &tree_gitlinks[2],
+        &tree_gitlinks[1],
+    ) {
+        Ok(passthrough) => passthrough,
+        Err(refusal) => {
+            return ReplayResult::internal(
+                ReplayErrorKind::GitlinkUnsupported,
+                refusal.to_string(),
+            );
+        }
+    };
 
     let mut merged_items: HashMap<PathBuf, RebaseTreeEntry> = HashMap::new();
     let mut conflict_items: Vec<(PathBuf, ConflictKind)> = Vec::new();
@@ -4831,6 +5074,18 @@ async fn replay_commit_with_conflict_detection(
         }
     }
 
+    // Pass-through gitlinks: identical on all three sides, so they are copied
+    // into the replayed tree without ever entering a merge decision.
+    for (path, gitlink) in &passthrough_gitlinks {
+        merged_items.insert(
+            path.clone(),
+            RebaseTreeEntry {
+                hash: *gitlink,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
+
     let conflicts: Vec<PathBuf> = conflict_items
         .iter()
         .map(|(path, _)| path.clone())
@@ -4838,8 +5093,16 @@ async fn replay_commit_with_conflict_detection(
 
     if !conflicts.is_empty() {
         let mut untracked_conflict = None;
+        // Pass-through gitlinks are excluded: Libra never writes a submodule
+        // working tree, so an existing submodule directory must not be mistaken
+        // for an untracked path the replay is about to overwrite.
+        let materialized: Vec<&PathBuf> = merged_items
+            .iter()
+            .filter(|(_, entry)| entry.mode != TreeItemMode::Commit)
+            .map(|(path, _)| path)
+            .collect();
         for untracked in &untracked_paths {
-            for path in conflicts.iter().chain(merged_items.keys()) {
+            for path in conflicts.iter().chain(materialized.iter().copied()) {
                 if worktree::paths_conflict(untracked, path) {
                     untracked_conflict = Some(untracked.clone());
                     break;
@@ -4918,6 +5181,11 @@ async fn replay_commit_with_conflict_detection(
         let conflict_set: HashSet<PathBuf> = conflicts.iter().cloned().collect();
 
         for (path, entry) in &merged_items {
+            // Pass-through gitlink: a submodule has no blob to write and Libra
+            // materializes no submodule working tree (ADR-MG-01).
+            if entry.mode == TreeItemMode::Commit {
+                continue;
+            }
             if let Err(e) = write_rebase_workdir_entry(&workdir, path, *entry) {
                 return ReplayResult::Conflict {
                     paths: conflicts,
@@ -5291,6 +5559,15 @@ fn reset_workdir_tracked_only(
 
     for path_buf in current_index.tracked_files() {
         if !new_tracked_paths.contains(&path_buf) {
+            // A submodule directory is not Libra's to unlink, and a gitlink can
+            // only leave the index through a decision the ADR-MG-01 guard has
+            // already refused.
+            if current_index
+                .get(path_to_index_key(&path_buf)?, 0)
+                .is_some_and(|entry| entry.mode & 0o170000 == 0o160000)
+            {
+                continue;
+            }
             let full_path = workdir.join(path_buf);
             if full_path.exists() {
                 fs::remove_file(&full_path).map_err(|e| e.to_string())?;
@@ -5301,6 +5578,10 @@ fn reset_workdir_tracked_only(
     for path_buf in new_index.tracked_files() {
         let path_str = path_to_index_key(&path_buf)?;
         if let Some(entry) = new_index.get(path_str, 0) {
+            // Pass-through gitlink: nothing to materialize in the working tree.
+            if entry.mode & 0o170000 == 0o160000 {
+                continue;
+            }
             let mode = index_mode_to_tree_item_mode(entry.mode)?;
             write_rebase_workdir_entry(
                 &workdir,
@@ -5336,17 +5617,26 @@ fn add_rebase_index_entry(
     item: RebaseTreeEntry,
     stage: u8,
 ) -> Result<(), String> {
-    let blob: Blob = load_object(&item.hash).map_err(|error| {
-        format!(
-            "failed to load blob {} for index entry '{}': {error}",
-            item.hash,
-            path.display()
-        )
-    })?;
+    // A gitlink records a SUBMODULE's commit id, which is not an object of this
+    // repository — asking for it as a blob would fail. Only a pass-through
+    // gitlink (identical on all three sides, ADR-MG-01) reaches here, so the
+    // pointer is registered verbatim with a zero size.
+    let size = if item.mode == TreeItemMode::Commit {
+        0
+    } else {
+        let blob: Blob = load_object(&item.hash).map_err(|error| {
+            format!(
+                "failed to load blob {} for index entry '{}': {error}",
+                item.hash,
+                path.display()
+            )
+        })?;
+        blob.data.len() as u32
+    };
     let mut entry = git_internal::internal::index::IndexEntry::new_from_blob(
         path_to_index_key(path)?.to_string(),
         item.hash,
-        blob.data.len() as u32,
+        size,
     );
     entry.mode = tree_item_mode_to_index_mode(item.mode)?;
     entry.flags.stage = stage;
@@ -5362,7 +5652,9 @@ fn tree_item_mode_to_index_mode(mode: TreeItemMode) -> Result<u32, String> {
         TreeItemMode::Tree => {
             Err("tree entry cannot be represented as a file index entry".to_string())
         }
-        TreeItemMode::Commit => Err("gitlink entries are not supported by rebase".to_string()),
+        // Pass-through gitlink (ADR-MG-01): an arbitrated one never gets this
+        // far, so the unchanged pointer is recorded instead of rejected.
+        TreeItemMode::Commit => Ok(0o160000),
     }
 }
 
@@ -5371,6 +5663,7 @@ fn index_mode_to_tree_item_mode(mode: u32) -> Result<TreeItemMode, String> {
         0o100644 => Ok(TreeItemMode::Blob),
         0o100755 => Ok(TreeItemMode::BlobExecutable),
         0o120000 => Ok(TreeItemMode::Link),
+        0o160000 => Ok(TreeItemMode::Commit),
         other => Err(format!(
             "unsupported index mode {other:o} while creating rebase tree"
         )),
@@ -5411,11 +5704,17 @@ fn rebuild_index_from_tree(
             git_internal::internal::object::tree::TreeItemMode::Blob => 0o100644,
             git_internal::internal::object::tree::TreeItemMode::BlobExecutable => 0o100755,
             git_internal::internal::object::tree::TreeItemMode::Link => 0o120000,
+            // A `160000` gitlink records a SUBMODULE's commit id, which is not
+            // an object of this repository, so it has no blob to size. Only a
+            // pass-through gitlink can reach here — an arbitrated one is refused
+            // by the ADR-MG-01 guard before the replay writes anything — so the
+            // pointer is recorded verbatim instead of failing the rebase.
             git_internal::internal::object::tree::TreeItemMode::Commit => {
-                return Err(format!(
-                    "unsupported gitlink tree entry '{}' while rebuilding rebase index",
-                    full_path
-                ));
+                let mut entry =
+                    git_internal::internal::index::IndexEntry::new_from_blob(full_path, item.id, 0);
+                entry.mode = 0o160000;
+                index.add(entry);
+                continue;
             }
         };
 
@@ -5517,7 +5816,7 @@ mod rebuild_index_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn rebuild_index_from_tree_rejects_gitlink_entries() {
+    async fn rebuild_index_from_tree_registers_gitlink_entries_verbatim() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
         let _guard = ChangeDirGuard::new(repo.path());
@@ -5531,9 +5830,16 @@ mod rebuild_index_tests {
         .unwrap();
         let mut index = Index::new();
 
-        let err = rebuild_index_from_tree(&tree, &mut index, "").unwrap_err();
+        // ADR-MG-01 pass-through: an arbitrated gitlink is refused by
+        // `merge::ensure_gitlinks_not_arbitrated` before the replay writes
+        // anything, so the index rebuild only ever sees pointers all three
+        // sides agree on — and must record them rather than fail. The commit
+        // object is a SUBMODULE's, absent from this object database, so asking
+        // for its blob was the wrong question.
+        rebuild_index_from_tree(&tree, &mut index, "").expect("gitlink entry is registered");
 
-        assert!(err.contains("unsupported gitlink tree entry"));
-        assert!(err.contains("vendor"));
+        let entry = index.get("vendor", 0).expect("gitlink index entry");
+        assert_eq!(entry.mode, 0o160000);
+        assert_eq!(entry.hash, gitlink);
     }
 }

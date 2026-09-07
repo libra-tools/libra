@@ -853,8 +853,8 @@ Memory 的逻辑 key 不得直接拼接进 Git ref 或 tree path：branch name�
 
 ### 5.2 SQLite 投影表
 
-M2-02 使用版本化迁移 `sql/migrations/2026082501_memory_core.sql` 与
-`2026082501_memory_core_down.sql` 引入核心 schema。前向 DDL 必须幂等
+M2-02 使用版本化迁移 `sql/migrations/2026090701_memory_core.sql` 与
+`2026090701_memory_core_down.sql` 引入核心 schema。前向 DDL 必须幂等
 （`CREATE TABLE/INDEX IF NOT EXISTS ...`）；**不要**把它们追加进 bootstrap
 文件 `sql/sqlite_20260309_init.sql`。这与外部捕获采用迁移
 `2026050303_agent_capture.sql` 的方式属于同一模式。
@@ -874,7 +874,7 @@ source-input fingerprint 拆列保存 `version/key_id/digest`；`purpose=source_
 迁移本身不得初始化、读取或轮换 repository keyed-digest seed。
 
 M2-02F 随后的版本化迁移
-`sql/migrations/2026082502_memory_fts_search.sql` 与对应 down 文件增加
+`sql/migrations/2026090702_memory_fts_search.sql` 与对应 down 文件增加
 Episode 搜索投影。这里的「搜索正文表」（search document）指 SQLite 普通表
 `memory_episode_search_doc`；它保存唯一一份可搜索文本。「全文倒排索引」
 （FTS5 index）指 external-content 虚拟表 `memory_episode_fts`；它只保存由正文生成的
@@ -1290,7 +1290,7 @@ CREATE TABLE memory_compile_observer_state (
     PRIMARY KEY (scope_key, source_ref_name)
 );
 
--- 以下均为后续长期方案，不属于 2026082501_memory_core。
+-- 以下均为后续长期方案，不属于 2026090701_memory_core。
 
 -- 实体 mention / alias 反向索引。历史真相是 MemoryNote.entities；
 -- canonical_key 与 alias_key 均为经过规范化的 repository-local key。

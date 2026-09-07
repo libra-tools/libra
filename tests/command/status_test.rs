@@ -2934,3 +2934,91 @@ async fn api_status_envelope_honors_status_config_defaults() {
         .expect_err("invalid config must fail closed in the API too");
     assert!(error.to_string().contains("status.showUntrackedFiles"));
 }
+
+/// Issue #464 regression (human surfaces): after clone/fetch/push write the
+/// tracking ref fully-qualified (`refs/remotes/<remote>/<branch>`), the SHORT
+/// --branch format must report a healthy upstream line, not `## main...origin/main
+/// [gone]`. Covers the rendering path the JSON test does not.
+#[tokio::test]
+#[serial(cwd)]
+async fn test_status_short_branch_reports_up_to_date_with_fully_qualified_tracking_ref() {
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+
+    fs::write("tracked.txt", "tracked\n").unwrap();
+    add::execute_safe(
+        AddArgs {
+            pathspec: vec![String::from("tracked.txt")],
+            all: false,
+            update: false,
+            verbose: false,
+            dry_run: false,
+            ignore_errors: false,
+            refresh: false,
+            force: false,
+
+            pathspec_from_file: None,
+            pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
+        },
+        &libra::utils::output::OutputConfig::default(),
+    )
+    .await
+    .expect("add tracked.txt should succeed");
+    execute_safe(
+        create_commit_args("initial"),
+        &libra::utils::output::OutputConfig::default(),
+    )
+    .await
+    .expect("initial commit should succeed");
+
+    let output = run_libra_command(&["config", "branch.main.remote", "origin"], test_dir.path());
+    assert_cli_success(&output, "configure branch.main.remote");
+    let output = run_libra_command(
+        &["config", "branch.main.merge", "refs/heads/main"],
+        test_dir.path(),
+    );
+    assert_cli_success(&output, "configure branch.main.merge");
+
+    let head = Head::current_commit().await.expect("head commit");
+    // The exact shape clone/fetch/push write: fully-qualified name + remote column.
+    Branch::update_branch(
+        "refs/remotes/origin/main",
+        &head.to_string(),
+        Some("origin"),
+    )
+    .await
+    .expect("create fully-qualified remote-tracking branch");
+
+    let mut output = Vec::new();
+    status_execute(
+        StatusArgs {
+            porcelain: None,
+            short: true,
+            branch: true,
+            show_stash: false,
+            ignored: false,
+            untracked_files: Some(UntrackedFiles::Normal),
+            exit_code: false,
+            ..Default::default()
+        },
+        &mut output,
+    )
+    .await;
+
+    let output_str = String::from_utf8(output).unwrap();
+    // Exact-line assertion: `contains("## main...origin/main")` would also be
+    // satisfied by the buggy `[gone]` rendering, so the healthy line must
+    // match EXACTLY; the negative `[gone]` check below carries the guard.
+    assert!(
+        output_str.lines().any(|l| l == "## main...origin/main"),
+        "short --branch format must report a healthy upstream: {output_str}"
+    );
+    assert!(
+        !output_str.contains("[gone]"),
+        "fully-qualified tracking ref must never render [gone]: {output_str}"
+    );
+}

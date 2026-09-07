@@ -1,5 +1,46 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed: `diff` scan progress is deferred, TTY-gated, and self-erasing (#466)
+
+`libra diff` no longer prints `Scanning working tree ...` on every invocation.
+The working-tree scan is a fast local read (a normal tree finishes in tens of
+milliseconds), so the line is now a liveness cue only:
+
+- It appears only when the scan has actually been running for more than 2
+  seconds (very large working trees), and is erased when the scan completes —
+  no more terminal scrollback residue.
+- Under the default `--progress=auto` it is TTY-gated: stderr redirected to a
+  file or pipe (CI logs, `2>&1`) never receives the line or any ANSI escape,
+  matching git's output conventions.
+- It never fires for `--staged`, rev-vs-rev comparisons, `--quiet`, or
+  `--json`/`--machine` runs — it only describes the unstaged working-tree scan.
+- `--progress=json` keeps emitting immediate `diff_scan.start` NDJSON events;
+  `--progress=none` suppresses everything. An explicit `--progress=text` with
+  redirected stderr receives the bare line text (no escape bytes).
+
+### Changed: SSH host key handling now matches Git's transport behavior
+
+`libra clone`/`fetch`/`push`/`ls-remote` over SSH no longer force
+`StrictHostKeyChecking=yes` + `BatchMode=yes`. In the new default `ask` mode
+libra passes **no** `StrictHostKeyChecking` option to `ssh`, so the user's
+`~/.ssh/config` governs and OpenSSH offers its interactive trust prompt (TOFU)
+on first connection — the same experience as `git clone` on a fresh machine
+(no more "No ED25519 host key is known for …" hard failure before the host key
+has been accepted once).
+
+- Interactive sessions (TTY on stdin): stderr is inherited, so the
+  authenticity warning, fingerprint, and "Permanently added" confirmation are
+  visible live; headless contexts (CI, agents, tests) keep the previous
+  piped-stderr diagnostics and gain `BatchMode=yes` so ssh fails fast instead
+  of prompting.
+- `ssh.strictHostKeyChecking` / `LIBRA_SSH_STRICT_HOST_KEY_CHECKING` now
+  accept the four OpenSSH policies: `ask` (default), `yes`, `accept-new`, `no`.
+- Host key verification failures in clone discovery now surface a targeted
+  hint (`ssh -T <host>`, `ssh-keyscan`, or `accept-new`) instead of the generic
+  network hint.
+
 ## [0.22.0] — 2026-08-30
 
 ### Removed (breaking): the SSE wire v1 snapshot stream (plan-20260824 DF-08, ADR-DF-03)

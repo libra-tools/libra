@@ -4,6 +4,7 @@
 
 use std::fs;
 
+use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 use libra::{
     internal::{branch::Branch, head::Head},
     utils::test::ChangeDirGuard,
@@ -112,6 +113,109 @@ async fn json_status_includes_upstream_tracking_info() {
     assert_eq!(upstream["ahead"], 0);
     assert_eq!(upstream["behind"], 0);
     assert_eq!(upstream["gone"], false);
+}
+
+/// Issue #464 regression: clone/fetch/push store the tracking ref under its
+/// fully-qualified `refs/remotes/<remote>/<branch>` name, so a fresh clone
+/// must report a healthy upstream (ahead/behind), not `gone: true`.
+#[tokio::test]
+#[serial(cwd)]
+async fn json_status_resolves_fully_qualified_tracking_ref() {
+    let repo = create_committed_repo();
+
+    let output = run_libra_command(&["config", "branch.main.remote", "origin"], repo.path());
+    assert_cli_success(&output, "configure branch.main.remote");
+    let output = run_libra_command(
+        &["config", "branch.main.merge", "refs/heads/main"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "configure branch.main.merge");
+
+    let _guard = ChangeDirGuard::new(repo.path());
+    let head = Head::current_commit().await.expect("head commit");
+    // Same shape clone/fetch/push write: fully-qualified name + remote column.
+    Branch::update_branch(
+        "refs/remotes/origin/main",
+        &head.to_string(),
+        Some("origin"),
+    )
+    .await
+    .expect("create fully-qualified remote-tracking branch");
+
+    let output = run_libra_command(&["--json", "status"], repo.path());
+    assert_cli_success(&output, "json status fully-qualified upstream");
+
+    let parsed = parse_json_stdout(&output);
+    let upstream = &parsed["data"]["upstream"];
+    assert_eq!(upstream["remote_ref"], "origin/main");
+    assert_eq!(
+        upstream["gone"], false,
+        "fully-qualified tracking ref must not be reported as gone"
+    );
+    assert_eq!(upstream["ahead"], 0);
+    assert_eq!(upstream["behind"], 0);
+}
+
+/// When BOTH naming conventions exist (a legacy short row left by an older
+/// binary plus a fresh fully-qualified row written by push/fetch), the
+/// fully-qualified row must win — it is the one current writers keep current.
+#[tokio::test]
+#[serial(cwd)]
+async fn json_status_prefers_fully_qualified_row_over_legacy_short_row() {
+    let repo = create_committed_repo();
+
+    let output = run_libra_command(&["config", "branch.main.remote", "origin"], repo.path());
+    assert_cli_success(&output, "configure branch.main.remote");
+    let output = run_libra_command(
+        &["config", "branch.main.merge", "refs/heads/main"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "configure branch.main.merge");
+
+    let _guard = ChangeDirGuard::new(repo.path());
+    // A second commit so the tracking rows can be pointed at different tips.
+    fs::write(repo.path().join("tracked.txt"), "second\n").unwrap();
+    let output = run_libra_command(
+        &["commit", "-a", "-m", "second", "--no-verify"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "second commit");
+    let head = Head::current_commit().await.expect("head commit");
+    // Diverge the two rows: the legacy short row points at HEAD, the
+    // fully-qualified row at its parent (as if the remote moved HEAD).
+    Branch::update_branch("main", &head.to_string(), Some("origin"))
+        .await
+        .expect("create legacy short remote-tracking branch");
+    let parent = load_parent_commit_oid(&head);
+    Branch::update_branch("refs/remotes/origin/main", &parent, Some("origin"))
+        .await
+        .expect("create fully-qualified remote-tracking branch");
+
+    let output = run_libra_command(&["--json", "status"], repo.path());
+    assert_cli_success(&output, "json status dual tracking rows");
+
+    let parsed = parse_json_stdout(&output);
+    let upstream = &parsed["data"]["upstream"];
+    assert_eq!(upstream["gone"], false, "fully-qualified row must be found");
+    // Short row == HEAD → the short row would report ahead 0/behind 0. The
+    // full row points at HEAD's parent, so ahead=1 pins that the FULLY
+    // qualified row won the lookup.
+    assert_eq!(
+        upstream["ahead"], 1,
+        "status must use the fully-qualified row's tip, not the legacy short row"
+    );
+    assert_eq!(upstream["behind"], 0);
+}
+
+fn load_parent_commit_oid(commit: &ObjectHash) -> String {
+    use libra::utils::object_ext::CommitExt;
+    let loaded = Commit::try_load(commit).expect("load head commit");
+    let parent = loaded
+        .parent_commit_ids
+        .first()
+        .copied()
+        .expect("head commit should have a parent");
+    parent.to_string()
 }
 
 // ---------------------------------------------------------------------------

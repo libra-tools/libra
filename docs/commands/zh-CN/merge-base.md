@@ -18,6 +18,8 @@ libra merge-base --is-ancestor <commit> <commit>
 
 每个 `<commit>` 可为分支、tag、`HEAD` 或对象 id。
 
+查找过程从两个提交同时向下染色，走一个按 committer date 排序的优先队列（与 Git 的 `paint_down_to_common` 同构）：一次带着两侧标记的合并遍历，取代「每侧一次全量遍历 + 每个共同祖先各一次」。commit 在拿到另一侧标记时会被再次访问，因此「一次遍历」指的是对图的一趟，而不是每个 commit 只访问一次。结果不变——committer date 只决定访问顺序，日期乱序或全部相同的历史给出的 base 完全一致。
+
 ## 选项
 
 | 选项 | 说明 | 示例 |
@@ -55,4 +57,4 @@ libra diff main...feature
 | 所有 merge base | `libra merge-base --all a b` | `git merge-base --all a b` |
 | 祖先测试 | `libra merge-base --is-ancestor a b` | `git merge-base --is-ancestor a b` |
 
-延后（暂未公开）：多于两个提交，以及 `--octopus` / `--independent` / `--fork-point`。（`log` / `rebase` 内部仍用各自的 first-found 遍历；把它们迁移到该共享 LCA 是已记录的后续项。）
+延后（暂未公开）：多于两个提交，以及 `--octopus` / `--independent` / `--fork-point`。`merge`、`rebase`、`am` 与 `diff A...B` 均经该共享 LCA 计算；只剩 `log A...B` 仍有自己的可达集实现，其迁移是已记录的后续项。

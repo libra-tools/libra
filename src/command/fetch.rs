@@ -496,6 +496,12 @@ fn load_repo_id_sync() -> Option<String> {
 /// Precedence:
 /// 1) `LIBRA_SSH_STRICT_HOST_KEY_CHECKING`
 /// 2) repo config `ssh.strictHostKeyChecking`
+///
+/// When unset, the `SshClient` default (`ask`) applies: no
+/// `StrictHostKeyChecking` option is passed to `ssh`, so the user's
+/// `~/.ssh/config` governs and OpenSSH runs its interactive trust prompt on
+/// first connection (TOFU) — matching Git's transport behavior. Supported
+/// values: `ask`, `yes`, `accept-new`, `no`.
 fn load_ssh_host_key_checking_mode() -> Option<String> {
     if let Ok(raw) = std::env::var("LIBRA_SSH_STRICT_HOST_KEY_CHECKING") {
         let mode = raw.trim();

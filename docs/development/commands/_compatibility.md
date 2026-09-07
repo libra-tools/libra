@@ -91,7 +91,7 @@ unsupported 子面。
 |---|---|---|---|
 | 命令接入治理 | `gc`、`package`、`prune`、`stats` 的开发文档或源码文件存在，但用户可见 CLI 与 `COMPATIBILITY.md` 未公开。 | `for-each-ref`、`ls-files`、`ls-tree`、`archive` 和 `notes` 已在 `src/cli.rs::Commands`、`COMPATIBILITY.md` 和命令开发文档中公开，不能再列为未公开命令。其余命令仍需按当前 CLI surface 核对是否返回 `LBR-CLI-001` 或应降级为内部资料。 | 作为全局未收口项保留；后续必须二选一：接入 CLI 并同步 `COMPATIBILITY.md`、命令文档和集成场景，或把对应命令文档降级为内部/历史资料。 |
 | 兼容证据治理 | 参数级缺口不能只停留在文字说明；需要在命令开发文档、用户文档和 compat/integration 测试之间闭环。 | 删除独立参数 YAML 后，不再存在 `test_evidence`/`last_verified` 字段；证据必须落到具体测试、脚本或 D 编号说明中。 | 不允许把未验证参数当作完成承诺；新增兼容项时补测试证据，或把状态改为拒绝、延后、有意差异并给出 D 编号。 |
-| 拒绝/延后决策 | submodule family、本地 file remote push、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、empty commit message、跨网/foreign-Git/push 侧 notes travel、依赖过滤克隆的工作树磁盘收窄。（clean pathspec 的共享 magic 已随 PD-07 落地，D-clean-pathspec 于 2026-08-08 收口，不再是活跃延后项。） | 对应 D1-D10、D15、D16、D17、D18、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
+| 拒绝/延后决策 | submodule family（含三路合并中的 gitlink 内容合并，D24）、本地 file remote push、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、empty commit message、跨网/foreign-Git/push 侧 notes travel、依赖过滤克隆的工作树磁盘收窄。（clean pathspec 的共享 magic 已随 PD-07 落地，D-clean-pathspec 于 2026-08-08 收口，不再是活跃延后项。） | 对应 D1-D10、D15、D16、D17、D18、D24、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
 | staging/worktree Git surface | `add --intent-to-add`、`clean -i`、`checkout -p` 以及跨命令 patch mode。（`clean <pathspec>` 已随 PD-07 经共享 `PathspecSet` 落地；`reset --merge/--keep` 与 `restore --overlay`/`--ours`/`--theirs`/`--merge`/`--conflict` 已实现；`restore --progress` 是全局 `--progress` 冲突，DEAD。） | `mv -k` / `--skip-errors` 已实现，`mv --sparse` 与 `rm --sparse` 均已作为 no-op 暴露；`add`、`clean` 的参数结构仍未暴露这些剩余 flag；patch mode 由 D15 拒绝；`switch --detach` 已实现，不能再把 detached HEAD 作为全局缺口。 | 作为命令级 Git 兼容缺口保留；实现时同步命令文档、`COMPATIBILITY.md` 和 integration scenarios。 |
 | commit/rewrite/sequencer | `commit --allow-empty-message`、`rebase -i/--edit-todo/--rebase-merges/--empty=stop|ask`、sequencer strategy 扩展。 | `CommitArgs` 已公开并实现 identity/date/message-source、fixup/squash/cleanup/editor/verbose/porcelain/status/template/trailer 等常用面；`--allow-empty-message` 仍由 D-empty-message 拒绝。`RebaseArgs` 已支持 `--onto`、autosquash、reapply-cherry-picks、empty controls，以及 P1-07a 的 `--autostash`、可重复且 required-sandbox 的 `--exec`、captured-tip/checked-out-safe 的 `--update-refs`、reflog `--fork-point`（均含负向 toggle）；这些不能再列为缺口。`cherry-pick` / `revert` 已有完整非交互 sequencer 基础。注意 `pull --rebase` 已实现。 | 仅保留 interactive/todo/rebase-merges/halt-on-empty 与其余 sequencer strategy 缺口；不能把已实现的 rebase non-interactive controls 或 commit 常用面当作缺失。 |
 | merge/pull strategy surface | octopus merge、`ours` 以外 strategy、`ours/theirs` 以外 strategy option。 | `MergeArgs` 已实现 P1-07b 的 `-s ours`、重复 last-wins `-X ours/theirs`、`--allow-unrelated-histories`、`--log[=<n>]`/`--no-log`，以及既有 merge flags；`PullArgs` 不暴露这些 merge-only controls。 | 仅 octopus 和其它 strategy/option 仍为缺口；不能再把已实现的 P1-07b controls 或既有 merge/pull flags 当作缺失。 |
@@ -247,6 +247,19 @@ unsupported 子面。
 - 原因：上游这类测试依赖预置 keyring 与可启动的 `gpg-agent`；Libra 的签名模型走 vault（`vault.signing`、`~/.libra/vault-unseal-key`），与 Git 的外部 keyring 互操作本身已是独立议题（见 `plan-long.md`「不进入本长期 Top 10 的兼容增强」中的 GPG 外部 keyring 互操作项）。以 pinned 语料复算，23 个上游文件命中。
 - 测试证据：同 `D21`；Libra 侧的签名行为由既有 commit/tag 测试覆盖，不依赖上游 fixture。
 - 重启条件：Git GPG 外部 keyring 互操作从「兼容增强清单」升入排期后，连同本条一并重启。
+
+### D24：三路合并中的 gitlink（submodule）内容合并
+
+- 状态：**拒绝（永久非目标）**（2026-09-04，plan-20260903 ADR-MG-01 裁定）。`merge` / `rebase` / `cherry-pick` 的三路合并不解析、不合并 `160000` gitlink 指向的 submodule 内容，与 D1（`submodule` 子命令族）同一产品边界。
+- 语义分两档（fail-closed 安全默认值）：① **裁决触及**的 gitlink——任一侧的 object id 与 merge base 不同（含单侧新增/删除）——在写入任何内容之前拒绝，错误码 `LBR-UNSUPPORTED-001`，消息含路径；② 三侧一致的 gitlink 原样带入结果树（不产生任何合并决策）。三个消费者共用 `command::merge::ensure_gitlinks_not_arbitrated` 一个校验入口。
+- 原因：此前三处 tree 拍平静默丢弃 gitlink（`merge.rs` / `rebase.rs` / `cherry_pick.rs`），会产出「submodule 被悄悄删掉」的错误合并结果；而「任一输入含 gitlink 即全拒」又会误伤三侧一致这种无需决策的场景。
+- 测试证据：`cargo test --test command_test command::merge_test::merge_gitlink`（三消费者的拒绝与放行）、`cargo test --lib merge::` 中的 `ensure_gitlinks_not_arbitrated_*` 单测。
+- **已登记残留（同属本条拒绝范围，2026-09-04 逐条评审后确认不修）**：这三项都要求 Libra 真正管理 submodule 工作树内容（即 D1/D24 拒绝的能力本身），且都**先于**本次改动存在、也未被本次改动变得可达——
+  ① 目标树把指针替换成真实目录时，`restore` 会把 `vendor/inner.txt` 之类的文件写进已检出的 submodule 里（规则匹配的是指针路径**本身**，不含其下路径）；
+  ② `reset --hard` 的全局空目录清理会删掉 Libra 自己建的空 gitlink 占位目录，递归恢复同样可能写入现有 submodule 目录之下；
+  ③ `restore --ours/--theirs` 在所选冲突 stage 缺失时会删除工作树路径，而 Libra 的 merge 从不产生 gitlink 冲突 stage（只有外部/手工构造的 unmerged index 才到得了）。
+  修这三项等于实现 submodule 内容管理，与 D1 同一条边界；重启条件同下。
+- 重启条件：与 D1 相同——产品边界改变、决定支持 submodule 时一并重启。
 
 ## 维护要求
 

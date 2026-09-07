@@ -15,9 +15,30 @@ libra merge --restart
 
 `libra merge <branch>` 会解析本地分支、提交哈希，或 `refs/remotes/origin/main` 这样的远程跟踪引用。
 
-如果当前分支可以快进，Libra 会将分支指针移动到目标提交，并恢复索引和工作树。如果分支已经分叉，Libra 会使用 merge base 执行单头三方合并。
+如果当前分支可以快进，Libra 会将分支指针移动到目标提交，并恢复索引和工作树。如果分支已经分叉，Libra 会使用 merge base 执行单头三方合并；当历史留下不止一个 merge base 时，改用由它们递归折叠出的虚拟祖先（见下文）。
 
 默认三方策略支持 `-X ours` / `-X theirs`：只在冲突 hunk/路径选择指定一侧，双方无冲突变更仍全部保留。它不同于 `-s ours`；后者会创建双父 merge commit（目标已经是当前分支祖先时除外），但完整保留当前 HEAD tree。其它 strategy/strategy option 会在参数解析阶段拒绝。
+
+### 交叉合并历史（多个 merge base）
+
+两条互相合并过的分支会留下**多个** merge base，彼此之间没有谁更好。任取其一会报出历史本可解释的冲突，因此 Libra 按 Git recursive 策略折叠它们：
+
+1. merge base 按 object id 升序排序，从左到右两两折叠，每次折叠本身又是一次三方合并（递归地拥有自己的 merge base）。
+2. 折叠出的单一 tree —— **虚拟祖先** —— 作为真实合并的 base。
+
+折叠内部的判定与真实合并不同，这一点与 Git 一致：
+
+- `-X ours` / `-X theirs` **不生效**：虚拟祖先是合成输入，用户并未要求对它偏袒。
+- 内容冲突不上抛，而是**作为内容**记录下来；冲突标记每递归一层加宽两个字符，使嵌套冲突绝不会被误读成外层合并产生的冲突。
+- change/delete 保留 base 版本——「已修改」与「已删除」之间没有中点。
+- 二进制内容（与 Git 判据一致：前 8000 字节含 NUL，或单个输入超过 1023 MiB）不做行级合并：祖先取 base 的内容；无 base 时取空 blob。
+- 符号链接，以及两侧**类型不同**的条目，一律保留 base 版本；无 base 时该路径在祖先中直接不存在。
+- 结果 mode 遵循 Git 规则：两侧一致或 ours 未改时取对侧 mode，否则取 ours。
+- 嵌套超过 20 层，或同一层要折叠超过 32 个 merge base 时——在加载任何 base 之前先按裸 id 计数，折叠过程中再按收集到的候选祖先计数——报 `LBR-UNSUPPORTED-001` 拒绝而不是继续（折叠的工作量随宽度平方增长；交叉合并只有两个）。`-s ours` 与 `--ff-only` 从不折叠，也从不因宽度被拒（分叉的 `--ff-only` 一如既往以 non-fast-forward 拒绝）。
+
+合成 commit 的 parents 是**到目前为止折叠过的全部真实 merge base**（Git 每折叠一步串一个双父虚拟提交）；可达历史相同，object id 不同。虚拟祖先的 tree 与合成 commit 会作为普通 loose object 写入，但它们是**一次性对象**：有意不写入 merge state，因而不是 GC root。`libra maintenance run --task gc` 随时可以回收它们（包括冲突合并仍在进行时）——没有任何东西依赖它们存活，`libra merge --restart` 会从真实 merge base 重新算出同一个祖先。因此 `merge-state.json` 只在 merge base 是单个真实提交时才记录 `base`。
+
+`libra merge --dry-run` 预演交叉合并遵循与其它预演相同的契约——不写对象库、索引、工作树、HEAD、reflog、merge 状态与 autostash sidecar：折叠把 blob 留在内存里，不落任何虚拟 tree 或 commit。（该契约**不**覆盖 CLI 在任何命令运行之前做的仓库级例行维护，例如打开数据库时的 schema 自动升级；见 `docs/development/commands/merge.md`。）
 
 没有共同祖先的历史默认仍被拒绝。显式传入 `--allow-unrelated-histories` 时，Libra 使用虚拟空 merge base：不相交的 root tree 正常合并，重叠新增正常冲突，且 conflict state 可跨 `--continue` / `--abort` / `--restart` 恢复，不会写入伪造的 base object。
 
@@ -25,17 +46,63 @@ libra merge --restart
 
 ### 冲突标记风格（`merge.conflictStyle`）
 
-标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；二进制与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
+标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；二进制与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
+
+### 目录/文件冲突（D/F 冲突）
+
+一侧保留（或修改）**文件** `foo`、另一侧把 `foo` 变成**目录**（删除文件并在 `foo/` 下新增路径）时，两者无法共用一个路径。Libra 遵循 Git recursive 策略（`merge-ort.c` 的 `unique_path`）：目录保留 `foo`，文件按持有它的分支写到唯一名字下——文件在我方时为 `foo~HEAD`，在对方时为 `foo~<branch>`（分支名中的 `/` 替换为 `_`）；该名字已被本次合并的任一输入或其结果占用——无论占用者是文件还是目录，仅 merge base 有过的路径也算，与 Git `unique_path` 检查的集合一致——时追加 `_0`、`_1`……。合并以冲突停止（`LBR-CONFLICT-002`），并先打印 Git 的提示行：
+
+```text
+CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD instead.
+```
+
+被移走的文件就是未合并路径：索引在新名字下记录文件所在侧的 stage 2（我方）或 stage 3（对方），若 merge base 在 `foo` 处跟踪的是文件则再记 stage 1；没有 stage 0 条目，`merge-state.json` 的 `conflicted_paths` 列出的是新名字。目录内容照常合并。与 Git 相同有两种形态：仅一侧*新增*的文件是纯粹的 file/directory 冲突——原样写到新名字，`--dry-run` 报为 `file-directory`；merge base 已跟踪、且文件侧*修改过*的文件是一个只是换了位置的 modify/delete 冲突——新名字下带 base（stage 1）与修改侧，`--dry-run` 报为 `modify-delete` 并附 `original_path`，同时打印 Git 的第二行（`CONFLICT (modify/delete): foo~HEAD deleted in <branch> and modified in HEAD.  Version HEAD of foo~HEAD left in tree.`），文件按该行所说原样留在新名字下。一侧未动、另一侧换成目录的文件则是普通的干净删除：无冲突、无提示。只含*空* tree 的目录仅在 merge base 在该路径上什么都没有时才算挡路——Git 会把这样的新目录原样采纳；base 已有该路径时 Git 会遍历该目录、发现没有文件，于是文件留在原地（普通 modify/delete）。两种情形均与 `git merge` 对人工构造 tree 的实测一致。`--json`/`--machine` 下不打印这些提示：stdout 保持机器可读，冲突由 stderr 上的错误信封承载。策略选项（`-X ours` / `-X theirs`）只裁决内容 hunk：目录之下的 modify/delete 仍是冲突，与 Git 一致。合并绝不*穿过*工作树里的符号链接写入或删除——被忽略的 `foo -> 别处` 挡在要写的 `foo/…` 前面、或压在合并要删除的已跟踪文件之上时，整个合并在任何改动前被拒绝；恰好占着移位文件名字的符号链接则被文件替换，而*已跟踪*的符号链接 `foo` 让位给目录 `foo/` 时像普通文件一样移到 `foo~HEAD`。只有当前已跟踪的路径才会被删除：碰巧沿用历史名字的未跟踪文件会留下。若要保留被移走的文件，编辑它、用 `libra add foo~…` 暂存后 `libra merge --continue`；或运行 `libra merge --abort`：它把 `foo` 恢复为合并前的样子，并同时移除被移走的副本与合并创建的目录（合并腾空的目录会被清理，嵌套的 `foo/a/` 不会挡住文件回位）。目前无法「丢弃」被移走的文件：`libra rm` 不接受未合并路径，只能用 `--abort` 得到不含该文件的结果（Git 用 `git rm foo~HEAD` 解决这一情形）。
+
+合并后**空无一物**的目录（其下每个条目都被文件侧删除、另一侧未动）不算挡路：文件留在原路径，与 Git 一致。递归的交叉合并折叠（见上）内部同样适用该规则且不询问用户：文件在虚拟祖先中移到 `foo~Temporary merge branch 1`（或 `2`），与 Git 在 `call_depth > 0` 时完全一致，因此祖先 tree 永远不会在同一名字下同时持有 blob 与子树。
+
+此处只处理两侧**已跟踪**内容之间的冲突。工作树里会被合并覆盖的**未跟踪** `foo` 或 `foo~HEAD` 由既有的 untracked-overwrite 检查预先拒绝；**被忽略**的文件一律视为可弃并被替换——无论它占着这些名字，还是挡在合并要创建的目录位置上（会被替换成目录）；与 `git merge` 的处理完全一致，因此不要把重要内容放在会被合并写入的被忽略路径上。改名已会被检测（见下文「重命名」），但由改名*引发*的碰撞——改名目标正是挡路的目录，或该目录里的文件是改名源——目前仍按普通的「一删一增」处理。
+
+### 子模块（`160000` gitlink 条目）
+
+Libra 定位 monorepo 客户端，永不合并 submodule 内容。三路合并对 gitlink 分两档处理：
+
+- **合并需要对该 gitlink 做裁决**——任一侧记录的 commit id 与 merge base 不同（包括某一侧新增或删除该条目）。合并在**写入任何内容之前**被拒绝（不写 merge state、不动索引与工作树、HEAD 不移动），错误码 `LBR-UNSUPPORTED-001`，消息包含路径：
+
+  ```
+  error: merge would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules
+  ```
+
+  请在 Libra 之外解决 submodule 指针，或从参与合并的分支中移除该 gitlink 条目。
+
+- **三侧记录的 commit id 完全一致**——没有任何决策要做，指针原样写入合并结果。（此前这类条目会被静默丢弃，等于把 submodule 从合并结果树里删掉。）
+
+`libra rebase` 与 `libra cherry-pick` 共用同一道校验与同一措辞，仅把 `merge` 换成 `rebase` / `cherry-pick`。
 
 Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`theirs` 以外的 strategy option，或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
 
+### 重命名
+
+一侧改名、另一侧原地修改同一个文件时，合并把它们当作同一个文件：Libra 对合并的每一侧各跑一次重命名检测（base→ours 与 base→theirs，与 `diff`/`status` 同一套引擎），另一侧的修改会跟随文件落到新路径。冲突同样呈现在新路径上，stage 1 记录 merge base 在*原*路径上的内容。
+
+`merge.renames` 可关闭检测（回退到 `diff.renames`；设为 `false` 时改名重新表现为一删一增），`merge.renameLimit` 限制每侧参与昂贵相似度阶段的新增/删除路径数（回退到 `diff.renameLimit`，默认 **7000**）。`0` 及任何负数都表示「用默认值」而非「不限」。Git 对它真正支持的取值（`0` 与它自己的「未设置」哨兵 `-1`）行为相同，但**小于 `-1` 的值会触发 Git 内部断言并让进程 abort**；Libra 有意不复刻这一崩溃，而是把所有非正值都当作默认值接受。只有非整数才是错误。超限时合并照常完成：精确改名仍会配对，并打印一条 notice 说明其余部分被跳过。Libra 的超限判据是**逐侧**的——任一侧超过阈值即跳过昂贵阶段；Git 则按整个矩阵判断，并且只统计本次合并真正需要的源，因此在某些形态下 Git 仍会继续检测而 Libra 已经停下。
+
+两个键都按**严格**方式读取：无法解析的值会在写入任何东西之前让合并失败——也早于 `--autostash` 保存你的改动。该检查的触发时机与 Git 解析这两个键的时机完全一致：快进、already-up-to-date、`-s ours`，以及**可快进**历史上的 `--squash` / `--no-commit` 都不受该值影响而正常成功；同一历史加 `--no-ff` 则是真合并，会失败。
+
+改名是把同一样东西换个名字，因此两端必须是**同类**条目。如果对侧把原路径上的文件换成了符号链接，对改名而言那就是一次删除，合并按删除处理，而不会把链接搬到新路径上。
+
+「目标被占用」只看**合并后仍然存在**的内容：merge base 有、但两侧都删掉的路径不算占用；对侧只是原样承接自 base 的路径同样不算——改名侧必然已经清空了目标之下的内容，这些路径会被合并删掉。两种情形改名都照常成立，`git merge` 亦然。真正挡路的是对侧在那里**新增或修改**过的内容：它会以自身条目或冲突的形式幸存下来。
+
+改名目标嵌在该文件*原路径之下*（`old` 改名为 `old/new`）并不构成冲突：改名本身就腾出了这个名字，因此改名成立，另一侧的修改跟随文件落到 `old/new`。`git merge` 与 `git merge-tree --messages` 对该形态同样干净合并，不打印 `CONFLICT (file/directory)`。
+
+Libra 尚未裁决的形态会打印 notice 并按「未检测到改名」合并——两侧都改名（改到同一路径或不同路径）、改名源被对侧删除、改名目标已被其它侧占用。目录级改名完全不推断。这些情形在结果里就是普通的删除与新增。
+
 ### 会改变历史的 merge 默认值
 
-未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。解析后的消息会记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前以 `LBR-CLI-002` 或 `LBR-IO-001` 失败；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
+未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。解析后的消息会记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
 
 ### `--dry-run`（Libra 扩展）
 
-`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，脏工作树也可预演（注意预演不校验工作树干净度，真实合并仍可能拒绝）。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`），真实合并的输出不含这两个键（schema 冻结）。
+`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，脏工作树也可预演（注意预演不校验工作树干净度，真实合并仍可能拒绝）。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`、`conflicted_paths` 与 `conflict_kinds`——每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content` / `modify-delete` / `file-directory`，`original_path` 仅目录/文件移位时出现并记录原路径，此时 `path` 是文件将被写到的带 `~` 后缀的名字），真实合并的输出不含这些键（schema 冻结）。
 
 ### `--restart`（Libra 扩展，移植 Lore `branch merge restart`）
 
@@ -175,7 +242,7 @@ Merge aborted.
 
 `-s ours` 使用 `strategy: "ours"`、`files_changed: 0` 并报告两个 parent。已经最新的合并使用 `strategy: "already-up-to-date"`、`commit: null`、`files_changed: 0` 和 `up_to_date: true`。
 
-`--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。
+`--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。 `--dry-run` 额外带 `dry_run`、`would_conflict`、`conflicted_paths` 与 `conflict_kinds`（每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content`、`modify-delete` 或 `file-directory`；`original_path` 仅在目录/文件移位时出现，记录文件原来的路径，此时 `path` 与 `conflicted_paths` 里都是带 `~` 后缀的目标名）。
 
 ## 参数对比：Libra vs Git vs jj
 
@@ -184,6 +251,7 @@ Merge aborted.
 | 分支目标 | `<branch>`（单个目标） | `<commit>...`（一个或多个） | N/A（使用 `jj new`） |
 | 快进 | 支持 | 支持 | N/A |
 | 单头三方合并 | 支持 | 支持 | N/A |
+| 交叉合并（多个 merge base） | 递归虚拟祖先（折叠顺序：object id 升序；最大深度 20，每层最多 32 个 base） | 递归虚拟祖先（`-s recursive`/`ort`，深度无上限） | N/A |
 | Continue / abort | `--continue`, `--abort` | `--continue`, `--abort` | N/A |
 | Octopus merge | 不支持 | 支持 | N/A |
 | 仅快进 | `--ff-only` | `--ff-only` | N/A |
@@ -214,6 +282,8 @@ Merge aborted.
 | 无法解析目标引用 | `LBR-CLI-003` | 129 |
 | 无法加载合并目标/当前提交/树 | `LBR-REPO-002` | 128 |
 | 未传 `--allow-unrelated-histories` 的无关历史 | `LBR-REPO-003` | 128 |
+| 三路合并需要裁决 `160000` gitlink（submodule） | `LBR-UNSUPPORTED-001` | 128 |
+| 递归虚拟祖先嵌套超过 20 层或同层超过 32 个 base | `LBR-UNSUPPORTED-001` | 128 |
 | 不支持的 `-s` / `-X` 值或不兼容的 strategy 组合 | `LBR-CLI-002` | 129 |
 | `--verify-signatures`：tip 未签名、签名无效或 vault 不可用 | `LBR-REPO-003` | 128 |
 | 合并冲突 | `LBR-CONFLICT-002` | 128 |

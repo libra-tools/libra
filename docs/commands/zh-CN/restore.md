@@ -234,5 +234,6 @@ Git 的 `restore` 默认为仅恢复工作树，并要求 `--staged` 才能以�
 | `LBR-IO-002` | 无法写入工作树文件 |
 | `LBR-NET-001` | LFS 下载失败 |
 | `LBR-CONFLICT-001` | 路径未合并且未给出冲突解决标志，或 `--ours`/`--theirs` 请求了不存在的冲突阶段（退出码 128） |
+| `LBR-CONFLICT-002` | 恢复会替换非空的已 materialize gitlink 目录，或会删除/覆盖 `160000` submodule 路径上并非 Libra 写入的内容——该路径上的两个方向都拒绝，除非索引把它记为普通 tracked 内容（可恢复）（退出码 128） |
 
 > `--ours` 与 `--theirs` 彼此互斥，并与 `--source`、`--staged`、`--ignore-unmerged` 互斥；任一此类组合会以 `LBR-CLI-002`、退出码 129 被拒绝。（`--source`、`--staged`、`--ignore-unmerged` 之间可以组合——例如 `--ignore-unmerged --source HEAD`。）

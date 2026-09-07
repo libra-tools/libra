@@ -5018,6 +5018,13 @@ fn get_worktree_mode(workdir_path: &std::path::Path) -> u32 {
     }
 }
 
+/// Whether `path` is recorded at stage 0 of `index` as a `160000` gitlink.
+fn is_gitlink_index_entry(index: &Index, path: &str) -> bool {
+    index
+        .get(path, 0)
+        .is_some_and(|entry| is_submodule_mode(entry.mode))
+}
+
 fn is_submodule_mode(mode: u32) -> bool {
     mode == 0o160000
 }
@@ -6177,9 +6184,22 @@ async fn resolve_upstream_info(
     let merge_branch = &branch_config.merge;
     let remote_ref_display = format!("{remote}/{merge_branch}");
 
-    let tracking_branch = Branch::find_branch_result(merge_branch, Some(remote))
+    // Tracking refs are stored under their fully-qualified
+    // `refs/remotes/<remote>/<branch>` name (clone/fetch/push writers), so the
+    // lookup must use that name — a short-name query never matches and made
+    // every fresh clone report "upstream is gone" (#464). The short-name probe
+    // is kept as a fallback for repositories written before the
+    // fully-qualified convention.
+    let tracking_full_ref = format!("refs/remotes/{remote}/{merge_branch}");
+    let tracking_branch = Branch::find_branch_result(&tracking_full_ref, Some(remote))
         .await
         .map_err(|error| status_branch_store_error("resolve upstream branch", error))?;
+    let tracking_branch = match tracking_branch {
+        Some(branch) => Some(branch),
+        None => Branch::find_branch_result(merge_branch, Some(remote))
+            .await
+            .map_err(|error| status_branch_store_error("resolve upstream branch", error))?,
+    };
 
     let tracking_commit = match tracking_branch {
         Some(b) => b.commit,
@@ -6563,6 +6583,32 @@ fn changes_to_be_staged_split_force_with_index(
         let Some(file_str) = file.to_str() else {
             continue;
         };
+        // Gitlinks have no working-tree blob to compare (see
+        // `changes_to_be_staged_split_with_index`).
+        if is_gitlink_index_entry(index, file_str) {
+            match workdir.join(file).symlink_metadata() {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    continue;
+                }
+                // Absent is the normal shape: Libra never checks a submodule out.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                // A plain file or symlink is neither shape, so it stays visible.
+                Ok(_) => {
+                    visible.modified.push(file.clone());
+                    continue;
+                }
+                // Anything else is a real worktree read failure: fall through to
+                // the ordinary handling below rather than reporting clean.
+                Err(_) => {}
+            }
+        }
         let file_abs = workdir.join(file);
         if file_abs.symlink_metadata().is_err() {
             visible.deleted.push(file.clone());
@@ -6624,6 +6670,40 @@ fn changes_to_be_staged_split_with_index(
         let Some(file_str) = file.to_str() else {
             continue;
         };
+        // A `160000` gitlink names a SUBMODULE commit, not a blob of this
+        // repository. Comparing one against the working tree as a file reports
+        // every submodule as deleted — or, when the directory exists, fails the
+        // whole status trying to hash a directory — and that verdict feeds
+        // `ensure_clean_status`, so it would block `switch`/`merge`/`rebase` in
+        // any repository that merely CONTAINS a submodule. Submodule content is
+        // out of scope (ADR-MG-01), so the two shapes Libra expects — absent
+        // (never materialized) and a directory (checked out by the user) — are
+        // left alone. A plain file or symlink there is neither, and stays
+        // visible as a modification rather than being silently ignored.
+        if is_gitlink_index_entry(index, file_str) {
+            match workdir.join(file).symlink_metadata() {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    continue;
+                }
+                // Absent is the normal shape: Libra never checks a submodule out.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                // A plain file or symlink is neither shape, so it stays visible.
+                Ok(_) => {
+                    visible.modified.push(file.clone());
+                    continue;
+                }
+                // Anything else is a real worktree read failure: fall through to
+                // the ordinary handling below rather than reporting clean.
+                Err(_) => {}
+            }
+        }
         let file_abs = workdir.join(file);
         if file_abs.symlink_metadata().is_err() {
             visible.deleted.push(file.clone());

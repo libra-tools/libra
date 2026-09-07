@@ -1108,6 +1108,314 @@ fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
 #[cfg(unix)]
 #[test]
 #[serial(env)]
+fn test_push_delete_short_name_resolves_tags_and_errors_on_missing() {
+    // Issue #465 regression: `push --delete <short-name>` must resolve the
+    // name against the remote's advertised refs (heads, then tags) instead of
+    // hardcoding refs/heads/, must delete an advertised tag, and must FAIL —
+    // not report Everything up-to-date — when the ref does not exist remotely.
+    let temp_root = tempfile::tempdir().expect("failed to create temp root");
+    let remote_dir = temp_root.path().join("remote.git");
+    let local_dir = temp_root.path().join("local");
+    let ssh_script = create_fake_ssh_script(temp_root.path());
+
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("failed to init bare remote")
+            .success()
+    );
+
+    init_local_repo_with_commit(
+        &local_dir,
+        "tracked.txt",
+        "initial content",
+        "initial commit",
+    );
+    add_fake_ssh_remote(&local_dir, &remote_dir);
+
+    // Publish the branch so the remote advertises refs/heads/<current>, then
+    // create and push a tag.
+    let current_branch = current_branch_name(&local_dir);
+    let initial_push = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args(["push", "origin", &current_branch])
+        .output()
+        .expect("failed to push initial branch");
+    assert!(
+        initial_push.status.success(),
+        "initial push failed: {}",
+        String::from_utf8_lossy(&initial_push.stderr)
+    );
+
+    let tag_out = libra_command(&local_dir)
+        .args(["tag", "v1.0"])
+        .output()
+        .expect("failed to create local tag");
+    assert!(
+        tag_out.status.success(),
+        "tag create failed: {}",
+        String::from_utf8_lossy(&tag_out.stderr)
+    );
+    let push_tag_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args(["--json", "push", "origin", "v1.0"])
+        .output()
+        .expect("failed to push tag");
+    assert!(
+        push_tag_out.status.success(),
+        "tag push failed: {}",
+        String::from_utf8_lossy(&push_tag_out.stderr)
+    );
+    assert!(
+        git_ref_exists(&remote_dir, "refs/tags/v1.0"),
+        "remote tag should exist before the delete"
+    );
+
+    // Dry-run delete reports the deletion plan without touching the remote.
+    let dry_run_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args(["--json", "push", "--dry-run", "--delete", "origin", "v1.0"])
+        .output()
+        .expect("failed to dry-run delete tag");
+    assert!(
+        dry_run_out.status.success(),
+        "dry-run delete of an advertised tag should succeed: {}",
+        String::from_utf8_lossy(&dry_run_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&dry_run_out.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("dry-run delete should emit valid JSON, got: {stdout}\nerror: {e}")
+    });
+    assert_eq!(json["data"]["dry_run"], true);
+    assert_eq!(json["data"]["updates"][0]["kind"], "delete");
+    assert_eq!(json["data"]["updates"][0]["remote_ref"], "refs/tags/v1.0");
+    assert!(
+        git_ref_exists(&remote_dir, "refs/tags/v1.0"),
+        "dry-run delete must not remove the remote tag"
+    );
+
+    // THE regression: short-name delete removes the remote TAG.
+    let delete_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args(["--json", "push", "--delete", "origin", "v1.0"])
+        .output()
+        .expect("failed to delete remote tag by short name");
+    assert!(
+        delete_out.status.success(),
+        "short-name delete of an advertised tag failed: {}",
+        String::from_utf8_lossy(&delete_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&delete_out.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("delete push should emit valid JSON, got: {stdout}\nerror: {e}")
+    });
+    assert_eq!(json["data"]["updates"][0]["kind"], "delete");
+    assert_eq!(
+        json["data"]["updates"][0]["remote_ref"], "refs/tags/v1.0",
+        "short name must resolve to the advertised TAG namespace"
+    );
+    assert!(
+        !git_ref_exists(&remote_dir, "refs/tags/v1.0"),
+        "remote tag should be gone after the short-name delete"
+    );
+
+    // A short name matching nothing the remote advertises now FAILS (exit
+    // 129, LBR-CLI-003) instead of printing Everything up-to-date with exit 0.
+    let missing_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args([
+            "--json",
+            "push",
+            "--delete",
+            "origin",
+            "zz-nonexistent-probe",
+        ])
+        .output()
+        .expect("failed to attempt missing-ref delete");
+    assert!(
+        !missing_out.status.success(),
+        "deleting an unadvertised ref must fail"
+    );
+    assert_eq!(
+        missing_out.status.code(),
+        Some(129),
+        "unadvertised delete should exit 129"
+    );
+    let (_stderr, report) = parse_cli_error_stderr(&missing_out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert_eq!(report.exit_code, 129);
+    assert!(
+        report
+            .message
+            .contains("unable to delete 'zz-nonexistent-probe'"),
+        "error must name the ref as typed: {report:?}"
+    );
+
+    // Dry-run surfaces the same error before sending anything.
+    let dry_missing_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args([
+            "--json",
+            "push",
+            "--dry-run",
+            "--delete",
+            "origin",
+            "zz-nonexistent-probe",
+        ])
+        .output()
+        .expect("failed to attempt missing-ref dry-run delete");
+    assert!(
+        !dry_missing_out.status.success(),
+        "dry-run delete of an unadvertised ref must fail too"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial(env)]
+fn test_push_delete_short_name_ambiguous_refused() {
+    // A short delete name matching BOTH refs/heads/<name> and refs/tags/<name>
+    // on the remote is refused (git: "dst refspec matches more than one").
+    let temp_root = tempfile::tempdir().expect("failed to create temp root");
+    let remote_dir = temp_root.path().join("remote.git");
+    let local_dir = temp_root.path().join("local");
+    let ssh_script = create_fake_ssh_script(temp_root.path());
+
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("failed to init bare remote")
+            .success()
+    );
+
+    init_local_repo_with_commit(
+        &local_dir,
+        "tracked.txt",
+        "initial content",
+        "initial commit",
+    );
+    add_fake_ssh_remote(&local_dir, &remote_dir);
+    let current_branch = current_branch_name(&local_dir);
+
+    let push_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args(["--json", "push", "origin", &current_branch])
+        .output()
+        .expect("failed to push branch");
+    assert!(
+        push_out.status.success(),
+        "branch push failed: {}",
+        String::from_utf8_lossy(&push_out.stderr)
+    );
+
+    let tag_out = libra_command(&local_dir)
+        .args(["tag", &current_branch])
+        .output()
+        .expect("failed to create same-named tag");
+    assert!(
+        tag_out.status.success(),
+        "tag create failed: {}",
+        String::from_utf8_lossy(&tag_out.stderr)
+    );
+    // The short `push origin <name>` form is ambiguous once a same-named tag
+    // exists, so publish the tag through its fully-qualified refspec.
+    let push_tag_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args([
+            "--json",
+            "push",
+            "origin",
+            &format!("refs/tags/{current_branch}"),
+        ])
+        .output()
+        .expect("failed to push same-named tag");
+    assert!(
+        push_tag_out.status.success(),
+        "tag push failed: {}",
+        String::from_utf8_lossy(&push_tag_out.stderr)
+    );
+    assert!(git_ref_exists(
+        &remote_dir,
+        &format!("refs/heads/{current_branch}")
+    ));
+    assert!(git_ref_exists(
+        &remote_dir,
+        &format!("refs/tags/{current_branch}")
+    ));
+
+    // The ambiguous short name is refused and deletes NOTHING.
+    let ambiguous_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args(["--json", "push", "--delete", "origin", &current_branch])
+        .output()
+        .expect("failed to attempt ambiguous delete");
+    assert!(
+        !ambiguous_out.status.success(),
+        "ambiguous short-name delete must be refused"
+    );
+    // Public error contract (docs/commands/push.md error table): exit 129,
+    // LBR-CLI-003, message naming the ref, and the qualification hint.
+    assert_eq!(
+        ambiguous_out.status.code(),
+        Some(129),
+        "ambiguous delete should exit 129"
+    );
+    let (_amb_stderr, amb_report) = parse_cli_error_stderr(&ambiguous_out.stderr);
+    assert_eq!(amb_report.error_code, "LBR-CLI-003");
+    assert_eq!(amb_report.exit_code, 129);
+    assert!(
+        amb_report.message.contains(&format!(
+            "dst refspec '{current_branch}' matches more than one"
+        )),
+        "unexpected ambiguity message: {amb_report:?}"
+    );
+    assert!(
+        amb_report
+            .hints
+            .iter()
+            .any(|h| h.contains("refs/heads/") && h.contains("refs/tags/")),
+        "ambiguity error must hint at the qualified spellings: {amb_report:?}"
+    );
+    assert!(git_ref_exists(
+        &remote_dir,
+        &format!("refs/heads/{current_branch}")
+    ));
+    assert!(git_ref_exists(
+        &remote_dir,
+        &format!("refs/tags/{current_branch}")
+    ));
+
+    // Fully-qualified spellings remain unambiguous and work.
+    let delete_tag_out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .args([
+            "--json",
+            "push",
+            "origin",
+            &format!(":refs/tags/{current_branch}"),
+        ])
+        .output()
+        .expect("failed to delete qualified tag");
+    assert!(
+        delete_tag_out.status.success(),
+        "qualified tag delete failed: {}",
+        String::from_utf8_lossy(&delete_tag_out.stderr)
+    );
+    assert!(!git_ref_exists(
+        &remote_dir,
+        &format!("refs/tags/{current_branch}")
+    ));
+    assert!(git_ref_exists(
+        &remote_dir,
+        &format!("refs/heads/{current_branch}")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial(env)]
 fn test_push_explicit_tag_refspec_uses_tag_namespace() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -1785,12 +2093,14 @@ async fn test_push_ssh_remote_via_fake_ssh() {
 
     let ssh_log = fs::read_to_string(&log_path).expect("failed to read fake ssh log");
     assert!(
-        ssh_log.contains("StrictHostKeyChecking=yes"),
-        "SSH command should enforce strict host key checking, log:\n{ssh_log}"
+        !ssh_log.contains("StrictHostKeyChecking="),
+        "default must defer host key checking to the user's ssh_config (git parity), \
+         log:\n{ssh_log}"
     );
     assert!(
-        !ssh_log.contains("StrictHostKeyChecking=accept-new"),
-        "SSH command must not use accept-new by default, log:\n{ssh_log}"
+        ssh_log.contains("BatchMode=yes"),
+        "headless runs must enable BatchMode so ssh fails fast instead of prompting, \
+         log:\n{ssh_log}"
     );
 }
 

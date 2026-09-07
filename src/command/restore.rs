@@ -76,6 +76,16 @@ pub enum RestoreError {
     WriteWorktree,
     #[error("refusing to replace non-empty worktree directory '{0}'")]
     NonEmptyWorktreeDirectory(String),
+    /// The working tree holds something at a `160000` submodule path that Libra
+    /// did not write: either an untracked file or symlink where a pointer must
+    /// be materialized as a directory placeholder, or an entry where the index
+    /// already records a pointer and the restore would remove or overwrite it.
+    /// Either way the content is not Libra's, so the whole restore is refused
+    /// before any write (ADR-MG-01).
+    #[error(
+        "refusing to replace worktree path '{0}': Libra does not manage submodule content there"
+    )]
+    SubmodulePathNotOwned(String),
     #[error("failed to download LFS content")]
     LfsDownload,
     /// Refused to restore from a Libra-managed locked branch (`intent`,
@@ -132,7 +142,9 @@ impl RestoreError {
             Self::ReadWorktree => StableErrorCode::IoReadFailed,
             Self::InvalidPathEncoding => StableErrorCode::CliInvalidArguments,
             Self::WriteWorktree => StableErrorCode::IoWriteFailed,
-            Self::NonEmptyWorktreeDirectory(_) => StableErrorCode::ConflictOperationBlocked,
+            Self::NonEmptyWorktreeDirectory(_) | Self::SubmodulePathNotOwned(_) => {
+                StableErrorCode::ConflictOperationBlocked
+            }
             Self::LfsDownload => StableErrorCode::NetworkUnavailable,
             Self::LockedSource(_) => StableErrorCode::CliInvalidTarget,
             Self::LockedCurrentBranch(_) => StableErrorCode::ConflictOperationBlocked,
@@ -195,6 +207,9 @@ impl From<RestoreError> for CliError {
             RestoreError::NonEmptyWorktreeDirectory(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("move or remove nested files before restoring across the gitlink"),
+            RestoreError::SubmodulePathNotOwned(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("move that path aside — Libra never writes or deletes submodule content"),
             _ => CliError::fatal(message).with_stable_code(stable_code),
         }
     }
@@ -1223,10 +1238,11 @@ fn preflight_conflict_stage_worktree(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => return Err(RestoreError::ReadWorktree),
         };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        if target.is_some_and(|target| matches!(target.mode, Some(TreeItemMode::Commit))) {
+            ensure_submodule_path_is_replaceable(path, &metadata, index)?;
             continue;
         }
-        if target.is_some_and(|target| matches!(target.mode, Some(TreeItemMode::Commit))) {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
             continue;
         }
         if fs::read_dir(&absolute)
@@ -1486,6 +1502,35 @@ async fn restore_target_to_file_typed(
     Ok(())
 }
 
+/// Refuse now exactly what a `restore --source <commit> --staged --worktree .`
+/// would refuse later — without writing anything.
+///
+/// `merge`'s fast-forward path restores AFTER moving the ref (a deliberate
+/// ordering: the updated pointers are what the restore reads). A refusal raised
+/// by the restore itself would therefore leave the ref ahead of the index and
+/// working tree. Running the same preflight before the ref moves keeps the
+/// fast-forward all-or-nothing — most visibly for a materialized submodule
+/// directory the target tree no longer declares (ADR-MG-01), which restore
+/// refuses to replace when it is non-empty.
+pub(crate) async fn preflight_worktree_restore_to_commit(
+    commit: &ObjectHash,
+) -> Result<(), RestoreError> {
+    let tree_id = load_object::<Commit>(commit)
+        .map_err(|_| RestoreError::ReadObject)?
+        .tree_id;
+    let target_blobs: Vec<(PathBuf, RestoreTarget)> = load_object::<Tree>(&tree_id)
+        .map_err(|_| RestoreError::ReadObject)?
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, hash, mode)| (path, RestoreTarget::new(hash, Some(mode))))
+        .collect();
+    let target_map = preprocess_blobs(&target_blobs);
+    let index = Index::load(path::index()).map_err(|_| RestoreError::ReadIndex)?;
+    let pathspecs = compile_restore_pathspecs(&[util::working_dir_string()]).await?;
+    let file_paths = collect_restore_worktree_paths(&pathspecs, &target_map, &index, &[])?;
+    preflight_worktree_directory_transitions(&file_paths, &target_map, &index, false)
+}
+
 fn preflight_worktree_directory_transitions(
     paths: &[PathBuf],
     targets: &HashMap<PathBuf, RestoreTarget>,
@@ -1499,16 +1544,27 @@ fn preflight_worktree_directory_transitions(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => return Err(RestoreError::ReadWorktree),
         };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            continue;
-        }
+        let is_directory = metadata.is_dir() && !metadata.file_type().is_symlink();
         let target_is_gitlink = targets
             .get(path)
             .is_some_and(|target| matches!(target.mode, Some(TreeItemMode::Commit)));
+        let path_str = path_to_utf8_typed(path)?;
+        let index_is_gitlink = index
+            .get(path_str, 0)
+            .is_some_and(|entry| entry.mode & 0o170000 == 0o160000);
+        // Either direction across a submodule path: materializing a pointer
+        // here, or replacing/dropping one the index already records. `--overlay`
+        // only suppresses DELETION of paths the source omits — a source-present
+        // replacement still writes, so it stays guarded.
+        if target_is_gitlink || (index_is_gitlink && (targets.contains_key(path) || !overlay)) {
+            ensure_submodule_path_is_replaceable(path, &metadata, index)?;
+        }
         if target_is_gitlink {
             continue;
         }
-        let path_str = path_to_utf8_typed(path)?;
+        if !is_directory {
+            continue;
+        }
         let will_replace = targets.contains_key(path) || (!overlay && index.tracked(path_str, 0));
         if will_replace
             && fs::read_dir(&absolute)
@@ -1522,6 +1578,38 @@ fn preflight_worktree_directory_transitions(
         }
     }
     Ok(())
+}
+
+/// Refuse a transition that would delete or overwrite something Libra did not
+/// write at a `160000` submodule path (ADR-MG-01). Two directions, one rule:
+///
+/// * **materializing** a pointer replaces the path with a DIRECTORY
+///   placeholder, deleting a plain file or symlink sitting exactly there; and
+/// * **dropping or replacing** a pointer the index already records would remove
+///   or overwrite whatever the user has at that path.
+///
+/// Only content Libra can put back is replaceable: an ordinary tracked BLOB
+/// (recoverable from the object store), or a directory it may own — an empty
+/// placeholder is removable, and a non-empty one is caught by the
+/// `NonEmptyWorktreeDirectory` rule further down. Everything else is the
+/// user's.
+fn ensure_submodule_path_is_replaceable(
+    path: &Path,
+    metadata: &fs::Metadata,
+    index: &Index,
+) -> Result<(), RestoreError> {
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let recoverable = index
+        .get(path_to_utf8_typed(path)?, 0)
+        .is_some_and(|entry| entry.mode & 0o170000 != 0o160000);
+    if recoverable {
+        return Ok(());
+    }
+    Err(RestoreError::SubmodulePathNotOwned(
+        path.display().to_string(),
+    ))
 }
 
 fn remove_existing_empty_directory(path: &Path) -> Result<(), RestoreError> {
@@ -1809,6 +1897,10 @@ mod tests {
             "failed to download LFS content",
         );
         assert_eq!(
+            RestoreError::SubmodulePathNotOwned("vendor/sub".to_string()).to_string(),
+            "refusing to replace worktree path 'vendor/sub': Libra does not manage submodule content there",
+        );
+        assert_eq!(
             RestoreError::LockedSource("intent".to_string()).to_string(),
             "refusing to restore from locked branch 'intent'",
         );
@@ -1910,6 +2002,10 @@ mod tests {
         assert_eq!(
             RestoreError::PathUnmerged("ignored".to_string()).stable_code(),
             StableErrorCode::ConflictUnresolved,
+        );
+        assert_eq!(
+            RestoreError::SubmodulePathNotOwned("ignored".to_string()).stable_code(),
+            StableErrorCode::ConflictOperationBlocked,
         );
         assert_eq!(
             RestoreError::MissingStageVersion {

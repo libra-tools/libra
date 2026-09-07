@@ -28,6 +28,8 @@ author date, and timezone). The committer is the current identity/date, honoring
 `GIT_COMMITTER_*` overrides. Signed source messages are de-signed before message
 cleanup/trailer handling, so `gpgsig` blocks never become the replayed subject.
 
+Submodules are never merged (see `docs/commands/merge.md`): if the pick's three-way inputs (the parent tree, the current index, and the picked tree) record different `160000` gitlink object ids, the cherry-pick is refused before anything is written, with `LBR-UNSUPPORTED-001` and a message naming the path (`cherry-pick would have to merge the submodule (gitlink) entry '<path>': Libra does not support submodules`). A gitlink all three sides agree on is left untouched instead of being dropped from the picked change set.
+
 When a commit cannot be applied cleanly, Libra performs a three-way apply (base = parent tree, ours = current index, theirs = picked tree) and writes any unresolved divergent path to the index (stages 1/2/3) and the working tree (line-level conflict markers, matching Git). `-X ours/theirs` can resolve only the overlapping hunks while retaining clean changes. The in-progress sequence is persisted in the unified SQLite `sequence_state` table, so you can resolve a remaining conflict and continue with `--continue`, drop the conflicted commit with `--skip`, or undo the whole sequence with `--abort`/`--quit`. While a cherry-pick sequence is in progress, other sequencer operations are blocked (`LBR-CONFLICT-002`).
 
 ## Options
@@ -288,7 +290,7 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 | `LBR-REPO-003` | HEAD detached, no cherry-pick in progress for `--continue`/`--skip`/`--abort`/`--quit`, or `--continue` on the wrong branch | Switch to a branch / start a pick first / switch back to the sequence branch |
 | `LBR-CLI-003` | Cannot resolve a commit reference | Use `libra log` to find valid commit references |
 | `LBR-CLI-002` | Merge commit without `-m`, invalid/out-of-range `-m`, an invalid `--cleanup` or `--empty` mode, empty commit without `--allow-empty`, redundant commit without `--keep-redundant-commits`/`--empty=drop`/`--empty=keep`, or empty message without `--allow-empty-message` | Use the flag named in the hint |
-| `LBR-UNSUPPORTED-001` | An unsupported custom `--strategy` was passed | Drop `--strategy`; Libra's built-in apply supports `-X ours/theirs` but not custom strategies |
+| `LBR-UNSUPPORTED-001` | An unsupported custom `--strategy` was passed, **or** an input of the pick sequence carries a `160000` gitlink (submodule) the pick would have to arbitrate | Drop `--strategy`; for a gitlink, resolve the submodule pointer outside Libra or drop the entry from the commits involved — the refusal comes before the first index/worktree/state write |
 | `LBR-CONFLICT-001` | Conflict during cherry-pick (three-way conflict, or untracked file would be overwritten) | Resolve and `libra add`, then `libra cherry-pick --continue` (or `--skip`/`--abort`/`--quit`) |
 | `LBR-CONFLICT-002` | `merge`/`rebase` started while a cherry-pick is in progress, or a new pick started over an in-progress sequence | Finish or cancel the cherry-pick first |
 | `LBR-IO-001` | Failed to load an object or cherry-pick state | Check repository integrity and retry |

@@ -575,6 +575,9 @@ Detached HEAD:
 - When on a branch, `head.name` is the branch name; when detached, `head.oid` is the commit hash
 - `upstream` is `null` when no tracking branch is configured or HEAD is detached
 - `upstream.gone` is `true` when the remote tracking branch no longer exists
+  (the tracking ref is resolved under its fully-qualified
+  `refs/remotes/<remote>/<branch>` name — the shape clone/fetch/push write —
+  with a legacy short-name fallback; issue #464)
 - `upstream.ahead` / `upstream.behind` are `null` when `gone` is `true`
 - `is_clean` is `true` only when staged, unstaged, untracked, and unmerged
   lists are empty, no global merge state is active, **and** `io_blocked` is

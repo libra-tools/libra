@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.22.10"
+version = "0.22.16"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -600,3 +600,11 @@ path = "tests/commit_change_id_header_spike.rs"
 # debug_assertions are independent of opt-level, so behavior is unchanged.
 [profile.dev.package."*"]
 opt-level = 2
+# OL-02..04: v2 persistence foundation targets.
+[[test]]
+name = "operation_schema_v2"
+path = "tests/operation_schema_v2.rs"
+
+[[test]]
+name = "operation_dag"
+path = "tests/operation_dag.rs"

@@ -1668,13 +1668,16 @@ mod tests {
         conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "INSERT INTO operation
-             (op_id, repo_id, view_id, command_name, description, actor,
-              args_digest, start_ts, end_ts, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (op_id, repo_id, pre_view_oid, post_view_oid, kind, scope_kind,
+              command_name, description, actor, args_digest, start_ts, end_ts, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 "secret-probe-operation-control".into(),
                 repository.repo_id.clone().into(),
                 "secret-probe-view".into(),
+                "secret-probe-view".into(),
+                "command".into(),
+                "repo".into(),
                 "memory-keyed-digest-probe".into(),
                 "non-secret operation-log control".into(),
                 "test-actor".into(),
@@ -1786,7 +1789,8 @@ mod tests {
         let operation_rows = conn
             .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
-                "SELECT op_id || char(31) || repo_id || char(31) || view_id || char(31) ||
+                "SELECT op_id || char(31) || repo_id || char(31) ||
+                        pre_view_oid || char(31) || post_view_oid || char(31) ||
                         command_name || char(31) || description || char(31) || actor || char(31) ||
                         COALESCE(args_digest, '')
                  FROM operation ORDER BY op_id",

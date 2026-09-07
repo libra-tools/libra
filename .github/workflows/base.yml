@@ -85,12 +85,11 @@ jobs:
           corepack enable
           corepack prepare pnpm@11.10.0 --activate
 
-      # The Rust crate's `build.rs` skips the web build whenever
-      # `LIBRA_SKIP_WEB_BUILD=1` (set on every other job for speed). This
-      # dedicated job re-asserts that the Next.js source still type-checks,
-      # lints, and produces a clean static export so `web/out/` cannot
-      # silently drift away from `WebAssets` in main. Per
-      # docs/improvement/web.md Phase 5 verification.
+      # Rust-oriented jobs skip the web build for speed. This dedicated job
+      # validates the Next.js source, generates a fresh static export, and
+      # compiles it into `WebAssets`; the generated directory is deliberately
+      # not version-controlled. Per docs/improvement/web.md Phase 5
+      # verification.
       - name: Install web dependencies
         run: pnpm --dir web install --frozen-lockfile
 
@@ -103,16 +102,20 @@ jobs:
       - name: Build web (static export → web/out/)
         run: pnpm --dir web build
 
-      - name: Check web/out static export drift
+      - name: Verify generated static export lifecycle
         shell: bash
         run: |
-          status="$(git status --porcelain -- web/out)"
-          if [[ -n "$status" ]]; then
-            echo "web/out has untracked, staged, or unstaged files after the static export build." >&2
-            echo "Run 'pnpm --dir web build' locally and commit the updated web/out files." >&2
-            printf '%s\n' "$status" >&2
+          test -f web/out/index.html
+          if git ls-files --error-unmatch -- web/out >/dev/null 2>&1; then
+            echo "web/out is generated build output and must not be tracked." >&2
             exit 1
           fi
+          git check-ignore -q web/out/index.html
+
+      - name: Check generated export embeds into the Rust binary
+        env:
+          LIBRA_SKIP_WEB_BUILD: "1"
+        run: cargo check --lib
 
   owner-liveness-macos:
     # plan-20260714 W1 (§C.9): the operation claim decides whether a control

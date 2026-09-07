@@ -1018,11 +1018,20 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
                     .with_hint("check SSH key / HTTP credentials and repository access rights")
             }
             GitError::NetworkError(_) => {
-                CliError::fatal(format!("remote discovery failed: {source}"))
-                    .with_stable_code(StableErrorCode::NetworkUnavailable)
-                    .with_hint(
+                let message = source.to_string();
+                let error = CliError::fatal(format!("remote discovery failed: {message}"))
+                    .with_stable_code(StableErrorCode::NetworkUnavailable);
+                if message.to_lowercase().contains("host key verification failed") {
+                    error.with_hint(
+                        "the remote host key is not in ~/.ssh/known_hosts yet; accept it once via \
+                         `ssh -T <host>` or `ssh-keyscan -t ed25519 <host> >> ~/.ssh/known_hosts`, \
+                         or set ssh.strictHostKeyChecking to `accept-new`",
+                    )
+                } else {
+                    error.with_hint(
                         "check the remote host, DNS, VPN/proxy, and network connectivity",
                     )
+                }
             }
             GitError::IOError(_) => CliError::fatal(format!("remote discovery failed: {source}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)
@@ -1107,6 +1116,11 @@ fn map_checkout_error(source: RestoreError) -> CliError {
         ))
         .with_stable_code(StableErrorCode::ConflictOperationBlocked)
         .with_hint("move or remove nested files before retrying the checkout"),
+        RestoreError::SubmodulePathNotOwned(path) => CliError::fatal(format!(
+            "working tree checkout refused to replace '{path}': Libra does not manage submodule content there"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("move that path aside before retrying the checkout"),
         RestoreError::LfsDownload => {
             CliError::fatal("checkout required downloading LFS content, but the transfer failed")
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
@@ -3867,6 +3881,27 @@ mod tests {
         assert_eq!(
             cli.hints()[0].as_str(),
             "check the remote host, DNS, VPN/proxy, and network connectivity"
+        );
+    }
+
+    #[test]
+    fn discover_remote_host_key_error_maps_to_host_key_hint() {
+        let cli = map_discover_remote_error(fetch::FetchError::Discovery {
+            remote: "git@example.com/repo.git".to_string(),
+            source: GitError::NetworkError(
+                "SSH read failed: early eof; exit status 255, stderr: \
+                 No ED25519 host key is known for example.com and you have requested \
+                 strict checking.\nHost key verification failed."
+                    .to_string(),
+            ),
+        });
+
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkUnavailable);
+        assert_eq!(cli.exit_code(), 128);
+        let hint = cli.hints()[0].as_str();
+        assert!(
+            hint.contains("~/.ssh/known_hosts") && hint.contains("ssh-keyscan"),
+            "host key failure should surface a targeted hint, got: {hint}"
         );
     }
 

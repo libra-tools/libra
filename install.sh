@@ -18,13 +18,14 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # user opts in with LIBRA_ALLOW_FALLBACK=1. Default behaviour is fail-fast so
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
-DEFAULT_VERSION="v0.22.10"
+DEFAULT_VERSION="v0.22.16"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override: the install-smoke harness rewrites these
 # clearly-marked constants in a temporary COPY of this script, never through
 # the environment. The PEM is the same key as the hex, in SubjectPublicKeyInfo
 # form for `openssl pkeyutl` (kept in sync by the trusted_keys unit tests).
 LIBRA_RELEASE_MANIFEST_KEY_ID="libra-release-1"
+# shellcheck disable=SC2034 # Audited by Rust tests against the PEM and native trust table.
 LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_HEX="68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3"
 LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_PEM="-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAaKoA6pNY1FVkUBDYEdQHArP2fOxL3/UtPU+4EHr67tM=
@@ -799,7 +800,11 @@ verify_stable_manifest() {
     published_at=$(json_string_field published_at "$head_file")
     expires_at=$(json_string_field expires_at "$head_file")
     min_key_generation=$(sed -n 's/.*"min_key_generation":\([0-9][0-9]*\).*/\1/p' "$head_file" | head -n1)
-    paused=$(sed -n 's/.*"paused":\(true\|false\).*/\1/p' "$head_file" | head -n1)
+    # Do not use BRE `\|` here: BSD sed treats it as a literal rather than
+    # alternation, which would leave `paused` empty and bypass a signed pause.
+    # The canonical grammar above fixes this field's surrounding shape; the
+    # explicit boolean check below still keeps extraction fail-closed.
+    paused=$(sed -n 's/.*"paused":\([^,]*\),"revoked_versions":.*/\1/p' "$head_file" | head -n1)
 
     [ "$channel" = "stable" ] || { rm -rf "$work_dir"; error_exit "signed manifest channel '${channel:-?}' is not 'stable'" "verify" "refusing to install"; }
     [ -n "$STABLE_VERSION" ] || { rm -rf "$work_dir"; error_exit "signed manifest carries no version" "verify" "refusing to install"; }
@@ -859,6 +864,11 @@ verify_stable_manifest() {
         rm -rf "$work_dir"
         error_exit "signed manifest lifetime is outside the pinned key's validity window (published_at ${published_at}, expires_at ${expires_at})" "verify" \
             "the signing key window ended or has not begun — re-download install.sh"
+    fi
+    if [ "$paused" != "true" ] && [ "$paused" != "false" ]; then
+        rm -rf "$work_dir"
+        error_exit "signed manifest paused field '${paused:-?}' is not boolean" "verify" \
+            "refusing to install — the payload field layout is not the release contract"
     fi
     if [ "$paused" = "true" ]; then
         rm -rf "$work_dir"

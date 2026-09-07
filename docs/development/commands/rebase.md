@@ -63,6 +63,7 @@ flowchart TD
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
 | 兼容矩阵说明 | `--onto`/autosquash/cherry-pick/empty controls 与 P1-07a 的 autostash/exec/update-refs/fork-point 已支持；interactive/`--rebase-merges`/`--rerere-autoupdate`/`--empty=stop\|ask` 未支持 | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
+| 永久非目标 | submodule / gitlink 内容合并（`_compatibility.md` D24、ADR-MG-01） | 三路重放输入的 gitlink 由 merge/rebase/cherry-pick 共用的 `command::merge::ensure_gitlinks_not_arbitrated` 校验：任一侧与 base 不同即在任何写入前以 `ReplayErrorKind::GitlinkUnsupported` → `LBR-UNSUPPORTED-001` 拒绝（消息含路径）；三侧一致原样带入重放树（此前 `collect_tree_items_and_paths` 会静默丢弃）。`rebuild_index_from_tree` 相应改为登记 gitlink 条目而非报错。证据：`command::merge_test::merge_gitlink_rebase_consumer_*`、`--lib rebase::rebuild_index_from_tree_registers_gitlink_entries_verbatim`。 |
 | 兼容差异项 | Interactive | 原始对照：不支持；相关参数/替代：-i / --interactive；当前说明：不适用。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
 | ✅ 已实现 | Exec | 可重复 `--exec <cmd>` 在每个 replay commit 后按序执行；required sandbox、禁网、workspace-write；失败 round-trip 到 `--continue`/`--skip`。 |
 | ✅ 已实现 | Autosquash | `--autosquash` 已支持（fixup!/squash!/amend! 移动并折叠到目标提交）。 |

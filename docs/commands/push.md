@@ -63,7 +63,7 @@ global storage config for that run.
 | `<refspec>...` | Local ref, `<src>:<dst>` mapping, or `:<dst>` deletion. Multiple values are sent as one update set. | `libra push origin main feature:release` |
 | `-u`, `--set-upstream` | Set the upstream tracking branch after a successful single branch push. | `libra push -u origin feature-x` |
 | `-f`, `--force` | Allow non-fast-forward updates that overwrite remote history. | `libra push --force origin main` |
-| `-d`, `--delete` | Delete the named remote refs (each `<refspec>` is rewritten to a `:<ref>` deletion). Requires at least one ref; conflicts with `--set-upstream`/`--tags`/`--all`/`--mirror`. | `libra push -d origin feature-x` |
+| `-d`, `--delete` | Delete the named remote refs (each `<refspec>` is rewritten to a `:<ref>` deletion). Short names resolve against the refs the remote advertises — `refs/heads/<name>` first, then `refs/tags/<name>`; an ambiguous name is refused. Requires at least one ref; conflicts with `--set-upstream`/`--tags`/`--all`/`--mirror`. | `libra push -d origin feature-x` |
 | `--force-with-lease[=<ref>[:<expect>]]` | Allow a non-fast-forward update only if the remote ref still matches the expected OID (the tracking-ref OID by default, or an explicit `<expect>`). Conflicts with `--force`. | `libra push --force-with-lease origin main` |
 | `--force-if-includes` | With `--force-with-lease` (All/Ref forms): additionally require the remote-tracking tip to be integrated locally (reachable from the pushed branch's reflog). Silent no-op with the exact lease form or without a lease (Git parity). |
 | `--thin` | Send REF_DELTA entries against server-known bases (the advertised old tips) — smaller packs on large-blob edits; the server completes them (`index-pack --fix-thin`). Self-contained packs remain the default (unlike git). |
@@ -377,6 +377,7 @@ The following forms are supported:
 | `libra push origin main feature:release` | Validate and send multiple ref updates together |
 | `libra push origin :feature` | Delete remote `refs/heads/feature` |
 | `libra push -d origin feature` | Delete remote `refs/heads/feature` (short form) |
+| `libra push -d origin v1.0` | Delete remote `refs/tags/v1.0` if no branch named `v1.0` is advertised (short-name deletion tries `refs/heads/<name>` then `refs/tags/<name>`) |
 | `libra push origin refs/tags/v1.0:refs/tags/v1.0` | Push a tag ref |
 | `libra push --tags origin` | Push all local tag refs |
 | `libra push --mirror --dry-run origin` | Preview mirroring branch/tag refs and deleting remote-only refs |
@@ -384,6 +385,23 @@ The following forms are supported:
 Empty destination syntax (`src:`), malformed ref names, duplicate destination refs,
 and `--mirror` combined with explicit refspecs are rejected before any network write.
 Invalid forms return `InvalidRefspec` with exit 129.
+
+### Deletion resolution (`-d`/`--delete` and `:<dst>` refspecs)
+
+Deletion targets are resolved against the refs the remote actually advertises:
+
+- A **short name** tries `refs/heads/<name>` first, then `refs/tags/<name>`; the single
+  advertised match is deleted. A name matching both namespaces is refused with
+  `dst refspec '<name>' matches more than one remote ref` (Git parity) — qualify the
+  target explicitly. Git's broader short-name matching — bare `<name>`, `refs/<name>`,
+  `refs/remotes/<name>`, `refs/remotes/<name>/HEAD`, with weak/strong preference — is
+  deliberately not implemented; use a fully-qualified target for those namespaces.
+- A **fully-qualified name** (`refs/heads/x`, `refs/tags/x`) is used verbatim.
+- A deletion naming a ref the remote does not advertise fails with
+  `unable to delete '<name>': remote ref does not exist` instead of reporting
+  `Everything up-to-date` (issue #465); `--dry-run` reports the same error without
+  sending anything. Idempotent cleanup scripts must tolerate this error (git behaves
+  the same way).
 
 ## Design Rationale
 
@@ -433,6 +451,7 @@ or configure a separate LFS tool.
 | Refspec mapping | `libra push origin src:dst` | `git push origin src:dst` | N/A |
 | Multiple refspecs | `libra push origin main feature:release` | `git push origin main feature:release` | N/A |
 | Delete remote branch | `libra push -d origin branch` or `libra push origin :branch` | `git push -d origin branch` / `git push origin :branch` | `jj git push --delete branch` |
+| Delete remote tag by short name | `libra push -d origin tag` (resolves the advertised `refs/tags/<tag>`, ambiguous names refused) | `git push -d origin tag` | N/A |
 | Push tags | `libra push --tags origin` | `git push --tags origin` | N/A |
 | Mirror preview | `libra push --mirror --dry-run origin` | `git push --mirror --dry-run origin` | N/A |
 | Structured output | `--json` / `--machine` | No | No |
@@ -452,6 +471,8 @@ trigger a fuzzy match suggestion via edit distance.
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v'" + fuzzy "did you mean?" |
 | Invalid refspec | `LBR-CLI-002` | 129 | "use '\<name>' or '\<src>:\<dst>'" |
 | Source ref not found | `LBR-CLI-003` | 129 | "verify the local branch/ref exists" |
+| Delete target does not exist on remote | `LBR-CLI-003` | 129 | "check the remote's refs with 'libra ls-remote \<remote>'" |
+| Ambiguous delete target | `LBR-CLI-003` | 129 | "qualify the target as refs/heads/\<name> or refs/tags/\<name>" |
 | Local file remote | `LBR-CLI-003` | 129 | "push supports network remotes only" |
 | Invalid remote URL | `LBR-CLI-002` | 129 | "check the remote URL" |
 | Authentication failed | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |

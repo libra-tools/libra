@@ -24,6 +24,8 @@ libra rebase --skip
 
 重放出的提交**保留原作者**——rebase 改写的是历史形状而非署名——而 committer 记为执行本次 rebase 的人，时间戳为当次。折叠类动作（`fixup` / `squash` / `amend`）保留**目标提交**的 author，与 Git 的「折叠组中第一个提交的作者胜出」一致。若未配置 `user.name` / `user.email`，rebase 会以 `LBR-AUTH-001` fail closed，而不是写入占位身份。
 
+子模块永不参与合并（见 `docs/commands/zh-CN/merge.md`）：若某次重放的三路输入中 `160000` gitlink 记录的 object id 不一致，rebase 会在写入任何内容之前被拒绝，错误码 `LBR-UNSUPPORTED-001`，消息包含路径（`rebase would have to merge the submodule (gitlink) entry '<path>': Libra does not support submodules`）。三侧一致的 gitlink 则原样带入改写后的树，而不再被丢弃。
+
 Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）持久化在 SQLite 数据库中。恢复关键的 autostash、exec 与 update-refs 元数据会原子且强制 fsync 到 `.libra/rebase-aux.json`，直到序列进入终态。旧 Libra 版本的 legacy file-based 状态会在首次访问时自动迁移到数据库。
 
 ## 选项
@@ -381,6 +383,7 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 | 没有进行中 rebase 却 `--skip` | `LBR-REPO-003`（RepoStateInvalid） | 128 | 报告没有进行中 rebase |
 | `--skip` 但没有已停止或待处理提交 | `LBR-REPO-003`（RepoStateInvalid） | 128 | 报告没有可跳过提交 |
 | 空或包含 NUL 的 `--exec` 命令 | `LBR-CLI-002`（CliInvalidArguments） | 129 | 在创建 rebase 状态或修改 worktree 前拒绝 |
+| 重放输入中存在需要裁决的 `160000` gitlink（submodule） | `LBR-UNSUPPORTED-001`（Unsupported） | 128 | 在 autostash、aux sidecar、HEAD detach 与任何状态写入之前拒绝 |
 | Exec 失败、超时或强制 sandbox 不可用 | `LBR-CONFLICT-002`（ConflictOperationBlocked） | 128 | Rebase 保持可续作；修复后 `--continue`，或 `--skip` 剩余 exec 命令 |
 | Autostash 重放冲突 | warning；held 对象提升为 `stash@{0}` | 0 | Rebase 完成且本地变更不丢失；检查 stash |
 | Update-refs 分支被并发移动 | `LBR-IO-002`（IoWriteFailed） | 128 | Ref 事务回滚，rebase 保持可续作 |

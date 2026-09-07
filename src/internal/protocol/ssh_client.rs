@@ -4,7 +4,7 @@
 //! Uses the vault-generated SSH private key for authentication when available.
 
 use std::{
-    io::{Error as IoError, ErrorKind},
+    io::{Error as IoError, ErrorKind, IsTerminal},
     time::Duration,
 };
 
@@ -83,11 +83,14 @@ impl SshClient {
 
     /// Configure StrictHostKeyChecking mode.
     ///
-    /// Supported values: `yes` (default), `accept-new` (explicit opt-in).
+    /// Supported values: `ask` (default), `yes`, `accept-new`, `no` — the same
+    /// four policies OpenSSH/Git expose. In `ask` mode the option is not passed
+    /// to `ssh` at all, so the user's `~/.ssh/config` governs, matching Git.
     pub fn with_strict_host_key_checking(mut self, mode: String) -> Result<Self, String> {
         let normalized = normalize_host_key_checking_mode(&mode).ok_or_else(|| {
             format!(
-                "invalid ssh.strictHostKeyChecking value '{mode}', expected 'yes' or 'accept-new'"
+                "invalid ssh.strictHostKeyChecking value '{mode}', \
+                 expected 'ask', 'yes', 'accept-new', or 'no'"
             )
         })?;
         self.strict_host_key_checking = normalized.to_string();
@@ -117,7 +120,7 @@ impl SshClient {
             repo_path,
             key_path: None,
             temp_key_file: None,
-            strict_host_key_checking: "yes".to_string(),
+            strict_host_key_checking: "ask".to_string(),
             idle_timeout: default_ssh_idle_timeout(),
         })
     }
@@ -140,12 +143,24 @@ impl SshClient {
             repo_path,
             key_path: None,
             temp_key_file: None,
-            strict_host_key_checking: "yes".to_string(),
+            strict_host_key_checking: "ask".to_string(),
             idle_timeout: default_ssh_idle_timeout(),
         })
     }
 
     /// Spawn an SSH subprocess running the given Git service on the remote.
+    ///
+    /// Host key checking mirrors Git's transport: in the default `ask` mode no
+    /// `StrictHostKeyChecking` option is passed, so the user's `~/.ssh/config`
+    /// governs and OpenSSH offers its interactive trust prompt (TOFU) on the
+    /// terminal. Explicit modes are forwarded verbatim.
+    ///
+    /// Interactivity is decided by libra's own stdin: in headless contexts
+    /// (CI, agents, tests) prompts can never be answered, so `BatchMode=yes`
+    /// makes ssh fail fast instead of hanging, and stderr stays piped so
+    /// diagnostics land in the error message. Interactive sessions inherit
+    /// stderr so the user sees ssh's host-key warning, fingerprint, and
+    /// "Permanently added" confirmation live — exactly like `git clone`.
     async fn spawn_service(&self, service: ServiceType) -> Result<tokio::process::Child, IoError> {
         let service_cmd = match service {
             ServiceType::UploadPack => "git-upload-pack",
@@ -153,12 +168,18 @@ impl SshClient {
         };
         // Build: ssh [opts] user@host "git-upload-pack '/repo/path'"
         let ssh_bin = std::env::var("LIBRA_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_string());
+        let interactive = std::io::stdin().is_terminal();
         let mut cmd = tokio::process::Command::new(ssh_bin);
-        cmd.arg("-o").arg(format!(
-            "StrictHostKeyChecking={}",
-            self.strict_host_key_checking
-        ));
-        cmd.arg("-o").arg("BatchMode=yes");
+        // In `ask` mode (default) defer to the user's ssh_config, like Git.
+        if self.strict_host_key_checking != "ask" {
+            cmd.arg("-o").arg(format!(
+                "StrictHostKeyChecking={}",
+                self.strict_host_key_checking
+            ));
+        }
+        if !interactive {
+            cmd.arg("-o").arg("BatchMode=yes");
+        }
         if let Some(ref key_file) = self.temp_key_file {
             cmd.arg("-i").arg(key_file.path());
         } else if let Some(ref key) = self.key_path {
@@ -173,15 +194,20 @@ impl SshClient {
             shell_single_quote(&self.repo_path)
         ));
         cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // The local `ssh` process can outlive the remote service (GitHub in
-            // particular keeps the channel open briefly, and ControlMaster
-            // setups can keep the client process alive even longer). Killing
-            // on drop ensures `fetch_objects`'s background task cannot leave
-            // an orphaned subprocess blocking shutdown.
-            .kill_on_drop(true)
-            .spawn()
+            .stdout(std::process::Stdio::piped());
+        if interactive {
+            // Let ssh talk to the user's terminal directly (host-key prompt
+            // context, banners, remote diagnostics), as Git does.
+            cmd.stderr(std::process::Stdio::inherit());
+        } else {
+            cmd.stderr(std::process::Stdio::piped());
+        }
+        // The local `ssh` process can outlive the remote service (GitHub in
+        // particular keeps the channel open briefly, and ControlMaster
+        // setups can keep the client process alive even longer). Killing
+        // on drop ensures `fetch_objects`'s background task cannot leave
+        // an orphaned subprocess blocking shutdown.
+        cmd.kill_on_drop(true).spawn()
     }
 
     /// Read pkt-line advertisement from the SSH child's stdout.
@@ -315,17 +341,18 @@ impl SshClient {
             .stdout
             .take()
             .ok_or_else(|| IoError::other("SSH child stdout not captured"))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| IoError::other("SSH child stderr not captured"))?;
+        // stderr may be uncaptured when it is inherited in interactive
+        // sessions; treat that the same as an empty stream.
+        let stderr = child.stderr.take();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, IoError>>(32);
         let idle_timeout = self.idle_timeout;
 
         tokio::spawn(async move {
             let stderr_task = tokio::spawn(async move {
                 let mut buf = Vec::new();
-                let _ = stderr.read_to_end(&mut buf).await;
+                if let Some(mut stderr) = stderr {
+                    let _ = stderr.read_to_end(&mut buf).await;
+                }
                 buf
             });
 
@@ -523,13 +550,9 @@ fn describe_status_with_stderr(status: &std::process::ExitStatus, stderr: &[u8])
 }
 
 fn normalize_host_key_checking_mode(mode: &str) -> Option<&'static str> {
-    if mode.eq_ignore_ascii_case("yes") {
-        Some("yes")
-    } else if mode.eq_ignore_ascii_case("accept-new") {
-        Some("accept-new")
-    } else {
-        None
-    }
+    ["ask", "yes", "accept-new", "no"]
+        .into_iter()
+        .find(|known| mode.eq_ignore_ascii_case(known))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -628,22 +651,34 @@ mod tests {
     }
 
     #[test]
-    fn test_with_strict_host_key_checking_accept_new() {
-        let client = SshClient::from_scp_style("git@github.com:user/repo.git")
-            .unwrap()
-            .with_strict_host_key_checking("accept-new".to_string())
-            .unwrap();
-        assert_eq!(client.strict_host_key_checking, "accept-new");
+    fn test_default_host_key_checking_is_ask() {
+        // Git parity: the default defers to the user's ssh_config and lets
+        // OpenSSH run its interactive TOFU prompt; no option is injected.
+        let client = SshClient::from_scp_style("git@github.com:user/repo.git").unwrap();
+        assert_eq!(client.strict_host_key_checking, "ask");
+        let client = SshClient::from_ssh_url("ssh://git@github.com/user/repo.git").unwrap();
+        assert_eq!(client.strict_host_key_checking, "ask");
+    }
+
+    #[test]
+    fn test_with_strict_host_key_checking_accepts_git_modes() {
+        for mode in ["ask", "yes", "accept-new", "no", "ACCEPT-NEW"] {
+            let client = SshClient::from_scp_style("git@github.com:user/repo.git")
+                .unwrap()
+                .with_strict_host_key_checking(mode.to_string())
+                .unwrap();
+            assert_eq!(client.strict_host_key_checking, mode.to_lowercase());
+        }
     }
 
     #[test]
     fn test_with_strict_host_key_checking_invalid_value() {
         let result = SshClient::from_scp_style("git@github.com:user/repo.git")
             .unwrap()
-            .with_strict_host_key_checking("no".to_string());
+            .with_strict_host_key_checking("bogus".to_string());
         assert!(result.is_err(), "invalid mode should be rejected");
         let err = result.err().unwrap();
-        assert!(err.contains("expected 'yes' or 'accept-new'"));
+        assert!(err.contains("expected 'ask', 'yes', 'accept-new', or 'no'"));
     }
 
     #[tokio::test]
