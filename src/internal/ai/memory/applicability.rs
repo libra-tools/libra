@@ -1,6 +1,6 @@
 use std::{
     collections::{HashSet, VecDeque},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use git_internal::{
@@ -9,11 +9,12 @@ use git_internal::{
         ObjectTrait,
         commit::Commit,
         tree::{Tree, TreeItemMode},
+        types::ObjectType,
     },
 };
 
 use super::domain::EpisodeCodeContextV1;
-use crate::utils::object::read_git_object_bounded_validated;
+use crate::utils::storage::local::LocalStorage;
 
 pub(crate) const MAX_APPLICABILITY_COMMITS: usize = 2_048;
 pub(crate) const MAX_APPLICABILITY_PATHS: usize = 512;
@@ -87,31 +88,35 @@ pub(crate) trait CodeHistory {
 }
 
 pub(crate) struct RepositoryCodeHistory {
-    repository_path: PathBuf,
+    storage: LocalStorage,
 }
 
 impl RepositoryCodeHistory {
     pub(crate) fn new(repository_path: &Path) -> Self {
         Self {
-            repository_path: repository_path.to_path_buf(),
+            storage: LocalStorage::open_no_create_with_alternates(
+                repository_path.join("objects"),
+            ),
         }
     }
 
     fn load_commit(&self, oid: ObjectHash) -> Result<Commit, ()> {
-        let (object_type, bytes) =
-            read_git_object_bounded_validated(&self.repository_path, &oid, MAX_CODE_COMMIT_BYTES)
-                .map_err(|_| ())?;
-        if object_type != "commit" {
+        let (bytes, object_type) = self
+            .storage
+            .get_existing_with_limit(&oid, MAX_CODE_COMMIT_BYTES)
+            .map_err(|_| ())?;
+        if object_type != ObjectType::Commit {
             return Err(());
         }
         Commit::from_bytes(&bytes, oid).map_err(|_| ())
     }
 
     fn load_tree(&self, oid: ObjectHash) -> Result<Tree, ()> {
-        let (object_type, bytes) =
-            read_git_object_bounded_validated(&self.repository_path, &oid, MAX_CODE_TREE_BYTES)
-                .map_err(|_| ())?;
-        if object_type != "tree" {
+        let (bytes, object_type) = self
+            .storage
+            .get_existing_with_limit(&oid, MAX_CODE_TREE_BYTES)
+            .map_err(|_| ())?;
+        if object_type != ObjectType::Tree {
             return Err(());
         }
         Tree::from_bytes(&bytes, oid).map_err(|_| ())

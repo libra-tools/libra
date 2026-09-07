@@ -676,7 +676,7 @@ pub(crate) mod tests {
         commit_oid
     }
 
-    async fn advance_code_head(
+    pub(crate) async fn advance_code_head(
         fixture: &Fixture,
         parent: ObjectHash,
         content: &[u8],

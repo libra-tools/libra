@@ -51,11 +51,7 @@ async fn bridge_ctx() -> BridgeContext {
     run_builtin_migrations(&conn)
         .await
         .expect("apply migrations");
-    BridgeContext {
-        conn,
-        repository_id: REPO_ID.into(),
-        worktree_id: None,
-    }
+    BridgeContext::new(conn, REPO_ID, None)
 }
 
 fn request(line: &str) -> BridgeRequest {

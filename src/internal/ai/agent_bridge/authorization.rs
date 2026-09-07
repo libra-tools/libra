@@ -32,9 +32,8 @@ pub enum ActionClass {
 pub fn classify(action: &str) -> ActionClass {
     match action {
         "checkpoint.create" | "checkpoint.list" | "checkpoint.show" | "evidence.append"
-        | "provenance.append" | "context.get" | "status.get" | "history.search" | "diff.get" => {
-            ActionClass::Normal
-        }
+        | "provenance.append" | "context.get" | "memory.recall" | "status.get"
+        | "history.search" | "diff.get" => ActionClass::Normal,
         // Default deny for anything that can change working state / refs /
         // remote: restore, branch-switch, reset, push, publish, delete-*,
         // commit (bounded but stateful — still approval-gated here).

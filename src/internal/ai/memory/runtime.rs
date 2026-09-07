@@ -8,12 +8,9 @@
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::{
-    collections::BTreeSet,
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
 };
 
 use chrono::Utc;
@@ -21,6 +18,8 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::delivery::bounded_recall_text_v1;
 use super::{
     compiler::{
         EpisodeCompileConfig, EpisodeCompiler, EpisodeCompilerSet,
@@ -30,22 +29,17 @@ use super::{
         },
         task::{TASK_EPISODE_PROMPT_VERSION, TASK_EPISODE_RULES_VERSION, TaskEpisodeCompiler},
     },
-    domain::{ActorKind, ActorRefV1},
+    delivery::{AuditedMemoryDelivery, AuditedMemoryDeliveryErrorKind, AuditedMemoryDeliveryV1},
+    domain::{ActorKind, ActorRefV1, EpisodeRoot},
     job::repair_observers_with_digest,
     limits::EpisodeSourceLimits,
     policy::{AuthenticatedMemoryContext, REPO_EPISODE_PRODUCER},
-    query::EpisodeQueryV1,
     runner::{EpisodeGenerationRunner, GenerationRunOutcome},
     writer::MemoryWriter,
 };
 use crate::{
     internal::ai::{
-        completion::CompletionModel,
-        context_budget::{
-            AuditedMemoryContextBundleV1, ContextBudget,
-            memory::{MemoryContextAssembler, MemoryContextAssemblerErrorKind},
-        },
-        history::HistoryManager,
+        completion::CompletionModel, context_budget::ContextBudget, history::HistoryManager,
         keyed_digest::RepositoryKeyedDigest,
     },
     utils::util::DATABASE,
@@ -54,9 +48,6 @@ use crate::{
 const MEMORY_SCOPE_KEY: &str = "repo";
 const RUNTIME_PRINCIPAL_ID: &str = "libra-memory-runtime";
 const MAX_GENERATIONS_PER_WAKE: usize = 4;
-const MAX_RUNTIME_QUERY_BYTES: usize = 4 * 1024;
-const MAX_RUNTIME_QUERY_TERM_BYTES: usize = 256;
-const MAX_RUNTIME_QUERY_TERMS: usize = 32;
 const MAINTENANCE_RUNNING: u8 = 1;
 const MAINTENANCE_DIRTY: u8 = 1 << 1;
 
@@ -162,7 +153,7 @@ impl MemoryRuntime {
     }
 
     #[cfg(test)]
-    fn for_tests<M>(
+    pub(super) fn for_tests<M>(
         history: Arc<HistoryManager>,
         digest: Arc<RepositoryKeyedDigest>,
         writer: Arc<MemoryWriter>,
@@ -181,6 +172,37 @@ impl MemoryRuntime {
             model_id.into(),
             context_budget,
         )
+    }
+
+    /// Reconcile terminal events and consume the generation for one Episode root.
+    pub(crate) async fn generate_episode(
+        &self,
+        root: &EpisodeRoot,
+    ) -> Result<GenerationRunOutcome, MemoryRuntimeError> {
+        let _guard = self.maintenance_gate.lock().await;
+        repair_observers_with_digest(self.history.as_ref(), self.digest.as_ref())
+            .await
+            .map_err(|_| MemoryRuntimeError::observer_repair())?;
+        let database = self.history.database_connection();
+        let runner = EpisodeGenerationRunner::new(
+            self.history.as_ref(),
+            &database,
+            self.digest.as_ref(),
+            self.writer.as_ref(),
+            MEMORY_SCOPE_KEY,
+            EpisodeSourceLimits::repo_v1(),
+        )
+        .map_err(|_| MemoryRuntimeError::configuration())?;
+        let compilers = EpisodeCompilerSet::new(
+            self.task_compiler.as_ref(),
+            &self.task_config,
+            self.intent_compiler.as_ref(),
+            &self.intent_config,
+        );
+        runner
+            .run_root(&compilers, &self.owner, Utc::now().timestamp_millis(), root)
+            .await
+            .map_err(|_| MemoryRuntimeError::generation())
     }
 
     /// Reconcile terminal events and consume at most four durable generations.
@@ -322,9 +344,6 @@ impl MemoryRuntime {
         &self,
         prompt: &str,
     ) -> Result<Option<String>, MemoryRuntimeError> {
-        let Some(text) = bounded_recall_text_v1(prompt) else {
-            return Ok(None);
-        };
         let context = AuthenticatedMemoryContext::new(
             self.digest.repository_id(),
             ActorRefV1 {
@@ -333,62 +352,34 @@ impl MemoryRuntime {
             },
         )
         .map_err(|_| MemoryRuntimeError::configuration())?;
-        let query = EpisodeQueryV1 {
-            text: Some(text),
-            ..EpisodeQueryV1::default()
-        };
-        let bundle = MemoryContextAssembler::new(self.history.as_ref(), Arc::clone(&self.digest))
-            .assemble(&context, &query, &self.context_budget, Utc::now())
-            .await
-            .map_err(|error| match error.kind() {
-                MemoryContextAssemblerErrorKind::Receipt
-                | MemoryContextAssemblerErrorKind::ReceiptStore => {
-                    MemoryRuntimeError::receipt_persistence()
-                }
-                _ => MemoryRuntimeError::recall(),
-            })?;
-        prepared_context(bundle)
+        let delivery = AuditedMemoryDelivery::from_dependencies(
+            Arc::clone(&self.history),
+            Arc::clone(&self.digest),
+            self.context_budget.clone(),
+        )
+        .recall(&context, prompt)
+        .await
+        .map_err(|error| match error.kind() {
+            AuditedMemoryDeliveryErrorKind::Storage => MemoryRuntimeError::receipt_persistence(),
+            _ => MemoryRuntimeError::recall(),
+        })?;
+        delivery
+            .map(prepared_context)
+            .transpose()
+            .map(Option::flatten)
     }
 }
 
 fn prepared_context(
-    bundle: AuditedMemoryContextBundleV1,
+    delivery: AuditedMemoryDeliveryV1,
 ) -> Result<Option<String>, MemoryRuntimeError> {
-    let selected_count = bundle.receipt().selected().len();
-    if selected_count == 0 {
+    if delivery.selected_count() == 0 {
         return Ok(None);
     }
-    if bundle.prompt_section().trim().is_empty() {
+    if delivery.prompt_section().trim().is_empty() {
         return Err(MemoryRuntimeError::recall());
     }
-    Ok(Some(bundle.prompt_section().to_string()))
-}
-
-/// Reduce an arbitrary Agent request to the bounded plain-text query accepted
-/// by the FTS5 reader. Input order is retained; duplicate terms use ASCII
-/// case-folding only, matching the reader's normalization contract.
-fn bounded_recall_text_v1(input: &str) -> Option<String> {
-    let mut selected = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut bytes = 0usize;
-    for term in input.split(|character: char| !character.is_alphanumeric()) {
-        if term.is_empty() || term.len() > MAX_RUNTIME_QUERY_TERM_BYTES {
-            continue;
-        }
-        let key = term.to_ascii_lowercase();
-        if !seen.insert(key) {
-            continue;
-        }
-        let separator = usize::from(!selected.is_empty());
-        if selected.len() == MAX_RUNTIME_QUERY_TERMS
-            || bytes.saturating_add(separator).saturating_add(term.len()) > MAX_RUNTIME_QUERY_BYTES
-        {
-            break;
-        }
-        bytes = bytes.saturating_add(separator).saturating_add(term.len());
-        selected.push(term);
-    }
-    (!selected.is_empty()).then(|| selected.join(" "))
+    Ok(Some(delivery.prompt_section().to_string()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -563,7 +554,7 @@ mod tests {
             .join(" / ");
         let query = bounded_recall_text_v1(&input).expect("query has searchable terms");
         let terms = query.split_whitespace().collect::<Vec<_>>();
-        assert_eq!(terms.len(), MAX_RUNTIME_QUERY_TERMS);
+        assert_eq!(terms.len(), 32);
         assert_eq!(terms[0], "Term0");
         assert_eq!(terms[31], "Term31");
         assert_eq!(
@@ -571,6 +562,83 @@ mod tests {
             Some(query.as_str())
         );
         assert_eq!(bounded_recall_text_v1("---\n\t"), None);
+    }
+
+    #[tokio::test]
+    async fn dsh_completed_turn_generates_persisted_episode() {
+        let fixture = fixture().await;
+        let start_commit = super::super::reader::tests::seed_code_head(&fixture).await;
+        let history = Arc::new(HistoryManager::new(
+            Arc::new(LocalStorage::new(fixture._temp.path().join("objects"))),
+            fixture._temp.path().to_path_buf(),
+            Arc::clone(&fixture.database),
+        ));
+        let runtime = MemoryRuntime::for_tests(
+            Arc::clone(&history),
+            Arc::clone(&fixture.digest),
+            Arc::clone(&fixture.writer),
+            TaskPromptModel,
+            "runtime-fake",
+            ContextBudget::default(),
+        )
+        .expect("construct Memory runtime");
+        let recorder = super::super::dsh::DshEpisodeRecorder::from_runtime(
+            Arc::clone(&history),
+            Arc::new(runtime),
+        );
+        recorder
+            .begin_turn("dsh-generation-test", 1)
+            .await
+            .expect("capture starting code revision");
+        super::super::reader::tests::advance_code_head(&fixture, start_commit, b"deployed blue\n")
+            .await;
+        recorder
+            .begin_turn("dsh-generation-test", 1)
+            .await
+            .expect("compaction retains starting revision");
+        let record = recorder
+            .record(super::super::dsh::DshEpisodeInput {
+                session_id: "dsh-generation-test".into(),
+                turn: 1,
+                goal: "Remember the deployment result".into(),
+                response_text: "The deployment used the blue environment.".into(),
+            })
+            .await
+            .expect("record and compile DSH turn");
+        assert!(!record.task_id.is_empty());
+        assert!(!record.note_id.is_empty());
+        assert!(!record.revision_oid.is_empty());
+        let changed: String = fixture
+            .database
+            .query_one_raw(sea_orm::Statement::from_string(
+                fixture.database.get_database_backend(),
+                "SELECT code_change_status FROM memory_episode_search_doc".to_string(),
+            ))
+            .await
+            .expect("query code status")
+            .expect("generated search row")
+            .try_get("", "code_change_status")
+            .expect("decode code status");
+        assert_eq!(changed, "changed");
+        let delivery = AuditedMemoryDelivery::from_dependencies(
+            history,
+            Arc::clone(&fixture.digest),
+            ContextBudget::default(),
+        );
+        let context = AuthenticatedMemoryContext::new(
+            fixture.digest.repository_id(),
+            ActorRefV1 {
+                kind: ActorKind::Agent,
+                principal_id: "deepseek-harness:dsh-generation-test".into(),
+            },
+        )
+        .expect("agent context");
+        let recalled = delivery
+            .recall(&context, "deployment")
+            .await
+            .expect("recall generated Episode")
+            .expect("query delivery");
+        assert_eq!(recalled.selected_count(), 1);
     }
 
     #[tokio::test]

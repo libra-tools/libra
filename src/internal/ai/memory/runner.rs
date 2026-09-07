@@ -10,9 +10,9 @@ use thiserror::Error;
 use super::{
     admission::{EpisodeAdmission, EpisodeAdmissionErrorKind},
     compiler::{EpisodeCompiler, EpisodeCompilerSet},
-    domain::{ActorKind, ActorRefV1, EpisodeRootKind},
+    domain::{ActorKind, ActorRefV1, EpisodeRoot, EpisodeRootKind},
     error::MemoryWriterErrorKind,
-    job_sql::{claim_next_job, complete_job, record_job_failure, release_job_dirty},
+    job_sql::{claim_job, claim_next_job, complete_job, record_job_failure, release_job_dirty},
     job_state::{
         CompileFailureClass, CompileJobCompletionOutcome, CompileJobMutationOutcome,
         StableJobFailure,
@@ -92,6 +92,31 @@ impl<'a> EpisodeGenerationRunner<'a> {
             return Ok(GenerationRunOutcome::NoWork);
         };
 
+        self.run_lease(compilers, lease, now_ms).await
+    }
+
+    pub(crate) async fn run_root<T: EpisodeCompiler + ?Sized, I: EpisodeCompiler + ?Sized>(
+        &self,
+        compilers: &EpisodeCompilerSet<'_, T, I>,
+        owner: &str,
+        now_ms: i64,
+        root: &EpisodeRoot,
+    ) -> Result<GenerationRunOutcome, EpisodeGenerationRunnerError> {
+        let Some(lease) = claim_job(self.database, self.scope_key, owner, now_ms, Some(root))
+            .await
+            .map_err(|_| EpisodeGenerationRunnerError::job())?
+        else {
+            return Ok(GenerationRunOutcome::NoWork);
+        };
+        self.run_lease(compilers, lease, now_ms).await
+    }
+
+    async fn run_lease<T: EpisodeCompiler + ?Sized, I: EpisodeCompiler + ?Sized>(
+        &self,
+        compilers: &EpisodeCompilerSet<'_, T, I>,
+        lease: super::job_state::CompileJobLease,
+        now_ms: i64,
+    ) -> Result<GenerationRunOutcome, EpisodeGenerationRunnerError> {
         let actor = match self.terminal_actor(&lease).await {
             Ok(actor) => actor,
             Err(failure) => return self.record_failure(&lease, failure, now_ms).await,

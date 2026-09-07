@@ -2,7 +2,7 @@
 //! `libra agent bridge --stdio` (plan-20260818 LB-01, ADR-LB-01/02/03).
 //!
 //! Everything a peer must agree on to speak to the bridge lives here:
-//! protocol version, capability matrix, the exact 20-method allowlist, the
+//! protocol version, capability matrix, the exact 22-method allowlist, the
 //! v1 frame/batch limits, JSON-RPC 2.0 frame shapes and the stable error
 //! catalogue with retryability. The TypeScript plugin consumes the fixture
 //! generated from these constants; it must not redefine any of them.
@@ -22,7 +22,7 @@ pub const SOURCE_DEEPSEEK_HARNESS: &str = "deepseek-harness";
 /// processed (GC-LB-05). `minor` allows additive, backward-compatible fields
 /// on the same major.
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 2;
 
 /// JSON-RPC 2.0 framing (ADR-LB-01): newline-delimited JSON on stdout;
 /// diagnostics only on stderr (GC-LB-04).
@@ -51,7 +51,7 @@ pub const MAX_PAGE: usize = 100;
 pub const MAX_SESSION_PAGE: usize = 500;
 
 // ---------------------------------------------------------------------------
-// The v1 method allowlist (20 methods). Implementations must dispatch on
+// The v1 method allowlist (22 methods). Implementations must dispatch on
 // these literal names; the model-visible tool aliases (`libra_context`, …)
 // are a TypeScript facade and are NOT bridge methods.
 // ---------------------------------------------------------------------------
@@ -68,6 +68,8 @@ pub const METHOD_ALLOWLIST: &[&str] = &[
     "evidence.append",
     "provenance.append",
     "context.get",
+    "memory.recall",
+    "memory.episode.record",
     "status.get",
     "diff.get",
     "history.search",
@@ -86,7 +88,7 @@ pub const METHOD_ALLOWLIST: &[&str] = &[
 pub struct MethodAllowlist;
 
 impl MethodAllowlist {
-    /// `true` when `method` is one of the 20 v1 methods.
+    /// `true` when `method` is one of the 22 v1 methods.
     pub fn contains(method: &str) -> bool {
         METHOD_ALLOWLIST.contains(&method)
     }
@@ -281,7 +283,7 @@ impl BridgeError {
         Self::new(
             code::METHOD_NOT_FOUND,
             "LBR-AGENT-026",
-            format!("unknown bridge method '{method}'; the v1 allowlist has 20 methods"),
+            format!("unknown bridge method '{method}'; the v1 allowlist has 22 methods"),
         )
     }
 
@@ -529,8 +531,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_has_exactly_20_methods() {
-        assert_eq!(METHOD_ALLOWLIST.len(), 20);
+    fn allowlist_has_exactly_22_methods() {
+        assert_eq!(METHOD_ALLOWLIST.len(), 22);
         // The four handshake/session/ingress methods, projection, reads,
         // mutation and workspace groups must all be present.
         for m in [
@@ -542,6 +544,8 @@ mod tests {
             "evidence.append",
             "provenance.append",
             "context.get",
+            "memory.recall",
+            "memory.episode.record",
             "status.get",
             "diff.get",
             "history.search",

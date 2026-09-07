@@ -130,6 +130,31 @@ impl LocalStorage {
         }
     }
 
+    /// Read an existing local object (loose or packed) with a bounded load
+    /// cost. This synchronous seam is for bounded parsers that already run on
+    /// a blocking filesystem path and cannot call the async [`Storage`] API.
+    pub(crate) fn get_existing_with_limit(
+        &self,
+        hash: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        if let Some(kind) = self.hash_kind {
+            set_hash_kind(kind);
+        }
+        if let Some(found) = self.get_here_with_limit(hash, Some(limit))? {
+            return Ok(found);
+        }
+        for alternate in &self.alternates {
+            if let Some((payload, obj_type)) =
+                alternate.get_here_with_limit(hash, Some(limit))?
+            {
+                super::tiered::verify_fetched_object(hash, obj_type, &payload)?;
+                return Ok((payload, obj_type));
+            }
+        }
+        Err(GitError::ObjectNotFound(hash.to_string()))
+    }
+
     /// Transforms an object hash into a path like "ab/cdef...". This is used for loose objects.
     fn transform_path(&self, hash: &ObjectHash) -> String {
         let hash = hash.to_string();

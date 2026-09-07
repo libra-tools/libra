@@ -608,6 +608,16 @@ pub(crate) async fn claim_next_job(
     owner: &str,
     now_ms: i64,
 ) -> Result<Option<CompileJobLease>, CompileJobStateError> {
+    claim_job(database, scope_key, owner, now_ms, None).await
+}
+
+pub(crate) async fn claim_job(
+    database: &DatabaseConnection,
+    scope_key: &str,
+    owner: &str,
+    now_ms: i64,
+    root: Option<&EpisodeRoot>,
+) -> Result<Option<CompileJobLease>, CompileJobStateError> {
     let scope_probe = EpisodeRoot::task("scope-validation")
         .map_err(|_| CompileJobStateError::new(CompileJobStateErrorKind::InvalidInput))?;
     CompileJobKey::new(scope_key, scope_probe)?;
@@ -621,7 +631,7 @@ pub(crate) async fn claim_next_job(
     let transaction = db::begin_write_transaction(database)
         .await
         .map_err(|_| CompileJobStateError::storage())?;
-    let result = claim_next_job_in_transaction(&transaction, scope_key, owner, now_ms).await;
+    let result = claim_next_job_in_transaction(&transaction, scope_key, owner, now_ms, root).await;
     match result {
         Ok(lease) => {
             transaction
@@ -642,6 +652,7 @@ async fn claim_next_job_in_transaction(
     scope_key: &str,
     owner: &str,
     now_ms: i64,
+    root: Option<&EpisodeRoot>,
 ) -> Result<Option<CompileJobLease>, CompileJobStateError> {
     let row = transaction
         .query_one_raw(Statement::from_sql_and_values(
@@ -651,11 +662,27 @@ async fn claim_next_job_in_transaction(
                     input_fingerprint_digest, observed_generation, lease_fence
              FROM memory_compile_job
              WHERE scope_key = ? AND processed_generation < observed_generation
+               AND (? IS NULL OR (root_kind = ? AND root_id = ?))
                AND ((state = 'dirty' AND (next_retry_at IS NULL OR next_retry_at <= ?))
                     OR (state = 'inflight' AND lease_expires_at <= ?))
              ORDER BY updated_at ASC, root_kind ASC, root_id ASC
              LIMIT 1",
-            [scope_key.into(), now_ms.into(), now_ms.into()],
+            vec![
+                scope_key.into(),
+                root.map(|r| match r.kind() {
+                    EpisodeRootKind::Task => "task",
+                    EpisodeRootKind::Intent => "intent",
+                })
+                .into(),
+                root.map(|r| match r.kind() {
+                    EpisodeRootKind::Task => "task",
+                    EpisodeRootKind::Intent => "intent",
+                })
+                .into(),
+                root.map(EpisodeRoot::id).into(),
+                now_ms.into(),
+                now_ms.into(),
+            ],
         ))
         .await
         .map_err(|_| CompileJobStateError::storage())?;

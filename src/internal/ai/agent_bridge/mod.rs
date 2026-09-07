@@ -17,6 +17,7 @@
 
 pub mod authorization;
 pub mod ingress;
+pub mod memory;
 pub mod methods;
 pub mod mutations;
 pub mod protocol;

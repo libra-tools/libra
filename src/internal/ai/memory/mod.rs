@@ -13,8 +13,10 @@ mod admission;
 mod applicability;
 mod canonical;
 mod compiler;
+mod delivery;
 mod diagnostics;
 mod domain;
+mod dsh;
 mod error;
 mod evidence;
 mod fts_sql;
@@ -39,13 +41,18 @@ mod view;
 mod writer;
 
 pub(crate) use applicability::CodeApplicability;
+pub(crate) use delivery::{
+    AuditedMemoryDelivery, AuditedMemoryDeliveryErrorKind, AuditedMemoryDeliveryV1,
+};
 pub(crate) use diagnostics::{
     MemoryDiagnostics, MemoryJobStatus, MemoryRebuildReport, MemoryStatusReport,
 };
 pub(crate) use domain::{
-    CodeChangeStatus, CompletionStatus, EpisodeRootKind, EvidenceKind, EvidenceRefV1,
-    EvidenceSourcePlane, MemoryNoteV1, MemoryScopeV1, MemorySensitivity, MemoryTrust,
+    ActorKind, ActorRefV1, CodeChangeStatus, CompletionStatus, EpisodeRootKind, EvidenceKind,
+    EvidenceRefV1, EvidenceSourcePlane, MemoryNoteV1, MemoryScopeV1, MemorySensitivity,
+    MemoryTrust,
 };
+pub(crate) use dsh::{DshEpisodeInput, DshEpisodeRecordErrorKind, DshEpisodeRecorder};
 #[cfg(test)]
 pub(crate) use error::MemoryDamagePoint;
 pub(crate) use error::{MemoryWriterError, MemoryWriterErrorKind};

@@ -1001,7 +1001,16 @@ impl<'resolver, 'history> SourceCollector<'resolver, 'history> {
             self.target.root().kind(),
             self.target.root().id(),
         )?;
-        let code = derive_code_context(&self.values, &self.run_ids);
+        let mut code = derive_code_context(&self.values, &self.run_ids);
+        let history = super::applicability::RepositoryCodeHistory::new(
+            self.resolver.history.repository_path(),
+        );
+        code.base_oid = code
+            .base_oid
+            .map(|anchor| resolve_code_anchor(&history, anchor));
+        code.result_oid = code
+            .result_oid
+            .map(|anchor| resolve_code_anchor(&history, anchor));
         let code_change_status = match (&code.base_oid, &code.result_oid) {
             (_, None) => CodeChangeStatus::Unknown,
             (Some(base), Some(result)) if base == result => CodeChangeStatus::Unchanged,
@@ -1348,6 +1357,28 @@ fn terminal_fact(
         .pop()
         .map(|(at, _, status)| (status, at))
         .ok_or_else(|| EpisodeSourceError::new(EpisodeSourceErrorKind::InvalidRequest))
+}
+
+// Canonical Run/Decision IntegrityHash fields store SHA-1 anchors padded to
+// 64 characters. Recover the real OID only after checking repository objects.
+fn resolve_code_anchor(
+    history: &super::applicability::RepositoryCodeHistory,
+    anchor: String,
+) -> String {
+    use super::applicability::CodeHistory;
+    if anchor.len() == 64 && anchor.ends_with("000000000000000000000000") {
+        let full_exists = anchor
+            .parse::<ObjectHash>()
+            .ok()
+            .is_some_and(|oid| history.parents(oid).is_ok());
+        if !full_exists
+            && let Ok(oid) = anchor[..40].parse::<ObjectHash>()
+            && history.parents(oid).is_ok()
+        {
+            return oid.to_string();
+        }
+    }
+    anchor
 }
 
 fn derive_code_context(

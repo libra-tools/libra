@@ -628,7 +628,9 @@ pub(crate) enum MemoryContextAssemblerErrorKind {
     Unauthorized,
     StaleView,
     UnknownPolicy,
-    Reader,
+    ReaderConfiguration,
+    ReaderStorage,
+    ReaderCorrupt,
     Digest,
     Serialization,
     Receipt,
@@ -661,9 +663,15 @@ impl From<EpisodeReaderError> for MemoryContextAssemblerError {
             EpisodeReaderErrorKind::Unauthorized => MemoryContextAssemblerErrorKind::Unauthorized,
             EpisodeReaderErrorKind::StaleProjection => MemoryContextAssemblerErrorKind::StaleView,
             EpisodeReaderErrorKind::UnknownPolicy => MemoryContextAssemblerErrorKind::UnknownPolicy,
-            EpisodeReaderErrorKind::InvalidConfiguration
-            | EpisodeReaderErrorKind::StorageUnavailable
-            | EpisodeReaderErrorKind::CorruptProjection => MemoryContextAssemblerErrorKind::Reader,
+            EpisodeReaderErrorKind::InvalidConfiguration => {
+                MemoryContextAssemblerErrorKind::ReaderConfiguration
+            }
+            EpisodeReaderErrorKind::StorageUnavailable => {
+                MemoryContextAssemblerErrorKind::ReaderStorage
+            }
+            EpisodeReaderErrorKind::CorruptProjection => {
+                MemoryContextAssemblerErrorKind::ReaderCorrupt
+            }
         };
         Self::new(kind)
     }
