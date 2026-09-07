@@ -12,10 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::store::OpHeadsView;
-use crate::{
-    internal::worktree_scope::RequestScope,
-    utils::atomic_write::write_atomic,
-};
+use crate::{internal::worktree_scope::RequestScope, utils::atomic_write::write_atomic};
 
 const POINTER_FILE: &str = "operation-pointer.json";
 const POINTER_SCHEMA_VERSION: u32 = 1;
@@ -42,6 +39,8 @@ struct PersistedPointer {
 pub struct WorkspaceStatePointer {
     pub last_op_id: String,
     pub last_snapshot_oid: ObjectHash,
+    #[serde(default)]
+    pub last_content_oid: Option<ObjectHash>,
     pub generation: u64,
 }
 
@@ -68,6 +67,7 @@ impl WorkspaceStatePointer {
         Self {
             last_op_id: last_op_id.into(),
             last_snapshot_oid,
+            last_content_oid: None,
             generation,
         }
     }
@@ -138,8 +138,9 @@ impl WorkspaceStatePointer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use git_internal::hash::ObjectHash;
+
+    use super::*;
 
     fn oid(byte: u8) -> ObjectHash {
         ObjectHash::from_bytes(&[byte; 20]).expect("test object id")

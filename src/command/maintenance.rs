@@ -4931,6 +4931,10 @@ mod tests {
                 "the HEAD pointer file (dual-layout compatibility); ref OIDs are inventoried in the DB half (reference)",
             ),
             (
+                "operation-v2.lock",
+                "the cross-process operation middleware lease; it contains no object ids and is never a GC root",
+            ),
+            (
                 "config",
                 "repository configuration file (dual-layout compatibility); no object ids",
             ),

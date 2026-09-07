@@ -1,8 +1,12 @@
 //! OL-07 focused coverage: raw index bytes are restored byte-for-byte.
 
-use libra::internal::operation::{FacetCaptureCtx, FacetRestoreCtx, RawIndexFacet, StateFacet};
-use libra::internal::worktree_scope::{RequestScope, WorktreeScope};
-use libra::utils::client_storage::ClientStorage;
+use libra::{
+    internal::{
+        operation::{FacetCaptureCtx, FacetRestoreCtx, RawIndexFacet, StateFacet},
+        worktree_scope::{RequestScope, WorktreeScope},
+    },
+    utils::client_storage::ClientStorage,
+};
 
 #[test]
 fn raw_index_facet_preserves_exact_bytes() {
@@ -22,7 +26,9 @@ fn raw_index_facet_preserves_exact_bytes() {
     let facet = RawIndexFacet::new(scope, storage);
     let capture = facet.capture(&FacetCaptureCtx::default()).unwrap();
     std::fs::write(gitdir.join("index"), b"changed\n").unwrap();
-    facet.restore(&capture, &mut FacetRestoreCtx::default()).unwrap();
+    facet
+        .restore(&capture, &mut FacetRestoreCtx::default())
+        .unwrap();
     assert_eq!(std::fs::read(gitdir.join("index")).unwrap(), bytes);
     assert_eq!(capture.meta["byte_exact"], true);
 }

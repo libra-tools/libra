@@ -260,6 +260,28 @@ impl WorktreeIo {
         self.submit_with_token(request, path_key, timeout, true, CancellationToken::new())
     }
 
+    /// Execute a bounded protocol request through the in-process handler.
+    ///
+    /// Cargo test and library hosts deliberately cannot launch the CLI worker
+    /// executable. Snapshot capture uses this seam only for those hosts; the
+    /// production CLI continues to use [`Self::submit_absolute`] so a hung
+    /// filesystem read remains killable.
+    pub(crate) fn submit_in_process(
+        &self,
+        request: IoRequest,
+        _path_key: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<IoEvent>, ExecutorError> {
+        if timeout.is_zero() {
+            return Err(ExecutorError::DeadlineExpired);
+        }
+        request.validate().map_err(ExecutorError::Protocol)?;
+        match run_in_process(self.pool.config.in_process_handler, request) {
+            JobOutcome::Events(events) => Ok(events),
+            JobOutcome::Error(error) => Err(error),
+        }
+    }
+
     pub(crate) fn submit_with_token(
         &self,
         request: IoRequest,

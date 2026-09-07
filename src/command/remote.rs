@@ -1174,6 +1174,12 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
                     BranchStoreError::Corrupt { name, detail } => {
                         RemoteError::BranchCorrupt { name, detail }
                     }
+                    BranchStoreError::Query(detail) if branch_delete_write_failure(&detail) => {
+                        RemoteError::BranchDelete {
+                            name: entry.remote_ref.clone(),
+                            detail,
+                        }
+                    }
                     BranchStoreError::Query(detail) => RemoteError::BranchList { detail },
                     other => RemoteError::ConfigWrite {
                         detail: other.to_string(),
@@ -1187,6 +1193,14 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
         dry_run,
         stale_branches,
     })
+}
+
+fn branch_delete_write_failure(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("readonly")
+        || detail.contains("read-only")
+        || detail.contains("permission denied")
+        || detail.contains("database is locked")
 }
 
 /// A remote is considered to exist if **any** `remote.<name>.*` key is
