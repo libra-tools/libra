@@ -2,7 +2,8 @@
 
 use libra::internal::change::{
     AiOperationLink, ChangeRevisionBuilder, PredecessorEdge, RelationKind, ai_links_for_change,
-    ai_links_for_intent, evolution_for_commit, insert_predecessor, link_ai_operation,
+    ai_links_for_intent, attach_pending_ai_operation_links, evolution_for_commit,
+    insert_predecessor, link_ai_operation, record_pending_ai_operation_link,
 };
 use libra::internal::db;
 use tempfile::tempdir;
@@ -145,4 +146,29 @@ async fn ai_links_query_by_intent_returns_stable_change_id() {
         .await
         .expect("change query");
     assert_eq!(by_change, by_intent);
+
+    record_pending_ai_operation_link(
+        &database,
+        "tool-op-1",
+        Some("session-1"),
+        Some("run-1"),
+        Some("tool-call-1"),
+        Some("intent-redacted"),
+        "repo",
+        "v1",
+    )
+    .await
+    .expect("pending AI link");
+    attach_pending_ai_operation_links(&database, "repo", revision.change_id)
+        .await
+        .expect("attach pending AI link");
+    let by_intent = ai_links_for_intent(&database, "repo", "intent-redacted")
+        .await
+        .expect("intent query after attach");
+    assert_eq!(by_intent.len(), 2);
+    assert_eq!(by_intent[1].operation_id, "tool-op-1");
+    assert_eq!(
+        by_intent[1].tool_invocation_id.as_deref(),
+        Some("tool-call-1")
+    );
 }

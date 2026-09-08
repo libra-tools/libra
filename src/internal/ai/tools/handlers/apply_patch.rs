@@ -47,7 +47,6 @@ impl ToolHandler for ApplyPatchHandler {
             payload,
             working_dir,
             runtime_context,
-            ai_operation,
             ..
         } = invocation;
 
@@ -141,14 +140,6 @@ impl ToolHandler for ApplyPatchHandler {
         })
         .await
         .map_err(|e| ToolError::ExecutionFailed(e.to_string()))??;
-
-        if let Some(ai_operation) = ai_operation.as_ref()
-            && let Err(error) =
-                crate::internal::ai::libra_vcs::record_ai_operation_link_for_tool(ai_operation)
-                    .await
-        {
-            tracing::warn!(%error, "failed to persist AI operation link for apply_patch");
-        }
 
         // Build unified diffs for UI display (metadata — not sent to model).
         let diffs_json: Vec<serde_json::Value> = result

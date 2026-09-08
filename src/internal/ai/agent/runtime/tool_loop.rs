@@ -234,6 +234,8 @@ pub struct ToolLoopConfig {
     pub usage_context: Option<UsageContext>,
     /// Stable intent identity used for AI-to-change causality links.
     pub intent_id: Option<String>,
+    /// Runtime-owned run identity used for AI-to-change causality links.
+    pub run_id: Option<String>,
     /// Shared model-turn sequence for cancellation accounting. The Code UI records a
     /// cancellation fallback against the active request's durable event key.
     pub active_model_turn: Option<Arc<AtomicUsize>>,
@@ -291,6 +293,7 @@ impl Default for ToolLoopConfig {
             usage_recorder: None,
             usage_context: None,
             intent_id: None,
+            run_id: None,
             active_model_turn: None,
             source_pool: None,
             source_session_id: None,
@@ -711,6 +714,7 @@ where
                 if let Some(ai_operation) = ai_operation_context(&config, &call.id) {
                     invocation = invocation.with_ai_operation(ai_operation);
                 }
+                let ai_operation = invocation.ai_operation.clone();
 
                 let tool_name = call.function.name.clone();
                 let mutates_state = if tool_name == "task" {
@@ -774,6 +778,21 @@ where
                         }
                     }
                 };
+                if mutates_state
+                    && tool_result.as_ref().is_ok_and(|output| output.is_success())
+                    && let Some(ai_operation) = ai_operation.as_ref()
+                    && let Err(error) =
+                        crate::internal::ai::libra_vcs::record_pending_ai_operation_link_for_tool(
+                            ai_operation,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        %error,
+                        tool = %tool_name,
+                        "failed to persist pending AI operation link"
+                    );
+                }
                 if mutates_state && let Some(cancellation) = config.cancellation.as_ref() {
                     cancellation.mark_mutation_finished();
                 }
@@ -1072,15 +1091,18 @@ fn ai_operation_context(config: &ToolLoopConfig, call_id: &str) -> Option<AiOper
 
     let operation_id = usage
         .and_then(|context| context.event_id.clone())
+        .map(|event_id| format!("{event_id}:tool-call:{call_id}"))
         .unwrap_or_else(|| format!("tool-call:{call_id}"));
     Some(AiOperationContext {
         operation_id,
         session_id: usage.and_then(|context| context.session_id.clone()),
-        run_id: usage.and_then(|context| {
-            context
-                .run_id
-                .clone()
-                .or_else(|| context.agent_run_id.clone())
+        run_id: config.run_id.clone().or_else(|| {
+            usage.and_then(|context| {
+                context
+                    .run_id
+                    .clone()
+                    .or_else(|| context.agent_run_id.clone())
+            })
         }),
         tool_invocation_id: call_id.to_string(),
         intent_id,
@@ -2212,6 +2234,7 @@ mod tests {
                 usage_recorder: None,
                 usage_context: None,
                 intent_id: None,
+                run_id: None,
                 active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,
@@ -2976,6 +2999,7 @@ mod tests {
                 usage_recorder: None,
                 usage_context: None,
                 intent_id: None,
+                run_id: None,
                 active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,
@@ -3115,6 +3139,7 @@ mod tests {
                 usage_recorder: None,
                 usage_context: None,
                 intent_id: None,
+                run_id: None,
                 active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,

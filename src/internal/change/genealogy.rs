@@ -146,6 +146,80 @@ pub async fn link_ai_operation(
     .map_err(GenealogyError::Database)
 }
 
+/// Store a redacted AI link until the mutating command creates its revision.
+/// The nullable `change_id` is intentional: tool calls happen before a commit
+/// exists, and the revision builder backfills these rows after the new stable
+/// Change ID is known.
+pub async fn record_pending_ai_operation_link(
+    db: &DatabaseConnection,
+    operation_id: &str,
+    session_id: Option<&str>,
+    run_id: Option<&str>,
+    tool_invocation_id: Option<&str>,
+    intent_id: Option<&str>,
+    repo_id: &str,
+    redaction_version: &str,
+) -> Result<(), GenealogyError> {
+    for (name, value) in [
+        ("operation id", operation_id),
+        ("repository id", repo_id),
+        ("redaction version", redaction_version),
+    ] {
+        validate_redacted_value(name, value)?;
+    }
+    for (name, value) in [
+        ("session id", session_id),
+        ("run id", run_id),
+        ("tool invocation id", tool_invocation_id),
+        ("intent id", intent_id),
+    ] {
+        if let Some(value) = value {
+            validate_redacted_value(name, value)?;
+        }
+    }
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO ai_operation_link \
+         (operation_id, change_id, session_id, run_id, tool_invocation_id, intent_id, \
+          repo_id, redaction_version) VALUES (?, NULL, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(operation_id) DO UPDATE SET \
+          session_id = excluded.session_id, run_id = excluded.run_id, \
+          tool_invocation_id = excluded.tool_invocation_id, intent_id = excluded.intent_id, \
+          repo_id = excluded.repo_id, redaction_version = excluded.redaction_version",
+        [
+            operation_id.to_string().into(),
+            session_id.map(str::to_string).into(),
+            run_id.map(str::to_string).into(),
+            tool_invocation_id.map(str::to_string).into(),
+            intent_id.map(str::to_string).into(),
+            repo_id.to_string().into(),
+            redaction_version.to_string().into(),
+        ],
+    ))
+    .await
+    .map(|_| ())
+    .map_err(GenealogyError::Database)
+}
+
+/// Attach all pending AI tool links for a repository to the revision just
+/// created by a mutating command. The operation ID remains the per-tool-call
+/// key, so multiple calls from one model turn cannot overwrite one another.
+pub async fn attach_pending_ai_operation_links(
+    db: &DatabaseConnection,
+    repo_id: &str,
+    change_id: ChangeId,
+) -> Result<(), GenealogyError> {
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE ai_operation_link SET change_id = ? \
+         WHERE repo_id = ? AND change_id IS NULL",
+        [change_id.to_string().into(), repo_id.to_string().into()],
+    ))
+    .await
+    .map(|_| ())
+    .map_err(GenealogyError::Database)
+}
+
 /// Return all AI links for a stable Change ID in one repository.
 pub async fn ai_links_for_change(
     db: &DatabaseConnection,
@@ -195,7 +269,7 @@ fn validate_ai_link(link: &AiOperationLink) -> Result<(), GenealogyError> {
         ("repository id", link.repo_id.as_str()),
         ("redaction version", link.redaction_version.as_str()),
     ] {
-        validate_redacted_value(name, value, true)?;
+        validate_redacted_value(name, value)?;
     }
     for (name, value) in [
         ("session id", link.session_id.as_deref()),
@@ -210,21 +284,28 @@ fn validate_ai_link(link: &AiOperationLink) -> Result<(), GenealogyError> {
         ),
     ] {
         if let Some(value) = value {
-            validate_redacted_value(name, value, false)?;
+            validate_redacted_value(name, value)?;
         }
     }
     Ok(())
 }
 
-fn validate_redacted_value(name: &str, value: &str, required: bool) -> Result<(), GenealogyError> {
-    if required && value.trim().is_empty() {
+fn validate_redacted_value(name: &str, value: &str) -> Result<(), GenealogyError> {
+    if value.trim().is_empty() {
         return Err(GenealogyError::InvalidAiLink(format!(
-            "{name} must not be empty"
+            "{name} must not be empty when present"
         )));
     }
-    if value.len() > 256 || value.chars().any(char::is_control) {
+    if value.len() > 256
+        || value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || !(character.is_ascii_alphanumeric()
+                    || matches!(character, '-' | '_' | ':' | '.' | '/'))
+        })
+    {
         return Err(GenealogyError::InvalidAiLink(format!(
-            "{name} must be a bounded, control-free redacted identifier"
+            "{name} must match the bounded opaque-ID grammar"
         )));
     }
     Ok(())

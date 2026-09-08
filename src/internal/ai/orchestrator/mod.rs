@@ -25,6 +25,8 @@ pub(crate) mod workspace;
 
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use types::{
     OrchestratorConfig, OrchestratorError, OrchestratorResult, PhaseConfirmationDecision,
     PhaseConfirmationPrompt,
@@ -353,6 +355,7 @@ impl<M: CompletionModel + 'static> Orchestrator<M> {
             .persisted_intent_id
             .clone()
             .or_else(|| Some(spec.metadata.id.clone()));
+        tool_loop_config.run_id = Some(Uuid::now_v7().to_string());
         if self.config.coder_preamble.is_some() {
             tool_loop_config.preamble = self.config.coder_preamble.clone();
         }

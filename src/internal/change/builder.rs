@@ -5,7 +5,8 @@ use thiserror::Error;
 
 use super::{
     AiOperationLink, ChangeId, ChangeRevision, ChangeStore, ChangeStoreError, GenealogyError,
-    PredecessorEdge, RelationKind, RevisionVisibility, link_ai_operation,
+    PredecessorEdge, RelationKind, RevisionVisibility, attach_pending_ai_operation_links,
+    link_ai_operation,
 };
 
 #[derive(Debug, Error)]
@@ -80,7 +81,7 @@ pub async fn record_current_repo_commit_revision_with_predecessors(
             run_id: None,
             tool_invocation_id: None,
             intent_id: None,
-            repo_id,
+            repo_id: repo_id.clone(),
             worktree_id: None,
             workspace_id: None,
             lease_generation: None,
@@ -89,6 +90,7 @@ pub async fn record_current_repo_commit_revision_with_predecessors(
         },
     )
     .await?;
+    attach_pending_ai_operation_links(&database, &repo_id, revision.change_id).await?;
     Ok(revision)
 }
 

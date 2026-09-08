@@ -253,6 +253,7 @@ impl<M: CompletionModel> ToolLoopAction<M> {
                 usage_recorder: None,
                 usage_context: None,
                 intent_id: None,
+                run_id: None,
                 active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,
