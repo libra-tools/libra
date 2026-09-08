@@ -2,7 +2,9 @@
 
 本文是 `docs/development/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。
 
-**模板版本:** `v2.3`（2026-09-08 起生效；相对 v2.2 的规范性变更：新增 **ER-06a 命令与网站文档同步** —— 每张任务卡必须判定并记录 `docs/commands/` EN + zh-CN 与相邻 `../libra-backend` 网站文档的影响；存在用户可见命令行为时，三处相关文档必须在同一卡同步更新。更新后端前必须识别其为 Libra 或 Git 仓库，并严格确认/切换到 `cf` 分支。）
+**模板版本:** `v2.4`（2026-09-10 起生效；相对 v2.3 的规范性变更：新增 **GC-13 数据库迁移作用域与全局配置隔离** —— 任何触及数据库 schema、连接建构、bootstrap、schema top-up、schema 兼容检查或迁移 fixture 的计划，必须声明数据库角色与每类 schema writer 的适用范围；仓库 writer 不得推进全局/系统配置库版本或创建 Repository 表，测试不得触及真实用户/系统配置库；显式 confirmed repair 必须采用一致性备份与原子前滚。）
+
+**历史版本 — v2.3**（2026-09-08 起生效；相对 v2.2 的规范性变更：新增 **ER-06a 命令与网站文档同步** —— 每张任务卡必须判定并记录 `docs/commands/` EN + zh-CN 与相邻 `../libra-backend` 网站文档的影响；存在用户可见命令行为时，三处相关文档必须在同一卡同步更新。更新后端前必须识别其为 Libra 或 Git 仓库，并严格确认/切换到 `cf` 分支。）
 
 **历史版本 — v2.2**（2026-08-27 起生效；相对 v2.1 的规范性变更：新增 **ER-13 测试执行分层** —— 任务卡执行阶段默认只跑本卡相关 focused 测试，只有命中 ER-13 全量触发条件（`T-1` 跨切面表面 / `T-2` 发布点与聚合卡 / `T-3` 删除重命名公开 surface / `T-4` 共享测试基建 / `T-5` 显式要求 / `T-6` 信号不足）的卡才在 C 组第 ④ 步跑 `cargo test --all`；全部任务卡完成后必须跑一次全量收口门并修复其暴露的全部 Bug。fmt 与 clippy 两门不受分层影响，任何会推送的卡都必须跑。本次同批同步 `CLAUDE.md`「Quality Acceptance Criteria」与 `AGENTS.md`「Testing Guidelines」。
 
@@ -25,6 +27,7 @@
 - 每个任务卡必须能交给 Agent 独立执行：范围明确、依赖明确、文件落点明确、验收标准明确、验证命令明确。
 - 每个任务卡必须满足「任务卡粒度规则」全部 `G-*` 条款：单一可独立恢复的行为轴、条目与规模在上限内、默认一张卡一个发布切片。粒度不合格的卡不得进入开工态，必须先拆分或合并。
 - 涉及公开命令、配置、schema、错误码、存储格式、网络协议、Agent 数据、迁移、权限或安全边界的计划，必须包含测试、文档、回滚和兼容处理；命令行为的文档处理必须遵守 ER-06a。
+- 任何触及 SQLite schema、连接建构、bootstrap、idempotent top-up、schema 兼容检查或 migration fixture 的计划，必须遵守 GC-13：按数据库角色列出每类 schema writer 的适用范围、独立兼容版本和 global/system 隔离测试；不得把仓库 writer 隐式施加给 `GlobalConfig` / `SystemConfig`。
 - 测试成本按阶段分层（ER-13）：任务卡执行阶段默认只跑与本卡相关的 focused 测试，命中 ER-13 全量触发条件或另有特定要求时才跑全量；全部任务卡完成后必须跑一次全量收口门，并修复该次全量暴露的全部 Bug。
 - 若计划使用外部项目或竞品作为参照，必须 pin 具体 revision、文件路径和核对日期；不得把浮动 `main` 当作规范。
 - 新增或重命名 `--test` target 时必须更新 `tests/INDEX.md`；`tests/compat/*` 下的文件还必须在 `Cargo.toml` 注册 `[[test]]` 并更新 `tests/compat/README.md`（未注册的 compat 文件根本不会运行）。只改动既有用例时，仅当索引行的描述失真才更新。
@@ -173,6 +176,7 @@
 - **GC-10 性能预算:** `status`、`diff`、`add`、`commit`、fetch/push、Agent hot path 和 Web/SSE 热路径不得引入无界扫描、无界内存或 N+1 网络/DB 调用。需要时写出数据规模和断言。
 - **GC-11 生产 panic 禁止:** 生产路径不得新增裸 `unwrap()`、`expect()`、`panic!()`；必须用 `Result`、`anyhow::Context` 或领域错误返回可操作信息。
 - **GC-12 精确暂存:** 提交前只 `libra add <相关路径>`，不得使用 `commit -a`。发现无关脏状态时保留并报告，不得清理、重置或混入提交。
+- **GC-13 数据库迁移作用域与全局配置隔离:** 任何触及 SQLite schema、连接建构、建库 bootstrap DDL、非 migration 的幂等 schema top-up、schema 兼容检查或 migration fixture 的计划与任务卡，都必须列出受影响的数据库角色（至少从 `Repository`、`GlobalConfig`、`SystemConfig`、`Derived` 中判定）及每项 migration、bootstrap 和 top-up 的显式 allowlist；schema 版本、兼容检查和 pending-migration runner 必须按角色使用对应的 migration 集/ledger，禁止以全局 `builtin_migrations()` 或其最高版本隐式判定所有库。`Repository`-only migration、bootstrap 或 top-up 不得创建、写入或推进 `GlobalConfig` / `SystemConfig` 的 schema receipt，也不得在其库中创建 Repository 表；配置库 schema 实际变化时才可由显式配置 migration、bootstrap 或 top-up 推进其自身版本。测试必须使用临时 `LIBRA_CONFIG_GLOBAL_DB`、`LIBRA_CONFIG_SYSTEM_DB`（及需要时临时 HOME/XDG），以作用域守卫恢复原进程环境，并断言 repo-only migration 不改变隔离 global-config/system-config 库的版本 receipt 与配置表语义；任何测试或普通工具不得**隐式回落**读写真实 `~/.libra/config.db` 或 `/etc/libra/config.db`。唯一例外是显式 operator-confirmed 的 GlobalConfig repair：它必须先只读分类、在锁定目标下重新核验资格、创建可重开验证的 SQLite 一致性备份，并以原子、可审计、fail-closed 的前滚步骤处理。禁止手改版本 receipt、无备份覆盖、自动降级用户库或通过路径猜测 database role。
 
 ## 执行检查必备需求（强制）
 
@@ -422,7 +426,7 @@
   - **仓库根文件**（`Cargo.toml`、`install.sh`、`COMPATIBILITY.md` 等）按「单个文件」计，不各占一个落点；若某张卡的行为变更**就发生在**根文件本身（例如改 `build.rs` 逻辑），则该文件计为一个落点。
   - `S`：≤ 2 个行为落点、≤ 3 个生产文件，无 schema / 协议 / 公开接口变更。
   - `M`：≤ 4 个行为落点、≤ 12 个生产文件，最多一处公开行为或接口变化，仍是单一行为轴。
-  - 超出 `M` 的计数即为 L：默认必须拆分。确实不可拆的机械变更（全仓重命名、批量删除、格式化）可在「字段全局默认与例外」的 waiver 白名单中登记 `EX-*`（需具名审批人与 review 轮次），写明为何不可拆、如何 review、如何恢复；此时该卡 `Estimated scope` 写 `L-exception:EX-<n>`，这是全文唯一允许出现 `L` 字样的形式，`XL` 永不允许。
+  - 超出 `M` 的计数即为 L：默认必须拆分。确实不可拆的机械变更（全仓重命名、批量删除、格式化、编译/类型系统强制的枚举或接口同型接线、跨文件同型 API 机械替换）可在「字段全局默认与例外」的 waiver 白名单中登记 `EX-*`（需具名审批人与 review 轮次），写明为何不可拆、如何 review、如何恢复；此时该卡 `Estimated scope` 写 `L-exception:EX-<n>`，这是全文唯一允许出现 `L` 字样的形式，`XL` 永不允许。
   - 把 `src/`、`tests/`、`docs/` 或仓库根算作「一个落点」是规避行为，按「粒度反模式速查」的「落点注水」处理。
 - **G-05 Agent 可独立执行:** 一张卡必须能在不阅读其它卡正文的前提下被执行：`Current evidence` 给出可核对的 `file:line` 锚点，`Acceptance criteria` 自洽可判定，`Verification` 是可直接复制执行的确切命令，`Dependencies` 只引用「依赖登记表」中的 `DEP-*` / 任务 ID。禁止「见上文」「同上一卡」式跨卡隐式约定；确属跨卡共享的约定要提升为全局工程约束或 ADR。
 - **G-06 依赖闭合且无环:** 依赖必须有向无环。本计划内依赖直接引用任务 ID；跨计划与外部前置必须先在「依赖登记表」登记为 `DEP-*` 再引用，不得在卡内自由描述。互相等待、循环依赖、以及「等某个 Phase 整体完成」都是拆分错误——把依赖收敛到具体前置卡。「实施顺序」的依赖边与各卡 `Dependencies` 必须一致；不一致时以「实施顺序」为准并当场修正卡片。
@@ -442,7 +446,7 @@
   - `Files likely touched` 是估计值，并发判定以 `Implementation write set` 为准。
 - **G-11 任务类型:** 每张卡必须声明 `Task type`，不同类型适用不同粒度口径：
   - `implementation`：默认类型，全部 `G-*` 条款全量适用。
-  - `migration`：数据/schema 迁移，`Rollback mode` 通常为 `forward-only`，必须有 up/down 或前滚验证与故障注入用例。
+  - `migration`：数据/schema 迁移，`Rollback mode` 通常为 `forward-only`，必须有 up/down 或前滚验证与故障注入用例；另必须按 GC-13 逐项登记数据库角色、migration allowlist、对应 schema ledger 与旧/新二进制兼容判定，并以隔离 global-config fixture 证明 repo-only migration 不会推进配置库 receipt 或改变配置表语义。
   - `removal`：公开 surface 删除，通常进入家族卡（G-08），必须先有 deprecation 窗口证据。
   - `spike`：探索/验证，**不得**改动生产代码。必须写出待回答的问题、时间箱、产物（结论 + ADR 或缺口登记）、go/no-go 退出标准与后续承接卡；不适用 G-04 的文件计数，`Estimated scope` 按时间箱判定：`S` ≤ 0.5 人日、`M` ≤ 2 人日，超出即拆成多个问题或直接转 ADR / `implementation` 卡。
   - `audit` / `docs`：只读核对或文档收敛，按 G-03 的文档-only 口径执行。规模上限按**产物文件数或人日**判定（不适用 G-04 的生产文件计数）：`S` ≤ 5 个产物文件或 ≤ 0.5 人日；`M` ≤ 15 个产物文件或 ≤ 2 人日；超出即拆卡。随代码卡强制同步的文档仍按 G-04 的随附同步集处理，不计入这里。
@@ -501,7 +505,7 @@
 |---|---|
 | G-03 条目上限 | 清单型产物（文档 / 审计 / 索引）确实需要超过本类上限，且已写明产物文件清单 |
 | G-03 条目上限（**门族型验收**，2026-08-06 扩充） | `implementation` 卡的验收本质是**同一恢复轴上的机械门族/fixture 清单**（净室、schema、绑定、投影、锁等），逐门计数必然超过本类上限，而按门拆卡会违反 G-01/G-02（同一行为轴的实现/测试/文档不得拆散）与「碎片卡」反模式。准入条件（缺一不可）：① 每个门都是**可复制执行的具名命令**，失败即整卡不达标；② 门族清单在卡内「判据规范（非计数正文）」块逐条枚举；③ 分子如实写作 `n/上限@EX-ID`，不得以合并长句掩盖；④ 门族增减时同批更新 waiver 行与粒度审计表 |
-| G-04 规模上限（`L-exception`） | 不可拆的机械变更：全仓重命名、批量删除、格式化 |
+| G-04 规模上限（`L-exception`） | 不可拆的机械变更：全仓重命名、批量删除、格式化、编译/类型系统强制的枚举或接口同型接线、跨文件同型 API 机械替换 |
 | ER-07 签名要求 | 仓库策略层面的具名豁免（sign-off-only） |
 
 | 例外 ID | 任务（或 `ALL/<作用域>`） | 豁免项 | 理由与补偿措施 | Approver | Review round | 证据 | 有效期 |
