@@ -26,6 +26,7 @@
 | `agent_shell_operation` | 1 | OL-09 Agent shell/external boundary requires verified before/after evidence | `src/internal/ai/tools/registry.rs`, `src/internal/operation/middleware.rs` |
 | `operation_restore_faults` | 1 | OL-10 restore receipt, facet selection, and fail-closed machine contract | `src/internal/operation/restore.rs`, `src/command/op.rs` |
 | `op_undo_redo` | 1 | OL-11 append-only undo/redo/revert receipt and stable kind contracts | `src/internal/operation/undo.rs`, `src/command/op.rs` |
+| `change_id_resolution` | 1 | CH-02 change projection, visibility, and exact/ambiguous/not-found prefix resolution | `src/internal/change/{store,resolve}.rs` |
 | `commit_change_id_header_spike` | 1 | OL-00 real-Git Change ID header vs sidecar-only compatibility spike | `docs/development/internal/operation-log-working-copy-change-id.md` |
 | `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema, confirmed legacy-capture adoption, W4-08 linked-worktree `libra code`/`automation` enablement, and the W5-08 `graph_machine_survives_tui_removal` breaking guard (interactive graph entry refused with a migration hint; `--json`/`--machine` wire intact) | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs`, `tests/command/code_agent_linked_guard_test.rs` |
 | `compat_stash_subcommand_surface` | 1 | Guards `libra stash` subcommand surface vs. git CLI | `src/command/stash.rs` |

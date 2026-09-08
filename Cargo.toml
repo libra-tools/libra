@@ -639,3 +639,8 @@ path = "tests/operation_restore_faults.rs"
 [[test]]
 name = "op_undo_redo"
 path = "tests/op_undo_redo.rs"
+
+# plan-20260822 CH-02: change projection and prefix-resolution contracts.
+[[test]]
+name = "change_id_resolution"
+path = "tests/change_id_resolution.rs"

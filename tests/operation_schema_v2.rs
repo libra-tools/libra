@@ -301,7 +301,7 @@ async fn operation_v2_migration_is_forward_only_and_versioned() {
         .expect("schema version query")
         .expect("schema version row");
     let version: i64 = row.try_get_by_index(0).expect("schema version");
-    assert_eq!(version, 2026090101);
+    assert_eq!(version, 2026090801);
     assert!(
         table_columns(&conn, "operation_parent")
             .await

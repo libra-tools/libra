@@ -1785,6 +1785,12 @@ pub fn builtin_migrations() -> Vec<Migration> {
             up: include_str!("../../../sql/migrations/2026090101_operation_v2.sql"),
             down: None,
         },
+        Migration {
+            version: 2026090801,
+            name: "change_identity_prefix_index",
+            up: include_str!("../../../sql/migrations/2026090801_change_identity_prefix_index.sql"),
+            down: None,
+        },
     ]
 }
 
