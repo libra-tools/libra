@@ -699,3 +699,4 @@ candidate OIDs while holding that fence through the prune transaction. With
 - jj does not have a traditional `commit` command with staging; `jj commit` finalizes the working copy commit
 - `--fixup` and `--squash` are supported (autosquash markers); `--cleanup=<mode>` controls comment/scissors stripping
 - Vault signing replaces the external keyring; `commit.gpgSign` is honored while `user.signingkey` remains vault-managed
+- Change identity is stored in the sidecar projection (`change_identity`/`change_revision`); Libra does not write a `change-id` commit header. Existing headers are import-compatible metadata only.

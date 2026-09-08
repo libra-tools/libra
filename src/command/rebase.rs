@@ -29,6 +29,7 @@ use crate::{
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
+        change::{RelationKind, record_current_repo_commit_revision},
         head::Head,
         model::{reference as ref_model, reflog as reflog_model},
         reflog,
@@ -3516,6 +3517,13 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
                 })?;
         save_object(&new_commit, &new_commit.id)
             .map_err(|e| RebaseError::CommitSave(e.to_string()))?;
+        record_current_repo_commit_revision(
+            format!("rebase:{}", new_commit.id),
+            new_commit.id.to_string(),
+            Some((stopped_sha.to_string(), RelationKind::Rebase)),
+        )
+        .await
+        .map_err(|error| RebaseError::CommitSave(error.to_string()))?;
 
         let previous_tip = state.current_head;
         state.current_head = new_commit.id;
@@ -5260,6 +5268,15 @@ async fn replay_commit_with_conflict_detection(
 
     if let Err(e) = save_object(&new_commit, &new_commit.id) {
         return ReplayResult::internal(ReplayErrorKind::CommitSave, e.to_string());
+    }
+    if let Err(error) = record_current_repo_commit_revision(
+        format!("rebase:{}", new_commit.id),
+        new_commit.id.to_string(),
+        Some((commit_to_replay.id.to_string(), RelationKind::Rebase)),
+    )
+    .await
+    {
+        return ReplayResult::internal(ReplayErrorKind::CommitSave, error.to_string());
     }
 
     // Update index and working directory

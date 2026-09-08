@@ -381,3 +381,10 @@ The graded command set is pinned to the plan's P0/P1 surface; the
 `compat_subface_labels` guard fails if it drifts from that set or from
 `src/cli.rs::Commands`, or if any cell names a label outside the fixed
 enumeration.
+
+## Change revision compatibility
+
+Change IDs are stored in the sidecar projection and are not injected into new
+Git commit headers. Rewrites preserve the stable Change ID through typed
+predecessor edges; existing `change-id` headers remain import-readable for
+compatibility and are not a new write dependency.

@@ -294,3 +294,6 @@ Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一�
 | `LBR-CONFLICT-002` | cherry-pick 进行中时启动了 `merge`/`rebase`，或在进行中的序列上又发起新的 pick | 先完成或取消该 cherry-pick |
 | `LBR-IO-001` | 无法加载对象或 cherry-pick 状态 | 检查仓库完整性并重试 |
 | `LBR-IO-002` | 无法保存对象、索引，或更新分支引用/状态 | 检查文件系统权限和仓库可写性 |
+
+Cherry-pick revision 使用 sidecar Change ID 投影和类型化 predecessor 谱系。已有 commit header
+仍可用于导入读取，但新提交不依赖也不会注入 `change-id` header。

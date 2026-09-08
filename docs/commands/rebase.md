@@ -446,3 +446,7 @@ Note: jj does not stop on conflicts during rebase. Instead, conflicts are materi
 | Conflict during commit replay | pending typed mapping | 128 | Rebase stops, state is saved, user prompted to resolve |
 | Failed to create rebased commit | pending typed mapping | 128 | Legacy text error with commit details |
 | Failed to update branch reference | pending typed mapping | 128 | Legacy text error with ref update details |
+
+Rewritten commits also pass through the ChangeRevisionBuilder. The resulting
+revision inherits the stable sidecar Change ID and records a typed `rebase`
+predecessor edge; no Change ID header is injected into the Git commit.

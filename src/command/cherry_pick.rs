@@ -37,6 +37,7 @@ use crate::{
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
+        change::{RelationKind, record_current_repo_commit_revision},
         config::ConfigKv,
         head::Head,
         reflog::{ReflogAction, ReflogContext, with_reflog},
@@ -1721,6 +1722,13 @@ async fn create_cherry_pick_commit(
 
     save_object(&commit, &commit.id)
         .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to save commit: {e}")))?;
+    record_current_repo_commit_revision(
+        format!("cherry-pick:{}", commit.id),
+        commit.id.to_string(),
+        Some((original_commit.id.to_string(), RelationKind::CherryPick)),
+    )
+    .await
+    .map_err(|error| CherryPickSingleError::SaveFailed(error.to_string()))?;
 
     let action = ReflogAction::CherryPick {
         source_message: original_commit.message.clone(),

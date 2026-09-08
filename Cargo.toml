@@ -644,3 +644,8 @@ path = "tests/op_undo_redo.rs"
 [[test]]
 name = "change_id_resolution"
 path = "tests/change_id_resolution.rs"
+
+# plan-20260822 CH-03: rewrite builder and predecessor genealogy.
+[[test]]
+name = "change_genealogy_rebase"
+path = "tests/change_genealogy_rebase.rs"
