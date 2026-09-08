@@ -6,6 +6,7 @@ pub mod middleware;
 pub mod restore;
 pub mod snapshot;
 pub mod store;
+pub mod undo;
 pub mod view;
 pub mod working_copy;
 
@@ -28,6 +29,7 @@ pub use store::{
     JournalEntry, JournalPhase, OpHeadsView, OperationKind, OperationMetaV2, OperationStatusV2,
     OperationStoreV2, OperationV2, StoreError,
 };
+pub use undo::{UndoEngine, UndoError};
 pub use view::{
     CapturePolicy, Completeness, HeadState, RepoViewV2, WorkspaceId, WorkspaceSnapshotV2,
 };

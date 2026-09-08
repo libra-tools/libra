@@ -17,7 +17,7 @@ use crate::{
         operation::{
             OperationGraphRecord, OperationLogListItem, OperationPage, OperationQueryPage,
             OperationService, OperationStatus, OperationStoreV2, RestoreEngine, RestoreError,
-            RestoreReceipt, RestoreWhat,
+            RestoreReceipt, RestoreWhat, UndoEngine, UndoError,
         },
         operation_wrapper::{OperationMeta, OperationScope, with_operation_log},
         worktree_scope::RequestScope,
@@ -94,6 +94,42 @@ pub enum OpCommand {
         #[clap(long)]
         confirm_repo_wide: bool,
     },
+
+    /// Append an operation that moves the current state back to a prior operation's parent.
+    Undo {
+        op_ref: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Re-apply the operation that was undone by the selected undo operation.
+    Redo {
+        op_ref: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Apply the inverse of an operation relative to an explicit parent.
+    Revert {
+        op_ref: String,
+        #[arg(long)]
+        parent: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,6 +177,12 @@ pub enum OpOutput {
     },
     #[serde(rename = "restore_v2")]
     RestoreV2 { receipt: RestoreReceipt },
+    #[serde(rename = "undo")]
+    Undo { receipt: RestoreReceipt },
+    #[serde(rename = "redo")]
+    Redo { receipt: RestoreReceipt },
+    #[serde(rename = "revert")]
+    Revert { receipt: RestoreReceipt },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,7 +228,174 @@ pub async fn execute_safe(args: OpArgs, output: &OutputConfig) -> CliResult<()> 
             what,
             confirm_repo_wide,
         } => handle_op_restore(op_ref, force, dry_run, what, confirm_repo_wide, output).await,
+        OpCommand::Undo {
+            op_ref,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_undo(op_ref, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Redo {
+            op_ref,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_redo(op_ref, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Revert {
+            op_ref,
+            parent,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_revert(op_ref, parent, force, dry_run, confirm_repo_wide, output).await,
     }
+}
+
+async fn v2_engine_for_repo(repo_id: &str) -> CliResult<RestoreEngine> {
+    let Some(scope) = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "v2 operation state is unavailable in this repository",
+        ));
+    };
+    let storage = ClientStorage::init_local(scope.storage.join("objects"));
+    let db = get_db_conn_instance().await;
+    Ok(RestoreEngine::new(scope, repo_id, db, storage))
+}
+
+async fn v2_engine_and_ref(repo_id: &str, op_ref: &str) -> CliResult<(RestoreEngine, String)> {
+    let engine = v2_engine_for_repo(repo_id).await?;
+    let resolved = resolve_v2_op_ref(engine.store(), op_ref)
+        .await?
+        .ok_or_else(|| {
+            CliError::fatal(format!("v2 operation '{op_ref}' not found"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?;
+    Ok((engine, resolved))
+}
+
+async fn handle_op_undo(
+    op_ref: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let receipt = UndoEngine::new(restore)
+        .undo(op_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("undo", receipt, output)
+}
+
+async fn handle_op_redo(
+    op_ref: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let receipt = UndoEngine::new(restore)
+        .redo(op_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("redo", receipt, output)
+}
+
+async fn handle_op_revert(
+    op_ref: String,
+    parent: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let parent_id = resolve_v2_op_ref(restore.store(), &parent)
+        .await?
+        .ok_or_else(|| {
+            CliError::fatal(format!("v2 parent operation '{parent}' not found"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?;
+    let receipt = UndoEngine::new(restore)
+        .revert(op_id, parent_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("revert", receipt, output)
+}
+
+fn emit_transition_output(
+    action: &str,
+    receipt: RestoreReceipt,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let payload = match action {
+        "undo" => OpOutput::Undo { receipt },
+        "redo" => OpOutput::Redo { receipt },
+        "revert" => OpOutput::Revert { receipt },
+        _ => return Err(CliError::fatal("unknown operation transition")),
+    };
+    if output.is_json() {
+        emit_json_data("op", &payload, output)
+    } else if output.quiet {
+        Ok(())
+    } else {
+        let receipt = match &payload {
+            OpOutput::Undo { receipt }
+            | OpOutput::Redo { receipt }
+            | OpOutput::Revert { receipt } => receipt,
+            _ => unreachable!(),
+        };
+        println!(
+            "{} {} facet(s), {} path(s)",
+            action,
+            receipt.restored_facets.len(),
+            receipt.changed_paths
+        );
+        if let Some(op_id) = &receipt.new_op_id {
+            println!("New operation recorded: {}", &op_id[..8.min(op_id.len())]);
+        } else {
+            println!("Dry run: no operation was published.");
+        }
+        Ok(())
+    }
+}
+
+fn undo_cli_error(error: UndoError) -> CliError {
+    match error {
+        UndoError::NotUndo(_) => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
+        UndoError::Restore(RestoreError::HeadConfirmationRequired)
+        | UndoError::Restore(RestoreError::WrongWorkspace(_))
+        | UndoError::Restore(RestoreError::Cas(_)) => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked),
+        UndoError::Restore(RestoreError::Storage(message))
+            if message.contains("not found") || message.contains("not a completed") =>
+        {
+            CliError::fatal(message).with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
+        UndoError::Restore(_) => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
+        }
+    }
+}
+
+async fn ensure_transition_clean(force: bool) -> CliResult<()> {
+    if !force && !status::is_clean().await {
+        return Err(CliError::fatal("working tree has uncommitted changes")
+            .with_stable_code(StableErrorCode::ConflictUnresolved)
+            .with_hint("use --force to transition anyway, or commit/stash changes first"));
+    }
+    Ok(())
 }
 
 /// Render one `op log` request, including optional command filtering and paging.

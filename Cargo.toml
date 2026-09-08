@@ -634,3 +634,8 @@ path = "tests/agent_shell_operation.rs"
 [[test]]
 name = "operation_restore_faults"
 path = "tests/operation_restore_faults.rs"
+
+# plan-20260822 OL-11: append-only undo/redo/revert contracts.
+[[test]]
+name = "op_undo_redo"
+path = "tests/op_undo_redo.rs"

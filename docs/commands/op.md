@@ -139,6 +139,26 @@ refuses a target that does not contain that worktree.
 Machine consumers can request the receipt with the command's normal `--json`
 output mode. A dry-run never writes an operation or changes the worktree.
 
+## `libra op undo`, `redo`, and `revert`
+
+These commands append a new operation; they never rewrite or delete commit
+objects. `undo` requires the selected operation to be the unique current head,
+and moves to its parent view. `redo` only accepts the current undo head and
+replays the source operation recorded by that undo. `revert` requires an
+explicit `--parent` operation and applies that parent's view as the inverse.
+
+```bash
+libra op undo <OP_REF> [--force] [--confirm-repo-wide] [--dry-run]
+libra op redo <UNDO_OP_REF> [--force] [--confirm-repo-wide] [--dry-run]
+libra op revert <OP_REF> --parent <PARENT_OP_REF> \
+  [--force] [--confirm-repo-wide] [--dry-run]
+```
+
+All three commands support JSON receipts. The receipt includes the selected
+facets, changed-path count, target view, and the new operation ID when a
+transition is published. A dry run computes the same plan without publishing.
+Dirty worktrees are refused unless `--force` is supplied.
+
 ## Examples
 
 ```bash

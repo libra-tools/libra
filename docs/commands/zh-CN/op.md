@@ -129,6 +129,24 @@ libra op restore @{0} --dry-run
 机器调用方可以使用命令的标准 `--json` 输出模式取得 receipt。dry-run 不写入
 operation，也不会修改工作区。
 
+## `libra op undo`、`redo` 和 `revert`
+
+这些命令都会追加新的 operation，不会改写或删除 commit 对象。`undo` 要求目标
+是当前唯一 head，并移动到它的 parent view；`redo` 只接受当前的 undo head，并
+重放该 undo 记录的源 operation；`revert` 必须显式提供 `--parent`，并将该
+parent 的 view 作为逆向结果应用。
+
+```bash
+libra op undo <OP_REF> [--force] [--confirm-repo-wide] [--dry-run]
+libra op redo <UNDO_OP_REF> [--force] [--confirm-repo-wide] [--dry-run]
+libra op revert <OP_REF> --parent <PARENT_OP_REF> \
+  [--force] [--confirm-repo-wide] [--dry-run]
+```
+
+三个命令都支持 JSON receipt，包含选择的 facet、变更路径数量、目标 view，以及
+实际发布时的新 operation ID。dry-run 只计算计划，不发布 operation。
+工作区 dirty 时默认拒绝，必须显式使用 `--force`。
+
 ## 示例
 
 ```bash

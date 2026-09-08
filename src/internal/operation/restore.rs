@@ -141,6 +141,14 @@ impl RestoreEngine {
         &self.store
     }
 
+    pub fn repo_id(&self) -> &str {
+        &self.repo_id
+    }
+
+    pub fn scope_key(&self) -> String {
+        self.scope.scope.storage_key().to_string()
+    }
+
     /// Restore one view.  A target with multiple workspaces is rejected unless
     /// the caller explicitly opts into repository-wide semantics; this engine
     /// still restores only the pinned worktree.
@@ -175,6 +183,99 @@ impl RestoreEngine {
         dry_run: bool,
         confirm_repo_wide: bool,
     ) -> Result<RestoreReceipt, RestoreError> {
+        self.restore_with_relationship(
+            target_op_id,
+            target_view_oid,
+            kind,
+            what,
+            dry_run,
+            confirm_repo_wide,
+            None,
+        )
+        .await
+    }
+
+    pub async fn restore_with_relationship(
+        &self,
+        target_op_id: impl Into<String>,
+        target_view_oid: ObjectHash,
+        kind: OperationKind,
+        what: RestoreWhat,
+        dry_run: bool,
+        confirm_repo_wide: bool,
+        reverts_op_id: Option<String>,
+    ) -> Result<RestoreReceipt, RestoreError> {
+        self.restore_with_relationship_and_expected_head(
+            target_op_id,
+            target_view_oid,
+            kind,
+            what,
+            dry_run,
+            confirm_repo_wide,
+            reverts_op_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn restore_with_expected_head(
+        &self,
+        target_op_id: impl Into<String>,
+        target_view_oid: ObjectHash,
+        kind: OperationKind,
+        what: RestoreWhat,
+        dry_run: bool,
+        confirm_repo_wide: bool,
+        expected_head: String,
+    ) -> Result<RestoreReceipt, RestoreError> {
+        self.restore_with_relationship_and_expected_head(
+            target_op_id,
+            target_view_oid,
+            kind,
+            what,
+            dry_run,
+            confirm_repo_wide,
+            None,
+            Some(expected_head),
+        )
+        .await
+    }
+
+    pub async fn restore_with_relationship_and_expected_head(
+        &self,
+        target_op_id: impl Into<String>,
+        target_view_oid: ObjectHash,
+        kind: OperationKind,
+        what: RestoreWhat,
+        dry_run: bool,
+        confirm_repo_wide: bool,
+        reverts_op_id: Option<String>,
+        expected_head: Option<String>,
+    ) -> Result<RestoreReceipt, RestoreError> {
+        self.restore_with_relationship_and_expected_head_inner(
+            target_op_id,
+            target_view_oid,
+            kind,
+            what,
+            dry_run,
+            confirm_repo_wide,
+            reverts_op_id,
+            expected_head,
+        )
+        .await
+    }
+
+    async fn restore_with_relationship_and_expected_head_inner(
+        &self,
+        target_op_id: impl Into<String>,
+        target_view_oid: ObjectHash,
+        kind: OperationKind,
+        what: RestoreWhat,
+        dry_run: bool,
+        confirm_repo_wide: bool,
+        reverts_op_id: Option<String>,
+        expected_head: Option<String>,
+    ) -> Result<RestoreReceipt, RestoreError> {
         let target_op_id = target_op_id.into();
         let target_operation = self
             .store
@@ -189,7 +290,8 @@ impl RestoreEngine {
                 "operation '{target_op_id}' is not a completed success"
             )));
         }
-        if target_operation.post_view_oid != target_view_oid
+        if kind != OperationKind::Revert
+            && target_operation.post_view_oid != target_view_oid
             && target_operation.pre_view_oid != target_view_oid
         {
             return Err(RestoreError::WrongWorkspace(format!(
@@ -279,6 +381,13 @@ impl RestoreEngine {
             .read_heads_view(&self.repo_id, &scope_key)
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        if let Some(expected_head) = expected_head
+            && heads.head_ids() != vec![expected_head]
+        {
+            return Err(RestoreError::Cas(
+                "current operation head changed after transition preflight".to_string(),
+            ));
+        }
         let generation = self
             .store
             .read_head_generation(&self.repo_id, &scope_key)
@@ -290,6 +399,13 @@ impl RestoreEngine {
         let restore_refs = confirm_repo_wide && what == RestoreWhat::All;
         let op_id = Uuid::now_v7().to_string();
         let owner = format!("pid-{}", std::process::id());
+        let command_name = match kind {
+            OperationKind::Undo => "op undo",
+            OperationKind::Redo => "op redo",
+            OperationKind::Revert => "op revert",
+            OperationKind::Restore => "op restore",
+            _ => "op restore",
+        };
         let operation = OperationV2 {
             op_id: op_id.clone(),
             parent_op_ids: heads.head_ids(),
@@ -298,14 +414,14 @@ impl RestoreEngine {
             kind,
             status: OperationStatusV2::Running,
             metadata: OperationMetaV2 {
-                command_name: Some("op restore".to_string()),
-                description: Some(format!("restore to {}", receipt.target_op_id)),
+                command_name: Some(command_name.to_string()),
+                description: Some(format!("{command_name} to {}", receipt.target_op_id)),
                 actor: Some("libra-user".to_string()),
                 args_digest: Some(receipt.target_op_id.clone()),
                 ..Default::default()
             },
             restores_op_id: Some(receipt.target_op_id.clone()),
-            reverts_op_id: None,
+            reverts_op_id,
             predecessor_map_oid: None,
         };
         self.store
@@ -918,7 +1034,10 @@ impl RestoreEngine {
         Ok(())
     }
 
-    async fn recover_interrupted_operations(&self, scope_key: &str) -> Result<(), RestoreError> {
+    pub async fn recover_interrupted_operations(
+        &self,
+        scope_key: &str,
+    ) -> Result<(), RestoreError> {
         let operations = self
             .store
             .list_operations()
