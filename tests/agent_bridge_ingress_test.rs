@@ -22,11 +22,7 @@ async fn ctx() -> BridgeContext {
     run_builtin_migrations(&conn)
         .await
         .expect("apply migrations");
-    BridgeContext {
-        conn,
-        repository_id: "repo-1".into(),
-        worktree_id: None,
-    }
+    BridgeContext::new(conn, "repo-1", None)
 }
 
 fn request(line: &str) -> libra::internal::ai::agent_bridge::protocol::BridgeRequest {
@@ -203,6 +199,24 @@ async fn session_flush_and_close_are_durable() {
         .expect("get")
         .expect("exists");
     assert_eq!(row.session_state, "closed");
+
+    // A resumed DSH session may reopen the same durable identity after a
+    // prior process observed disposal. The stored scope remains immutable.
+    let reopened = dispatch(
+        &c,
+        &request(
+            r#"{"jsonrpc":"2.0","method":"session.open","params":{"session_id":"s1"},"id":4}"#,
+        ),
+    )
+    .await
+    .expect("reopen")
+    .expect("response");
+    assert_eq!(result_of(&reopened)["created"], false);
+    let row = get_session(&c.conn, "s1")
+        .await
+        .expect("get reopened session")
+        .expect("reopened session exists");
+    assert_eq!(row.session_state, "open");
 }
 
 #[tokio::test]
@@ -295,6 +309,53 @@ async fn session_open_scope_drift_fails_closed() {
     .await
     .expect_err("scope drift must fail closed");
     assert_eq!(err.stable_code, "LBR-AGENT-032");
+}
+
+/// A durable session cannot be reopened or mutated from a sibling worktree,
+/// even when both worktrees share the same repository database.
+#[tokio::test]
+async fn session_scope_rejects_cross_worktree_reopen_and_mutation() {
+    let conn = Database::connect("sqlite::memory:").await.expect("connect");
+    run_builtin_migrations(&conn)
+        .await
+        .expect("apply migrations");
+    let worktree_a = BridgeContext::new(conn.clone(), "repo-1", Some("wt-a".to_string()));
+    let worktree_b = BridgeContext::new(conn, "repo-1", Some("wt-b".to_string()));
+
+    dispatch(
+        &worktree_a,
+        &request(
+            r#"{"jsonrpc":"2.0","method":"session.open","params":{"session_id":"scoped"},"id":1}"#,
+        ),
+    )
+    .await
+    .expect("open in worktree A");
+    dispatch(
+        &worktree_a,
+        &request(
+            r#"{"jsonrpc":"2.0","method":"session.close","params":{"session_id":"scoped"},"id":2}"#,
+        ),
+    )
+    .await
+    .expect("close in worktree A");
+
+    for request_json in [
+        r#"{"jsonrpc":"2.0","method":"session.open","params":{"session_id":"scoped"},"id":3}"#,
+        r#"{"jsonrpc":"2.0","method":"session.close","params":{"session_id":"scoped"},"id":4}"#,
+        r#"{"jsonrpc":"2.0","method":"event.append","params":{"session_id":"scoped","events":[]},"id":5}"#,
+    ] {
+        let error = dispatch(&worktree_b, &request(request_json))
+            .await
+            .expect_err("cross-worktree access must fail closed");
+        assert_eq!(error.stable_code, "LBR-AGENT-032");
+    }
+
+    let row = get_session(&worktree_a.conn, "scoped")
+        .await
+        .expect("get session")
+        .expect("session exists");
+    assert_eq!(row.worktree_id.as_deref(), Some("wt-a"));
+    assert_eq!(row.session_state, "closed");
 }
 
 /// `last_event_seq` advances to the highest accepted sequence after an append

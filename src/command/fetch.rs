@@ -35,6 +35,7 @@ use crate::{
     },
     git_protocol::ServiceType::{self, UploadPack},
     internal::{
+        ai::linear_ref::{OwnedRefSpec, OwnedRefTransportPolicy},
         branch::Branch,
         config::{ConfigKv, ConfigKvEntry, RemoteConfig},
         head::Head,
@@ -1477,6 +1478,11 @@ fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), Fe
     }
 }
 
+fn fetch_ref_is_local_only(name: &str) -> bool {
+    OwnedRefSpec::for_transport_ref(name)
+        .is_some_and(|spec| spec.transport_policy() == OwnedRefTransportPolicy::LocalOnly)
+}
+
 fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchError> {
     if raw.is_empty() || raw.matches(':').count() > 1 {
         return Err(FetchError::InvalidRefspec {
@@ -1528,6 +1534,18 @@ fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchErr
         });
     }
     validate_fetch_destination(&destination, raw)?;
+    if !source.contains('*') && fetch_ref_is_local_only(&source) {
+        return Err(FetchError::InvalidRefspec {
+            refspec: raw.to_string(),
+            reason: "the Memory source ref is local-only".to_string(),
+        });
+    }
+    if !destination.contains('*') && fetch_ref_is_local_only(&destination) {
+        return Err(FetchError::InvalidRefspec {
+            refspec: raw.to_string(),
+            reason: "the Memory destination ref is local-only".to_string(),
+        });
+    }
 
     Ok(FetchRefspec {
         source,
@@ -1573,6 +1591,9 @@ fn expand_refspec(
             if reference._ref.ends_with("^{}") {
                 continue;
             }
+            if fetch_ref_is_local_only(&reference._ref) {
+                continue;
+            }
             if let Some(middle) = reference
                 ._ref
                 .strip_prefix(source_prefix)
@@ -1591,6 +1612,9 @@ fn expand_refspec(
                     &destination,
                     &format!("{}:{}", spec.source, spec.destination),
                 )?;
+                if fetch_ref_is_local_only(&destination) {
+                    continue;
+                }
                 plans.push(FetchRefPlan {
                     reference: reference.clone(),
                     destination,
@@ -1598,7 +1622,9 @@ fn expand_refspec(
                 });
             }
         }
-    } else if let Some(reference) = refs.iter().find(|reference| reference._ref == spec.source) {
+    } else if let Some(reference) = refs.iter().find(|reference| {
+        reference._ref == spec.source && !fetch_ref_is_local_only(&reference._ref)
+    }) {
         plans.push(FetchRefPlan {
             reference: reference.clone(),
             destination: spec.destination.clone(),
@@ -1632,6 +1658,7 @@ async fn build_fetch_ref_plans(
 
     let plans = if specs.is_empty() {
         refs.iter()
+            .filter(|reference| !fetch_ref_is_local_only(&reference._ref))
             .filter_map(|reference| {
                 default_fetch_destination(remote, &reference._ref)
                     .ok()
@@ -1690,6 +1717,7 @@ pub(crate) async fn configured_remote_tracking_branch_names(
     let specs = configured_fetch_refspecs(remote).await?;
     let plans = if specs.is_empty() {
         refs.iter()
+            .filter(|reference| !fetch_ref_is_local_only(&reference._ref))
             .filter_map(|reference| {
                 default_fetch_destination(remote, &reference._ref)
                     .ok()
@@ -3000,18 +3028,23 @@ pub(crate) fn resolve_remote_default_branch(
     ref_heads: &[DiscRef],
     remote_head: Option<&DiscRef>,
 ) -> Option<String> {
+    let ordinary_heads: Vec<&DiscRef> = ref_heads
+        .iter()
+        .filter(|reference| !fetch_ref_is_local_only(&reference._ref))
+        .collect();
     // 1. `symref=HEAD:refs/heads/<branch>` capability.
     for cap in capabilities {
         if let Some(rest) = cap.strip_prefix("symref=HEAD:")
             && let Some(branch) = rest.strip_prefix("refs/heads/")
             && !branch.is_empty()
+            && !fetch_ref_is_local_only(rest)
         {
             return Some(branch.to_string());
         }
     }
     // 2. Match HEAD's advertised OID against a branch tip.
     if let Some(remote_head) = remote_head
-        && let Some(branch) = ref_heads
+        && let Some(branch) = ordinary_heads
             .iter()
             .find(|r| r._hash == remote_head._hash)
             .and_then(|r| r._ref.strip_prefix("refs/heads/"))
@@ -3019,14 +3052,18 @@ pub(crate) fn resolve_remote_default_branch(
         return Some(branch.to_string());
     }
     // 3. Heuristic fallback: main, then master, then the first branch.
-    if ref_heads.is_empty() {
+    if ordinary_heads.is_empty() {
         return None;
     }
-    ref_heads
+    ordinary_heads
         .iter()
         .find(|r| r._ref == "refs/heads/main")
-        .or_else(|| ref_heads.iter().find(|r| r._ref == "refs/heads/master"))
-        .or(ref_heads.first())
+        .or_else(|| {
+            ordinary_heads
+                .iter()
+                .find(|r| r._ref == "refs/heads/master")
+        })
+        .or(ordinary_heads.first())
         .and_then(|r| r._ref.strip_prefix("refs/heads/"))
         .map(str::to_owned)
 }
@@ -3146,6 +3183,25 @@ async fn update_references(
     crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
+            for storage_name in [
+                "libra/memory/repo".to_string(),
+                format!(
+                    "refs/remotes/{}/libra/memory/repo",
+                    remote_config.name
+                ),
+            ] {
+                ref_model::Entity::delete_many()
+                    .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Branch))
+                    .filter(ref_model::Column::Remote.eq(&remote_config.name))
+                    .filter(ref_model::Column::Name.eq(storage_name))
+                    .exec(txn)
+                    .await
+                    .map_err(|error| FetchError::UpdateRefs {
+                        message: format!(
+                            "failed to remove prohibited Memory tracking ref: {error}"
+                        ),
+                    })?;
+            }
             let checked_out_branches = checked_out_local_branches_with_conn(txn).await?;
             for plan in &plans {
                 let (storage_name, remote_scope) =
@@ -3813,6 +3869,63 @@ mod tests {
         );
         // 4. No branches at all -> None.
         assert_eq!(resolve_remote_default_branch(&[], &[], None), None);
+    }
+
+    #[test]
+    fn fetch_refspec_rejects_exact_memory_and_wildcard_omits_it() {
+        use super::{DiscRef, expand_refspec, parse_fetch_refspec};
+
+        assert!(parse_fetch_refspec("libra/memory/repo", "origin").is_err());
+        assert!(
+            parse_fetch_refspec("refs/heads/main:refs/heads/libra/memory/repo", "origin").is_err()
+        );
+        assert!(
+            parse_fetch_refspec(
+                "refs/heads/main:refs/remotes/origin/libra/memory/repo",
+                "origin"
+            )
+            .is_err()
+        );
+        assert!(parse_fetch_refspec("libra/memory/repo-user", "origin").is_ok());
+
+        let wildcard = parse_fetch_refspec("+refs/heads/*:refs/remotes/origin/*", "origin")
+            .expect("ordinary wildcard refspec");
+        let refs = vec![
+            DiscRef {
+                _hash: "aaa".to_string(),
+                _ref: "refs/heads/main".to_string(),
+            },
+            DiscRef {
+                _hash: "bbb".to_string(),
+                _ref: "refs/heads/libra/memory/repo".to_string(),
+            },
+        ];
+        let plans = expand_refspec(&wildcard, &refs, "origin").expect("expand wildcard");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].reference._ref, "refs/heads/main");
+    }
+
+    #[test]
+    fn remote_default_branch_ignores_memory_symref_and_oid() {
+        use super::{DiscRef, resolve_remote_default_branch};
+
+        let memory = DiscRef {
+            _hash: "same".to_string(),
+            _ref: "refs/heads/libra/memory/repo".to_string(),
+        };
+        let main = DiscRef {
+            _hash: "main".to_string(),
+            _ref: "refs/heads/main".to_string(),
+        };
+        let head = DiscRef {
+            _hash: "same".to_string(),
+            _ref: "HEAD".to_string(),
+        };
+        let capabilities = vec!["symref=HEAD:refs/heads/libra/memory/repo".to_string()];
+        assert_eq!(
+            resolve_remote_default_branch(&capabilities, &[memory, main], Some(&head)).as_deref(),
+            Some("main")
+        );
     }
 
     #[test]

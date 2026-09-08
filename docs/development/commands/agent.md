@@ -113,7 +113,7 @@ same identity count by simulating coverage removal in a rolled-back transaction.
 - **Protocol authority:** the frame/method/limit/error contract lives only in
   `src/internal/ai/agent_bridge/{protocol,transport}.rs` (GC-LB-02). The
   TypeScript plugin consumes the fixture generated from it; it must not define
-  a second schema. Protocol v1: 20-method allowlist, 256 KiB frame cap, 64
+  a second schema. Protocol v1.2: 22-method allowlist, 256 KiB frame cap, 64
   in-flight requests, 64-event/256 KiB batch, 30 s default deadline.
 - **Scope:** repository/worktree/workspace/actor scope is derived from the
   trusted context at handshake (GC-LB-06/07); self-reported identity is never
@@ -123,10 +123,29 @@ same identity count by simulating coverage removal in a rolled-back transaction.
   session/event/operation storage (LB-02), the session/event ingress (LB-03),
   the typed read methods (LB-04), mutation admission/approval/actor binding
   (LB-05) and workspace lease claim/renew/release over `WorkspaceStore`
-  (LB-06). As of `v0.21.1` all 20 v1 methods are implemented:
+  (LB-06), plus the additive audited `memory.recall` read method. All 22 v1.2 methods are implemented:
   `diff.get`/`commit.create`/`review.run`/`checkpoint.restore` reach the real
   services through the typed `agent_bridge/vcs.rs` adapter instead of failing
   closed behind the admission/approval gate.
+- **Memory recall:** `context.get` remains parameter-free and side-effect-free.
+  `memory.recall` accepts `session_id`, `query_text`, and optional `turn`, requires the
+  session in the current process active set, derives an Agent principal as
+  `deepseek-harness:<session_id>`, and applies the server-owned 1600-token
+  Project Memory budget. A delivery is constructed only after its receipt is
+  durable; zero-hit queries still write a receipt, while queries with no valid
+  terms return `delivery: null` without one.
+- **Memory generation (v1.2):** opt in at bridge startup with
+  `LIBRA_DSH_MEMORY_MODEL=deepseek-chat`. The plugin sends optional `turn` on
+  `memory.recall` to freeze the initial code HEAD once per turn, then submits
+  `{session_id, turn, goal, response_text}` to `memory.episode.record` after
+  successful completion. The session must remain active in this process.
+  Libra reads terminal HEAD, writes canonical Task/Run/Decision/TaskEvent
+  evidence, and runs the existing compiler, admission, writer, and projections
+  for that specific root. Success is `{schema_version: 1, data: {task_id,
+  note_id, revision_oid}}`. This requires a committed repository and normal
+  DeepSeek provider credentials. There is no durable capture replay or
+  request idempotency in this initial adapter; failed capture is surfaced to
+  the plugin, which warns without undoing the completed DSH turn.
 - **Preflight:** the bridge uses the standard repository preflight (it is
   repo-scoped). It must never start without `--stdio`.
 - **Publish lock:** `commit.create` takes `MaintenanceLock::shared` itself, for

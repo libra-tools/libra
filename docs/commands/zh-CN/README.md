@@ -138,6 +138,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | `libra graph` | | 检查 Libra Code thread version graph（`--json`/`--machine`；交互式 TUI 入口已在 W5 breaking 发布中删除，请用 Web Code UI） | [graph.md](graph.md) |
 | `libra sandbox` | | 检查 AI sandbox diagnostics，包括 OS backend 可用性和 downgrade warnings | [sandbox.md](sandbox.md) |
 | `libra agent` | | 管理外部 agent 捕获、checkpoints、hooks 和 RPC adapters | [agent.md](agent.md) |
+| `libra memory` | | 搜索、查看、诊断和重建当前仓库的研发历程记忆 | [memory.md](memory.md) |
 
 ### 底层与检查
 
@@ -204,6 +205,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | `LBR-IDX-*` | 索引/暂存区错误（索引损坏、锁竞争） |
 | `LBR-OBJ-*` | 对象存储错误（对象缺失、哈希不匹配） |
 | `LBR-VAULT-*` | Vault 和加密错误（解封失败、密钥生成） |
+| `LBR-MEMORY-*` | Agent Memory 查询、策略、投影与存储错误 |
 
 ## 设计理念
 

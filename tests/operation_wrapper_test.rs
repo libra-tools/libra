@@ -214,6 +214,42 @@ async fn success_path_exposes_parent_selection_metrics() {
 }
 
 #[tokio::test]
+/// Memory authority is local-only state and must not be captured by an operation view.
+async fn operation_snapshot_omits_memory_ref_but_keeps_lookalike_user_branch() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    create_operation_schema(&db).await;
+    create_reference_table_with_head(&db).await;
+    db.execute_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "INSERT INTO reference(name, kind, \"commit\", remote) VALUES
+         ('libra/memory/repo', 'Branch', '2222222222222222222222222222222222222222', NULL),
+         ('libra/memory/repo-user', 'Branch', '3333333333333333333333333333333333333333', NULL)"
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+
+    let result =
+        with_operation_log_with_conn(&db, valid_meta(), OperationScope::default(), |_txn| {
+            Box::pin(async move { Ok::<_, DbErr>(()) })
+        })
+        .await
+        .unwrap();
+    let graph = OperationService::load_restore_view_by_operation_with_conn(&db, &result.op_id)
+        .await
+        .unwrap()
+        .expect("operation graph");
+    let names: HashSet<&str> = graph
+        .refs
+        .iter()
+        .map(|record| record.ref_name.as_str())
+        .collect();
+    assert!(names.contains("main"));
+    assert!(names.contains("libra/memory/repo-user"));
+    assert!(!names.contains("libra/memory/repo"));
+}
+
+#[tokio::test]
 /// Verifies that invalid parent-policy combinations are rejected before execution.
 async fn invalid_parent_policy_is_rejected() {
     let db = Database::connect("sqlite::memory:").await.unwrap();

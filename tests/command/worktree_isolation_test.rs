@@ -5973,7 +5973,7 @@ fn worktree_repair_path_refuses_main_and_unregistered() {
 /// refused at connect time no matter which command first touches the v2 file.
 #[tokio::test]
 async fn worktree_commands_apply_capability_marker_before_registry_io() {
-    use libra::internal::db::migration::builtin_runner;
+    use libra::internal::db::migration::{MigrationRunner, builtin_migrations};
     use sea_orm::{ConnectionTrait, Database, Statement};
 
     let dir = repo_with_feature();
@@ -5993,8 +5993,15 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         .await
         .expect("remove forward-only v2 version marker before rollback fixture");
         restore_v1_operation_shape(&conn).await;
-        let rolled = builtin_runner()
-            .expect("builtin runner")
+        let mut runner = MigrationRunner::new();
+        runner
+            .extend(
+                builtin_migrations()
+                    .into_iter()
+                    .filter(|migration| migration.version != 2026090101),
+            )
+            .expect("historical migration registry");
+        let rolled = runner
             .rollback_to(&conn, 2026072304)
             .await
             .expect("roll back capability marker");
@@ -6009,7 +6016,7 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         let mut expected_rolled: Vec<i64> = libra::internal::db::migration::builtin_migrations()
             .into_iter()
             .map(|migration| migration.version)
-            .filter(|version| *version > 2026072304 && *version < 2026090101)
+            .filter(|version| *version > 2026072304 && *version != 2026090101)
             .collect();
         expected_rolled.reverse();
         assert_eq!(rolled, expected_rolled);
@@ -8660,47 +8667,31 @@ fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
 #[tokio::test]
 async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
     use libra::internal::db::migration::builtin_runner;
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::Database;
 
     let dir = repo_with_feature();
     let main = dir.path();
     let db = main.join(".libra").join("libra.db");
     let db_url = format!("sqlite://{}?mode=rwc", db.display());
 
-    // Use the real down migration rather than deleting its ledger row. W4's
-    // schema adds physical columns/triggers, so merely removing the version
-    // would turn the next ordinary migration run into a duplicate-column
-    // failure instead of representing a repository that is genuinely behind.
+    // Use the real down migration rather than deleting its ledger row. The
+    // newest Memory receipt migration creates physical tables, so undoing it
+    // represents a repository that is genuinely one migration behind.
     let conn = Database::connect(&db_url)
         .await
         .expect("open repository db");
-    conn.execute_raw(sea_orm::Statement::from_string(
-        conn.get_database_backend(),
-        "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
-    ))
-    .await
-    .expect("remove forward-only v2 version marker before rollback fixture");
-    restore_v1_operation_shape(&conn).await;
-    // Registry-derived for the same reason as the capability-marker case
-    // above: everything registered above 2026073101 rolls back with it.
-    let mut expected_rolled_back: Vec<i64> = libra::internal::db::migration::builtin_migrations()
-        .into_iter()
-        .map(|migration| migration.version)
-        .filter(|version| *version > 2026073101 && *version < 2026090101)
-        .collect();
-    expected_rolled_back.reverse();
     assert_eq!(
         builtin_runner()
             .expect("builtin runner")
-            .rollback_to(&conn, 2026073101)
+            .rollback_to(&conn, 2026090702)
             .await
             .expect("roll back newest migration"),
-        expected_rolled_back
+        vec![2026090703]
     );
     conn.close().await.expect("close repository db");
     assert!(
-        sqlite_max_schema_version(&db) < 2026080401,
-        "2026080401 must be the NEWEST migration for this test to leave one \
+        sqlite_max_schema_version(&db) < 2026090703,
+        "2026090703 must be the NEWEST migration for this test to leave one \
          pending — retarget it at the new newest migration"
     );
     let before = std::fs::read(&db).expect("db before");

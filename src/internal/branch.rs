@@ -27,7 +27,7 @@ use sea_orm::{
 };
 use tokio::time::sleep;
 
-use crate::internal::{db::get_db_conn_instance, model::reference};
+use crate::internal::{ai::linear_ref::OwnedRefSpec, db::get_db_conn_instance, model::reference};
 
 /// The default trunk branch. Created on `libra init` and treated as a locked
 /// branch (cannot be deleted while it is HEAD).
@@ -52,16 +52,13 @@ pub const LEGACY_TRACES_BRANCH: &str = "agent-traces";
 /// Return `true` for branches that the CLI refuses to delete, rename, or
 /// otherwise route user-facing destructive ops at.
 ///
-/// Functional scope: covers [`DEFAULT_BRANCH`], [`INTENT_BRANCH`],
-/// [`TRACES_BRANCH`], and its legacy alias [`LEGACY_TRACES_BRANCH`]. The check
-/// is purely syntactic — it does not consult the storage layer. Callers that
-/// need a richer policy (e.g. branch protection rules) must layer additional
-/// checks on top.
+/// Functional scope: covers [`DEFAULT_BRANCH`] plus exact Libra-owned branch
+/// names whose policy forbids ordinary user mutation. The check is purely
+/// syntactic and does not consult the storage layer.
 pub fn is_locked_branch(name: &str) -> bool {
     name == DEFAULT_BRANCH
-        || name == INTENT_BRANCH
-        || name == TRACES_BRANCH
-        || name == LEGACY_TRACES_BRANCH
+        || name == "refs/heads/main"
+        || owned_ref_spec(name).is_some_and(|spec| !spec.policy().mutable_by_user)
 }
 
 /// Return `true` for Libra-owned AI branches whose checked-out worktree must
@@ -71,7 +68,11 @@ pub fn is_locked_branch(name: &str) -> bool {
 /// branch-management operations such as delete/rename, but it remains the
 /// normal user worktree branch.
 pub fn is_ai_managed_branch(name: &str) -> bool {
-    name == INTENT_BRANCH || name == TRACES_BRANCH || name == LEGACY_TRACES_BRANCH
+    owned_ref_spec(name).is_some_and(|spec| !spec.policy().mutable_by_user)
+}
+
+fn owned_ref_spec(name: &str) -> Option<OwnedRefSpec> {
+    OwnedRefSpec::for_storage_name(name).or_else(|| OwnedRefSpec::for_full_ref(name))
 }
 
 /// Return `true` if the user-supplied revision string targets a locked
@@ -86,6 +87,7 @@ pub fn is_ai_managed_branch(name: &str) -> bool {
 /// the bare ref name.
 pub fn is_locked_revision(rev: &str) -> bool {
     let head = rev.split(['~', '^', '@']).next().unwrap_or(rev);
+    let head = head.strip_prefix("refs/heads/").unwrap_or(head);
     is_locked_branch(head)
 }
 
@@ -1167,6 +1169,9 @@ mod tests {
         assert!(is_locked_branch(INTENT_BRANCH));
         assert!(is_locked_branch(TRACES_BRANCH));
         assert!(is_locked_branch(LEGACY_TRACES_BRANCH));
+        assert!(is_locked_branch("libra/memory/repo"));
+        assert!(is_locked_branch("refs/heads/libra/memory/repo"));
+        assert!(!is_locked_branch("libra/memory/repo-user"));
         assert!(!is_locked_branch("traces-feature"));
         assert!(!is_locked_branch("agent-traces-feature"));
         assert!(!is_locked_branch("not-locked"));
@@ -1179,6 +1184,9 @@ mod tests {
         assert!(is_ai_managed_branch(INTENT_BRANCH));
         assert!(is_ai_managed_branch(TRACES_BRANCH));
         assert!(is_ai_managed_branch(LEGACY_TRACES_BRANCH));
+        assert!(is_ai_managed_branch("libra/memory/repo"));
+        assert!(is_ai_managed_branch("refs/heads/libra/memory/repo"));
+        assert!(!is_ai_managed_branch("libra/memory/repo-user"));
         assert!(!is_ai_managed_branch("traces-feature"));
         assert!(!is_ai_managed_branch("agent-traces-feature"));
         assert!(!is_ai_managed_branch(""));
@@ -1195,6 +1203,10 @@ mod tests {
         assert!(is_locked_revision("agent-traces"));
         assert!(is_locked_revision("intent"));
         assert!(is_locked_revision(DEFAULT_BRANCH));
+        assert!(is_locked_revision("libra/memory/repo"));
+        assert!(is_locked_revision("libra/memory/repo~1"));
+        assert!(is_locked_revision("refs/heads/libra/memory/repo"));
+        assert!(is_locked_revision("refs/heads/libra/memory/repo^"));
 
         // Single-suffix variants.
         assert!(is_locked_revision("traces~1"));
@@ -1224,6 +1236,7 @@ mod tests {
         assert!(!is_locked_revision("agent-traces-feature"));
         assert!(!is_locked_revision("agent-traces-feature^"));
         assert!(!is_locked_revision("not-locked@{0}"));
+        assert!(!is_locked_revision("libra/memory/repo-user"));
         assert!(!is_locked_revision(""));
     }
 }

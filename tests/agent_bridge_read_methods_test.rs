@@ -22,11 +22,7 @@ async fn ctx() -> BridgeContext {
     run_builtin_migrations(&conn)
         .await
         .expect("apply migrations");
-    BridgeContext {
-        conn,
-        repository_id: "repo-1".into(),
-        worktree_id: None,
-    }
+    BridgeContext::new(conn, "repo-1", None)
 }
 
 fn request(line: &str) -> BridgeRequest {
@@ -276,16 +272,8 @@ async fn status_get_totals_are_repository_scoped() {
         .expect("apply migrations");
 
     // Two repositories share one database; both open sessions and write events.
-    let repo1 = BridgeContext {
-        conn: conn.clone(),
-        repository_id: "repo-1".into(),
-        worktree_id: None,
-    };
-    let repo2 = BridgeContext {
-        conn: conn.clone(),
-        repository_id: "repo-2".into(),
-        worktree_id: None,
-    };
+    let repo1 = BridgeContext::new(conn.clone(), "repo-1", None);
+    let repo2 = BridgeContext::new(conn.clone(), "repo-2", None);
     // Note: bridge_session_id is a global primary key, so each repo uses its
     // own session id.
     let opens = [(&repo1, "s1"), (&repo2, "s2")];

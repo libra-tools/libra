@@ -7,7 +7,10 @@ use serde::Serialize;
 
 use crate::{
     command::branch::is_valid_git_branch_name,
-    internal::{branch::BranchStoreError, head::Head},
+    internal::{
+        branch::{BranchStoreError, is_ai_managed_branch},
+        head::Head,
+    },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -141,6 +144,13 @@ fn validate_name(name: &str) -> CliResult<()> {
 
 async fn set_head_target(target: &str) -> CliResult<()> {
     let branch_name = branch_name_from_full_ref(target)?;
+    if is_ai_managed_branch(branch_name) {
+        return Err(CliError::failure(format!(
+            "cannot point HEAD at Libra-managed branch '{branch_name}'"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("choose an ordinary working branch"));
+    }
     // Part C W0 (§C.11): pointing this worktree's HEAD at a branch already
     // checked out in ANOTHER worktree would create a forbidden duplicate
     // checkout. `branch_checked_out_elsewhere` excludes the current worktree, so

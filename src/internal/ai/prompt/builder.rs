@@ -10,7 +10,10 @@ use super::{
 };
 use crate::internal::ai::{
     agent::TaskIntent,
-    context_budget::{ContextBudget, MemoryAnchor, build_memory_anchor_prompt_section},
+    context_budget::{
+        AuditedMemoryContextBundleV1, ContextBudget, MemoryAnchor,
+        build_memory_anchor_prompt_section,
+    },
 };
 
 /// Builds a complete system prompt from modular rule files.
@@ -26,6 +29,7 @@ pub struct SystemPromptBuilder {
     dynamic_context: bool,
     context_budget: Option<ContextBudget>,
     memory_anchors: Vec<MemoryAnchor>,
+    audited_memory_context: Option<String>,
     extra_sections: Vec<(String, String)>,
 }
 
@@ -43,6 +47,7 @@ impl SystemPromptBuilder {
             dynamic_context: false,
             context_budget: None,
             memory_anchors: Vec::new(),
+            audited_memory_context: None,
             extra_sections: Vec::new(),
         })
     }
@@ -88,6 +93,19 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Include one transient Memory bundle whose shared selection receipt was
+    /// already committed. The builder cannot accept raw `MemoryNote` values,
+    /// so an unaudited retrieval cannot cross this prompt-delivery seam.
+    #[allow(
+        dead_code,
+        reason = "M2-13 connects this audited bundle at the command/runtime boundary"
+    )]
+    pub(crate) fn with_memory_bundle(mut self, bundle: &AuditedMemoryContextBundleV1) -> Self {
+        self.audited_memory_context =
+            (!bundle.prompt_section().is_empty()).then(|| bundle.prompt_section().to_string());
+        self
+    }
+
     /// Append a custom section to the end of the prompt.
     pub fn extra_section(mut self, heading: impl Into<String>, content: impl Into<String>) -> Self {
         self.extra_sections.push((heading.into(), content.into()));
@@ -104,7 +122,8 @@ impl SystemPromptBuilder {
                 + self.extra_sections.len()
                 + usize::from(self.context.is_some())
                 + usize::from(self.dynamic_context)
-                + usize::from(!self.memory_anchors.is_empty()),
+                + usize::from(!self.memory_anchors.is_empty())
+                + usize::from(self.audited_memory_context.is_some()),
         );
 
         for rule in &self.rules {
@@ -129,6 +148,10 @@ impl SystemPromptBuilder {
         if let Some(section) =
             build_memory_anchor_prompt_section(&self.memory_anchors, chrono::Utc::now())
         {
+            parts.push(section);
+        }
+
+        if let Some(section) = self.audited_memory_context {
             parts.push(section);
         }
 

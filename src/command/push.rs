@@ -34,7 +34,10 @@ use crate::{
     git_protocol::{ServiceType::ReceivePack, add_pkt_line_string, read_pkt_line},
     info_println,
     internal::{
-        ai::automation::{VCS_EVENT_POST_PUSH, dispatch_current_repo_vcs_event_to_history},
+        ai::{
+            automation::{VCS_EVENT_POST_PUSH, dispatch_current_repo_vcs_event_to_history},
+            linear_ref::{OwnedRefSpec, OwnedRefTransportPolicy},
+        },
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
         db::get_db_conn_instance,
@@ -80,6 +83,7 @@ EXAMPLES:
     libra push origin :feature          Delete the remote feature branch
     libra push -d origin feature        Delete the remote feature branch (short form)
     libra push --tags origin            Push local tags
+    libra push --all origin             Push all ordinary local branches
     libra push --mirror --dry-run origin
                                         Preview a mirror sync without writing
     libra push -u origin feature-x      Push and set upstream tracking
@@ -166,6 +170,10 @@ pub struct PushArgs {
     #[clap(long, requires("repository"))]
     pub tags: bool,
 
+    /// Push all ordinary local branch refs under refs/heads/*
+    #[clap(long, requires("repository"))]
+    pub all: bool,
+
     /// Mirror all local refs/heads/* and refs/tags/* to the remote, deleting remote-only refs
     #[clap(long, requires("repository"))]
     pub mirror: bool,
@@ -203,6 +211,7 @@ impl PushArgs {
             porcelain: false,
             dry_run: false,
             tags: false,
+            all: false,
             mirror: false,
             no_verify: false,
             no_progress: false,
@@ -254,6 +263,8 @@ pub enum PushError {
     #[error("source ref '{0}' not found")]
     SourceRefNotFound(String),
 
+    #[error("Memory ref '{0}' is local-only and cannot use ordinary push")]
+    LocalOnlyRef(String),
     #[error("unable to delete '{name}': remote ref does not exist")]
     DeleteRefNotFound { name: String },
 
@@ -365,6 +376,9 @@ impl From<PushError> for CliError {
             PushError::SourceRefNotFound(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("verify the local branch/ref exists before pushing"),
+            PushError::LocalOnlyRef(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("Memory publication will use a dedicated command in a later milestone"),
             PushError::DeleteRefNotFound { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("check the remote's refs with 'libra ls-remote <remote>'"),
@@ -708,6 +722,7 @@ pub async fn execute_safe(args: PushArgs, output: &OutputConfig) -> CliResult<()
         args.delete,
         args.set_upstream,
         args.tags,
+        args.all,
         args.mirror,
     )
     .map_err(CliError::from)?;
@@ -743,14 +758,16 @@ fn apply_delete_flag(
     delete: bool,
     set_upstream: bool,
     tags: bool,
+    all: bool,
     mirror: bool,
 ) -> Result<Vec<String>, PushError> {
     if !delete {
         return Ok(refspecs);
     }
-    if set_upstream || tags || mirror {
+    if set_upstream || tags || all || mirror {
         return Err(PushError::InvalidArguments(
-            "--delete cannot be combined with --set-upstream, --tags, or --mirror".to_string(),
+            "--delete cannot be combined with --set-upstream, --tags, --all, or --mirror"
+                .to_string(),
         ));
     }
     if refspecs.is_empty() {
@@ -773,17 +790,25 @@ fn apply_delete_flag(
 }
 
 fn validate_push_args(args: &PushArgs) -> Result<(), PushError> {
-    if args.repository.is_none() && (!args.refspecs.is_empty() || args.tags || args.mirror) {
+    if args.repository.is_none()
+        && (!args.refspecs.is_empty() || args.tags || args.all || args.mirror)
+    {
         return Err(PushError::InvalidArguments(
-            "repository is required when specifying refspecs, --tags, or --mirror".to_string(),
+            "repository is required when specifying refspecs, --tags, --all, or --mirror"
+                .to_string(),
         ));
     }
-    if args.repository.is_some() && args.refspecs.is_empty() && !args.tags && !args.mirror {
+    if args.repository.is_some()
+        && args.refspecs.is_empty()
+        && !args.tags
+        && !args.all
+        && !args.mirror
+    {
         return Err(PushError::InvalidArguments(
-            "repository-only push requires a refspec, --tags, or --mirror".to_string(),
+            "repository-only push requires a refspec, --tags, --all, or --mirror".to_string(),
         ));
     }
-    if args.set_upstream && (args.refspecs.len() != 1 || args.tags) {
+    if args.set_upstream && (args.refspecs.len() != 1 || args.tags || args.all) {
         return Err(PushError::InvalidArguments(
             "--set-upstream requires exactly one branch refspec".to_string(),
         ));
@@ -791,6 +816,12 @@ fn validate_push_args(args: &PushArgs) -> Result<(), PushError> {
     if args.mirror && (!args.refspecs.is_empty() || args.tags || args.set_upstream) {
         return Err(PushError::InvalidArguments(
             "--mirror cannot be combined with refspecs, --tags, or --set-upstream".to_string(),
+        ));
+    }
+    if args.all && (!args.refspecs.is_empty() || args.tags || args.mirror || args.set_upstream) {
+        return Err(PushError::InvalidArguments(
+            "--all cannot be combined with refspecs, --tags, --mirror, or --set-upstream"
+                .to_string(),
         ));
     }
 
@@ -802,7 +833,7 @@ async fn validate_local_refspecs(args: &PushArgs, current_branch: &str) -> Resul
         return Ok(());
     }
 
-    if args.refspecs.is_empty() && !args.tags {
+    if args.refspecs.is_empty() && !args.tags && !args.all {
         resolve_local_ref(current_branch).await?;
     }
 
@@ -931,6 +962,8 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     let effective_force = args.force || args.force_with_lease.is_some();
     let mut plans = if args.mirror {
         build_mirror_update_plan(&remote_refs, &mut warnings).await?
+    } else if args.all {
+        build_all_branch_update_plan(&remote_refs, effective_force, &mut warnings).await?
     } else {
         let mut plans = Vec::new();
         let mut seen_remote_refs = HashSet::new();
@@ -1466,21 +1499,34 @@ fn normalize_tag_ref(input: &str) -> Result<String, PushError> {
 }
 
 fn normalize_destination_ref(input: &str, source_kind: LocalRefKind) -> Result<String, PushError> {
-    if input.starts_with("refs/") {
-        return ensure_valid_ref(input.to_string(), input);
-    }
-    match source_kind {
-        LocalRefKind::Branch => normalize_branch_ref(input),
-        LocalRefKind::Tag => normalize_tag_ref(input),
-    }
+    let normalized = if input.starts_with("refs/") {
+        ensure_valid_ref(input.to_string(), input)?
+    } else {
+        match source_kind {
+            LocalRefKind::Branch => normalize_branch_ref(input),
+            LocalRefKind::Tag => normalize_tag_ref(input),
+        }?
+    };
+    ensure_not_local_only_ref(&normalized)?;
+    Ok(normalized)
 }
 
 fn normalize_delete_ref(input: &str) -> Result<String, PushError> {
-    if input.starts_with("refs/") {
-        ensure_valid_ref(input.to_string(), input)
+    let normalized = if input.starts_with("refs/") {
+        ensure_valid_ref(input.to_string(), input)?
     } else {
-        normalize_branch_ref(input)
+        normalize_branch_ref(input)?
+    };
+    ensure_not_local_only_ref(&normalized)?;
+    Ok(normalized)
+}
+
+fn ensure_not_local_only_ref(name: &str) -> Result<(), PushError> {
+    let spec = OwnedRefSpec::for_transport_ref(name);
+    if spec.is_some_and(|spec| spec.transport_policy() == OwnedRefTransportPolicy::LocalOnly) {
+        return Err(PushError::LocalOnlyRef(name.to_string()));
     }
+    Ok(())
 }
 
 /// A resolved deletion target: the fully-qualified remote ref plus the name as
@@ -1535,6 +1581,7 @@ fn resolve_delete_target(
 }
 
 async fn resolve_local_ref(input: &str) -> Result<ResolvedLocalRef, PushError> {
+    ensure_not_local_only_ref(input)?;
     if input.starts_with("refs/heads/") {
         let short_name = input
             .strip_prefix("refs/heads/")
@@ -2024,6 +2071,9 @@ async fn build_mirror_update_plan(
         .map_err(|error| PushError::RepoState(error.to_string()))?;
     for branch in branches {
         let full_ref = normalize_branch_ref(&branch.name)?;
+        if ensure_not_local_only_ref(&full_ref).is_err() {
+            continue;
+        }
         local_refs.insert(full_ref.clone());
         add_update_ref_plan(
             ResolvedLocalRef {
@@ -2069,6 +2119,9 @@ async fn build_mirror_update_plan(
         if local_refs.contains(remote_ref) {
             continue;
         }
+        if ensure_not_local_only_ref(remote_ref).is_err() {
+            continue;
+        }
         add_delete_ref_plan(
             remote_ref.clone(),
             remote_refs,
@@ -2087,6 +2140,38 @@ async fn build_mirror_update_plan(
         warnings.push("mirror push will delete remote-only refs".to_string());
     }
 
+    Ok(plans)
+}
+
+async fn build_all_branch_update_plan(
+    remote_refs: &HashMap<String, String>,
+    force: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<RefUpdatePlan>, PushError> {
+    let branches = Branch::list_branches_result(None)
+        .await
+        .map_err(|error| PushError::RepoState(error.to_string()))?;
+    let mut plans = Vec::new();
+    let mut seen_remote_refs = HashSet::new();
+    for branch in branches {
+        let full_ref = normalize_branch_ref(&branch.name)?;
+        if ensure_not_local_only_ref(&full_ref).is_err() {
+            continue;
+        }
+        add_update_ref_plan(
+            ResolvedLocalRef {
+                full_ref: full_ref.clone(),
+                oid: branch.commit,
+                kind: LocalRefKind::Branch,
+            },
+            full_ref,
+            remote_refs,
+            force,
+            warnings,
+            &mut seen_remote_refs,
+            &mut plans,
+        )?;
+    }
     Ok(plans)
 }
 
@@ -3013,13 +3098,56 @@ mod test {
             tree::{Tree, TreeItem, TreeItemMode},
         },
     };
+    use serial_test::serial;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
 
     fn save_test_blob(content: &str) -> Blob {
         let blob = Blob::from_content(content);
         crate::command::save_object(&blob, &blob.id).expect("test blob should save");
         blob
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn all_and_mirror_plans_exclude_memory_ref() {
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        let oid = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        Branch::update_branch("main", oid, None).await.unwrap();
+        Branch::update_branch("libra/memory/repo", oid, None)
+            .await
+            .unwrap();
+        Branch::update_branch("libra/memory/repo-user", oid, None)
+            .await
+            .unwrap();
+
+        let mut warnings = Vec::new();
+        let all = build_all_branch_update_plan(&HashMap::new(), false, &mut warnings)
+            .await
+            .unwrap();
+        let destinations: HashSet<&str> = all
+            .iter()
+            .map(|plan| plan.update.remote_ref.as_str())
+            .collect();
+        assert!(destinations.contains("refs/heads/main"));
+        assert!(destinations.contains("refs/heads/libra/memory/repo-user"));
+        assert!(!destinations.contains("refs/heads/libra/memory/repo"));
+
+        let remote_refs = HashMap::from([
+            ("refs/heads/main".to_string(), oid.to_string()),
+            ("refs/heads/libra/memory/repo".to_string(), oid.to_string()),
+        ]);
+        let mirror = build_mirror_update_plan(&remote_refs, &mut warnings)
+            .await
+            .unwrap();
+        assert!(mirror.iter().all(|plan| {
+            plan.update.remote_ref != "refs/heads/libra/memory/repo"
+                && plan.update.local_ref != "refs/heads/libra/memory/repo"
+        }));
     }
 
     fn save_test_tree(items: Vec<TreeItem>) -> Tree {
@@ -3444,6 +3572,10 @@ mod test {
             "source ref 'topic/x' not found",
         );
         assert_eq!(
+            PushError::LocalOnlyRef("refs/heads/libra/memory/repo".to_string()).to_string(),
+            "Memory ref 'refs/heads/libra/memory/repo' is local-only and cannot use ordinary push",
+        );
+        assert_eq!(
             PushError::UnsupportedLocalFileRemote.to_string(),
             "pushing to local file repositories is not supported",
         );
@@ -3632,6 +3764,11 @@ mod test {
         assert!(args.refspecs.is_empty());
         assert!(args.tags);
 
+        let args = PushArgs::parse_from(["push", "--all", "origin"]);
+        assert_eq!(args.repository.as_deref(), Some("origin"));
+        assert!(args.all);
+        assert!(args.refspecs.is_empty());
+
         let args = vec!["push", "--mirror", "--dry-run", "origin"];
         let args = PushArgs::parse_from(args);
         assert_eq!(args.repository, Some("origin".to_string()));
@@ -3682,7 +3819,7 @@ mod test {
     fn apply_delete_flag_rewrites_and_validates() {
         // Without --delete, the refspecs pass through unchanged.
         assert_eq!(
-            apply_delete_flag(vec!["main".to_string()], false, false, false, false).unwrap(),
+            apply_delete_flag(vec!["main".to_string()], false, false, false, false, false).unwrap(),
             vec!["main".to_string()]
         );
         // --delete rewrites each plain ref name to a `:<ref>` deletion request.
@@ -3692,19 +3829,31 @@ mod test {
                 true,
                 false,
                 false,
+                false,
                 false
             )
             .unwrap(),
             vec![":main".to_string(), ":feature".to_string()]
         );
         // --delete requires at least one ref.
-        assert!(apply_delete_flag(vec![], true, false, false, false).is_err());
+        assert!(apply_delete_flag(vec![], true, false, false, false, false).is_err());
         // --delete rejects a refspec that already carries a ':'.
-        assert!(apply_delete_flag(vec!["a:b".to_string()], true, false, false, false).is_err());
-        // --delete cannot combine with --set-upstream / --tags / --mirror.
-        assert!(apply_delete_flag(vec!["main".to_string()], true, true, false, false).is_err());
-        assert!(apply_delete_flag(vec!["main".to_string()], true, false, true, false).is_err());
-        assert!(apply_delete_flag(vec!["main".to_string()], true, false, false, true).is_err());
+        assert!(
+            apply_delete_flag(vec!["a:b".to_string()], true, false, false, false, false).is_err()
+        );
+        // --delete cannot combine with --set-upstream / --tags / --all / --mirror.
+        assert!(
+            apply_delete_flag(vec!["main".to_string()], true, true, false, false, false).is_err()
+        );
+        assert!(
+            apply_delete_flag(vec!["main".to_string()], true, false, true, false, false).is_err()
+        );
+        assert!(
+            apply_delete_flag(vec!["main".to_string()], true, false, false, true, false).is_err()
+        );
+        assert!(
+            apply_delete_flag(vec!["main".to_string()], true, false, false, false, true).is_err()
+        );
     }
 
     #[test]
@@ -3713,7 +3862,8 @@ mod test {
         assert!(matches!(
             validate_push_args(&args),
             Err(PushError::InvalidArguments(message))
-                if message == "repository-only push requires a refspec, --tags, or --mirror"
+                if message
+                    == "repository-only push requires a refspec, --tags, --all, or --mirror"
         ));
 
         let args = PushArgs::parse_from(["push", "-u", "origin", "main", "topic"]);
@@ -3754,6 +3904,7 @@ mod test {
             porcelain: false,
             dry_run: false,
             tags: false,
+            all: false,
             mirror: false,
             no_verify: false,
             no_progress: false,
@@ -3761,7 +3912,7 @@ mod test {
         assert!(matches!(
             validate_push_args(&args),
             Err(PushError::InvalidArguments(message))
-                if message == "repository is required when specifying refspecs, --tags, or --mirror"
+                if message == "repository is required when specifying refspecs, --tags, --all, or --mirror"
         ));
     }
 
@@ -3994,6 +4145,19 @@ old1 new1 refs/heads/main\n"
     }
 
     #[test]
+    fn ordinary_push_rejects_exact_memory_ref_and_allows_lookalikes() {
+        for name in ["libra/memory/repo", "refs/heads/libra/memory/repo"] {
+            assert!(matches!(
+                ensure_not_local_only_ref(name),
+                Err(PushError::LocalOnlyRef(blocked)) if blocked == name
+            ));
+        }
+        assert!(ensure_not_local_only_ref("libra/memory/repo-user").is_ok());
+        assert!(normalize_destination_ref("libra/memory/repo", LocalRefKind::Branch).is_err());
+        assert!(normalize_delete_ref("refs/heads/libra/memory/repo").is_err());
+    }
+
+    #[test]
     fn test_normalize_branch_ref_still_rejects_private_refs_source() {
         assert!(matches!(
             normalize_branch_ref("refs/libra/traces"),
@@ -4192,6 +4356,14 @@ old1 new1 refs/heads/main\n"
         let err: CliError = PushError::SourceRefNotFound("missing-branch".to_string()).into();
         assert_eq!(err.stable_code(), StableErrorCode::CliInvalidTarget);
         assert_eq!(err.exit_code(), 129);
+    }
+
+    #[test]
+    fn local_only_memory_push_has_stable_conflict_error() {
+        let err: CliError =
+            PushError::LocalOnlyRef("refs/heads/libra/memory/repo".to_string()).into();
+        assert_eq!(err.stable_code(), StableErrorCode::ConflictOperationBlocked);
+        assert!(!err.hints().is_empty());
     }
 
     #[test]

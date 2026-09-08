@@ -62,7 +62,7 @@ Command Groups:
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
-  AI And Automation       code, automation, usage, graph, sandbox, agent, review, investigate, service
+  AI And Automation       code, automation, usage, graph, sandbox, agent, memory, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
@@ -715,6 +715,8 @@ enum Commands {
     Automation(command::automation::AutomationArgs),
     #[command(about = "Report AI provider/model usage")]
     Usage(command::usage::UsageArgs),
+    #[command(about = "Search and diagnose repository Agent Memory")]
+    Memory(command::memory::MemoryArgs),
     #[command(
         about = "Inspect an AI thread version graph (JSON/machine output; interactive view in Web Code UI)"
     )]
@@ -1535,6 +1537,17 @@ fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<C
             )),
             Err(_) => Ok(CommandPreflight::sha1_without_repo()),
         },
+        // M2-13: the Memory adapter owns schema inspection and maps future or
+        // unreadable schemas to stable LBR-MEMORY-* errors. Reads and rebuild
+        // previews also promise zero writes, while a real rebuild explicitly
+        // applies known pending migrations inside that adapter.
+        Commands::Memory(_) => {
+            let storage = utils::util::try_get_storage_path(None)
+                .map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
+                storage,
+            ))
+        }
         // `grep --no-index` searches the filesystem directly and works outside a
         // repository, so it needs no storage/hash-kind preflight.
         Commands::Grep(args) if args.no_index => Ok(CommandPreflight::none()),
@@ -1751,6 +1764,13 @@ fn command_scope(command: &Commands) -> CommandScope {
                 ReadOnly
             } else {
                 Worktree
+            }
+        }
+        Commands::Memory(args) => {
+            if args.mutates_repository() {
+                Repository
+            } else {
+                ReadOnly
             }
         }
         // The write form moves this worktree's HEAD directly.
@@ -2936,6 +2956,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
                 command::automation::execute_safe(cmd_args, &output).await?
             }
             Commands::Usage(cmd_args) => command::usage::execute_safe(cmd_args, &output).await?,
+            Commands::Memory(cmd_args) => command::memory::execute_safe(cmd_args, &output).await?,
             Commands::Graph(cmd_args) => command::graph::execute_safe(cmd_args, &output).await?,
             Commands::Sandbox(cmd_args) => {
                 command::sandbox::execute_safe(cmd_args, &output).await?

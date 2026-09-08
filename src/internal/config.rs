@@ -27,7 +27,7 @@ use std::{collections::HashSet, mem::swap, path::Path};
 use anyhow::{Context, Result, anyhow};
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ModelTrait,
-    QueryFilter, QueryOrder, entity::ActiveModelTrait,
+    QueryFilter, QueryOrder, Statement, entity::ActiveModelTrait,
 };
 
 use crate::{
@@ -262,6 +262,36 @@ impl ConfigKv {
             entry.save(db).await.context("failed to insert config_kv")?;
         }
         Ok(())
+    }
+
+    /// Insert one repository-owned vault-internal value if the key is absent.
+    ///
+    /// This deliberately has narrower semantics than [`Self::set_with_conn`]:
+    /// it never updates, never creates plaintext, and never accepts an ordinary
+    /// user configuration key. Callers must already hold the repository write
+    /// transaction when first-writer-wins initialization is required.
+    pub(crate) async fn insert_vault_internal_if_absent_with_conn<C: ConnectionTrait>(
+        db: &C,
+        key: &str,
+        value: &str,
+    ) -> Result<bool> {
+        if !is_vault_internal_key(key) {
+            return Err(anyhow!(
+                "refusing internal encrypted insert for non-vault key '{key}'"
+            ));
+        }
+
+        let result = db
+            .execute_raw(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "INSERT INTO config_kv (key, value, encrypted) \
+                 SELECT ?, ?, 1 \
+                 WHERE NOT EXISTS (SELECT 1 FROM config_kv WHERE key = ?)",
+                [key.into(), value.into(), key.into()],
+            ))
+            .await
+            .context("failed to conditionally insert vault-internal config")?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Add a value for a key (allows duplicates, for multi-value keys).
@@ -1972,6 +2002,18 @@ fn git_config_key_matches(stored: &str, requested: &str) -> bool {
 // Sensitive key detection
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Repository-local encrypted seed owned exclusively by Agent Memory.
+///
+/// Public config commands may read this key in redacted form, but only the
+/// keyed-digest provider may create or mutate it. Keeping the spelling in this
+/// module prevents the owner and the CLI guard from drifting apart.
+pub(crate) const MEMORY_KEYED_DIGEST_CONFIG_KEY: &str = "memory.keyed_digest.v1";
+
+/// Returns `true` for configuration state whose lifecycle belongs to Memory.
+pub(crate) fn is_memory_owned_config_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case(MEMORY_KEYED_DIGEST_CONFIG_KEY)
+}
+
 /// Returns `true` if the key holds sensitive material that should be
 /// encrypted and redacted by default.
 ///
@@ -1999,7 +2041,11 @@ pub fn is_sensitive_key(key: &str) -> bool {
     if lower.ends_with(".privkey") {
         return true;
     }
-    if lower == "vault.unsealkey" || lower == "vault.roottoken" || lower == "vault.roottoken_enc" {
+    if lower == "vault.unsealkey"
+        || lower == "vault.roottoken"
+        || lower == "vault.roottoken_enc"
+        || is_memory_owned_config_key(key)
+    {
         return true;
     }
 
@@ -2041,6 +2087,7 @@ pub fn is_vault_internal_key(key: &str) -> bool {
         || lower == "vault.unsealkey"
         || lower == "vault.roottoken"
         || lower == "vault.roottoken_enc"
+        || is_memory_owned_config_key(key)
         // `libra auth` token records: unset via config would be an unaudited
         // logout outside the owner API.
         || lower.starts_with("auth.token.")

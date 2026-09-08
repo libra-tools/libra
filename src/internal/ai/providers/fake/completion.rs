@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use serde_json::Value;
 use tokio::time::sleep;
 
 use super::fixture::{
@@ -141,6 +142,9 @@ impl CompletionModelTrait for CompletionModel {
             FakeResponseAction::Error { message, .. } => {
                 return Err(CompletionError::ProviderError(message));
             }
+            FakeResponseAction::MemoryEpisode => vec![AssistantContent::Text(Text {
+                text: memory_episode_response(&latest_user_text)?,
+            })],
         };
 
         Ok(CompletionResponse {
@@ -153,6 +157,87 @@ impl CompletionModelTrait for CompletionModel {
             },
         })
     }
+}
+
+fn memory_episode_response(input: &str) -> Result<String, CompletionError> {
+    let value: Value = serde_json::from_str(input).map_err(|_| {
+        CompletionError::ProviderError(
+            "fake Memory Episode action received malformed compiler input".to_string(),
+        )
+    })?;
+    let (summary, evidence_ids) =
+        if let Some(fragments) = value.get("fragments").and_then(Value::as_array) {
+            (
+                "the development task completed with repository evidence",
+                first_fragment_ids(fragments, 1)?,
+            )
+        } else {
+            let intent = value
+                .get("intent_fragments")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    CompletionError::ProviderError(
+                        "fake Memory Episode action received an unknown compiler shape".to_string(),
+                    )
+                })?;
+            let tasks = value
+                .get("task_episodes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    CompletionError::ProviderError(
+                        "fake Memory Intent action has no pinned task episodes".to_string(),
+                    )
+                })?;
+            let mut ids = first_fragment_ids(intent, 1)?;
+            ids.extend(first_fragment_ids(tasks, 1)?);
+            (
+                "the development intent completed with a pinned task episode",
+                ids,
+            )
+        };
+    Ok(serde_json::json!({
+        "summary": {
+            "epistemic_status": "inference",
+            "claim": summary,
+            "confidence": "high",
+            "evidence_fragment_ids": evidence_ids.clone(),
+        },
+        "observations": [{
+            "epistemic_status": "observation",
+            "claim": "the terminal development record was available for compilation",
+            "confidence": null,
+            "evidence_fragment_ids": evidence_ids,
+        }],
+        "inferences": [],
+        "decisions": [],
+        "failed_attempts": [],
+        "unresolved": [],
+    })
+    .to_string())
+}
+
+fn first_fragment_ids(fragments: &[Value], count: usize) -> Result<Vec<String>, CompletionError> {
+    let ids = fragments
+        .iter()
+        .take(count)
+        .map(|fragment| {
+            fragment
+                .get("fragment_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CompletionError::ProviderError(
+                        "fake Memory compiler fragment has no ID".to_string(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if ids.len() != count {
+        return Err(CompletionError::ProviderError(
+            "fake Memory compiler request has too few fragments".to_string(),
+        ));
+    }
+    Ok(ids)
 }
 
 fn last_tool_result_name(request: &CompletionRequest) -> Option<&str> {
@@ -275,6 +360,46 @@ mod tests {
             [AssistantContent::ToolCall(ToolCall { id, name, .. })]
                 if id == "call-1" && name == "request_user_input"
         ));
+    }
+
+    #[tokio::test]
+    async fn fake_provider_builds_memory_episode_from_request_fragment_ids() {
+        let fixture = FakeFixture {
+            responses: vec![super::super::fixture::FakeResponseRule {
+                matcher: Default::default(),
+                once: false,
+                action: FakeResponseAction::MemoryEpisode,
+            }],
+            fallback: None,
+        };
+        let model = CompletionModel {
+            fixture: Arc::new(fixture),
+            consumed: Arc::new(Mutex::new(HashSet::new())),
+            model: "fake".to_string(),
+        };
+        let response = model
+            .completion(CompletionRequest::new(vec![Message::user(
+                serde_json::json!({
+                    "schema_version": 1,
+                    "fragments": [{
+                        "fragment_id": "task:fixture",
+                        "object_type": "task",
+                        "text": "fixture"
+                    }]
+                })
+                .to_string(),
+            )]))
+            .await
+            .expect("build deterministic Memory proposal");
+        let [AssistantContent::Text(Text { text })] = response.content.as_slice() else {
+            panic!("expected one text response")
+        };
+        let proposal: serde_json::Value =
+            serde_json::from_str(text).expect("decode deterministic Memory proposal");
+        assert_eq!(
+            proposal["summary"]["evidence_fragment_ids"],
+            serde_json::json!(["task:fixture"])
+        );
     }
 
     #[tokio::test]

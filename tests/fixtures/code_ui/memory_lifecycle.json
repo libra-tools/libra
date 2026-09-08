@@ -1,0 +1,95 @@
+{
+  "responses": [
+    {
+      "match": { "contains": "\"intent_fragments\":" },
+      "type": "memory_episode"
+    },
+    {
+      "match": { "contains": "\"fragments\":" },
+      "type": "memory_episode"
+    },
+    {
+      "match": { "contains": "You are running /plan mode." },
+      "type": "tool_call",
+      "id": "call_request_user_input_1",
+      "name": "request_user_input",
+      "arguments": {
+        "questions": [
+          {
+            "id": "risk_profile",
+            "header": "Risk",
+            "question": "What risk level should be used?",
+            "options": ["Low", "Medium", "High"]
+          }
+        ]
+      }
+    },
+    {
+      "match": { "contains": "You are generating an execution plan" },
+      "type": "tool_call",
+      "id": "call_submit_plan_draft_1",
+      "name": "submit_plan_draft",
+      "arguments": {
+        "explanation": "Phase 1 plan for the README usage section",
+        "steps": [
+          { "title": "Add a Usage section documenting the CLI commands" }
+        ]
+      }
+    },
+    {
+      "match": { "contains": "Add a Usage section documenting the CLI commands" },
+      "once": true,
+      "type": "tool_call",
+      "id": "call_apply_usage_patch_1",
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: README.md\n@@\n Placeholder for plan-review Web process.\n+\n+## Usage\n+\n+Run `libra --help` to list the available commands.\n*** End Patch"
+      }
+    },
+    {
+      "match": { "afterToolResult": true, "afterToolName": "apply_patch" },
+      "type": "text",
+      "text": "README.md now contains the requested Usage section."
+    },
+    {
+      "match": {
+        "equals": "",
+        "afterToolResult": true,
+        "afterToolName": "request_user_input"
+      },
+      "once": true,
+      "type": "tool_call",
+      "id": "call_submit_intent_draft_1",
+      "name": "submit_intent_draft",
+      "arguments": {
+        "draft": {
+          "intent": {
+            "summary": "Add a README usage section",
+            "problemStatement": "The README is missing a usage walkthrough for new contributors",
+            "changeType": "feature",
+            "objectives": [
+              { "title": "document usage in README", "kind": "implementation" }
+            ],
+            "inScope": ["README.md"],
+            "outOfScope": []
+          },
+          "acceptance": {
+            "successCriteria": ["README.md contains a Usage section"],
+            "fastChecks": [],
+            "integrationChecks": [],
+            "securityChecks": [],
+            "releaseChecks": []
+          },
+          "risk": {
+            "rationale": "single documentation file change",
+            "level": "low"
+          }
+        }
+      }
+    }
+  ],
+  "fallback": {
+    "type": "text",
+    "text": "fake assistant: plan execution completed"
+  }
+}

@@ -312,6 +312,10 @@ filter = 'test(/(^|::)mcp_http_and_stdio_expose_identical_tool_set$/)'
 test-group = 'external'
 
 [[profile.default.overrides]]
+filter = 'test(/(^|::)memory_public_cli_lifecycle_after_agent_terminal$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
 filter = 'test(/(^|::)metadata_model_field_prefers_event_model$/)'
 test-group = 'external'
 

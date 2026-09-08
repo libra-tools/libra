@@ -91,7 +91,7 @@ async fn make_legacy_database(path: &Path) -> sea_orm::DatabaseConnection {
           VALUES ('legacy-view-1', 'branch', 'main', '', 'deadbeef');\
           INSERT INTO operation_view_workspace (view_id, pointer_kind, pointer_value)\
           VALUES ('legacy-view-1', 'head', 'deadbeef');\
-          DELETE FROM schema_versions WHERE version = 2026090101",
+          DELETE FROM schema_versions WHERE version >= 2026090101",
      )
      .await
      .expect("install legacy operation schema");
@@ -197,7 +197,7 @@ async fn fresh_and_legacy_databases_converge_to_the_same_v2_schema() {
             1
         );
         upgraded
-            .execute_unprepared("DELETE FROM schema_versions WHERE version = 2026090101")
+            .execute_unprepared("DELETE FROM schema_versions WHERE version >= 2026090101")
             .await
             .expect("remove migration marker for idempotence check");
         drop(upgraded);
@@ -294,7 +294,7 @@ async fn operation_v2_migration_is_forward_only_and_versioned() {
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT MAX(version) FROM schema_versions",
+            "SELECT MAX(version) FROM schema_versions WHERE version <= 2026090101",
             [],
         ))
         .await

@@ -114,7 +114,7 @@ fn historical_builtin_runner() -> Result<MigrationRunner, MigrationError> {
     runner.extend(
         builtin_migrations()
             .into_iter()
-            .filter(|migration| migration.version < 2026090101),
+            .filter(|migration| migration.version != 2026090101),
     )?;
     Ok(runner)
 }

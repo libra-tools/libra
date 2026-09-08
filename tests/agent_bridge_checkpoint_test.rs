@@ -17,11 +17,7 @@ async fn ctx() -> BridgeContext {
     run_builtin_migrations(&conn)
         .await
         .expect("apply migrations");
-    BridgeContext {
-        conn,
-        repository_id: "repo-1".into(),
-        worktree_id: None,
-    }
+    BridgeContext::new(conn, "repo-1", None)
 }
 
 fn request(line: &str) -> BridgeRequest {
@@ -105,16 +101,8 @@ async fn checkpoint_reads_are_repository_scoped() {
     run_builtin_migrations(&conn)
         .await
         .expect("apply migrations");
-    let c1 = BridgeContext {
-        conn: conn.clone(),
-        repository_id: "repo-1".into(),
-        worktree_id: None,
-    };
-    let c2 = BridgeContext {
-        conn: conn.clone(),
-        repository_id: "repo-2".into(),
-        worktree_id: None,
-    };
+    let c1 = BridgeContext::new(conn.clone(), "repo-1", None);
+    let c2 = BridgeContext::new(conn.clone(), "repo-2", None);
 
     // Open a session and create a checkpoint in repo-1.
     ingress_dispatch(

@@ -3,7 +3,7 @@
 //!
 //! Covers initialize/handshake, protocol major mismatch, unknown-method
 //! rejection, request id echo, NDJSON framing, frame/batch caps and the
-//! exact 20-method allowlist. These are the fixture-level guarantees the
+//! exact 22-method allowlist. These are the fixture-level guarantees the
 //! TypeScript plugin consumes.
 
 use libra::internal::ai::agent_bridge::protocol::{
@@ -12,11 +12,13 @@ use libra::internal::ai::agent_bridge::protocol::{
 };
 
 #[test]
-fn protocol_v1_allowlist_is_exactly_20_methods() {
+fn protocol_v1_2_allowlist_includes_memory_recall_and_record() {
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::METHOD_ALLOWLIST.len(),
-        20
+        22
     );
+    assert!(MethodAllowlist::contains("memory.recall"));
+    assert!(MethodAllowlist::contains("memory.episode.record"));
 }
 
 #[test]
@@ -34,6 +36,7 @@ fn protocol_v1_capability_negotiation_has_expected_limits() {
 #[test]
 fn protocol_v1_current_version_is_major_1() {
     assert_eq!(ProtocolVersion::current().major, PROTOCOL_MAJOR);
+    assert_eq!(ProtocolVersion::current().minor, 2);
     assert_eq!(SOURCE_DEEPSEEK_HARNESS, "deepseek-harness");
 }
 

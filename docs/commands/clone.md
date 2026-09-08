@@ -149,7 +149,8 @@ repository. Not supported for `libra+cloud://` sources (rejected with
 Narrowings vs Git: (1) Git mirrors `refs/*:refs/*` verbatim; Libra mirrors only
 what its fetch transfers — every fetched branch is promoted to `refs/heads/*` and
 tags are kept, but ref namespaces Libra does not fetch (e.g. `refs/notes/*`) are
-not mirrored. (2) Because Libra's fetch collapses `refs/heads/mr/*` and
+not mirrored. The repository-local Memory authority is never fetched or
+promoted. (2) Because Libra's fetch collapses `refs/heads/mr/*` and
 `refs/mr/*` into one tracking namespace, any such refs are mirrored as
 `refs/heads/mr/*` (provenance is not preserved). (3) The `mirror=true` marker is
 informational — no `+refs/*:refs/*` refspec is recorded and `libra fetch` is not

@@ -36,11 +36,7 @@ async fn fresh_db() -> sea_orm::DatabaseConnection {
 }
 
 fn ctx(db: sea_orm::DatabaseConnection) -> BridgeContext {
-    BridgeContext {
-        conn: db,
-        repository_id: REPO.to_string(),
-        worktree_id: None,
-    }
+    BridgeContext::new(db, REPO, None)
 }
 
 fn request(method: &str, params: serde_json::Value) -> BridgeRequest {

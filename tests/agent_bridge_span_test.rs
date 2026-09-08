@@ -61,11 +61,7 @@ fn capture(input: &str, repo_id: &str) -> (String, String) {
             let db = Database::connect("sqlite::memory:").await.expect("connect");
             run_builtin_migrations(&db).await.expect("apply migrations");
 
-            let handler = IngressBridgeHandler::new(BridgeContext {
-                conn: db.clone(),
-                repository_id: repo_id.to_string(),
-                worktree_id: None,
-            });
+            let handler = IngressBridgeHandler::new(BridgeContext::new(db.clone(), repo_id, None));
             run(
                 Cursor::new(input.as_bytes()),
                 &mut out,

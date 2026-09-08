@@ -11,8 +11,18 @@ pub mod compaction;
 pub mod compaction_agent;
 pub mod frame;
 pub mod handoff;
+// Replay/inspection accessors remain staged for the M2-13 command adapter.
+#[allow(dead_code)]
+pub(crate) mod memory;
 pub mod memory_anchor;
 pub mod projection;
+// M2-02R freezes the shared receipt seam before M2-12 wires retrieval into
+// prompt assembly. Keep the staged crate-private implementation lint-clean
+// without exposing it as a public API prematurely.
+#[allow(dead_code)]
+pub(crate) mod receipt;
+#[allow(dead_code)]
+pub(crate) mod receipt_store;
 
 pub use allocator::{
     AllocationOmissionReason, ContextAllocation, ContextAllocationOmission, ContextBudgetAllocator,
@@ -40,6 +50,7 @@ pub use handoff::{
     ContextHandoff, ContextHandoffBuilder, ContextHandoffParseError, ParsedSection, ParsedSummary,
     parse_handoff_template,
 };
+pub(crate) use memory::AuditedMemoryContextBundleV1;
 pub use memory_anchor::{
     MemoryAnchor, MemoryAnchorAction, MemoryAnchorConfidence, MemoryAnchorDraft, MemoryAnchorEvent,
     MemoryAnchorKind, MemoryAnchorLookupError, MemoryAnchorReplay, MemoryAnchorReviewState,

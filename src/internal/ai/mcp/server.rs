@@ -54,14 +54,17 @@ impl LibraMcpServer {
         intent_history_manager: Option<Arc<HistoryManager>>,
         storage: Option<Arc<dyn Storage + Send + Sync>>,
     ) -> Self {
-        Self {
+        let repair_history = intent_history_manager.clone();
+        let server = Self {
             intent_history_manager,
             storage,
             working_dir: None,
             code_ui_session: Arc::new(Mutex::new(None)),
             authz: Arc::new(Mutex::new(None)),
             tool_router: Self::build_tool_router(),
-        }
+        };
+        crate::internal::ai::memory::schedule_observer_repair(repair_history);
+        server
     }
 
     pub fn new_with_working_dir(
@@ -69,14 +72,17 @@ impl LibraMcpServer {
         storage: Option<Arc<dyn Storage + Send + Sync>>,
         working_dir: PathBuf,
     ) -> Self {
-        Self {
+        let repair_history = intent_history_manager.clone();
+        let server = Self {
             intent_history_manager,
             storage,
             working_dir: Some(working_dir),
             code_ui_session: Arc::new(Mutex::new(None)),
             authz: Arc::new(Mutex::new(None)),
             tool_router: Self::build_tool_router(),
-        }
+        };
+        crate::internal::ai::memory::schedule_observer_repair(repair_history);
+        server
     }
 
     /// Install an authorization gate. Call before serving any requests; once

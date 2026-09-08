@@ -8,21 +8,109 @@
 //! means the redacted projection is durable, never that the Harness raw
 //! transcript has been taken over.
 
+use std::{collections::HashSet, sync::Arc};
+
 use sea_orm::{DatabaseConnection, DbErr};
 use serde_json::{Value, json};
+use tokio::sync::RwLock;
 
 use super::{
     protocol::{BridgeError, BridgeRequest, BridgeResponse, JSONRPC_VERSION},
     storage::{self, AppendEvent, EventStatus},
 };
+use crate::internal::ai::memory::{
+    AuditedMemoryDelivery, AuditedMemoryDeliveryErrorKind, DshEpisodeRecordErrorKind,
+    DshEpisodeRecorder,
+};
 
 /// Trusted bridge scope derived from the repository/context at handshake
 /// (GC-LB-06/07). The request body never supplies these.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BridgeContext {
     pub conn: DatabaseConnection,
     pub repository_id: String,
     pub worktree_id: Option<String>,
+    active_sessions: Arc<RwLock<HashSet<String>>>,
+    memory_delivery: Result<Arc<AuditedMemoryDelivery>, AuditedMemoryDeliveryErrorKind>,
+    episode_recorder: Result<Arc<DshEpisodeRecorder>, DshEpisodeRecordErrorKind>,
+}
+
+impl std::fmt::Debug for BridgeContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BridgeContext")
+            .field("repository_id", &self.repository_id)
+            .field("worktree_id", &self.worktree_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BridgeContext {
+    pub fn new(
+        conn: DatabaseConnection,
+        repository_id: impl Into<String>,
+        worktree_id: Option<String>,
+    ) -> Self {
+        Self {
+            conn,
+            repository_id: repository_id.into(),
+            worktree_id,
+            active_sessions: Arc::new(RwLock::new(HashSet::new())),
+            memory_delivery: Err(AuditedMemoryDeliveryErrorKind::Digest),
+            episode_recorder: Err(DshEpisodeRecordErrorKind::Unavailable),
+        }
+    }
+
+    pub(crate) fn with_memory_delivery(
+        mut self,
+        delivery: Result<Arc<AuditedMemoryDelivery>, AuditedMemoryDeliveryErrorKind>,
+    ) -> Self {
+        self.memory_delivery = delivery;
+        self
+    }
+
+    pub(crate) fn memory_delivery(
+        &self,
+    ) -> Result<Arc<AuditedMemoryDelivery>, AuditedMemoryDeliveryErrorKind> {
+        self.memory_delivery.clone()
+    }
+
+    pub(crate) fn with_episode_recorder(
+        mut self,
+        recorder: Result<Arc<DshEpisodeRecorder>, DshEpisodeRecordErrorKind>,
+    ) -> Self {
+        self.episode_recorder = recorder;
+        self
+    }
+
+    pub(crate) fn episode_recorder(
+        &self,
+    ) -> Result<Arc<DshEpisodeRecorder>, DshEpisodeRecordErrorKind> {
+        self.episode_recorder.clone()
+    }
+
+    async fn activate_session(&self, session_id: &str) {
+        self.active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string());
+    }
+
+    async fn deactivate_session(&self, session_id: &str) {
+        self.active_sessions.write().await.remove(session_id);
+        if let Ok(recorder) = &self.episode_recorder {
+            recorder.close_session(session_id).await;
+        }
+    }
+
+    pub(crate) async fn require_active_session(&self, session_id: &str) -> Result<(), BridgeError> {
+        if self.active_sessions.read().await.contains(session_id) {
+            return Ok(());
+        }
+        Err(BridgeError::scope_mismatch(format!(
+            "bridge session '{session_id}' is not active in this bridge process; call session.open first"
+        )))
+    }
 }
 
 fn now_ms() -> i64 {
@@ -42,17 +130,24 @@ fn ok_result(data: Value, id: Value) -> BridgeResponse {
     }
 }
 
-/// Look up a session's repository scope and verify it matches the trusted
-/// context (fail-closed on mismatch — a session created by another repository
-/// can never be written to from here).
-async fn require_session_in_repo(ctx: &BridgeContext, session_id: &str) -> Result<(), BridgeError> {
+/// Look up a session's repository/worktree scope and verify it matches the
+/// trusted context. A session created in another scope can never be written
+/// from this bridge process.
+pub(crate) async fn require_session_in_repo(
+    ctx: &BridgeContext,
+    session_id: &str,
+) -> Result<(), BridgeError> {
     let session = storage::get_session(&ctx.conn, session_id)
         .await
         .map_err(db_error("look up bridge session"))?;
     match session {
-        Some(row) if row.repository_id == ctx.repository_id => Ok(()),
+        Some(row)
+            if row.repository_id == ctx.repository_id && row.worktree_id == ctx.worktree_id =>
+        {
+            Ok(())
+        }
         Some(_) => Err(BridgeError::scope_mismatch(format!(
-            "bridge session '{session_id}' belongs to a different repository; refusing cross-repository write"
+            "bridge session '{session_id}' belongs to a different repository or worktree; refusing cross-scope write"
         ))),
         None => Err(BridgeError::scope_mismatch(format!(
             "bridge session '{session_id}' is not open in this connection; call session.open first"
@@ -137,6 +232,11 @@ async fn session_open(
             row.repository_id, ctx.repository_id
         )));
     }
+    if row.worktree_id != ctx.worktree_id {
+        return Err(BridgeError::scope_mismatch(format!(
+            "bridge session '{session_id}' is bound to a different worktree; refusing scope drift"
+        )));
+    }
 
     // Fail-closed on a retry whose lineage differs from the stored scope
     // (GC-LB-06): a second `session.open` with a different workspace /
@@ -164,6 +264,13 @@ async fn session_open(
             }
         }
     }
+
+    if row.session_state != "open" {
+        storage::set_session_state(&ctx.conn, &session_id, "open", now_ms())
+            .await
+            .map_err(db_error("reopen bridge session"))?;
+    }
+    ctx.activate_session(&session_id).await;
 
     Ok(ok_result(
         json!({
@@ -327,6 +434,7 @@ async fn session_close(
     storage::set_session_state(&ctx.conn, &session_id, "closed", now_ms())
         .await
         .map_err(db_error("close bridge session"))?;
+    ctx.deactivate_session(&session_id).await;
     let last_acked = storage::contiguous_acked_seq(&ctx.conn, &session_id)
         .await
         .map_err(db_error("read ack"))?;

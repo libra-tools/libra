@@ -11,6 +11,8 @@
 //! `crate::internal::ai::agent_bridge::protocol` (GC-LB-02); session/event
 //! ingress lives in `crate::internal::ai::agent_bridge::ingress`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use clap::Args;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
@@ -18,17 +20,26 @@ use tracing::Instrument;
 
 use crate::{
     internal::{
-        ai::agent_bridge::{
-            ingress::{BridgeContext, dispatch as dispatch_ingress},
-            methods::dispatch as dispatch_read,
-            mutations::dispatch as dispatch_mutation,
-            protocol::{BridgeError, BridgeRequest, BridgeResponse, dispatch_handshake},
-            transport::{BridgeHandler, run},
-            workspace::dispatch as dispatch_workspace,
+        ai::{
+            agent_bridge::{
+                ingress::{BridgeContext, dispatch as dispatch_ingress},
+                memory::dispatch as dispatch_memory,
+                methods::dispatch as dispatch_read,
+                mutations::dispatch as dispatch_mutation,
+                protocol::{BridgeError, BridgeRequest, BridgeResponse, dispatch_handshake},
+                transport::{BridgeHandler, run},
+                workspace::dispatch as dispatch_workspace,
+            },
+            history::HistoryManager,
+            memory::{AuditedMemoryDelivery, DshEpisodeRecorder},
         },
         db::get_db_conn_instance,
+        worktree_scope::WorktreeScope,
     },
-    utils::{error::CliResult, output::OutputConfig},
+    utils::{
+        error::CliResult, output::OutputConfig, storage::local::LocalStorage,
+        util::try_get_storage_path,
+    },
 };
 
 #[derive(Args, Debug)]
@@ -79,6 +90,11 @@ impl BridgeHandler for IngressBridgeHandler {
                     if let Some(resp) = dispatch_read(&self.ctx, request).await? {
                         return Ok(Some(resp));
                     }
+                    // Model-free audited Memory delivery. This remains a
+                    // narrow bridge method rather than overloading context.get.
+                    if let Some(resp) = dispatch_memory(&self.ctx, request).await? {
+                        return Ok(Some(resp));
+                    }
                     // Session/event ingress methods (LB-03).
                     if let Some(resp) = dispatch_ingress(&self.ctx, request).await? {
                         return Ok(Some(resp));
@@ -120,14 +136,34 @@ pub async fn execute_safe(args: BridgeArgs, _output: &OutputConfig) -> CliResult
     let repository_id = resolve_repository_id(&conn).await.map_err(|msg| {
         crate::utils::error::CliError::fatal(format!("libra agent bridge: {msg}"))
     })?;
-
-    let ctx = BridgeContext {
-        conn,
-        repository_id,
-        // Worktree binding is refined in LB-06; the bridge command currently
-        // binds repository scope only.
-        worktree_id: None,
+    let storage_root =
+        try_get_storage_path(None).map_err(|_| crate::utils::error::CliError::repo_not_found())?;
+    let history = Arc::new(HistoryManager::new(
+        Arc::new(LocalStorage::new(storage_root.join("objects"))),
+        storage_root,
+        Arc::new(conn.clone()),
+    ));
+    let episode_recorder = match std::env::var("LIBRA_DSH_MEMORY_MODEL") {
+        Ok(model_name) if !model_name.trim().is_empty() => {
+            DshEpisodeRecorder::open(Arc::clone(&history), model_name)
+                .await
+                .map(Arc::new)
+                .map_err(|error| error.kind())
+        }
+        _ => Err(crate::internal::ai::memory::DshEpisodeRecordErrorKind::Unavailable),
     };
+    // Opt-in generation initializes Memory for a fresh repository before recall opens it.
+    let memory_delivery = AuditedMemoryDelivery::open(Arc::clone(&history))
+        .await
+        .map(Arc::new)
+        .map_err(|error| error.kind());
+
+    let worktree_id = WorktreeScope::for_request()
+        .worktree_id()
+        .map(str::to_owned);
+    let ctx = BridgeContext::new(conn, repository_id, worktree_id)
+        .with_memory_delivery(memory_delivery)
+        .with_episode_recorder(episode_recorder);
 
     let handler = IngressBridgeHandler::new(ctx);
     let stdin = std::io::stdin();

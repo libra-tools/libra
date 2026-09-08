@@ -35,7 +35,7 @@ flowchart TD
 
 ## GC 类型化根清单（W2 §C.4.3）
 
-- `GC_OBJECT_SOURCE_INVENTORY`（`src/command/maintenance.rs`,版本 1）登记**每一个**可含对象库 OID 的持久存储:traced root(refs、双侧 reflog、全 scope sequencer/rebase/bisect 行、全 worktree index 各 stage、全 gitdir held-autostash + merge/revert/rebase-aux sidecar + FETCH_HEAD、stash reflog、`notes.blob`、`operation_view_ref.target_oid`、`agent_checkpoint.*`)或 documented non-root(advisory 校验键、可重建缓存、obliteration 墓碑、layer 磁盘身份)。
+- `GC_OBJECT_SOURCE_INVENTORY`（`src/command/maintenance.rs`,版本 1）登记**每一个**可含对象库 OID 的持久存储:traced root(refs、双侧 reflog、全 scope sequencer/rebase/bisect 行、全 worktree index 各 stage、全 gitdir held-autostash + merge/revert/rebase-aux sidecar + FETCH_HEAD、stash reflog、`notes.blob`、`operation_view_ref.target_oid`、`agent_checkpoint.*`)或 documented non-root(advisory 校验键、Memory 可重建投影与作业/observer 水位、obliteration 墓碑、layer 磁盘身份)。Memory SQLite 行不保活对象；后续权威 Memory ref/object collector 负责版本历史的可达性，投影由 replay 修复。
 - 守卫测试 `gc_object_source_inventory_covers_every_oid_column`(db_migration_test)扫描 live schema 的 OID 形态列,未登记即失败——新表新列不可能静默漏根。
 - 由此 W0 的多 worktree gc/repack skip 已解除;任何根读取失败仍 fail-closed(绝不在部分根集上 prune)。本切片同时修复了单 worktree 下 note blob / undo 快照 / AI checkpoint 对象会被 prune 的既有数据丢失洞。
 

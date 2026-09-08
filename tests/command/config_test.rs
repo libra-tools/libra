@@ -987,6 +987,166 @@ async fn test_config_set_plaintext_on_vault_internal_key_is_failure() {
 }
 
 #[tokio::test]
+#[serial(cwd)]
+async fn test_config_memory_keyed_digest_is_owner_managed() {
+    use libra::internal::config::ConfigKv;
+
+    const KEY: &str = "memory.keyed_digest.v1";
+    const CONTROL_VALUE: &str = "owner-encrypted-control";
+
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp.path());
+
+    for command in [
+        &["config", "set", KEY, "replacement"][..],
+        &["config", "--add", KEY, "additional"][..],
+        &["config", "unset", KEY][..],
+        &["config", "--unset-all", KEY][..],
+        &["config", "--remove-section", "memory.keyed_digest"][..],
+        &[
+            "config",
+            "--rename-section",
+            "memory.keyed_digest",
+            "archive.keyed_digest",
+        ][..],
+    ] {
+        ConfigKv::set(KEY, CONTROL_VALUE, true)
+            .await
+            .expect("owner-controlled fixture row must be stored");
+
+        let output = run_libra_command(command, temp.path());
+        assert!(
+            !output.status.success(),
+            "public mutation must reject {command:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("managed by Libra Memory"),
+            "rejection must name the owning subsystem for {command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let rows = ConfigKv::get_all(KEY)
+            .await
+            .expect("owner row must remain readable");
+        assert_eq!(rows.len(), 1, "{command:?} changed row cardinality");
+        assert_eq!(rows[0].value, CONTROL_VALUE, "{command:?} changed value");
+        assert!(rows[0].encrypted, "{command:?} changed encryption state");
+    }
+
+    // A section rename must not create the owner key when it is absent.
+    ConfigKv::unset_all(KEY)
+        .await
+        .expect("fixture owner row must be removable internally");
+    ConfigKv::set("source.keyed_digest.v1", "rename-control", false)
+        .await
+        .expect("rename source must be stored");
+    let rename_into_owner = run_libra_command(
+        &[
+            "config",
+            "--rename-section",
+            "source.keyed_digest",
+            "memory.keyed_digest",
+        ],
+        temp.path(),
+    );
+    assert!(!rename_into_owner.status.success());
+    assert!(String::from_utf8_lossy(&rename_into_owner.stderr).contains("managed by Libra Memory"));
+    assert!(
+        ConfigKv::get_all(KEY).await.unwrap().is_empty(),
+        "rename must not create the owner key"
+    );
+    assert_eq!(
+        ConfigKv::get("source.keyed_digest.v1")
+            .await
+            .unwrap()
+            .map(|entry| entry.value)
+            .as_deref(),
+        Some("rename-control"),
+        "rejected rename must preserve its source"
+    );
+
+    // Git import follows the existing reserved-key convention: ignore the
+    // owner key, warn, and continue importing unrelated entries.
+    let git_init = Command::new("git")
+        .arg("init")
+        .current_dir(temp.path())
+        .output()
+        .expect("git init must run");
+    assert!(git_init.status.success());
+    let git_set = Command::new("git")
+        .args(["config", KEY, "imported-replacement"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git config must run");
+    assert!(
+        git_set.status.success(),
+        "Git must accept the owner-key fixture: {}",
+        String::from_utf8_lossy(&git_set.stderr)
+    );
+    let import = run_libra_command(&["config", "import"], temp.path());
+    assert_cli_success(&import, "config import with an owner key");
+    assert!(
+        String::from_utf8_lossy(&import.stderr).contains("Memory-owned"),
+        "import must report the ignored owner key: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    assert!(
+        ConfigKv::get_all(KEY).await.unwrap().is_empty(),
+        "import must not create the owner key"
+    );
+
+    // Reads remain available, but the encrypted payload never leaves the CLI.
+    ConfigKv::set(KEY, CONTROL_VALUE, true)
+        .await
+        .expect("owner row must be restored for read probe");
+    let read = run_libra_command(&["config", "get", KEY], temp.path());
+    assert_cli_success(&read, "read owner-managed key");
+    let stdout = String::from_utf8_lossy(&read.stdout);
+    assert!(
+        stdout.contains("<REDACTED>"),
+        "owner key must be redacted: {stdout}"
+    );
+    assert!(!stdout.contains(CONTROL_VALUE));
+
+    let reveal = run_libra_command(&["config", "get", "--reveal", KEY], temp.path());
+    assert!(!reveal.status.success(), "owner key must not be revealable");
+
+    // Corruption must not turn the config command into a secret exfiltration
+    // path. Redaction is an ownership rule, independent of the row flag.
+    const PLAINTEXT_CORRUPT: &str =
+        r#"{"seed_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    ConfigKv::unset_all(KEY)
+        .await
+        .expect("encrypted fixture row must be removable internally");
+    ConfigKv::set(KEY, PLAINTEXT_CORRUPT, false)
+        .await
+        .expect("plaintext corruption fixture must be stored");
+    for command in [
+        &["config", "get", KEY][..],
+        &["config", "--get-all", KEY][..],
+        &["config", "--get-regexp", r"^memory\.keyed_digest\.v1$"][..],
+        &["config", "--list"][..],
+        &["config", "--list", "--show-origin"][..],
+        &["config", "--json", "get", KEY][..],
+        &["config", "--json", "--get-regexp", KEY][..],
+        &["config", "--json", "list"][..],
+    ] {
+        let output = run_libra_command(command, temp.path());
+        assert_cli_success(&output, "read corrupt owner-managed key");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("<REDACTED>"),
+            "{command:?} must render a redacted placeholder: {stdout}"
+        );
+        assert!(
+            !stdout.contains(PLAINTEXT_CORRUPT) && !stdout.contains("aaaaaaaaaaaaaaaa"),
+            "{command:?} leaked the corrupt plaintext row: {stdout}"
+        );
+    }
+}
+
+#[tokio::test]
 #[serial(env, cwd)]
 async fn test_config_set_read_failure_does_not_silently_skip_existing_state_check() {
     let temp_path = tempdir().unwrap();

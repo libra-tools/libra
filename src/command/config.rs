@@ -13,7 +13,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     internal::{
-        config::{ConfigKv, ConfigKvEntry, is_sensitive_key, is_vault_internal_key},
+        config::{
+            ConfigKv, ConfigKvEntry, is_memory_owned_config_key, is_sensitive_key,
+            is_vault_internal_key,
+        },
         db::{create_database, establish_connection, get_db_conn_instance},
         upgrade::settings::{
             UPGRADE_MODE_KEY, UpgradeMode, UpgradeSettingsError, read_mode as read_upgrade_mode,
@@ -1424,6 +1427,8 @@ async fn handle_set(
         .with_exit_code(1));
     }
 
+    reject_memory_owned_config_mutation(key, "written")?;
+
     // `--encrypt` and `--plaintext` are mutually exclusive. config.md (line 77)
     // classifies this as a CLI usage error (exit 2 in fine mode, 129 in
     // coarse) — route through `command_usage` so the category matches.
@@ -1675,6 +1680,9 @@ async fn render_get_value(
     scope: ConfigScope,
     _use_cascade: bool,
 ) -> CliResult<String> {
+    if is_memory_owned_config_key(&entry.key) {
+        return Ok("<REDACTED>".to_string());
+    }
     if !entry.encrypted {
         return Ok(entry.value.clone());
     }
@@ -1689,6 +1697,21 @@ async fn render_get_value(
         .map_err(|e| config_decrypt_cli_error(&entry.key, scope_label, e))?;
 
     Ok(decrypted)
+}
+
+fn render_list_value(entry: &ConfigKvEntry, name_only: bool) -> Option<String> {
+    if name_only {
+        return None;
+    }
+    if entry.encrypted || is_memory_owned_config_key(&entry.key) {
+        return Some("<REDACTED>".to_string());
+    }
+    let plaintext_warning = if is_sensitive_key(&entry.key) {
+        " [PLAINTEXT]"
+    } else {
+        ""
+    };
+    Some(format!("{}{plaintext_warning}", entry.value))
 }
 
 /// Value type for `--type`/`--bool`/`--int`/`--path` canonicalization on read.
@@ -2231,20 +2254,9 @@ async fn handle_list(
                     if is_upgrade_namespace_key(&e.key) {
                         continue;
                     }
-                    let plaintext_warning = if !e.encrypted && is_sensitive_key(&e.key) {
-                        " [PLAINTEXT]"
-                    } else {
-                        ""
-                    };
                     entries.push(ConfigListEntry {
                         key: e.key.clone(),
-                        value: if name_only {
-                            None
-                        } else if e.encrypted {
-                            Some("<REDACTED>".to_string())
-                        } else {
-                            Some(format!("{}{plaintext_warning}", e.value))
-                        },
+                        value: render_list_value(&e, name_only),
                         origin: if show_origin {
                             Some(scope_name(s).to_string())
                         } else {
@@ -2303,24 +2315,11 @@ async fn handle_list(
             .into_iter()
             // Reserved namespace: suppress any legacy SQLite `upgrade.*` rows.
             .filter(|e| !is_upgrade_namespace_key(&e.key))
-            .map(|e| {
-                let plaintext_warning = if !e.encrypted && is_sensitive_key(&e.key) {
-                    " [PLAINTEXT]"
-                } else {
-                    ""
-                };
-                ConfigListEntry {
-                    key: e.key.clone(),
-                    value: if name_only {
-                        None
-                    } else if e.encrypted {
-                        Some("<REDACTED>".to_string())
-                    } else {
-                        Some(format!("{}{plaintext_warning}", e.value))
-                    },
-                    origin: None,
-                    encrypted: Some(e.encrypted),
-                }
+            .map(|e| ConfigListEntry {
+                key: e.key.clone(),
+                value: render_list_value(&e, name_only),
+                origin: None,
+                encrypted: Some(e.encrypted),
             })
             .collect();
 
@@ -2426,6 +2425,8 @@ async fn handle_unset(
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    reject_memory_owned_config_mutation(key, "removed")?;
+
     let count = if all {
         ScopedConfig::unset_all(scope, key)
             .await
@@ -2472,6 +2473,19 @@ fn config_write_cli_error(message: impl Into<String>) -> CliError {
     CliError::fatal(message)
         .with_stable_code(StableErrorCode::IoWriteFailed)
         .with_exit_code(128)
+}
+
+/// Keep repository Memory key material behind its single owner seam. Reads
+/// continue through the normal redacted config path; every public mutation is
+/// rejected before it can alter row cardinality, encryption state, or value.
+fn reject_memory_owned_config_mutation(key: &str, action: &str) -> CliResult<()> {
+    if !is_memory_owned_config_key(key) {
+        return Ok(());
+    }
+    Err(CliError::failure(format!(
+        "configuration key '{key}' is managed by Libra Memory and cannot be {action} through `libra config`"
+    ))
+    .with_stable_code(StableErrorCode::RepoStateInvalid))
 }
 
 /// Whether `key` belongs to git section `section`, using Git's section /
@@ -2547,6 +2561,9 @@ async fn handle_remove_section(
                 .with_exit_code(128),
         );
     }
+    for key in &keys {
+        reject_memory_owned_config_mutation(key, "removed")?;
+    }
 
     let mut removed = 0usize;
     for key in &keys {
@@ -2618,6 +2635,20 @@ async fn handle_rename_section(
         );
     }
 
+    let destination: Vec<String> = source
+        .iter()
+        .map(|entry| {
+            let name = entry.key.strip_prefix(&old_prefix).unwrap_or(&entry.key);
+            format!("{new}.{name}")
+        })
+        .collect();
+    for entry in &source {
+        reject_memory_owned_config_mutation(&entry.key, "moved")?;
+    }
+    for key in &destination {
+        reject_memory_owned_config_mutation(key, "created")?;
+    }
+
     // Refuse to write into a destination section that already exists, so every
     // re-added key is fresh (preserving the source's exact value + encrypted
     // flag, and avoiding silent multi-value merges).
@@ -2632,12 +2663,10 @@ async fn handle_rename_section(
     // encrypted source row into it or land a key under a vault/secret namespace
     // (which direct `set --system` also rejects).
     if scope == ConfigScope::System {
-        for e in &source {
-            let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
-            let new_key = format!("{new}.{name}");
+        for (e, new_key) in source.iter().zip(&destination) {
             if e.encrypted
                 || new_key.to_ascii_lowercase().starts_with("vault.")
-                || is_sensitive_key(&new_key)
+                || is_sensitive_key(new_key)
             {
                 return Err(CliError::command_usage(
                     "vault-encrypted secrets are not supported in --system scope",
@@ -2649,12 +2678,8 @@ async fn handle_rename_section(
         }
     }
 
-    for e in &source {
-        // Exact members all begin with `{old}.`; the remainder is the key name
-        // under the section (which itself may contain dots for nested names).
-        let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
-        let new_key = format!("{new}.{name}");
-        ConfigKv::add_with_conn(&txn, &new_key, &e.value, e.encrypted)
+    for (e, new_key) in source.iter().zip(&destination) {
+        ConfigKv::add_with_conn(&txn, new_key, &e.value, e.encrypted)
             .await
             .map_err(|err| config_write_cli_error(format!("failed to write '{new_key}': {err}")))?;
     }
@@ -3063,6 +3088,7 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
     let mut skipped = 0usize;
     let mut ignored_invalid = 0usize;
     let mut ignored_reserved = 0usize;
+    let mut ignored_memory_owned = 0usize;
     let mut auto_encrypted = 0usize;
     let mut collapsed_warnings = 0usize;
 
@@ -3101,6 +3127,10 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
         // upgrade settings are managed only via `{LIBRA_HOME}/upgrade/settings.json`.
         if is_upgrade_namespace_key(&key_raw) {
             ignored_reserved += 1;
+            continue;
+        }
+        if is_memory_owned_config_key(&key_raw) {
+            ignored_memory_owned += 1;
             continue;
         }
         all_entries.push((key_raw, value));
@@ -3189,13 +3219,18 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
             "ignored {ignored_reserved} reserved upgrade.* entries (manage the upgrade mode with: libra config set --global upgrade.mode <auto|manual|off>)"
         ));
     }
+    if ignored_memory_owned > 0 {
+        emit_warning(format!(
+            "ignored {ignored_memory_owned} Memory-owned configuration entries"
+        ));
+    }
 
     Ok(ConfigImportSummary {
         scope: scope_name(scope),
         imported,
         skipped_duplicates: skipped,
         ignored_invalid,
-        ignored_reserved,
+        ignored_reserved: ignored_reserved + ignored_memory_owned,
         auto_encrypted,
         collapsed_multivalue_warnings: collapsed_warnings,
     })

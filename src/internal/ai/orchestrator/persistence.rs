@@ -2294,6 +2294,10 @@ async fn append_task_event(
         kind,
     )
     .map_err(|e| OrchestratorError::ConfigError(format!("failed to create task event: {e}")))?;
+    let is_terminal = matches!(
+        event.kind(),
+        TaskEventKind::Done | TaskEventKind::Failed | TaskEventKind::Cancelled
+    );
     event.set_reason(reason);
     event.set_run_id(
         run_id
@@ -2307,7 +2311,13 @@ async fn append_task_event(
         &event.header().object_id().to_string(),
         &event,
     )
-    .await
+    .await?;
+    if is_terminal {
+        crate::internal::ai::memory::schedule_observer_repair(
+            mcp_server.intent_history_manager.clone(),
+        );
+    }
+    Ok(())
 }
 
 async fn append_run_event(
@@ -4157,6 +4167,9 @@ async fn record_terminal_intent_event(
         .map_err(|error| {
             OrchestratorError::ConfigError(format!("MCP update_intent failed: {error:?}"))
         })?;
+    crate::internal::ai::memory::schedule_observer_repair(
+        mcp_server.intent_history_manager.clone(),
+    );
     Ok(())
 }
 

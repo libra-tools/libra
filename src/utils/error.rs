@@ -194,6 +194,25 @@ pub enum StableErrorCode {
     RepoNotFound,
     RepoCorrupt,
     RepoStateInvalid,
+    /// The repository-local Memory keyed-digest seed is missing, malformed,
+    /// uses an unsupported generation, or cannot be decrypted.
+    MemoryDigestKeyUnavailable,
+    /// A Memory object or bounded source violates the persisted contract.
+    MemoryContractViolation,
+    /// Repository Memory policy rejected the requested operation.
+    MemoryPolicyRejected,
+    /// Memory authority, evidence, object history, or projection is corrupt.
+    MemoryCorrupt,
+    /// Memory storage could not complete a local atomic operation.
+    MemoryStorageFailure,
+    /// The rebuildable Memory projection is not current for the pinned ref.
+    MemoryProjectionStale,
+    /// A Memory search or structured filter is invalid.
+    MemoryQueryInvalid,
+    /// The requested Memory note or revision does not exist in the frozen view.
+    MemoryNotFound,
+    /// The linked SQLite build does not provide the required FTS5 capability.
+    MemoryFtsUnavailable,
     /// Global config database schema is newer than this Libra binary supports.
     ConfigSchemaFuture,
     ConflictUnresolved,
@@ -362,6 +381,15 @@ impl StableErrorCode {
             Self::RepoNotFound => "LBR-REPO-001",
             Self::RepoCorrupt => "LBR-REPO-002",
             Self::RepoStateInvalid => "LBR-REPO-003",
+            Self::MemoryDigestKeyUnavailable => "LBR-MEMORY-001",
+            Self::MemoryContractViolation => "LBR-MEMORY-002",
+            Self::MemoryPolicyRejected => "LBR-MEMORY-003",
+            Self::MemoryCorrupt => "LBR-MEMORY-004",
+            Self::MemoryStorageFailure => "LBR-MEMORY-005",
+            Self::MemoryProjectionStale => "LBR-MEMORY-PROJECTION-STALE",
+            Self::MemoryQueryInvalid => "LBR-MEMORY-QUERY-INVALID",
+            Self::MemoryNotFound => "LBR-MEMORY-NOT-FOUND",
+            Self::MemoryFtsUnavailable => "LBR-MEMORY-FTS-UNAVAILABLE",
             Self::ConfigSchemaFuture => "LBR-CONFIG-001",
             Self::ConflictUnresolved => "LBR-CONFLICT-001",
             Self::ConflictOperationBlocked => "LBR-CONFLICT-002",
@@ -429,8 +457,17 @@ impl StableErrorCode {
             Self::RepoNotFound
             | Self::RepoCorrupt
             | Self::RepoStateInvalid
+            | Self::MemoryDigestKeyUnavailable
+            | Self::MemoryContractViolation
+            | Self::MemoryPolicyRejected
+            | Self::MemoryCorrupt
+            | Self::MemoryStorageFailure
+            | Self::MemoryProjectionStale
+            | Self::MemoryNotFound
+            | Self::MemoryFtsUnavailable
             | Self::WorktreeCursorInvalid
             | Self::WorktreeScopeCorrupt => CliErrorCategory::Repo,
+            Self::MemoryQueryInvalid => CliErrorCategory::Cli,
             Self::ConfigSchemaFuture | Self::UpgradeSettingsInvalid => CliErrorCategory::Config,
             Self::ConflictUnresolved
             | Self::ConflictOperationBlocked
@@ -534,6 +571,31 @@ impl StableErrorCode {
             Self::RepoCorrupt => "Repository metadata is missing, incompatible, or corrupt.",
             Self::RepoStateInvalid => {
                 "Repository state prevents the requested operation from proceeding."
+            }
+            Self::MemoryDigestKeyUnavailable => {
+                "Repository Memory digest key is missing, invalid, or cannot be decrypted."
+            }
+            Self::MemoryContractViolation => {
+                "Memory proposal or bounded source violates the persisted contract."
+            }
+            Self::MemoryPolicyRejected => {
+                "Repository Memory policy rejected the requested operation."
+            }
+            Self::MemoryCorrupt => {
+                "Memory authority, evidence, object history, or projection is corrupt."
+            }
+            Self::MemoryStorageFailure => {
+                "Memory storage could not complete the requested local operation."
+            }
+            Self::MemoryProjectionStale => {
+                "Memory projection does not match the pinned repository Memory ref."
+            }
+            Self::MemoryQueryInvalid => "Memory query or structured filter is invalid.",
+            Self::MemoryNotFound => {
+                "Requested Memory note or revision was not found in the frozen view."
+            }
+            Self::MemoryFtsUnavailable => {
+                "This Libra build does not provide the SQLite FTS5 capability required by Memory."
             }
             Self::ConfigSchemaFuture => {
                 "Global config database schema is newer than this Libra binary supports."
@@ -2143,8 +2205,8 @@ mod tests {
     /// would invalidate every downstream pin without tripping any
     /// test until end-to-end JSON harness assertions caught it.
     ///
-    /// Enumerate all 23 non-agent variants so a new addition trips both this
-    /// list and the `as_str` impl's exhaustive match.
+    /// Pin the general-purpose and domain-specific variants alongside the
+    /// agent-code table below; the `as_str` impl remains exhaustive.
     #[test]
     fn stable_error_code_as_str_pins_each_variant() {
         assert_eq!(StableErrorCode::CliUnknownCommand.as_str(), "LBR-CLI-001");
@@ -2153,6 +2215,39 @@ mod tests {
         assert_eq!(StableErrorCode::RepoNotFound.as_str(), "LBR-REPO-001");
         assert_eq!(StableErrorCode::RepoCorrupt.as_str(), "LBR-REPO-002");
         assert_eq!(StableErrorCode::RepoStateInvalid.as_str(), "LBR-REPO-003");
+        assert_eq!(
+            StableErrorCode::MemoryDigestKeyUnavailable.as_str(),
+            "LBR-MEMORY-001",
+        );
+        assert_eq!(
+            StableErrorCode::MemoryContractViolation.as_str(),
+            "LBR-MEMORY-002",
+        );
+        assert_eq!(
+            StableErrorCode::MemoryPolicyRejected.as_str(),
+            "LBR-MEMORY-003",
+        );
+        assert_eq!(StableErrorCode::MemoryCorrupt.as_str(), "LBR-MEMORY-004",);
+        assert_eq!(
+            StableErrorCode::MemoryStorageFailure.as_str(),
+            "LBR-MEMORY-005",
+        );
+        assert_eq!(
+            StableErrorCode::MemoryProjectionStale.as_str(),
+            "LBR-MEMORY-PROJECTION-STALE",
+        );
+        assert_eq!(
+            StableErrorCode::MemoryQueryInvalid.as_str(),
+            "LBR-MEMORY-QUERY-INVALID",
+        );
+        assert_eq!(
+            StableErrorCode::MemoryNotFound.as_str(),
+            "LBR-MEMORY-NOT-FOUND",
+        );
+        assert_eq!(
+            StableErrorCode::MemoryFtsUnavailable.as_str(),
+            "LBR-MEMORY-FTS-UNAVAILABLE",
+        );
         assert_eq!(
             StableErrorCode::ConfigSchemaFuture.as_str(),
             "LBR-CONFIG-001",
@@ -2305,6 +2400,25 @@ mod tests {
         assert_eq!(
             StableErrorCode::RepoStateInvalid.category(),
             CliErrorCategory::Repo,
+        );
+        assert_eq!(
+            StableErrorCode::MemoryDigestKeyUnavailable.category(),
+            CliErrorCategory::Repo,
+        );
+        for code in [
+            StableErrorCode::MemoryContractViolation,
+            StableErrorCode::MemoryPolicyRejected,
+            StableErrorCode::MemoryCorrupt,
+            StableErrorCode::MemoryStorageFailure,
+            StableErrorCode::MemoryProjectionStale,
+            StableErrorCode::MemoryNotFound,
+            StableErrorCode::MemoryFtsUnavailable,
+        ] {
+            assert_eq!(code.category(), CliErrorCategory::Repo);
+        }
+        assert_eq!(
+            StableErrorCode::MemoryQueryInvalid.category(),
+            CliErrorCategory::Cli,
         );
         // The worktree-doctor pair reuses `repo` deliberately (§C.13) —
         // re-bucketing either one would change `fine_exit_code()` for

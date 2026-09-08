@@ -1914,6 +1914,6 @@ fn nextest_groups_toml_matches_generator_and_registry() {
         "external group binary(=..) members must equal the pure-global site \
          rows' host targets"
     );
-    assert_eq!(toml_fns.len(), 209, "union fn member count drifted");
+    assert_eq!(toml_fns.len(), 210, "union fn member count drifted");
     assert_eq!(toml_bins.len(), 7, "site host target count drifted");
 }

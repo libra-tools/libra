@@ -1785,6 +1785,31 @@ pub fn builtin_migrations() -> Vec<Migration> {
             up: include_str!("../../../sql/migrations/2026090101_operation_v2.sql"),
             down: None,
         },
+        // M2-02: rebuildable Agent Memory projections plus bounded compiler
+        // job/observer state. FTS and receipts intentionally land separately.
+        sql_migration(
+            2026090701,
+            "memory_core",
+            include_str!("../../../sql/migrations/2026090701_memory_core.sql"),
+            include_str!("../../../sql/migrations/2026090701_memory_core_down.sql"),
+        ),
+        // M2-02F: a single-copy Episode search document and its
+        // external-content FTS5 postings. Runtime synchronization is owned by
+        // internal::ai::memory::fts_sql; no triggers or fallback scan exist.
+        sql_migration(
+            2026090702,
+            "memory_fts_search",
+            include_str!("../../../sql/migrations/2026090702_memory_fts_search.sql"),
+            include_str!("../../../sql/migrations/2026090702_memory_fts_search_down.sql"),
+        ),
+        // M2-02R: the single local-only context selection receipt ledger shared
+        // by Memory and mainline, plus its bounded retention watermark.
+        sql_migration(
+            2026090703,
+            "context_selection_receipt",
+            include_str!("../../../sql/migrations/2026090703_context_selection_receipt.sql"),
+            include_str!("../../../sql/migrations/2026090703_context_selection_receipt_down.sql"),
+        ),
     ]
 }
 
@@ -2232,12 +2257,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 58);
+        assert_eq!(runner.len(), 61);
         assert!(!runner.is_empty());
-        assert_eq!(
-            runner.max_registered_version(),
-            Some(OPERATION_V2_MIGRATION_VERSION)
-        );
+        assert_eq!(runner.max_registered_version(), Some(2026090703));
     }
 
     #[test]

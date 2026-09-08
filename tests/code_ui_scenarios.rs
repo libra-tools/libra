@@ -14,6 +14,8 @@ use harness::{CodeSession, CodeSessionOptions, Scenario};
 #[cfg(feature = "test-provider")]
 use reqwest::StatusCode;
 #[cfg(feature = "test-provider")]
+use sea_orm::ConnectionTrait;
+#[cfg(feature = "test-provider")]
 use serde_json::{Value, json};
 #[cfg(feature = "test-provider")]
 use serial_test::serial;
@@ -799,19 +801,68 @@ fn run_plan_review_libra(repo_dir: &Path, args: &[&str], action: &str) -> Result
     Ok(())
 }
 
+#[cfg(feature = "test-provider")]
+fn run_memory_json(repo_dir: &Path, args: &[&str], action: &str) -> Result<Value> {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .arg("--json")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .with_context(|| format!("failed to run {action}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{action} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("failed to decode {action} JSON output"))
+}
+
+#[cfg(feature = "test-provider")]
+fn run_memory_human(repo_dir: &Path, args: &[&str], action: &str) -> Result<String> {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .with_context(|| format!("failed to run {action}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{action} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8(output.stdout).with_context(|| format!("decode {action} output"))
+}
+
 /// Phase 1 binds every reviewed plan to an immutable checkout commit. Keep the
 /// Web-process fixtures realistic by creating a born HEAD before runtime start.
 #[cfg(feature = "test-provider")]
 fn initialize_plan_review_repo(case_name: &str) -> Result<tempfile::TempDir> {
+    initialize_plan_review_repo_with_vault(case_name, false)
+}
+
+#[cfg(feature = "test-provider")]
+fn initialize_plan_review_repo_with_vault(
+    case_name: &str,
+    vault_enabled: bool,
+) -> Result<tempfile::TempDir> {
     let repo_root = tempfile::Builder::new()
         .prefix(&format!("{case_name}-"))
         .tempdir()
         .context("failed to create plan-review repo tempdir")?;
     let repo_dir = repo_root.path().join("repo");
     std::fs::create_dir_all(&repo_dir).context("failed to create plan-review repo subdir")?;
+    let vault_arg = if vault_enabled {
+        "--vault=true"
+    } else {
+        "--vault=false"
+    };
     run_plan_review_libra(
         &repo_dir,
-        &["init", "--vault=false", "--quiet"],
+        &["init", vault_arg, "--quiet"],
         "libra init for plan-review fixture",
     )?;
     run_plan_review_libra(
@@ -1744,6 +1795,208 @@ fn plan_review_network_allow_enters_runtime_queue() -> Result<()> {
         "Network Allow must consume the pending network gate: {after}"
     );
     session.shutdown()
+}
+
+/// M2-13 public lifecycle: an Agent terminal boundary schedules automatic
+/// Episode compilation, then only public `libra memory` commands inspect and
+/// recover the result. The one direct SQLite operation is deliberate fault
+/// injection that removes the rebuildable projection.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+fn memory_public_cli_lifecycle_after_agent_terminal() -> Result<()> {
+    // The repository Memory digest is encrypted by the existing repository
+    // vault. This lifecycle fixture therefore exercises the normal
+    // vault-enabled `libra init` path instead of the faster plan-only helper.
+    let repo_root = initialize_plan_review_repo_with_vault("memory-public-lifecycle", true)?;
+    let repo_dir = repo_root.path().join("repo");
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new("memory-public-lifecycle", fixture("memory_lifecycle"))
+            .with_existing_repo_dir(repo_dir.clone())
+            .with_context("dev"),
+    )?;
+    let plan_snapshot = drive_to_plan_review_gate(&mut session, "memory-public-lifecycle")?;
+    let plan_interaction_id = find_post_plan_execute_interaction(&plan_snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("post_plan_choice missing id: {plan_snapshot}"))?
+        .to_string();
+    let (http_status, body) = session.respond_interaction(
+        &plan_interaction_id,
+        &json!({ "selectedOption": "execute" }),
+    )?;
+    assert_eq!(http_status, StatusCode::OK, "Plan Execute rejected: {body}");
+
+    let network_snapshot = session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_network_policy_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+    })?;
+    let network_interaction_id = find_network_policy_interaction(&network_snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("network-policy gate missing id: {network_snapshot}"))?
+        .to_string();
+    let (http_status, body) = session.respond_interaction(
+        &network_interaction_id,
+        &json!({ "selectedOption": "network-allow" }),
+    )?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "Network Allow should admit the deterministic execution: {body}"
+    );
+    session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        find_network_policy_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            != Some("pending")
+            && status(snapshot) == Some("idle")
+    })?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status_report = loop {
+        let report = run_memory_json(&repo_dir, &["memory", "status"], "memory status")?;
+        if report["data"]["memory_ref"].is_string() {
+            break report;
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("automatic Memory compilation did not publish a ref: {report}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(status_report["data"]["projection_state"], "current");
+
+    // The terminal boundary and automatic compilation are now durable. Stop
+    // the Agent host before exercising standalone Memory maintenance commands
+    // so this test verifies persisted CLI behavior rather than process-level
+    // SQLite lock scheduling between two independent runtimes.
+    session.shutdown()?;
+
+    let default_search = run_memory_json(
+        &repo_dir,
+        &["memory", "search", "development"],
+        "memory search at the current code version",
+    )?;
+    assert!(
+        default_search["data"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "Episodes without an applicable result code version must not be injected: {default_search}"
+    );
+    assert!(
+        default_search["data"]["omitted_by_applicability"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "the default search must account for code-inapplicable candidates: {default_search}"
+    );
+    let search = run_memory_json(
+        &repo_dir,
+        &["memory", "search", "development", "--include-diagnostics"],
+        "diagnostic memory search",
+    )?;
+    let first = search["data"]["items"]
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or_else(|| anyhow::anyhow!("compiled Episode was not searchable: {search}"))?;
+    let note_id = first["note_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("search item has no note ID: {first}"))?
+        .to_string();
+    let revision_oid = first["revision_oid"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("search item has no revision OID: {first}"))?
+        .to_string();
+    let show = run_memory_json(
+        &repo_dir,
+        &["memory", "show", &note_id, "--evidence"],
+        "memory show --evidence",
+    )?;
+    assert_eq!(show["data"]["note_id"], note_id);
+    assert_eq!(show["data"]["revision_oid"], revision_oid);
+
+    let human_search = run_memory_human(
+        &repo_dir,
+        &["memory", "search", "development", "--include-diagnostics"],
+        "human-readable memory search",
+    )?;
+    assert!(human_search.contains(&note_id));
+    assert!(human_search.contains("evidence="));
+    let human_show = run_memory_human(
+        &repo_dir,
+        &["memory", "show", &note_id],
+        "human-readable memory show",
+    )?;
+    for field in ["episode:", "goal:", "summary:", "code:", "evidence refs:"] {
+        assert!(
+            human_show.contains(field),
+            "human Memory show omitted {field}: {human_show}"
+        );
+    }
+
+    let database_path = repo_dir.join(".libra/libra.db");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build projection fault-injection runtime")?;
+    runtime.block_on(async {
+        let database = libra::internal::db::open_database_without_migrations(&database_path)
+            .await
+            .context("open repository database for projection fault injection")?;
+        for statement in [
+            "INSERT INTO memory_episode_fts(memory_episode_fts) VALUES('delete-all')",
+            "DELETE FROM memory_episode_search_doc WHERE revision_oid IN (SELECT revision_oid FROM memory_revision_index WHERE scope_key = 'repo')",
+            "DELETE FROM memory_link_index WHERE source_scope_key = 'repo'",
+            "DELETE FROM memory_episode_path WHERE revision_oid IN (SELECT revision_oid FROM memory_revision_index WHERE scope_key = 'repo')",
+            "DELETE FROM memory_head WHERE scope_key = 'repo'",
+            "DELETE FROM memory_path_summary WHERE scope_key = 'repo'",
+            "DELETE FROM memory_revision_index WHERE scope_key = 'repo'",
+            "DELETE FROM memory_note_index WHERE scope_key = 'repo'",
+            "DELETE FROM memory_projection_state WHERE scope_key = 'repo'",
+        ] {
+            database
+                .execute_unprepared(statement)
+                .await
+                .with_context(|| format!("remove repository Memory projection with {statement}"))?;
+        }
+        database
+            .close()
+            .await
+            .context("close repository database")?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    let stale = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args(["--json", "memory", "search", "development"])
+        .current_dir(&repo_dir)
+        .output()
+        .context("run stale Memory search")?;
+    assert!(!stale.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("LBR-MEMORY-PROJECTION-STALE"),
+        "stale search must use the stable Memory code: {}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+
+    let dry_run = run_memory_json(
+        &repo_dir,
+        &["memory", "rebuild", "--dry-run"],
+        "memory rebuild dry-run",
+    )?;
+    assert_eq!(dry_run["data"]["changed"], false);
+    assert!(dry_run["data"]["event_count"].as_u64().unwrap_or(0) > 0);
+    let rebuild = run_memory_json(&repo_dir, &["memory", "rebuild"], "memory rebuild")?;
+    assert_eq!(rebuild["data"]["changed"], true);
+    let repaired = run_memory_json(
+        &repo_dir,
+        &["memory", "search", "development", "--include-diagnostics"],
+        "diagnostic memory search after rebuild",
+    )?;
+    assert_eq!(repaired["data"]["items"][0]["note_id"], note_id);
+    assert_eq!(repaired["data"]["items"][0]["revision_oid"], revision_oid);
+    Ok(())
 }
 
 /// Historical W2-03 leftover name: the 409 PLAN_EXECUTION_NOT_AVAILABLE
