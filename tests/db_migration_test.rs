@@ -72,7 +72,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
             2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
-            2026082401, 2026090101, 2026090801
+            2026082401, 2026090101, 2026090801, 2026090802
         ]
     );
     assert_eq!(
@@ -137,13 +137,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_bridge_link_relations",
             "operation_v2",
             "change_identity_prefix_index",
+            "change_ai_link",
         ]
     );
 
     let runner = all_builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 59);
-    assert_eq!(runner.max_registered_version(), Some(2026090801));
+    assert_eq!(runner.len(), 60);
+    assert_eq!(runner.max_registered_version(), Some(2026090802));
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,7 +1228,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
             2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
-            2026082401, 2026090101, 2026090801
+            2026082401, 2026090101, 2026090801, 2026090802
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1249,6 +1250,9 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     assert!(table_exists(&conn, "revision_ordinal_meta").await);
     assert!(table_exists(&conn, "ai_final_decision").await);
     assert!(table_exists(&conn, "automation_log").await);
+    assert!(column_exists(&conn, "ai_operation_link", "change_id").await);
+    assert!(index_exists(&conn, "idx_ai_operation_link_repo_change").await);
+    assert!(index_exists(&conn, "idx_ai_operation_link_repo_intent").await);
     assert!(table_exists(&conn, "agent_usage_stats").await);
     assert!(table_exists(&conn, "agent_session").await);
     assert!(table_exists(&conn, "agent_checkpoint").await);
@@ -5077,7 +5081,7 @@ async fn approved_permission_old_reader_rejects_migrated_schema() {
         .await
         .expect("read tip")
         .expect("applied tip");
-    assert_eq!(current, 2026090801);
+    assert_eq!(current, 2026090802);
     // An old binary whose registry tip is still 2026080403 would see this
     // repository as UnsupportedFuture. Prove the refuse path on repository
     // DBs (not global config.db) by planting a version above this binary.

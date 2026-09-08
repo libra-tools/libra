@@ -388,3 +388,13 @@ Change IDs are stored in the sidecar projection and are not injected into new
 Git commit headers. Rewrites preserve the stable Change ID through typed
 predecessor edges; existing `change-id` headers remain import-readable for
 compatibility and are not a new write dependency.
+
+Genealogy edges are typed and ordered: `amend`, `rebase`, and `cherry_pick`
+describe rewrites/imports, while `squash` may have multiple predecessors,
+`split` may produce multiple independent visible Change IDs, and `duplicate`
+creates a new Change ID with an explicit predecessor. AI causal links are
+redacted rows keyed by stable operation ID, repository ID, Change ID, and
+optional intent/run/invocation IDs; they never use a mutable commit OID or
+store prompt/transcript/secret data. The legacy AI FileHistoryStore manifest
+at the session root remains readable; new writes materialize the canonical
+`file_history/manifest.json` path without introducing a new undo format.

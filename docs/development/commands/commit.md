@@ -1,5 +1,14 @@
 # `libra commit` 开发设计
 
+## Change genealogy (CH-04)
+
+`commit` records its result through the ChangeRevisionBuilder sidecar. The
+normal path creates a new stable Change ID; `--amend` keeps the logical Change
+ID and records an `amend` predecessor edge. Change IDs are never written into
+Git commit headers. AI causal metadata references the stable operation ID and
+Change ID through the redacted `ai_operation_link` projection, not the commit
+OID.
+
 ## 命令实现目标
 
 `libra commit` 的目标是把索引快照记录为新提交，并处理消息来源、作者/提交者、vault 签名、`.libra/hooks` commit 生命周期、结构化输出和兼容拒绝。P1-10 支持 `pre-commit`、`prepare-commit-msg`、`commit-msg`、`post-rewrite` 与 `post-commit`；Git hooks bridge（`.git/hooks` / `core.hooksPath`）仍按 [`_compatibility.md` D3](_compatibility.md#d3git-hooks-bridge-作为核心特性) 拒绝。常用 Git commit 表面已经覆盖：消息/模板/复用、amend、auto-stage、author/date/env、cleanup、dry-run/porcelain、trailers、编辑器、verbose diff 与稳定错误码。编辑器模板默认含注释化 status；`commit.status=false` 可关闭，`--status`/`--no-status` 显式覆盖，且仅在 cleanup 会剥离注释时注入。`commit.cleanup`/`commit.verbose` 提供既有 local→global 默认；`commit.gpgSign` 与 `--no-gpg-sign` 控制 vault 签名。Git 正向 `-S`/`--gpg-sign` 尚未公开。

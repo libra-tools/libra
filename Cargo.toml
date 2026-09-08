@@ -649,3 +649,8 @@ path = "tests/change_id_resolution.rs"
 [[test]]
 name = "change_genealogy_rebase"
 path = "tests/change_genealogy_rebase.rs"
+
+# plan-20260822 CH-04: multi-edge genealogy and stable AI causal links.
+[[test]]
+name = "change_genealogy_squash_split"
+path = "tests/change_genealogy_squash_split.rs"

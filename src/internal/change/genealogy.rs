@@ -1,6 +1,6 @@
 //! Typed predecessor edges and bounded genealogy queries.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, QueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -50,6 +50,25 @@ pub struct GenealogyRevision {
     pub predecessors: Vec<PredecessorEdge>,
 }
 
+/// Redacted causal metadata connecting an AI operation to a stable logical
+/// change. This intentionally contains no commit OID, prompt, transcript, or
+/// secret; commit revisions are queried through `ChangeId` projections.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AiOperationLink {
+    pub operation_id: String,
+    pub change_id: ChangeId,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub tool_invocation_id: Option<String>,
+    pub intent_id: Option<String>,
+    pub repo_id: String,
+    pub worktree_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub lease_generation: Option<i64>,
+    pub config_provenance_digest: Option<String>,
+    pub redaction_version: String,
+}
+
 #[derive(Debug, Error)]
 pub enum GenealogyError {
     #[error("database error: {0}")]
@@ -58,6 +77,8 @@ pub enum GenealogyError {
     InvalidChangeId(String),
     #[error("invalid relation kind: {0}")]
     InvalidRelation(String),
+    #[error("invalid AI operation link: {0}")]
+    InvalidAiLink(String),
 }
 
 pub async fn insert_predecessor(
@@ -65,6 +86,126 @@ pub async fn insert_predecessor(
     edge: &PredecessorEdge,
 ) -> Result<(), GenealogyError> {
     insert_predecessor_on(db, edge).await
+}
+
+/// Atomically upsert redacted AI causal metadata by stable operation
+/// identity. The change association is a Change ID, never a commit OID.
+pub async fn link_ai_operation(
+    db: &DatabaseConnection,
+    link: &AiOperationLink,
+) -> Result<(), GenealogyError> {
+    validate_ai_link(link)?;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO ai_operation_link \
+         (operation_id, change_id, session_id, run_id, tool_invocation_id, intent_id, \
+          repo_id, worktree_id, workspace_id, lease_generation, config_provenance_digest, \
+          redaction_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(operation_id) DO UPDATE SET \
+          change_id = excluded.change_id, session_id = excluded.session_id, \
+          run_id = excluded.run_id, tool_invocation_id = excluded.tool_invocation_id, \
+          intent_id = excluded.intent_id, repo_id = excluded.repo_id, \
+          worktree_id = excluded.worktree_id, workspace_id = excluded.workspace_id, \
+          lease_generation = excluded.lease_generation, \
+          config_provenance_digest = excluded.config_provenance_digest, \
+          redaction_version = excluded.redaction_version",
+        [
+            link.operation_id.clone().into(),
+            link.change_id.to_string().into(),
+            link.session_id.clone().into(),
+            link.run_id.clone().into(),
+            link.tool_invocation_id.clone().into(),
+            link.intent_id.clone().into(),
+            link.repo_id.clone().into(),
+            link.worktree_id.clone().into(),
+            link.workspace_id.clone().into(),
+            link.lease_generation.into(),
+            link.config_provenance_digest.clone().into(),
+            link.redaction_version.clone().into(),
+        ],
+    ))
+    .await
+    .map(|_| ())
+    .map_err(GenealogyError::Database)
+}
+
+/// Return all AI links for a stable Change ID in one repository.
+pub async fn ai_links_for_change(
+    db: &DatabaseConnection,
+    repo_id: &str,
+    change_id: ChangeId,
+) -> Result<Vec<AiOperationLink>, GenealogyError> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT operation_id, change_id, session_id, run_id, tool_invocation_id, intent_id, \
+             repo_id, worktree_id, workspace_id, lease_generation, config_provenance_digest, \
+             redaction_version FROM ai_operation_link \
+             WHERE repo_id = ? AND change_id = ? ORDER BY operation_id",
+            [repo_id.to_string().into(), change_id.to_string().into()],
+        ))
+        .await?;
+    rows.into_iter().map(ai_link_from_row).collect()
+}
+
+/// Return all AI links for a redacted intent ID in one repository.
+pub async fn ai_links_for_intent(
+    db: &DatabaseConnection,
+    repo_id: &str,
+    intent_id: &str,
+) -> Result<Vec<AiOperationLink>, GenealogyError> {
+    if intent_id.trim().is_empty() {
+        return Err(GenealogyError::InvalidAiLink(
+            "intent id must not be empty".to_string(),
+        ));
+    }
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT operation_id, change_id, session_id, run_id, tool_invocation_id, intent_id, \
+             repo_id, worktree_id, workspace_id, lease_generation, config_provenance_digest, \
+             redaction_version FROM ai_operation_link \
+             WHERE repo_id = ? AND intent_id = ? AND change_id IS NOT NULL ORDER BY operation_id",
+            [repo_id.to_string().into(), intent_id.to_string().into()],
+        ))
+        .await?;
+    rows.into_iter().map(ai_link_from_row).collect()
+}
+
+fn validate_ai_link(link: &AiOperationLink) -> Result<(), GenealogyError> {
+    for (name, value) in [
+        ("operation id", link.operation_id.as_str()),
+        ("repository id", link.repo_id.as_str()),
+        ("redaction version", link.redaction_version.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(GenealogyError::InvalidAiLink(format!(
+                "{name} must not be empty"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ai_link_from_row(row: QueryResult) -> Result<AiOperationLink, GenealogyError> {
+    let raw_change_id = row.try_get::<String>("", "change_id")?;
+    let change_id = raw_change_id
+        .parse()
+        .map_err(|_| GenealogyError::InvalidChangeId(raw_change_id.clone()))?;
+    Ok(AiOperationLink {
+        operation_id: row.try_get("", "operation_id")?,
+        change_id,
+        session_id: row.try_get::<Option<String>>("", "session_id")?,
+        run_id: row.try_get::<Option<String>>("", "run_id")?,
+        tool_invocation_id: row.try_get::<Option<String>>("", "tool_invocation_id")?,
+        intent_id: row.try_get::<Option<String>>("", "intent_id")?,
+        repo_id: row.try_get("", "repo_id")?,
+        worktree_id: row.try_get::<Option<String>>("", "worktree_id")?,
+        workspace_id: row.try_get::<Option<String>>("", "workspace_id")?,
+        lease_generation: row.try_get::<Option<i64>>("", "lease_generation")?,
+        config_provenance_digest: row.try_get::<Option<String>>("", "config_provenance_digest")?,
+        redaction_version: row.try_get("", "redaction_version")?,
+    })
 }
 
 pub(crate) async fn insert_predecessor_on<C: ConnectionTrait>(
