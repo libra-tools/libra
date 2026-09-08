@@ -209,41 +209,36 @@ pub async fn attach_pending_ai_operation_links(
     repo_id: &str,
     change_id: ChangeId,
     operation_id: Option<&str>,
-    run_id: Option<&str>,
-    intent_id: Option<&str>,
 ) -> Result<(), GenealogyError> {
-    let (query, values) = if let (Some(operation_id), Some(run_id), Some(intent_id)) =
-        (operation_id, run_id, intent_id)
-    {
-        (
-            "UPDATE ai_operation_link SET change_id = ? \
-             WHERE repo_id = ? AND change_id IS NULL \
-             AND (operation_id = ? OR (run_id = ? AND intent_id = ?))",
-            vec![
-                change_id.to_string().into(),
-                repo_id.to_string().into(),
-                operation_id.to_string().into(),
-                run_id.to_string().into(),
-                intent_id.to_string().into(),
-            ],
-        )
-    } else if let Some(operation_id) = operation_id {
-        (
-            "UPDATE ai_operation_link SET change_id = ? \
-             WHERE repo_id = ? AND operation_id = ? AND change_id IS NULL",
-            vec![
-                change_id.to_string().into(),
-                repo_id.to_string().into(),
-                operation_id.to_string().into(),
-            ],
-        )
-    } else {
+    let Some(operation_id) = operation_id else {
         return Ok(());
     };
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        query,
-        values,
+        "UPDATE ai_operation_link SET change_id = ? \
+         WHERE repo_id = ? AND operation_id = ? AND change_id IS NULL",
+        [
+            change_id.to_string().into(),
+            repo_id.to_string().into(),
+            operation_id.to_string().into(),
+        ],
+    ))
+    .await
+    .map(|_| ())
+    .map_err(GenealogyError::Database)
+}
+
+/// Remove a pending link when the mutating tool failed before creating a
+/// revision. A successful later operation must never be able to claim a
+/// failed tool's row.
+pub async fn remove_pending_ai_operation_link(
+    db: &DatabaseConnection,
+    operation_id: &str,
+) -> Result<(), GenealogyError> {
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM ai_operation_link WHERE operation_id = ? AND change_id IS NULL",
+        [operation_id.to_string().into()],
     ))
     .await
     .map(|_| ())

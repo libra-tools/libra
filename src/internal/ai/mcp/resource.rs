@@ -74,6 +74,7 @@ use crate::{
                 unsupported_command_message,
             },
             mcp::{authz::McpOperation, server::LibraMcpServer},
+            tools::AiOperationContext,
             util::normalize_commit_anchor,
             web::code_ui::{CodeUiTaskSnapshot, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind},
         },
@@ -1366,6 +1367,15 @@ impl LibraMcpServer {
         &self,
         params: RunLibraVcsParams,
     ) -> Result<CallToolResult, ErrorData> {
+        self.run_libra_vcs_impl_with_ai_operation(params, None)
+            .await
+    }
+
+    pub async fn run_libra_vcs_impl_with_ai_operation(
+        &self,
+        params: RunLibraVcsParams,
+        ai_operation: Option<&AiOperationContext>,
+    ) -> Result<CallToolResult, ErrorData> {
         let args = params.args.unwrap_or_default();
         let safety_decision = classify_run_libra_vcs_safety(&params.command, &args);
         if !safety_decision.is_allow() {
@@ -1373,7 +1383,8 @@ impl LibraMcpServer {
                 format_run_libra_vcs_safety_message(&params.command, &args, &safety_decision),
             )]));
         }
-        self.dispatch_libra_vcs(&params.command, args).await
+        self.dispatch_libra_vcs(&params.command, args, ai_operation)
+            .await
     }
 
     /// Variant of [`Self::run_libra_vcs_impl`] that runs `add`/`commit`/`switch` and
@@ -1385,6 +1396,15 @@ impl LibraMcpServer {
         &self,
         params: RunLibraVcsParams,
     ) -> Result<CallToolResult, ErrorData> {
+        self.run_libra_vcs_impl_unchecked_with_ai_operation(params, None)
+            .await
+    }
+
+    pub async fn run_libra_vcs_impl_unchecked_with_ai_operation(
+        &self,
+        params: RunLibraVcsParams,
+        ai_operation: Option<&AiOperationContext>,
+    ) -> Result<CallToolResult, ErrorData> {
         let args = params.args.unwrap_or_default();
         let safety_decision = classify_run_libra_vcs_safety(&params.command, &args);
         if safety_decision.is_deny() {
@@ -1392,13 +1412,15 @@ impl LibraMcpServer {
                 format_run_libra_vcs_safety_message(&params.command, &args, &safety_decision),
             )]));
         }
-        self.dispatch_libra_vcs(&params.command, args).await
+        self.dispatch_libra_vcs(&params.command, args, ai_operation)
+            .await
     }
 
     async fn dispatch_libra_vcs(
         &self,
         command: &str,
         args: Vec<String>,
+        ai_operation: Option<&AiOperationContext>,
     ) -> Result<CallToolResult, ErrorData> {
         let command = normalize_libra_vcs_command(command)?;
         validate_libra_vcs_args(&args)?;
@@ -1410,11 +1432,24 @@ impl LibraMcpServer {
         })?;
         let process_args = libra_vcs_process_args(command, &args);
 
-        let child = Command::new(executable)
+        let mut child = Command::new(executable);
+        child
             .args(&process_args)
             .current_dir(&working_dir)
-            .stdin(Stdio::null())
-            .output();
+            .stdin(Stdio::null());
+        if let Some(ai_operation) = ai_operation {
+            child.env("LIBRA_AI_OPERATION_ID", &ai_operation.operation_id);
+            if let Some(run_id) = ai_operation.run_id.as_deref() {
+                child.env("LIBRA_AI_RUN_ID", run_id);
+            }
+            if let Some(intent_id) = ai_operation.intent_id.as_deref() {
+                child.env("LIBRA_AI_INTENT_ID", intent_id);
+            }
+            if let Some(session_id) = ai_operation.session_id.as_deref() {
+                child.env("LIBRA_AI_SESSION_ID", session_id);
+            }
+        }
+        let child = child.output();
 
         match timeout(Duration::from_secs(LIBRA_VCS_TIMEOUT_SECONDS), child).await {
             Ok(Ok(output)) => Ok(format_libra_vcs_output(command, &args, output)),

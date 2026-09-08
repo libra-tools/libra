@@ -159,16 +159,21 @@ async fn ai_links_query_by_intent_returns_stable_change_id() {
     )
     .await
     .expect("pending AI link");
-    attach_pending_ai_operation_links(
+    record_pending_ai_operation_link(
         &database,
-        "repo",
-        revision.change_id,
-        Some("tool-op-1"),
+        "tool-op-2",
+        Some("session-1"),
         Some("run-1"),
+        Some("tool-call-2"),
         Some("intent-redacted"),
+        "repo",
+        "v1",
     )
     .await
-    .expect("attach pending AI link");
+    .expect("second pending AI link");
+    attach_pending_ai_operation_links(&database, "repo", revision.change_id, Some("tool-op-1"))
+        .await
+        .expect("attach pending AI link");
     let by_intent = ai_links_for_intent(&database, "repo", "intent-redacted")
         .await
         .expect("intent query after attach");
@@ -177,5 +182,14 @@ async fn ai_links_query_by_intent_returns_stable_change_id() {
     assert_eq!(
         by_intent[1].tool_invocation_id.as_deref(),
         Some("tool-call-1")
+    );
+    let by_change = ai_links_for_change(&database, "repo", revision.change_id)
+        .await
+        .expect("change query after exact attach");
+    assert_eq!(by_change.len(), 2);
+    assert!(
+        by_change
+            .iter()
+            .all(|link| link.operation_id != "tool-op-2")
     );
 }

@@ -44,6 +44,16 @@ pub async fn record_pending_ai_operation_link_for_tool(
     .map_err(|error| error.to_string())
 }
 
+/// Remove a pending link after a mutating tool fails before creating a Change.
+pub async fn remove_pending_ai_operation_link_for_tool(
+    context: &AiOperationContext,
+) -> Result<(), String> {
+    let database = crate::internal::db::get_db_conn_instance().await;
+    crate::internal::change::remove_pending_ai_operation_link(&database, &context.operation_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 pub fn run_libra_vcs_tool_guidance() -> String {
     format!(
         "Allowed run_libra_vcs commands: {ALLOWED_COMMANDS_DISPLAY}. Pass flags and paths in \

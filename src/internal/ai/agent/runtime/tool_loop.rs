@@ -796,6 +796,21 @@ where
                         }
                     }
                 };
+                if mutates_state
+                    && !tool_result.as_ref().is_ok_and(ToolOutput::is_success)
+                    && let Some(ai_operation) = ai_operation.as_ref()
+                    && let Err(error) =
+                        crate::internal::ai::libra_vcs::remove_pending_ai_operation_link_for_tool(
+                            ai_operation,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        %error,
+                        tool = %tool_name,
+                        "failed to remove pending AI operation link after tool failure"
+                    );
+                }
                 if mutates_state && let Some(cancellation) = config.cancellation.as_ref() {
                     cancellation.mark_mutation_finished();
                 }
