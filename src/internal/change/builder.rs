@@ -4,8 +4,8 @@ use sea_orm::{DatabaseConnection, DatabaseTransaction, TransactionTrait};
 use thiserror::Error;
 
 use super::{
-    ChangeId, ChangeRevision, ChangeStore, ChangeStoreError, GenealogyError, PredecessorEdge,
-    RelationKind, RevisionVisibility,
+    AiOperationLink, ChangeId, ChangeRevision, ChangeStore, ChangeStoreError, GenealogyError,
+    PredecessorEdge, RelationKind, RevisionVisibility, link_ai_operation,
 };
 
 #[derive(Debug, Error)]
@@ -31,13 +31,32 @@ pub async fn record_current_repo_commit_revision(
     commit_oid: impl Into<String>,
     predecessor: Option<(String, RelationKind)>,
 ) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+    record_current_repo_commit_revision_with_predecessors(
+        op_id,
+        commit_oid,
+        predecessor.into_iter().collect(),
+    )
+    .await
+}
+
+/// Record one revision with an ordered, possibly multi-edge predecessor set.
+/// The first predecessor with a known projection supplies the stable Change
+/// ID; callers use this for squash (fold target first, folded commit second),
+/// split, and duplicate workflows.
+pub async fn record_current_repo_commit_revision_with_predecessors(
+    op_id: impl Into<String>,
+    commit_oid: impl Into<String>,
+    predecessors: Vec<(String, RelationKind)>,
+) -> Result<ChangeRevision, ChangeRevisionBuildError> {
     let database = crate::internal::db::get_db_conn_instance().await;
     let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init(&database)
         .await
         .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?;
+    let repo_id = repo_id.to_string();
     let op_id = op_id.into();
+    let operation_id = op_id.clone();
     let commit_oid = commit_oid.into();
-    let inherited = if let Some((predecessor_oid, _)) = predecessor.as_ref() {
+    let inherited = if let Some((predecessor_oid, _)) = predecessors.first() {
         ChangeStore::new(database.clone())
             .change_id_for_commit(repo_id.as_str(), predecessor_oid)
             .await?
@@ -46,16 +65,31 @@ pub async fn record_current_repo_commit_revision(
     };
     let builder = match inherited {
         Some(change_id) => {
-            ChangeRevisionBuilder::for_rewrite(database, repo_id.as_str(), op_id, change_id)
+            ChangeRevisionBuilder::for_rewrite(database.clone(), repo_id.as_str(), op_id, change_id)
         }
-        None => ChangeRevisionBuilder::for_new_change(database, repo_id.as_str(), op_id),
+        None => ChangeRevisionBuilder::for_new_change(database.clone(), repo_id.as_str(), op_id),
     }
     .set_commit_oid(commit_oid);
-    let builder = match predecessor {
-        Some(predecessor) => builder.set_predecessors([predecessor]),
-        None => builder,
-    };
-    builder.build().await
+    let revision = builder.set_predecessors(predecessors).build().await?;
+    link_ai_operation(
+        &database,
+        &AiOperationLink {
+            operation_id,
+            change_id: revision.change_id,
+            session_id: None,
+            run_id: None,
+            tool_invocation_id: None,
+            intent_id: None,
+            repo_id,
+            worktree_id: None,
+            workspace_id: None,
+            lease_generation: None,
+            config_provenance_digest: None,
+            redaction_version: "v1".to_string(),
+        },
+    )
+    .await?;
+    Ok(revision)
 }
 
 pub struct ChangeRevisionBuilder {

@@ -7,6 +7,7 @@ mod resolve;
 mod store;
 pub use builder::{
     ChangeRevisionBuildError, ChangeRevisionBuilder, record_current_repo_commit_revision,
+    record_current_repo_commit_revision_with_predecessors,
 };
 pub use genealogy::{
     AiOperationLink, GenealogyError, GenealogyRevision, PredecessorEdge, RelationKind,

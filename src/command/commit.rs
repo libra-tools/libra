@@ -26,6 +26,7 @@ use git_internal::{
 use ring::digest::{Context as DigestContext, SHA256};
 use sea_orm::ConnectionTrait;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::{
     command::{diff, editor, load_object, read_symlink_blob_bytes, save_object_to_storage, status},
@@ -1341,7 +1342,7 @@ async fn run_commit_with_index(
         // after ref update never points the branch at a missing object.
         save_commit_object(&storage, &commit)?;
         record_current_repo_commit_revision(
-            format!("commit:{}", commit.id),
+            Uuid::now_v7().to_string(),
             commit.id.to_string(),
             Some((parents_commit_ids[0].to_string(), RelationKind::Amend)),
         )
@@ -1461,13 +1462,9 @@ async fn run_commit_with_index(
     // INVARIANT: persist the commit object before moving HEAD so a crash after
     // ref update never points the branch at a missing object.
     save_commit_object(&storage, &commit)?;
-    record_current_repo_commit_revision(
-        format!("commit:{}", commit.id),
-        commit.id.to_string(),
-        None,
-    )
-    .await
-    .map_err(|error| CommitError::ChangeRevision(error.to_string()))?;
+    record_current_repo_commit_revision(Uuid::now_v7().to_string(), commit.id.to_string(), None)
+        .await
+        .map_err(|error| CommitError::ChangeRevision(error.to_string()))?;
     update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
     if !skip_all_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;

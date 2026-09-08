@@ -24,6 +24,7 @@ use git_internal::{
 };
 use sea_orm::ConnectionTrait;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::{
     command::{
@@ -1723,7 +1724,7 @@ async fn create_cherry_pick_commit(
     save_object(&commit, &commit.id)
         .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to save commit: {e}")))?;
     record_current_repo_commit_revision(
-        format!("cherry-pick:{}", commit.id),
+        Uuid::now_v7().to_string(),
         commit.id.to_string(),
         Some((original_commit.id.to_string(), RelationKind::CherryPick)),
     )
