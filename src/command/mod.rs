@@ -246,7 +246,7 @@ where
     // `show`, `rev-parse` peeling, etc. transparently see the replacement.
     // Cheap no-op when no replacements exist.
     let hash = replace::resolve(*hash);
-    let storage = util::objects_storage();
+    let storage = util::try_objects_storage().map_err(GitError::IOError)?;
     let data = storage.get(&hash)?;
     T::from_bytes(&data.to_vec(), hash)
 }
@@ -260,7 +260,7 @@ pub fn load_object_raw<T>(hash: &ObjectHash) -> Result<T, GitError>
 where
     T: ObjectTrait,
 {
-    let storage = util::objects_storage();
+    let storage = util::try_objects_storage().map_err(GitError::IOError)?;
     let data = storage.get(hash)?;
     T::from_bytes(&data.to_vec(), *hash)
 }

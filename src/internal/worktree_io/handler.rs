@@ -37,7 +37,8 @@ pub(crate) fn handle_request_to_buffer(
 }
 fn seal_worktree_capability(request: &IoRequest) -> io::Result<Option<WorktreeRootCapability>> {
     let root = match request {
-        IoRequest::SymlinkMetadata { root, .. }
+        IoRequest::EntryIdentity { root, .. }
+        | IoRequest::SymlinkMetadata { root, .. }
         | IoRequest::CanonicalizePair { root, .. }
         | IoRequest::ReadDir { root, .. }
         | IoRequest::FileBlobHash { root, .. }
@@ -159,6 +160,19 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
     let object_store_capability = seal_object_store_capability(&request)?;
     match request {
         IoRequest::Shutdown => return Ok(false),
+        IoRequest::EntryIdentity { path, .. } => {
+            write_frame(stdout, &IoEvent::Begin)?;
+            let path = bytes_to_path(&path);
+            let Some(capability) = worktree_capability.as_ref() else {
+                return Err(io::Error::other("missing worktree capability"));
+            };
+            let result = wire_result(capability.relative_or_root(&path).and_then(|relative| {
+                crate::utils::beneath::open_root(capability.root()).and_then(|root| {
+                    crate::utils::beneath::entry_identity_beneath(&root, &relative)
+                })
+            }));
+            write_frame(stdout, &IoEvent::DoneEntryIdentity { result })?;
+        }
         IoRequest::SymlinkMetadata { path, .. } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let path = bytes_to_path(&path);

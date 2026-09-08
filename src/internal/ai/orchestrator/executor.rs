@@ -33,8 +33,9 @@ use super::{
         TaskRuntimeNoteLevel, TaskRuntimePhase, TaskSpec, TaskWorkspaceBackend, ToolCallRecord,
     },
     workspace::{
-        FuseAttemptOutcome, FuseProvisionState, detect_contract_violations,
-        format_contract_violation_message, is_fuse_infrastructure_error_message,
+        FuseAttemptOutcome, FuseProvisionState, SyncBackReport, WorkspaceSyncError,
+        detect_contract_violations, format_contract_violation_message,
+        is_fuse_infrastructure_error_message,
     },
 };
 use crate::internal::ai::{
@@ -79,6 +80,10 @@ pub struct ExecutorConfig {
 const NO_CHANGES_NEEDED_TOKEN: &str = "[NO_CHANGES_NEEDED]";
 const MAX_STORED_THINKING_CHARS: usize = 64_000;
 const MAX_GATE_FAILURE_OUTPUT_CHARS: usize = 2_000;
+// Scope leases intentionally use a zero-wait acquisition. A completed task
+// gets a short, bounded chance to publish from the same isolated workspace
+// before the scheduler considers the more expensive fresh-baseline retry.
+const SYNC_BACK_LEASE_RETRY_DELAYS_MS: [u64; 5] = [50, 100, 200, 400, 800];
 
 struct TaskExecutionArtifacts {
     tool_calls: Vec<ToolCallRecord>,
@@ -1277,10 +1282,10 @@ where
         let backend = environment.backend();
         let baseline = environment.baseline_snapshot();
 
-        let task_registry = Arc::new(registry.clone_with_working_dir_and_alias(
-            task_worktree_root.clone(),
-            config.working_dir.clone(),
-        ));
+        let task_registry = Arc::new(
+            registry
+                .clone_for_task_worktree(task_worktree_root.clone(), config.working_dir.clone()),
+        );
         let mut task_config = config.clone();
         task_config.working_dir = task_worktree_root.clone();
         task_config.tool_loop_config =
@@ -1323,20 +1328,21 @@ where
         }
 
         if result.status == TaskNodeStatus::Completed {
-            let sync_result = {
-                let _guard = workspace_sync.lock().await;
-                environment_provider
-                    .sync_back(
-                        &environment,
-                        SyncBackRequest {
-                            main_working_dir: config.working_dir.clone(),
-                            touch_files: task.contract.touch_files.clone(),
-                            scope_in: task.scope_in.clone(),
-                            scope_out: task.scope_out.clone(),
-                        },
-                    )
-                    .await
-            };
+            let sync_result = sync_completed_task_back(
+                task,
+                &environment_provider,
+                &environment,
+                SyncBackRequest {
+                    task_id: task.id(),
+                    main_working_dir: config.working_dir.clone(),
+                    touch_files: task.contract.touch_files.clone(),
+                    scope_in: task.scope_in.clone(),
+                    scope_out: task.scope_out.clone(),
+                },
+                workspace_sync,
+                config.observer.as_ref(),
+            )
+            .await;
 
             match sync_result {
                 Ok(report) => {
@@ -1395,9 +1401,17 @@ where
                     continue;
                 }
                 Err(err) => {
-                    let detail = format!(
-                        "task completed in isolated worktree but failed to sync changes back: {err}"
-                    );
+                    let detail = if err.main_workspace_may_have_changes() {
+                        format!(
+                            "task replay reached the main workspace, but its operation record \
+                             could not be finalized: {err}"
+                        )
+                    } else {
+                        format!(
+                            "task completed in isolated worktree but failed to sync changes back: \
+                             {err}"
+                        )
+                    };
                     if let Some(observer) = &config.observer {
                         observer.on_task_runtime_event(
                             task,
@@ -1422,6 +1436,49 @@ where
         .await;
 
         return result;
+    }
+}
+
+async fn sync_completed_task_back(
+    task: &TaskSpec,
+    environment_provider: &ExecutionEnvironmentProvider,
+    environment: &crate::internal::ai::runtime::environment::TaskExecutionEnvironment,
+    request: SyncBackRequest,
+    workspace_sync: &Arc<tokio::sync::Mutex<()>>,
+    observer: Option<&Arc<dyn OrchestratorObserver>>,
+) -> Result<SyncBackReport, WorkspaceSyncError> {
+    let mut lease_retry = 0_usize;
+    loop {
+        let result = {
+            let _guard = workspace_sync.lock().await;
+            environment_provider
+                .sync_back(environment, request.clone())
+                .await
+        };
+        let Err(error) = &result else {
+            return result;
+        };
+        if !error.is_scope_lease_busy() || lease_retry == SYNC_BACK_LEASE_RETRY_DELAYS_MS.len() {
+            return result;
+        }
+
+        let delay_ms = SYNC_BACK_LEASE_RETRY_DELAYS_MS[lease_retry];
+        lease_retry += 1;
+        if let Some(observer) = observer {
+            observer.on_task_runtime_event(
+                task,
+                TaskRuntimeEvent::Note {
+                    level: TaskRuntimeNoteLevel::Info,
+                    text: format!(
+                        "main operation scope lease is busy; retrying sync-back from the \
+                         completed task workspace ({lease_retry}/{}) after {delay_ms} ms · \
+                         {error}",
+                        SYNC_BACK_LEASE_RETRY_DELAYS_MS.len()
+                    ),
+                },
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 
@@ -2814,11 +2871,15 @@ mod tests {
     use std::{
         collections::BTreeMap,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
     use git_internal::internal::object::{task::Task as GitTask, types::ActorRef};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
     use serial_test::serial;
 
     use super::*;
@@ -3226,6 +3287,23 @@ mod tests {
                 reasoning_content: None,
                 raw_response: (),
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingPatchApplyingModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CompletionModel for CountingPatchApplyingModel {
+        type Response = ();
+
+        async fn completion(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            PatchApplyingModel.completion(request).await
         }
     }
 
@@ -4836,13 +4914,12 @@ mod tests {
             fuse_state: FuseProvisionState::default(),
         };
 
-        let plan = plan_for_tasks(
-            vec![
-                scoped_implementation_task("Task A", "task_a.txt"),
-                scoped_implementation_task("Task B", "task_b.txt"),
-            ],
-            2,
-        );
+        let task_a = scoped_implementation_task("Task A", "task_a.txt");
+        let task_b = scoped_implementation_task("Task B", "task_b.txt");
+        let mut expected_causal_context_ids =
+            vec![task_a.id().to_string(), task_b.id().to_string()];
+        expected_causal_context_ids.sort();
+        let plan = plan_for_tasks(vec![task_a, task_b], 2);
 
         let run_state = execute_dag(&plan, &PatchApplyingModel, &registry, &config)
             .await
@@ -4861,6 +4938,86 @@ mod tests {
                 .ordered_task_results()
                 .iter()
                 .all(|result| result.status == TaskNodeStatus::Completed)
+        );
+
+        let scope =
+            crate::internal::worktree_scope::RequestScope::resolve(repo.path().to_path_buf())
+                .expect("resolve test repository scope");
+        let db = crate::internal::db::get_db_conn_instance_for_path(
+            &scope.storage.join(crate::utils::util::DATABASE),
+        )
+        .await
+        .expect("open test repository database");
+        let sync_operations = crate::internal::model::operation::Entity::find()
+            .filter(crate::internal::model::operation::Column::FormatVersion.eq(2))
+            .filter(
+                crate::internal::model::operation::Column::CommandName.eq("agent.task.sync-back"),
+            )
+            .all(&db)
+            .await
+            .expect("query task sync-back operations");
+        let mut actual_causal_context_ids = sync_operations
+            .into_iter()
+            .map(|operation| {
+                operation
+                    .causal_context_id
+                    .expect("task sync-back operation carries causal task id")
+            })
+            .collect::<Vec<_>>();
+        actual_causal_context_ids.sort();
+        assert_eq!(actual_causal_context_ids, expected_causal_context_ids);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn execute_dag_retries_busy_sync_back_without_reexecuting_completed_task() {
+        let repo = tempfile::tempdir().unwrap();
+        test::setup_with_new_libra_in(repo.path()).await;
+        std::fs::write(repo.path().join("task_a.txt"), "base\n").unwrap();
+
+        let mut registry = ToolRegistry::with_working_dir(repo.path().to_path_buf());
+        registry.register("apply_patch", Arc::new(ApplyPatchHandler));
+        let registry = Arc::new(registry);
+        let config = ExecutorConfig {
+            tool_loop_config: ToolLoopConfig::default(),
+            max_retries: 1,
+            backoff_seconds: 0,
+            working_dir: repo.path().to_path_buf(),
+            spec: spec(),
+            reviewer_preamble: None,
+            dagrs_resume_checkpoint_id: None,
+            observer: None,
+            workspace_baseline: None,
+            fuse_state: FuseProvisionState::default(),
+        };
+        let task = scoped_implementation_task("Task A", "task_a.txt");
+        crate::internal::operation::middleware::test_hooks::fail_next_lease_for_causal_context(
+            task.id().to_string(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = CountingPatchApplyingModel {
+            calls: Arc::clone(&calls),
+        };
+
+        let run_state = execute_dag(&plan_for_tasks(vec![task], 1), &model, &registry, &config)
+            .await
+            .unwrap();
+        crate::internal::operation::middleware::test_hooks::clear_pre_lease_busy();
+
+        let result = &run_state.ordered_task_results()[0];
+        assert_eq!(result.status, TaskNodeStatus::Completed);
+        assert_eq!(
+            result.retry_count, 0,
+            "scope-lease contention must not consume the task re-execution budget"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a completed task must not be re-executed only because sync-back found the main scope lease busy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("task_a.txt")).unwrap(),
+            "task-a\n"
         );
     }
 
@@ -4933,7 +5090,12 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
 
-        let mut registry = ToolRegistry::with_working_dir(repo.path().to_path_buf());
+        let hardening = crate::internal::ai::runtime::ToolBoundaryRuntime::system(
+            uuid::Uuid::new_v4(),
+            Arc::new(crate::internal::ai::runtime::InMemoryAuditSink::default()),
+        );
+        let mut registry =
+            ToolRegistry::with_working_dir(repo.path().to_path_buf()).with_hardening(hardening);
         registry.register("shell", Arc::new(ShellHandler));
         let registry = Arc::new(registry);
 

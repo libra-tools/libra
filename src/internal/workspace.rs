@@ -639,7 +639,10 @@ pub mod test_hooks {
     };
 
     /// An async callback fired inside the store, around a contended write.
-    pub type WriteHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+    /// The attempted workspace and owner let a test ignore concurrent writes
+    /// that belong to another case in the same test process.
+    pub type WriteHook =
+        Arc<dyn Fn(&str, &str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
     static BEFORE_WRITE: OnceLock<Mutex<Option<WriteHook>>> = OnceLock::new();
     static AFTER_WRITE: OnceLock<Mutex<Option<WriteHook>>> = OnceLock::new();
@@ -669,19 +672,19 @@ pub mod test_hooks {
 
     /// Fire the pre-write hook, if any. A poisoned lock is treated as "no
     /// hook": a test seam must never fail a real operation.
-    pub(crate) async fn before_write() {
-        fire(before_slot()).await;
+    pub(crate) async fn before_write(workspace_id: &str, lease_owner: &str) {
+        fire(before_slot(), workspace_id, lease_owner).await;
     }
 
     /// Fire the post-write hook, if any.
-    pub(crate) async fn after_write() {
-        fire(after_slot()).await;
+    pub(crate) async fn after_write(workspace_id: &str, lease_owner: &str) {
+        fire(after_slot(), workspace_id, lease_owner).await;
     }
 
-    async fn fire(slot: &'static Mutex<Option<WriteHook>>) {
+    async fn fire(slot: &'static Mutex<Option<WriteHook>>, workspace_id: &str, lease_owner: &str) {
         let hook = slot.lock().ok().and_then(|guard| guard.clone());
         if let Some(hook) = hook {
-            hook().await;
+            hook(workspace_id, lease_owner).await;
         }
     }
 }
@@ -689,8 +692,8 @@ pub mod test_hooks {
 /// Release builds compile the contended writes with no seam at all.
 #[cfg(not(debug_assertions))]
 mod test_hooks {
-    pub(crate) async fn before_write() {}
-    pub(crate) async fn after_write() {}
+    pub(crate) async fn before_write(_workspace_id: &str, _lease_owner: &str) {}
+    pub(crate) async fn after_write(_workspace_id: &str, _lease_owner: &str) {}
 }
 
 /// Wall-clock milliseconds, the unit every timestamp column in this table uses./// Wall-clock milliseconds, the unit every timestamp column in this table uses.
@@ -787,7 +790,7 @@ impl WorkspaceStore {
             ],
         );
 
-        test_hooks::before_write().await;
+        test_hooks::before_write(&workspace_id, &normalized.lease_owner).await;
         match conn.execute_raw(statement).await {
             Ok(result) if result.rows_affected() == 1 => Ok(WorkspaceLease {
                 workspace_id,
@@ -1134,7 +1137,7 @@ impl WorkspaceStore {
              RETURNING workspace_id, lease_fence, lease_expires_at",
             WorkspaceState::live_sql_set()
         );
-        test_hooks::before_write().await;
+        test_hooks::before_write(workspace_id, new_owner).await;
         let updated = match conn
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
@@ -1178,7 +1181,7 @@ impl WorkspaceStore {
         // The window a fence read-back would have lived in: a regressed
         // implementation that re-read the row here would see a competing
         // takeover's fence instead of its own.
-        test_hooks::after_write().await;
+        test_hooks::after_write(workspace_id, new_owner).await;
 
         let Some(row) = updated else {
             // Identity drift is reported as such rather than as "not expired".

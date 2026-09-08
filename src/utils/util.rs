@@ -1000,17 +1000,8 @@ pub fn objects_storage() -> ClientStorage {
 
 /// Get `ClientStorage` for the `objects` directory, returning a Result
 pub fn try_objects_storage() -> io::Result<ClientStorage> {
-    // Check if we are in a valid repo first to avoid panic in path::objects() if possible,
-    // though path::objects() currently panics if storage_path() fails.
-    // Ideally path::objects() should also be fallible.
-    // For now, let's wrap the panic-prone call if we can, or just rely on try_get_storage_path check.
-    if try_get_storage_path(None).is_err() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "not a libra repository",
-        ));
-    }
-    Ok(cached_objects_storage(path::objects()))
+    let storage = try_get_storage_path(None)?;
+    Ok(cached_objects_storage(storage.join("objects")))
 }
 
 fn cached_objects_storage(base_path: PathBuf) -> ClientStorage {
@@ -2554,9 +2545,26 @@ pub fn check_gitignore_as_dir_for_walk(
     is_dir: bool,
     walk_epoch: u64,
 ) -> bool {
-    IGNORE_OP_EPOCH.with(|cell| cell.set(walk_epoch));
-    let answer = check_gitignore_as_dir(work_dir, target_file, is_dir);
-    IGNORE_OP_EPOCH.with(|cell| cell.set(0));
+    check_gitignore_with_layers_as_dir_for_walk(
+        work_dir,
+        target_file,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+        is_dir,
+        walk_epoch,
+    )
+}
+
+/// Match within an explicit epoch without recapturing the caller's layer scope.
+pub(crate) fn check_gitignore_with_layers_as_dir_for_walk(
+    work_dir: &Path,
+    target_file: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+    is_dir: bool,
+    walk_epoch: u64,
+) -> bool {
+    let previous = IGNORE_OP_EPOCH.with(|cell| cell.replace(walk_epoch));
+    let answer = check_gitignore_with_layers_as_dir(work_dir, target_file, layers, is_dir);
+    IGNORE_OP_EPOCH.with(|cell| cell.set(previous));
     answer
 }
 
@@ -2733,10 +2741,12 @@ fn find_pattern_line(source: &Path, pattern: &str) -> Option<usize> {
 
 fn cached_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
     let Ok(metadata) = fs::metadata(ignore_path) else {
-        return load_ignore_file(ignore_path, base);
+        return load_ignore_file(ignore_path, base)
+            .unwrap_or_else(|()| Arc::new(Gitignore::empty()));
     };
     let Ok(modified) = metadata.modified() else {
-        return load_ignore_file(ignore_path, base);
+        return load_ignore_file(ignore_path, base)
+            .unwrap_or_else(|()| Arc::new(Gitignore::empty()));
     };
     let len = metadata.len();
     let key = IgnoreCacheKey {
@@ -2744,18 +2754,28 @@ fn cached_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
         base: base.to_path_buf(),
     };
 
+    {
+        let cache = match LIBRAIGNORE_CACHE.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cached) = cache.get(&key)
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return Arc::clone(&cached.matcher);
+        }
+    }
+
+    // A blocked source must not hold the process-wide cache lock.
+    let Ok(matcher) = load_ignore_file(ignore_path, base) else {
+        // Failed reads must relatch in later walks, including after epoch-zero warmup.
+        return Arc::new(Gitignore::empty());
+    };
     let mut cache = match LIBRAIGNORE_CACHE.lock() {
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(cached) = cache.get(&key)
-        && cached.len == len
-        && cached.modified == modified
-    {
-        return Arc::clone(&cached.matcher);
-    }
-
-    let matcher = load_ignore_file(ignore_path, base);
     cache.insert(
         key,
         CachedGitignore {
@@ -2778,17 +2798,26 @@ fn cached_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) 
         source: ignore_path.to_path_buf(),
         base: base.to_path_buf(),
     };
+    {
+        let cache = match LIBRAIGNORE_CACHE.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cached) = cache.get(&key)
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return Arc::clone(&cached.matcher);
+        }
+    }
+    // Parsing and warning emission do not serialize unrelated cache users.
+    let Ok(matcher) = load_ignore_file_from_bytes(ignore_path, base, bytes) else {
+        return Arc::new(Gitignore::empty());
+    };
     let mut cache = match LIBRAIGNORE_CACHE.lock() {
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(cached) = cache.get(&key)
-        && cached.len == len
-        && cached.modified == modified
-    {
-        return Arc::clone(&cached.matcher);
-    }
-    let matcher = load_ignore_file_from_bytes(ignore_path, base, bytes);
     cache.insert(
         key,
         CachedGitignore {
@@ -2862,6 +2891,10 @@ pub fn exclude_matcher_verdict(
 /// status/probe walk.
 pub fn ignore_read_failed() -> bool {
     let epoch = CURRENT_WALK_EPOCH.with(|cell| cell.get());
+    ignore_read_failed_for_walk(epoch)
+}
+
+pub(crate) fn ignore_read_failed_for_walk(epoch: u64) -> bool {
     if epoch == 0 {
         return false;
     }
@@ -2907,7 +2940,7 @@ pub fn ignore_file_defines_any_pattern(ignore_path: &Path, base: &Path) -> bool 
     builder.build().map(|set| !set.is_empty()).unwrap_or(false)
 }
 
-fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
+fn load_ignore_file(ignore_path: &Path, base: &Path) -> Result<Arc<Gitignore>, ()> {
     match fs::read(ignore_path) {
         Ok(bytes) => load_ignore_file_from_bytes(ignore_path, base, &bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2919,12 +2952,16 @@ fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
                 "failed to read ignore file {}: {error}",
                 ignore_path.display()
             ));
-            load_ignore_file_from_bytes(ignore_path, base, b"")
+            Err(())
         }
     }
 }
 
-fn load_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) -> Arc<Gitignore> {
+fn load_ignore_file_from_bytes(
+    ignore_path: &Path,
+    base: &Path,
+    bytes: &[u8],
+) -> Result<Arc<Gitignore>, ()> {
     let contents = match std::str::from_utf8(bytes) {
         Ok(text) => text,
         Err(error) => {
@@ -2933,7 +2970,7 @@ fn load_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) ->
                 "ignore file {} is not valid UTF-8: {error}",
                 ignore_path.display()
             ));
-            return Arc::new(Gitignore::empty());
+            return Err(());
         }
     };
     let mut builder = GitignoreBuilder::new(base);
@@ -2946,13 +2983,13 @@ fn load_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) ->
         }
     }
     match builder.build() {
-        Ok(ignore) => Arc::new(ignore),
+        Ok(ignore) => Ok(Arc::new(ignore)),
         Err(error) => {
             eprintln!(
                 "warning: failed to compile ignore file {}: {error}",
                 ignore_path.display()
             );
-            Arc::new(Gitignore::empty())
+            Ok(Arc::new(Gitignore::empty()))
         }
     }
 }

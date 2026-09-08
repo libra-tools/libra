@@ -1,35 +1,16 @@
 //! CLI coverage for repository database schema upgrades.
 
-use std::{path::Path, time::Duration};
+use libra::internal::db::migration::builtin_runner as current_builtin_runner;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
-use libra::internal::db::migration::builtin_runner;
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
-use tempfile::tempdir;
-
-use super::{assert_cli_success, init_repo_via_cli, run_libra_command};
-
-async fn connect_raw_repo_db(repo: &Path) -> DatabaseConnection {
-    let db_path = repo.join(".libra").join("libra.db");
-    let mut opts = ConnectOptions::new(format!("sqlite://{}", db_path.display()));
-    opts.sqlx_logging(false)
-        .connect_timeout(Duration::from_secs(5));
-    Database::connect(opts)
-        .await
-        .expect("connect raw repository database")
-}
+use super::{
+    assert_cli_success,
+    historical_schema::{self, connect as connect_raw_repo_db},
+    run_libra_command,
+};
 
 async fn stale_repo_at_approved_permission() -> tempfile::TempDir {
-    let repo = tempdir().expect("create repository root");
-    init_repo_via_cli(repo.path());
-
-    let conn = connect_raw_repo_db(repo.path()).await;
-    let runner = builtin_runner().expect("built-in migration registry");
-    runner
-        .rollback_to(&conn, 2026050601)
-        .await
-        .expect("roll back latest migration");
-    conn.close().await.expect("close raw connection");
-    repo
+    historical_schema::repository_at(2026050601).await
 }
 
 async fn max_schema_version(conn: &DatabaseConnection) -> Option<i64> {
@@ -73,6 +54,9 @@ async fn column_exists(conn: &DatabaseConnection, table: &str, column: &str) -> 
 #[tokio::test]
 async fn normal_command_auto_upgrades_stale_schema() {
     let repo = stale_repo_at_approved_permission().await;
+    let before = connect_raw_repo_db(repo.path()).await;
+    historical_schema::assert_history(&before, 2026050601).await;
+    before.close().await.unwrap();
 
     // A plain command opens the repository database, which now auto-applies any
     // pending migrations on connect — no explicit upgrade step is required.
@@ -80,7 +64,7 @@ async fn normal_command_auto_upgrades_stale_schema() {
     assert_cli_success(&output, "libra status on a stale-schema repository");
 
     let conn = connect_raw_repo_db(repo.path()).await;
-    let latest = builtin_runner()
+    let latest = current_builtin_runner()
         .expect("built-in migration registry")
         .max_registered_version();
     assert_eq!(
@@ -96,12 +80,17 @@ async fn normal_command_auto_upgrades_stale_schema() {
         index_exists(&conn, "idx_agent_usage_stats_agent_name_provider_model").await,
         "auto-upgrade should recreate the agent_name/provider/model index"
     );
+    historical_schema::assert_current(&conn).await;
 }
 
 #[tokio::test]
 async fn hash_object_read_only_skips_stale_schema_guard() {
     let repo = stale_repo_at_approved_permission().await;
     std::fs::write(repo.path().join("hello.txt"), b"hello world\n").expect("write fixture");
+    let conn = connect_raw_repo_db(repo.path()).await;
+    historical_schema::assert_history(&conn, 2026050601).await;
+    let before = historical_schema::snapshot(&conn).await;
+    conn.close().await.unwrap();
 
     let output = run_libra_command(&["hash-object", "hello.txt"], repo.path());
     assert_cli_success(
@@ -119,6 +108,12 @@ async fn hash_object_read_only_skips_stale_schema_guard() {
         !column_exists(&conn, "agent_usage_stats", "agent_name").await,
         "read-only hash-object preflight must not apply pending migrations"
     );
+    historical_schema::assert_history(&conn, 2026050601).await;
+    assert_eq!(
+        before,
+        historical_schema::snapshot(&conn).await,
+        "hash-object must preserve every receipt, timestamp and schema object"
+    );
 }
 
 #[tokio::test]
@@ -133,6 +128,9 @@ async fn hash_object_read_only_defaults_sha1_when_config_kv_is_missing() {
     ))
     .await
     .expect("drop config_kv table");
+    historical_schema::assert_history(&conn, 2026050601).await;
+    assert!(!column_exists(&conn, "config_kv", "key").await);
+    let before = historical_schema::snapshot(&conn).await;
     conn.close().await.expect("close raw connection");
 
     let output = run_libra_command(&["hash-object", "hello.txt"], repo.path());
@@ -143,5 +141,13 @@ async fn hash_object_read_only_defaults_sha1_when_config_kv_is_missing() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "3b18e512dba79e4c8300dd08aeb37f8e728b8dad"
+    );
+    let conn = connect_raw_repo_db(repo.path()).await;
+    historical_schema::assert_history(&conn, 2026050601).await;
+    assert!(!column_exists(&conn, "config_kv", "key").await);
+    assert_eq!(
+        before,
+        historical_schema::snapshot(&conn).await,
+        "missing-config fallback must preserve receipts, timestamps and schema"
     );
 }

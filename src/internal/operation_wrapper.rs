@@ -869,7 +869,7 @@ pub async fn begin_operation_with_conn(
             Ok(Reclaim::TookOver { op_id, command }) => {
                 crate::utils::error::emit_warning(format!(
                     "released the control claim of '{command}' (operation {}) — the process that \
-                     held it is gone; its record is kept as failed",
+                      held it is gone; its record is kept as failed",
                     &op_id[..8.min(op_id.len())]
                 ));
             }
@@ -881,7 +881,7 @@ pub async fn begin_operation_with_conn(
                 let _ = txn.rollback().await;
                 return Err(OperationError::business(format!(
                     "'{command}' is already running in this worktree (owner {owner}, started \
-                     {age}s ago); wait for it to finish, or stop that process"
+                      {age}s ago); wait for it to finish, or stop that process"
                 )));
             }
             Err(err) => {
@@ -1260,7 +1260,7 @@ impl OperationBoundary {
             command_name: self.meta.command_name.clone(),
             description: format!(
                 "{} | resolver_mode={} scanned_pages={} scanned_items={} success_candidates={} \
-                 selected_parents={} selection_latency_us={}",
+                  selected_parents={} selection_latency_us={}",
                 self.meta.description,
                 match metrics.resolver_mode {
                     ParentSelectionMode::SingleLatestSuccess => "single_latest_success",
@@ -1326,7 +1326,7 @@ impl OperationBoundary {
                 let _ = txn.rollback().await;
                 return Err(OperationError::business(format!(
                     "the operation claim for '{}' was released by another process while it ran; \
-                     its record was not written",
+                      its record was not written",
                     self.meta.command_name
                 )));
             }
@@ -1633,21 +1633,21 @@ mod tests {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             r#"
-            CREATE TABLE operation (
-                op_id TEXT PRIMARY KEY,
-                repo_id TEXT NOT NULL,
-                view_id TEXT NOT NULL,
-                command_name TEXT NOT NULL,
-                description TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                args_digest TEXT,
-                start_ts INTEGER NOT NULL,
-                end_ts INTEGER,
-                status TEXT NOT NULL,
-                worktree_id TEXT NOT NULL DEFAULT '',
-                scope_provenance TEXT NOT NULL DEFAULT 'declared'
-            )
-            "#
+             CREATE TABLE legacy_operation (
+                 op_id TEXT PRIMARY KEY,
+                 repo_id TEXT NOT NULL,
+                 view_id TEXT NOT NULL,
+                 command_name TEXT NOT NULL,
+                 description TEXT NOT NULL,
+                 actor TEXT NOT NULL,
+                 args_digest TEXT,
+                 start_ts INTEGER NOT NULL,
+                 end_ts INTEGER,
+                 status TEXT NOT NULL,
+                 worktree_id TEXT NOT NULL DEFAULT '',
+                 scope_provenance TEXT NOT NULL DEFAULT 'declared'
+             )
+             "#
             .to_string(),
         ))
         .await
@@ -1657,19 +1657,19 @@ mod tests {
     async fn create_operation_graph_tables_missing_view(db: &sea_orm::DatabaseConnection) {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE operation_parent (op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id))".to_string(),
+            "CREATE TABLE legacy_operation_parent (op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id))".to_string(),
         ))
         .await
         .unwrap();
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE operation_view_ref (view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote))".to_string(),
+            "CREATE TABLE legacy_operation_view_ref (view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote))".to_string(),
         ))
         .await
         .unwrap();
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE operation_view_workspace (view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind))".to_string(),
+            "CREATE TABLE legacy_operation_view_workspace (view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind))".to_string(),
         ))
         .await
         .unwrap();
@@ -1678,25 +1678,25 @@ mod tests {
     async fn create_operation_graph_tables(db: &sea_orm::DatabaseConnection) {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE operation_parent (op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id))".to_string(),
+            "CREATE TABLE legacy_operation_parent (op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id))".to_string(),
         ))
         .await
         .unwrap();
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE operation_view (view_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,head_kind TEXT NOT NULL,head_target TEXT NOT NULL,created_at INTEGER NOT NULL)".to_string(),
+            "CREATE TABLE legacy_operation_view (view_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,head_kind TEXT NOT NULL,head_target TEXT NOT NULL,created_at INTEGER NOT NULL)".to_string(),
         ))
         .await
         .unwrap();
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE operation_view_ref (view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote))".to_string(),
+            "CREATE TABLE legacy_operation_view_ref (view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote))".to_string(),
         ))
         .await
         .unwrap();
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE operation_view_workspace (view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind))".to_string(),
+            "CREATE TABLE legacy_operation_view_workspace (view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind))".to_string(),
         ))
         .await
         .unwrap();
@@ -1970,7 +1970,7 @@ mod tests {
         let op_row = db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT COUNT(*) FROM operation".to_string(),
+                "SELECT COUNT(*) FROM legacy_operation".to_string(),
             ))
             .await
             .unwrap()
@@ -1981,7 +1981,7 @@ mod tests {
         let view_row = db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT COUNT(*) FROM operation_view".to_string(),
+                "SELECT COUNT(*) FROM legacy_operation_view".to_string(),
             ))
             .await
             .unwrap()
@@ -1992,7 +1992,7 @@ mod tests {
         let parent_row = db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT COUNT(*) FROM operation_parent".to_string(),
+                "SELECT COUNT(*) FROM legacy_operation_parent".to_string(),
             ))
             .await
             .unwrap()
@@ -2099,7 +2099,7 @@ mod tests {
         let op_row = db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT COUNT(*) FROM operation".to_string(),
+                "SELECT COUNT(*) FROM legacy_operation".to_string(),
             ))
             .await
             .unwrap()
@@ -2110,7 +2110,7 @@ mod tests {
         let view_row = db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT COUNT(*) FROM operation_view".to_string(),
+                "SELECT COUNT(*) FROM legacy_operation_view".to_string(),
             ))
             .await
             .unwrap()
@@ -2121,7 +2121,7 @@ mod tests {
         let parent_row = db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT COUNT(*) FROM operation_parent".to_string(),
+                "SELECT COUNT(*) FROM legacy_operation_parent".to_string(),
             ))
             .await
             .unwrap()

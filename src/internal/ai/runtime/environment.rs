@@ -3,6 +3,10 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -22,10 +26,12 @@ use crate::{
             workspace_snapshot::WorkspaceSnapshot,
         },
         db,
+        operation::{MutationClass, OperationError, OperationMetaV2, run_with_operation},
         workspace::{
             AcquireRequest, WorkspaceError, WorkspaceKind, WorkspaceLease, WorkspaceState,
             WorkspaceStore, now_ms,
         },
+        worktree_scope::RequestScope,
     },
     utils::util,
 };
@@ -178,6 +184,7 @@ impl TaskExecutionEnvironment {
 
 #[derive(Clone, Debug)]
 pub struct SyncBackRequest {
+    pub task_id: Uuid,
     pub main_working_dir: PathBuf,
     pub touch_files: Vec<String>,
     pub scope_in: Vec<String>,
@@ -301,6 +308,100 @@ impl ExecutionEnvironmentProvider {
     }
 
     pub(crate) async fn sync_back(
+        &self,
+        environment: &TaskExecutionEnvironment,
+        request: SyncBackRequest,
+    ) -> Result<SyncBackReport, WorkspaceSyncError> {
+        let scope = match RequestScope::try_resolve(request.main_working_dir.clone()) {
+            Ok(Some(scope)) => scope,
+            Ok(None) => return self.sync_back_without_operation(environment, request).await,
+            Err(error) => {
+                return Err(WorkspaceSyncError::HardConflict {
+                    path: Some(request.main_working_dir),
+                    reason: format!(
+                        "cannot resolve the main repository scope before task sync-back: {error}; repair the worktree metadata, then retry"
+                    ),
+                });
+            }
+        };
+        let causal_context_id = request.task_id.to_string();
+        let replay_error = Arc::new(tokio::sync::Mutex::new(None));
+        let operation_error_slot = Arc::clone(&replay_error);
+        let replay_completed = Arc::new(AtomicBool::new(false));
+        let operation_replay_completed = Arc::clone(&replay_completed);
+        let operation = run_with_operation(
+            &scope,
+            OperationMetaV2 {
+                command_name: Some("agent.task.sync-back".to_string()),
+                description: Some("Replay isolated task workspace into the main workspace".into()),
+                causal_context_id: Some(causal_context_id.clone()),
+                ..Default::default()
+            },
+            MutationClass::WorkspaceMutation,
+            move |_txn| async move {
+                match self.sync_back_without_operation(environment, request).await {
+                    Ok(report) => {
+                        operation_replay_completed.store(true, Ordering::Release);
+                        Ok(report)
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        *operation_error_slot.lock().await = Some(error);
+                        Err(OperationError::Mutation(message))
+                    }
+                }
+            },
+        )
+        .await;
+
+        match operation {
+            Ok(result) => Ok(result.value),
+            Err(operation_error) => {
+                if let Some(error) = replay_error.lock().await.take() {
+                    return Err(error);
+                }
+                let reason = operation_error.to_string();
+                if replay_completed.load(Ordering::Acquire) {
+                    return Err(WorkspaceSyncError::OperationPublicationAfterReplay {
+                        path: scope.worktree_root,
+                        reason,
+                    });
+                }
+                match operation_error {
+                    OperationError::LeaseBusy { .. } => {
+                        return Err(WorkspaceSyncError::ScopeLeaseBusy {
+                            path: scope.worktree_root,
+                            reason: format!(
+                                "cannot begin task sync-back operation for task \
+                                 {causal_context_id}: {reason}; wait for the active main \
+                                 operation to finish, then retry sync-back"
+                            ),
+                        });
+                    }
+                    OperationError::Stale(_) | OperationError::Cas(_) => {
+                        return Err(WorkspaceSyncError::RetryableConflict {
+                            path: scope.worktree_root,
+                            reason: format!(
+                                "cannot begin task sync-back operation for task \
+                                 {causal_context_id}: {reason}; refresh the main workspace \
+                                 state, then retry"
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                Err(WorkspaceSyncError::HardConflict {
+                    path: Some(scope.worktree_root),
+                    reason: format!(
+                        "cannot begin task sync-back operation for task {causal_context_id}: \
+                         {reason}; repair the repository operation metadata or storage, then retry"
+                    ),
+                })
+            }
+        }
+    }
+
+    async fn sync_back_without_operation(
         &self,
         environment: &TaskExecutionEnvironment,
         request: SyncBackRequest,
@@ -822,10 +923,11 @@ mod tests {
         std::fs::write(main.path().join("README.md"), "hello").unwrap();
         let provider = ExecutionEnvironmentProvider;
 
+        let task_id = Uuid::new_v4();
         let environment = provider
             .provision_task_worktree(
                 main.path().to_path_buf(),
-                Uuid::new_v4(),
+                task_id,
                 FuseProvisionState::default(),
             )
             .await
@@ -851,6 +953,7 @@ mod tests {
             .sync_back(
                 &environment,
                 SyncBackRequest {
+                    task_id,
                     main_working_dir: main.path().to_path_buf(),
                     touch_files: vec!["README.md".to_string()],
                     scope_in: Vec::new(),
@@ -872,6 +975,129 @@ mod tests {
             root.exists(),
             "the reclaimed workspace is the doctor's to remove"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sync_back_reports_a_held_operation_lease_as_retryable() {
+        let main = TempDir::new().unwrap();
+        test::setup_with_new_libra_in(main.path()).await;
+        std::fs::write(main.path().join("README.md"), "hello").unwrap();
+        let provider = ExecutionEnvironmentProvider;
+        let task_id = Uuid::new_v4();
+        let environment = provider
+            .provision_task_worktree(
+                main.path().to_path_buf(),
+                task_id,
+                FuseProvisionState::default(),
+            )
+            .await
+            .expect("provision task worktree");
+        std::fs::write(environment.root().join("README.md"), "task result").expect("task result");
+
+        let lock_path = main.path().join(".libra/info/operation-v2.lock");
+        std::fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
+        let held = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("scope lock");
+        held.try_lock().expect("hold scope lock");
+
+        let error = provider
+            .sync_back(
+                &environment,
+                SyncBackRequest {
+                    task_id,
+                    main_working_dir: main.path().to_path_buf(),
+                    touch_files: vec!["README.md".to_string()],
+                    scope_in: Vec::new(),
+                    scope_out: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("a held operation lease must defer sync-back");
+        assert!(
+            error.is_retryable_conflict(),
+            "a transient operation lease conflict must preserve the completed task: {error}"
+        );
+        assert!(
+            error.is_scope_lease_busy(),
+            "lease contention must remain distinguishable from stale/CAS conflicts: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(main.path().join("README.md")).expect("main content"),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(environment.root().join("README.md")).expect("task content"),
+            "task result"
+        );
+
+        drop(held);
+        provider
+            .cleanup(environment)
+            .await
+            .expect("cleanup worktree");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sync_back_reports_publication_failure_after_replay_without_inviting_retry() {
+        let main = TempDir::new().unwrap();
+        test::setup_with_new_libra_in(main.path()).await;
+        std::fs::write(main.path().join("README.md"), "hello").unwrap();
+        let provider = ExecutionEnvironmentProvider;
+        let task_id = Uuid::new_v4();
+        let environment = provider
+            .provision_task_worktree(
+                main.path().to_path_buf(),
+                task_id,
+                FuseProvisionState::default(),
+            )
+            .await
+            .expect("provision task worktree");
+        std::fs::write(environment.root().join("README.md"), "task result").expect("task result");
+
+        crate::internal::operation::middleware::test_hooks::fail_after_mutation_for_causal_context(
+            task_id.to_string(),
+            "forced post-replay publication failure".to_string(),
+        );
+        let error = provider
+            .sync_back(
+                &environment,
+                SyncBackRequest {
+                    task_id,
+                    main_working_dir: main.path().to_path_buf(),
+                    touch_files: vec!["README.md".to_string()],
+                    scope_in: Vec::new(),
+                    scope_out: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("operation publication fails after replay");
+        crate::internal::operation::middleware::test_hooks::clear_post_mutation_failure();
+
+        assert_eq!(
+            std::fs::read_to_string(main.path().join("README.md")).expect("main content"),
+            "task result",
+            "the error occurs after replay has already changed main"
+        );
+        assert!(
+            !error.is_retryable_conflict(),
+            "blindly rerunning after replay could apply the task twice"
+        );
+        let message = error.to_string();
+        assert!(message.contains("replay completed"), "{message}");
+        assert!(message.contains("may already contain"), "{message}");
+        assert!(message.contains("do not retry"), "{message}");
+
+        provider
+            .cleanup(environment)
+            .await
+            .expect("cleanup worktree");
     }
 
     /// The sync worker itself is fenced: once the lease deadline this run last

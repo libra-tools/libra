@@ -22,6 +22,7 @@ fn run_libra_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> std::proces
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("LIBRA_CONFIG_GLOBAL_DB", home.join(".libra/config.db"))
         .env_remove("RUST_LOG")
         .env_remove("LIBRA_LOG")
         .env_remove("GIT_EDITOR")

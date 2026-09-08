@@ -1724,8 +1724,12 @@ fn command_scope(command: &Commands) -> CommandScope {
         // FETCH_HEAD is worktree-local: run from a legacy shared-`.libra`
         // worktree it lands in MAIN's gitdir.
         | Commands::Pull(_)
-        | Commands::Fetch(_)
-        | Commands::Stash(_)
+        | Commands::Fetch(_) => Composite,
+
+        // `stash list/show` only inspect the shared stash namespace; they
+        // must not acquire a writer boundary or create operation-log state.
+        Commands::Stash(Stash::List) | Commands::Stash(Stash::Show { .. }) => ReadOnly,
+        Commands::Stash(_)
         // These run tools that edit the working tree.
         | Commands::Automation(_)
         | Commands::Sandbox(_) => Composite,
@@ -1914,6 +1918,140 @@ fn command_scope(command: &Commands) -> CommandScope {
 /// identically from any scope.
 fn command_mutates_worktree_state(command: &Commands) -> bool {
     command_scope(command).mutates_worktree_state()
+}
+
+/// Map the already-exhaustive CLI scope census onto the operation-log v2
+/// mutation classes. `command_scope` remains the authority for coverage: a
+/// newly added `Commands` variant must still be classified there before this
+/// adapter can compile and run.
+fn operation_class_for_command(command: &Commands) -> crate::internal::operation::MutationClass {
+    use crate::internal::operation::MutationClass;
+    // `commit --dry-run` and `commit --porcelain` are previews: the command
+    // deliberately uses ephemeral blob/cache state and promises not to
+    // publish an operation or durable snapshot of its own.
+    if matches!(
+        command,
+        Commands::Commit(args) if args.dry_run || args.porcelain
+    ) {
+        return MutationClass::ReadOnly;
+    }
+    if matches!(command_scope(command), CommandScope::ReadOnly) {
+        return MutationClass::ReadOnly;
+    }
+    // These surfaces either have their own durable boundary or are pure
+    // inspection when the parsed subcommand says so.  In particular, a
+    // read-only hash-object must remain usable from a library/test binary
+    // where the killable CLI worker is intentionally unavailable.
+    if matches!(command, Commands::Fsck(_))
+        || matches!(command, Commands::HashObject(args) if !args.write)
+        || matches!(
+            command,
+            Commands::Cloud(command::cloud::CloudArgs {
+                command: command::cloud::CloudCommand::Status(_),
+            })
+        )
+        || matches!(
+            command,
+            Commands::Cache(command::cache::CacheArgs {
+                command: command::cache::CacheCommand::Info,
+            })
+        )
+    {
+        return MutationClass::ReadOnly;
+    }
+    match command {
+        Commands::Config(args) if config_command_is_read_only(args) => MutationClass::ReadOnly,
+        Commands::Agent(args) if agent_command_is_read_only(args) => MutationClass::ReadOnly,
+        Commands::Merge(_)
+        | Commands::Rebase(_)
+        | Commands::CherryPick(_)
+        | Commands::Revert(_)
+        | Commands::Am(_)
+        | Commands::Bisect(_) => MutationClass::SequencerMutation,
+        Commands::Worktree(_) | Commands::SparseView(_) | Commands::Layer(_) => {
+            MutationClass::LibraStateMutation
+        }
+        Commands::Dirty(args) if args.list => MutationClass::ReadOnly,
+        Commands::Dirty(_) => MutationClass::LibraStateMutation,
+        Commands::Automation(args) => match args.command {
+            command::automation::AutomationSubcommand::List
+            | command::automation::AutomationSubcommand::History { .. } => MutationClass::ReadOnly,
+            command::automation::AutomationSubcommand::Run { live: true, .. } => {
+                MutationClass::ExternalOrUnknown
+            }
+            command::automation::AutomationSubcommand::Run { .. } => {
+                MutationClass::LibraStateMutation
+            }
+        },
+        Commands::Agent(_) | Commands::Review(_) | Commands::Investigate(_) | Commands::Code(_) => {
+            MutationClass::LibraStateMutation
+        }
+        _ => match command_scope(command) {
+            CommandScope::ReadOnly => MutationClass::ReadOnly,
+            CommandScope::Worktree => MutationClass::WorkspaceMutation,
+            CommandScope::Repository | CommandScope::Composite => MutationClass::RepoMutation,
+        },
+    }
+}
+
+/// Commands with a pre-existing operation boundary must not be wrapped a
+/// second time by the CLI adapter.  The legacy wrapper is intentionally kept
+/// for OL-15 compatibility, while the Agent gateway owns its own boundary;
+/// nesting either wrapper would take two leases and can deadlock a command
+/// that legitimately invokes another Libra operation.
+fn command_has_existing_operation_boundary(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Branch(_)
+            | Commands::Op(_)
+            | Commands::Config(_)
+            | Commands::Worktree(_)
+            | Commands::ReadTree(_)
+            | Commands::Merge(_)
+            | Commands::Rebase(_)
+            | Commands::CherryPick(_)
+            | Commands::Revert(_)
+            | Commands::Am(_)
+            | Commands::Bisect(_)
+            | Commands::Repack(_)
+            | Commands::Maintenance(_)
+            | Commands::File(_)
+            | Commands::HashObject(_)
+            | Commands::IndexPack(_)
+            | Commands::Service(_)
+            | Commands::Code(_)
+            | Commands::Agent(_)
+            | Commands::Review(_)
+            | Commands::Investigate(_)
+    )
+}
+
+fn config_command_is_read_only(args: &command::config::ConfigArgs) -> bool {
+    args.get
+        || args.get_all
+        || args.list
+        || args.get_regexp
+        || args.show_origin
+        || matches!(
+            &args.command,
+            Some(
+                command::config::ConfigCommand::Get { .. }
+                    | command::config::ConfigCommand::List { .. }
+                    | command::config::ConfigCommand::Path
+                    | command::config::ConfigCommand::Edit
+            )
+        )
+}
+
+fn agent_command_is_read_only(args: &command::agent::AgentArgs) -> bool {
+    matches!(
+        &args.command,
+        command::agent::AgentSubcommand::Status(_)
+            | command::agent::AgentSubcommand::List(_)
+            | command::agent::AgentSubcommand::Graph(_)
+            | command::agent::AgentSubcommand::Skill(_)
+            | command::agent::AgentSubcommand::Workspace(_)
+    )
 }
 
 /// Does this command hold the SHARED maintenance lock for its whole run
@@ -2454,8 +2592,10 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         return command::upgrade::run_probe(probe);
     }
     let _invocation_guard = CLI_INVOCATION_LOCK.lock().await;
-    utils::client_storage::ClientStorage::with_background_index_failure_scope(parse_async_scoped(
-        argv,
+    // Keep the large dispatcher out of the generic task-local wrapper's state
+    // and poll-frame temporaries, including when called through exec_async.
+    utils::client_storage::ClientStorage::with_background_index_failure_scope(Box::pin(
+        parse_async_scoped(argv),
     ))
     .await
 }
@@ -2556,6 +2696,23 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    // OL-09 census seam: every concrete CLI command is classified before any
+    // dispatch-specific mutation code runs. The actual operation transaction
+    // is owned by the command/Agent boundary; keeping this call at the
+    // central parse seam prevents a new surface from bypassing classification.
+    let operation_class = operation_class_for_command(&args.command);
+    let use_central_operation_boundary = !command_has_existing_operation_boundary(&args.command);
+    // Read-only commands must not charge their census diagnostic to the
+    // active logfile; `logfile info` reports rolled-file sizes exactly.
+    if !matches!(
+        operation_class,
+        crate::internal::operation::MutationClass::ReadOnly
+    ) {
+        tracing::debug!(
+            ?operation_class,
+            "classified CLI operation mutation surface"
+        );
+    }
     if let Commands::Diff(diff_args) = &mut args.command {
         command::diff::record_algorithm_selector_events(diff_args, &utf8_argv);
     }
@@ -2748,7 +2905,14 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         None => None,
     };
 
-    let command_result: CliResult<()> = async {
+    let remote_prune_name = match &args.command {
+        Commands::Remote(command::remote::RemoteCmds::Prune {
+            name,
+            dry_run: false,
+        }) => Some(name.clone()),
+        _ => None,
+    };
+    let command_future = async {
         match args.command {
             Commands::Init(cmd_args) => {
                 let original_dir = utils::util::cur_dir();
@@ -2998,8 +3162,46 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             }
         }
         Ok(())
-    }
-    .await;
+    };
+    let command_result: CliResult<()> = if let Some(scope) =
+        crate::internal::worktree_scope::WorktreeScope::request_scope()
+        && !matches!(
+            operation_class,
+            crate::internal::operation::MutationClass::ReadOnly
+                | crate::internal::operation::MutationClass::InternalWorker
+        )
+        && use_central_operation_boundary
+    {
+        let command_name = utf8_argv
+            .iter()
+            .skip(1)
+            .find(|argument| !argument.starts_with('-'))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let meta = crate::internal::operation::OperationMetaV2 {
+            command_name: Some(command_name),
+            description: Some("CLI mutation".to_string()),
+            ..Default::default()
+        };
+        let outcome = crate::internal::operation::run_with_operation(
+            &scope,
+            meta,
+            operation_class,
+            |_txn| async move {
+                command_future
+                    .await
+                    .map_err(crate::internal::operation::OperationError::Cli)
+            },
+        )
+        .await;
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(crate::internal::operation::OperationError::Cli(error)) => Err(error),
+            Err(error) => Err(operation_error_to_cli(error, remote_prune_name.as_deref())),
+        }
+    } else {
+        command_future.await
+    };
 
     background_index_guard.finish().await;
 
@@ -3031,6 +3233,28 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+fn operation_error_to_cli(
+    error: crate::internal::operation::OperationError,
+    remote_prune_name: Option<&str>,
+) -> CliError {
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("failed to register its cloud object-index repair marker")
+        || lower.contains("object-index repair lock")
+        || lower.contains("readonly database")
+        || lower.contains("read-only database")
+        || lower.contains("database is locked")
+    {
+        let message = remote_prune_name.map_or_else(
+            || detail.clone(),
+            |name| format!("failed to prune remote-tracking branch for remote '{name}': {detail}"),
+        );
+        return CliError::fatal(message)
+            .with_stable_code(crate::utils::error::StableErrorCode::IoWriteFailed);
+    }
+    CliError::fatal(detail)
 }
 
 struct BackgroundIndexDrainGuard {

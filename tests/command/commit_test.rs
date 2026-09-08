@@ -10,6 +10,7 @@ use serial_test::serial;
 use tempfile::tempdir;
 
 use super::*;
+mod env_restore_tests;
 #[tokio::test]
 #[serial(cwd)]
 /// A commit with no file changes should fail if `allow_empty` is false.
@@ -51,11 +52,8 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
     // leak into the cascade lookup and make the test pass incorrectly.
     let fake_global = temp_path.path().join("fake_global.db");
     let fake_system = temp_path.path().join("fake_system.db");
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
-    unsafe {
-        std::env::set_var("LIBRA_CONFIG_GLOBAL_DB", &fake_global);
-        std::env::set_var("LIBRA_CONFIG_SYSTEM_DB", &fake_system);
-    }
+    let _global_config = test::ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &fake_global);
+    let _system_config = test::ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &fake_system);
 
     use libra::internal::config::ConfigKv;
     ConfigKv::unset_all("user.name").await.unwrap();
@@ -104,13 +102,6 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
     let rendered = result.unwrap_err().render();
     assert!(rendered.contains("fatal: author identity unknown"));
     assert!(rendered.contains("Hint:"));
-
-    // Restore env vars so subsequent serial tests are not affected.
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
-    unsafe {
-        std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB");
-        std::env::remove_var("LIBRA_CONFIG_SYSTEM_DB");
-    }
 }
 
 #[test]
@@ -751,17 +742,17 @@ async fn test_commit_amend_preserves_author_unless_reset() {
 
     use libra::internal::config::ConfigKv;
 
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
     // Clear identity env vars so the config-driven identity below is authoritative.
-    unsafe {
-        std::env::remove_var("GIT_COMMITTER_NAME");
-        std::env::remove_var("GIT_COMMITTER_EMAIL");
-        std::env::remove_var("GIT_AUTHOR_NAME");
-        std::env::remove_var("GIT_AUTHOR_EMAIL");
-        std::env::remove_var("EMAIL");
-        std::env::remove_var("LIBRA_COMMITTER_NAME");
-        std::env::remove_var("LIBRA_COMMITTER_EMAIL");
-    }
+    let _identity_env = [
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "EMAIL",
+        "LIBRA_COMMITTER_NAME",
+        "LIBRA_COMMITTER_EMAIL",
+    ]
+    .map(test::ScopedEnvVar::unset);
 
     // Initial commit authored by the original identity.
     ConfigKv::unset_all("user.name").await.unwrap();
@@ -1123,19 +1114,18 @@ async fn test_commit_without_identity_fails_by_default() {
     // Isolate from host config so no user.name/email leaks in
     let fake_global = temp_path.path().join("fake_global.db");
     let fake_system = temp_path.path().join("fake_system.db");
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
-    unsafe {
-        std::env::set_var("LIBRA_CONFIG_GLOBAL_DB", &fake_global);
-        std::env::set_var("LIBRA_CONFIG_SYSTEM_DB", &fake_system);
-        // Clear env vars that could provide identity
-        std::env::remove_var("GIT_COMMITTER_NAME");
-        std::env::remove_var("GIT_COMMITTER_EMAIL");
-        std::env::remove_var("GIT_AUTHOR_NAME");
-        std::env::remove_var("GIT_AUTHOR_EMAIL");
-        std::env::remove_var("EMAIL");
-        std::env::remove_var("LIBRA_COMMITTER_NAME");
-        std::env::remove_var("LIBRA_COMMITTER_EMAIL");
-    }
+    let _global_config = test::ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &fake_global);
+    let _system_config = test::ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &fake_system);
+    let _identity_env = [
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "EMAIL",
+        "LIBRA_COMMITTER_NAME",
+        "LIBRA_COMMITTER_EMAIL",
+    ]
+    .map(test::ScopedEnvVar::unset);
 
     // Ensure useConfigOnly is NOT set (default)
     ConfigKv::unset_all("user.name").await.unwrap();
@@ -1182,13 +1172,6 @@ async fn test_commit_without_identity_fails_by_default() {
     let rendered = result.unwrap_err().render();
     assert!(rendered.contains("fatal: author identity unknown"));
     assert!(rendered.contains("Hint:"));
-
-    // Restore env vars so subsequent serial tests are not affected.
-    // SAFETY: this test is #[serial], so no other threads are reading env vars.
-    unsafe {
-        std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB");
-        std::env::remove_var("LIBRA_CONFIG_SYSTEM_DB");
-    }
 }
 
 /// `libra commit --help` surfaces the EXAMPLES section so users see the

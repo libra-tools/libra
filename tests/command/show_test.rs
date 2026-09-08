@@ -21,14 +21,14 @@ use super::{
     parse_json_stdout, run_libra_command,
 };
 
-/// Initialize a temporary repository using CLI.
+/// Initialize a temporary CLI repository without real-user signing keys.
 fn init_temp_repo() -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
     let temp_path = temp_dir.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_libra"))
         .current_dir(temp_path)
-        .args(["init"])
+        .args(["init", "--vault", "false"])
         .output()
         .expect("Failed to execute libra binary");
 

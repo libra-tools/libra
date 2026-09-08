@@ -1157,9 +1157,39 @@ fn validate_numeric_shared_mode(raw: &str, bits: u32) -> Result<(), InitError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn apply_shared(root_dir: &Path, shared_mode: &SharedMode) -> io::Result<()> {
+fn set_shared_path_permissions(root_dir: &Path, path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    let is_transient_file = path.parent().is_some_and(|parent| {
+        parent == root_dir.join("object-index-repair")
+            || parent == root_dir.join("object-index-repair-tmp")
+            || (parent == root_dir
+                && matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("libra.db-journal" | "libra.db-wal" | "libra.db-shm")
+                ))
+    });
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if is_transient_file && error.kind() == ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut perms = metadata.permissions();
+    perms.set_mode(mode);
+    match fs::set_permissions(path, perms) {
+        Ok(()) => Ok(()),
+        // Repair files and SQLite sidecars are retired concurrently after their
+        // durable work commits. Their disappearance means there is no remaining
+        // path whose permissions need migration.
+        Err(error) if is_transient_file && error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_shared(root_dir: &Path, shared_mode: &SharedMode) -> io::Result<()> {
     fn set_recursive(dir: &Path, mode: u32) -> io::Result<()> {
         // `WalkDir` does not follow symlinks (so it never descends through them), but
         // `fs::set_permissions` WOULD follow a symlink and chmod its target — which a
@@ -1177,10 +1207,7 @@ fn apply_shared(root_dir: &Path, shared_mode: &SharedMode) -> io::Result<()> {
             if is_vault_artifact(path) {
                 continue;
             }
-            let metadata = fs::metadata(path)?;
-            let mut perms = metadata.permissions();
-            perms.set_mode(mode);
-            fs::set_permissions(path, perms)?;
+            set_shared_path_permissions(dir, path, mode)?;
         }
         Ok(())
     }
@@ -1544,6 +1571,7 @@ fn detect_system_ssh_key() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::{Read, Write},
         path::PathBuf,
     };
@@ -1552,8 +1580,92 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    use super::set_shared_path_permissions;
     use super::{DEFAULT_BRANCH, InitArgs, InitError, run_init};
     use crate::utils::test::{self, ChangeDirGuard};
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_permissions_tolerate_retired_index_repair_files() {
+        let root = tempdir().expect("failed to create storage root");
+        for directory in ["object-index-repair", "object-index-repair-tmp"] {
+            let parent = root.path().join(directory);
+            fs::create_dir(&parent).expect("failed to create repair directory");
+            let retired = parent.join("retired.blob.json");
+
+            set_shared_path_permissions(root.path(), &retired, 0o2777)
+                .expect("a concurrently retired repair file should not fail shared init");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_permissions_tolerate_retired_repository_database_sidecars() {
+        let root = tempdir().expect("failed to create storage root");
+        for file_name in ["libra.db-journal", "libra.db-wal", "libra.db-shm"] {
+            let retired = root.path().join(file_name);
+
+            set_shared_path_permissions(root.path(), &retired, 0o2777)
+                .expect("a concurrently retired database sidecar should not fail shared init");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_permissions_reject_a_missing_ordinary_path() {
+        let root = tempdir().expect("failed to create storage root");
+        let error = set_shared_path_permissions(root.path(), &root.path().join("missing"), 0o2777)
+            .expect_err("ordinary missing paths must remain errors");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_permissions_update_a_live_index_repair_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("failed to create storage root");
+        let parent = root.path().join("object-index-repair");
+        fs::create_dir(&parent).expect("failed to create repair directory");
+        let marker = parent.join("live.blob.json");
+        fs::write(&marker, b"marker").expect("failed to write repair marker");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .expect("failed to seed marker mode");
+
+        set_shared_path_permissions(root.path(), &marker, 0o2777)
+            .expect("live repair marker should receive shared permissions");
+
+        let mode = fs::metadata(&marker)
+            .expect("failed to stat repair marker")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o2777);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_permissions_update_a_live_repository_database_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("failed to create storage root");
+        let sidecar = root.path().join("libra.db-journal");
+        fs::write(&sidecar, b"journal").expect("failed to write database sidecar");
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))
+            .expect("failed to seed sidecar mode");
+
+        set_shared_path_permissions(root.path(), &sidecar, 0o2777)
+            .expect("live database sidecar should receive shared permissions");
+
+        let mode = fs::metadata(&sidecar)
+            .expect("failed to stat database sidecar")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o2777);
+    }
 
     #[test]
     fn init_error_display_pins_owned_variants() {

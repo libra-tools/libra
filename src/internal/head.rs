@@ -2,7 +2,7 @@
 
 use std::{str::FromStr, time::Duration};
 
-use git_internal::hash::ObjectHash;
+use git_internal::hash::{HashKind, ObjectHash};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
     QueryFilter,
@@ -11,8 +11,10 @@ use tokio::time::sleep;
 
 use crate::internal::{
     branch::{Branch, BranchStoreError},
+    config::ConfigKv,
     db::get_db_conn_instance,
     model::reference,
+    worktree_scope::WorktreeScope,
 };
 
 #[derive(Debug, Clone)]
@@ -57,11 +59,19 @@ pub enum Head {
 /// local, linked-worktree, and remote HEAD boundaries and the message is
 /// the only thing that tells them apart.
 fn parse_ref_commit(raw: &str, ref_name: &str, what: &str) -> Result<ObjectHash, BranchStoreError> {
+    parse_ref_commit_for_kind(raw, ref_name, what, git_internal::hash::get_hash_kind())
+}
+
+fn parse_ref_commit_for_kind(
+    raw: &str,
+    ref_name: &str,
+    what: &str,
+    repo_kind: HashKind,
+) -> Result<ObjectHash, BranchStoreError> {
     let commit = ObjectHash::from_str(raw).map_err(|error| BranchStoreError::Corrupt {
         name: ref_name.to_string(),
         detail: format!("invalid {what}: {error}"),
     })?;
-    let repo_kind = git_internal::hash::get_hash_kind();
     if commit.kind() != repo_kind {
         return Err(BranchStoreError::Corrupt {
             name: ref_name.to_string(),
@@ -73,6 +83,54 @@ fn parse_ref_commit(raw: &str, ref_name: &str, what: &str) -> Result<ObjectHash,
         });
     }
     Ok(commit)
+}
+
+fn decode_local_head(
+    head: reference::Model,
+    repo_kind: HashKind,
+) -> Result<Head, BranchStoreError> {
+    match head.name {
+        Some(name) if name.trim().is_empty() => Err(BranchStoreError::Corrupt {
+            name: "HEAD".to_string(),
+            detail: "symbolic HEAD branch name is empty".to_string(),
+        }),
+        Some(name) => Ok(Head::Branch(name)),
+        None => {
+            let commit = head.commit.ok_or_else(|| BranchStoreError::Corrupt {
+                name: "HEAD".to_string(),
+                detail: "detached HEAD is missing commit hash".to_string(),
+            })?;
+            parse_ref_commit_for_kind(&commit, "HEAD", "detached HEAD commit hash", repo_kind)
+                .map(Head::Detached)
+        }
+    }
+}
+
+async fn repository_hash_kind_with_conn<C: ConnectionTrait>(
+    db: &C,
+) -> Result<HashKind, BranchStoreError> {
+    let entry = ConfigKv::get_with_conn(db, "core.objectformat")
+        .await
+        .map_err(|error| {
+            BranchStoreError::Query(format!(
+                "failed to read core.objectformat for HEAD: {error:#}"
+            ))
+        })?;
+    // Match CLI preflight exactly; HashKind::from_str also accepts noncanonical uppercase.
+    match entry
+        .as_ref()
+        .map(|entry| entry.value.as_str())
+        .unwrap_or("sha1")
+    {
+        "sha1" => Ok(HashKind::Sha1),
+        "sha256" => Ok(HashKind::Sha256),
+        value => Err(BranchStoreError::Corrupt {
+            name: "core.objectformat".to_string(),
+            detail: format!(
+                "unsupported repository object format '{value}'; expected 'sha1' or 'sha256'"
+            ),
+        }),
+    }
 }
 
 impl Head {
@@ -170,6 +228,13 @@ impl Head {
         // dirty, layer, sparse) uses `for_request()`; HEAD is the exception
         // because a command legitimately writes another scope's row.
         let scope = crate::internal::worktree_scope::WorktreeScope::current();
+        Self::query_local_head_rows_for_scope_with_conn(db, &scope).await
+    }
+
+    async fn query_local_head_rows_for_scope_with_conn<C: ConnectionTrait>(
+        db: &C,
+        scope: &WorktreeScope,
+    ) -> Result<Option<reference::Model>, BranchStoreError> {
         let worktree_id = scope.worktree_id().map(str::to_string);
         for attempt in 0..=Self::SQLITE_BUSY_MAX_RETRIES {
             let mut query = reference::Entity::find()
@@ -216,7 +281,10 @@ impl Head {
             }
         }
 
-        unreachable!("sqlite retry loop must return")
+        Err(BranchStoreError::Query(
+            "failed to query HEAD after SQLite busy retries; retry when the repository is idle"
+                .to_string(),
+        ))
     }
 
     async fn query_remote_head_with_conn<C>(db: &C, remote: &str) -> Option<reference::Model>
@@ -279,18 +347,25 @@ impl Head {
         C: ConnectionTrait,
     {
         let head = Self::query_local_head_result_with_conn(db).await?;
-        match head.name {
-            Some(name) => Ok(Head::Branch(name)),
-            None => {
-                let commit_hash = head.commit.ok_or_else(|| BranchStoreError::Corrupt {
-                    name: "HEAD".to_string(),
-                    detail: "detached HEAD is missing commit hash".to_string(),
-                })?;
-                let commit_hash =
-                    parse_ref_commit(commit_hash.as_str(), "HEAD", "detached HEAD commit hash")?;
-                Ok(Head::Detached(commit_hash))
-            }
-        }
+        decode_local_head(head, git_internal::hash::get_hash_kind())
+    }
+
+    /// Read one explicitly scoped HEAD from this connection, independent of cwd and hash TLS.
+    pub(crate) async fn current_for_scope_result_with_conn<C: ConnectionTrait>(
+        db: &C,
+        scope: &WorktreeScope,
+    ) -> Result<Head, BranchStoreError> {
+        let head = Self::query_local_head_rows_for_scope_with_conn(db, scope)
+            .await?
+            .ok_or_else(|| BranchStoreError::Corrupt {
+                name: "HEAD".to_string(),
+                detail: format!(
+                    "HEAD reference is missing from storage for worktree '{}'; restore this worktree's HEAD reference before retrying",
+                    scope.worktree_id().unwrap_or("main")
+                ),
+            })?;
+        let repo_kind = repository_hash_kind_with_conn(db).await?;
+        decode_local_head(head, repo_kind)
     }
 
     pub async fn current_result() -> Result<Head, BranchStoreError> {
@@ -684,6 +759,9 @@ impl Head {
         }
     }
 }
+
+#[cfg(test)]
+mod scoped_tests;
 
 #[cfg(test)]
 mod tests {

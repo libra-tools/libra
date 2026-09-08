@@ -131,8 +131,8 @@ struct PendingObjectIndexPage {
     updates: Vec<IndexUpdateMsg>,
     has_more: bool,
     // Held from the directory snapshot through the batch upsert and durable
-    // marker retirement. Publishers, queued writers, replay, and destructive
-    // deletion therefore observe one total order for marker generations.
+    // marker retirement. Publishers, replay, and destructive deletion therefore
+    // observe one total order for marker generations.
     _generation_lock: Option<ObjectIndexRepairLock>,
 }
 
@@ -451,9 +451,13 @@ fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
     // Marker creation participates in a repository-wide generation fence.
     // Destructive cleanup holds this lock from its final marker revalidation
     // through the catalog transaction, so a new durable repair job cannot be
-    // published in the deletion window.
+    // published in the deletion window. Replay holds the same fence while it
+    // owns and retires a page of markers. Do not also take the coarse OID-shard
+    // lock here: a queued consumer may hold that shard for an unrelated object
+    // with the same four-hex prefix, and repeated publication of the same
+    // content-addressed marker is idempotent. Queued and replay consumers still
+    // use the shard lock to arbitrate marker retirement.
     let _generation_lock = acquire_index_repair_generation_lock(&msg.db_path)?;
-    let _lock = acquire_index_repair_lock(&msg.db_path, &msg.hash)?;
     let marker = PendingObjectIndexUpdate {
         schema_version: INDEX_REPAIR_MARKER_SCHEMA_VERSION,
         o_id: msg.hash.clone(),
@@ -641,77 +645,65 @@ async fn run_index_update_consumer(mut rx: Receiver<IndexUpdateMsg>) {
 }
 
 async fn apply_queued_index_update(msg: &IndexUpdateMsg) -> Result<(), String> {
+    let marker_path = msg.marker_path.as_deref().ok_or_else(|| {
+        format!(
+            "queued object-index update for {} has no durable repair marker",
+            msg.hash
+        )
+    })?;
+
+    // The marker was published under the generation lock before this message
+    // entered the queue. Keeping that repository-wide lock across SQLite retries
+    // would let the consumer starve the next foreground marker publisher. The
+    // OID-shard lock is sufficient here: same-OID deletion sees the marker and
+    // fails closed, while retirement happens only after the row update commits.
     let db_path = msg.db_path.clone();
-    let generation_lock =
-        tokio::task::spawn_blocking(move || acquire_index_repair_generation_lock(&db_path))
-            .await
-            .map_err(|error| {
-                format!(
-                    "object-index repair generation task failed for {}: {error}",
-                    msg.hash
-                )
-            })?
-            .map_err(|error| {
-                format!(
-                    "failed to acquire object-index repair generation for {}: {error}",
-                    msg.hash
-                )
-            })?;
-    let _ownership = if let Some(marker_path) = msg.marker_path.as_deref() {
-        let db_path = msg.db_path.clone();
-        let oid = msg.hash.clone();
-        let lock = tokio::task::spawn_blocking(move || acquire_index_repair_lock(&db_path, &oid))
-            .await
-            .map_err(|error| {
-                format!(
-                    "object-index repair ownership task failed for {}: {error}",
-                    msg.hash
-                )
-            })?
-            .map_err(|error| {
-                format!(
-                    "failed to acquire object-index repair ownership for {}: {error}",
-                    msg.hash
-                )
-            })?;
-
-        match fs::symlink_metadata(marker_path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => {
-                return Err(format!(
-                    "object-index repair marker is not a regular file: {}",
-                    marker_path.display()
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // A replay owner already reconciled and retired this exact
-                // marker while the queued writer was delayed. Skipping under
-                // the same OID-shard lock is what prevents post-clean resurrection.
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "failed to inspect object-index repair marker '{}': {error}",
-                    marker_path.display()
-                ));
-            }
-        }
-        Some(lock)
-    } else {
-        None
-    };
-
-    update_object_index(&msg.db_path, &msg.hash, &msg.obj_type, msg.size).await?;
-    if let Some(marker_path) = msg.marker_path.as_deref() {
-        retire_index_repair_marker(marker_path).map_err(|error| {
+    let oid = msg.hash.clone();
+    let _ownership = tokio::task::spawn_blocking(move || acquire_index_repair_lock(&db_path, &oid))
+        .await
+        .map_err(|error| {
             format!(
-                "object index updated for {}, but its repair marker '{}' could not be retired: {error}",
-                msg.hash,
-                marker_path.display()
+                "object-index repair ownership task failed for {}: {error}",
+                msg.hash
+            )
+        })?
+        .map_err(|error| {
+            format!(
+                "failed to acquire object-index repair ownership for {}: {error}",
+                msg.hash
             )
         })?;
+
+    match fs::symlink_metadata(marker_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "object-index repair marker is not a regular file: {}",
+                marker_path.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A replay owner already reconciled and retired this exact marker
+            // while the queued writer was delayed. Skipping under the same
+            // OID-shard lock prevents post-clean resurrection.
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect object-index repair marker '{}': {error}",
+                marker_path.display()
+            ));
+        }
     }
-    drop(generation_lock);
+
+    update_object_index(&msg.db_path, &msg.hash, &msg.obj_type, msg.size).await?;
+    retire_index_repair_marker(marker_path).map_err(|error| {
+        format!(
+            "object index updated for {}, but its repair marker '{}' could not be retired: {error}",
+            msg.hash,
+            marker_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -3258,6 +3250,30 @@ mod tests {
     }
 
     #[test]
+    fn marker_publication_does_not_wait_for_unrelated_object_in_same_shard() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let held_oid = format!("abcd{}", "1".repeat(36));
+        let published_oid = format!("abcd{}", "2".repeat(36));
+        let _held = acquire_index_repair_lock(&db_path, &held_oid)
+            .expect("acquire unrelated object-index repair shard");
+
+        let marker_path = super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: published_oid,
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path,
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("a coarse shard collision must not block durable marker publication");
+
+        assert!(marker_path.is_file());
+    }
+
+    #[test]
     fn object_index_repair_lock_namespace_is_bounded_and_stable() {
         let storage = tempdir().expect("create storage directory");
         let db_path = storage.path().join("libra.db");
@@ -4281,6 +4297,63 @@ mod tests {
             .expect_err("destructive deletion must fail closed while a marker exists");
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert!(error.to_string().contains("durable repair marker"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_reconciliation_ignores_an_unrelated_deletion_fence() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "queued-fence-repo", false)
+            .await
+            .expect("set repo id");
+
+        let queued_oid = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let mut msg = super::IndexUpdateMsg {
+            hash: queued_oid.clone(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        };
+        let marker_path = super::persist_index_repair_marker(&msg)
+            .expect("persist marker before queued reconciliation");
+        msg.marker_path = Some(marker_path.clone());
+
+        let unrelated_oid = "fedcba9876543210fedcba9876543210fedcba98".to_string();
+        let fence = super::acquire_object_index_deletion_fence(&db_path, &[unrelated_oid])
+            .await
+            .expect("acquire unrelated deletion fence")
+            .expect("non-empty OID set must return a fence");
+
+        super::apply_queued_index_update(&msg)
+            .await
+            .expect("a durable queued marker must reconcile through an unrelated deletion fence");
+        assert!(
+            !marker_path.exists(),
+            "successful queued reconciliation must retire its marker"
+        );
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("queued-fence-repo"))
+                .filter(object_index::Column::OId.eq(queued_oid))
+                .count(&db_conn)
+                .await
+                .expect("count reconciled object-index row"),
+            1
+        );
+
+        drop(fence);
     }
 
     #[tokio::test]

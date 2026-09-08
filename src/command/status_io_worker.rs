@@ -393,6 +393,79 @@ pub(crate) fn deadline_marker_probe(dir: &Path) -> Result<Result<bool, io::Error
 
 #[cfg(test)]
 mod tests {
+    fn helper_entry_identity(
+        root: &std::path::Path,
+        path: &std::path::Path,
+    ) -> std::io::Result<crate::utils::beneath::EntryIdentity> {
+        let mut wire = Vec::new();
+        super::handle_request(
+            super::IoRequest::EntryIdentity {
+                path: super::path_to_bytes(path),
+                root: super::path_to_bytes(root),
+            },
+            &mut wire,
+        )?;
+        crate::internal::worktree_io::protocol::parse_event_frames(&wire)
+            .expect("identity frames")
+            .into_iter()
+            .find_map(|event| match event {
+                super::IoEvent::DoneEntryIdentity { result } => Some(super::unwrap_wire(result)),
+                _ => None,
+            })
+            .expect("identity terminal event")
+    }
+
+    #[test]
+    fn entry_identity_helper_preserves_missing_path_errors() {
+        // Given an existing sealed root with no matching child.
+        let root = tempfile::tempdir().expect("root");
+        // When the helper attempts the no-follow identity lookup.
+        let error = helper_entry_identity(root.path(), std::path::Path::new("missing"))
+            .expect_err("missing entry must fail");
+        // Then absence remains distinguishable from an unknown identity.
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn entry_identity_helper_rejects_path_traversal_before_output() {
+        // Given an identity request supplied directly to the helper.
+        let root = tempfile::tempdir().expect("root");
+        let mut wire = Vec::new();
+        let request = super::IoRequest::EntryIdentity {
+            path: super::path_to_bytes(std::path::Path::new("../escape")),
+            root: super::path_to_bytes(root.path()),
+        };
+        // When post-deserialization validation runs.
+        let error = super::handle_request(request, &mut wire).expect_err("traversal rejected");
+        // Then the malformed request never produces an identity response.
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(wire.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_identity_helper_never_follows_leaf_or_ancestor_symlinks() {
+        use crate::utils::beneath::EntryKind;
+
+        // Given links to an external entry and to its containing directory.
+        let root = tempfile::tempdir().expect("root");
+        let external = tempfile::tempdir().expect("external root");
+        std::fs::write(external.path().join("file"), "outside").expect("external file");
+        std::os::unix::fs::symlink(external.path().join("file"), root.path().join("leaf"))
+            .expect("leaf link");
+        std::os::unix::fs::symlink(external.path(), root.path().join("parent"))
+            .expect("parent link");
+
+        // When asking for the link itself and for a path beneath the parent link.
+        let leaf = helper_entry_identity(root.path(), std::path::Path::new("leaf"))
+            .expect("link identity");
+        let descendant = helper_entry_identity(root.path(), std::path::Path::new("parent/file"));
+
+        // Then only the link identity is observable, never an outside descendant.
+        assert_eq!(leaf.kind, EntryKind::Symlink);
+        assert!(descendant.is_err(), "ancestor symlink must not be followed");
+    }
+
     #[test]
     fn json_frame_rejects_payload_above_cap_without_writing() {
         let event = super::IoEvent::Error {

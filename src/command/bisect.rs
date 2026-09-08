@@ -887,15 +887,25 @@ async fn run_bisect_start(
         first_parent,
     };
 
-    // If both bad and good are provided, validate bounds before saving state
-    // This prevents leaving orphaned state if bounds are invalid
-    if bad_hash.is_some() && good_hash.is_some() {
-        // Validate that there are commits to test between bad and good
-        if let Err(e) = find_next_bisect_point(&state).await {
-            // Don't save state for invalid bounds - return error immediately
-            return Err(CliError::fatal(e));
+    // Validate the initial checkout before claiming the session, so a known
+    // restore refusal cannot leave an orphaned bisect row behind.
+    let initial_next = if let (Some(bad), Some(_)) = (bad_hash, good_hash) {
+        let next = find_next_bisect_point(&state)
+            .await
+            .map_err(CliError::fatal)?;
+        match &next {
+            BisectNext::Next(candidate) => {
+                restore::preflight_worktree_restore_to_commit(candidate).await?;
+            }
+            BisectNext::Converged => {
+                restore::preflight_worktree_restore_to_commit(&bad).await?;
+            }
+            BisectNext::AllSkipped => {}
         }
-    }
+        Some(next)
+    } else {
+        None
+    };
 
     // The first write of a STARTING session is a claim, not an upsert
     // (§C.4.4) — see `BisectState::claim_start`.
@@ -928,12 +938,9 @@ async fn run_bisect_start(
         });
     }
 
-    // If both bad and good are provided, find the first bisect point (already validated above)
-    if bad_hash.is_some() && good_hash.is_some() {
-        match find_next_bisect_point(&state)
-            .await
-            .map_err(CliError::fatal)?
-        {
+    // Reuse the candidate whose restore was validated before claiming state.
+    if let Some(next) = initial_next {
+        match next {
             BisectNext::Next(next) => {
                 let remaining = checkout_to_bisect_point(next, &mut state).await?;
                 return Ok(BisectOutput::Start {
@@ -1363,6 +1370,7 @@ fn map_bisect_branch_store_error(branch_name: &str, error: BranchStoreError) -> 
 /// - Transaction begin/commit failures and HEAD-mismatch detection both
 ///   return fatal `CliError`s with diagnostic messages.
 async fn restore_to_branch(branch_name: String, commit_hash: ObjectHash) -> CliResult<()> {
+    restore::preflight_worktree_restore_to_commit(&commit_hash).await?;
     let db = crate::internal::sequencer::request_db_checked()
         .await
         .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
@@ -1624,10 +1632,12 @@ async fn resolve_ref(ref_str: &str) -> CliResult<ObjectHash> {
 /// the worktree.
 ///
 /// Boundary conditions:
+/// - Known directory-transition refusals are checked before publishing HEAD.
 /// - The HEAD update happens inside a SQLite transaction. The worktree
-///   restore runs after commit, so a partial failure between them leaves the
+///   restore runs after commit, so a later write failure can still leave the
 ///   worktree out of sync until `bisect reset`.
 async fn checkout_to_commit(commit_hash: ObjectHash) -> CliResult<()> {
+    restore::preflight_worktree_restore_to_commit(&commit_hash).await?;
     let db = crate::internal::sequencer::request_db_checked()
         .await
         .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;

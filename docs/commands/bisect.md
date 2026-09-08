@@ -25,6 +25,8 @@ Bisect state is persisted in a `bisect_state` table in the SQLite database, maki
 
 When bisect identifies the culprit, it prints the commit details and marks the session as completed. The user must then run `bisect reset` to end the session and restore HEAD to its original position.
 
+Libra does not manage submodule contents. If checking out a bisect candidate or reset target would remove or replace a tracked gitlink (mode `160000`) whose directory is nonempty, the command refuses with `LBR-CONFLICT-002` before changing HEAD, the index, or the working tree. Move the nested files safely aside before retrying; an empty Libra-owned directory placeholder can be removed successfully. Initial `bisect start` still requires a clean tree, including nested untracked or ignored files, so it may stop at the cleanliness check before this preflight without creating a session. In an existing session, a `good`, `bad`, `skip`, or `reset` operation refused by this preflight check also leaves the saved bisect state unchanged.
+
 ## Options
 
 ### Subcommand: `start`
@@ -371,6 +373,7 @@ Note: jj does not have a bisect command. Users who need binary search debugging 
 | `LBR-CLI-003` | Commit not found (invalid rev argument) |
 | `LBR-CLI-003` | Bad commit is an ancestor of good commit (invalid range) |
 | `LBR-CONFLICT-001` | Uncommitted changes would be overwritten by checkout |
+| `LBR-CONFLICT-002` | A nonempty tracked gitlink directory would be removed or replaced (exit 128). Move nested files safely aside before retrying; an empty Libra-owned directory placeholder can be removed. |
 | `LBR-IO-001` | Failed to read bisect state from database |
 | `LBR-IO-002` | Failed to save bisect state to database |
 | `LBR-IO-002` | Failed to create bisect_state table |

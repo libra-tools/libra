@@ -359,6 +359,8 @@ mod fsck_test;
 mod graph_test;
 mod grep_test;
 mod hash_object_test;
+#[path = "../helpers/historical_schema.rs"]
+mod historical_schema;
 mod hooks_help_test;
 mod hydrate_test;
 mod index_pack_keep_test;
