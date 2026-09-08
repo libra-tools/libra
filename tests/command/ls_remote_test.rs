@@ -10,7 +10,7 @@ use git_internal::{
 };
 use libra::{
     command::save_object_to_storage,
-    internal::{db::get_db_conn_instance_for_path, head::Head, model::reference},
+    internal::{branch::Branch, db::get_db_conn_instance_for_path, model::reference},
     utils::{
         client_storage::ClientStorage,
         util::{DATABASE, ROOT_DIR},
@@ -267,10 +267,11 @@ fn create_nested_annotated_tag(repo: &Path) -> (String, String, String) {
             .expect("inner tag ref should exist");
         let inner_tag_hash = inner_ref.commit.expect("inner tag should have a target");
         let inner_tag_id = ObjectHash::from_str(&inner_tag_hash).expect("inner tag hash is valid");
-        let commit_hash = Head::current_commit_result_with_conn(&db)
+        let commit_hash = Branch::find_branch_result_with_conn(&db, "main", None)
             .await
-            .expect("failed to resolve HEAD commit")
-            .expect("expected committed HEAD")
+            .expect("failed to resolve main branch")
+            .expect("expected committed main branch")
+            .commit
             .to_string();
         let outer_tag = GitTag::new(
             inner_tag_id,
