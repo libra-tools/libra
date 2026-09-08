@@ -201,27 +201,35 @@ pub async fn record_pending_ai_operation_link(
     .map_err(GenealogyError::Database)
 }
 
-/// Attach all pending AI tool links for a repository to the revision just
-/// created by a mutating command. The operation ID remains the per-tool-call
-/// key, so multiple calls from one model turn cannot overwrite one another.
+/// Attach the explicit pending operation set for the mutation batch to the
+/// revision just created by a mutating command. Each operation remains a
+/// per-tool-call key; callers never authorize a repo-wide or run-wide scan.
 pub async fn attach_pending_ai_operation_links(
     db: &DatabaseConnection,
     repo_id: &str,
     change_id: ChangeId,
-    operation_id: Option<&str>,
+    operation_ids: &[&str],
 ) -> Result<(), GenealogyError> {
-    let Some(operation_id) = operation_id else {
+    if operation_ids.is_empty() {
         return Ok(());
-    };
+    }
+    let placeholders = std::iter::repeat_n("?", operation_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "UPDATE ai_operation_link SET change_id = ? \
+         WHERE repo_id = ? AND operation_id IN ({placeholders}) AND change_id IS NULL"
+    );
+    let mut values = vec![change_id.to_string().into(), repo_id.to_string().into()];
+    values.extend(
+        operation_ids
+            .iter()
+            .map(|operation_id| (*operation_id).to_string().into()),
+    );
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE ai_operation_link SET change_id = ? \
-         WHERE repo_id = ? AND operation_id = ? AND change_id IS NULL",
-        [
-            change_id.to_string().into(),
-            repo_id.to_string().into(),
-            operation_id.to_string().into(),
-        ],
+        query,
+        values,
     ))
     .await
     .map(|_| ())

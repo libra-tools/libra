@@ -1439,6 +1439,12 @@ impl LibraMcpServer {
             .stdin(Stdio::null());
         if let Some(ai_operation) = ai_operation {
             child.env("LIBRA_AI_OPERATION_ID", &ai_operation.operation_id);
+            if !ai_operation.pending_operation_ids.is_empty() {
+                child.env(
+                    "LIBRA_AI_PENDING_OPERATION_IDS",
+                    ai_operation.pending_operation_ids.join(","),
+                );
+            }
             if let Some(run_id) = ai_operation.run_id.as_deref() {
                 child.env("LIBRA_AI_RUN_ID", run_id);
             }

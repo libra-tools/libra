@@ -171,7 +171,7 @@ async fn ai_links_query_by_intent_returns_stable_change_id() {
     )
     .await
     .expect("second pending AI link");
-    attach_pending_ai_operation_links(&database, "repo", revision.change_id, Some("tool-op-1"))
+    attach_pending_ai_operation_links(&database, "repo", revision.change_id, &["tool-op-1"])
         .await
         .expect("attach pending AI link");
     let by_intent = ai_links_for_intent(&database, "repo", "intent-redacted")
@@ -192,4 +192,18 @@ async fn ai_links_query_by_intent_returns_stable_change_id() {
             .iter()
             .all(|link| link.operation_id != "tool-op-2")
     );
+
+    let next_revision = ChangeRevisionBuilder::for_new_change(database.clone(), "repo", "op-next")
+        .set_commit_oid("next-commit")
+        .build()
+        .await
+        .expect("next revision");
+    attach_pending_ai_operation_links(&database, "repo", next_revision.change_id, &["tool-op-2"])
+        .await
+        .expect("attach next batch");
+    let next_links = ai_links_for_change(&database, "repo", next_revision.change_id)
+        .await
+        .expect("next change query");
+    assert_eq!(next_links.len(), 1);
+    assert_eq!(next_links[0].operation_id, "tool-op-2");
 }

@@ -947,6 +947,12 @@ pub async fn run_shell_command_with_approval(
             "LIBRA_AI_OPERATION_ID".to_string(),
             ai_operation.operation_id,
         );
+        if !ai_operation.pending_operation_ids.is_empty() {
+            spec.env.insert(
+                "LIBRA_AI_PENDING_OPERATION_IDS".to_string(),
+                ai_operation.pending_operation_ids.join(","),
+            );
+        }
         if let Some(run_id) = ai_operation.run_id {
             spec.env.insert("LIBRA_AI_RUN_ID".to_string(), run_id);
         }

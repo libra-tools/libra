@@ -432,6 +432,7 @@ where
         .collect::<HashSet<_>>();
     let mut executed_tool_signatures: VecDeque<String> = VecDeque::new();
     let mut executed_tool_signature_counts: HashMap<String, usize> = HashMap::new();
+    let mut pending_ai_operation_ids = Vec::new();
 
     let effective_registry = registry_with_source_tools(registry, &config).map_err(|error| {
         CompletionError::ResponseError(format!("failed to load source tools: {error}"))
@@ -711,7 +712,9 @@ where
                 if let Some(runtime_context) = config.runtime_context.clone() {
                     invocation = invocation.with_runtime_context(runtime_context);
                 }
-                if let Some(ai_operation) = ai_operation_context(&config, &call.id) {
+                if let Some(ai_operation) =
+                    ai_operation_context(&config, &call.id, &pending_ai_operation_ids)
+                {
                     invocation = invocation.with_ai_operation(ai_operation);
                 }
                 let ai_operation = invocation.ai_operation.clone();
@@ -810,6 +813,12 @@ where
                         tool = %tool_name,
                         "failed to remove pending AI operation link after tool failure"
                     );
+                }
+                if mutates_state
+                    && tool_result.as_ref().is_ok_and(ToolOutput::is_success)
+                    && let Some(ai_operation) = ai_operation.as_ref()
+                {
+                    pending_ai_operation_ids.push(ai_operation.operation_id.clone());
                 }
                 if mutates_state && let Some(cancellation) = config.cancellation.as_ref() {
                     cancellation.mark_mutation_finished();
@@ -1097,7 +1106,11 @@ fn terminal_tool_final_text(tool_name: &str, tool_result: &Result<ToolOutput, St
     }
 }
 
-fn ai_operation_context(config: &ToolLoopConfig, call_id: &str) -> Option<AiOperationContext> {
+fn ai_operation_context(
+    config: &ToolLoopConfig,
+    call_id: &str,
+    pending_operation_ids: &[String],
+) -> Option<AiOperationContext> {
     let usage = config.usage_context.as_ref();
     let intent_id = config
         .intent_id
@@ -1125,6 +1138,7 @@ fn ai_operation_context(config: &ToolLoopConfig, call_id: &str) -> Option<AiOper
         tool_invocation_id: call_id.to_string(),
         intent_id,
         repo_id: usage.and_then(|context| context.repo_id.clone()),
+        pending_operation_ids: pending_operation_ids.to_vec(),
     })
 }
 

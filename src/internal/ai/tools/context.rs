@@ -35,6 +35,10 @@ pub struct AiOperationContext {
     pub tool_invocation_id: String,
     pub intent_id: Option<String>,
     pub repo_id: Option<String>,
+    /// Earlier successful mutating operations in this tool-loop mutation batch.
+    /// A later commit/rewrite may consume this explicit set, never a repo-wide
+    /// or run-wide scan.
+    pub pending_operation_ids: Vec<String>,
 }
 
 /// A tool invocation containing all context needed for execution.
