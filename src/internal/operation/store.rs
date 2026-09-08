@@ -368,6 +368,10 @@ impl OperationStoreV2 {
         &self.db
     }
 
+    pub fn storage(&self) -> ClientStorage {
+        self.storage.clone()
+    }
+
     pub fn write_view_manifest(&self, view: &RepoViewV2) -> Result<ObjectHash, StoreError> {
         view.validate_recursive_closure(|oid| self.storage.get(oid).ok())?;
         let bytes = view.to_canonical_bytes()?;

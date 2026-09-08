@@ -1,5 +1,6 @@
 //! Version 2 operation-log primitives.
 
+pub mod doctor;
 pub mod facet;
 pub mod facets;
 pub mod middleware;
@@ -12,6 +13,7 @@ pub mod working_copy;
 
 // OL-15 removes this compatibility service. Re-exporting it keeps existing
 // command integrations source-compatible while all new code uses v2 types.
+pub use doctor::{DoctorEngine, DoctorError, DoctorIssue, DoctorReport};
 pub use facet::{
     FacetCapture, FacetCaptureCtx, FacetDiff, FacetError, FacetName, FacetRegistry,
     FacetRestoreCtx, RestorePolicy, StateFacet,

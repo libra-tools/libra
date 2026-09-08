@@ -159,6 +159,17 @@ facets, changed-path count, target view, and the new operation ID when a
 transition is published. A dry run computes the same plan without publishing.
 Dirty worktrees are refused unless `--force` is supplied.
 
+## `libra op doctor`
+
+Inspect operation object closures, heads, unfinished journals, and the
+workspace pointer. Diagnosis is read-only by default; `--fix` enables journal
+recovery and pointer reconstruction. `--dry-run` reports the repairs without
+performing them.
+
+```bash
+libra op doctor [--fix] [--dry-run]
+```
+
 ## Examples
 
 ```bash

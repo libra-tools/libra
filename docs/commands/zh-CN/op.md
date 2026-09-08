@@ -147,6 +147,15 @@ libra op revert <OP_REF> --parent <PARENT_OP_REF> \
 实际发布时的新 operation ID。dry-run 只计算计划，不发布 operation。
 工作区 dirty 时默认拒绝，必须显式使用 `--force`。
 
+## `libra op doctor`
+
+检查 operation 对象闭包、heads、未完成 journal 和 workspace pointer。默认只读；
+`--fix` 才会执行 journal 恢复和 pointer 重建，`--dry-run` 只报告计划中的修复。
+
+```bash
+libra op doctor [--fix] [--dry-run]
+```
+
 ## 示例
 
 ```bash

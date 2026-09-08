@@ -15,9 +15,9 @@ use crate::{
         db::get_db_conn_instance,
         head::Head,
         operation::{
-            OperationGraphRecord, OperationLogListItem, OperationPage, OperationQueryPage,
-            OperationService, OperationStatus, OperationStoreV2, RestoreEngine, RestoreError,
-            RestoreReceipt, RestoreWhat, UndoEngine, UndoError,
+            DoctorEngine, DoctorReport, OperationGraphRecord, OperationLogListItem, OperationPage,
+            OperationQueryPage, OperationService, OperationStatus, OperationStoreV2, RestoreEngine,
+            RestoreError, RestoreReceipt, RestoreWhat, UndoEngine, UndoError,
         },
         operation_wrapper::{OperationMeta, OperationScope, with_operation_log},
         worktree_scope::RequestScope,
@@ -130,6 +130,13 @@ pub enum OpCommand {
         confirm_repo_wide: bool,
     },
 
+    /// Diagnose operation state; repair is opt-in with --fix.
+    Doctor {
+        #[clap(long)]
+        fix: bool,
+        #[clap(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +190,8 @@ pub enum OpOutput {
     Redo { receipt: RestoreReceipt },
     #[serde(rename = "revert")]
     Revert { receipt: RestoreReceipt },
+    #[serde(rename = "doctor")]
+    Doctor { report: DoctorReport },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -247,6 +256,7 @@ pub async fn execute_safe(args: OpArgs, output: &OutputConfig) -> CliResult<()> 
             dry_run,
             confirm_repo_wide,
         } => handle_op_revert(op_ref, parent, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Doctor { fix, dry_run } => handle_op_doctor(fix, dry_run, output).await,
     }
 }
 
@@ -330,6 +340,50 @@ async fn handle_op_revert(
         .await
         .map_err(undo_cli_error)?;
     emit_transition_output("revert", receipt, output)
+}
+
+async fn handle_op_doctor(fix: bool, dry_run: bool, output: &OutputConfig) -> CliResult<()> {
+    let repo_id = current_repo_id().await?;
+    let restore = v2_engine_for_repo(&repo_id).await?;
+    let report = DoctorEngine::new(
+        RequestScope::try_resolve(util::cur_dir())
+            .map_err(|error| {
+                CliError::fatal(format!("failed to resolve repository scope: {error}"))
+            })?
+            .ok_or_else(|| {
+                CliError::fatal("v2 operation state is unavailable in this repository")
+            })?,
+        repo_id,
+        restore.store().clone(),
+    )
+    .inspect(dry_run, fix)
+    .await
+    .map_err(|error| CliError::fatal(error.to_string()))?;
+    let payload = OpOutput::Doctor { report };
+    if output.is_json() {
+        emit_json_data("op", &payload, output)
+    } else if output.quiet {
+        Ok(())
+    } else {
+        println!(
+            "Operation doctor: {} issue(s)",
+            payload_report(&payload).issues.len()
+        );
+        for issue in &payload_report(&payload).issues {
+            println!("{}: {}", issue.code, issue.message);
+        }
+        for fixed in &payload_report(&payload).fixed {
+            println!("fixed: {fixed}");
+        }
+        Ok(())
+    }
+}
+
+fn payload_report(payload: &OpOutput) -> &DoctorReport {
+    let OpOutput::Doctor { report } = payload else {
+        unreachable!()
+    };
+    report
 }
 
 fn emit_transition_output(
