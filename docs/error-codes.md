@@ -95,7 +95,7 @@ structured report is always present.
 | `128` | `LBR-CONFIG-001` | `config` | Global config DB schema is newer than this Libra binary supports | `pull`, `push`, `fetch`, `clone`, or `cloud` would otherwise silently ignore global storage config |
 | `128` | `LBR-UPGRADE-001` | `config` | Reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt (unsupported `upgrade.*` config spellings are usage errors, `LBR-CLI-002`) | `libra config get --global upgrade.mode` on a hand-edited, non-JSON settings file |
 | `128` | `LBR-CONFLICT-001` | `conflict` | Unresolved conflict is present | merge/rebase conflict still unresolved |
-| `128` | `LBR-CONFLICT-002` | `conflict` | Operation blocked to avoid overwriting state | non-fast-forward, destination exists, dirty worktree |
+| `128` | `LBR-CONFLICT-002` | `conflict` | Operation blocked to avoid overwriting state | non-fast-forward, destination exists, dirty worktree, or an unsafe v2 restore target/lease/CAS state |
 | `128` | `LBR-POLICY-001` | `conflict` | Branch policy (protect/archive metadata) blocked the ref update | `branch reset` / `update-ref` on a protected or archived branch |
 | `128` | `LBR-CASE-001` | `conflict` | Paths that differ only by case collide on a case-insensitive filesystem | `add`/`checkout`/`switch`/`mv` under `core.casehandling=error` |
 | `128` | `LBR-LAYER-001` | `conflict` | A layer overlay path collided with tracked content, or a layer path was staged | `layer apply` collision / `add` of a layer overlay path (lore.md 2.4) |

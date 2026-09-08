@@ -16,11 +16,14 @@ use crate::{
         head::Head,
         operation::{
             OperationGraphRecord, OperationLogListItem, OperationPage, OperationQueryPage,
-            OperationService, OperationStatus,
+            OperationService, OperationStatus, OperationStoreV2, RestoreEngine, RestoreError,
+            RestoreReceipt, RestoreWhat,
         },
         operation_wrapper::{OperationMeta, OperationScope, with_operation_log},
+        worktree_scope::RequestScope,
     },
     utils::{
+        client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         util,
@@ -82,6 +85,14 @@ pub enum OpCommand {
         /// Only show what would be done
         #[clap(long)]
         dry_run: bool,
+
+        /// Facet selection for an operation-log v2 restore.
+        #[clap(long, value_enum, default_value_t = RestoreWhat::All)]
+        what: RestoreWhat,
+
+        /// Explicitly acknowledge a repository-wide/multi-worktree target.
+        #[clap(long)]
+        confirm_repo_wide: bool,
     },
 }
 
@@ -128,6 +139,8 @@ pub enum OpOutput {
         /// Human-readable restore confirmation.
         message: String,
     },
+    #[serde(rename = "restore_v2")]
+    RestoreV2 { receipt: RestoreReceipt },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,7 +183,9 @@ pub async fn execute_safe(args: OpArgs, output: &OutputConfig) -> CliResult<()> 
             op_ref,
             force,
             dry_run,
-        } => handle_op_restore(op_ref, force, dry_run, output).await,
+            what,
+            confirm_repo_wide,
+        } => handle_op_restore(op_ref, force, dry_run, what, confirm_repo_wide, output).await,
     }
 }
 
@@ -388,10 +403,27 @@ async fn handle_op_restore(
     op_ref: String,
     force: bool,
     dry_run: bool,
+    what: RestoreWhat,
+    confirm_repo_wide: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
     let db = get_db_conn_instance().await;
     let repo_id = current_repo_id().await?;
+    if handle_v2_restore(
+        &db,
+        &repo_id,
+        &op_ref,
+        force,
+        what,
+        dry_run,
+        confirm_repo_wide,
+        output,
+    )
+    .await?
+    .is_some()
+    {
+        return Ok(());
+    }
     let target_op_id = resolve_op_ref(&db, &repo_id, &op_ref).await?;
     let target_graph = load_operation_graph(&db, &target_op_id).await?;
     let target_op = target_graph.operation.clone();
@@ -668,7 +700,124 @@ async fn handle_op_restore(
     Ok(())
 }
 
+/// Prefer the v2 restore engine when the reference names a v2 operation. The
+/// existing v1 graph remains available during the migration window; it is
+/// intentionally not converted into a fabricated v2 view.
+async fn handle_v2_restore(
+    db: &sea_orm::DatabaseConnection,
+    repo_id: &str,
+    op_ref: &str,
+    force: bool,
+    what: RestoreWhat,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<Option<()>> {
+    let Some(operation_scope) = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+    else {
+        return Ok(None);
+    };
+    let object_storage = ClientStorage::init_local(operation_scope.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(repo_id, db.clone(), object_storage.clone());
+    let Some(resolved_op_ref) = resolve_v2_op_ref(&store, op_ref).await? else {
+        return Ok(None);
+    };
+    let Some(operation) = store
+        .load_operation(&resolved_op_ref)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to load v2 operation: {error}")))?
+    else {
+        return Ok(None);
+    };
+    if !force && !status::is_clean().await {
+        return Err(CliError::fatal("working tree has uncommitted changes")
+            .with_stable_code(StableErrorCode::ConflictUnresolved)
+            .with_hint("use --force to restore anyway, or commit/stash changes first"));
+    }
+    let engine = RestoreEngine::new(operation_scope, repo_id, db.clone(), object_storage);
+    let receipt = engine
+        .restore(
+            resolved_op_ref,
+            operation.post_view_oid,
+            what,
+            dry_run,
+            confirm_repo_wide,
+        )
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("v2 restore failed: {error}"))
+                .with_stable_code(restore_error_code(&error))
+        })?;
+    let op_output = OpOutput::RestoreV2 { receipt };
+    if output.is_json() {
+        emit_json_data("op", &op_output, output)?;
+    } else if !output.quiet {
+        let OpOutput::RestoreV2 { receipt } = &op_output else {
+            unreachable!();
+        };
+        println!(
+            "{} {} {} path(s)",
+            if receipt.dry_run {
+                "Would restore"
+            } else {
+                "Restored"
+            },
+            receipt.target_op_id,
+            receipt.changed_paths
+        );
+        if let Some(new_op_id) = &receipt.new_op_id {
+            println!("New operation recorded: {new_op_id}");
+        }
+    }
+    Ok(Some(()))
+}
+
+fn restore_error_code(error: &RestoreError) -> StableErrorCode {
+    match error {
+        RestoreError::WorkspaceMissing(_)
+        | RestoreError::WrongWorkspace(_)
+        | RestoreError::IncompleteSnapshot
+        | RestoreError::HeadConfirmationRequired => StableErrorCode::CliInvalidTarget,
+        RestoreError::Cas(_) => StableErrorCode::ConflictUnresolved,
+        RestoreError::Object { .. } | RestoreError::IncompleteView => StableErrorCode::RepoCorrupt,
+        RestoreError::Io(_) => StableErrorCode::IoWriteFailed,
+        RestoreError::Facet(_) | RestoreError::Storage(_) => {
+            StableErrorCode::ConflictOperationBlocked
+        }
+    }
+}
+
 /// Read the current repository id from config and validate that it is non-empty.
+async fn resolve_v2_op_ref(store: &OperationStoreV2, op_ref: &str) -> CliResult<Option<String>> {
+    let Some(index) = op_ref
+        .strip_prefix("@{")
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return Ok(Some(op_ref.to_string()));
+    };
+    let index = index.parse::<usize>().map_err(|_| {
+        CliError::fatal(format!("invalid v2 operation index: {op_ref}"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+    })?;
+    let operations = store
+        .list_operations()
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to list v2 operations: {error}")))?;
+    if operations.is_empty() {
+        return Ok(None);
+    }
+    operations
+        .iter()
+        .rev()
+        .nth(index)
+        .map(|operation| Some(operation.op_id.clone()))
+        .ok_or_else(|| {
+            CliError::fatal(format!("v2 operation index out of range: {op_ref}"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })
+}
+
 async fn current_repo_id() -> CliResult<String> {
     ConfigKv::get("libra.repoid")
         .await

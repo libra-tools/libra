@@ -3,6 +3,7 @@
 pub mod facet;
 pub mod facets;
 pub mod middleware;
+pub mod restore;
 pub mod snapshot;
 pub mod store;
 pub mod view;
@@ -18,6 +19,9 @@ pub use facets::{RawIndexFacet, SequencerFacet, SparseFacet, registry_for_scope}
 pub use middleware::{
     ClassificationError, MutationClass, OperationError, OperationFuture, OperationResult,
     OperationTxn, classify_command, run_with_operation,
+};
+pub use restore::{
+    RestoreEngine, RestoreError, RestoreReceipt, RestoreWhat, recover_restore_transactions,
 };
 pub use snapshot::{ScanError, ScanResult, SnapshotError, SnapshotOutcome, WorkspaceSnapshotter};
 pub use store::{

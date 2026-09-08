@@ -629,3 +629,8 @@ path = "tests/operation_command_coverage.rs"
 [[test]]
 name = "agent_shell_operation"
 path = "tests/agent_shell_operation.rs"
+
+# plan-20260822 OL-10: restore receipt and fail-closed selection contract.
+[[test]]
+name = "operation_restore_faults"
+path = "tests/operation_restore_faults.rs"

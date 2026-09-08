@@ -93,7 +93,8 @@ libra op show @{0} --view
 将仓库状态恢复到先前捕获的 operation view。HEAD 和捕获的 branch refs 会重置为目标 view，本地分支中不存在于该 view 的会被 prune，因此 restore 会复现该 operation 的精确本地分支集合。恢复后的 HEAD branch 始终保留；remote-tracking refs 和 Libra-owned internal refs（locked `main`/`intent`/`traces` branches 以及保留 `libra/` namespace，例如 AI history branch `libra/intent`）永不 prune。
 
 ```bash
-libra op restore [--force] [--dry-run] <OP_REF>
+libra op restore [--what <all|working-copy|index|sequencer|sparse|head>] \
+  [--confirm-repo-wide] [--force] [--dry-run] <OP_REF>
 ```
 
 ### 选项
@@ -113,6 +114,20 @@ libra op restore @{0} --force
 ```bash
 libra op restore @{0} --dry-run
 ```
+
+### `--what <FACET>`
+
+选择要恢复的状态 facet。默认值为 `all`，也可以选择 `working-copy`、
+`index`、`sequencer`、`sparse` 或 `head`。v2 restore 会输出 receipt，其中包含
+目标 view、选择的 facet、路径数量，以及真实恢复产生的新 operation ID。
+
+### `--confirm-repo-wide`
+
+显式确认目标 view 含有多个 workspace。引擎仍只会对当前请求固定的 worktree
+应用恢复，并拒绝不包含当前 worktree 的目标。
+
+机器调用方可以使用命令的标准 `--json` 输出模式取得 receipt。dry-run 不写入
+operation，也不会修改工作区。
 
 ## 示例
 

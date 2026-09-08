@@ -101,7 +101,8 @@ branches and the reserved `libra/` namespace, e.g. the AI history branch
 `libra/intent`) are never pruned.
 
 ```bash
-libra op restore [--force] [--dry-run] <OP_REF>
+libra op restore [--what <all|working-copy|index|sequencer|sparse|head>] \
+  [--confirm-repo-wide] [--force] [--dry-run] <OP_REF>
 ```
 
 ### Options
@@ -121,6 +122,22 @@ Show the target HEAD and refs without writing a new restore operation.
 ```bash
 libra op restore @{0} --dry-run
 ```
+
+### `--what <FACET>`
+
+Select the state facet to restore. The default is `all`; use
+`working-copy`, `index`, `sequencer`, `sparse`, or `head` for a selective
+restore. v2 restores emit a receipt containing the target view, selected
+facets, changed-path count, and (for a real restore) the new operation ID.
+
+### `--confirm-repo-wide`
+
+Explicitly acknowledge a target view containing more than one workspace. The
+engine still applies the selected facet only to the pinned worktree and
+refuses a target that does not contain that worktree.
+
+Machine consumers can request the receipt with the command's normal `--json`
+output mode. A dry-run never writes an operation or changes the worktree.
 
 ## Examples
 

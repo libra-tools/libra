@@ -181,7 +181,7 @@ fn repository_scope_is_ready(scope: &PinnedRequestScope) -> bool {
     scope.gitdir.is_dir()
 }
 
-struct ScopeLease {
+pub(crate) struct ScopeLease {
     #[cfg(unix)]
     file: File,
     #[cfg(not(unix))]
@@ -189,11 +189,34 @@ struct ScopeLease {
 }
 
 impl ScopeLease {
-    async fn acquire(scope: &PinnedRequestScope, repo_id: &str) -> Result<Self, OperationError> {
+    pub(crate) async fn acquire(
+        scope: &PinnedRequestScope,
+        repo_id: &str,
+    ) -> Result<Self, OperationError> {
         let key = format!("{repo_id}:{}", scope.scope.storage_key());
         #[cfg(unix)]
         {
             let path = scope.gitdir.join("info").join("operation-v2.lock");
+            tokio::task::spawn_blocking(move || Self::acquire_blocking(path, key))
+                .await
+                .map_err(|error| OperationError::Storage(error.to_string()))?
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self { _key: key })
+        }
+    }
+
+    /// Repository-wide lease used by transitions that rewrite shared refs.
+    /// Worktree leases intentionally live below this one in the lock order.
+    pub(crate) async fn acquire_repository(
+        scope: &PinnedRequestScope,
+        repo_id: &str,
+    ) -> Result<Self, OperationError> {
+        let key = format!("{repo_id}:repository");
+        #[cfg(unix)]
+        {
+            let path = scope.storage.join("operation-v2-repository.lock");
             tokio::task::spawn_blocking(move || Self::acquire_blocking(path, key))
                 .await
                 .map_err(|error| OperationError::Storage(error.to_string()))?
@@ -266,6 +289,7 @@ where
         .await
         .map_err(|error| OperationError::Storage(error.to_string()))?;
     let repo_id = identity.as_str().to_string();
+    let _repo_lease = ScopeLease::acquire_repository(scope, &repo_id).await?;
     let _lease = ScopeLease::acquire(scope, &repo_id).await?;
     let storage = ClientStorage::init_local(scope.storage.join("objects"));
     let store = OperationStoreV2::new_for_repo(&repo_id, db.clone(), storage.clone());

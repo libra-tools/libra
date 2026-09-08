@@ -386,6 +386,29 @@ impl OperationStoreV2 {
         RepoViewV2::from_canonical_bytes(&bytes).map_err(StoreError::View)
     }
 
+    /// Load a canonical workspace snapshot referenced by a repository view.
+    pub fn load_snapshot(
+        &self,
+        oid: &ObjectHash,
+    ) -> Result<super::view::WorkspaceSnapshotV2, StoreError> {
+        let bytes = self
+            .storage
+            .get(oid)
+            .map_err(|error| StoreError::Object(error.to_string()))?;
+        super::view::WorkspaceSnapshotV2::from_canonical_bytes(&bytes).map_err(StoreError::View)
+    }
+
+    /// Load an immutable object payload for a restore or doctor operation.
+    pub fn load_object(&self, oid: &ObjectHash) -> Result<Vec<u8>, StoreError> {
+        self.storage
+            .get(oid)
+            .map_err(|error| StoreError::Object(error.to_string()))
+    }
+
+    pub fn is_object_type(&self, oid: &ObjectHash, object_type: ObjectType) -> bool {
+        self.storage.is_object_type(oid, object_type)
+    }
+
     /// Store one immutable content-addressed object for a view facet.
     ///
     /// View publication uses this narrow seam for the refs facet; callers
@@ -471,6 +494,91 @@ impl OperationStoreV2 {
         }
         txn.commit().await?;
         Ok(())
+    }
+
+    /// Load one operation and its ordered parent edges for target validation.
+    pub async fn load_operation(&self, op_id: &str) -> Result<Option<OperationV2>, StoreError> {
+        let row = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT kind, status, command_name, description, args_digest, actor, \
+                 pre_view_oid, post_view_oid, restores_op_id, reverts_op_id, \
+                 predecessor_map_oid, causal_context_id \
+                 FROM operation WHERE repo_id = ? AND op_id = ?",
+                [self.repo_id.clone().into(), op_id.to_string().into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let parent_rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT parent_op_id FROM operation_parent WHERE op_id = ? ORDER BY ordinal",
+                [op_id.to_string().into()],
+            ))
+            .await?;
+        let mut parent_op_ids = Vec::with_capacity(parent_rows.len());
+        for parent in parent_rows {
+            parent_op_ids.push(parent.try_get::<String>("", "parent_op_id")?);
+        }
+
+        let parse_oid = |field: &'static str| -> Result<ObjectHash, StoreError> {
+            let value = row.try_get::<String>("", field)?;
+            value
+                .parse()
+                .map_err(|_| StoreError::InvalidObjectHash(value))
+        };
+        let parse_optional_oid = |field: &'static str| -> Result<Option<ObjectHash>, StoreError> {
+            let value = row.try_get::<Option<String>>("", field)?;
+            value
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|_| StoreError::InvalidObjectHash(value))
+                })
+                .transpose()
+        };
+
+        Ok(Some(OperationV2 {
+            op_id: op_id.to_string(),
+            parent_op_ids,
+            pre_view_oid: parse_oid("pre_view_oid")?,
+            post_view_oid: parse_oid("post_view_oid")?,
+            kind: row.try_get::<String>("", "kind")?.parse()?,
+            status: row.try_get::<String>("", "status")?.parse()?,
+            metadata: OperationMetaV2 {
+                command_name: row.try_get("", "command_name")?,
+                description: row.try_get("", "description")?,
+                args_digest: row.try_get("", "args_digest")?,
+                actor: row.try_get("", "actor")?,
+                causal_context_id: row.try_get("", "causal_context_id")?,
+            },
+            restores_op_id: row.try_get("", "restores_op_id")?,
+            reverts_op_id: row.try_get("", "reverts_op_id")?,
+            predecessor_map_oid: parse_optional_oid("predecessor_map_oid")?,
+        }))
+    }
+
+    pub async fn list_operations(&self) -> Result<Vec<OperationV2>, StoreError> {
+        let rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT op_id FROM operation WHERE repo_id = ? ORDER BY start_ts, op_id",
+                [self.repo_id.clone().into()],
+            ))
+            .await?;
+        let mut operations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let op_id = row.try_get::<String>("", "op_id")?;
+            if let Some(operation) = self.load_operation(&op_id).await? {
+                operations.push(operation);
+            }
+        }
+        Ok(operations)
     }
 
     /// Move a persisted operation to its terminal status after publication
@@ -775,6 +883,19 @@ impl OperationStoreV2 {
                   updated_at, recovery_payload FROM operation_journal WHERE op_id = ? \
                   ORDER BY updated_at ASC, journal_id ASC",
                 [op_id.into()],
+            ))
+            .await?;
+        rows.into_iter().map(journal_from_row).collect()
+    }
+
+    pub async fn read_all_journal(&self) -> Result<Vec<JournalEntry>, StoreError> {
+        let rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT journal_id, op_id, phase, pre_view_oid, target_view_oid, owner, \
+                 updated_at, recovery_payload FROM operation_journal ORDER BY updated_at, journal_id",
+                [],
             ))
             .await?;
         rows.into_iter().map(journal_from_row).collect()
