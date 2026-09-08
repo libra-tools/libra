@@ -746,6 +746,24 @@ where
                 } else if tool_loop_cancelled(&config) {
                     return Err(tool_loop_cancelled_error());
                 }
+                // Persist the causality intent only after the call has passed
+                // the cancellation gate, but before dispatching the mutating
+                // handler. Commit/rewrite handlers may then bind this exact
+                // operation to the Change they create.
+                if mutates_state
+                    && let Some(ai_operation) = ai_operation.as_ref()
+                    && let Err(error) =
+                        crate::internal::ai::libra_vcs::record_pending_ai_operation_link_for_tool(
+                            ai_operation,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        %error,
+                        tool = %tool_name,
+                        "failed to persist pending AI operation link"
+                    );
+                }
                 let mut tool_result: Result<ToolOutput, String> = if tool_name == "task" {
                     dispatch_task_tool_call(
                         config.subagent_runtime.as_ref(),
@@ -778,21 +796,6 @@ where
                         }
                     }
                 };
-                if mutates_state
-                    && tool_result.as_ref().is_ok_and(|output| output.is_success())
-                    && let Some(ai_operation) = ai_operation.as_ref()
-                    && let Err(error) =
-                        crate::internal::ai::libra_vcs::record_pending_ai_operation_link_for_tool(
-                            ai_operation,
-                        )
-                        .await
-                {
-                    tracing::warn!(
-                        %error,
-                        tool = %tool_name,
-                        "failed to persist pending AI operation link"
-                    );
-                }
                 if mutates_state && let Some(cancellation) = config.cancellation.as_ref() {
                     cancellation.mark_mutation_finished();
                 }

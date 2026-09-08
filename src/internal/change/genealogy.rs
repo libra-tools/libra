@@ -208,12 +208,42 @@ pub async fn attach_pending_ai_operation_links(
     db: &DatabaseConnection,
     repo_id: &str,
     change_id: ChangeId,
+    operation_id: Option<&str>,
+    run_id: Option<&str>,
+    intent_id: Option<&str>,
 ) -> Result<(), GenealogyError> {
+    let (query, values) = if let (Some(operation_id), Some(run_id), Some(intent_id)) =
+        (operation_id, run_id, intent_id)
+    {
+        (
+            "UPDATE ai_operation_link SET change_id = ? \
+             WHERE repo_id = ? AND change_id IS NULL \
+             AND (operation_id = ? OR (run_id = ? AND intent_id = ?))",
+            vec![
+                change_id.to_string().into(),
+                repo_id.to_string().into(),
+                operation_id.to_string().into(),
+                run_id.to_string().into(),
+                intent_id.to_string().into(),
+            ],
+        )
+    } else if let Some(operation_id) = operation_id {
+        (
+            "UPDATE ai_operation_link SET change_id = ? \
+             WHERE repo_id = ? AND operation_id = ? AND change_id IS NULL",
+            vec![
+                change_id.to_string().into(),
+                repo_id.to_string().into(),
+                operation_id.to_string().into(),
+            ],
+        )
+    } else {
+        return Ok(());
+    };
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE ai_operation_link SET change_id = ? \
-         WHERE repo_id = ? AND change_id IS NULL",
-        [change_id.to_string().into(), repo_id.to_string().into()],
+        query,
+        values,
     ))
     .await
     .map(|_| ())

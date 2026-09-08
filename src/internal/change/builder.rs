@@ -90,7 +90,18 @@ pub async fn record_current_repo_commit_revision_with_predecessors(
         },
     )
     .await?;
-    attach_pending_ai_operation_links(&database, &repo_id, revision.change_id).await?;
+    let pending_operation_id = std::env::var("LIBRA_AI_OPERATION_ID").ok();
+    let pending_run_id = std::env::var("LIBRA_AI_RUN_ID").ok();
+    let pending_intent_id = std::env::var("LIBRA_AI_INTENT_ID").ok();
+    attach_pending_ai_operation_links(
+        &database,
+        &repo_id,
+        revision.change_id,
+        pending_operation_id.as_deref(),
+        pending_run_id.as_deref(),
+        pending_intent_id.as_deref(),
+    )
+    .await?;
     Ok(revision)
 }
 

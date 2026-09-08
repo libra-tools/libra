@@ -159,9 +159,16 @@ async fn ai_links_query_by_intent_returns_stable_change_id() {
     )
     .await
     .expect("pending AI link");
-    attach_pending_ai_operation_links(&database, "repo", revision.change_id)
-        .await
-        .expect("attach pending AI link");
+    attach_pending_ai_operation_links(
+        &database,
+        "repo",
+        revision.change_id,
+        Some("tool-op-1"),
+        Some("run-1"),
+        Some("intent-redacted"),
+    )
+    .await
+    .expect("attach pending AI link");
     let by_intent = ai_links_for_intent(&database, "repo", "intent-redacted")
         .await
         .expect("intent query after attach");
