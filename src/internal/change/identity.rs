@@ -74,7 +74,7 @@ impl FromStr for ChangeId {
             return Err(ChangeIdError::InvalidHex);
         }
         let mut bytes = [0; CHANGE_ID_BYTES];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let high = (pair[0] as char).to_digit(16);
             let low = (pair[1] as char).to_digit(16);
             let (Some(high), Some(low)) = (high, low) else {

@@ -1,15 +1,18 @@
 //! OL-10 receipt and fail-closed contract tests.
 
-use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
-use libra::internal::{
-    db,
-    operation::{
-        OperationKind, OperationMetaV2, OperationStatusV2, OperationStoreV2, OperationV2,
-        RepoViewV2, RestoreReceipt, RestoreWhat, recover_restore_transactions,
-    },
-};
-use libra::utils::client_storage::ClientStorage;
 use std::fs;
+
+use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
+use libra::{
+    internal::{
+        db,
+        operation::{
+            OperationKind, OperationMetaV2, OperationStatusV2, OperationStoreV2, OperationV2,
+            RepoViewV2, RestoreReceipt, RestoreWhat, recover_restore_transactions,
+        },
+    },
+    utils::client_storage::ClientStorage,
+};
 use tempfile::tempdir;
 
 fn oid(label: &[u8]) -> ObjectHash {

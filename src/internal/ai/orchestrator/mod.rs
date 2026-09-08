@@ -25,12 +25,11 @@ pub(crate) mod workspace;
 
 use std::sync::Arc;
 
-use uuid::Uuid;
-
 use types::{
     OrchestratorConfig, OrchestratorError, OrchestratorResult, PhaseConfirmationDecision,
     PhaseConfirmationPrompt,
 };
+use uuid::Uuid;
 
 use crate::internal::ai::{
     completion::{CompletionModel, CompletionUsage, ThrottledCompletionModel},

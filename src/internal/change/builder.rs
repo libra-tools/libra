@@ -160,9 +160,10 @@ pub struct ChangeRevisionBuilder {
 mod tests {
     use std::str::FromStr;
 
+    use tempfile::tempdir;
+
     use super::*;
     use crate::internal::{change::ChangeStore, db};
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn new_change_duplicate_and_rewrite_identity_contract() {
@@ -241,6 +242,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 impl ChangeRevisionBuilder {
     pub fn for_new_change(
         db: DatabaseConnection,

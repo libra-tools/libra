@@ -966,6 +966,7 @@ async fn handle_op_restore(
 /// Prefer the v2 restore engine when the reference names a v2 operation. The
 /// existing v1 graph remains available during the migration window; it is
 /// intentionally not converted into a fabricated v2 view.
+#[allow(clippy::too_many_arguments)]
 async fn handle_v2_restore(
     db: &sea_orm::DatabaseConnection,
     repo_id: &str,

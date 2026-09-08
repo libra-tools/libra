@@ -6,8 +6,10 @@
 
 use serde_json::json;
 
-use crate::internal::ai::runtime::hardening::{BlastRadius, SafetyDecision};
-use crate::internal::ai::tools::AiOperationContext;
+use crate::internal::ai::{
+    runtime::hardening::{BlastRadius, SafetyDecision},
+    tools::AiOperationContext,
+};
 
 pub const ALLOWED_COMMANDS: &[&str] = &[
     "status", "diff", "branch", "log", "show", "show-ref", "ls-files", "add", "commit", "switch",

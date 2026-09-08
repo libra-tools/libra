@@ -5,8 +5,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::middleware::ScopeLease;
-use super::{OperationStoreV2, PinnedRequestScope, PointerError, WorkspaceStatePointer};
+use super::{
+    OperationStoreV2, PinnedRequestScope, PointerError, WorkspaceStatePointer,
+    middleware::ScopeLease,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DoctorIssue {
@@ -157,11 +159,12 @@ impl DoctorEngine {
 
         let mut latest_journals = BTreeMap::new();
         for journal in journals.iter().cloned() {
-            let replace = latest_journals
-                .get(&journal.op_id)
-                .map_or(true, |current: &super::JournalEntry| {
-                    current.updated_at <= journal.updated_at
-                });
+            let replace =
+                latest_journals
+                    .get(&journal.op_id)
+                    .is_none_or(|current: &super::JournalEntry| {
+                        current.updated_at <= journal.updated_at
+                    });
             if replace {
                 latest_journals.insert(journal.op_id.clone(), journal);
             }
@@ -256,7 +259,7 @@ impl DoctorEngine {
                     .map_err(|error| DoctorError::Storage(error.to_string()))?;
                 if let Some(snapshot_oid) = view
                     .workspaces
-                    .get(&self.scope.scope.worktree_id().unwrap_or("main").to_string())
+                    .get(self.scope.scope.worktree_id().unwrap_or("main"))
                 {
                     let generation = self
                         .store

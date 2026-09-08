@@ -33,9 +33,8 @@ use super::{
     Completeness, FacetCapture, FacetName, FacetRestoreCtx, HeadState, JournalEntry, JournalPhase,
     OperationKind, OperationMetaV2, OperationStatusV2, OperationStoreV2, OperationV2,
     PinnedRequestScope, RepoViewV2, RestorePolicy, WorkspaceSnapshotV2, WorkspaceSnapshotter,
-    WorkspaceStatePointer,
+    WorkspaceStatePointer, middleware::ScopeLease, view::REPO_VIEW_SCHEMA_VERSION,
 };
-use super::{middleware::ScopeLease, view::REPO_VIEW_SCHEMA_VERSION};
 use crate::{
     internal::{
         head::Head,
@@ -122,6 +121,7 @@ struct DryRunSnapshot {
     _scratch: tempfile::TempDir,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl RestoreEngine {
     pub fn new(
         scope: PinnedRequestScope,
@@ -1454,9 +1454,7 @@ fn restore_working_copy(
             }
             Ok::<(), io::Error>(())
         })();
-        if let Err(error) = install_result {
-            return Err(error);
-        }
+        install_result?;
         Ok::<(), io::Error>(())
     })();
 
@@ -1646,12 +1644,11 @@ mod tests {
     use git_internal::internal::object::tree::TreeItem;
     use tempfile::tempdir;
 
+    use super::*;
     use crate::{
         internal::{db, operation::CapturePolicy},
         utils::client_storage::ClientStorage,
     };
-
-    use super::*;
 
     #[test]
     fn selected_all_restores_every_mutable_surface() {

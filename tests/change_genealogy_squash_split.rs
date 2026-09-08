@@ -1,11 +1,13 @@
 //! CH-04 multi-edge genealogy contract.
 
-use libra::internal::change::{
-    AiOperationLink, ChangeRevisionBuilder, PredecessorEdge, RelationKind, ai_links_for_change,
-    ai_links_for_intent, attach_pending_ai_operation_links, evolution_for_commit,
-    insert_predecessor, link_ai_operation, record_pending_ai_operation_link,
+use libra::internal::{
+    change::{
+        AiOperationLink, ChangeRevisionBuilder, PredecessorEdge, RelationKind, ai_links_for_change,
+        ai_links_for_intent, attach_pending_ai_operation_links, evolution_for_commit,
+        insert_predecessor, link_ai_operation, record_pending_ai_operation_link,
+    },
+    db,
 };
-use libra::internal::db;
 use tempfile::tempdir;
 
 #[tokio::test]

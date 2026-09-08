@@ -150,6 +150,7 @@ pub async fn link_ai_operation(
 /// The nullable `change_id` is intentional: tool calls happen before a commit
 /// exists, and the revision builder backfills these rows after the new stable
 /// Change ID is known.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_pending_ai_operation_link(
     db: &DatabaseConnection,
     operation_id: &str,

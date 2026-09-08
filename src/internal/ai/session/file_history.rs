@@ -609,6 +609,7 @@ fn prune_manifest(manifest: &mut FileHistoryManifest) {
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
+
     use tempfile::tempdir;
 
     use super::{FileHistoryError, FileHistoryStore};

@@ -1,10 +1,12 @@
 //! CH-03 rewrite predecessor contract.
 
-use libra::internal::change::{
-    ChangeRevisionBuilder, ChangeStore, PredecessorEdge, RelationKind, evolution_for_commit,
-    insert_predecessor,
+use libra::internal::{
+    change::{
+        ChangeRevisionBuilder, ChangeStore, PredecessorEdge, RelationKind, evolution_for_commit,
+        insert_predecessor,
+    },
+    db,
 };
-use libra::internal::db;
 use tempfile::tempdir;
 
 #[tokio::test]
