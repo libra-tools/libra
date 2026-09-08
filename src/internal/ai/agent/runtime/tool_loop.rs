@@ -51,8 +51,8 @@ use crate::internal::ai::{
     session::jsonl::{SessionEvent, SessionJsonlStore},
     sources::{SourcePool, SourcePoolError, SourceToolNaming},
     tools::{
-        FunctionParameters, ToolDefinition, ToolInvocation, ToolOutput, ToolPayload, ToolRegistry,
-        ToolRuntimeContext, ToolSpec,
+        AiOperationContext, FunctionParameters, ToolDefinition, ToolInvocation, ToolOutput,
+        ToolPayload, ToolRegistry, ToolRuntimeContext, ToolSpec,
     },
     usage::{UsageContext, UsageRecorder},
 };
@@ -232,6 +232,8 @@ pub struct ToolLoopConfig {
     pub usage_recorder: Option<UsageRecorder>,
     /// Provider/model/thread metadata attached to usage rows.
     pub usage_context: Option<UsageContext>,
+    /// Stable intent identity used for AI-to-change causality links.
+    pub intent_id: Option<String>,
     /// Shared model-turn sequence for cancellation accounting. The Code UI records a
     /// cancellation fallback against the active request's durable event key.
     pub active_model_turn: Option<Arc<AtomicUsize>>,
@@ -288,6 +290,7 @@ impl Default for ToolLoopConfig {
             context_frame_attachment_threshold_bytes: None,
             usage_recorder: None,
             usage_context: None,
+            intent_id: None,
             active_model_turn: None,
             source_pool: None,
             source_session_id: None,
@@ -705,6 +708,9 @@ where
                 if let Some(runtime_context) = config.runtime_context.clone() {
                     invocation = invocation.with_runtime_context(runtime_context);
                 }
+                if let Some(ai_operation) = ai_operation_context(&config, &call.id) {
+                    invocation = invocation.with_ai_operation(ai_operation);
+                }
 
                 let tool_name = call.function.name.clone();
                 let mutates_state = if tool_name == "task" {
@@ -1052,6 +1058,34 @@ fn terminal_tool_final_text(tool_name: &str, tool_result: &Result<ToolOutput, St
             .unwrap_or_else(|| format!("Tool '{tool_name}' completed.")),
         Err(message) => message.clone(),
     }
+}
+
+fn ai_operation_context(config: &ToolLoopConfig, call_id: &str) -> Option<AiOperationContext> {
+    let usage = config.usage_context.as_ref();
+    let intent_id = config
+        .intent_id
+        .clone()
+        .or_else(|| usage.and_then(|context| context.intent.clone()));
+    if intent_id.is_none() && usage.is_none() {
+        return None;
+    }
+
+    let operation_id = usage
+        .and_then(|context| context.event_id.clone())
+        .unwrap_or_else(|| format!("tool-call:{call_id}"));
+    Some(AiOperationContext {
+        operation_id,
+        session_id: usage.and_then(|context| context.session_id.clone()),
+        run_id: usage.and_then(|context| {
+            context
+                .run_id
+                .clone()
+                .or_else(|| context.agent_run_id.clone())
+        }),
+        tool_invocation_id: call_id.to_string(),
+        intent_id,
+        repo_id: usage.and_then(|context| context.repo_id.clone()),
+    })
 }
 
 async fn dispatch_task_tool_call<O: ToolLoopObserver>(
@@ -2177,6 +2211,7 @@ mod tests {
                 context_frame_attachment_threshold_bytes: None,
                 usage_recorder: None,
                 usage_context: None,
+                intent_id: None,
                 active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,
@@ -2940,6 +2975,7 @@ mod tests {
                 context_frame_attachment_threshold_bytes: None,
                 usage_recorder: None,
                 usage_context: None,
+                intent_id: None,
                 active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,
@@ -3078,6 +3114,7 @@ mod tests {
                 context_frame_attachment_threshold_bytes: None,
                 usage_recorder: None,
                 usage_context: None,
+                intent_id: None,
                 active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,

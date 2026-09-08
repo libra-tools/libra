@@ -95,6 +95,23 @@ pub async fn link_ai_operation(
     link: &AiOperationLink,
 ) -> Result<(), GenealogyError> {
     validate_ai_link(link)?;
+    let change_exists = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT 1 FROM change_identity WHERE repo_id = ? AND change_id = ? LIMIT 1",
+            [
+                link.repo_id.clone().into(),
+                link.change_id.to_string().into(),
+            ],
+        ))
+        .await?
+        .is_some();
+    if !change_exists {
+        return Err(GenealogyError::InvalidAiLink(format!(
+            "change {} is not registered in repository {}",
+            link.change_id, link.repo_id
+        )));
+    }
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO ai_operation_link \
@@ -178,11 +195,37 @@ fn validate_ai_link(link: &AiOperationLink) -> Result<(), GenealogyError> {
         ("repository id", link.repo_id.as_str()),
         ("redaction version", link.redaction_version.as_str()),
     ] {
-        if value.trim().is_empty() {
-            return Err(GenealogyError::InvalidAiLink(format!(
-                "{name} must not be empty"
-            )));
+        validate_redacted_value(name, value, true)?;
+    }
+    for (name, value) in [
+        ("session id", link.session_id.as_deref()),
+        ("run id", link.run_id.as_deref()),
+        ("tool invocation id", link.tool_invocation_id.as_deref()),
+        ("intent id", link.intent_id.as_deref()),
+        ("worktree id", link.worktree_id.as_deref()),
+        ("workspace id", link.workspace_id.as_deref()),
+        (
+            "config provenance digest",
+            link.config_provenance_digest.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_redacted_value(name, value, false)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_redacted_value(name: &str, value: &str, required: bool) -> Result<(), GenealogyError> {
+    if required && value.trim().is_empty() {
+        return Err(GenealogyError::InvalidAiLink(format!(
+            "{name} must not be empty"
+        )));
+    }
+    if value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(GenealogyError::InvalidAiLink(format!(
+            "{name} must be a bounded, control-free redacted identifier"
+        )));
     }
     Ok(())
 }

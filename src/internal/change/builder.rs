@@ -92,6 +92,47 @@ pub async fn record_current_repo_commit_revision_with_predecessors(
     Ok(revision)
 }
 
+/// Record the visible revisions created by a split operation. Each output has
+/// its own operation/commit identity and points back to every supplied source
+/// commit with the typed `split` relation.
+pub async fn record_split_revisions<I>(
+    revisions: I,
+) -> Result<Vec<ChangeRevision>, ChangeRevisionBuildError>
+where
+    I: IntoIterator<Item = (String, String, Vec<String>)>,
+{
+    let mut recorded = Vec::new();
+    for (operation_id, commit_oid, predecessors) in revisions {
+        let predecessors = predecessors
+            .into_iter()
+            .map(|oid| (oid, RelationKind::Split))
+            .collect();
+        recorded.push(
+            record_current_repo_commit_revision_with_predecessors(
+                operation_id,
+                commit_oid,
+                predecessors,
+            )
+            .await?,
+        );
+    }
+    Ok(recorded)
+}
+
+/// Record a visible duplicate revision with a typed `duplicate` edge.
+pub async fn record_duplicate_revision(
+    operation_id: impl Into<String>,
+    commit_oid: impl Into<String>,
+    predecessor_oid: impl Into<String>,
+) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+    record_current_repo_commit_revision_with_predecessors(
+        operation_id,
+        commit_oid,
+        vec![(predecessor_oid.into(), RelationKind::Duplicate)],
+    )
+    .await
+}
+
 pub struct ChangeRevisionBuilder {
     db: DatabaseConnection,
     repo_id: String,

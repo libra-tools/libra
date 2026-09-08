@@ -223,6 +223,16 @@ impl FileHistoryStore {
                 source,
             })?;
         }
+        let legacy_manifest = self.legacy_manifest_path();
+        if legacy_manifest.exists() {
+            fs::remove_file(&legacy_manifest).map_err(|source| FileHistoryError::Io {
+                context: format!(
+                    "failed to remove legacy file history manifest {}",
+                    legacy_manifest.display()
+                ),
+                source,
+            })?;
+        }
         Ok(())
     }
 

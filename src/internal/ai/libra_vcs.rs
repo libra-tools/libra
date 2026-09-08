@@ -7,6 +7,7 @@
 use serde_json::json;
 
 use crate::internal::ai::runtime::hardening::{BlastRadius, SafetyDecision};
+use crate::internal::ai::tools::AiOperationContext;
 
 pub const ALLOWED_COMMANDS: &[&str] = &[
     "status", "diff", "branch", "log", "show", "show-ref", "ls-files", "add", "commit", "switch",
@@ -14,6 +15,55 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
 
 pub const ALLOWED_COMMANDS_DISPLAY: &str =
     "status, diff, branch, log, show, show-ref, ls-files, add, commit, switch";
+
+/// Persist a redacted AI operation link for a mutating tool call when the
+/// current HEAD already has a stable change projection. Patch application is
+/// intentionally best-effort here: the subsequent commit/rewrite path remains
+/// the authoritative producer of the revision row, while this hook records the
+/// real session/run/intent/tool-call identifiers instead of synthetic NULLs.
+pub async fn record_ai_operation_link_for_tool(context: &AiOperationContext) -> Result<(), String> {
+    let database = crate::internal::db::get_db_conn_instance().await;
+    let repo_id = match context.repo_id.clone() {
+        Some(repo_id) if !repo_id.trim().is_empty() => repo_id,
+        _ => crate::internal::workspace::RepoIdentity::resolve_or_init(&database)
+            .await
+            .map_err(|error| error.to_string())?
+            .to_string(),
+    };
+    let Some(head) = crate::internal::head::Head::current_commit_result_with_conn(&database)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let Some(change_id) = crate::internal::change::ChangeStore::new(database.clone())
+        .change_id_for_commit(&repo_id, &head.to_string())
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+
+    crate::internal::change::link_ai_operation(
+        &database,
+        &crate::internal::change::AiOperationLink {
+            operation_id: context.operation_id.clone(),
+            change_id,
+            session_id: context.session_id.clone(),
+            run_id: context.run_id.clone(),
+            tool_invocation_id: Some(context.tool_invocation_id.clone()),
+            intent_id: context.intent_id.clone(),
+            repo_id,
+            worktree_id: None,
+            workspace_id: None,
+            lease_generation: None,
+            config_provenance_digest: None,
+            redaction_version: "v1".to_string(),
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
 
 pub fn run_libra_vcs_tool_guidance() -> String {
     format!(
