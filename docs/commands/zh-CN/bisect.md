@@ -25,6 +25,8 @@ Bisect 状态持久化在 SQLite 数据库的 `bisect_state` 表中，使会话�
 
 当 bisect 识别出罪魁提交时，它会打印提交详情并将会话标记为完成。然后用户必须运行 `bisect reset` 结束会话，并将 HEAD 恢复到原始位置。
 
+Libra 不管理子模块内容。如果 checkout bisect 候选或 reset 目标需要移除或替换已跟踪的 gitlink（模式 `160000`），且对应目录非空，命令会在更改 HEAD、索引或工作树前以 `LBR-CONFLICT-002` 拒绝。请先将目录内文件安全移到其他位置再重试；Libra 创建的空目录占位符可以正常移除。初次 `bisect start` 仍要求工作树干净，嵌套的未跟踪或忽略文件也在检查范围内，因此可能在此前置检查之前就被干净性检查拒绝，且不会创建会话。在已有会话中，`good`、`bad`、`skip` 或 `reset` 操作被此前置检查拒绝时，已保存的 bisect 状态也保持不变。
+
 ## 选项
 
 ### 子命令：`start`
@@ -369,6 +371,7 @@ Bisect 会话可能跨越数小时或数天，因为用户要测试每个候选�
 | `LBR-CLI-003` | 找不到提交（无效 rev 参数） |
 | `LBR-CLI-003` | Bad 提交是 good 提交的祖先（无效范围） |
 | `LBR-CONFLICT-001` | 未提交更改会被 checkout 覆盖 |
+| `LBR-CONFLICT-002` | 需要移除或替换已跟踪 gitlink 的非空目录（退出码 128）。请先将目录内文件安全移到其他位置再重试；Libra 创建的空目录占位符可以移除。 |
 | `LBR-IO-001` | 无法从数据库读取 bisect 状态 |
 | `LBR-IO-002` | 无法将 bisect 状态保存到数据库 |
 | `LBR-IO-002` | 无法创建 bisect_state 表 |

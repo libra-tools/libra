@@ -19,7 +19,7 @@ use crate::{
     internal::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
-        db::get_db_conn_instance,
+        db::{get_db_conn_instance, write_transaction},
         head::Head,
         model::{reference, reflog},
         protocol::{DiscRef, set_wire_hash_kind},
@@ -693,7 +693,7 @@ async fn run_add_remote(
         let db = get_db_conn_instance().await;
         let txn_name = name.clone();
         let txn_branch = branch.clone();
-        db.transaction::<_, (), DbErr>(move |txn| {
+        write_transaction::<_, _, (), DbErr>(&db, move |txn| {
             Box::pin(async move {
                 Head::update_result_with_conn(txn, Head::Branch(txn_branch), Some(&txn_name))
                     .await
@@ -739,7 +739,7 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
     let old_for_txn = old.clone();
     let new_for_txn = new.clone();
     let new_for_error = new.clone();
-    db.transaction::<_, (), anyhow::Error>(move |txn| {
+    write_transaction::<_, _, (), anyhow::Error>(&db, move |txn| {
         Box::pin(async move {
             let target_rows = reference::Entity::find()
                 .filter(reference::Column::Remote.eq(&new_for_txn))
@@ -1174,6 +1174,12 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
                     BranchStoreError::Corrupt { name, detail } => {
                         RemoteError::BranchCorrupt { name, detail }
                     }
+                    BranchStoreError::Query(detail) if branch_delete_write_failure(&detail) => {
+                        RemoteError::BranchDelete {
+                            name: entry.remote_ref.clone(),
+                            detail,
+                        }
+                    }
                     BranchStoreError::Query(detail) => RemoteError::BranchList { detail },
                     other => RemoteError::ConfigWrite {
                         detail: other.to_string(),
@@ -1187,6 +1193,14 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
         dry_run,
         stale_branches,
     })
+}
+
+fn branch_delete_write_failure(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("readonly")
+        || detail.contains("read-only")
+        || detail.contains("permission denied")
+        || detail.contains("database is locked")
 }
 
 /// A remote is considered to exist if **any** `remote.<name>.*` key is
@@ -1528,7 +1542,7 @@ async fn run_set_branches(
     let db = get_db_conn_instance().await;
     let txn_key = key.clone();
     let txn_refspecs = refspecs.clone();
-    db.transaction::<_, (), DbErr>(move |txn| {
+    write_transaction::<_, _, (), DbErr>(&db, move |txn| {
         Box::pin(async move {
             if !add {
                 ConfigKv::unset_all_with_conn(txn, &txn_key)
@@ -1627,7 +1641,7 @@ async fn run_set_head(
 
     let txn_name = name.clone();
     let txn_branch = branch.clone();
-    db.transaction::<_, (), DbErr>(move |txn| {
+    write_transaction::<_, _, (), DbErr>(&db, move |txn| {
         Box::pin(async move {
             Head::update_result_with_conn(txn, Head::Branch(txn_branch), Some(&txn_name))
                 .await

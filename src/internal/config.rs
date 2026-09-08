@@ -2680,6 +2680,10 @@ mod tests {
 
     use super::*;
 
+    mod env_restore_tests {
+        include!("config/env_restore_tests.rs");
+    }
+
     /// plan-20260825 PS-06: `locate_env_for_target` tags the hit layer and
     /// `resolve_env_for_target` delegates to it, so value and layer can
     /// never disagree. Uses the process-env layer (deterministic, no DB) and
@@ -2687,9 +2691,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn locate_env_reports_the_hit_layer_and_resolver_delegates() {
+        use crate::utils::test::ScopedEnvVar;
+
         let name = "LIBRA_PS06_LOCATE_TEST_KEY";
-        // SAFETY-adjacent: serial(env) — process env is shared state.
-        unsafe { std::env::set_var(name, "layer-probe") };
+        let _process_probe = ScopedEnvVar::set(name, "layer-probe");
         let located = locate_env_for_target(name, LocalIdentityTarget::None)
             .await
             .expect("locate over process env");
@@ -2701,11 +2706,12 @@ mod tests {
             .await
             .expect("resolver delegates");
         assert_eq!(resolved.as_deref(), Some("layer-probe"));
-        unsafe { std::env::remove_var(name) };
+        // Drops before _process_probe, which then restores the caller's value.
+        let _missing_probe = ScopedEnvVar::unset(name);
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("isolated-global.db");
-        unsafe { std::env::set_var("LIBRA_CONFIG_GLOBAL_DB", &db) };
+        let _global_db = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &db);
         let missing = locate_env_for_target(name, LocalIdentityTarget::None)
             .await
             .expect("miss path");
@@ -2759,8 +2765,6 @@ mod tests {
             Some(("from-local".to_string(), EnvHitLayer::RepoLocalVault)),
             "repo-local must win over global and carry the RepoLocalVault label"
         );
-
-        unsafe { std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB") };
     }
 
     /// plan-20260825 PS-06 terra R3: the factory's sync lookup must read the
@@ -2770,15 +2774,15 @@ mod tests {
     #[test]
     #[serial_test::serial(env)]
     fn resolve_env_sync_for_dir_reads_the_target_repos_vault() {
+        use crate::utils::test::ScopedEnvVar;
+
         let name = "LIBRA_PS06_AB_FACTORY_KEY";
-        unsafe { std::env::remove_var(name) };
+        let _probe = ScopedEnvVar::unset(name);
         let tmp = tempfile::tempdir().expect("tempdir");
-        unsafe {
-            std::env::set_var(
-                "LIBRA_CONFIG_GLOBAL_DB",
-                tmp.path().join("isolated-global.db"),
-            )
-        };
+        let _global_db = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            tmp.path().join("isolated-global.db"),
+        );
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         for (repo, value) in [("a", "from-repo-a"), ("b", "from-repo-b")] {
             let storage = tmp.path().join(repo).join(".libra");
@@ -2808,7 +2812,6 @@ mod tests {
             Some("from-repo-b"),
             "the factory chain must follow the given directory, not the cwd"
         );
-        unsafe { std::env::remove_var("LIBRA_CONFIG_GLOBAL_DB") };
     }
 
     async fn write_schema_version(db_path: &Path, version: i64) {

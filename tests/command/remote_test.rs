@@ -24,6 +24,8 @@ use libra::{
 
 use super::*;
 
+mod write_transactions;
+
 #[tokio::test]
 #[serial(cwd)]
 async fn test_remote_add_creates_entry() {

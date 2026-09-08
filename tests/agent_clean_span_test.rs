@@ -170,6 +170,7 @@ fn clean_prune_span_carries_required_fields_without_raw_paths() {
 
     let checkpoint_id = "aa000000-0000-4000-8000-0000000000aa";
     rt.block_on(seed_temporary_checkpoint(&conn, &repo_path, checkpoint_id));
+    ClientStorage::wait_for_background_tasks();
 
     let captured = capture_spans(|| {
         rt.block_on(async {

@@ -1,4 +1,4 @@
-//! SeaORM entity definition for operation parent edges.
+//! SeaORM entity for v2 operation parent edges.
 
 use sea_orm::entity::prelude::*;
 
@@ -9,6 +9,7 @@ pub struct Model {
     pub op_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub parent_op_id: String,
+    pub ordinal: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

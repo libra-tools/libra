@@ -5,7 +5,7 @@
 //! **Layer:** L1 — deterministic, no external dependencies.
 //!
 //! Fixture conventions: each test uses `init_temp_repo()` to spawn a
-//! fresh `libra init` repo in a tempdir, optionally calls
+//! fresh `libra init --vault false` repo in a tempdir, optionally calls
 //! `configure_user_identity()` and `create_commit()` to lay down a known
 //! object graph, and runs `libra cat-file ...` through `Command`. The
 //! tests cross-reference object hashes by parsing the human-readable
@@ -24,7 +24,7 @@ use super::{
     run_libra_command_with_stdin_and_env,
 };
 
-/// Spawn `libra init` in a fresh tempdir and return the `TempDir` (kept
+/// Spawn `libra init --vault false` in a tempdir and return the `TempDir` (kept
 /// alive by the caller for RAII cleanup).
 fn init_temp_repo() -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
@@ -32,7 +32,7 @@ fn init_temp_repo() -> tempfile::TempDir {
 
     let output = Command::new(env!("CARGO_BIN_EXE_libra"))
         .current_dir(temp_path)
-        .args(["init"])
+        .args(["init", "--vault", "false"])
         .output()
         .expect("Failed to execute libra binary");
 

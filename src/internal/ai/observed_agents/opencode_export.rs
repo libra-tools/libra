@@ -1876,7 +1876,8 @@ printf 'offline-ok'"#,
     /// before store bind, FD-pinned `/proc/self/fd/N → store`, binary-parent
     /// via sandbox_cwd, `--` then the exporter).
     #[cfg(target_os = "linux")]
-    #[serial_test::serial(export_sandbox_env)]
+    // Bridge default and env groups (env alone misses default), in that order.
+    #[serial_test::serial(inner_attrs = [serial_test::serial(env, export_sandbox_env)])]
     #[test]
     fn bwrap_argv_equivalent() {
         let tmp = tempfile::tempdir().unwrap();

@@ -445,11 +445,8 @@ async fn run_checkout(
     if let Some(new_branch) = args.new_branch {
         let start_point = args.branch;
         let target_commit = resolve_checkout_create_startpoint(start_point.as_deref()).await?;
-        let clean_status = if args.force {
-            switch::ensure_no_untracked_overwrite(target_commit)
-        } else {
-            switch::ensure_clean_status_for_commit(target_commit, output).await
-        };
+        let clean_status =
+            switch::ensure_switch_clean_or_force(args.force, target_commit, output).await;
         map_switch_preflight(clean_status)?;
 
         let child_output = silent_child_output(output);
@@ -475,11 +472,8 @@ async fn run_checkout(
     if let Some(new_branch) = args.force_new_branch {
         let start_point = args.branch;
         let target_commit = resolve_checkout_create_startpoint(start_point.as_deref()).await?;
-        let clean_status = if args.force {
-            switch::ensure_no_untracked_overwrite(target_commit)
-        } else {
-            switch::ensure_clean_status_for_commit(target_commit, output).await
-        };
+        let clean_status =
+            switch::ensure_switch_clean_or_force(args.force, target_commit, output).await;
         map_switch_preflight(clean_status)?;
 
         if let Some(prev) = previous_branch.as_deref()

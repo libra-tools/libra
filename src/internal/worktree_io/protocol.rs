@@ -13,6 +13,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::utils::beneath::EntryIdentity;
+
 /// Maximum JSON or binary payload accepted by either side of the protocol.
 pub(crate) const FRAME_CAP: usize = 8 * 1024 * 1024;
 
@@ -380,6 +382,12 @@ pub(crate) struct CapRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum IoRequest {
+    EntryIdentity {
+        /// A canonical relative path beneath `root`; empty means `root`.
+        path: Vec<u8>,
+        /// An absolute, sealed worktree root.
+        root: Vec<u8>,
+    },
     SymlinkMetadata {
         /// A canonical relative path beneath `root`; empty means `root`.
         path: Vec<u8>,
@@ -436,7 +444,9 @@ impl IoRequest {
     /// read uses the beneath no-follow operations for TOCTOU enforcement.
     pub(crate) fn validate(&self) -> io::Result<()> {
         match self {
-            Self::SymlinkMetadata { path, root } | Self::ReadDir { path, root, .. } => {
+            Self::EntryIdentity { path, root }
+            | Self::SymlinkMetadata { path, root }
+            | Self::ReadDir { path, root, .. } => {
                 validate_worktree_path(root, path, true).map(|_| ())
             }
             Self::CanonicalizePair { left, right, root } => {
@@ -629,6 +639,9 @@ pub(crate) enum IoEvent {
     },
     DoneStat {
         result: WireResult<CapturedStat>,
+    },
+    DoneEntryIdentity {
+        result: WireResult<EntryIdentity>,
     },
     DoneCanonicalize {
         left: WireResult<Vec<u8>>,
@@ -865,6 +878,80 @@ mod tests {
         WorktreeRootCapability, io_from_wire, parse_event_frames, path_to_bytes, unwrap_wire,
         wire_result, write_frame, write_raw_frame, write_request,
     };
+    use crate::utils::beneath::{EntryIdentity, EntryIdentityKey, EntryKind};
+
+    #[test]
+    fn entry_identity_request_rejects_non_relative_paths_before_encoding() {
+        // Given an absolute root that need not exist for lexical validation.
+        let parent = tempdir().expect("temporary parent");
+        let root = parent.path().join("missing-root");
+        for path in ["../escape", "./child", "child//file", "/outside"] {
+            let request = IoRequest::EntryIdentity {
+                path: path_to_bytes(Path::new(path)),
+                root: path_to_bytes(&root),
+            };
+            let mut wire = Vec::new();
+
+            // When an identity lookup tries to encode a noncanonical path.
+            let error = write_request(&mut wire, "test-cap", request)
+                .expect_err("non-relative identity lookup must fail");
+
+            // Then no malformed request or filesystem query is issued.
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(wire.is_empty());
+        }
+        let request = IoRequest::EntryIdentity {
+            path: path_to_bytes(Path::new("child")),
+            root: path_to_bytes(&root),
+        };
+        assert!(
+            request.validate().is_ok(),
+            "validation must not stat the missing root"
+        );
+    }
+
+    #[test]
+    fn entry_identity_request_and_event_round_trip_without_losing_key_bits() {
+        // Given an identity using the complete volume and file-ID representation.
+        let root = tempdir().expect("root");
+        let request = IoRequest::EntryIdentity {
+            path: path_to_bytes(Path::new("tracked")),
+            root: path_to_bytes(root.path()),
+        };
+        let identity = EntryIdentity {
+            key: EntryIdentityKey {
+                volume: u64::MAX,
+                file_id: [0xa5; 16],
+            },
+            kind: EntryKind::Directory,
+        };
+        let mut request_wire = Vec::new();
+        let mut event_wire = Vec::new();
+
+        // When the request and successful result cross their framing boundary.
+        write_request(&mut request_wire, "test-cap", request).expect("encode request");
+        let decoded: super::CapRequest =
+            super::read_frame(&mut request_wire.as_slice()).expect("decode request");
+        write_frame(
+            &mut event_wire,
+            &IoEvent::DoneEntryIdentity {
+                result: WireResult::Ok(identity),
+            },
+        )
+        .expect("encode identity");
+        let mut events = parse_event_frames(&event_wire).expect("decode identity");
+
+        // Then neither raw paths nor the 128-bit file ID are narrowed.
+        assert_eq!(decoded.cap, "test-cap");
+        assert!(
+            matches!(decoded.request, IoRequest::EntryIdentity { path, root: decoded_root }
+            if path == path_to_bytes(Path::new("tracked")) && decoded_root == path_to_bytes(root.path()))
+        );
+        let Some(IoEvent::DoneEntryIdentity { result }) = events.pop() else {
+            panic!("identity terminal event expected");
+        };
+        assert_eq!(unwrap_wire(result).expect("identity"), identity);
+    }
 
     #[test]
     fn worktree_capability_accepts_only_canonical_relative_paths() {

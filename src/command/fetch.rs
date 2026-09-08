@@ -4366,6 +4366,8 @@ mod tests {
         assert!(keep.exists(), "non-temp file should remain");
     }
 
+    // Bridge default and env groups (env alone misses default), in that order.
+    #[serial_test::serial(inner_attrs = [serial_test::serial(env)])]
     #[test]
     fn test_ensure_vault_ssh_tmp_dir_uses_home_directory() {
         let temp_home = tempdir().expect("failed to create temp home");

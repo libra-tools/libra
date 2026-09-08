@@ -620,11 +620,12 @@ async fn reset_pathspecs(
     pathspecs: &[String],
     target_commit_id: &ObjectHash,
 ) -> Result<Vec<String>, ResetError> {
-    let commit: Commit = load_object(target_commit_id)
-        .map_err(|e| object_load_error("commit", target_commit_id.to_string(), e.to_string()))?;
-
-    let tree: Tree = load_object(&commit.tree_id)
-        .map_err(|e| object_load_error("tree", commit.tree_id.to_string(), e.to_string()))?;
+    // Rebuild the target index before applying pathspecs. Besides providing
+    // the exact target entries, this validates every traversed subtree. A
+    // corrupt nested tree must be reported as repository corruption rather
+    // than being mistaken for a path that should simply be removed from the
+    // current index.
+    let target_index = index_for_commit(target_commit_id)?;
 
     let index_file = path::index();
     let mut index = Index::load(&index_file).map_err(|e| ResetError::IndexLoad(e.to_string()))?;
@@ -646,17 +647,18 @@ async fn reset_pathspecs(
         let path_str = relative_path.to_str().ok_or_else(|| {
             ResetError::InvalidPathspecEncoding(relative_path.display().to_string())
         })?;
-
-        match find_tree_item(&tree, path_str)? {
-            Some(item) => {
-                let blob: git_internal::internal::object::blob::Blob = load_object(&item.id)
-                    .map_err(|e| object_load_error("blob", item.id.to_string(), e.to_string()))?;
+        match target_index.get(path_str, 0) {
+            Some(target_entry) => {
+                let blob: git_internal::internal::object::blob::Blob =
+                    load_object(&target_entry.hash).map_err(|e| {
+                        object_load_error("blob", target_entry.hash.to_string(), e.to_string())
+                    })?;
                 let mut entry = IndexEntry::new_from_blob(
                     path_str.to_string(),
-                    item.id,
+                    target_entry.hash,
                     blob.data.len() as u32,
                 );
-                entry.mode = tree_item_mode_to_index_mode(item.mode)?;
+                entry.mode = target_entry.mode;
                 index.add(entry);
                 changed = true;
                 changed_paths.push(pathspec.clone());

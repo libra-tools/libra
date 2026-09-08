@@ -3055,7 +3055,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(target_os = "linux", serial)]
+    // Bridge default and env groups (env alone misses default), in that order.
+    #[serial_test::serial(inner_attrs = [serial_test::serial(env)])]
     #[test]
     fn seccomp_policy_path_falls_back_to_default_and_obeys_explicit_disable() {
         let temp = tempfile::tempdir().expect("tempdir for default seccomp path test");

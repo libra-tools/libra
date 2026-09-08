@@ -23,6 +23,8 @@ libra switch [--guess | --no-guess] <branch>
 
 该命令支持多种模式：切换到已有本地分支（默认）、用 `-` 返回上一个 checkout 目标、用 `-c` 创建新分支、用 `-C` 强制创建或重置分支、用 `--orphan` 创建 unborn 无父提交分支、用 `-d` detach HEAD，以及用 `--track` 跟踪远程分支。当目标分支已经是当前分支时，该命令是 no-op，并完全跳过干净性检查。
 
+Libra 不管理子模块内容。如果切换到分支或 detached 目标需要移除或替换已跟踪的 gitlink（模式 `160000`），且对应目录非空，命令会在更改 HEAD、分支引用、reflog、索引或工作树前以 `LBR-CONFLICT-002` 拒绝。创建/重置分支（`-c` / `-C`）同样受此检查保护，`--force` 也不能绕过。请先将目录内的文件安全移到其他位置，再重试。Libra 创建的空目录占位符可以正常移除。这是 Libra 的保护边界；Git 的默认 checkout 则可能保留非空子模块目录。
+
 `libra switch -` 会从当前 worktree 的 HEAD reflog 中选择最近一次 `switch` 或 `checkout` 移动的来源。若来源是本地分支，则跟随该分支当前 tip；若来源是 detached HEAD，则使用 reflog 保存的完整 object ID。每次成功移动都会写入新记录，因此重复执行 `switch -` 会在两个目标间来回切换。如果没有导航记录、记录的分支已删除，或最新记录损坏，Libra 会在修改 HEAD、索引或工作树前 fail-closed。
 
 当找不到分支时，会通过 Levenshtein 距离提供模糊分支名建议，帮助捕获拼写错误，而无需精确匹配。
@@ -321,6 +323,7 @@ Git 的 `checkout` 被过度重载：它切换分支、恢复文件、detach HEA
 | 未暂存更改 | `LBR-REPO-003` | 128 | "commit or stash your changes before switching." |
 | 未提交更改 | `LBR-REPO-003` | 128 | "commit or stash your changes before switching." |
 | 未跟踪文件会被覆盖 | `LBR-CONFLICT-002` | 128 | "move or remove it before switching." |
+| 需要移除或替换已跟踪 gitlink 的非空目录 | `LBR-CONFLICT-002` | 128 | 请先将目录内文件安全移到其他位置再重试；Libra 创建的空目录占位符可以移除。 |
 | 状态检查失败 | `LBR-IO-001` | 128 | -- |
 | 提交解析失败 | `LBR-CLI-003` | 129 | "check the revision name and try again." |
 | 分支创建失败 | `LBR-IO-002` | 128 | -- |

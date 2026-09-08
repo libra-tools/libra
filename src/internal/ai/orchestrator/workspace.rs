@@ -1214,11 +1214,17 @@ pub(crate) enum WorkspaceSyncError {
     ContractViolation(String),
     #[error("retryable sync conflict at '{path}': {reason}")]
     RetryableConflict { path: PathBuf, reason: String },
+    #[error("main operation scope lease is busy at '{path}': {reason}")]
+    ScopeLeaseBusy { path: PathBuf, reason: String },
     #[error("hard sync conflict: {reason}")]
     HardConflict {
         path: Option<PathBuf>,
         reason: String,
     },
+    #[error(
+        "task replay completed in main workspace at '{path}', but operation publication failed: {reason}; main may already contain task changes; do not retry automatically; inspect `libra status` and `libra op log` before deciding how to recover"
+    )]
+    OperationPublicationAfterReplay { path: PathBuf, reason: String },
     #[error("FUSE infrastructure failure while {stage} at '{path}': {message}")]
     FuseInfrastructure {
         stage: &'static str,
@@ -1236,11 +1242,22 @@ pub(crate) enum WorkspaceSyncError {
 
 impl WorkspaceSyncError {
     pub(crate) fn is_retryable_conflict(&self) -> bool {
-        matches!(self, Self::RetryableConflict { .. })
+        matches!(
+            self,
+            Self::RetryableConflict { .. } | Self::ScopeLeaseBusy { .. }
+        )
+    }
+
+    pub(crate) fn is_scope_lease_busy(&self) -> bool {
+        matches!(self, Self::ScopeLeaseBusy { .. })
     }
 
     pub(crate) fn is_fuse_infrastructure(&self) -> bool {
         matches!(self, Self::FuseInfrastructure { .. })
+    }
+
+    pub(crate) fn main_workspace_may_have_changes(&self) -> bool {
+        matches!(self, Self::OperationPublicationAfterReplay { .. })
     }
 }
 
@@ -1673,6 +1690,35 @@ mod tests {
         },
         utils::{test, util},
     };
+
+    #[test]
+    fn operation_publication_after_replay_display_is_actionable() {
+        let error = WorkspaceSyncError::OperationPublicationAfterReplay {
+            path: PathBuf::from("/repo"),
+            reason: "post-view write failed".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "task replay completed in main workspace at '/repo', but operation publication failed: post-view write failed; main may already contain task changes; do not retry automatically; inspect `libra status` and `libra op log` before deciding how to recover"
+        );
+        assert!(!error.is_retryable_conflict());
+        assert!(error.main_workspace_may_have_changes());
+    }
+
+    #[test]
+    fn scope_lease_busy_display_and_classification_are_stable() {
+        let error = WorkspaceSyncError::ScopeLeaseBusy {
+            path: PathBuf::from("/repo"),
+            reason: "another operation owns the lease".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "main operation scope lease is busy at '/repo': another operation owns the lease"
+        );
+        assert!(error.is_scope_lease_busy());
+        assert!(error.is_retryable_conflict());
+        assert!(!error.main_workspace_may_have_changes());
+    }
 
     /// A `tracing` writer that captures every emitted line into a shared
     /// buffer so a test can assert what was (or was not) logged. Used to

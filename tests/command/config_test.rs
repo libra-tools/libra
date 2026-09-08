@@ -11,11 +11,14 @@ use tempfile::tempdir;
 
 use super::*;
 
+mod git_import;
+
 /// Guard for temporarily setting an environment variable during a test and restoring it on drop.
 ///
 /// # Safety
-/// Modifying environment variables is process-global state. These tests are all annotated with
-/// `#[serial]`, ensuring no concurrent mutation happens across tests.
+/// Callers must serialize access to process-global environment variables.
+/// Configuration-path overrides also share `cwd` with in-process init fixtures,
+/// which read global defaults while holding that lane.
 struct EnvVarGuard {
     key: &'static str,
     original: Option<std::ffi::OsString>,
@@ -229,53 +232,7 @@ async fn test_config_system_scope_roundtrip_and_vault_rejection() {
 #[tokio::test]
 #[serial(env, cwd)]
 async fn test_config_import_global_from_git() {
-    let temp_dir = tempdir().unwrap();
-    let _guard = test::ChangeDirGuard::new(temp_dir.path());
-
-    let global_db_dir = tempdir().unwrap();
-    let _scoped = ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config_import.db"));
-
-    let fake_home = tempdir().unwrap();
-    let _home_guard = EnvVarGuard::set("HOME", fake_home.path().as_os_str());
-    let _xdg_guard = EnvVarGuard::set(
-        "XDG_CONFIG_HOME",
-        fake_home.path().join(".config").as_os_str(),
-    );
-
-    let set_name = Command::new("git")
-        .args(["config", "--global", "user.name", "Git Global Import User"])
-        .output()
-        .unwrap();
-    assert!(set_name.status.success());
-
-    let set_email = Command::new("git")
-        .args([
-            "config",
-            "--global",
-            "user.email",
-            "git-global-import@example.com",
-        ])
-        .output()
-        .unwrap();
-    assert!(set_email.status.success());
-
-    let result = exec_config(vec!["config", "--global", "import"]).await;
-    assert!(result.is_ok());
-
-    let imported_name = config::ScopedConfig::get(config::ConfigScope::Global, "user.name")
-        .await
-        .unwrap();
-    let imported_email = config::ScopedConfig::get(config::ConfigScope::Global, "user.email")
-        .await
-        .unwrap();
-    assert_eq!(
-        imported_name.map(|e| e.value).as_deref(),
-        Some("Git Global Import User")
-    );
-    assert_eq!(
-        imported_email.map(|e| e.value).as_deref(),
-        Some("git-global-import@example.com")
-    );
+    git_import::import_global_from_git_fixture().await;
 }
 
 #[tokio::test]
@@ -810,11 +767,14 @@ async fn test_config_scope_isolation() {
 }
 
 #[tokio::test]
-#[serial(cwd)]
+#[serial(env, cwd)]
 async fn test_config_get_reveal_decrypt_failure_returns_error() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
+    let fake_home = tempdir().unwrap();
+    let _home_guard = EnvVarGuard::set("HOME", fake_home.path().as_os_str());
+    let _userprofile_guard = EnvVarGuard::set("USERPROFILE", fake_home.path().as_os_str());
 
     libra::internal::vault::lazy_init_vault_for_scope("local")
         .await
@@ -1040,6 +1000,9 @@ async fn test_config_set_missing_value_uses_protected_input_when_existing_key_is
     let _guard = test::ChangeDirGuard::new(temp_path.path());
     // Prevent rpassword::read_password() from blocking on stdin.
     let _test_env = EnvVarGuard::set("LIBRA_TEST", std::ffi::OsStr::new("1"));
+    let fake_home = tempdir().unwrap();
+    let _home_guard = EnvVarGuard::set("HOME", fake_home.path().as_os_str());
+    let _userprofile_guard = EnvVarGuard::set("USERPROFILE", fake_home.path().as_os_str());
 
     let result = exec_config(vec![
         "config",
@@ -1049,7 +1012,7 @@ async fn test_config_set_missing_value_uses_protected_input_when_existing_key_is
         "encrypted-value",
     ])
     .await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "initial encrypted set failed: {result:?}");
 
     let result = exec_config(vec!["config", "set", "custom.value"]).await;
     let err = result.expect_err("existing encrypted state should require protected input");
@@ -1498,53 +1461,38 @@ async fn test_config_generate_gpg_key_rejects_invalid_usage() {
 #[tokio::test]
 #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_config_scope_path_logic() {
-    // Test the path logic for different scopes without executing config operations
-
-    // Local scope should return None (uses repository database)
+    let inherited = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB");
     assert_eq!(config::ConfigScope::Local.get_config_path(), None);
-
-    // Global scope should return a path in the home directory (if available)
-    let global_path = config::ConfigScope::Global.get_config_path();
-    if dirs::home_dir().is_some() {
-        assert!(global_path.is_some());
-        let path = global_path.unwrap();
-        assert!(path.to_string_lossy().contains(".libra"));
-        assert!(path.to_string_lossy().ends_with("config.db"));
-    } else {
-        // In environments without home directory, should return None
-        assert_eq!(global_path, None);
+    {
+        let _global = EnvVarGuard::unset("LIBRA_CONFIG_GLOBAL_DB");
+        // This pure path query performs no I/O against the default location.
+        let actual = config::ConfigScope::Global.get_config_path();
+        let expected = dirs::home_dir().map(|home| home.join(".libra").join("config.db"));
+        assert_eq!(actual, expected);
     }
+    assert_eq!(std::env::var_os("LIBRA_CONFIG_GLOBAL_DB"), inherited);
 }
 
 #[tokio::test]
 #[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 async fn test_config_cross_platform_paths() {
-    // Test that all scopes return appropriate paths for the current platform
-
-    // Local scope should always return None (uses repository database)
+    let inherited = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB");
+    let isolated = tempdir().unwrap();
+    let override_path = isolated
+        .path()
+        .join("custom config")
+        .join("settings.sqlite");
     assert_eq!(config::ConfigScope::Local.get_config_path(), None);
-
-    // Global scope behavior (should work on all platforms with home directory)
-    let global_path = config::ConfigScope::Global.get_config_path();
-    if dirs::home_dir().is_some() {
-        assert!(global_path.is_some());
-        let path = global_path.unwrap();
-        assert!(path.to_string_lossy().contains(".libra"));
-        assert!(path.to_string_lossy().ends_with("config.db"));
-
-        // Verify the path uses the correct separator for the platform
-        #[cfg(windows)]
-        {
-            // On Windows, paths should use backslashes or be properly normalized
-            let path_str = path.to_string_lossy();
-            assert!(path_str.contains("libra") && path_str.contains("config.db"));
-        }
-        #[cfg(unix)]
-        {
-            // On Unix, paths should use forward slashes
-            assert!(path.to_string_lossy().contains("/"));
-        }
+    {
+        let _global = EnvVarGuard::set("LIBRA_CONFIG_GLOBAL_DB", override_path.as_os_str());
+        // Native path components, including spaces, are preserved without a
+        // requirement for the default directory name or database filename.
+        assert_eq!(
+            config::ConfigScope::Global.get_config_path(),
+            Some(override_path)
+        );
     }
+    assert_eq!(std::env::var_os("LIBRA_CONFIG_GLOBAL_DB"), inherited);
 }
 
 /// Regression: a corrupted/incompatible `~/.libra/config.db` must not block
@@ -1558,7 +1506,7 @@ async fn test_config_cross_platform_paths() {
 /// warning and returns `Ok` with `config_*` set to `None`, letting init
 /// fall back to env vars / "Libra User" defaults.
 #[tokio::test]
-#[serial(env)]
+#[serial(env, cwd)]
 async fn resolve_user_identity_sources_tolerates_corrupt_global_db() {
     use libra::internal::config::{LocalIdentityTarget, resolve_user_identity_sources};
 
@@ -1653,7 +1601,7 @@ async fn resolve_env_for_target_process_env_overrides_local_vault() {
 /// commands that can run outside a Libra worktree (provider/bootstrap path).
 /// process env > global vault.
 #[tokio::test]
-#[serial(env)]
+#[serial(env, cwd)]
 async fn resolve_env_for_target_process_env_overrides_global_vault() {
     use libra::internal::{
         config::{ConfigKv, LocalIdentityTarget, resolve_env_for_target},
@@ -1702,7 +1650,7 @@ async fn resolve_env_for_target_process_env_overrides_global_vault() {
 /// Process env remains the final fallback when neither local nor global Vault
 /// supplies the key.
 #[tokio::test]
-#[serial(env)]
+#[serial(env, cwd)]
 async fn resolve_env_sync_falls_back_to_process_env_when_vault_missing() {
     use libra::internal::config::resolve_env_sync;
 
@@ -1725,7 +1673,7 @@ async fn resolve_env_sync_falls_back_to_process_env_when_vault_missing() {
 /// `resolve_env_for_target` already downgrades that to `tracing::warn!`),
 /// matching the v0.17.515 / v0.17.534 fallback contract.
 #[tokio::test]
-#[serial(env)]
+#[serial(env, cwd)]
 async fn resolve_env_sync_returns_none_when_no_layer_supplies_value() {
     use libra::internal::config::resolve_env_sync;
 
@@ -2574,58 +2522,7 @@ async fn test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite() {
 
 #[test]
 fn test_config_upgrade_mode_import_skips_reserved() {
-    let temp = tempdir().unwrap();
-    let p = temp.path();
-    if Command::new("git")
-        .arg("--version")
-        .current_dir(p)
-        .output()
-        .is_err()
-    {
-        eprintln!("skipped (git binary not available)");
-        return;
-    }
-    let home = p.join(".libra-test-home");
-    std::fs::create_dir_all(&home).unwrap();
-
-    // Write a Git global config containing a reserved key, using the same
-    // isolated HOME the spawned libra binary sees.
-    for kv in [
-        ["user.name", "Import Reserved User"],
-        ["upgrade.mode", "auto"],
-    ] {
-        let out = Command::new("git")
-            .args(["config", "--global", kv[0], kv[1]])
-            .current_dir(p)
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git config {kv:?}");
-    }
-
-    let import = run_libra_command(&["config", "--global", "import"], p);
-    assert_cli_success(&import, "import");
-    let stderr = String::from_utf8_lossy(&import.stderr);
-    assert!(
-        stderr.contains("reserved upgrade.*"),
-        "import warns about skipped reserved keys: {stderr}"
-    );
-
-    // The normal key imported; the reserved key did not touch file or SQLite.
-    let get = run_libra_command(&["config", "get", "--global", "user.name"], p);
-    assert_cli_success(&get, "imported user.name");
-    assert_eq!(
-        String::from_utf8_lossy(&get.stdout).trim(),
-        "Import Reserved User"
-    );
-    assert!(
-        !upgrade_settings_file(p).exists(),
-        "import must not create settings.json"
-    );
-    let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
-    assert_cli_success(&get, "upgrade.mode after import");
-    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "off");
+    git_import::import_reserved_from_git_fixture();
 }
 
 #[test]

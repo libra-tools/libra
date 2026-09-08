@@ -10,7 +10,7 @@ use sea_orm::{
 };
 use thiserror::Error;
 
-use crate::internal::model::{
+use crate::internal::legacy_operation_model::{
     operation, operation_parent, operation_view, operation_view_ref, operation_view_workspace,
 };
 
@@ -1276,12 +1276,12 @@ mod tests {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             r#"
-            CREATE TABLE IF NOT EXISTS operation_parent (
-                op_id TEXT NOT NULL,
-                parent_op_id TEXT NOT NULL,
-                PRIMARY KEY (op_id, parent_op_id)
-            );
-            "#,
+             CREATE TABLE IF NOT EXISTS operation_parent (
+                 op_id TEXT NOT NULL,
+                 parent_op_id TEXT NOT NULL,
+                 PRIMARY KEY (op_id, parent_op_id)
+             );
+             "#,
         ))
         .await
         .unwrap();
@@ -1423,13 +1423,13 @@ mod tests {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             r#"
-            CREATE TABLE IF NOT EXISTS operation_view_workspace (
-                view_id TEXT NOT NULL,
-                pointer_kind TEXT NOT NULL,
-                pointer_value TEXT NOT NULL,
-                PRIMARY KEY (view_id, pointer_kind)
-            );
-            "#,
+             CREATE TABLE IF NOT EXISTS operation_view_workspace (
+                 view_id TEXT NOT NULL,
+                 pointer_kind TEXT NOT NULL,
+                 pointer_value TEXT NOT NULL,
+                 PRIMARY KEY (view_id, pointer_kind)
+             );
+             "#,
         ))
         .await
         .unwrap();

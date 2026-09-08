@@ -19,6 +19,11 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+mod entry_identity;
+pub(crate) use entry_identity::{
+    EntryIdentity, EntryIdentityKey, EntryKind, entry_identity_beneath,
+};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RootIdentity {
     #[cfg(unix)]
@@ -1543,9 +1548,18 @@ fn fstatat_nofollow(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLst
 
 #[cfg(unix)]
 fn fstatat_raw(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLstat> {
+    fstatat_value(dir, name).map(|stat| RawLstat::from_libc_stat(&stat))
+}
+
+#[cfg(unix)]
+fn fstatat_value(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<libc::stat> {
     use std::os::fd::AsRawFd;
     let c_name = component_cstring(name)?;
+    // SAFETY: libc::stat contains only integer fields on the supported Unix
+    // targets; zero initialization produces a valid writable output buffer.
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: the borrowed directory descriptor and NUL-terminated name remain
+    // live during the call; stat is an aligned, exclusively borrowed buffer.
     let rc = unsafe {
         libc::fstatat(
             dir.as_raw_fd(),
@@ -1557,7 +1571,7 @@ fn fstatat_raw(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLstat> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(RawLstat::from_libc_stat(&stat))
+    Ok(stat)
 }
 
 /// Test harness seam: when `LIBRA_TEST=1` and the swap env vars are set,
