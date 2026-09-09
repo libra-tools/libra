@@ -169,6 +169,11 @@ struct WalkStats {
     /// this replaced held two full ancestor sets plus a `common` set plus a
     /// fresh visited set per candidate.
     peak_painted: usize,
+    /// Largest combined number of logical entries resident in the paint map
+    /// and priority queue at one time. Queue entries are counted separately
+    /// because the same painted commit can be queued more than once while its
+    /// flags converge.
+    peak_resident_entries: usize,
     /// Committer date of each commit as it was popped, in order. TEST-ONLY: it
     /// grows with the number of pops, so it must never exist in a production
     /// walk — the whole point of the residency claim is that nothing here
@@ -241,10 +246,14 @@ fn paint_down_to_common<S: CommitSource>(
         painted.entry(**tip).or_default().merge(*paint);
         queue.push(Queued { date, id: **tip });
     }
+    stats.peak_resident_entries = painted.len() + queue.len();
 
     while let Some(Queued { date, id }) = queue.pop() {
         stats.peak_frontier = stats.peak_frontier.max(queue.len() + 1);
         stats.peak_painted = stats.peak_painted.max(painted.len());
+        stats.peak_resident_entries = stats
+            .peak_resident_entries
+            .max(painted.len() + queue.len() + 1);
         #[cfg(test)]
         stats.pop_dates.push(date);
         stats.priority_respected &= queue.peek().is_none_or(|next| next.date <= date);
@@ -272,6 +281,7 @@ fn paint_down_to_common<S: CommitSource>(
             painted.insert(*parent, next);
             queue.push(Queued { date, id: *parent });
         }
+        stats.peak_resident_entries = stats.peak_resident_entries.max(painted.len() + queue.len());
     }
 
     Ok((result, stats))
@@ -384,6 +394,8 @@ mod tests {
         /// How many `node()` lookups the algorithm asked for, and the largest
         /// number of commits it held painted at once — the frontier bound.
         reads: usize,
+        /// Distinct commit ids requested by the algorithm under test.
+        unique_reads: HashSet<ObjectHash>,
     }
 
     impl TestGraph {
@@ -391,6 +403,7 @@ mod tests {
             Self {
                 nodes: HashMap::new(),
                 reads: 0,
+                unique_reads: HashSet::new(),
             }
         }
 
@@ -430,6 +443,7 @@ mod tests {
     impl CommitSource for TestGraph {
         fn node(&mut self, id: &ObjectHash) -> Result<CommitNode, MergeBaseError> {
             self.reads += 1;
+            self.unique_reads.insert(*id);
             self.nodes
                 .get(id)
                 .cloned()
@@ -441,17 +455,29 @@ mod tests {
     /// intersection, then a full walk from EVERY common ancestor to drop the
     /// non-maximal ones. Kept as the oracle the new painting is checked
     /// against, and as the baseline the scaling assertion measures.
+    #[derive(Debug, Default)]
+    struct ReferenceStats {
+        /// Peak logical entries simultaneously retained by the replaced walk's
+        /// ancestor sets, intersection, per-candidate visited set and queues.
+        peak_resident_entries: usize,
+    }
+
     fn reference_merge_bases(
         graph: &mut TestGraph,
         a: &ObjectHash,
         b: &ObjectHash,
-    ) -> Result<Vec<ObjectHash>, MergeBaseError> {
+    ) -> Result<(Vec<ObjectHash>, ReferenceStats), MergeBaseError> {
         fn ancestors(
             graph: &mut TestGraph,
             start: &ObjectHash,
+            already_resident: usize,
+            stats: &mut ReferenceStats,
         ) -> Result<HashSet<ObjectHash>, MergeBaseError> {
             let mut seen = HashSet::new();
             let mut queue = VecDeque::from([*start]);
+            stats.peak_resident_entries = stats
+                .peak_resident_entries
+                .max(already_resident + seen.len() + queue.len());
             while let Some(id) = queue.pop_front() {
                 if !seen.insert(id) {
                     continue;
@@ -459,21 +485,36 @@ mod tests {
                 for parent in graph.node(&id)?.parents {
                     queue.push_back(parent);
                 }
+                stats.peak_resident_entries = stats
+                    .peak_resident_entries
+                    .max(already_resident + seen.len() + queue.len());
             }
             Ok(seen)
         }
 
-        let common: HashSet<ObjectHash> = ancestors(graph, a)?
-            .intersection(&ancestors(graph, b)?)
+        let mut stats = ReferenceStats::default();
+        let lhs_ancestors = ancestors(graph, a, 0, &mut stats)?;
+        let rhs_ancestors = ancestors(graph, b, lhs_ancestors.len(), &mut stats)?;
+        let common: HashSet<ObjectHash> = lhs_ancestors
+            .intersection(&rhs_ancestors)
             .copied()
             .collect();
+        stats.peak_resident_entries = stats
+            .peak_resident_entries
+            .max(lhs_ancestors.len() + rhs_ancestors.len() + common.len());
         if common.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), stats));
         }
+        drop(lhs_ancestors);
+        drop(rhs_ancestors);
+
         let mut dominated: HashSet<ObjectHash> = HashSet::new();
         for start in &common {
             let mut seen = HashSet::new();
             let mut queue: VecDeque<ObjectHash> = graph.node(start)?.parents.into_iter().collect();
+            stats.peak_resident_entries = stats
+                .peak_resident_entries
+                .max(common.len() + dominated.len() + seen.len() + queue.len());
             while let Some(id) = queue.pop_front() {
                 if !seen.insert(id) {
                     continue;
@@ -484,6 +525,9 @@ mod tests {
                 for parent in graph.node(&id)?.parents {
                     queue.push_back(parent);
                 }
+                stats.peak_resident_entries = stats
+                    .peak_resident_entries
+                    .max(common.len() + dominated.len() + seen.len() + queue.len());
             }
         }
         let mut lcas: Vec<ObjectHash> = common
@@ -491,14 +535,14 @@ mod tests {
             .filter(|id| !dominated.contains(id))
             .collect();
         lcas.sort_by_key(|id| id.to_string());
-        Ok(lcas)
+        Ok((lcas, stats))
     }
 
     /// Assert the painting agrees with the reference implementation, and return
     /// what both produced.
     fn agree(graph: &mut TestGraph, a: ObjectHash, b: ObjectHash) -> Vec<ObjectHash> {
         let painted = merge_bases_with(graph, &a, &b).expect("paint down");
-        let reference = reference_merge_bases(graph, &a, &b).expect("reference walk");
+        let (reference, _) = reference_merge_bases(graph, &a, &b).expect("reference walk");
         assert_eq!(
             painted, reference,
             "the painting must agree with the BFS-intersection oracle"
@@ -670,24 +714,26 @@ mod tests {
         let left = TestGraph::id(TRUNK + 1);
         let right = TestGraph::id(TRUNK + 2);
 
+        graph.unique_reads.clear();
         let (_, stats) = paint_down_to_common(&mut graph, &left, &right).expect("paint down");
-        let commits = usize::try_from(TRUNK).expect("trunk fits") + 2;
+        let painted_unique_reads = graph.unique_reads.len();
 
-        // One entry per visited commit, and no more.
-        assert!(
-            stats.peak_painted <= commits,
-            "the paint map must not exceed one entry per commit: {} over {commits}",
-            stats.peak_painted
+        // Every commit loaded by the walk has exactly one paint-map entry,
+        // even if changing flags enqueue it more than once.
+        assert_eq!(
+            stats.peak_painted, painted_unique_reads,
+            "the paint map must contain exactly one entry per visited commit"
         );
-        // The replaced implementation's residency on the same history: two full
-        // ancestor sets (each the whole trunk) plus their intersection, before
-        // its per-candidate visited sets are counted at all.
-        let replaced_residency = 3 * commits;
+
+        graph.unique_reads.clear();
+        let (_, reference_stats) =
+            reference_merge_bases(&mut graph, &left, &right).expect("reference walk");
         assert!(
-            stats.peak_painted * 2 < replaced_residency,
-            "the paint must hold materially less than the two ancestor sets \
-             plus intersection it replaced: {} vs {replaced_residency}",
-            stats.peak_painted
+            stats.peak_resident_entries * 2 < reference_stats.peak_resident_entries,
+            "the paint must hold materially fewer logical entries than the \
+             measured reference walk: {} vs {}",
+            stats.peak_resident_entries,
+            reference_stats.peak_resident_entries
         );
         // And the queue is the frontier, not the history.
         assert!(
@@ -874,7 +920,7 @@ mod tests {
             graph.chain(trunk + 1, 5, Some(tip));
             graph.chain(trunk + 100, 5, Some(tip));
             graph.reads = 0;
-            reference_merge_bases(
+            let _ = reference_merge_bases(
                 &mut graph,
                 &TestGraph::id(trunk + 5),
                 &TestGraph::id(trunk + 104),
