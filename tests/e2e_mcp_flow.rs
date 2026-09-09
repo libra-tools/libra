@@ -175,20 +175,10 @@ async fn test_e2e_mcp_flow() {
 
     println!("Test Repo Path: {:?}", repo_path);
 
-    // Build binary first to ensure it's fresh
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "libra"])
-        .status()
-        .expect("Failed to build libra");
-    assert!(status.success(), "cargo build failed");
-
-    let project_root = std::env::current_dir().expect("Failed to get current dir");
-    // Honor CARGO_TARGET_DIR like the sigterm case below — a hardcoded
-    // target/ path ENOENTs under an isolated target dir (PS-02 terra R1).
-    let libra_bin = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| project_root.join("target"))
-        .join("debug/libra");
+    // Reuse the binary built by Cargo/nextest. Building from inside an
+    // integration test can deadlock on Cargo's target-directory lock while
+    // the test runner is still executing this binary.
+    let libra_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_libra"));
 
     // Init repo
     let status = Command::new(&libra_bin)
@@ -480,18 +470,7 @@ async fn test_web_only_sigterm_releases_ports() {
     let config_home = home_dir.join(".config");
     std::fs::create_dir_all(&config_home).expect("failed to create isolated HOME");
 
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "libra"])
-        .env("LIBRA_SKIP_WEB_BUILD", "1")
-        .status()
-        .expect("Failed to build libra");
-    assert!(status.success(), "cargo build failed");
-
-    let project_root = std::env::current_dir().expect("Failed to get current dir");
-    let libra_bin = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| project_root.join("target"))
-        .join("debug/libra");
+    let libra_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_libra"));
 
     let status = Command::new(&libra_bin)
         .args(["init"])
