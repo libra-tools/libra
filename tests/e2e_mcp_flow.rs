@@ -8,8 +8,8 @@
 //! smoke test for the MCP server: TUI-side details may change, but the wire protocol
 //! must keep round-tripping.
 //!
-//! **Layer:** L1 — uses local HTTP server on dynamically allocated ports. Builds
-//! the binary on demand inside the test so the harness picks up local edits.
+//! **Layer:** L1 — uses local HTTP server on dynamically allocated ports and
+//! reuses the binary built by Cargo/nextest for the integration test.
 
 use std::{
     process::{Command, Stdio},
@@ -146,7 +146,7 @@ async fn mcp_post(
 
 /// Scenario: full end-to-end MCP flow over the Streamable HTTP transport.
 ///
-/// 1. Build the `libra` binary (so the test runs against current code).
+/// 1. Reuse the `libra` binary built by Cargo/nextest for this integration test.
 /// 2. Initialize a temp-dir repo with isolated HOME/XDG_CONFIG_HOME.
 /// 3. Start `libra code` (default Web Code UI) on dynamically allocated ports.
 /// 4. Wait up to 30 seconds for the MCP TCP listener to accept connections.
