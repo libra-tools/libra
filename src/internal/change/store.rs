@@ -121,7 +121,8 @@ impl ChangeStore {
             DbBackend::Sqlite,
             "INSERT INTO change_revision \
              (change_id, commit_oid, created_op_id, visibility, revision_ordinal) \
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(change_id, commit_oid) DO NOTHING",
             [
                 revision.change_id.to_string().into(),
                 revision.commit_oid.clone().into(),
@@ -133,6 +134,39 @@ impl ChangeStore {
         .await
         .map(|_| ())
         .map_err(ChangeStoreError::Database)
+    }
+
+    pub(crate) async fn revision_on<C: ConnectionTrait>(
+        db: &C,
+        change_id: ChangeId,
+        commit_oid: &str,
+    ) -> Result<Option<ChangeRevision>, ChangeStoreError> {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT change_id, commit_oid, created_op_id, visibility, revision_ordinal \
+                 FROM change_revision WHERE change_id = ? AND commit_oid = ?",
+                [change_id.to_string().into(), commit_oid.to_string().into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id = row.try_get::<String>("", "change_id")?;
+        let visibility = match row.try_get::<String>("", "visibility")?.as_str() {
+            "visible" => RevisionVisibility::Visible,
+            "hidden" => RevisionVisibility::Hidden,
+            value => return Err(ChangeStoreError::InvalidChangeId(value.to_string())),
+        };
+        Ok(Some(ChangeRevision {
+            change_id: id
+                .parse()
+                .map_err(|_| ChangeStoreError::InvalidChangeId(id))?,
+            commit_oid: row.try_get("", "commit_oid")?,
+            created_op_id: row.try_get("", "created_op_id")?,
+            visibility,
+            revision_ordinal: row.try_get("", "revision_ordinal")?,
+        }))
     }
 
     pub(crate) async fn insert_identity_on<C: ConnectionTrait>(

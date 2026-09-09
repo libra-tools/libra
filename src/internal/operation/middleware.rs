@@ -305,7 +305,6 @@ where
     if let Some(error) = test_hooks::take_pre_lease_busy(&meta) {
         return Err(error);
     }
-    let _repo_lease = ScopeLease::acquire_repository(scope, &repo_id).await?;
     let _lease = ScopeLease::acquire_with_permissions(scope, &repo_id, lease_permissions).await?;
     let storage = ClientStorage::init_local(scope.storage.join("objects"));
     let store = OperationStoreV2::new_for_repo(&repo_id, db.clone(), storage.clone());

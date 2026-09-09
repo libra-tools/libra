@@ -93,7 +93,6 @@ pub(crate) struct ScopeLease {
 }
 
 impl ScopeLease {
-    #[cfg(test)]
     pub(crate) async fn acquire(
         scope: &PinnedRequestScope,
         repo_id: &str,

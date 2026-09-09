@@ -390,6 +390,8 @@ impl ChangeRevisionBuilder {
             )
             .await?;
         }
-        Ok(revision)
+        Ok(ChangeStore::revision_on(database, change_id, &commit_oid)
+            .await?
+            .unwrap_or(revision))
     }
 }
