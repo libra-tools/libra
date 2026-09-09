@@ -6,19 +6,21 @@ use libra::internal::db;
 use sea_orm::ConnectionTrait;
 use tokio::sync::Barrier;
 
-use super::{all_builtin_runner, builtin_migrations, column_exists, connect, table_exists};
+use super::{
+    MigrationRunner, all_builtin_runner, builtin_migrations, column_exists, connect, table_exists,
+};
 
 #[path = "branch_convergence/fixtures.rs"]
 mod fixtures;
 use fixtures::{
-    CONFIG_REPAIR, CONVERGENCE, OPERATION_V2, branch_database, operation_rows, receipts, rows,
-    snapshot,
+    CHANGE_AI_LINK, CONFIG_REPAIR, CONVERGENCE, OPERATION_V2, branch_database, operation_rows,
+    receipts, rows, snapshot,
 };
 
 #[test]
 fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier() {
     let migrations = builtin_migrations();
-    assert_eq!(migrations.len(), 60);
+    assert_eq!(migrations.len(), 61);
     let tail: Vec<_> = migrations
         .iter()
         .filter(|migration| migration.version >= OPERATION_V2)
@@ -30,6 +32,7 @@ fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier()
             (OPERATION_V2, "operation_v2"),
             (CONFIG_REPAIR, "legacy_config_table"),
             (CONVERGENCE, "operation_v2_branch_convergence"),
+            (CHANGE_AI_LINK, "change_ai_link"),
         ]
     );
     assert!(migrations.last().unwrap().down.is_none());
@@ -62,10 +65,11 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
     assert_eq!(rows(&conn, "config").await, config);
     assert_eq!(rows(&conn, "config_kv").await, modern);
     let after = receipts(&conn).await;
-    assert_eq!(after.len(), 60);
+    assert_eq!(after.len(), 61);
     for (version, name) in [
         (OPERATION_V2, "operation_v2"),
         (CONVERGENCE, "operation_v2_branch_convergence"),
+        (CHANGE_AI_LINK, "change_ai_link"),
     ] {
         assert_eq!(after.iter().find(|row| row.0 == version).unwrap().1, name);
     }
@@ -75,7 +79,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
             "changed original receipt {receipt:?}"
         );
     }
-    assert_eq!(after.last().unwrap().0, CONVERGENCE);
+    assert_eq!(after.last().unwrap().0, CHANGE_AI_LINK);
     let unchanged = snapshot(&conn).await;
     conn.close().await.unwrap();
     let reopened = db::establish_connection(path.to_str().unwrap())
@@ -114,7 +118,10 @@ async fn operation_v2_branch_keeps_modern_and_legacy_rows_without_recopying() {
     let report = db::upgrade_database_schema(&path).await.unwrap();
 
     // Then both histories and the original 0101 claim survive unchanged.
-    assert_eq!(report.applied_versions, vec![CONFIG_REPAIR, CONVERGENCE]);
+    assert_eq!(
+        report.applied_versions,
+        vec![CONFIG_REPAIR, CONVERGENCE, CHANGE_AI_LINK]
+    );
     assert_eq!(operation_rows(&conn, "legacy_").await, legacy);
     assert_eq!(rows(&conn, "operation").await, modern);
     assert_eq!(rows(&conn, "operation_head").await, heads);
@@ -158,8 +165,15 @@ async fn convergence_barrier_refuses_rollback_below_the_old_binary_tip_atomicall
     let before = snapshot(&conn).await;
 
     // When a downgrade would advertise compatibility with an old #472 binary.
-    let error = all_builtin_runner()
-        .unwrap()
+    let mut runner = MigrationRunner::new();
+    runner
+        .extend(
+            builtin_migrations()
+                .into_iter()
+                .filter(|migration| migration.version <= CONVERGENCE),
+        )
+        .unwrap();
+    let error = runner
         .rollback_to(&conn, CONFIG_REPAIR)
         .await
         .unwrap_err();
@@ -200,7 +214,7 @@ async fn concurrent_config_branch_upgraders_claim_the_copy_and_barrier_once() {
     // Then one barrier owner performs the catch-up; the loser does no copy DDL.
     let mut applied = a.unwrap();
     applied.extend(b.unwrap());
-    assert_eq!(applied, vec![CONVERGENCE]);
+    assert_eq!(applied, vec![CONVERGENCE, CHANGE_AI_LINK]);
     assert_eq!(operation_rows(&left, "legacy_").await, expected);
-    assert_eq!(receipts(&left).await.len(), 60);
+    assert_eq!(receipts(&left).await.len(), 61);
 }
