@@ -709,6 +709,10 @@ where
                     },
                     registry.working_dir().to_path_buf(),
                 );
+                // `dispatch` consumes the invocation. Keep the exact
+                // invocation directory for both sides of the pending-link
+                // lifecycle so persistence cannot fall back to process cwd.
+                let tool_working_dir = invocation.working_dir.clone();
                 if let Some(runtime_context) = config.runtime_context.clone() {
                     invocation = invocation.with_runtime_context(runtime_context);
                 }
@@ -758,6 +762,7 @@ where
                     && let Err(error) =
                         crate::internal::ai::libra_vcs::record_pending_ai_operation_link_for_tool(
                             ai_operation,
+                            &tool_working_dir,
                         )
                         .await
                 {
@@ -805,6 +810,7 @@ where
                     && let Err(error) =
                         crate::internal::ai::libra_vcs::remove_pending_ai_operation_link_for_tool(
                             ai_operation,
+                            &tool_working_dir,
                         )
                         .await
                 {
