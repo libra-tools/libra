@@ -1798,6 +1798,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
 
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args(["init", "--bare", remote_dir.to_str().unwrap()])
             .status()
             .expect("failed to init bare remote")
@@ -1826,6 +1827,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
 
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "clone",
                 "--branch",
@@ -1839,6 +1841,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     );
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "-C",
                 other_dir.to_str().unwrap(),
@@ -1852,6 +1855,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     );
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "-C",
                 other_dir.to_str().unwrap(),
@@ -1866,6 +1870,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     fs::write(other_dir.join("remote.txt"), "remote change").expect("failed to write remote file");
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args(["-C", other_dir.to_str().unwrap(), "add", "remote.txt"])
             .status()
             .expect("failed to add remote file")
@@ -1873,6 +1878,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     );
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "-C",
                 other_dir.to_str().unwrap(),
@@ -1886,6 +1892,7 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
     );
     assert!(
         Command::new("git")
+            .current_dir(temp_root.path())
             .args([
                 "-C",
                 other_dir.to_str().unwrap(),
@@ -1897,21 +1904,25 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
             .expect("failed to push remote change")
             .success()
     );
-    let remote_diverged_head = String::from_utf8(
-        Command::new("git")
-            .args([
-                "--git-dir",
-                remote_dir.to_str().unwrap(),
-                "rev-parse",
-                &format!("refs/heads/{current_branch}"),
-            ])
-            .output()
-            .expect("failed to read diverged remote head")
-            .stdout,
-    )
-    .expect("remote head not utf8")
-    .trim()
-    .to_string();
+    let remote_diverged_out = Command::new("git")
+        .current_dir(temp_root.path())
+        .args([
+            "--git-dir",
+            remote_dir.to_str().unwrap(),
+            "rev-parse",
+            &format!("refs/heads/{current_branch}"),
+        ])
+        .output()
+        .expect("failed to read diverged remote head");
+    assert!(
+        remote_diverged_out.status.success(),
+        "failed to read diverged remote head: {}",
+        String::from_utf8_lossy(&remote_diverged_out.stderr)
+    );
+    let remote_diverged_head = String::from_utf8(remote_diverged_out.stdout)
+        .expect("remote head not utf8")
+        .trim()
+        .to_string();
 
     fs::write(local_dir.join("tracked.txt"), "local divergent change")
         .expect("failed to write local divergent file");
@@ -1963,21 +1974,25 @@ fn test_push_quiet_force_still_emits_warning_and_warning_exit_code() {
         "quiet force push should preserve warning output, got: {stderr}"
     );
 
-    let final_remote_head = String::from_utf8(
-        Command::new("git")
-            .args([
-                "--git-dir",
-                remote_dir.to_str().unwrap(),
-                "rev-parse",
-                &format!("refs/heads/{current_branch}"),
-            ])
-            .output()
-            .expect("failed to read final remote head")
-            .stdout,
-    )
-    .expect("final remote head not utf8")
-    .trim()
-    .to_string();
+    let final_remote_out = Command::new("git")
+        .current_dir(temp_root.path())
+        .args([
+            "--git-dir",
+            remote_dir.to_str().unwrap(),
+            "rev-parse",
+            &format!("refs/heads/{current_branch}"),
+        ])
+        .output()
+        .expect("failed to read final remote head");
+    assert!(
+        final_remote_out.status.success(),
+        "failed to read final remote head: {}",
+        String::from_utf8_lossy(&final_remote_out.stderr)
+    );
+    let final_remote_head = String::from_utf8(final_remote_out.stdout)
+        .expect("final remote head not utf8")
+        .trim()
+        .to_string();
     assert_ne!(
         remote_diverged_head, final_remote_head,
         "force push should still update the remote ref"
