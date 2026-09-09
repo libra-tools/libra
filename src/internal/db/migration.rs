@@ -1798,6 +1798,18 @@ pub fn builtin_migrations() -> Vec<Migration> {
             up: include_str!("../../../sql/migrations/2026090802_change_ai_link.sql"),
             down: None,
         },
+        // CH-02 compatibility repair: 0802 was already applied by some
+        // databases before the repository-scoped Change ID prefix index was
+        // added to its SQL. Keep the repair in a new monotonic migration;
+        // changing an applied migration body cannot replay it for those DBs.
+        Migration {
+            version: 2026090803,
+            name: "change_identity_prefix_index_repair",
+            up: include_str!(
+                "../../../sql/migrations/2026090803_change_identity_prefix_index_repair.sql"
+            ),
+            down: None,
+        },
     ]
 }
 
@@ -2245,9 +2257,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 61);
+        assert_eq!(runner.len(), 62);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026090802));
+        assert_eq!(runner.max_registered_version(), Some(2026090803));
     }
 
     #[test]

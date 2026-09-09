@@ -184,6 +184,8 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026090101` | `operation_v2` | `2026090101_operation_v2.sql` (OL-02..04: the Rust runner validates and copies v1 operation history into five `legacy_*` tables before creating the v2 operation schema; forward-only, registered with `down: None`.) |
 | `2026090601` | `legacy_config_table` | `2026090601_legacy_config_table{,_down}.sql` (#472: idempotently restores the bootstrap-owned `config` table when missing; down is a no-op that preserves the table and all existing rows while the runner removes only this migration's receipt.) |
 | `2026090801` | `operation_v2_branch_convergence` | `2026090801_operation_v2_branch_convergence.sql` (forward-only compatibility barrier for the independently shipped 0101/0601 branches; targeted missing-0101 catch-up and receipt/schema verification run in Rust under the existing writer transaction; `down: None`.) |
+| `2026090802` | `change_ai_link` | `2026090802_change_ai_link.sql` (CH-04: adds the AI-operation Change ID projection and its repository-scoped lookup indexes after operation-v2 branch convergence; forward-only.) |
+| `2026090803` | `change_identity_prefix_index_repair` | `2026090803_change_identity_prefix_index_repair.sql` (CH-02 compatibility repair: adds the repository-scoped Change ID prefix index for databases that already recorded 0802 before that index was shipped; forward-only.) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no
