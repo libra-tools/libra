@@ -6,6 +6,11 @@
 -- SQLite ALTER TABLE is applied exactly once per database.
 ALTER TABLE `ai_operation_link` ADD COLUMN `change_id` TEXT;
 
+-- CH-02: preserve repository-scoped Change ID prefix resolution after the
+-- independently shipped 0801 convergence migration claimed that version.
+CREATE INDEX IF NOT EXISTS `idx_change_identity_v2_repo_change`
+    ON `change_identity`(`repo_id`, `change_id`);
+
 CREATE INDEX IF NOT EXISTS `idx_ai_operation_link_repo_change`
     ON `ai_operation_link`(`repo_id`, `change_id`);
 

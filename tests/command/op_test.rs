@@ -600,7 +600,7 @@ fn test_op_restore_out_of_range_index_reports_invalid_target() {
     let output = run_libra_command(&["op", "restore", "@{99}"], repo.path());
     let (_human, report) = parse_cli_error_stderr(&output.stderr);
 
-    assert_invalid_target_error(&output, "fatal: operation index 99 out of range");
+    assert_invalid_target_error(&output, "fatal: v2 operation index out of range: @{99}");
     assert_eq!(
         report.hints,
         vec!["use 'libra op log' to see available operations"]

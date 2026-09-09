@@ -1079,6 +1079,7 @@ async fn resolve_v2_op_ref(store: &OperationStoreV2, op_ref: &str) -> CliResult<
         .ok_or_else(|| {
             CliError::fatal(format!("v2 operation index out of range: {op_ref}"))
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use 'libra op log' to see available operations")
         })
 }
 
