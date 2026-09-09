@@ -5,8 +5,6 @@
 //! keeping the raw index bytes as a separate blob.  This deliberately leaves
 //! publication and pointer advancement to the operation middleware.
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
@@ -738,19 +736,35 @@ fn tree_from_working_copy(
     for (name, oid) in untracked {
         let mode = fs::symlink_metadata(root_path.join(name))
             .ok()
-            .map(|metadata| {
-                if metadata.file_type().is_symlink() {
-                    TreeItemMode::Link
-                } else if metadata.permissions().mode() & 0o111 != 0 {
-                    TreeItemMode::BlobExecutable
-                } else {
-                    TreeItemMode::Blob
-                }
-            })
+            .map(|metadata| untracked_tree_item_mode(&metadata))
             .unwrap_or(TreeItemMode::Blob);
         insert_tree_path(&mut root, name, mode, *oid)?;
     }
     write_tree_node(storage, root)
+}
+
+fn untracked_tree_item_mode(metadata: &fs::Metadata) -> TreeItemMode {
+    if metadata.file_type().is_symlink() {
+        TreeItemMode::Link
+    } else {
+        regular_worktree_file_mode(metadata)
+    }
+}
+
+#[cfg(unix)]
+fn regular_worktree_file_mode(metadata: &fs::Metadata) -> TreeItemMode {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o111 != 0 {
+        TreeItemMode::BlobExecutable
+    } else {
+        TreeItemMode::Blob
+    }
+}
+
+#[cfg(not(unix))]
+fn regular_worktree_file_mode(_metadata: &fs::Metadata) -> TreeItemMode {
+    TreeItemMode::Blob
 }
 
 fn index_mode(mode: u32) -> TreeItemMode {
@@ -874,6 +888,49 @@ mod ignore_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untracked_regular_file_is_a_blob() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("plain.txt");
+        fs::write(&path, b"plain").expect("write regular file");
+
+        let metadata = fs::symlink_metadata(path).expect("read regular file metadata");
+        assert_eq!(untracked_tree_item_mode(&metadata), TreeItemMode::Blob);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_executable_file_preserves_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("run.sh");
+        fs::write(&path, b"#!/bin/sh\n").expect("write executable file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make file executable");
+
+        let metadata = fs::symlink_metadata(path).expect("read executable file metadata");
+        assert_eq!(
+            untracked_tree_item_mode(&metadata),
+            TreeItemMode::BlobExecutable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_symlink_is_a_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        fs::write(&target, b"target").expect("write symlink target");
+        symlink(&target, &link).expect("create symlink");
+
+        let metadata = fs::symlink_metadata(link).expect("read symlink metadata");
+        assert_eq!(untracked_tree_item_mode(&metadata), TreeItemMode::Link);
+    }
 
     #[test]
     fn untracked_manifest_is_deterministic() {

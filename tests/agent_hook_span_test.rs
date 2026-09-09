@@ -5,8 +5,10 @@
 //! `tests/agent_rpc_span_test.rs`: the assertions install a thread-local
 //! `tracing` subscriber, and tracing's per-callsite interest cache can flap
 //! when sibling threads in the same process evaluate the same callsites
-//! without a subscriber — a single-test binary removes that concurrency by
-//! construction.
+//! without a subscriber. This integration-test target has several sibling
+//! tests, so every call into the hook-ingest tracing callsites must run under
+//! a subscriber; otherwise one sibling can disable a callsite while another
+//! is capturing it.
 //!
 //! Spans do not cross process boundaries, so these tests drive
 //! `libra::internal::ai::hooks::runtime::ingest_agent_traces_payload`
@@ -289,10 +291,11 @@ fn foreign_export_claim_blocks_hook_capture() {
     let conn = rt.block_on(fresh_conn(dir.path()));
     let provider_session_id = "sess-span-foreign-export";
 
-    rt.block_on(async {
-        conn.execute_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "INSERT INTO agent_export_job (
+    let captured = capture_spans(|| {
+        rt.block_on(async {
+            conn.execute_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO agent_export_job (
                 job_id, agent_kind, provider_session_id, observed_generation,
                 processed_generation, state, created_at, updated_at, ttl_expires_at,
                 repo_id, worktree_id, workspace_id, workspace_fence, scope_state
@@ -300,37 +303,40 @@ fn foreign_export_claim_blocks_hook_capture() {
                 'foreign-export-job', 'opencode', 'sess-span-foreign-export', 0,
                 0, 'idle', 1, 1, 9999999999999,
                 'other-repo', 'foreign-worktree', NULL, NULL, 'scoped'
-             )",
-        ))
-        .await
-        .expect("seed foreign export claim");
-
-        let error = ingest_agent_traces_payload(
-            &envelope("SessionStart", provider_session_id, json!({})),
-            ProviderHookCommand::SessionStart,
-            LifecycleEventKind::SessionStart,
-            claude_provider(),
-            &conn,
-            None,
-        )
-        .await
-        .expect_err("foreign provider claim must reject hook capture");
-        assert!(
-            format!("{error:#}").contains("already claimed by another"),
-            "unexpected ownership error: {error:#}"
-        );
-
-        let session = conn
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT 1 FROM agent_session
-                 WHERE provider_session_id = 'sess-span-foreign-export'",
+            )",
             ))
             .await
-            .expect("query hook session after refused capture");
-        assert!(
-            session.is_none(),
-            "a rejected hook must not create a competing session claim"
-        );
+            .expect("seed foreign export claim");
+
+            let error = ingest_agent_traces_payload(
+                &envelope("SessionStart", provider_session_id, json!({})),
+                ProviderHookCommand::SessionStart,
+                LifecycleEventKind::SessionStart,
+                claude_provider(),
+                &conn,
+                None,
+            )
+            .await
+            .expect_err("foreign provider claim must reject hook capture");
+            assert!(
+                format!("{error:#}").contains("already claimed by another"),
+                "unexpected ownership error: {error:#}"
+            );
+
+            let session = conn
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT 1 FROM agent_session
+                 WHERE provider_session_id = 'sess-span-foreign-export'",
+                ))
+                .await
+                .expect("query hook session after refused capture");
+            assert!(
+                session.is_none(),
+                "a rejected hook must not create a competing session claim"
+            );
+        });
     });
+    assert!(captured.contains("agent.hook.ingest"), "{captured}");
+    assert!(captured.contains("agent.redaction.apply"), "{captured}");
 }
