@@ -1245,7 +1245,12 @@ impl RestoreEngine {
                 return Err(RestoreError::HeadConfirmationRequired);
             }
             let head = match &snapshot.head {
-                HeadState::Symbolic { reference } => Head::Branch(reference.clone()),
+                HeadState::Symbolic { reference } => Head::Branch(
+                    reference
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(reference)
+                        .to_string(),
+                ),
                 HeadState::Detached { oid } => Head::Detached(*oid),
             };
             Head::update_result_with_conn(self.store.db(), head, None)
