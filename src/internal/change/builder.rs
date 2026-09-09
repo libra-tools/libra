@@ -1,6 +1,6 @@
 //! Single entry point for new and rewritten Change revisions.
 
-use sea_orm::{DatabaseConnection, DatabaseTransaction, TransactionTrait};
+use sea_orm::{DatabaseConnection, DatabaseTransaction};
 use thiserror::Error;
 
 use super::{
@@ -306,7 +306,9 @@ impl ChangeRevisionBuilder {
     }
 
     pub async fn build(self) -> Result<ChangeRevision, ChangeRevisionBuildError> {
-        let transaction = self.db.begin().await.map_err(ChangeStoreError::Database)?;
+        let transaction = crate::internal::db::begin_write_transaction(&self.db)
+            .await
+            .map_err(ChangeStoreError::Database)?;
         let result = self.build_on(&transaction).await;
         match result {
             Ok(revision) => {
