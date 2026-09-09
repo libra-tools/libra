@@ -5988,7 +5988,7 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         let conn = Database::connect(&db_url).await.expect("connect repo db");
         conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
-            "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
+            "DELETE FROM schema_versions WHERE version >= 2026090101".to_string(),
         ))
         .await
         .expect("remove forward-only v2 version marker before rollback fixture");
@@ -8676,7 +8676,7 @@ async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
         .expect("open repository db");
     conn.execute_raw(sea_orm::Statement::from_string(
         conn.get_database_backend(),
-        "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
+        "DELETE FROM schema_versions WHERE version >= 2026090101".to_string(),
     ))
     .await
     .expect("remove forward-only v2 version marker before rollback fixture");

@@ -4935,6 +4935,10 @@ mod tests {
                 "the cross-process operation middleware lease; it contains no object ids and is never a GC root",
             ),
             (
+                "operation-v2-repository.lock",
+                "the repository-scoped operation middleware lease; it contains no object ids and is never a GC root",
+            ),
+            (
                 "config",
                 "repository configuration file (dual-layout compatibility); no object ids",
             ),

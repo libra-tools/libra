@@ -91,7 +91,7 @@ async fn make_legacy_database(path: &Path) -> sea_orm::DatabaseConnection {
           VALUES ('legacy-view-1', 'branch', 'main', '', 'deadbeef');\
           INSERT INTO operation_view_workspace (view_id, pointer_kind, pointer_value)\
           VALUES ('legacy-view-1', 'head', 'deadbeef');\
-          DELETE FROM schema_versions WHERE version = 2026090101",
+          DELETE FROM schema_versions WHERE version >= 2026090101",
      )
      .await
      .expect("install legacy operation schema");

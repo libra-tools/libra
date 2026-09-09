@@ -96,7 +96,7 @@ async fn stale_repo_at_approved_permission() -> tempfile::TempDir {
     let runner = historical_builtin_runner().expect("historical migration registry");
     conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
-        "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
+        "DELETE FROM schema_versions WHERE version >= 2026090101".to_string(),
     ))
     .await
     .expect("remove forward-only v2 version marker before rollback fixture");

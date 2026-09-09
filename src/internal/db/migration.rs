@@ -2244,12 +2244,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 58);
+        assert_eq!(runner.len(), 60);
         assert!(!runner.is_empty());
-        assert_eq!(
-            runner.max_registered_version(),
-            Some(OPERATION_V2_MIGRATION_VERSION)
-        );
+        assert_eq!(runner.max_registered_version(), Some(2026090802));
     }
 
     #[test]
