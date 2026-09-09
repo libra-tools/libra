@@ -838,18 +838,23 @@ fn target_index_for_commit(commit_id: &ObjectHash) -> Result<Index, SwitchError>
 
 /// Working-tree precondition before switching to `target_commit`. Without
 /// `--force` the worktree must be clean relative to the target; with `--force`
-/// local (tracked) changes are allowed to be discarded and only untracked files
-/// that the target would overwrite are guarded.
-async fn ensure_switch_clean_or_force(
+/// local tracked changes may be discarded, but untracked overwrites and unsafe
+/// gitlink directory transitions are still refused.
+pub(crate) async fn ensure_switch_clean_or_force(
     force: bool,
     target_commit: ObjectHash,
     output: &OutputConfig,
 ) -> Result<(), SwitchError> {
     if force {
-        ensure_no_untracked_overwrite(target_commit)
+        ensure_no_untracked_overwrite(target_commit)?;
     } else {
-        ensure_clean_status_for_commit(target_commit, output).await
+        ensure_clean_status_for_commit(target_commit, output).await?;
     }
+    // Creation/reset callers must reject unsafe restores before changing refs.
+    restore::preflight_worktree_restore_to_commit(&target_commit)
+        .await
+        .map_err(CliError::from)?;
+    Ok(())
 }
 
 pub(crate) fn ensure_no_untracked_overwrite(target_commit: ObjectHash) -> Result<(), SwitchError> {
@@ -966,31 +971,33 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
 
     if let Some(new_branch_name) = force_create {
         validate_new_branch_request(&new_branch_name, branch.as_deref(), true).await?;
-        if let Some(existing) = Branch::find_branch_result(&new_branch_name, None)
+        let existing = Branch::find_branch_result(&new_branch_name, None)
             .await
-            .map_err(map_branch_store_error)?
+            .map_err(map_branch_store_error)?;
+        if let Some(existing) = &existing
+            && Some(existing.name.as_str()) == previous_branch.as_deref()
         {
-            if Some(existing.name.as_str()) == previous_branch.as_deref() {
-                return Err(SwitchError::DelegatedCli(
-                    CliError::fatal(format!(
-                        "cannot force-create the currently checked-out branch '{}'",
-                        new_branch_name
-                    ))
-                    .with_stable_code(StableErrorCode::ConflictOperationBlocked),
-                ));
-            }
-            Branch::delete_branch_result(&new_branch_name, None)
-                .await
-                .map_err(|e| SwitchError::BranchDelete {
-                    branch: new_branch_name.clone(),
-                    detail: e.to_string(),
-                })?;
+            return Err(SwitchError::DelegatedCli(
+                CliError::fatal(format!(
+                    "cannot force-create the currently checked-out branch '{}'",
+                    new_branch_name
+                ))
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked),
+            ));
         }
         match resolve_create_switch_target(branch.as_deref()).await? {
             Some(target_commit) => {
                 ensure_switch_clean_or_force(force, target_commit, output).await?
             }
             None => ensure_clean_status(output).await?,
+        }
+        if existing.is_some() {
+            Branch::delete_branch_result(&new_branch_name, None)
+                .await
+                .map_err(|e| SwitchError::BranchDelete {
+                    branch: new_branch_name.clone(),
+                    detail: e.to_string(),
+                })?;
         }
         branch::create_branch_safe(new_branch_name.clone(), branch).await?;
         let created_branch = resolve_created_branch(&new_branch_name).await?;
@@ -1387,6 +1394,10 @@ async fn move_to_commit(
     guard_target_tree_case(&commit_hash)
         .await
         .map_err(SwitchError::CaseCollision)?;
+    // Restore runs after publishing HEAD, so reject directory transitions now.
+    restore::preflight_worktree_restore_to_commit(&commit_hash)
+        .await
+        .map_err(CliError::from)?;
 
     let action = navigation_reflog_action(
         navigation_command,
@@ -1520,6 +1531,9 @@ async fn move_to_resolved_branch(
     guard_target_tree_case(&target_commit_id)
         .await
         .map_err(SwitchError::CaseCollision)?;
+    restore::preflight_worktree_restore_to_commit(&target_commit_id)
+        .await
+        .map_err(CliError::from)?;
     let context = ReflogContext {
         old_oid,
         new_oid: target_commit_id.to_string(),

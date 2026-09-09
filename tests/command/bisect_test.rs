@@ -29,6 +29,8 @@ use libra::{
 use serial_test::serial;
 use tempfile::tempdir;
 
+mod gitlink_preflight;
+
 /// Run the Libra binary with an isolated HOME so host config never leaks into tests.
 fn run_libra_command(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
     let home = cwd.join(".libra-test-home");

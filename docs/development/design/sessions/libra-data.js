@@ -1,0 +1,253 @@
+// Mock data — prototype demonstration only, not real sessions.
+const R = (status, kind, provider, text, meta) => ({ k: 'reasoning', status, kind, provider, text, meta });
+const T = (id, name, input, output, status, basis, file) => ({ k: 'tool', id, name, input, output, status, basis, file });
+
+export const TODAY = '2026-09-05';
+
+export const SESSIONS = [
+  {
+    id: 's-cc-arch', sessionId: 'a3f9c2e1-7b44-4d0e-9a51-2c8e0f6d1b73', agent: 'Claude Code', agentVersion: '2.1.259',
+    title: 'Effect of async checkpoint writes on recovery consistency', titleSource: 'First real user question',
+    summary: 'Compared sync vs. async checkpoint writes; no code changed; produced an option table.', summarySource: 'Structural stats summary',
+    models: ['claude-opus-4-1', 'claude-sonnet-4-5'], model: 'claude-opus-4-1 → claude-sonnet-4-5',
+    start: '2026-09-05T10:42:00', end: '2026-09-05T11:08:00', repo: 'libra', worktree: 'main', head: '9d1e4c7',
+    status: { running: false, runningLabel: 'Stopped', capture: 'complete', captureLabel: 'Capture complete', readable: 'partial', readableLabel: 'Partly readable (archived ciphertext)', evidence: '1 failing test' },
+    usage: { input: 48210, cacheRead: 31900, cacheWrite: 4200, output: 6120, reasoning: 'Unknown', calls: 9, cost: null, costNote: 'Source provides no cost' },
+    verification: [{ label: 'cargo test -p libra-hooks', result: 'failed', detail: 'exit 101 · 1 failed / 24 passed', ref: 'cc-t2-bash' }],
+    files: [
+      { path: 'CLAUDE.md', source: 'FileChanged hook (literal watch)', ref: 'cc-t3', hasDiff: false, note: 'FileChanged currently watches only CLAUDE.md and a few settings files — not all workspace changes.' },
+      { path: 'src/checkpoint/writer.rs', source: 'Read tool (path only)', ref: 'cc-t1-read1', hasDiff: false, note: 'Path record only; no historical snapshot, so no diff is generated.' },
+      { path: 'src/hooks/post_tool_use.rs', source: 'Read tool (path only)', ref: 'cc-t2-read', hasDiff: false },
+    ],
+    commits: [],
+    hooks: {
+      baseline: '33 events · baseline Claude Code 2.1.259', installed: 33, observed: 12,
+      groups: [
+        { name: 'Session', items: [['SessionStart', 'observed'], ['SessionEnd', 'observed'], ['Stop', 'observed'], ['StopFailure', 'installed']] },
+        { name: 'Prompting', items: [['UserPromptSubmit', 'observed'], ['MessageDisplay', 'observed'], ['AssistantMessage', 'observed']] },
+        { name: 'Tools & permissions', items: [['PreToolUse', 'observed'], ['PostToolUse', 'observed'], ['PostToolUseFailure', 'observed'], ['PermissionRequest', 'observed'], ['PermissionDenied', 'installed']] },
+        { name: 'Tasks & subagents', items: [['SubagentStart', 'installed'], ['SubagentStop', 'installed'], ['TaskCreated', 'installed'], ['TaskCompleted', 'installed'], ['TeammateIdle', 'unsupported']] },
+        { name: 'Workspace', items: [['FileChanged', 'observed'], ['WorktreeCreate', 'installed'], ['WorktreeRemove', 'installed'], ['CwdChanged', 'mismatch']] },
+        { name: 'Compaction & model', items: [['PreCompact', 'installed'], ['PostCompact', 'installed'], ['ModelChanged', 'observed'], ['ConfigChange', 'installed']] },
+        { name: 'Notifications & MCP', items: [['Notification', 'observed'], ['Elicitation', 'installed'], ['ElicitationResult', 'installed'], ['McpServerConnected', 'installed'], ['McpServerFailed', 'installed'], ['InstructionsLoaded', 'installed'], ['SessionResume', 'installed'], ['Setup', 'installed']] },
+      ],
+      fileChangedScope: ['CLAUDE.md', '.claude/settings.json', '.claude/settings.local.json'],
+    },
+    aiSummary: [
+      { text: 'Leans toward keeping the synchronous write path; async queue only for non-critical derived indexes.', ref: 'cc-t3-a' },
+      { text: 'Main risk of going async is losing queued checkpoints on crash — needs an fsync boundary.', ref: 'cc-t1-a' },
+    ],
+    turns: [
+      { id: 'cc-t1', n: 1, time: '10:42', user: 'Our checkpoint writes are synchronous today. I want to think through whether moving to an async queue would hurt recovery consistency. Start by looking at how the writer does it now.',
+        events: [
+          R('provider_visible', 'thinking', 'Anthropic', 'The user wants an assessment of consistency risk for async checkpoint writes. I should read writer.rs first to see the write points and where fsync happens, then check which checkpoint fields the recovery path depends on. Key questions: does recovery assume write ordering, and how large is the loss window for a queue on crash.', { size: '1.4 KB' }),
+          T('cc-t1-read1', 'Read', 'src/checkpoint/writer.rs', '// 212 lines · truncated\npub fn write_checkpoint(&mut self, cp: &Checkpoint) -> Result<()> {\n    let bytes = cp.encode()?;\n    self.file.write_all(&bytes)?;\n    self.file.sync_data()?;\n    self.index.append(cp.id, self.offset)?;\n    ...', 'ok', 'PostToolUse event', 'src/checkpoint/writer.rs'),
+          T('cc-t1-read2', 'Read', 'src/checkpoint/recover.rs', '// 158 lines · truncated', 'ok', 'PostToolUse event', 'src/checkpoint/recover.rs'),
+          T('cc-t1-read3', 'Read', 'src/checkpoint/mod.rs', '// 41 lines', 'ok', 'PostToolUse event', 'src/checkpoint/mod.rs'),
+          T('cc-t1-grep', 'Grep', 'pattern: sync_data|fsync  path: src/', 'src/checkpoint/writer.rs:19\nsrc/store/wal.rs:77', 'ok', 'PostToolUse event'),
+          { k: 'assistant', id: 'cc-t1-a', md: 'The current path is **write data → `sync_data` → append index**, and recovery (`recover.rs`) relies on every index entry pointing at data that is already durable.\n\nMoving to an async queue carries two main risks:\n\n- **Loss window**: on crash, checkpoints still queued and not yet `fsync`ed are lost, so recovery falls back to an earlier point.\n- **Ordering assumption**: `recover.rs` assumes index order equals write order; going async requires a single consumer or an explicit sequence number.\n\n```rust\n// recover.rs:63 — where the ordering assumption lives\nfor entry in index.iter() {\n    let cp = read_at(entry.offset)?; // assumes already durable\n    apply(cp);\n}\n```\n\nWant me to look at how the hooks side depends on checkpoint timing?' },
+        ] },
+      { id: 'cc-t2', n: 2, time: '10:51', user: 'Check how the hooks directory handles PostToolUse right now, then run the libra-hooks tests.',
+        events: [
+          R('provider_visible', 'thinking', 'Anthropic', 'Read post_tool_use.rs first, then run cargo test -p libra-hooks. If tests fail, separate environment problems from logic problems.', { size: '0.6 KB' }),
+          R('opaque_archived', 'signature', 'Anthropic', null, { size: '1.9 KB', hash: 'sha256:7c1e…a90f', integrity: 'Intact', archivedAt: '10:51:32' }),
+          T('cc-t2-read', 'Read', 'src/hooks/post_tool_use.rs', '// 96 lines · truncated\npub async fn on_post_tool_use(ev: HookEnvelope) -> Result<()> {\n    let cp = Checkpoint::from_tool_event(&ev)?;\n    writer.write_checkpoint(&cp) // synchronous call\n}', 'ok', 'PostToolUse event', 'src/hooks/post_tool_use.rs'),
+          T('cc-t2-bash', 'Bash', 'cargo test -p libra-hooks', 'running 25 tests\n...\ntest post_tool_use::writes_checkpoint_on_failure ... FAILED\n\nfailures:\n    post_tool_use::writes_checkpoint_on_failure\n        assertion failed: writer.len() == 2\n\ntest result: FAILED. 24 passed; 1 failed\nerror: test failed, exit status 101', 'failed', 'PostToolUseFailure event · exit 101'),
+          { k: 'assistant', id: 'cc-t2-a', md: '`on_post_tool_use` calls `write_checkpoint` synchronously, so hooks have a hard dependency on write timing.\n\nOne test **fails**: `writes_checkpoint_on_failure` expects a checkpoint to be written when a tool fails, but the current implementation only writes on the success path. That gap is pre-existing and unrelated to going async.' },
+        ] },
+      { id: 'cc-t3', n: 3, time: '11:02', user: 'Do not change code yet. Give me a comparison table of the options.',
+        events: [
+          { k: 'event', kind: 'model_switch', title: 'Model switch: claude-opus-4-1 → claude-sonnet-4-5', detail: 'Source: ModelChanged hook event · 11:01:48' },
+          R('opaque_archived', 'redacted_thinking', 'Anthropic', null, { size: '3.2 KB', hash: 'sha256:0b4d…e2c1', integrity: 'Intact', archivedAt: '11:02:10' }),
+          { k: 'display', count: 14, summary: '14 MessageDisplay events (progress and streaming fragments), shown as a merged count — not a verbatim transcript.' },
+          { k: 'assistant', id: 'cc-t3-a', md: '| Option | Recovery consistency | Latency | Blast radius |\n|---|---|---|---|\n| Keep sync writes | Strong: index implies durable | Blocks ~2–6 ms per tool event | None |\n| Async queue + batched fsync | Weak: loss window on crash | Low | writer / recover / hooks |\n| Sync main path, async derived index | Strong (main path unchanged) | Low | Index layer only |\n\nI would take the third option: **keep the main checkpoint synchronous and make the derived index async**. That leaves the ordering assumption in `recover.rs` untouched.\n\nI also appended this conclusion to the "architecture conventions" section of `CLAUDE.md`.' },
+        ] },
+    ],
+  },
+
+  {
+    id: 's-cx-pagination', sessionId: 'thr_01J7Q2X8K4M9N3P6R1S5T0V2W', agent: 'Codex', agentVersion: 'codex-cli 0.42.0',
+    title: 'Fix last row dropped from paginated list endpoint', titleSource: 'First real user question',
+    summary: 'Traced an off-by-one offset, patched pagination.ts, tests pass, linked commit 4b2c9e1.', summarySource: 'Structural stats summary',
+    models: ['gpt-5-codex'], model: 'gpt-5-codex', reasoningEffort: 'high',
+    start: '2026-09-05T09:12:00', end: '2026-09-05T09:47:00', repo: 'libra', worktree: 'feat/api-v2', head: '4b2c9e1',
+    status: { running: false, runningLabel: 'Stopped', capture: 'finalize_pending', captureLabel: 'Finalize pending', readable: 'readable', readableLabel: 'Readable', evidence: 'Tests passed · linked commit',
+      finalize: { reason: 'The capture process exited while the index was locked; the trailing usage delta and turn 4 completion event were never written.', lastUpdate: '2026-09-05 09:47:12', action: 'Re-run finalize' } },
+    usage: { input: 91300, cacheRead: 62000, cacheWrite: 'Unknown', output: 8840, reasoning: 5210, calls: 14, cost: 0.31, costNote: 'Source: Codex usage event deltas, estimated at public list prices',
+      subagent: { input: 12400, output: 1900, reasoning: 880, calls: 3 }, subagentIncluded: false },
+    verification: [{ label: 'pnpm test pagination', result: 'passed', detail: 'exit 0 · 12 passed', ref: 'cx-sub-1' }],
+    files: [
+      { path: 'src/api/pagination.ts', source: 'apply_patch tool · checkpoint #3 → #5', ref: 'cx-t1-patch', hasDiff: true, from: 'checkpoint #3 · 09:18', to: 'checkpoint #5 · 09:26',
+        diff: [
+          { t: 'c', s: 'export function page<T>(rows: T[], size: number, index: number) {' },
+          { t: 'c', s: '  const start = index * size;' },
+          { t: '-', s: '  const end = start + size - 1;' },
+          { t: '+', s: '  const end = start + size;' },
+          { t: 'c', s: '  return {' },
+          { t: 'c', s: '    items: rows.slice(start, end),' },
+          { t: '-', s: '    hasMore: end < rows.length - 1,' },
+          { t: '+', s: '    hasMore: end < rows.length,' },
+          { t: 'c', s: '  };' },
+          { t: 'c', s: '}' },
+        ] },
+      { path: 'src/api/pagination.test.ts', source: 'apply_patch tool · checkpoint #4', ref: 'cx-t1-patch2', hasDiff: false, note: 'Single snapshot only; nothing to compare against.' },
+    ],
+    commits: [{ sha: '4b2c9e1', message: 'fix(api): include last row in paginated results', kind: 'Linked commit', sharedWith: ['s-old-history'], attribution: 'Of the 2 files in this commit, 1 has tool-level evidence from this session (pagination.ts). Attribution for pagination.test.ts is unconfirmed.' }],
+    reconcile: { available: false, reason: 'Index busy (sessions.jsonl is being written by Codex)', lastRun: '2026-09-04 22:10', range: '2026-08-29 – 2026-09-04', imported: 27, notImported: 3, notImportedNote: 'Non-imported sessions show only approved metadata; importing is a separate explicit action.' },
+    aiSummary: [
+      { text: 'Root cause: the slice end index was computed as a closed interval, dropping one row per page.', ref: 'cx-t1-a' },
+      { text: 'Verification ran in a subagent via pnpm test — 12 tests passed.', ref: 'cx-sub-1' },
+    ],
+    turns: [
+      { id: 'cx-t1', n: 1, turnId: 'turn_8f2a', time: '09:12', user: 'The list endpoint drops the last row on page two, and page one is short by one as well. Look at the pagination implementation under src/api and find the cause.',
+        injected: [{ label: 'environment_context', text: '<environment_context>\n  cwd: /Users/dev/libra\n  shell: zsh\n  approval: on-request\n</environment_context>' }, { label: 'AGENTS.md', text: '# AGENTS.md\n- Use pnpm\n- Run the relevant tests before editing\n… (1.2 KB)' }],
+        events: [
+          R('provider_visible', 'reasoning_summary', 'OpenAI', 'Check the slice boundary in pagination.ts; `end = start + size - 1` treats slice as a closed interval and takes one row too few. The `hasMore` check is off by one for the same reason.', { size: '0.3 KB' }),
+          T('cx-t1-rg', 'shell', 'rg -n "slice|offset" src/api', 'src/api/pagination.ts:6:  return { items: rows.slice(start, end),', 'ok', 'exit 0'),
+          T('cx-t1-patch', 'apply_patch', '*** Update File: src/api/pagination.ts\n@@\n-  const end = start + size - 1;\n+  const end = start + size;\n@@\n-    hasMore: end < rows.length - 1,\n+    hasMore: end < rows.length,', 'Success. Updated the following files:\nM src/api/pagination.ts', 'ok', 'exit 0', 'src/api/pagination.ts'),
+          T('cx-t1-patch2', 'apply_patch', '*** Update File: src/api/pagination.test.ts\n+ it("includes the last row", () => { … })', 'Success. Updated the following files:\nM src/api/pagination.test.ts', 'ok', 'exit 0', 'src/api/pagination.test.ts'),
+          { k: 'assistant', id: 'cx-t1-a', md: 'The cause is in `pagination.ts`: `end = start + size - 1` treats `slice` as a closed interval when it is half-open, so every page is one row short, and `hasMore` is off by one for the same reason.\n\nChanged it to `end = start + size` and added an "includes the last row" test. Next I will have a subagent run the tests.' },
+        ] },
+      { id: 'cx-t2', n: 2, turnId: 'turn_9c17', time: '09:27', user: null, system: 'Agent continued (no new user input)',
+        events: [
+          { k: 'subagent', id: 'cx-sub-1', name: 'tests-runner', hasBody: true, lifecycle: 'started 09:27:04 · stopped 09:28:40', usage: { input: 12400, output: 1900, reasoning: 880, calls: 3 },
+            body: [
+              T('cx-sub-1-t', 'shell', 'pnpm test pagination', '> vitest run pagination\n\n ✓ src/api/pagination.test.ts (12)\n\n Test Files  1 passed (1)\n      Tests  12 passed (12)', 'ok', 'exit 0'),
+              { k: 'assistant', id: 'cx-sub-1-a', md: 'All 12 tests pass.' },
+            ] },
+          { k: 'assistant', id: 'cx-t2-a', md: 'The `tests-runner` subagent reports **12 passed** (exit 0).' },
+        ] },
+      { id: 'cx-t3', n: 3, turnId: 'turn_a044', time: '09:31', user: null, system: null,
+        events: [
+          { k: 'event', kind: 'compaction', title: 'Context compaction', detail: 'Source: compaction event · 09:31:05 · 91k tokens before → 23k after. Reading earlier turns is unaffected.' },
+        ] },
+      { id: 'cx-t4', n: 4, turnId: 'turn_b3e9', time: '09:44', user: 'Good, commit it. Use conventional commits for the message.',
+        events: [
+          R('provider_visible', 'reasoning_summary', 'OpenAI', 'Commit both changes; type fix, scope api.', { size: '0.1 KB' }),
+          T('cx-t4-git', 'shell', 'git commit -am "fix(api): include last row in paginated results"', '[feat/api-v2 4b2c9e1] fix(api): include last row in paginated results\n 2 files changed, 9 insertions(+), 3 deletions(-)', 'ok', 'exit 0'),
+          { k: 'assistant', id: 'cx-t4-a', md: 'Committed as `4b2c9e1`.' },
+          { k: 'event', kind: 'finalize', title: 'Completion event missing', detail: 'This turn\u2019s turn.completed event and trailing usage delta were never written (finalize pending).' },
+        ] },
+    ],
+  },
+
+  {
+    id: 's-oc-full', sessionId: 'ses_4Yk2mT9pQ', agent: 'OpenCode', agentVersion: '0.6.3', source: 'Desktop',
+    title: 'Add corrupt-block skipping to wal.rs', titleSource: 'Redacted title (export title)',
+    summary: 'Read wal.rs, added a skip_corrupt branch and unit tests; all pass.', summarySource: 'Structural stats summary',
+    models: ['anthropic/claude-sonnet-4-5'], model: 'anthropic/claude-sonnet-4-5',
+    start: '2026-09-04T16:20:00', end: '2026-09-04T16:41:00', repo: 'libra', worktree: 'main', head: '9d1e4c7',
+    status: { running: false, runningLabel: 'Stopped normally', capture: 'complete', captureLabel: 'Content capture complete', readable: 'partial', readableLabel: 'Partly readable (archived signature)', evidence: 'Tests passed' },
+    usage: { input: 30400, cacheRead: 18700, cacheWrite: 2600, output: 4100, reasoning: 1320, calls: 6, cost: null, costNote: 'Source provides no cost', note: 'Aggregate tokens come from the session-level field; step-finish details are used only for per-turn display and are never added on top.' },
+    verification: [{ label: 'cargo test wal', result: 'passed', detail: 'exit 0 · 9 passed', ref: 'oc-t2-bash' }],
+    files: [
+      { path: 'src/store/wal.rs', source: 'edit tool + patch file list (deduplicated)', ref: 'oc-t1-edit', hasDiff: true, from: 'export snapshot #1 · 16:24', to: 'export snapshot #2 · 16:33',
+        diff: [
+          { t: 'c', s: '    while let Some(block) = reader.next_block()? {' },
+          { t: '-', s: '        let rec = block.decode()?;' },
+          { t: '+', s: '        let rec = match block.decode() {' },
+          { t: '+', s: '            Ok(r) => r,' },
+          { t: '+', s: '            Err(e) if self.skip_corrupt => { warn!("skip corrupt block: {e}"); continue }' },
+          { t: '+', s: '            Err(e) => return Err(e.into()),' },
+          { t: '+', s: '        };' },
+          { t: 'c', s: '        out.push(rec);' },
+        ] },
+      { path: 'src/store/wal_test.rs', source: 'patch file list', ref: 'oc-t1-edit2', hasDiff: false, note: 'Single snapshot only.' },
+    ],
+    commits: [],
+    exporter: { trusted: true, sandbox: 'Available', duration: '1.8 s', parts: { recognized: 41, projected: 38, note: '3 parts (step-start) were recognized but the backend provides no semantic projection, so they are not rendered as content.' } },
+    turns: [
+      { id: 'oc-t1', n: 1, time: '16:20', user: 'wal.rs errors out as soon as it hits a corrupt block. I want an optional skip path, off by default.',
+        events: [
+          R('provider_visible', 'reasoning_text', 'Anthropic', 'Add a skip_corrupt field on WalReader; on decode failure the flag decides between continue and returning the error. Default false keeps current behaviour.', { size: '0.4 KB' }),
+          R('opaque_archived', 'signature', 'Anthropic', null, { size: '0.9 KB', hash: 'sha256:c31a…77d0', integrity: 'Intact', archivedAt: '16:20:41' }),
+          T('oc-t1-read', 'read', 'src/store/wal.rs', '// 140 lines · truncated', 'ok', 'tool.state = completed', 'src/store/wal.rs'),
+          T('oc-t1-edit', 'edit', 'src/store/wal.rs', 'Edited src/store/wal.rs (+6 −1)', 'ok', 'tool.state = completed', 'src/store/wal.rs'),
+          T('oc-t1-edit2', 'edit', 'src/store/wal_test.rs', 'Edited src/store/wal_test.rs (+18)', 'ok', 'tool.state = completed', 'src/store/wal_test.rs'),
+          { k: 'assistant', id: 'oc-t1-a', md: 'Added `skip_corrupt: bool` to `WalReader` (default `false`). On `decode` failure the flag decides whether to skip the block or return the error, plus two new tests.' },
+        ] },
+      { id: 'oc-t2', n: 2, time: '16:33', user: 'Run the tests.',
+        events: [
+          R('not_present', 'reasoning_text', 'Anthropic', null, {}),
+          T('oc-t2-bash', 'bash', 'cargo test wal', 'running 9 tests\n...\ntest result: ok. 9 passed; 0 failed', 'ok', 'tool.state = completed · exit 0'),
+          { k: 'assistant', id: 'oc-t2-a', md: '`cargo test wal`: **9 passed**.' },
+        ] },
+    ],
+  },
+
+  {
+    id: 's-oc-meta', sessionId: 'ses_7Hn3wR2xL', agent: 'OpenCode', agentVersion: '0.6.3', source: 'CLI/TUI',
+    title: '(Export unavailable) OpenCode session ses_7Hn3wR2xL', titleSource: 'Placeholder: no readable title',
+    summary: null, models: [], model: 'Unknown',
+    start: '2026-09-04T11:05:00', end: '2026-09-04T11:19:00', repo: 'libra', worktree: 'main', head: '8a0f21b',
+    status: { running: false, runningLabel: 'Stopped normally', capture: 'metadata_only', captureLabel: 'Metadata only', readable: 'none', readableLabel: 'No content', evidence: 'None' },
+    usage: { input: 'Unknown', cacheRead: 'Unknown', cacheWrite: 'Unknown', output: 'Unknown', reasoning: 'Unknown', calls: 'Unknown', cost: null, costNote: 'Unknown' },
+    verification: [], files: [], commits: [],
+    exporter: { trusted: false, reason: 'Exporter not trusted: the signature of ~/.opencode/bin/export does not match the registered fingerprint', sandbox: 'Unavailable (bubblewrap missing)', duration: '—', kept: ['Session ID', 'Start / end time', 'Worktree and HEAD at capture', 'Source type CLI/TUI'] },
+    turns: [],
+  },
+
+  {
+    id: 's-old-history', sessionId: 'c9d0e1f2-3a4b-4c5d-8e6f-7a8b9c0d1e2f', agent: 'Claude Code', agentVersion: '2.0.31',
+    title: '(No summary) Claude Code session · Jun 12', titleSource: 'Placeholder: legacy session, no reliable title',
+    summary: null, models: ['claude-sonnet-4'], model: 'claude-sonnet-4',
+    start: '2026-06-12T14:03:00', end: '2026-06-12T15:20:00', repo: 'libra', worktree: 'main', head: '2c77e0a',
+    status: { running: false, runningLabel: 'Stopped', capture: 'partial', captureLabel: 'Capture incomplete', readable: 'partial', readableLabel: 'Partly readable (unknown shape)', evidence: 'None' },
+    usage: { input: 20100, cacheRead: 'Unknown', cacheWrite: 'Unknown', output: 3300, reasoning: 'Unknown', calls: 5, cost: null, costNote: 'Source provides no cost' },
+    verification: [], files: [{ path: 'src/api/pagination.test.ts', source: 'Edit tool (path only)', ref: 'old-cp3', hasDiff: false, note: 'Path record only.' }],
+    commits: [{ sha: '4b2c9e1', message: 'fix(api): include last row in paginated results', kind: 'Linked commit (multi-session)', sharedWith: ['s-cx-pagination'], attribution: 'This session holds only a path record for pagination.test.ts, which cannot establish attribution.' }],
+    orderNote: 'This session has no stable turn index; it is read in checkpoint time order.',
+    turns: [
+      { id: 'old-cp1', n: 1, cp: 'checkpoint #1', time: '14:03', user: 'Add a few boundary cases to the pagination tests.',
+        events: [
+          R('not_present', 'thinking', 'Anthropic', null, {}),
+          { k: 'assistant', id: 'old-cp1-a', md: 'Sure. Let me look at the existing test file structure first.' },
+        ] },
+      { id: 'old-cp3', n: 2, cp: 'checkpoint #3', time: '14:41', user: 'Cover the empty array and size=0 too.',
+        revisions: [{ id: 'rev-2', time: '14:41:20', label: 'Current effective version', current: true }, { id: 'rev-1', time: '14:40:02', label: 'First capture (later superseded)', current: false, note: 'Repeat capture of the same checkpoint; text differs slightly.' }],
+        events: [
+          { k: 'unsupported', shape: 'content_block.type = "tool_reference"', detail: 'This block shape is not supported yet; only the raw envelope is stored. The turn is shown as partly incomplete.' },
+          T('old-cp3-edit', 'Edit', 'src/api/pagination.test.ts', '(output not captured)', 'unknown', 'No PostToolUse record; result unknown', 'src/api/pagination.test.ts'),
+          { k: 'redacted', reason: 'Hidden by security policy: credential-shaped strings were detected, redacted at capture time and removed from the index.' },
+          { k: 'assistant', id: 'old-cp3-a', md: 'Added `empty input` and `size = 0` cases.' },
+        ] },
+    ],
+  },
+
+  {
+    id: 's-cx-readme', sessionId: 'thr_01J7N5Y2B8C4D9E1F3G6H0J2K', agent: 'Codex', agentVersion: 'codex-cli 0.42.0',
+    title: 'Unify checkpoint / snapshot wording in the README', titleSource: 'First real user question',
+    summary: 'Replaced snapshot with checkpoint in the README, 7 occurrences.', summarySource: 'Structural stats summary',
+    models: ['gpt-5-codex'], model: 'gpt-5-codex', reasoningEffort: 'medium',
+    start: '2026-09-04T18:02:00', end: '2026-09-04T18:09:00', repo: 'libra', worktree: 'main', head: '9d1e4c7',
+    status: { running: false, runningLabel: 'Stopped', capture: 'complete', captureLabel: 'Capture complete', readable: 'readable', readableLabel: 'Readable', evidence: 'None' },
+    usage: { input: 8200, cacheRead: 5100, cacheWrite: 'Unknown', output: 900, reasoning: 210, calls: 2, cost: 0.03, costNote: 'Source: Codex usage event deltas, estimated at public list prices' },
+    verification: [], files: [{ path: 'README.md', source: 'apply_patch tool · single snapshot', ref: 'cxr-t1-patch', hasDiff: false, note: 'Single snapshot only.' }], commits: [],
+    reconcile: { available: false, reason: 'Index busy', lastRun: '2026-09-04 22:10', range: '2026-08-29 – 2026-09-04', imported: 27, notImported: 3 },
+    turns: [
+      { id: 'cxr-t1', n: 1, turnId: 'turn_c201', time: '18:02', user: 'The README mixes snapshot and checkpoint. Standardise on checkpoint.',
+        injected: [{ label: 'environment_context', text: '<environment_context>cwd: /Users/dev/libra</environment_context>' }],
+        events: [
+          R('provider_visible', 'reasoning_summary', 'OpenAI', 'Replace snapshot with checkpoint throughout, keeping API names inside code blocks unchanged.', { size: '0.1 KB' }),
+          T('cxr-t1-patch', 'apply_patch', '*** Update File: README.md (7 hunks)', 'Success. Updated the following files:\nM README.md', 'ok', 'exit 0', 'README.md'),
+          { k: 'assistant', id: 'cxr-t1-a', md: 'Replaced 7 occurrences; `create_snapshot()` inside code blocks keeps its original name.' },
+        ] },
+    ],
+  },
+];
+
+export const CAPABILITY_MAP = [
+  ['Session list and grouping', 'CC/CX/OG capture plans: session metadata', 'session id, agent, start time, redacted title', 'Placeholder title, keep agent and time'],
+  ['Real turn reading', 'CX turn_id · CC UserPromptSubmit · OG message part', 'Stable turn index or backend fallback order', 'Read in checkpoint time order'],
+  ['Reasoning display (5 states)', 'RG reasoning retention contract', 'status, kind, provider, safe metadata', '"Not provided by source" / archive metadata'],
+  ['Tool status', 'CC PostToolUseFailure · CX exit code · OG tool.state', 'Reliable status field or execution evidence', '"Result unknown"'],
+  ['File records', 'CC FileChanged · CX apply_patch · OG tool + patch list', 'Path plus source reference', 'Show path and source only'],
+  ['Historical diff reading (new design)', '— depends on checkpoint / export snapshots', 'Two comparable snapshots', 'No diff generated'],
+  ['Session ↔ commit link', 'CX/CC/OG HEAD at capture and commit events', 'sha, message, attribution evidence', 'Show HEAD only, claim no attribution'],
+  ['Usage', 'CX usage deltas · OG session aggregate · CC unknown', 'Raw values per source convention', '"Unknown", never zero-filled'],
+  ['Claude Code hook coverage', 'CC hook plan (33-event baseline)', 'Capability data: installed / observed / version', 'Label each event separately'],
+  ['Codex capture reconciliation', 'CX reconciliation capability', 'Index availability, time range, counts', '"Reconciliation unavailable"'],
+  ['OpenCode exporter status', 'OG capture plan: exporter trust and sandbox', 'Trust, sandbox, duration, part projection', 'Keep metadata and the safety reason'],
+  ['Full-text search (new design)', '— over stored redacted projections', 'Content and readable reasoning index', 'Ciphertext and envelopes stay out of the index'],
+  ['AI semantic summary (new design idea)', '— not a capability in the capture plans', 'Readable content plus source refs', 'Not shown'],
+];

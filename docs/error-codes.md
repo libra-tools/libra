@@ -85,7 +85,7 @@ structured report is always present.
 | Exit | Stable code | Category | Meaning | Typical examples |
 | --- | --- | --- | --- | --- |
 | `129` | `LBR-CLI-001` | `cli` | Unknown command | `libra wat` |
-| `129` | `LBR-CLI-002` | `cli` | Invalid or missing CLI arguments | missing required flag, conflicting flags ; `update-ref` fatals exit `128` instead — see the note below the table |
+| `129` | `LBR-CLI-002` | `cli` | Invalid or missing CLI arguments | missing required flag, conflicting flags, `init` targeting the per-user Libra home as repository storage; `update-ref` fatals exit `128` instead — see the note below the table |
 | `129` | `LBR-CLI-003` | `cli` | Invalid object, revision, pathspec, or move target | bad ref, invalid pathspec, outside-repo move target, `update-ref <newvalue>` naming an unresolvable revision or an object that is not a commit ; `update-ref` fatals exit `128` instead — see the note below the table |
 | `128` | `LBR-REPO-001` | `repo` | Not inside a Libra repository | running repo commands outside `.libra` |
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata |

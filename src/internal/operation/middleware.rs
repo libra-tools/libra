@@ -6,12 +6,8 @@
 //! time census for every concrete command variant.  Unknown names are a hard
 //! error: an unclassified mutation must never silently run outside the log.
 
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::{
-    fs::{File, OpenOptions},
     future::Future,
-    io::Write,
     pin::Pin,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,13 +18,17 @@ use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod lease;
+use lease::LeaseFilePermissions;
+pub(crate) use lease::ScopeLease;
+
 use super::{
     Completeness, JournalEntry, JournalPhase, OperationKind, OperationMetaV2, OperationStatusV2,
     OperationStoreV2, OperationV2, PinnedRequestScope, RepoViewV2, SnapshotError, Staleness,
     WorkspaceSnapshotter, WorkspaceStatePointer,
 };
 use crate::{
-    internal::{db::get_db_conn_instance_for_path, workspace::RepoIdentity},
+    internal::{config::ConfigKv, db::get_db_conn_instance_for_path, workspace::RepoIdentity},
     utils::{
         client_storage::ClientStorage,
         error::{CliError, StableErrorCode},
@@ -89,6 +89,10 @@ pub enum OperationError {
     Mutation(String),
     #[error("operation storage failed: {0}")]
     Storage(String),
+    #[error(
+        "operation storage failed: operation scope lease is already held for {scope_key} at '{path}'; wait for the other operation to finish, then retry"
+    )]
+    LeaseBusy { scope_key: String, path: String },
     #[error("workspace operation pointer is stale: {0}")]
     Stale(String),
     #[error("operation publication compare-and-swap failed: {0}")]
@@ -119,6 +123,75 @@ pub struct OperationResult<T> {
     pub recorded: bool,
 }
 
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{OperationError, OperationMetaV2};
+
+    static PRE_LEASE_BUSY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    static POST_MUTATION_FAILURE: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+
+    fn pre_lease_busy() -> &'static Mutex<Option<String>> {
+        PRE_LEASE_BUSY.get_or_init(|| Mutex::new(None))
+    }
+
+    fn post_mutation_failure() -> &'static Mutex<Option<(String, String)>> {
+        POST_MUTATION_FAILURE.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(crate) fn fail_next_lease_for_causal_context(causal_context_id: String) {
+        if let Ok(mut slot) = pre_lease_busy().lock() {
+            *slot = Some(causal_context_id);
+        }
+    }
+
+    pub(crate) fn clear_pre_lease_busy() {
+        if let Ok(mut slot) = pre_lease_busy().lock() {
+            *slot = None;
+        }
+    }
+
+    pub(crate) fn fail_after_mutation_for_causal_context(
+        causal_context_id: String,
+        reason: String,
+    ) {
+        if let Ok(mut slot) = post_mutation_failure().lock() {
+            *slot = Some((causal_context_id, reason));
+        }
+    }
+
+    pub(crate) fn clear_post_mutation_failure() {
+        if let Ok(mut slot) = post_mutation_failure().lock() {
+            *slot = None;
+        }
+    }
+
+    pub(super) fn take_pre_lease_busy(meta: &OperationMetaV2) -> Option<OperationError> {
+        let causal_context_id = meta.causal_context_id.as_deref()?;
+        let mut slot = pre_lease_busy().lock().ok()?;
+        if slot.as_deref() != Some(causal_context_id) {
+            return None;
+        }
+        slot.take();
+        Some(OperationError::LeaseBusy {
+            scope_key: "test-scope".to_string(),
+            path: "test-operation-v2.lock".to_string(),
+        })
+    }
+
+    pub(super) fn take_post_mutation_failure(meta: &OperationMetaV2) -> Option<OperationError> {
+        let causal_context_id = meta.causal_context_id.as_deref()?;
+        let mut slot = post_mutation_failure().lock().ok()?;
+        let (expected, _) = slot.as_ref()?;
+        if expected != causal_context_id {
+            return None;
+        }
+        let (_, reason) = slot.take()?;
+        Some(OperationError::Storage(reason))
+    }
+}
+
 /// Execute a closure at the unified mutation boundary.
 ///
 /// Repository-backed scopes execute the complete v2 pipeline: scope lease,
@@ -137,15 +210,18 @@ where
     F: FnOnce(&mut OperationTxn) -> Fut,
     Fut: Future<Output = Result<T, OperationError>>,
 {
-    if repository_scope_is_ready(scope) {
-        return run_with_persistent_operation(scope, meta, class, f).await;
-    }
-    if class == MutationClass::ExternalOrUnknown {
-        // Outside a pinned repository there is no bounded before/after
-        // snapshot, so an external mutation must not be executed at all.
-        return Err(OperationError::ExternalUnverified);
-    }
-    run_ephemeral_operation(class, f).await
+    crate::internal::worktree_scope::with_request_scope(Some(scope.clone()), async {
+        if repository_scope_is_ready(scope) {
+            return run_with_persistent_operation(scope, meta, class, f).await;
+        }
+        if class == MutationClass::ExternalOrUnknown {
+            // Outside a pinned repository there is no bounded before/after
+            // snapshot, so an external mutation must not be executed at all.
+            return Err(OperationError::ExternalUnverified);
+        }
+        run_ephemeral_operation(class, f).await
+    })
+    .await
 }
 
 async fn run_ephemeral_operation<T, F, Fut>(
@@ -181,81 +257,6 @@ fn repository_scope_is_ready(scope: &PinnedRequestScope) -> bool {
     scope.gitdir.is_dir()
 }
 
-pub(crate) struct ScopeLease {
-    #[cfg(unix)]
-    file: File,
-    #[cfg(not(unix))]
-    _key: String,
-}
-
-impl ScopeLease {
-    pub(crate) async fn acquire(
-        scope: &PinnedRequestScope,
-        repo_id: &str,
-    ) -> Result<Self, OperationError> {
-        let key = format!("{repo_id}:{}", scope.scope.storage_key());
-        #[cfg(unix)]
-        {
-            let path = scope.gitdir.join("info").join("operation-v2.lock");
-            tokio::task::spawn_blocking(move || Self::acquire_blocking(path, key))
-                .await
-                .map_err(|error| OperationError::Storage(error.to_string()))?
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(Self { _key: key })
-        }
-    }
-
-    /// Repository-wide lease used by transitions that rewrite shared refs.
-    /// Worktree leases intentionally live below this one in the lock order.
-    pub(crate) async fn acquire_repository(
-        scope: &PinnedRequestScope,
-        repo_id: &str,
-    ) -> Result<Self, OperationError> {
-        let key = format!("{repo_id}:repository");
-        #[cfg(unix)]
-        {
-            let path = scope.storage.join("operation-v2-repository.lock");
-            tokio::task::spawn_blocking(move || Self::acquire_blocking(path, key))
-                .await
-                .map_err(|error| OperationError::Storage(error.to_string()))?
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(Self { _key: key })
-        }
-    }
-
-    #[cfg(unix)]
-    fn acquire_blocking(path: std::path::PathBuf, key: String) -> Result<Self, OperationError> {
-        std::fs::create_dir_all(path.parent().expect("lock has parent"))
-            .map_err(|error| OperationError::Storage(error.to_string()))?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| OperationError::Storage(error.to_string()))?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if result != 0 {
-            return Err(OperationError::Storage(format!(
-                "operation scope lease is already held for {key}"
-            )));
-        }
-        let _ = (&file).write_all(format!("pid={}\n", std::process::id()).as_bytes());
-        Ok(Self { file })
-    }
-}
-
-impl Drop for ScopeLease {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
 async fn run_with_persistent_operation<T, F, Fut>(
     scope: &PinnedRequestScope,
     meta: OperationMetaV2,
@@ -273,14 +274,6 @@ where
         return run_ephemeral_operation(class, f).await;
     }
 
-    // Agent gateways resolve a RequestScope without going through the CLI
-    // dispatcher, so no process-global request pin exists yet.  Install the
-    // already-resolved scope for the complete transaction; facets and legacy
-    // helpers must not re-resolve the ambient CWD and accidentally inspect a
-    // different repository.
-    let _scope_guard =
-        crate::internal::worktree_scope::WorktreeScope::pin_request_scope(scope.workdir.clone());
-
     let db_path = scope.storage.join(DATABASE);
     let db = get_db_conn_instance_for_path(&db_path)
         .await
@@ -289,8 +282,31 @@ where
         .await
         .map_err(|error| OperationError::Storage(error.to_string()))?;
     let repo_id = identity.as_str().to_string();
+    let shared_repository = ConfigKv::get_with_conn(&db, "core.sharedRepository")
+        .await
+        .map_err(|error| {
+            OperationError::Storage(format!(
+                "cannot read core.sharedRepository before acquiring the operation scope lease: {error}"
+            ))
+        })?;
+    if shared_repository
+        .as_ref()
+        .is_some_and(|entry| entry.encrypted)
+    {
+        return Err(OperationError::Storage(
+            "core.sharedRepository must be plaintext; reset it with `libra init --shared=<mode>`"
+                .to_string(),
+        ));
+    }
+    let lease_permissions = LeaseFilePermissions::from_shared_repository(
+        shared_repository.as_ref().map(|entry| entry.value.as_str()),
+    )?;
+    #[cfg(test)]
+    if let Some(error) = test_hooks::take_pre_lease_busy(&meta) {
+        return Err(error);
+    }
     let _repo_lease = ScopeLease::acquire_repository(scope, &repo_id).await?;
-    let _lease = ScopeLease::acquire(scope, &repo_id).await?;
+    let _lease = ScopeLease::acquire_with_permissions(scope, &repo_id, lease_permissions).await?;
     let storage = ClientStorage::init_local(scope.storage.join("objects"));
     let store = OperationStoreV2::new_for_repo(&repo_id, db.clone(), storage.clone());
     let scope_key = scope.scope.storage_key().to_string();
@@ -494,6 +510,20 @@ where
             return Err(error);
         }
     };
+
+    #[cfg(test)]
+    if let Some(error) = test_hooks::take_post_mutation_failure(&meta) {
+        persist_failed_operation(
+            &store,
+            &operation_id,
+            &meta,
+            &heads.head_ids(),
+            pre_view_oid,
+            &owner,
+        )
+        .await?;
+        return Err(error);
+    }
 
     let mut post_snapshotter = WorkspaceSnapshotter::new(scope.clone(), pointer.clone());
     let post = match post_snapshotter.capture().await {
@@ -770,6 +800,12 @@ async fn persist_failed_operation(
 /// Type alias useful to gateways that erase a closure into a boxed future.
 pub type OperationFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, OperationError>> + Send + 'a>>;
+
+#[cfg(test)]
+mod lease_tests;
+
+#[cfg(test)]
+mod scope_context_tests;
 
 #[cfg(test)]
 mod tests {

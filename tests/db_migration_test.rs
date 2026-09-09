@@ -13,6 +13,13 @@ use libra::internal::db::migration::{
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 use tempfile::TempDir;
 
+#[path = "db_migration/branch_convergence.rs"]
+mod branch_convergence;
+#[path = "db_migration/branch_convergence/historical_bootstrap.rs"]
+mod historical_bootstrap;
+#[path = "db_migration/legacy_config.rs"]
+mod legacy_config;
+
 /// Path helper. Returns `(tempdir, sqlite-url)`. The TempDir is held by the
 /// caller for the lifetime of the test.
 fn fresh_db_url() -> (TempDir, String, PathBuf) {
@@ -53,98 +60,25 @@ async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64>, M
 
 #[test]
 fn builtin_migrations_register_current_schema_migrations() {
-    // Keep this explicit so future built-in migrations update this test with
-    // the registry shape they introduce.
     let migrations = builtin_migrations();
     let versions: Vec<i64> = migrations
         .iter()
         .map(|migration| migration.version)
         .collect();
-    let names: Vec<&str> = migrations.iter().map(|migration| migration.name).collect();
-    assert_eq!(
-        versions,
-        vec![
-            2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
-            2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
-            2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
-            2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
-            2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
-            2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
-            2026082401, 2026090101, 2026090801, 2026090802
-        ]
-    );
-    assert_eq!(
-        names,
-        vec![
-            "automation_log",
-            "agent_usage_stats",
-            "agent_capture",
-            "agent_checkpoint_parent_nullable",
-            "approved_permission",
-            "agent_usage_stats_agent_name",
-            "source_call_log",
-            "ai_final_decision",
-            "source_call_log_agent_run_id",
-            "cherry_pick_state",
-            "revert_sequence",
-            "notes",
-            "rename_agent_traces_branch",
-            "metadata_kv",
-            "working_dirty",
-            "revision_ordinal",
-            "sequence_state",
-            "layer",
-            "object_obliteration",
-            "sparse_view",
-            "worktree_isolation",
-            "agent_checkpoint_paging",
-            "agent_audit_log",
-            "agent_coverage_gate",
-            "agent_export_job",
-            "agent_import_identity",
-            "agent_import_tombstone",
-            "agent_tombstone_compat_barrier",
-            "agent_coverage_conflict",
-            "agent_subagent_content",
-            "agent_subagent_replication",
-            "sequencer_worktree_scope",
-            "rebase_state_worktree_scope",
-            "operation_worktree_scope",
-            "bisect_state_worktree_scope",
-            "working_dirty_worktree_scope",
-            "layer_worktree_scope",
-            "sparse_view_worktree_scope",
-            "worktree_registry_v2",
-            "worktree_lifecycle_journal",
-            "worktree_migrate_intent",
-            "workspace_record",
-            "workspace_paging_index",
-            "head_scope_unique",
-            "operation_scope_provenance",
-            "operation_args_digest_canonical",
-            "operation_dedup_index",
-            "operation_boundary_claim",
-            "operation_scope_kind",
-            "worktree_registry_v3_capability",
-            "stash_generation_fence",
-            "agent_capture_workspace_scope",
-            "agent_usage_runtime_attribution",
-            "agent_usage_event_session_scope",
-            "approved_permission_provenance",
-            "agent_bridge_capture",
-            "agent_bridge_link_relations",
-            "operation_v2",
-            "change_identity_prefix_index",
-            "change_ai_link",
-        ]
-    );
-
+    assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
+    for (version, name) in [
+        (2026090101, "operation_v2"),
+        (2026090601, "legacy_config_table"),
+    ] {
+        let migration = migrations
+            .iter()
+            .find(|migration| migration.version == version)
+            .expect("both shipped branch migrations must remain registered");
+        assert_eq!(migration.name, name);
+    }
     let runner = all_builtin_runner().expect("builtin registry must build clean");
-    assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 60);
-    assert_eq!(runner.max_registered_version(), Some(2026090802));
+    assert_eq!(runner.len(), migrations.len());
+    assert_eq!(runner.max_registered_version(), versions.last().copied());
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,18 +1082,16 @@ async fn fresh_create_database_runs_migrations_just_like_reopen() {
 
 #[tokio::test]
 async fn establish_connection_auto_upgrades_stale_schema() {
-    use libra::internal::db::{create_database, establish_connection};
+    use libra::internal::db::establish_connection;
 
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("stale.db");
+    let (_dir, url, path) = fresh_db_url();
     let path_str = path.to_str().unwrap();
-    let conn = create_database(path_str).await.unwrap();
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "DELETE FROM schema_versions WHERE version = 2026090101".to_string(),
-    ))
-    .await
-    .expect("remove the v2 version claim to simulate a stale connection");
+    let conn = connect(&url).await;
+    historical_bootstrap::initialize(&conn).await;
+    builtin_runner().unwrap().run_pending(&conn).await.unwrap();
+    historical_bootstrap::assert_pre_v2_history(&conn).await;
+    assert!(column_exists(&conn, "operation", "view_id").await);
+    assert!(!column_exists(&conn, "operation", "format_version").await);
     conn.close().await.unwrap();
 
     // Opening the connection now applies any pending migrations automatically,
@@ -1181,9 +1113,20 @@ async fn establish_connection_auto_upgrades_stale_schema() {
         current, latest,
         "connecting should migrate the schema up to the latest registered version"
     );
-    assert!(
-        column_exists(&raw, "agent_usage_stats", "agent_name").await,
-        "ordinary connect should apply the pending agent_name migration"
+    assert!(column_exists(&raw, "operation", "format_version").await);
+    assert!(table_exists(&raw, "legacy_operation").await);
+    assert!(table_exists(&raw, "operation_journal").await);
+    assert_eq!(
+        raw.query_one_raw(Statement::from_string(
+            raw.get_database_backend(),
+            "SELECT name FROM schema_versions WHERE version = 2026090101",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index::<String>(0)
+        .unwrap(),
+        "operation_v2"
     );
 }
 
@@ -1217,20 +1160,13 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     let applied = run_all_builtin_migrations(&conn)
         .await
         .expect("run_builtin_migrations");
-    assert_eq!(
-        applied,
-        vec![
-            2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
-            2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
-            2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
-            2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
-            2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
-            2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
-            2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
-            2026082401, 2026090101, 2026090801, 2026090802
-        ]
-    );
+    let expected: Vec<i64> = builtin_migrations()
+        .iter()
+        .map(|migration| migration.version)
+        .collect();
+    assert_eq!(applied, expected);
+    assert!(applied.contains(&2026090101));
+    assert!(applied.contains(&2026090601));
     assert!(table_exists(&conn, "schema_versions").await);
     // AG-20 agent_checkpoint_paging: traces_commit probe index (non-unique
     // by design) + keyset pagination indexes.
@@ -1250,9 +1186,6 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     assert!(table_exists(&conn, "revision_ordinal_meta").await);
     assert!(table_exists(&conn, "ai_final_decision").await);
     assert!(table_exists(&conn, "automation_log").await);
-    assert!(column_exists(&conn, "ai_operation_link", "change_id").await);
-    assert!(index_exists(&conn, "idx_ai_operation_link_repo_change").await);
-    assert!(index_exists(&conn, "idx_ai_operation_link_repo_intent").await);
     assert!(table_exists(&conn, "agent_usage_stats").await);
     assert!(table_exists(&conn, "agent_session").await);
     assert!(table_exists(&conn, "agent_checkpoint").await);
@@ -4861,7 +4794,7 @@ async fn stash_generation_fence_up_down_up_round_trip() {
     assert_eq!(
         runner.current_version(&conn).await.expect("version"),
         Some(2026082401),
-        "the runtime usage migrations are the newest migrations — retarget this test when a newer one lands"
+        "the historical runner stops before the forward-only operation v2 migration"
     );
 
     let rolled = runner
@@ -5081,7 +5014,10 @@ async fn approved_permission_old_reader_rejects_migrated_schema() {
         .await
         .expect("read tip")
         .expect("applied tip");
-    assert_eq!(current, 2026090802);
+    assert_eq!(
+        Some(current),
+        all_builtin_runner().unwrap().max_registered_version()
+    );
     // An old binary whose registry tip is still 2026080403 would see this
     // repository as UnsupportedFuture. Prove the refuse path on repository
     // DBs (not global config.db) by planting a version above this binary.

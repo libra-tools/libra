@@ -53,6 +53,9 @@ use crate::{
     },
 };
 
+mod gitlinks;
+use gitlinks::BoundaryMatch;
+
 // A repository with a large working tree must still get a bounded capture,
 // but five seconds is too small for the 2k-file rename and compatibility
 // fixtures on a busy CI worker.  The deadline remains shared by enumeration,
@@ -176,29 +179,34 @@ impl WorkspaceSnapshotter {
 
     async fn scan_working_copy_until(&self, deadline: Instant) -> Result<ScanResult, ScanError> {
         let index_path = self.scope.gitdir.join("index");
-        if let Ok(metadata) = fs::metadata(&index_path)
-            && metadata.len() > self.max_bytes
-        {
-            return Err(ScanError::Budget("raw index byte limit".to_string()));
-        }
-        let (index, index_valid) = if index_path.exists() {
-            match Index::load(&index_path) {
-                Ok(index) => (index, true),
-                Err(_) => {
-                    // The raw index is captured separately below.  Keep the
-                    // external snapshot partial but let the mutation itself
-                    // report the typed index error it would have reported
-                    // without the middleware.
-                    (Index::new(), false)
+        let (index, index_valid) = match fs::symlink_metadata(&index_path) {
+            // Only an actually absent entry is a valid unborn index. A
+            // dangling link or inaccessible entry cannot establish boundaries.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (Index::new(), true),
+            Err(_) => (Index::new(), false),
+            Ok(_) => match fs::metadata(&index_path) {
+                Ok(metadata) if metadata.is_file() => {
+                    if metadata.len() > self.max_bytes {
+                        return Err(ScanError::Budget("raw index byte limit".to_string()));
+                    }
+                    match Index::from_file(&index_path) {
+                        Ok(index) => (index, true),
+                        // Raw bytes are captured separately; the wrapped
+                        // command remains responsible for its typed error.
+                        Err(_) => (Index::new(), false),
+                    }
                 }
-            }
-        } else {
-            // An unborn repository may not have an index yet.  Treat the
-            // missing file as an empty index.
-            (Index::new(), true)
+                Ok(_) | Err(_) => (Index::new(), false),
+            },
         };
         let mut tracked_names = BTreeSet::new();
-        let (all_files, listing_complete) = self.list_visible_files(&index, deadline)?;
+        let (all_files, listing_complete) = if index_valid {
+            self.list_visible_files(&index, deadline)?
+        } else {
+            // A corrupt index cannot identify opaque gitlink boundaries. Keep
+            // its raw bytes in the partial snapshot without reading user files.
+            (Vec::new(), false)
+        };
         let mut tracked = BTreeMap::new();
         let mut untracked = BTreeMap::new();
         let mut bytes = 0u64;
@@ -277,13 +285,15 @@ impl WorkspaceSnapshotter {
 
     /// Capture immutable blobs and a canonical `WorkspaceSnapshotV2` manifest.
     pub async fn capture(&mut self) -> Result<SnapshotOutcome, SnapshotError> {
+        let deadline = Instant::now() + self.timeout;
+        // Validate authoritative repository state before scanning or writing snapshot objects.
+        let head = read_head(&self.scope).await?;
         let index_path = self.scope.gitdir.join("index");
         let index_before = match fs::metadata(&index_path) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(SnapshotError::Index(error.to_string())),
         };
-        let deadline = Instant::now() + self.timeout;
         let scan = self.scan_working_copy_until(deadline).await?;
         let storage = self
             .storage
@@ -385,7 +395,7 @@ impl WorkspaceSnapshotter {
         let snapshot = WorkspaceSnapshotV2 {
             schema_version: WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
             workspace_id: workspace_id(&self.scope),
-            head: read_head(&self.scope.gitdir.join("HEAD"))?,
+            head,
             index_tree_oid,
             raw_index_blob_oid: raw_index_oid,
             working_copy_tree_oid,
@@ -526,18 +536,26 @@ impl WorkspaceSnapshotter {
         index: &Index,
         deadline: Instant,
     ) -> Result<(Vec<PathBuf>, bool), ScanError> {
+        let Some(gitlinks) = self.gitlink_boundaries(index, deadline) else {
+            return Ok((Vec::new(), false));
+        };
+        if !self.gitlink_boundaries_unchanged(&gitlinks, deadline) {
+            return Ok((Vec::new(), false));
+        }
+        let ignore_walk = ignore::BoundedIgnoreWalk::new(
+            &self.scope.worktree_root,
+            crate::internal::layer::ExclusionSnapshot::for_request(),
+        );
         let mut files = Vec::new();
         let mut complete = true;
         let mut directories = VecDeque::from([PathBuf::new()]);
         while let Some(directory) = directories.pop_front() {
             if Instant::now() > deadline {
-                complete = false;
-                break;
+                return Ok((Vec::new(), false));
             }
             let timeout = deadline.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
-                complete = false;
-                break;
+                return Ok((Vec::new(), false));
             }
             let path_key = path_to_bytes(&directory);
             let request = || IoRequest::ReadDir {
@@ -556,25 +574,52 @@ impl WorkspaceSnapshotter {
                     .map_err(|error| ScanError::Worker(error.to_string()))?
             };
             for event in events {
+                if Instant::now() >= deadline {
+                    return Ok((Vec::new(), false));
+                }
                 match event {
                     IoEvent::RecordDirent(dirent) => {
+                        let relative = directory.join(bytes_to_path(&dirent.name));
+                        if gitlinks.contains_literal(&relative) {
+                            continue;
+                        }
+                        if !gitlinks.is_empty() {
+                            let identity = match self.entry_identity(&relative, deadline) {
+                                Ok(identity) => identity,
+                                Err(_) => {
+                                    complete = false;
+                                    continue;
+                                }
+                            };
+                            match gitlinks.classify(identity) {
+                                BoundaryMatch::Visible => {}
+                                BoundaryMatch::Opaque => continue,
+                                BoundaryMatch::Ambiguous => {
+                                    complete = false;
+                                    continue;
+                                }
+                            }
+                        }
                         if !dirent.type_ok {
                             complete = false;
                             continue;
                         }
-                        let relative = directory.join(bytes_to_path(&dirent.name));
                         if relative.components().any(|component| {
                         matches!(component, std::path::Component::Normal(name) if name == ".git" || name == ".libra")
                     }) {
                         continue;
                     }
                         if dirent.is_dir {
-                            if !ignore::should_ignore_at(
+                            let Some(ignored) = ignore_walk.should_ignore(
                                 &relative,
                                 IgnorePolicy::Respect,
                                 index,
-                                &self.scope.worktree_root,
-                            ) {
+                                true,
+                                deadline,
+                            ) else {
+                                return Ok((Vec::new(), false));
+                            };
+                            if !ignored {
                                 directories.push_back(relative);
                             }
                         } else if relative.to_str().is_none() {
@@ -584,15 +629,19 @@ impl WorkspaceSnapshotter {
                             // such a path is outside the representable v2
                             // manifest and is deliberately omitted from this
                             // snapshot rather than lossy-converted to U+FFFD.
-                        } else if (dirent.is_file || dirent.is_symlink)
-                            && !ignore::should_ignore_at(
+                        } else if dirent.is_file || dirent.is_symlink {
+                            let Some(ignored) = ignore_walk.should_ignore(
                                 &relative,
                                 IgnorePolicy::Respect,
                                 index,
-                                &self.scope.worktree_root,
-                            )
-                        {
-                            files.push(relative);
+                                false,
+                                deadline,
+                            ) else {
+                                return Ok((Vec::new(), false));
+                            };
+                            if !ignored {
+                                files.push(relative);
+                            }
                         }
                         if files.len() >= self.max_files {
                             complete = false;
@@ -613,6 +662,9 @@ impl WorkspaceSnapshotter {
             if !complete && files.len() >= self.max_files {
                 break;
             }
+        }
+        if Instant::now() >= deadline || !self.gitlink_boundaries_unchanged(&gitlinks, deadline) {
+            return Ok((Vec::new(), false));
         }
         files.sort();
         Ok((files, complete))
@@ -772,29 +824,52 @@ fn workspace_id(scope: &PinnedRequestScope) -> String {
         .unwrap_or_else(|| "main".to_string())
 }
 
-fn read_head(path: &Path) -> Result<HeadState, io::Error> {
-    let value = match fs::read_to_string(path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // A freshly initialized repository has no HEAD file until its
-            // first ref is materialized.  Preserve the unborn default branch
-            // in the snapshot instead of making the first workspace mutation
-            // fail before it can be journaled.
-            return Ok(HeadState::Symbolic {
-                reference: "refs/heads/main".to_string(),
-            });
-        }
-        Err(error) => return Err(error),
+async fn read_head(scope: &PinnedRequestScope) -> Result<HeadState, SnapshotError> {
+    use crate::internal::{
+        branch::BranchStoreError, db::get_db_conn_instance_for_path, head::Head,
     };
-    let value = value.trim();
-    if let Some(reference) = value.strip_prefix("ref: ") {
-        return Ok(HeadState::Symbolic {
-            reference: reference.to_string(),
-        });
-    }
-    let oid = ObjectHash::from_str(value).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(HeadState::Detached { oid })
+
+    let path = scope.storage.join(crate::utils::util::DATABASE);
+    let db = get_db_conn_instance_for_path(&path)
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot open repository database '{}' to read HEAD for worktree '{}': {error}",
+                    path.display(),
+                    scope.worktree_root.display()
+                ),
+            )
+        })?;
+    let head = Head::current_for_scope_result_with_conn(&db, &scope.scope)
+        .await
+        .map_err(|error| {
+            let kind = match &error {
+                BranchStoreError::Corrupt { .. } => io::ErrorKind::InvalidData,
+                _ => io::ErrorKind::Other,
+            };
+            io::Error::new(kind, format!(
+                "cannot read authoritative HEAD for worktree '{}' from repository database '{}': {error}",
+                scope.worktree_root.display(), path.display()
+            ))
+        })?;
+    Ok(match head {
+        Head::Branch(name) => HeadState::Symbolic {
+            reference: format!("refs/heads/{name}"),
+        },
+        Head::Detached(oid) => HeadState::Detached { oid },
+    })
 }
+
+#[cfg(test)]
+mod gitlink_tests;
+
+#[cfg(test)]
+mod head_tests;
+
+#[cfg(test)]
+mod ignore_tests;
 
 #[cfg(test)]
 mod tests {

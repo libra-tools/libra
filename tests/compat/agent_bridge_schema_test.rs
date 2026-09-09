@@ -16,7 +16,7 @@ const BRIDGE_MIGRATION_VERSION: i64 = 2026081801;
 const BRIDGE_LINK_RELATIONS_VERSION: i64 = 2026082401;
 
 #[test]
-fn bridge_migrations_are_registered_and_link_relations_is_the_latest() {
+fn bridge_migrations_remain_registered_after_later_migrations() {
     let runner = builtin_runner().expect("builtin registry builds clean");
     assert!(
         builtin_migrations()
@@ -24,14 +24,11 @@ fn bridge_migrations_are_registered_and_link_relations_is_the_latest() {
             .any(|migration| migration.version == BRIDGE_MIGRATION_VERSION),
         "2026081801_agent_bridge_capture must stay registered"
     );
-    assert_eq!(
+    assert!(
         builtin_migrations()
             .iter()
-            .filter(|migration| migration.version <= BRIDGE_LINK_RELATIONS_VERSION)
-            .map(|migration| migration.version)
-            .max(),
-        Some(BRIDGE_LINK_RELATIONS_VERSION),
-        "2026082401_agent_bridge_link_relations must remain the latest bridge migration"
+            .any(|migration| migration.version == BRIDGE_LINK_RELATIONS_VERSION),
+        "2026082401_agent_bridge_link_relations must stay registered"
     );
     assert!(
         runner.max_registered_version() > Some(BRIDGE_LINK_RELATIONS_VERSION),

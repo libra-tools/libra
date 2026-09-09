@@ -15,6 +15,9 @@ use tempfile::tempdir;
 
 use super::{assert_cli_success, run_libra_command};
 
+#[path = "init_home_test.rs"]
+mod home;
+
 async fn open_repo_conn(repo: &std::path::Path, bare: bool) -> sea_orm::DatabaseConnection {
     let db_path = if bare {
         repo.join("libra.db")
@@ -716,5 +719,143 @@ fn init_vault_true_ignores_commit_use_config_only_strictness() {
     assert!(
         stderr.contains("Generating PGP signing key ..."),
         "expected vault key generation progress, got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #472: the Libra home (`$LIBRA_HOME`, default `~/.libra`) is per-user state,
+// never repository storage. Global config lives in `~/.libra/config.db`; repo
+// data lives in a project's `.libra/libra.db`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Seed the "stray artifact" database shape found in a real user's `~/.libra`
+/// (#472): schema bookkeeping at the current registry tip, `config_kv` and
+/// `object_index` present, legacy `config` table missing. Opening it must not
+/// be necessary for any command — repository discovery skips the home.
+async fn seed_libra_home_artifact_db(db_path: &std::path::Path) {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    assert!(!db_path.exists(), "artifact db must not pre-exist");
+    // sqlx refuses to CREATE a missing SQLite file (create_if_missing=false);
+    // an empty file is a valid empty database, so seed it before connecting.
+    std::fs::File::create(db_path).expect("create empty artifact db file");
+    let conn = Database::connect(format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("connect artifact db");
+    for ddl in [
+        "CREATE TABLE `config_kv` (\
+             `id` INTEGER PRIMARY KEY AUTOINCREMENT, \
+             `key` TEXT NOT NULL, \
+             `value` TEXT NOT NULL, \
+             `encrypted` INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE `object_index` (\
+             `id` INTEGER PRIMARY KEY AUTOINCREMENT, \
+             `o_id` TEXT NOT NULL, \
+             `o_type` TEXT NOT NULL, \
+             `o_size` INTEGER NOT NULL, \
+             `repo_id` TEXT NOT NULL, \
+             `created_at` INTEGER NOT NULL, \
+             `is_synced` INTEGER DEFAULT 0)",
+        "CREATE TABLE `schema_versions` (\
+             `version` INTEGER PRIMARY KEY, \
+             `name` TEXT NOT NULL, \
+             `applied_at` TEXT NOT NULL)",
+    ] {
+        conn.execute_unprepared(ddl)
+            .await
+            .expect("seed artifact table");
+    }
+    let latest = libra::internal::db::migration::latest_builtin_schema_version()
+        .expect("read latest schema version")
+        .expect("built-in migrations have a latest version");
+    conn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "INSERT INTO `schema_versions` (`version`, `name`, `applied_at`) VALUES (?, ?, ?)",
+        [
+            latest.into(),
+            "artifact-seed".into(),
+            "2026-09-06T00:00:00Z".into(),
+        ],
+    ))
+    .await
+    .expect("seed artifact schema version");
+    conn.close().await.expect("close artifact db");
+}
+
+/// `libra init <dir>` run from `$HOME` must NOT read the stray
+/// `~/.libra/libra.db` artifact as repo-local config — the failure mode was
+/// `fatal: ... no such table: config`. Discovery skips the Libra home, the
+/// config cascade falls through to the global scope (`~/.libra/config.db`),
+/// and the initial branch comes from the GLOBAL `init.defaultBranch`.
+#[tokio::test]
+async fn init_from_home_ignores_libra_home_artifact_and_honors_global_config() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("fake-home");
+    fs::create_dir_all(&home).unwrap();
+    let libra_home = home.join(".libra");
+    fs::create_dir_all(&libra_home).unwrap();
+    seed_libra_home_artifact_db(&libra_home.join("libra.db")).await;
+
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
+    ];
+    let artifact_before = fs::read(libra_home.join("libra.db")).unwrap();
+
+    // A distinct branch name proves the value came from the global scope (the
+    // built-in default is `main`).
+    let set = run_libra_command_with_env(
+        &["config", "--global", "init.defaultBranch", "trunk"],
+        &home,
+        &envs,
+    );
+    assert_cli_success(&set, "seed global init.defaultBranch");
+
+    let output = run_libra_command_with_env(&["init", "linked"], &home, &envs);
+    assert_cli_success(
+        &output,
+        "init must succeed from a directory whose .libra is the Libra home",
+    );
+    assert!(
+        home.join("linked").join(".libra").join("libra.db").exists(),
+        "the repository must be created at the requested target"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("branch: trunk"),
+        "the initial branch must come from the global scope: {stdout}"
+    );
+    assert_eq!(
+        fs::read(libra_home.join("libra.db")).unwrap(),
+        artifact_before
+    );
+}
+
+/// `libra init` whose storage root IS the Libra home is refused: repo data
+/// must live in a project's `.libra/`, never mixed into the per-user state
+/// directory (global config, vault keys, binaries).
+#[tokio::test]
+async fn init_refuses_to_initialize_inside_the_libra_home() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("fake-home");
+    fs::create_dir_all(&home).unwrap();
+    let libra_home = home.join(".libra");
+    fs::create_dir_all(&libra_home).unwrap();
+    seed_libra_home_artifact_db(&libra_home.join("libra.db")).await;
+
+    let envs = [("LIBRA_HOME", libra_home.to_str().unwrap())];
+    let output = run_libra_command_with_env(&["init"], &home, &envs);
+    assert!(
+        !output.status.success(),
+        "initializing with the Libra home as storage root must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Libra home"),
+        "the refusal must name the Libra home: {stderr}"
+    );
+    assert!(
+        !libra_home.join("objects").exists(),
+        "no repository layout may be written into the Libra home"
     );
 }

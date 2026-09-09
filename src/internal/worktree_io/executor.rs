@@ -206,6 +206,21 @@ impl WorktreeIo {
         })
     }
 
+    /// Inject a request-local handler for deterministic in-process tests.
+    #[cfg(test)]
+    pub(crate) fn with_test_handler(handler: InProcessHandler) -> Self {
+        Self::new_with_limits(
+            WorkerConfig {
+                worker_arg: super::handler::WORKER_ARG,
+                cap_env: super::handler::CAP_ENV,
+                ppid_env: super::handler::PPID_ENV,
+                in_process_handler: handler,
+            },
+            IoLimits::default(),
+            false,
+        )
+    }
+
     fn new(config: WorkerConfig) -> Self {
         Self::new_with_limits(config, IoLimits::default(), true)
     }
@@ -1191,6 +1206,7 @@ fn drive_worker(
         let done = matches!(
             event,
             IoEvent::DoneStat { .. }
+                | IoEvent::DoneEntryIdentity { .. }
                 | IoEvent::DoneCanonicalize { .. }
                 | IoEvent::DoneReadDir { .. }
                 | IoEvent::DoneHash { .. }
@@ -1382,6 +1398,101 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn entry_identity_zero_deadline_never_reaches_the_handler() {
+        // Given an identity request whose execution budget is already exhausted.
+        let root = tempfile::tempdir().expect("root");
+        let executor =
+            WorktreeIo::new_with_limits(test_config(fail_handler), IoLimits::default(), false);
+        let request = IoRequest::EntryIdentity {
+            path: super::super::protocol::path_to_bytes(std::path::Path::new("missing")),
+            root: super::super::protocol::path_to_bytes(root.path()),
+        };
+        // When submitted with an absolute zero deadline.
+        let result = executor.submit_absolute(request, b"missing".to_vec(), Duration::ZERO);
+        // Then timeout is reported before either filesystem access or enqueue.
+        assert!(matches!(result, Err(ExecutorError::DeadlineExpired)));
+        let pending = executor
+            .pool
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_identity_terminal_event_returns_before_waiting_for_another_frame() {
+        use std::{os::unix::process::CommandExt, path::Path};
+
+        use super::super::protocol::path_to_bytes;
+
+        // Given a real no-follow response, followed by a helper waiting for its next request.
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("file"), "content").expect("file");
+        for name in ["file", "missing"] {
+            let request = || IoRequest::EntryIdentity {
+                path: path_to_bytes(Path::new(name)),
+                root: path_to_bytes(root.path()),
+            };
+            let JobOutcome::Events(expected) =
+                run_in_process(super::super::handler::handle_request_to_buffer, request())
+            else {
+                panic!("in-process identity request must succeed");
+            };
+            let mut wire = Vec::new();
+            for event in &expected {
+                wire.extend(frame_wire(event));
+            }
+            let escaped: String = wire.iter().map(|byte| format!("\\0{byte:03o}")).collect();
+            let script = format!("printf '%b' '{escaped}'; cat >/dev/null");
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", &script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("framed-response helper");
+            let stdin = child.stdin.take().expect("helper stdin");
+            let stdout = child.stdout.take().expect("helper stdout");
+            set_stdout_nonblocking(&stdout).expect("nonblocking stdout");
+            let mut worker = WorkerProc {
+                child,
+                stdin,
+                stdout,
+            };
+
+            // When the process-side receiver sees DoneEntryIdentity.
+            let result = drive_worker(
+                &mut worker,
+                "test-cap",
+                request(),
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(1),
+                true,
+                &CancellationToken::new(),
+            );
+            drop(worker.stdin);
+            worker
+                .child
+                .wait()
+                .expect("reap helper after closing input");
+
+            // Then the request finishes immediately and the helper remains reusable.
+            assert!(
+                !result.timed_out,
+                "identity completion must not wait for the next frame"
+            );
+            assert!(result.error.is_none());
+            assert!(result.reuse);
+            assert_eq!(
+                serde_json::to_value(&result.events).expect("process events"),
+                serde_json::to_value(&expected).expect("in-process events")
+            );
+        }
     }
 
     #[test]

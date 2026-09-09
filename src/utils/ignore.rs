@@ -11,6 +11,9 @@ use walkdir::WalkDir;
 
 use super::util;
 
+mod bounded;
+pub(crate) use bounded::BoundedIgnoreWalk;
+
 const LIBRAIGNORE_FILE: &str = ".libraignore";
 const GITIGNORE_FILE: &str = ".gitignore";
 const DEFAULT_LIBRAIGNORE_CONTENT: &[u8] = b"# Libra ignore file
@@ -226,18 +229,6 @@ pub fn should_ignore(path: &Path, policy: IgnorePolicy, index: &Index) -> bool {
     should_ignore_with_workdir(path, policy, index, &workdir, &layers)
 }
 
-/// Scope-aware counterpart for bounded scanners that operate on a pinned
-/// worktree without changing the process CWD (notably Agent tool gateways).
-pub(crate) fn should_ignore_at(
-    path: &Path,
-    policy: IgnorePolicy,
-    index: &Index,
-    workdir: &Path,
-) -> bool {
-    let layers = crate::internal::layer::ExclusionSnapshot::for_request();
-    should_ignore_with_workdir(path, policy, index, workdir, &layers)
-}
-
 /// Applies [`should_ignore`] over an iterator of workdir paths and returns the retained list.
 pub fn filter_workdir_paths<I>(paths: I, policy: IgnorePolicy, index: &Index) -> Vec<PathBuf>
 where
@@ -263,6 +254,22 @@ fn should_ignore_with_workdir(
     workdir: &Path,
     layers: &crate::internal::layer::ExclusionSnapshot,
 ) -> bool {
+    match should_ignore_with_matcher(path, policy, index, layers, || {
+        Ok::<_, std::convert::Infallible>(is_path_ignored_with_layers(path, workdir, layers))
+    }) {
+        Ok(ignored) => ignored,
+        Err(infallible) => match infallible {},
+    }
+}
+
+/// Apply index/layer policy once; callers choose the raw lookup's I/O boundary.
+fn should_ignore_with_matcher<E>(
+    path: &Path,
+    policy: IgnorePolicy,
+    index: &Index,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+    matcher: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
     let is_tracked = path_is_tracked_or_unknown_encoding(path, index);
 
     // lore.md 2.4: a materialized layer-overlay path is UN-NEGATABLY excluded
@@ -280,22 +287,22 @@ fn should_ignore_with_workdir(
         // OnlyIgnored (the `clean -x` candidate scan): NOT a candidate — protect
         // the active local overlay from being deleted by `clean -x` (only a
         // re-apply could restore it).
-        return matches!(policy, IgnorePolicy::Respect);
+        return Ok(matches!(policy, IgnorePolicy::Respect));
     }
 
     match policy {
         IgnorePolicy::Respect => {
             if is_tracked {
-                return false;
+                return Ok(false);
             }
-            is_path_ignored_with_layers(path, workdir, layers)
+            matcher()
         }
-        IgnorePolicy::IncludeIgnored => false,
+        IgnorePolicy::IncludeIgnored => Ok(false),
         IgnorePolicy::OnlyIgnored => {
             if is_tracked {
-                return true;
+                return Ok(true);
             }
-            !is_path_ignored_with_layers(path, workdir, layers)
+            matcher().map(|ignored| !ignored)
         }
     }
 }

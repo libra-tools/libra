@@ -73,6 +73,12 @@ pub trait ToolHandler: Send + Sync {
 /// handler here changes what an AI can do in `libra code`, so new tools should
 /// document the task they enable, whether they mutate state, and what evidence
 /// they return to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepositoryOperationBoundary {
+    PerTool,
+    TaskSyncBack,
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     /// Map of tool name to handler implementation.
@@ -83,6 +89,8 @@ pub struct ToolRegistry {
     path_aliases: Vec<(PathBuf, PathBuf)>,
     /// Optional runtime boundary policy and audit pipeline.
     hardening: Option<ToolBoundaryRuntime>,
+    /// Where repository operation history is published for mutations.
+    operation_boundary: RepositoryOperationBoundary,
 }
 
 impl ToolRegistry {
@@ -100,6 +108,7 @@ impl ToolRegistry {
             working_dir: std::env::current_dir()?,
             path_aliases: Vec::new(),
             hardening: None,
+            operation_boundary: RepositoryOperationBoundary::PerTool,
         })
     }
 
@@ -110,6 +119,7 @@ impl ToolRegistry {
             working_dir,
             path_aliases: Vec::new(),
             hardening: None,
+            operation_boundary: RepositoryOperationBoundary::PerTool,
         }
     }
 
@@ -120,6 +130,7 @@ impl ToolRegistry {
             working_dir,
             path_aliases: self.path_aliases.clone(),
             hardening: self.hardening.clone(),
+            operation_boundary: self.operation_boundary,
         }
     }
 
@@ -139,7 +150,20 @@ impl ToolRegistry {
             working_dir,
             path_aliases,
             hardening: self.hardening.clone(),
+            operation_boundary: self.operation_boundary,
         }
+    }
+
+    /// Clone the registry for an ephemeral task workspace whose file changes
+    /// are published into the real repository only by the sync-back boundary.
+    pub(crate) fn clone_for_task_worktree(
+        &self,
+        working_dir: PathBuf,
+        alias_from: PathBuf,
+    ) -> Self {
+        let mut cloned = self.clone_with_working_dir_and_alias(working_dir, alias_from);
+        cloned.operation_boundary = RepositoryOperationBoundary::TaskSyncBack;
+        cloned
     }
 
     /// Attach runtime tool-boundary policy, audit, and redaction.
@@ -299,7 +323,8 @@ impl ToolRegistry {
         // a repository that cannot resolve a pinned scope keeps the existing
         // non-repository behavior (external tools are still subject to the
         // hardening policy below).
-        if mutates_state
+        if self.operation_boundary == RepositoryOperationBoundary::PerTool
+            && mutates_state
             && let Some(scope) =
                 crate::internal::worktree_scope::RequestScope::resolve(self.working_dir.clone())
         {
@@ -891,6 +916,86 @@ mod tests {
 
         assert!(cloned.contains_tool("mock"));
         assert_eq!(cloned.working_dir(), std::path::Path::new("/tmp/cloned"));
+        assert_eq!(
+            cloned.operation_boundary,
+            RepositoryOperationBoundary::PerTool
+        );
+    }
+
+    #[tokio::test]
+    async fn task_worktree_clone_defers_operations_but_preserves_hardening() {
+        let original = TempDir::new().unwrap();
+        let task_worktree = TempDir::new().unwrap();
+        let sink = Arc::new(crate::internal::ai::runtime::InMemoryAuditSink::default());
+        let hardening = ToolBoundaryRuntime::new(
+            uuid::Uuid::new_v4(),
+            crate::internal::ai::runtime::PrincipalContext {
+                principal_id: "observer".to_string(),
+                role: crate::internal::ai::runtime::PrincipalRole::Observer,
+            },
+            crate::internal::ai::runtime::ToolBoundaryPolicy::default_runtime(),
+            crate::internal::ai::runtime::SecretRedactor::default_runtime(),
+            sink.clone(),
+        );
+        let mut registry =
+            ToolRegistry::with_working_dir(original.path().to_path_buf()).with_hardening(hardening);
+        registry.register("apply_patch", Arc::new(MutatingMockHandler));
+
+        let task_registry = registry.clone_for_task_worktree(
+            task_worktree.path().to_path_buf(),
+            original.path().to_path_buf(),
+        );
+        assert_eq!(
+            task_registry.operation_boundary,
+            RepositoryOperationBoundary::TaskSyncBack
+        );
+
+        let result = task_registry
+            .dispatch(ToolInvocation::new(
+                "call-task",
+                "apply_patch",
+                ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+                original.path().to_path_buf(),
+            ))
+            .await;
+
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].redacted_summary.contains("decision=deny"));
+    }
+
+    #[tokio::test]
+    async fn task_worktree_clone_without_hardening_still_rejects_external_mutation() {
+        let original = TempDir::new().unwrap();
+        let task_worktree = TempDir::new().unwrap();
+        let mut registry = ToolRegistry::with_working_dir(original.path().to_path_buf());
+        registry.register("shell", Arc::new(MutatingMockHandler));
+        let task_registry = registry.clone_for_task_worktree(
+            task_worktree.path().to_path_buf(),
+            original.path().to_path_buf(),
+        );
+
+        let result = task_registry
+            .dispatch(ToolInvocation::new(
+                "call-task-shell",
+                "shell",
+                ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+                original.path().to_path_buf(),
+            ))
+            .await;
+
+        let error = result.expect_err("external task mutation needs a hardening boundary");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a repository scope and post-snapshot verification"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

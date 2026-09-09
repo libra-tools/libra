@@ -45,6 +45,18 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement, TransactionTrait};
 use thiserror::Error;
 
+use self::copy_validation::validate_copy;
+
+mod copy_validation;
+#[cfg(test)]
+mod copy_validation_test;
+mod operation_v2_branch_convergence;
+#[cfg(test)]
+mod operation_v2_branch_convergence_test;
+mod operation_v2_schema;
+#[cfg(test)]
+mod operation_v2_schema_test;
+
 /// One named, versioned schema change.
 ///
 /// `up` is required; `down` is optional and only used by
@@ -644,6 +656,8 @@ async fn apply_one_migration_guarded(
                 apply_migration_compatibility(txn, version, name).await?;
                 if version == OPERATION_V2_MIGRATION_VERSION {
                     apply_operation_v2_migration(txn, up).await?;
+                } else if version == operation_v2_branch_convergence::VERSION {
+                    operation_v2_branch_convergence::apply(txn, up).await?;
                 } else {
                     txn.execute_raw(Statement::from_string(backend, up)).await?;
                 }
@@ -773,6 +787,14 @@ async fn apply_operation_v2_migration(
                 "description",
                 "actor",
             ],
+            &[
+                "op_id",
+                "repo_id",
+                "view_id",
+                "command_name",
+                "description",
+                "actor",
+            ],
         )
         .await?;
         txn.execute_raw(Statement::from_string(
@@ -793,6 +815,7 @@ async fn apply_operation_v2_migration(
                 "CREATE TABLE legacy_operation_parent__staging (op_id TEXT NOT NULL, parent_op_id TEXT NOT NULL, PRIMARY KEY (op_id, parent_op_id));",
                 "INSERT INTO legacy_operation_parent__staging (op_id, parent_op_id) SELECT op_id, parent_op_id FROM operation_parent;",
                 &["op_id", "parent_op_id"],
+                &["op_id", "parent_op_id"],
             )
             .await?;
         }
@@ -804,6 +827,7 @@ async fn apply_operation_v2_migration(
         "CREATE TABLE legacy_operation_view__staging (view_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, head_kind TEXT NOT NULL, head_target TEXT NOT NULL, created_at INTEGER NOT NULL);",
         "INSERT INTO legacy_operation_view__staging (view_id, repo_id, head_kind, head_target, created_at) SELECT view_id, repo_id, head_kind, head_target, created_at FROM operation_view;",
         &["view_id", "repo_id", "head_kind", "head_target"],
+        &["view_id", "repo_id", "head_kind", "head_target"],
     )
     .await?;
     copy_legacy_table_if_present(
@@ -813,6 +837,7 @@ async fn apply_operation_v2_migration(
         "CREATE TABLE legacy_operation_view_ref__staging (view_id TEXT NOT NULL, ref_kind TEXT NOT NULL, ref_name TEXT NOT NULL, ref_remote TEXT NOT NULL, target_oid TEXT NOT NULL, PRIMARY KEY (view_id, ref_kind, ref_name, ref_remote));",
         "INSERT INTO legacy_operation_view_ref__staging (view_id, ref_kind, ref_name, ref_remote, target_oid) SELECT view_id, ref_kind, ref_name, ref_remote, target_oid FROM operation_view_ref;",
         &["view_id", "ref_kind", "ref_name", "target_oid"],
+        &["view_id", "ref_kind", "ref_name", "ref_remote", "target_oid"],
     )
     .await?;
     copy_legacy_table_if_present(
@@ -821,6 +846,7 @@ async fn apply_operation_v2_migration(
         "legacy_operation_view_workspace",
         "CREATE TABLE legacy_operation_view_workspace__staging (view_id TEXT NOT NULL, pointer_kind TEXT NOT NULL, pointer_value TEXT NOT NULL, PRIMARY KEY (view_id, pointer_kind));",
         "INSERT INTO legacy_operation_view_workspace__staging (view_id, pointer_kind, pointer_value) SELECT view_id, pointer_kind, pointer_value FROM operation_view_workspace;",
+        &["view_id", "pointer_kind", "pointer_value"],
         &["view_id", "pointer_kind", "pointer_value"],
     )
     .await?;
@@ -916,10 +942,20 @@ async fn copy_legacy_table_if_present(
     target: &str,
     staging_ddl: &str,
     insert_sql: &str,
-    keys: &[&str],
+    nonempty_fields: &[&str],
+    comparison_fields: &[&str],
 ) -> Result<(), DbErr> {
     if sqlite_table_exists(txn, source).await? {
-        copy_legacy_table(txn, source, target, staging_ddl, insert_sql, keys).await?;
+        copy_legacy_table(
+            txn,
+            source,
+            target,
+            staging_ddl,
+            insert_sql,
+            nonempty_fields,
+            comparison_fields,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -930,7 +966,8 @@ async fn copy_legacy_table(
     target: &str,
     staging_ddl: &str,
     insert_sql: &str,
-    keys: &[&str],
+    nonempty_fields: &[&str],
+    comparison_fields: &[&str],
 ) -> Result<(), DbErr> {
     if sqlite_table_exists(txn, target).await? {
         return Err(DbErr::Custom(format!(
@@ -948,64 +985,12 @@ async fn copy_legacy_table(
         insert_sql.to_string(),
     ))
     .await?;
-    validate_copy(txn, source, &staging, keys).await?;
+    validate_copy(txn, source, &staging, nonempty_fields, comparison_fields).await?;
     txn.execute_raw(Statement::from_string(
         txn.get_database_backend(),
         format!("DROP TABLE {source}; ALTER TABLE {staging} RENAME TO {target};"),
     ))
     .await?;
-    Ok(())
-}
-
-async fn validate_copy(
-    txn: &sea_orm::DatabaseTransaction,
-    source: &str,
-    staging: &str,
-    keys: &[&str],
-) -> Result<(), DbErr> {
-    let source_count = count_rows(txn, source, None).await?;
-    let staging_count = count_rows(txn, staging, None).await?;
-    if source_count != staging_count {
-        return Err(DbErr::Custom(format!(
-            "copy-first migration row-count mismatch for {source}: source={source_count}, staging={staging_count}"
-        )));
-    }
-    let invalid_predicate = keys
-        .iter()
-        .map(|key| format!("COALESCE(TRIM({key}), '') = ''"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    if count_rows(txn, staging, Some(&invalid_predicate)).await? != 0 {
-        return Err(DbErr::Custom(format!(
-            "copy-first migration found an empty key in {source}"
-        )));
-    }
-    let key_predicate = keys
-        .iter()
-        .map(|key| format!("s.{key} = t.{key}"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let source_missing = count_rows(
-        txn,
-        &format!(
-            "{source} AS s WHERE NOT EXISTS (SELECT 1 FROM {staging} AS t WHERE {key_predicate})"
-        ),
-        None,
-    )
-    .await?;
-    let staging_missing = count_rows(
-        txn,
-        &format!(
-            "{staging} AS t WHERE NOT EXISTS (SELECT 1 FROM {source} AS s WHERE {key_predicate})"
-        ),
-        None,
-    )
-    .await?;
-    if source_missing != 0 || staging_missing != 0 {
-        return Err(DbErr::Custom(format!(
-            "copy-first migration key-set mismatch for {source}: source_missing={source_missing}, staging_missing={staging_missing}"
-        )));
-    }
     Ok(())
 }
 
@@ -1785,12 +1770,28 @@ pub fn builtin_migrations() -> Vec<Migration> {
             up: include_str!("../../../sql/migrations/2026090101_operation_v2.sql"),
             down: None,
         },
+        // Self-heal stores missing the legacy `config` table (#472): the
+        // bootstrap schema always defined it, but stores created by builds
+        // whose bootstrap omitted it failed every legacy-config reader with
+        // `no such table: config`. Idempotent DDL matching the bootstrap
+        // shape exactly; down preserves this bootstrap-owned table and its data.
+        sql_migration(
+            2026090601,
+            "legacy_config_table",
+            include_str!("../../../sql/migrations/2026090601_legacy_config_table.sql"),
+            include_str!("../../../sql/migrations/2026090601_legacy_config_table_down.sql"),
+        ),
         Migration {
-            version: 2026090801,
-            name: "change_identity_prefix_index",
-            up: include_str!("../../../sql/migrations/2026090801_change_identity_prefix_index.sql"),
+            version: operation_v2_branch_convergence::VERSION,
+            name: "operation_v2_branch_convergence",
+            up: include_str!(
+                "../../../sql/migrations/2026090801_operation_v2_branch_convergence.sql"
+            ),
             down: None,
         },
+        // CH-04: associate AI operations with a stable Change ID after the
+        // operation-v2 namespace has converged across independently shipped
+        // branches.
         Migration {
             version: 2026090802,
             name: "change_ai_link",

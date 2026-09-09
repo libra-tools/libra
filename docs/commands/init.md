@@ -29,11 +29,60 @@ configured `init.defaultBranch` is not used to rename or misreport that imported
 Running `libra init` again inside an already-initialized repository is safe: like
 `git init`, it re-initializes in place, printing `Reinitialized existing Libra
 repository in <path>` and re-creating any missing standard layout (templates,
-directories) and re-applying `--shared`, while preserving the existing database —
+directories) and re-applying `--shared`, while preserving existing repository data —
 configuration, `HEAD`, refs, objects, vault, and repository id are otherwise untouched.
+Opening the database can still apply schema migrations; preserving data does not
+mean preserving the old database schema.
 `--initial-branch` and `--object-format` are ignored (with a warning) when they
 differ from the existing repository, and `--from-git-repository` is rejected on an
 already-initialized repository.
+
+Initializing a repository whose storage root is the Libra home itself (`$LIBRA_HOME`,
+default `~/.libra`) is refused. The Libra home stores per-user state — the global
+config database (`~/.libra/config.db`), vault keys, and binaries — and must never mix
+in repository data, which lives in a project's own `.libra/libra.db` (or a dedicated
+bare repository directory).
+If `LIBRA_HOME` and the global config location differ, both directories are reserved.
+This also applies to linked worktree `commondir` targets and to paths whose `.libra`
+directory does not exist yet. Repository discovery never treats these directories
+as a repository, even if a stray
+`libra.db` exists there, so commands run from the home directory resolve configuration
+through the global scope instead of reading the home database as repo-local config.
+
+Opening an older repository or global config database automatically recreates a missing
+legacy `config` table without changing existing configuration. The ignored home
+`libra.db` artifact is left untouched; commands no longer open it as a repository.
+
+### Operation-v2 convergence (current branch, unreleased)
+
+The `2026090801` convergence migration is implemented in this unreleased branch
+and has passed focused migration validation, including a controlled old-binary
+repository upgrade. Full integration and release acceptance remain pending.
+
+- The forward-only `2026090801` migration must retain the original
+  `2026090101` (`operation_v2`) and `2026090601` (`legacy_config_table`, #472)
+  migration receipts, including existing receipt timestamps. A #472 repository
+  with v1 operations needs the missing operation-v2 migration, not just a newer
+  maximum version number.
+- Existing v1 operation data must remain in the `legacy_operation*` namespace.
+  Existing `config` and `config_kv` values and the #472 missing-table repair must
+  be preserved; convergence is not permission to delete legacy data.
+- Once `2026090801` commits, a binary supporting schemas only through
+  `2026090601` must refuse the newer repository schema before using incompatible
+  operation tables. The package version string alone does not identify a
+  binary's supported schema.
+- Before upgrading a live database, retain a verified, consistent pre-upgrade
+  backup, using SQLite's online-backup mechanism rather than copying only a
+  live DB file without its WAL. Keep the backup protected and retain the old
+  binary. Linked worktrees share the repository database, so another worktree
+  is not an isolated upgrade test.
+- This migration has no down path. Running an old binary, re-running `init`, or
+  deleting migration receipts is not a downgrade procedure. Binary-install
+  rollback does not restore the database; recovery needs the matching
+  pre-upgrade backup and binary.
+
+See [operation capture limits](op.md#current-branch-capture-contract-unreleased)
+and the [convergence rationale](../development/commands/op.md#current-branch-convergence-contract-unreleased).
 
 ## Options
 
@@ -310,7 +359,8 @@ Every `InitError` variant maps to an explicit `StableErrorCode`.
 |----------|-----------|------|------|
 | Invalid argument (bad branch name, bad format) | `LBR-CLI-002` | 129 | varies by argument |
 | Empty or invalid `init.defaultBranch` | `LBR-CLI-002` | 129 | fix the local/global value or use `--initial-branch <name>` |
-| Unreadable local/global default config | `LBR-IO-001` | 128 | fix the config database or pass `--initial-branch <name>` |
+| Unreadable local/global default config | `LBR-IO-001` | 128 | pass `--initial-branch <name>` to bypass the lookup, or repair the config database named in the error (`libra config --global` cannot repair a repository's local database) |
+| Storage root is the Libra home (`~/.libra`) | `LBR-CLI-002` | 129 | "choose a project subdirectory, e.g. `libra init <project>`" |
 | `--from-git-repository` on an already-initialized repo | `LBR-CLI-002` | 129 | "convert into a fresh directory instead" |
 | Source Git repository not found | `LBR-IO-001` | 128 | -- |
 | Source is not a valid Git repository | `LBR-CLI-003` | 129 | "a valid Git repository must contain HEAD, config, and objects" |

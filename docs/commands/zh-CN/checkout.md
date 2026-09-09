@@ -18,6 +18,8 @@ libra checkout [<tree-ish>] -- <pathspec>...
 
 `libra checkout` 是一个 Git 兼容表面，内部委托给 `switch` 和 `restore`。它支持最常见的 `git checkout` 模式：显示当前分支、切换到已有分支、用 `-` 返回上一个 checkout 目标、用 `-b` 从 HEAD 或显式 start-point 创建新分支、用 `-B` 从 HEAD 或显式 start-point 强制创建/重置分支、用 `--orphan` 创建 unborn orphan 分支、自动跟踪远程分支，以及在存在显式 `--` 分隔符时恢复路径。
 
+在本地分支或 detached checkout 中，包括显式创建/重置分支（`-b` / `-B`），Libra 不管理子模块内容。如果目标需要移除或替换已跟踪的 gitlink（模式 `160000`），且对应目录非空，命令会在更改 HEAD、分支引用、reflog、索引或工作树前以 `LBR-CONFLICT-002` 拒绝。`--force` 也不能绕过此检查。请先将目录内的文件安全移到其他位置，再重试。Libra 创建的空目录占位符可以正常移除。这是 Libra 的保护边界；Git 的默认 checkout 则可能保留非空子模块目录。远程自动跟踪是独立的组合操作：其后续 `pull` 有自己的失败行为，不受上述前置检查保证覆盖。
+
 `libra checkout -` 与 `switch -` 共享当前 worktree 的 HEAD 导航历史。本地分支来源跟随该分支当前 tip；detached 来源返回 reflog 中保存的完整 commit ID。重复执行会在两个目标间切换；缺少记录、最新来源分支已删除或记录损坏时，会在移动 HEAD 或更改索引/工作树前 fail-closed。
 
 该命令存在的目的是让从 Git 迁移的开发者可以使用熟悉的肌肉记忆。对于新工作流，优先使用 `libra switch`（分支操作）和 `libra restore`（文件操作），它们提供更丰富的错误消息、结构化 JSON 输出和更清晰的语义。
@@ -284,6 +286,7 @@ Git 肌肉记忆根深蒂固。使用 `git checkout` 多年的开发者会本能
 |----------|-------------|---------|------|
 | 脏工作树（未暂存或已暂存更改） | `LBR-REPO-003` | "local changes would be overwritten by checkout" | 128 |
 | 未跟踪文件会被覆盖 | `LBR-CONFLICT-002` | "local changes would be overwritten by checkout" | 128 |
+| 本地分支/detached 切换（包括显式 `-b` / `-B` 创建/重置分支）需要移除或替换已跟踪 gitlink 的非空目录 | `LBR-CONFLICT-002` | "refusing to replace non-empty worktree directory '{path}'"；请先将目录内文件安全移到其他位置再重试。 | 128 |
 | 内部分支被阻止 | `LBR-CLI-003` | "checking out '{name}' branch is not allowed" | 128 |
 | 创建内部分支被阻止 | `LBR-CLI-003` | "creating/switching to '{name}' branch is not allowed" | 128 |
 | 找不到分支或 start-point（无远程匹配） | `LBR-CLI-003` | "path specification '{name}' did not match any files known to libra" | 129 |

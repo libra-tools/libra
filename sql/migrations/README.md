@@ -42,13 +42,13 @@ idempotently (see the rationale below).
 
 Rationale: legacy databases initialized via `sqlite_20260309_init.sql` may
 already contain tables that an early migration tries to create. Idempotent
-DDL means the explicit upgrade command can safely apply every pending
+DDL means the schema-upgrade path can safely apply every pending
 migration over such pre-existing shapes. For plain additive migrations the
 `schema_versions` table is bookkeeping; for the RENAME-rebuild exception it
 is also the safety layer — the claim-first transaction is what prevents a
-second execution. Normal command connections do not apply migrations implicitly.
-They check compatibility first and ask the user to run `libra db upgrade` when
-the repository is stale.
+second execution. Normal schema-managed connections check compatibility and
+apply pending migrations automatically on open; there is no separate `libra db
+upgrade` command. Read-only inspection connections do not migrate the database.
 
 ## Transaction-unsafe DDL is forbidden
 
@@ -166,16 +166,59 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026072402`  | `worktree_lifecycle_journal` | `2026072402_worktree_lifecycle_journal{,_down}.sql` (§C.7 W3-s1b: `worktree_lifecycle` mirrors the registry's detached_from_registry/tombstone states into SQL for the down guard and doctor; `worktree_intent_journal` records add/move/remove/prune intents before any filesystem/registry mutation so `worktree repair` can roll a crash forward/back; down REFUSES (CHECK guard) while any lifecycle row, journal row, or linked-scope sequencer/rebase/bisect state exists — v2 lifecycle must never fold into a v1 active entry; live workspace leases block via 2026072501's own down, which deeper rollbacks pass through first) |
 | `2026072403`  | `worktree_migrate_intent` | `2026072403_worktree_migrate_intent{,_down}.sql` (§C.6 W3-s3: RENAME-rebuild of `worktree_intent_journal` admitting the 'migrate' op plus a `stage` column for its state machine; down refuses while any migrate intent exists, then restores the narrower shape) |
 | `2026072501`  | `workspace_record` | `2026072501_workspace_record{,_down}.sql` (§C.8 W4-s1: the unified Agent workspace association + lease record covering linked worktrees, task copy/FUSE worktrees, and future remote workspaces. Two PARTIAL unique indexes are the arbiters the service relies on — `idx_workspace_linked_live` gives a linked worktree at most one live record per `(repo_id, worktree_id)`, `idx_workspace_active_path` gives a canonical directory at most one live claim per repository — both scoped to the live states `provisioning`/`active`/`releasing`, so `released`/`orphaned` rows free the identity while staying diagnosable. Leases are owner + monotonic `lease_fence` conditional writes; down REFUSES (CHECK guard) while any NON-terminal row (`provisioning`/`active`/`releasing`/`orphaned`) exists — dropping the table would orphan live leases and lose the scavenger's recovery state — and every deeper rollback passes through this guard first) |
+| `2026072502` | `workspace_paging_index` | `2026072502_workspace_paging_index{,_down}.sql` |
+| `2026072901` | `head_scope_unique` | `2026072901_head_scope_unique{,_down}.sql` |
+| `2026072902` | `operation_scope_provenance` | `2026072902_operation_scope_provenance{,_down}.sql` |
+| `2026073001` | `operation_args_digest_canonical` | `2026073001_operation_args_digest_canonical{,_down}.sql` |
+| `2026073002` | `operation_dedup_index` | `2026073002_operation_dedup_index{,_down}.sql` |
+| `2026073003` | `operation_boundary_claim` | `2026073003_operation_boundary_claim{,_down}.sql` |
+| `2026073004` | `operation_scope_kind` | `2026073004_operation_scope_kind{,_down}.sql` |
+| `2026073005` | `worktree_registry_v3_capability` | `2026073005_worktree_registry_v3_capability{,_down}.sql` |
+| `2026073101` | `stash_generation_fence` | `2026073101_stash_generation_fence{,_down}.sql` |
 | `2026080401`  | `agent_capture_workspace_scope` | `2026080401_agent_capture_workspace_scope{,_down}.sql` (plan-20260714 W4: marks existing capture/export/import rows `legacy_unknown`; new scoped rows bind repository, worktree, optional live workspace fence, and provider-id collision checks. Explicit doctor adoption is append-only audited; down refuses scoped rows or audit history.) |
 | `2026080402`  | `agent_usage_runtime_attribution` | `2026080402_agent_usage_runtime_attribution{,_down}.sql` (plan-20260715 W2-12: durable repository, turn, and replay-event attribution for runtime usage.) |
 | `2026080403`  | `agent_usage_event_session_scope` | `2026080403_agent_usage_event_session_scope{,_down}.sql` (W2-12 follow-up: replay event IDs are unique within the durable session, permitting the same browser command ID in independent sessions.) |
 | `2026081301`  | `approved_permission_provenance` | `2026081301_approved_permission_provenance{,_down}.sql` (plan-20260715 W4-07: Always-approval provenance columns; empty backfill; `project_id` not rewritten; down fail-closed with provenance or linked HEAD evidence.) |
 | `2026081801`  | `agent_bridge_capture` | `2026081801_agent_bridge_capture{,_down}.sql` (plan-20260818 LB-02: DeepSeek Harness bridge durable projection — `agent_bridge_session/event/operation/checkpoint/link`; source fixed to `deepseek-harness`, 256 KiB event payload CHECK, `(bridge_session_id,event_seq)` and `operation_id` idempotency; forward-only down that freezes while any bridge row exists and never deletes acked events/evidence.) |
 | `2026082401`  | `agent_bridge_link_relations` | `2026082401_agent_bridge_link_relations{,_down}.sql` (plan-20260818 LB-04/LB-05 VCS wiring: `agent_bridge_link` becomes a real relation graph — uniqueness moves to the full edge `(source_type,source_id,target_type,target_id)` so one result can carry its operation, workspace, parent-session and evidence associations, and `source_type` gains the mutation result kinds `commit`/`restore`/`review`; every existing edge is copied verbatim; forward-only down that freezes while any link row exists.) |
+| `2026090101` | `operation_v2` | `2026090101_operation_v2.sql` (OL-02..04: the Rust runner validates and copies v1 operation history into five `legacy_*` tables before creating the v2 operation schema; forward-only, registered with `down: None`.) |
+| `2026090601` | `legacy_config_table` | `2026090601_legacy_config_table{,_down}.sql` (#472: idempotently restores the bootstrap-owned `config` table when missing; down is a no-op that preserves the table and all existing rows while the runner removes only this migration's receipt.) |
+| `2026090801` | `operation_v2_branch_convergence` | `2026090801_operation_v2_branch_convergence.sql` (forward-only compatibility barrier for the independently shipped 0101/0601 branches; targeted missing-0101 catch-up and receipt/schema verification run in Rust under the existing writer transaction; `down: None`.) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no
 longer accepted.
+
+## September branch convergence and downgrade boundary
+
+A database from the #472 branch can have `MAX(schema_versions.version) =
+2026090601` without an `operation_v2` receipt for `2026090101`. Merely registering
+0101 below that maximum does not make it pending. The higher 0801 barrier closes
+this known branch-history hole without changing either original migration:
+
+- If 0101 is absent, the barrier requires the complete v1 operation-table
+  shapes and rejects pre-existing v2, legacy-copy, or staging mixtures. It
+  invokes the original operation-v2 copy path, verifies the resulting schema,
+  and inserts the original `2026090101` / `operation_v2` receipt.
+- If 0101 is present, its name must be exactly `operation_v2`. The barrier
+  verifies all eight v2 and five legacy tables, including required column,
+  primary-key, index, and trigger identities. It does not recopy existing rows.
+
+The 0801 claim, any copy/drop work, validation, and new 0101 receipt share one
+claim-first writer transaction. Failure rolls them back together; existing
+receipt names/timestamps and configuration rows are not rewritten. This is not
+a general missing-migration replay or an adoption path for unreceipted v2
+schemas. Run it through the migration runner: the 0801 SQL file alone is only
+the marker payload, not the catch-up implementation.
+
+Before the first schema-managed open with the newer binary, stop all repository
+writers and take a consistent, restorable pre-upgrade backup of the repository,
+including its database and object storage. Both 0101 and 0801 are forward-only;
+rollback through either is refused. In particular, 0801 keeps the schema maximum
+above 0601 so older binaries reject the upgraded database as a future schema.
+Do not delete receipts to bypass that fence. To return to an older binary,
+restore the consistent pre-upgrade backup instead; retained `legacy_*` rows are
+not a down migration.
 
 ## `include_str!` example
 

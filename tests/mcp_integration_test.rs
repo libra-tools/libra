@@ -48,6 +48,7 @@ use libra::{
             util::normalize_commit_anchor,
         },
         model::reference,
+        worktree_scope::WorktreeScope,
     },
     utils::{storage::local::LocalStorage, storage_ext::StorageExt},
 };
@@ -87,9 +88,13 @@ async fn setup_test_db() -> sea_orm::DatabaseConnection {
     db
 }
 
-/// Insert a detached-HEAD row (`name = None`, `commit = Some(commit)`) so tests can
-/// exercise the `HEAD` alias path of `create_run_impl` without committing real
-/// git objects.
+fn current_worktree_id() -> Option<String> {
+    WorktreeScope::current().worktree_id().map(str::to_owned)
+}
+
+/// Insert a detached-HEAD row (`name = None`, `commit = Some(commit)`) in the
+/// ambient worktree scope so tests can exercise the `HEAD` alias path of
+/// `create_run_impl` without committing real git objects.
 async fn seed_detached_head(history_manager: &HistoryManager, commit: &str) {
     let db = history_manager.database_connection();
     reference::ActiveModel {
@@ -97,6 +102,7 @@ async fn seed_detached_head(history_manager: &HistoryManager, commit: &str) {
         kind: Set(reference::ConfigKind::Head),
         commit: Set(Some(commit.to_string())),
         remote: Set(None),
+        worktree_id: Set(current_worktree_id()),
         ..Default::default()
     }
     .insert(&db)
@@ -104,9 +110,10 @@ async fn seed_detached_head(history_manager: &HistoryManager, commit: &str) {
     .unwrap();
 }
 
-/// Insert an unborn-branch HEAD row (`name = Some(branch)`, `commit = None`) so
-/// tests can exercise the "HEAD on a branch that has no commits yet" code path —
-/// the commit anchor must normalise to forty zeros.
+/// Insert an unborn-branch HEAD row (`name = Some(branch)`, `commit = None`) in
+/// the ambient worktree scope so tests can exercise the "HEAD on a branch that
+/// has no commits yet" code path — the commit anchor must normalise to forty
+/// zeros.
 async fn seed_unborn_branch_head(history_manager: &HistoryManager, branch: &str) {
     let db = history_manager.database_connection();
     reference::ActiveModel {
@@ -114,6 +121,7 @@ async fn seed_unborn_branch_head(history_manager: &HistoryManager, branch: &str)
         kind: Set(reference::ConfigKind::Head),
         commit: Set(None),
         remote: Set(None),
+        worktree_id: Set(current_worktree_id()),
         ..Default::default()
     }
     .insert(&db)

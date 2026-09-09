@@ -16,7 +16,23 @@ libra init [OPTIONS] [DIRECTORY]
 
 提供 `--from-git-repository` 时，会从源 Git 仓库导入对象和 refs，并配置 `origin` 指向源分支布局。转换后的仓库会把源仓库实际 `HEAD` 分支报告为 `initial_branch`；不会使用 `init.defaultBranch` 重命名或错误报告导入分支。在源工作树或已 checkout 导入中发现的任何 `.gitignore` 文件都会复制为匹配的 `.libraignore` 文件。
 
-在已初始化的仓库中再次运行 `libra init` 是安全的：与 `git init` 一致，它会就地重新初始化，打印 `Reinitialized existing Libra repository in <path>`，补齐缺失的标准布局（模板、目录）并重新应用 `--shared`，同时完整保留现有数据库——配置、`HEAD`、refs、对象、vault 与仓库 id 均不受影响。当 `--initial-branch`/`--object-format` 与现有仓库不一致时会被忽略（并给出警告）；`--from-git-repository` 在已初始化的仓库上会被拒绝。
+在已初始化的仓库中再次运行 `libra init` 是安全的：与 `git init` 一致，它会就地重新初始化，打印 `Reinitialized existing Libra repository in <path>`，补齐缺失的标准布局（模板、目录）并重新应用 `--shared`，同时保留现有仓库数据——配置、`HEAD`、refs、对象、vault 与仓库 id 均不受影响。打开数据库仍可能应用 schema 迁移；保留数据不等于保留旧数据库结构。当 `--initial-branch`/`--object-format` 与现有仓库不一致时会被忽略（并给出警告）；`--from-git-repository` 在已初始化的仓库上会被拒绝。
+
+不能把用户级 Libra home（`LIBRA_HOME`，默认 `~/.libra`）作为仓库存储根。该目录保存用户状态；全局配置保存在 `~/.libra/config.db`（或 `LIBRA_CONFIG_GLOBAL_DB` 指定的位置）。当这两个目录不同时，两者都受保护。检查同样适用于尚不存在的目录、路径别名和 linked worktree 的 `commondir` 目标。
+
+仓库发现会忽略 home 中遗留的 `libra.db`，因此从用户主目录初始化项目时会读取真正的全局配置。打开旧仓库或全局配置数据库时，迁移会自动补建缺失的旧版 `config` 表，保留已有配置；被忽略的 home `libra.db` 文件保持原样。
+
+### Operation-v2 收敛（当前分支，未发布）
+
+`2026090801` 收敛迁移已在当前未发布分支实现，并通过 focused 迁移验证，包括真实旧 binary 创建的受控仓库升级。整树集成与发布验收仍未完成。
+
+- 单向迁移 `2026090801` 必须保留原始 `2026090101`（`operation_v2`）与 `2026090601`（`legacy_config_table`，#472）迁移收据，包括已有收据时间戳。已应用 #472、仍使用 v1 operation 的仓库需要补齐缺失的 operation-v2 迁移，而不只是提高最大版本号。
+- 已有 v1 operation 数据必须保留在 `legacy_operation*` 命名空间；已有 `config`、`config_kv` 配置值与 #472 缺表修复必须保留。分支收敛不授权删除 legacy 数据。
+- `2026090801` 成功提交后，最高仅支持 `2026090601` schema 的旧 binary 必须在使用不兼容的 operation 表之前拒绝打开较新的仓库 schema。不能仅凭软件包版本字符串判断 binary 支持的 schema。
+- 升级真实数据库前，先保留经过验证的一致性升级前备份：使用 SQLite online-backup 机制，不要只复制运行中数据库的主文件而遗漏 WAL。保护好备份并保留旧 binary。Linked worktree 共享仓库数据库，不能充当隔离的升级测试环境。
+- 此迁移没有 down 路径。运行旧 binary、再次执行 `init` 或删除迁移收据都不是降级流程。Binary 安装回滚不会恢复数据库；恢复需要匹配的升级前备份与 binary。
+
+另见 [operation 捕获边界](op.md#当前分支的捕获契约未发布)与[收敛原理](../../development/commands/op.md#current-branch-convergence-contract-unreleased)。
 
 ## 选项
 
@@ -234,7 +250,8 @@ jj（`jj git init`）包装 Git 后端，不创建自己的对象存储；它将
 |----------|-----------|------|------|
 | 无效参数（错误分支名、错误格式） | `LBR-CLI-002` | 129 | 因参数而异 |
 | `init.defaultBranch` 为空或无效 | `LBR-CLI-002` | 129 | 修复 local/global 值或使用 `--initial-branch <name>` |
-| local/global 默认配置不可读 | `LBR-IO-001` | 128 | 修复配置数据库或使用 `--initial-branch <name>` |
+| local/global 默认配置不可读 | `LBR-IO-001` | 128 | 修复错误中列出的数据库，或使用 `--initial-branch <name>`；`libra config --global` 无法修复仓库的本地数据库 |
+| 仓库存储根为用户级 Libra home | `LBR-CLI-002` | 129 | 选择独立项目目录，例如 `libra init <project>` |
 | 在已初始化仓库上使用 `--from-git-repository` | `LBR-CLI-002` | 129 | "convert into a fresh directory instead" |
 | 找不到源 Git 仓库 | `LBR-IO-001` | 128 | -- |
 | 源不是有效 Git 仓库 | `LBR-CLI-003` | 129 | "a valid Git repository must contain HEAD, config, and objects" |

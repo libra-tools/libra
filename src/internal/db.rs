@@ -364,7 +364,7 @@ where
             Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'c>,
         > + Send,
     T: Send,
-    E: std::error::Error + Send,
+    E: std::fmt::Display + std::fmt::Debug + Send,
 {
     let txn = begin_write_transaction(db)
         .await
@@ -613,7 +613,7 @@ fn ai_projection_sql() -> io::Result<&'static str> {
     Ok(sql)
 }
 
-async fn sqlite_schema_contains(
+pub(crate) async fn sqlite_schema_contains(
     conn: &DatabaseConnection,
     entry_type: &str,
     name: &str,

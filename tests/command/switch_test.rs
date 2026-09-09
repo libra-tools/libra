@@ -13,6 +13,8 @@ use libra::{
 
 use super::*;
 
+mod gitlink_preflight;
+
 #[test]
 fn test_switch_cli_missing_branch_returns_cli_exit_code() {
     let repo = create_committed_repo_via_cli();

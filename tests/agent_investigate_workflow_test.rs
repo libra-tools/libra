@@ -1954,6 +1954,10 @@ fn findings_retention_manifest() {
             libra::internal::ai::review::store::RedactionReportSummary::default(),
         )
         .expect("finalize objectizes findings");
+    // This test writes through the in-process store and then starts a separate
+    // destructive-clean process. Drain the producer's object-index queue so
+    // the child does not correctly fail closed on a marker still owned here.
+    libra::utils::client_storage::ClientStorage::wait_for_background_tasks();
 
     let run_dir = repo.join(".libra/sessions/agent-runs/gc-run");
     let manifest: serde_json::Value =
