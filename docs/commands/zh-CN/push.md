@@ -15,6 +15,8 @@ libra push [OPTIONS] [<repository> [<refspec>...]]
 
 该命令会与远程协商以确定缺失对象，把它们打包为单个 pack 文件，并随 ref-update 请求一起发送。如果远程 ref 已分叉（非快进），除非使用 `--force`，否则推送会被拒绝。
 
+对象选择会复用远端所有已通告且本地可用的 ref 对象，而不只使用当前待更新 ref 的旧值。因此，当新分支或标签指向远端已通过其他 ref 通告的提交时，不会重新打包该提交的历史，而是发送零个对象。无法解析或本地不可用的已通告 OID 会被保守忽略。真实的零对象 ref 更新仍须发送协议要求的空 pack：SHA-1 仓库为 32 字节，SHA-256 仓库为 44 字节。
+
 LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lfs push`。
 
 ## 全局配置 Schema 保护
@@ -284,7 +286,8 @@ Dry-run：
 - 删除更新使用空 `local_ref`，并以全零对象 ID 作为 `new_oid`
 - 新分支没有先前远程 ref，因此 `old_oid` 为 `null`
 - 需要 `--force` 的更新（非快进）中 `forced` 为 `true`
-- `bytes_pushed` 是 pack 数据大小（字节）；dry-run 时为 `0`
+- `objects_pushed` 是生成 pack 中的对象数；新 ref 的目标已被远端通告时可为 `0`
+- `bytes_pushed` 是 pack 数据大小（字节）；dry-run 时为 `0`，真实零对象更新则报告 SHA-1 的 32 字节或 SHA-256 的 44 字节空 pack
 - `lfs_files_uploaded` 统计已传输的 LFS 对象（仅 HTTP 传输）
 - 使用 `-u` / `--set-upstream` 时，`upstream_set` 非 null
 - `warnings` 包含强制推送警告或其他建议性消息
