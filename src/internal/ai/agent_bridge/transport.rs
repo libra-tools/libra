@@ -16,7 +16,6 @@ use std::{
 use async_trait::async_trait;
 use futures::FutureExt;
 use serde_json::Value;
-use tokio::time::timeout;
 
 use super::protocol::{BridgeError, BridgeRequest, BridgeResponse, JSONRPC_VERSION, MAX_INFLIGHT};
 
@@ -50,9 +49,8 @@ impl BridgeHandler for HandshakeHandler {
 /// Run the bridge loop over the given reader/writer. `reader` is normally
 /// stdin and `writer` stdout, but tests inject in-memory buffers.
 ///
-/// `request_deadline` is the per-request timeout applied to every dispatched
-/// method; the CLI passes the v1 default (`REQUEST_DEADLINE_SECS`), tests pass
-/// a short one so the timeout path is exercised quickly.
+/// `request_deadline` is an inactivity window renewed by useful progress.
+/// No method has a transport-level total-duration cap.
 ///
 /// Returns the count of frames read, so tests can assert how much was
 /// consumed. The loop terminates cleanly on EOF.
@@ -149,25 +147,23 @@ pub async fn run<R: BufRead, W: Write>(
         }
         in_flight += 1;
 
-        // Dispatch with a hard request deadline (GC-LB-11). A handler that
-        // stalls past the v1 default deadline (30 s) is failed with a stable,
-        // retryable timeout error rather than blocking the loop forever.
+        // Useful request-local progress renews the watchdog for every method.
+        // Silence before/after a model or other operation remains bounded.
         //
         // A panic inside a handler is caught (AssertUnwindSafe + catch_unwind)
         // and converted into a stable internal error so one bad request cannot
         // tear down the whole connection — matching the contract documented on
         // `BridgeHandler::handle`.
-        let outcome = timeout(
-            request_deadline,
-            AssertUnwindSafe(handler.handle(&request)).catch_unwind(),
-        )
-        .await;
+        let future = AssertUnwindSafe(handler.handle(&request)).catch_unwind();
+        let outcome =
+            crate::internal::ai::completion::progress::with_idle_timeout(request_deadline, future)
+                .await;
 
         let response = match outcome {
             Err(_elapsed) => BridgeError::timeout(format!(
-                "bridge method '{}' exceeded the {}s request deadline",
+                "bridge method '{}' exceeded the {}s inactivity timeout",
                 request.method,
-                request_deadline.as_secs()
+                request_deadline.as_secs(),
             ))
             .into_object(id),
             Ok(Err(panic)) => {
@@ -493,7 +489,7 @@ mod tests {
 "#;
         let mut out = Vec::new();
         // The deadline is injectable, so we use a short one (200 ms) instead
-        // of the 30 s v1 default to keep the test fast. A handler that never
+        // of the 60 s inactivity default to keep the test fast. A handler that never
         // resolves must be failed with a stable timeout error frame (code
         // 1010) rather than blocking the loop forever.
         run(
@@ -510,6 +506,46 @@ mod tests {
             "expected a timeout error frame (code 1010), got: {text}"
         );
         assert!(text.contains("\"id\":3"));
+    }
+
+    struct StreamingEpisodeHandler;
+
+    #[async_trait(?Send)]
+    impl BridgeHandler for StreamingEpisodeHandler {
+        async fn handle(
+            &self,
+            request: &BridgeRequest,
+        ) -> Result<Option<BridgeResponse>, BridgeError> {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                crate::internal::ai::completion::progress::record();
+            }
+            Ok(Some(BridgeResponse {
+                jsonrpc: JSONRPC_VERSION,
+                result: Some(serde_json::json!({ "ok": true })),
+                error: None,
+                id: request.id.clone().unwrap_or(Value::Null),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_extends_all_method_idle_deadlines() {
+        for method in ["memory.episode.record", "status.get"] {
+            let input = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"id\":9}}\n");
+            let mut out = Vec::new();
+            run(
+                Cursor::new(input),
+                &mut out,
+                &StreamingEpisodeHandler,
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("streaming request completes");
+            let response: Value = serde_json::from_slice(&out).expect("one response frame");
+            assert_eq!(response["result"]["ok"], true);
+            assert_eq!(response["id"], 9);
+        }
     }
 
     /// A handler that returns an oversized result, to verify the result-size

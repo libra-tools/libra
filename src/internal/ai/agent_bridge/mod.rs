@@ -33,6 +33,6 @@ pub use protocol::{
     SOURCE_DEEPSEEK_HARNESS,
 };
 
-/// Default request deadline (seconds) for a single bridge request. Requests
-/// that do not complete within this window are failed with a retryable error.
-pub const REQUEST_DEADLINE_SECS: u64 = 30;
+/// Default inactivity timeout; useful output renews it without a total cap.
+/// Keep the legacy public name for bridge protocol compatibility.
+pub const REQUEST_DEADLINE_SECS: u64 = 60;

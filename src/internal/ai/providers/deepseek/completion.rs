@@ -580,6 +580,12 @@ impl DeepSeekStreamAccumulator {
             }
 
             if let Some(delta) = choice.delta.content.filter(|delta| !delta.is_empty()) {
+                if self.content.is_empty() {
+                    tracing::debug!(
+                        provider = "deepseek",
+                        "DeepSeek stream received first text delta"
+                    );
+                }
                 self.content.push_str(&delta);
                 if let Some(stream_events) = stream_events {
                     let _ = stream_events.send(CompletionStreamEvent::TextDelta {
@@ -594,6 +600,12 @@ impl DeepSeekStreamAccumulator {
                 .reasoning_content
                 .filter(|delta| !delta.is_empty())
             {
+                if self.reasoning_content.is_empty() {
+                    tracing::debug!(
+                        provider = "deepseek",
+                        "DeepSeek stream received first reasoning delta"
+                    );
+                }
                 self.reasoning_content.push_str(&delta);
                 if let Some(stream_events) = stream_events {
                     let _ = stream_events.send(CompletionStreamEvent::ThinkingDelta {
@@ -766,6 +778,10 @@ fn process_deepseek_stream_line(
     };
     let data = data.trim();
     if data == "[DONE]" {
+        tracing::debug!(
+            provider = "deepseek",
+            "DeepSeek stream received DONE marker"
+        );
         return Ok(true);
     }
 

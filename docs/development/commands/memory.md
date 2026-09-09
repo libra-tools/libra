@@ -85,6 +85,18 @@ mixed view.
 
 ## Agent runtime boundary
 
+Task Episode and Intent Iteration compilation explicitly enable provider
+thinking mode and request streaming. The provider adapter accumulates stream
+fragments before compilation validates the response. Nonempty thinking and text
+deltas renew a 60-second inactivity watchdog, including the enclosing
+`memory.episode.record` request; there is no total-duration cap. All bridge
+methods use an inactivity watchdog rather than a hard deadline. The output contract still requires
+one final structured JSON
+text response, separate from any reasoning transcript. Providers without
+thinking controls may ignore this setting. Reasoning-only responses remain
+invalid; compilation never promotes reasoning content into trusted Memory or
+bypasses evidence and schema checks.
+
 Lifecycle wakes are coalesced behind one session-local maintenance worker.
 Repeated terminal events set a dirty bit and request at most one additional
 bounded pass; they do not create an unbounded queue of Tokio tasks waiting on a

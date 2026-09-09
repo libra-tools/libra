@@ -158,7 +158,7 @@ structured report is always present.
 | `frame` | `LBR-AGENT-033` | `internal` | Bridge payload digest conflict — a duplicate `(session_id,event_seq)` or `operation_id` carried a different payload hash | a peer replays an event sequence with altered payload |
 | `frame` | `LBR-AGENT-034` | `internal` | Bridge redaction or payload-size validation could not be satisfied; the original payload was refused (no raw fallback) | a peer sends a payload that cannot be safely redacted |
 | `frame` | `LBR-AGENT-035` | `internal` | Bridge mutating operation denied by policy or approval | `checkpoint.restore` without the required approval |
-| `frame` | `LBR-AGENT-036` | `internal` | Bridge request exceeded its deadline (default 30 s) | a `commit.create` that stalls past the request deadline |
+| `frame` | `LBR-AGENT-036` | `internal` | Bridge request had no useful progress for the inactivity window (default 60 s); no total-duration cap | a `commit.create` that stalls without reporting progress |
 | `frame` | `LBR-AGENT-037` | `internal` | Bridge internal error (JSON-RPC `-32603`) — a database/VCS/generic failure that cannot be attributed to the peer | the bridge's SQLite store returns a transient error during `event.append` |
 | `frame` | `LBR-AGENT-038` | `internal` | Bridge mutation fence drifted — HEAD moved, or the index/worktree is dirty where the operation requires a clean one; refused **before** any write | `commit.create` with a stale `expected_head`, or `checkpoint.restore` against a dirty working tree |
 | `128` | `LBR-AGENT-039` | `internal` | `review --fix` or `investigate fix` was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied | answering `deny` to a pending tool or sandbox approval |
@@ -284,7 +284,7 @@ structured report is always present.
 | `LBR-AGENT-033` | Bridge payload digest conflict on a duplicate `(session_id,event_seq)` or `operation_id` |
 | `LBR-AGENT-034` | Bridge redaction or payload-size validation could not be satisfied; payload refused |
 | `LBR-AGENT-035` | Bridge mutating operation denied by policy or approval |
-| `LBR-AGENT-036` | Bridge request exceeded its deadline |
+| `LBR-AGENT-036` | Bridge request exceeded its inactivity window without useful progress |
 | `LBR-AGENT-037` | Bridge internal error (DB/VCS/generic failure) |
 | `LBR-AGENT-038` | Bridge mutation fence drifted (HEAD moved or the index/worktree is dirty); refused before any write |
 | `LBR-AGENT-039` | `review --fix` was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied |

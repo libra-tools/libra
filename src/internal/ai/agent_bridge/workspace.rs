@@ -15,6 +15,9 @@
 
 use std::path::PathBuf;
 
+// Lease expiry is independent of the request inactivity watchdog.
+const DEFAULT_LEASE_TTL_MS: i64 = 30_000;
+
 use serde_json::{Value, json};
 
 use super::{
@@ -149,7 +152,7 @@ async fn workspace_claim(
         .as_ref()
         .and_then(|p| p.get("lease_ttl_ms"))
         .and_then(Value::as_i64)
-        .unwrap_or(crate::internal::ai::agent_bridge::REQUEST_DEADLINE_SECS as i64 * 1000);
+        .unwrap_or(DEFAULT_LEASE_TTL_MS);
 
     // 3. Derive the lease owner from the session lineage (never self-reported).
     let lease_owner = lease_owner_for(&session);
@@ -190,7 +193,7 @@ async fn workspace_renew(
         .as_ref()
         .and_then(|p| p.get("lease_ttl_ms"))
         .and_then(Value::as_i64)
-        .unwrap_or(crate::internal::ai::agent_bridge::REQUEST_DEADLINE_SECS as i64 * 1000);
+        .unwrap_or(DEFAULT_LEASE_TTL_MS);
 
     // The lease owner must be derived from this session's lineage.
     if lease.owner != lease_owner_for(&session) {

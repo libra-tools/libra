@@ -136,6 +136,7 @@ pub struct BridgeLimits {
     pub max_event_bytes: usize,
     pub max_result_bytes: usize,
     pub max_page: usize,
+    /// Legacy wire name: inactivity window, not a total-duration cap.
     pub request_deadline_secs: u64,
 }
 
@@ -583,7 +584,7 @@ mod tests {
         assert_eq!(limits.max_event_bytes, 256 * 1024);
         assert_eq!(limits.max_result_bytes, 256 * 1024);
         assert_eq!(limits.max_page, 100);
-        assert_eq!(limits.request_deadline_secs, 30);
+        assert_eq!(limits.request_deadline_secs, 60);
     }
 
     #[test]

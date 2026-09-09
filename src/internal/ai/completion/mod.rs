@@ -5,6 +5,7 @@
 
 pub mod json_repair;
 pub mod message;
+pub(crate) mod progress;
 pub mod request;
 pub mod retry;
 pub mod throttle;

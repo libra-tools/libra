@@ -9,7 +9,9 @@ use super::{
     schema::{MAX_COMPILER_OUTPUT_BYTES, ProposalValidationErrorKind, validate_proposal},
 };
 use crate::internal::ai::{
-    completion::{AssistantContent, CompletionModel, CompletionRequest, Message},
+    completion::{
+        AssistantContent, CompletionModel, CompletionRequest, CompletionThinking, Message,
+    },
     memory::{domain::EpisodeRootKind, source::RedactedEpisodeSource},
     observed_agents::Redactor,
     providers::AnyCompletionModel,
@@ -17,7 +19,7 @@ use crate::internal::ai::{
 
 pub(crate) const TASK_EPISODE_PROMPT_VERSION: &str = "task-episode-v1";
 pub(crate) const TASK_EPISODE_RULES_VERSION: u32 = 1;
-const DEFAULT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_PROVIDER_TIMEOUT: Duration = super::PROVIDER_IDLE_TIMEOUT;
 const MAX_MODEL_ID_BYTES: usize = 80;
 const TASK_EPISODE_PROMPT: &str = include_str!("../../prompt/embedded/memory_task_episode_v1.md");
 
@@ -123,11 +125,11 @@ where
         let mut request = CompletionRequest::new(vec![Message::user(input_json)]);
         request.preamble = Some(TASK_EPISODE_PROMPT.to_string());
         request.temperature = Some(0.0);
-        request.stream = Some(false);
-        let response = tokio::time::timeout(self.timeout, self.model.completion(request))
-            .await
-            .map_err(|_| EpisodeCompilerError::new(EpisodeCompilerErrorKind::ProviderTimedOut))?
-            .map_err(|_| EpisodeCompilerError::new(EpisodeCompilerErrorKind::ProviderFailed))?;
+        request.stream = Some(true);
+        // Preserve reasoning while requiring a separate final JSON response below.
+        request.thinking = Some(CompletionThinking::Enabled);
+        let response =
+            super::complete_with_idle_timeout(&self.model, request, self.timeout).await?;
 
         let mut content = response.content.into_iter();
         let Some(AssistantContent::Text(text)) = content.next() else {
@@ -389,7 +391,8 @@ mod tests {
             .expect("completion request was captured");
         assert_eq!(request.preamble.as_deref(), Some(TASK_EPISODE_PROMPT));
         assert_eq!(request.temperature, Some(0.0));
-        assert_eq!(request.stream, Some(false));
+        assert_eq!(request.stream, Some(true));
+        assert_eq!(request.thinking, Some(CompletionThinking::Enabled));
         assert!(request.tools.is_empty());
         let Message::User { content } = &request.chat_history[0] else {
             panic!("Task Episode request must contain one user message");
