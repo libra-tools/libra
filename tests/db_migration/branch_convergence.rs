@@ -6,19 +6,21 @@ use libra::internal::db;
 use sea_orm::ConnectionTrait;
 use tokio::sync::Barrier;
 
-use super::{all_builtin_runner, builtin_migrations, column_exists, connect, table_exists};
+use super::{
+    MigrationRunner, all_builtin_runner, builtin_migrations, column_exists, connect, table_exists,
+};
 
 #[path = "branch_convergence/fixtures.rs"]
 mod fixtures;
 use fixtures::{
-    CONFIG_REPAIR, CONVERGENCE, OPERATION_V2, branch_database, operation_rows, receipts, rows,
-    snapshot,
+    CHANGE_AI_LINK, CHANGE_IDENTITY_PREFIX_INDEX_REPAIR, CONFIG_REPAIR, CONVERGENCE, OPERATION_V2,
+    branch_database, operation_rows, receipts, rows, snapshot,
 };
 
 #[test]
 fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier() {
     let migrations = builtin_migrations();
-    assert_eq!(migrations.len(), 60);
+    assert_eq!(migrations.len(), 62);
     let tail: Vec<_> = migrations
         .iter()
         .filter(|migration| migration.version >= OPERATION_V2)
@@ -30,9 +32,58 @@ fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier()
             (OPERATION_V2, "operation_v2"),
             (CONFIG_REPAIR, "legacy_config_table"),
             (CONVERGENCE, "operation_v2_branch_convergence"),
+            (CHANGE_AI_LINK, "change_ai_link"),
+            (
+                CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
+                "change_identity_prefix_index_repair"
+            ),
         ]
     );
     assert!(migrations.last().unwrap().down.is_none());
+}
+
+#[tokio::test]
+async fn change_identity_prefix_index_repair_replays_after_old_receipt() {
+    // Given a database that shipped with 0802 before its prefix index was
+    // added to the immutable migration body.
+    let (_dir, _path, conn) = branch_database(CONFIG_REPAIR).await;
+    let mut shipped_runner = MigrationRunner::new();
+    shipped_runner
+        .extend(
+            builtin_migrations()
+                .into_iter()
+                .filter(|migration| migration.version <= CHANGE_AI_LINK),
+        )
+        .unwrap();
+    assert_eq!(
+        shipped_runner.run_pending(&conn).await.unwrap(),
+        vec![CONVERGENCE, CHANGE_AI_LINK]
+    );
+    conn.execute_unprepared("DROP INDEX idx_change_identity_v2_repo_change")
+        .await
+        .unwrap();
+
+    // When the current binary opens the already-receipted database.
+    let runner = super::all_builtin_runner().unwrap();
+    assert_eq!(
+        runner.run_pending(&conn).await.unwrap(),
+        vec![CHANGE_IDENTITY_PREFIX_INDEX_REPAIR]
+    );
+
+    // Then the repair is durable and subsequent opens are no-ops.
+    let index_count = conn
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = \
+             'idx_change_identity_v2_repo_change'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index::<i64>(0)
+        .unwrap();
+    assert_eq!(index_count, 1);
+    assert!(runner.run_pending(&conn).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -62,10 +113,15 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
     assert_eq!(rows(&conn, "config").await, config);
     assert_eq!(rows(&conn, "config_kv").await, modern);
     let after = receipts(&conn).await;
-    assert_eq!(after.len(), 60);
+    assert_eq!(after.len(), 62);
     for (version, name) in [
         (OPERATION_V2, "operation_v2"),
         (CONVERGENCE, "operation_v2_branch_convergence"),
+        (CHANGE_AI_LINK, "change_ai_link"),
+        (
+            CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
+            "change_identity_prefix_index_repair",
+        ),
     ] {
         assert_eq!(after.iter().find(|row| row.0 == version).unwrap().1, name);
     }
@@ -75,7 +131,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
             "changed original receipt {receipt:?}"
         );
     }
-    assert_eq!(after.last().unwrap().0, CONVERGENCE);
+    assert_eq!(after.last().unwrap().0, CHANGE_IDENTITY_PREFIX_INDEX_REPAIR);
     let unchanged = snapshot(&conn).await;
     conn.close().await.unwrap();
     let reopened = db::establish_connection(path.to_str().unwrap())
@@ -114,7 +170,15 @@ async fn operation_v2_branch_keeps_modern_and_legacy_rows_without_recopying() {
     let report = db::upgrade_database_schema(&path).await.unwrap();
 
     // Then both histories and the original 0101 claim survive unchanged.
-    assert_eq!(report.applied_versions, vec![CONFIG_REPAIR, CONVERGENCE]);
+    assert_eq!(
+        report.applied_versions,
+        vec![
+            CONFIG_REPAIR,
+            CONVERGENCE,
+            CHANGE_AI_LINK,
+            CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
+        ]
+    );
     assert_eq!(operation_rows(&conn, "legacy_").await, legacy);
     assert_eq!(rows(&conn, "operation").await, modern);
     assert_eq!(rows(&conn, "operation_head").await, heads);
@@ -158,11 +222,15 @@ async fn convergence_barrier_refuses_rollback_below_the_old_binary_tip_atomicall
     let before = snapshot(&conn).await;
 
     // When a downgrade would advertise compatibility with an old #472 binary.
-    let error = all_builtin_runner()
-        .unwrap()
-        .rollback_to(&conn, CONFIG_REPAIR)
-        .await
-        .unwrap_err();
+    let mut runner = MigrationRunner::new();
+    runner
+        .extend(
+            builtin_migrations()
+                .into_iter()
+                .filter(|migration| migration.version <= CONVERGENCE),
+        )
+        .unwrap();
+    let error = runner.rollback_to(&conn, CONFIG_REPAIR).await.unwrap_err();
 
     // Then the forward-only fence refuses before any schema/data/receipt change.
     assert!(matches!(
@@ -200,7 +268,14 @@ async fn concurrent_config_branch_upgraders_claim_the_copy_and_barrier_once() {
     // Then one barrier owner performs the catch-up; the loser does no copy DDL.
     let mut applied = a.unwrap();
     applied.extend(b.unwrap());
-    assert_eq!(applied, vec![CONVERGENCE]);
+    assert_eq!(
+        applied,
+        vec![
+            CONVERGENCE,
+            CHANGE_AI_LINK,
+            CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
+        ]
+    );
     assert_eq!(operation_rows(&left, "legacy_").await, expected);
-    assert_eq!(receipts(&left).await.len(), 60);
+    assert_eq!(receipts(&left).await.len(), 62);
 }

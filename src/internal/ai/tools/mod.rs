@@ -21,8 +21,8 @@ pub mod spec;
 pub mod utils;
 
 pub use context::{
-    GrepFilesArgs, ListDirArgs, ReadFileArgs, ShellArgs, ToolInvocation, ToolKind, ToolOutput,
-    ToolPayload, WebSearchArgs,
+    AiOperationContext, GrepFilesArgs, ListDirArgs, ReadFileArgs, ShellArgs, ToolInvocation,
+    ToolKind, ToolOutput, ToolPayload, WebSearchArgs,
 };
 pub use error::{ToolError, ToolResult};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};

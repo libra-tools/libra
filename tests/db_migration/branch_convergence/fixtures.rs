@@ -13,6 +13,8 @@ use super::super::{
 pub(super) const OPERATION_V2: i64 = 2026090101;
 pub(super) const CONFIG_REPAIR: i64 = 2026090601;
 pub(super) const CONVERGENCE: i64 = 2026090801;
+pub(super) const CHANGE_AI_LINK: i64 = 2026090802;
+pub(super) const CHANGE_IDENTITY_PREFIX_INDEX_REPAIR: i64 = 2026090803;
 
 pub(super) async fn branch_database(tip: i64) -> (TempDir, PathBuf, DatabaseConnection) {
     assert!([OPERATION_V2, CONFIG_REPAIR].contains(&tip));

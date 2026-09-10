@@ -29,6 +29,7 @@ use types::{
     OrchestratorConfig, OrchestratorError, OrchestratorResult, PhaseConfirmationDecision,
     PhaseConfirmationPrompt,
 };
+use uuid::Uuid;
 
 use crate::internal::ai::{
     completion::{CompletionModel, CompletionUsage, ThrottledCompletionModel},
@@ -348,6 +349,12 @@ impl<M: CompletionModel + 'static> Orchestrator<M> {
         }
 
         let mut tool_loop_config = self.config.tool_loop_config.clone();
+        tool_loop_config.intent_id = self
+            .config
+            .persisted_intent_id
+            .clone()
+            .or_else(|| Some(spec.metadata.id.clone()));
+        tool_loop_config.run_id = Some(Uuid::now_v7().to_string());
         if self.config.coder_preamble.is_some() {
             tool_loop_config.preamble = self.config.coder_preamble.clone();
         }

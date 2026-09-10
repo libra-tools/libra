@@ -19,7 +19,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod lease;
-use lease::{LeaseFilePermissions, ScopeLease};
+use lease::LeaseFilePermissions;
+pub(crate) use lease::ScopeLease;
 
 use super::{
     Completeness, JournalEntry, JournalPhase, OperationKind, OperationMetaV2, OperationStatusV2,

@@ -43,7 +43,7 @@ fn removed_existing_leaf_is_not_recreated_by_existing_open() {
     fs::remove_file(&path).expect("remove owned lock leaf");
 
     // When the actual existing-open helper runs, not a stub or alternate primitive.
-    let error = open_existing_leaf(&parent, &path)
+    let error = open_existing_leaf(&parent, &path, c"operation-v2.lock")
         .expect_err("existing-open must not recreate a disappeared leaf");
 
     // Then ENOENT and the affected path survive, with no retry that recreates the leaf.

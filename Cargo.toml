@@ -629,3 +629,28 @@ path = "tests/operation_command_coverage.rs"
 [[test]]
 name = "agent_shell_operation"
 path = "tests/agent_shell_operation.rs"
+
+# plan-20260822 OL-10: restore receipt and fail-closed selection contract.
+[[test]]
+name = "operation_restore_faults"
+path = "tests/operation_restore_faults.rs"
+
+# plan-20260822 OL-11: append-only undo/redo/revert contracts.
+[[test]]
+name = "op_undo_redo"
+path = "tests/op_undo_redo.rs"
+
+# plan-20260822 CH-02: change projection and prefix-resolution contracts.
+[[test]]
+name = "change_id_resolution"
+path = "tests/change_id_resolution.rs"
+
+# plan-20260822 CH-03: rewrite builder and predecessor genealogy.
+[[test]]
+name = "change_genealogy_rebase"
+path = "tests/change_genealogy_rebase.rs"
+
+# plan-20260822 CH-04: multi-edge genealogy and stable AI causal links.
+[[test]]
+name = "change_genealogy_squash_split"
+path = "tests/change_genealogy_squash_split.rs"

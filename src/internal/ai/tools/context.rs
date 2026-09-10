@@ -22,6 +22,25 @@ pub enum ToolKind {
     Custom,
 }
 
+/// Redacted causal identifiers attached to a tool invocation.
+///
+/// These values are runtime-owned identifiers, not model-provided payload. They
+/// are carried to mutating handlers so the handler can persist an auditable link
+/// to the current stable change projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiOperationContext {
+    pub operation_id: String,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub tool_invocation_id: String,
+    pub intent_id: Option<String>,
+    pub repo_id: Option<String>,
+    /// Earlier successful mutating operations in this tool-loop mutation batch.
+    /// A later commit/rewrite may consume this explicit set, never a repo-wide
+    /// or run-wide scan.
+    pub pending_operation_ids: Vec<String>,
+}
+
 /// A tool invocation containing all context needed for execution.
 #[derive(Clone)]
 pub struct ToolInvocation {
@@ -35,6 +54,8 @@ pub struct ToolInvocation {
     pub working_dir: PathBuf,
     /// Optional runtime constraints attached by the orchestrator.
     pub runtime_context: Option<ToolRuntimeContext>,
+    /// Optional runtime-owned AI causality identifiers.
+    pub ai_operation: Option<AiOperationContext>,
 }
 
 impl ToolInvocation {
@@ -51,12 +72,19 @@ impl ToolInvocation {
             payload,
             working_dir,
             runtime_context: None,
+            ai_operation: None,
         }
     }
 
     /// Attach runtime context to this invocation.
     pub fn with_runtime_context(mut self, runtime_context: ToolRuntimeContext) -> Self {
         self.runtime_context = Some(runtime_context);
+        self
+    }
+
+    /// Attach runtime-owned AI causality identifiers to this invocation.
+    pub fn with_ai_operation(mut self, ai_operation: AiOperationContext) -> Self {
+        self.ai_operation = Some(ai_operation);
         self
     }
 

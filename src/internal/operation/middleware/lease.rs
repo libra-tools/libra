@@ -86,15 +86,14 @@ fn invalid_shared_repository(value: &str) -> OperationError {
     ))
 }
 
-pub(super) struct ScopeLease {
+pub(crate) struct ScopeLease {
     // Closing the independently opened file releases its lock on every platform.
     _file: File,
     _parent: File,
 }
 
 impl ScopeLease {
-    #[cfg(test)]
-    pub(super) async fn acquire(
+    pub(crate) async fn acquire(
         scope: &PinnedRequestScope,
         repo_id: &str,
     ) -> Result<Self, OperationError> {
@@ -134,6 +133,34 @@ impl ScopeLease {
             _parent: parent,
         })
     }
+
+    /// Repository-wide lease used by transitions that rewrite shared refs.
+    /// Worktree leases intentionally live below this one in the lock order.
+    pub(crate) async fn acquire_repository(
+        scope: &PinnedRequestScope,
+        repo_id: &str,
+    ) -> Result<Self, OperationError> {
+        let key = format!("{repo_id}:repository");
+        let path = scope.storage.join("operation-v2-repository.lock");
+        let open_path = path.clone();
+        let parent_path = scope.storage.clone();
+        let (file, parent) =
+            tokio::task::spawn_blocking(move || open_repository_files(&parent_path, &open_path))
+                .await
+                .map_err(|error| {
+                    OperationError::Storage(format!(
+                        "cannot prepare repository operation lease '{}' for {key}: {error}",
+                        path.display()
+                    ))
+                })??;
+        file.try_lock()
+            .map_err(|error| lock_error(error, &key, &path))?;
+        verify_parent(&parent, &scope.storage)?;
+        Ok(Self {
+            _file: file,
+            _parent: parent,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +189,36 @@ fn open_files_with_permissions(
     }
     permissions.apply(&file, path)?;
     verify_parent(&parent, info)?;
+    Ok((file, parent))
+}
+
+fn open_repository_files(parent_path: &Path, path: &Path) -> Result<(File, File), OperationError> {
+    let parent = open_parent(parent_path)?;
+    let file = {
+        #[cfg(unix)]
+        {
+            unix::open_repository_leaf(&parent, path, 0o666)?
+        }
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|error| storage_error("open", path, error))?
+        }
+    };
+    if !metadata(&file, path)?.is_file() {
+        return Err(storage_error(
+            "open",
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repository lease must be a regular file",
+            ),
+        ));
+    }
+    verify_parent(&parent, parent_path)?;
     Ok((file, parent))
 }
 

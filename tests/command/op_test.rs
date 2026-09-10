@@ -580,7 +580,7 @@ fn test_op_restore_dry_run_does_not_record_new_operation() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Would restore to operation"),
+        stdout.starts_with("Would restore ") && stdout.contains(" path(s)"),
         "unexpected stdout: {stdout}"
     );
 
@@ -600,7 +600,7 @@ fn test_op_restore_out_of_range_index_reports_invalid_target() {
     let output = run_libra_command(&["op", "restore", "@{99}"], repo.path());
     let (_human, report) = parse_cli_error_stderr(&output.stderr);
 
-    assert_invalid_target_error(&output, "fatal: operation index 99 out of range");
+    assert_invalid_target_error(&output, "fatal: v2 operation index out of range: @{99}");
     assert_eq!(
         report.hints,
         vec!["use 'libra op log' to see available operations"]
@@ -733,7 +733,7 @@ fn test_op_command_smoke_flow_covers_first_batch_chain() {
     assert_cli_success(&restore_output, "op restore --dry-run");
     let restore_stdout = String::from_utf8_lossy(&restore_output.stdout);
     assert!(
-        restore_stdout.contains("Would restore to operation"),
+        restore_stdout.starts_with("Would restore ") && restore_stdout.contains(" path(s)"),
         "unexpected stdout: {restore_stdout}"
     );
 }

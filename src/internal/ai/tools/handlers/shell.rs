@@ -76,6 +76,7 @@ impl ToolHandler for ShellHandler {
             payload,
             working_dir,
             runtime_context,
+            ai_operation,
             ..
         } = invocation;
 
@@ -146,6 +147,7 @@ impl ToolHandler for ShellHandler {
             approval,
             justification: args.justification,
             safety_decision: Some(safety_decision.clone()),
+            ai_operation,
         })
         .await
         {

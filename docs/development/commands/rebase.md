@@ -1,5 +1,14 @@
 # `libra rebase` 开发设计
 
+## Change genealogy (CH-04)
+
+Each replayed revision is recorded through the ChangeRevisionBuilder. Rebase
+edges use the typed `rebase` relation and preserve the logical Change ID across
+rewrites. Multi-parent `squash` and multi-result `split` edges are represented
+as ordered sidecar predecessor rows; no Change ID is inserted into a Git
+header. AI links use redacted stable operation/Change IDs, never replayed
+commit OIDs.
+
 ## 命令实现目标
 
 `libra rebase` 的目标是把提交重放到新的 base 上，并支持 continue/abort/skip 等冲突恢复流程。实现需要保持作者/提交者语义、文件模式、错误分类和 pull --rebase 交互。除 `--onto`、`--autosquash`、`--reapply-cherry-picks` 与 empty 控制外，P1-07a 已补齐四个脚本化控制：tracked dirty state 的 `--autostash`、逐提交且强制 sandbox 的可重复 `--exec`、原子 `--update-refs`（排除所有 worktree 已检出分支）和 reflog 驱动的 `--fork-point`。interactive、`--rebase-merges`、`--rerere-autoupdate` 与 `--empty=stop|ask` 仍未实现。

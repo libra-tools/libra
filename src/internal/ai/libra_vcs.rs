@@ -4,9 +4,14 @@
 //! commands only; raw shell/git execution stays outside this contract. MCP tests cover
 //! accepted commands, rejected commands, and argument normalization.
 
+use std::path::Path;
+
 use serde_json::json;
 
-use crate::internal::ai::runtime::hardening::{BlastRadius, SafetyDecision};
+use crate::internal::ai::{
+    runtime::hardening::{BlastRadius, SafetyDecision},
+    tools::AiOperationContext,
+};
 
 pub const ALLOWED_COMMANDS: &[&str] = &[
     "status", "diff", "branch", "log", "show", "show-ref", "ls-files", "add", "commit", "switch",
@@ -14,6 +19,95 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
 
 pub const ALLOWED_COMMANDS_DISPLAY: &str =
     "status, diff, branch, log, show, show-ref, ls-files, add, commit, switch";
+
+/// Persist a redacted pending AI operation link for a mutating tool call. The
+/// subsequent commit/rewrite builder attaches it to the newly created stable
+/// Change ID, so the link never points at the pre-edit HEAD by accident.
+pub async fn record_pending_ai_operation_link_for_tool(
+    context: &AiOperationContext,
+    working_dir: &Path,
+) -> Result<(), String> {
+    let Some(database) = database_for_tool_working_dir(working_dir).await? else {
+        return Ok(());
+    };
+    let repo_id = match context.repo_id.clone() {
+        Some(repo_id) if !repo_id.trim().is_empty() => repo_id,
+        _ => crate::internal::workspace::RepoIdentity::resolve_or_init(&database)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to resolve repository identity for '{}': {error}",
+                    working_dir.display()
+                )
+            })?
+            .to_string(),
+    };
+    crate::internal::change::record_pending_ai_operation_link(
+        &database,
+        &context.operation_id,
+        context.session_id.as_deref(),
+        context.run_id.as_deref(),
+        Some(&context.tool_invocation_id),
+        context.intent_id.as_deref(),
+        &repo_id,
+        "v1",
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "failed to record pending AI operation link for '{}': {error}",
+            working_dir.display()
+        )
+    })
+}
+
+/// Remove a pending link after a mutating tool fails before creating a Change.
+pub async fn remove_pending_ai_operation_link_for_tool(
+    context: &AiOperationContext,
+    working_dir: &Path,
+) -> Result<(), String> {
+    let Some(database) = database_for_tool_working_dir(working_dir).await? else {
+        return Ok(());
+    };
+    crate::internal::change::remove_pending_ai_operation_link(&database, &context.operation_id)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to remove pending AI operation link for '{}': {error}",
+                working_dir.display()
+            )
+        })
+}
+
+/// Resolve the database for a tool invocation without consulting process cwd.
+///
+/// A tool may legitimately run against a temporary directory that is not a
+/// Libra repository. There is no repository database to record in that case,
+/// so the causality link is a best-effort no-op. Corrupt repository metadata or
+/// database failures remain errors for the tool loop to report as warnings.
+async fn database_for_tool_working_dir(
+    working_dir: &Path,
+) -> Result<Option<sea_orm::DbConn>, String> {
+    let storage = match crate::utils::util::try_get_storage_path(Some(working_dir.to_path_buf())) {
+        Ok(storage) => storage,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to resolve Libra storage for '{}': {error}",
+                working_dir.display()
+            ));
+        }
+    };
+    crate::internal::db::get_db_conn_instance_for_path(&storage.join(crate::utils::util::DATABASE))
+        .await
+        .map(Some)
+        .map_err(|error| {
+            format!(
+                "failed to open Libra database for '{}': {error}",
+                working_dir.display()
+            )
+        })
+}
 
 pub fn run_libra_vcs_tool_guidance() -> String {
     format!(
@@ -719,7 +813,112 @@ fn command_has_control_characters(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
     use super::*;
+
+    async fn create_test_repository() -> tempfile::TempDir {
+        let repository = tempfile::tempdir().unwrap();
+        let storage = repository.path().join(crate::utils::util::ROOT_DIR);
+        fs::create_dir(&storage).unwrap();
+        let database_path = storage.join(crate::utils::util::DATABASE);
+        crate::internal::db::create_database(database_path.to_str().unwrap())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        repository
+    }
+
+    async fn pending_link_count(repository: &Path, operation_id: &str) -> usize {
+        let storage =
+            crate::utils::util::try_get_storage_path(Some(repository.to_path_buf())).unwrap();
+        let database = crate::internal::db::get_db_conn_instance_for_path(
+            &storage.join(crate::utils::util::DATABASE),
+        )
+        .await
+        .unwrap();
+        database
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT operation_id FROM ai_operation_link WHERE operation_id = ?",
+                [operation_id.to_string().into()],
+            ))
+            .await
+            .unwrap()
+            .len()
+    }
+
+    fn test_context(operation_id: &str) -> AiOperationContext {
+        AiOperationContext {
+            operation_id: operation_id.to_string(),
+            session_id: Some("session".to_string()),
+            run_id: Some("run".to_string()),
+            tool_invocation_id: "call".to_string(),
+            intent_id: Some("intent".to_string()),
+            repo_id: Some("target-repository".to_string()),
+            pending_operation_ids: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_link_helpers_noop_outside_a_libra_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = test_context("operation-outside-repository");
+
+        record_pending_ai_operation_link_for_tool(&context, directory.path())
+            .await
+            .unwrap();
+        remove_pending_ai_operation_link_for_tool(&context, directory.path())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_link_helpers_route_to_invocation_repository() {
+        let target = create_test_repository().await;
+        let decoy = create_test_repository().await;
+        let context = test_context("operation-target-repository");
+
+        record_pending_ai_operation_link_for_tool(&context, target.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pending_link_count(target.path(), &context.operation_id).await,
+            1
+        );
+        assert_eq!(
+            pending_link_count(decoy.path(), &context.operation_id).await,
+            0
+        );
+
+        remove_pending_ai_operation_link_for_tool(&context, target.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_link_count(target.path(), &context.operation_id).await,
+            0
+        );
+
+        crate::internal::db::reset_db_conn_instance_for_path(
+            &target
+                .path()
+                .join(crate::utils::util::ROOT_DIR)
+                .join(crate::utils::util::DATABASE),
+        )
+        .await;
+        crate::internal::db::reset_db_conn_instance_for_path(
+            &decoy
+                .path()
+                .join(crate::utils::util::ROOT_DIR)
+                .join(crate::utils::util::DATABASE),
+        )
+        .await;
+    }
 
     #[test]
     fn tool_guidance_mentions_allowed_commands_and_read_only_hints() {

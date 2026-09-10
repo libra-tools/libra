@@ -22,6 +22,7 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, Statement, Value,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
     cli_error,
@@ -29,6 +30,7 @@ use crate::{
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
+        change::{RelationKind, record_current_repo_commit_revision_with_predecessors},
         head::Head,
         model::{reference as ref_model, reflog as reflog_model},
         reflog,
@@ -1826,6 +1828,26 @@ impl RebaseTodoAction {
     }
 }
 
+fn replay_genealogy_predecessors(
+    original_commit: &Commit,
+    previous_commit: ObjectHash,
+    action: RebaseTodoAction,
+) -> Vec<(String, RelationKind)> {
+    match action {
+        RebaseTodoAction::Fixup | RebaseTodoAction::Squash => vec![
+            (previous_commit.to_string(), RelationKind::Squash),
+            (original_commit.id.to_string(), RelationKind::Squash),
+        ],
+        RebaseTodoAction::Amend => vec![
+            (previous_commit.to_string(), RelationKind::Amend),
+            (original_commit.id.to_string(), RelationKind::Amend),
+        ],
+        RebaseTodoAction::Pick => {
+            vec![(original_commit.id.to_string(), RelationKind::Rebase)]
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RebaseTodoItem {
     commit: ObjectHash,
@@ -3516,6 +3538,13 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
                 })?;
         save_object(&new_commit, &new_commit.id)
             .map_err(|e| RebaseError::CommitSave(e.to_string()))?;
+        record_current_repo_commit_revision_with_predecessors(
+            Uuid::now_v7().to_string(),
+            new_commit.id.to_string(),
+            replay_genealogy_predecessors(&original_commit, state.current_head, action),
+        )
+        .await
+        .map_err(|error| RebaseError::CommitSave(error.to_string()))?;
 
         let previous_tip = state.current_head;
         state.current_head = new_commit.id;
@@ -5260,6 +5289,15 @@ async fn replay_commit_with_conflict_detection(
 
     if let Err(e) = save_object(&new_commit, &new_commit.id) {
         return ReplayResult::internal(ReplayErrorKind::CommitSave, e.to_string());
+    }
+    if let Err(error) = record_current_repo_commit_revision_with_predecessors(
+        Uuid::now_v7().to_string(),
+        new_commit.id.to_string(),
+        replay_genealogy_predecessors(&commit_to_replay, *new_parent_id, action),
+    )
+    .await
+    {
+        return ReplayResult::internal(ReplayErrorKind::CommitSave, error.to_string());
     }
 
     // Update index and working directory

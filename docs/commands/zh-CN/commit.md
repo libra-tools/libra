@@ -458,3 +458,4 @@ cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 
 - 支持 `--fixup` 和 `--squash`（autosquash 提交重组）
 - Vault signing 替代外部 keyring；`commit.gpgSign` 已生效，`user.signingkey` 仍由 vault 管理
 - 支持 `--cleanup=<mode>` 消息清理（`strip`/`whitespace`/`verbatim`/`scissors`/`default`），未给时回退到 `commit.cleanup` 配置；`commit.verbose` 配置可使 `-v` 成为默认
+- Change identity 仅写入 sidecar 投影（`change_identity`/`change_revision`）；Libra 不向 Git commit 写入 `change-id` header。已有 header 只用于导入兼容。

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MANIFEST_FILE: &str = "manifest.json";
+const LEGACY_MANIFEST_FILE: &str = "file_history.json";
 const MAX_VERSIONS_PER_FILE: usize = 50;
 
 #[derive(Debug, Error)]
@@ -222,6 +223,16 @@ impl FileHistoryStore {
                 source,
             })?;
         }
+        let legacy_manifest = self.legacy_manifest_path();
+        if legacy_manifest.exists() {
+            fs::remove_file(&legacy_manifest).map_err(|source| FileHistoryError::Io {
+                context: format!(
+                    "failed to remove legacy file history manifest {}",
+                    legacy_manifest.display()
+                ),
+                source,
+            })?;
+        }
         Ok(())
     }
 
@@ -231,6 +242,10 @@ impl FileHistoryStore {
 
     fn manifest_path(&self) -> PathBuf {
         self.history_dir().join(MANIFEST_FILE)
+    }
+
+    fn legacy_manifest_path(&self) -> PathBuf {
+        self.session_root.join(LEGACY_MANIFEST_FILE)
     }
 
     fn snapshot_path(&self, hash: &str) -> PathBuf {
@@ -258,7 +273,32 @@ impl FileHistoryStore {
                 })
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Ok(FileHistoryManifest::default())
+                // Pre-CH-04 sessions used a flat manifest at the session
+                // root. Keep this fallback read-only: the next write goes
+                // through save_manifest() and materializes the canonical
+                // file_history/manifest.json location.
+                let legacy_path = self.legacy_manifest_path();
+                match fs::read_to_string(&legacy_path) {
+                    Ok(content) => {
+                        serde_json::from_str(&content).map_err(|source| FileHistoryError::Serde {
+                            context: format!(
+                                "failed to parse legacy file history manifest {}",
+                                legacy_path.display()
+                            ),
+                            source,
+                        })
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Ok(FileHistoryManifest::default())
+                    }
+                    Err(source) => Err(FileHistoryError::Io {
+                        context: format!(
+                            "failed to read legacy file history manifest {}",
+                            legacy_path.display()
+                        ),
+                        source,
+                    }),
+                }
             }
             Err(source) => Err(FileHistoryError::Io {
                 context: format!("failed to read file history manifest {}", path.display()),
@@ -568,9 +608,28 @@ fn prune_manifest(manifest: &mut FileHistoryManifest) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
-    use super::FileHistoryError;
+    use tempfile::tempdir;
+
+    use super::{FileHistoryError, FileHistoryStore};
+
+    #[test]
+    fn legacy_manifest_is_read_and_next_write_moves_to_canonical_path() {
+        let dir = tempdir().expect("tempdir");
+        let legacy = dir.path().join("file_history.json");
+        fs::write(
+            &legacy,
+            r#"{"batches":[{"id":"legacy","created_at":"2026-09-08T00:00:00Z","entries":[]}]}"#,
+        )
+        .expect("legacy manifest");
+        let store = FileHistoryStore::new(dir.path().to_path_buf());
+        let manifest = store.load_manifest().expect("legacy read");
+        assert_eq!(manifest.batches[0].id, "legacy");
+        store.save_manifest(&manifest).expect("canonical write");
+        assert!(dir.path().join("file_history/manifest.json").is_file());
+        assert!(legacy.is_file());
+    }
 
     #[test]
     fn file_history_error_display_pins_owned_variants() {

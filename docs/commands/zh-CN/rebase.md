@@ -391,3 +391,6 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 | 提交重放期间冲突 | 待定类型映射 | 128 | Rebase 停止，状态已保存，提示用户解决 |
 | 无法创建 rebased 提交 | 待定类型映射 | 128 | 带提交详情的 legacy text 错误 |
 | 无法更新分支引用 | 待定类型映射 | 128 | 带 ref 更新详情的 legacy text 错误 |
+
+重写后的提交统一经过 ChangeRevisionBuilder，继承 sidecar 中的稳定
+Change ID，并记录类型化的 `rebase` predecessor 边；不会向 Git commit 注入 Change ID header。
