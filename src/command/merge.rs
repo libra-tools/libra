@@ -657,8 +657,8 @@ pub(crate) enum PullMergeError {
     /// The repository configures an unsupported `merge.conflictStyle` value.
     /// Surfaced only when a conflict actually needs rendering, and a hard error
     /// rather than a silent fall-back to the default style — a typo must not
-    /// quietly change the conflict-marker format (`zdiff3` is not implemented).
-    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge' or 'diff3')")]
+    /// quietly change the conflict-marker format.
+    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge', 'diff3', or 'zdiff3')")]
     InvalidConflictStyle(String),
     /// The `merge.conflictStyle` config could not be read (config-store I/O
     /// failure) — surfaced as an I/O error, never a silent default-style
@@ -871,7 +871,7 @@ impl From<PullMergeError> for CliError {
                 .with_hint("set merge.autostash to true/false (or remove it)"),
             PullMergeError::InvalidConflictStyle(..) => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
-                .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
+                .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
             PullMergeError::ConflictStyleRead(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -2386,15 +2386,21 @@ async fn perform_three_way_merge(
     // better than the others. Fold them into one virtual ancestor (Git's
     // recursive strategy, `merge-ort.c:5313`) instead of arbitrarily picking
     // one, which reports conflicts the recursion resolves.
-    // A conflict inside the virtual ancestor, and MG-06's rename-driven
-    // content merges, are both rendered with the configured style — exactly as
-    // Git renders one at any call depth. Resolved once, ahead of both, so a
-    // merge that renames pays a single config read: an invalid
-    // `merge.conflictStyle` stops the merge before anything is written.
-    let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
-        ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
-        ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
-    })?;
+    // A valid style must reach the first content merge so refinement and rename
+    // replay agree. Preserve the existing single-base failure boundary,
+    // though: a bad presentation setting is reported only if a conflict needs
+    // rendering. The recursive fold is the documented exception because its
+    // synthetic ancestor may itself contain conflict markers.
+    let (conflict_style, mut deferred_conflict_style_error) =
+        match conflict_style_from_config().await {
+            Ok(style) => (style, None),
+            Err(error) => (ConflictStyle::Merge, Some(error)),
+        };
+    if base_commits.len() > 1
+        && let Some(error) = deferred_conflict_style_error.take()
+    {
+        return Err(pull_conflict_style_error(error));
+    }
     let (base_items, mut virtual_blobs) = match base_commits.as_slice() {
         [] => (HashMap::new(), VirtualBlobs::new()),
         [base] => (commit_tree_split_for_merge(base)?.0, VirtualBlobs::new()),
@@ -2429,6 +2435,7 @@ async fn perform_three_way_merge(
         &mut TreeMergeContext::top_level_with_external(
             !options.dry_run,
             options.favor,
+            conflict_style,
             options.merge_default_driver.as_deref(),
             upstream,
             options.external_merge_runtime.clone(),
@@ -2448,6 +2455,7 @@ async fn perform_three_way_merge(
         &mut TreeMergeContext::top_level_with_external(
             !options.dry_run,
             options.favor,
+            conflict_style,
             options.merge_default_driver.as_deref(),
             upstream,
             options.external_merge_runtime.clone(),
@@ -2562,14 +2570,9 @@ async fn perform_three_way_merge(
     )?;
 
     if !merge_result.conflicts.is_empty() {
-        // For a single-base merge the style is resolved only here, on the
-        // conflict path, so an invalid value cannot block a clean merge. A
-        // multi-base merge already resolved it above (the fold's content
-        // depends on it) — this second read then simply agrees with the first.
-        let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
-            ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
-            ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
-        })?;
+        if let Some(error) = deferred_conflict_style_error.take() {
+            return Err(pull_conflict_style_error(error));
+        }
         write_conflicted_merge_state(MergeConflictInput {
             head_name,
             message: resolved_message,
@@ -2762,12 +2765,14 @@ async fn perform_three_way_merge(
 
 /// Resolve the conflict-marker style from the Git-compatible
 /// `merge.conflictStyle` config key (lore.md §1.3): unset/`merge` → the default
-/// two-marker style, `diff3` → additionally emit the `||||||| base` block.
+/// two-marker style, `diff3` → additionally emit the `||||||| base` block, and
+/// `zdiff3` → retain that base block while moving common postimage edges out
+/// of the conflict region.
 /// Matching Git, this is config-only — `git merge` has no CLI style flag. An
-/// unrecognized value (including the unimplemented `zdiff3`) is a hard error so
+/// unrecognized value is a hard error so
 /// a typo never silently changes the marker format. Consulted only when a
-/// conflict actually needs rendering; shared by `merge`/`pull` and
-/// `cherry-pick`, which use the same line-level renderer.
+/// conflict actually needs rendering; shared by `merge`/`pull`,
+/// `cherry-pick`, and `revert`, which use the same content renderer.
 /// Why [`conflict_style_from_config`] could not produce a style: the configured
 /// value is unsupported, or the config store itself could not be read. The two
 /// are distinct on purpose — a read failure must surface as an I/O problem, not
@@ -2778,8 +2783,32 @@ pub(crate) enum ConflictStyleError {
     Read(String),
 }
 
-pub(crate) async fn conflict_style_from_config() -> Result<diffy::ConflictStyle, ConflictStyleError>
-{
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictStyle {
+    Merge,
+    Diff3,
+    ZDiff3,
+}
+
+impl ConflictStyle {
+    fn diffy_style(self) -> diffy::ConflictStyle {
+        match self {
+            Self::Merge => diffy::ConflictStyle::Merge,
+            Self::Diff3 | Self::ZDiff3 => diffy::ConflictStyle::Diff3,
+        }
+    }
+}
+
+impl From<diffy::ConflictStyle> for ConflictStyle {
+    fn from(style: diffy::ConflictStyle) -> Self {
+        match style {
+            diffy::ConflictStyle::Merge => Self::Merge,
+            diffy::ConflictStyle::Diff3 => Self::Diff3,
+        }
+    }
+}
+
+pub(crate) async fn conflict_style_from_config() -> Result<ConflictStyle, ConflictStyleError> {
     // Case-insensitive variable lookup: Git config variable names are
     // case-insensitive, and Libra stores keys verbatim, so both
     // `merge.conflictStyle` and `merge.conflictstyle` spellings must match.
@@ -2790,9 +2819,17 @@ pub(crate) async fn conflict_style_from_config() -> Result<diffy::ConflictStyle,
         .map(|entry| entry.value.trim().to_ascii_lowercase())
         .as_deref()
     {
-        None | Some("") | Some("merge") => Ok(diffy::ConflictStyle::Merge),
-        Some("diff3") => Ok(diffy::ConflictStyle::Diff3),
+        None | Some("") | Some("merge") => Ok(ConflictStyle::Merge),
+        Some("diff3") => Ok(ConflictStyle::Diff3),
+        Some("zdiff3") => Ok(ConflictStyle::ZDiff3),
         Some(other) => Err(ConflictStyleError::Invalid(other.to_string())),
+    }
+}
+
+fn pull_conflict_style_error(error: ConflictStyleError) -> PullMergeError {
+    match error {
+        ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
+        ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
     }
 }
 
@@ -2820,7 +2857,7 @@ struct MergeConflictInput {
     our_items: HashMap<PathBuf, MergeTreeEntry>,
     their_items: HashMap<PathBuf, MergeTreeEntry>,
     /// Marker style for conflicted paths, resolved from `merge.conflictStyle`.
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
 }
 
 fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMergeError> {
@@ -2857,7 +2894,6 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
 
     let workdir = util::working_dir();
-    let marker_eol = conflict_marker_eol();
     let theirs_abbrev = short_object_id(&input.theirs);
 
     let mut index = Index::new();
@@ -2995,15 +3031,8 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
                 .map_err(PullMergeError::WorkdirReset)?;
             continue;
         }
-        write_conflict_markers(
-            &workdir,
-            path,
-            marker_eol,
-            &theirs_abbrev,
-            *kind,
-            input.conflict_style,
-        )
-        .map_err(PullMergeError::WorkdirReset)?;
+        write_conflict_markers(&workdir, path, &theirs_abbrev, *kind, input.conflict_style)
+            .map_err(PullMergeError::WorkdirReset)?;
     }
 
     Ok(())
@@ -4234,13 +4263,13 @@ fn try_merge_blob_contents(
         context.depth,
     );
     let outcome = match &driver {
-        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_driver(
+        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_refined_driver(
             *driver,
             base_data,
             &ours_blob.data,
             &theirs_blob.data,
             context.favor,
-            diffy::ConflictStyle::Diff3,
+            context.conflict_style,
             2 * context.depth,
         )
         .map_err(PullMergeError::TreeCreate)?,
@@ -4808,9 +4837,9 @@ async fn read_external_merge_runtime() -> Result<SharedExternalMergeRuntime, Str
     }))
 }
 
-/// Apply one built-in low-level driver. The text and union drivers use a diff3
-/// rendering internally so hunk selection can be parsed without ambiguity;
-/// the configured style is preserved when a text conflict is returned.
+/// Apply one built-in low-level driver without MG-10 presentation refinement.
+/// `merge-file` retains this compatibility wrapper because its independent CLI
+/// surface is outside the card; merge/cherry-pick/revert use the refined entry.
 pub(crate) fn merge_bytes_with_driver(
     driver: BuiltinMergeDriver,
     base: &[u8],
@@ -4819,6 +4848,53 @@ pub(crate) fn merge_bytes_with_driver(
     favor: Option<MergeFavor>,
     conflict_style: diffy::ConflictStyle,
     extra_marker_size: usize,
+) -> Result<BuiltinMergeOutcome, String> {
+    merge_bytes_with_driver_impl(
+        driver,
+        base,
+        ours,
+        theirs,
+        favor,
+        conflict_style.into(),
+        extra_marker_size,
+        false,
+    )
+}
+
+/// Apply the shared merge/cherry-pick/revert built-in content driver. Text and
+/// union use a diff3 rendering internally where needed for unambiguous hunk
+/// selection; an unresolved text result is rendered in the configured style.
+pub(crate) fn merge_bytes_with_refined_driver(
+    driver: BuiltinMergeDriver,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    favor: Option<MergeFavor>,
+    conflict_style: ConflictStyle,
+    extra_marker_size: usize,
+) -> Result<BuiltinMergeOutcome, String> {
+    merge_bytes_with_driver_impl(
+        driver,
+        base,
+        ours,
+        theirs,
+        favor,
+        conflict_style,
+        extra_marker_size,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_bytes_with_driver_impl(
+    driver: BuiltinMergeDriver,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    favor: Option<MergeFavor>,
+    conflict_style: ConflictStyle,
+    extra_marker_size: usize,
+    refine: bool,
 ) -> Result<BuiltinMergeOutcome, String> {
     // High-level merge consumers normally settle these OID-equality cases
     // before low-level dispatch. Keep the shared helper equally safe for
@@ -4860,7 +4936,7 @@ pub(crate) fn merge_bytes_with_driver(
         .set_conflict_style(if favor.is_some() || driver == BuiltinMergeDriver::Union {
             diffy::ConflictStyle::Diff3
         } else {
-            conflict_style
+            conflict_style.diffy_style()
         })
         .set_conflict_marker_length(marker_len);
     match options.merge_bytes(base, ours, theirs) {
@@ -4873,6 +4949,26 @@ pub(crate) fn merge_bytes_with_driver(
             BuiltinMergeDriver::Text => match favor {
                 Some(favor) => resolve_favored_content(conflicted, marker_len, favor)
                     .map(BuiltinMergeOutcome::Clean),
+                None if refine => {
+                    let (rendered, has_conflicts) = refine_diffy_conflicts(
+                        &conflicted,
+                        marker_len,
+                        conflict_style,
+                        base,
+                        ours,
+                        theirs,
+                        ConflictMarkerLabels {
+                            ours: "ours",
+                            base: "original",
+                            theirs: "theirs",
+                        },
+                    )?;
+                    Ok(if has_conflicts {
+                        BuiltinMergeOutcome::Conflict(rendered)
+                    } else {
+                        BuiltinMergeOutcome::Clean(rendered)
+                    })
+                }
                 None => Ok(BuiltinMergeOutcome::Conflict(conflicted)),
             },
             BuiltinMergeDriver::Binary => {
@@ -4880,6 +4976,387 @@ pub(crate) fn merge_bytes_with_driver(
             }
         },
     }
+}
+
+#[derive(Clone, Copy)]
+struct ConflictMarkerLabels<'a> {
+    ours: &'a str,
+    base: &'a str,
+    theirs: &'a str,
+}
+
+fn marker_bytes(byte: u8, marker_len: usize, label: Option<&str>, eol: &[u8]) -> Vec<u8> {
+    let mut marker = vec![byte; marker_len];
+    if let Some(label) = label {
+        marker.push(b' ');
+        marker.extend_from_slice(label.as_bytes());
+    }
+    marker.extend_from_slice(eol);
+    marker
+}
+
+fn input_uses_crlf_only(content: &[u8]) -> Option<bool> {
+    let mut saw_crlf = false;
+    for (index, byte) in content.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        if index == 0 || content[index - 1] != b'\r' {
+            return Some(false);
+        }
+        saw_crlf = true;
+    }
+    saw_crlf.then_some(true)
+}
+
+/// Match xdiff's conservative marker-EOL rule for uniformly styled inputs:
+/// emit CRLF only when every input with a detectable line ending uses CRLF.
+/// An empty or one-line unterminated side is neutral; an LF side wins.
+fn conflict_marker_eol_for_inputs(inputs: &[&[u8]]) -> &'static [u8] {
+    let mut saw_crlf = false;
+    for input in inputs {
+        match input_uses_crlf_only(input) {
+            Some(true) => saw_crlf = true,
+            Some(false) => return b"\n",
+            None => {}
+        }
+    }
+    if saw_crlf { b"\r\n" } else { b"\n" }
+}
+
+fn split_lines_preserving_eol(content: &[u8]) -> Vec<&[u8]> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in content.iter().enumerate() {
+        if *byte == b'\n' {
+            lines.push(&content[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < content.len() {
+        lines.push(&content[start..]);
+    }
+    lines
+}
+
+fn append_lines(output: &mut Vec<u8>, lines: &[&[u8]]) {
+    for line in lines {
+        output.extend_from_slice(line);
+    }
+}
+
+fn append_marker(
+    output: &mut Vec<u8>,
+    byte: u8,
+    marker_len: usize,
+    label: Option<&str>,
+    eol: &[u8],
+) {
+    output.extend_from_slice(&marker_bytes(byte, marker_len, label, eol));
+}
+
+fn ensure_conflict_side_ends_with_eol(output: &mut Vec<u8>, side: &[&[u8]], eol: &[u8]) {
+    if side.last().is_some_and(|line| !line.ends_with(b"\n")) {
+        output.extend_from_slice(eol);
+    }
+}
+
+fn append_conflict_block(
+    output: &mut Vec<u8>,
+    ours: &[&[u8]],
+    base: Option<&[&[u8]]>,
+    theirs: &[&[u8]],
+    marker_len: usize,
+    eol: &[u8],
+    labels: ConflictMarkerLabels<'_>,
+) {
+    append_marker(output, b'<', marker_len, Some(labels.ours), eol);
+    append_lines(output, ours);
+    ensure_conflict_side_ends_with_eol(output, ours, eol);
+    if let Some(base) = base {
+        append_marker(output, b'|', marker_len, Some(labels.base), eol);
+        append_lines(output, base);
+        ensure_conflict_side_ends_with_eol(output, base, eol);
+    }
+    append_marker(output, b'=', marker_len, None, eol);
+    append_lines(output, theirs);
+    ensure_conflict_side_ends_with_eol(output, theirs, eol);
+    append_marker(output, b'>', marker_len, Some(labels.theirs), eol);
+}
+
+pub(crate) fn render_whole_file_conflict(
+    ours: &[u8],
+    theirs: &[u8],
+    ours_label: &str,
+    theirs_label: &str,
+) -> Vec<u8> {
+    let ours_lines = split_lines_preserving_eol(ours);
+    let theirs_lines = split_lines_preserving_eol(theirs);
+    let eol = conflict_marker_eol_for_inputs(&[ours, theirs]);
+    let marker_len = conflict_marker_length(&[ours, theirs]);
+    let mut output = Vec::with_capacity(ours.len() + theirs.len() + 64);
+    append_conflict_block(
+        &mut output,
+        &ours_lines,
+        None,
+        &theirs_lines,
+        marker_len,
+        eol,
+        ConflictMarkerLabels {
+            ours: ours_label,
+            base: "base",
+            theirs: theirs_label,
+        },
+    );
+    output
+}
+
+fn append_refined_merge_block(
+    output: &mut Vec<u8>,
+    ours: &[u8],
+    theirs: &[u8],
+    marker_len: usize,
+    eol: &[u8],
+    labels: ConflictMarkerLabels<'_>,
+) -> bool {
+    let ours_lines = split_lines_preserving_eol(ours);
+    let theirs_lines = split_lines_preserving_eol(theirs);
+    if ours_lines.is_empty() || theirs_lines.is_empty() {
+        append_conflict_block(
+            output,
+            &ours_lines,
+            None,
+            &theirs_lines,
+            marker_len,
+            eol,
+            labels,
+        );
+        return true;
+    }
+
+    let operations =
+        similar::capture_diff_slices(similar::Algorithm::Myers, &ours_lines, &theirs_lines);
+    let first_change = operations
+        .iter()
+        .position(|operation| operation.tag() != similar::DiffTag::Equal);
+    let Some(first_change) = first_change else {
+        append_lines(output, &ours_lines);
+        return false;
+    };
+    let last_change = operations
+        .iter()
+        .rposition(|operation| operation.tag() != similar::DiffTag::Equal)
+        .unwrap_or(first_change);
+
+    let first_old = operations[first_change].old_range();
+    let first_new = operations[first_change].new_range();
+    append_lines(output, &ours_lines[..first_old.start]);
+    let mut group_old_start = first_old.start;
+    let mut group_new_start = first_new.start;
+
+    // XDL_MERGE_ZEALOUS re-diffs the two postimages, then folds equal runs of
+    // at most three lines back into the surrounding conflict. Longer runs stay
+    // visible as non-conflicting context between smaller conflict blocks.
+    if first_change < last_change {
+        for operation in &operations[(first_change + 1)..last_change] {
+            if operation.tag() != similar::DiffTag::Equal {
+                continue;
+            }
+            let old = operation.old_range();
+            let new = operation.new_range();
+            if old.len() <= 3 {
+                continue;
+            }
+            append_conflict_block(
+                output,
+                &ours_lines[group_old_start..old.start],
+                None,
+                &theirs_lines[group_new_start..new.start],
+                marker_len,
+                eol,
+                labels,
+            );
+            append_lines(output, &ours_lines[old.clone()]);
+            group_old_start = old.end;
+            group_new_start = new.end;
+        }
+    }
+
+    let last_old = operations[last_change].old_range();
+    let last_new = operations[last_change].new_range();
+    append_conflict_block(
+        output,
+        &ours_lines[group_old_start..last_old.end],
+        None,
+        &theirs_lines[group_new_start..last_new.end],
+        marker_len,
+        eol,
+        labels,
+    );
+    append_lines(output, &ours_lines[last_old.end..]);
+    true
+}
+
+fn append_zdiff3_block(
+    output: &mut Vec<u8>,
+    ours: &[u8],
+    base: &[u8],
+    theirs: &[u8],
+    marker_len: usize,
+    eol: &[u8],
+    labels: ConflictMarkerLabels<'_>,
+) -> bool {
+    let ours_lines = split_lines_preserving_eol(ours);
+    let base_lines = split_lines_preserving_eol(base);
+    let theirs_lines = split_lines_preserving_eol(theirs);
+    let mut prefix = 0usize;
+    while prefix < ours_lines.len()
+        && prefix < theirs_lines.len()
+        && ours_lines[prefix] == theirs_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < ours_lines.len().saturating_sub(prefix)
+        && suffix < theirs_lines.len().saturating_sub(prefix)
+        && ours_lines[ours_lines.len() - 1 - suffix]
+            == theirs_lines[theirs_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    append_lines(output, &ours_lines[..prefix]);
+    let ours_end = ours_lines.len() - suffix;
+    let theirs_end = theirs_lines.len() - suffix;
+    let remains_conflicted = prefix < ours_end || prefix < theirs_end;
+    if remains_conflicted {
+        append_conflict_block(
+            output,
+            &ours_lines[prefix..ours_end],
+            Some(&base_lines),
+            &theirs_lines[prefix..theirs_end],
+            marker_len,
+            eol,
+            labels,
+        );
+    }
+    append_lines(output, &ours_lines[ours_end..]);
+    remains_conflicted
+}
+
+fn find_generated_marker(haystack: &[u8], start: usize, marker: &[u8]) -> Option<usize> {
+    let tail = haystack.get(start..)?;
+    let mut fallback = None;
+    for relative in tail
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == marker).then_some(index))
+    {
+        let position = start + relative;
+        fallback.get_or_insert(position);
+        if position == 0 || haystack[position - 1] == b'\n' {
+            return Some(position);
+        }
+    }
+    // diffy does not insert a missing newline before the next marker. Retain a
+    // fallback for an unterminated conflict side after preferring line-start
+    // markers, which cannot collide with input because marker size is bumped.
+    fallback
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_diffy_conflicts(
+    conflicted: &[u8],
+    marker_len: usize,
+    style: ConflictStyle,
+    base_input: &[u8],
+    ours_input: &[u8],
+    theirs_input: &[u8],
+    labels: ConflictMarkerLabels<'_>,
+) -> Result<(Vec<u8>, bool), String> {
+    let raw_eol = b"\n";
+    let open = marker_bytes(b'<', marker_len, Some("ours"), raw_eol);
+    let original = marker_bytes(b'|', marker_len, Some("original"), raw_eol);
+    let separator = marker_bytes(b'=', marker_len, None, raw_eol);
+    let close = marker_bytes(b'>', marker_len, Some("theirs"), raw_eol);
+    let eol = conflict_marker_eol_for_inputs(&[ours_input, theirs_input, base_input]);
+    let malformed = || "internal three-way merge produced malformed conflict markers".to_string();
+
+    let mut output = Vec::with_capacity(conflicted.len());
+    let mut cursor = 0usize;
+    let mut parsed = 0usize;
+    let mut has_conflicts = false;
+    while let Some(open_start) = find_generated_marker(conflicted, cursor, &open) {
+        output.extend_from_slice(&conflicted[cursor..open_start]);
+        let ours_start = open_start + open.len();
+        let (ours_end, base_range, separator_start) = match style {
+            ConflictStyle::Merge => {
+                let separator_start = find_generated_marker(conflicted, ours_start, &separator)
+                    .ok_or_else(malformed)?;
+                (separator_start, None, separator_start)
+            }
+            ConflictStyle::Diff3 | ConflictStyle::ZDiff3 => {
+                let original_start = find_generated_marker(conflicted, ours_start, &original)
+                    .ok_or_else(malformed)?;
+                let base_start = original_start + original.len();
+                let separator_start = find_generated_marker(conflicted, base_start, &separator)
+                    .ok_or_else(malformed)?;
+                (
+                    original_start,
+                    Some(base_start..separator_start),
+                    separator_start,
+                )
+            }
+        };
+        let theirs_start = separator_start + separator.len();
+        let close_start =
+            find_generated_marker(conflicted, theirs_start, &close).ok_or_else(malformed)?;
+        let ours = &conflicted[ours_start..ours_end];
+        let theirs = &conflicted[theirs_start..close_start];
+        has_conflicts |= match style {
+            ConflictStyle::Merge => {
+                append_refined_merge_block(&mut output, ours, theirs, marker_len, eol, labels)
+            }
+            ConflictStyle::Diff3 => {
+                let base_range = base_range.ok_or_else(malformed)?;
+                let ours_lines = split_lines_preserving_eol(ours);
+                let base_lines = split_lines_preserving_eol(&conflicted[base_range]);
+                let theirs_lines = split_lines_preserving_eol(theirs);
+                append_conflict_block(
+                    &mut output,
+                    &ours_lines,
+                    Some(&base_lines),
+                    &theirs_lines,
+                    marker_len,
+                    eol,
+                    labels,
+                );
+                true
+            }
+            ConflictStyle::ZDiff3 => {
+                let base_range = base_range.ok_or_else(malformed)?;
+                append_zdiff3_block(
+                    &mut output,
+                    ours,
+                    &conflicted[base_range],
+                    theirs,
+                    marker_len,
+                    eol,
+                    labels,
+                )
+            }
+        };
+        cursor = close_start + close.len();
+        parsed += 1;
+    }
+    if parsed == 0 {
+        return Err(malformed());
+    }
+    output.extend_from_slice(&conflicted[cursor..]);
+    Ok((output, has_conflicts))
 }
 
 /// Merge three blob payloads and resolve only overlapping regions in favor of
@@ -4994,6 +5471,10 @@ struct TreeMergeContext<'a> {
     /// `call_depth` is non-zero), because a virtual ancestor is an input the
     /// user never asked to bias.
     favor: Option<MergeFavor>,
+    /// User-selected presentation for built-in text conflicts. Keeping it in
+    /// the context makes the first content merge and every rename replay use
+    /// the same refinement decision as the eventual worktree renderer.
+    conflict_style: ConflictStyle,
     /// Recursion depth: 0 for the merge the user asked for, 1 for the merges
     /// that fold its merge bases, 2 for the merges that fold *those* bases, and
     /// so on — Git's `call_depth`.
@@ -5030,6 +5511,7 @@ impl TreeMergeContext<'_> {
         TreeMergeContext {
             persist_merged_blobs,
             favor,
+            conflict_style: ConflictStyle::Merge,
             depth: 0,
             default_driver: default_driver.map(str::to_owned),
             external_merge_runtime: Arc::new(ExternalMergeRuntime::default()),
@@ -5043,6 +5525,7 @@ impl TreeMergeContext<'_> {
     fn top_level_with_external<'a>(
         persist_merged_blobs: bool,
         favor: Option<MergeFavor>,
+        conflict_style: ConflictStyle,
         default_driver: Option<&str>,
         theirs_label: &str,
         external_merge_runtime: SharedExternalMergeRuntime,
@@ -5051,6 +5534,7 @@ impl TreeMergeContext<'_> {
         TreeMergeContext {
             persist_merged_blobs,
             favor,
+            conflict_style,
             depth: 0,
             default_driver: default_driver.map(str::to_owned),
             external_merge_runtime,
@@ -5075,6 +5559,7 @@ impl TreeMergeContext<'_> {
         Self::nested_with_external(
             persist_merged_blobs,
             depth,
+            ConflictStyle::Merge,
             default_driver,
             Arc::new(ExternalMergeRuntime::default()),
             virtual_blobs,
@@ -5084,6 +5569,7 @@ impl TreeMergeContext<'_> {
     fn nested_with_external<'a>(
         persist_merged_blobs: bool,
         depth: usize,
+        conflict_style: ConflictStyle,
         default_driver: Option<&str>,
         external_merge_runtime: SharedExternalMergeRuntime,
         virtual_blobs: &'a mut VirtualBlobs,
@@ -5091,6 +5577,7 @@ impl TreeMergeContext<'_> {
         TreeMergeContext {
             persist_merged_blobs,
             favor: None,
+            conflict_style,
             depth,
             default_driver: default_driver.map(str::to_owned),
             external_merge_runtime,
@@ -5281,7 +5768,7 @@ fn merge_bases_of_folded_with(
 struct VirtualFold<'a> {
     /// `false` under `--dry-run`: the fold keeps its blobs in memory.
     persist: bool,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     /// The fold is a merge, so it detects renames like any other (FIX-MG05-02).
     rename_config: &'a MergeRenameConfig,
     default_driver: Option<&'a str>,
@@ -5297,7 +5784,7 @@ fn virtual_merge_base(
     bases: &[ObjectHash],
     gitlinks: &GitlinkEntries,
     persist: bool,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     rename_config: &MergeRenameConfig,
     default_driver: Option<&str>,
     external_merge_runtime: SharedExternalMergeRuntime,
@@ -5398,6 +5885,7 @@ fn merge_virtual_items(
         &mut TreeMergeContext::nested_with_external(
             fold.persist,
             depth,
+            fold.conflict_style,
             fold.default_driver,
             fold.external_merge_runtime.clone(),
             blobs,
@@ -5420,6 +5908,7 @@ fn merge_virtual_items(
             let mut context = TreeMergeContext {
                 persist_merged_blobs: fold.persist,
                 favor: None,
+                conflict_style: fold.conflict_style,
                 depth,
                 default_driver: fold.default_driver.map(str::to_owned),
                 external_merge_runtime: fold.external_merge_runtime.clone(),
@@ -5589,6 +6078,7 @@ fn virtual_conflict_resolution(
         TreeMergeContext {
             persist_merged_blobs: fold.persist,
             favor: None,
+            conflict_style: fold.conflict_style,
             depth,
             default_driver: None,
             external_merge_runtime: fold.external_merge_runtime.clone(),
@@ -5700,10 +6190,18 @@ fn merge_virtual_content(
     ours: &[u8],
     theirs: &[u8],
     depth: usize,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
 ) -> Result<Vec<u8>, String> {
     let marker_len = conflict_marker_length_at_depth(&[base, ours, theirs], depth);
-    match merge_bytes_with_driver(driver, base, ours, theirs, None, conflict_style, 2 * depth)? {
+    match merge_bytes_with_refined_driver(
+        driver,
+        base,
+        ours,
+        theirs,
+        None,
+        conflict_style,
+        2 * depth,
+    )? {
         BuiltinMergeOutcome::Clean(merged) => Ok(merged),
         BuiltinMergeOutcome::Conflict(conflicted) => Ok(relabel_conflict_markers(
             conflicted,
@@ -7655,7 +8153,7 @@ fn apply_directory_renames(
     our_matches: &mut [rename_detect::RenameMatch],
     their_matches: &mut [rename_detect::RenameMatch],
     config: &MergeRenameConfig,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     branches: (&str, &str),
     context: &mut TreeMergeContext<'_>,
     forced: &mut Vec<(PathBuf, ConflictKind)>,
@@ -7839,7 +8337,7 @@ fn merge_rename_content(
     ours_label: &str,
     theirs_label: &str,
     base_label: &str,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     context: &mut TreeMergeContext<'_>,
 ) -> Result<(MergeTreeEntry, bool), PullMergeError> {
     // Git merges the mode independently of the content: the side that differs
@@ -7972,7 +8470,7 @@ fn merge_rename_content(
     )
     .saturating_add(1);
     let outcome = match &driver {
-        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_driver(
+        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_refined_driver(
             *driver,
             base_data,
             &ours_blob.data,
@@ -8034,7 +8532,7 @@ fn rename_destination_conflict(
     ours: &MergeTreeEntry,
     theirs: &MergeTreeEntry,
     upstream: &str,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     context: &mut TreeMergeContext<'_>,
 ) -> Result<ConflictKind, PullMergeError> {
     let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
@@ -8076,7 +8574,6 @@ fn rename_destination_conflict(
                         None,
                         &ours_blob.data,
                         &theirs_blob.data,
-                        conflict_marker_eol(),
                         upstream,
                         conflict_style,
                     )
@@ -8107,7 +8604,7 @@ fn apply_renames(
     theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
     decisions: &[RenameDecision],
     forced: &mut Vec<(PathBuf, ConflictKind)>,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     // How each side is named in a conflict marker. `HEAD` / the upstream ref
     // for the merge the user asked for, and Git's virtual-ancestor labels
     // inside the fold — Git labels a rename-involved merge `<branch>:<path>`
@@ -8550,7 +9047,7 @@ fn detect_and_apply_renames(
     ours: &mut HashMap<PathBuf, MergeTreeEntry>,
     theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
     config: &MergeRenameConfig,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     branches: (&str, &str),
     context: &mut TreeMergeContext<'_>,
 ) -> Result<RenameOutcome, PullMergeError> {
@@ -8673,7 +9170,7 @@ fn apply_incremental_renames(
     context: &mut TreeMergeContext<'_>,
     // MG-06: the style the rename-driven content merges are rendered with, and
     // the label the other side's paths carry in their conflict markers.
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     upstream: &str,
     // The merge base's root, for MG-04's base-presence rule: a destination
     // directory holding nothing but empty trees is in the way only when the
@@ -10031,6 +10528,15 @@ async fn perform_incremental_three_way_merge(
     // the deferred enumeration can read more, and only the subtrees that
     // differ on a side offering both a source and a destination.
     let rename_config = three_way_rename_config(&options).await?;
+    // The walk itself performs content merges, so a valid style must reach it
+    // and the later rename replay. A bad presentation setting is deferred until
+    // the result actually needs conflict rendering; clean single-base merges
+    // retain the established behavior of ignoring an irrelevant bad value.
+    let (conflict_style, mut deferred_conflict_style_error) =
+        match conflict_style_from_config().await {
+            Ok(style) => (style, None),
+            Err(error) => (ConflictStyle::Merge, Some(error)),
+        };
     let (walk, passthrough_gitlinks) = incremental_merge_trees(
         &mut source,
         base_tree,
@@ -10039,6 +10545,7 @@ async fn perform_incremental_three_way_merge(
         &mut TreeMergeContext::top_level_with_external(
             !options.dry_run,
             options.favor,
+            conflict_style,
             options.merge_default_driver.as_deref(),
             upstream,
             options.external_merge_runtime.clone(),
@@ -10067,18 +10574,10 @@ async fn perform_incremental_three_way_merge(
     // them, so the pair is re-resolved at the new path (Git's
     // `process_renames` does the same to its already-collected entries).
     //
-    // MG-06: the rename pass now renders content merges of its own, so the
-    // conflict style is resolved BEFORE it rather than only on the conflict
-    // path — an invalid `merge.conflictStyle` stops the merge before anything
-    // is written either way, and a merge without renames still reads the
-    // config exactly once.
-    let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
-        ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
-        ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
-    })?;
     let mut rename_context = TreeMergeContext::top_level_with_external(
         !options.dry_run,
         options.favor,
+        conflict_style,
         options.merge_default_driver.as_deref(),
         upstream,
         options.external_merge_runtime.clone(),
@@ -10130,6 +10629,12 @@ async fn perform_incremental_three_way_merge(
         df_candidates,
         &mut files_changed,
     )?;
+
+    if !conflicts.is_empty()
+        && let Some(error) = deferred_conflict_style_error.take()
+    {
+        return Err(pull_conflict_style_error(error));
+    }
 
     if options.dry_run {
         // A preview writes nothing, so there is no write preflight to wait for
@@ -10245,6 +10750,7 @@ async fn perform_incremental_three_way_merge(
             &mut TreeMergeContext::top_level_with_external(
                 !options.dry_run,
                 options.favor,
+                conflict_style,
                 options.merge_default_driver.as_deref(),
                 upstream,
                 options.external_merge_runtime.clone(),
@@ -10983,10 +11489,6 @@ fn prune_empty_parents(workdir: &Path, relative: &Path) {
     }
 }
 
-fn conflict_marker_eol() -> &'static str {
-    if cfg!(windows) { "\r\n" } else { "\n" }
-}
-
 fn conflict_payload(content: &[u8]) -> Cow<'_, str> {
     match std::str::from_utf8(content) {
         Ok(text) => Cow::Borrowed(text),
@@ -10997,10 +11499,9 @@ fn conflict_payload(content: &[u8]) -> Cow<'_, str> {
 fn write_conflict_markers(
     workdir: &Path,
     path: &Path,
-    marker_eol: &str,
     commit_abbrev: &str,
     kind: ConflictKind,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
 ) -> Result<(), String> {
     let content: Vec<u8> = match kind {
         ConflictKind::BothChanged {
@@ -11029,7 +11530,7 @@ fn write_conflict_markers(
                         }
                         None => Vec::new(),
                     };
-                    match merge_bytes_with_driver(
+                    match merge_bytes_with_refined_driver(
                         driver,
                         &base_data,
                         &ours_blob.data,
@@ -11046,7 +11547,6 @@ fn write_conflict_markers(
                     base,
                     &ours_blob.data,
                     &theirs_blob.data,
-                    marker_eol,
                     commit_abbrev,
                     conflict_style,
                 )?,
@@ -11054,21 +11554,18 @@ fn write_conflict_markers(
         }
         ConflictKind::OursModifiedTheirsDeleted { ours } => {
             let ours_blob: Blob = load_object(&ours).map_err(|error| error.to_string())?;
-            format!(
-                "<<<<<<< HEAD{marker_eol}{}{marker_eol}======={marker_eol}>>>>>>> {} (deleted){marker_eol}",
-                conflict_payload(&ours_blob.data),
-                commit_abbrev
+            let ours = conflict_payload(&ours_blob.data);
+            render_whole_file_conflict(
+                ours.as_bytes(),
+                &[],
+                "HEAD",
+                &format!("{commit_abbrev} (deleted)"),
             )
-            .into_bytes()
         }
         ConflictKind::TheirsModifiedOursDeleted { theirs } => {
             let theirs_blob: Blob = load_object(&theirs).map_err(|error| error.to_string())?;
-            format!(
-                "<<<<<<< HEAD (deleted){marker_eol}======={marker_eol}{}{marker_eol}>>>>>>> {}{marker_eol}",
-                conflict_payload(&theirs_blob.data),
-                commit_abbrev
-            )
-            .into_bytes()
+            let theirs = conflict_payload(&theirs_blob.data);
+            render_whole_file_conflict(&[], theirs.as_bytes(), "HEAD (deleted)", commit_abbrev)
         }
         // The directory kept the original path; `path` here is already the
         // file's `unique_path`, and its content is written verbatim — Git
@@ -11107,18 +11604,13 @@ fn both_changed_conflict_content(
     base: Option<ObjectHash>,
     ours: &[u8],
     theirs: &[u8],
-    marker_eol: &str,
     commit_abbrev: &str,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
 ) -> Result<Vec<u8>, String> {
     let whole_file = || {
-        format!(
-            "<<<<<<< HEAD{marker_eol}{}{marker_eol}======={marker_eol}{}{marker_eol}>>>>>>> {}{marker_eol}",
-            conflict_payload(ours),
-            conflict_payload(theirs),
-            commit_abbrev
-        )
-        .into_bytes()
+        let ours = conflict_payload(ours);
+        let theirs = conflict_payload(theirs);
+        render_whole_file_conflict(ours.as_bytes(), theirs.as_bytes(), "HEAD", commit_abbrev)
     };
 
     // Load the common-ancestor content (if any) and defer to the shared
@@ -11136,7 +11628,7 @@ fn both_changed_conflict_content(
         theirs,
         commit_abbrev,
         conflict_style,
-    )
+    )?
     .unwrap_or_else(whole_file))
 }
 
@@ -11156,13 +11648,13 @@ pub(crate) fn render_line_level_conflict(
     ours: &[u8],
     theirs: &[u8],
     commit_label: &str,
-    conflict_style: diffy::ConflictStyle,
-) -> Option<Vec<u8>> {
+    conflict_style: ConflictStyle,
+) -> Result<Option<Vec<u8>>, String> {
     if std::str::from_utf8(ours).is_err()
         || std::str::from_utf8(theirs).is_err()
         || base.is_some_and(|b| std::str::from_utf8(b).is_err())
     {
-        return None;
+        return Ok(None);
     }
 
     // Choose a marker length long enough that no line in the inputs can be
@@ -11171,22 +11663,30 @@ pub(crate) fn render_line_level_conflict(
     // only `diffy`'s emitted markers.
     let marker_len = conflict_marker_length(&[base.unwrap_or(&[]), ours, theirs]);
     let mut options = diffy::MergeOptions::new();
-    options.set_conflict_style(conflict_style);
+    options.set_conflict_style(conflict_style.diffy_style());
     options.set_conflict_marker_length(marker_len);
     match options.merge_bytes(base.unwrap_or(&[]), ours, theirs) {
-        // A genuine conflict: `diffy` returns the file with line-level markers
-        // labelled `ours`/`theirs`; relabel them to Git's `HEAD`/<commit>.
-        Err(conflicted) => Some(relabel_conflict_markers(
-            conflicted,
+        // A genuine conflict: refine diffy's block and relabel it in one
+        // byte-preserving pass so the shared merge/cherry-pick/revert renderer
+        // also controls zdiff3 and marker line endings.
+        Err(conflicted) => refine_diffy_conflicts(
+            &conflicted,
             marker_len,
-            "HEAD",
-            commit_label,
-            "base",
-        )),
+            conflict_style,
+            base.unwrap_or(&[]),
+            ours,
+            theirs,
+            ConflictMarkerLabels {
+                ours: "HEAD",
+                base: "base",
+                theirs: commit_label,
+            },
+        )
+        .map(|(rendered, has_conflicts)| has_conflicts.then_some(rendered)),
         // Content merged cleanly with no markers (no real text conflict — e.g. a
         // mode-only divergence): let the caller surface it as a whole-file
         // conflict rather than writing the silently-merged text.
-        Ok(_) => None,
+        Ok(_) => Ok(None),
     }
 }
 
@@ -11239,7 +11739,7 @@ fn relabel_conflict_markers(
     let bars = "|".repeat(marker_len);
     let ours_marker = format!("{open} ours");
     let theirs_marker = format!("{close} theirs");
-    // `diffy`'s diff3 base marker; only emitted under ConflictStyle::Diff3.
+    // `diffy`'s base marker; emitted for Diff3 and ZDiff3 raw blocks.
     let original_marker = format!("{bars} original");
     let head_marker = format!("{open} {ours_label}");
     let label_marker = format!("{close} {theirs_label}");
@@ -11258,16 +11758,23 @@ fn relabel_conflict_markers(
         if index > 0 {
             relabelled.push(b'\n');
         }
-        let replacement = if line == ours_marker.as_bytes() {
+        let (body, had_cr) = match line.strip_suffix(b"\r") {
+            Some(body) => (body, true),
+            None => (line, false),
+        };
+        let replacement = if body == ours_marker.as_bytes() {
             head_marker.as_bytes()
-        } else if line == theirs_marker.as_bytes() {
+        } else if body == theirs_marker.as_bytes() {
             label_marker.as_bytes()
-        } else if line == original_marker.as_bytes() {
+        } else if body == original_marker.as_bytes() {
             base_marker.as_bytes()
         } else {
-            line
+            body
         };
         relabelled.extend_from_slice(replacement);
+        if had_cr {
+            relabelled.push(b'\r');
+        }
     }
     relabelled
 }
@@ -11507,13 +12014,13 @@ mod driver {
 
     #[test]
     fn union_retains_only_both_conflicting_sides_in_order() {
-        let result = merge_bytes_with_driver(
+        let result = merge_bytes_with_refined_driver(
             BuiltinMergeDriver::Union,
             b"top\nbase\nbottom\n",
             b"top\nours\nbottom\n",
             b"top\ntheirs\nbottom\n",
             None,
-            diffy::ConflictStyle::Merge,
+            ConflictStyle::Merge,
             0,
         )
         .expect("union driver");
@@ -11545,13 +12052,13 @@ mod driver {
                 &b"same\n"[..],
             ),
         ] {
-            let outcome = merge_bytes_with_driver(
+            let outcome = merge_bytes_with_refined_driver(
                 BuiltinMergeDriver::Binary,
                 base,
                 ours,
                 theirs,
                 None,
-                diffy::ConflictStyle::Merge,
+                ConflictStyle::Merge,
                 0,
             )
             .expect("binary driver");
@@ -11562,13 +12069,13 @@ mod driver {
     #[test]
     fn union_driver_falls_back_to_binary_for_nul_content() {
         let ours = b"ours\0bytes";
-        let outcome = merge_bytes_with_driver(
+        let outcome = merge_bytes_with_refined_driver(
             BuiltinMergeDriver::Union,
             b"base\0bytes",
             ours,
             b"theirs\0bytes",
             None,
-            diffy::ConflictStyle::Merge,
+            ConflictStyle::Merge,
             0,
         )
         .expect("union binary fallback");
@@ -11603,7 +12110,7 @@ mod driver {
             &mut blobs,
             VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &rename_config,
                 default_driver: Some("binary"),
                 external_merge_runtime: Arc::new(ExternalMergeRuntime::default()),
@@ -11784,6 +12291,144 @@ mod ext_driver {
 }
 
 #[cfg(test)]
+mod refine {
+    use super::*;
+
+    #[test]
+    fn adopts_equal_postimage_suffix() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"top\nbase-a\nbase-b\nbottom\n",
+            b"top\nOURS\nSAME\nbottom\n",
+            b"top\nTHEIRS\nSAME\nbottom\n",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("text merge succeeds");
+        assert_eq!(
+            outcome,
+            BuiltinMergeOutcome::Conflict(
+                b"top\n<<<<<<< ours\nOURS\n=======\nTHEIRS\n>>>>>>> theirs\nSAME\nbottom\n"
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn simplifies_short_equal_gap_into_one_block() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"top\nbase-a\nbase-b\nbottom\n",
+            b"top\nOURS-A\nc1\nc2\nc3\nOURS-B\nbottom\n",
+            b"top\nTHEIRS-A\nc1\nc2\nc3\nTHEIRS-B\nbottom\n",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("text merge succeeds");
+        let BuiltinMergeOutcome::Conflict(bytes) = outcome else {
+            panic!("genuine differences must remain conflicted");
+        };
+        assert_eq!(
+            bytes
+                .windows(b"=======\n".len())
+                .filter(|window| *window == b"=======\n")
+                .count(),
+            1,
+            "three common lines stay inside one simpler conflict block"
+        );
+    }
+
+    #[test]
+    fn splits_around_long_equal_gap_without_changing_status() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"top\nbase-a\nbase-b\nbottom\n",
+            b"top\nOURS-A\nc1\nc2\nc3\nc4\nOURS-B\nbottom\n",
+            b"top\nTHEIRS-A\nc1\nc2\nc3\nc4\nTHEIRS-B\nbottom\n",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("text merge succeeds");
+        let BuiltinMergeOutcome::Conflict(bytes) = outcome else {
+            panic!("genuine differences must remain conflicted");
+        };
+        assert_eq!(
+            bytes
+                .windows(b"=======\n".len())
+                .filter(|window| *window == b"=======\n")
+                .count(),
+            2,
+            "four common lines separate two refined conflict blocks"
+        );
+        assert!(
+            bytes
+                .windows(b"c1\nc2\nc3\nc4\n".len())
+                .any(|window| window == b"c1\nc2\nc3\nc4\n"),
+            "long shared context is retained byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn zdiff3_keeps_base_but_trims_postimage_edges() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"1\n2\n3\n4\n5\n6\n7\n8\n9\n",
+            b"1\n2\n3\n4\nA\nB\nC\nD\nE\n7\n8\n9\n",
+            b"1\n2\n3\n4\nA\nX\nC\nY\nE\n7\n8\n9\n",
+            None,
+            ConflictStyle::ZDiff3,
+            0,
+        )
+        .expect("text merge succeeds");
+        assert_eq!(
+            outcome,
+            BuiltinMergeOutcome::Conflict(
+                b"1\n2\n3\n4\nA\n<<<<<<< ours\nB\nC\nD\n||||||| original\n5\n6\n=======\nX\nC\nY\n>>>>>>> theirs\nE\n7\n8\n9\n"
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn refines_unterminated_conflict_sides_without_malformed_markers() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"base",
+            b"ours",
+            b"theirs",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("unterminated text merge succeeds");
+        assert_eq!(
+            outcome,
+            BuiltinMergeOutcome::Conflict(
+                b"<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n".to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn whole_file_markers_follow_uniform_crlf_input() {
+        assert_eq!(
+            render_whole_file_conflict(b"OURS\r\n", b"THEIRS\r\n", "HEAD", "topic"),
+            b"<<<<<<< HEAD\r\nOURS\r\n=======\r\nTHEIRS\r\n>>>>>>> topic\r\n"
+        );
+    }
+
+    #[test]
+    fn mixed_input_line_endings_conservatively_use_lf_markers() {
+        let rendered = render_whole_file_conflict(b"one\r\ntwo\n", b"other\r\n", "HEAD", "topic");
+        assert!(rendered.starts_with(b"<<<<<<< HEAD\n"));
+        assert!(rendered.ends_with(b">>>>>>> topic\n"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -11810,14 +12455,10 @@ mod tests {
         let base = b"top\nl1\nl2\nl3\nbottom\n";
         let ours = b"top\nl1\nMAIN\nl3\nbottom\n";
         let theirs = b"top\nl1\nOTHER\nl3\nbottom\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Merge,
-        )
-        .expect("a real text conflict renders line-level markers");
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "top\nl1\n<<<<<<< HEAD\nMAIN\n=======\nOTHER\n>>>>>>> abc1234\nl3\nbottom\n",
@@ -11833,14 +12474,10 @@ mod tests {
         let base = b"<<<<<<< ours\nl2\n";
         let ours = b"<<<<<<< ours\nMAIN\n";
         let theirs = b"<<<<<<< ours\nOTHER\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Merge,
-        )
-        .unwrap();
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with("<<<<<<< ours\n"),
@@ -11866,14 +12503,10 @@ mod tests {
         let base = b"prefix <<<<<<< ours\nl2\n";
         let ours = b"prefix <<<<<<< ours\nMAIN\n";
         let theirs = b"prefix <<<<<<< ours\nOTHER\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Merge,
-        )
-        .unwrap();
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with("prefix <<<<<<< ours\n"),
@@ -11893,25 +12526,15 @@ mod tests {
     fn render_line_level_conflict_skips_binary_and_clean_merges() {
         // Binary side -> None (caller falls back to whole-file markers).
         assert!(
-            render_line_level_conflict(
-                None,
-                b"a\n",
-                &[0xff, 0xfe],
-                "x",
-                diffy::ConflictStyle::Merge
-            )
-            .is_none()
+            render_line_level_conflict(None, b"a\n", &[0xff, 0xfe], "x", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .is_none()
         );
         // No real text conflict (only one side changed) -> None.
         assert!(
-            render_line_level_conflict(
-                Some(b"a\n"),
-                b"a\n",
-                b"b\n",
-                "x",
-                diffy::ConflictStyle::Merge
-            )
-            .is_none()
+            render_line_level_conflict(Some(b"a\n"), b"a\n", b"b\n", "x", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .is_none()
         );
     }
 
@@ -11922,14 +12545,10 @@ mod tests {
         let base = b"top\nl1\nORIG\nl3\nbottom\n";
         let ours = b"top\nl1\nMAIN\nl3\nbottom\n";
         let theirs = b"top\nl1\nOTHER\nl3\nbottom\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Diff3,
-        )
-        .expect("a real text conflict renders line-level markers");
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Diff3)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "top\nl1\n<<<<<<< HEAD\nMAIN\n||||||| base\nORIG\n=======\nOTHER\n>>>>>>> abc1234\nl3\nbottom\n",
@@ -11945,14 +12564,10 @@ mod tests {
         let base = b"||||||| original\nORIG\n";
         let ours = b"||||||| original\nMAIN\n";
         let theirs = b"||||||| original\nOTHER\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Diff3,
-        )
-        .unwrap();
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Diff3)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with("||||||| original\n"),
@@ -12152,8 +12767,8 @@ mod tests {
             "a/b - not something we can merge",
         );
         assert_eq!(
-            PullMergeError::InvalidConflictStyle("zdiff3".to_string()).to_string(),
-            "unsupported merge.conflictStyle 'zdiff3' (expected 'merge' or 'diff3')",
+            PullMergeError::InvalidConflictStyle("bogus".to_string()).to_string(),
+            "unsupported merge.conflictStyle 'bogus' (expected 'merge', 'diff3', or 'zdiff3')",
         );
         assert_eq!(
             PullMergeError::ConflictStyleRead("db locked".to_string()).to_string(),
@@ -12402,12 +13017,12 @@ mod recursive {
     };
 
     use super::{
-        GitlinkEntries, MAX_VIRTUAL_ANCESTOR_BASES, MAX_VIRTUAL_ANCESTOR_DEPTH, MAX_XDIFF_SIZE,
-        MergeTreeEntry, PullMergeError, VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL, VirtualBlobs,
-        conflict_marker_length_at_depth, ensure_virtual_ancestor_depth, fold_merge_bases,
-        merge_bases_of_folded, merge_bases_of_folded_with, merge_input_exceeds_xdiff_size,
-        merge_input_is_binary, merge_virtual_items, recorded_merge_base, virtual_base_fold_order,
-        virtual_merged_mode,
+        ConflictStyle, GitlinkEntries, MAX_VIRTUAL_ANCESTOR_BASES, MAX_VIRTUAL_ANCESTOR_DEPTH,
+        MAX_XDIFF_SIZE, MergeTreeEntry, PullMergeError, VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL,
+        VirtualBlobs, conflict_marker_length_at_depth, ensure_virtual_ancestor_depth,
+        fold_merge_bases, merge_bases_of_folded, merge_bases_of_folded_with,
+        merge_input_exceeds_xdiff_size, merge_input_is_binary, merge_virtual_items,
+        recorded_merge_base, virtual_base_fold_order, virtual_merged_mode,
     };
 
     fn oid(byte: u8) -> ObjectHash {
@@ -12474,7 +13089,7 @@ mod recursive {
             blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
@@ -12511,7 +13126,7 @@ mod recursive {
             &mut blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
@@ -12527,7 +13142,7 @@ mod recursive {
             &mut blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
@@ -12557,7 +13172,7 @@ mod recursive {
             &mut blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
@@ -12576,7 +13191,7 @@ mod recursive {
             &mut blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
@@ -14222,7 +14837,7 @@ mod rename {
             theirs,
             decisions,
             &mut forced,
-            diffy::ConflictStyle::Merge,
+            ConflictStyle::Merge,
             ("HEAD", "feature"),
             &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
         )

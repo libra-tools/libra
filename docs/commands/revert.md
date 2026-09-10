@@ -247,8 +247,14 @@ changes, standard conflict markers are written to the working tree, the unmerged
 state and revert progress are saved in `revert-state.json`, and `LBR-CONFLICT-001`
 is returned. You resolve the markers and run `libra revert --continue`, skip the
 commit with `libra revert --skip`, or unwind with `libra revert --abort`.
-The implicit `text` driver preserves revert's existing diff3-style
-`||||||| original` base section in conflicted output.
+Text conflicts use the `merge.conflictStyle` renderer shared with merge and
+cherry-pick. The default `merge` style re-diffs both postimages; `diff3` adds
+the complete `||||||| original` ancestor block, while `zdiff3` keeps that block
+and moves common postimage prefixes and suffixes outside the markers. An
+unknown style fails before the index or working tree is changed when a content
+merge remains conflicted and needs rendering. Marker lines follow uniformly CRLF input; otherwise
+they use LF. A binary driver still keeps the complete current file without
+markers.
 Passing `-X ours` or `-X theirs` resolves overlapping regions during that
 three-way merge while preserving every clean inverse hunk.
 

@@ -44,11 +44,11 @@ libra merge --restart
 
 没有共同祖先的历史默认仍被拒绝。显式传入 `--allow-unrelated-histories` 时，Libra 使用虚拟空 merge base：不相交的 root tree 正常合并，重叠新增正常冲突，且非 squash 合并的 conflict state 可跨 `--continue` / `--abort` / `--restart` 恢复，不会写入伪造的 base object。
 
-默认情况下，干净的三方合并会创建双父合并提交、更新 HEAD、重建索引、恢复工作树，并写入 merge reflog 条目。有冲突的三方合并会向工作树写入行级冲突标记（与 Git 一致——仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>>` 之间，共享上下文留在标记外；二进制或 modify/delete 路径回退整文件标记），写入未合并的索引 stage，除 `--squash` 外保存 Libra merge 状态，并返回 `LBR-CONFLICT-002`。非 squash 冲突给出 `libra merge --continue` 和 `libra merge --abort` 的提示；squash 冲突则提示解决、暂存路径后用普通 `libra commit` 创建单亲提交。squash 即使冲突也不移动 HEAD、不记录 merge 状态，因此 `merge --continue`、`--abort`、`--restart` 均报 `no merge in progress`。
+默认情况下，干净的三方合并会创建双父合并提交、更新 HEAD、重建索引、恢复工作树，并写入 merge reflog 条目。有冲突的三方合并会向工作树写入行级冲突标记（与 Git 一致——仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>>` 之间；渲染器会重新比较双方 postimage，把共同边缘与足够长的共同片段留在标记外；二进制或 modify/delete 路径回退整文件标记），写入未合并的索引 stage，除 `--squash` 外保存 Libra merge 状态，并返回 `LBR-CONFLICT-002`。非 squash 冲突给出 `libra merge --continue` 和 `libra merge --abort` 的提示；squash 冲突则提示解决、暂存路径后用普通 `libra commit` 创建单亲提交。squash 即使冲突也不移动 HEAD、不记录 merge 状态，因此 `merge --continue`、`--abort`、`--restart` 均报 `no merge in progress`。
 
 ### 冲突标记风格（`merge.conflictStyle`）
 
-标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；由 text 回退处理的 NUL 内容与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），显式 binary driver 则保留 ours 原文且不写 marker。`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
+标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）使用双标记风格，并重新 diff 双方 postimage：共同前后缀移到 marker 外，超过三行的共同片段拆开相邻冲突块，至多三行的共同片段留在同一冲突块内以避免碎片化；`diff3` 额外在 `||||||| base` 与 `=======` 之间输出共同祖先；`zdiff3` 保留完整 ancestor 块，只把双方共同前后缀移出 marker，不做 `merge` 风格的内部共同片段拆分；其它值在需要渲染内容合并时直接报错（退出 128），绝不静默回落。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge`、`libra cherry-pick` 与 `libra revert` 的文本冲突尊重；由 text 回退处理的 NUL 内容与 modify/delete 冲突保持两段式整文件呈现，显式 binary driver 则保留 ours 原文且不写 marker。所有可识别输入行尾均为 CRLF 时，marker 行也使用 CRLF；否则使用 LF。精化只改变呈现，不改变真实冲突结论；唯一例外是双方 postimage 完全相同时可简化为干净结果。`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
 
 ### 按路径选择 merge driver（`gitattributes`）
 

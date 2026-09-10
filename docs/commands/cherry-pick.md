@@ -255,7 +255,7 @@ Git maintains `.git/CHERRY_PICK_HEAD` and sequencer state files. Libra persists 
 
 A divergent path is surfaced with line-level conflict markers, matching Git: a three-way merge (base = parent tree, ours = current index, theirs = picked tree) encloses only the diverging hunks between `<<<<<<< HEAD` / `=======` / `>>>>>>> <short-source>`, leaving lines that both sides share outside the markers. A delete/modify conflict (one side absent) or binary content falls back to a whole-file presentation, where a line-level merge would be meaningless. The `>>>>>>>` label is the picked commit's abbreviation (Libra omits the commit subject Git appends).
 
-The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge`: `diff3` additionally emits the common-ancestor content between a `||||||| base` marker and the `=======` separator; an unsupported value (e.g. `zdiff3`) is a hard error when a conflict must be rendered. See the [merge documentation](merge.md#conflict-style-mergeconflictstyle).
+The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge`: `merge` re-diffs the two postimages to expose common edges and longer common runs, `diff3` adds the complete ancestor block, and `zdiff3` keeps that ancestor block while trimming common postimage prefixes and suffixes. An unknown value is a hard error before index or working-tree writes whenever a divergent content merge needs the renderer. Marker lines follow uniformly CRLF input; otherwise they use LF. See the [merge documentation](merge.md#conflict-style-mergeconflictstyle).
 
 ### Custom strategies remain explicit
 

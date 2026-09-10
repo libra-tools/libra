@@ -7,7 +7,8 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。既有 revert surface、`-X ours/theirs`、`--cleanup=<mode>` 与冲突 sequencer 已支持；favor/cleanup/edit/remaining 队列均在 fsynced `RevertState` 中向后兼容持久化。`--rerere-autoupdate` 与自定义 `--strategy` 尚未公开。
-- MG-08：`three_way_revert_blob` 接收路径并复用 merge 的 strict-cascade `merge.default`、既有 gitattributes 引擎与 `merge_bytes_with_driver`；内建 text/binary/union，未知名称回退 text。union clean 结果直接生成 blob；binary 无 favor 时保存 ours 原文并保持 conflicted。被 revert 的提交删除路径、后续历史又重建不同内容时，binary/union 以空 base 处理该 add/add inverse；有效 text 保留既有恢复 parent 行为及 diff3 风格 `||||||| original` base 段。仅存在真正内容分歧时读取配置，普通 revert 路径不增加 config 失败面。
+- MG-08：`three_way_revert_blob` 接收路径并复用 merge 的 strict-cascade `merge.default`、既有 gitattributes 引擎与 `merge_bytes_with_driver`；内建 text/binary/union，未知名称回退 text。union clean 结果直接生成 blob；binary 无 favor 时保存 ours 原文并保持 conflicted。被 revert 的提交删除路径、后续历史又重建不同内容时，binary/union 以空 base 处理该 add/add inverse。仅存在真正内容分歧时读取配置，普通 revert 路径不增加 config 失败面。
+- MG-10：`three_way_revert_blob` 不再硬编码 diff3，而是消费 merge/cherry-pick 共用的 `merge.conflictStyle=merge|diff3|zdiff3` 与 refinement/EOL renderer；默认输出因此改为 Git 兼容的 refined merge style，`diff3` 显式恢复完整 `||||||| original` base 段，`zdiff3` 保留该段并移出双方共同前后缀。未知/不可读值暂用默认 style 判断是否真的冲突：干净 inverse merge 保持成功，真实冲突通过专属 `InvalidConflictStyle` / `ConflictStyleRead` 在 index/worktree 写入前 fail-closed，并有稳定错误码、actionable hint 与 Display pin。无 favor 的 revert 走 `merge_bytes_with_refined_driver`，`-X` 仍只改变冲突选择。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 

@@ -105,6 +105,12 @@ enum RevertError {
     #[error("failed to read merge.default config: {0}")]
     MergeDriverConfigRead(String),
 
+    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge', 'diff3', or 'zdiff3')")]
+    InvalidConflictStyle(String),
+
+    #[error("failed to read merge.conflictStyle config: {0}")]
+    ConflictStyleRead(String),
+
     #[error("failed to save object: {0}")]
     SaveObject(String),
 
@@ -216,7 +222,10 @@ impl RevertError {
             | Self::MainlineForNonMerge(_)
             | Self::InvalidMainline { .. } => StableErrorCode::CliInvalidArguments,
             Self::LoadObject(_) => StableErrorCode::IoReadFailed,
-            Self::MergeDriverConfigRead(_) => StableErrorCode::IoReadFailed,
+            Self::MergeDriverConfigRead(_) | Self::ConflictStyleRead(_) => {
+                StableErrorCode::IoReadFailed
+            }
+            Self::InvalidConflictStyle(_) => StableErrorCode::RepoStateInvalid,
             Self::SaveObject(_) => StableErrorCode::IoWriteFailed,
             Self::WriteWorktree(_) => StableErrorCode::IoWriteFailed,
             Self::IndexSave(_) => StableErrorCode::IoWriteFailed,
@@ -271,6 +280,12 @@ impl From<RevertError> for CliError {
             RevertError::InvalidCleanup(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("valid modes: strip, whitespace, verbatim, scissors, default"),
+            RevertError::InvalidConflictStyle(_) => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
+            RevertError::ConflictStyleRead(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("check repository integrity and retry"),
             _ => CliError::fatal(message).with_stable_code(stable_code),
         }
     }
@@ -944,6 +959,7 @@ fn three_way_revert_blob(
     parent_hash: Option<ObjectHash>,
     favor: Option<MergeFavor>,
     default_driver: Option<&str>,
+    conflict_style: merge::ConflictStyle,
 ) -> Result<(ObjectHash, bool), RevertError> {
     let reverted_data = match reverted_hash {
         Some(reverted_hash) => {
@@ -964,16 +980,13 @@ fn three_way_revert_blob(
         None => Vec::new(),
     };
     let driver = merge::builtin_merge_driver_for_path(path, default_driver);
-    let (bytes, conflicted) = match merge::merge_bytes_with_driver(
+    let (bytes, conflicted) = match merge::merge_bytes_with_refined_driver(
         driver,
         &reverted_data,
         &current.data,
         &parent_data,
         favor,
-        // `diffy::merge_bytes`, used here before MG-08, defaults to Diff3.
-        // Preserve that no-attribute presentation while sharing driver
-        // dispatch; MG-10 owns any later rendering-layer change.
-        diffy::ConflictStyle::Diff3,
+        conflict_style,
         0,
     )
     .map_err(RevertError::SaveObject)?
@@ -1095,6 +1108,14 @@ async fn revert_single_commit(
     } else {
         None
     };
+    let (conflict_style, deferred_conflict_style_error) = if needs_content_driver {
+        match merge::conflict_style_from_config().await {
+            Ok(style) => (style, None),
+            Err(error) => (merge::ConflictStyle::Merge, Some(error)),
+        }
+    } else {
+        (merge::ConflictStyle::Merge, None)
+    };
 
     let mut files_changed: usize = 0;
     let mut conflicted_paths: Vec<String> = Vec::new();
@@ -1137,6 +1158,7 @@ async fn revert_single_commit(
                 parent_hash.copied(),
                 params.strategy_option,
                 default_driver.as_deref(),
+                conflict_style,
             )?;
             current_files.insert(path.clone(), merged_hash);
             files_changed += 1;
@@ -1170,6 +1192,7 @@ async fn revert_single_commit(
                         Some(parent_hash),
                         params.strategy_option,
                         default_driver.as_deref(),
+                        conflict_style,
                     )?;
                     current_files.insert(path.clone(), merged_hash);
                     files_changed += 1;
@@ -1194,6 +1217,15 @@ async fn revert_single_commit(
                 files_changed += 1;
             }
         }
+    }
+
+    if !conflicted_paths.is_empty()
+        && let Some(error) = deferred_conflict_style_error
+    {
+        return Err(match error {
+            merge::ConflictStyleError::Invalid(value) => RevertError::InvalidConflictStyle(value),
+            merge::ConflictStyleError::Read(detail) => RevertError::ConflictStyleRead(detail),
+        });
     }
 
     let final_tree_id = build_tree_from_map(current_files).await?;
@@ -1605,6 +1637,14 @@ mod tests {
             "failed to load object: ignored",
         );
         assert_eq!(
+            RevertError::InvalidConflictStyle("bogus".to_string()).to_string(),
+            "unsupported merge.conflictStyle 'bogus' (expected 'merge', 'diff3', or 'zdiff3')",
+        );
+        assert_eq!(
+            RevertError::ConflictStyleRead("db locked".to_string()).to_string(),
+            "failed to read merge.conflictStyle config: db locked",
+        );
+        assert_eq!(
             RevertError::SaveObject("ignored".to_string()).to_string(),
             "failed to save object: ignored",
         );
@@ -1674,6 +1714,14 @@ mod tests {
         );
         assert_eq!(
             RevertError::LoadObject("ignored".to_string()).stable_code(),
+            StableErrorCode::IoReadFailed,
+        );
+        assert_eq!(
+            RevertError::InvalidConflictStyle("bogus".to_string()).stable_code(),
+            StableErrorCode::RepoStateInvalid,
+        );
+        assert_eq!(
+            RevertError::ConflictStyleRead("db locked".to_string()).stable_code(),
             StableErrorCode::IoReadFailed,
         );
         assert_eq!(

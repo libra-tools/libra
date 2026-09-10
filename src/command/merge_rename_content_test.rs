@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use super::{
-    Blob, MergeFavor, MergeTreeEntry, TreeItemMode, TreeMergeContext, VirtualBlobs,
+    Blob, ConflictStyle, MergeFavor, MergeTreeEntry, TreeItemMode, TreeMergeContext, VirtualBlobs,
     merge_rename_content,
 };
 
@@ -28,7 +28,7 @@ fn merge(
         "temporary 1:a",
         "temporary 2:b",
         "base:old",
-        diffy::ConflictStyle::Merge,
+        ConflictStyle::Merge,
         &mut TreeMergeContext::nested(false, 1, None, blobs),
     )
     .expect("recursive content merge")
@@ -120,7 +120,7 @@ fn non_file_rename_without_an_original_refuses_the_invalid_helper_contract() {
         "a",
         "b",
         "base:old",
-        diffy::ConflictStyle::Merge,
+        ConflictStyle::Merge,
         &mut TreeMergeContext::nested(false, 1, None, &mut blobs),
     )
     .expect_err("do not invent either side as the virtual original");
@@ -166,7 +166,7 @@ fn outer_binary_content_selection_preserves_mode_and_mode_conflicts() {
                 "HEAD:a",
                 "feature:b",
                 "base:old",
-                diffy::ConflictStyle::Merge,
+                ConflictStyle::Merge,
                 &mut TreeMergeContext::top_level(false, favor, None, &mut blobs),
             )
             .expect("outer binary merge");

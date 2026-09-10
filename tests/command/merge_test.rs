@@ -2309,7 +2309,7 @@ fn test_merge_conflict_diff3_markers() {
     );
 }
 
-/// An unsupported `merge.conflictStyle` (e.g. the unimplemented `zdiff3`) is a
+/// An unsupported `merge.conflictStyle` is a
 /// hard error when a conflict must be rendered — never a silent fall-back to
 /// the default marker format — and nothing is written (no merge state).
 #[test]
@@ -2317,7 +2317,7 @@ fn test_merge_conflict_style_invalid_rejected() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
     assert_cli_success(
-        &run_libra_command(&["config", "merge.conflictStyle", "zdiff3"], p),
+        &run_libra_command(&["config", "merge.conflictStyle", "bogus"], p),
         "set conflictStyle",
     );
 
@@ -2325,7 +2325,7 @@ fn test_merge_conflict_style_invalid_rejected() {
     assert_eq!(out.status.code(), Some(128), "invalid style is fatal");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unsupported merge.conflictStyle 'zdiff3'"),
+        stderr.contains("unsupported merge.conflictStyle 'bogus'"),
         "actionable error names the bad value: {stderr}"
     );
     assert!(
@@ -2336,6 +2336,169 @@ fn test_merge_conflict_style_invalid_rejected() {
     assert!(
         !body.contains("<<<<<<<"),
         "no conflict markers were written: {body:?}"
+    );
+}
+
+/// MG-10 G5: a bad presentation setting is irrelevant when a single-base
+/// three-way merge has no conflict to render. Multi-base folds remain the
+/// documented exception because their synthetic ancestor can contain markers.
+#[test]
+fn merge_conflict_refine_invalid_style_does_not_block_clean_merge() {
+    let temp_repo = create_committed_repo_via_cli();
+    let p = temp_repo.path();
+    commit_file(p, "base.txt", "base\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "checkout feature",
+    );
+    commit_file(p, "theirs.txt", "theirs\n", "feature change");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    commit_file(p, "ours.txt", "ours\n", "main change");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "bogus"], p),
+        "set invalid style",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], p),
+        "clean merge does not need conflictStyle",
+    );
+    assert_eq!(std::fs::read(p.join("ours.txt")).unwrap(), b"ours\n");
+    assert_eq!(std::fs::read(p.join("theirs.txt")).unwrap(), b"theirs\n");
+}
+
+/// MG-10 G1/G2: zealous refinement keeps a change both sides made identically
+/// outside the marker block, while the genuinely different line remains a
+/// conflict. The old direct-diffy presentation kept `SAME` inside the block.
+#[test]
+fn merge_conflict_refine_adopts_same_change_outside_markers() {
+    let temp_repo = create_committed_repo_via_cli();
+    let p = temp_repo.path();
+    commit_file(p, "shared.txt", "top\nbase-a\nbase-b\nbottom\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "checkout feature",
+    );
+    commit_file(
+        p,
+        "shared.txt",
+        "top\nFEATURE\nSAME\nbottom\n",
+        "feature edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    commit_file(p, "shared.txt", "top\nMAIN\nSAME\nbottom\n", "main edit");
+    let target = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], p).stdout)
+        .trim()
+        .chars()
+        .take(7)
+        .collect::<String>();
+
+    let out = run_libra_command(&["merge", "feature"], p);
+    assert_eq!(out.status.code(), Some(128), "real conflict remains");
+    let body = std::fs::read_to_string(p.join("shared.txt")).expect("read conflict");
+    assert_eq!(
+        body,
+        format!("top\n<<<<<<< HEAD\nMAIN\n=======\nFEATURE\n>>>>>>> {target}\nSAME\nbottom\n")
+    );
+}
+
+/// MG-10 G3: zdiff3 retains the complete base hunk but moves the common prefix
+/// and suffix of the two postimages outside the conflict markers.
+#[test]
+fn merge_conflict_refine_zdiff3_trims_common_edges() {
+    let temp_repo = create_committed_repo_via_cli();
+    let p = temp_repo.path();
+    commit_file(p, "shared.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "checkout feature",
+    );
+    commit_file(
+        p,
+        "shared.txt",
+        "1\n2\n3\n4\nA\nX\nC\nY\nE\n7\n8\n9\n",
+        "feature edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    commit_file(
+        p,
+        "shared.txt",
+        "1\n2\n3\n4\nA\nB\nC\nD\nE\n7\n8\n9\n",
+        "main edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "zdiff3"], p),
+        "set zdiff3",
+    );
+
+    let target = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], p).stdout)
+        .trim()
+        .chars()
+        .take(7)
+        .collect::<String>();
+    let out = run_libra_command(&["merge", "feature"], p);
+    assert_eq!(out.status.code(), Some(128), "zdiff3 conflict exits 128");
+    let body = std::fs::read_to_string(p.join("shared.txt")).expect("read conflict");
+    assert_eq!(
+        body,
+        format!(
+            "1\n2\n3\n4\nA\n<<<<<<< HEAD\nB\nC\nD\n||||||| base\n5\n6\n=======\nX\nC\nY\n>>>>>>> {target}\nE\n7\n8\n9\n"
+        ),
+        "zdiff3 follows Git's edge-only refinement"
+    );
+}
+
+/// MG-10 G6: when all three source files use CRLF, every generated marker line
+/// uses CRLF as well. Content and marker lines are checked as bytes.
+#[test]
+fn merge_conflict_refine_crlf_markers_follow_input() {
+    let temp_repo = create_committed_repo_via_cli();
+    let p = temp_repo.path();
+    commit_file(p, "shared.txt", "top\r\nBASE\r\nbottom\r\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "checkout feature",
+    );
+    commit_file(
+        p,
+        "shared.txt",
+        "top\r\nFEATURE\r\nbottom\r\n",
+        "feature edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    commit_file(p, "shared.txt", "top\r\nMAIN\r\nbottom\r\n", "main edit");
+
+    let out = run_libra_command(&["merge", "feature"], p);
+    assert_eq!(out.status.code(), Some(128), "CRLF conflict exits 128");
+    let body = std::fs::read(p.join("shared.txt")).expect("read conflict bytes");
+    let marker_lines: Vec<&[u8]> = body
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| matches!(line.first(), Some(b'<') | Some(b'=') | Some(b'>')))
+        .collect();
+    assert_eq!(
+        marker_lines.len(),
+        3,
+        "expected three merge markers: {body:?}"
+    );
+    assert!(
+        marker_lines.iter().all(|line| line.ends_with(b"\r\n")),
+        "all generated marker lines must follow CRLF input: {body:?}"
     );
 }
 

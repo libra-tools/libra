@@ -44,7 +44,7 @@ The synthetic commit's parents are **all** the real merge bases folded so far (G
 
 Histories without a common ancestor remain rejected unless `--allow-unrelated-histories` is explicit. With it, Libra uses a virtual empty merge base: disjoint root trees combine normally, overlapping additions conflict normally, and non-squash conflict state survives `--continue`, `--abort`, and `--restart` without creating a fake base object.
 
-By default, clean three-way merges create a two-parent merge commit, update HEAD, rebuild the index, restore the working tree, and write a merge reflog entry. Conflicting three-way merges write line-level conflict markers to the working tree (matching Git — only the diverging hunks are enclosed between `<<<<<<< HEAD` / `=======` / `>>>>>>>`, with shared context left outside; binary or modify/delete paths fall back to whole-file markers), write unmerged index stages, save Libra merge state unless `--squash` was requested, and return `LBR-CONFLICT-002`. Non-squash conflicts provide hints for `libra merge --continue` and `libra merge --abort`; squash conflicts instead direct you to resolve and stage the paths, then run a plain `libra commit` to create a single-parent commit. A squash leaves HEAD unchanged and records no merge state, even when it conflicts, so `merge --continue`, `--abort`, and `--restart` report `no merge in progress`.
+By default, clean three-way merges create a two-parent merge commit, update HEAD, rebuild the index, restore the working tree, and write a merge reflog entry. Conflicting three-way merges write line-level conflict markers to the working tree (matching Git — only the diverging hunks are enclosed between `<<<<<<< HEAD` / `=======` / `>>>>>>>`; the renderer re-diffs both postimages so common edges and sufficiently long common runs stay outside; binary or modify/delete paths fall back to whole-file markers), write unmerged index stages, save Libra merge state unless `--squash` was requested, and return `LBR-CONFLICT-002`. Non-squash conflicts provide hints for `libra merge --continue` and `libra merge --abort`; squash conflicts instead direct you to resolve and stage the paths, then run a plain `libra commit` to create a single-parent commit. A squash leaves HEAD unchanged and records no merge state, even when it conflicts, so `merge --continue`, `--abort`, and `--restart` report `no merge in progress`.
 
 ### Conflict style (`merge.conflictStyle`)
 
@@ -54,13 +54,14 @@ The marker format follows the Git-compatible `merge.conflictStyle` config key (c
 libra config merge.conflictStyle diff3
 ```
 
-- `merge` (default, or unset) — the two-marker style above.
+- `merge` (default, or unset) — the two-marker style above. Conflicting postimages are re-diffed: equal prefixes and suffixes are moved outside the markers, equal runs longer than three lines split neighboring conflict blocks, and runs of up to three lines remain inside one block to avoid noisy fragmentation.
 - `diff3` — additionally emits the common-ancestor content between a `||||||| base` marker and the `=======` separator, so you can see what both sides started from.
-- Any other value — including the unimplemented `zdiff3` — is a hard error when a conflict must be rendered (exit 128), never a silent fall-back to the default style.
+- `zdiff3` — emits the same complete ancestor block as `diff3`, while moving equal prefixes and suffixes of the two postimages outside the markers. It deliberately does not apply `merge` style's internal equal-run splitting.
+- Any other value is a hard error when a content merge must be rendered (exit 128), never a silent fall-back to the default style.
 
 For a merge with **several merge bases** the value is read before the merge runs rather than only when a conflict is rendered, because the recursive virtual ancestor's own content depends on it (Git does the same at every recursion depth). An invalid value therefore stops a criss-cross merge even when that merge would have come out clean.
 
-The config is honored by both `libra merge` and `libra cherry-pick` for line-level text conflicts. NUL-containing content handled by the text fallback and modify/delete conflicts keep their two-part whole-file presentation (Git also emits no base block there); an explicitly selected binary driver instead keeps ours without markers. `libra rebase` currently renders whole-file markers without a base block regardless of this setting.
+The config is honored by `libra merge`, `libra cherry-pick`, and `libra revert` for text conflicts. NUL-containing content handled by the text fallback and modify/delete conflicts keep their two-part whole-file presentation (Git also emits no base block there); an explicitly selected binary driver instead keeps ours without markers. Marker lines use CRLF when every detected input line ending is CRLF; otherwise they use LF. Refinement changes presentation only: a genuine conflict remains a conflict, except that byte-identical postimages become a clean result. `libra rebase` currently renders whole-file markers without a base block regardless of this setting.
 
 ### Per-path merge drivers (`gitattributes`)
 

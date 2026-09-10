@@ -810,9 +810,12 @@ fn test_revert_conflict_then_continue() {
         "worktree should carry conflict markers"
     );
     assert!(
-        conflict.contains("||||||| original"),
-        "the implicit text driver must preserve revert's pre-MG-08 diff3 base section: \
-         {conflict}"
+        !conflict.contains("|||||||"),
+        "MG-10 changes revert's no-favor default from diffy's implicit diff3 to the shared merge style: {conflict}"
+    );
+    assert!(
+        conflict.starts_with("line1\n<<<<<<< ours\n") && conflict.ends_with("line3\n"),
+        "shared context stays outside the refined conflict: {conflict}"
     );
 
     // Resolve and continue.
@@ -827,6 +830,104 @@ fn test_revert_conflict_then_continue() {
     assert_eq!(
         fs::read_to_string(p.join("f.txt")).unwrap(),
         "line1\nRESOLVED\nline3\n"
+    );
+}
+
+/// MG-10 G9/G10: revert resolves `merge.conflictStyle` before it writes state
+/// and sends its no-favor conflict through the shared zdiff3 renderer.
+#[test]
+fn revert_conflict_honors_zdiff3_shared_renderer() {
+    let (repo, c2) = setup_revert_conflict();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "zdiff3"], p),
+        "set zdiff3",
+    );
+
+    let out = run_libra_command(&["revert", c2.as_str()], p);
+    assert!(!out.status.success(), "conflicting revert should pause");
+    let conflict = fs::read_to_string(p.join("f.txt")).unwrap();
+    assert!(
+        conflict.starts_with("line1\n<<<<<<< ours\nDIVERGED\n"),
+        "shared prefix is outside the zdiff3 conflict: {conflict}"
+    );
+    assert!(
+        conflict.contains("||||||| original\nCHANGED\n=======\nline2\n"),
+        "zdiff3 preserves the revert base section: {conflict}"
+    );
+    assert!(
+        conflict.ends_with(">>>>>>> theirs\nline3\n"),
+        "shared suffix is outside the zdiff3 conflict: {conflict}"
+    );
+}
+
+#[test]
+fn revert_conflict_rejects_invalid_style_before_state_or_worktree_write() {
+    let (repo, c2) = setup_revert_conflict();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "bogus"], p),
+        "set invalid style",
+    );
+    let before = fs::read(p.join("f.txt")).unwrap();
+
+    let out = run_libra_command(&["revert", c2.as_str()], p);
+    assert!(!out.status.success(), "invalid style is rejected");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unsupported merge.conflictStyle 'bogus'"),
+        "error names the invalid value: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(p.join("f.txt")).unwrap(), before);
+    assert!(
+        !p.join(".libra/revert-state.json").exists(),
+        "preflight error leaves no resumable state"
+    );
+}
+
+#[test]
+fn revert_invalid_conflict_style_does_not_block_clean_content_merge() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("shared.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], root), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], root),
+        "commit base",
+    );
+    fs::write(root.join("shared.txt"), "one\nTARGET\nthree\nfour\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], root),
+        "add target",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "target", "--no-verify"], root),
+        "commit target",
+    );
+    let reverted = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    fs::write(root.join("shared.txt"), "one\nTARGET\nthree\nLATER\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], root),
+        "add later",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "later", "--no-verify"], root),
+        "commit later",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "bogus"], root),
+        "set invalid style",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["revert", &reverted, "--no-edit"], root),
+        "clean inverse content merge does not render conflict markers",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("shared.txt")).unwrap(),
+        "one\ntwo\nthree\nLATER\n"
     );
 }
 

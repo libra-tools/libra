@@ -181,7 +181,7 @@ Git 的 `--mainline <parent-number>` 会选择合并提交的某个父提交，�
 ### 冲突模型（三方合并）
 
 Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时干净更新文件；与后续更改重叠时，向工作树写入标准冲突标记，把未合并状态与 revert 进度记录到 `revert-state.json`，并返回 `LBR-CONFLICT-001`。随后解决标记并运行 `libra revert --continue`、用 `libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。
-隐式 `text` driver 保留 revert 既有的 diff3 风格 `||||||| original` base 段。
+文本冲突与 merge/cherry-pick 共用 `merge.conflictStyle`：默认 `merge` 风格重新 diff 双方 postimage；`diff3` 加入完整 `||||||| original` ancestor 块；`zdiff3` 保留该块并把共同前后缀移到 marker 外。未知风格只会在内容合并仍有冲突、确需渲染时于索引或工作树写入前失败；干净合并不会被无关的呈现配置阻断。所有可识别输入行尾均为 CRLF 时 marker 行也使用 CRLF，否则使用 LF。binary driver 仍保留完整当前文件且不写 marker。
 
 ## 参数对比：Libra vs Git vs jj
 
