@@ -5167,9 +5167,9 @@ fn worktree_shape(p: &Path, path: &str) -> String {
 /// MG-03 G6 at the CLI: a mode-only change on theirs (`tool.sh` becomes
 /// executable, content untouched) merges to a `100755` tree entry and index
 /// entry on both walks, and the two walks leave the working tree in the same
-/// state. (The merge checkout's working-tree materialization of mode bits and
-/// symlink retargets is a pre-existing, walk-independent residual — see the
-/// dev doc; `libra checkout` applies them, `merge`'s writer does not yet.)
+/// state. MG-04 R7 later made the shared merge writer apply entry type and
+/// mode; `merge_preserves_symlinks_and_executable_bits_when_it_writes` pins
+/// that current write behavior on both walks.
 #[cfg(unix)]
 #[test]
 fn merge_tree_walk_preserves_a_mode_only_change_on_both_walks() {
