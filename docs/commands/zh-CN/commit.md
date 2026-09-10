@@ -23,6 +23,21 @@ libra commit --amend [--no-edit]
 
 在计算暂存变更或写入 tree/commit 对象之前，`commit` 会校验 stage-0 index 条目是否指向缺失或类型不匹配的 blob/tree 对象。损坏的 index 条目会 fail-closed，返回 `LBR-REPO-002`，并保持 `HEAD` 不变。
 
+索引仍有未解决冲突（stage 1/2/3 且没有 stage-0 解决结果）时，真实提交会返回
+`LBR-CONFLICT-001`，`--amend`、`--allow-empty` 和 `--no-verify` 均不能绕过。
+冲突的 `merge --squash` 虽不保留 merge 生命周期状态，也受此保护。先解决报错中
+点名的文件，再用 `libra add <path>` 暂存解决结果。
+拒绝发生在 hook 和 tree/commit 写入前，保持 `HEAD`、index 和工作树不变。
+与 Git 一致，`-a` 先将冲突普通文件和符号链接的当前内容或删除暂存，再检查最终
+索引；它不检查内容是否仍含冲突标记。未解决的 gitlink 必须显式暂存解决结果
+（例如 `libra update-index --cacheinfo 160000,<commit>,<path>`）：Libra 不物化
+子模块，因此 `-a` 不会把缺失的子模块目录推断为删除。dry-run 和 porcelain
+预览始终保持 live index、`HEAD` 与工作树，包括用 `-a` 预览解决结果时。
+删除冲突文件后，仅当所有 tracked 变更都应进入本次提交时才用 `commit -a` 暂存。
+父目录被普通文件或符号链接替换时，其已跟踪子路径视为删除；`-a` 不会通过该
+符号链接读取外部内容。冲突文件被含有 `.git` 或 `.libra` 元数据的目录替换时，
+同样需要显式暂存 gitlink 解决结果，不会自动暂存为删除。
+
 作者身份来自 `--author`，其次是 `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`，再回退到配置的 `user.name`/`user.email`；提交者身份来自 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`，再回退到配置。除非设置了 `user.useConfigOnly=true`，Git 环境变量优先于配置。既有 `LIBRA_COMMITTER_NAME`/`LIBRA_COMMITTER_EMAIL` 仍作为更低优先级后备，兼容旧自动化。
 
 ## 选项
@@ -410,6 +425,7 @@ cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 
 | 场景 | 错误码 | 退出码 | 提示 |
 |----------|-----------|------|------|
 | 索引损坏 | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
+| 索引存在未解决冲突 | `LBR-CONFLICT-001` | 128 | 用 `libra add` 暂存文件；删除冲突仅在所有 tracked 变更都应提交时用 `commit -a` |
 | index 对象缺失或类型不匹配 | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | 无法保存索引 | `LBR-IO-002` | 128 | -- |
 | 无内容可提交（干净） | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |

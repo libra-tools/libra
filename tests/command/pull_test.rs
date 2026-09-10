@@ -18,6 +18,8 @@ use super::{
     init_repo_via_cli, parse_cli_error_stderr, parse_json_stdout, run_libra_command,
 };
 
+mod squash_conflicts;
+
 fn git(args: &[&str], cwd: &Path) {
     let output = Command::new("git")
         .current_dir(cwd)

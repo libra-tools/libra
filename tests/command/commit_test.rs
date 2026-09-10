@@ -11,6 +11,9 @@ use tempfile::tempdir;
 
 use super::*;
 mod env_restore_tests;
+
+mod unmerged;
+
 #[tokio::test]
 #[serial(cwd)]
 /// A commit with no file changes should fail if `allow_empty` is false.

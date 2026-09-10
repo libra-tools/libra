@@ -715,7 +715,7 @@ pub(crate) enum PullMergeError {
     )]
     VirtualAncestorTooWide { bases: usize },
     #[error("merge has conflicts in {paths}")]
-    Conflicts { paths: String },
+    Conflicts { paths: String, squash: bool },
     #[error("no merge in progress")]
     NoMergeInProgress,
     /// `--restart` on an in-progress merge that has NO conflicts (a staged
@@ -836,7 +836,10 @@ impl From<PullMergeError> for CliError {
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
                 .with_hint("or run 'libra pull --rebase' to replay local commits"),
-            PullMergeError::Conflicts { .. }
+            PullMergeError::Conflicts { squash: true, .. } => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'"),
+            PullMergeError::Conflicts { squash: false, .. }
             | PullMergeError::DirtyWorktree
             | PullMergeError::UntrackedOverwrite { .. }
             | PullMergeError::MergeInProgress
@@ -1272,12 +1275,7 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
 }
 
 fn merge_error_to_cli(error: MergeError) -> CliError {
-    match error {
-        MergeError::Conflicts { .. } => CliError::from(error)
-            .with_priority_hint("resolve conflicts, then run 'libra merge --continue'")
-            .with_hint("or run 'libra merge --abort' to restore the pre-merge state"),
-        error => CliError::from(error),
-    }
+    CliError::from(error)
 }
 
 /// Resolve whether autostash is enabled: explicit flag wins; otherwise the
@@ -1377,7 +1375,10 @@ fn snapshot_held_autostash() -> Result<Option<AutostashSnapshot>, String> {
     MergeAutostash::load_snapshot()
 }
 
-async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
+async fn resolve_pending_autostash(
+    output: &OutputConfig,
+    preserve_conflicts: bool,
+) -> Option<String> {
     let snapshot = match snapshot_held_autostash() {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return None,
@@ -1388,7 +1389,7 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             return None;
         }
     };
-    resolve_pending_autostash_with(output, snapshot).await
+    resolve_pending_autostash_with(output, snapshot, preserve_conflicts).await
 }
 
 /// The consumer half, taking a snapshot the CALLER loaded — the merge
@@ -1397,6 +1398,7 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
 async fn resolve_pending_autostash_with(
     output: &OutputConfig,
     snapshot: AutostashSnapshot,
+    preserve_conflicts: bool,
 ) -> Option<String> {
     let sidecar = &snapshot.sidecar;
     match MergeState::load_optional_sync() {
@@ -1423,6 +1425,11 @@ async fn resolve_pending_autostash_with(
             return None;
         }
     };
+    // A conflicted squash has no merge sidecar, but its unmerged stages must
+    // survive. Git leaves its autostash for a later stash pop in this case.
+    if preserve_conflicts {
+        return store_pending_autostash(output, &snapshot, &oid).await;
+    }
     match crate::command::stash::apply_held_stash_commit(&oid).await {
         Ok(()) => {
             match cleanup_autostash_if_matches(&snapshot) {
@@ -1444,40 +1451,51 @@ async fn resolve_pending_autostash_with(
         Err(crate::command::stash::StashError::MergeConflict(_)) => {
             // All-or-nothing apply: the merge result is intact. Promote the
             // stash into the visible list so nothing is lost.
-            match crate::command::stash::store_stash_commit(&oid, "autostash").await {
-                Ok(()) => {
-                    match cleanup_autostash_if_matches(&snapshot) {
-                        Ok(true) => {}
-                        Ok(false) => crate::utils::error::emit_warning(
-                            "the autostash sidecar changed while it was being promoted; \
-                             the newer file was left in place",
-                        ),
-                        Err(error) => crate::utils::error::emit_warning(format!(
-                            "the promoted autostash's sidecar could not be removed \
-                             ({error}); a later merge would re-promote it — remove it \
-                             manually"
-                        )),
-                    }
-                    if !output.quiet {
-                        eprintln!(
-                            "Applying autostash resulted in conflicts.\nYour changes are safe in the stash (stash@{{0}}).\nYou can run \"libra stash pop\" or \"libra stash drop\" at any time."
-                        );
-                    }
-                    Some("stashed".to_string())
-                }
-                Err(error) => {
-                    crate::utils::error::emit_warning(format!(
-                        "failed to store the autostash into the stash list ({error}); \
-                         merge-autostash.json still references stash commit {oid}"
-                    ));
-                    None
-                }
+            if !output.quiet {
+                eprintln!("Applying autostash resulted in conflicts.");
             }
+            store_pending_autostash(output, &snapshot, &oid).await
         }
         Err(error) => {
             crate::utils::error::emit_warning(format!(
                 "failed to re-apply the autostash ({error}); \
                  merge-autostash.json still references stash commit {oid}"
+            ));
+            None
+        }
+    }
+}
+
+async fn store_pending_autostash(
+    output: &OutputConfig,
+    snapshot: &AutostashSnapshot,
+    oid: &ObjectHash,
+) -> Option<String> {
+    match crate::command::stash::store_stash_commit(oid, "autostash").await {
+        Ok(()) => {
+            match cleanup_autostash_if_matches(snapshot) {
+                Ok(true) => {}
+                Ok(false) => crate::utils::error::emit_warning(
+                    "the autostash sidecar changed while it was being promoted; \
+                             the newer file was left in place",
+                ),
+                Err(error) => crate::utils::error::emit_warning(format!(
+                    "the promoted autostash's sidecar could not be removed \
+                             ({error}); a later merge would re-promote it — remove it \
+                             manually"
+                )),
+            }
+            if !output.quiet {
+                eprintln!(
+                    "Your changes are safe in the stash (stash@{{0}}).\nAfter resolving any conflicts, run \"libra stash pop\" to restore your local changes."
+                );
+            }
+            Some("stashed".to_string())
+        }
+        Err(error) => {
+            crate::utils::error::emit_warning(format!(
+                "failed to store the autostash into the stash list ({error}); \
+                         merge-autostash.json still references stash commit {oid}"
             ));
             None
         }
@@ -1496,6 +1514,19 @@ pub(crate) async fn run_merge_for_pull_with_options(
         .is_some()
     {
         return Err(PullMergeError::MergeInProgress);
+    }
+
+    // A squash leaves conflict stages but deliberately no merge sidecar.
+    // Git checks the index even for an otherwise up-to-date merge, before
+    // autostash or any other operation can replace the unresolved entries.
+    let index =
+        Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
+    let unresolved = unresolved_conflicted_paths(&index, &[]);
+    if !unresolved.is_empty() {
+        return Err(PullMergeError::Conflicts {
+            paths: unresolved.join(", "),
+            squash: true,
+        });
     }
 
     // Resolve and load the merge target up front so `--verify-signatures` /
@@ -1644,7 +1675,11 @@ pub(crate) async fn run_merge_for_pull_with_options(
     let autostash_outcome = if dry_run {
         None
     } else {
-        resolve_pending_autostash(output).await
+        resolve_pending_autostash(
+            output,
+            matches!(&result, Err(PullMergeError::Conflicts { squash: true, .. })),
+        )
+        .await
     };
     match result {
         Ok(mut summary) => {
@@ -2312,20 +2347,19 @@ async fn perform_three_way_merge(
     // better than the others. Fold them into one virtual ancestor (Git's
     // recursive strategy, `merge-ort.c:5313`) instead of arbitrarily picking
     // one, which reports conflicts the recursion resolves.
+    // A conflict inside the virtual ancestor, and MG-06's rename-driven
+    // content merges, are both rendered with the configured style — exactly as
+    // Git renders one at any call depth. Resolved once, ahead of both, so a
+    // merge that renames pays a single config read: an invalid
+    // `merge.conflictStyle` stops the merge before anything is written.
+    let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
+        ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
+        ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
+    })?;
     let (base_items, mut virtual_blobs) = match base_commits.as_slice() {
         [] => (HashMap::new(), VirtualBlobs::new()),
         [base] => (commit_tree_split_for_merge(base)?.0, VirtualBlobs::new()),
         bases => {
-            // A conflict INSIDE the virtual ancestor is rendered with the
-            // configured style, exactly as Git renders one at any call depth.
-            // Resolving the style here rather than only on the outer conflict
-            // path is what a multi-base merge costs: an invalid
-            // `merge.conflictStyle` stops a criss-cross merge even when the
-            // merge itself would come out clean.
-            let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
-                ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
-                ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
-            })?;
             let base_ids: Vec<ObjectHash> = bases.iter().map(|base| base.id).collect();
             let ancestor = virtual_merge_base(
                 &base_ids,
@@ -2345,8 +2379,13 @@ async fn perform_three_way_merge(
         &mut base_items,
         &mut our_items,
         &mut their_items,
-        &virtual_blobs,
         &rename_config,
+        conflict_style,
+        (
+            df_branch_label(MergeSide::Ours, upstream).as_str(),
+            upstream,
+        ),
+        &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
     )?;
 
     // Under `--dry-run`, auto-merged blobs are computed in memory only
@@ -2354,12 +2393,24 @@ async fn perform_three_way_merge(
     // under tiered storage a `save_object` would even upload to the remote.
     // The virtual ancestor obeys the same rule: its blobs stay in
     // `virtual_blobs` and its one-shot tree/commit are not materialized.
-    let merge_result = merge_tree_items(
+    let mut merge_result = merge_tree_items(
         &base_items,
         &our_items,
         &their_items,
         &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
     )?;
+    // MG-06: conflicts the ordinary match must not decide for itself. A
+    // rename/rename(1to2)'s destinations look like one-sided adds to it, its
+    // source like a clean delete, and a rename/delete whose content never
+    // changed like a clean delete too — all three are PATH-level conflicts for
+    // Git. Applied after the match so the paths carry the rename pass's
+    // verdict, exactly as the pruned walk's `settle` does.
+    for (path, kind) in &rename_report.forced {
+        merge_result.merged_items.remove(path);
+        merge_result.conflicts.retain(|(other, _)| other != path);
+        merge_result.conflicts.push((path.clone(), *kind));
+    }
+    let merge_result = merge_result;
     // A rename THEIRS made moves a file ours still had at the old path: the
     // remapped comparison sees the same entry on both sides, so the move
     // itself has to be counted here (Git's diffstat shows it as one changed
@@ -2413,7 +2464,7 @@ async fn perform_three_way_merge(
         // make, or a declined rename would be invisible until the merge itself
         // (Codex R13 P2). `--json`/`--machine` stay silent, as always.
         announce_rename_notices(
-            &rename_report.decisions,
+            &rename_report.notes,
             &rename_report.limited,
             upstream,
             options.output,
@@ -2467,6 +2518,7 @@ async fn perform_three_way_merge(
         write_conflicted_merge_state(MergeConflictInput {
             head_name,
             message: resolved_message,
+            squash: options.squash,
             upstream: upstream.to_string(),
             base: recorded_merge_base(&base_commits),
             allow_unrelated_histories: options.allow_unrelated_histories,
@@ -2486,7 +2538,7 @@ async fn perform_three_way_merge(
         // same moment and print first, so the decision that shaped the conflict
         // is read before the conflict itself.
         announce_rename_notices(
-            &rename_report.decisions,
+            &rename_report.notes,
             &rename_report.limited,
             upstream,
             options.output,
@@ -2499,8 +2551,15 @@ async fn perform_three_way_merge(
         if let Err(error) = crate::command::rerere::auto_update(false).await {
             tracing::warn!("rerere auto-update after merge conflict failed: {error}");
         }
-        let paths = MergeState::load_required()?.conflicted_paths.join(", ");
-        return Err(PullMergeError::Conflicts { paths });
+        let paths = placements
+            .iter()
+            .map(|(path, _, _)| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(PullMergeError::Conflicts {
+            paths,
+            squash: options.squash,
+        });
     }
 
     let current_index =
@@ -2524,7 +2583,7 @@ async fn perform_three_way_merge(
     // The preflight passed, so the merge will happen: the rename notices can be
     // printed now (Codex R12 P2 — a refused merge prints no rename decision).
     announce_rename_notices(
-        &rename_report.decisions,
+        &rename_report.notes,
         &rename_report.limited,
         upstream,
         options.output,
@@ -2684,6 +2743,8 @@ pub(crate) async fn conflict_style_from_config() -> Result<diffy::ConflictStyle,
 
 struct MergeConflictInput {
     head_name: String,
+    /// Git skips MERGE_HEAD even when a squash has unresolved conflicts.
+    squash: bool,
     /// Resolved merge message (see [`MergeState::message`]).
     message: String,
     upstream: String,
@@ -2807,10 +2868,16 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
             .collect(),
         message: Some(input.message),
     };
-    state.save()?;
+    // Git builtin/merge.c writes merge state only for a non-squash result.
+    // A squash's staged resolution must be committed with one parent.
+    if !input.squash {
+        state.save()?;
+    }
 
     if let Err(error) = index.save(path::index()) {
-        let _ = MergeState::cleanup();
+        if !input.squash {
+            let _ = MergeState::cleanup();
+        }
         return Err(PullMergeError::IndexSave(error.to_string()));
     }
 
@@ -2896,6 +2963,10 @@ fn moved_file_content(kind: &ConflictKind) -> Option<MergeTreeEntry> {
             mode: TreeItemMode::Blob,
         }),
         ConflictKind::BothChanged { .. } => None,
+        // MG-06: not a D/F relocation, so never consulted here (`original` is
+        // `None` for every rename-driven conflict) — the 1to2 destinations get
+        // their already-merged content from `write_conflict_markers`.
+        ConflictKind::RenameMerged { .. } => None,
     }
 }
 
@@ -3126,7 +3197,7 @@ async fn run_merge_continue(
     // (clean → dropped; conflict → promoted to the stash list with a notice).
     // The control's pre-mutation snapshot is what is consumed (W2 r6 #4).
     let autostash = match held_autostash {
-        Some(snapshot) => resolve_pending_autostash_with(output, snapshot).await,
+        Some(snapshot) => resolve_pending_autostash_with(output, snapshot, false).await,
         None => None,
     };
     if !skip_hooks {
@@ -3296,7 +3367,7 @@ async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeErro
     // is consumed (W2 r6 #4): a sidecar replaced in between is preserved by
     // the identity-checked cleanup, never adopted by this control.
     let autostash = match held_autostash {
-        Some(snapshot) => resolve_pending_autostash_with(output, snapshot).await,
+        Some(snapshot) => resolve_pending_autostash_with(output, snapshot, false).await,
         None => None,
     };
 
@@ -3847,6 +3918,20 @@ enum ConflictKind {
         /// conflict even under `-X ours/theirs`, as Git does (verified).
         modify_delete: bool,
     },
+    /// MG-06: a rename path conflict with its final worktree content already
+    /// rendered. Stage entries remain in the remapped input maps: a colliding
+    /// add must stay independently addressable even when -X settles the text.
+    RenameMerged {
+        content: MergeTreeEntry,
+        kind: RenameConflictKind,
+    },
+}
+
+/// A path conflict retains its stages even when its content is already settled.
+#[derive(Debug, Copy, Clone)]
+enum RenameConflictKind {
+    RenameRename,
+    Content,
 }
 
 /// Which merge input a D/F file came from.
@@ -4255,6 +4340,23 @@ impl TreeMergeContext<'_> {
         }
     }
 
+    /// The context for a merge INSIDE the virtual-ancestor fold. `favor` is
+    /// always `None` there: Git disables `-X ours`/`-X theirs` whenever
+    /// `call_depth` is non-zero, because a virtual ancestor is an input the
+    /// user never asked to bias.
+    fn nested(
+        persist_merged_blobs: bool,
+        depth: usize,
+        virtual_blobs: &mut VirtualBlobs,
+    ) -> TreeMergeContext<'_> {
+        TreeMergeContext {
+            persist_merged_blobs,
+            favor: None,
+            depth,
+            virtual_blobs,
+        }
+    }
+
     /// Record a blob this merge produced: written to the object store, or —
     /// when nothing may be written — kept addressable in memory instead.
     fn record_merged_blob(&mut self, blob: &Blob) -> Result<(), PullMergeError> {
@@ -4513,12 +4615,21 @@ fn merge_virtual_items(
     let mut base_items = base_items.clone();
     let mut our_items = our_items.clone();
     let mut their_items = their_items.clone();
+    // MG-06: the fold raises the same path-level rename shapes the user's own
+    // merge does. It needs no `forced` conflicts, though: a virtual ancestor
+    // can never fail, so every shape settles as CONTENT here — a 1to2 leaves
+    // the one merged blob at both destinations and drops the source, a
+    // collision leaves the rename's merge to be resolved against the occupant,
+    // and a rename/delete reuses the base version — which is exactly what the
+    // path-by-path resolution below produces from the maps this rewrites.
     detect_and_apply_renames(
         &mut base_items,
         &mut our_items,
         &mut their_items,
-        blobs,
         fold.rename_config,
+        fold.conflict_style,
+        (VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL),
+        &mut TreeMergeContext::nested(fold.persist, depth, blobs),
     )?;
     let (base_items, our_items, their_items) = (&base_items, &our_items, &their_items);
 
@@ -4811,6 +4922,7 @@ fn merge_virtual_content(
             marker_len,
             VIRTUAL_OURS_LABEL,
             VIRTUAL_THEIRS_LABEL,
+            "base",
         ),
     }
 }
@@ -5125,8 +5237,9 @@ fn incremental_merge_walk(
                     out.merged.insert(path, o.leaf());
                 }
                 // Both sides made the SAME change: take it, verbatim. Both
-                // sides could have made the same rename in there, which the
-                // flattening engine reports as a `SameDestination` notice.
+                // sides could have made the same rename in there; recording
+                // both candidates lets the rename pass move their base to the
+                // shared destination and run a normal three-way merge there.
                 (base_entry, Some(o), Some(t)) if o == t => {
                     for side in [MergeSide::Ours, MergeSide::Theirs] {
                         // `left` is the BASE: the other side equals this one,
@@ -6019,20 +6132,38 @@ fn detect_side_renames_inner(
     }
 }
 
-/// Why a detected rename was not used — every reason is reported to the user,
-/// because the merge then behaves as if the file had simply been deleted and
-/// another added (which is what Libra did before MG-05).
+/// How a detected rename must be handled when it cannot use the ordinary
+/// one-sided remap. These are path-level classifications, not all failures:
+/// some are resolved by specialized rename handling and only real conflicts
+/// produce a user-visible line.
 #[derive(Debug, PartialEq, Eq)]
 enum RenameDeclined {
-    /// Both sides renamed the same file to different paths (MG-06 turns this
-    /// into a proper rename/rename conflict).
+    /// Both sides renamed the same file to different paths: handled as a
+    /// rename/rename conflict.
     DivergentRenames { theirs: PathBuf },
-    /// Both sides renamed it to the SAME path (also MG-06).
+    /// Both sides renamed it to the SAME path: move the base there and merge.
     SameDestination,
-    /// The other side deleted the source (rename/delete, MG-06).
+    /// The other side DELETED the source — Git's rename/delete
+    /// (`merge-ort.c:3213-3221`).
     SourceDeleted,
-    /// Something already occupies the destination (rename/add, MG-06).
-    DestinationTaken,
+    /// The other side replaced the source with something of a different kind —
+    /// a symbolic link, a directory, a gitlink. Git takes its own
+    /// `type_changed` branch (`merge-ort.c:3205-3212`): the base still follows
+    /// the rename to the new path, but the source is NOT reported as deleted
+    /// and the type-changed entry SURVIVES under the old name. Measured on
+    /// git 2.50.1 (`/Volumes/Data/tmp/mg06-git/ktype`): the result holds
+    /// `120000 old` beside a `new` conflicted at stages 1 and 2, and the only
+    /// message is `CONFLICT (modify/delete): new deleted in <them> and
+    /// modified in <us>.` — never `rename/delete`.
+    SourceTypeChanged,
+    /// The other side has a file at the exact destination (rename/add,
+    /// MG-06). The collision consumes the source even though the rename does
+    /// not take the ordinary accepted path through the fix-up.
+    DestinationCollision,
+    /// A file ancestor, descendant, or directory marker structurally blocks
+    /// the destination. Unlike an exact collision, the rename does not happen
+    /// and its source continues to occupy its old path.
+    DestinationBlocked,
 }
 
 /// A rename accepted into the three-way match, or the reason it was not.
@@ -6139,8 +6270,10 @@ fn decide_renames(
             }),
             // The other side must still hold the source AS A FILE, and as the
             // same KIND the rename moved, for a three-way match at the new
-            // path. Nothing there — a directory, an empty marker, or a type
-            // change — is Git's rename/delete, which MG-06 will arbitrate.
+            // path. Nothing there at all is Git's rename/delete; something of
+            // a DIFFERENT kind (a directory, an empty marker, a symlink) is its
+            // `type_changed` branch instead — the two are split below because
+            // Git reports and resolves them differently.
             None if !other.get(&pair.old).is_some_and(|entry| {
                 entry.mode != TreeItemMode::Tree
                     && this
@@ -6148,7 +6281,11 @@ fn decide_renames(
                         .is_some_and(|moved| same_entry_kind(entry.mode, moved.mode))
             }) =>
             {
-                Some(RenameDeclined::SourceDeleted)
+                Some(if other.contains_key(&pair.old) {
+                    RenameDeclined::SourceTypeChanged
+                } else {
+                    RenameDeclined::SourceDeleted
+                })
             }
             None => None,
         });
@@ -6158,14 +6295,16 @@ fn decide_renames(
     //
     // A rename takes its source away, so that source stops occupying its own
     // path and the directories above it, and two renames can free each other's
-    // destination. But a rename BLOCKED at its destination never happens, so
-    // its source stays — and that can block a further rename in turn. Releasing
-    // once and deciding once gets both wrong (Codex R15 gave the first, R16 the
-    // second, which left conflicting index entries for `new` and `new/child`).
-    // So: release every eligible source, then re-take the ones whose
-    // destination turns out to be occupied, re-checking only the renames that
-    // re-taking could affect. Each rename is blocked at most once, so the walk
-    // terminates and costs the paths' depth, not the square of the rename
+    // destination. But a rename structurally BLOCKED by an ancestor,
+    // descendant, or marker never happens, so its source stays — and that can
+    // block a further rename in turn. An exact file collision is different:
+    // MG-06 resolves it at the destination and consumes the source, as Git
+    // does. Releasing once and deciding once gets the structural case wrong
+    // (Codex R15 gave the first, R16 the second, which left conflicting index
+    // entries for `new` and `new/child`). So: release every eligible source,
+    // then re-take only the structurally blocked ones, re-checking the renames
+    // that re-taking could affect. Each rename is blocked at most once, so the
+    // walk terminates and costs the paths' depth, not the square of the rename
     // count.
     let base_names: HashSet<PathBuf> = occupied_names(base.keys());
     let mut occupancy = [
@@ -6207,7 +6346,15 @@ fn decide_renames(
         if !occupancy[other].occupied(&pair.new, base, &base_names) {
             continue;
         }
-        declined[slot] = Some(RenameDeclined::DestinationTaken);
+        let exact_collision = occupancy[other].file_at_path(&pair.new);
+        declined[slot] = Some(if exact_collision {
+            RenameDeclined::DestinationCollision
+        } else {
+            RenameDeclined::DestinationBlocked
+        });
+        if exact_collision {
+            continue;
+        }
         // The source stays where it is, so it occupies its path again.
         if let Some(marker) = counted_at(other, &pair.old) {
             occupancy[other].apply(&pair.old, marker, true, 1);
@@ -6234,15 +6381,23 @@ fn decide_renames(
 /// Do two tree entries hold the same KIND of thing — a regular file (either
 /// mode), a symbolic link, a directory, a gitlink?
 ///
-/// A rename pairs like with like. Git treats a source the other side turned
-/// into a symlink as DELETED and reports rename/delete: measured on git 2.50.1
-/// with base `old` (a regular file), ours renaming it to `new` and theirs
-/// replacing `old` with a symlink, `git merge` prints
-/// `CONFLICT (modify/delete): new deleted in th and modified in HEAD` and
-/// leaves ours' content at `new` (stages 1 and 2) with the symlink at `old`.
-/// Accepting the pair instead lets the type-changed entry be remapped onto the
-/// new path, where the ordinary three-way match takes it as the only change —
-/// and the renamed file's content disappears from a merge that exits 0.
+/// A rename pairs like with like: the source the other side turned into a
+/// symlink cannot be carried onto the new path. Git takes its own
+/// `type_changed` branch for this (`merge-ort.c:3205-3212`) — NOT rename/delete
+/// — and Libra classifies it as [`RenameDeclined::SourceTypeChanged`]. Measured
+/// on git 2.50.1 with base `old` (a regular file), ours renaming it to `new`
+/// and theirs replacing `old` with a symlink: the only message is
+/// `CONFLICT (modify/delete): new deleted in <them> and modified in <us>.`,
+/// `new` carries stages 1 and 2, and the SYMLINK SURVIVES at `old` in the
+/// result tree (`/Volumes/Data/tmp/mg06-git/ktype`).
+///
+/// Accepting the pair instead would let the type-changed entry be remapped onto
+/// the new path, where the ordinary three-way match takes it as the only change
+/// — and the renamed file's content disappears from a merge that exits 0.
+///
+/// (An earlier revision of this note said Git "reports rename/delete" here,
+/// which contradicted the measurement quoted in the same paragraph — Codex R1
+/// P2-6.)
 fn same_entry_kind(left: TreeItemMode, right: TreeItemMode) -> bool {
     fn kind(mode: TreeItemMode) -> u8 {
         match mode {
@@ -6370,6 +6525,10 @@ impl DestinationOccupancy {
             *slot = slot.saturating_add_signed(delta as isize);
             current = prefix.parent();
         }
+    }
+
+    fn file_at_path(&self, path: &Path) -> bool {
+        self.files_at_path.get(path).is_some_and(|count| *count > 0)
     }
 
     fn file_occupied(&self, path: &Path) -> bool {
@@ -6523,34 +6682,625 @@ fn unseen_renames_by(
         .count()
 }
 
+/// MG-06: a path-level rename conflict, in the words Git reports it with.
+///
+/// The paths live here rather than inside [`ConflictKind`], which stays `Copy`
+/// because it travels through the whole conflict pipeline by value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RenameConflictNote {
+    /// `CONFLICT (rename/rename): <old> renamed to <a> in <ours> and to <b> in
+    /// <theirs>.` — `merge-ort.c:3069-3076`. One note per PAIR: Git handles
+    /// both sides' entries in a single step (`merge-ort.c:3078`, `i++`).
+    RenameRename {
+        old: PathBuf,
+        ours_path: PathBuf,
+        theirs_path: PathBuf,
+    },
+    /// `CONFLICT (rename/delete): <old> renamed to <new> in <X>, but deleted in
+    /// <Y>.` — `merge-ort.c:3215-3221`.
+    RenameDelete {
+        old: PathBuf,
+        new: PathBuf,
+        rename_side: MergeSide,
+    },
+    /// `CONFLICT (rename involved in collision): rename of <old> -> <new> has
+    /// content conflicts AND collides with another path; this may result in
+    /// nested conflict markers.` — `merge-ort.c:3169-3178`, printed ONLY when
+    /// the rename's OWN content merge came out unclean.
+    Collision { old: PathBuf, new: PathBuf },
+}
+
+/// MG-06: the content merge Git runs for a rename before it settles the
+/// path-level conflict.
+///
+/// `handle_content_merge` is called with `extra_marker_size = 1 + 2 *
+/// call_depth` (`merge-ort.c:3027` for rename/rename(1to2), `:3161` for a
+/// collision), so a rename-involved conflict's markers are ONE character
+/// longer than an ordinary content conflict's, and the labels are
+/// `<branch>:<path>` rather than the bare branch name. Measured on git 2.50.1
+/// (`/Volumes/Data/tmp/mg06-git/r1to2c`): `<<<<<<<< HEAD:a` / `========` /
+/// `>>>>>>>> theirs:b`.
+///
+/// Unlike [`try_merge_blob_contents`] this returns a blob even on a conflict —
+/// Git passes `record_object = true` and stores a new result when needed, which
+/// lets both destinations of a 1to2 point at the same object. Trivial merges
+/// reuse an input object. Returns the entry and whether the merge was clean.
+#[allow(clippy::too_many_arguments)]
+fn merge_rename_content(
+    base: Option<&MergeTreeEntry>,
+    ours: &MergeTreeEntry,
+    theirs: &MergeTreeEntry,
+    ours_label: &str,
+    theirs_label: &str,
+    base_label: &str,
+    conflict_style: diffy::ConflictStyle,
+    context: &mut TreeMergeContext<'_>,
+) -> Result<(MergeTreeEntry, bool), PullMergeError> {
+    // Git merges the mode independently of the content: the side that differs
+    // from the base wins, and when BOTH differ from it there is no answer —
+    // `handle_content_merge` keeps ours' and reports the merge UNCLEAN
+    // (`merge-ort.c:2211-2218`), which is what makes a collision print Git's
+    // `rename involved in collision` line even for a mode-only divergence
+    // (Codex R1 P2-3).
+    let (merged_mode, mode_clean) = match base {
+        Some(base) if ours.mode != theirs.mode => {
+            if ours.mode == base.mode {
+                (theirs.mode, true)
+            } else if theirs.mode == base.mode {
+                (ours.mode, true)
+            } else {
+                (ours.mode, false)
+            }
+        }
+        None if ours.mode != theirs.mode => (ours.mode, false),
+        _ => (ours.mode, true),
+    };
+    // Git handles trivial OID merges before the file-type-specific rules
+    // (`merge-ort.c:2243-2246`). A binary pure rename must carry the other
+    // side's source edit, just as a text rename does, without invoking the
+    // unmergeable-binary fallback or losing the independently merged mode.
+    let trivial_hash =
+        if ours.hash == theirs.hash || base.is_some_and(|base| ours.hash == base.hash) {
+            Some(theirs.hash)
+        } else if base.is_some_and(|base| theirs.hash == base.hash) {
+            Some(ours.hash)
+        } else {
+            None
+        };
+    if let Some(hash) = trivial_hash {
+        return Ok((
+            MergeTreeEntry {
+                hash,
+                mode: merged_mode,
+            },
+            mode_clean,
+        ));
+    }
+    // `-X ours` / `-X theirs` reach the rename's own content merge too: Git
+    // maps `MERGE_VARIANT_OURS`/`THEIRS` onto `ll_opts.variant`
+    // (`merge-ort.c:2129-2143`), so the favoured side settles the hunks and the
+    // merge comes out clean. `context.favor` is always `None` inside the
+    // virtual-ancestor fold, exactly as Git disables the variant at
+    // `call_depth > 0` (Codex R1 P1-1).
+    let favor = context.favor;
+    // A symlink, a gitlink, or binary content has no line-level merge:
+    // `ll_binary_merge` takes one whole side. Without `-X` this path keeps
+    // ours and reports UNCLEAN; with `-X` it takes the favoured side and is clean.
+    if !is_regular_file_mode(ours.mode) || !is_regular_file_mode(theirs.mode) {
+        if context.depth > 0 {
+            // Git restores the full original entry for recursive symlink
+            // conflicts, but keeps clean=false (merge-ort.c:2301-2305).
+            // Every rename caller supplies an original; an absent entry needs
+            // the optional-path result of virtual_conflict_resolution instead.
+            let original = base.copied().ok_or_else(|| {
+                PullMergeError::TreeCreate(format!(
+                    "cannot construct the virtual ancestor for {base_label}: \
+                     the renamed non-file entry has no original version"
+                ))
+            })?;
+            return Ok((original, false));
+        }
+        return Ok(match favor {
+            Some(MergeFavor::Ours) => (*ours, true),
+            Some(MergeFavor::Theirs) => (*theirs, true),
+            None => (*ours, false),
+        });
+    }
+    // A different original kind is a two-way content merge in Git; its mode
+    // still participates independently above (merge-ort.c:2254-2263).
+    let base_blob = match base.filter(|entry| is_regular_file_mode(entry.mode)) {
+        Some(base) => Some(load_merge_blob(base.hash, context.virtual_blobs)?),
+        None => None,
+    };
+    let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
+    let theirs_blob = load_merge_blob(theirs.hash, context.virtual_blobs)?;
+    let base_data: &[u8] = match &base_blob {
+        Some(blob) => &blob.data,
+        None => &[],
+    };
+    if merge_input_is_binary(base_data)
+        || merge_input_is_binary(&ours_blob.data)
+        || merge_input_is_binary(&theirs_blob.data)
+    {
+        if context.depth > 0 {
+            // ll_binary_merge(virtual_ancestor) returns orig with LL_MERGE_OK.
+            // Preserve the merged mode; no regular original means an empty
+            // blob, not either side's bytes or a missing ancestor path.
+            let hash = match &base_blob {
+                Some(original) => original.id,
+                None => {
+                    let empty = Blob::from_content_bytes(Vec::new());
+                    context.record_merged_blob(&empty)?;
+                    empty.id
+                }
+            };
+            return Ok((
+                MergeTreeEntry {
+                    hash,
+                    mode: merged_mode,
+                },
+                mode_clean,
+            ));
+        }
+        // ll_binary_merge selects bytes only; handle_content_merge retains
+        // the mode result even when the selected side has a different mode.
+        let (hash, content_clean) = match favor {
+            Some(MergeFavor::Ours) => (ours.hash, true),
+            Some(MergeFavor::Theirs) => (theirs.hash, true),
+            None => (ours.hash, false),
+        };
+        return Ok((
+            MergeTreeEntry {
+                hash,
+                mode: merged_mode,
+            },
+            content_clean && mode_clean,
+        ));
+    }
+    let marker_len = conflict_marker_length_at_depth(
+        &[base_data, &ours_blob.data, &theirs_blob.data],
+        context.depth,
+    )
+    .saturating_add(1);
+    let mut options = diffy::MergeOptions::new();
+    options
+        // `resolve_favored_content` finds the conflict regions by their
+        // `|||||||` marker, so `-X` needs the diff3 rendering to work on —
+        // exactly as [`try_merge_blob_contents`] hardcodes it. The choice is
+        // invisible in the output: a favoured merge resolves every region, so
+        // no marker of any style survives. Rendering a KEPT conflict still uses
+        // the style the user configured. (Codex R2 P1-1: passing the configured
+        // style here made `-X ours` on a rename conflict fail with
+        // `LBR-IO-002 ... malformed conflict markers` under the default
+        // two-marker style.)
+        .set_conflict_style(if favor.is_some() {
+            diffy::ConflictStyle::Diff3
+        } else {
+            conflict_style
+        })
+        .set_conflict_marker_length(marker_len);
+    let (bytes, clean) = match options.merge_bytes(base_data, &ours_blob.data, &theirs_blob.data) {
+        Ok(merged) => (merged, true),
+        Err(conflicted) => match favor {
+            Some(favor) => (
+                resolve_favored_content(conflicted, marker_len, favor)
+                    .map_err(PullMergeError::TreeCreate)?,
+                true,
+            ),
+            None => (
+                relabel_conflict_markers(
+                    conflicted,
+                    marker_len,
+                    ours_label,
+                    theirs_label,
+                    base_label,
+                ),
+                false,
+            ),
+        },
+    };
+    let blob = Blob::from_content_bytes(bytes);
+    context.record_merged_blob(&blob)?;
+    Ok((
+        MergeTreeEntry {
+            hash: blob.id,
+            mode: merged_mode,
+        },
+        // A mode divergence with no answer keeps the merge unclean even when
+        // the CONTENT merged cleanly.
+        clean && mode_clean,
+    ))
+}
+
+/// Merge a colliding destination's content without clearing its path conflict.
+fn rename_destination_conflict(
+    ours: &MergeTreeEntry,
+    theirs: &MergeTreeEntry,
+    upstream: &str,
+    conflict_style: diffy::ConflictStyle,
+    context: &mut TreeMergeContext<'_>,
+) -> Result<ConflictKind, PullMergeError> {
+    let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
+    let theirs_blob = load_merge_blob(theirs.hash, context.virtual_blobs)?;
+    let content = if ours.hash == theirs.hash {
+        *ours
+    } else if !is_regular_file_mode(ours.mode)
+        || !is_regular_file_mode(theirs.mode)
+        || merge_input_is_binary(&ours_blob.data)
+        || merge_input_is_binary(&theirs_blob.data)
+    {
+        // Git's binary fallback selects one complete input. Even a favored
+        // result still carries the path conflict and both original stages.
+        match context.favor {
+            Some(MergeFavor::Theirs) => *theirs,
+            Some(MergeFavor::Ours) | None => *ours,
+        }
+    } else {
+        // A base-less add/add still merges against the empty blob. In
+        // particular, an empty added file has no conflicting hunk for -X to
+        // choose, so it must not erase the other side's nonempty content.
+        let empty_blob = Blob::from_content_bytes(Vec::new());
+        context.record_merged_blob(&empty_blob)?;
+        let empty_base = MergeTreeEntry {
+            hash: empty_blob.id,
+            mode: ours.mode,
+        };
+        match try_merge_blob_contents(&empty_base, *ours, *theirs, context)? {
+            Some(merged) => MergeTreeEntry {
+                hash: merged.hash,
+                mode: ours.mode,
+            },
+            None => {
+                let bytes = both_changed_conflict_content(
+                    None,
+                    &ours_blob.data,
+                    &theirs_blob.data,
+                    conflict_marker_eol(),
+                    upstream,
+                    conflict_style,
+                )
+                .map_err(PullMergeError::TreeCreate)?;
+                let blob = Blob::from_content_bytes(bytes);
+                context.record_merged_blob(&blob)?;
+                MergeTreeEntry {
+                    hash: blob.id,
+                    mode: ours.mode,
+                }
+            }
+        }
+    };
+    Ok(ConflictKind::RenameMerged {
+        content,
+        kind: RenameConflictKind::Content,
+    })
+}
+
 /// Rewrite the base and the non-renaming side onto the new path so the
 /// ordinary three-way match sees one triple there (Git's `process_renames`).
 /// The source path disappears from all three maps: it is the same file.
+#[allow(clippy::too_many_arguments)]
 fn apply_renames(
     base: &mut HashMap<PathBuf, MergeTreeEntry>,
     ours: &mut HashMap<PathBuf, MergeTreeEntry>,
     theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
     decisions: &[RenameDecision],
-) {
+    forced: &mut Vec<(PathBuf, ConflictKind)>,
+    conflict_style: diffy::ConflictStyle,
+    // How each side is named in a conflict marker. `HEAD` / the upstream ref
+    // for the merge the user asked for, and Git's virtual-ancestor labels
+    // inside the fold — Git labels a rename-involved merge `<branch>:<path>`
+    // at every call depth.
+    branches: (&str, &str),
+    context: &mut TreeMergeContext<'_>,
+) -> Result<Vec<RenameConflictNote>, PullMergeError> {
+    let label = |side: MergeSide, path: &Path| {
+        let branch = match side {
+            MergeSide::Ours => branches.0,
+            MergeSide::Theirs => branches.1,
+        };
+        format!("{branch}:{}", path.display())
+    };
+    let mut notes = Vec::new();
+    // A rename/rename(1to2) arrives as one decision per side; Git reports and
+    // resolves the PAIR once (`merge-ort.c:3078` consumes `i+1` as well).
+    let mut folded: HashSet<PathBuf> = HashSet::new();
     for decision in decisions {
-        if decision.declined.is_some() {
-            continue;
-        }
-        let Some(base_entry) = base.remove(&decision.old) else {
-            continue;
-        };
-        base.insert(decision.new.clone(), base_entry);
-        let other: &mut HashMap<PathBuf, MergeTreeEntry> = match decision.side {
-            MergeSide::Ours => &mut *theirs,
-            MergeSide::Theirs => &mut *ours,
-        };
-        if let Some(entry) = other.remove(&decision.old) {
-            other.insert(decision.new.clone(), entry);
+        match &decision.declined {
+            // A plain rename, and rename/rename(1to1): Git carries the base to
+            // the new path for both. For 1to1 (`merge-ort.c:2991-3018`) BOTH
+            // sides already hold the destination, so moving the base is the
+            // whole of it and the ordinary content merge decides the rest —
+            // which is why 1to1 is a CLEAN merge in Git whenever the contents
+            // agree, not the base-less add/add Libra degraded it to before.
+            None | Some(RenameDeclined::SameDestination) => {
+                let Some(base_entry) = base.remove(&decision.old) else {
+                    continue;
+                };
+                base.insert(decision.new.clone(), base_entry);
+                let other: &mut HashMap<PathBuf, MergeTreeEntry> = match decision.side {
+                    MergeSide::Ours => &mut *theirs,
+                    MergeSide::Theirs => &mut *ours,
+                };
+                if let Some(entry) = other.remove(&decision.old) {
+                    other.insert(decision.new.clone(), entry);
+                }
+            }
+            Some(RenameDeclined::DivergentRenames { theirs: other_path }) => {
+                if !folded.insert(decision.old.clone()) {
+                    continue;
+                }
+                let (ours_path, theirs_path) = match decision.side {
+                    MergeSide::Ours => (decision.new.clone(), other_path.clone()),
+                    MergeSide::Theirs => (other_path.clone(), decision.new.clone()),
+                };
+                let (Some(base_entry), Some(ours_entry), Some(theirs_entry)) = (
+                    base.get(&decision.old).copied(),
+                    ours.get(&ours_path).copied(),
+                    theirs.get(&theirs_path).copied(),
+                ) else {
+                    continue;
+                };
+                let (merged, clean) = merge_rename_content(
+                    Some(&base_entry),
+                    &ours_entry,
+                    &theirs_entry,
+                    &label(MergeSide::Ours, &ours_path),
+                    &label(MergeSide::Theirs, &theirs_path),
+                    &format!("base:{}", decision.old.display()),
+                    conflict_style,
+                    context,
+                )?;
+                // Git's `was_binary_blob` fallback (`merge-ort.c:3032-3053`):
+                // when the content merge could not actually be performed it
+                // just TOOK one whole side, so copying that side's blob to both
+                // destinations would overwrite the other side's data. Git
+                // detects exactly that shape — an unclean merge whose result IS
+                // ours' input — and hands the second destination theirs'
+                // original object instead. Git's own regression
+                // `t/t6422-merge-rename-corner-cases.sh:1423-1438` requires the
+                // two destinations to equal the two sides' originals
+                // (Codex R1 P1-2).
+                let theirs_content = if !clean && merged == ours_entry {
+                    theirs_entry
+                } else {
+                    merged
+                };
+                // Git copies ONE merge result into both sides' stages and
+                // leaves the base under the OLD name — `merge-ort.c:3036-3068`
+                // documents keeping the source at stage 1 as deliberate.
+                ours.insert(ours_path.clone(), merged);
+                theirs.insert(theirs_path.clone(), theirs_content);
+                forced.push((
+                    ours_path.clone(),
+                    match theirs.get(&ours_path) {
+                        Some(added) if context.depth == 0 => rename_destination_conflict(
+                            &merged,
+                            added,
+                            branches.1,
+                            conflict_style,
+                            context,
+                        )?,
+                        // The fold discards forced conflicts and resolves the
+                        // remapped stages with virtual_conflict_resolution.
+                        Some(_) | None => ConflictKind::RenameMerged {
+                            content: merged,
+                            kind: RenameConflictKind::RenameRename,
+                        },
+                    },
+                ));
+                forced.push((
+                    theirs_path.clone(),
+                    match ours.get(&theirs_path) {
+                        Some(added) if context.depth == 0 => rename_destination_conflict(
+                            added,
+                            &theirs_content,
+                            branches.1,
+                            conflict_style,
+                            context,
+                        )?,
+                        Some(_) | None => ConflictKind::RenameMerged {
+                            content: theirs_content,
+                            kind: RenameConflictKind::RenameRename,
+                        },
+                    },
+                ));
+                // INTENTIONAL DEVIATION from Git: the source is resolved by
+                // REMOVAL rather than left unmerged at stage 1.
+                //
+                // Git's own comment at `merge-ort.c:3057-3068` calls keeping it
+                // legacy — "For renames we normally remove the path at the old
+                // name. It would thus seem consistent to do the same for
+                // rename/rename(1to2) cases, but we haven't done so
+                // traditionally and a number of the regression tests now encode
+                // an expectation that the file is left there at stage 1" — and
+                // spells out the two lines that would change it.
+                //
+                // Libra takes the consistent branch. The primary reason is
+                // Git's own verdict above; the secondary one is that keeping
+                // the stage would put the conflict out of reach of the ordinary
+                // staging flow. The source has no working-tree file, and
+                // `libra add` / `libra rm` / `libra restore --staged` all match
+                // paths through the staged entry, so none of them can address
+                // it (`LBR-CLI-003: pathspec did not match any files`, or
+                // `path is unmerged`); `add -A` silently no-ops on it.
+                //
+                // It is NOT unresolvable, and an earlier version of this note
+                // wrongly said so (Codex R1 P1-4): `libra read-tree HEAD`
+                // followed by `add -A .` does clear it, as does
+                // `update-index --cacheinfo`. Both are blunt — `read-tree`
+                // replaces the whole index and so discards every resolution
+                // staged so far, and `update-index` is plumbing — so the shape
+                // would still be a trap for anyone following the documented
+                // `add <path>` + `merge --continue` workflow.
+                //
+                // Both destinations carry the merged result, which already
+                // incorporates the base, so nothing is lost by dropping it.
+                base.remove(&decision.old);
+                notes.push(RenameConflictNote::RenameRename {
+                    old: decision.old.clone(),
+                    ours_path,
+                    theirs_path,
+                });
+            }
+            Some(reason @ (RenameDeclined::SourceDeleted | RenameDeclined::SourceTypeChanged)) => {
+                let type_changed = *reason == RenameDeclined::SourceTypeChanged;
+                let other: &HashMap<PathBuf, MergeTreeEntry> = match decision.side {
+                    MergeSide::Ours => &*theirs,
+                    MergeSide::Theirs => &*ours,
+                };
+                // rename/add/delete: the destination is ALSO taken by the other
+                // side. Git reports rename/delete but leaves the destination
+                // "as-is so they look like an add/add conflict"
+                // (`merge-ort.c:3180-3188`) — so the base is NOT carried over.
+                let destination_taken = other.contains_key(&decision.new);
+                let Some(base_entry) = base.remove(&decision.old) else {
+                    continue;
+                };
+                let side: &HashMap<PathBuf, MergeTreeEntry> = match decision.side {
+                    MergeSide::Ours => &*ours,
+                    MergeSide::Theirs => &*theirs,
+                };
+                let Some(entry) = side.get(&decision.new).copied() else {
+                    continue;
+                };
+                // A type-changed source SURVIVES under the old name (Git keeps
+                // the two side stages and only clears the base's,
+                // `merge-ort.c:3209-3211`); a deleted one is already gone from
+                // both sides.
+                if !type_changed {
+                    ours.remove(&decision.old);
+                    theirs.remove(&decision.old);
+                }
+                // Git copies the base to the NEW path's stage 1 whenever it
+                // reaches the rename branch (`merge-ort.c:3202-3204`, before
+                // the `type_changed` / `source_deleted` split). A COLLISION is
+                // what suppresses that — and for a type change Git clears the
+                // collision first (`:3090-3120`), so the base still travels.
+                // Only rename/add/delete (`collision && source_deleted`) leaves
+                // the destination base-less, "so they look like an add/add
+                // conflict" (`:3180-3188`). Codex R1 P1-3.
+                if type_changed || !destination_taken {
+                    base.insert(decision.new.clone(), base_entry);
+                }
+                if !destination_taken {
+                    // A PURE rename plus a delete is still a conflict for Git
+                    // even though the content never changed (measured: stages
+                    // 1 and 2 hold the same blob), so it is forced here — the
+                    // ordinary match would call it a clean delete.
+                    forced.push((
+                        decision.new.clone(),
+                        match decision.side {
+                            MergeSide::Ours => {
+                                ConflictKind::OursModifiedTheirsDeleted { ours: entry.hash }
+                            }
+                            MergeSide::Theirs => {
+                                ConflictKind::TheirsModifiedOursDeleted { theirs: entry.hash }
+                            }
+                        },
+                    ));
+                } else if !type_changed && context.depth == 0 {
+                    let (Some(ours_entry), Some(theirs_entry)) =
+                        (ours.get(&decision.new), theirs.get(&decision.new))
+                    else {
+                        continue;
+                    };
+                    // Git keeps path_conflict after the add/add content merge,
+                    // including when -X settles every hunk (merge-ort.c:3190).
+                    forced.push((
+                        decision.new.clone(),
+                        rename_destination_conflict(
+                            ours_entry,
+                            theirs_entry,
+                            branches.1,
+                            conflict_style,
+                            context,
+                        )?,
+                    ));
+                }
+                // Git prints NOTHING extra for a type change: the destination's
+                // own modify/delete line is the whole report.
+                if !type_changed {
+                    notes.push(RenameConflictNote::RenameDelete {
+                        old: decision.old.clone(),
+                        new: decision.new.clone(),
+                        rename_side: decision.side,
+                    });
+                }
+            }
+            Some(RenameDeclined::DestinationCollision) => {
+                let Some(base_entry) = base.get(&decision.old).copied() else {
+                    continue;
+                };
+                let (side_entry, other_entry) = match decision.side {
+                    MergeSide::Ours => (
+                        ours.get(&decision.new).copied(),
+                        theirs.get(&decision.old).copied(),
+                    ),
+                    MergeSide::Theirs => (
+                        theirs.get(&decision.new).copied(),
+                        ours.get(&decision.old).copied(),
+                    ),
+                };
+                let (Some(side_entry), Some(other_entry)) = (side_entry, other_entry) else {
+                    continue;
+                };
+                let (ours_entry, theirs_entry) = match decision.side {
+                    MergeSide::Ours => (side_entry, other_entry),
+                    MergeSide::Theirs => (other_entry, side_entry),
+                };
+                let (merged, clean) = merge_rename_content(
+                    Some(&base_entry),
+                    &ours_entry,
+                    &theirs_entry,
+                    // Codex R1 P2-1: Git's collision branch sets
+                    // `pathnames[other_source_index] = oldpath` and
+                    // `pathnames[target_index] = newpath`
+                    // (`merge-ort.c:3144-3146`) — only the side that DID the
+                    // rename is labelled with the destination.
+                    &label(
+                        MergeSide::Ours,
+                        match decision.side {
+                            MergeSide::Ours => &decision.new,
+                            MergeSide::Theirs => &decision.old,
+                        },
+                    ),
+                    &label(
+                        MergeSide::Theirs,
+                        match decision.side {
+                            MergeSide::Theirs => &decision.new,
+                            MergeSide::Ours => &decision.old,
+                        },
+                    ),
+                    &format!("base:{}", decision.old.display()),
+                    conflict_style,
+                    context,
+                )?;
+                // Git stores the rename's own merge at the renaming side's
+                // stage of the destination, leaves the other side's entry at
+                // its stage, records NO base there, and resolves the source by
+                // removal (`merge-ort.c:3137-3179`) — so the destination comes
+                // out as the add/add that was measured, for rename/add and
+                // rename/rename(2to1) alike.
+                match decision.side {
+                    MergeSide::Ours => ours.insert(decision.new.clone(), merged),
+                    MergeSide::Theirs => theirs.insert(decision.new.clone(), merged),
+                };
+                base.remove(&decision.old);
+                ours.remove(&decision.old);
+                theirs.remove(&decision.old);
+                if !clean {
+                    notes.push(RenameConflictNote::Collision {
+                        old: decision.old.clone(),
+                        new: decision.new.clone(),
+                    });
+                }
+            }
+            Some(RenameDeclined::DestinationBlocked) => {}
         }
     }
+    Ok(notes)
 }
 
-/// What the user is told about renames the merge could not use.
 /// What the rename pass decided, held until the merge is known to proceed.
 ///
 /// The notices are NOT printed where the decision is made: the writer's
@@ -6560,10 +7310,17 @@ fn apply_renames(
 struct RenameOutcome {
     decisions: Vec<RenameDecision>,
     limited: Vec<MergeSide>,
+    /// MG-06: the path-level conflicts the renames produced, in Git's words.
+    notes: Vec<RenameConflictNote>,
+    /// MG-06: conflicts the ordinary three-way match must NOT decide for
+    /// itself — a rename/rename(1to2)'s two destinations and a rename/delete
+    /// whose content never changed (which the plain match would call a clean
+    /// delete).
+    forced: Vec<(PathBuf, ConflictKind)>,
 }
 
 fn announce_rename_notices(
-    decisions: &[RenameDecision],
+    notes: &[RenameConflictNote],
     limited_sides: &[MergeSide],
     upstream: &str,
     output: &OutputConfig,
@@ -6578,65 +7335,83 @@ fn announce_rename_notices(
             df_branch_label(*side, upstream)
         );
     }
-    for decision in decisions {
-        let Some(reason) = &decision.declined else {
-            continue;
-        };
-        let label = df_branch_label(decision.side, upstream);
-        match reason {
-            RenameDeclined::DivergentRenames { theirs } => info_println!(
+    // MG-06: Git's own wording, verbatim. Each line is a CONFLICT, not a
+    // notice: before this card these shapes degraded to "merging without
+    // rename detection", which lost the merge base and with it the conflict.
+    for note in notes {
+        match note {
+            RenameConflictNote::RenameRename {
+                old,
+                ours_path,
+                theirs_path,
+            } => info_println!(
                 output,
-                "notice: {} was renamed to {} on {} and to {} on the other side; merging without rename detection for that path",
-                decision.old.display(),
-                decision.new.display(),
-                label,
-                theirs.display()
+                "CONFLICT (rename/rename): {} renamed to {} in {} and to {} in {}.",
+                old.display(),
+                ours_path.display(),
+                df_branch_label(MergeSide::Ours, upstream),
+                theirs_path.display(),
+                df_branch_label(MergeSide::Theirs, upstream)
             ),
-            RenameDeclined::SameDestination => info_println!(
+            RenameConflictNote::RenameDelete {
+                old,
+                new,
+                rename_side,
+            } => info_println!(
                 output,
-                "notice: both sides renamed {} to {}; merging without rename detection for that path",
-                decision.old.display(),
-                decision.new.display()
+                "CONFLICT (rename/delete): {} renamed to {} in {}, but deleted in {}.",
+                old.display(),
+                new.display(),
+                df_branch_label(*rename_side, upstream),
+                df_branch_label(
+                    match rename_side {
+                        MergeSide::Ours => MergeSide::Theirs,
+                        MergeSide::Theirs => MergeSide::Ours,
+                    },
+                    upstream
+                )
             ),
-            RenameDeclined::SourceDeleted => info_println!(
+            RenameConflictNote::Collision { old, new } => info_println!(
                 output,
-                "notice: {} was renamed to {} on {} and deleted on the other side; merging without rename detection for that path",
-                decision.old.display(),
-                decision.new.display(),
-                label
-            ),
-            RenameDeclined::DestinationTaken => info_println!(
-                output,
-                "notice: {} was renamed to {} on {}, which another side already occupies; merging without rename detection for that path",
-                decision.old.display(),
-                decision.new.display(),
-                label
+                "CONFLICT (rename involved in collision): rename of {} -> {} has content conflicts AND collides with another path; this may result in nested conflict markers.",
+                old.display(),
+                new.display()
             ),
         }
     }
 }
 
-/// Detect renames on both sides and rewrite the maps in place. Returns what
-/// was detected so the caller can report it; the notices are printed here (a
-/// preview says the same thing a real merge would).
+/// Detect renames on both sides and rewrite the maps in place. Returns the
+/// decisions and deferred notices so the caller can announce them only after
+/// the merge's write preflight succeeds (or while producing a dry-run).
+#[allow(clippy::too_many_arguments)]
 fn detect_and_apply_renames(
     base: &mut HashMap<PathBuf, MergeTreeEntry>,
     ours: &mut HashMap<PathBuf, MergeTreeEntry>,
     theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
-    virtual_blobs: &VirtualBlobs,
     config: &MergeRenameConfig,
+    conflict_style: diffy::ConflictStyle,
+    branches: (&str, &str),
+    context: &mut TreeMergeContext<'_>,
 ) -> Result<RenameOutcome, PullMergeError> {
     if !config.enabled {
         return Ok(RenameOutcome {
             decisions: Vec::new(),
             limited: Vec::new(),
+            notes: Vec::new(),
+            forced: Vec::new(),
         });
     }
     // ONE reader for both sides: a blob shared by the two detections (the
     // base's, above all) is then read once.
     let mut reader = MergeRenameReader::new();
-    let our_side = detect_side_renames(base, ours, config, virtual_blobs, &mut reader);
-    let their_side = detect_side_renames(base, theirs, config, virtual_blobs, &mut reader);
+    let (our_side, their_side) = {
+        let virtual_blobs = &*context.virtual_blobs;
+        (
+            detect_side_renames(base, ours, config, virtual_blobs, &mut reader),
+            detect_side_renames(base, theirs, config, virtual_blobs, &mut reader),
+        )
+    };
     if our_side.matches.is_empty()
         && their_side.matches.is_empty()
         && !our_side.skipped_by_limit
@@ -6645,10 +7420,22 @@ fn detect_and_apply_renames(
         return Ok(RenameOutcome {
             decisions: Vec::new(),
             limited: Vec::new(),
+            notes: Vec::new(),
+            forced: Vec::new(),
         });
     }
     let decisions = decide_renames(base, ours, theirs, &our_side.matches, &their_side.matches);
-    apply_renames(base, ours, theirs, &decisions);
+    let mut forced = Vec::new();
+    let notes = apply_renames(
+        base,
+        ours,
+        theirs,
+        &decisions,
+        &mut forced,
+        conflict_style,
+        branches,
+        context,
+    )?;
     let mut limited = Vec::new();
     if our_side.skipped_by_limit {
         limited.push(MergeSide::Ours);
@@ -6656,7 +7443,12 @@ fn detect_and_apply_renames(
     if their_side.skipped_by_limit {
         limited.push(MergeSide::Theirs);
     }
-    Ok(RenameOutcome { decisions, limited })
+    Ok(RenameOutcome {
+        decisions,
+        limited,
+        notes,
+        forced,
+    })
 }
 
 /// MG-05 for the pruned walk: the walk resolved the rename's source and
@@ -6673,6 +7465,10 @@ fn apply_incremental_renames(
     conflicts: &mut Vec<(PathBuf, ConflictKind)>,
     files_changed: &mut usize,
     context: &mut TreeMergeContext<'_>,
+    // MG-06: the style the rename-driven content merges are rendered with, and
+    // the label the other side's paths carry in their conflict markers.
+    conflict_style: diffy::ConflictStyle,
+    upstream: &str,
     // The merge base's root, for MG-04's base-presence rule: a destination
     // directory holding nothing but empty trees is in the way only when the
     // base had NOTHING there (Codex R15). Probed per destination, and only for
@@ -6684,6 +7480,8 @@ fn apply_incremental_renames(
         return Ok(RenameOutcome {
             decisions: Vec::new(),
             limited: Vec::new(),
+            notes: Vec::new(),
+            forced: Vec::new(),
         });
     }
     let mut decisions = Vec::new();
@@ -6819,15 +7617,20 @@ fn apply_incremental_renames(
                     .is_some_and(|moved| same_entry_kind(entry.mode, moved.mode))
             }) =>
             {
-                Some(RenameDeclined::SourceDeleted)
+                Some(if other_at(*index, &pair.old).is_some() {
+                    RenameDeclined::SourceTypeChanged
+                } else {
+                    RenameDeclined::SourceDeleted
+                })
             }
             None => None,
         });
     }
 
     // PASS 2 — occupancy, as the same fixed point the flattening engine runs:
-    // release every eligible source, then re-take the ones whose destination
-    // turns out to be occupied and re-check only what that could affect.
+    // release every eligible source, then re-take only the ones structurally
+    // blocked at their destination and re-check what that could affect. An
+    // exact file collision consumes its source in the MG-06 collision pass.
     for (slot, (index, pair)) in pairs.iter().enumerate() {
         if declined[slot].is_some() {
             continue;
@@ -6860,7 +7663,16 @@ fn apply_incremental_renames(
         if !taken {
             continue;
         }
-        declined[slot] = Some(RenameDeclined::DestinationTaken);
+        let exact_collision =
+            dest_at(1 - index, &pair.new).is_some_and(|entry| entry.mode != TreeItemMode::Tree);
+        declined[slot] = Some(if exact_collision {
+            RenameDeclined::DestinationCollision
+        } else {
+            RenameDeclined::DestinationBlocked
+        });
+        if exact_collision {
+            continue;
+        }
         if let Some((marker, at_own_path, _)) = held_at(index, &pair.old) {
             occupancy.apply(&pair.old, marker, at_own_path, 1);
             destination_dependents.requeue_blocked_by(&pair.old, &mut queue);
@@ -6893,7 +7705,7 @@ fn apply_incremental_renames(
     // ONE prune of the conflict list. Conflicts the resolution below pushes are
     // added afterwards, so they survive; two accepted renames never share a
     // path (a shared destination is declined as `SameDestination` or
-    // `DestinationTaken`), so the order within the pass does not matter.
+    // `DestinationCollision`), so the order within the pass does not matter.
     let mut renamed_paths: HashSet<PathBuf> = HashSet::new();
     for decision in &decisions {
         if decision.declined.is_some() {
@@ -6994,7 +7806,374 @@ fn apply_incremental_renames(
         };
         *files_changed = (*files_changed + truth).saturating_sub(counted_by_walk);
     }
-    Ok(RenameOutcome { decisions, limited })
+    // MG-06: the declines the walk left as "no rename" become Git's PATH-LEVEL
+    // conflicts here, over the walk's own output. The flattening engine does
+    // the same surgery on its maps before it resolves anything
+    // ([`apply_renames`]); both engines must land on the same result, which is
+    // what the double-walk cases assert.
+    let mut notes = Vec::new();
+    let mut folded: HashSet<PathBuf> = HashSet::new();
+    // A 2to1 collision updates each destination stage separately. Keep the
+    // first source's merged content when processing the second source.
+    let mut collision_inputs: HashMap<PathBuf, [Option<MergeTreeEntry>; 2]> = HashMap::new();
+    // Whatever the walk decided for a path the rename pass takes over is
+    // replaced wholesale: its merged entry and any conflict it recorded go,
+    // and the rename's own verdict (if any) takes their place.
+    let settle = |path: &PathBuf,
+                  kind: Option<ConflictKind>,
+                  merged: &mut HashMap<PathBuf, MergeTreeEntry>,
+                  conflicts: &mut Vec<(PathBuf, ConflictKind)>| {
+        merged.remove(path);
+        conflicts.retain(|(other, _)| other != path);
+        if let Some(kind) = kind {
+            conflicts.push((path.clone(), kind));
+        }
+    };
+    for decision in &decisions {
+        let index = match decision.side {
+            MergeSide::Ours => 0,
+            MergeSide::Theirs => 1,
+        };
+        match &decision.declined {
+            None => {}
+            Some(RenameDeclined::SameDestination) => {
+                // rename/rename(1to1): Git carries the base to the shared
+                // destination and merges normally there
+                // (`merge-ort.c:2991-3018`), so the add/add the walk saw
+                // becomes a three-way merge that can come out CLEAN.
+                let (Some(base_entry), Some(ours_entry), Some(theirs_entry)) = (
+                    base_at(index, &decision.old),
+                    dest_at(0, &decision.new),
+                    dest_at(1, &decision.new),
+                ) else {
+                    continue;
+                };
+                if !folded.insert(decision.new.clone()) {
+                    continue;
+                }
+                let resolved = resolve_three_way(
+                    Some(&base_entry),
+                    Some(&ours_entry),
+                    Some(&theirs_entry),
+                    context,
+                )?;
+                let before_counted = merged
+                    .get(&decision.new)
+                    .is_none_or(|entry| *entry != ours_entry)
+                    || conflicts.iter().any(|(path, _)| *path == decision.new);
+                settle(
+                    &decision.new,
+                    match resolved {
+                        MergeResolution::Conflict(kind) => Some(kind),
+                        _ => None,
+                    },
+                    merged,
+                    conflicts,
+                );
+                let after = match resolved {
+                    MergeResolution::Use(entry) => {
+                        merged.insert(decision.new.clone(), entry);
+                        Some(entry)
+                    }
+                    MergeResolution::Delete => None,
+                    MergeResolution::Conflict(_) => None,
+                };
+                let after_counted = after != Some(ours_entry);
+                *files_changed = (*files_changed + usize::from(after_counted))
+                    .saturating_sub(usize::from(before_counted));
+                // The old path is gone from both sides already; the walk
+                // resolved it as a clean delete, which is what Git does.
+            }
+            Some(RenameDeclined::DivergentRenames { theirs: other_path }) => {
+                if !folded.insert(decision.old.clone()) {
+                    continue;
+                }
+                let (ours_path, theirs_path) = match decision.side {
+                    MergeSide::Ours => (decision.new.clone(), other_path.clone()),
+                    MergeSide::Theirs => (other_path.clone(), decision.new.clone()),
+                };
+                let (Some(base_entry), Some(ours_entry), Some(theirs_entry)) = (
+                    base_at(index, &decision.old),
+                    dest_at(0, &ours_path),
+                    dest_at(1, &theirs_path),
+                ) else {
+                    continue;
+                };
+                let (merged_entry, merged_clean) = merge_rename_content(
+                    Some(&base_entry),
+                    &ours_entry,
+                    &theirs_entry,
+                    &format!(
+                        "{}:{}",
+                        df_branch_label(MergeSide::Ours, upstream),
+                        ours_path.display()
+                    ),
+                    &format!(
+                        "{}:{}",
+                        df_branch_label(MergeSide::Theirs, upstream),
+                        theirs_path.display()
+                    ),
+                    &format!("base:{}", decision.old.display()),
+                    conflict_style,
+                    context,
+                )?;
+                // Git's `was_binary_blob` fallback (`merge-ort.c:3032-3053`):
+                // when the content merge could not actually be performed it
+                // just TOOK one whole side, so copying that side's blob to both
+                // destinations would overwrite the other side's data. Git
+                // detects exactly that shape — an unclean merge whose result IS
+                // ours' input — and hands the second destination theirs'
+                // original object instead. Git's own regression
+                // `t/t6422-merge-rename-corner-cases.sh:1423-1438` requires the
+                // two destinations to equal the two sides' originals
+                // (Codex R1 P1-2).
+                let theirs_content = if !merged_clean && merged_entry == ours_entry {
+                    theirs_entry
+                } else {
+                    merged_entry
+                };
+                for (path, content, rename_side) in [
+                    (&ours_path, merged_entry, 0),
+                    (&theirs_path, theirs_content, 1),
+                ] {
+                    let original_ours = dest_at(0, path);
+                    let before_counted = merged.get(path).copied() != original_ours;
+                    let kind = match dest_at(1 - rename_side, path) {
+                        Some(added) => {
+                            let (ours_side, theirs_side) = if rename_side == 0 {
+                                (content, added)
+                            } else {
+                                (added, content)
+                            };
+                            rename_destination_conflict(
+                                &ours_side,
+                                &theirs_side,
+                                upstream,
+                                conflict_style,
+                                context,
+                            )?
+                        }
+                        None => ConflictKind::RenameMerged {
+                            content,
+                            kind: RenameConflictKind::RenameRename,
+                        },
+                    };
+                    settle(path, Some(kind), merged, conflicts);
+                    let ours_after_remap = if rename_side == 0 {
+                        Some(content)
+                    } else {
+                        original_ours
+                    };
+                    *files_changed = (*files_changed + usize::from(ours_after_remap.is_some()))
+                        .saturating_sub(usize::from(before_counted));
+                }
+                // The source is resolved by removal, not left unmerged — see
+                // the deviation note in `apply_renames`.
+                settle(&decision.old, None, merged, conflicts);
+                notes.push(RenameConflictNote::RenameRename {
+                    old: decision.old.clone(),
+                    ours_path,
+                    theirs_path,
+                });
+            }
+            Some(reason @ (RenameDeclined::SourceDeleted | RenameDeclined::SourceTypeChanged)) => {
+                let type_changed = *reason == RenameDeclined::SourceTypeChanged;
+                let Some(side_entry) = dest_at(index, &decision.new) else {
+                    continue;
+                };
+                // rename/add/delete: the destination is ALSO taken, and Git
+                // leaves it looking like an add/add (`merge-ort.c:3180-3188`).
+                let destination_taken = dest_at(1 - index, &decision.new).is_some();
+                if !destination_taken {
+                    settle(
+                        &decision.new,
+                        Some(match decision.side {
+                            MergeSide::Ours => ConflictKind::OursModifiedTheirsDeleted {
+                                ours: side_entry.hash,
+                            },
+                            MergeSide::Theirs => ConflictKind::TheirsModifiedOursDeleted {
+                                theirs: side_entry.hash,
+                            },
+                        }),
+                        merged,
+                        conflicts,
+                    );
+                    // Codex R1 P1-6. The walk decided the destination on its
+                    // own: when OURS renamed, it saw ours' own entry there and
+                    // counted nothing; when THEIRS renamed, it saw an add that
+                    // differs from ours' absence and counted one. Forcing the
+                    // conflict takes the path out of the result, so the truth —
+                    // what `count_item_map_changes(ours_after_remap, merged)`
+                    // sees — is one when ours holds a file there after the
+                    // remap (i.e. ours did the rename) and zero otherwise.
+                    let truth = usize::from(decision.side == MergeSide::Ours);
+                    let counted_by_walk = usize::from(decision.side == MergeSide::Theirs);
+                    *files_changed = (*files_changed + truth).saturating_sub(counted_by_walk);
+                } else if !type_changed {
+                    let (Some(ours_entry), Some(theirs_entry)) =
+                        (dest_at(0, &decision.new), dest_at(1, &decision.new))
+                    else {
+                        continue;
+                    };
+                    let before_counted = merged.get(&decision.new).copied() != Some(ours_entry);
+                    settle(
+                        &decision.new,
+                        Some(rename_destination_conflict(
+                            &ours_entry,
+                            &theirs_entry,
+                            upstream,
+                            conflict_style,
+                            context,
+                        )?),
+                        merged,
+                        conflicts,
+                    );
+                    *files_changed =
+                        (*files_changed + 1).saturating_sub(usize::from(before_counted));
+                }
+                if type_changed && destination_taken {
+                    // The base travels to the destination even though something
+                    // occupies it (Codex R1 P1-3), so the walk's base-less
+                    // add/add verdict has to be replaced by the three-way the
+                    // flattening engine forms there.
+                    if let (Some(base_entry), Some(other_entry)) = (
+                        base_at(index, &decision.old),
+                        dest_at(1 - index, &decision.new),
+                    ) {
+                        let (ours_side, theirs_side) = match decision.side {
+                            MergeSide::Ours => (side_entry, other_entry),
+                            MergeSide::Theirs => (other_entry, side_entry),
+                        };
+                        let resolved = resolve_three_way(
+                            Some(&base_entry),
+                            Some(&ours_side),
+                            Some(&theirs_side),
+                            context,
+                        )?;
+                        settle(
+                            &decision.new,
+                            match resolved {
+                                MergeResolution::Conflict(kind) => Some(kind),
+                                _ => None,
+                            },
+                            merged,
+                            conflicts,
+                        );
+                        if let MergeResolution::Use(entry) = resolved {
+                            merged.insert(decision.new.clone(), entry);
+                        }
+                    }
+                }
+                if type_changed {
+                    // Git clears only the BASE bit at the source
+                    // (`oldinfo->filemask &= 0x06`, `merge-ort.c:3211`), which
+                    // leaves the type-changed entry as a plain one-sided add —
+                    // the walk saw base + one side and called it modify/delete,
+                    // so its verdict has to be replaced. Measured on git 2.50.1
+                    // (`/Volumes/Data/tmp/mg06-git/ktype`): the result tree
+                    // holds `120000 old` beside the conflicted `new`.
+                    if let Some(surviving) = other_at(index, &decision.old) {
+                        settle(&decision.old, None, merged, conflicts);
+                        merged.insert(decision.old.clone(), surviving);
+                    }
+                } else {
+                    settle(&decision.old, None, merged, conflicts);
+                    notes.push(RenameConflictNote::RenameDelete {
+                        old: decision.old.clone(),
+                        new: decision.new.clone(),
+                        rename_side: decision.side,
+                    });
+                }
+            }
+            Some(RenameDeclined::DestinationCollision) => {
+                let (Some(base_entry), Some(side_entry), Some(other_entry)) = (
+                    base_at(index, &decision.old),
+                    dest_at(index, &decision.new),
+                    other_at(index, &decision.old),
+                ) else {
+                    continue;
+                };
+                let (ours_entry, theirs_entry) = match decision.side {
+                    MergeSide::Ours => (side_entry, other_entry),
+                    MergeSide::Theirs => (other_entry, side_entry),
+                };
+                let (rename_merged, clean) = merge_rename_content(
+                    Some(&base_entry),
+                    &ours_entry,
+                    &theirs_entry,
+                    // Codex R1 P2-1: only the renaming side carries the
+                    // destination path; the other side keeps the source.
+                    &format!(
+                        "{}:{}",
+                        df_branch_label(MergeSide::Ours, upstream),
+                        match decision.side {
+                            MergeSide::Ours => decision.new.display(),
+                            MergeSide::Theirs => decision.old.display(),
+                        }
+                    ),
+                    &format!(
+                        "{}:{}",
+                        df_branch_label(MergeSide::Theirs, upstream),
+                        match decision.side {
+                            MergeSide::Theirs => decision.new.display(),
+                            MergeSide::Ours => decision.old.display(),
+                        }
+                    ),
+                    &format!("base:{}", decision.old.display()),
+                    conflict_style,
+                    context,
+                )?;
+                // The destination becomes an add/add between the rename's own
+                // merge and whatever the other side put there — no base stage,
+                // exactly as measured for rename/add and rename/rename(2to1).
+                let destination = collision_inputs
+                    .entry(decision.new.clone())
+                    .or_insert_with(|| [dest_at(0, &decision.new), dest_at(1, &decision.new)]);
+                let counted_destination = merged.get(&decision.new).copied() != destination[0];
+                let original_source = match decision.side {
+                    MergeSide::Ours => None,
+                    MergeSide::Theirs => Some(other_entry),
+                };
+                let counted_source = merged.get(&decision.old).copied() != original_source;
+                destination[index] = Some(rename_merged);
+                let [ours_side, theirs_side] = *destination;
+                let resolved =
+                    resolve_three_way(None, ours_side.as_ref(), theirs_side.as_ref(), context)?;
+                settle(
+                    &decision.new,
+                    match resolved {
+                        MergeResolution::Conflict(kind) => Some(kind),
+                        _ => None,
+                    },
+                    merged,
+                    conflicts,
+                );
+                if let MergeResolution::Use(entry) = resolved {
+                    merged.insert(decision.new.clone(), entry);
+                }
+                settle(&decision.old, None, merged, conflicts);
+                // Compare against the same remapped ours that the flat path
+                // uses. Consuming a source removes its earlier walk count;
+                // a destination shared by two renames is counted only once.
+                let changed_destination = merged.get(&decision.new).copied() != ours_side;
+                *files_changed = (*files_changed + usize::from(changed_destination))
+                    .saturating_sub(usize::from(counted_destination) + usize::from(counted_source));
+                if !clean {
+                    notes.push(RenameConflictNote::Collision {
+                        old: decision.old.clone(),
+                        new: decision.new.clone(),
+                    });
+                }
+            }
+            Some(RenameDeclined::DestinationBlocked) => {}
+        }
+    }
+    Ok(RenameOutcome {
+        decisions,
+        limited,
+        notes,
+        forced: Vec::new(),
+    })
 }
 
 /// A path that is a FILE on one side and a DIRECTORY on the other — recorded
@@ -7449,6 +8628,12 @@ fn conflict_kind_name(kind: &ConflictKind) -> &'static str {
             ..
         } => "modify-delete",
         ConflictKind::FileDirectory { .. } => "file-directory",
+        // A 1to2 destination with another add is a content collision as well
+        // as a path conflict; pre-rendering must not hide that public kind.
+        ConflictKind::RenameMerged { kind, .. } => match kind {
+            RenameConflictKind::RenameRename => "rename-rename",
+            RenameConflictKind::Content => "content",
+        },
     }
 }
 
@@ -7646,6 +8831,16 @@ async fn perform_incremental_three_way_merge(
     // The walk resolved each path on its own; a detected rename joins two of
     // them, so the pair is re-resolved at the new path (Git's
     // `process_renames` does the same to its already-collected entries).
+    //
+    // MG-06: the rename pass now renders content merges of its own, so the
+    // conflict style is resolved BEFORE it rather than only on the conflict
+    // path — an invalid `merge.conflictStyle` stops the merge before anything
+    // is written either way, and a merge without renames still reads the
+    // config exactly once.
+    let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
+        ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
+        ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
+    })?;
     let mut rename_context =
         TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs);
     let rename_decisions = apply_incremental_renames(
@@ -7657,6 +8852,8 @@ async fn perform_incremental_three_way_merge(
         &mut conflicts,
         &mut files_changed,
         &mut rename_context,
+        conflict_style,
+        upstream,
         base_tree,
     )?;
     // Now the result is complete, so the collisions are settled last: an
@@ -7674,8 +8871,12 @@ async fn perform_incremental_three_way_merge(
     let renamed_paths: HashSet<&Path> = rename_decisions
         .decisions
         .iter()
-        .filter(|decision| decision.declined.is_none())
-        .flat_map(|decision| [decision.old.as_path(), decision.new.as_path()])
+        .flat_map(|decision| match &decision.declined {
+            None => [Some(decision.old.as_path()), Some(decision.new.as_path())],
+            Some(RenameDeclined::DestinationCollision) => [Some(decision.old.as_path()), None],
+            _ => [None, None],
+        })
+        .flatten()
         .collect();
     let df_candidates: Vec<DfCandidate> = df_candidates
         .into_iter()
@@ -7694,7 +8895,7 @@ async fn perform_incremental_three_way_merge(
         // — and it must still report the rename decisions the real merge would
         // make (Codex R13 P2). `--json`/`--machine` stay silent, as always.
         announce_rename_notices(
-            &rename_decisions.decisions,
+            &rename_decisions.notes,
             &rename_decisions.limited,
             upstream,
             options.output,
@@ -7770,10 +8971,6 @@ async fn perform_incremental_three_way_merge(
         // lists every file. Reads here are O(tree), as the flattening path's
         // were; the pruning pays off on the decision and on the clean path.
         expand_adopted_subtrees(&mut source, &mut merged_items)?;
-        let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
-            ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
-            ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
-        })?;
         let (mut base_items, _) = match base_tree {
             Some(id) => split_gitlink_entries(tree_leaves(&mut source, id)?),
             None => (HashMap::new(), GitlinkEntries::new()),
@@ -7785,12 +8982,27 @@ async fn perform_incremental_three_way_merge(
         // MG-05: a conflict the rename moved is unmerged at the NEW path, so
         // its stages must be looked up there — the same remap the flattening
         // engine applies to its maps before it resolves anything.
+        // MG-06: replaying the SAME surgery the walk's rename pass performed
+        // is what makes the stages agree with it — a rename/rename(1to2) puts
+        // the one merged blob on both destinations and keeps the base under
+        // the old name, a collision drops the source entirely. The content
+        // merges are deterministic, so replaying them re-derives the identical
+        // object ids; the forced conflicts are already in `conflicts` and the
+        // replay's copy is discarded.
+        let mut replayed_forced = Vec::new();
         apply_renames(
             &mut base_items,
             &mut our_items,
             &mut their_items,
             &rename_decisions.decisions,
-        );
+            &mut replayed_forced,
+            conflict_style,
+            (
+                df_branch_label(MergeSide::Ours, upstream).as_str(),
+                upstream,
+            ),
+            &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
+        )?;
         conflicts.sort_by(|(left, _), (right, _)| left.cmp(right));
         let placements = conflict_placements(
             &conflicts,
@@ -7806,6 +9018,7 @@ async fn perform_incremental_three_way_merge(
         write_conflicted_merge_state(MergeConflictInput {
             head_name,
             message: resolved_message,
+            squash: options.squash,
             upstream: upstream.to_string(),
             base: recorded_base,
             allow_unrelated_histories: options.allow_unrelated_histories,
@@ -7823,7 +9036,7 @@ async fn perform_incremental_three_way_merge(
         // symlink traversal, directory takeover) may still refuse the merge,
         // and Git prints nothing when it does. Same for the rename notices.
         announce_rename_notices(
-            &rename_decisions.decisions,
+            &rename_decisions.notes,
             &rename_decisions.limited,
             upstream,
             options.output,
@@ -7832,8 +9045,15 @@ async fn perform_incremental_three_way_merge(
         if let Err(error) = crate::command::rerere::auto_update(false).await {
             tracing::warn!("rerere auto-update after merge conflict failed: {error}");
         }
-        let paths = MergeState::load_required()?.conflicted_paths.join(", ");
-        return Err(PullMergeError::Conflicts { paths });
+        let paths = placements
+            .iter()
+            .map(|(path, _, _)| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(PullMergeError::Conflicts {
+            paths,
+            squash: options.squash,
+        });
     }
 
     let current_index =
@@ -7853,7 +9073,7 @@ async fn perform_incremental_three_way_merge(
     // The preflight passed, so the merge will happen: the rename notices can be
     // printed now (Codex R12 P2 — a refused merge prints no rename decision).
     announce_rename_notices(
-        &rename_decisions.decisions,
+        &rename_decisions.notes,
         &rename_decisions.limited,
         upstream,
         options.output,
@@ -8572,6 +9792,14 @@ fn write_conflict_markers(
             let blob: Blob = load_object(&file.hash).map_err(|error| error.to_string())?;
             blob.data
         }
+        // MG-06: already the merged result Git recorded for the rename
+        // (`merge-ort.c:3021-3053`), including its conflict markers when the
+        // content merge was not clean — written verbatim, never marked up
+        // twice.
+        ConflictKind::RenameMerged { content, .. } => {
+            let blob: Blob = load_object(&content.hash).map_err(|error| error.to_string())?;
+            return write_workdir_entry(workdir, path, content.mode, &blob.data);
+        }
     };
     write_workdir_file(workdir, path, &content)
 }
@@ -8664,6 +9892,7 @@ pub(crate) fn render_line_level_conflict(
             marker_len,
             "HEAD",
             commit_label,
+            "base",
         )),
         // Content merged cleanly with no markers (no real text conflict — e.g. a
         // mode-only divergence): let the caller surface it as a whole-file
@@ -8710,6 +9939,11 @@ fn relabel_conflict_markers(
     marker_len: usize,
     ours_label: &str,
     theirs_label: &str,
+    // The `|||||||` label under `diff3`. Git names the merge base
+    // `<ancestor>` when all three paths are the same and `<ancestor>:<path>`
+    // when they are not (`merge-ort.c:2147-2155`), so a rename-driven merge
+    // labels it with the SOURCE path (Codex R1 P2-2).
+    base_label: &str,
 ) -> Vec<u8> {
     let open = "<".repeat(marker_len);
     let close = ">".repeat(marker_len);
@@ -8721,7 +9955,7 @@ fn relabel_conflict_markers(
     let head_marker = format!("{open} {ours_label}");
     let label_marker = format!("{close} {theirs_label}");
     // Match the `||||||| base` label convention `restore --conflict=diff3` uses.
-    let base_marker = format!("{bars} base");
+    let base_marker = format!("{bars} {base_label}");
 
     // Byte-wise, never through `String::from_utf8_lossy`: the recursive
     // virtual-ancestor fold relabels content that Git's binary rule considers
@@ -8948,8 +10182,23 @@ fn short_object_id(object_id: &ObjectHash) -> String {
 }
 
 #[cfg(test)]
+#[path = "merge_rename_content_test.rs"]
+mod merge_rename_content_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_cli_hints_preserve_both_resolution_and_abort_choices() {
+        let cli = merge_error_to_cli(PullMergeError::Conflicts {
+            paths: "renamed.txt".to_string(),
+            squash: false,
+        });
+        let rendered = cli.render();
+        assert_eq!(rendered.matches("libra merge --continue").count(), 1);
+        assert_eq!(rendered.matches("libra merge --abort").count(), 1);
+    }
 
     fn merge_entry(byte: u8, mode: TreeItemMode) -> MergeTreeEntry {
         MergeTreeEntry {
@@ -11250,21 +12499,52 @@ mod rename {
 
     use super::*;
 
-    fn file(content: &str) -> MergeTreeEntry {
+    pub(super) fn file(content: &str) -> MergeTreeEntry {
         MergeTreeEntry {
             hash: Blob::from_content(content).id,
             mode: TreeItemMode::Blob,
         }
     }
 
-    fn items(entries: &[(&str, MergeTreeEntry)]) -> HashMap<PathBuf, MergeTreeEntry> {
+    pub(super) fn items(entries: &[(&str, MergeTreeEntry)]) -> HashMap<PathBuf, MergeTreeEntry> {
         entries
             .iter()
             .map(|(path, entry)| (PathBuf::from(path), *entry))
             .collect()
     }
 
-    fn pair(old: &str, new: &str) -> rename_detect::RenameMatch {
+    /// MG-06: [`apply_renames`] now merges content for the collision and 1to2
+    /// shapes, so the unit tests hand it a blob store already holding the
+    /// fixtures' contents. `persist` is false, so nothing reaches the object
+    /// store and every merged blob stays addressable in memory.
+    pub(super) fn apply_for_test(
+        base: &mut HashMap<PathBuf, MergeTreeEntry>,
+        ours: &mut HashMap<PathBuf, MergeTreeEntry>,
+        theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
+        decisions: &[RenameDecision],
+        contents: &[&str],
+    ) -> (Vec<(PathBuf, ConflictKind)>, Vec<RenameConflictNote>) {
+        let mut blobs = VirtualBlobs::new();
+        for content in contents {
+            let blob = Blob::from_content(content);
+            blobs.insert(blob.id, blob.data.clone());
+        }
+        let mut forced = Vec::new();
+        let notes = apply_renames(
+            base,
+            ours,
+            theirs,
+            decisions,
+            &mut forced,
+            diffy::ConflictStyle::Merge,
+            ("HEAD", "feature"),
+            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+        )
+        .expect("the rename pass succeeds");
+        (forced, notes)
+    }
+
+    pub(super) fn pair(old: &str, new: &str) -> rename_detect::RenameMatch {
         rename_detect::RenameMatch {
             old: PathBuf::from(old),
             new: PathBuf::from(new),
@@ -11322,7 +12602,13 @@ mod rename {
         let mut theirs = items(&[("old.txt", theirs_entry)]);
         let decisions = decide_renames(&base, &ours, &theirs, &[pair("old.txt", "new.txt")], &[]);
         assert!(decisions[0].declined.is_none());
-        apply_renames(&mut base, &mut ours, &mut theirs, &decisions);
+        apply_for_test(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &decisions,
+            &["base\n", "theirs\n"],
+        );
         assert_eq!(base.get(Path::new("new.txt")), Some(&base_entry));
         assert_eq!(theirs.get(Path::new("new.txt")), Some(&theirs_entry));
         assert!(!base.contains_key(Path::new("old.txt")));
@@ -11332,7 +12618,7 @@ mod rename {
     /// Every shape MG-05 leaves to MG-06 is declined with a reason, and
     /// declining changes nothing about the maps.
     #[test]
-    fn the_shapes_left_to_mg06_are_declined_with_a_reason() {
+    fn path_level_rename_shapes_are_classified_and_the_collision_is_settled() {
         let base_entry = file("base\n");
         // Both sides renamed the source, to different paths and to the same.
         let base = items(&[("old.txt", base_entry)]);
@@ -11362,20 +12648,90 @@ mod rename {
         let theirs = items(&[("unrelated.txt", file("u\n"))]);
         let decisions = decide_renames(&base, &ours, &theirs, &[pair("old.txt", "ours.txt")], &[]);
         assert_eq!(decisions[0].declined, Some(RenameDeclined::SourceDeleted));
-        // Something already occupies the destination: rename/add.
-        let theirs = items(&[("old.txt", base_entry), ("ours.txt", file("theirs add\n"))]);
+        // The other side replaced the source with a different KIND of entry:
+        // Git's `type_changed` branch, NOT a rename/delete (`merge-ort.c:3205`).
+        let link = MergeTreeEntry {
+            hash: Blob::from_content("target").id,
+            mode: TreeItemMode::Link,
+        };
+        let theirs = items(&[("old.txt", link)]);
         let decisions = decide_renames(&base, &ours, &theirs, &[pair("old.txt", "ours.txt")], &[]);
         assert_eq!(
             decisions[0].declined,
-            Some(RenameDeclined::DestinationTaken)
+            Some(RenameDeclined::SourceTypeChanged)
+        );
+        // A file at the exact destination is rename/add, and the collision
+        // consumes the source. Structural occupancy is classified separately
+        // because it leaves the source in place.
+        let collision_theirs =
+            items(&[("old.txt", base_entry), ("ours.txt", file("theirs add\n"))]);
+        let decisions = decide_renames(
+            &base,
+            &ours,
+            &collision_theirs,
+            &[pair("old.txt", "ours.txt")],
+            &[],
+        );
+        assert_eq!(
+            decisions[0].declined,
+            Some(RenameDeclined::DestinationCollision)
+        );
+        let theirs = items(&[
+            ("old.txt", base_entry),
+            ("ours.txt/child", file("theirs child\n")),
+        ]);
+        let blocked = decide_renames(&base, &ours, &theirs, &[pair("old.txt", "ours.txt")], &[]);
+        assert_eq!(
+            blocked[0].declined,
+            Some(RenameDeclined::DestinationBlocked)
         );
 
+        // MG-06: a collision no longer degrades to "no rename". Git merges the
+        // rename itself first — base source, the renaming side's landing spot,
+        // the other side's source — parks that result at the renaming side's
+        // stage of the destination, and resolves the SOURCE by removal
+        // (`merge-ort.c:3137-3179`), leaving the destination an add/add with no
+        // base stage.
         let mut base_copy = base.clone();
         let mut ours_copy = ours.clone();
-        let mut theirs_copy = theirs.clone();
-        apply_renames(&mut base_copy, &mut ours_copy, &mut theirs_copy, &decisions);
-        assert_eq!(base_copy, base, "a declined rename rewrites nothing");
-        assert_eq!(theirs_copy, theirs);
+        let mut theirs_copy = collision_theirs.clone();
+        let (forced, notes) = apply_for_test(
+            &mut base_copy,
+            &mut ours_copy,
+            &mut theirs_copy,
+            &decisions,
+            &["base\n", "ours\n", "theirs add\n"],
+        );
+        assert!(
+            !base_copy.contains_key(Path::new("old.txt"))
+                && !ours_copy.contains_key(Path::new("old.txt"))
+                && !theirs_copy.contains_key(Path::new("old.txt")),
+            "the source is resolved by removal on every side"
+        );
+        assert!(
+            !base_copy.contains_key(Path::new("ours.txt")),
+            "the destination records no merge base, so it is an add/add"
+        );
+        assert_eq!(
+            ours_copy.get(Path::new("ours.txt")).map(|entry| entry.hash),
+            Some(base_entry.hash),
+            "the destination holds the rename's OWN merge — base, ours' landing \
+             spot and theirs' source are all the base content here, so that \
+             merge is the base content"
+        );
+        assert_eq!(
+            theirs_copy.get(Path::new("ours.txt")),
+            collision_theirs.get(Path::new("ours.txt")),
+            "the other side's entry stays where it is"
+        );
+        assert!(
+            forced.is_empty(),
+            "a collision needs no forced conflict: the add/add is the ordinary match's own verdict"
+        );
+        assert!(
+            notes.is_empty(),
+            "the rename's own merge is clean here, so Git prints nothing extra"
+        );
     }
 
     /// G6: past `merge.renameLimit` the engine drops the inexact stage —
@@ -11843,5 +13199,166 @@ mod df {
         relocate_virtual_df_files(&mut merged, &base, &theirs, &ours);
         assert!(merged.contains_key(Path::new("foo~Temporary merge branch 2_0")));
         assert!(merged.contains_key(Path::new("foo/bar.txt")));
+    }
+}
+
+/// MG-06 G9: the index stage combination each path-level rename shape leaves,
+/// asserted where it is decided — on the three maps a conflict's stages are
+/// read from (`merge.rs` builds stage 1/2/3 from base/ours/theirs at the
+/// conflict path) plus the conflicts the rename pass forces. Every expectation
+/// is the shape measured on git 2.50.1; the CLI cases in
+/// `command::merge_test::merge_rename_conflict*` pin the same combinations end
+/// to end, on both walks.
+#[cfg(test)]
+mod rename_conflict {
+    use git_internal::internal::object::blob::Blob;
+
+    use super::{
+        rename::{apply_for_test, file, items, pair},
+        *,
+    };
+
+    /// Which stages a path would get, in the order the index writer reads them.
+    fn stages_at(
+        base: &HashMap<PathBuf, MergeTreeEntry>,
+        ours: &HashMap<PathBuf, MergeTreeEntry>,
+        theirs: &HashMap<PathBuf, MergeTreeEntry>,
+        path: &str,
+    ) -> Vec<u8> {
+        let path = PathBuf::from(path);
+        let mut stages = Vec::new();
+        for (stage, map) in [(1u8, base), (2, ours), (3, theirs)] {
+            if map
+                .get(&path)
+                .is_some_and(|entry| entry.mode != TreeItemMode::Tree)
+            {
+                stages.push(stage);
+            }
+        }
+        stages
+    }
+
+    /// rename/rename(1to2): stage 1 stays under the OLD name, each destination
+    /// carries only its own side, and both destinations hold the SAME merged
+    /// object (`merge-ort.c:3021-3068`). Measured: `1 old`, `2 a`, `3 b`.
+    #[test]
+    fn one_to_two_records_both_destinations_and_drops_the_source() {
+        let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+        let ours_entry = file("l1\nOURS\nl3\nl4\nl5\nl6\nl7\nl8\n");
+        let theirs_entry = file("l1\nl2\nTHEIRS\nl4\nl5\nl6\nl7\nl8\n");
+        let mut base = items(&[("old", base_entry)]);
+        let mut ours = items(&[("a", ours_entry)]);
+        let mut theirs = items(&[("b", theirs_entry)]);
+        let decisions = decide_renames(
+            &base,
+            &ours,
+            &theirs,
+            &[pair("old", "a")],
+            &[pair("old", "b")],
+        );
+        let (forced, notes) = apply_for_test(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &decisions,
+            &[
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n",
+                "l1\nOURS\nl3\nl4\nl5\nl6\nl7\nl8\n",
+                "l1\nl2\nTHEIRS\nl4\nl5\nl6\nl7\nl8\n",
+            ],
+        );
+        // Deviation from Git, documented in `apply_renames`: the source is
+        // resolved by removal so the conflict stays resolvable.
+        assert!(stages_at(&base, &ours, &theirs, "old").is_empty());
+        assert_eq!(stages_at(&base, &ours, &theirs, "a"), vec![2]);
+        assert_eq!(stages_at(&base, &ours, &theirs, "b"), vec![3]);
+        assert_eq!(
+            ours.get(Path::new("a")),
+            theirs.get(Path::new("b")),
+            "ONE content merge is recorded at both destinations"
+        );
+        let forced_paths: Vec<&Path> = forced.iter().map(|(path, _)| path.as_path()).collect();
+        assert!(
+            forced_paths.contains(&Path::new("a")) && forced_paths.contains(&Path::new("b")),
+            "both destinations are conflicts the ordinary match must not decide: {forced_paths:?}"
+        );
+        assert!(
+            !forced_paths.contains(&Path::new("old")),
+            "the source is not a conflict: {forced_paths:?}"
+        );
+        assert!(matches!(
+            notes.as_slice(),
+            [RenameConflictNote::RenameRename { .. }]
+        ));
+    }
+
+    /// rename/delete: the base moves to the NEW path's stage 1, the renaming
+    /// side keeps its stage, the deleting side has none, and the conflict is
+    /// forced even for a PURE rename (`merge-ort.c:3202-3221`).
+    #[test]
+    fn rename_delete_moves_the_base_to_the_new_path() {
+        let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+        let mut base = items(&[("old", base_entry)]);
+        let mut ours = items(&[("new", base_entry)]);
+        let mut theirs = items(&[("unrelated", file("u\n"))]);
+        let decisions = decide_renames(&base, &ours, &theirs, &[pair("old", "new")], &[]);
+        assert_eq!(decisions[0].declined, Some(RenameDeclined::SourceDeleted));
+        let (forced, notes) = apply_for_test(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &decisions,
+            &["l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n"],
+        );
+        assert_eq!(stages_at(&base, &ours, &theirs, "new"), vec![1, 2]);
+        assert!(stages_at(&base, &ours, &theirs, "old").is_empty());
+        assert!(
+            matches!(
+                forced.as_slice(),
+                [(path, ConflictKind::OursModifiedTheirsDeleted { .. })] if path == Path::new("new")
+            ),
+            "a pure rename plus a delete is still forced to conflict: {forced:?}"
+        );
+        assert!(matches!(
+            notes.as_slice(),
+            [RenameConflictNote::RenameDelete { .. }]
+        ));
+    }
+
+    /// A source the other side TYPE-changed is not a rename/delete: the base
+    /// still follows the rename, but the type-changed entry SURVIVES under the
+    /// old name and Git says nothing about a rename (`merge-ort.c:3205-3212`).
+    #[test]
+    fn a_type_changed_source_survives_and_is_not_announced() {
+        let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+        let link = MergeTreeEntry {
+            hash: Blob::from_content("target").id,
+            mode: TreeItemMode::Link,
+        };
+        let mut base = items(&[("old", base_entry)]);
+        let mut ours = items(&[("new", base_entry)]);
+        let mut theirs = items(&[("old", link)]);
+        let decisions = decide_renames(&base, &ours, &theirs, &[pair("old", "new")], &[]);
+        assert_eq!(
+            decisions[0].declined,
+            Some(RenameDeclined::SourceTypeChanged)
+        );
+        let (_, notes) = apply_for_test(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &decisions,
+            &["l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n"],
+        );
+        assert_eq!(stages_at(&base, &ours, &theirs, "new"), vec![1, 2]);
+        assert_eq!(
+            theirs.get(Path::new("old")),
+            Some(&link),
+            "the type-changed entry keeps the old name"
+        );
+        assert!(
+            notes.is_empty(),
+            "Git prints no rename line for a type change: {notes:?}"
+        );
     }
 }

@@ -7341,11 +7341,13 @@ fn merge_rename_conflict_is_presented_at_the_new_path() {
     }
 }
 
-/// G7: both sides rename the same file to DIFFERENT paths. MG-05 does not
-/// arbitrate that (MG-06 turns it into a rename/rename conflict): the merge
-/// says so and proceeds as if neither rename had been detected.
+/// Both sides rename the same file to DIFFERENT paths. MG-05 left this
+/// unarbitrated — a notice, then a merge that behaved as if neither rename had
+/// been detected — and MG-06 turns it into Git's rename/rename conflict. The
+/// fixture is kept as the regression for that transition; the shape's stages,
+/// merged blob and markers are pinned by `merge_rename_conflict_1to2_*`.
 #[test]
-fn merge_divergent_renames_report_a_notice_and_skip_detection() {
+fn merge_divergent_renames_conflict_as_rename_rename() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
     let base = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
@@ -7366,16 +7368,23 @@ fn merge_divergent_renames_report_a_notice_and_skip_detection() {
     );
     assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
 
-    let out = run_libra_command(&["merge", "feature"], p);
-    assert_cli_success(&out, "the merge still completes");
+    let out = merge_expecting_conflict(p, &["merge", "feature"], &[]);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
-        stdout.contains("was renamed to") && stdout.contains("on the other side"),
-        "the divergent renames are reported: {stdout}"
+        stdout.contains(
+            "CONFLICT (rename/rename): old.txt renamed to ours.txt in HEAD and to theirs.txt in feature."
+        ),
+        "the divergent renames are reported in Git's words: {stdout}"
     );
-    // Without rename detection both destinations are plain one-sided adds.
+    // Both destinations are kept, and the source keeps neither a working-tree
+    // file nor an index stage. What changed from MG-05 is that the destination
+    // pair is now an explicit path-level conflict.
     assert!(p.join("ours.txt").is_file() && p.join("theirs.txt").is_file());
     assert!(!p.join("old.txt").exists());
+    assert!(
+        index_stage_lines(p, "old.txt").is_empty(),
+        "the source is resolved by removal (deviation documented in apply_renames)"
+    );
 }
 
 /// The notices are human output only: `--json` keeps stdout machine-clean.
@@ -7401,12 +7410,27 @@ fn merge_rename_notices_stay_out_of_json_output() {
     );
     assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
 
+    // MG-06: this shape is a rename/rename(1to2) conflict now, so the envelope
+    // reports the failure — but stdout must still be EXACTLY that envelope,
+    // with none of the human-readable CONFLICT prose leaking into it.
     let out = run_libra_command(&["--json", "merge", "feature"], p);
-    assert_cli_success(&out, "merge");
-    let json = parse_json_stdout(&out);
     assert_eq!(
-        json["ok"], true,
-        "stdout is exactly the JSON envelope: {json}"
+        out.status.code(),
+        Some(128),
+        "rename/rename(1to2) conflicts"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !stdout.contains("CONFLICT (") && !stdout.contains("notice:"),
+        "the human-readable rename lines stay out of machine output: {stdout}"
+    );
+    // A conflicted merge reports through the error envelope on stderr, so
+    // stdout carries nothing at all here.
+    let (stderr, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-002", "{stderr}");
+    assert!(
+        !stderr.contains("renamed to"),
+        "the envelope carries the code, not the prose: {stderr}"
     );
 }
 
@@ -7908,9 +7932,15 @@ fn merge_rename_onto_a_path_the_other_side_added_keeps_both_sides() {
 
         let output = merge_expecting_conflict(p, &["merge", "feature"], env);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // MG-06: Git prints NO rename line here — `merge-ort.c` has no
+        // `CONFLICT (rename/add)` at all, and the collision branch only speaks
+        // up when the rename's OWN merge was unclean (it is clean here: only
+        // ours touched the file). Measured on git 2.50.1
+        // (`/Volumes/Data/tmp/mg06-git/radd`): the sole message is
+        // `CONFLICT (add/add): Merge conflict in new`.
         assert!(
-            stdout.contains("which another side already occupies"),
-            "walk {env:?}: the declined rename is reported: {stdout}"
+            !stdout.contains("rename/") && !stdout.contains("notice:"),
+            "walk {env:?}: no rename line is printed for a clean collision: {stdout}"
         );
         let markers = std::fs::read_to_string(p.join("new.txt")).expect("conflicted file");
         assert!(
@@ -7922,6 +7952,13 @@ fn merge_rename_onto_a_path_the_other_side_added_keeps_both_sides() {
             stages.iter().any(|line| line.contains(" 2\t"))
                 && stages.iter().any(|line| line.contains(" 3\t")),
             "walk {env:?}: an add/add conflict keeps both sides: {stages:?}"
+        );
+        // Git records NO merge base at the destination for a collision
+        // (`merge-ort.c:3137-3179` never copies `base->stages[0]` there), so
+        // the conflict is a genuine add/add. Measured: stages 2 and 3 only.
+        assert!(
+            !stages.iter().any(|line| line.contains(" 1\t")),
+            "walk {env:?}: a collision records no base stage: {stages:?}"
         );
     }
 }
@@ -9209,8 +9246,13 @@ fn merge_three_renames_emptying_one_directory_all_apply() {
 /// stays — and that can block a further rename that was counting on it moving.
 /// Releasing every source once and deciding once accepted both, which left a
 /// file and a directory sharing the name `new` in the index (`ls-files` failed
-/// with EISDIR). The decision is now a fixed point: both walks decline both
-/// renames, agree exactly, and keep every side's content on a stage.
+/// with EISDIR); the decision is a fixed point, and both walks still agree
+/// exactly on it.
+///
+/// MG-06 then took the outcome to Git's: the first rename is used and merges
+/// cleanly, the second collides with theirs' added `z` as a base-less add/add,
+/// and both sources are resolved by removal — every blob id asserted below is
+/// Git's own, measured on git 2.50.1.
 #[test]
 fn merge_a_blocked_rename_keeps_its_source_occupied() {
     let mut results = Vec::new();
@@ -9287,15 +9329,37 @@ fn merge_a_blocked_rename_keeps_its_source_occupied() {
             .map(|line| line.to_string())
             .collect();
         stages.sort();
+        // MG-06 brings this chain to Git's own answer. Measured on git 2.50.1
+        // (`/Volumes/Data/tmp/mg06-git/blocked`, `git merge-tree --messages`):
+        // `old` -> `new` is USED and merges cleanly, carrying theirs' edit
+        // (blob `5a094330…`), while `new/child` -> `z` collides with theirs'
+        // added `z` and comes out as a base-less add/add (stages `a8aa0f7b…`
+        // and `b49573fd…`); the sole message is
+        // `CONFLICT (add/add): Merge conflict in z`. Every blob id below is
+        // Git's, byte for byte. Before MG-06 Libra declined BOTH renames and
+        // left `new` absent — safe (Codex R16 fixed an index corruption that
+        // way) but not what Git does.
         assert!(
-            !stages.iter().any(|line| line.ends_with("\tnew")),
-            "walk {env:?}: no file sits at `new` while `new/child` is unmerged: {stages:?}"
+            stages.iter().any(|line| line.contains(" 0\tnew")
+                && line.contains("5a094330b268dbf633b76f4ebd1e61d2aad066e1")),
+            "walk {env:?}: the rename is used and merges cleanly, as Git's does: {stages:?}"
         );
-        // Theirs' edit to the blocked rename's source survives on a stage.
-        let old_stages = index_stage_lines(p, "old");
+        let z_stages = index_stage_lines(p, "z");
         assert!(
-            old_stages.iter().any(|line| line.contains(" 3\t")),
-            "walk {env:?}: theirs' edit to `old` is kept: {old_stages:?}"
+            z_stages.iter().any(|line| line.contains(" 2\t")
+                && line.contains("a8aa0f7b7e73a0c2b690f9fde090dad0985e1399"))
+                && z_stages.iter().any(|line| line.contains(" 3\t")
+                    && line.contains("b49573fdc4779b84118727665b110636da2463f0")),
+            "walk {env:?}: the second rename collides as a base-less add/add: {z_stages:?}"
+        );
+        assert!(
+            !z_stages.iter().any(|line| line.contains(" 1\t")),
+            "walk {env:?}: a collision records no merge base: {z_stages:?}"
+        );
+        // Both rename sources are resolved by removal, as Git resolves them.
+        assert!(
+            index_stage_lines(p, "old").is_empty() && index_stage_lines(p, "new/child").is_empty(),
+            "walk {env:?}: neither source survives: {stages:?}"
         );
         results.push(stages);
     }
@@ -9305,13 +9369,12 @@ fn merge_a_blocked_rename_keeps_its_source_occupied() {
     );
 }
 
-/// MG-05 fixed-point complement to R16: re-taking a blocked rename source must
-/// also re-check destinations BELOW that source. Here `a -> x` is blocked by
-/// the other side's independent `x`, so file `a` stays and must in turn block
-/// the optimistically released `b -> a/child`. Missing that descendant edge
-/// leaves a file and one of its children in the same index/tree.
+/// MG-06 collision/structural-block split: the independent `x` is an exact
+/// destination collision for `a -> x`, so that rename consumes source `a`
+/// rather than reoccupying it. The now-valid `b -> a/child` must remain clean,
+/// and stale pre-rename D/F bookkeeping must not resurrect `a` under a suffix.
 #[test]
-fn merge_a_reoccupied_rename_source_blocks_descendant_destinations() {
+fn merge_collision_consumed_source_is_not_restored_as_a_df_conflict() {
     let mut results = Vec::new();
     for env in [
         &[][..],
@@ -9352,10 +9415,14 @@ fn merge_a_reoccupied_rename_source_blocks_descendant_destinations() {
 
         assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
         assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
-        std::fs::write(p.join("a"), a_body.replace("a2\n", "a2 EDIT\n")).expect("edit a");
-        std::fs::write(p.join("b"), b_body.replace("b2\n", "b2 EDIT\n")).expect("edit b");
-        // This blocks `a -> x`; re-taking source `a` must then block the
-        // descendant destination `a/child` as well.
+        let edited_a = a_body.replace("a2\n", "a2 EDIT\n");
+        let edited_b = b_body.replace("b2\n", "b2 EDIT\n");
+        std::fs::write(p.join("a"), &edited_a).expect("edit a");
+        std::fs::write(p.join("b"), &edited_b).expect("edit b");
+        // `a -> x` collides with this independent add. Path-level rename
+        // arbitration consumes source `a`; that makes room for `b -> a/child`.
+        // Git 2.54.0 keeps the latter as a clean stage-0 path and does not
+        // resurrect `a` as a stale file/directory conflict afterwards.
         std::fs::write(p.join("x"), "theirs own x\n").expect("x");
         assert_cli_success(&run_libra_command(&["add", "a", "b", "x"], p), "stage");
         assert_cli_success(
@@ -9382,16 +9449,30 @@ fn merge_a_reoccupied_rename_source_blocks_descendant_destinations() {
             .map(|line| line.to_string())
             .collect();
         stages.sort();
-        let b_stages = index_stage_lines(p, "b");
+        let child_stages = index_stage_lines(p, "a/child");
+        assert_eq!(child_stages.len(), 1, "walk {env:?}: {stages:?}");
         assert!(
-            b_stages.iter().any(|line| line.contains(" 3\t")),
-            "walk {env:?}: theirs' edit to blocked source `b` survives: {stages:?}"
+            child_stages[0].contains(" 0\ta/child"),
+            "walk {env:?}: the moved `b` is resolved at stage 0: {stages:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("a/child")).expect("a/child result"),
+            edited_b,
+            "walk {env:?}: the moved path keeps the other side's source edit"
+        );
+        assert!(
+            index_stage_lines(p, "b").is_empty() && !p.join("b").exists(),
+            "walk {env:?}: the consumed source `b` stays absent: {stages:?}"
+        );
+        assert!(
+            index_stage_lines(p, "a~feature").is_empty() && !p.join("a~feature").exists(),
+            "walk {env:?}: the consumed source `a` must not return as a D/F conflict: {stages:?}"
         );
         results.push(stages);
     }
     assert_eq!(
         results[0], results[1],
-        "the two walks agree on the descendant dependency"
+        "the two walks agree after both colliding renames consume their sources"
     );
 }
 
@@ -9719,12 +9800,14 @@ fn merge_does_not_pair_empty_blobs_as_renames() {
     }
 }
 
-/// Codex R13 P2: holding the rename notices until the write preflight must not
-/// silence `--dry-run`, which writes nothing and so has no preflight to wait
-/// for. A preview reports the same rename decisions the real merge would make;
-/// `--json` stays machine-clean as always.
+/// Codex R13 P2: holding the rename announcements until the write preflight
+/// must not silence `--dry-run`, which writes nothing and so has no preflight
+/// to wait for. A preview reports the same rename decisions the real merge
+/// would make; `--json` stays machine-clean as always. MG-06 turned this
+/// shape's notice into Git's rename/rename CONFLICT line, so the preview now
+/// carries that line — and, like every would-conflict preview, exits 1.
 #[test]
-fn merge_dry_run_reports_rename_notices() {
+fn merge_dry_run_reports_rename_decisions() {
     for env in [
         &[][..],
         &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
@@ -9754,11 +9837,15 @@ fn merge_dry_run_reports_rename_notices() {
 
         let preview =
             run_libra_command_with_stdin_and_env(&["merge", "--dry-run", "feature"], p, "", env);
-        assert_cli_success(&preview, "the preview succeeds");
+        assert_eq!(
+            preview.status.code(),
+            Some(1),
+            "walk {env:?}: a would-conflict preview exits 1"
+        );
         let stdout = String::from_utf8_lossy(&preview.stdout).to_string();
         assert!(
-            stdout.contains("was renamed to"),
-            "walk {env:?}: the preview reports the declined rename: {stdout}"
+            stdout.contains("CONFLICT (rename/rename):"),
+            "walk {env:?}: the preview reports the rename decision: {stdout}"
         );
 
         let json = run_libra_command_with_stdin_and_env(
@@ -9767,10 +9854,10 @@ fn merge_dry_run_reports_rename_notices() {
             "",
             env,
         );
-        assert_cli_success(&json, "the json preview succeeds");
+        assert_eq!(json.status.code(), Some(1), "walk {env:?}: same verdict");
         let json_out = String::from_utf8_lossy(&json.stdout).to_string();
         assert!(
-            !json_out.contains("notice:"),
+            !json_out.contains("notice:") && !json_out.contains("CONFLICT ("),
             "walk {env:?}: json stdout stays machine-clean: {json_out}"
         );
     }
@@ -9997,7 +10084,7 @@ fn strategy_option_keeps_a_modify_delete_under_a_relocated_directory() {
 /// with a notice. Git reports `CONFLICT (rename/delete)` for this shape, which
 /// MG-06 owns; MG-05 must at least decline it the same way on both walks.
 #[test]
-fn merge_rename_whose_source_both_sides_deleted_is_declined_on_both_walks() {
+fn merge_rename_whose_source_both_sides_deleted_conflicts_as_rename_delete() {
     for env in [
         &[][..],
         &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
@@ -10042,12 +10129,25 @@ fn merge_rename_whose_source_both_sides_deleted_is_declined_on_both_walks() {
         );
         assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
 
-        let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
-        assert_cli_success(&out, "clean merge");
+        let out = merge_expecting_conflict(p, &["merge", "feature"], env);
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        // MG-06: this IS Git's rename/delete — ours renamed the file, theirs
+        // deleted it, and both having dropped the source path changes nothing.
+        // Measured on git 2.50.1 (`/Volumes/Data/tmp/mg06-git/jboth`):
+        // `CONFLICT (rename/delete): sub/src renamed to dest in main, but
+        // deleted in theirs.`, exit 1, stages 1 and 2 at `dest`.
         assert!(
-            stdout.contains("deleted on the other side"),
-            "walk {env:?}: both walks report the rename/delete deferral: {stdout}"
+            stdout.contains(
+                "CONFLICT (rename/delete): sub/src renamed to dest in HEAD, but deleted in feature."
+            ),
+            "walk {env:?}: Git's rename/delete wording, verbatim: {stdout}"
+        );
+        let stages = index_stage_lines(p, "dest");
+        assert!(
+            stages.iter().any(|line| line.contains(" 1\t"))
+                && stages.iter().any(|line| line.contains(" 2\t"))
+                && !stages.iter().any(|line| line.contains(" 3\t")),
+            "walk {env:?}: the base follows the rename, the deleting side has no stage: {stages:?}"
         );
     }
 }
@@ -10168,20 +10268,48 @@ fn merge_rename_whose_source_became_a_symlink_keeps_the_content() {
 
         let output = merge_expecting_conflict(p, &["merge", "feature"], env);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // MG-06: Git takes its `type_changed` branch (`merge-ort.c:3205-3212`)
+        // and never says rename/delete — the destination's own modify/delete
+        // is the whole report. Measured on git 2.50.1
+        // (`/Volumes/Data/tmp/mg06-git/ktype`).
         assert!(
-            stdout.contains("deleted on the other side"),
-            "walk {env:?}: the type change is reported as a delete: {stdout}"
+            !stdout.contains("rename/delete"),
+            "walk {env:?}: a type change is not a rename/delete: {stdout}"
         );
-        assert_eq!(
-            std::fs::read_to_string(p.join("new")).expect("the renamed file"),
-            "a\nb\nc\nd\ne\nf\ng\nh\n",
-            "walk {env:?}: the renamed file's content survives"
+        // ... and the type-changed entry SURVIVES under the old name: git's
+        // result tree holds `120000 old` beside the conflicted `new`.
+        assert!(
+            std::fs::symlink_metadata(p.join("old"))
+                .expect("the type-changed entry survives")
+                .file_type()
+                .is_symlink(),
+            "walk {env:?}: the symlink the other side put at the old name survives"
         );
+        // MG-06: the merge base still follows the rename, so the new path is
+        // an unmerged modify/delete with stages 1 and 2 — exactly the shape
+        // measured on git 2.50.1 (`/Volumes/Data/tmp/mg06-git/ktype`), where
+        // the only message is `CONFLICT (modify/delete)`. Before MG-06 the
+        // rename was declined outright and `new` was a clean one-sided add.
         let stages = index_stage_lines(p, "new");
-        assert_eq!(stages.len(), 1, "walk {env:?}: {stages:?}");
         assert!(
-            stages[0].contains("100644") && stages[0].contains(" 0\t"),
+            stages.iter().any(|line| line.contains(" 1\t"))
+                && stages.iter().any(|line| line.contains(" 2\t"))
+                && !stages.iter().any(|line| line.contains(" 3\t")),
+            "walk {env:?}: base and ours only: {stages:?}"
+        );
+        assert!(
+            stages.iter().all(|line| line.contains("100644")),
             "walk {env:?}: it is still a regular file: {stages:?}"
+        );
+        // The renamed content survives. Git leaves the surviving version
+        // VERBATIM here ("Version HEAD of new left in tree") while Libra marks
+        // every modify/delete up — a presentation difference on the conflict
+        // axis that predates this card (MG-05 Codex R13 recorded it), not a
+        // loss of content.
+        let body = std::fs::read_to_string(p.join("new")).expect("the renamed file");
+        assert!(
+            body.contains("a\nb\nc\nd\ne\nf\ng\nh\n"),
+            "walk {env:?}: the renamed file's content survives: {body}"
         );
     }
 }
@@ -10580,8 +10708,36 @@ fn merge_crisscross_df_collision_inside_the_fold_moves_the_file_like_git() {
     assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
     assert_cli_success(&run_libra_command(&["checkout", "x"], p), "x");
 
-    let out = run_libra_command(&["merge", "y"], p);
-    assert_cli_success(&out, "the outer merge is clean");
+    // MG-06: the ancestor holds the relocated file at `…_0` and BOTH sides
+    // renamed it — ours back to `foo`, theirs to `foo~a` — which is Git's
+    // rename/rename(1to2). MG-05 degraded that shape to "no rename detected"
+    // and the outer merge came out clean; MG-06 raises the conflict Git raises
+    // for it (measured on git 2.50.1, `/Volumes/Data/tmp/mg06-git/r1to2`).
+    //
+    // The conflict line NAMES the ancestor's path, so it is now the most
+    // direct evidence of what this case has always guarded: that the fold took
+    // `…_0` for its relocation rather than one of the planted names.
+    let out = merge_expecting_conflict(p, &["merge", "y"], &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    // Which of the two planted labels the fold relocates from follows the
+    // bases' ids, so only the `…_0` SUFFIX is deterministic — that suffix is
+    // the whole point: the ancestor took a name neither planted path holds.
+    assert!(
+        stdout.contains("CONFLICT (rename/rename): foo~Temporary merge branch ")
+            && stdout.contains("_0 renamed to foo in HEAD and to foo~a in y."),
+        "the fold relocated to `…_0`, and both sides renamed it: {stdout}"
+    );
+    // Resolve it the way the pre-MG-06 result already looked — ours' `foo`,
+    // theirs' `foo~a` — so the rest of the case still checks the merge the
+    // fold produced.
+    assert_cli_success(
+        &run_libra_command(&["add", "foo", "foo~a"], p),
+        "stage the rename/rename resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--continue"], p),
+        "the merge concludes",
+    );
     assert_eq!(
         std::fs::read_to_string(p.join("foo")).expect("foo"),
         "file\n",
@@ -10613,4 +10769,1317 @@ fn merge_crisscross_df_collision_inside_the_fold_moves_the_file_like_git() {
             .count(),
         2
     );
+}
+
+// ---------------------------------------------------------------------------
+// MG-06: path-level rename conflicts (git@3cb9185f6 `process_renames`,
+// `merge-ort.c:2913-3232`). Every gate below is anchored to a measurement on
+// git 2.50.1; the fixtures live under `/Volumes/Data/tmp/mg06-git/`.
+// ---------------------------------------------------------------------------
+
+/// Build the 1to2 fixture: `old` on the base, renamed to `a` by ours and to
+/// `b` by theirs, each side editing the line it is given.
+fn rename_1to2_repo(ours_line: usize, theirs_line: usize) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+    commit_file(p, "old", &base, "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    let edited = |line: usize, text: &str| -> String {
+        (1..=8)
+            .map(|n| {
+                if n == line {
+                    format!("{text}\n")
+                } else {
+                    format!("l{n}\n")
+                }
+            })
+            .collect()
+    };
+    std::fs::remove_file(p.join("old")).expect("drop old");
+    std::fs::write(p.join("a"), edited(ours_line, "OURS")).expect("a");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours renames to a", "--no-verify"], p),
+        "ours",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    std::fs::remove_file(p.join("old")).expect("drop old");
+    std::fs::write(p.join("b"), edited(theirs_line, "THEIRS")).expect("b");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "theirs renames to b", "--no-verify"], p),
+        "theirs",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    repo
+}
+
+/// The blob id `ls-files -s` printed for one stage line.
+fn stage_blob(line: &str) -> String {
+    line.split_whitespace().nth(1).expect("blob id").to_string()
+}
+
+/// G1/G2/G10: rename/rename(1to2). Git runs ONE content merge and copies the
+/// result into BOTH destinations, leaves the merge base unmerged under the
+/// ORIGINAL name — `merge-ort.c:3057-3068` spells out that keeping it there is
+/// deliberate — and reports its own wording. Measured on git 2.50.1
+/// (`/Volumes/Data/tmp/mg06-git/r1to2b`): `1 old`, `2 a`, `3 b` with `a` and
+/// `b` holding the SAME blob, and a working tree holding only `a` and `b`.
+#[test]
+fn merge_rename_conflict_1to2_keeps_both_destinations_and_drops_the_source() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = rename_1to2_repo(2, 3);
+        let p = repo.path();
+        let out = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            stdout.contains(
+                "CONFLICT (rename/rename): old renamed to a in HEAD and to b in feature."
+            ),
+            "walk {env:?}: Git's rename/rename wording, verbatim: {stdout}"
+        );
+
+        // INTENTIONAL DEVIATION from Git, documented in `apply_renames`: the
+        // source is resolved by REMOVAL. Git leaves it unmerged at stage 1 and
+        // its own comment (`merge-ort.c:3057-3068`) calls that legacy; keeping
+        // it in Libra would put the source outside the ordinary documented
+        // `libra add <path>` / `libra rm <path>` flow because those commands
+        // match through stage 0. Plumbing or an index rebuild can resolve the
+        // shape, but would discard or bypass ordinary staged resolutions.
+        assert!(
+            index_stage_lines(p, "old").is_empty(),
+            "walk {env:?}: the source is resolved by removal, not left unmerged"
+        );
+        assert!(
+            !p.join("old").exists(),
+            "walk {env:?}: and no working-tree file is left at the source"
+        );
+
+        let a_stages = index_stage_lines(p, "a");
+        let b_stages = index_stage_lines(p, "b");
+        assert!(
+            a_stages.len() == 1 && a_stages[0].contains(" 2\t"),
+            "walk {env:?}: ours' destination is stage 2 alone: {a_stages:?}"
+        );
+        assert!(
+            b_stages.len() == 1 && b_stages[0].contains(" 3\t"),
+            "walk {env:?}: theirs' destination is stage 3 alone: {b_stages:?}"
+        );
+        assert_eq!(
+            stage_blob(&a_stages[0]),
+            stage_blob(&b_stages[0]),
+            "walk {env:?}: ONE merge result is recorded at both destinations"
+        );
+
+        let merged = std::fs::read_to_string(p.join("a")).expect("a");
+        assert_eq!(
+            merged,
+            std::fs::read_to_string(p.join("b")).expect("b"),
+            "walk {env:?}: both working-tree files hold that same result"
+        );
+        assert!(
+            merged.contains("OURS") && merged.contains("THEIRS"),
+            "walk {env:?}: edits on different lines merge into it: {merged}"
+        );
+    }
+}
+
+/// G16: a rename-involved content merge widens Git's conflict markers by one
+/// (`handle_content_merge` is called with `extra_marker_size = 1 + 2 *
+/// call_depth`, `merge-ort.c:3027`) and labels them `<branch>:<path>` rather
+/// than by branch alone. Measured on git 2.50.1
+/// (`/Volumes/Data/tmp/mg06-git/r1to2c`, both sides editing line 2):
+/// `<<<<<<<< HEAD:a` / `========` / `>>>>>>>> theirs:b`.
+#[test]
+fn merge_rename_conflict_1to2_marks_up_with_wide_labelled_markers() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = rename_1to2_repo(2, 2);
+        let p = repo.path();
+        merge_expecting_conflict(p, &["merge", "feature"], env);
+        let merged = std::fs::read_to_string(p.join("a")).expect("a");
+        // Compared as WHOLE LINES: an eight-character run contains a
+        // seven-character one, so `contains` cannot tell the widened marker
+        // from the ordinary one.
+        let marker_line = |lead: char| -> String {
+            merged
+                .lines()
+                .find(|line| line.starts_with(lead))
+                .unwrap_or_else(|| panic!("walk {env:?}: no {lead} marker in {merged}"))
+                .to_string()
+        };
+        assert_eq!(
+            marker_line('<'),
+            "<<<<<<<< HEAD:a",
+            "walk {env:?}: eight characters, labelled <branch>:<path>: {merged}"
+        );
+        assert_eq!(
+            marker_line('='),
+            "========",
+            "walk {env:?}: the separator is widened too: {merged}"
+        );
+        assert_eq!(
+            marker_line('>'),
+            ">>>>>>>> feature:b",
+            "walk {env:?}: the other side is labelled by its own path: {merged}"
+        );
+        assert_eq!(
+            merged,
+            std::fs::read_to_string(p.join("b")).expect("b"),
+            "walk {env:?}: the conflicted result is copied to both destinations"
+        );
+    }
+}
+
+/// G7/G8: rename/delete, in BOTH directions, for a PURE rename — Git keeps it
+/// a conflict even though the content never changed, moving the merge base to
+/// the NEW path's stage 1 and leaving the renaming side's content beside it
+/// while the deleting side contributes no stage (`merge-ort.c:3202-3221`).
+/// Measured on git 2.50.1: `/Volumes/Data/tmp/mg06-git/rdel2` gives `1 new` +
+/// `2 new`, `rdel3` gives `1 new` + `3 new`, with the wording flipped.
+#[test]
+fn merge_rename_conflict_rename_delete_reports_git_wording_both_directions() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        for ours_renames in [true, false] {
+            let repo = create_committed_repo_via_cli();
+            let p = repo.path();
+            let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+            commit_file(p, "old", &base, "base");
+            assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+            let rename_here = |p: &Path| {
+                std::fs::rename(p.join("old"), p.join("new")).expect("rename");
+            };
+            let delete_here = |p: &Path| {
+                std::fs::remove_file(p.join("old")).expect("delete");
+            };
+            if ours_renames {
+                rename_here(p);
+            } else {
+                delete_here(p);
+            }
+            assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", "ours", "--no-verify"], p),
+                "ours",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+            if ours_renames {
+                delete_here(p);
+            } else {
+                rename_here(p);
+            }
+            assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", "theirs", "--no-verify"], p),
+                "theirs",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+            let out = merge_expecting_conflict(p, &["merge", "feature"], env);
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let (renamer, deleter) = if ours_renames {
+                ("HEAD", "feature")
+            } else {
+                ("feature", "HEAD")
+            };
+            assert!(
+                stdout.contains(&format!(
+                    "CONFLICT (rename/delete): old renamed to new in {renamer}, but deleted in {deleter}."
+                )),
+                "walk {env:?} ours_renames={ours_renames}: Git's wording, verbatim: {stdout}"
+            );
+            let stages = index_stage_lines(p, "new");
+            let side_stage = if ours_renames { " 2\t" } else { " 3\t" };
+            let absent_stage = if ours_renames { " 3\t" } else { " 2\t" };
+            assert!(
+                stages.iter().any(|line| line.contains(" 1\t")),
+                "walk {env:?} ours_renames={ours_renames}: the base follows the rename: {stages:?}"
+            );
+            assert!(
+                stages.iter().any(|line| line.contains(side_stage)),
+                "walk {env:?} ours_renames={ours_renames}: the renaming side keeps its content: {stages:?}"
+            );
+            assert!(
+                !stages.iter().any(|line| line.contains(absent_stage)),
+                "walk {env:?} ours_renames={ours_renames}: the deleting side has no stage: {stages:?}"
+            );
+            assert!(
+                index_stage_lines(p, "old").is_empty(),
+                "walk {env:?} ours_renames={ours_renames}: the source is resolved by removal"
+            );
+        }
+    }
+}
+
+/// G5/G6: rename/add. `merge-ort.c` has NO `CONFLICT (rename/add)` string at
+/// all — the collision branch (`:3137-3179`) merges the rename itself first,
+/// parks that result at the renaming side's stage of the destination, leaves
+/// the other side's add at its own stage, and records NO base there, so the
+/// destination lands as a base-less add/add. Measured on git 2.50.1
+/// (`/Volumes/Data/tmp/mg06-git/radd2`, where theirs ALSO edits the source):
+/// stage 2 carries that edit, stage 3 is theirs' independent add.
+#[test]
+fn merge_rename_conflict_rename_add_carries_the_rename_merge_into_its_stage() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+        commit_file(p, "old", &base, "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        std::fs::rename(p.join("old"), p.join("new")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        // theirs edits the SOURCE and independently adds the destination.
+        let edited: String = (1..=8)
+            .map(|n| {
+                if n == 4 {
+                    "THEIRS\n".to_string()
+                } else {
+                    format!("l{n}\n")
+                }
+            })
+            .collect();
+        std::fs::write(p.join("old"), &edited).expect("old");
+        std::fs::write(p.join("new"), "theirs own file\n").expect("new");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs edits and adds", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            !stdout.contains("rename/add"),
+            "walk {env:?}: Git has no such conflict name: {stdout}"
+        );
+        let stages = index_stage_lines(p, "new");
+        assert!(
+            !stages.iter().any(|line| line.contains(" 1\t")),
+            "walk {env:?}: a collision records no merge base: {stages:?}"
+        );
+        assert!(
+            stages.iter().any(|line| line.contains(" 2\t"))
+                && stages.iter().any(|line| line.contains(" 3\t")),
+            "walk {env:?}: both sides are kept: {stages:?}"
+        );
+        // Stage 2 is the rename's own merge, so it carries THEIRS' edit of the
+        // source even though ours only moved the file.
+        let stage2 = stages
+            .iter()
+            .find(|line| line.contains(" 2\t"))
+            .expect("stage 2");
+        let out = run_libra_command(&["cat-file", "-p", &stage_blob(stage2)], p);
+        assert_cli_success(&out, "cat-file");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("THEIRS"),
+            "walk {env:?}: the rename carried the other side's edit to the new path"
+        );
+        assert!(
+            index_stage_lines(p, "old").is_empty() && !p.join("old").exists(),
+            "walk {env:?}: Git resolves the rename source by removal"
+        );
+    }
+}
+
+/// G15: the collision branch speaks up ONLY when the rename's OWN content
+/// merge came out unclean — `merge-ort.c:3169-3178`. Measured on git 2.50.1
+/// (`/Volumes/Data/tmp/mg06-git/rcoll`): both the collision line and the
+/// destination's add/add are printed.
+#[test]
+fn merge_rename_conflict_collision_announces_when_the_rename_merge_is_dirty() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+        commit_file(p, "old", &base, "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        let edited = |text: &str| -> String {
+            (1..=8)
+                .map(|n| {
+                    if n == 2 {
+                        format!("{text}\n")
+                    } else {
+                        format!("l{n}\n")
+                    }
+                })
+                .collect()
+        };
+        std::fs::remove_file(p.join("old")).expect("drop");
+        std::fs::write(p.join("new"), edited("OURS")).expect("new");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames and edits", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::write(p.join("old"), edited("THEIRS")).expect("old");
+        std::fs::write(p.join("new"), "theirs own file\n").expect("new");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs edits and adds", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            stdout.contains(
+                "CONFLICT (rename involved in collision): rename of old -> new has content conflicts AND collides with another path; this may result in nested conflict markers."
+            ),
+            "walk {env:?}: Git's collision wording, verbatim: {stdout}"
+        );
+    }
+}
+
+/// G3/G4: rename/rename(2to1) — two DIFFERENT sources renamed onto one name.
+/// Git treats each rename as its own collision (`merge-ort.c:3137-3179`), so
+/// each side's stage at the destination holds that side's rename merged
+/// against the other side's copy of ITS source, and no merge base is recorded.
+/// Measured on git 2.50.1 (`/Volumes/Data/tmp/mg06-git/r2to1b`): stages 2 and
+/// 3 only, each carrying the other side's edit of the matching source.
+#[test]
+fn merge_rename_conflict_2to1_merges_each_source_into_its_own_stage() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        let body = |tag: &str| -> String { (1..=8).map(|n| format!("{tag}{n}\n")).collect() };
+        let edited = |tag: &str, text: &str| -> String {
+            (1..=8)
+                .map(|n| {
+                    if n == 3 {
+                        format!("{text}\n")
+                    } else {
+                        format!("{tag}{n}\n")
+                    }
+                })
+                .collect()
+        };
+        std::fs::write(p.join("o1"), body("a")).expect("o1");
+        std::fs::write(p.join("o2"), body("b")).expect("o2");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        // ours: o1 -> new, and an edit to o2 (the source theirs will move).
+        std::fs::rename(p.join("o1"), p.join("new")).expect("rename o1");
+        std::fs::write(p.join("o2"), edited("b", "OURS")).expect("o2");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "ours moves o1", "--no-verify"], p),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        // theirs: o2 -> new, and an edit to o1 (the source ours moved).
+        std::fs::rename(p.join("o2"), p.join("new")).expect("rename o2");
+        std::fs::write(p.join("o1"), edited("a", "THEIRS")).expect("o1");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs moves o2", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let out = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            !stdout.contains("rename/rename"),
+            "walk {env:?}: 2to1 is a collision, not Git's rename/rename line: {stdout}"
+        );
+        let stages = index_stage_lines(p, "new");
+        assert!(
+            !stages.iter().any(|line| line.contains(" 1\t")),
+            "walk {env:?}: a collision records no merge base: {stages:?}"
+        );
+        let read_stage = |needle: &str| -> String {
+            let line = stages
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("walk {env:?}: stage {needle} missing: {stages:?}"));
+            let out = run_libra_command(&["cat-file", "-p", &stage_blob(line)], p);
+            assert_cli_success(&out, "cat-file");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        assert!(
+            read_stage(" 2\t").contains("THEIRS"),
+            "walk {env:?}: ours' stage merged theirs' edit of o1 into the destination"
+        );
+        assert!(
+            read_stage(" 3\t").contains("OURS"),
+            "walk {env:?}: theirs' stage merged ours' edit of o2 into the destination"
+        );
+        assert!(
+            index_stage_lines(p, "o1").is_empty() && index_stage_lines(p, "o2").is_empty(),
+            "walk {env:?}: both sources are resolved by removal"
+        );
+    }
+}
+
+/// G14: rename/rename(1to1) is NOT a conflict. Both sides moving the same file
+/// to the same name lets Git carry the merge base to that name
+/// (`merge-ort.c:2991-3018`) and merge the two contents there normally — so
+/// edits on different lines come out CLEAN. Before MG-06 Libra declined the
+/// pair and the destination degraded to a base-less add/add, which turned a
+/// clean merge into a conflict and lost the base. Measured on git 2.50.1
+/// (`/Volumes/Data/tmp/mg06-git/r1to1`).
+#[test]
+fn merge_rename_conflict_1to1_merges_cleanly_with_the_base_carried_over() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        for same_line in [false, true] {
+            let repo = create_committed_repo_via_cli();
+            let p = repo.path();
+            let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+            commit_file(p, "old", &base, "base");
+            assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+            let edited = |line: usize, text: &str| -> String {
+                (1..=8)
+                    .map(|n| {
+                        if n == line {
+                            format!("{text}\n")
+                        } else {
+                            format!("l{n}\n")
+                        }
+                    })
+                    .collect()
+            };
+            std::fs::remove_file(p.join("old")).expect("drop");
+            std::fs::write(p.join("new"), edited(2, "OURS")).expect("new");
+            assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", "ours moves and edits", "--no-verify"], p),
+                "ours",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+            std::fs::remove_file(p.join("old")).expect("drop");
+            let their_line = if same_line { 2 } else { 6 };
+            std::fs::write(p.join("new"), edited(their_line, "THEIRS")).expect("new");
+            assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+            assert_cli_success(
+                &run_libra_command(
+                    &["commit", "-m", "theirs moves and edits", "--no-verify"],
+                    p,
+                ),
+                "theirs",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+            if same_line {
+                // The base IS carried over, so this is an ordinary content
+                // conflict at the new path — stage 1 proves the base arrived.
+                merge_expecting_conflict(p, &["merge", "feature"], env);
+                let stages = index_stage_lines(p, "new");
+                assert!(
+                    stages.iter().any(|line| line.contains(" 1\t")),
+                    "walk {env:?}: the base followed the agreed rename: {stages:?}"
+                );
+                assert!(
+                    stages.iter().any(|line| line.contains(" 2\t"))
+                        && stages.iter().any(|line| line.contains(" 3\t")),
+                    "walk {env:?}: both sides are staged: {stages:?}"
+                );
+            } else {
+                let out = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+                assert_cli_success(&out, "walk {env:?}: an agreed rename merges cleanly");
+                let merged = std::fs::read_to_string(p.join("new")).expect("new");
+                assert!(
+                    merged.contains("OURS") && merged.contains("THEIRS"),
+                    "walk {env:?}: both edits survive on the shared destination: {merged}"
+                );
+                assert!(!p.join("old").exists(), "walk {env:?}: the source is gone");
+            }
+        }
+    }
+}
+
+/// G12: `--abort` restores the pre-merge state for every rename shape — the
+/// two destinations of a 1to2 go back to what each side had, the source
+/// reappears where HEAD had it (nowhere: ours renamed it away), and no merge
+/// state survives.
+#[test]
+fn merge_rename_conflict_abort_restores_the_pre_merge_state() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        // Codex R1 P2-4: every conflicting shape, not just 1to2.
+        for (label, build, conflicts) in rename_shape_table() {
+            if !conflicts {
+                continue;
+            }
+            let repo = build();
+            let p = repo.path();
+            let head_before = run_libra_command(&["rev-parse", "HEAD"], p);
+            assert_cli_success(&head_before, "rev-parse");
+            merge_expecting_conflict(p, &["merge", "feature"], env);
+            assert_cli_success(
+                &run_libra_command_with_stdin_and_env(&["merge", "--abort"], p, "", env),
+                "abort",
+            );
+            let left = unmerged_stage_lines(p);
+            assert!(
+                left.is_empty(),
+                "walk {env:?} / {label}: no unmerged entry survives the abort: {left:?}"
+            );
+            let head_after = run_libra_command(&["rev-parse", "HEAD"], p);
+            assert_cli_success(&head_after, "rev-parse");
+            assert_eq!(
+                head_before.stdout, head_after.stdout,
+                "walk {env:?} / {label}: HEAD is back where it was"
+            );
+        }
+        let repo = rename_1to2_repo(2, 3);
+        let p = repo.path();
+        let before = std::fs::read_to_string(p.join("a")).expect("a before");
+        merge_expecting_conflict(p, &["merge", "feature"], env);
+        assert_cli_success(
+            &run_libra_command_with_stdin_and_env(&["merge", "--abort"], p, "", env),
+            "abort",
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("a")).expect("a after"),
+            before,
+            "walk {env:?}: ours' destination is back to HEAD's content"
+        );
+        assert!(
+            !p.join("b").exists(),
+            "walk {env:?}: theirs' destination is gone again"
+        );
+        assert!(
+            !p.join("old").exists(),
+            "walk {env:?}: the source stays where HEAD had it — nowhere"
+        );
+        // `index_stage_lines` returns EVERY stage line for the path, stage 0
+        // included — ours' own entry legitimately survives the abort.
+        let a_stages = index_stage_lines(p, "a");
+        assert!(
+            a_stages.len() == 1 && a_stages[0].contains(" 0\t"),
+            "walk {env:?}: ours' file is back as an ordinary entry: {a_stages:?}"
+        );
+        assert!(
+            index_stage_lines(p, "b").is_empty() && index_stage_lines(p, "old").is_empty(),
+            "walk {env:?}: nothing the merge introduced survives the abort"
+        );
+    }
+}
+
+/// G11: `--continue` finishes a rename conflict once the paths are staged —
+/// including the source Git leaves unmerged under its old name, which has to
+/// stop being unmerged before the merge can conclude.
+#[test]
+fn merge_rename_conflict_continue_finishes_the_1to2() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        // Codex R1 P2-4: every conflicting shape, not just 1to2.
+        for (label, build, conflicts) in rename_shape_table() {
+            if !conflicts {
+                continue;
+            }
+            let repo = build();
+            let p = repo.path();
+            merge_expecting_conflict(p, &["merge", "feature"], env);
+            // Every conflicted path of every shape exists on disk, so `add -A`
+            // is the whole resolution — which is exactly why no shape may leave
+            // an unmerged entry at a path that exists nowhere.
+            assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+            let out = run_libra_command_with_stdin_and_env(&["merge", "--continue"], p, "", env);
+            assert_cli_success(&out, "walk {env:?} / {label}: the merge concludes");
+            let left = unmerged_stage_lines(p);
+            assert!(
+                left.is_empty(),
+                "walk {env:?} / {label}: nothing is left unmerged: {left:?}"
+            );
+            let parents = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+            assert_cli_success(&parents, "cat-file");
+            assert_eq!(
+                String::from_utf8_lossy(&parents.stdout)
+                    .lines()
+                    .filter(|line| line.starts_with("parent "))
+                    .count(),
+                2,
+                "walk {env:?} / {label}: a two-parent merge commit was recorded"
+            );
+        }
+        let repo = rename_1to2_repo(2, 3);
+        let p = repo.path();
+        merge_expecting_conflict(p, &["merge", "feature"], env);
+        // Both destinations exist on disk, so staging them is the whole
+        // resolution — which is exactly why the source must not be left
+        // unmerged: nothing could stage a path that exists nowhere.
+        assert_cli_success(
+            &run_libra_command(&["add", "-A", "."], p),
+            "stage the resolution",
+        );
+        let out = run_libra_command_with_stdin_and_env(&["merge", "--continue"], p, "", env);
+        assert_cli_success(&out, "walk {env:?}: the merge concludes");
+        assert!(
+            index_stage_lines(p, "a")
+                .iter()
+                .all(|line| line.contains(" 0\t")),
+            "walk {env:?}: nothing is left unmerged"
+        );
+        let log = run_libra_command(&["log", "--oneline", "-1"], p);
+        assert_cli_success(&log, "log");
+        assert!(
+            !String::from_utf8_lossy(&log.stdout).is_empty(),
+            "walk {env:?}: a merge commit was recorded"
+        );
+    }
+}
+
+/// G13: `--dry-run` names the conflict kinds without writing, and `--json`
+/// keeps stdout machine-clean while doing so.
+#[test]
+fn merge_rename_conflict_dry_run_reports_the_kind_without_writing() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        // Every shape previews the verdict it would really reach, and writes
+        // nothing doing it (Codex R1 P2-4: these gates used to test 1to2 only).
+        for (label, build, conflicts) in rename_shape_table() {
+            let repo = build();
+            let p = repo.path();
+            let head_before = run_libra_command(&["rev-parse", "HEAD"], p);
+            assert_cli_success(&head_before, "rev-parse");
+            let preview = run_libra_command_with_stdin_and_env(
+                &["merge", "--dry-run", "--json", "feature"],
+                p,
+                "",
+                env,
+            );
+            assert_eq!(
+                preview.status.code(),
+                Some(if conflicts { 1 } else { 0 }),
+                "walk {env:?} / {label}: the preview reaches the real verdict"
+            );
+            let parsed = parse_json_stdout(&preview);
+            assert_eq!(parsed["data"]["dry_run"], true, "{label}: {parsed}");
+            if conflicts {
+                assert_eq!(parsed["data"]["would_conflict"], true, "{label}: {parsed}");
+                assert_eq!(
+                    parsed["data"]["conflict_kinds"],
+                    rename_matrix::expected_conflict_kinds(label),
+                    "walk {env:?} / {label}: exact conflicted paths and kinds: {parsed}"
+                );
+            } else {
+                // A clean preview carries NEITHER key — the documented frozen
+                // schema, which this now pins for a shape that merges.
+                assert!(
+                    parsed["data"]["would_conflict"].is_null()
+                        && parsed["data"]["conflict_kinds"].is_null(),
+                    "{label}: a clean preview omits the conflict keys: {parsed}"
+                );
+            }
+            // A preview writes nothing: HEAD, the index and the merge state
+            // are all untouched.
+            let head_after = run_libra_command(&["rev-parse", "HEAD"], p);
+            assert_cli_success(&head_after, "rev-parse");
+            assert_eq!(
+                head_before.stdout, head_after.stdout,
+                "{label}: a preview does not move HEAD"
+            );
+            assert!(
+                unmerged_stage_lines(p).is_empty(),
+                "{label}: a preview leaves no unmerged entry"
+            );
+        }
+        let repo = rename_1to2_repo(2, 3);
+        let p = repo.path();
+        let before = std::fs::read_to_string(p.join("a")).expect("a before");
+        let preview =
+            run_libra_command_with_stdin_and_env(&["merge", "--dry-run", "feature"], p, "", env);
+        assert_eq!(
+            preview.status.code(),
+            Some(1),
+            "walk {env:?}: a would-conflict preview exits 1"
+        );
+        let stdout = String::from_utf8_lossy(&preview.stdout).to_string();
+        assert!(
+            stdout.contains(
+                "CONFLICT (rename/rename): old renamed to a in HEAD and to b in feature."
+            ),
+            "walk {env:?}: the preview says what the merge would say: {stdout}"
+        );
+        assert!(
+            stdout.contains("Would conflict in: a, b"),
+            "walk {env:?}: both destinations are previewed: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("a")).expect("a after"),
+            before,
+            "walk {env:?}: a preview writes nothing"
+        );
+        assert!(
+            !p.join("b").exists(),
+            "walk {env:?}: a preview creates no destination"
+        );
+
+        let json = run_libra_command_with_stdin_and_env(
+            &["merge", "--dry-run", "--json", "feature"],
+            p,
+            "",
+            env,
+        );
+        assert_eq!(json.status.code(), Some(1), "walk {env:?}: same verdict");
+        let json_out = String::from_utf8_lossy(&json.stdout).to_string();
+        assert!(
+            !json_out.contains("CONFLICT (") && !json_out.contains("notice:"),
+            "walk {env:?}: json stdout stays machine-clean: {json_out}"
+        );
+        let parsed = parse_json_stdout(&json);
+        assert_eq!(parsed["data"]["dry_run"], true, "walk {env:?}: {parsed}");
+        assert_eq!(
+            parsed["data"]["would_conflict"], true,
+            "walk {env:?}: {parsed}"
+        );
+        // The machine surface carries the kind too, not just the human line —
+        // `rename-rename` is a NEW enum value and has to be pinned where
+        // clients actually read it (Codex R1 P1-5).
+        assert_eq!(
+            parsed["data"]["conflict_kinds"],
+            serde_json::json!([
+                {"path": "a", "kind": "rename-rename"},
+                {"path": "b", "kind": "rename-rename"},
+            ]),
+            "walk {env:?}: {parsed}"
+        );
+    }
+}
+
+/// G18: a collision whose rename merge is ALSO unclean produces NESTED markers
+/// — the rename's own conflicted result becomes one side of the destination's
+/// add/add, so the file carries an 8-character region inside a 7-character one.
+/// That is the literal meaning of Git's warning "this may result in nested
+/// conflict markers", which MG-06 quotes verbatim; measured on git 2.50.1 under
+/// `merge.conflictStyle=diff3` (`/Volumes/Data/tmp/mg06-sweep.sh`):
+///
+/// ```text
+/// <<<<<<< HEAD              (7, the outer add/add)
+/// <<<<<<<< HEAD:new         (8, the rename's own merge)
+/// |||||||| <ancestor>:old
+/// ========
+/// >>>>>>>> feature:old
+/// ||||||| <ancestor>
+/// =======
+/// >>>>>>> feature
+/// ```
+///
+/// Libra nests the same way, with two documented differences: it writes the
+/// ancestor label as `base:<path>` (its own diff3 convention, where Git names
+/// the ancestor commit), and the OUTER markers come out longer than Git's seven
+/// — Libra additionally requires a marker to be longer than any marker-like run
+/// in its inputs (`unambiguous_conflict_marker_length`, an extension MG-02
+/// registered), and the nested eight-character run is such an input. Measured:
+/// Git 7 outside / 8 inside, Libra 9 outside / 8 inside. The STRUCTURE — which
+/// side carries which path, and the inner region sitting wholly inside the
+/// outer one — is identical, and that is what this gate asserts.
+#[test]
+fn merge_rename_conflict_collision_nests_the_rename_merge_markers() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+        commit_file(p, "old", &base, "base");
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+        let edited = |text: &str| -> String {
+            (1..=8)
+                .map(|n| {
+                    if n == 2 {
+                        format!("{text}\n")
+                    } else {
+                        format!("l{n}\n")
+                    }
+                })
+                .collect()
+        };
+        // ours renames AND edits; theirs edits the source differently AND adds
+        // the destination — so the rename's own merge conflicts and then
+        // collides.
+        std::fs::remove_file(p.join("old")).expect("drop");
+        std::fs::write(p.join("new"), edited("OURS")).expect("new");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "ours renames and edits", "--no-verify"],
+                p,
+            ),
+            "ours",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::write(p.join("old"), edited("THEIRS")).expect("edit source");
+        std::fs::write(p.join("new"), "theirs own file\n").expect("add destination");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "theirs edits and adds", "--no-verify"], p),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        assert_cli_success(
+            &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
+            "diff3",
+        );
+
+        merge_expecting_conflict(p, &["merge", "feature"], env);
+        let body = std::fs::read_to_string(p.join("new")).expect("the conflicted destination");
+        let target = run_libra_command(&["rev-parse", "feature"], p);
+        assert_cli_success(&target, "read the outer conflict's target label");
+        let target_id = String::from_utf8(target.stdout).expect("target object id is ASCII");
+        let target_abbrev: String = target_id.trim().chars().take(7).collect();
+        // The whole rename result, including every context line, belongs to
+        // the outer ours arm. Exact bytes pin both complete diff3 regions:
+        // matching open/base/separator/close widths, labels, and one outer
+        // block. Git uses seven outside; MG-02's documented rule requires
+        // Libra's outer markers to be longer than the nested eight. The outer
+        // writer uses the target commit's abbreviation, as for plain conflicts.
+        let renamed = concat!(
+            "l1\n",
+            "<<<<<<<< HEAD:new\n",
+            "OURS\n",
+            "|||||||| base:old\n",
+            "l2\n",
+            "========\n",
+            "THEIRS\n",
+            ">>>>>>>> feature:old\n",
+            "l3\nl4\nl5\nl6\nl7\nl8\n",
+        );
+        assert_eq!(
+            body,
+            format!(
+                "<<<<<<<<< HEAD\n{renamed}||||||||| base\n=========\ntheirs own file\n>>>>>>>>> {target_abbrev}\n"
+            ),
+            "walk {env:?}: one complete outer add/add contains the complete rename conflict"
+        );
+    }
+}
+
+/// G17 (Codex R2 P2-1): `-X ours` / `-X theirs` reach the rename's OWN content
+/// merge. Git maps the variant onto `ll_opts.variant` (`merge-ort.c:2129-2143`)
+/// so the favoured side settles every hunk — while the PATH-level rename
+/// conflict itself survives, because `-X` only settles content. Measured on
+/// git 2.50.1: `git merge -X ours` on this shape prints
+/// `CONFLICT (rename/rename)` and leaves the OURS line at both destinations.
+///
+/// This gate exists because the first attempt at the `-X` support passed the
+/// user's configured (two-marker) conflict style to the favoured resolver,
+/// which looks for `|||||||` — so `-X` on any text rename conflict died with
+/// `LBR-IO-002 ... malformed conflict markers`, and no gate noticed.
+#[test]
+fn merge_rename_conflict_strategy_option_settles_the_rename_content_merge() {
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        for (favor, expected) in [("ours", "OURS"), ("theirs", "THEIRS")] {
+            // rename/rename(1to2) with BOTH sides editing the same line, so the
+            // rename's own content merge really does conflict.
+            let repo = rename_1to2_repo(2, 2);
+            let p = repo.path();
+            let out = merge_expecting_conflict(p, &["merge", "-X", favor, "feature"], env);
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(
+                stdout.contains("CONFLICT (rename/rename):"),
+                "walk {env:?} / -X {favor}: the path-level conflict survives `-X`: {stdout}"
+            );
+            for destination in ["a", "b"] {
+                let body = std::fs::read_to_string(p.join(destination))
+                    .unwrap_or_else(|_| panic!("walk {env:?} / -X {favor}: {destination}"));
+                assert!(
+                    body.contains(expected),
+                    "walk {env:?} / -X {favor}: {destination} takes the favoured side: {body}"
+                );
+                assert!(
+                    !body.contains("<<<<<<<") && !body.contains("|||||||"),
+                    "walk {env:?} / -X {favor}: {destination} keeps no marker of any style: {body}"
+                );
+            }
+        }
+
+        // The collision branch runs the same content merge, so `-X` reaches it
+        // too — and there `-X` settles the destination's add/add as well, so
+        // the whole merge comes out CLEAN. Measured on git 2.50.1
+        // (`/Volumes/Data/tmp/mg06-xc.sh`): `Merge made by the 'ort' strategy`,
+        // no unmerged entries, and the blob ids asserted below are Git's own.
+        for (favor, expected_blob) in [
+            ("ours", "5088f08d9902bc42a1cbf78a7a40e4362f8c4e5f"),
+            ("theirs", "0deff81a0a4001538d3f973b2cf8cf012b591f1c"),
+        ] {
+            let repo = create_committed_repo_via_cli();
+            let p = repo.path();
+            let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+            commit_file(p, "old", &base, "base");
+            assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+            std::fs::rename(p.join("old"), p.join("new")).expect("rename");
+            assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+                "ours",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+            let edited: String = (1..=8)
+                .map(|n| {
+                    if n == 2 {
+                        "THEIRS\n".to_string()
+                    } else {
+                        format!("l{n}\n")
+                    }
+                })
+                .collect();
+            std::fs::write(p.join("old"), &edited).expect("edit source");
+            std::fs::write(p.join("new"), "theirs own file\n").expect("add destination");
+            assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", "theirs edits and adds", "--no-verify"], p),
+                "theirs",
+            );
+            assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+            let out = run_libra_command_with_stdin_and_env(
+                &["merge", "-X", favor, "feature"],
+                p,
+                "",
+                env,
+            );
+            assert_cli_success(
+                &out,
+                "walk {env:?} / -X {favor}: `-X` settles the collision outright, as Git's does",
+            );
+            let stages = index_stage_lines(p, "new");
+            assert_eq!(
+                stages.len(),
+                1,
+                "walk {env:?} / -X {favor}: nothing is left unmerged: {stages:?}"
+            );
+            assert!(
+                stages[0].contains(" 0\t") && stages[0].contains(expected_blob),
+                "walk {env:?} / -X {favor}: the result is Git's own blob: {stages:?}"
+            );
+        }
+    }
+}
+
+/// Codex R1 P2-5: the virtual-ancestor fold runs MG-06's shapes too, and the
+/// fold has no conflicts of its own — every shape has to settle as CONTENT
+/// there. A criss-cross whose two merge bases disagree about a renamed file is
+/// the case that exercises it: the fold must produce ONE ancestor both walks
+/// then merge against identically, on the default (pruned) walk and the
+/// flattening one alike.
+#[test]
+fn merge_rename_conflict_inside_the_fold_agrees_across_both_walks() {
+    let mut results = Vec::new();
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "0\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+        commit_file(p, "old", &base, "base file");
+        assert_cli_success(&run_libra_command(&["branch", "a"], p), "a");
+        assert_cli_success(&run_libra_command(&["branch", "b"], p), "b");
+        // a renames the file; b edits it in place — the two merge bases of the
+        // criss-cross below therefore disagree about where it lives.
+        assert_cli_success(&run_libra_command(&["checkout", "a"], p), "a");
+        std::fs::rename(p.join("old"), p.join("moved")).expect("rename");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "a renames", "--no-verify"], p),
+            "a",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "b"], p), "b");
+        let edited: String = (1..=8)
+            .map(|n| {
+                if n == 7 {
+                    "b edit\n".to_string()
+                } else {
+                    format!("l{n}\n")
+                }
+            })
+            .collect();
+        std::fs::write(p.join("old"), &edited).expect("edit");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "b edits", "--no-verify"], p),
+            "b",
+        );
+        // Two tips, each merging both bases — the fold has two bases to settle.
+        for (from, other, tip) in [("a", "b", "x"), ("b", "a", "y")] {
+            assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+            assert_cli_success(&run_libra_command(&["checkout", from], p), "from");
+            assert_cli_success(&run_libra_command(&["checkout", "-b", tip], p), "tip");
+            let merged = run_libra_command_with_stdin_and_env(&["merge", other], p, "", env);
+            assert_cli_success(&merged, "the criss-cross arm merges");
+        }
+        assert_cli_success(&run_libra_command(&["checkout", "x"], p), "x");
+        let out = run_libra_command_with_stdin_and_env(
+            &["merge", "--dry-run", "--json", "y"],
+            p,
+            "",
+            env,
+        );
+        let mut parsed = parse_json_stdout(&out);
+        let data = parsed["data"]
+            .as_object_mut()
+            .expect("the envelope carries a data object");
+        data.remove("old_commit");
+        data.remove("commit");
+        results.push(parsed);
+    }
+    assert_eq!(
+        results[0], results[1],
+        "the fold's ancestor makes both walks reach the same verdict"
+    );
+}
+
+/// Every shape, with whether the merge it produces CONFLICTS. `1to1 clean` is
+/// the one that does not — MG-06 turned it from a degraded add/add into a real
+/// three-way that merges. Drives the lifecycle gates (Codex R1 P2-4).
+#[allow(clippy::type_complexity)]
+fn rename_shape_table() -> Vec<(&'static str, Box<dyn Fn() -> tempfile::TempDir>, bool)> {
+    vec![
+        (
+            "1to2 clean content",
+            Box::new(|| rename_1to2_repo(2, 3)) as Box<dyn Fn() -> tempfile::TempDir>,
+            true,
+        ),
+        (
+            "1to2 conflicting content",
+            Box::new(|| rename_1to2_repo(2, 2)),
+            true,
+        ),
+        (
+            "rename/delete, ours renames",
+            Box::new(|| rename_delete_repo(true)),
+            true,
+        ),
+        (
+            "rename/delete, theirs renames",
+            Box::new(|| rename_delete_repo(false)),
+            true,
+        ),
+        ("rename/add", Box::new(rename_add_repo), true),
+        ("2to1", Box::new(rename_matrix::rename_2to1_repo), true),
+        ("1to1 clean", Box::new(|| rename_1to1_repo(2, 6)), false),
+        (
+            "1to1 conflicting",
+            Box::new(|| rename_1to1_repo(2, 2)),
+            true,
+        ),
+    ]
+}
+
+mod rename_binary;
+mod rename_fold;
+mod rename_fold_binary;
+mod rename_interactions;
+mod rename_matrix;
+mod rename_path_collisions;
+mod squash;
+
+/// Every unmerged stage line in the index, for the "nothing is left unmerged"
+/// assertions the lifecycle gates share.
+fn unmerged_stage_lines(p: &Path) -> Vec<String> {
+    let out = run_libra_command(&["ls-files", "-s"], p);
+    assert_cli_success(&out, "ls-files -s");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.contains(" 0\t"))
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// Every path-level rename shape MG-06 settles, as `(label, builder)`. Used by
+/// the cross-engine parity case so each shape is compared field by field.
+#[allow(clippy::type_complexity)]
+fn rename_conflict_shapes() -> Vec<(&'static str, Box<dyn Fn() -> tempfile::TempDir>)> {
+    vec![
+        (
+            "1to2 clean content",
+            Box::new(|| rename_1to2_repo(2, 3)) as Box<dyn Fn() -> tempfile::TempDir>,
+        ),
+        (
+            "1to2 conflicting content",
+            Box::new(|| rename_1to2_repo(2, 2)),
+        ),
+        (
+            "rename/delete, ours renames",
+            Box::new(|| rename_delete_repo(true)),
+        ),
+        (
+            "rename/delete, theirs renames",
+            Box::new(|| rename_delete_repo(false)),
+        ),
+        ("rename/add", Box::new(rename_add_repo)),
+        ("2to1", Box::new(rename_matrix::rename_2to1_repo)),
+        ("1to1 clean", Box::new(|| rename_1to1_repo(2, 6))),
+        ("1to1 conflicting", Box::new(|| rename_1to1_repo(2, 2))),
+    ]
+}
+
+/// base `old`; one side renames it to `new` (pure rename), the other deletes it.
+fn rename_delete_repo(ours_renames: bool) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+    commit_file(p, "old", &base, "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    let act = |p: &Path, rename: bool| {
+        if rename {
+            std::fs::rename(p.join("old"), p.join("new")).expect("rename");
+        } else {
+            std::fs::remove_file(p.join("old")).expect("delete");
+        }
+    };
+    act(p, ours_renames);
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours", "--no-verify"], p),
+        "ours",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    act(p, !ours_renames);
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "theirs", "--no-verify"], p),
+        "theirs",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    repo
+}
+
+/// base `old`; ours renames it to `new`, theirs independently ADDS `new`.
+fn rename_add_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+    commit_file(p, "old", &base, "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    std::fs::rename(p.join("old"), p.join("new")).expect("rename");
+    assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours renames", "--no-verify"], p),
+        "ours",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+    commit_file(p, "new", "theirs own file\n", "theirs adds new");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    repo
+}
+
+/// base `old`; BOTH sides rename it to `new`, each editing the given line.
+fn rename_1to1_repo(ours_line: usize, theirs_line: usize) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base: String = (1..=8).map(|n| format!("l{n}\n")).collect();
+    commit_file(p, "old", &base, "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+    let edited = |line: usize, text: &str| -> String {
+        (1..=8)
+            .map(|n| {
+                if n == line {
+                    format!("{text}\n")
+                } else {
+                    format!("l{n}\n")
+                }
+            })
+            .collect()
+    };
+    for (branch, line, text, message) in [
+        ("main", ours_line, "OURS", "ours moves and edits"),
+        ("feature", theirs_line, "THEIRS", "theirs moves and edits"),
+    ] {
+        if branch == "feature" {
+            assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        }
+        std::fs::remove_file(p.join("old")).expect("drop");
+        std::fs::write(p.join("new"), edited(line, text)).expect("new");
+        assert_cli_success(&run_libra_command(&["add", "-A", "."], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+            message,
+        );
+    }
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    repo
+}
+
+/// Both engines must reach the SAME verdict for every MG-06 shape — MG-04 set
+/// this rule with `merge_df_conflict_is_identical_on_the_flat_walk`, and the
+/// rename shapes need it more: the pruned walk decides each path on its own
+/// and the rename pass then overrides those decisions, while the flattening
+/// engine rewrites its maps before deciding anything. The `--dry-run` summary
+/// is compared field by field, `files_changed` included.
+#[test]
+fn merge_rename_conflict_summaries_match_across_both_walks() {
+    // Every MG-06 shape, not just 1to2 — Codex R1 P1-6 found the two engines
+    // disagreeing on `files_changed` for rename/delete, which this had not
+    // been wide enough to catch.
+    for (label, build) in rename_conflict_shapes() {
+        let mut summaries = Vec::new();
+        for env in [
+            &[][..],
+            &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+        ] {
+            let repo = build();
+            let p = repo.path();
+            let out = run_libra_command_with_stdin_and_env(
+                &["merge", "--dry-run", "--json", "feature"],
+                p,
+                "",
+                env,
+            );
+            // A would-conflict preview exits 1 and still prints its envelope.
+            // Each iteration builds its OWN repository, so the commit ids
+            // differ by construction — only the merge OUTCOME is comparable.
+            let mut parsed = parse_json_stdout(&out);
+            let data = parsed["data"]
+                .as_object_mut()
+                .expect("the envelope carries a data object");
+            data.remove("old_commit");
+            data.remove("commit");
+            summaries.push(parsed);
+        }
+        assert_eq!(
+            summaries[0], summaries[1],
+            "{label}: the pruned walk and the flattening engine must agree"
+        );
+    }
 }

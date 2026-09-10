@@ -1069,7 +1069,10 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
             .with_hint("or run 'libra pull --rebase' to replay local commits"),
-        merge::PullMergeError::Conflicts { .. }
+        merge::PullMergeError::Conflicts { squash: true, .. } => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'"),
+        merge::PullMergeError::Conflicts { squash: false, .. }
         | merge::PullMergeError::DirtyWorktree
         | merge::PullMergeError::UntrackedOverwrite { .. }
         | merge::PullMergeError::MergeInProgress
@@ -1154,6 +1157,23 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_conflict_hints_follow_the_pending_merge_state() {
+        for squash in [false, true] {
+            let error = merge::PullMergeError::Conflicts {
+                paths: "renamed.txt".to_string(),
+                squash,
+            };
+            let cli = map_merge_error_to_cli(&error);
+            assert_eq!(cli.stable_code(), StableErrorCode::ConflictOperationBlocked);
+            let rendered = cli.render();
+            assert!(rendered.contains("renamed.txt"));
+            assert_eq!(rendered.contains("libra merge --continue"), !squash);
+            assert_eq!(rendered.contains("libra merge --abort"), !squash);
+            assert_eq!(rendered.contains("'libra commit'"), squash);
+        }
+    }
 
     #[test]
     fn depth_and_no_ff_flags_parse() {

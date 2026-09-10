@@ -17,6 +17,8 @@ libra merge --restart
 
 如果当前分支可以快进，Libra 会将分支指针移动到目标提交，并恢复索引和工作树。如果分支已经分叉，Libra 会使用 merge base 执行单头三方合并；当历史留下不止一个 merge base 时，改用由它们递归折叠出的虚拟祖先（见下文）。
 
+开始新合并前，Libra 同时检查 merge 状态和索引。已有 merge 状态时仍提示 `merge --continue` 或 `--abort`；没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使目标已经最新，或使用 `--dry-run`，也以 `LBR-CONFLICT-002` 拒绝（退出 128），HEAD、索引和工作树保持原样。先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`，然后才能开始新合并。
+
 默认三方策略支持 `-X ours` / `-X theirs`：只在冲突 hunk/路径选择指定一侧，双方无冲突变更仍全部保留。它不同于 `-s ours`；后者会创建双父 merge commit（目标已经是当前分支祖先时除外），但完整保留当前 HEAD tree。其它 strategy/strategy option 会在参数解析阶段拒绝。
 
 ### 交叉合并历史（多个 merge base）
@@ -40,9 +42,9 @@ libra merge --restart
 
 `libra merge --dry-run` 预演交叉合并遵循与其它预演相同的契约——不写对象库、索引、工作树、HEAD、reflog、merge 状态与 autostash sidecar：折叠把 blob 留在内存里，不落任何虚拟 tree 或 commit。（该契约**不**覆盖 CLI 在任何命令运行之前做的仓库级例行维护，例如打开数据库时的 schema 自动升级；见 `docs/development/commands/merge.md`。）
 
-没有共同祖先的历史默认仍被拒绝。显式传入 `--allow-unrelated-histories` 时，Libra 使用虚拟空 merge base：不相交的 root tree 正常合并，重叠新增正常冲突，且 conflict state 可跨 `--continue` / `--abort` / `--restart` 恢复，不会写入伪造的 base object。
+没有共同祖先的历史默认仍被拒绝。显式传入 `--allow-unrelated-histories` 时，Libra 使用虚拟空 merge base：不相交的 root tree 正常合并，重叠新增正常冲突，且非 squash 合并的 conflict state 可跨 `--continue` / `--abort` / `--restart` 恢复，不会写入伪造的 base object。
 
-干净的三方合并会创建双父合并提交、更新 HEAD、重建索引、恢复工作树，并写入 merge reflog 条目。有冲突的三方合并会向工作树写入行级冲突标记（与 Git 一致——仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>>` 之间，共享上下文留在标记外；二进制或 modify/delete 路径回退整文件标记），写入未合并的索引 stage，保存 Libra merge 状态，并返回 `LBR-CONFLICT-002`，同时给出 `libra merge --continue` 和 `libra merge --abort` 的提示。
+默认情况下，干净的三方合并会创建双父合并提交、更新 HEAD、重建索引、恢复工作树，并写入 merge reflog 条目。有冲突的三方合并会向工作树写入行级冲突标记（与 Git 一致——仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>>` 之间，共享上下文留在标记外；二进制或 modify/delete 路径回退整文件标记），写入未合并的索引 stage，除 `--squash` 外保存 Libra merge 状态，并返回 `LBR-CONFLICT-002`。非 squash 冲突给出 `libra merge --continue` 和 `libra merge --abort` 的提示；squash 冲突则提示解决、暂存路径后用普通 `libra commit` 创建单亲提交。squash 即使冲突也不移动 HEAD、不记录 merge 状态，因此 `merge --continue`、`--abort`、`--restart` 均报 `no merge in progress`。
 
 ### 冲突标记风格（`merge.conflictStyle`）
 
@@ -56,7 +58,7 @@ libra merge --restart
 CONFLICT (file/directory): directory in the way of foo from HEAD; moving it to foo~HEAD instead.
 ```
 
-被移走的文件就是未合并路径：索引在新名字下记录文件所在侧的 stage 2（我方）或 stage 3（对方），若 merge base 在 `foo` 处跟踪的是文件则再记 stage 1；没有 stage 0 条目，`merge-state.json` 的 `conflicted_paths` 列出的是新名字。目录内容照常合并。与 Git 相同有两种形态：仅一侧*新增*的文件是纯粹的 file/directory 冲突——原样写到新名字，`--dry-run` 报为 `file-directory`；merge base 已跟踪、且文件侧*修改过*的文件是一个只是换了位置的 modify/delete 冲突——新名字下带 base（stage 1）与修改侧，`--dry-run` 报为 `modify-delete` 并附 `original_path`，同时打印 Git 的第二行（`CONFLICT (modify/delete): foo~HEAD deleted in <branch> and modified in HEAD.  Version HEAD of foo~HEAD left in tree.`），文件按该行所说原样留在新名字下。一侧未动、另一侧换成目录的文件则是普通的干净删除：无冲突、无提示。只含*空* tree 的目录仅在 merge base 在该路径上什么都没有时才算挡路——Git 会把这样的新目录原样采纳；base 已有该路径时 Git 会遍历该目录、发现没有文件，于是文件留在原地（普通 modify/delete）。两种情形均与 `git merge` 对人工构造 tree 的实测一致。`--json`/`--machine` 下不打印这些提示：stdout 保持机器可读，冲突由 stderr 上的错误信封承载。策略选项（`-X ours` / `-X theirs`）只裁决内容 hunk：目录之下的 modify/delete 仍是冲突，与 Git 一致。合并绝不*穿过*工作树里的符号链接写入或删除——被忽略的 `foo -> 别处` 挡在要写的 `foo/…` 前面、或压在合并要删除的已跟踪文件之上时，整个合并在任何改动前被拒绝；恰好占着移位文件名字的符号链接则被文件替换，而*已跟踪*的符号链接 `foo` 让位给目录 `foo/` 时像普通文件一样移到 `foo~HEAD`。只有当前已跟踪的路径才会被删除：碰巧沿用历史名字的未跟踪文件会留下。若要保留被移走的文件，编辑它、用 `libra add foo~…` 暂存后 `libra merge --continue`；或运行 `libra merge --abort`：它把 `foo` 恢复为合并前的样子，并同时移除被移走的副本与合并创建的目录（合并腾空的目录会被清理，嵌套的 `foo/a/` 不会挡住文件回位）。目前无法「丢弃」被移走的文件：`libra rm` 不接受未合并路径，只能用 `--abort` 得到不含该文件的结果（Git 用 `git rm foo~HEAD` 解决这一情形）。
+被移走的文件就是未合并路径：索引在新名字下记录文件所在侧的 stage 2（我方）或 stage 3（对方），若 merge base 在 `foo` 处跟踪的是文件则再记 stage 1；没有 stage 0 条目，非 squash 合并的 `merge-state.json` 在 `conflicted_paths` 中列出新名字。目录内容照常合并。与 Git 相同有两种形态：仅一侧*新增*的文件是纯粹的 file/directory 冲突——原样写到新名字，`--dry-run` 报为 `file-directory`；merge base 已跟踪、且文件侧*修改过*的文件是一个只是换了位置的 modify/delete 冲突——新名字下带 base（stage 1）与修改侧，`--dry-run` 报为 `modify-delete` 并附 `original_path`，同时打印 Git 的第二行（`CONFLICT (modify/delete): foo~HEAD deleted in <branch> and modified in HEAD.  Version HEAD of foo~HEAD left in tree.`），文件按该行所说原样留在新名字下。一侧未动、另一侧换成目录的文件则是普通的干净删除：无冲突、无提示。只含*空* tree 的目录仅在 merge base 在该路径上什么都没有时才算挡路——Git 会把这样的新目录原样采纳；base 已有该路径时 Git 会遍历该目录、发现没有文件，于是文件留在原地（普通 modify/delete）。两种情形均与 `git merge` 对人工构造 tree 的实测一致。`--json`/`--machine` 下不打印这些提示：stdout 保持机器可读，冲突由 stderr 上的错误信封承载。策略选项（`-X ours` / `-X theirs`）只裁决内容 hunk：目录之下的 modify/delete 仍是冲突，与 Git 一致。合并绝不*穿过*工作树里的符号链接写入或删除——被忽略的 `foo -> 别处` 挡在要写的 `foo/…` 前面、或压在合并要删除的已跟踪文件之上时，整个合并在任何改动前被拒绝；恰好占着移位文件名字的符号链接则被文件替换，而*已跟踪*的符号链接 `foo` 让位给目录 `foo/` 时像普通文件一样移到 `foo~HEAD`。只有当前已跟踪的路径才会被删除：碰巧沿用历史名字的未跟踪文件会留下。对于非 squash 合并，若要保留被移走的文件，编辑它、用 `libra add foo~…` 暂存后 `libra merge --continue`；或运行 `libra merge --abort`：它把 `foo` 恢复为合并前的样子，并同时移除被移走的副本与合并创建的目录（合并腾空的目录会被清理，嵌套的 `foo/a/` 不会挡住文件回位）。目前无法「丢弃」被移走的文件：`libra rm` 不接受未合并路径，上述非 squash 恢复方式是 `--abort`（Git 用 `git rm foo~HEAD` 解决这一情形）。squash 冲突仍编辑并暂存同一个移位路径，随后用普通 `libra commit` 收尾；由于未记录 merge 状态，无法使用这些 merge 控制动作。
 
 合并后**空无一物**的目录（其下每个条目都被文件侧删除、另一侧未动）不算挡路：文件留在原路径，与 Git 一致。递归的交叉合并折叠（见上）内部同样适用该规则且不询问用户：文件在虚拟祖先中移到 `foo~Temporary merge branch 1`（或 `2`），与 Git 在 `call_depth > 0` 时完全一致，因此祖先 tree 永远不会在同一名字下同时持有 blob 与子树。
 
@@ -88,25 +90,35 @@ Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`the
 
 两个键都按**严格**方式读取：无法解析的值会在写入任何东西之前让合并失败——也早于 `--autostash` 保存你的改动。该检查的触发时机与 Git 解析这两个键的时机完全一致：快进、already-up-to-date、`-s ours`，以及**可快进**历史上的 `--squash` / `--no-commit` 都不受该值影响而正常成功；同一历史加 `--no-ff` 则是真合并，会失败。
 
-改名是把同一样东西换个名字，因此两端必须是**同类**条目。如果对侧把原路径上的文件换成了符号链接，对改名而言那就是一次删除，合并按删除处理，而不会把链接搬到新路径上。
+改名是把同一样东西换个名字，因此两端必须是**同类**条目。如果对侧把原路径上的文件换成了符号链接，改名就用不上它：merge base 仍会跟随改名落到新路径并在那里以 modify/delete 冲突呈现，但那个符号链接**在原路径上幸存**，且**不报 rename/delete**——git 对该形态走独立的 type-change 分支，Libra 与之一致。
 
 「目标被占用」只看**合并后仍然存在**的内容：merge base 有、但两侧都删掉的路径不算占用；对侧只是原样承接自 base 的路径同样不算——改名侧必然已经清空了目标之下的内容，这些路径会被合并删掉。两种情形改名都照常成立，`git merge` 亦然。真正挡路的是对侧在那里**新增或修改**过的内容：它会以自身条目或冲突的形式幸存下来。
 
 改名目标嵌在该文件*原路径之下*（`old` 改名为 `old/new`）并不构成冲突：改名本身就腾出了这个名字，因此改名成立，另一侧的修改跟随文件落到 `old/new`。`git merge` 与 `git merge-tree --messages` 对该形态同样干净合并，不打印 `CONFLICT (file/directory)`。
 
-Libra 尚未裁决的形态会打印 notice 并按「未检测到改名」合并——两侧都改名（改到同一路径或不同路径）、改名源被对侧删除、改名目标已被其它侧占用。目录级改名完全不推断。这些情形在结果里就是普通的删除与新增。
+两侧把同一文件改名到**同一路径**根本不是冲突：merge base 跟随该文件落到新路径，两侧内容在那里正常三路合并，因此双方一致的改名可以干净合并。
+
+其余形态是 Git 的路径级改名冲突：
+
+* **rename/rename**——两侧把同一文件改名到*不同*路径。两个目标都保留，通常写入**同一份**合并结果；部分未解决的二进制冲突会让两个目标各保留本侧原条目：仅当未干净合并结果的 hash 和 mode 均等于 ours 原条目时，才触发 Git 的此项回退。选择内容不会丢弃独立合并出的可执行位。合并报告 `CONFLICT (rename/rename): <old> renamed to <a> in HEAD and to <b> in <branch>.`，**原路径按删除收口**。git 则把 merge base 以未合并状态留在原路径的 stage 1——git 自己的源码注释说那是只为兼容其回归测试而保留的历史行为、「一致的做法」是删掉它。Libra 采纳一致的做法。保留它还会让该冲突脱离常规暂存流程——原路径没有工作区文件，而 `libra add`、`libra rm`、`libra restore --staged` 都按已暂存条目匹配路径，没有一条够得着它。它并非**不可解决**：`libra read-tree HEAD` 后接 `libra add -A .`，或 `libra update-index --cacheinfo`，都能清掉；但两者都很粗暴——前者整体替换索引、丢弃此前已暂存的全部解决成果，后者属 plumbing 层。
+* **rename/delete**——一侧改名、另一侧删除。新路径保留改名侧的内容，base 记在其旁，合并报告 `CONFLICT (rename/delete): <old> renamed to <new> in HEAD, but deleted in <branch>.` 即使改名没有改动任何内容，这仍然是冲突。
+* **rename/add**，以及改名目标被另一次改名占用——先跑改名自身的三路合并，其结果再与对侧放在该路径上的内容相撞，于是目标路径以**无共同祖先的 add/add** 冲突呈现。当改名自身的合并不干净时，还会额外报告 `CONFLICT (rename involved in collision): rename of <old> -> <new> has content conflicts AND collides with another path; this may result in nested conflict markers.`
+
+改名相关合并写出的冲突标记比普通内容冲突**长一个字符**，且每一侧的标签为 `<分支>:<路径>` 而非仅分支名——只有真正做了改名的那一侧用目标路径，另一侧仍用源路径。两者均与 Git 一致。`merge.conflictStyle=diff3` 下共同祖先的标记同样带源路径限定；Libra 写作 `base:<路径>`，沿用其 diff3 输出一贯的 `base` 标签，而 Git 在该位置写的是祖先提交的缩写，这是有意保留的输出差异。
+
+目录级改名仍然完全不推断。
 
 ### 会改变历史的 merge 默认值
 
-未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。解析后的消息会记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
+未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
 
 ### `--dry-run`（Libra 扩展）
 
-`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，脏工作树也可预演（注意预演不校验工作树干净度，真实合并仍可能拒绝）。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`、`conflicted_paths` 与 `conflict_kinds`——每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content` / `modify-delete` / `file-directory`，`original_path` 仅目录/文件移位时出现并记录原路径，此时 `path` 是文件将被写到的带 `~` 后缀的名字），真实合并的输出不含这些键（schema 冻结）。
+`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，只要没有进行中的 merge 状态且索引没有未解决条目，脏工作树也可预演。入口检查仍适用于 `--dry-run`，包括未解决的 squash 冲突；除此之外，预演不校验工作树干净度，真实合并仍可能拒绝。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`、`conflicted_paths` 与 `conflict_kinds`——每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content` / `modify-delete` / `file-directory` / `rename-rename`（后者是 rename/rename(1to2) 的两个目标），`original_path` 仅目录/文件移位时出现并记录原路径，此时 `path` 是文件将被写到的带 `~` 后缀的名字），真实合并的输出不含这些键（schema 冻结）。
 
 ### `--restart`（Libra 扩展，移植 Lore `branch merge restart`）
 
-`libra merge --restart` 一步「推倒重来」：像 `--abort` 一样恢复合并前状态（**丢弃**已做的冲突解决），随后立刻对**记录的目标提交**重跑同一个合并（即使分支已移动也确定重现），重新生成冲突标记与 merge 状态。recovery-critical 的 `--allow-unrelated-histories` 会重放；原 `-m`/`--no-ff` 等展示/策略选项不重放。要求**有冲突**的合并：对已暂存的 `--no-commit` 干净合并会拒绝（用 `--continue` 完成或 `--abort` 丢弃）；无合并进行中时报错（均退出 128）。
+`libra merge --restart` 一步「推倒重来」：像 `--abort` 一样恢复合并前状态（**丢弃**已做的冲突解决），随后立刻对**记录的目标提交**重跑同一个合并（即使分支已移动也确定重现），重新生成冲突标记与 merge 状态。recovery-critical 的 `--allow-unrelated-histories` 会重放；原 `-m`/`--no-ff` 等展示/策略选项不重放。要求**有冲突的非 squash** 合并：squash 没有可重启的 merge 状态；对已暂存的 `--no-commit` 干净合并会拒绝（用 `--continue` 完成或 `--abort` 丢弃）；无合并进行中时报错（均退出 128）。
 
 ## 选项
 
@@ -119,11 +131,11 @@ Libra 尚未裁决的形态会打印 notice 并按「未检测到改名」合并
 | `--no-ff` | 即使可以快进也强制生成双父合并提交。 |
 | `-s ours`, `--strategy=ours` | 以双父提交记录合并关系，但完整保留当前 HEAD tree；不同于 `-X ours`。其它 strategy 被拒绝。 |
 | `-X ours`, `-X theirs`, `--strategy-option=<ours\|theirs>` | 只在冲突 hunk/路径偏向指定一侧；双方无冲突变更仍保留。可重复，最后一个值生效；不能与 `-s ours` 组合。 |
-| `--allow-unrelated-histories` | 以虚拟空 merge base 允许没有共同祖先的历史；冲突 `--restart` 会保留此许可。 |
+| `--allow-unrelated-histories` | 以虚拟空 merge base 允许没有共同祖先的历史；非 squash 冲突的 `--restart` 会保留此许可。 |
 | `--log[=<N>]` | 向 merge 消息追加最多 N 条目标侧 subject；bare `--log` 为 20。覆盖 `merge.log`，并可追加到显式 `-m`；与 `--no-log` last-one-wins。 |
 | `--no-log` | 禁用 merge 消息 shortlog，覆盖 `merge.log` 和更早的 `--log`。 |
-| `--squash` | 生成合并后的索引/工作树但不创建提交、不移动 HEAD；随后用普通 `libra commit` 收尾。 |
-| `--no-commit` | 执行合并并暂存结果但停在提交之前；随后用 `libra merge --continue` 收尾。 |
+| `--squash` | 生成合并后的索引/工作树，但不创建提交、不移动 HEAD、不记录 merge 状态，即使发生冲突也如此。解决并暂存冲突后，用普通 `libra commit` 创建单亲提交；`--continue`、`--abort`、`--restart` 均报 `no merge in progress`。 |
+| `--no-commit` | 执行合并但停在提交之前，即使冲突也保留 merge 状态。解决并暂存冲突后，用 `libra merge --continue` 创建双父合并提交。 |
 | `--no-verify` | 本次 merge 跳过全部 `.libra/hooks`；与 `--continue` 一起使用时绕过待执行的 commit/消息/post hooks。 |
 | `--no-edit` | 接受自动生成的合并消息而不启动编辑器。Libra 从不为 merge 打开编辑器，故此为对齐 Git 而接受的 no-op。 |
 | `--stat` | 合并完成后显示 diffstat（合并前 HEAD 与新提交之间的变更）。Git 默认显示；Libra 默认不显示，故用 `--stat` 主动开启。与 `--no-stat`/`-n` 构成 last-wins 切换。仅人类输出。 |
@@ -133,11 +145,11 @@ Libra 尚未裁决的形态会打印 notice 并按「未检测到改名」合并
 | `--no-verify-signatures` | 不验证被合并提交的签名，覆盖 `merge.verifySignatures=true`；与正向标志 last-wins。 |
 | `--no-rerere-autoupdate` | 为对齐 Git 而接受。rerere 已集成：`rerere.enabled` 开启时，冲突合并会记录每个冲突的 preimage 并在有匹配记录时回放已保存的解法；回放文件是否自动暂存跟随 `rerere.autoUpdate` 配置。逐次调用的覆盖未实现——暂存始终跟随配置。（Git 的正向 `--rerere-autoupdate` 未公开。） |
 | `--no-gpg-sign` | 不对合并提交 GPG 签名。为对齐 Git 而接受的 no-op：Libra 的 merge 从不签名。（Git 的 `-S`/`--gpg-sign` 未实现。） |
-| `--continue` | 在冲突已解决并暂存后完成进行中的合并。 |
-| `--abort` | 恢复合并前的 HEAD、索引和工作树。 |
-| `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；发生冲突时 held 在 `stash list` 之外，直到 `--continue`/`--abort`。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
+| `--continue` | 在冲突已解决并暂存后完成进行中的非 squash 合并，创建双父提交。squash 没有可继续的 merge 状态。 |
+| `--abort` | 恢复进行中的非 squash 合并开始前的 HEAD、索引和工作树。`--squash` 后不可用。 |
+| `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；非 squash 冲突期间 held 在 `stash list` 之外，直到 `--continue`/`--abort`。干净的 squash 在命令返回时尝试恢复；冲突 squash 则直接把 autostash 保存进 `stash list`，不执行回贴，保留未解决的索引和工作树。解决并提交 squash 后再运行 `libra stash pop`；保存失败时警告并保留 held sidecar 对原改动的引用。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
 | `--dry-run` | Libra 扩展：预演合并结果而不写任何东西（见上文）。干净预演退出 0，会冲突退出 1。与 `--continue`/`--abort`/`--restart`/`--squash`/`--no-commit` 互斥。 |
-| `--restart` | Libra 扩展：像 `--abort` 一样恢复合并前状态（丢弃解决工作）后，立刻对记录的目标提交重跑同一合并（见上文）。不接受分支与合并选项。 |
+| `--restart` | Libra 扩展：对有冲突的非 squash 合并，像 `--abort` 一样恢复合并前状态（丢弃解决工作）后，立刻对记录的目标提交重跑同一合并（见上文）。不接受分支与合并选项。 |
 | `--json` | 输出结构化成功信封。 |
 | `--machine` | 以一行紧凑 JSON 输出同一结构化信封。 |
 | `--quiet` | 抑制人类可读的成功输出。 |
@@ -173,13 +185,15 @@ libra merge --json feature-x
 
 ## 冲突生命周期
 
-当合并发生冲突时：
+未使用 `--squash` 的合并（包括 `--no-commit`）发生冲突时：
 
 1. 编辑包含冲突标记的文件。
 2. 使用 `libra add <path>` 暂存每个已解决路径。
 3. 运行 `libra merge --continue` 创建双父合并提交。
 
 在继续之前运行 `libra merge --abort` 可将分支、索引和工作树恢复到合并前提交。当存在 merge 状态时，`libra status` 会显示进行中的合并目标，以及 continue/abort 命令。
+
+`--squash` 冲突会留下未解决的索引 stage 和工作树结果，保持 HEAD 不变，但不创建 merge 状态。解决文件、用 `libra add <path>` 暂存每个已解决路径后，运行普通 `libra commit` 创建单亲提交。`libra merge --continue`、`--abort`、`--restart` 均以 `no merge in progress` 拒绝（`LBR-REPO-003`，退出 128），上面的非 squash 恢复步骤不适用。若启用了 `--autostash`，本地改动直接保存进 `stash list`，未解决的索引和工作树保持原样；解决并提交 squash 后，再用 `libra stash pop` 恢复本地改动。
 
 ## 人类可读输出
 
@@ -242,7 +256,7 @@ Merge aborted.
 
 `-s ours` 使用 `strategy: "ours"`、`files_changed: 0` 并报告两个 parent。已经最新的合并使用 `strategy: "already-up-to-date"`、`commit: null`、`files_changed: 0` 和 `up_to_date: true`。
 
-`--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。 `--dry-run` 额外带 `dry_run`、`would_conflict`、`conflicted_paths` 与 `conflict_kinds`（每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content`、`modify-delete` 或 `file-directory`；`original_path` 仅在目录/文件移位时出现，记录文件原来的路径，此时 `path` 与 `conflicted_paths` 里都是带 `~` 后缀的目标名）。
+`--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。 `--dry-run` 额外带 `dry_run`、`would_conflict`、`conflicted_paths` 与 `conflict_kinds`（每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content`、`modify-delete`、`file-directory` 或 `rename-rename`（后者是 rename/rename(1to2) 的两个目标）；`original_path` 仅在目录/文件移位时出现，记录文件原来的路径，此时 `path` 与 `conflicted_paths` 里都是带 `~` 后缀的目标名）。
 
 ## 参数对比：Libra vs Git vs jj
 
@@ -252,11 +266,11 @@ Merge aborted.
 | 快进 | 支持 | 支持 | N/A |
 | 单头三方合并 | 支持 | 支持 | N/A |
 | 交叉合并（多个 merge base） | 递归虚拟祖先（折叠顺序：object id 升序；最大深度 20，每层最多 32 个 base） | 递归虚拟祖先（`-s recursive`/`ort`，深度无上限） | N/A |
-| Continue / abort | `--continue`, `--abort` | `--continue`, `--abort` | N/A |
+| Continue / abort | `--continue`, `--abort`（需要非 squash merge 状态） | `--continue`, `--abort`（需要非 squash merge 状态） | N/A |
 | Octopus merge | 不支持 | 支持 | N/A |
 | 仅快进 | `--ff-only` | `--ff-only` | N/A |
 | 强制合并提交 | `--no-ff` | `--no-ff` | N/A |
-| Squash | `--squash` | `--squash` | N/A |
+| Squash | `--squash`；解决/暂存冲突后普通 `commit`（单亲） | `--squash`；解决/暂存冲突后普通 `commit`（单亲） | N/A |
 | 不提交 | `--no-commit` | `--no-commit` | N/A |
 | 跳过全部 merge lifecycle hooks | `--no-verify` | `--no-verify` | N/A |
 | 提交消息 | `-m <msg>` | `-m <msg>` | N/A |
@@ -287,10 +301,11 @@ Merge aborted.
 | 不支持的 `-s` / `-X` 值或不兼容的 strategy 组合 | `LBR-CLI-002` | 129 |
 | `--verify-signatures`：tip 未签名、签名无效或 vault 不可用 | `LBR-REPO-003` | 128 |
 | 合并冲突 | `LBR-CONFLICT-002` | 128 |
+| 无 merge 状态但索引有未解决条目，包括目标已最新或 `--dry-run` | `LBR-CONFLICT-002` | 128 |
 | 脏工作树或暂存更改 | `LBR-CONFLICT-002` | 128 |
 | 未跟踪文件会被覆盖 | `LBR-CONFLICT-002` | 128 |
 | 合并已在进行中 | `LBR-CONFLICT-002` | 128 |
-| 对 `--continue` / `--abort` 没有进行中的合并 | `LBR-REPO-003` | 128 |
+| 对 `--continue` / `--abort` / `--restart` 没有进行中的合并（包括 `--squash` 后） | `LBR-REPO-003` | 128 |
 | `--continue` 仍有未解决的冲突 stage | `LBR-CONFLICT-002` | 128 |
 | 无法读取 merge 状态或索引 | `LBR-IO-001` | 128 |
 | 无法保存状态、索引、树、提交、HEAD 或工作树 | `LBR-IO-002` | 128 |
