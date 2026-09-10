@@ -1664,14 +1664,6 @@ pub(crate) async fn run_merge_for_pull_with_options(
     }
 }
 
-/// Whether the target is already reachable from HEAD — nothing to merge.
-/// Shared by the merge itself and by [`preflight_merge_gitlinks`] so the two can
-/// never disagree about which merges arbitrate anything (GC-02).
-///
-/// Phrased over the merge-base SET (MG-02): a commit that is an ancestor of the
-/// other dominates every other common ancestor, so "already merged" is exactly
-/// the shape where the target is the ONE merge base. A criss-cross history with
-/// several bases is never up to date and never fast-forwardable.
 /// The rename configuration for a three-way merge — read strictly, EXCEPT on a
 /// merge that is only here because `--squash` or `--no-commit` skipped the
 /// fast-forward branch. There the result is the target tree whatever rename
@@ -1749,6 +1741,14 @@ async fn merge_reaches_three_way_engine(
     true
 }
 
+/// Whether the target is already reachable from HEAD — nothing to merge.
+/// Shared by the merge itself and by [`preflight_merge_gitlinks`] so the two can
+/// never disagree about which merges arbitrate anything (GC-02).
+///
+/// Phrased over the merge-base SET (MG-02): a commit that is an ancestor of the
+/// other dominates every other common ancestor, so "already merged" is exactly
+/// the shape where the target is the ONE merge base. A criss-cross history with
+/// several bases is never up to date and never fast-forwardable.
 fn merge_is_up_to_date(bases: &[Commit], target_commit: &Commit) -> bool {
     matches!(bases, [base] if base.id == target_commit.id)
 }
@@ -4191,7 +4191,8 @@ pub(crate) const MAX_VIRTUAL_ANCESTOR_DEPTH: usize = 20;
 pub(crate) const MAX_VIRTUAL_ANCESTOR_BASES: usize = 32;
 
 /// The two side labels Git renders inside a virtual-ancestor merge
-/// (`merge-ort.c:5429` swaps `opt->branch1`/`branch2` for these while it folds).
+/// (`merge-ort.c` `merge_ort_internal`, lines 5371-5372 at git@`3cb9185f6`,
+/// swaps `opt->branch1`/`branch2` for these inside the fold loop).
 const VIRTUAL_OURS_LABEL: &str = "Temporary merge branch 1";
 const VIRTUAL_THEIRS_LABEL: &str = "Temporary merge branch 2";
 
@@ -4326,11 +4327,13 @@ fn load_merge_commit(id: &ObjectHash) -> Result<Commit, PullMergeError> {
 
 /// The merge bases of the ancestor folded from `folded` with `next`.
 ///
-/// Git asks this of the synthetic commit it just built (`merge-ort.c:5429`
-/// chains `make_virtual_commit` so the next round can call `get_merge_bases()`
-/// on it). The same set falls out of the REAL bases folded so far: the virtual
-/// commit's ancestry is exactly the union of theirs, so the common ancestors of
-/// it and `next` are `⋃ᵢ (anc(folded[i]) ∩ anc(next))`, and the maximal elements
+/// Git asks this of the synthetic commit it just built (`merge-ort.c`
+/// `merge_ort_internal`, lines 5353-5385 at git@`3cb9185f6`, chains
+/// `make_virtual_commit` at line 5380 so the next round can call
+/// `get_merge_bases()` on it). The same set falls out of the REAL bases folded
+/// so far: the virtual commit's ancestry is exactly the union of theirs, so the
+/// common ancestors of it and `next` are
+/// `⋃ᵢ (anc(folded[i]) ∩ anc(next))`, and the maximal elements
 /// of a union are always among the maximal elements of its parts — i.e. among
 /// `⋃ᵢ merge_bases(folded[i], next)`, filtered for domination across the parts.
 ///
@@ -4355,13 +4358,35 @@ fn merge_bases_of_folded(
     folded: &[ObjectHash],
     next: &ObjectHash,
 ) -> Result<Vec<ObjectHash>, PullMergeError> {
-    let history = |error: merge_base::MergeBaseError| PullMergeError::History(error.to_string());
+    merge_bases_of_folded_with(
+        folded,
+        next,
+        |base, tip| {
+            merge_base::merge_bases(base, tip)
+                .map_err(|error| PullMergeError::History(error.to_string()))
+        },
+        |ancestor, descendant| {
+            merge_base::is_ancestor(ancestor, descendant)
+                .map_err(|error| PullMergeError::History(error.to_string()))
+        },
+    )
+}
+
+/// Candidate collection and cross-part domination for
+/// [`merge_bases_of_folded`], parameterized by graph reads so the otherwise
+/// rare dominated-candidate branch can be exercised on a small in-memory DAG.
+fn merge_bases_of_folded_with(
+    folded: &[ObjectHash],
+    next: &ObjectHash,
+    mut merge_bases: impl FnMut(&ObjectHash, &ObjectHash) -> Result<Vec<ObjectHash>, PullMergeError>,
+    mut is_ancestor: impl FnMut(&ObjectHash, &ObjectHash) -> Result<bool, PullMergeError>,
+) -> Result<Vec<ObjectHash>, PullMergeError> {
     ensure_virtual_ancestor_width(folded.len())?;
     let [single] = folded else {
         // Candidates tagged with the part (folded base) that produced them.
         let mut candidates: Vec<(usize, ObjectHash)> = Vec::new();
         for (part, base) in folded.iter().enumerate() {
-            for candidate in merge_base::merge_bases(base, next).map_err(history)? {
+            for candidate in merge_bases(base, next)? {
                 if !candidates.iter().any(|(_, known)| *known == candidate) {
                     candidates.push((part, candidate));
                     ensure_virtual_ancestor_width(candidates.len())?;
@@ -4375,7 +4400,7 @@ fn merge_bases_of_folded(
                 if other_part == part {
                     continue;
                 }
-                if merge_base::is_ancestor(candidate, other).map_err(history)? {
+                if is_ancestor(candidate, other)? {
                     dominated = true;
                     break;
                 }
@@ -4386,7 +4411,7 @@ fn merge_bases_of_folded(
         }
         return Ok(virtual_base_fold_order(&maximal));
     };
-    merge_base::merge_bases(single, next).map_err(history)
+    merge_bases(single, next)
 }
 
 /// The knobs every level of the virtual-ancestor fold shares.
@@ -4464,8 +4489,9 @@ fn fold_merge_bases(
 /// The difference from the user's merge is that this one can never fail: a
 /// virtual ancestor is a synthetic input, so every path has to end up with
 /// SOME content. Git resolves the same way — a content conflict is recorded
-/// with its markers, and a modify/delete "simply reuse[s] the base version for
-/// [the] virtual merge base" (`merge-recursive.c`, `handle_change_delete`).
+/// with its markers, and a modify/delete selects the original entry while
+/// `call_depth` is non-zero (`merge-ort.c` `process_entry`, lines 4374-4381 at
+/// git@`3cb9185f6`).
 fn merge_virtual_items(
     base_items: &HashMap<PathBuf, MergeTreeEntry>,
     our_items: &HashMap<PathBuf, MergeTreeEntry>,
@@ -4626,8 +4652,8 @@ fn relocate_virtual_df_files(
 /// "ask the user":
 ///
 /// * only one side survives (modify/delete) — keep the original, because there
-///   is no midpoint between "changed" and "gone"
-///   (`merge-recursive.c` `handle_change_delete`);
+///   is no midpoint between "changed" and "gone" (`merge-ort.c`
+///   `process_entry`, lines 4374-4381 at git@`3cb9185f6`);
 /// * the two sides are different KINDS of entry, or are not regular files
 ///   (symlinks) — keep the original, which is *nothing* when there is none
 ///   (`merge-ort.c` `handle_content_merge`: `result->mode = o->mode;
@@ -4748,9 +4774,9 @@ fn is_regular_file_mode(mode: TreeItemMode) -> bool {
     matches!(mode, TreeItemMode::Blob | TreeItemMode::BlobExecutable)
 }
 
-/// Git's mode rule for a conflicted content merge (`merge-recursive.c`,
-/// `merge_mode_and_contents`): take theirs when the two sides agree or when
-/// ours is unchanged, otherwise keep ours.
+/// Git's mode rule for a conflicted content merge (`merge-ort.c`
+/// `handle_content_merge`, lines 2211-2217 at git@`3cb9185f6`): take theirs
+/// when the two sides agree or when ours is unchanged, otherwise keep ours.
 fn virtual_merged_mode(
     base: Option<&MergeTreeEntry>,
     ours: &MergeTreeEntry,
@@ -9460,7 +9486,10 @@ mod tests {
 /// through [`VirtualBlobs`] exactly as a `--dry-run` supplies them).
 #[cfg(test)]
 mod recursive {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+    };
 
     use git_internal::{
         hash::ObjectHash,
@@ -9476,8 +9505,9 @@ mod recursive {
         GitlinkEntries, MAX_VIRTUAL_ANCESTOR_BASES, MAX_VIRTUAL_ANCESTOR_DEPTH, MAX_XDIFF_SIZE,
         MergeTreeEntry, PullMergeError, VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL, VirtualBlobs,
         conflict_marker_length_at_depth, ensure_virtual_ancestor_depth, fold_merge_bases,
-        merge_bases_of_folded, merge_input_exceeds_xdiff_size, merge_input_is_binary,
-        merge_virtual_items, recorded_merge_base, virtual_base_fold_order, virtual_merged_mode,
+        merge_bases_of_folded, merge_bases_of_folded_with, merge_input_exceeds_xdiff_size,
+        merge_input_is_binary, merge_virtual_items, recorded_merge_base, virtual_base_fold_order,
+        virtual_merged_mode,
     };
 
     fn oid(byte: u8) -> ObjectHash {
@@ -9665,6 +9695,96 @@ mod recursive {
         );
     }
 
+    /// The maximal filter must compare candidates contributed by different
+    /// folded bases. Here `x` is a strict ancestor of `y`, so the virtual
+    /// commit whose parents are `left` and `right` has exactly `y` as its merge
+    /// base with `next`; retaining `x` would add redundant work to the next
+    /// recursive fold.
+    #[test]
+    fn cross_part_domination_drops_the_strict_ancestor_candidate() {
+        fn ancestors(
+            parents: &HashMap<ObjectHash, Vec<ObjectHash>>,
+            tip: ObjectHash,
+        ) -> HashSet<ObjectHash> {
+            let mut seen = HashSet::new();
+            let mut stack = vec![tip];
+            while let Some(commit) = stack.pop() {
+                if seen.insert(commit) {
+                    stack.extend(parents.get(&commit).into_iter().flatten().copied());
+                }
+            }
+            seen
+        }
+
+        fn graph_merge_bases(
+            parents: &HashMap<ObjectHash, Vec<ObjectHash>>,
+            left: ObjectHash,
+            right: ObjectHash,
+        ) -> Vec<ObjectHash> {
+            let left_ancestors = ancestors(parents, left);
+            let right_ancestors = ancestors(parents, right);
+            let common: Vec<ObjectHash> = left_ancestors
+                .intersection(&right_ancestors)
+                .copied()
+                .collect();
+            let mut maximal: Vec<ObjectHash> = common
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    !common.iter().any(|other| {
+                        candidate != other && ancestors(parents, *other).contains(candidate)
+                    })
+                })
+                .collect();
+            maximal.sort_by_key(|id| id.to_string());
+            maximal
+        }
+
+        // root <- x <- y; left descends only from x, while right and next
+        // descend from y. Therefore mb(left,next)={x}, mb(right,next)={y}, and
+        // the synthetic commit with parents left+right has mb(virtual,next)={y}.
+        let root = oid(0x10);
+        let x = oid(0x20);
+        let y = oid(0x30);
+        let left = oid(0x40);
+        let right = oid(0x50);
+        let next = oid(0x60);
+        let virtual_commit = oid(0x70);
+        let parents = HashMap::from([
+            (root, vec![]),
+            (x, vec![root]),
+            (y, vec![x]),
+            (left, vec![x]),
+            (right, vec![y]),
+            (next, vec![y]),
+            (virtual_commit, vec![left, right]),
+        ]);
+        let mut ancestry_checks = Vec::new();
+
+        let maximal = merge_bases_of_folded_with(
+            &[left, right],
+            &next,
+            |base, tip| Ok(graph_merge_bases(&parents, *base, *tip)),
+            |ancestor, descendant| {
+                ancestry_checks.push((*ancestor, *descendant));
+                Ok(ancestors(&parents, *descendant).contains(ancestor))
+            },
+        )
+        .expect("the in-memory ancestry graph is valid");
+
+        assert_eq!(
+            maximal,
+            graph_merge_bases(&parents, virtual_commit, next),
+            "filtering the union of per-parent bases matches the equivalent virtual commit"
+        );
+        assert_eq!(maximal, vec![y]);
+        assert_eq!(
+            ancestry_checks,
+            vec![(x, y), (y, x)],
+            "both cross-part directions are considered; only the strict ancestor is dropped"
+        );
+    }
+
     /// G3 + G4: the recursion has a ceiling and reports it instead of running
     /// the stack out. Git recurses unbounded (`merge-ort.c:5313`); the ceiling
     /// is Libra's, because the fold recurses for real.
@@ -9709,7 +9829,7 @@ mod recursive {
 
     /// G1: several ancestors fold pairwise, left to right, into ONE tree —
     /// Git's `merged_merge_bases = merge(merged_merge_bases, next)` loop
-    /// (`merge-ort.c:5429`).
+    /// (`merge-ort.c` `merge_ort_internal`, lines 5353-5385 at git@`3cb9185f6`).
     #[test]
     fn folds_three_ancestors_pairwise_into_one_tree() {
         let mut blobs = VirtualBlobs::new();
@@ -9795,7 +9915,8 @@ mod recursive {
 
     /// Git's rule for a change/delete inside a virtual ancestor: there is no
     /// midpoint between "changed" and "gone", so the ancestor keeps the base
-    /// version (`merge-recursive.c`, `handle_change_delete`).
+    /// version (`merge-ort.c` `process_entry`, lines 4374-4381 at
+    /// git@`3cb9185f6`).
     #[test]
     fn change_delete_inside_an_ancestor_keeps_the_base_version() {
         let mut blobs = VirtualBlobs::new();
@@ -9986,8 +10107,8 @@ mod recursive {
         assert_eq!(folded.get(&PathBuf::from("p")), Some(&base_entry));
     }
 
-    /// Git's mode rule for a conflicted content merge
-    /// (`merge-recursive.c`, `merge_mode_and_contents`).
+    /// Git's mode rule for a conflicted content merge (`merge-ort.c`
+    /// `handle_content_merge`, lines 2211-2217 at git@`3cb9185f6`).
     #[test]
     fn conflicted_ancestor_mode_follows_gits_rule() {
         let base = MergeTreeEntry {
