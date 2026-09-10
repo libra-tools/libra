@@ -19,6 +19,12 @@ libra revert --abort
 
 该命令通过计算目标提交与其父提交之间的 diff，然后将该 diff 的逆应用到当前工作树和索引来工作。如果结果状态干净，会记录一个新提交，消息格式为 `Revert "<original subject>"`。
 
+当逆向更改与后续历史都修改了同一路径时，内容合并与 `libra merge`
+共用该路径的 `merge` gitattribute 与 `merge.default` 回退。内建支持
+`text`、`binary`、`union`；未知名称回退 `text`。union 在每个重叠区域
+依次保留 current 与要恢复的 parent 内容；binary driver 冲突保留完整
+current 文件，不插入文本标记。
+
 revert 提交使用当前 author 与 committer 身份/日期，并在创建提交时遵循与 `libra commit` 相同的 `GIT_AUTHOR_*` 与 `GIT_COMMITTER_*` 环境变量规则。生成的 subject 来自目标提交剥离签名后的消息正文，因此嵌入的 `gpgsig` 块不会被当作原始 subject。
 
 回滚 root 提交（没有父提交的提交）会产生空树，实际效果是撤销初始提交的更改。
@@ -175,6 +181,7 @@ Git 的 `--mainline <parent-number>` 会选择合并提交的某个父提交，�
 ### 冲突模型（三方合并）
 
 Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时干净更新文件；与后续更改重叠时，向工作树写入标准冲突标记，把未合并状态与 revert 进度记录到 `revert-state.json`，并返回 `LBR-CONFLICT-001`。随后解决标记并运行 `libra revert --continue`、用 `libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。
+隐式 `text` driver 保留 revert 既有的 diff3 风格 `||||||| original` base 段。
 
 ## 参数对比：Libra vs Git vs jj
 

@@ -16,6 +16,196 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn cherry_pick_driver_union_resolves_overlapping_change() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("driver.txt"), "top\nbase\nbottom\n").unwrap();
+    fs::write(root.join(".gitattributes"), "*.txt merge=union\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt", ".gitattributes"], root),
+        "add driver fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "driver base", "--no-verify"], root),
+        "commit driver fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "pick-side"], root),
+        "create pick side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "pick-side"], root),
+        "checkout pick side",
+    );
+    fs::write(root.join("driver.txt"), "top\ntheirs\nbottom\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add pick change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "pick theirs", "--no-verify"], root),
+        "commit pick change",
+    );
+    let picked = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "checkout main",
+    );
+    fs::write(root.join("driver.txt"), "top\nours\nbottom\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add current change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "current ours", "--no-verify"], root),
+        "commit current change",
+    );
+
+    let output = run_libra_command(&["cherry-pick", &picked], root);
+    assert_cli_success(&output, "union cherry-pick");
+    assert_eq!(
+        fs::read_to_string(root.join("driver.txt")).unwrap(),
+        "top\nours\ntheirs\nbottom\n"
+    );
+}
+
+#[test]
+fn cherry_pick_driver_default_union_resolves_add_add() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.default", "union"], root),
+        "configure default union driver",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "pick-side"], root),
+        "create pick side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "pick-side"], root),
+        "checkout pick side",
+    );
+    fs::write(root.join("added.txt"), "theirs\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "added.txt"], root),
+        "add picked file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "pick add", "--no-verify"], root),
+        "commit picked addition",
+    );
+    let picked = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "checkout main",
+    );
+    fs::write(root.join("added.txt"), "ours\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "added.txt"], root),
+        "add current file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "current add", "--no-verify"], root),
+        "commit current addition",
+    );
+
+    let output = run_libra_command(&["cherry-pick", &picked], root);
+    assert_cli_success(&output, "default-union add/add cherry-pick");
+    assert_eq!(
+        fs::read_to_string(root.join("added.txt")).unwrap(),
+        "ours\ntheirs\n"
+    );
+}
+
+#[test]
+fn cherry_pick_driver_binary_preserves_surviving_modify_delete_side() {
+    for (attribute, default_driver, label) in [
+        (Some("*.txt -merge\n"), None, "binary attribute"),
+        (None, Some("binary"), "binary default"),
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let root = repo.path();
+        fs::write(root.join("driver.txt"), "base\n").unwrap();
+        let mut paths = vec!["driver.txt"];
+        if let Some(attribute) = attribute {
+            fs::write(root.join(".gitattributes"), attribute).unwrap();
+            paths.push(".gitattributes");
+        }
+        assert_cli_success(
+            &run_libra_command(&["add", paths[0]], root),
+            "add binary-driver base",
+        );
+        if paths.len() == 2 {
+            assert_cli_success(
+                &run_libra_command(&["add", paths[1]], root),
+                "add binary-driver attributes",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "binary base", "--no-verify"], root),
+            "commit binary-driver base",
+        );
+        if let Some(default_driver) = default_driver {
+            assert_cli_success(
+                &run_libra_command(&["config", "merge.default", default_driver], root),
+                "configure default binary driver",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(&["branch", "pick-side"], root),
+            "create pick side",
+        );
+        assert_cli_success(
+            &run_libra_command(&["checkout", "pick-side"], root),
+            "checkout pick side",
+        );
+        fs::write(root.join("driver.txt"), "picked modification\n").unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", "driver.txt"], root),
+            "add picked modification",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "picked modification", "--no-verify"],
+                root,
+            ),
+            "commit picked modification",
+        );
+        let picked =
+            String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+                .trim()
+                .to_string();
+        assert_cli_success(
+            &run_libra_command(&["checkout", "main"], root),
+            "checkout main",
+        );
+        assert_cli_success(
+            &run_libra_command(&["rm", "driver.txt"], root),
+            "delete current file",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "current deletion", "--no-verify"], root),
+            "commit current deletion",
+        );
+
+        let output = run_libra_command(&["cherry-pick", &picked], root);
+        assert!(
+            !output.status.success(),
+            "{label}: modify/delete must remain conflicted"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("driver.txt")).unwrap(),
+            "picked modification\n",
+            "{label}: preserve the complete surviving side without text markers"
+        );
+    }
+}
+
+#[test]
 fn test_cherry_pick_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["cherry-pick", "abc123"], temp.path());

@@ -35,6 +35,14 @@ is removed on a clean merge and kept (with a note) when conflicts remain.
 The three arguments are read as raw bytes; `merge-file` does not require them to
 be tracked or to correspond to stored blobs.
 
+Inside a Libra repository, the `<current>` path uses the same `merge`
+gitattribute and `merge.default` dispatch as `libra merge`: `text` is the
+normal marker-producing merge, `binary` keeps the complete current file on a
+conflict without markers, and `union` retains current then other for each
+overlap. Unknown names fall back to `text`. Outside a repository there is no
+attributes/config source, so `merge-file` always uses `text`. Input containing
+a NUL byte is still rejected before driver dispatch.
+
 ## Options
 
 | Option | Description | Example |

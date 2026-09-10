@@ -60,7 +60,31 @@ libra config merge.conflictStyle diff3
 
 For a merge with **several merge bases** the value is read before the merge runs rather than only when a conflict is rendered, because the recursive virtual ancestor's own content depends on it (Git does the same at every recursion depth). An invalid value therefore stops a criss-cross merge even when that merge would have come out clean.
 
-The config is honored by both `libra merge` and `libra cherry-pick` for line-level text conflicts. Binary and modify/delete conflicts keep their two-part whole-file presentation (Git also emits no base block there), and `libra rebase` currently renders whole-file markers without a base block regardless of this setting.
+The config is honored by both `libra merge` and `libra cherry-pick` for line-level text conflicts. NUL-containing content handled by the text fallback and modify/delete conflicts keep their two-part whole-file presentation (Git also emits no base block there); an explicitly selected binary driver instead keeps ours without markers. `libra rebase` currently renders whole-file markers without a base block regardless of this setting.
+
+### Per-path merge drivers (`gitattributes`)
+
+For a path whose contents changed on both sides, Libra reads the existing
+`.gitattributes` / `.libra_attributes` cascade and dispatches the `merge`
+attribute like Git's low-level merge layer:
+
+- `merge` or `merge=text` uses the normal line-level text merge.
+- `-merge` or `merge=binary` treats the file as indivisible. An unresolved
+  conflict keeps the complete ours version in the working tree, writes stages
+  1/2/3 to the index, and emits no conflict markers.
+- `merge=union` resolves each overlapping region by retaining ours followed by
+  theirs, and reports the content merge as clean. If xdiff classifies any input
+  as binary (for example, a NUL byte), union falls back to a whole-file binary
+  conflict and keeps ours without markers.
+- An unknown attribute value falls back to `text`; it is not an error and does
+  not consult `merge.default`.
+
+When a path has no `merge` attribute, `merge.default=text|binary|union` selects
+the fallback driver. An unset or unknown `merge.default` also falls back to
+`text`. The same dispatch is used by `merge-file`, `cherry-pick`, and `revert`;
+`merge-file` outside a Libra repository has no attribute/config source and
+always uses `text`. External `merge.<name>.driver` commands are not yet
+implemented, so custom names currently take the documented text fallback.
 
 ### Directory/file collisions (D/F conflicts)
 

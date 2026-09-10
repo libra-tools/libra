@@ -1,5 +1,7 @@
 //! Boundary coverage for Git's recursive rename-content merge rules.
 
+use std::path::Path;
+
 use super::{
     Blob, MergeFavor, MergeTreeEntry, TreeItemMode, TreeMergeContext, VirtualBlobs,
     merge_rename_content,
@@ -19,6 +21,7 @@ fn merge(
     theirs: &MergeTreeEntry,
 ) -> (MergeTreeEntry, bool) {
     merge_rename_content(
+        Path::new("renamed.txt"),
         base,
         ours,
         theirs,
@@ -26,7 +29,7 @@ fn merge(
         "temporary 2:b",
         "base:old",
         diffy::ConflictStyle::Merge,
-        &mut TreeMergeContext::nested(false, 1, blobs),
+        &mut TreeMergeContext::nested(false, 1, None, blobs),
     )
     .expect("recursive content merge")
 }
@@ -110,6 +113,7 @@ fn non_file_rename_without_an_original_refuses_the_invalid_helper_contract() {
     let theirs = entry(&mut blobs, b"theirs-target", TreeItemMode::Link);
     // When: this non-optional rename helper is incorrectly given no original.
     let error = merge_rename_content(
+        Path::new("renamed.txt"),
         None,
         &ours,
         &theirs,
@@ -117,7 +121,7 @@ fn non_file_rename_without_an_original_refuses_the_invalid_helper_contract() {
         "b",
         "base:old",
         diffy::ConflictStyle::Merge,
-        &mut TreeMergeContext::nested(false, 1, &mut blobs),
+        &mut TreeMergeContext::nested(false, 1, None, &mut blobs),
     )
     .expect_err("do not invent either side as the virtual original");
     // Then: identify the affected original instead of silently choosing ours.
@@ -155,6 +159,7 @@ fn outer_binary_content_selection_preserves_mode_and_mode_conflicts() {
         for favor in [None, Some(MergeFavor::Ours), Some(MergeFavor::Theirs)] {
             // When: the final merge chooses a whole binary side.
             let (result, clean) = merge_rename_content(
+                Path::new("renamed.txt"),
                 original,
                 &ours,
                 &theirs,
@@ -162,7 +167,7 @@ fn outer_binary_content_selection_preserves_mode_and_mode_conflicts() {
                 "feature:b",
                 "base:old",
                 diffy::ConflictStyle::Merge,
-                &mut TreeMergeContext::top_level(false, favor, &mut blobs),
+                &mut TreeMergeContext::top_level(false, favor, None, &mut blobs),
             )
             .expect("outer binary merge");
             // Then: content selection cannot overwrite mode merging or turn

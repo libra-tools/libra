@@ -26,6 +26,13 @@ libra merge-file [-p|--stdout] [--diff3] [-q|--quiet] <current> <base> <other>
 
 三个参数按原始字节读取；不要求它们被跟踪或对应已存 blob。
 
+在 Libra 仓库内，`<current>` 路径与 `libra merge` 共用 `merge`
+gitattribute 和 `merge.default` 分派：`text` 是普通的标记式文本合并，
+`binary` 在冲突时保留完整 current 内容且不写标记，`union` 在每个
+重叠区域依次保留 current、other。未知名称回退 `text`。仓库外没有
+attributes/config 来源，因此 `merge-file` 恒用 `text`。包含 NUL 字节的
+输入仍会在 driver 分派前被拒绝。
+
 ## 选项
 
 | 选项 | 说明 | 示例 |

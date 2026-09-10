@@ -44,6 +44,7 @@ use crate::{
         tree_plumbing,
     },
     utils::{
+        attributes::{self, AttributeState},
         error::{CliError, CliResult, StableErrorCode},
         object_ext::TreeExt,
         output::{OutputConfig, emit_json_data},
@@ -660,6 +661,11 @@ pub(crate) enum PullMergeError {
     /// fall-back that would ignore a configured `diff3`.
     #[error("failed to read merge.conflictStyle config: {0}")]
     ConflictStyleRead(String),
+    /// The default low-level merge driver could not be read. Unknown VALUES
+    /// are valid and fall back to text; only an actual config-store failure is
+    /// an error.
+    #[error("failed to read merge.default config: {0}")]
+    MergeDriverConfigRead(String),
     /// A rename-detection config value Libra rejects (`merge.renames`,
     /// `merge.renameLimit`, `merge.directoryRenames`, and the applicable
     /// `diff.*` fall-backs). A typo must not silently change merge behavior.
@@ -863,6 +869,9 @@ impl From<PullMergeError> for CliError {
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
             PullMergeError::ConflictStyleRead(..) => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            PullMergeError::MergeDriverConfigRead(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
             PullMergeError::InvalidRenameConfig { .. } => CliError::failure(error.to_string())
@@ -1557,12 +1566,19 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // follows it, which writes a stash commit, a durable sidecar and resets the
     // worktree. Only the three-way path is preflighted, matching exactly where
     // Git parses the value at all.
-    let preflighted_rename_config =
-        if merge_reaches_three_way_engine(&target_commit, &options).await {
-            Some(merge_rename_config().await?)
-        } else {
-            None
-        };
+    let reaches_three_way = merge_reaches_three_way_engine(&target_commit, &options).await;
+    let preflighted_rename_config = if reaches_three_way {
+        Some(merge_rename_config().await?)
+    } else {
+        None
+    };
+    let preflighted_default_driver = if reaches_three_way {
+        read_merge_default_driver()
+            .await
+            .map_err(PullMergeError::MergeDriverConfigRead)?
+    } else {
+        None
+    };
 
     // ── autostash (lore.md §1.8) ──
     // Stale-sidecar recovery: a leftover sidecar with NO merge in progress
@@ -1665,6 +1681,7 @@ pub(crate) async fn run_merge_for_pull_with_options(
         output,
         options,
         preflighted_rename_config,
+        preflighted_default_driver,
     )
     .await;
     // Uniform finalize: applies when no merge state persists (clean success,
@@ -1967,6 +1984,7 @@ async fn run_merge_for_pull_inner(
     // transient failure or a concurrent edit could refuse the merge after the
     // autostash had already saved and reset the tree (Codex R9).
     preflighted_rename_config: Option<MergeRenameConfig>,
+    preflighted_default_driver: Option<String>,
 ) -> Result<PullMergeSummary, PullMergeError> {
     let Some(current_commit_id) = Head::current_commit().await else {
         let files_changed = count_changed_files(None, &target_commit)?;
@@ -2071,6 +2089,7 @@ async fn run_merge_for_pull_inner(
         allow_unrelated_histories: options.allow_unrelated_histories,
         fast_forwardable: merge_head_is_sole_base(&bases, &current_commit) && !options.no_ff,
         rename_config: preflighted_rename_config,
+        merge_default_driver: preflighted_default_driver,
         output,
     };
     match options.strategy {
@@ -2132,6 +2151,7 @@ struct ThreeWayMergeOptions<'a> {
     /// stale-sidecar recovery and the autostash it guards. Reading it again in
     /// the engine would reopen the window those refusals exist to close.
     rename_config: Option<MergeRenameConfig>,
+    merge_default_driver: Option<String>,
     output: &'a OutputConfig,
 }
 
@@ -2371,6 +2391,7 @@ async fn perform_three_way_merge(
                 !options.dry_run,
                 conflict_style,
                 &rename_config,
+                options.merge_default_driver.as_deref(),
             )?;
             (ancestor.items, ancestor.blobs)
         }
@@ -2389,7 +2410,12 @@ async fn perform_three_way_merge(
             df_branch_label(MergeSide::Ours, upstream).as_str(),
             upstream,
         ),
-        &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
+        &mut TreeMergeContext::top_level(
+            !options.dry_run,
+            options.favor,
+            options.merge_default_driver.as_deref(),
+            &mut virtual_blobs,
+        ),
     )?;
 
     // Under `--dry-run`, auto-merged blobs are computed in memory only
@@ -2401,7 +2427,12 @@ async fn perform_three_way_merge(
         &base_items,
         &our_items,
         &their_items,
-        &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
+        &mut TreeMergeContext::top_level(
+            !options.dry_run,
+            options.favor,
+            options.merge_default_driver.as_deref(),
+            &mut virtual_blobs,
+        ),
     )?;
     // MG-06: conflicts the ordinary match must not decide for itself. A
     // rename/rename(1to2)'s destinations look like one-sided adds to it, its
@@ -3905,6 +3936,7 @@ enum ConflictKind {
         base: Option<ObjectHash>,
         ours: ObjectHash,
         theirs: ObjectHash,
+        driver: BuiltinMergeDriver,
     },
     OursModifiedTheirsDeleted {
         ours: ObjectHash,
@@ -3983,6 +4015,7 @@ fn classify_relative_to_base(
 }
 
 fn resolve_three_way(
+    path: &Path,
     base: Option<&MergeTreeEntry>,
     ours: Option<&MergeTreeEntry>,
     theirs: Option<&MergeTreeEntry>,
@@ -4002,14 +4035,23 @@ fn resolve_three_way(
         (false, RelativeState::Added(ours), RelativeState::Added(theirs)) => {
             if ours == theirs {
                 MergeResolution::Use(theirs)
-            } else if let Some(favor) = favor {
-                favored_resolution(favor, Some(ours), Some(theirs))
             } else {
-                MergeResolution::Conflict(ConflictKind::BothChanged {
-                    base: None,
-                    ours: ours.hash,
-                    theirs: theirs.hash,
-                })
+                let driver = context.driver_for_path(path);
+                if driver != BuiltinMergeDriver::Text
+                    && let Some(merged) =
+                        try_merge_blob_contents(None, ours, theirs, driver, context)?
+                {
+                    MergeResolution::Use(merged)
+                } else if let Some(favor) = favor {
+                    favored_resolution(favor, Some(ours), Some(theirs))
+                } else {
+                    MergeResolution::Conflict(ConflictKind::BothChanged {
+                        base: None,
+                        ours: ours.hash,
+                        theirs: theirs.hash,
+                        driver,
+                    })
+                }
             }
         }
         (true, RelativeState::Same(ours), RelativeState::Same(_)) => MergeResolution::Use(ours),
@@ -4020,18 +4062,21 @@ fn resolve_three_way(
         (true, RelativeState::Modified(ours), RelativeState::Modified(theirs)) => {
             if ours == theirs {
                 MergeResolution::Use(theirs)
-            } else if let Some(base) = base
-                && let Some(merged) = try_merge_blob_contents(base, ours, theirs, context)?
-            {
-                MergeResolution::Use(merged)
-            } else if let Some(favor) = favor {
-                favored_resolution(favor, Some(ours), Some(theirs))
             } else {
-                MergeResolution::Conflict(ConflictKind::BothChanged {
-                    base: base.map(|b| b.hash),
-                    ours: ours.hash,
-                    theirs: theirs.hash,
-                })
+                let driver = context.driver_for_path(path);
+                if let Some(merged) = try_merge_blob_contents(base, ours, theirs, driver, context)?
+                {
+                    MergeResolution::Use(merged)
+                } else if let Some(favor) = favor {
+                    favored_resolution(favor, Some(ours), Some(theirs))
+                } else {
+                    MergeResolution::Conflict(ConflictKind::BothChanged {
+                        base: base.map(|b| b.hash),
+                        ours: ours.hash,
+                        theirs: theirs.hash,
+                        driver,
+                    })
+                }
             }
         }
         (true, RelativeState::Deleted, RelativeState::Same(_)) => MergeResolution::Delete,
@@ -4075,9 +4120,10 @@ fn favored_resolution(
 }
 
 fn try_merge_blob_contents(
-    base: &MergeTreeEntry,
+    base: Option<&MergeTreeEntry>,
     ours: MergeTreeEntry,
     theirs: MergeTreeEntry,
+    driver: BuiltinMergeDriver,
     context: &mut TreeMergeContext<'_>,
 ) -> Result<Option<MergeTreeEntry>, PullMergeError> {
     // Git merges the CONTENT and the MODE independently
@@ -4087,7 +4133,7 @@ fn try_merge_blob_contents(
     // answer — that stays a conflict. Verified against `git merge`:
     // rename + `chmod +x` on one side and an edit on the other merges cleanly
     // and keeps `100755`.
-    if !is_regular_file_mode(base.mode)
+    if base.is_some_and(|base| !is_regular_file_mode(base.mode))
         || !is_regular_file_mode(ours.mode)
         || !is_regular_file_mode(theirs.mode)
     {
@@ -4095,50 +4141,38 @@ fn try_merge_blob_contents(
     }
     let merged_mode = if ours.mode == theirs.mode {
         ours.mode
-    } else if ours.mode == base.mode {
+    } else if base.is_some_and(|base| ours.mode == base.mode) {
         theirs.mode
-    } else if theirs.mode == base.mode {
+    } else if base.is_some_and(|base| theirs.mode == base.mode) {
         ours.mode
     } else {
         // Both sides changed the mode, differently.
         return Ok(None);
     };
 
-    let base_blob = load_merge_blob(base.hash, context.virtual_blobs)?;
+    let base_blob = match base {
+        Some(base) => Some(load_merge_blob(base.hash, context.virtual_blobs)?),
+        None => None,
+    };
     let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
     let theirs_blob = load_merge_blob(theirs.hash, context.virtual_blobs)?;
-
-    // Git routes ANY binary input to `ll_binary_merge` instead of the
-    // line-level merge (`merge-ll.c` `ll_xdl_merge`), and inside a virtual
-    // ancestor that is what decides the content — so the line-level path has to
-    // decline here and let [`virtual_conflict_resolution`] apply the rule. The
-    // depth-0 behaviour is deliberately left exactly as it was: binary content
-    // merging for the user's own merge is a different axis, untouched by MG-02.
-    if context.depth > 0
-        && (merge_input_is_binary(&base_blob.data)
-            || merge_input_is_binary(&ours_blob.data)
-            || merge_input_is_binary(&theirs_blob.data))
+    let base_data = base_blob
+        .as_ref()
+        .map_or(&[][..], |blob| blob.data.as_slice());
+    let merged_bytes = match merge_bytes_with_driver(
+        driver,
+        base_data,
+        &ours_blob.data,
+        &theirs_blob.data,
+        context.favor,
+        diffy::ConflictStyle::Diff3,
+        2 * context.depth,
+    )
+    .map_err(PullMergeError::TreeCreate)?
     {
-        return Ok(None);
-    }
-
-    let marker_len = conflict_marker_length_at_depth(
-        &[&base_blob.data, &ours_blob.data, &theirs_blob.data],
-        context.depth,
-    );
-    let mut merge_options = diffy::MergeOptions::new();
-    merge_options
-        .set_conflict_style(diffy::ConflictStyle::Diff3)
-        .set_conflict_marker_length(marker_len);
-    let merged_bytes =
-        match merge_options.merge_bytes(&base_blob.data, &ours_blob.data, &theirs_blob.data) {
-            Ok(merged) => merged,
-            Err(conflicted) => match context.favor {
-                Some(favor) => resolve_favored_content(conflicted, marker_len, favor)
-                    .map_err(PullMergeError::TreeCreate)?,
-                None => return Ok(None),
-            },
-        };
+        BuiltinMergeOutcome::Clean(bytes) => bytes,
+        BuiltinMergeOutcome::Conflict(_) => return Ok(None),
+    };
 
     let merged_blob = Blob::from_content_bytes(merged_bytes);
     // `--dry-run` (persist=false): the merged OID is computed in memory only —
@@ -4163,6 +4197,20 @@ fn resolve_favored_content(
     conflicted: Vec<u8>,
     marker_len: usize,
     favor: MergeFavor,
+) -> Result<Vec<u8>, String> {
+    resolve_conflicted_content(conflicted, marker_len, ConflictResolution::Favor(favor))
+}
+
+#[derive(Debug, Copy, Clone)]
+enum ConflictResolution {
+    Favor(MergeFavor),
+    Union,
+}
+
+fn resolve_conflicted_content(
+    conflicted: Vec<u8>,
+    marker_len: usize,
+    resolution: ConflictResolution,
 ) -> Result<Vec<u8>, String> {
     let marker = |byte: u8, label: Option<&[u8]>| {
         let mut line = vec![byte; marker_len];
@@ -4202,9 +4250,17 @@ fn resolve_favored_content(
             find_after(&conflicted, base_start, &separator).ok_or_else(malformed)?;
         let theirs_start = separator_start + separator.len();
         let close_start = find_after(&conflicted, theirs_start, &close).ok_or_else(malformed)?;
-        match favor {
-            MergeFavor::Ours => output.extend_from_slice(&conflicted[ours_start..original_start]),
-            MergeFavor::Theirs => output.extend_from_slice(&conflicted[theirs_start..close_start]),
+        match resolution {
+            ConflictResolution::Favor(MergeFavor::Ours) => {
+                output.extend_from_slice(&conflicted[ours_start..original_start]);
+            }
+            ConflictResolution::Favor(MergeFavor::Theirs) => {
+                output.extend_from_slice(&conflicted[theirs_start..close_start]);
+            }
+            ConflictResolution::Union => {
+                output.extend_from_slice(&conflicted[ours_start..original_start]);
+                output.extend_from_slice(&conflicted[theirs_start..close_start]);
+            }
         }
         cursor = close_start + close.len();
         resolved += 1;
@@ -4214,6 +4270,146 @@ fn resolve_favored_content(
     }
     output.extend_from_slice(&conflicted[cursor..]);
     Ok(output)
+}
+
+/// Git's built-in low-level merge drivers. External drivers are deliberately
+/// deferred to MG-09; an unknown driver name therefore resolves to `Text`, the
+/// same fallback used by `find_ll_merge_driver`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum BuiltinMergeDriver {
+    Text,
+    Binary,
+    Union,
+}
+
+/// The bytes a low-level driver produced, and whether the path remains
+/// unmerged. A binary conflict intentionally carries ours verbatim rather than
+/// manufacturing text markers in arbitrary bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BuiltinMergeOutcome {
+    Clean(Vec<u8>),
+    Conflict(Vec<u8>),
+}
+
+fn builtin_driver_named(name: &str) -> BuiltinMergeDriver {
+    match name {
+        "binary" => BuiltinMergeDriver::Binary,
+        "union" => BuiltinMergeDriver::Union,
+        "text" => BuiltinMergeDriver::Text,
+        _ => BuiltinMergeDriver::Text,
+    }
+}
+
+fn select_builtin_merge_driver(
+    attribute: Option<AttributeState>,
+    default_driver: Option<&str>,
+) -> BuiltinMergeDriver {
+    match attribute {
+        Some(AttributeState::Set) => BuiltinMergeDriver::Text,
+        Some(AttributeState::Unset) => BuiltinMergeDriver::Binary,
+        Some(AttributeState::Value(name)) => builtin_driver_named(&name),
+        Some(AttributeState::Unspecified) | None => {
+            default_driver.map_or(BuiltinMergeDriver::Text, builtin_driver_named)
+        }
+    }
+}
+
+/// Resolve the effective built-in driver for a worktree-relative path through
+/// the existing gitattributes engine. A named-but-unknown attribute never
+/// consults `merge.default`; it falls straight back to text, matching Git.
+pub(crate) fn builtin_merge_driver_for_path(
+    path: &Path,
+    default_driver: Option<&str>,
+) -> BuiltinMergeDriver {
+    select_builtin_merge_driver(
+        attributes::attribute_state_for_path("merge", path),
+        default_driver,
+    )
+}
+
+/// Read `merge.default` through the same strict local-to-system cascade used
+/// by the other merge configuration. The caller decides whether it is inside
+/// a repository; merge-file outside a repository must not consult config.
+pub(crate) async fn read_merge_default_driver() -> Result<Option<String>, String> {
+    use crate::internal::config::{LocalIdentityTarget, read_cascaded_config_value_strict};
+
+    read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, "merge.default")
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Apply one built-in low-level driver. The text and union drivers use a diff3
+/// rendering internally so hunk selection can be parsed without ambiguity;
+/// the configured style is preserved when a text conflict is returned.
+pub(crate) fn merge_bytes_with_driver(
+    driver: BuiltinMergeDriver,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    favor: Option<MergeFavor>,
+    conflict_style: diffy::ConflictStyle,
+    extra_marker_size: usize,
+) -> Result<BuiltinMergeOutcome, String> {
+    // High-level merge consumers normally settle these OID-equality cases
+    // before low-level dispatch. Keep the shared helper equally safe for
+    // byte-oriented consumers such as merge-file.
+    if ours == theirs {
+        return Ok(BuiltinMergeOutcome::Clean(ours.to_vec()));
+    }
+    if ours == base {
+        return Ok(BuiltinMergeOutcome::Clean(theirs.to_vec()));
+    }
+    if theirs == base {
+        return Ok(BuiltinMergeOutcome::Clean(ours.to_vec()));
+    }
+    let binary_fallback = driver == BuiltinMergeDriver::Binary
+        || (driver == BuiltinMergeDriver::Union
+            && (merge_input_is_binary(base)
+                || merge_input_is_binary(ours)
+                || merge_input_is_binary(theirs)));
+    if binary_fallback {
+        // Git's union driver sets the union variant itself; if xdiff rejects
+        // binary input, that variant is not ours/theirs and the binary fallback
+        // therefore reports a conflict with ours.
+        let effective_favor = if driver == BuiltinMergeDriver::Union {
+            None
+        } else {
+            favor
+        };
+        return Ok(match effective_favor {
+            None => BuiltinMergeOutcome::Conflict(ours.to_vec()),
+            Some(MergeFavor::Ours) => BuiltinMergeOutcome::Clean(ours.to_vec()),
+            Some(MergeFavor::Theirs) => BuiltinMergeOutcome::Clean(theirs.to_vec()),
+        });
+    }
+
+    let marker_len =
+        unambiguous_conflict_marker_length(&[base, ours, theirs]).saturating_add(extra_marker_size);
+    let mut options = diffy::MergeOptions::new();
+    options
+        .set_conflict_style(if favor.is_some() || driver == BuiltinMergeDriver::Union {
+            diffy::ConflictStyle::Diff3
+        } else {
+            conflict_style
+        })
+        .set_conflict_marker_length(marker_len);
+    match options.merge_bytes(base, ours, theirs) {
+        Ok(bytes) => Ok(BuiltinMergeOutcome::Clean(bytes)),
+        Err(conflicted) => match driver {
+            BuiltinMergeDriver::Union => {
+                resolve_conflicted_content(conflicted, marker_len, ConflictResolution::Union)
+                    .map(BuiltinMergeOutcome::Clean)
+            }
+            BuiltinMergeDriver::Text => match favor {
+                Some(favor) => resolve_favored_content(conflicted, marker_len, favor)
+                    .map(BuiltinMergeOutcome::Clean),
+                None => Ok(BuiltinMergeOutcome::Conflict(conflicted)),
+            },
+            BuiltinMergeDriver::Binary => {
+                Err("internal binary merge driver unexpectedly reached the text merger".to_string())
+            }
+        },
+    }
 }
 
 /// Merge three blob payloads and resolve only overlapping regions in favor of
@@ -4332,6 +4528,8 @@ struct TreeMergeContext<'a> {
     /// that fold its merge bases, 2 for the merges that fold *those* bases, and
     /// so on — Git's `call_depth`.
     depth: usize,
+    /// Configured fallback used only when the path has no `merge` attribute.
+    default_driver: Option<String>,
     /// Blobs this merge (and, inside the recursive fold, every level below it)
     /// synthesized WITHOUT writing them, consulted by [`load_merge_blob`] ahead
     /// of the object store.
@@ -4346,15 +4544,17 @@ struct TreeMergeContext<'a> {
 
 impl TreeMergeContext<'_> {
     /// The context for a real (depth 0) merge.
-    fn top_level(
+    fn top_level<'a>(
         persist_merged_blobs: bool,
         favor: Option<MergeFavor>,
-        virtual_blobs: &mut VirtualBlobs,
-    ) -> TreeMergeContext<'_> {
+        default_driver: Option<&str>,
+        virtual_blobs: &'a mut VirtualBlobs,
+    ) -> TreeMergeContext<'a> {
         TreeMergeContext {
             persist_merged_blobs,
             favor,
             depth: 0,
+            default_driver: default_driver.map(str::to_owned),
             virtual_blobs,
         }
     }
@@ -4363,15 +4563,17 @@ impl TreeMergeContext<'_> {
     /// always `None` there: Git disables `-X ours`/`-X theirs` whenever
     /// `call_depth` is non-zero, because a virtual ancestor is an input the
     /// user never asked to bias.
-    fn nested(
+    fn nested<'a>(
         persist_merged_blobs: bool,
         depth: usize,
-        virtual_blobs: &mut VirtualBlobs,
-    ) -> TreeMergeContext<'_> {
+        default_driver: Option<&str>,
+        virtual_blobs: &'a mut VirtualBlobs,
+    ) -> TreeMergeContext<'a> {
         TreeMergeContext {
             persist_merged_blobs,
             favor: None,
             depth,
+            default_driver: default_driver.map(str::to_owned),
             virtual_blobs,
         }
     }
@@ -4390,6 +4592,10 @@ impl TreeMergeContext<'_> {
             self.virtual_blobs.insert(blob.id, blob.data.clone());
         }
         Ok(())
+    }
+
+    fn driver_for_path(&self, path: &Path) -> BuiltinMergeDriver {
+        builtin_merge_driver_for_path(path, self.default_driver.as_deref())
     }
 }
 
@@ -4543,6 +4749,7 @@ struct VirtualFold<'a> {
     conflict_style: diffy::ConflictStyle,
     /// The fold is a merge, so it detects renames like any other (FIX-MG05-02).
     rename_config: &'a MergeRenameConfig,
+    default_driver: Option<&'a str>,
 }
 
 /// Fold every merge base of a criss-cross history into ONE virtual ancestor
@@ -4556,12 +4763,14 @@ fn virtual_merge_base(
     persist: bool,
     conflict_style: diffy::ConflictStyle,
     rename_config: &MergeRenameConfig,
+    default_driver: Option<&str>,
 ) -> Result<VirtualAncestor, PullMergeError> {
     let mut blobs = VirtualBlobs::new();
     let fold = VirtualFold {
         persist,
         conflict_style,
         rename_config,
+        default_driver,
     };
     let items = fold_merge_bases(bases, gitlinks, 1, &mut blobs, fold)?;
     Ok(VirtualAncestor { items, blobs })
@@ -4648,7 +4857,7 @@ fn merge_virtual_items(
         fold.rename_config,
         fold.conflict_style,
         (VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL),
-        &mut TreeMergeContext::nested(fold.persist, depth, blobs),
+        &mut TreeMergeContext::nested(fold.persist, depth, fold.default_driver, blobs),
     )?;
     let (base_items, our_items, their_items) = (&base_items, &our_items, &their_items);
 
@@ -4668,22 +4877,21 @@ fn merge_virtual_items(
                 persist_merged_blobs: fold.persist,
                 favor: None,
                 depth,
+                default_driver: fold.default_driver.map(str::to_owned),
                 virtual_blobs: blobs,
             };
-            resolve_three_way(base, ours, theirs, &mut context)?
+            resolve_three_way(&path, base, ours, theirs, &mut context)?
         };
         let entry = match resolution {
             MergeResolution::Use(entry) => Some(entry),
             MergeResolution::Delete => None,
-            MergeResolution::Conflict(_) => virtual_conflict_resolution(
-                base,
-                ours,
-                theirs,
-                depth,
-                fold.persist,
-                fold.conflict_style,
-                blobs,
-            )?,
+            MergeResolution::Conflict(kind) => {
+                let driver = match kind {
+                    ConflictKind::BothChanged { driver, .. } => driver,
+                    _ => BuiltinMergeDriver::Text,
+                };
+                virtual_conflict_resolution(base, ours, theirs, driver, depth, blobs, fold)?
+            }
         };
         if let Some(entry) = entry {
             merged.insert(path, entry);
@@ -4796,10 +5004,10 @@ fn virtual_conflict_resolution(
     base: Option<&MergeTreeEntry>,
     ours: Option<&MergeTreeEntry>,
     theirs: Option<&MergeTreeEntry>,
+    driver: BuiltinMergeDriver,
     depth: usize,
-    persist: bool,
-    conflict_style: diffy::ConflictStyle,
     blobs: &mut VirtualBlobs,
+    fold: VirtualFold<'_>,
 ) -> Result<Option<MergeTreeEntry>, PullMergeError> {
     let (Some(ours), Some(theirs)) = (ours, theirs) else {
         return Ok(base.copied());
@@ -4823,15 +5031,17 @@ fn virtual_conflict_resolution(
 
     let mut record = |blob: &Blob| {
         TreeMergeContext {
-            persist_merged_blobs: persist,
+            persist_merged_blobs: fold.persist,
             favor: None,
             depth,
+            default_driver: None,
             virtual_blobs: blobs,
         }
         .record_merged_blob(blob)
     };
 
-    if merge_input_is_binary(base_bytes)
+    if driver == BuiltinMergeDriver::Binary
+        || merge_input_is_binary(base_bytes)
         || merge_input_is_binary(&ours_blob.data)
         || merge_input_is_binary(&theirs_blob.data)
     {
@@ -4853,12 +5063,14 @@ fn virtual_conflict_resolution(
     }
 
     let content = merge_virtual_content(
+        driver,
         base_bytes,
         &ours_blob.data,
         &theirs_blob.data,
         depth,
-        conflict_style,
-    );
+        fold.conflict_style,
+    )
+    .map_err(PullMergeError::TreeCreate)?;
     let blob = Blob::from_content_bytes(content);
     record(&blob)?;
     Ok(Some(MergeTreeEntry {
@@ -4878,7 +5090,7 @@ const MAX_XDIFF_SIZE: usize = 1024 * 1024 * 1023;
 /// than shared with `grep`'s private copy of the same rule — promoting it would
 /// move a helper into `src/utils/`, a cross-cutting surface this card has no
 /// reason to touch.
-fn merge_input_is_binary(content: &[u8]) -> bool {
+pub(crate) fn merge_input_is_binary(content: &[u8]) -> bool {
     merge_input_exceeds_xdiff_size(content.len())
         || content.iter().take(8000).any(|&byte| byte == 0)
 }
@@ -4923,26 +5135,23 @@ fn virtual_merged_mode(
 /// when there is one, otherwise the conflicted text with markers widened for
 /// `depth` and labelled the way Git labels a virtual-ancestor merge.
 fn merge_virtual_content(
+    driver: BuiltinMergeDriver,
     base: &[u8],
     ours: &[u8],
     theirs: &[u8],
     depth: usize,
     conflict_style: diffy::ConflictStyle,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, String> {
     let marker_len = conflict_marker_length_at_depth(&[base, ours, theirs], depth);
-    let mut options = diffy::MergeOptions::new();
-    options
-        .set_conflict_style(conflict_style)
-        .set_conflict_marker_length(marker_len);
-    match options.merge_bytes(base, ours, theirs) {
-        Ok(merged) => merged,
-        Err(conflicted) => relabel_conflict_markers(
+    match merge_bytes_with_driver(driver, base, ours, theirs, None, conflict_style, 2 * depth)? {
+        BuiltinMergeOutcome::Clean(merged) => Ok(merged),
+        BuiltinMergeOutcome::Conflict(conflicted) => Ok(relabel_conflict_markers(
             conflicted,
             marker_len,
             VIRTUAL_OURS_LABEL,
             VIRTUAL_THEIRS_LABEL,
             "base",
-        ),
+        )),
     }
 }
 
@@ -5473,7 +5682,8 @@ fn resolve_walk_leaf(
         return Ok(());
     }
     out.note_rename_candidates(path, [base, ours, theirs]);
-    let resolution = resolve_three_way(base.as_ref(), ours.as_ref(), theirs.as_ref(), context)?;
+    let resolution =
+        resolve_three_way(path, base.as_ref(), ours.as_ref(), theirs.as_ref(), context)?;
     match resolution {
         MergeResolution::Use(entry) => {
             if ours != Some(entry) {
@@ -7011,6 +7221,7 @@ fn apply_directory_renames(
                     .filter(|entry| entry.mode != TreeItemMode::Tree);
                 let kind = match (rename.side, counterpart) {
                     (MergeSide::Ours, Some(ours_entry)) => rename_destination_conflict(
+                        &new_path,
                         &ours_entry,
                         &moved,
                         branches.1,
@@ -7018,6 +7229,7 @@ fn apply_directory_renames(
                         context,
                     )?,
                     (MergeSide::Theirs, Some(theirs_entry)) => rename_destination_conflict(
+                        &new_path,
                         &moved,
                         &theirs_entry,
                         branches.1,
@@ -7060,6 +7272,7 @@ fn apply_directory_renames(
 /// reuse an input object. Returns the entry and whether the merge was clean.
 #[allow(clippy::too_many_arguments)]
 fn merge_rename_content(
+    path: &Path,
     base: Option<&MergeTreeEntry>,
     ours: &MergeTreeEntry,
     theirs: &MergeTreeEntry,
@@ -7151,7 +7364,9 @@ fn merge_rename_content(
         Some(blob) => &blob.data,
         None => &[],
     };
-    if merge_input_is_binary(base_data)
+    let driver = context.driver_for_path(path);
+    if driver == BuiltinMergeDriver::Binary
+        || merge_input_is_binary(base_data)
         || merge_input_is_binary(&ours_blob.data)
         || merge_input_is_binary(&theirs_blob.data)
     {
@@ -7177,10 +7392,10 @@ fn merge_rename_content(
         }
         // ll_binary_merge selects bytes only; handle_content_merge retains
         // the mode result even when the selected side has a different mode.
-        let (hash, content_clean) = match favor {
-            Some(MergeFavor::Ours) => (ours.hash, true),
-            Some(MergeFavor::Theirs) => (theirs.hash, true),
-            None => (ours.hash, false),
+        let (hash, content_clean) = match (driver, favor) {
+            (BuiltinMergeDriver::Union, _) | (_, None) => (ours.hash, false),
+            (_, Some(MergeFavor::Ours)) => (ours.hash, true),
+            (_, Some(MergeFavor::Theirs)) => (theirs.hash, true),
         };
         return Ok((
             MergeTreeEntry {
@@ -7195,42 +7410,22 @@ fn merge_rename_content(
         context.depth,
     )
     .saturating_add(1);
-    let mut options = diffy::MergeOptions::new();
-    options
-        // `resolve_favored_content` finds the conflict regions by their
-        // `|||||||` marker, so `-X` needs the diff3 rendering to work on —
-        // exactly as [`try_merge_blob_contents`] hardcodes it. The choice is
-        // invisible in the output: a favoured merge resolves every region, so
-        // no marker of any style survives. Rendering a KEPT conflict still uses
-        // the style the user configured. (Codex R2 P1-1: passing the configured
-        // style here made `-X ours` on a rename conflict fail with
-        // `LBR-IO-002 ... malformed conflict markers` under the default
-        // two-marker style.)
-        .set_conflict_style(if favor.is_some() {
-            diffy::ConflictStyle::Diff3
-        } else {
-            conflict_style
-        })
-        .set_conflict_marker_length(marker_len);
-    let (bytes, clean) = match options.merge_bytes(base_data, &ours_blob.data, &theirs_blob.data) {
-        Ok(merged) => (merged, true),
-        Err(conflicted) => match favor {
-            Some(favor) => (
-                resolve_favored_content(conflicted, marker_len, favor)
-                    .map_err(PullMergeError::TreeCreate)?,
-                true,
-            ),
-            None => (
-                relabel_conflict_markers(
-                    conflicted,
-                    marker_len,
-                    ours_label,
-                    theirs_label,
-                    base_label,
-                ),
-                false,
-            ),
-        },
+    let (bytes, clean) = match merge_bytes_with_driver(
+        driver,
+        base_data,
+        &ours_blob.data,
+        &theirs_blob.data,
+        favor,
+        conflict_style,
+        1 + 2 * context.depth,
+    )
+    .map_err(PullMergeError::TreeCreate)?
+    {
+        BuiltinMergeOutcome::Clean(bytes) => (bytes, true),
+        BuiltinMergeOutcome::Conflict(bytes) => (
+            relabel_conflict_markers(bytes, marker_len, ours_label, theirs_label, base_label),
+            false,
+        ),
     };
     let blob = Blob::from_content_bytes(bytes);
     context.record_merged_blob(&blob)?;
@@ -7247,6 +7442,7 @@ fn merge_rename_content(
 
 /// Merge a colliding destination's content without clearing its path conflict.
 fn rename_destination_conflict(
+    path: &Path,
     ours: &MergeTreeEntry,
     theirs: &MergeTreeEntry,
     upstream: &str,
@@ -7255,44 +7451,44 @@ fn rename_destination_conflict(
 ) -> Result<ConflictKind, PullMergeError> {
     let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
     let theirs_blob = load_merge_blob(theirs.hash, context.virtual_blobs)?;
+    let driver = context.driver_for_path(path);
     let content = if ours.hash == theirs.hash {
         *ours
     } else if !is_regular_file_mode(ours.mode)
         || !is_regular_file_mode(theirs.mode)
+        || driver == BuiltinMergeDriver::Binary
         || merge_input_is_binary(&ours_blob.data)
         || merge_input_is_binary(&theirs_blob.data)
     {
         // Git's binary fallback selects one complete input. Even a favored
         // result still carries the path conflict and both original stages.
-        match context.favor {
-            Some(MergeFavor::Theirs) => *theirs,
-            Some(MergeFavor::Ours) | None => *ours,
+        match (driver, context.favor) {
+            (BuiltinMergeDriver::Union, _) | (_, Some(MergeFavor::Ours) | None) => *ours,
+            (_, Some(MergeFavor::Theirs)) => *theirs,
         }
     } else {
         // A base-less add/add still merges against the empty blob. In
         // particular, an empty added file has no conflicting hunk for -X to
         // choose, so it must not erase the other side's nonempty content.
-        let empty_blob = Blob::from_content_bytes(Vec::new());
-        context.record_merged_blob(&empty_blob)?;
-        let empty_base = MergeTreeEntry {
-            hash: empty_blob.id,
-            mode: ours.mode,
-        };
-        match try_merge_blob_contents(&empty_base, *ours, *theirs, context)? {
+        match try_merge_blob_contents(None, *ours, *theirs, driver, context)? {
             Some(merged) => MergeTreeEntry {
                 hash: merged.hash,
                 mode: ours.mode,
             },
             None => {
-                let bytes = both_changed_conflict_content(
-                    None,
-                    &ours_blob.data,
-                    &theirs_blob.data,
-                    conflict_marker_eol(),
-                    upstream,
-                    conflict_style,
-                )
-                .map_err(PullMergeError::TreeCreate)?;
+                let bytes = if driver == BuiltinMergeDriver::Binary {
+                    ours_blob.data
+                } else {
+                    both_changed_conflict_content(
+                        None,
+                        &ours_blob.data,
+                        &theirs_blob.data,
+                        conflict_marker_eol(),
+                        upstream,
+                        conflict_style,
+                    )
+                    .map_err(PullMergeError::TreeCreate)?
+                };
                 let blob = Blob::from_content_bytes(bytes);
                 context.record_merged_blob(&blob)?;
                 MergeTreeEntry {
@@ -7374,6 +7570,7 @@ fn apply_renames(
                     continue;
                 };
                 let (merged, clean) = merge_rename_content(
+                    &ours_path,
                     Some(&base_entry),
                     &ours_entry,
                     &theirs_entry,
@@ -7407,6 +7604,7 @@ fn apply_renames(
                     ours_path.clone(),
                     match theirs.get(&ours_path) {
                         Some(added) if context.depth == 0 => rename_destination_conflict(
+                            &ours_path,
                             &merged,
                             added,
                             branches.1,
@@ -7425,6 +7623,7 @@ fn apply_renames(
                     theirs_path.clone(),
                     match ours.get(&theirs_path) {
                         Some(added) if context.depth == 0 => rename_destination_conflict(
+                            &theirs_path,
                             added,
                             &theirs_content,
                             branches.1,
@@ -7542,6 +7741,7 @@ fn apply_renames(
                     forced.push((
                         decision.new.clone(),
                         rename_destination_conflict(
+                            &decision.new,
                             ours_entry,
                             theirs_entry,
                             branches.1,
@@ -7582,6 +7782,7 @@ fn apply_renames(
                     MergeSide::Theirs => (other_entry, side_entry),
                 };
                 let (merged, clean) = merge_rename_content(
+                    &decision.new,
                     Some(&base_entry),
                     &ours_entry,
                     &theirs_entry,
@@ -8163,6 +8364,7 @@ fn apply_incremental_renames(
             MergeSide::Theirs => (other_entry, side_entry),
         };
         let resolved = match resolve_three_way(
+            &decision.new,
             Some(&base_entry),
             Some(&ours_entry),
             Some(&theirs_entry),
@@ -8264,6 +8466,7 @@ fn apply_incremental_renames(
                     continue;
                 }
                 let resolved = resolve_three_way(
+                    &decision.new,
                     Some(&base_entry),
                     Some(&ours_entry),
                     Some(&theirs_entry),
@@ -8312,6 +8515,7 @@ fn apply_incremental_renames(
                     continue;
                 };
                 let (merged_entry, merged_clean) = merge_rename_content(
+                    &ours_path,
                     Some(&base_entry),
                     &ours_entry,
                     &theirs_entry,
@@ -8358,6 +8562,7 @@ fn apply_incremental_renames(
                                 (added, content)
                             };
                             rename_destination_conflict(
+                                path,
                                 &ours_side,
                                 &theirs_side,
                                 upstream,
@@ -8431,6 +8636,7 @@ fn apply_incremental_renames(
                     settle(
                         &decision.new,
                         Some(rename_destination_conflict(
+                            &decision.new,
                             &ours_entry,
                             &theirs_entry,
                             upstream,
@@ -8457,6 +8663,7 @@ fn apply_incremental_renames(
                             MergeSide::Theirs => (other_entry, side_entry),
                         };
                         let resolved = resolve_three_way(
+                            &decision.new,
                             Some(&base_entry),
                             Some(&ours_side),
                             Some(&theirs_side),
@@ -8510,6 +8717,7 @@ fn apply_incremental_renames(
                     MergeSide::Theirs => (other_entry, side_entry),
                 };
                 let (rename_merged, clean) = merge_rename_content(
+                    &decision.new,
                     Some(&base_entry),
                     &ours_entry,
                     &theirs_entry,
@@ -8549,8 +8757,13 @@ fn apply_incremental_renames(
                 let counted_source = merged.get(&decision.old).copied() != original_source;
                 destination[index] = Some(rename_merged);
                 let [ours_side, theirs_side] = *destination;
-                let resolved =
-                    resolve_three_way(None, ours_side.as_ref(), theirs_side.as_ref(), context)?;
+                let resolved = resolve_three_way(
+                    &decision.new,
+                    None,
+                    ours_side.as_ref(),
+                    theirs_side.as_ref(),
+                    context,
+                )?;
                 settle(
                     &decision.new,
                     match resolved {
@@ -9230,7 +9443,12 @@ async fn perform_incremental_three_way_merge(
         base_tree,
         ours_tree,
         theirs_tree,
-        &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
+        &mut TreeMergeContext::top_level(
+            !options.dry_run,
+            options.favor,
+            options.merge_default_driver.as_deref(),
+            &mut virtual_blobs,
+        ),
         rename_config.enabled,
     )?;
     if incremental_may_need_flat_directory_renames(
@@ -9263,8 +9481,12 @@ async fn perform_incremental_three_way_merge(
         ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
         ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
     })?;
-    let mut rename_context =
-        TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs);
+    let mut rename_context = TreeMergeContext::top_level(
+        !options.dry_run,
+        options.favor,
+        options.merge_default_driver.as_deref(),
+        &mut virtual_blobs,
+    );
     let rename_decisions = apply_incremental_renames(
         &mut source,
         &walk.rename_sources,
@@ -9423,7 +9645,12 @@ async fn perform_incremental_three_way_merge(
                 df_branch_label(MergeSide::Ours, upstream).as_str(),
                 upstream,
             ),
-            &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
+            &mut TreeMergeContext::top_level(
+                !options.dry_run,
+                options.favor,
+                options.merge_default_driver.as_deref(),
+                &mut virtual_blobs,
+            ),
         )?;
         conflicts.sort_by(|(left, _), (right, _)| left.cmp(right));
         let placements = conflict_placements(
@@ -9741,7 +9968,7 @@ fn merge_tree_items(
             our_items.get(&path),
             their_items.get(&path),
         );
-        match resolve_three_way(base, ours, theirs, context)? {
+        match resolve_three_way(&path, base, ours, theirs, context)? {
             MergeResolution::Use(hash) => {
                 merged_items.insert(path, hash);
             }
@@ -10177,17 +10404,47 @@ fn write_conflict_markers(
     conflict_style: diffy::ConflictStyle,
 ) -> Result<(), String> {
     let content: Vec<u8> = match kind {
-        ConflictKind::BothChanged { base, ours, theirs } => {
+        ConflictKind::BothChanged {
+            base,
+            ours,
+            theirs,
+            driver,
+        } => {
             let ours_blob: Blob = load_object(&ours).map_err(|error| error.to_string())?;
             let theirs_blob: Blob = load_object(&theirs).map_err(|error| error.to_string())?;
-            both_changed_conflict_content(
-                base,
-                &ours_blob.data,
-                &theirs_blob.data,
-                marker_eol,
-                commit_abbrev,
-                conflict_style,
-            )?
+            match driver {
+                BuiltinMergeDriver::Binary => ours_blob.data,
+                BuiltinMergeDriver::Union => {
+                    let base_data = match base {
+                        Some(base) => {
+                            load_object::<Blob>(&base)
+                                .map_err(|error| error.to_string())?
+                                .data
+                        }
+                        None => Vec::new(),
+                    };
+                    match merge_bytes_with_driver(
+                        driver,
+                        &base_data,
+                        &ours_blob.data,
+                        &theirs_blob.data,
+                        None,
+                        conflict_style,
+                        0,
+                    )? {
+                        BuiltinMergeOutcome::Clean(bytes)
+                        | BuiltinMergeOutcome::Conflict(bytes) => bytes,
+                    }
+                }
+                BuiltinMergeDriver::Text => both_changed_conflict_content(
+                    base,
+                    &ours_blob.data,
+                    &theirs_blob.data,
+                    marker_eol,
+                    commit_abbrev,
+                    conflict_style,
+                )?,
+            }
         }
         ConflictKind::OursModifiedTheirsDeleted { ours } => {
             let ours_blob: Blob = load_object(&ours).map_err(|error| error.to_string())?;
@@ -10612,6 +10869,146 @@ fn short_object_id(object_id: &ObjectHash) -> String {
 mod merge_rename_content_test;
 
 #[cfg(test)]
+mod driver {
+    use super::*;
+
+    #[test]
+    fn builtins_follow_attribute_precedence_and_text_fallbacks() {
+        for (attribute, default, expected) in [
+            (Some(AttributeState::Set), None, BuiltinMergeDriver::Text),
+            (
+                Some(AttributeState::Unset),
+                Some("union"),
+                BuiltinMergeDriver::Binary,
+            ),
+            (
+                Some(AttributeState::Value("union".to_string())),
+                None,
+                BuiltinMergeDriver::Union,
+            ),
+            (
+                Some(AttributeState::Value("unknown".to_string())),
+                Some("union"),
+                BuiltinMergeDriver::Text,
+            ),
+            (None, Some("binary"), BuiltinMergeDriver::Binary),
+            (None, Some("unknown"), BuiltinMergeDriver::Text),
+            (None, None, BuiltinMergeDriver::Text),
+        ] {
+            assert_eq!(select_builtin_merge_driver(attribute, default), expected);
+        }
+    }
+
+    #[test]
+    fn union_retains_only_both_conflicting_sides_in_order() {
+        let result = merge_bytes_with_driver(
+            BuiltinMergeDriver::Union,
+            b"top\nbase\nbottom\n",
+            b"top\nours\nbottom\n",
+            b"top\ntheirs\nbottom\n",
+            None,
+            diffy::ConflictStyle::Merge,
+            0,
+        )
+        .expect("union driver");
+        assert_eq!(
+            result,
+            BuiltinMergeOutcome::Clean(b"top\nours\ntheirs\nbottom\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn binary_driver_keeps_trivial_three_way_resolutions_clean() {
+        for (base, ours, theirs, expected) in [
+            (
+                &b"base\n"[..],
+                &b"base\n"[..],
+                &b"theirs\n"[..],
+                &b"theirs\n"[..],
+            ),
+            (
+                &b"base\n"[..],
+                &b"ours\n"[..],
+                &b"base\n"[..],
+                &b"ours\n"[..],
+            ),
+            (
+                &b"base\n"[..],
+                &b"same\n"[..],
+                &b"same\n"[..],
+                &b"same\n"[..],
+            ),
+        ] {
+            let outcome = merge_bytes_with_driver(
+                BuiltinMergeDriver::Binary,
+                base,
+                ours,
+                theirs,
+                None,
+                diffy::ConflictStyle::Merge,
+                0,
+            )
+            .expect("binary driver");
+            assert_eq!(outcome, BuiltinMergeOutcome::Clean(expected.to_vec()));
+        }
+    }
+
+    #[test]
+    fn union_driver_falls_back_to_binary_for_nul_content() {
+        let ours = b"ours\0bytes";
+        let outcome = merge_bytes_with_driver(
+            BuiltinMergeDriver::Union,
+            b"base\0bytes",
+            ours,
+            b"theirs\0bytes",
+            None,
+            diffy::ConflictStyle::Merge,
+            0,
+        )
+        .expect("union binary fallback");
+        assert_eq!(outcome, BuiltinMergeOutcome::Conflict(ours.to_vec()));
+    }
+
+    #[test]
+    fn recursive_binary_driver_uses_the_original_for_the_virtual_ancestor() {
+        let mut blobs = VirtualBlobs::new();
+        let mut entry = |data: &[u8]| {
+            let blob = Blob::from_content_bytes(data.to_vec());
+            blobs.insert(blob.id, blob.data);
+            MergeTreeEntry {
+                hash: blob.id,
+                mode: TreeItemMode::Blob,
+            }
+        };
+        let base = entry(b"base\n");
+        let ours = entry(b"ours\n");
+        let theirs = entry(b"theirs\n");
+        let path = PathBuf::from("driver.txt");
+        let base_items = HashMap::from([(path.clone(), base)]);
+        let our_items = HashMap::from([(path.clone(), ours)]);
+        let their_items = HashMap::from([(path.clone(), theirs)]);
+        let rename_config = MergeRenameConfig::default();
+
+        let merged = merge_virtual_items(
+            &base_items,
+            &our_items,
+            &their_items,
+            1,
+            &mut blobs,
+            VirtualFold {
+                persist: false,
+                conflict_style: diffy::ConflictStyle::Merge,
+                rename_config: &rename_config,
+                default_driver: Some("binary"),
+            },
+        )
+        .expect("recursive binary-driver merge");
+
+        assert_eq!(merged.get(&path), Some(&base));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -10850,8 +11247,9 @@ mod tests {
         let mut no_virtual_blobs = VirtualBlobs::new();
         let mut favored = |base, ours, theirs, favor| {
             let mut context =
-                TreeMergeContext::top_level(false, Some(favor), &mut no_virtual_blobs);
-            resolve_three_way(base, ours, theirs, &mut context).expect("favored resolution")
+                TreeMergeContext::top_level(false, Some(favor), None, &mut no_virtual_blobs);
+            resolve_three_way(Path::new("f"), base, ours, theirs, &mut context)
+                .expect("favored resolution")
         };
 
         assert!(matches!(
@@ -11105,7 +11503,7 @@ mod tests {
             &base_items,
             &our_items,
             &their_items,
-            &mut TreeMergeContext::top_level(true, None, &mut no_virtual_blobs),
+            &mut TreeMergeContext::top_level(true, None, None, &mut no_virtual_blobs),
         )
         .expect("merge tree items");
 
@@ -11302,6 +11700,7 @@ mod recursive {
                 persist: false,
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
             },
         )
         .expect("folding two ancestors never fails")
@@ -11337,6 +11736,7 @@ mod recursive {
                 persist: false,
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
             },
         )
         .expect_err("one level past the ceiling is refused");
@@ -11351,6 +11751,7 @@ mod recursive {
                 persist: false,
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
             },
         )
         .expect_err("these ids name no object");
@@ -11379,6 +11780,7 @@ mod recursive {
                 persist: false,
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
             },
         )
         .expect_err("one base past the width ceiling is refused");
@@ -11396,6 +11798,7 @@ mod recursive {
                 persist: false,
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
             },
         )
         .expect_err("these ids name no object");
@@ -12087,7 +12490,7 @@ mod tree {
             &base_items,
             &our_items,
             &their_items,
-            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+            &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
         )?;
         let mut conflicts: Vec<PathBuf> = result.conflicts.into_iter().map(|(p, _)| p).collect();
         conflicts.sort();
@@ -12106,7 +12509,7 @@ mod tree {
             base,
             ours,
             theirs,
-            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+            &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
             false,
         )?;
         // Production settles the collisions after the rename fix-up; this
@@ -12138,7 +12541,7 @@ mod tree {
             base,
             ours,
             theirs,
-            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+            &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
             true,
         )?;
         Ok(out)
@@ -13040,7 +13443,7 @@ mod rename {
             &mut forced,
             diffy::ConflictStyle::Merge,
             ("HEAD", "feature"),
-            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+            &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
         )
         .expect("the rename pass succeeds");
         (forced, notes)

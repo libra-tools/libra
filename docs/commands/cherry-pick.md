@@ -32,6 +32,13 @@ Submodules are never merged (see `docs/commands/merge.md`): if the pick's three-
 
 When a commit cannot be applied cleanly, Libra performs a three-way apply (base = parent tree, ours = current index, theirs = picked tree) and writes any unresolved divergent path to the index (stages 1/2/3) and the working tree (line-level conflict markers, matching Git). `-X ours/theirs` can resolve only the overlapping hunks while retaining clean changes. The in-progress sequence is persisted in the unified SQLite `sequence_state` table, so you can resolve a remaining conflict and continue with `--continue`, drop the conflicted commit with `--skip`, or undo the whole sequence with `--abort`/`--quit`. While a cherry-pick sequence is in progress, other sequencer operations are blocked (`LBR-CONFLICT-002`).
 
+That content merge honors the path's `merge` gitattribute and the
+`merge.default` fallback exactly as `libra merge` does: `text`, `binary`, and
+`union` are built in, while unknown names fall back to `text`. A union driver
+can therefore resolve an overlapping pick by keeping current content followed
+by picked content; a binary-driver conflict keeps the complete surviving side
+(current when present) without adding text markers.
+
 ## Options
 
 ### `-n`, `--no-commit`

@@ -48,7 +48,27 @@ libra merge --restart
 
 ### 冲突标记风格（`merge.conflictStyle`）
 
-标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；二进制与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
+标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；由 text 回退处理的 NUL 内容与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），显式 binary driver 则保留 ours 原文且不写 marker。`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
+
+### 按路径选择 merge driver（`gitattributes`）
+
+当一个路径的内容在两侧都发生变化时，Libra 通过既有的
+`.gitattributes` / `.libra_attributes` 级联读取 `merge` 属性，并按 Git
+低层合并语义分派：
+
+- `merge` 或 `merge=text` 使用普通行级文本三路合并。
+- `-merge` 或 `merge=binary` 把文件视为不可拆分整体。未解决冲突时，
+  工作树保留完整 ours 内容，索引写入 stage 1/2/3，且不生成冲突标记。
+- `merge=union` 在每个重叠区域依次保留 ours、theirs，并把内容合并视为干净；
+  若 xdiff 把任一输入判为二进制（例如含 NUL），则回退整文件 binary 冲突，
+  保留 ours 且不写 marker。
+- 未知属性值回退 `text`；不报错，也不会继续查询 `merge.default`。
+
+路径没有 `merge` 属性时，`merge.default=text|binary|union` 选择默认
+driver；未配置或配置为未知值同样回退 `text`。`merge-file`、
+`cherry-pick`、`revert` 共用该分派；`merge-file` 在 Libra 仓库外没有
+属性/配置来源，恒用 `text`。外部 `merge.<name>.driver` 命令尚未实现，
+所以自定义名称目前按上述规则回退文本合并。
 
 ### 目录/文件冲突（D/F 冲突）
 

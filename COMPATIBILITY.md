@@ -282,6 +282,20 @@ Myers-minimal, Patience, and Histogram backends through `--algorithm` plus
 Git-compatible anchored Patience: qualifying lines must be unique on both sides
 and start with a supplied prefix; selector retention/clearing follows Git.
 
+### Built-in merge-driver dispatch (MG-08)
+
+`merge`, `merge-file`, `cherry-pick`, and `revert` share the path-level
+`merge` gitattribute dispatch. `merge`/`merge=text` selects the existing text
+three-way merge; `-merge`/`merge=binary` selects whole-file conflict handling
+without markers; `merge=union` retains ours then theirs in each overlapping
+region; xdiff-classified binary input makes union fall back to the marker-free
+whole-file binary conflict. A named-but-unknown attribute value falls back directly to text. Only
+an absent attribute consults `merge.default`, whose unset or unknown value also
+falls back to text. `merge-file` outside a Libra repository deliberately has no
+attributes/config source and always selects text. External
+`merge.<name>.driver` commands remain deferred, so custom names currently take
+the Git-compatible built-in text fallback.
+
 ## Git commands intentionally absent from `src/cli.rs`
 
 | Command | Tier | Notes |

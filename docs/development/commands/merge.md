@@ -7,7 +7,8 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。fast-forward、单头 three-way、`-s ours`、`-X ours/theirs`、`--allow-unrelated-histories`、`--log[=<n>]`/`--no-log`、冲突 lifecycle、autostash、历史 config 与现有签名/显示 flags 已支持；octopus、其它 strategy/option、`--rerere-autoupdate` 与 merge-commit signing 延后。
-- three-way 冲突仍由 `merge_tree_items` + `diffy` 行级合并处理；`-X` 只替换冲突 region，clean hunk 继续合并。`--dry-run` 仍在首次持久写前返回，strategy/option 与虚拟空 base 都只在内存计算；JSON `strategy` 对 `-s ours` 为 `ours`，真实输出不新增其它 schema key。
+- three-way 内容分歧仍由 `merge_tree_items` 处理；text/union driver 使用共享 `diffy` 行级合并，binary driver 使用整文件选择。`-X` 只替换冲突 region，clean hunk 继续合并。`--dry-run` 仍在首次持久写前返回，strategy/option 与虚拟空 base 都只在内存计算；JSON `strategy` 对 `-s ours` 为 `ours`，真实输出不新增其它 schema key。
+- MG-08 merge driver：`builtin_merge_driver_for_path` 复用 `utils::attributes::attribute_state_for_path("merge", path)`；Set/`text` → text、Unset/`binary` → binary、`union` → union，属性值未知时立即回退 text。仅属性缺失时读取 strict-cascade `merge.default`，其未知值同样回退 text。`merge_bytes_with_driver` 是 merge/merge-file/cherry-pick/revert 的共享内容层；binary 冲突返回 ours 原文而不伪造 marker，union 只在冲突 region 拼接 ours→theirs，任一 xdiff 输入为 binary 时按 Git 回退 binary conflict。三路 merge 在 autostash 等写入前预读 config，并把值贯穿 flat/incremental/recursive/rename 路径；虚拟祖先 binary driver 取 original。
 - `--restart` 继续对记录的 `state.target` 确定性重跑；recovery-critical 的 `allow_unrelated_histories` 从 fsynced state 重放，其它原始展示/策略 option 仍使用默认。`--no-commit` 的干净 state 继续由 `RestartWithoutConflicts` 拒绝。`--squash` 即使冲突也不写 `MergeState`，因此 `--continue`、`--abort`、`--restart` 都由 `NoMergeInProgress` 拒绝。
 - P1-07b 实现边界：`MergeStrategy::Ours` 记录双父并复用当前 tree；`MergeFavor::{Ours,Theirs}` 对 add/add、modify/delete 和内容冲突统一选侧，内容冲突使用不可与输入碰撞的动态 marker 只抽取冲突区段。LCA 缺失且显式允许时使用空 item map，`MergeState.base: Option<String>` 的 `None` 表达虚拟 base，不写伪对象。
 

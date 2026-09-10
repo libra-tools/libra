@@ -1,26 +1,33 @@
 //! `libra merge-file` — file-level three-way merge, a focused subset of
 //! `git merge-file`. Merges `<current>` and `<other>` relative to their common
-//! ancestor `<base>`, reusing the same `diffy` three-way merge that `merge` uses
-//! for blob contents, so conflict markers are identical (`<<<<<<< ours` /
-//! `======= ` / `>>>>>>> theirs`, plus `||||||| original` with `--diff3`).
+//! ancestor `<base>`, reusing the same built-in text/binary/union driver layer
+//! that `merge` uses for blob contents. Text conflict markers are identical
+//! (`<<<<<<< ours` / `======= ` / `>>>>>>> theirs`, plus `||||||| original`
+//! with `--diff3`).
 //!
-//! This does NOT touch the branch merge sequencer — it is a standalone text
+//! This does NOT touch the branch merge sequencer — it is a standalone content
 //! merge over three files on disk.
 
 use std::{
     fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use clap::Parser;
-use diffy::{ConflictStyle, MergeOptions};
+use diffy::ConflictStyle;
 use serde::Serialize;
 
-use crate::utils::{
-    error::{CliError, CliResult, StableErrorCode},
-    output::{OutputConfig, emit_json_data},
-    util,
+use crate::{
+    command::merge::{
+        self, BuiltinMergeDriver, BuiltinMergeOutcome, builtin_merge_driver_for_path,
+        merge_bytes_with_driver,
+    },
+    utils::{
+        error::{CliError, CliResult, StableErrorCode},
+        output::{OutputConfig, emit_json_data},
+        util,
+    },
 };
 
 /// `--help` examples (cross-cutting EXAMPLES contract, `_general.md`).
@@ -102,13 +109,36 @@ pub async fn execute_safe(args: MergeFileArgs, output: &OutputConfig) -> CliResu
         }
     }
 
-    let mut options = MergeOptions::new();
-    if args.diff3 {
-        options.set_conflict_style(ConflictStyle::Diff3);
-    }
-    let (merged, conflict) = match options.merge_bytes(&base, &current, &other) {
-        Ok(clean) => (clean, false),
-        Err(conflicted) => (conflicted, true),
+    let in_repo = util::try_get_storage_path(None).is_ok();
+    let default_driver = if in_repo {
+        merge::read_merge_default_driver().await.map_err(|detail| {
+            CliError::fatal(format!("failed to read merge.default config: {detail}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+    } else {
+        None
+    };
+    let driver = if in_repo {
+        builtin_merge_driver_for_path(Path::new(&args.current), default_driver.as_deref())
+    } else {
+        BuiltinMergeDriver::Text
+    };
+    let style = if args.diff3 {
+        ConflictStyle::Diff3
+    } else {
+        ConflictStyle::Merge
+    };
+    let (merged, conflict) = match merge_bytes_with_driver(
+        driver, &base, &current, &other, None, style, 0,
+    )
+    .map_err(|detail| {
+        CliError::fatal(format!("failed to merge '{}': {detail}", args.current))
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })? {
+        BuiltinMergeOutcome::Clean(bytes) => (bytes, false),
+        BuiltinMergeOutcome::Conflict(bytes) => (bytes, true),
     };
 
     let written = !args.stdout;

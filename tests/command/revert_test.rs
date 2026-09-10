@@ -11,6 +11,96 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn revert_driver_union_resolves_overlapping_change() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("driver.txt"), "top\nbase\nbottom\n").unwrap();
+    fs::write(root.join(".gitattributes"), "*.txt merge=union\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt", ".gitattributes"], root),
+        "add revert driver fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "revert driver base", "--no-verify"], root),
+        "commit revert driver fixture",
+    );
+    fs::write(root.join("driver.txt"), "top\ntarget\nbottom\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add reverted change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "reverted change", "--no-verify"], root),
+        "commit reverted change",
+    );
+    let reverted = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    fs::write(root.join("driver.txt"), "top\ncurrent\nbottom\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add later change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "later change", "--no-verify"], root),
+        "commit later change",
+    );
+
+    let output = run_libra_command(&["revert", &reverted, "--no-edit"], root);
+    assert_cli_success(&output, "union revert");
+    assert_eq!(
+        fs::read_to_string(root.join("driver.txt")).unwrap(),
+        "top\ncurrent\nbase\nbottom\n"
+    );
+}
+
+#[test]
+fn revert_driver_default_union_resolves_readded_file() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("driver.txt"), "parent\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add original file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "original file", "--no-verify"], root),
+        "commit original file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.default", "union"], root),
+        "configure default union driver",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rm", "driver.txt"], root),
+        "remove original file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "delete file", "--no-verify"], root),
+        "commit deletion",
+    );
+    let reverted = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    fs::write(root.join("driver.txt"), "current\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add later replacement",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "replace file", "--no-verify"], root),
+        "commit later replacement",
+    );
+
+    let output = run_libra_command(&["revert", &reverted, "--no-edit"], root);
+    assert_cli_success(&output, "default-union revert of deletion");
+    assert_eq!(
+        fs::read_to_string(root.join("driver.txt")).unwrap(),
+        "current\nparent\n"
+    );
+}
+
+#[test]
 fn test_revert_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["revert", "HEAD"], temp.path());
@@ -714,11 +804,15 @@ fn test_revert_conflict_then_continue() {
         p.join(".libra/revert-state.json").exists(),
         "revert state should be recorded"
     );
+    let conflict = fs::read_to_string(p.join("f.txt")).unwrap();
     assert!(
-        fs::read_to_string(p.join("f.txt"))
-            .unwrap()
-            .contains("<<<<<<<"),
+        conflict.contains("<<<<<<<"),
         "worktree should carry conflict markers"
+    );
+    assert!(
+        conflict.contains("||||||| original"),
+        "the implicit text driver must preserve revert's pre-MG-08 diff3 base section: \
+         {conflict}"
     );
 
     // Resolve and continue.

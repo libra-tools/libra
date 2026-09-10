@@ -19,6 +19,13 @@ libra revert --abort
 
 The command works by computing the diff between the target commit and its parent, then applying the inverse of that diff to the current working tree and index. If the resulting state is clean, a new commit is recorded with a message of the form `Revert "<original subject>"`.
 
+When both the inverse change and later history changed the same path, the
+content merge honors that path's `merge` gitattribute and the `merge.default`
+fallback shared with `libra merge`. Built-in `text`, `binary`, and `union`
+drivers are supported; unknown names fall back to `text`. Union retains current
+content followed by the reverted-to parent content in each overlap, while a
+binary-driver conflict keeps the complete current file without text markers.
+
 The revert commit uses the current author and committer identity/date, honoring
 `GIT_AUTHOR_*` and `GIT_COMMITTER_*` through the same environment rules as
 `libra commit` when it creates the commit. The generated subject is derived from
@@ -240,6 +247,8 @@ changes, standard conflict markers are written to the working tree, the unmerged
 state and revert progress are saved in `revert-state.json`, and `LBR-CONFLICT-001`
 is returned. You resolve the markers and run `libra revert --continue`, skip the
 commit with `libra revert --skip`, or unwind with `libra revert --abort`.
+The implicit `text` driver preserves revert's existing diff3-style
+`||||||| original` base section in conflicted output.
 Passing `-X ours` or `-X theirs` resolves overlapping regions during that
 three-way merge while preserving every clean inverse hunk.
 

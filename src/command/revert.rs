@@ -102,6 +102,9 @@ enum RevertError {
     #[error("failed to load object: {0}")]
     LoadObject(String),
 
+    #[error("failed to read merge.default config: {0}")]
+    MergeDriverConfigRead(String),
+
     #[error("failed to save object: {0}")]
     SaveObject(String),
 
@@ -213,6 +216,7 @@ impl RevertError {
             | Self::MainlineForNonMerge(_)
             | Self::InvalidMainline { .. } => StableErrorCode::CliInvalidArguments,
             Self::LoadObject(_) => StableErrorCode::IoReadFailed,
+            Self::MergeDriverConfigRead(_) => StableErrorCode::IoReadFailed,
             Self::SaveObject(_) => StableErrorCode::IoWriteFailed,
             Self::WriteWorktree(_) => StableErrorCode::IoWriteFailed,
             Self::IndexSave(_) => StableErrorCode::IoWriteFailed,
@@ -930,17 +934,25 @@ enum SingleRevertOutcome {
 }
 
 /// Content-level 3-way merge for a path that diverged since the reverted commit:
-/// base = the reverted commit's blob, ours = the current blob, theirs = the
-/// parent's blob (the revert target). Returns the resulting blob hash and whether
-/// it carries conflict markers.
+/// base = the reverted commit's blob (or empty when that commit deleted the
+/// path), ours = the current blob, and theirs = the parent's blob (the revert
+/// target). Returns the resulting blob hash and whether it remains conflicted.
 fn three_way_revert_blob(
-    reverted_hash: ObjectHash,
+    path: &Path,
+    reverted_hash: Option<ObjectHash>,
     current_hash: ObjectHash,
     parent_hash: Option<ObjectHash>,
     favor: Option<MergeFavor>,
+    default_driver: Option<&str>,
 ) -> Result<(ObjectHash, bool), RevertError> {
-    let reverted: Blob =
-        load_object(&reverted_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+    let reverted_data = match reverted_hash {
+        Some(reverted_hash) => {
+            let reverted: Blob =
+                load_object(&reverted_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+            reverted.data
+        }
+        None => Vec::new(),
+    };
     let current: Blob =
         load_object(&current_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
     let parent_data = match parent_hash {
@@ -951,16 +963,23 @@ fn three_way_revert_blob(
         }
         None => Vec::new(),
     };
-    let (bytes, conflicted) = match favor {
-        Some(favor) => (
-            merge::merge_bytes_with_favor(&reverted.data, &current.data, &parent_data, favor)
-                .map_err(RevertError::SaveObject)?,
-            false,
-        ),
-        None => match diffy::merge_bytes(&reverted.data, &current.data, &parent_data) {
-            Ok(merged) => (merged, false),
-            Err(conflicted) => (conflicted, true),
-        },
+    let driver = merge::builtin_merge_driver_for_path(path, default_driver);
+    let (bytes, conflicted) = match merge::merge_bytes_with_driver(
+        driver,
+        &reverted_data,
+        &current.data,
+        &parent_data,
+        favor,
+        // `diffy::merge_bytes`, used here before MG-08, defaults to Diff3.
+        // Preserve that no-attribute presentation while sharing driver
+        // dispatch; MG-10 owns any later rendering-layer change.
+        diffy::ConflictStyle::Diff3,
+        0,
+    )
+    .map_err(RevertError::SaveObject)?
+    {
+        merge::BuiltinMergeOutcome::Clean(bytes) => (bytes, false),
+        merge::BuiltinMergeOutcome::Conflict(bytes) => (bytes, true),
     };
     let blob = Blob::from_content_bytes(bytes);
     save_object(&blob, &blob.id).map_err(|e| RevertError::SaveObject(e.to_string()))?;
@@ -1056,6 +1075,27 @@ async fn revert_single_commit(
     let parent_files: std::collections::HashMap<_, _> =
         parent_tree.get_plain_items().into_iter().collect();
 
+    let modifies_existing_path = reverted_files.iter().any(|(path, reverted_hash)| {
+        let parent_hash = parent_files.get(path);
+        Some(*reverted_hash) != parent_hash.copied()
+            && current_files.get(path) != Some(reverted_hash)
+            && current_files.contains_key(path)
+    });
+    let restores_divergent_deleted_path = parent_files.iter().any(|(path, parent_hash)| {
+        !reverted_files.contains_key(path)
+            && current_files
+                .get(path)
+                .is_some_and(|current_hash| current_hash != parent_hash)
+    });
+    let needs_content_driver = modifies_existing_path || restores_divergent_deleted_path;
+    let default_driver = if needs_content_driver {
+        merge::read_merge_default_driver()
+            .await
+            .map_err(RevertError::MergeDriverConfigRead)?
+    } else {
+        None
+    };
+
     let mut files_changed: usize = 0;
     let mut conflicted_paths: Vec<String> = Vec::new();
 
@@ -1091,10 +1131,12 @@ async fn revert_single_commit(
         if current_files.get(path) != Some(&reverted_hash) && current_files.contains_key(path) {
             let current_hash = current_files[path];
             let (merged_hash, conflicted) = three_way_revert_blob(
-                reverted_hash,
+                path,
+                Some(reverted_hash),
                 current_hash,
                 parent_hash.copied(),
                 params.strategy_option,
+                default_driver.as_deref(),
             )?;
             current_files.insert(path.clone(), merged_hash);
             files_changed += 1;
@@ -1116,16 +1158,37 @@ async fn revert_single_commit(
     for (path, &parent_hash) in &parent_files {
         if !reverted_files.contains_key(path) {
             let current_hash = current_files.get(path).copied();
-            if current_hash.is_some()
-                && current_hash != Some(parent_hash)
-                && let Some(favor) = params.strategy_option
+            if let Some(current_hash) = current_hash
+                && current_hash != parent_hash
             {
-                if favor == MergeFavor::Theirs
-                    && current_files.insert(path.clone(), parent_hash) != Some(parent_hash)
-                {
+                let driver = merge::builtin_merge_driver_for_path(path, default_driver.as_deref());
+                if driver != merge::BuiltinMergeDriver::Text {
+                    let (merged_hash, conflicted) = three_way_revert_blob(
+                        path,
+                        None,
+                        current_hash,
+                        Some(parent_hash),
+                        params.strategy_option,
+                        default_driver.as_deref(),
+                    )?;
+                    current_files.insert(path.clone(), merged_hash);
                     files_changed += 1;
+                    if conflicted {
+                        conflicted_paths.push(path.display().to_string());
+                    }
+                    continue;
                 }
-                continue;
+                // The implicit text fallback keeps the pre-MG-08 add/add
+                // inverse behavior: -X ours retains current, otherwise the
+                // deleted path is restored from the selected parent.
+                if let Some(favor) = params.strategy_option {
+                    if favor == MergeFavor::Theirs
+                        && current_files.insert(path.clone(), parent_hash) != Some(parent_hash)
+                    {
+                        files_changed += 1;
+                    }
+                    continue;
+                }
             }
             if current_files.insert(path.clone(), parent_hash) != Some(parent_hash) {
                 files_changed += 1;

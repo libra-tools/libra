@@ -29,6 +29,11 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 当某提交无法干净应用时，Libra 执行三方 apply（base = 父提交树，ours = 当前索引，theirs = 被 pick 的树），并把未解决的发散路径写入索引（stage 1/2/3）与工作树（行级冲突标记，与 Git 一致）。`-X ours/theirs` 可只解决重叠 hunk 而保留 clean 变更。进行中的序列持久化到统一 SQLite `sequence_state` 表，因此你可以解决剩余冲突后用 `--continue` 续作、用 `--skip` 丢弃冲突提交，或用 `--abort`/`--quit` 撤销整个序列。cherry-pick 序列进行期间，其他 sequencer 操作被阻止（`LBR-CONFLICT-002`）。
 
+该内容合并与 `libra merge` 完全共用路径上的 `merge` gitattribute 及
+`merge.default` 回退：内建 `text`、`binary`、`union`，未知名称回退
+`text`。因此 union driver 可把重叠 pick 解析为 current 内容后接 picked
+内容；binary driver 冲突则保留完整的存活侧（current 存在时优先），不插入文本标记。
+
 ## 选项
 
 ### `-n`, `--no-commit`

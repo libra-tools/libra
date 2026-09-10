@@ -1095,7 +1095,8 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::RenameConfigRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
-        merge::PullMergeError::ConflictStyleRead(..) => {
+        merge::PullMergeError::ConflictStyleRead(..)
+        | merge::PullMergeError::MergeDriverConfigRead(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
         merge::PullMergeError::HistoryConfig(

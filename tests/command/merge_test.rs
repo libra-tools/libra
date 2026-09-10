@@ -30,6 +30,230 @@ fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
     );
 }
 
+fn merge_driver_repo(attribute: Option<&str>, default_driver: Option<&str>) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    std::fs::write(root.join("driver.txt"), "top\nbase\nbottom\n")
+        .expect("failed to write merge-driver base");
+    let mut paths = vec!["driver.txt"];
+    if let Some(attribute) = attribute {
+        std::fs::write(root.join(".gitattributes"), format!("*.txt {attribute}\n"))
+            .expect("failed to write merge attributes");
+        paths.push(".gitattributes");
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", paths[0]], root),
+        "add driver base",
+    );
+    if paths.len() == 2 {
+        assert_cli_success(
+            &run_libra_command(&["add", paths[1]], root),
+            "add merge attributes",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "driver base", "--no-verify"], root),
+        "commit driver base",
+    );
+    if let Some(driver) = default_driver {
+        assert_cli_success(
+            &run_libra_command(&["config", "merge.default", driver], root),
+            "configure default merge driver",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["branch", "driver-side"], root),
+        "create side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "driver-side"], root),
+        "checkout side",
+    );
+    commit_file(root, "driver.txt", "top\ntheirs\nbottom\n", "driver theirs");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "checkout main",
+    );
+    commit_file(root, "driver.txt", "top\nours\nbottom\n", "driver ours");
+    repo
+}
+
+#[test]
+fn merge_driver_dispatches_builtin_attributes_and_defaults() {
+    struct Case {
+        attribute: Option<&'static str>,
+        default_driver: Option<&'static str>,
+        clean: bool,
+        marker: bool,
+        label: &'static str,
+    }
+
+    for case in [
+        Case {
+            attribute: Some("merge"),
+            default_driver: None,
+            clean: false,
+            marker: true,
+            label: "set means text",
+        },
+        Case {
+            attribute: Some("merge=text"),
+            default_driver: None,
+            clean: false,
+            marker: true,
+            label: "named text",
+        },
+        Case {
+            attribute: Some("-merge"),
+            default_driver: None,
+            clean: false,
+            marker: false,
+            label: "unset means binary",
+        },
+        Case {
+            attribute: Some("merge=binary"),
+            default_driver: None,
+            clean: false,
+            marker: false,
+            label: "named binary",
+        },
+        Case {
+            attribute: Some("merge=union"),
+            default_driver: None,
+            clean: true,
+            marker: false,
+            label: "named union",
+        },
+        Case {
+            attribute: Some("merge=unknown"),
+            default_driver: Some("union"),
+            clean: false,
+            marker: true,
+            label: "unknown attribute falls back to text",
+        },
+        Case {
+            attribute: None,
+            default_driver: Some("union"),
+            clean: true,
+            marker: false,
+            label: "configured default",
+        },
+        Case {
+            attribute: None,
+            default_driver: Some("unknown"),
+            clean: false,
+            marker: true,
+            label: "unknown default falls back to text",
+        },
+        Case {
+            attribute: None,
+            default_driver: None,
+            clean: false,
+            marker: true,
+            label: "implicit text default",
+        },
+    ] {
+        let repo = merge_driver_repo(case.attribute, case.default_driver);
+        let output = run_libra_command(&["merge", "driver-side", "--no-verify"], repo.path());
+        assert_eq!(
+            output.status.success(),
+            case.clean,
+            "{}: unexpected status {:?}: {}",
+            case.label,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let content = std::fs::read_to_string(repo.path().join("driver.txt"))
+            .expect("failed to read merge-driver result");
+        assert_eq!(
+            content.contains("<<<<<<<"),
+            case.marker,
+            "{}: unexpected merge result: {content:?}",
+            case.label
+        );
+        if case.clean {
+            let ours = content.find("ours").expect("clean union must retain ours");
+            let theirs = content
+                .find("theirs")
+                .expect("clean union must retain theirs");
+            assert!(
+                ours < theirs,
+                "{}: union order must be ours then theirs",
+                case.label
+            );
+        }
+        if case
+            .attribute
+            .is_some_and(|value| value == "-merge" || value == "merge=binary")
+        {
+            assert_eq!(
+                content, "top\nours\nbottom\n",
+                "{}: binary keeps ours whole",
+                case.label
+            );
+        }
+    }
+}
+
+#[test]
+fn merge_driver_union_binary_input_keeps_ours_without_markers() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    std::fs::write(root.join("driver.bin"), b"base\0bytes").unwrap();
+    std::fs::write(root.join(".gitattributes"), "*.bin merge=union\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.bin", ".gitattributes"], root),
+        "add union-binary base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "union-binary base", "--no-verify"], root),
+        "commit union-binary base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "driver-side"], root),
+        "create union-binary side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "driver-side"], root),
+        "checkout union-binary side",
+    );
+    std::fs::write(root.join("driver.bin"), b"theirs\0bytes").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.bin"], root),
+        "add union-binary theirs",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "union-binary theirs", "--no-verify"],
+            root,
+        ),
+        "commit union-binary theirs",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "checkout union-binary main",
+    );
+    std::fs::write(root.join("driver.bin"), b"ours\0bytes").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.bin"], root),
+        "add union-binary ours",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "union-binary ours", "--no-verify"], root),
+        "commit union-binary ours",
+    );
+
+    let output = run_libra_command(&["merge", "driver-side", "--no-verify"], root);
+    assert!(
+        !output.status.success(),
+        "binary union fallback must conflict"
+    );
+    assert_eq!(
+        std::fs::read(root.join("driver.bin")).unwrap(),
+        b"ours\0bytes"
+    );
+}
+
 #[test]
 fn test_merge_cli_missing_branch_returns_error_1() {
     let repo = create_committed_repo_via_cli();

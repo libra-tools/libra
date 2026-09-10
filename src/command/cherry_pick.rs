@@ -61,6 +61,7 @@ type ConflictEntry = (
     Option<ObjectHash>,
     Option<ObjectHash>,
     Option<ObjectHash>,
+    merge::BuiltinMergeDriver,
 );
 
 const CHERRY_PICK_EXAMPLES: &str = "\
@@ -151,6 +152,9 @@ enum CherryPickError {
     /// failure) — never a silent default-style fall-back.
     #[error("failed to read merge.conflictStyle config: {0}")]
     ConflictStyleRead(String),
+
+    #[error("failed to read merge.default config: {0}")]
+    MergeDriverConfigRead(String),
 }
 
 impl CherryPickError {
@@ -175,6 +179,7 @@ impl CherryPickError {
             Self::SaveFailed(_) => StableErrorCode::IoWriteFailed,
             Self::InvalidConflictStyle(_) => StableErrorCode::RepoStateInvalid,
             Self::ConflictStyleRead(_) => StableErrorCode::IoReadFailed,
+            Self::MergeDriverConfigRead(_) => StableErrorCode::IoReadFailed,
         }
     }
 }
@@ -252,6 +257,9 @@ impl From<CherryPickError> for CliError {
             CherryPickError::ConflictStyleRead(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("check repository integrity and retry"),
+            CherryPickError::MergeDriverConfigRead(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("check repository config readability and retry"),
         }
     }
 }
@@ -275,6 +283,7 @@ enum CherryPickSingleError {
     InvalidConflictStyle(String),
     /// `merge.conflictStyle` config-store read failure.
     ConflictStyleRead(String),
+    MergeDriverConfigRead(String),
     /// The pick's three-way inputs carry a gitlink the cherry-pick would have to
     /// arbitrate — refused before any index/worktree write (ADR-MG-01).
     GitlinkUnsupported(String),
@@ -684,6 +693,9 @@ fn map_single_error(err: CherryPickSingleError, commit_label: &str) -> CherryPic
         CherryPickSingleError::SaveFailed(r) => CherryPickError::SaveFailed(r),
         CherryPickSingleError::InvalidConflictStyle(v) => CherryPickError::InvalidConflictStyle(v),
         CherryPickSingleError::ConflictStyleRead(r) => CherryPickError::ConflictStyleRead(r),
+        CherryPickSingleError::MergeDriverConfigRead(r) => {
+            CherryPickError::MergeDriverConfigRead(r)
+        }
         CherryPickSingleError::GitlinkUnsupported(detail) => {
             CherryPickError::GitlinkUnsupported(detail)
         }
@@ -1372,7 +1384,6 @@ async fn cherry_pick_single_commit(
     let mut index = Index::load(&index_file).map_err(|e| {
         CherryPickSingleError::LoadObject(format!("failed to load current index: {e}"))
     })?;
-
     // ── Three-way apply: base = parent tree, ours = current index stage 0,
     // theirs = picked commit tree. A path whose ours-side still matches base
     // fast-forwards to theirs; a path where both sides agree is a no-op; a path
@@ -1399,8 +1410,23 @@ async fn cherry_pick_single_commit(
     )
     .map_err(|refusal| CherryPickSingleError::GitlinkUnsupported(refusal.to_string()))?;
 
+    let changes = diff_trees(&their_tree, &parent_tree);
+    let needs_content_driver = changes.iter().any(|(path, their_hash, base_hash)| {
+        let ours_hash = ours_items.get(path).copied();
+        ours_hash != *base_hash
+            && ours_hash != *their_hash
+            && (ours_hash.is_some() || their_hash.is_some())
+    });
+    let default_driver = if needs_content_driver {
+        merge::read_merge_default_driver()
+            .await
+            .map_err(CherryPickSingleError::MergeDriverConfigRead)?
+    } else {
+        None
+    };
+
     let mut conflicts: Vec<ConflictEntry> = Vec::new();
-    for (path, their_hash, base_hash) in diff_trees(&their_tree, &parent_tree) {
+    for (path, their_hash, base_hash) in changes {
         let ours_hash = ours_items.get(&path).cloned();
         if ours_hash == base_hash {
             match their_hash {
@@ -1411,11 +1437,78 @@ async fn cherry_pick_single_commit(
             }
         } else if ours_hash == their_hash {
             // Both sides already converged on the same content — nothing to do.
+        } else if let (Some(ours_hash), Some(their_hash)) = (ours_hash, their_hash) {
+            let driver = merge::builtin_merge_driver_for_path(&path, default_driver.as_deref());
+            // Preserve the pre-driver add/add behavior for the implicit text
+            // fallback (MG-08 G15). An explicitly selected binary/union driver
+            // still owns the base-less content merge below.
+            if base_hash.is_none() && driver == merge::BuiltinMergeDriver::Text {
+                if let Some(favor) = args.strategy_option.last().copied() {
+                    apply_favored_pick_resolution(
+                        &mut index,
+                        &path,
+                        base_hash,
+                        Some(ours_hash),
+                        Some(their_hash),
+                        favor,
+                    )?;
+                } else {
+                    index.remove(path_to_utf8(&path)?, 0);
+                    add_stage_entry(&mut index, &path, ours_hash, 2)?;
+                    add_stage_entry(&mut index, &path, their_hash, 3)?;
+                    conflicts.push((path, Some(ours_hash), Some(their_hash), None, driver));
+                }
+                continue;
+            }
+            let base_data = match base_hash {
+                Some(base_hash) => {
+                    let base: Blob = load_object(&base_hash)
+                        .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+                    base.data
+                }
+                None => Vec::new(),
+            };
+            let ours: Blob = load_object(&ours_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            let theirs: Blob = load_object(&their_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            match merge::merge_bytes_with_driver(
+                driver,
+                &base_data,
+                &ours.data,
+                &theirs.data,
+                args.strategy_option.last().copied(),
+                diffy::ConflictStyle::Diff3,
+                0,
+            )
+            .map_err(CherryPickSingleError::SaveFailed)?
+            {
+                merge::BuiltinMergeOutcome::Clean(bytes) => {
+                    let blob = Blob::from_content_bytes(bytes);
+                    save_object(&blob, &blob.id).map_err(|error| {
+                        CherryPickSingleError::SaveFailed(format!(
+                            "failed to save merged cherry-pick result for '{}': {error}",
+                            path.display()
+                        ))
+                    })?;
+                    update_index_entry(&mut index, &path, blob.id)?;
+                }
+                merge::BuiltinMergeOutcome::Conflict(_) => {
+                    index.remove(path_to_utf8(&path)?, 0);
+                    if let Some(base_hash) = base_hash {
+                        add_stage_entry(&mut index, &path, base_hash, 1)?;
+                    }
+                    add_stage_entry(&mut index, &path, ours_hash, 2)?;
+                    add_stage_entry(&mut index, &path, their_hash, 3)?;
+                    conflicts.push((path, Some(ours_hash), Some(their_hash), base_hash, driver));
+                }
+            }
         } else if let Some(favor) = args.strategy_option.last().copied() {
             apply_favored_pick_resolution(
                 &mut index, &path, base_hash, ours_hash, their_hash, favor,
             )?;
         } else {
+            let driver = merge::builtin_merge_driver_for_path(&path, default_driver.as_deref());
             index.remove(path_to_utf8(&path)?, 0);
             if let Some(b) = base_hash {
                 add_stage_entry(&mut index, &path, b, 1)?;
@@ -1426,7 +1519,7 @@ async fn cherry_pick_single_commit(
             if let Some(t) = their_hash {
                 add_stage_entry(&mut index, &path, t, 3)?;
             }
-            conflicts.push((path, ours_hash, their_hash, base_hash));
+            conflicts.push((path, ours_hash, their_hash, base_hash, driver));
         }
     }
 
@@ -1453,7 +1546,7 @@ async fn cherry_pick_single_commit(
         // onto each divergent path so the user can resolve them in the worktree.
         reset_workdir_tracked_only(&current_index, &index)?;
         let short_src = short_display_hash(&commit_id.to_string()).to_string();
-        for (path, ours_hash, their_hash, base_hash) in &conflicts {
+        for (path, ours_hash, their_hash, base_hash, driver) in &conflicts {
             write_conflict_markers_file(
                 path,
                 ours_hash,
@@ -1461,6 +1554,7 @@ async fn cherry_pick_single_commit(
                 base_hash,
                 &short_src,
                 conflict_style,
+                *driver,
             )?;
         }
         // rerere: record the preimage of each just-written conflict and replay a
@@ -1471,7 +1565,7 @@ async fn cherry_pick_single_commit(
         }
         let mut paths: Vec<String> = conflicts
             .iter()
-            .map(|(path, _, _, _)| path.display().to_string())
+            .map(|(path, _, _, _, _)| path.display().to_string())
             .collect();
         paths.sort();
         return Err(CherryPickSingleError::Conflicted(paths));
@@ -1877,6 +1971,7 @@ fn write_conflict_markers_file(
     base_hash: &Option<ObjectHash>,
     short_src: &str,
     conflict_style: diffy::ConflictStyle,
+    driver: merge::BuiltinMergeDriver,
 ) -> Result<(), CherryPickSingleError> {
     fn side_bytes(hash: &Option<ObjectHash>) -> Option<Vec<u8>> {
         hash.as_ref()
@@ -1888,20 +1983,42 @@ fn write_conflict_markers_file(
 
     // Line-level merge applies only when both sides are present and text; the
     // shared helper returns None otherwise so we fall back to whole-file markers.
-    let content: Vec<u8> = match (&ours_bytes, &theirs_bytes) {
-        (Some(ours), Some(theirs)) => super::merge::render_line_level_conflict(
-            base_bytes.as_deref(),
-            ours,
-            theirs,
-            short_src,
-            conflict_style,
-        )
-        .unwrap_or_else(|| whole_file_conflict(ours, theirs, short_src)),
-        _ => whole_file_conflict(
-            ours_bytes.as_deref().unwrap_or(&[]),
-            theirs_bytes.as_deref().unwrap_or(&[]),
-            short_src,
-        ),
+    let binary_conflict = driver == merge::BuiltinMergeDriver::Binary
+        || (driver == merge::BuiltinMergeDriver::Union
+            && ours_bytes.is_some()
+            && theirs_bytes.is_some()
+            && [
+                base_bytes.as_deref(),
+                ours_bytes.as_deref(),
+                theirs_bytes.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(merge::merge_input_is_binary));
+    let content: Vec<u8> = if binary_conflict {
+        // A binary modify/delete conflict keeps whichever complete side still
+        // exists. Choosing only ours would turn an ours-deleted/theirs-modified
+        // path into an empty worktree file even though stage 3 retained data.
+        ours_bytes
+            .clone()
+            .or_else(|| theirs_bytes.clone())
+            .unwrap_or_default()
+    } else {
+        match (&ours_bytes, &theirs_bytes) {
+            (Some(ours), Some(theirs)) => super::merge::render_line_level_conflict(
+                base_bytes.as_deref(),
+                ours,
+                theirs,
+                short_src,
+                conflict_style,
+            )
+            .unwrap_or_else(|| whole_file_conflict(ours, theirs, short_src)),
+            _ => whole_file_conflict(
+                ours_bytes.as_deref().unwrap_or(&[]),
+                theirs_bytes.as_deref().unwrap_or(&[]),
+                short_src,
+            ),
+        }
     };
 
     let target = util::working_dir().join(path);
